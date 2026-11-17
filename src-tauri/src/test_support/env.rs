@@ -360,6 +360,7 @@ pub(crate) mod hermetic {
         "GITPULSE_CLAUDE_CONFIG_DIRS",
         "GITPULSE_CODEX_TRANSCRIPT_ROOT",
         "CODEX_HOME",
+        "ANTIGRAVITY_HOME",
         "GITPULSE_BACKUPS_DIR",
     ];
 

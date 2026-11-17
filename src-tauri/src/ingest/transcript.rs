@@ -1107,34 +1107,35 @@ pub fn candidate_path(call: &ToolCall) -> &str {
 /// The root of `roots` that owns `call`: the deepest one its path lies under,
 /// so a worktree nested in the repository takes its own calls and the
 /// repository keeps only what is not under any worktree. Roots are ranked by
-/// their length without trailing separators, so `/repo/` does not outrank
-/// `/repo`; equal depth keeps the first listed.
+/// their length without trailing separators (`/` or `\`), so `/repo/` does not
+/// outrank `/repo`; equal depth keeps the first listed. A path longer than
+/// [`MAX_PATH_BYTES`] is unattributable, not read.
 ///
-/// Containment is a prefix match with a separator check, so `/repo-other` is
-/// never under `/repo`. No path is canonicalized, so `/tmp/x` and
-/// `/private/tmp/x` are different roots, and `\` is not a separator; both are
-/// the byte-wise comparison of [`under`], the one place to change for either.
-pub fn attribution_root<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<&'a str> {
+/// Containment is by whole components, so `/repo-other` is never under `/repo`.
+/// What a path is compared with is decided once, when the [`RootSet`] is built
+/// for a pass, and the comparison itself touches no file; see [`RootSet`] for
+/// what that does and does not match.
+pub fn attribution_root<'a>(call: &ToolCall, roots: &RootSet<'a>) -> Option<&'a str> {
     deepest_root(candidate_path(call), roots)
 }
 
-pub fn deepest_root<'a>(path: &str, roots: &[&'a str]) -> Option<&'a str> {
-    let depth = |root: &str| root.trim_end_matches('/').len();
+/// The deepest root of `roots` that `path` lies under; see [`attribution_root`].
+pub fn deepest_root<'a>(path: &str, roots: &RootSet<'a>) -> Option<&'a str> {
+    if path.len() > MAX_PATH_BYTES {
+        return None;
+    }
+    let path = PathForm::new(path);
     roots
+        .roots
         .iter()
-        .copied()
-        .filter(|root| under(path, root))
-        .reduce(|best, root| {
-            if depth(root) > depth(best) {
-                root
-            } else {
-                best
-            }
-        })
+        .filter(|root| root.owns(&path))
+        .reduce(|best, root| if root.depth > best.depth { root } else { best })
+        .map(|root| root.raw)
 }
 
-/// A call longer than this is never read as a removed worktree's.
-const MAX_CWD_BYTES: usize = 4096;
+/// A path longer than this is never attributed, and a call whose `cwd` is
+/// longer is never read as a removed worktree's.
+const MAX_PATH_BYTES: usize = 4096;
 /// Where isolation worktrees live below a checkout.
 const WORKTREES_DIR: &str = "/.claude/worktrees/";
 
@@ -1162,10 +1163,10 @@ pub struct Departed<'c, 'r> {
 /// The call's own path must also lie under the removed worktree. A cwd with an
 /// empty, `.` or `..` segment, a NUL, or more than 4096 bytes is never read as
 /// departed.
-pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<Departed<'c, 'r>> {
+pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &RootSet<'r>) -> Option<Departed<'c, 'r>> {
     let cwd = call.cwd.trim_end_matches('/');
     // Almost every call: nothing below its root has the shape.
-    if cwd.len() > MAX_CWD_BYTES || !cwd.contains(WORKTREES_DIR) {
+    if cwd.len() > MAX_PATH_BYTES || !cwd.contains(WORKTREES_DIR) {
         return None;
     }
     let host = deepest_root(cwd, roots)?;
@@ -1186,7 +1187,7 @@ pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<De
     }
     let root = &cwd[..deepest?];
     // A live checkout is the live root's, whatever it is called.
-    let live = roots.iter().any(|live| live.trim_end_matches('/') == root);
+    let live = roots.is_live(root);
     (!live && under(candidate_path(call), root)).then_some(Departed { root, host })
 }
 
@@ -1230,102 +1231,227 @@ fn lexical(path: &str) -> std::borrow::Cow<'_, str> {
     })
 }
 
-/// Whether `path` lies under `root`, by whole components: `/repo-other` and
-/// `/repo/../repo-other` are not under `/repo`, and `/repo/../other/x` is not
-/// either.
+/// The roots one ingest pass attributes calls to, each prepared once.
 ///
-/// Compared in three steps, each only when the one before said no:
-/// 1. lexically, after `.`, `..` and empty components are resolved by text;
-/// 2. as Windows paths when both are spelled so (a drive letter or `\\`),
-///    where `\` separates and case does not matter: `C:\repo\src\a.rs` is
-///    under `c:/Repo`, and `C:\repo-other\x` is not under `C:\repo`;
-/// 3. as the files they name, when the paths exist: `/tmp/x` and
-///    `/private/tmp/x` are one directory, and `/work/Repo` is `/work/repo` on a
-///    volume that ignores case (probed, never assumed from the OS).
-fn under(path: &str, root: &str) -> bool {
-    if root.is_empty() || path.is_empty() {
-        return false;
-    }
-    match (windows_form(path), windows_form(root)) {
-        (Some(path), Some(root)) => return under_windows(&path, &root),
-        (None, None) => {}
-        // A Windows path and a POSIX one never name the same place.
-        _ => return false,
-    }
-    under_lexical(path, root) || under_resolved(path, root)
+/// Preparing is where the filesystem is asked, once per root per pass, and
+/// nothing is asked afterwards, so a call is attributed by text alone and
+/// nothing outlives the pass (a root re-pointed between passes is read again):
+///
+/// * the root as written, resolved lexically (`.`, `..`, empty components);
+/// * its real spelling, when it exists and differs (`/var/x` is
+///   `/private/var/x` on macOS, a linked root is its target), so a path written
+///   either way is under it;
+/// * whether its volume ignores case, probed by asking whether its last
+///   component in flipped case is the same directory, and never assumed from
+///   the OS; where it does, both sides compare without case;
+/// * for a root spelled as a Windows path (a drive letter, `\\server\share`,
+///   `//server/share`, `\\?\C:\`), its drive or share and the components below,
+///   compared without case.
+///
+/// Not matched: a path that reaches a root only through a symlinked directory
+/// in the path itself (`/link/f.rs` where `/link` points into the root). The
+/// transcript's path is taken as written; resolving every line's path would ask
+/// the filesystem once per call.
+#[derive(Debug)]
+pub struct RootSet<'a> {
+    roots: Vec<PreparedRoot<'a>>,
 }
 
-/// [`under`] by text alone, for POSIX-spelled paths.
-fn under_lexical(path: &str, root: &str) -> bool {
-    let (path, root) = (lexical(path), lexical(root));
-    let (path, root) = (path.as_ref(), root.as_ref());
-    // A root is an absolute path. A relative one (or one that resolves to
-    // nothing, like `.`) names no directory, so it owns nothing.
-    if !root.starts_with('/') {
-        return false;
-    }
-    let root = root.trim_end_matches('/');
-    if path == root {
-        return true;
-    }
-    path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/')
+#[derive(Debug)]
+struct PreparedRoot<'a> {
+    raw: &'a str,
+    /// The ranking measure: `raw` without trailing `/` or `\`.
+    depth: usize,
+    forms: Vec<RootForm>,
 }
 
-/// `path` as a Windows path in one comparable spelling (`/` separators, lower
-/// case), or `None` when it is not spelled as one: a drive letter and a
-/// separator (`C:\repo`, `c:/repo`), or a UNC prefix (`\\server\share`). A path
-/// like `/a\b` is a POSIX path with a backslash in a name, and stays one.
-fn windows_form(path: &str) -> Option<String> {
-    let bytes = path.as_bytes();
-    let drive = bytes.len() > 2
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    if !(drive || path.starts_with("\\\\")) {
-        return None;
-    }
-    Some(path.replace('\\', "/").to_lowercase())
+/// One way a root can be spelled, ready to compare with a path.
+#[derive(Debug)]
+enum RootForm {
+    /// An absolute POSIX path, lexical, without a trailing `/`; lower case when
+    /// `fold`, which is then how the path is compared too.
+    Posix { text: String, fold: bool },
+    /// A Windows path, lower case with `/` separators: the drive (`c:`) or the
+    /// `//server/share`, and the absolute rest.
+    Windows(WindowsForm),
 }
 
-/// [`under`] for two paths already in [`windows_form`]: the same drive (or UNC
-/// prefix), then whole components.
-fn under_windows(path: &str, root: &str) -> bool {
-    let split = |text: &str| -> (String, String) {
-        if text.starts_with('/') {
-            (String::new(), text.to_string())
-        } else {
-            let (drive, rest) = text.split_at(2);
-            (drive.to_string(), rest.to_string())
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsForm {
+    prefix: String,
+    rest: String,
+}
+
+impl<'a> RootSet<'a> {
+    /// Prepares `roots`, asking the filesystem about each that exists.
+    pub fn new(roots: &[&'a str]) -> Self {
+        RootSet {
+            roots: roots
+                .iter()
+                .map(|&raw| PreparedRoot::new(raw, true))
+                .collect(),
         }
-    };
-    let ((path_drive, path_rest), (root_drive, root_rest)) = (split(path), split(root));
-    path_drive == root_drive && under_lexical(&path_rest, &root_rest)
-}
-
-/// Roots and directories already resolved, so a pass asks the filesystem once
-/// per distinct one rather than once per call it attributes. Only answers that
-/// were found are kept, so a root created later is found; a full table is
-/// emptied rather than grown.
-struct Resolved {
-    roots: std::collections::HashMap<String, (String, bool)>,
-    dirs: std::collections::HashMap<String, String>,
-}
-
-const MAX_RESOLVED: usize = 4096;
-
-static RESOLVED: std::sync::Mutex<Option<Resolved>> = std::sync::Mutex::new(None);
-
-fn with_resolved<T>(f: impl FnOnce(&mut Resolved) -> T) -> T {
-    let mut guard = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
-    let table = guard.get_or_insert_with(|| Resolved {
-        roots: std::collections::HashMap::new(),
-        dirs: std::collections::HashMap::new(),
-    });
-    if table.roots.len() >= MAX_RESOLVED || table.dirs.len() >= MAX_RESOLVED {
-        table.roots.clear();
-        table.dirs.clear();
     }
-    f(table)
+
+    /// Whether `root` is one of the roots, as written but for trailing `/`.
+    fn is_live(&self, root: &str) -> bool {
+        self.roots
+            .iter()
+            .any(|live| live.raw.trim_end_matches('/') == root)
+    }
+}
+
+impl<'a> PreparedRoot<'a> {
+    /// `probe` asks the filesystem for the real spelling and the volume's case
+    /// handling; without it the root is only its text.
+    fn new(raw: &'a str, probe: bool) -> Self {
+        let mut forms = Vec::new();
+        if !raw.is_empty() {
+            let lexical = lexical(raw);
+            // A root is an absolute path. A relative one (or one that resolves
+            // to nothing, like `.`) names no directory, so it owns nothing.
+            if lexical.starts_with('/') {
+                let text = lexical.trim_end_matches('/');
+                let directory = if text.is_empty() { "/" } else { text };
+                let real = if probe {
+                    std::fs::canonicalize(directory).ok()
+                } else {
+                    None
+                };
+                let fold = real.as_deref().is_some_and(ignores_case);
+                let real_text = real
+                    .as_deref()
+                    .and_then(std::path::Path::to_str)
+                    .map(|real| real.trim_end_matches('/').to_string())
+                    .filter(|real| real != text);
+                let fold_text = |text: &str| {
+                    if fold {
+                        text.to_lowercase()
+                    } else {
+                        text.to_string()
+                    }
+                };
+                forms.push(RootForm::Posix {
+                    text: fold_text(text),
+                    fold,
+                });
+                if let Some(real) = real_text {
+                    forms.push(RootForm::Posix {
+                        text: fold_text(&real),
+                        fold,
+                    });
+                }
+            }
+            if let Some(windows) = WindowsForm::of(raw) {
+                forms.push(RootForm::Windows(windows));
+            }
+        }
+        PreparedRoot {
+            raw,
+            depth: raw.trim_end_matches(['/', '\\']).len(),
+            forms,
+        }
+    }
+
+    fn owns(&self, path: &PathForm<'_>) -> bool {
+        self.forms.iter().any(|form| match form {
+            RootForm::Posix { text, fold } => within(
+                if *fold {
+                    path.lowered()
+                } else {
+                    path.posix.as_ref()
+                },
+                text,
+            ),
+            RootForm::Windows(root) => path
+                .windows
+                .as_ref()
+                .is_some_and(|path| path.prefix == root.prefix && within(&path.rest, &root.rest)),
+        })
+    }
+}
+
+/// A path read once for comparison with every root.
+struct PathForm<'p> {
+    posix: std::borrow::Cow<'p, str>,
+    windows: Option<WindowsForm>,
+    lowered: std::cell::OnceCell<String>,
+}
+
+impl<'p> PathForm<'p> {
+    fn new(path: &'p str) -> Self {
+        PathForm {
+            posix: lexical(path),
+            windows: WindowsForm::of(path),
+            lowered: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn lowered(&self) -> &str {
+        self.lowered.get_or_init(|| self.posix.to_lowercase())
+    }
+}
+
+/// Whether `path` is `root` or lies below it, by whole components. `root` has no
+/// trailing separator (the filesystem root is the empty string).
+fn within(path: &str, root: &str) -> bool {
+    path == root || (path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/'))
+}
+
+impl WindowsForm {
+    /// `path` as a Windows path, or `None` when it is not spelled as one: a
+    /// drive letter and a separator (`C:\repo`, `c:/repo`), a UNC prefix
+    /// (`\\server\share`, or `//server/share` as git and Node print it), or the
+    /// extended-length forms of those (`\\?\C:\repo`, `\\?\UNC\server\share`).
+    /// `\` separates and case does not matter. A path like `/a\b` is a POSIX path
+    /// with a backslash in a name, and stays one; so does `//w1/f`, which is
+    /// also read as UNC here and matches a Windows root only.
+    ///
+    /// `..` cannot leave its drive or its share: `\\srv\other\..\share` is a
+    /// path inside `other`, not `\\srv\share`.
+    fn of(path: &str) -> Option<WindowsForm> {
+        let lowered = path.replace('\\', "/").to_lowercase();
+        let text = if let Some(rest) = lowered.strip_prefix("//?/unc/") {
+            format!("//{rest}")
+        } else if let Some(rest) = lowered.strip_prefix("//?/") {
+            rest.to_string()
+        } else {
+            lowered
+        };
+        let bytes = text.as_bytes();
+        if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+        {
+            return Some(WindowsForm {
+                prefix: text[..2].to_string(),
+                rest: absolute_lexical(&text[2..]),
+            });
+        }
+        let unc = text.strip_prefix("//")?.trim_start_matches('/');
+        let (server, after) = unc.split_once('/').unwrap_or((unc, ""));
+        if server.is_empty() {
+            return None;
+        }
+        let after = after.trim_start_matches('/');
+        let (share, rest) = after.split_once('/').unwrap_or((after, ""));
+        if share.is_empty() {
+            return Some(WindowsForm {
+                prefix: format!("//{server}"),
+                rest: String::new(),
+            });
+        }
+        Some(WindowsForm {
+            prefix: format!("//{server}/{share}"),
+            rest: absolute_lexical(rest),
+        })
+    }
+}
+
+/// `text` (a `/`-separated absolute rest) with `.`, `..` and empty components
+/// resolved, never climbing above its start; the empty rest is `/`.
+fn absolute_lexical(text: &str) -> String {
+    let rooted = format!("/{text}");
+    let resolved = lexical(&rooted);
+    resolved.trim_end_matches('/').to_string()
 }
 
 /// Whether `a` and `b` are one file or directory.
@@ -1367,72 +1493,11 @@ fn ignores_case(canonical: &std::path::Path) -> bool {
     flipped != name && same_object(canonical, &parent.join(flipped))
 }
 
-/// The directory `root` really is, and whether its volume ignores case; `None`
-/// when it does not exist (nothing to resolve).
-fn resolve_root(root: &str) -> Option<(String, bool)> {
-    if let Some(found) = with_resolved(|t| t.roots.get(root).cloned()) {
-        return Some(found);
-    }
-    let canonical = std::fs::canonicalize(root).ok()?;
-    let found = (canonical.to_str()?.to_string(), ignores_case(&canonical));
-    with_resolved(|t| t.roots.insert(root.to_string(), found.clone()));
-    Some(found)
-}
-
-/// `path` with its nearest existing ancestor resolved: the file itself may be
-/// gone (a deleted file's edit is still attributed), its directory is not.
-fn resolve_path(path: &str) -> Option<String> {
-    let (dir, name) = path.rsplit_once('/')?;
-    let dir = if dir.is_empty() { "/" } else { dir };
-    if let Some(found) = with_resolved(|t| t.dirs.get(dir).cloned()) {
-        return Some(join_name(&found, name));
-    }
-    let mut kept: Vec<&str> = Vec::new();
-    let mut here = std::path::Path::new(dir);
-    let canonical = loop {
-        match std::fs::canonicalize(here) {
-            Ok(found) => break found,
-            Err(_) => {
-                kept.push(here.file_name()?.to_str()?);
-                here = here.parent()?;
-            }
-        }
-    };
-    let mut resolved = canonical.to_str()?.to_string();
-    for component in kept.iter().rev() {
-        resolved = join_name(&resolved, component);
-    }
-    with_resolved(|t| t.dirs.insert(dir.to_string(), resolved.clone()));
-    Some(join_name(&resolved, name))
-}
-
-fn join_name(dir: &str, name: &str) -> String {
-    if dir.ends_with('/') {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}/{name}")
-    }
-}
-
-/// [`under`] for two POSIX-spelled paths that text could not tell apart: both
-/// resolved against the filesystem, and compared without case where the root's
-/// volume ignores it.
-fn under_resolved(path: &str, root: &str) -> bool {
-    let (path, root) = (lexical(path), lexical(root));
-    if !root.starts_with('/') || !path.starts_with('/') {
-        return false;
-    }
-    let Some((root, ignores_case)) = resolve_root(&root) else {
-        return false;
-    };
-    let Some(path) = resolve_path(&path) else {
-        return false;
-    };
-    if ignores_case {
-        under_lexical(&path.to_lowercase(), &root.to_lowercase())
-    } else {
-        under_lexical(&path, &root)
-    }
+/// Whether `path` lies under `root`, by whole components, by text alone: the
+/// root as written, with no filesystem, case or link handling beyond what the
+/// spelling says (a Windows-spelled pair compares without case).
+fn under(path: &str, root: &str) -> bool {
+    PreparedRoot::new(root, false).owns(&PathForm::new(path))
 }
 
 #[cfg(test)]
@@ -1441,7 +1506,7 @@ mod tests {
 
     /// Whether `root` alone would own `call`.
     fn owned_by(call: &ToolCall, root: &str) -> bool {
-        attribution_root(call, &[root]).is_some()
+        attribution_root(call, &RootSet::new(&[root])).is_some()
     }
 
     fn record(tool: &str, input: &str) -> String {
@@ -1585,12 +1650,12 @@ mod tests {
         assert!(owned_by(c, "/repo"));
         assert!(owned_by(c, "/repo/.claude/worktrees/wt"));
         assert_eq!(
-            attribution_root(c, &["/repo", "/repo/.claude/worktrees/wt"]),
+            attribution_root(c, &RootSet::new(&["/repo", "/repo/.claude/worktrees/wt"])),
             Some("/repo/.claude/worktrees/wt")
         );
         // Whatever the order roots are listed in.
         assert_eq!(
-            attribution_root(c, &["/repo/.claude/worktrees/wt", "/repo"]),
+            attribution_root(c, &RootSet::new(&["/repo/.claude/worktrees/wt", "/repo"])),
             Some("/repo/.claude/worktrees/wt")
         );
     }
@@ -1608,25 +1673,40 @@ mod tests {
         // A trailing separator must not make a shallower root look deeper.
         let c = edit_at("/repo/.claude/worktrees/wt/a.rs");
         assert_eq!(
-            attribution_root(&c, &["/repo/", "/repo/.claude/worktrees/wt"]),
+            attribution_root(&c, &RootSet::new(&["/repo/", "/repo/.claude/worktrees/wt"])),
             Some("/repo/.claude/worktrees/wt")
         );
         let c = edit_at("/repo/a.rs");
-        assert_eq!(attribution_root(&c, &["/repo/", "/repo"]), Some("/repo/"));
+        assert_eq!(
+            attribution_root(&c, &RootSet::new(&["/repo/", "/repo"])),
+            Some("/repo/")
+        );
         // `/repo2` is a sibling of `/repo`, not a deeper or shallower root.
         let c = edit_at("/repo2/a.rs");
         assert_eq!(
-            attribution_root(&c, &["/repo", "/repo2", "/repo/.claude/worktrees/wt"]),
+            attribution_root(
+                &c,
+                &RootSet::new(&["/repo", "/repo2", "/repo/.claude/worktrees/wt"])
+            ),
             Some("/repo2")
         );
         let c = edit_at("/repo/a.rs");
         assert_eq!(
-            attribution_root(&c, &["/repo2", "/repo", "/repo/.claude/worktrees/wt"]),
+            attribution_root(
+                &c,
+                &RootSet::new(&["/repo2", "/repo", "/repo/.claude/worktrees/wt"])
+            ),
             Some("/repo")
         );
         // Under no root at all.
-        assert_eq!(attribution_root(&edit_at("/other/a.rs"), &["/repo"]), None);
-        assert_eq!(attribution_root(&edit_at("/repo/a.rs"), &[]), None);
+        assert_eq!(
+            attribution_root(&edit_at("/other/a.rs"), &RootSet::new(&["/repo"])),
+            None
+        );
+        assert_eq!(
+            attribution_root(&edit_at("/repo/a.rs"), &RootSet::new(&[])),
+            None
+        );
     }
 
     #[test]
@@ -1634,12 +1714,15 @@ mod tests {
         let root = "/Users/b h/Café Ünï/repo";
         let wt = "/Users/b h/Café Ünï/repo/.claude/worktrees/ü wt";
         let c = edit_at(&format!("{wt}/a.rs"));
-        assert_eq!(attribution_root(&c, &[root, wt]), Some(wt));
+        assert_eq!(attribution_root(&c, &RootSet::new(&[root, wt])), Some(wt));
         let c = edit_at(&format!("{root}/a.rs"));
-        assert_eq!(attribution_root(&c, &[root, wt]), Some(root));
+        assert_eq!(attribution_root(&c, &RootSet::new(&[root, wt])), Some(root));
         // A different normalization of the same text is a different root.
         let decomposed = "/Users/b h/Cafe\u{301} Ünï/repo/a.rs";
-        assert_eq!(attribution_root(&edit_at(decomposed), &[root]), None);
+        assert_eq!(
+            attribution_root(&edit_at(decomposed), &RootSet::new(&[root])),
+            None
+        );
     }
 
     fn command_in(cwd: &str, path: Option<&str>) -> ToolCall {
@@ -1660,7 +1743,7 @@ mod tests {
     const WT: &str = "/repo/.claude/worktrees/wt";
 
     fn departed<'a>(call: &ToolCall, roots: &[&'a str]) -> Option<(String, &'a str)> {
-        departed_root(call, roots).map(|d| (d.root.to_string(), d.host))
+        departed_root(call, &RootSet::new(roots)).map(|d| (d.root.to_string(), d.host))
     }
 
     #[test]
@@ -1740,7 +1823,7 @@ mod tests {
         for i in 0..100_000 {
             let cwd = format!("/repo/.claude/worktrees/gone{i}/src");
             let call = command_in(&cwd, Some(&format!("{cwd}/a.rs")));
-            let d = departed_root(&call, &[REPO]).unwrap();
+            let d = departed_root(&call, &RootSet::new(&[REPO])).unwrap();
             assert_eq!(
                 d.root.len(),
                 "/repo/.claude/worktrees/gone".len() + i.to_string().len()
@@ -1879,32 +1962,43 @@ mod adv2_under_tests {
         assert!(under("/a\\b/f", "/a\\b"));
     }
 
+    /// Whether `path` is under `root` as a pass decides it: the root prepared
+    /// once (its real spelling, its volume's case handling), the path by text.
+    fn owned(path: &str, root: &str) -> bool {
+        deepest_root(path, &RootSet::new(&[root])).is_some()
+    }
+
     /// `/var/...` and `/private/var/...` are one directory on macOS; a root
-    /// reached through a link owns what is under its target.
+    /// reached through a link owns what is written under its target.
     #[test]
     fn u04_a_path_under_the_real_directory_is_under_a_root_spelled_through_a_link() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().canonicalize().unwrap();
         let spelled = tmp.path().to_str().unwrap();
         let file = real.join("sub").join("a.rs");
-        assert!(under(file.to_str().unwrap(), spelled), "{file:?} {spelled}");
-        assert!(!under(real.parent().unwrap().to_str().unwrap(), spelled));
+        assert!(owned(file.to_str().unwrap(), spelled), "{file:?} {spelled}");
+        assert!(!owned(real.parent().unwrap().to_str().unwrap(), spelled));
     }
 
     #[cfg(unix)]
     #[test]
-    fn u04b_a_symlinked_root_owns_its_target() {
+    fn u04b_a_symlinked_root_owns_its_target_and_not_the_other_way_round() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().canonicalize().unwrap().join("real");
         std::fs::create_dir_all(&real).unwrap();
         let link = tmp.path().canonicalize().unwrap().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let file = real.join("gone.rs");
-        assert!(under(file.to_str().unwrap(), link.to_str().unwrap()));
+        assert!(owned(file.to_str().unwrap(), link.to_str().unwrap()));
+        // Written through the link, the path is taken as written: it is under
+        // the link root, and not under the target root. The transcript's path
+        // is not resolved (one filesystem question per call), so a directory
+        // link inside the path is not followed.
         let through = link.join("gone.rs");
-        assert!(under(through.to_str().unwrap(), real.to_str().unwrap()));
+        assert!(owned(through.to_str().unwrap(), link.to_str().unwrap()));
+        assert!(!owned(through.to_str().unwrap(), real.to_str().unwrap()));
         let sibling = real.parent().unwrap().join("real-other").join("x");
-        assert!(!under(sibling.to_str().unwrap(), link.to_str().unwrap()));
+        assert!(!owned(sibling.to_str().unwrap(), link.to_str().unwrap()));
     }
 
     /// Case is ignored exactly where the root's volume ignores it, found by
@@ -1918,12 +2012,12 @@ mod adv2_under_tests {
         let ignores = flipped.exists();
         let file = flipped.join("a.rs");
         assert_eq!(
-            under(file.to_str().unwrap(), root.to_str().unwrap()),
+            owned(file.to_str().unwrap(), root.to_str().unwrap()),
             ignores,
             "volume ignores case: {ignores}"
         );
         let other = root.parent().unwrap().join("MixedCase-other").join("a.rs");
-        assert!(!under(other.to_str().unwrap(), root.to_str().unwrap()));
+        assert!(!owned(other.to_str().unwrap(), root.to_str().unwrap()));
     }
 }
 

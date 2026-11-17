@@ -455,6 +455,9 @@ fn ingest_family(
         }
     }
     let paths = &roots[..roots.len().min(MAX_PARTICIPANTS)];
+    // Prepared once for the pass: every call below is attributed by text alone.
+    let root_set = transcript::RootSet::new(&roots);
+    let path_set = transcript::RootSet::new(paths);
     let mut participants = match participants(ledger_repo, paths, &mut out, expired) {
         Some(participants) => participants,
         None => return out,
@@ -659,13 +662,13 @@ fn ingest_family(
                 // bytes ride the transaction of the deepest root that
                 // has a slot, whose cursor keeps them exactly-once.
                 let departed = if resolved {
-                    transcript::departed_root(&call, &roots)
+                    transcript::departed_root(&call, &root_set)
                 } else {
                     None
                 };
                 let (hosted_owner_root, live_host) = match &departed {
                     Some(departed) => (Some((departed.root, false)), departed.host),
-                    None => match transcript::attribution_root(&call, &roots) {
+                    None => match transcript::attribution_root(&call, &root_set) {
                         Some(root) if by_path.contains_key(root) => (None, root),
                         Some(root) => (Some((root, true)), root),
                         None => continue,
@@ -675,7 +678,7 @@ fn ingest_family(
                     Some(&index) => (index, false),
                     None => {
                         let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
-                        match transcript::deepest_root(owner, paths)
+                        match transcript::deepest_root(owner, &path_set)
                             .and_then(|root| by_path.get(root))
                         {
                             Some(&index) => (index, true),

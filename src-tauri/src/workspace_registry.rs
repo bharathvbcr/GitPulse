@@ -300,6 +300,24 @@ pub fn unregister(
     })
 }
 
+/// What makes two members one: the directory they are, by the identity the
+/// trust store pins (`repository_trust::directory_key`), so
+/// `/work/Repo` and `/work/repo` are two on a volume that tells them apart and
+/// one on a volume that does not, whatever the spelling. A directory whose
+/// identity cannot be read is told apart by its canonical path, exactly.
+#[derive(PartialEq, Eq, Hash)]
+enum MemberKey {
+    Directory(crate::repository_trust::DirectoryKey),
+    Path(PathBuf),
+}
+
+fn member_key(member: &Path) -> MemberKey {
+    match crate::repository_trust::directory_key(member) {
+        Ok(key) => MemberKey::Directory(key),
+        Err(_) => MemberKey::Path(member.to_path_buf()),
+    }
+}
+
 /// Replace the registry contents so they match the open-tab set exactly.
 ///
 /// Uses the same file lock as upstream `Workspace::update`. Names are
@@ -320,24 +338,6 @@ pub fn unregister(
 /// The registry host is not a member that can be skipped. The file is written
 /// into that repository, so a refused host returns the trust error and writes
 /// nothing.
-/// What makes two members one: the directory they are, by the identity the
-/// trust store pins (`repository_trust::directory_key`), so
-/// `/work/Repo` and `/work/repo` are two on a volume that tells them apart and
-/// one on a volume that does not, whatever the spelling. A directory whose
-/// identity cannot be read is told apart by its canonical path, exactly.
-#[derive(PartialEq, Eq, Hash)]
-enum MemberKey {
-    Directory(crate::repository_trust::DirectoryKey),
-    Path(PathBuf),
-}
-
-fn member_key(member: &Path) -> MemberKey {
-    match crate::repository_trust::directory_key(member) {
-        Ok(key) => MemberKey::Directory(key),
-        Err(_) => MemberKey::Path(member.to_path_buf()),
-    }
-}
-
 pub fn sync_open_tabs(
     registry_root: &str,
     repo_paths: &[String],

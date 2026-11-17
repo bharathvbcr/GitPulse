@@ -3255,6 +3255,9 @@ mod source_tests;
 #[cfg(test)]
 mod transcript_bench_tests;
 #[cfg(test)]
+#[path = "under_adv2_tests.rs"]
+mod under_adv2_tests;
+#[cfg(test)]
 mod walk_tests;
 
 #[cfg(test)]

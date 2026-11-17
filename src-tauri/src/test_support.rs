@@ -1025,6 +1025,7 @@ mod hermetic_canary {
             "GITPULSE_CLAUDE_CONFIG_DIRS",
             "GITPULSE_CODEX_TRANSCRIPT_ROOT",
             "CODEX_HOME",
+            "ANTIGRAVITY_HOME",
         ] {
             assert!(
                 std::env::var_os(key).is_none(),
