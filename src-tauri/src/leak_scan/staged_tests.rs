@@ -407,3 +407,119 @@ fn a_diff_configuration_cannot_change_what_is_read() {
     let scan = scan_staged(dir.path(), &[]).expect("scan runs");
     assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally);
 }
+
+/// Replace `name` in the working tree with a symlink to `target`.
+#[cfg(unix)]
+fn become_symlink(dir: &Path, name: &str, target: &str) {
+    std::fs::remove_file(dir.join(name)).unwrap();
+    std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+}
+
+/// Replace `name` in the working tree with a regular file of `bytes`.
+#[cfg(unix)]
+fn become_file(dir: &Path, name: &str, bytes: &[u8]) {
+    std::fs::remove_file(dir.join(name)).unwrap();
+    std::fs::write(dir.join(name), bytes).unwrap();
+}
+
+/// A repository whose `HEAD` holds a symlink `link` and a regular file
+/// `cfg.txt`, so either can change type.
+#[cfg(unix)]
+fn repo_with_link_and_file() -> TempDir {
+    let dir = repo_with_commit();
+    std::os::unix::fs::symlink("README.md", dir.path().join("link")).unwrap();
+    write(dir.path(), "cfg.txt", "mode=plain\n");
+    git_in(dir.path(), &["add", "link", "cfg.txt"]);
+    git_in(dir.path(), &["commit", "-q", "-m", "link and file"]);
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_that_changes_type_either_way_is_scanned_not_refused() {
+    let dir = repo_with_link_and_file();
+    become_file(dir.path(), "link", b"now a plain file\n");
+    become_symlink(dir.path(), "cfg.txt", "README.md");
+    git_in(dir.path(), &["add", "link", "cfg.txt"]);
+    // One raw entry and two patch sections per path: the scan must still
+    // reach a verdict, and read the added side of each.
+    let scan = scan_staged(dir.path(), &[]).expect("a type change is scannable");
+    assert!(scan.tally.is_clean(), "{:?}", scan.tally);
+    assert_eq!(scan.tally.inputs_scanned, 2, "{:?}", scan.tally);
+    assert_eq!(scan.tally.lines_scanned, 2, "{:?}", scan.tally);
+    GitWriter::commit(&path_of(&dir), "retype", false).expect("a clean type change commits");
+    assert_eq!(out(dir.path(), &["log", "-1", "--format=%s"]), "retype");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_secret_planted_in_the_new_file_of_a_type_change_is_found() {
+    let dir = repo_with_link_and_file();
+    let token = github_pat();
+    become_file(dir.path(), "link", format!("{token}\n").as_bytes());
+    git_in(dir.path(), &["add", "link"]);
+    let scan = scan_staged(dir.path(), &[]).expect("a type change is scannable");
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally);
+    assert_eq!(scan.tally.hits[0].path, "link");
+    assert_eq!(scan.tally.hits[0].line, 1);
+    let before = head(&dir);
+    let err = GitWriter::commit(&path_of(&dir), "leak", false).expect_err("blocked");
+    assert_eq!(err.kind(), IpcErrorKind::SecretScanBlocked);
+    assert!(err.message().contains("link:1"), "{}", err.message());
+    assert!(
+        !err.message().contains("could not be scanned"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(head(&dir), before, "nothing was committed");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_type_change_into_or_out_of_a_binary_file_reads_only_the_new_side() {
+    let dir = repo_with_link_and_file();
+    // symlink -> binary file: the new side is a blob git calls binary, so its
+    // bytes come from the index rather than the patch.
+    let mut bytes = b"\x00\x01blob\x00\n".to_vec();
+    bytes.extend_from_slice(format!("key={}\n", aws_key_id()).as_bytes());
+    become_file(dir.path(), "link", &bytes);
+    git_in(dir.path(), &["add", "link"]);
+    let scan = scan_staged(dir.path(), &[]).expect("a type change is scannable");
+    assert_eq!(scan.tally.hits_total, 1, "{:?}", scan.tally);
+    assert_eq!(scan.tally.hits[0].path, "link");
+    assert_eq!(scan.tally.hits[0].line, 2);
+    git_in(dir.path(), &["reset", "-q", "--", "link"]);
+
+    // binary file -> symlink: the removed binary is history and is not read;
+    // the new symlink is a text section and is.
+    std::fs::write(dir.path().join("cfg.txt"), &bytes).unwrap();
+    git_in(dir.path(), &["add", "cfg.txt"]);
+    git_in(dir.path(), &["commit", "-q", "-m", "binary", "--no-verify"]);
+    become_symlink(dir.path(), "cfg.txt", "README.md");
+    git_in(dir.path(), &["add", "cfg.txt"]);
+    let scan = scan_staged(dir.path(), &[]).expect("a type change is scannable");
+    assert!(scan.tally.is_clean(), "{:?}", scan.tally);
+    assert_eq!(scan.tally.inputs_scanned, 1, "{:?}", scan.tally);
+}
+
+#[test]
+fn a_nested_submodule_diff_in_the_users_configuration_cannot_add_sections() {
+    let dir = repo_with_commit();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    git_in(&sub, &["init", "-q", "-b", "main"]);
+    git_in(&sub, &["config", "user.name", "Scan Test"]);
+    git_in(&sub, &["config", "user.email", "scan@example.com"]);
+    git_in(&sub, &["config", "commit.gpgsign", "false"]);
+    write(&sub, "a.txt", "one\n");
+    git_in(&sub, &["add", "a.txt"]);
+    git_in(&sub, &["commit", "-q", "-m", "one"]);
+    git_in(dir.path(), &["add", "sub"]);
+    git_in(dir.path(), &["commit", "-q", "-m", "add sub"]);
+    write(&sub, "a.txt", "one\ntwo\n");
+    git_in(&sub, &["commit", "-q", "-am", "two"]);
+    git_in(dir.path(), &["add", "sub"]);
+    git_in(dir.path(), &["config", "diff.submodule", "diff"]);
+    let scan = scan_staged(dir.path(), &[]).expect("scan runs");
+    assert!(scan.tally.is_clean(), "{:?}", scan.tally);
+}

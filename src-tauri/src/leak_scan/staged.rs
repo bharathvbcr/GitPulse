@@ -12,7 +12,8 @@
 //! the commit view, can let a refused commit through ([`Policy::HumanOverride`]).
 
 use super::{
-    note_scan_completed, parse_patch, parse_raw, BlobLines, RawEntry, SkipReason, Tally, ENGINE,
+    note_scan_completed, pair_sections, parse_patch, parse_raw, BlobLines, Paired, RawEntry,
+    SkipReason, Tally, ENGINE,
 };
 use crate::engine::git_cli::{git, git_observed, git_with_stdin};
 use crate::engine::process::{
@@ -40,12 +41,15 @@ const _: () = assert!(STREAM_BUDGET_BYTES < MAX_DRAINED_OUTPUT_BYTES as u64);
 
 /// Options every diff here runs with, so a user's diff configuration cannot
 /// change what the scan reads: no external diff driver, no textconv filter,
-/// no colour codes, renames detected the same way in both listings.
-const DIFF_OPTIONS: [&str; 5] = [
+/// no colour codes, no nested submodule diff (`diff.submodule=diff` would add
+/// sections no listing entry names), renames detected the same way in both
+/// listings.
+const DIFF_OPTIONS: [&str; 6] = [
     "--cached",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
+    "--submodule=short",
     "-M",
 ];
 
@@ -85,22 +89,22 @@ pub fn scan_staged(repo: &Path, pathspec: &[String]) -> Result<StagedScan, ScanF
     let patch = git(repo, &diff_args(&["-p", "-U0"], pathspec))
         .map_err(|_| ScanFailure("git could not produce the staged diff".into()))?;
     let sections = parse_patch(&patch).map_err(|e| ScanFailure(e.describe().into()))?;
-    // Both listings come from one diff queue, so they name the same files in
-    // the same order. If they disagree, which lines belong to which file is
-    // unknown, and so is the verdict.
-    if sections.len() != entries.len() {
-        return Err(ScanFailure(format!(
-            "the staged diff named {} files and the listing {}",
-            sections.len(),
-            entries.len()
-        )));
-    }
+    // Both listings come from one diff queue; `pair_sections` is the one place
+    // they are matched, and refuses what it cannot explain.
+    let pairs = pair_sections(&sections, &entries).map_err(|m| ScanFailure(m.describe()))?;
 
     let mut tally = Tally::default();
     let mut blobs: Vec<&RawEntry> = Vec::new();
-    for (section, entry) in sections.iter().zip(&entries) {
+    for Paired {
+        section,
+        entry,
+        removed_half,
+    } in pairs
+    {
         if section.binary {
-            if entry.has_blob() {
+            // A removed binary is history, and `entry` names the blob that
+            // replaced it.
+            if !removed_half && entry.has_blob() {
                 blobs.push(entry);
             }
             continue;

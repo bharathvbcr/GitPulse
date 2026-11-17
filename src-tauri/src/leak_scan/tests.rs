@@ -298,3 +298,137 @@ fn raw_entries_take_the_destination_of_a_rename_and_spot_blobless_entries() {
     assert_eq!(parse_raw(b"not raw\0x\0"), None);
     assert_eq!(parse_raw(b""), Some(Vec::new()));
 }
+
+/// A patch as git prints it for a symlink `l` that becomes a regular file,
+/// between two ordinary modifications.
+const TYPE_CHANGE_PATCH: &str = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
++new
+diff --git a/l b/l
+deleted file mode 120000
+--- a/l
++++ /dev/null
+@@ -1 +0,0 @@
+-target
+diff --git a/l b/l
+new file mode 100644
+--- /dev/null
++++ b/l
+@@ -0,0 +1 @@
++contents
+diff --git a/z.txt b/z.txt
+--- a/z.txt
++++ b/z.txt
+@@ -1 +1 @@
+-old
++new
+";
+
+fn raw_listing(statuses: &[(&str, &str)]) -> Vec<RawEntry> {
+    let oid = "a".repeat(40);
+    let raw: String = statuses
+        .iter()
+        .map(|(status, path)| format!(":100644 100644 {oid} {oid} {status}\0{path}\0"))
+        .collect();
+    parse_raw(raw.as_bytes()).expect("parses")
+}
+
+#[test]
+fn a_type_change_pairs_both_sections_with_its_one_entry() {
+    let sections = parse_patch(TYPE_CHANGE_PATCH.as_bytes()).expect("parses");
+    let entries = raw_listing(&[("M", "a.txt"), ("T", "l"), ("M", "z.txt")]);
+    let pairs = pair_sections(&sections, &entries).expect("a type change pairs");
+    let shape: Vec<(&str, bool, usize)> = pairs
+        .iter()
+        .map(|p| (p.entry.path.as_str(), p.removed_half, p.section.added.len()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("a.txt", false, 1),
+            ("l", true, 0),
+            ("l", false, 1),
+            ("z.txt", false, 1),
+        ]
+    );
+}
+
+#[test]
+fn sections_that_cannot_be_explained_do_not_pair() {
+    let sections = parse_patch(TYPE_CHANGE_PATCH.as_bytes()).expect("parses");
+    // Four sections for three entries and no type change to account for the
+    // fourth: the listing is not the patch's.
+    let no_type_change = raw_listing(&[("M", "a.txt"), ("M", "l"), ("M", "z.txt")]);
+    let err = pair_sections(&sections, &no_type_change).expect_err("one section too many");
+    assert_eq!(
+        err,
+        PairMismatch {
+            sections: 4,
+            entries: 3
+        }
+    );
+    // A type change at the wrong place takes the wrong two sections.
+    let misplaced = raw_listing(&[("T", "a.txt"), ("M", "l"), ("M", "z.txt")]);
+    assert!(pair_sections(&sections, &misplaced).is_err());
+    // A type change with only one section left, or none.
+    let last = raw_listing(&[("M", "a.txt"), ("M", "l"), ("T", "z.txt")]);
+    assert!(pair_sections(&sections, &last).is_err());
+    let two = raw_listing(&[("T", "a.txt"), ("T", "l")]);
+    assert!(pair_sections(&sections, &two).is_err());
+    // More entries than sections.
+    let more = raw_listing(&[("M", "a.txt"), ("T", "l"), ("M", "z.txt"), ("M", "extra")]);
+    assert!(pair_sections(&sections, &more).is_err());
+    // No sections at all for an entry.
+    assert!(pair_sections(&[], &raw_listing(&[("M", "a.txt")])).is_err());
+    // A section for no entry.
+    assert!(pair_sections(&sections, &[]).is_err());
+    assert_eq!(pair_sections(&[], &[]).map(|p| p.len()), Ok(0));
+    assert!(PairMismatch {
+        sections: 4,
+        entries: 3
+    }
+    .describe()
+    .contains("4 sections for 3 listed files"));
+}
+
+#[test]
+fn the_two_sections_of_a_type_change_must_be_a_removal_then_a_creation() {
+    let entries = raw_listing(&[("T", "l")]);
+    let swapped = "\
+diff --git a/l b/l
+new file mode 100644
+--- /dev/null
++++ b/l
+@@ -0,0 +1 @@
++contents
+diff --git a/l b/l
+deleted file mode 120000
+--- a/l
++++ /dev/null
+@@ -1 +0,0 @@
+-target
+";
+    let sections = parse_patch(swapped.as_bytes()).expect("parses");
+    assert!(pair_sections(&sections, &entries).is_err());
+    // Two plain modifications are not a type change.
+    let modified = "\
+diff --git a/l b/l
+--- a/l
++++ b/l
+@@ -1 +1 @@
+-a
++b
+diff --git a/l b/l
+--- a/l
++++ b/l
+@@ -1 +1 @@
+-b
++c
+";
+    let sections = parse_patch(modified.as_bytes()).expect("parses");
+    assert!(pair_sections(&sections, &entries).is_err());
+}
