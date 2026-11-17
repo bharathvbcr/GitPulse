@@ -14,7 +14,7 @@ flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]
         direction TB
         Webview["Tauri Webview<br/>(Strict CSP: default-src 'self')"]
-        IPCBoundary["Tauri IPC Seam<br/>(331 Registered cmd_* Handlers)"]
+        IPCBoundary["Tauri IPC Seam<br/>(332 Registered cmd_* Handlers)"]
         LocalEngine["Rust Core Engine<br/>(Validated paths, git sandbox & policy gates)"]
         
         Webview -->|Typed IPC Only| IPCBoundary
@@ -242,10 +242,24 @@ flowchart TD
   not be confirmed, and warns against a blind retry — because a false failure is
   what turns one deployment into two.
 
-### Loopback-Only Local AI Transport
+### Loopback-Only Local AI Transport (and the Claude route)
 - Built-in local AI completions (commit messages, explanations and branch names)
   and local model probes restrict their transport to loopback addresses
   (`127.0.0.1`, `localhost`, `[::1]`); remote base URLs are rejected on that path.
+- Manvi's own config (`manvi use --json`) owns the local/cloud switch. In both modes
+  the same features go through Manvi's `work.assist.complete`; that route never
+  sweeps, probes or falls back to loopback after a failed call. In cloud mode the
+  request reaches the Claude API. Manvi does not redact the prompt (`redactions` is
+  always 0), so the staged diff or commit goes as GitPulse built it. Cloud mode is
+  followed only when someone chose it (saved config, `MANVI_*` environment or a
+  flag): an unset config answers cloud with `provider_from: default`, which GitPulse
+  reads as `not_chosen` and does not route to Manvi. GitPulse's own loopback client
+  (and its consent flow) is used then, and when Manvi is not installed or lacks the
+  op, with a warning saying why. The one write path, `cmd_manvi_use`, runs
+  `manvi use cloud|local` only on a human action: the Manvi pane's cloud/local
+  toggle and Claude model picker, and picking a local model in the Manvi pill or
+  the Local model servers card (which switches Manvi to local for every program
+  that starts it). The loopback consent dialog never writes it.
 - Commit messages are classified in the app from the staged patch. When no
   loopback model is selected, a supported Mac may ask Apple Intelligence only
   for the subject, and only from that classified brief — the patch itself is

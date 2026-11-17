@@ -181,7 +181,15 @@ telemetry. Git remotes, GitHub operations, Firebase App Hosting checks you ask f
 optional tool downloads, release checks, and configured agent providers can use the
 network.
 
-Built-in local AI connects to loopback model servers. Task enhancement and agent
+Built-in AI (commit messages, explanations, branch names, health and coverage plans)
+runs on whatever Manvi itself is set to (`manvi use`), through Manvi's
+`work.assist.complete`: a local model server in local mode, the Claude API in cloud
+mode, and only in cloud mode does a diff leave the machine. Cloud mode has to be
+chosen: with nothing saved, Manvi reports its built-in default (cloud) and GitPulse
+does not follow it. It uses its own loopback client instead, which asks before it
+sends anything to a server it found, until a mode is chosen in the Manvi pane or with
+`manvi use`. The loopback client is also the fallback when Manvi is not installed or
+is too old. Task enhancement and agent
 runs use their configured provider; supported Mac builds can also use Apple
 Intelligence for task titles and descriptions. These are distinct execution paths.
 
@@ -206,7 +214,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]
-        Bridge["invoke('cmd_*') — 331 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+        Bridge["invoke('cmd_*') — 332 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]

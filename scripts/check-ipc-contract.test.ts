@@ -341,8 +341,9 @@ describe("annotated but unregistered commands", () => {
     // terminal session-ledger handlers on this tree. 331 with
     // cmd_agent_connect_plan and cmd_agent_connect_apply (Connect your agent)
     // and cmd_storage_stale_worktrees (worktree storage), which met when the
-    // storage branch took main.
-    expect(found.size).toBe(331);
+    // storage branch took main. 332 with cmd_manvi_use (the Manvi pane's
+    // local/cloud switch), which the Manvi-route AI branch added.
+    expect(found.size).toBe(332);
     expect(found.has("cmd_agent_connect_plan")).toBe(true);
     expect(found.has("cmd_agent_connect_apply")).toBe(true);
     expect(found.has("cmd_list_op_snapshots")).toBe(true);

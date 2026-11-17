@@ -145,7 +145,7 @@ export async function runCoverageChecks(ctx) {
     document.execCommand = originalExec;
 
     // ---- Manvi analysis: the report it is sent, and the journal ------------
-    button("Manvi: analyze coverage with the local model").click(); await tick();
+    button("Manvi: analyze coverage with the selected model").click(); await tick();
     ok("the generate button is usable with no model server discovered",
       () => region().textContent.includes("No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.")
         && !byText("Generate AI report").disabled);
@@ -173,7 +173,7 @@ export async function runCoverageChecks(ctx) {
       () => journal("coverage-report").length === beforeStale + 1 && journal("coverage-report").at(-1).ok === true);
 
     // ---- Manvi plan steps --------------------------------------------------
-    button("Manvi: analyze coverage with the local model").click(); await tick();
+    button("Manvi: analyze coverage with the selected model").click(); await tick();
     knobs.aiHandler = () => aiResult("1. Run the first: `npm run cov-one`\n2. Run the second: `npm run cov-two`");
     knobs.runHandler = (argv) => done({
       command: argv.join(" "),
@@ -368,7 +368,7 @@ export async function runCoverageChecks(ctx) {
         && !!rowOf(PYTEST).querySelector(".text-warn\\/90") && !rowOf(PYTEST).querySelector(".text-ok\\/90"), () => rowText(PYTEST));
     button("Copy coverage report").click(); await wait();
     ok("the copied report says what the recovery excluded", () => copied.at(-1).includes("bench/my stress.py") && copied.at(-1).includes("excluded from measurement"), () => copied.at(-1));
-    button("Manvi: analyze coverage with the local model").click(); await tick();
+    button("Manvi: analyze coverage with the selected model").click(); await tick();
     knobs.aiHandler = () => aiResult("No steps.");
     byText("Generate AI report").click();
     await until(() => aiCalls.length === 1);

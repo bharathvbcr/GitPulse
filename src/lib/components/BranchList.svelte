@@ -1,7 +1,6 @@
 <script lang="ts">
-  import type { AiGeneration } from "../stores/harnessStore";
+  import { harnessStore } from "../stores/harnessStore";
   import { onMount, tick, untrack } from "svelte";
-  import { invoke } from "../ipc/invoke";
   import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
@@ -488,9 +487,7 @@
     const epoch = tabScope.epoch;
     suggesting = true;
     try {
-      const gen = await invoke<AiGeneration>("cmd_ai_suggest_branch_name", {
-        repoPath: repo,
-      });
+      const gen = await harnessStore.suggestBranchName(repo);
       // The suggestion raced a tab switch: it belongs to another repo now,
       // even when the person has since switched back (the epoch counts
       // switches, the path only compares endpoints).

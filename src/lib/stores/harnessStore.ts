@@ -1,9 +1,15 @@
-import { writable, get } from "svelte/store";
+import { writable, get, derived } from "svelte/store";
 import { invoke, readIpcError } from "../ipc/invoke";
 import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
 import { clean } from "../terminal/sessionActivity";
 import { formatDisplayFailure } from "../diagnostics/report";
 import { mergeEvents } from "../ledger/projection";
+import {
+  claudeCredentialProblem,
+  claudeCredentialStatus,
+  type ClaudeCredentialStatus,
+} from "../workbench/claudeKey";
+import type { ModelSelection } from "../workbench/taskModel";
 import {
   ledgerStatus,
   type LedgerEvent,
@@ -116,6 +122,37 @@ export interface AiSelection {
   model: string;
 }
 
+/**
+ * What `manvi use --json` said, read by the backend (`cmd_ai_status`). `state`
+ * is `ready` when Manvi answered with a mode someone chose. `not_chosen` means
+ * Manvi answered but its mode is the built-in default (cloud) nobody picked:
+ * the fields say what it would run, `selection` is null, and AI features use
+ * GitPulse's own loopback client until a mode is chosen in the Manvi pane.
+ * `not_installed`, `needs_update` (a Manvi without `manvi use`) and `failed`
+ * carry why in `detail`.
+ */
+export interface ManviStatus {
+  state: "ready" | "not_chosen" | "not_installed" | "needs_update" | "failed";
+  detail: string;
+  /** `cloud`, `local` or `other`. */
+  mode: string;
+  provider: string;
+  provider_from: string;
+  model: string;
+  model_from: string;
+  /** Environment variables that override the saved choice for this process. */
+  shadowed_by: string[];
+  user_config: string;
+  local_base_url: string;
+  local_model: string;
+  cloud_model: string;
+  warnings: string[];
+  /** Why GitPulse cannot use this mode; empty when `selection` is set. */
+  unsupported: string;
+  /** What the worker is spawned with, in the wire shape of a model selection. */
+  selection: ModelSelection | null;
+}
+
 export interface AiStatus {
   harness: HarnessStatus;
   endpoints: DiscoveredEndpoint[];
@@ -124,6 +161,7 @@ export interface AiStatus {
   model_detail: string;
   ready: boolean;
   detail: string;
+  manvi: ManviStatus;
 }
 
 export interface BudgetReport {
@@ -152,16 +190,114 @@ export interface AiGeneration {
   elapsed_ms: number;
 }
 
+/** The credential check for a Claude-selected Manvi: unknown until answered. */
+export interface ClaudeCredentialState {
+  status: ClaudeCredentialStatus | null;
+  /** Why the check itself failed; never conflated with "no credential". */
+  error: string | null;
+}
+
+/** Whether GitPulse's AI features can run right now, and on what. */
+export interface AiReadiness {
+  ready: boolean;
+  /** What answers: the Claude API (cloud) or a model server on this machine (local). */
+  target: "cloud" | "local";
+  /**
+   * Who carries the request: Manvi (`work.assist.complete`, in both modes), or
+   * GitPulse's own loopback client when Manvi cannot be used.
+   */
+  via: "manvi" | "loopback";
+  /** The model that would answer ("" when none is chosen). */
+  model: string;
+  /** Why it is not ready; empty when it is. */
+  reason: string;
+}
+
+/**
+ * The one answer to "can an AI feature run?", from what Manvi itself is set to
+ * run on (`ai.manvi`, read by the backend from `manvi use`).
+ *
+ * - Cloud: ready only when the Claude credential check answered with no
+ *   problem (an unanswered check is not ready, never assumed fine).
+ * - Local through Manvi: ready when the local server is up (local discovery
+ *   follows Manvi's own server and model).
+ * - A mode GitPulse cannot use: not ready, and says so.
+ * - Manvi unreadable (not installed, no `manvi use`, failed), on a mode nobody
+ *   chose (`not_chosen`), or not asked yet: GitPulse's own loopback client,
+ *   with local discovery's verdict.
+ *
+ * Pure, so it is testable without Svelte.
+ */
+export function deriveAiReadiness(state: Pick<HarnessState, "ai" | "claudeCredential">): AiReadiness {
+  const ai = state.ai;
+  const manvi = ai?.manvi;
+  if (ai && manvi?.state === "ready") {
+    const target = manvi.mode === "cloud" ? "cloud" : "local";
+    if (!manvi.selection) {
+      return { ready: false, target, via: "manvi", model: manvi.model, reason: manvi.unsupported };
+    }
+    if (manvi.mode === "cloud") {
+      const { status, error } = state.claudeCredential;
+      if (error) {
+        return { ready: false, target, via: "manvi", model: manvi.model, reason: `Couldn't check the Claude credential. ${error}` };
+      }
+      if (!status) {
+        return { ready: false, target, via: "manvi", model: manvi.model, reason: "Checking the Claude credential…" };
+      }
+      const problem = claudeCredentialProblem(status);
+      return { ready: problem === null, target, via: "manvi", model: manvi.model, reason: problem ?? "" };
+    }
+    return {
+      ready: ai.ready,
+      target,
+      via: "manvi",
+      model: manvi.model,
+      reason: ai.ready ? "" : ai.detail || "The local model server Manvi uses did not answer.",
+    };
+  }
+  return {
+    ready: ai?.ready ?? false,
+    target: "local",
+    via: "loopback",
+    model: ai?.selected?.model ?? "",
+    reason: ai?.detail || (ai ? "" : "Local models have not been checked."),
+  };
+}
+
+/**
+ * Whether a person can set Manvi's mode from GitPulse (`cmd_manvi_use`): Manvi
+ * answered `manvi use`, with a chosen mode (`ready`) or with none
+ * (`not_chosen`, which is exactly when a choice is wanted).
+ */
+export function manviWritable(manvi: Pick<ManviStatus, "state"> | null | undefined): boolean {
+  return manvi?.state === "ready" || manvi?.state === "not_chosen";
+}
+
+/** How AI features name where a request goes, for tooltips and notes. */
+export function describeAiTarget(readiness: AiReadiness): string {
+  if (readiness.via === "loopback") return "the local model";
+  return readiness.target === "cloud"
+    ? `${readiness.model} (Claude API, via Manvi)`
+    : `${readiness.model || "the local model"} (local model, via Manvi)`;
+}
+
 export interface HarnessState {
   harness: HarnessStatus | null;
   ai: AiStatus | null;
-  /** Model the user pinned, or null to let discovery choose. */
+  /**
+   * The local model the user pinned, or null to let discovery choose. Manvi's
+   * own config (`ai.manvi`, from `manvi use`) decides what GitPulse's AI
+   * features and task enhancements run on; this is what GitPulse's own
+   * loopback client uses when Manvi cannot be read, and picking one here also
+   * writes it to Manvi (`useManvi`).
+   */
   preferred: AiSelection | null;
   /**
-   * The Claude model Manvi uses instead of a local one, or null to keep Manvi
-   * on the local selection. Manvi only: GitPulse's own AI features stay local.
+   * What the last credential check answered, for a cloud Manvi. Owned here so
+   * the Manvi pill and every AI control read one answer
+   * ([`deriveAiReadiness`]) instead of each asking the Keychain.
    */
-  manviClaude: { model: string } | null;
+  claudeCredential: ClaudeCredentialState;
   isProbing: boolean;
   /** Most recent policy decision for the active repository, for the status strip. */
   lastVerdict: PolicyVerdict | null;
@@ -195,7 +331,8 @@ export interface HarnessState {
 }
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
-const STORAGE_KEY_MANVI_CLAUDE = "gitpulse_manvi_claude_model";
+/** Where GitPulse once kept its own copy of the Claude choice; Manvi's config owns it now. */
+const RETIRED_KEY_MANVI_CLAUDE = "gitpulse_manvi_claude_model";
 
 type RepositoryProjectionState = Pick<
   HarnessState,
@@ -310,25 +447,6 @@ function loadPreferred(): AiSelection | null {
   return null;
 }
 
-/** The persisted Claude choice. Only the model id is stored; the key is in the Keychain. */
-function loadManviClaude(): { model: string } | null {
-  try {
-    const model = localStorage.getItem(STORAGE_KEY_MANVI_CLAUDE);
-    return model ? { model } : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveManviClaude(choice: { model: string } | null) {
-  try {
-    if (choice) localStorage.setItem(STORAGE_KEY_MANVI_CLAUDE, choice.model);
-    else localStorage.removeItem(STORAGE_KEY_MANVI_CLAUDE);
-  } catch {
-    /* ignore quota / private-mode failures */
-  }
-}
-
 function savePreferred(selection: AiSelection | null) {
   try {
     if (selection) {
@@ -402,6 +520,11 @@ export function unconfirmedEndpoint(
 export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   const invokeFn = deps.invoke ?? invoke;
   const confirmFn = deps.confirm ?? askConfirm;
+  try {
+    localStorage.removeItem(RETIRED_KEY_MANVI_CLAUDE);
+  } catch {
+    /* no storage: nothing was kept there */
+  }
   const pathIdentityOptions: PathIdentityOptions = {
     caseInsensitive: isCaseInsensitiveFs(),
   };
@@ -418,7 +541,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     harness: null,
     ai: null,
     preferred: loadPreferred(),
-    manviClaude: loadManviClaude(),
+    claudeCredential: { status: null, error: null },
     isProbing: false,
     lastVerdict: null,
     error: null,
@@ -681,7 +804,12 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         cancelLabel: "Don't send",
       });
       if (!confirmed) return null;
-      void store.selectModel(found.selection);
+      // The dialog promises to remember this server for GitPulse's own
+      // loopback client, nothing more: Manvi's config is written only from
+      // the Manvi pane and the model pickers (`selectModel`).
+      savePreferred(found.selection);
+      update((s) => ({ ...s, preferred: found.selection }));
+      void probeAi(++probeToken);
       return found.selection;
     })();
     return consentFlight;
@@ -690,8 +818,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   /**
    * Runs one AI call with the saved selection. With none saved the backend
    * finds a server but sends nothing, answering `ai_endpoint_unconfirmed`; this
-   * asks the user about exactly that runtime and address, saves the choice
-   * through the same path as picking a model (`selectModel`), and asks again.
+   * asks the user about exactly that runtime and address, saves the choice as
+   * GitPulse's own loopback selection (`askEndpointConsent`: `savePreferred`
+   * only, never `selectModel`, so Manvi's config is not written), and asks
+   * again.
    * A saved selection whose server no longer serves its model is refused the
    * same way, marked stale: the saved choice is dropped and the refusal shown,
    * with no prompt about a server that is not there.
@@ -721,6 +851,21 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     }
   }
 
+  let credentialToken = 0;
+  /** Asks the backend which credential a Claude-selected Manvi would use. */
+  async function refreshClaudeCredential(): Promise<void> {
+    const token = ++credentialToken;
+    try {
+      const status = claudeCredentialStatus(await invokeFn<unknown>("cmd_claude_key_status"));
+      if (token !== credentialToken) return;
+      update((s) => ({ ...s, claudeCredential: { status, error: null } }));
+    } catch (err: unknown) {
+      if (token !== credentialToken) return;
+      const error = formatDisplayFailure(err, "manvi");
+      update((s) => ({ ...s, claudeCredential: { status: null, error } }));
+    }
+  }
+
   async function probeAi(token: number): Promise<AiStatus | null> {
     const preferred = currentPreferred();
     update((s) => ({ ...s, isProbing: true }));
@@ -737,6 +882,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         isProbing: false,
         error: null,
       }));
+      // Cloud bills a credential GitPulse checks itself. Every refresh path
+      // (startup, Refresh, Reconnect, a change of mode) ends here, so a stale
+      // or stuck answer clears.
+      if (ai.manvi?.state === "ready" && ai.manvi.mode === "cloud") void refreshClaudeCredential();
       return ai;
     } catch (err: unknown) {
       if (token !== probeToken) return null;
@@ -748,6 +897,26 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       }));
       return null;
     }
+  }
+
+  /** `manvi use <mode>`; see `store.useManvi`. */
+  async function useManvi(
+    mode: "cloud" | "local",
+    options: { model?: string; baseUrl?: string } = {},
+  ): Promise<ManviStatus> {
+    const manvi = await invokeFn<ManviStatus>("cmd_manvi_use", {
+      mode,
+      model: options.model ?? null,
+      baseUrl: options.baseUrl ?? null,
+    });
+    update((s) => ({
+      ...s,
+      ai: s.ai ? { ...s.ai, manvi } : s.ai,
+      // A new choice invalidates the last credential answer.
+      claudeCredential: { status: null, error: null },
+    }));
+    void probeAi(++probeToken);
+    return manvi;
   }
 
   async function syncLedgerRun(run: LedgerRun): Promise<void> {
@@ -909,17 +1078,38 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       return probeAi(token);
     },
 
-    selectModel: (selection: AiSelection | null) => {
+    /**
+     * Picks a local model. Saved as GitPulse's own selection (the loopback
+     * fallback uses it) and, when Manvi can be written, made Manvi's choice
+     * too: `manvi use local --base-url U --model M`. Manvi can be written when
+     * it answered, with a chosen mode or with none (`not_chosen`): picking a
+     * model is the person's choice. `null` (Automatic) only clears the saved
+     * selection; Manvi's config is left as it is.
+     */
+    selectModel: async (selection: AiSelection | null) => {
       savePreferred(selection);
       update((s) => ({ ...s, preferred: selection }));
+      if (selection && manviWritable(get({ subscribe }).ai?.manvi)) {
+        try {
+          await useManvi("local", { baseUrl: selection.base_url, model: selection.model });
+          return get({ subscribe }).ai;
+        } catch (err: unknown) {
+          update((s) => ({ ...s, error: statusFailure(err) }));
+        }
+      }
       return probeAi(++probeToken);
     },
 
-    /** Points Manvi at a Claude model, or back at the local selection with null. */
-    selectManviClaude: (choice: { model: string } | null) => {
-      saveManviClaude(choice);
-      update((s) => ({ ...s, manviClaude: choice }));
-    },
+    /**
+     * The one writer of Manvi's own choice (`manvi use cloud|local …`), called
+     * only from a person's action in the Manvi pane. The backend validates the
+     * shapes and retires the live worker; this re-reads status afterwards so
+     * every control shows what Manvi now says.
+     */
+    useManvi,
+
+    /** Re-asks which Claude credential applies (after a fix in Settings). */
+    refreshClaudeCredential,
 
     recordVerdict: (verdict: PolicyVerdict | null, repoPath?: string) => {
       const target = repoPath
@@ -1056,6 +1246,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
      */
     syncLedger,
 
+    // Where these go is the backend's call: Manvi's own choice (`manvi use`),
+    // through `work.assist.complete`, in either mode. `baseUrl`/`model` here
+    // are only what GitPulse's own loopback client needs when Manvi cannot be
+    // used; the consent flow below belongs to that fallback path alone.
     generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
       return withEndpointConsent((preferred) =>
         invokeFn<AiGeneration>("cmd_ai_generate_commit_message", {
@@ -1105,7 +1299,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       );
     },
 
-    /** Turns a rendered coverage report into a local-model analysis. */
+    /** Turns a rendered coverage report into an analysis by the selected model. */
     coverageReport: async (
       repoPath: string,
       report: string,
@@ -1125,6 +1319,9 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
 }
 
 export const harnessStore = createHarnessStore();
+
+/** The one readiness every AI control reads (see [`deriveAiReadiness`]). */
+export const aiReadiness = derived(harnessStore, deriveAiReadiness);
 
 /** How a verdict is labelled in the UI. */
 export function verdictLabel(verdict: PolicyVerdict): string {

@@ -42,6 +42,17 @@
         { base_url: "http://localhost:11434/v1", reachable: true, detail: "", models: ["local-chat", "code-model"] },
         { base_url: "http://localhost:1234/v1", reachable: true, detail: "", models: ["local-chat", "a-long-model-name-that-must-stay-within-the-header"] },
       ];
+      // What the fixture Manvi is set to run on (`manvi use`), changed by cmd_manvi_use.
+      let mode = "local";
+      const manviStatus = () => ({
+        state: "ready", detail: "", mode, provider: mode === "cloud" ? "anthropic" : "local",
+        provider_from: "config", model: mode === "cloud" ? "claude-sonnet-5-5" : "local-chat", model_from: "config",
+        shadowed_by: [], user_config: "/fixture/manvi.toml", local_base_url: "http://localhost:11434/v1",
+        local_model: "local-chat", cloud_model: "claude-sonnet-5-5", warnings: [], unsupported: "",
+        selection: mode === "cloud"
+          ? { provider: "anthropic", model: "claude-sonnet-5-5" }
+          : { provider: "local", base_url: "http://localhost:11434/v1", model: "local-chat" },
+      });
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           if (command === "cmd_harness_status") return harness;
@@ -54,6 +65,7 @@
               account_error: credential === "broken" ? "`anthropic-account` is not on PATH" : null,
             };
           }
+          if (command === "cmd_manvi_use") { mode = args.mode; return manviStatus(); }
           if (command !== "cmd_ai_status") throw new Error(`Unexpected fixture command: ${command}`);
           document.getElementById("probe").textContent = JSON.stringify(args);
           const offline = document.getElementById("offline").checked;
@@ -65,6 +77,7 @@
             selected: offline ? null : { base_url: args.baseUrl ?? endpoints[0].base_url, model: args.model ?? endpoints[0].models[0] },
             model_info: null, model_detail: "", ready: !offline,
             detail: offline ? "No local model server answered." : "Local model ready.",
+            manvi: manviStatus(),
           };
         },
       };
@@ -76,9 +89,9 @@
           ? `${state.preferred.model} at ${state.preferred.base_url}` : "Automatic";
       });
       const cloud = document.getElementById("cloud");
-      cloud.checked = Boolean((await import("svelte/store")).get(harnessStore).manviClaude);
+      cloud.checked = false;
       cloud.addEventListener("change", () => {
-        harnessStore.selectManviClaude(cloud.checked ? { model: "claude-sonnet-5-5" } : null);
+        void harnessStore.useManvi(cloud.checked ? "cloud" : "local", cloud.checked ? { model: "claude-sonnet-5-5" } : {});
       });
       mount(HarnessBadge, { target: document.getElementById("app") });
     </script>

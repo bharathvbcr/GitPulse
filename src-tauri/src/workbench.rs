@@ -817,6 +817,78 @@ impl WorkbenchState {
         self.call_worker(worker, method, params)
     }
 
+    /// The Manvi route for GitPulse's own AI features: `work.assist.complete`
+    /// on the SAME profile worker (and fingerprint) task enhancements use for
+    /// this selection, so explaining a commit never retires a live enhancement
+    /// worker. Manvi serves the op on a lane of its own. The selection is
+    /// Manvi's own choice (`manvi use`), cloud or local.
+    pub(crate) fn assist_route(
+        &self,
+        selection: crate::harness::sidecar::ModelSelection,
+    ) -> crate::ai::ManviRoute {
+        use crate::harness::sidecar::ModelSelection;
+        let (model, provider, destination) = match &selection {
+            ModelSelection::Claude { model } => (
+                model.clone(),
+                "anthropic",
+                "Claude API via Manvi".to_string(),
+            ),
+            ModelSelection::Local { base_url, model } => (
+                model.clone(),
+                "local",
+                format!("Local model via Manvi ({base_url})"),
+            ),
+        };
+        let state = self.clone();
+        crate::ai::ManviRoute {
+            model,
+            provider,
+            destination,
+            complete: std::sync::Arc::new(move |params| {
+                state
+                    .worker_call(
+                        crate::ai::OP_ASSIST_COMPLETE,
+                        params,
+                        Some(selection.clone()),
+                    )
+                    .map_err(|e| crate::ai::ManviError {
+                        code: e.code,
+                        message: e.message,
+                    })
+            }),
+        }
+    }
+
+    /// Whether the worker for `selection` serves `work.assist.complete`
+    /// (its handshake lists the op). Builds that worker, which is the one the
+    /// call would use anyway. An error is the worker not starting (Manvi not
+    /// installed, a credential problem), never "the op is missing".
+    pub(crate) fn assist_served(
+        &self,
+        selection: &crate::harness::sidecar::ModelSelection,
+    ) -> Result<bool, WorkbenchError> {
+        let worker = self.worker(Some(selection.clone()))?;
+        let (_, hello) = worker
+            .handshake()
+            .map_err(|error| worker_error(&self.profile_label(), error))?;
+        Ok(crate::harness::sidecar::serves(
+            &hello,
+            crate::ai::OP_ASSIST_COMPLETE,
+        ))
+    }
+
+    /// Stops the live profile worker whatever it was spawned with, so the next
+    /// call spawns one for Manvi's choice as it is now. Called after the model
+    /// choice is written.
+    pub(crate) fn retire_worker(&self) {
+        let previous = crate::supervisor::lock_or_recover(&self.0.worker).take();
+        if let Some((_, worker)) = previous {
+            if !worker.retire() {
+                log::warn!(target: "workbench", "profile worker retire could not acquire the active request; it stops when that request ends");
+            }
+        }
+    }
+
     /// A call that has no model of its own (verify, scan, suggest, managed run
     /// control): it uses whatever worker is live, whatever its fingerprint, and
     /// builds the default one only when none is. Going through [`Self::worker`]

@@ -4,16 +4,26 @@
    * Anthropic API, and shows which credential Claude bills: the machine's
    * `~/.anthropic-accounts` account (key and workspace from one organisation,
    * set up with Manvi's `anthropic-account`) when there is one, else a key
-   * saved here. GitPulse's own AI features (commit messages, explanations)
-   * stay on the local model either way.
+   * saved here. GitPulse's own AI features (commit messages, explanations,
+   * branch names, health and coverage plans) follow the same choice.
    */
   import { onMount } from "svelte";
-  import { harnessStore } from "../stores/harnessStore";
+  import { harnessStore, manviWritable } from "../stores/harnessStore";
   import { CLAUDE_MODELS } from "../workbench/taskModel";
   import { claudeKey, claudeKeyProblem, type ClaudeCredentialStatus } from "../workbench/claudeKey";
   import { formatDisplayFailure } from "../diagnostics/report";
 
-  let choice = $derived($harnessStore.manviClaude);
+  /** What Manvi itself is set to run on (`manvi use`); the controls below write it back. */
+  let manvi = $derived($harnessStore.ai?.manvi ?? null);
+  let manviReadable = $derived(manvi?.state === "ready");
+  /**
+   * The radios can set Manvi's mode once Manvi answered, including while no
+   * mode is chosen (`not_chosen`): then neither radio is checked, so either
+   * one is a real choice that fires its change.
+   */
+  let canChoose = $derived(manviWritable(manvi));
+  /** The Claude choice while Manvi is on cloud, else null. */
+  let choice = $derived(manvi?.state === "ready" && manvi.mode === "cloud" ? { model: manvi.model } : null);
   /** null until the backend has answered. */
   let status = $state<ClaudeCredentialStatus | null>(null);
   let keySaved = $derived(status?.keySaved ?? null);
@@ -44,6 +54,8 @@
     try {
       await action();
       await refresh();
+      // Saving or removing a key changes what every AI control is ready for.
+      if (choice) void harnessStore.refreshClaudeCredential();
     } catch (err: unknown) {
       error = formatDisplayFailure(err, "manvi");
     } finally {
@@ -63,8 +75,18 @@
     });
   }
 
+  /** `manvi use cloud --model M`: the writer behind the Claude model list. */
   function useClaude(model: string) {
-    harnessStore.selectManviClaude({ model });
+    void run(async () => {
+      await harnessStore.useManvi("cloud", { model });
+    });
+  }
+
+  /** `manvi use local`: switch mode, keeping the server and model Manvi already has. */
+  function useLocal() {
+    void run(async () => {
+      await harnessStore.useManvi("local");
+    });
   }
 </script>
 
@@ -75,9 +97,9 @@
       <input
         type="radio"
         name="manvi-model"
-        checked={!choice}
-        disabled={working}
-        onchange={() => harnessStore.selectManviClaude(null)}
+        checked={manviReadable && !choice}
+        disabled={working || !canChoose}
+        onchange={useLocal}
       />
       Local model (below)
     </label>
@@ -86,12 +108,22 @@
         type="radio"
         name="manvi-model"
         checked={Boolean(choice)}
-        disabled={working}
-        onchange={() => useClaude(choice?.model ?? CLAUDE_MODELS[1])}
+        disabled={working || !canChoose}
+        onchange={() => void run(async () => { await harnessStore.useManvi("cloud"); })}
       />
       Claude API
     </label>
   </div>
+  {#if manvi && !manviReadable}
+    <p class="text-meta text-warn" data-testid="manvi-use-unavailable">{manvi.detail}</p>
+  {:else if manvi?.unsupported}
+    <p class="text-meta text-warn" data-testid="manvi-use-unsupported">{manvi.unsupported}</p>
+  {/if}
+  {#if manvi && manviReadable && manvi.shadowed_by.length > 0}
+    <p class="text-meta text-textMuted" data-testid="manvi-use-shadowed">
+      {manvi.shadowed_by.join(", ")} {manvi.shadowed_by.length === 1 ? "is" : "are"} set in this app's environment and win over the saved choice.
+    </p>
+  {/if}
 
   {#if choice}
     <label class="flex items-center gap-2 text-meta">
@@ -100,7 +132,7 @@
         class="gp-select"
         data-size="sm"
         value={choice.model}
-        disabled={working}
+        disabled={working || !manviReadable}
         onchange={(event) => useClaude((event.currentTarget as HTMLSelectElement).value)}
       >
         {#each CLAUDE_MODELS as model (model)}
@@ -110,6 +142,8 @@
     </label>
     <p class="text-meta text-textMuted">
       Task suggestions and Manvi's own model calls are billed to {account ? "this account" : "this key"}.
+      GitPulse's own AI features (commit messages, commit explanations, branch names, health and
+      coverage plans) use this model too, so their diffs are sent to the Claude API through Manvi.
       Claude Code agents Manvi launches keep their own login. Manvi keeps the key from every program it
       starts.
     </p>

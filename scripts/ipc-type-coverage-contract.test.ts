@@ -99,6 +99,7 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["FileWriteError", { reason: "internally tagged enum (`code`) the struct checker does not model; mirrored in src/lib/files/types.ts and read by src/lib/files/fileWrite.ts, pinned by the Rust contract test file_write_error_serializes_to_the_contract_shape" }],
   ["LadderAssessment", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["LiveRefreshOutcome", { reason: "devmap live refresh; pending CONTRACTS row" }],
+  ["ManviStatus", { reason: "`manvi use --json` read-out; carries a serde(skip) typed selection and a nested selection union a field-for-field row cannot express" }],
   ["MergeTeardownError", { reason: "internally tagged enum (`code`) the struct checker does not model; mirrored in src/lib/branches/types.ts and read by src/lib/branches/mergeTeardown.ts, pinned by the Rust contract test the_result_and_every_error_serialize_to_the_contract_shape" }],
   ["PreflightReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["PreviewFileResult", { reason: "devmap preview file envelope; pending CONTRACTS row" }],

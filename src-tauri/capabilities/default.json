@@ -219,6 +219,7 @@
     "allow-cmd-local-scan",
     "allow-cmd-lock-worktree",
     "allow-cmd-manvi-run-action",
+    "allow-cmd-manvi-use",
     "allow-cmd-markdown-render",
     "allow-cmd-mcp-info",
     "allow-cmd-merge-branch",
