@@ -223,11 +223,16 @@ pub async fn cmd_delete_tag(repo_path: String, tag_name: String) -> Result<Guard
 /// Creates (or resumes) an annotated release tag and pushes exactly that tag.
 /// Both commands are policy-checked before the first mutation, so a refusal
 /// cannot strand a tag created by a previously unchecked second step.
+///
+/// The commits the tag would send are scanned for credentials before the
+/// push. A refusal leaves the tag local and comes back as the secret scan's
+/// own typed error; `allow_secrets` is the person's "Publish anyway".
 #[tauri::command(async)]
 pub async fn cmd_publish_release(
     repo_path: String,
     tag: String,
     message: String,
+    allow_secrets: Option<bool>,
 ) -> Result<Guarded<ReleasePublishResult>, IpcError> {
     off_thread(move || {
         let plan = crate::ops::prepare_release(&repo_path, &tag, &message)?;
@@ -252,13 +257,22 @@ pub async fn cmd_publish_release(
                 Some(&plan.message),
             )?;
         }
-        let output =
-            GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
-                format!(
-                    "Release tag '{}' exists locally but could not be pushed: {}. Retry the release action after fixing connectivity.",
-                    plan.tag, error.message()
-                )
-            })?;
+        let output = GitWriter::push_tag_with_policy(
+            &repo_path,
+            &plan.remote,
+            &plan.tag,
+            super::staging::secret_policy(allow_secrets),
+        )
+        .map_err(|error| {
+            if error.kind() == crate::ipc_error::IpcErrorKind::SecretScanBlocked {
+                return error;
+            }
+            format!(
+                "Release tag '{}' exists locally but could not be pushed: {}. Retry the release action after fixing connectivity.",
+                plan.tag, error.message()
+            )
+            .into()
+        })?;
         Ok(Guarded {
             policy: push_policy,
             output: ReleasePublishResult {

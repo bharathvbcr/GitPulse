@@ -530,7 +530,7 @@ fn execute_worktree_hooks_within(
         // waiting on a terminal that is not there) is killed with its process
         // tree at the deadline instead of hanging worktree creation, and its
         // output is capped. It was `child.output()`: no deadline, no cap.
-        let output = match crate::engine::git_cli::run_bounded_capped(
+        let output = match crate::engine::process::run_bounded_capped(
             child,
             "worktree hook",
             timeout,

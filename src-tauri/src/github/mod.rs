@@ -1,7 +1,7 @@
 use crate::analyzer::deps::severity_rank;
-use crate::engine::git_cli::{
-    capture_command, classify_tool_probe, git_text, run_command_in, validate_repo, CapturedOutput,
-    RunError, ToolProbe,
+use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::process::{
+    capture_command, classify_tool_probe, run_command_in, CapturedOutput, RunError, ToolProbe,
 };
 use crate::ipc_error::CommandError;
 pub mod actions;
@@ -548,18 +548,18 @@ static GH_PROBES: crate::tool_capability::BinaryProbeCache<ToolProbe> =
 /// What `gh --version` says about the GitHub CLI. No working directory, so a
 /// not-found can only mean the program (see [`is_spawn_not_found`]).
 ///
-/// [`is_spawn_not_found`]: crate::engine::git_cli::is_spawn_not_found
+/// [`is_spawn_not_found`]: crate::engine::process::is_spawn_not_found
 pub(crate) fn probe_gh_cli() -> ToolProbe {
     // Every GitHub call asks this first — the live run poll included — and the
     // answer changes only when the `gh` binary does, so it is kept per binary.
     // Only a `Present` answer is kept: a shed or failed probe is asked again.
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let path = crate::engine::git_cli::extended_child_path(
+    let path = crate::engine::process::extended_child_path(
         std::env::var_os("PATH").as_deref(),
         home.as_deref(),
     );
     let program =
-        crate::engine::git_cli::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
+        crate::engine::process::resolve_spawn_program_with("gh", path.as_deref(), home.as_deref());
     GH_PROBES.get_or_probe(&program, || {
         let probe = classify_tool_probe(
             "gh",
@@ -867,7 +867,7 @@ fn bounded_error(message: String) -> String {
     if message.len() <= MAX_GH_ERROR_BYTES {
         return message;
     }
-    crate::engine::git_cli::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
+    crate::engine::process::byte_tail(message.as_bytes(), MAX_GH_ERROR_BYTES)
 }
 
 fn run_gh(
@@ -966,11 +966,17 @@ pub fn strip_outbox_marker(body: &str) -> String {
         let Some(start) = trimmed_end.rfind(OUTBOX_MARKER_PREFIX) else {
             break;
         };
-        if !trimmed_end.ends_with(OUTBOX_MARKER_SUFFIX) {
+        let Some(without_suffix) = trimmed_end.strip_suffix(OUTBOX_MARKER_SUFFIX) else {
             break;
-        }
-        let inner = &trimmed_end
-            [start + OUTBOX_MARKER_PREFIX.len()..trimmed_end.len() - OUTBOX_MARKER_SUFFIX.len()];
+        };
+        // The prefix ends with a space and the suffix begins with one, so a body
+        // that is the prefix followed by `-->` ends with the suffix while the
+        // inner text would start after it ends. `get` refuses that range (and
+        // any cut that is not a character boundary) where indexing panicked on
+        // issue text GitPulse did not write.
+        let Some(inner) = without_suffix.get(start + OUTBOX_MARKER_PREFIX.len()..) else {
+            break;
+        };
         if inner.contains("-->") || inner.contains('\n') || inner.contains('\r') {
             break;
         }
@@ -3608,7 +3614,7 @@ mod tests {
         let path = dir.path().to_str().unwrap();
         // Only `gh --version` is refused; the remote is still read.
         let (runs, context, dependabot, scanning, workflows) =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || {
+            crate::engine::process::with_forced_spawn_failure_of("--version", || {
                 (
                     load_workflow_runs_report(path),
                     load_github_context(path),
@@ -5481,7 +5487,7 @@ mod tests {
         let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
         GH_PROBES.clear();
         let probes = || {
-            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (_, labels) = crate::engine::process::spawn_labels_during(|| {
                 for _ in 0..5 {
                     assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
                 }
@@ -5516,7 +5522,7 @@ mod tests {
         // Another test's probe, as it would leave the cache.
         assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
         let refused =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", probe_gh_cli);
+            crate::engine::process::with_forced_spawn_failure_of("--version", probe_gh_cli);
         assert!(
             matches!(refused, ToolProbe::NotRun(_)),
             "a refused `gh --version` was answered from the cache: {refused:?}"
@@ -5921,6 +5927,20 @@ mod non_ascii_tail_tests {
         assert_eq!(detail.labels, vec!["bug", "ui"]);
         assert_eq!(strip_outbox_marker(&detail.body), "Body text");
         assert!(outbox_marker("key-1").contains("gitpulse-outbox-idempotency: key-1"));
+    }
+
+    #[test]
+    fn a_body_whose_marker_prefix_and_suffix_share_a_space_is_left_alone_not_a_panic() {
+        // Prefix + "-->" ends with the suffix (the prefix's last space is the
+        // suffix's first), so the inner range used to run from byte 34 to byte 33.
+        let overlapping = format!("{OUTBOX_MARKER_PREFIX}-->");
+        assert_eq!(strip_outbox_marker(&overlapping), overlapping);
+        // And a marker with nothing inside still strips, as a whole one does.
+        let empty = format!("Body\n\n{OUTBOX_MARKER_PREFIX}{OUTBOX_MARKER_SUFFIX}");
+        assert_eq!(strip_outbox_marker(&empty), "Body");
+        // Multibyte text around a real marker is untouched by the cut.
+        let multibyte = format!("é ünï {}", outbox_marker("clé-1"));
+        assert_eq!(strip_outbox_marker(&multibyte), "é ünï");
     }
 
     #[test]

@@ -23,7 +23,7 @@ workflow has been tested on that platform.
 > produced and covered by the automated suites, but are not exercised against a
 > running app by a person. Some features are deliberately macOS-only — desktop
 > notifications among them — and others are simply untried elsewhere.
-> [Platform coverage](QUALIFICATION.md#platform-coverage) lists which is which.
+> [Platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) lists which is which.
 
 Git must be installed and available to the app. For native build dependencies,
 see [Contributing](../CONTRIBUTING.md).
@@ -43,6 +43,25 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 
 This removes a local quarantine attribute; it does not verify or notarize the app.
 Open GitPulse from Applications, Finder, or Spotlight.
+
+To let Claude Code or Codex use GitPulse's MCP tools, open
+**Settings → Agents → Connect your agent** once GitPulse runs from
+Applications. The `gitpulse-mcp` and `gitpulse-hook` binaries ship inside
+`GitPulse.app/Contents/MacOS/`; connecting links them into `~/.local/bin` and
+registers the MCP server through each agent's own CLI, after showing you the
+plan. Because the links point into the app, they follow the app when you update
+it. Connecting does not install GitPulse's Claude Code plugin, which is what
+wires its hooks; **Copy setup prompt** includes the plugin's install commands,
+and its hooks find `gitpulse-hook` only when `~/.local/bin` is on your shell's
+`PATH`. The plugin also provides the `gitpulse` server, so use the plugin or
+the direct registration, not both: when the plugin is enabled, Connect marks
+the Claude Code registration done instead of adding a second server. A
+registration or link from an older setup (for example a `cargo install` copy
+in `~/.cargo/bin`) is left alone, and the plan shows the commands to switch it.
+Connecting is refused while macOS runs the app from a temporary App
+Translocation location (opened straight from the DMG or Downloads); move it to
+Applications first. `bun run mcp:install` is only for building these binaries
+from a source checkout.
 
 #### Signing local builds
 
@@ -190,9 +209,10 @@ store (dc-store) migrates one way: a profile migrated to a newer schema cannot b
 read back by a host built against an older one. (The dc-store vendored in this
 tree is store schema 11 with workbench schema 17.) GitPulse, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
-schema, before any of them opens it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
-(`bun run mcp:install`); a binary built against an older schema refuses the
-migrated profile. The release notes in the CHANGELOG record each schema change.
+schema, before any of them opens it. A connected app install updates the
+`gitpulse-mcp` and `gitpulse-hook` it links along with the app; a source build
+must reinstall them (`bun run mcp:install`). A binary built against an older
+schema refuses the migrated profile. The release notes in the CHANGELOG record each schema change.
 After updating, `bun run check:schema-parity` asks each installed reader which
 schemas it reads, including the app's bundled server, and names any that were
 left behind.

@@ -49,6 +49,12 @@ pub const SOCKET_FILE: &str = "instance.sock";
 /// Bumped on any incompatible change to the frames below. A launch that meets
 /// an owner speaking another version still never starts a second instance.
 const PROTOCOL: u32 = 1;
+/// How long a hook waits for the app's answer to [`Request::RecordGitOp`], and
+/// so how long the app has, from the moment it receives that request, before
+/// its asker has stopped waiting. The one budget both sides read: the hook
+/// waits on it, and the app refuses to capture state once it has passed. Not a
+/// request field, so the wire shape is unchanged.
+pub const OP_RECORD_DEADLINE: Duration = Duration::from_secs(2);
 /// Every frame is one JSON line no longer than this: room for [`MAX_PATHS`]
 /// paths of [`MAX_PATH_BYTES`] even when every byte is a control character
 /// JSON spells as six (`\u0001`). `forward` checks the encoded size anyway,
@@ -60,6 +66,8 @@ const MAX_PATH_BYTES: usize = 1024;
 /// The longest command line a hook may ask the app to judge. A longer one is
 /// judged by the hook's own path, which has no frame to fit in.
 const MAX_GATE_COMMAND_BYTES: usize = 48 * 1024;
+/// The longest label a turn-checkpoint request may carry.
+const MAX_CHECKPOINT_LABEL_BYTES: usize = 4 * 1024;
 /// Native notification identifiers are well under this; see
 /// `alerts::native_session_key` and `workbench::notifications::owned`, which
 /// validate them properly on the owner's side.
@@ -82,6 +90,14 @@ const MAX_ORCHESTRATE_HANDLERS: usize = 8;
 /// Agent A2A deliveries/kickoffs in flight at once: a share of
 /// [`MAX_GATE_HANDLERS`], bounded inside [`HANDLER_TIMEOUT`].
 const MAX_DELIVER_HANDLERS: usize = 4;
+/// Turn checkpoint captures in flight at once: a share of
+/// [`MAX_GATE_HANDLERS`], so the 14 slots left are always a verdict's. A capture
+/// outlives its hook's 1 s wait (scan bound plus git calls of up to 90 s each)
+/// and is asked at both boundaries of every turn, so it must not be able to
+/// hold more than a sliver. Two lets one worktree's start and another's end
+/// overlap; a third request is answered "busy" and its hook reports "not
+/// captured". Captures of one worktree already coalesce in the engine.
+const MAX_CHECKPOINT_HANDLERS: usize = 2;
 /// Longest prompt text an unattended `gitpulse_kickoff_agent` spawn may pass.
 const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
 /// Requests held for an owner whose window is not up yet.
@@ -207,6 +223,13 @@ pub enum Request {
     /// Asks the app owner to snapshot `refs/heads`, `refs/tags`, and
     /// `git stash create` under `refs/gitpulse/ops/<n>` before a gated agent
     /// git write proceeds; answered synchronously on the connection.
+    ///
+    /// The asker waits [`OP_RECORD_DEADLINE`] and then lets the write run; the
+    /// app measures that budget from receipt and captures nothing after it.
+    /// The fields below are the wire contract with every installed app: the
+    /// enum refuses unknown fields, so a field added here would make a newer
+    /// hook's request fail against an older app. See
+    /// `the_record_git_op_request_keeps_the_fields_it_has_always_had`.
     RecordGitOp {
         id: String,
         cwd: String,
@@ -215,6 +238,23 @@ pub enum Request {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
+    },
+    /// Asks the app owner to take a turn checkpoint of the worktree at `cwd`
+    /// (`refs/gitpulse/turns/<key>/<stamp>`) at an agent turn boundary;
+    /// answered synchronously on the connection like [`Request::RecordGitOp`].
+    /// `event` is `turn_start` or `turn_end`. An owner that predates this
+    /// request refuses the unknown `kind` and the hook reports "not captured";
+    /// the protocol version is deliberately not bumped for it (see
+    /// [`Request::InsightsRead`]), and an old hook never sends it.
+    RecordTurnCheckpoint {
+        id: String,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        event: String,
+        /// A one-line label (what the turn ended on); redacted by the owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
 }
 
@@ -228,7 +268,8 @@ impl Request {
             | Request::InsightsRead { id, .. }
             | Request::TerminalOrchestrate { id, .. }
             | Request::AgentDeliver { id, .. }
-            | Request::RecordGitOp { id, .. } => Some(id),
+            | Request::RecordGitOp { id, .. }
+            | Request::RecordTurnCheckpoint { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -484,6 +525,39 @@ impl Request {
                     if tid.len() > MAX_NATIVE_ID || tid.chars().any(char::is_control) {
                         return Err("op-record task_id is too long or not printable".into());
                     }
+                }
+                Ok(())
+            }
+            Request::RecordTurnCheckpoint {
+                id,
+                cwd,
+                session_id,
+                event,
+                label,
+            } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("checkpoint request id is empty, too long or not printable".into());
+                }
+                if cwd.is_empty()
+                    || cwd.len() > MAX_PATH_BYTES
+                    || cwd.contains('\0')
+                    || !Path::new(cwd).is_absolute()
+                {
+                    return Err("checkpoint cwd must be an absolute path".into());
+                }
+                if !matches!(event.as_str(), "turn_start" | "turn_end") {
+                    return Err("checkpoint event must be turn_start or turn_end".into());
+                }
+                if let Some(sid) = session_id.as_deref() {
+                    if sid.len() > MAX_NATIVE_ID || sid.chars().any(char::is_control) {
+                        return Err("checkpoint session_id is too long or not printable".into());
+                    }
+                }
+                if label
+                    .as_deref()
+                    .is_some_and(|l| l.len() > MAX_CHECKPOINT_LABEL_BYTES)
+                {
+                    return Err("checkpoint label is too long".into());
                 }
                 Ok(())
             }
@@ -912,13 +986,41 @@ impl Secondary {
 
     /// Asks the owner to snapshot refs and working-tree changes before a gated
     /// agent git write proceeds: the owner's reply to [`Request::RecordGitOp`].
+    ///
+    /// The failure says how far the exchange got ([`Reached`]), because only a
+    /// request that was sent and then went unanswered leaves the app's
+    /// snapshot outcome unknown. `sent` is set the moment the whole request is
+    /// written, so a caller that abandons this call from outside (its own
+    /// budget) still knows whether the request left.
     pub fn record_git_op(
         self,
         request: &Request,
         within: Duration,
-    ) -> Result<serde_json::Value, String> {
+        sent: &AtomicBool,
+    ) -> Result<serde_json::Value, AskFailure> {
         if !matches!(request, Request::RecordGitOp { .. }) {
-            return Err("not an op-record request".into());
+            return Err(AskFailure::not_sent("not an op-record request"));
+        }
+        let id = request.answered_id().ok_or_else(|| {
+            AskFailure::not_sent("this request is not answered on its connection")
+        })?;
+        let ack = self.exchange_reaching(request, within, Some(sent))?;
+        if ack.id.as_deref() != Some(id) {
+            return Err(AskFailure::unanswered("the answer names another request"));
+        }
+        ack.reply
+            .ok_or_else(|| AskFailure::unanswered("the answer carries no verdict"))
+    }
+
+    /// Asks the owner to take a turn checkpoint: the owner's reply to
+    /// [`Request::RecordTurnCheckpoint`].
+    pub fn record_turn_checkpoint(
+        self,
+        request: &Request,
+        within: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !matches!(request, Request::RecordTurnCheckpoint { .. }) {
+            return Err("not a turn-checkpoint request".into());
         }
         self.answered(request, within)
     }
@@ -935,30 +1037,92 @@ impl Secondary {
             .ok_or_else(|| "the answer carries no verdict".into())
     }
 
-    fn exchange(mut self, request: &Request, within: Duration) -> Result<Ack, String> {
-        request.validate()?;
+    fn exchange(self, request: &Request, within: Duration) -> Result<Ack, String> {
+        self.exchange_reaching(request, within, None)
+            .map_err(|failure| failure.why)
+    }
+
+    /// [`Self::exchange`] saying how far it got when it failed. `sent` is set
+    /// right after the request is completely written.
+    fn exchange_reaching(
+        mut self,
+        request: &Request,
+        within: Duration,
+        sent: Option<&AtomicBool>,
+    ) -> Result<Ack, AskFailure> {
+        request.validate().map_err(AskFailure::not_sent)?;
         self.stream
             .set_read_timeout(Some(within))
             .and_then(|()| self.stream.set_write_timeout(Some(within)))
-            .map_err(|error| format!("timeouts: {error}"))?;
+            .map_err(|error| AskFailure::not_sent(format!("timeouts: {error}")))?;
         let envelope = Envelope {
             v: PROTOCOL,
             request: request.clone(),
         };
-        let encoded = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_vec(&envelope)
+            .map_err(|error| AskFailure::not_sent(error.to_string()))?;
         if encoded.len() > MAX_FRAME {
-            return Err(format!(
+            return Err(AskFailure::not_sent(format!(
                 "request is {} bytes; frames carry {MAX_FRAME}",
                 encoded.len()
-            ));
+            )));
         }
-        write_frame(&mut self.stream, &envelope)?;
-        let line = read_frame(&mut self.reader)?.ok_or("the owner closed without an answer")?;
-        let ack: Ack = serde_json::from_str(&line).map_err(|error| format!("answer: {error}"))?;
+        // A frame cut short by a failed write has no newline, so the owner
+        // reads it as no request at all: a failed write is "never sent".
+        write_frame(&mut self.stream, &envelope).map_err(AskFailure::not_sent)?;
+        if let Some(sent) = sent {
+            sent.store(true, Ordering::Release);
+        }
+        let line = read_frame(&mut self.reader)
+            .map_err(AskFailure::unanswered)?
+            .ok_or_else(|| AskFailure::unanswered("the owner closed without an answer"))?;
+        let ack: Ack = serde_json::from_str(&line)
+            .map_err(|error| AskFailure::unanswered(format!("answer: {error}")))?;
         if ack.accepted {
             Ok(ack)
         } else {
-            Err(ack.reason.unwrap_or_else(|| "refused".into()))
+            Err(AskFailure {
+                reached: Reached::Refused,
+                why: ack.reason.unwrap_or_else(|| "refused".into()),
+            })
+        }
+    }
+}
+
+/// How far an exchange with the owner got before it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    /// The request was never completely written: the owner cannot have acted
+    /// on it.
+    NotSent,
+    /// The owner read the request and answered that it refused it. A refusal
+    /// is written before the request's work is attempted.
+    Refused,
+    /// The request was completely written and no usable answer came back: a
+    /// timeout, a read error or an owner that closed. The owner may or may not
+    /// have acted.
+    SentUnanswered,
+}
+
+/// Why an exchange failed, and how far it got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskFailure {
+    pub reached: Reached,
+    pub why: String,
+}
+
+impl AskFailure {
+    pub fn not_sent(why: impl Into<String>) -> Self {
+        Self {
+            reached: Reached::NotSent,
+            why: why.into(),
+        }
+    }
+
+    fn unanswered(why: impl Into<String>) -> Self {
+        Self {
+            reached: Reached::SentUnanswered,
+            why: why.into(),
         }
     }
 }
@@ -992,7 +1156,17 @@ pub type OrchestrateSink = Arc<
 /// Delivers an A2A peer message or kickoff spawn for an MCP process.
 pub type DeliverSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 /// Snapshots pre-op refs and `git stash create` under `refs/gitpulse/ops/<n>`.
-pub type OpRecordSink = Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
+/// The instant is no later than the moment the asker sent the request (the
+/// owner takes it just before it greets the asker, who cannot send before it
+/// has read the greeting): the asker waits a full [`OP_RECORD_DEADLINE`] from
+/// its send, so a deadline counted from this instant never falls after the
+/// asker gave up.
+pub type OpRecordSink =
+    Arc<dyn Fn(&Request, Instant) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// Takes a turn checkpoint (`refs/gitpulse/turns/<key>/<stamp>`).
+pub type TurnCheckpointSink =
+    Arc<dyn Fn(&Request) -> Result<serde_json::Value, String> + Send + Sync>;
 
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
@@ -1012,11 +1186,14 @@ struct Shared {
     insights: Mutex<Option<InsightsSink>>,
     deliver: Mutex<Option<DeliverSink>>,
     op_record: Mutex<Option<OpRecordSink>>,
+    turn_checkpoint: Mutex<Option<TurnCheckpointSink>>,
     /// Insights reads in flight, a share of `gating` of their own.
     reading: AtomicUsize,
     orchestrate: Mutex<Option<OrchestrateSink>>,
     /// Agent deliveries in flight, a share of `gating` of their own.
     delivering: AtomicUsize,
+    /// Turn checkpoint captures in flight, a share of `gating` of their own.
+    checkpointing: AtomicUsize,
     inbox: Mutex<Inbox>,
     own_uid: u32,
     /// Times the accept loop's wait returned. An idle mailbox adds none.
@@ -1039,9 +1216,11 @@ impl Shared {
             insights: Mutex::new(None),
             deliver: Mutex::new(None),
             op_record: Mutex::new(None),
+            turn_checkpoint: Mutex::new(None),
             reading: AtomicUsize::new(0),
             orchestrate: Mutex::new(None),
             delivering: AtomicUsize::new(0),
+            checkpointing: AtomicUsize::new(0),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
             accept_wakes: AtomicU64::new(0),
@@ -1197,6 +1376,16 @@ impl Primary {
         *self
             .shared
             .op_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Where turn checkpoint requests ([`Request::RecordTurnCheckpoint`]) are
+    /// answered. Until this is called they are refused.
+    pub fn attach_turn_checkpointer(&self, sink: TurnCheckpointSink) {
+        *self
+            .shared
+            .turn_checkpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(sink);
     }
@@ -1470,6 +1659,31 @@ impl Ended {
         }
     }
 
+    /// A failure writing the answer to the op log. Its asker (a git write's
+    /// hook) waits [`OP_RECORD_DEADLINE`], lets the write run and leaves, by
+    /// design, so a snapshot that finishes after that is delivered to nobody. The
+    /// snapshot itself was taken, which is all the asker ever needed from the
+    /// owner, so that is not a refusal. Unlike [`Ended::after_ask`] this does
+    /// not insist the ask was read-only, because the answer is the only thing
+    /// the asker could have missed; unlike a delivery, nothing it acted on
+    /// depends on the asker hearing back.
+    ///
+    /// [`Unheard`] needs both signals: the write failed the way a departed peer
+    /// makes it fail, and the socket reads as hung up with nothing queued. An
+    /// error on a peer that is still connected stays a refusal.
+    ///
+    /// [`Unheard`]: Ended::Unheard
+    fn after_op_record(stream: &UnixStream, started: Instant, reason: String) -> Self {
+        let ms = started.elapsed().as_millis();
+        if write_says_peer_left(&reason) && crate::local_socket::peer_hung_up_silently(stream) {
+            Self::Unheard(format!(
+                "the asker of the op log left before its answer, {ms} ms after asking: {reason}"
+            ))
+        } else {
+            Self::Refused(format!("the op log, {ms} ms after asking: {reason}"))
+        }
+    }
+
     /// A failure with nothing of the peer's first frame read: a [`Probe`]
     /// only if the peer is provably gone and sent nothing. When that cannot be
     /// established it is a refusal, so an unexplained failure stays loud.
@@ -1482,6 +1696,19 @@ impl Ended {
             Self::Refused(reason)
         }
     }
+}
+
+/// Whether a failed write's `reason` (as [`write_frame`] words it) is one a
+/// peer that closed its end causes: a broken pipe, a reset, or a socket that is
+/// no longer connected. Read from the `os error` number rather than the text,
+/// which differs between macOS and Linux. A timeout is a peer that is still
+/// there and slow, and anything else is ours, so those are not this.
+fn write_says_peer_left(reason: &str) -> bool {
+    let code = reason
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once("(os error "))
+        .and_then(|(_, number)| number.parse::<i32>().ok());
+    matches!(code, Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN))
 }
 
 impl From<String> for Ended {
@@ -1509,6 +1736,13 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     if shared.closing.load(Ordering::Acquire) {
         return Ok(());
     }
+    // The asker cannot send its request before it has read this `Hello`, so
+    // this instant is no later than the moment it sent. The op-record budget
+    // runs from here and not from when the request was read and parsed: the
+    // asker's own wait runs a full `OP_RECORD_DEADLINE` from its send, so an
+    // app deadline measured from any instant at or before the send can never
+    // fall after the asker has given up, however slow this accept was.
+    let before_hello = Instant::now();
     write_frame(
         stream,
         &Hello {
@@ -1575,7 +1809,13 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
         });
     }
     if let Request::RecordGitOp { id, .. } = &request {
-        return answer_op_record(stream, shared, id, &request).map_err(Ended::Refused);
+        return answer_op_record(stream, shared, id, &request, before_hello)
+            .map_err(|reason| Ended::after_op_record(stream, started, reason));
+    }
+    if let Request::RecordTurnCheckpoint { id, .. } = &request {
+        return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {
+            Ended::after_ask(stream, "the turn checkpoint", true, started, reason)
+        });
     }
     let verdict = admit(shared, request);
     let ack = match &verdict {
@@ -1603,7 +1843,7 @@ fn answer_gate(
     cwd: &str,
     command: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the gate", || {
+    answer_asked(stream, shared, id, "the gate", true, || {
         attached(&shared.gate, "the gate")?(cwd, command)
     })
 }
@@ -1619,7 +1859,7 @@ fn answer_scan(
     repo: &str,
     path: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the collision scan", || {
+    answer_asked(stream, shared, id, "the collision scan", true, || {
         attached(&shared.collision, "the collision scan")?(repo, path)
     })
 }
@@ -1636,7 +1876,7 @@ fn answer_insights(
     repo: &str,
 ) -> Result<(), String> {
     let reading = ReadSlot::take(shared);
-    answer_asked(stream, shared, id, "the insights read", || {
+    answer_asked(stream, shared, id, "the insights read", true, || {
         if reading.is_none() {
             return Err("the insights read is busy".to_string());
         }
@@ -1651,7 +1891,7 @@ fn answer_agent_deliver(
     request: &Request,
 ) -> Result<(), String> {
     let delivering = DeliverSlot::take(shared);
-    answer_asked(stream, shared, id, "the agent delivery", || {
+    answer_asked(stream, shared, id, "the agent delivery", false, || {
         if delivering.is_none() {
             return Err("the agent delivery is busy".to_string());
         }
@@ -1664,10 +1904,46 @@ fn answer_op_record(
     shared: &Shared,
     id: &str,
     request: &Request,
+    not_after_send: Instant,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the op log", || {
-        attached(&shared.op_record, "the op log")?(request)
+    answer_asked(stream, shared, id, "the op log", false, || {
+        attached(&shared.op_record, "the op log")?(request, not_after_send)
     })
+}
+
+fn answer_turn_checkpoint(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    request: &Request,
+) -> Result<(), String> {
+    let capturing = CheckpointSlot::take(shared);
+    answer_asked(stream, shared, id, "the turn checkpoint", false, || {
+        if capturing.is_none() {
+            return Err("the turn checkpoint is busy".to_string());
+        }
+        attached(&shared.turn_checkpoint, "the turn checkpoint")?(request)
+    })
+}
+
+/// One of the [`MAX_CHECKPOINT_HANDLERS`] turn checkpoints in flight, released
+/// on drop.
+struct CheckpointSlot<'a>(&'a Shared);
+
+impl<'a> CheckpointSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.checkpointing.fetch_add(1, Ordering::AcqRel) >= MAX_CHECKPOINT_HANDLERS {
+            shared.checkpointing.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for CheckpointSlot<'_> {
+    fn drop(&mut self) {
+        self.0.checkpointing.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The sink in `slot`, cloned out so its lock is not held while the answer is
@@ -1679,15 +1955,31 @@ fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> 
         .ok_or_else(|| format!("{name} is not attached"))
 }
 
+/// What a read-only ask reports when its asker had already hung up by the time
+/// the owner got to it: [`Ended::after_ask`] reads it as the asker leaving.
+const ASKER_GONE: &str =
+    "the asker hung up before its answer was started, so no answer was worked out";
+
 /// Runs `call` for a request answered on its own connection, and writes its
 /// reply, or its error as a refusal. A reply that would not fit one frame is a
 /// refusal too: the asker reads it at once and reads for itself, instead of
 /// waiting out its deadline on a frame it cannot take.
+///
+/// `abandonable` is for an ask whose asker works the answer out itself when it
+/// gives up (a gate verdict, a collision scan, an insights read). Such an ask
+/// is not started once the socket reads as hung up with nothing queued, because
+/// the answer would be computed for nobody and again by the asker, which is
+/// what drained the git spawn budget under load. The check is `recv` with
+/// `MSG_PEEK`: only an end-of-file or a reset says the asker is gone, and
+/// anything else, including a failure of the check itself, computes the answer
+/// as it always did. An ask that acts for the world (a delivery, an op record,
+/// a checkpoint) is never abandonable: its work is not for the asker's ears.
 fn answer_asked(
     stream: &mut UnixStream,
     shared: &Shared,
     id: &str,
     name: &str,
+    abandonable: bool,
     call: impl FnOnce() -> Result<serde_json::Value, String>,
 ) -> Result<(), String> {
     let slot = GateSlot::take(shared);
@@ -1695,6 +1987,8 @@ fn answer_asked(
         Err("GitPulse is quitting".to_string())
     } else if slot.is_none() {
         Err(format!("{name} is busy"))
+    } else if abandonable && crate::local_socket::peer_hung_up_silently(stream) {
+        return Err(ASKER_GONE.to_string());
     } else {
         call()
     };

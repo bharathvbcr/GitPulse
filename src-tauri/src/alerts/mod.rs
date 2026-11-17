@@ -38,11 +38,66 @@ use intake::{Intake, LowGate};
 #[cfg(all(unix, test))]
 pub(crate) use intake::{OrderBook, ORDER_BOOK_CAP};
 use policy::Verdict;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// File inside GitPulse's config directory holding the desktop app's live
+/// hook-derived session states for out-of-process MCP readers.
+pub const STATE_SNAPSHOT_NAME: &str = "agent-session-state.json";
+
+const STATE_SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_WRITE_GAP: Duration = Duration::from_millis(100);
+const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
+static SNAPSHOT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Default location of [`STATE_SNAPSHOT_NAME`] in GitPulse's config directory.
+pub fn default_state_snapshot_path() -> Option<PathBuf> {
+    Some(crate::tool_config::default_config_dir()?.join(STATE_SNAPSHOT_NAME))
+}
+
+/// One session's live state published by the alerts worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubSessionState {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    pub changed_ms: u64,
+}
+
+/// Atomic snapshot written by the app's alerts worker. `writer_pid` and
+/// `writer_start_us` let a reader reject a file left behind after a crash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubStateSnapshot {
+    pub version: u32,
+    pub writer_pid: u32,
+    pub writer_start_us: u64,
+    pub updated_ms: u64,
+    pub sessions: Vec<HubSessionState>,
+}
+
+/// Outcome of reading the desktop app's hook-state snapshot.
+#[derive(Debug, Clone)]
+pub enum HubStateRead {
+    Ok(HubStateSnapshot),
+    Unavailable(String),
+}
+
+fn wall_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 /// How long one session must wait between banners.
 ///
@@ -492,6 +547,11 @@ pub trait Host: Send + Sync + 'static {
     /// Takes down a banner whose question has been answered, so the
     /// notification centre does not keep asking it. Must not block.
     fn withdraw(&self, _native: &str) {}
+    /// Optional path for the atomic session-state snapshot read by MCP.
+    /// `None` in headless tests that do not expose app state on disk.
+    fn state_snapshot_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 struct Hub {
@@ -834,6 +894,15 @@ struct Tracked {
     shown: bool,
     /// That banner answers a question nobody is asking any more.
     withdraw: bool,
+    provider_session_id: Option<String>,
+    place: Option<String>,
+    hub_state: Option<HubEntryState>,
+}
+
+struct HubEntryState {
+    state: &'static str,
+    event: Option<&'static str>,
+    changed_ms: u64,
 }
 
 impl Tracked {
@@ -850,6 +919,9 @@ impl Tracked {
             standing: None,
             shown: false,
             withdraw: false,
+            provider_session_id: None,
+            place: None,
+            hub_state: None,
         }
     }
 
@@ -916,6 +988,160 @@ impl Bucket {
     }
 }
 
+fn snapshot_wake(dirty: bool, last_write: Option<Instant>, now: Instant) -> Option<Duration> {
+    if !dirty {
+        return None;
+    }
+    Some(match last_write {
+        Some(last) => (last + SNAPSHOT_WRITE_GAP).saturating_duration_since(now),
+        None => Duration::ZERO,
+    })
+}
+
+fn snapshot_of(
+    tracked: &HashMap<String, Tracked>,
+    writer_pid: u32,
+    writer_start_us: u64,
+    updated_ms: u64,
+) -> HubStateSnapshot {
+    let mut sessions: Vec<HubSessionState> = tracked
+        .iter()
+        .filter_map(|(key, entry)| {
+            let state = entry.hub_state.as_ref()?;
+            Some(HubSessionState {
+                key: key.clone(),
+                provider_session_id: entry.provider_session_id.clone(),
+                place: entry.place.clone(),
+                state: state.state.to_owned(),
+                event: state.event.map(str::to_owned),
+                changed_ms: state.changed_ms,
+            })
+        })
+        .collect();
+    sessions.sort_by(|a, b| a.key.cmp(&b.key));
+    HubStateSnapshot {
+        version: STATE_SNAPSHOT_VERSION,
+        writer_pid,
+        writer_start_us,
+        updated_ms,
+        sessions,
+    }
+}
+
+fn write_state_snapshot_atomic(path: &Path, snapshot: &HubStateSnapshot) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("snapshot path {} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("snapshot path {} has no file name", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|e| format!("could not encode session snapshot: {e}"))?;
+    let seq = SNAPSHOT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = opts.open(&tmp)?;
+        file.write_all(&bytes)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("could not write {}: {e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("could not install {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Reads the live hook-derived session-state snapshot written by the app's
+/// alerts worker, verifying that the writer process is still alive with the
+/// same start time. Returns [`HubStateRead::Unavailable`] when the app is not
+/// running or the file cannot be trusted.
+pub fn read_state_snapshot() -> HubStateRead {
+    read_state_snapshot_at(default_state_snapshot_path().as_deref())
+}
+
+pub(crate) fn read_state_snapshot_at(path: Option<&Path>) -> HubStateRead {
+    let Some(path) = path else {
+        return HubStateRead::Unavailable("session-state snapshot path is unavailable".into());
+    };
+    let file = match crate::fs_entry::open_private_record_readonly(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            return HubStateRead::Unavailable(
+                "GitPulse desktop app is not running (no active session-state snapshot)".into(),
+            );
+        }
+        Err(error) => {
+            return HubStateRead::Unavailable(format!(
+                "session-state snapshot could not be opened: {error}"
+            ));
+        }
+    };
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            return HubStateRead::Unavailable(format!(
+                "session-state snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    use std::io::Read;
+    if let Err(error) = file.take(MAX_SNAPSHOT_BYTES + 1).read_to_end(&mut buf) {
+        return HubStateRead::Unavailable(format!(
+            "session-state snapshot could not be read: {error}"
+        ));
+    }
+    if buf.len() as u64 > MAX_SNAPSHOT_BYTES {
+        return HubStateRead::Unavailable(format!(
+            "session-state snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
+        ));
+    }
+    let snapshot: HubStateSnapshot = match serde_json::from_slice(&buf) {
+        Ok(snap) => snap,
+        Err(error) => {
+            return HubStateRead::Unavailable(format!(
+                "session-state snapshot is malformed: {error}"
+            ));
+        }
+    };
+    if snapshot.version != STATE_SNAPSHOT_VERSION {
+        return HubStateRead::Unavailable(format!(
+            "unsupported session-state snapshot version {}",
+            snapshot.version
+        ));
+    }
+    if snapshot.writer_start_us == 0 {
+        return HubStateRead::Unavailable(
+            "session-state snapshot missing writer start timestamp".into(),
+        );
+    }
+    match crate::sysload::process_start_us(snapshot.writer_pid) {
+        Some(live_start) if live_start == snapshot.writer_start_us => HubStateRead::Ok(snapshot),
+        Some(_) => HubStateRead::Unavailable(format!(
+            "session-state snapshot writer pid {} no longer matches the running app",
+            snapshot.writer_pid
+        )),
+        None => HubStateRead::Unavailable(format!(
+            "GitPulse desktop app pid {} is no longer running",
+            snapshot.writer_pid
+        )),
+    }
+}
+
 fn run(
     receiver: mpsc::Receiver<Notice>,
     bells: Arc<LowGate>,
@@ -926,8 +1152,27 @@ fn run(
 ) {
     let mut tracked: HashMap<String, Tracked> = HashMap::new();
     let mut bucket = Bucket::new(Instant::now());
+    let snapshot_path = host.state_snapshot_path();
+    let writer_pid = std::process::id();
+    let writer_start_us = crate::sysload::process_start_us(writer_pid).unwrap_or(0);
+    let mut snapshot_dirty = false;
+    let mut last_snapshot_write: Option<Instant> = None;
+    if let Some(path) = snapshot_path.as_deref() {
+        let initial = snapshot_of(&tracked, writer_pid, writer_start_us, wall_now_ms());
+        if let Err(error) = write_state_snapshot_atomic(path, &initial) {
+            log::warn!(target: "alerts", "{error}");
+        }
+        last_snapshot_write = Some(Instant::now());
+    }
     loop {
-        let wait = next_wake(&tracked);
+        let now_for_wait = Instant::now();
+        let wait = [
+            next_wake(&tracked),
+            snapshot_wake(snapshot_dirty, last_snapshot_write, now_for_wait),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let received = match wait {
             Some(wait) => receiver.recv_timeout(wait),
             None => receiver
@@ -942,6 +1187,7 @@ fn run(
             if let Some(last) = admit(notice, now, &mut tracked, &counters) {
                 host.announce(&last);
             }
+            snapshot_dirty = true;
         }
         // A closing channel is the last chance to act on what is held. The
         // coalescing window exists to batch notices that are still arriving;
@@ -957,9 +1203,30 @@ fn run(
             &last_error,
         );
         if closed {
+            if let Some(path) = snapshot_path.as_deref() {
+                let _ = std::fs::remove_file(path);
+            }
             break;
         }
+        let before_prune = tracked.len();
         prune(now, &mut tracked);
+        if tracked.len() != before_prune {
+            snapshot_dirty = true;
+        }
+        if snapshot_dirty
+            && snapshot_path.is_some()
+            && last_snapshot_write
+                .is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_WRITE_GAP)
+        {
+            if let Some(path) = snapshot_path.as_deref() {
+                let snap = snapshot_of(&tracked, writer_pid, writer_start_us, wall_now_ms());
+                if let Err(error) = write_state_snapshot_atomic(path, &snap) {
+                    log::warn!(target: "alerts", "{error}");
+                }
+            }
+            snapshot_dirty = false;
+            last_snapshot_write = Some(now);
+        }
         if let Ok(mut slot) = standing.lock() {
             *slot = standing_of(&tracked, now);
         }
@@ -1009,9 +1276,45 @@ fn next_wake(tracked: &HashMap<String, Tracked>) -> Option<Duration> {
 /// it had not yet said: an announcement still waiting out its gap. The caller
 /// says it at once. Dropped with the entry, it left the pane showing what the
 /// worker had already moved past — a request it had decided was answered.
+fn mapped_standing_state(standing: &Standing) -> &'static str {
+    match standing.attention.event {
+        Some("idle_prompt") => "idle",
+        Some("agent_completed" | "turn_finished") => "done",
+        _ => "blocked",
+    }
+}
+
+fn update_hub_state(entry: &mut Tracked, event: Option<&'static str>, now_ms: u64) {
+    if event == Some("session_ended") {
+        entry.hub_state = None;
+        return;
+    }
+    let next = if let Some(standing) = &entry.standing {
+        let state = mapped_standing_state(standing);
+        Some((state, standing.attention.event.or(event)))
+    } else if matches!(event, Some("prompt_submitted" | "tool_finished")) {
+        Some(("working", event))
+    } else {
+        None
+    };
+    let Some((state, ev)) = next else {
+        return;
+    };
+    let changed_ms = entry
+        .hub_state
+        .as_ref()
+        .filter(|prev| prev.state == state)
+        .map_or(now_ms, |prev| prev.changed_ms);
+    entry.hub_state = Some(HubEntryState {
+        state,
+        event: ev,
+        changed_ms,
+    });
+}
+
 #[must_use = "an evicted session's unsaid announcement must be announced"]
 fn admit(
-    mut notice: Notice,
+    notice: Notice,
     now: Instant,
     tracked: &mut HashMap<String, Tracked>,
     counters: &Counters,
@@ -1053,14 +1356,37 @@ fn admit(
     if notice.origin == Origin::Hook {
         entry.hooked_at = Some(now);
     }
+    if let Some(pid) = notice
+        .provider_session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        entry.provider_session_id = Some(pid.to_owned());
+    }
+    if let Some(place) = notice.place.as_deref().filter(|s| !s.is_empty()) {
+        entry.place = Some(place.to_owned());
+    }
+    let event = notice.event;
+    admit_body(entry, notice, known, now, counters);
+    update_hub_state(entry, event, wall_now_ms());
+    farewell
+}
+
+fn admit_body(
+    entry: &mut Tracked,
+    mut notice: Notice,
+    known: bool,
+    now: Instant,
+    counters: &Counters,
+) {
     match notice.role() {
         bridge::Role::Resolve => {
             resolve(entry, &notice, known, counters);
-            return farewell;
+            return;
         }
         bridge::Role::State => {
             stand(entry, &notice);
-            return farewell;
+            return;
         }
         bridge::Role::Banner => {}
     }
@@ -1069,7 +1395,7 @@ fn admit(
     // same session is that report rung again, and has nothing to add.
     if notice.is_bare_signal() && entry.hooked_within(now, HOOK_SHADOW) {
         counters.coalesced.fetch_add(1, Ordering::Relaxed);
-        return farewell;
+        return;
     }
     // A bell later than that, while a hook's question still stands, is a
     // reminder of that question — not a new, reasonless one replacing it.
@@ -1106,7 +1432,6 @@ fn admit(
         }
         None => entry.pending_since = now,
     }
-    farewell
 }
 
 /// Records what a session now stands asking for and queues it to be
@@ -1342,3 +1667,6 @@ mod stress;
 mod tests;
 #[cfg(test)]
 mod text_tests;
+
+#[cfg(test)]
+mod snapshot_tests;

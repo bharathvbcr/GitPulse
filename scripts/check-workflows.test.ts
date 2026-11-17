@@ -15,7 +15,13 @@ import {
   workflowFiles,
   workflowPolicyFindings,
   workflowsMissingPermissions,
+  RELEASE_GATE_ALLOWLIST,
+  gateFindings,
+  releaseGateFindings,
+  trustedWorkflowNames,
 } from "./check-workflows.mjs";
+
+type ReleaseGateAllowEntry = { workflow: string; job: string; step?: string; key: string; reason: string };
 
 describe("check:workflows", () => {
   it("finds the repository's workflow files", () => {
@@ -398,5 +404,527 @@ describe("check:workflows adversarial: downloads run without a check", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * The release gate (`release-state.mjs`, `.githooks/pre-push`) reads a workflow
+ * RUN's conclusion, never its jobs. GitHub concludes a run `success` when a job
+ * was skipped, so a check job that gains an `if:`, a `continue-on-error`, or a
+ * `needs:` on a skippable job would satisfy the gate without ever running.
+ */
+describe("check:workflows release-gate rule: a trusted check must not be able to skip", () => {
+  const wf = (...body: string[]) => ["on: push", "permissions:", "  contents: read", "jobs:", ...body].join("\n");
+  const gate = (text: string, allowlist: ReleaseGateAllowEntry[] = [], name = "ci.yml") =>
+    gateFindings({ [name]: text }, allowlist);
+  const allow = (over: Partial<ReleaseGateAllowEntry>): ReleaseGateAllowEntry => ({
+    workflow: "ci.yml",
+    job: "test",
+    key: "if",
+    reason: "a written reason",
+    ...over,
+  });
+  const clean = wf("  test:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Build", "        run: make");
+
+  it("passes a workflow whose jobs and steps always run", () => {
+    expect(gate(clean)).toEqual([]);
+  });
+
+  describe("job-level if", () => {
+    const withIf = wf("  test:", "    if: github.ref == 'refs/heads/main'", "    runs-on: ubuntu-latest", "    steps:", "      - run: make");
+
+    it("fails, naming the workflow, the job, the key and what to do", () => {
+      const [finding, ...rest] = gate(withIf);
+      expect(rest).toEqual([]);
+      expect(finding).toContain("ci.yml");
+      expect(finding).toContain('job "test"');
+      expect(finding).toContain("`if`");
+      expect(finding).toMatch(/remove the condition or add an allowlist entry with a reason/);
+    });
+
+    it("passes when an allowlist entry with a reason covers that job and key", () => {
+      expect(gate(withIf, [allow({})])).toEqual([]);
+    });
+
+    it("does not let an entry for another key, job or workflow cover it", () => {
+      for (const entry of [allow({ key: "continue-on-error" }), allow({ job: "other" }), allow({ workflow: "coverage.yml" })]) {
+        expect(gate(withIf, [entry]).some((f) => f.includes('job "test"') && f.includes("`if`"))).toBe(true);
+      }
+    });
+  });
+
+  describe("continue-on-error", () => {
+    it("fails on a job", () => {
+      const [finding] = gate(wf("  test:", "    continue-on-error: true", "    runs-on: ubuntu-latest", "    steps:", "      - run: make"));
+      expect(finding).toContain('job "test"');
+      expect(finding).toContain("continue-on-error");
+    });
+
+    it("fails on a step, naming the step", () => {
+      const [finding] = gate(wf("  test:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Lint", "        continue-on-error: true", "        run: make lint"));
+      expect(finding).toContain('job "test"');
+      expect(finding).toContain('step "Lint"');
+      expect(finding).toContain("continue-on-error");
+    });
+
+    it("accepts only a literal false; anything else, quoted or computed, fails", () => {
+      const step = (value: string) => wf("  test:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Lint", `        continue-on-error: ${value}`, "        run: x");
+      expect(gate(step("false"))).toEqual([]);
+      for (const value of ["true", "'false'", '"false"', "${{ false }}", "${{ matrix.experimental }}", "yes", ""]) {
+        expect(gate(step(value)), value).toHaveLength(1);
+      }
+    });
+
+    it("can be allowlisted on a step by name or by index", () => {
+      const text = wf("  test:", "    runs-on: ubuntu-latest", "    steps:", "      - name: Lint", "        continue-on-error: true", "        run: x");
+      expect(gate(text, [allow({ step: "Lint", key: "continue-on-error" })])).toEqual([]);
+      expect(gate(text, [allow({ step: "#0", key: "continue-on-error" })])).toEqual([]);
+    });
+  });
+
+  describe("needs on a job that can skip", () => {
+    const skippable = ["  a:", "    if: github.event_name == 'workflow_dispatch'", "    runs-on: ubuntu-latest", "    steps:", "      - run: x"];
+    const dependent = (needs: string) => ["  b:", `    needs: ${needs}`, "    runs-on: ubuntu-latest", "    steps:", "      - run: y"];
+
+    it("fails the dependent job even when the job it needs is allowlisted", () => {
+      const findings = gate(wf(...skippable, ...dependent("a")), [allow({ job: "a" })]);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toContain('job "b"');
+      expect(findings[0]).toContain("`needs`");
+      expect(findings[0]).toContain('"a"');
+    });
+
+    it("sees through the list form and through a chain", () => {
+      const text = wf(...skippable, ...dependent("[x, a]"), "  x:", "    runs-on: ubuntu-latest", "    steps:", "      - run: z", "  c:", "    needs: b", "    runs-on: ubuntu-latest", "    steps:", "      - run: w");
+      const findings = gate(text, [allow({ job: "a" })]);
+      expect(findings.filter((f) => f.includes('job "b"'))).toHaveLength(1);
+      expect(findings.filter((f) => f.includes('job "c"'))).toHaveLength(1);
+      expect(findings.some((f) => f.includes('job "x"'))).toBe(false);
+    });
+
+    it("passes when the dependent job is allowlisted for needs, and when the dependency cannot skip", () => {
+      expect(gate(wf(...skippable, ...dependent("a")), [allow({ job: "a" }), allow({ job: "b", key: "needs" })])).toEqual([]);
+      expect(gate(wf("  a:", "    runs-on: ubuntu-latest", "    steps:", "      - run: x", ...dependent("a")))).toEqual([]);
+    });
+
+    it("fails a needs that names a job the workflow does not define", () => {
+      const findings = gate(wf(...dependent("ghost")));
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toContain('"ghost"');
+    });
+  });
+
+  describe("step-level if", () => {
+    const step = (condition: string, extra: string[] = []) =>
+      wf("  test:", "    runs-on: ${{ matrix.os }}", "    strategy:", "      matrix:", "        os: [ubuntu-latest, macos-latest]", "    steps:", "      - name: Check", `        if: ${condition}`, ...extra.map((l) => `        ${l}`), "        run: x");
+
+    it.each([
+      "!cancelled()",
+      "${{ !cancelled() }}",
+      "${{!cancelled()}}",
+      "matrix.os == 'ubuntu-latest'",
+      "${{ matrix.os == 'macos-latest' }}",
+      "${{ !cancelled() && matrix.os == 'ubuntu-latest' }}",
+      "${{ !cancelled() && runner.os != 'Windows' }}",
+      "${{ !cancelled() && runner.os == 'macOS' }}",
+      "${{ matrix.os != 'macos-latest' && !cancelled() }}",
+    ])("accepts the platform or cancellation form %s", (condition) => {
+      expect(gate(step(condition)), condition).toEqual([]);
+    });
+
+    it.each([
+      "github.ref == 'refs/heads/main'",
+      "always()",
+      "success()",
+      "failure()",
+      "${{ !cancelled() || matrix.os == 'ubuntu-latest' }}",
+      "${{ !cancelled() && github.event_name == 'push' }}",
+      "${{ (!cancelled()) }}",
+      "matrix.os == 'ubuntu-latest' || true",
+      "${{ matrix.os == github.ref }}",
+      "contains(matrix.os, 'ubuntu')",
+      "${{ !cancelled() }} && x",
+      "${{ !cancelled() && }}",
+      "false",
+      "true",
+    ])("fails the condition %s because it cannot be classified", (condition) => {
+      const findings = gate(step(condition));
+      expect(findings, condition).toHaveLength(1);
+      expect(findings[0]).toContain('step "Check"');
+      expect(findings[0]).toContain("`if`");
+    });
+
+    it("fails a platform selector that matches none of the job's legs", () => {
+      expect(gate(step("matrix.os == 'solaris'"))).toHaveLength(1);
+      expect(gate(step("runner.os == 'Solaris'"))).toHaveLength(1);
+      expect(gate(step("matrix.arch == 'x64'"))).toHaveLength(1);
+    });
+
+    it("evaluates the whole condition against each leg, so one that no leg satisfies fails", () => {
+      expect(gate(step("matrix.os == 'ubuntu-latest' && matrix.os == 'macos-latest'"))).toHaveLength(1);
+      expect(gate(step("matrix.os == 'macos-latest' && runner.os == 'Linux'"))).toHaveLength(1);
+      expect(gate(step("matrix.os == 'ubuntu-latest' && runner.os == 'Linux'"))).toEqual([]);
+      expect(gate(step("${{ !cancelled() && matrix.os != 'ubuntu-latest' && runner.os != 'macOS' }}"))).toHaveLength(1);
+    });
+
+    it("checks runner.os against the operating systems the job's runs-on can give", () => {
+      const single = (condition: string, runsOn = "ubuntu-latest") =>
+        wf("  test:", `    runs-on: ${runsOn}`, "    steps:", "      - name: Check", `        if: ${condition}`, "        run: x");
+      expect(gate(single("runner.os == 'Windows'"))).toHaveLength(1);
+      expect(gate(single("runner.os != 'Linux'"))).toHaveLength(1);
+      expect(gate(single("runner.os == 'Linux'"))).toEqual([]);
+      expect(gate(single("runner.os == 'Linux'", "[self-hosted, big]"))).toHaveLength(1);
+      expect(gate(single("runner.os == 'Linux'", "${{ inputs.runner }}"))).toHaveLength(1);
+    });
+
+    it("accepts only matrix.os, matrix.platform and runner.os as platform subjects", () => {
+      const axis = (name: string) =>
+        wf("  test:", `    runs-on: \${{ matrix.${name} }}`, "    strategy:", "      matrix:", `        ${name}: [ubuntu-latest, macos-latest]`, "    steps:", "      - name: Check", `        if: matrix.${name} == 'ubuntu-latest'`, "        run: x");
+      expect(gate(axis("platform"))).toEqual([]);
+      expect(gate(axis("os"))).toEqual([]);
+      expect(gate(axis("flavour"))).toHaveLength(1);
+    });
+
+    it("fails an inequality that excludes every leg", () => {
+      const single = wf("  test:", "    runs-on: ${{ matrix.os }}", "    strategy:", "      matrix:", "        os: [ubuntu-latest]", "    steps:", "      - name: Check", "        if: matrix.os != 'ubuntu-latest'", "        run: x");
+      expect(gate(single)).toHaveLength(1);
+    });
+
+    it("can be allowlisted by step name", () => {
+      expect(gate(step("always()"), [allow({ step: "Check" })])).toEqual([]);
+    });
+
+    it("refers to an unnamed step by its index", () => {
+      const text = wf("  test:", "    runs-on: ubuntu-latest", "    steps:", "      - run: x", "      - if: always()", "        run: y");
+      const [finding] = gate(text);
+      expect(finding).toContain("step #1");
+      expect(gate(text, [allow({ step: "#1" })])).toEqual([]);
+    });
+
+    it("judges a multi-line condition as one condition", () => {
+      expect(gate(step(">-", ["  ${{ !cancelled()", "  && matrix.os == 'ubuntu-latest' }}"]))).toEqual([]);
+      expect(gate(step("${{ !cancelled() &&", ["  matrix.os == 'ubuntu-latest' }}"]))).toEqual([]);
+      expect(gate(step("${{ !cancelled() &&", ["  github.ref == 'x' }}"]))).toHaveLength(1);
+    });
+  });
+
+  describe("a job that calls a reusable workflow, or has no steps", () => {
+    const calls = (target: string, extra: string[] = []) => wf("  a:", `    uses: ${target}`, ...extra);
+
+    it.each(["./.github/workflows/other.yml", "octo/repo/.github/workflows/x.yml@3d3c42e5aac5ba805825da76410c181273ba90b1"])(
+      "fails a job-level uses of %s, whose jobs this rule cannot read",
+      (target) => {
+        const [finding, ...rest] = gate(calls(target));
+        expect(rest).toEqual([]);
+        expect(finding).toContain('job "a"');
+        expect(finding).toContain("`uses`");
+        expect(finding).toMatch(/reusable workflow/);
+      },
+    );
+
+    it("honours an allowlist entry for uses, and fails a stale one", () => {
+      expect(gate(calls("./.github/workflows/other.yml"), [allow({ job: "a", key: "uses" })])).toEqual([]);
+      const stale = gate(clean, [allow({ job: "a", key: "uses" })]);
+      expect(stale).toHaveLength(1);
+      expect(stale[0]).toMatch(/stale/);
+      // An entry for another key does not excuse it.
+      expect(gate(calls("./x.yml"), [allow({ job: "a", key: "if" })]).some((f) => f.includes("`uses`"))).toBe(true);
+    });
+
+    it("fails a job with neither steps nor uses", () => {
+      const [finding, ...rest] = gate(wf("  a:", "    runs-on: ubuntu-latest"));
+      expect(rest).toEqual([]);
+      expect(finding).toContain('job "a"');
+      expect(finding).toContain("`steps`");
+    });
+
+    it("fails a job with both steps and uses, and still judges the rest of a uses job", () => {
+      expect(gate(wf("  a:", "    uses: ./x.yml", "    steps:", "      - run: x"))).toHaveLength(1);
+      expect(gate(calls("./x.yml", ["    if: always()"]))).toHaveLength(2);
+    });
+  });
+
+  describe("matrix exclude", () => {
+    const withExclude = (shape: string[]) =>
+      wf("  test:", "    runs-on: ${{ matrix.os }}", "    strategy:", "      matrix:", "        os: [ubuntu-latest, windows-latest]", ...shape, "    steps:", "      - run: x");
+
+    it("fails, because it removes legs without a trace", () => {
+      for (const shape of [["        exclude:", "          - os: windows-latest"], ["        exclude: [{ os: windows-latest }]"]]) {
+        const [finding, ...rest] = gate(withExclude(shape));
+        expect(rest).toEqual([]);
+        expect(finding).toContain('job "test"');
+        expect(finding).toContain("exclude");
+      }
+    });
+
+    it("passes when allowlisted for matrix.exclude", () => {
+      expect(gate(withExclude(["        exclude:", "          - os: windows-latest"]), [allow({ key: "matrix.exclude" })])).toEqual([]);
+    });
+
+    it("fails a matrix it cannot read, such as one computed by fromJSON", () => {
+      const text = wf("  test:", "    runs-on: ubuntu-latest", "    strategy:", "      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}", "    steps:", "      - run: x");
+      expect(gate(text)).toHaveLength(1);
+    });
+  });
+
+  describe("the allowlist itself", () => {
+    const withIf = wf("  test:", "    if: always()", "    runs-on: ubuntu-latest", "    steps:", "      - run: x");
+
+    it("fails an entry that matches nothing, naming it", () => {
+      const findings = gate(clean, [allow({ job: "gone" })]);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatch(/stale/);
+      expect(findings[0]).toContain('"gone"');
+    });
+
+    it("fails an entry whose key or step no longer matches, even if the job does", () => {
+      expect(gate(withIf, [allow({}), allow({ key: "continue-on-error" })]).filter((f) => /stale/.test(f))).toHaveLength(1);
+      expect(gate(withIf, [allow({}), allow({ step: "Nope" })]).filter((f) => /stale/.test(f))).toHaveLength(1);
+    });
+
+    it("fails an entry with an empty or blank reason, and does not honour it", () => {
+      for (const reason of ["", "   ", "\n"]) {
+        const findings = gate(withIf, [allow({ reason })]);
+        expect(findings.some((f) => /reason/.test(f)), JSON.stringify(reason)).toBe(true);
+        expect(findings.some((f) => f.includes("remove the condition")), JSON.stringify(reason)).toBe(true);
+      }
+    });
+
+    it("fails an entry that is malformed", () => {
+      for (const entry of [{ workflow: "ci.yml", job: "test", key: "when", reason: "r" }, { workflow: "ci.yml", key: "if", reason: "r" }, { job: "test", key: "if", reason: "r" }]) {
+        expect(gate(withIf, [entry as unknown as ReleaseGateAllowEntry]).some((f) => /allowlist entry/.test(f))).toBe(true);
+      }
+    });
+  });
+
+  describe("a guard that could not run does not pass", () => {
+    it("fails a trusted workflow that is missing or unreadable", () => {
+      const findings = gateFindings({ "ci.yml": null }, []);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toContain("ci.yml");
+      expect(findings[0]).toMatch(/cannot be read|missing/);
+    });
+
+    it.each([
+      ["a tab used as indentation", "on: push\njobs:\n\ttest:\n\t\truns-on: x\n"],
+      ["an unterminated quote", "on: push\njobs:\n  test:\n    name: 'oops\n    runs-on: x\n"],
+      ["a duplicated key", "on: push\njobs:\n  test:\n    if: a\n    if: b\n    runs-on: x\n"],
+      ["an anchor", "on: push\njobs:\n  test: &t\n    runs-on: x\n"],
+      ["no jobs", "on: push\n"],
+      ["jobs that is not a mapping", "on: push\njobs: nope\n"],
+      ["a job that is not a mapping", "on: push\njobs:\n  test: nope\n"],
+      ["steps that is not a list", "on: push\njobs:\n  test:\n    runs-on: x\n    steps: nope\n"],
+      ["an empty file", ""],
+    ])("fails %s", (_label, text) => {
+      const findings = gate(text);
+      expect(findings.length).toBeGreaterThan(0);
+      expect(findings[0]).toContain("ci.yml");
+    });
+  });
+
+  describe("adversarial YAML shapes", () => {
+    it("reads quoted keys", () => {
+      expect(gate(wf("  test:", '    "if": always()', "    runs-on: x", "    steps:", "      - run: x"))).toHaveLength(1);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", "        'continue-on-error': true"))).toHaveLength(1);
+      expect(gate(wf("  'test':", "    runs-on: x", "    steps:", "      - run: x"))).toEqual([]);
+    });
+
+    it("does not let an anchor or a tag hide a key", () => {
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - &a if: always()", "        run: x")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", "        !!str if: always()")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", "        *ref continue-on-error: true")).length).toBeGreaterThan(0);
+      expect(gate(wf("  test:", "    runs-on: x", "    steps:", "      - run: x", '        "&not-anchor": fine'))).toEqual([]);
+    });
+
+    it("reads an if written with and without ${{ }}", () => {
+      const job = (value: string) => wf("  test:", `    if: ${value}`, "    runs-on: x", "    steps:", "      - run: x");
+      expect(gate(job("${{ github.ref == 'x' }}"))).toHaveLength(1);
+      expect(gate(job("github.ref == 'x'"))).toHaveLength(1);
+      expect(gate(job("true"))).toHaveLength(1);
+    });
+
+    it("reads a multi-line job condition", () => {
+      const text = wf("  test:", "    if: >-", "      github.ref == 'x' &&", "      github.event_name == 'push'", "    runs-on: x", "    steps:", "      - run: x");
+      expect(gate(text)).toHaveLength(1);
+      const plain = wf("  test:", "    if: github.ref == 'x' &&", "      github.event_name == 'push'", "    runs-on: x", "    steps:", "      - run: x");
+      expect(gate(plain)).toHaveLength(1);
+    });
+
+    it("does not mistake text inside a run block scalar, a comment or a string for a condition", () => {
+      const text = wf(
+        "  test:",
+        "    # if: github.ref == 'x'",
+        "    # continue-on-error: true",
+        "    runs-on: x",
+        "    steps:",
+        "      - name: 'if: not a condition'",
+        "        run: |",
+        "          if [ -n \"$X\" ]; then echo go; fi",
+        "          if: still text",
+        "          continue-on-error: true",
+        "            exclude: [a]",
+        "        env:",
+        "          NOTE: if: x",
+        "      - name: Second  # if: nope",
+        "        run: echo \"if: y\"",
+        "        with:",
+        "          if: a-with-input-named-if",
+        "          continue-on-error: not-a-step-key",
+      );
+      expect(gate(text)).toEqual([]);
+    });
+
+    it("finds a real if that follows a block scalar", () => {
+      const text = wf("  test:", "    runs-on: x", "    steps:", "      - run: |", "          echo hi", "        if: always()");
+      expect(gate(text)).toHaveLength(1);
+    });
+
+    it("reads a file that starts with a byte-order mark", () => {
+      const bom = String.fromCharCode(0xfeff);
+      expect(gate(bom + clean)).toEqual([]);
+      expect(gate(bom + wf("  test:", "    if: always()", "    runs-on: x", "    steps:", "      - run: x"))).toHaveLength(1);
+    });
+
+    it("reads CRLF and bare-CR line endings the same as LF", () => {
+      const withIf = wf("  test:", "    if: always()", "    runs-on: x", "    steps:", "      - run: x", "        continue-on-error: true");
+      const lf = gate(withIf);
+      expect(lf).toHaveLength(2);
+      expect(gate(withIf.replace(/\n/g, "\r\n"))).toEqual(lf);
+      expect(gate(withIf.replace(/\n/g, "\r"))).toEqual(lf);
+      expect(gate(clean.replace(/\n/g, "\r\n"))).toEqual([]);
+    });
+
+    it("reads a tab between the key and its value, and rejects a tab used as indentation", () => {
+      expect(gate(wf("  test:", "    if:\talways()", "    runs-on: x", "    steps:", "      - run: x"))).toHaveLength(1);
+      const tabbed = gate(wf("  test:", "\tif: always()", "    runs-on: x", "    steps:", "      - run: x"));
+      expect(tabbed).toHaveLength(1);
+      expect(tabbed[0]).toMatch(/cannot be parsed/);
+    });
+
+    it("reads a step written compactly after the dash, and a sequence at the key's own indent", () => {
+      const text = wf("  test:", "    runs-on: x", "    steps:", "    - name: A", "      if: always()", "      run: x", "    - run: y");
+      const [finding, ...rest] = gate(text);
+      expect(rest).toEqual([]);
+      expect(finding).toContain('step "A"');
+    });
+
+    it("reads flow sequences in needs and in matrix values, and a trailing comment after a value", () => {
+      const text = wf("  a:", "    runs-on: x", "    steps:", "      - run: x", "  b:", "    needs: [ a ]  # after a", "    runs-on: x", "    steps:", "      - run: y");
+      expect(gate(text)).toEqual([]);
+      // Steps written as a flow collection cannot be inspected, so they fail.
+      expect(gate(wf("  a:", "    runs-on: x", "    steps: [{ run: x, if: always() }]"))).toHaveLength(1);
+    });
+
+    it("treats duplicate step names as ambiguous and refers to them by index", () => {
+      const text = wf("  test:", "    runs-on: x", "    steps:", "      - name: Same", "        if: always()", "        run: x", "      - name: Same", "        if: failure()", "        run: y");
+      const findings = gate(text);
+      expect(findings).toHaveLength(2);
+      expect(findings[0]).toContain("step #0");
+      expect(findings[1]).toContain("step #1");
+    });
+  });
+
+  describe("which workflows are judged", () => {
+    const withTempTree = (releaseState: string, files: Record<string, string>, body: (dir: string, state: string) => void) => {
+      const root = mkdtempSync(path.join(tmpdir(), "gate-rule-"));
+      try {
+        const dir = path.join(root, "workflows");
+        mkdirSync(dir);
+        for (const [name, text] of Object.entries(files)) writeFileSync(path.join(dir, name), text);
+        const state = path.join(root, "release-state.mjs");
+        writeFileSync(state, releaseState);
+        body(dir, state);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
+    const gateSource = (...lists: string[]) =>
+      [
+        "function requireSuccessfulPushRun(workflow) { return workflow; }",
+        ...lists.map((list) => `for (const workflow of ${list}) requireSuccessfulPushRun(workflow);`),
+      ].join("\n");
+    const skipping = wf("  t:", "    if: always()", "    runs-on: x", "    steps:", "      - run: x");
+
+    it("does not judge a workflow the release gate does not read", () => {
+      withTempTree(gateSource('["ci.yml"]'), { "ci.yml": clean, "bench.yml": skipping }, (dir, state) => {
+        expect(releaseGateFindings(dir, state, [])).toEqual([]);
+      });
+    });
+
+    it("judges every workflow the gate reads", () => {
+      withTempTree(gateSource('["ci.yml", "bench.yml"]'), { "ci.yml": clean, "bench.yml": skipping }, (dir, state) => {
+        const findings = releaseGateFindings(dir, state, []);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]).toContain("bench.yml");
+      });
+    });
+
+    it("fails a trusted workflow whose file is not there", () => {
+      withTempTree(gateSource('["ci.yml", "gone.yml"]'), { "ci.yml": clean }, (dir, state) => {
+        const findings = releaseGateFindings(dir, state, []);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]).toContain("gone.yml");
+      });
+    });
+
+    it("fails when the list the gate reads cannot be determined", () => {
+      withTempTree("export const nothing = 1;\n", { "ci.yml": clean }, (dir, state) => {
+        const findings = releaseGateFindings(dir, state, []);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]).toMatch(/trusted workflows/);
+      });
+      withTempTree(gateSource('["ci.yml"]') + "\n[x].map(requireSuccessfulPushRun);\n", { "ci.yml": clean }, (dir, state) => {
+        expect(releaseGateFindings(dir, state, [])).toHaveLength(1);
+      });
+      expect(releaseGateFindings("/nonexistent/dir", "/nonexistent/release-state.mjs", [])).toHaveLength(1);
+    });
+  });
+
+  describe("derivation from release-state.mjs", () => {
+    const repo = (relative: string) => fileURLToPath(new URL(relative, import.meta.url));
+    const releaseState = readFileSync(repo("./release-state.mjs"), "utf8");
+
+    it("reads the workflows the gate checks, from every call site", () => {
+      const { workflows, sites } = trustedWorkflowNames(releaseState);
+      expect(workflows).toEqual(["ci.yml", "coverage.yml"]);
+      expect(sites.length).toBeGreaterThanOrEqual(2);
+      // The `ready` and `prepare` stages must trust the same workflows. If they
+      // ever differ the guard judges the union, and this says so.
+      for (const site of sites) expect(site).toEqual(workflows);
+    });
+
+    it("is the list the pre-push hook describes", () => {
+      const hook = readFileSync(repo("../.githooks/pre-push"), "utf8");
+      for (const name of trustedWorkflowNames(releaseState).workflows) expect(hook).toContain(name);
+    });
+
+    it("takes the union and fails closed on a call site it cannot read", () => {
+      expect(trustedWorkflowNames("function requireSuccessfulPushRun(w) {}\nfor (const w of ['a.yml']) requireSuccessfulPushRun(w);\nrequireSuccessfulPushRun('b.yml');").workflows).toEqual(["a.yml", "b.yml"]);
+      expect(() => trustedWorkflowNames("function requireSuccessfulPushRun(w) {}\nrequireSuccessfulPushRun(name);")).toThrow(/call site/);
+      expect(() => trustedWorkflowNames("function requireSuccessfulPushRun(w) {}\nlist.forEach(requireSuccessfulPushRun);")).toThrow(/call site/);
+      expect(() => trustedWorkflowNames("function requireSuccessfulPushRun(w) {}")).toThrow(/no call site/);
+      expect(() => trustedWorkflowNames("function requireSuccessfulPushRun(w) {}\nfor (const w of ['../x.yml']) requireSuccessfulPushRun(w);")).toThrow(/workflow file name/);
+    });
+
+    it("ignores the identifier in comments", () => {
+      const text = "// requireSuccessfulPushRun(x) is the gate\n/**\n * requireSuccessfulPushRun\n */\nfunction requireSuccessfulPushRun(w) {}\nfor (const w of ['a.yml']) requireSuccessfulPushRun(w);";
+      expect(trustedWorkflowNames(text).workflows).toEqual(["a.yml"]);
+    });
+  });
+
+  it("holds this repository's trusted workflows to the rule, with exactly the exemptions that are there", () => {
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    const state = fileURLToPath(new URL("./release-state.mjs", import.meta.url));
+    expect(releaseGateFindings(dir, state)).toEqual([]);
+    for (const entry of RELEASE_GATE_ALLOWLIST) expect(entry.reason.trim().length, JSON.stringify(entry)).toBeGreaterThan(20);
+  });
+
+  it("does not let arm-bundle's exemption cover a new continue-on-error on the same job", () => {
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    const text = readFileSync(path.join(dir, "ci.yml"), "utf8");
+    expect(text).toContain("if: github.event_name == 'workflow_dispatch'");
+    const changed = text.replace("if: github.event_name == 'workflow_dispatch'", "if: github.event_name == 'workflow_dispatch'\n    continue-on-error: true");
+    const findings = gateFindings({ "ci.yml": changed }, RELEASE_GATE_ALLOWLIST);
+    expect(findings.some((f) => f.includes('job "arm-bundle"') && f.includes("continue-on-error"))).toBe(true);
   });
 });

@@ -1,0 +1,11 @@
+✔ a (0.3135ms)
+✔ b (0.053042ms)
+✔ c (0.0365ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 94.736542

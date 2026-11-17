@@ -1,12 +1,22 @@
 //! Free space on the volume a path lives on, and what a launch is told when
 //! there is not enough of it.
 //!
-//! Low disk is advice, never a refusal (owner decision, 2026-10-21): it can
-//! skip the optional build-cache copy of a worktree, which only saves a
-//! rebuild, and it can never stop a launch, a checkout or a worktree being
-//! made. [`governor::Site`](super::Site) has no disk site and
-//! `Reason`/`Refused` have no disk variant; `tests::low_disk_is_advice_only`
-//! holds that.
+//! Two decisions are recorded here, in order:
+//!
+//! * 2026-10-21 (owner): low disk is advice, never a refusal. It can skip the
+//!   optional build-cache copy of a worktree, which only saves a rebuild, and
+//!   it could never stop a launch, a checkout or a worktree being made. That
+//!   is still true of the advisory below ([`LOW_DISK_FLOOR`],
+//!   `Advisory::LowDisk`), which is unchanged.
+//! * 2026-11-14 (owner instruction, after the machine hung and reset): the
+//!   governor's guards become configurable with protective defaults. Free
+//!   disk is now one of them: the `disk` rule (`thresholds.rs`) refuses agent
+//!   launches below its severe threshold when its mode is `refuse` (the
+//!   default), and never refuses when it is `off` or `shed`, which is the
+//!   2026-10-21 behaviour. The binding is `Binding::LowDisk`.
+//!
+//! `governor::tests::low_disk_advice_never_refuses_and_the_disk_setting_does_only_in_refuse_mode`
+//! holds both: the advisory never refuses, the setting does only in `refuse`.
 
 use super::sensor::{Reading, Why};
 use serde::{Deserialize, Serialize};
@@ -79,6 +89,33 @@ pub fn block_size(path: &Path) -> Option<u64> {
 
 #[cfg(not(unix))]
 pub fn block_size(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Physical memory in bytes, read once: what the automatic disk floors scale
+/// with in a process that has no sensor sample to ask (Settings, the hook).
+/// `None` where it cannot be read.
+#[cfg(unix)]
+pub fn physical_memory() -> Option<u64> {
+    static MEMORY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(|| {
+        // SAFETY: sysconf has no memory preconditions.
+        let (pages, page) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        let bytes = u64::try_from(pages)
+            .ok()?
+            .checked_mul(u64::try_from(page).ok()?)?;
+        (bytes > 0).then_some(bytes)
+    })
+}
+
+/// Windows has no reader here: the automatic floors are the fixed ones.
+#[cfg(not(unix))]
+pub fn physical_memory() -> Option<u64> {
     None
 }
 

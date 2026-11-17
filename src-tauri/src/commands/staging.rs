@@ -1,6 +1,7 @@
 //! Index and commit commands: staging, selective patches, committing, discarding changes.
 
 use super::*;
+use crate::engine::git_writer::SecretPolicy;
 use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
@@ -97,13 +98,27 @@ pub async fn cmd_unstage_selective_patch(
     .await
 }
 
+/// The secret gate's policy for a commit or push the webview asked for.
+/// `allow_secrets` is sent only by the commit view's "Commit anyway" button
+/// and the "Push anyway" / "Publish anyway" actions on a push refusal, which
+/// a person sees after the scan refused; it is no MCP tool's argument, so an
+/// agent cannot set it.
+pub(super) fn secret_policy(allow_secrets: Option<bool>) -> SecretPolicy {
+    if allow_secrets == Some(true) {
+        SecretPolicy::HumanOverride
+    } else {
+        SecretPolicy::Enforce
+    }
+}
+
 /// Commits the index, after the harness's command gate has judged the exact
-/// command line this would run.
+/// command line this would run and the secret scan has read what it adds.
 #[tauri::command(async)]
 pub async fn cmd_commit(
     repo_path: String,
     message: String,
     amend: bool,
+    allow_secrets: Option<bool>,
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         // Mirror GitWriter::commit_inner's branching exactly so the judged
@@ -119,7 +134,12 @@ pub async fn cmd_commit(
             argv
         };
         let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::commit(&repo_path, &message, amend)?;
+        let output = GitWriter::commit_with_policy(
+            &repo_path,
+            &message,
+            amend,
+            secret_policy(allow_secrets),
+        )?;
         // After the commit landed, and unable to fail it: a local caller
         // record of the type the user actually committed, when that setting
         // is on and a low-confidence draft for this repository is pending.
@@ -139,6 +159,7 @@ pub async fn cmd_commit(
 pub async fn cmd_quick_commit(
     repo_path: String,
     message: String,
+    allow_secrets: Option<bool>,
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let add_argv: Vec<&str> = std::iter::once("git")
@@ -149,7 +170,11 @@ pub async fn cmd_quick_commit(
         let commit_argv: Vec<&str> = commit_owned.iter().map(String::as_str).collect();
         let commit_policy = guard(&repo_path, &commit_argv)?;
         let policy = strictest_verdict(add_policy, commit_policy);
-        let output = GitWriter::quick_commit(&repo_path, &message)?;
+        let output = GitWriter::quick_commit_with_policy(
+            &repo_path,
+            &message,
+            secret_policy(allow_secrets),
+        )?;
         crate::lappi::record_commit_outcome(&repo_path, &message);
         Ok(Guarded { policy, output })
     })
@@ -189,7 +214,7 @@ pub async fn cmd_discard_changes(
 /// first: shed as a deferrable read under memory pressure it would fail closed
 /// to "delete" for a file that is only being restored.
 pub(super) fn discard_file_op(repo_path: &str, file_path: &str) -> &'static str {
-    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::engine::process::mark_user_action(repo_path);
     match GitReader::is_tracked(repo_path, file_path) {
         Ok(true) => "modify",
         Ok(false) | Err(_) => "delete",

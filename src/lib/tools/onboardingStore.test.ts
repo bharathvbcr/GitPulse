@@ -6,11 +6,13 @@ import {
   cloneSource,
   closeSetupWizard,
   dismissFirstRun,
+  ensureToolsStatus,
   finishSetup,
   markOnboardingComplete,
   onboardingStore,
   openSetupWizard,
   refreshToolsStatus,
+  resetEnsureToolsStatus,
   retryWizardLoad,
   runInstall,
   runVerify,
@@ -309,5 +311,38 @@ describe("onboardingStore", () => {
         }),
       }),
     );
+  });
+});
+
+describe("ensureToolsStatus", () => {
+  beforeEach(() => {
+    onboardingStore.status.set(null);
+    onboardingStore.loadError.set(null);
+    resetEnsureToolsStatus();
+  });
+
+  const statusCalls = () =>
+    vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_external_tools_status").length;
+
+  it("reads once for every concurrent caller", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === "cmd_external_tools_status" ? { devmap: { installed: false }, manvi: { installed: false } } : null,
+    );
+    await Promise.all([ensureToolsStatus(), ensureToolsStatus(), ensureToolsStatus()]);
+    expect(statusCalls()).toBe(1);
+    await ensureToolsStatus();
+    expect(statusCalls()).toBe(1);
+  });
+
+  it("does not retry a failed read; refreshToolsStatus does", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("Unconfigured command"));
+    expect(await ensureToolsStatus()).toBeNull();
+    expect(await ensureToolsStatus()).toBeNull();
+    expect(statusCalls()).toBeLessThanOrEqual(1);
+    const before = vi.mocked(invoke).mock.calls.length;
+    await ensureToolsStatus();
+    expect(vi.mocked(invoke).mock.calls.length).toBe(before);
+    await refreshToolsStatus();
+    expect(vi.mocked(invoke).mock.calls.length).toBeGreaterThan(before);
   });
 });

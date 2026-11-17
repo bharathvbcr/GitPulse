@@ -29,7 +29,7 @@ use tempfile::TempDir;
 /// defers a `GitReader` call mid-test ("local bucket: 0 token(s)"). The switch
 /// is order-independent and idempotent, like the other integration suites'.
 fn unmetered_spawns() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
@@ -194,13 +194,15 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     assert_eq!(files[0].path, "bin5m.dat");
 
     // Sparse 65 MiB file (> MAX_WORKING_TREE_BYTES): committing is fine
-    // (zeros compress away), but the blob reader must refuse via stat BEFORE
-    // reading — Err with the size-limit message, never an OOM or panic.
+    // (zeros compress away, and the commit gate's secret scan streams a
+    // staged blob this size rather than holding it), but the blob reader must
+    // refuse via stat BEFORE reading — Err with the size-limit message, never
+    // an OOM or panic.
     let big = File::create(repo.path().join("big.bin")).unwrap();
     big.set_len(65 * 1024 * 1024).unwrap();
     drop(big);
     GitWriter::commit_files(path, "big", &["big.bin".to_string()])
-        .expect("git handles sparse commits fine");
+        .expect("a clean 65 MiB blob is scanned and committed");
     let started = Instant::now();
     let err = GitReader::get_file_blob(path, "big.bin", None).unwrap_err();
     assert!(

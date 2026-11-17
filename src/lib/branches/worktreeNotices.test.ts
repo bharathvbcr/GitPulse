@@ -56,4 +56,10 @@ describe("what a worktree operation left undone", () => {
       "The merge and teardown finished, but the post-merge hook did not: exit 4",
     ]);
   });
+
+  it("after a create, says when the clone budget left the build cache out", () => {
+    const budget = "'target' was not cloned: 4 other worktree(s) already hold one and the build-cache clone budget is 4.";
+    expect(worktreeSetupNotices({ clone_budget: budget }, "create")).toEqual([budget]);
+    expect(worktreeSetupNotices({ clone_budget: budget }, "merge")).toEqual([]);
+  });
 });

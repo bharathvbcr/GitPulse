@@ -22,6 +22,10 @@
 //! [`super::event_may_change_ignore_rules`]). Nothing here, and nothing built on
 //! it, may rely on a path having been classified as unable to matter.
 //!
+//! (The narrowed registration in [`super::scope`] does leave some directories
+//! out of the stream, so their writes never reach this gate at all. It does not
+//! use this gate's listing to decide that; see the exception in [`super::skip`].)
+//!
 //! The poll's "nothing happened since the read I kept" fact ([`super::skip`])
 //! does not use this gate's verdict either: the callback counts every
 //! invocation, before any filtering, so an event dropped here still ends it.
@@ -48,11 +52,13 @@
 //! descriptor per directory and ReadDirectoryChangesW reports a whole tree), so
 //! the backend never delivers nested paths and this gate forwards everything.
 
+use super::debouncer::Registration;
 use super::skip::PollSkip;
 use super::{event_has_signal, is_worktree_root, IgnoreRules};
+use crate::engine::git_reader::FileStatus;
 use notify::{Event, RecursiveMode};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
 /// How the worktree root is registered. Recursive only where the backend's
 /// recursion is a user-space filter over a kernel-recursive stream (FSEvents).
@@ -73,6 +79,14 @@ pub(crate) struct EventFilter {
     /// Counts every callback invocation, before any filtering, so the poll can
     /// tell that nothing at all happened (see [`super::skip`]).
     skip: PollSkip,
+    /// The directories a narrowed registration leaves out of its stream,
+    /// worktree-relative and `/`-separated (empty when the whole root is
+    /// registered). A status row under one of them is evidence the narrowing was
+    /// wrong; see [`Self::row_under_excluded`].
+    excluded: RwLock<Arc<Vec<String>>>,
+    /// The registration that owns the stream, so evidence can widen it. One
+    /// owner: the filter only asks.
+    registration: Mutex<Weak<Registration>>,
     /// Paths classified by the callback; the bound a test holds a storm to.
     #[cfg(test)]
     examined: std::sync::atomic::AtomicU64,
@@ -97,6 +111,8 @@ impl EventFilter {
             root: root.map(Path::to_path_buf).unwrap_or_default(),
             root_canonical: root.and_then(|root| root.canonicalize().ok()),
             internal_roots,
+            excluded: RwLock::new(Arc::new(Vec::new())),
+            registration: Mutex::new(Weak::new()),
             // Until the loop publishes its first load, only the built-in
             // build-output names are known.
             rules: RwLock::new(Arc::new(IgnoreRules::builtin())),
@@ -111,6 +127,70 @@ impl EventFilter {
 
     pub(crate) fn skip(&self) -> &PollSkip {
         &self.skip
+    }
+
+    /// Tells the filter which registration to widen on evidence.
+    pub(crate) fn bind(&self, registration: &Arc<Registration>) {
+        *self
+            .registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(registration);
+    }
+
+    fn registration(&self) -> Option<Arc<Registration>> {
+        self.registration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade()
+    }
+
+    pub(crate) fn set_excluded(&self, dirs: Vec<String>) {
+        *self
+            .excluded
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(dirs);
+    }
+
+    pub(crate) fn excluded(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.excluded.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The first excluded directory a status row (or the old path of a rename)
+    /// lies in, if any. `git status` never reports inside a directory git
+    /// ignores, so a row there means the directory was excluded wrongly.
+    pub(crate) fn row_under_excluded(&self, rows: &[FileStatus]) -> Option<String> {
+        let excluded = self.excluded();
+        if excluded.is_empty() {
+            return None;
+        }
+        let under = |path: &str| {
+            excluded.iter().find(|dir| {
+                path.len() >= dir.len()
+                    && path.as_bytes()[..dir.len()].eq_ignore_ascii_case(dir.as_bytes())
+                    && (path.len() == dir.len() || path.as_bytes()[dir.len()] == b'/')
+            })
+        };
+        rows.iter().find_map(|row| {
+            under(&row.path)
+                .or_else(|| row.old_path.as_deref().and_then(under))
+                .cloned()
+        })
+    }
+
+    /// Evidence that the narrowing is wrong: the registration is the whole root
+    /// for the rest of this watch's life.
+    pub(crate) fn widen_for_evidence(&self, reason: &str) {
+        if let Some(registration) = self.registration() {
+            registration.widen_for_evidence(reason);
+        }
+    }
+
+    /// Called by the poll after it decides: a convicted watch that is narrowed
+    /// goes whole. The conviction itself stays.
+    pub(crate) fn note_conviction(&self) {
+        if self.skip.convicted() {
+            self.widen_for_evidence("the poll-skip convicted this watch of missing a change");
+        }
     }
 
     pub(crate) fn publish_rules(&self, rules: Arc<IgnoreRules>) {

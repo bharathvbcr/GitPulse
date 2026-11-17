@@ -1,6 +1,8 @@
 <script lang="ts">
   /**
-   * The host-load sensor's kill switch (`host_load.enabled`), on by default.
+   * The host-load sensor's kill switch (`host_load.enabled`), on by default,
+   * the launch-refusal switch, and a reset for the per-input thresholds below
+   * them (each input is its own row, `HostLoadInputSetting`).
    *
    * Off stops the readings, not the heartbeat: the sampler keeps publishing
    * a snapshot that says "switched off", so other GitPulse processes can tell
@@ -8,11 +10,17 @@
    */
   import { explainError } from "../workbench/client";
   import SettingToggle from "./SettingToggle.svelte";
+  import SettingSegment from "./SettingSegment.svelte";
   import {
     DEFAULT_HOST_LOAD_SETTINGS,
+    DEFAULT_THRESHOLDS,
+    hostLoadSettings,
+    thresholdsAreDefault as defaultThresholds,
     loadHostLoadSettings,
     resourceProfile,
-    saveHostLoadSettings,
+    updateHostLoadSettings,
+    type HostLoadHookMode,
+    type LeaseMode,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
   import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
@@ -20,7 +28,23 @@
 
   let { active = true }: { active?: boolean } = $props();
 
-  let settings = $state<HostLoadSettings>(DEFAULT_HOST_LOAD_SETTINGS);
+  // The shared copy: the input rows save through the same store, so a toggle
+  // here never saves their thresholds back stale.
+  const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
+  const thresholdsAreDefault = $derived(defaultThresholds(settings.thresholds));
+  const HOOK_MODES: readonly { value: HostLoadHookMode; label: string; title: string }[] = [
+    { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
+    { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },
+    { value: "off", label: "Off", title: "Say nothing about load" },
+  ];
+  const LEASE_MODES: readonly { value: LeaseMode; label: string; title: string }[] = [
+    { value: "on", label: "Queue", title: "A cargo or go build waits for a free slot" },
+    { value: "off", label: "Off", title: "Builds run at once and the wrapper says nothing" },
+  ];
+  const SLOT_COUNTS: readonly { value: string; label: string }[] = ["1", "2", "3", "4", "6", "8"].map((n) => ({
+    value: n,
+    label: n,
+  }));
   let busy = $state(false);
   let error = $state("");
   // False until a read succeeds: before that `settings` is the defaults, and a
@@ -31,7 +55,7 @@
     busy = true;
     error = "";
     try {
-      settings = await loadHostLoadSettings();
+      await loadHostLoadSettings();
       readOk = true;
     } catch (cause) {
       error = explainError(cause);
@@ -45,7 +69,7 @@
     busy = true;
     error = "";
     try {
-      settings = await saveHostLoadSettings({ ...settings, ...change });
+      await updateHostLoadSettings(change);
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -71,8 +95,8 @@
     onchange={(next) => void save({ enabled: next })}
   />
   <SettingToggle
-    label="Refuse agent launches under severe memory pressure"
-    description="On by default. When the kernel reports critical memory pressure, or the memory compressor is thrashing, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still sheds GitPulse's own background and refresh work under pressure, but never refuses a launch. Needs the measurement above."
+    label="Refuse agent launches when the machine is overloaded"
+    description="On by default. When the kernel reports critical memory pressure, the memory compressor is thrashing, or an input below is set to refuse launches and reaches its limit, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still slows GitPulse's own background and refresh work under load, but never refuses a launch. Needs the measurement above."
     checked={settings.govern_launches}
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
@@ -104,6 +128,68 @@
       It never changes your session limits or scrollback. Automatic picks from this computer's memory.
       {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
     </p>
+  </div>
+  <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
+    <p class="text-text">Command gate: heavy commands in agent sessions</p>
+    <p class="text-textMuted text-micro leading-snug">
+      Refuse (the default): when the machine is overloaded, GitPulse's hook refuses a build or test command (cargo, go, npm test, vitest) in any Claude session with a reason telling the agent to wait, even a session GitPulse did not launch. Advise: the same message, but the command runs. Off: the hook says nothing about load. A command it couldn't check (GitPulse not running, or too old) is never refused; the agent is told it was not checked.
+    </p>
+    <SettingSegment
+      ariaLabel="What the command gate does with a heavy command under load"
+      options={HOOK_MODES}
+      value={settings.hook_mode}
+      onselect={(next) => {
+        // Before a read has succeeded `settings` is the defaults; saving one
+        // would write them over the real configuration.
+        if (readOk && !busy) void save({ hook_mode: next });
+      }}
+    />
+  </div>
+  <div class="space-y-1 pt-1" data-testid="host-load-lease-settings">
+    <p class="text-text">Build slots: heavy cargo and go builds</p>
+    <p class="text-textMuted text-micro leading-snug">
+      Queue (the default): a cargo or go build started from an agent session takes one of this many slots and
+      waits when they are all held, so a handful of sessions cannot compile at once. Under elevated load it
+      halves the count, and under severe load it starts nothing new. A build that cannot be leased still runs and
+      says so. Off: builds run at once.
+    </p>
+    <SettingSegment
+      ariaLabel="Whether heavy builds queue for a slot"
+      options={LEASE_MODES}
+      value={settings.leases.mode}
+      onselect={(next) => {
+        if (readOk && !busy) void save({ leases: { ...settings.leases, mode: next } });
+      }}
+    />
+    <SettingSegment
+      ariaLabel="How many builds may run at once"
+      options={SLOT_COUNTS}
+      value={String(settings.leases.slots)}
+      onselect={(next) => {
+        if (readOk && !busy) void save({ leases: { ...settings.leases, slots: Number(next) } });
+      }}
+    />
+  </div>
+  <SettingToggle
+    label="Turn incremental compilation off for leased builds"
+    description="Off by default. Sets CARGO_INCREMENTAL=0 for a build that holds a slot: smaller target directories, slower rebuilds. Nothing is deleted."
+    checked={settings.leases.incremental_off}
+    disabled={busy || !readOk}
+    onchange={(next) => void save({ leases: { ...settings.leases, incremental_off: next } })}
+  />
+  <div class="flex items-center gap-2 pt-1">
+    <p class="text-textMuted text-micro leading-snug flex-1">
+      Each input below can slow GitPulse's background work, also refuse agent launches, or be ignored. The starting values come from one crash and are a protective guess, not a measured optimum.
+    </p>
+    <button
+      type="button"
+      class="gp-btn text-meta px-2 py-0.5 shrink-0"
+      disabled={!readOk || busy || thresholdsAreDefault}
+      data-testid="host-load-reset-thresholds"
+      onclick={() => void save({ thresholds: DEFAULT_THRESHOLDS })}
+    >
+      Reset to defaults
+    </button>
   </div>
   {#if error}
     <p class="text-warn">{error}</p>

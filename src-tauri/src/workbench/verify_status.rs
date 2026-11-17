@@ -220,7 +220,7 @@ impl Gh for RealGh<'_> {
         argv.push("gh".into());
         argv.extend(args.iter().cloned());
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        crate::engine::git_cli::mark_user_action(repo);
+        crate::engine::process::mark_user_action(repo);
         crate::harness::guard_command(repo, &refs)?;
         if let Some(reason) = crate::github::gh_unavailable_reason(&crate::github::probe_gh_cli()) {
             return Err(reason);
@@ -394,7 +394,7 @@ pub(crate) fn post_for_task(
     let remote = crate::github::discover_github_remote(repo_path)?
         .ok_or_else(|| "No GitHub remote configured".to_string())?;
     let record = match store {
-        Ok(store) => super::verification_gate::latest(store, item_id),
+        Ok(store) => super::verification_gate::Memo::shared().latest(store, item_id),
         Err(e) => Err(e),
     };
     // The worktree the verdict was taken in when the record names one of this

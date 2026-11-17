@@ -7,28 +7,6 @@
         "timeout": 10
       }
     ],
-    "PreToolUse": [
-      {
-        "matcher": "^(edit_file|write_file)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gitpulse-hook --host=agy collision-guard",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "^run_command$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gitpulse-hook --host=agy command-gate",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "",

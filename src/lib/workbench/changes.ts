@@ -4,23 +4,20 @@ import { describeError } from "../ui/copy/describeFailure";
  *
  * Four surfaces (board, archive dock, attention inbox, and the issue import now on Remote) used
  * to listen for it themselves, each ignoring the payload, and each answered
- * every event with a full reload. The host also announces one write twice:
- * `{sequence}` straight from the writing command, then `{sequence: null,
- * source: "external"}` about a second later, because the watcher polls the
- * profile's `PRAGMA data_version`, which moves for this process's own commits
- * too (`src-tauri/src/workbench/external_changes.rs`).
+ * every event with a full reload. This hub listens once, fans out, and drops a
+ * repeated `sequence`: the same in-process write announced twice.
  *
- * This hub listens once and fans out. It drops a repeated `sequence`, and the
- * first external event within `ECHO_WINDOW_MS` of an in-process one, which is
- * the echo of it. One echo is owed per burst of local writes (the watcher
- * coalesces them into one poll), so a second external event is a real one.
- * The cost of the heuristic is stated, not hidden: a write by another process
- * landing in the same poll tick as a local one is folded into the echo; the
- * window coming forward still refreshes every surface.
+ * It does not drop the external event that follows an in-process write. The
+ * host announces one write twice — `{sequence}` from the writing command,
+ * then `{sequence: null, source: "external"}` about a second later, because
+ * the watcher polls the profile's `PRAGMA data_version`, which moves for this
+ * process's own commits too (`src-tauri/src/workbench/external_changes.rs`) —
+ * but that second event cannot say whether an agent's write landed in the
+ * same poll tick. Dropping it as an echo lost that write until the next commit
+ * or a click into the window. Delivering it costs one more read per burst of
+ * local writes, which each surface's live loader spaces (`liveLoader.ts`).
  */
 
-/** About three poll ticks: the watcher polls every second while the window is shown. */
-export const ECHO_WINDOW_MS = 3_000;
 /** How many recent sequences are remembered to drop a repeat; bounded, oldest first. */
 const SEEN_SEQUENCES = 64;
 
@@ -40,8 +37,6 @@ type Listen = (event: string, handler: (event: { payload: unknown }) => void) =>
 
 export interface WorkbenchChangesDeps {
   listen: Listen;
-  now?: () => number;
-  echoWindowMs?: number;
   explain?: (cause: unknown) => string;
 }
 
@@ -52,8 +47,6 @@ function readChange(payload: unknown): WorkbenchChange {
 }
 
 export function createWorkbenchChanges(deps: WorkbenchChangesDeps) {
-  const now = deps.now ?? (() => Date.now());
-  const echoWindowMs = deps.echoWindowMs ?? ECHO_WINDOW_MS;
   const explain = deps.explain ?? ((cause: unknown) => (describeError(cause, "workbench")));
   const subscribers = new Set<WorkbenchSubscriber>();
   let stop: (() => void) | null = null;
@@ -62,7 +55,6 @@ export function createWorkbenchChanges(deps: WorkbenchChangesDeps) {
   let listening = false;
   let failure: string | null = null;
   let seen: number[] = [];
-  let echoOwedUntil = 0;
 
   function deliver(change: WorkbenchChange): void {
     for (const subscriber of [...subscribers]) subscriber.changed(change);
@@ -73,11 +65,6 @@ export function createWorkbenchChanges(deps: WorkbenchChangesDeps) {
     if (change.source === "local" && change.sequence !== null) {
       if (seen.includes(change.sequence)) return;
       seen = [...seen.slice(-(SEEN_SEQUENCES - 1)), change.sequence];
-      echoOwedUntil = now() + echoWindowMs;
-    } else if (echoOwedUntil > 0) {
-      const echo = now() <= echoOwedUntil;
-      echoOwedUntil = 0;
-      if (echo) return;
     }
     deliver(change);
   }
@@ -102,7 +89,6 @@ export function createWorkbenchChanges(deps: WorkbenchChangesDeps) {
     listening = false;
     failure = null;
     seen = [];
-    echoOwedUntil = 0;
     stop?.();
     stop = null;
   }

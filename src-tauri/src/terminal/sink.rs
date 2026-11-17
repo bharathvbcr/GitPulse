@@ -84,8 +84,8 @@ impl OutputSink {
 
     /// A sink over any transport: `send(session, Some(bytes))` for output and
     /// `send(session, None)` for the end marker. The terminal host's sink,
-    /// which frames output to whichever app is connected.
-    #[cfg(unix)]
+    /// which frames output to whichever app is connected, and the orchestrator's
+    /// discard sink, which Windows builds too.
     pub(crate) fn from_fn(
         send: impl Fn(&str, Option<&[u8]>) -> Result<(), String> + Send + Sync + 'static,
     ) -> Self {

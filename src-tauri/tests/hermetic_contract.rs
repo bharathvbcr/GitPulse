@@ -293,7 +293,7 @@ fn the_wall_clock_matcher_sees_single_line_and_wrapped_limits_only() {
 /// `HEAD`'s reflog holds afterwards.
 fn reflog_entries_after_commits(global: &Path, epoch: u64, count: usize) -> usize {
     use gitpulse_lib::procguard::LockedSpawn;
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let dir = tempfile::TempDir::new().unwrap();
     let date = format!("{epoch} +0000");
     let git = |args: &[&str]| {

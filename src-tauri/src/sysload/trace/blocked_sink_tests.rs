@@ -1,0 +1,106 @@
+//! A trace sink that blocks until released: what a flush that stalls on the
+//! disk looks like to the feed, without touching the disk.
+use super::{TraceOpener, TraceRecord, TraceSink, TraceWriter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+/// Closed until [`Gate::release`]. Records that a caller reached it.
+pub(in crate::sysload) struct Gate {
+    open: Mutex<bool>,
+    changed: Condvar,
+    entered: AtomicBool,
+}
+
+impl Gate {
+    pub(in crate::sysload) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+            entered: AtomicBool::new(false),
+        })
+    }
+
+    pub(in crate::sysload) fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    /// Whether something is, or has been, waiting at the gate.
+    pub(in crate::sysload) fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// Waits up to `within` for something to reach the gate.
+    pub(in crate::sysload) fn wait_entered(&self, within: Duration) -> bool {
+        crate::test_support::wait_until(within, || self.entered())
+    }
+
+    fn pass(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.changed.wait(open).unwrap();
+        }
+    }
+}
+
+struct GatedSink {
+    ring: TraceWriter,
+    gate: Arc<Gate>,
+}
+
+impl TraceSink for GatedSink {
+    fn append(&mut self, record: &TraceRecord) -> Result<(), String> {
+        self.gate.pass();
+        self.ring.append(record)
+    }
+}
+
+/// Opens the real ring, and blocks every write at `gate`.
+pub(in crate::sysload) fn blocked_writes(gate: Arc<Gate>) -> TraceOpener {
+    Arc::new(move |dir, boot_id| {
+        Ok(Box::new(GatedSink {
+            ring: TraceWriter::open(dir, boot_id)?,
+            gate: gate.clone(),
+        }) as Box<dyn TraceSink>)
+    })
+}
+
+/// Waits at the gate like [`GatedSink`], and fails its first `failures`
+/// appends without writing anything: a flush the disk refused.
+struct FlakySink {
+    ring: TraceWriter,
+    gate: Arc<Gate>,
+    failures: usize,
+}
+
+impl TraceSink for FlakySink {
+    fn append(&mut self, record: &TraceRecord) -> Result<(), String> {
+        self.gate.pass();
+        if self.failures > 0 {
+            self.failures -= 1;
+            return Err("disk said no".into());
+        }
+        self.ring.append(record)
+    }
+}
+
+/// Opens the real ring; the first `failures` writes (after `gate`) fail.
+pub(in crate::sysload) fn failing_writes(gate: Arc<Gate>, failures: usize) -> TraceOpener {
+    Arc::new(move |dir, boot_id| {
+        Ok(Box::new(FlakySink {
+            ring: TraceWriter::open(dir, boot_id)?,
+            gate: gate.clone(),
+            failures,
+        }) as Box<dyn TraceSink>)
+    })
+}
+
+/// Blocks the open itself at `gate`, then opens the real ring.
+pub(in crate::sysload) fn blocked_open(gate: Arc<Gate>) -> TraceOpener {
+    Arc::new(move |dir, boot_id| {
+        gate.pass();
+        TraceWriter::open(dir, boot_id).map(|w| Box::new(w) as Box<dyn TraceSink>)
+    })
+}

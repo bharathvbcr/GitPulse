@@ -24,14 +24,17 @@
 //!   else to stderr; "any non-zero exit code makes worktree creation fail".
 //!   Claude Code "refuses an absolute path that contains `.` or `..` segments,
 //!   and any path that passes through a symlink below the repository root".
-//! * Claude Code's own default is "`.claude/worktrees/<name>/` at your
+//! * Claude Code's own built-in default is "`.claude/worktrees/<name>/` at your
 //!   repository root, on a new branch named `worktree-<name>`"
-//!   (<https://code.claude.com/docs/en/worktrees>). That is the path and the
-//!   branch made here, so `engine::worktree::agent_layout` attributes the
-//!   result to Claude exactly as before. The repository root is the main
-//!   checkout: run live (Claude Code 2.1.319, 2026-11-06), a session started
-//!   inside a linked worktree gets its worktree under the main checkout, with
-//!   or without this hook, never nested under the linked one.
+//!   (<https://code.claude.com/docs/en/worktrees>). GitPulse places hook-created
+//!   worktrees at `<main_checkout>/.gitpulse/worktrees/<name>` via
+//!   [`crate::engine::worktree::resolve_worktree_path`] (excluding the
+//!   container from `git status` through `$GIT_COMMON_DIR/info/exclude`) so
+//!   agent edits satisfy the default write gate without bypass mode. The
+//!   repository root is the main checkout: run live (Claude Code 2.1.319,
+//!   2026-11-06), a session started inside a linked worktree gets its worktree
+//!   under the main checkout, with or without this hook, never nested under
+//!   the linked one.
 //! * With the hook configured, "`.worktreeinclude` is not processed", so
 //!   GitPulse processes it ([`crate::engine::cow_clone::worktree_include`]).
 //! * `WorktreeRemove` carries `worktree_path`. Exit 0 counts as removed;
@@ -112,9 +115,9 @@ pub const HOST_TIMEOUT_SECS: u64 = 600;
 /// printing, reaping children and the launcher's own work after a hand-back.
 pub const WORKTREE_BUDGET: Duration = Duration::from_secs(540);
 
-/// The directories, under the repository root, Claude Code puts its
+/// The directories, under the main checkout, GitPulse places hook-created
 /// worktrees in.
-pub const CONTAINER: [&str; 2] = [".claude", "worktrees"];
+pub const CONTAINER: [&str; 2] = [".gitpulse", "worktrees"];
 
 /// What Claude Code names a worktree's branch: this, then the worktree's name.
 pub const BRANCH_PREFIX: &str = "worktree-";
@@ -279,7 +282,7 @@ pub(crate) fn run_within(
 pub(crate) struct CreatePlan {
     /// The working tree holding the session's `cwd`, canonical.
     pub root: PathBuf,
-    /// `<root>/.claude/worktrees/<name>`.
+    /// `<root>/.gitpulse/worktrees/<name>`.
     pub target: PathBuf,
     /// `worktree-<name>`.
     pub branch: String,
@@ -397,7 +400,10 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
     }
 
     mark_write_started(progress);
-    let selection = CacheSelection::default();
+    if let Err(error) = crate::engine::worktree::ensure_gitpulse_lane_excluded(&plan.root) {
+        return Finished::failed(notes, format!("GitPulse failure: {}", error.into_message()));
+    }
+    let selection = CacheSelection::for_new_worktree();
     let created = match add_worktree_with_devmap(
         &root_text,
         &target,
@@ -493,13 +499,16 @@ pub(crate) fn creation_lock(common: &Path, name: &str) -> PathBuf {
 }
 
 /// The worktree a run of this hook already made for `name` under `root`: a
-/// registered worktree ([`is_ready`]) at Claude Code's path whose `HEAD` is
-/// still `worktree-<name>`. Anything else at that path is not ours to hand
-/// over, and [`plan_create`] refuses it.
+/// registered worktree ([`is_ready`]) at `<main_checkout>/.gitpulse/worktrees/<name>`
+/// whose `HEAD` is still `worktree-<name>`. Anything else at that path is not
+/// ours to hand over, and [`plan_create`] refuses it.
 fn already_made(root: &Path, common: &Path, name: &str) -> Option<PathBuf> {
-    let mut target = root.to_path_buf();
-    target.extend(CONTAINER);
-    target.push(name);
+    let target = crate::engine::worktree::resolve_worktree_path(
+        root,
+        name,
+        crate::engine::worktree::WorktreeLayout::Lane,
+    )
+    .ok()?;
     let gitdir = registered_gitdir(&target, common)?;
     let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
     (head.trim() == format!("ref: refs/heads/{BRANCH_PREFIX}{name}")).then_some(target)
@@ -614,22 +623,12 @@ pub(crate) fn validate_name(name: &str) -> Result<&str, String> {
 /// directory that is a link (Claude Code refuses such a path anyway) and a
 /// target that already exists.
 pub(crate) fn plan_create(root: &Path, name: &str) -> Result<CreatePlan, String> {
-    let mut container = root.to_path_buf();
-    for segment in CONTAINER {
-        container.push(segment);
-        match container.symlink_metadata() {
-            Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "{} is not a directory (Claude Code refuses a worktree path through a link inside the repository)",
-                    container.display()
-                ))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot read {}: {e}", container.display())),
-        }
-    }
-    let target = container.join(name);
+    let target = crate::engine::worktree::resolve_worktree_path(
+        root,
+        name,
+        crate::engine::worktree::WorktreeLayout::Lane,
+    )
+    .map_err(crate::ipc_error::CommandError::into_message)?;
     if target.symlink_metadata().is_ok() {
         return Err(format!("{} already exists", target.display()));
     }
@@ -983,18 +982,21 @@ pub(crate) fn work_held(worktree: &Path, branch: Option<&str>) -> Result<Option<
 }
 
 /// Whether `branch` is the one a `WorktreeCreate` made for this worktree:
-/// `worktree-<name>`, checked out at a path ending `.claude/worktrees/<name>`.
+/// `worktree-<name>`, checked out at a path ending `.gitpulse/worktrees/<name>`
+/// (or legacy/fallback `.claude/worktrees/<name>`).
 ///
 /// Read from the end of the path, not with `agent_layout`, whose outermost
 /// match is the right answer for attribution and the wrong one here. The hook
 /// never nests a worktree (it anchors at the main checkout), but a removal can
 /// still be asked for one made some other way under another agent's layout
-/// (`<lane>/.claude/worktrees/<name>`), and its branch is named after the
-/// innermost segment.
+/// (`<lane>/.gitpulse/worktrees/<name>` or `<lane>/.claude/worktrees/<name>`),
+/// and its branch is named after the innermost segment.
 pub(crate) fn made_by_claude(worktree: &Path, branch: &str) -> bool {
     let segments: Vec<&str> = worktree.iter().filter_map(|s| s.to_str()).collect();
     match segments.as_slice() {
-        [.., claude, worktrees, name] if *claude == CONTAINER[0] && *worktrees == CONTAINER[1] => {
+        [.., kind, worktrees, name]
+            if (*kind == CONTAINER[0] || *kind == ".claude") && *worktrees == CONTAINER[1] =>
+        {
             branch == format!("{BRANCH_PREFIX}{name}")
         }
         _ => false,

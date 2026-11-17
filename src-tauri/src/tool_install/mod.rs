@@ -12,7 +12,8 @@
 pub mod components;
 pub mod release;
 
-use crate::engine::git_cli::{self, BoundedRun};
+use crate::engine::git_cli;
+use crate::engine::process::{self, BoundedRun};
 use crate::ipc_error::CommandError;
 use crate::ipc_error::IpcErrorKind;
 use crate::tool_capability;
@@ -557,7 +558,7 @@ pub(crate) fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
         }
     }
     let run =
-        git_cli::run_bounded_capped(cmd, tool.as_str(), Duration::from_secs(5), None, 64 * 1024)
+        process::run_bounded_capped(cmd, tool.as_str(), Duration::from_secs(5), None, 64 * 1024)
             .ok()?
             .require_complete(tool.as_str())
             .ok()?;
@@ -692,14 +693,14 @@ fn assess_ladder_with(tool: ExternalTool, probe: ReleaseProbe) -> LadderAssessme
 
     // Rung 3 — toolchain remote
     let (toolchain_ok, toolchain_block) = match tool {
-        ExternalTool::Devmap => match git_cli::find_external_tool("cargo") {
+        ExternalTool::Devmap => match process::find_external_tool("cargo") {
             Some(_) => (true, None),
             None => (
                 false,
                 Some("cargo is not installed (needed for cargo install --git)".into()),
             ),
         },
-        ExternalTool::Manvi => match git_cli::find_external_tool("go") {
+        ExternalTool::Manvi => match process::find_external_tool("go") {
             Some(_) => (true, None),
             None => (
                 false,
@@ -726,8 +727,8 @@ fn assess_ladder_with(tool: ExternalTool, probe: ReleaseProbe) -> LadderAssessme
         .as_ref()
         .and_then(|root| install_target(tool, root).ok());
     let installer_ok = match tool {
-        ExternalTool::Devmap => git_cli::find_external_tool("cargo").is_some(),
-        ExternalTool::Manvi => git_cli::find_external_tool("go").is_some(),
+        ExternalTool::Devmap => process::find_external_tool("cargo").is_some(),
+        ExternalTool::Manvi => process::find_external_tool("go").is_some(),
     };
     let (local_ok, local_block) = match (&target, installer_ok) {
         (Some(_), true) => (true, None),
@@ -998,15 +999,15 @@ struct InstallProgress {
     lines: [Vec<u8>; 2],
 }
 
-impl git_cli::ProcessObserver for InstallProgress {
+impl process::ProcessObserver for InstallProgress {
     fn cancelled(&self) -> bool {
         cancelled()
     }
 
-    fn output(&mut self, stream: git_cli::OutputStream, bytes: &[u8]) {
+    fn output(&mut self, stream: process::OutputStream, bytes: &[u8]) {
         let index = match stream {
-            git_cli::OutputStream::Stdout => 0,
-            git_cli::OutputStream::Stderr => 1,
+            process::OutputStream::Stdout => 0,
+            process::OutputStream::Stderr => 1,
         };
         let line = &mut self.lines[index];
         for &byte in bytes {
@@ -1031,7 +1032,7 @@ fn run_cancellable_install(
         rung,
         lines: [Vec::new(), Vec::new()],
     };
-    let result = git_cli::run_observed(
+    let result = process::run_observed(
         cmd,
         label,
         INSTALL_DEADLINE,
@@ -1235,9 +1236,16 @@ fn finish_ok(
         .path
         .as_deref()
         .and_then(|path| tool_config::set_binary(tool, path).err());
+    // Whatever rung produced it, a devmap whose store this build cannot read
+    // is not an install: it would be reported as done and then refused.
+    let incompatible = if tool == ExternalTool::Devmap && status.installed {
+        devmap_too_old(verify_devmap().store_schema)
+    } else {
+        None
+    };
     InstallOutcome {
         tool,
-        ok: status.installed && persist_error.is_none(),
+        ok: status.installed && persist_error.is_none() && incompatible.is_none(),
         binary: status.path.clone(),
         lookup: Some(status.lookup.clone()),
         version: status.version.clone(),
@@ -1253,6 +1261,8 @@ fn finish_ok(
                 "{} installed but its path could not be saved: {error}",
                 tool.as_str()
             ))
+        } else if let Some(reason) = incompatible {
+            Some(format!("devmap installed but is {reason}"))
         } else if status.installed {
             None
         } else {
@@ -1338,7 +1348,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
     }
     let mut cmd = match tool {
         ExternalTool::Devmap => {
-            let cargo = match git_cli::find_external_tool("cargo") {
+            let cargo = match process::find_external_tool("cargo") {
                 Some(c) => c,
                 None => {
                     return InstallOutcome {
@@ -1365,7 +1375,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             cmd
         }
         ExternalTool::Manvi => {
-            let go = match git_cli::find_external_tool("go") {
+            let go = match process::find_external_tool("go") {
                 Some(g) => g,
                 None => {
                     return InstallOutcome {
@@ -1453,7 +1463,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             exit_code: None,
             stdout: String::new(),
             stderr: err.message().to_string(),
-            timed_out: git_cli::is_run_timeout(err.message()),
+            timed_out: process::is_run_timeout(err.message()),
             cancelled: cancelled(),
             reason_kind: reason_kind_of(&err),
             reason: Some(err.into_message()),
@@ -1566,7 +1576,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
 
     let mut cmd = match tool {
         ExternalTool::Devmap => {
-            let cargo = match git_cli::find_external_tool("cargo") {
+            let cargo = match process::find_external_tool("cargo") {
                 Some(c) => c,
                 None => {
                     return InstallOutcome {
@@ -1599,7 +1609,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             cmd
         }
         ExternalTool::Manvi => {
-            let go = match git_cli::find_external_tool("go") {
+            let go = match process::find_external_tool("go") {
                 Some(g) => g,
                 None => {
                     return InstallOutcome {
@@ -1657,7 +1667,7 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             reason_kind: None,
         },
         InstallRun::Failed(err) => {
-            let was_timeout = git_cli::is_run_timeout(err.message());
+            let was_timeout = process::is_run_timeout(err.message());
             // The source module may itself be a nested checkout. The approval
             // flow must name the same repository that process admission checks.
             let source = if crate::repository_trust::refused(err.message()) {
@@ -1726,11 +1736,11 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
     let mut requirements = Vec::new();
     match tool {
         ExternalTool::Devmap => {
-            let cargo = git_cli::find_external_tool("cargo");
+            let cargo = process::find_external_tool("cargo");
             let ver = cargo.as_ref().and_then(|p| {
                 let mut cmd = Command::new(p);
                 cmd.arg("--version");
-                git_cli::run_bounded_capped(cmd, "cargo", Duration::from_secs(5), None, 8 * 1024)
+                process::run_bounded_capped(cmd, "cargo", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
                     .and_then(|run| run.require_complete("cargo").ok())
                     .filter(|run| run.success)
@@ -1746,9 +1756,9 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
                     .is_none()
                     .then(|| "needed for cargo install / --git".into()),
             });
-            let cc = git_cli::find_external_tool("cc")
-                .or_else(|| git_cli::find_external_tool("clang"))
-                .or_else(|| git_cli::find_external_tool("gcc"));
+            let cc = process::find_external_tool("cc")
+                .or_else(|| process::find_external_tool("clang"))
+                .or_else(|| process::find_external_tool("gcc"));
             requirements.push(PreflightRequirement {
                 name: "c_compiler".into(),
                 found: cc.is_some(),
@@ -1762,11 +1772,11 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
             });
         }
         ExternalTool::Manvi => {
-            let go = git_cli::find_external_tool("go");
+            let go = process::find_external_tool("go");
             let ver = go.as_ref().and_then(|p| {
                 let mut cmd = Command::new(p);
                 cmd.arg("version");
-                git_cli::run_bounded_capped(cmd, "go", Duration::from_secs(5), None, 8 * 1024)
+                process::run_bounded_capped(cmd, "go", Duration::from_secs(5), None, 8 * 1024)
                     .ok()
                     .and_then(|run| run.require_complete("go").ok())
                     .filter(|run| run.success)
@@ -1790,7 +1800,7 @@ pub fn preflight(tool: ExternalTool) -> PreflightReport {
             });
         }
     }
-    let curl = git_cli::find_external_tool("curl");
+    let curl = process::find_external_tool("curl");
     requirements.push(PreflightRequirement {
         name: "curl".into(),
         found: curl.is_some(),
@@ -1877,6 +1887,17 @@ fn parse_doctor_json(v: &serde_json::Value) -> DoctorSchemas {
     }
 }
 
+/// `Some("too old for this GitPulse: writes schema N, needs ≥ M")` when a
+/// devmap reports a store schema below what this build's reader accepts
+/// (`MIN_READER_SCHEMA_VERSION`). An unreported schema is not "too old": that
+/// is "unverified", which [`verify_devmap`] reports as not ok on its own.
+fn devmap_too_old(spoken: Option<i32>) -> Option<String> {
+    let minimum = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
+    spoken
+        .filter(|n| *n < minimum)
+        .map(|n| format!("too old for this GitPulse: writes schema {n}, needs ≥ {minimum}"))
+}
+
 fn verify_devmap() -> VerifyReport {
     let expected_store = crate::codeintel::SUPPORTED_STORE_SCHEMA;
     let expected_cg = devmap_query::code_graph::CODE_GRAPH_SCHEMA_VERSION;
@@ -1901,7 +1922,7 @@ fn verify_devmap() -> VerifyReport {
     // Prefer `devmap doctor --json` over scraping `--version` prose.
     let mut cmd = Command::new(&binary);
     cmd.args(["doctor", "--json"]);
-    if let Ok(run) = git_cli::run_bounded_capped(
+    if let Ok(run) = process::run_bounded_capped(
         cmd,
         "devmap doctor",
         Duration::from_secs(10),
@@ -1926,6 +1947,8 @@ fn verify_devmap() -> VerifyReport {
                             "doctor ok — expected_schema_version {expected_store}, code_graph_schema_version {}",
                             cg.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
                         )
+                    } else if let Some(reason) = devmap_too_old(spoken) {
+                        reason
                     } else {
                         format!(
                             "doctor expected_schema_version {:?} ≠ vendored {expected_store}",
@@ -1945,7 +1968,7 @@ fn verify_devmap() -> VerifyReport {
 
     let mut cmd = Command::new(&binary);
     cmd.arg("--version");
-    let run = match git_cli::run_bounded_capped(
+    let run = match process::run_bounded_capped(
         cmd,
         "devmap --version",
         Duration::from_secs(5),
@@ -1984,6 +2007,8 @@ fn verify_devmap() -> VerifyReport {
         binary: Some(binary),
         detail: if ok {
             format!("version handshake ok — store schema {expected_store}")
+        } else if let Some(reason) = devmap_too_old(store) {
+            reason
         } else {
             format!(
                 "version text did not confirm store schema {expected_store}: {}",
@@ -2712,6 +2737,66 @@ mod tests {
         assert!(
             keep.exists(),
             "directory named like a binary was removed: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_devmap_below_the_reader_minimum_is_too_old_and_an_unknown_one_is_not() {
+        let min = devmap_store::schema::MIN_READER_SCHEMA_VERSION;
+        assert_eq!(
+            devmap_too_old(Some(22)).as_deref(),
+            Some(format!("too old for this GitPulse: writes schema 22, needs ≥ {min}").as_str())
+        );
+        assert!(devmap_too_old(Some(min)).is_none());
+        assert!(devmap_too_old(Some(min + 1)).is_none());
+        assert!(devmap_too_old(None).is_none());
+    }
+
+    /// Installing a devmap that writes schema 22 (what DevCouncil v0.2.3
+    /// ships) through any rung must end in "incompatible", not "installed".
+    #[cfg(unix)]
+    #[test]
+    fn installing_a_devmap_that_writes_an_old_schema_is_reported_incompatible() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let dir = TempDir::new().unwrap();
+        let binary = audit_binary(
+            dir.path(),
+            r#"case "$1" in
+doctor) echo '{"schema_version":null,"expected_schema_version":22,"code_graph_schema_version":2}';;
+*) echo 'devmap 0.2.3 (store schema 22)';;
+esac"#,
+        );
+        let cfg = dir.path().join("tools.json");
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &cfg)
+            .set("GITPULSE_DEVMAP_BIN", &binary)
+            .invalidating(crate::tool_config::invalidate_cache)
+            .invalidating(|| tool_capability::invalidate(ExternalTool::Devmap));
+        let outcome = finish_ok(
+            ExternalTool::Devmap,
+            InstallRung::PrebuiltRelease,
+            "fixture".into(),
+            None,
+            String::new(),
+            String::new(),
+            Some(0),
+        );
+        assert!(
+            !outcome.ok,
+            "an unreadable devmap was reported installed: {outcome:?}"
+        );
+        let reason = outcome.reason.expect("a reason");
+        assert!(
+            reason.contains("too old for this GitPulse: writes schema 22, needs ≥"),
+            "{reason}"
+        );
+        let report = verify_devmap();
+        assert!(!report.ok);
+        assert!(
+            report.detail.contains("too old for this GitPulse"),
+            "{}",
+            report.detail
         );
     }
 

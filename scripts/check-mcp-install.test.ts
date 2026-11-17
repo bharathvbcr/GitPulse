@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -9,13 +9,20 @@ import {
   SERVER_BIN,
   classify,
   classifyHook,
+  classifyLease,
+  formatReport,
+  probeLease,
+  classifyPluginCache,
   declaredHookSubcommands,
   parseArgs,
   parseHookIdentity,
   parseServerVersion,
   parseServerManifest,
+  PLUGIN_ID,
   probeHook,
   probeServer,
+  readInstalledPluginHooks,
+  readRepoHooks,
   resolveOnPath,
 } from "./check-mcp-install.mjs";
 import { wallClockBudget } from "../src/lib/testing/wallClock";
@@ -438,5 +445,193 @@ describe("the doctor covers both executables the package spawns", () => {
 
   it("accepts a hook binary path so the probe is drivable without an install", () => {
     expect(parseArgs(["--hook-bin", "/tmp/h"]).hookBin).toBe(path.resolve("/tmp/h"));
+  });
+});
+
+
+describe("the installed plugin cache", () => {
+  const shipped = {
+    hooks: {
+      PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "gitpulse-hook command-gate", timeout: 10 }] }],
+      SessionStart: [{ hooks: [{ type: "command", command: "gitpulse-hook session-brief", timeout: 10 }] }],
+      PostToolUse: [{ hooks: [{ type: "command", command: "gitpulse-hook notify post_tool_use", async: true }] }],
+      Stop: [{ hooks: [{ type: "command", command: "gitpulse-hook notify stop", async: true }] }],
+    },
+  };
+  const install = (hooks: unknown, installPath = "/cache/gitpulse/gitpulse/1.4.0") => ({
+    registry: "ok",
+    registryError: null,
+    installs: [{ installPath, hooks, error: null }],
+  });
+
+  it("is ok when the installed copy declares what this tree does, however its keys are ordered", () => {
+    const reordered = JSON.parse(JSON.stringify(shipped), (_key, value) =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value).reverse())
+        : value,
+    );
+    const verdict = classifyPluginCache(install(reordered), shipped);
+    expect(verdict.status).toBe("ok");
+    expect(verdict.violations).toEqual([]);
+  });
+
+  it("names the hooks the installed copy lacks, the ones declared differently, and the ones only it has", () => {
+    const stale = {
+      hooks: {
+        PreToolUse: [{ matcher: "^Bash$", hooks: [{ type: "command", command: "gitpulse-hook command-gate", timeout: 5 }] }],
+        SessionStart: shipped.hooks.SessionStart,
+        Elicitation: [{ hooks: [{ type: "command", command: "gitpulse-hook notify elicitation" }] }],
+      },
+    };
+    const verdict = classifyPluginCache(install(stale), shipped);
+    expect(verdict.status).toBe("drift");
+    const text = verdict.violations.join("\n");
+    expect(text).toContain("missing from the installed cache");
+    expect(text).toMatch(/missing from the installed cache[^\n]*PostToolUse, Stop/);
+    expect(text).toMatch(/declared differently: PreToolUse/);
+    expect(text).toMatch(/no longer declared here: Elicitation/);
+    expect(text).toContain("never edits the cache");
+  });
+
+  it("reports one drifted copy among several, and says nothing was compared when it cannot read one", () => {
+    const two = {
+      registry: "ok",
+      registryError: null,
+      installs: [
+        { installPath: "/c/1.3.0", hooks: shipped, error: null },
+        { installPath: "/c/1.4.0", hooks: { hooks: {} }, error: null },
+      ],
+    };
+    const verdict = classifyPluginCache(two, shipped);
+    expect(verdict.status).toBe("drift");
+    expect(verdict.violations.join("\n")).toContain("/c/1.4.0/hooks/hooks.json differs");
+    expect(verdict.violations.join("\n")).not.toContain("/c/1.3.0/hooks/hooks.json differs");
+
+    const unreadable = {
+      registry: "ok",
+      registryError: null,
+      installs: [{ installPath: "/c/1.4.0", hooks: null, error: "/c/1.4.0/hooks/hooks.json: ENOENT" }],
+    };
+    const unread = classifyPluginCache(unreadable, shipped);
+    expect(unread.status).toBe("unverifiable");
+    expect(classifyPluginCache({ registry: "unreadable", registryError: "bad json", installs: [] }, shipped).status).toBe(
+      "unverifiable",
+    );
+    expect(classifyPluginCache(install(shipped), { nothing: true }).status).toBe("unverifiable");
+  });
+
+  it("calls an uninstalled plugin absent, which is neither ok nor drift", () => {
+    for (const registry of ["missing", "ok"]) {
+      const verdict = classifyPluginCache({ registry, registryError: null, installs: [] }, shipped);
+      expect(verdict.status).toBe("absent");
+      expect(verdict.violations.join(" ")).toContain("not installed");
+    }
+  });
+
+  it("reads the installed copies the way the host registers them, and writes nothing", async () => {
+    const config = await scratchDir("claude");
+    const installPath = path.join(config, "plugins", "cache", "gitpulse", "gitpulse", "1.4.0");
+    await mkdir(path.join(installPath, "hooks"), { recursive: true });
+    await writeFile(path.join(installPath, "hooks", "hooks.json"), JSON.stringify({ hooks: { Stop: [] } }));
+    await writeFile(
+      path.join(config, "plugins", "installed_plugins.json"),
+      JSON.stringify({ version: 2, plugins: { [PLUGIN_ID]: [{ scope: "user", installPath }], "other@x": [{ installPath: "/nope" }] } }),
+    );
+    const before = JSON.stringify(
+      await Promise.all(
+        [path.join(config, "plugins", "installed_plugins.json"), path.join(installPath, "hooks", "hooks.json")].map(async (file) => {
+          const info = await stat(file);
+          return [file, info.mtimeMs, info.size, await readFile(file, "utf8")];
+        }),
+      ),
+    );
+    const read = readInstalledPluginHooks(config);
+    expect(read.registry).toBe("ok");
+    expect(read.installs).toEqual([{ installPath, hooks: { hooks: { Stop: [] } }, error: null }]);
+    const verdict = classifyPluginCache(read, readRepoHooks());
+    expect(verdict.status).toBe("drift");
+    expect(verdict.violations.join("\n")).toMatch(/missing from the installed cache[^\n]*PreToolUse/);
+    const after = JSON.stringify(
+      await Promise.all(
+        [path.join(config, "plugins", "installed_plugins.json"), path.join(installPath, "hooks", "hooks.json")].map(async (file) => {
+          const info = await stat(file);
+          return [file, info.mtimeMs, info.size, await readFile(file, "utf8")];
+        }),
+      ),
+    );
+    expect(after).toBe(before);
+    expect(await readdir(path.join(config, "plugins"))).toEqual(["cache", "installed_plugins.json"]);
+
+    // No registry at all, and a registry that is not JSON.
+    const empty = await scratchDir("claude-empty");
+    expect(readInstalledPluginHooks(empty)).toEqual({ registry: "missing", registryError: null, installs: [] });
+    await mkdir(path.join(empty, "plugins"), { recursive: true });
+    await writeFile(path.join(empty, "plugins", "installed_plugins.json"), "{ not json");
+    expect(readInstalledPluginHooks(empty).registry).toBe("unreadable");
+  });
+
+  it("compares against the hooks this tree really ships, and takes a config directory flag", () => {
+    const repo = readRepoHooks() as { hooks: Record<string, unknown> };
+    expect(Object.keys(repo.hooks)).toContain("PreToolUse");
+    expect(classifyPluginCache(install(repo), repo).status).toBe("ok");
+    expect(parseArgs(["--claude-dir", "/tmp/x"]).claudeDir).toBe("/tmp/x");
+    expect(parseArgs([]).claudeDir).toBeUndefined();
+  });
+});
+
+describe("the lease row", () => {
+  const binDir = "/c/lease-bin";
+  const link = "/c/lease-bin/cargo";
+
+  it("passes only when a login shell finds the wrapper's own link first", () => {
+    expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: link, error: null }).status).toBe("gated");
+  });
+
+  it("never prints ok for a cargo that shadows the link", () => {
+    const verdict = classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: "/home/u/.claude-bin/cargo", error: null });
+    expect(verdict.status).toBe("shadowed");
+    expect(verdict.detail).toContain("/home/u/.claude-bin/cargo");
+    const report = formatReport({
+      binPath: null, version: null, storeSchema: null, expected: "1", expectedSchema: 1, status: "absent", violations: [],
+      lease: { ...verdict, resolved: "/home/u/.claude-bin/cargo", ok: false },
+    } as never);
+    expect(report).toContain("shadowed by /home/u/.claude-bin/cargo");
+    expect(report).toContain("FAIL (shadowed)");
+    expect(report).not.toContain("a login shell runs GitPulse's lease wrapper");
+  });
+
+  it("says absent when the app made no links, and unverifiable when the shell could not be asked", () => {
+    expect(classifyLease({ binDir, linkTarget: null, resolved: null, error: null }).status).toBe("absent");
+    expect(classifyLease({ binDir, linkTarget: "/x", resolved: null, error: "exit 1" }).status).toBe("unverifiable");
+  });
+
+  it("asks a real login shell, and sees a profile that puts another cargo first", async () => {
+    const root = await scratchDir("lease");
+    const bin = path.join(root, "lease-bin");
+    const other = path.join(root, "other");
+    await mkdir(bin);
+    await mkdir(other);
+    const hook = path.join(root, "gitpulse-hook");
+    await writeFile(hook, "#!/bin/sh\n");
+    await chmod(hook, 0o755);
+    const { symlink } = await import("node:fs/promises");
+    await symlink(hook, path.join(bin, "cargo"));
+    const shim = path.join(other, "cargo");
+    await writeFile(shim, "#!/bin/sh\n");
+    await chmod(shim, 0o755);
+    // A shell whose "profile" prepends the other folder, as the owner's does.
+    const shell = path.join(root, "fakeshell");
+    await writeFile(shell, `#!/bin/sh\nPATH="${other}:$PATH"\nexec /bin/sh -c "$2"\n`);
+    await chmod(shell, 0o755);
+    const shadowed = probeLease(bin, { shell });
+    expect(classifyLease(shadowed).status).toBe("shadowed");
+    expect(shadowed.resolved).toBe(shim);
+    // And a shell that leaves PATH alone finds the link first.
+    const plain = path.join(root, "plainshell");
+    await writeFile(plain, '#!/bin/sh\nexec /bin/sh -c "$2"\n');
+    await chmod(plain, 0o755);
+    expect(classifyLease(probeLease(bin, { shell: plain })).status).toBe("gated");
+    // No link: absent, and the shell is never run.
+    expect(classifyLease(probeLease(path.join(root, "nowhere"), { shell })).status).toBe("absent");
   });
 });

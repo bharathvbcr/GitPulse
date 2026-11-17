@@ -30,6 +30,7 @@
   import { describeFailure, unknownState } from "../ui/copy/describeFailure";
   import HygienePanel from "./HygienePanel.svelte";
   import CommitGraphWrite from "./CommitGraphWrite.svelte";
+  import StaleWorktrees from "./StaleWorktrees.svelte";
   import TuningApply from "./TuningApply.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
@@ -41,6 +42,7 @@
     humanBytes,
     pctOf,
   } from "../storage/format";
+  import { worktreeCountText, worktreeSizeText } from "../storage/worktreeSize";
   import {
     clearRepoHistory,
     deltaOver,
@@ -311,7 +313,7 @@
       lines.push("");
       lines.push("Linked worktrees:");
       for (const w of current.worktrees) {
-        lines.push(`  ${w.name} (${w.branch ?? "detached"}): ${humanBytes(w.bytes)}${w.truncated ? " (truncated)" : ""}`);
+        lines.push(`  ${w.name} (${w.branch ?? "detached"}): ${worktreeSizeText(w)}`);
       }
     }
     lines.push("");
@@ -749,7 +751,7 @@
       {#if report.worktrees.length > 0}
         <section class="gp-page-section">
           <h3 class="gp-label">
-            Linked worktrees ({report.worktrees.length})
+            Linked worktrees ({worktreeCountText(report)})
           </h3>
           <div class="gp-card overflow-hidden">
             <table class="w-full text-left">
@@ -759,7 +761,7 @@
                     <td class="px-3 py-1.5 font-mono text-textPrimary truncate" title={worktree.path}>{worktree.name}</td>
                     <td class="px-3 py-1.5 text-textSecondary">{worktree.branch ?? "detached"}</td>
                     <td class="px-3 py-1.5 font-mono text-textSecondary text-right whitespace-nowrap">
-                      {humanBytes(worktree.bytes)}{worktree.truncated ? "+" : ""}
+                      {worktreeSizeText(worktree)}
                     </td>
                   </tr>
                 {/each}
@@ -769,6 +771,8 @@
           <ListPreviewToggle total={report.worktrees.length} noun="worktrees" bind:expanded={expandedLists.worktrees} />
         </section>
       {/if}
+
+      <StaleWorktrees repoPath={report.repo_path} storage={report} />
 
       <!-- Branch weight -->
       <section class="gp-page-section">

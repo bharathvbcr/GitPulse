@@ -5,7 +5,8 @@
 //! behavior, failing loudly if it reappears.
 
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
-use gitpulse_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin, MAX_OUTPUT_BYTES};
+use gitpulse_lib::engine::git_cli::{git_text, git_text_partial, git_with_stdin};
+use gitpulse_lib::engine::process::MAX_OUTPUT_BYTES;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;

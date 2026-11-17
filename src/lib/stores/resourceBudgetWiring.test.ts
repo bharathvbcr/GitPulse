@@ -31,7 +31,7 @@ const statusWith = (p: ResourceProfile): HostLoadStatus =>
     governor: {
       verdict: {
         admit: true,
-        shed: { background: false, reactive: false },
+        shed: { background: false, reactive: false, cause: null },
         reason: "healthy",
         tier: "clear",
         binding: null,
@@ -53,6 +53,7 @@ const statusWith = (p: ResourceProfile): HostLoadStatus =>
     procs: null,
     tick: { ticks: 0, overruns: 0, missed: 0, last_us: 0, max_us: 0, cpu_ns: 0 },
     problems: [],
+    previous_boot: null,
   }) satisfies HostLoadStatus;
 
 const ROOMY = { gpu_contexts: 8, gpu_hide_grace_ms: 300_000, graph_cache_repositories: 6 };

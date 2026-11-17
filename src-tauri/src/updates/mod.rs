@@ -46,7 +46,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Wall-clock ceiling for the tag listing.
 ///
-/// Deliberately *not* [`crate::engine::git_cli::NETWORK_TIMEOUT`] (30 min):
+/// Deliberately *not* [`crate::engine::process::NETWORK_TIMEOUT`] (30 min):
 /// that budget exists for multi-gigabyte clones and fetches. A version check
 /// transfers a few kilobytes of ref names, and one that has not answered in
 /// twenty seconds has failed as far as the user is concerned.

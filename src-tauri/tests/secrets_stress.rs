@@ -294,7 +294,9 @@ fn malformed_and_failed_runs_fail_closed() {
         ("no output", "exit 0", "not valid JSON"),
         ("jsonl rows", "echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/x\"}}'; echo '{\"rule\":{\"id\":\"r\"},\"finding\":{\"path\":\"/y\"}}'; exit 200", "not"),
         ("bad flag", &format!("echo '{PLANTED}' >&2; exit 2"), "exited with status 2"),
-        ("signal", "kill -9 $$", "terminated before it finished"),
+        ("signal", "kill -9 $$", "stopped by SIGKILL before it finished"),
+        ("fault", "kill -s BUS $$", "kingfisher crashed (SIGBUS)"),
+        ("abort", "kill -s ABRT $$", "kingfisher crashed (SIGABRT)"),
         ("crash with output", &format!("echo '{{\"findings\":[]}}'; echo '{PLANTED}' >&2; exit 101"), "status 101"),
     ];
     for (name, body, expected) in cases {
@@ -306,6 +308,38 @@ fn malformed_and_failed_runs_fail_closed() {
         assert_failure_diagnostic(&report);
         assert_no_plant(&report);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scan_that_died_carries_what_the_runner_knew_about_its_end() {
+    // A "terminated before it finished" with no cause was seen twice in the
+    // field, 2 s into a 300 s deadline with nothing captured. The banner is
+    // unchanged; the copyable diagnostic names the raw wait status, the signal,
+    // whether a core was dumped, whether the cancel token fired and whether the
+    // runner itself signalled the group, so the next occurrence has a cause to
+    // read instead of a guess.
+    let _serial = serial();
+    let (_dir, root) = repo();
+    let tools = TempDir::new().unwrap();
+    let report = scan(&root, &stub(tools.path(), "kill -9 $$"));
+    assert!(!report.ok);
+    let diagnostic = report.diagnostic.as_deref().expect("a diagnostic");
+    for line in [
+        "wait_status_raw: 0x0009",
+        "exit_signal: SIGKILL (9)",
+        "core_dumped: false",
+        "stopped_signal: none",
+        "cancel_token_fired: false",
+        "runner_signalled_group: false",
+        "shutdown_sweep_started: false",
+    ] {
+        assert!(
+            diagnostic.lines().any(|found| found == line),
+            "missing `{line}` in:\n{diagnostic}"
+        );
+    }
+    assert_failure_diagnostic(&report);
 }
 
 #[test]

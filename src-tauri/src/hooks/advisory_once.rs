@@ -136,7 +136,7 @@ fn claim(dir: &Path, name: &str) -> Claim {
 
 /// Makes `dir` if needed and confirms it is a real directory only this user
 /// can write. A directory someone else planted is refused, not used.
-fn private_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -166,7 +166,7 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 /// [`PRUNE_SCAN`] entries. Errors are ignored: a stale marker costs a few
 /// bytes, and a marker another copy is about to read must not be raced away,
 /// which the age bound already guarantees.
-fn prune(dir: &Path, now: SystemTime) {
+pub(super) fn prune(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

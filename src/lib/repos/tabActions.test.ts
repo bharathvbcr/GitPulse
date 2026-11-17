@@ -47,7 +47,7 @@ function buildHarness(paths: readonly { path: string; group?: string | null }[],
     sessionBook.snapshotRuns.set(tab.id, 1);
   }
 
-  const unwatch = vi.fn(async () => {});
+  const unwatch = vi.fn(async (_path: string) => {});
   const forgetRepository = vi.fn();
   const stop = vi.fn();
   const ensure = vi.fn();
@@ -251,5 +251,121 @@ describe("createTabActions", () => {
     expect(Object.keys(h3.getInternal().sessions)).toHaveLength(1);
     expect(h3.unwatch).toHaveBeenCalledWith("/repo/a");
     expect(h3.unwatch).toHaveBeenCalledWith("/repo/b");
+  });
+
+  describe("a tab opened while the terminal-loss dialog is up", () => {
+    type Harness = ReturnType<typeof buildHarness>;
+
+    /** Runs `close` with a dialog held open, opens `/repo/new` behind it, then answers `answer`. */
+    async function closeWithTabOpenedBehindDialog(
+      h: Harness,
+      close: () => Promise<void>,
+      answer: boolean,
+      opened: { group?: string } = {},
+    ): Promise<void> {
+      let answerDialog: (yes: boolean) => void = () => {};
+      askConfirmMock.mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => { answerDialog = resolve; }),
+      );
+      const closing = close();
+      await Promise.resolve();
+      expect(askConfirmMock).toHaveBeenCalledTimes(1);
+      expect(await h.actions.openRepo("/repo/new", { activate: false, ...opened })).toBe(true);
+      answerDialog(answer);
+      await closing;
+    }
+
+    /** Every tab that left the workspace must have had its watch and graph cache released. */
+    function expectNoTabLeftUnreleased(h: Harness, everOpened: readonly string[]): void {
+      const open = new Set(h.getInternal().workspace.tabs.map((tab) => tab.path));
+      for (const path of everOpened) {
+        if (open.has(path)) continue;
+        expect(h.unwatch, `${path} left without its watch released`).toHaveBeenCalledWith(path);
+        expect(h.evict, `${path} left with its graph cache`).toHaveBeenCalledWith(path);
+      }
+      expect(Object.keys(h.getInternal().sessions).sort()).toEqual(
+        h.getInternal().workspace.tabs.map((tab) => tab.id).sort(),
+      );
+    }
+
+    const EVER = ["/repo/a", "/repo/b", "/repo/c", "/repo/new"];
+
+    it("closeOtherTabs closes only the tabs the dialog listed and releases each", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }, { path: "/repo/c" }], { "/repo/b": 1 });
+      const keepId = h.getInternal().workspace.tabs[0].id;
+      await closeWithTabOpenedBehindDialog(h, () => h.actions.closeOtherTabs(keepId), true);
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(["/repo/a", "/repo/new"]);
+      expect(h.getInternal().workspace.activeId).toBe(keepId);
+      expectNoTabLeftUnreleased(h, EVER);
+    });
+
+    it("closeTabsToTheRight closes only the tabs the dialog listed and releases each", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }, { path: "/repo/c" }], { "/repo/c": 1 });
+      const anchorId = h.getInternal().workspace.tabs[0].id;
+      await closeWithTabOpenedBehindDialog(h, () => h.actions.closeTabsToTheRight(anchorId), true);
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(["/repo/a", "/repo/new"]);
+      expect(h.getInternal().workspace.activeId).toBe(anchorId);
+      expectNoTabLeftUnreleased(h, EVER);
+    });
+
+    it("closeGroup closes only the tabs the dialog listed and releases each", async () => {
+      const h = buildHarness(
+        [{ path: "/repo/a", group: "grp" }, { path: "/repo/b", group: "grp" }, { path: "/repo/c" }],
+        { "/repo/a": 1 },
+      );
+      await closeWithTabOpenedBehindDialog(h, () => h.actions.closeGroup("grp"), true, { group: "grp" });
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(["/repo/c", "/repo/new"]);
+      expectNoTabLeftUnreleased(h, EVER);
+    });
+
+    it("asks nothing and closes nothing for a tab id that is not open", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }], { "/repo/a": 1, "/repo/b": 1 });
+      await h.actions.closeOtherTabs("no-such-tab");
+      await h.actions.closeTabsToTheRight("no-such-tab");
+      expect(askConfirmMock).not.toHaveBeenCalled();
+      expect(h.getInternal().workspace.tabs).toHaveLength(2);
+    });
+
+    it("closes nothing when the dialog is declined", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }, { path: "/repo/c" }], { "/repo/b": 1 });
+      const keepId = h.getInternal().workspace.tabs[0].id;
+      await closeWithTabOpenedBehindDialog(h, () => h.actions.closeOtherTabs(keepId), false);
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(
+        ["/repo/a", "/repo/b", "/repo/c", "/repo/new"],
+      );
+      expect(h.unwatch).not.toHaveBeenCalled();
+    });
+
+    it("skips a tab that was closed behind the dialog and does not close the survivor it was keeping", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }, { path: "/repo/c" }], { "/repo/b": 1 });
+      const [aId, bId] = h.getInternal().workspace.tabs.map((t) => t.id);
+      let answerDialog: (yes: boolean) => void = () => {};
+      askConfirmMock.mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => { answerDialog = resolve; }),
+      );
+      const closing = h.actions.closeOtherTabs(aId);
+      await Promise.resolve();
+      await h.actions.closeTab(bId);
+      answerDialog(true);
+      await closing;
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(["/repo/a"]);
+      expectNoTabLeftUnreleased(h, ["/repo/a", "/repo/b", "/repo/c"]);
+      expect(h.unwatch.mock.calls.filter(([p]) => p === "/repo/b")).toHaveLength(1);
+    });
+
+    it("aborts when the tab being kept was closed behind the dialog", async () => {
+      const h = buildHarness([{ path: "/repo/a" }, { path: "/repo/b" }, { path: "/repo/c" }], { "/repo/b": 1 });
+      const [aId] = h.getInternal().workspace.tabs.map((t) => t.id);
+      let answerDialog: (yes: boolean) => void = () => {};
+      askConfirmMock.mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => { answerDialog = resolve; }),
+      );
+      const closing = h.actions.closeOtherTabs(aId);
+      await Promise.resolve();
+      await h.actions.closeTab(aId);
+      answerDialog(true);
+      await closing;
+      expect(h.getInternal().workspace.tabs.map((t) => t.path)).toEqual(["/repo/b", "/repo/c"]);
+    });
   });
 });

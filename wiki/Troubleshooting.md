@@ -39,7 +39,7 @@ Same honesty rule. Click the cell to scan that repository for that column. A tot
 
 ## Code map / Map panel says unavailable
 
-DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). Install the `devmap` CLI from **Settings → Agents** or Code → Map when missing (`cargo install --path …/devmap-cli --locked --force` from a sibling DevCouncil checkout), so Build / Refresh can index. A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
+DevMap answers from the store resolved by `devmap paths --json` (the vendored reader is store schema **29**; default `.devmap/codeintel/devmap.sqlite`, legacy `.devcouncil` supported). When DevMap is missing, Health, Suspects, the diff impact panel, palette symbol search and the Map show **Set up code map** (or **Build index** when it is installed but unindexed); use that button, or Settings → Agents. For now the install builds `devmap` from source, so it needs a Rust toolchain (cargo); no published DevMap release is pinned yet (devmap v0.2.3 writes store schema 22, GitPulse reads 29 or newer). A schema mismatch names both versions rather than looking like an empty all-clear. `walk_incomplete` and truncated samples are floors, not complete coverage. See [[Views]].
 
 Use **Code → Map → Copy DevMap logs** to copy the current Map status, binary
 lookup, build/background-refresh state, visible errors, and recent DevMap entries
@@ -58,7 +58,7 @@ rotated out. Each copied section is capped at 64 Ki characters and says when cut
 
 ## Terminal vanished after switching views
 
-The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switching **repositories** does. Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size or toggle the dock to return to the repository view.
+The dock is toggled with `Ctrl+\``. Hiding it or switching views or **repositories** does not kill the session: each repository tab has its own terminal dock and preserves its sessions until you close the terminal tab or repository tab (and on Unix, PTY sessions live in `gitpulse-ptyd` and survive app quit or crash unless stopped). Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size, double-click a page header/background, or toggle the dock to return to the repository view.
 
 ## Terminal shows non-GPU rendering or text glitching
 
@@ -70,12 +70,24 @@ This notice indicates agent hook notifications were sent when GitPulse was busy,
 
 ## `gitpulse-mcp` is missing or stale
 
+App install: open **Settings → Agents → Connect your agent**. It links the app's bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` and registers the server with Claude Code and Codex, so they follow the app when it updates. Check these first:
+
+- `~/.local/bin` is not on the `PATH` of the shell your agent starts from. The Claude Code plugin starts both binaries by bare name.
+- You ran `bun run mcp:install` before: `~/.cargo/bin/gitpulse-mcp` or `gitpulse-hook` may shadow the app's copies, or a registration may point at the cargo copy. Connect leaves those alone and shows them. Switch with `cargo uninstall gitpulse` and the remove/add commands it shows.
+- Claude Code runs with a non-default `CLAUDE_CONFIG_DIR`: Connect uses the `claude` CLI's default profile, so use **Copy setup prompt** instead.
+
+Source checkout only:
+
 ```sh
 bun run mcp:install
 bun run mcp:doctor
 ```
 
 Doctor reports absent / unresponsive / stale / matching for **both** `gitpulse-mcp` and `gitpulse-hook`. Agents spawn the bare names out of `.mcp.json` and `hooks/hooks.json`, so both must be on `PATH`; `GITPULSE_MCP_PATH` only moves the binary GitPulse's own Settings panel reports and is not read by any MCP client. See [[MCP and Agents]].
+
+## Manvi is not installed
+
+Settings shows "Manvi is not installed" with **Set up Manvi**, which builds Manvi from source with Go (Settings → Agents → Manvi policy). Until then Git actions run without policy checks. No published Manvi release is pinned yet (v0.0.5 links an older dc-store).
 
 ## Dev app will not start
 

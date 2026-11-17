@@ -1,16 +1,27 @@
 use crate::engine::git_cli::{
     git_captured, git_captured_with_stdin, git_global_observed, git_text, git_text_network,
-    git_with_stdin, git_with_timeout, is_deferred_under_load, is_slot_wait_timeout,
-    is_transient_git_lock_error, resolve_git_common_dir, sandbox_join, validate_repo,
-    with_background_processes, BoundedRun, OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+    git_with_stdin, git_with_timeout, is_transient_git_lock_error, resolve_git_common_dir,
+    sandbox_join, validate_repo,
 };
 use crate::engine::git_reader::{config_snapshot, config_snapshot_fresh};
+use crate::engine::process::{
+    is_deferred_under_load, is_slot_wait_timeout, with_background_processes, BoundedRun,
+    OutputStream, ProcessObserver, NETWORK_TIMEOUT,
+};
 use crate::ipc_error::CommandError;
+use crate::leak_scan::range::{guard_push as guard_pushed_secrets, PushRefs};
+use crate::leak_scan::staged::guard_commit as guard_staged_secrets;
+pub use crate::leak_scan::staged::Policy as SecretPolicy;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+// Bare `Duration` is named by the macOS-only `AskerDeadline::new` and, through
+// `use super::*`, by macOS-only tests; everything else spells the path.
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -1191,19 +1202,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
     fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
-        let run = git_captured(repo, &["config", "--get", name])?;
-        match run.status_code {
-            0 => Ok(
-                Some(String::from_utf8_lossy(&run.stdout).trim().to_string())
-                    .filter(|value| !value.is_empty()),
-            ),
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read {name} from git config (exit {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )
-            .into()),
-        }
+        Ok(config_get_exact(repo, name)?.filter(|value| !value.is_empty()))
     }
 
     /// The identity a commit in `repo` would be recorded under, resolved as
@@ -1508,6 +1507,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, CommandError> {
+        Self::commit_with_policy(repo_path, message, amend, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::commit`] with the secret gate's policy named. The staged
+    /// changes are scanned under the mutation lock, so the index that was
+    /// scanned is the index this process commits; a refusal leaves it as it was.
+    pub fn commit_with_policy(
+        repo_path: &str,
+        message: &str,
+        amend: bool,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() && !(amend && message.is_empty()) {
             return Err("Commit message must not be empty".into());
@@ -1517,6 +1528,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard_staged_secrets(&repo, &[], secrets)?;
         Self::commit_inner(&repo, message, amend)
     }
 
@@ -1549,6 +1561,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// silently marked resolved. Ignored untracked files stay untracked —
     /// `git add --all` does not force them.
     pub fn quick_commit(repo_path: &str, message: &str) -> Result<String, CommandError> {
+        Self::quick_commit_with_policy(repo_path, message, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::quick_commit`] with the secret gate's policy named. The scan
+    /// runs after `add --all`, so it reads what the commit will record. A
+    /// refusal leaves those files staged and nothing committed.
+    pub fn quick_commit_with_policy(
+        repo_path: &str,
+        message: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() {
             return Err("Commit message must not be empty".into());
@@ -1557,16 +1580,21 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::quick_commit_inner(&repo, message)
+        Self::quick_commit_inner(&repo, message, secrets)
     }
 
-    fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, CommandError> {
+    fn quick_commit_inner(
+        repo: &Path,
+        message: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         Self::require_commit_identity(repo)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
             return Err("Resolve merge conflicts before committing.".into());
         }
         git_text(repo, Self::QUICK_COMMIT_ADD_ARGV)?;
+        guard_staged_secrets(repo, &[], secrets)?;
         Self::commit_inner(repo, message, false)
     }
 
@@ -1605,6 +1633,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
             &["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
             &input,
         )?;
+        // `--only` commits these paths and nothing else staged, so the scan
+        // reads exactly these paths: the same `:(literal)` strings the commit
+        // is handed, so the two cannot match different files. Programmatic
+        // callers have no person to override a refusal.
+        guard_staged_secrets(&repo, &paths, SecretPolicy::Enforce)?;
         git_with_stdin(
             &repo,
             &[
@@ -1617,7 +1650,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             ],
             &input,
         )
-        .map(crate::engine::git_cli::text_from_bytes)
+        .map(crate::engine::process::text_from_bytes)
     }
 
     /// The one argv [`Self::checkout_branch`] runs for `branch_name`, with the
@@ -2024,26 +2057,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
 
         let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-        // A step whose commit is not reachable from the HEAD being rebased
-        // would transplant a foreign commit onto the new base; refuse before
-        // any state is touched.
-        for step in steps {
-            let is_ancestor = git_text(
-                &repo,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &step.commit_id,
-                    &original_head,
-                ],
-            );
-            if is_ancestor.is_err() {
-                return Err(format!(
-                    "Rebase step {} is not an ancestor of HEAD; refusing to transplant foreign commits",
-                    step.commit_id
-                ).into());
-            }
-        }
+        // The replay builds the branch from the steps alone, so a plan that
+        // leaves a commit of onto..HEAD out would delete it from the branch,
+        // and one that names a foreign or repeated commit would transplant or
+        // duplicate it. Refuse before any state is touched.
+        require_plan_covers_range(&repo, onto_commit, &original_head, steps)?;
         // A refused read is an error: taking it for "detached" would skip the
         // final `branch -f` and report success with HEAD left detached.
         let original_branch = crate::engine::git_reader::head_branch(&repo)?;
@@ -2478,15 +2496,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
             }
             // A deadline is a finished run that git did not: its message is
             // the same sentence a timeout error carries.
-            Ok(crate::engine::git_cli::BoundedRun {
-                incomplete: Some(crate::engine::git_cli::Incomplete::Deadline { message, .. }),
+            Ok(crate::engine::process::BoundedRun {
+                incomplete: Some(crate::engine::process::Incomplete::Deadline { message, .. }),
                 ..
             }) => (Err(with_lock(message).into()), "timed_out"),
             Ok(run) if run.success => (Ok(finished(false, started)), "written"),
             Ok(run) => (
                 Err(with_lock(format!(
                     "git commit-graph write failed: {}",
-                    crate::engine::git_cli::byte_tail(&run.stderr, 400).trim()
+                    crate::engine::process::byte_tail(&run.stderr, 400).trim()
                 ))
                 .into()),
                 "failed",
@@ -2495,12 +2513,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
             // spawned, and the person's stop is the answer, not a failure.
             Err(error)
                 if stop.load(std::sync::atomic::Ordering::SeqCst)
-                    && !crate::engine::git_cli::is_timed_out(error.message()) =>
+                    && !crate::engine::process::is_timed_out(error.message()) =>
             {
                 (Ok(finished(true, started)), "cancelled")
             }
             Err(error) => {
-                let journal = if crate::engine::git_cli::is_timed_out(error.message()) {
+                let journal = if crate::engine::process::is_timed_out(error.message()) {
                     "timed_out"
                 } else {
                     "failed"
@@ -2594,6 +2612,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// an explicit expected value, or a lease without the includes check past
     /// the contract.
     pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, CommandError> {
+        Self::push_planned_with_policy(repo_path, args, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::push_planned`], with the secret scan of the commits the push
+    /// would send run under the repository lock just before it.
+    /// [`SecretPolicy::HumanOverride`] skips the scan, and only the "Push
+    /// anyway" button reaches it.
+    pub fn push_planned_with_policy(
+        repo_path: &str,
+        args: &[String],
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if args.first().map(String::as_str) != Some("push") {
             return Err("internal: planned push argv must start with push".into());
@@ -2640,13 +2670,16 @@ Unset the local override with `git config --local --unset-all user.name` and \
         // re-checked here, under the lock, so a planned argv that was edited
         // or went stale between plan and run cannot reach an unconfigured
         // repository.
-        if let Some(repository) = args
+        let mut positionals = args
             .iter()
             .skip(1)
-            .find(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
-        {
+            .filter(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
+            .map(String::as_str);
+        let (repository, branch) = (positionals.next(), positionals.next());
+        if let Some(repository) = repository {
             crate::engine::remotes::require_configured(&repo, repository)?;
         }
+        guard_pushed_secrets(&repo, repository, PushRefs::Branch(branch), secrets)?;
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         git_text_network(&repo, &refs)
     }
@@ -2654,6 +2687,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
     /// ambiguous branch/tag name from publishing the wrong object.
     pub fn push_tag(repo_path: &str, remote: &str, tag: &str) -> Result<String, CommandError> {
+        Self::push_tag_with_policy(repo_path, remote, tag, SecretPolicy::Enforce)
+    }
+
+    /// [`Self::push_tag`], with the secret scan of the commits the tag would
+    /// send, as [`Self::push_planned_with_policy`] runs it.
+    pub fn push_tag_with_policy(
+        repo_path: &str,
+        remote: &str,
+        tag: &str,
+        secrets: SecretPolicy,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2661,6 +2705,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::engine::remotes::require_configured(&repo, remote)?;
         let argv = Self::push_tag_argv(remote, tag)?;
+        guard_pushed_secrets(&repo, Some(remote), PushRefs::Tag(tag), secrets)?;
         git_text_network(&repo, &Self::argv_refs(&argv)[1..])
     }
 
@@ -3235,7 +3280,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     )
                 )) {
             Some(
-                super::git_cli::canonicalize_plain(source_path)
+                super::process::canonicalize_plain(source_path)
                     .map_err(|error| format!("Cannot resolve local clone source: {error}"))?,
             )
         } else {
@@ -3361,6 +3406,93 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
     }
 }
 
+/// Refuses a rebase plan that is not a permutation of `onto..head`: every
+/// commit of the range exactly once, nothing else. Steps may be abbreviated
+/// oids or any revision naming a commit; they are resolved before comparing.
+///
+/// The range is read with at most [`MAX_REPLAY_COMMITS`] + 1 entries, the same
+/// ceiling a cherry-pick or revert replay has, and a longer one is refused
+/// rather than truncated. A merge commit in the range is refused too: the replay
+/// is cherry-pick based and cannot carry one, and refusing here leaves the
+/// branch and the working tree untouched.
+fn require_plan_covers_range(
+    repo: &std::path::Path,
+    onto: &str,
+    head: &str,
+    steps: &[RebaseStep],
+) -> Result<(), CommandError> {
+    let listing = git_text(
+        repo,
+        &[
+            "rev-list",
+            "--parents",
+            &format!("--max-count={}", MAX_REPLAY_COMMITS + 1),
+            &format!("{onto}..{head}"),
+        ],
+    )?;
+    let mut range = std::collections::HashSet::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(oid) = fields.next() else { continue };
+        if fields.nth(1).is_some() {
+            return Err(format!(
+                "Rebase refused: {onto}..HEAD contains the merge commit {oid}, which a replay cannot carry"
+            )
+            .into());
+        }
+        range.insert(oid.to_string());
+    }
+    if range.len() > MAX_REPLAY_COMMITS {
+        return Err(format!(
+            "Rebase refused: {onto}..HEAD holds more than {MAX_REPLAY_COMMITS} commits"
+        )
+        .into());
+    }
+    if steps.len() != range.len() {
+        return Err(format!(
+            "Rebase plan covers {} commit(s) but {onto}..HEAD holds {}; refusing a plan that would drop or add commits",
+            steps.len(),
+            range.len()
+        )
+        .into());
+    }
+    let mut planned = std::collections::HashSet::new();
+    for step in steps {
+        let oid = git_text(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{}^{{commit}}", step.commit_id),
+            ],
+        )
+        .map_err(|_| {
+            CommandError::from(format!(
+                "Rebase step {} does not name a commit",
+                step.commit_id
+            ))
+        })?
+        .trim()
+        .to_string();
+        if !range.contains(&oid) {
+            return Err(format!(
+                "Rebase step {} is not in {onto}..HEAD; refusing to transplant a foreign commit",
+                step.commit_id
+            )
+            .into());
+        }
+        if !planned.insert(oid) {
+            return Err(format!(
+                "Rebase step {} appears more than once in the plan",
+                step.commit_id
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a plan in which a squash or fixup has no kept commit before it, as
 /// git does ("cannot 'squash' without a previous commit"). A dropped step is
 /// not a commit to fold into: with only drops ahead of it the fold would amend
@@ -3452,7 +3584,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
             dest.display()
         )
     })?;
-    let parent_canonical = crate::engine::git_cli::canonicalize_plain(parent).map_err(|e| {
+    let parent_canonical = crate::engine::process::canonicalize_plain(parent).map_err(|e| {
         format!(
             "Cannot resolve clone destination parent '{}': {}",
             parent.display(),
@@ -3469,7 +3601,7 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
                 )
                 .into());
             }
-            let actual = crate::engine::git_cli::canonicalize_plain(dest).map_err(|e| {
+            let actual = crate::engine::process::canonicalize_plain(dest).map_err(|e| {
                 format!(
                     "Cannot resolve clone destination '{}': {}",
                     dest.display(),
@@ -3738,25 +3870,86 @@ pub(crate) fn summarize_git_failure(raw: &str) -> String {
 
 const PUSH_DETACHED: &str = "Cannot push: HEAD is detached. Check out a branch, then push.";
 const PUSH_NO_REMOTES: &str = "This repository has no remotes. Add a remote before pushing.";
+const PUSH_UPSTREAM_UNKNOWN: &str = "Cannot push: the upstream could not be determined";
 
-fn branch_has_upstream(repo: &Path) -> bool {
-    git_text(
-        repo,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .map(|text| !text.trim().is_empty())
-    .unwrap_or(false)
+/// What a read of one git config key reported, before any caller decides what
+/// absence means.
+///
+/// `git config --get` exits 1 for a key that is unset, and also for a key git
+/// refuses as invalid; the second prints to stderr, so exit 1 with output on
+/// stderr is a failed read, not an absent key. Every other non-zero exit, a
+/// stream cut short, and a cancelled run are failed reads too. The value is
+/// returned as git printed it, trimmed: an empty value is `Some("")`, which is
+/// not the same answer as `None`.
+fn config_get_outcome(name: &str, run: BoundedRun) -> Result<Option<String>, CommandError> {
+    let run = run.require_complete("git config")?;
+    if run.cancelled {
+        return Err(format!("Reading {name} from git config was cancelled").into());
+    }
+    match run.status_code {
+        0 => Ok(Some(
+            String::from_utf8_lossy(&run.stdout).trim().to_string(),
+        )),
+        1 if String::from_utf8_lossy(&run.stderr).trim().is_empty() => Ok(None),
+        code => Err(format!(
+            "Could not read {name} from git config (exit {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )
+        .into()),
+    }
 }
 
-fn current_branch_name(repo: &Path) -> Result<String, CommandError> {
-    crate::engine::git_reader::head_branch(repo)?
-        .ok_or_else(|| PUSH_DETACHED.to_string())
-        .map_err(CommandError::from)
+fn config_get_exact(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
+    config_get_outcome(name, git_captured(repo, &["config", "--get", name])?)
+}
+
+/// Whether a branch publishes somewhere by its own configuration.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchUpstream {
+    /// `branch.<name>.remote` and `branch.<name>.merge` are both set. Git, not
+    /// GitPulse, decides what a bare `git push` does with them, whether or not
+    /// the tracking ref exists yet and whether or not the remote still does.
+    Configured,
+    /// Neither key is set: git read the configuration and found no upstream.
+    Unconfigured,
+}
+
+/// Reads a branch's upstream from its configuration. `Err` is the third answer,
+/// "could not be determined": a failed read, or a configuration that sets only
+/// part of an upstream (one key, or an empty value). Neither may be planned as
+/// an unpublished branch, because `-u <default remote> <branch>` would send the
+/// branch to a remote it was not configured for and rewrite its upstream.
+fn branch_upstream(repo: &Path, branch: &str) -> Result<BranchUpstream, CommandError> {
+    let read = |key: &str| {
+        let name = format!("branch.{branch}.{key}");
+        config_get_exact(repo, &name).map_err(|err| {
+            CommandError::from(format!(
+                "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: {}",
+                err.message()
+            ))
+        })
+    };
+    let remote = read("remote")?;
+    let merge = read("merge")?;
+    let set = |value: &Option<String>| value.as_deref().is_some_and(|text| !text.trim().is_empty());
+    match (&remote, &merge) {
+        (None, None) => Ok(BranchUpstream::Unconfigured),
+        _ if set(&remote) && set(&merge) => Ok(BranchUpstream::Configured),
+        _ => Err(format!(
+            "{PUSH_UPSTREAM_UNKNOWN} of `{branch}`: its upstream is only partly configured \
+             (branch.{branch}.remote and branch.{branch}.merge must both be set, or both \
+             removed). Fix the configuration or name the remote to push to."
+        )
+        .into()),
+    }
+}
+
+/// The branch HEAD is on; `None` when HEAD is detached. The name is not
+/// validated for argv here: a branch that is only read for its configuration
+/// is never put on a command line, and the callers that do put it there
+/// validate it themselves.
+fn read_head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
+    crate::engine::git_reader::head_branch_name(repo)
 }
 
 /// Remote to publish an unpublished branch to when the caller did not name one.
@@ -3770,10 +3963,9 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, CommandError> {
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
     }
-    if let Ok(configured) = git_text(repo, &["config", "--get", "checkout.defaultRemote"]) {
-        let name = configured.trim();
-        if remotes.iter().any(|remote| remote == name) {
-            return Ok(name.to_string());
+    if let Some(configured) = config_get_exact(repo, "checkout.defaultRemote")? {
+        if remotes.contains(&configured) {
+            return Ok(configured);
         }
     }
     if remotes.iter().any(|remote| remote == "origin") {
@@ -3805,7 +3997,8 @@ const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"
 fn require_force_if_includes(
     preflight: &crate::engine::git_cli::GitPreflight,
 ) -> Result<(), CommandError> {
-    use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
+    use crate::engine::git_cli::{supports, GitPreflightStatus};
+    use crate::engine::process::is_deferred_under_load;
     if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
         return Ok(());
     }
@@ -3876,8 +4069,8 @@ fn plan_push_argv(
     }
     match (remote, branch) {
         (None, None) => {
-            if !branch_has_upstream(repo) {
-                let branch = current_branch_name(repo)?;
+            let branch = read_head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())?;
+            if branch_upstream(repo, &branch)? == BranchUpstream::Unconfigured {
                 let remote = unpublished_push_remote(repo)?;
                 validate_ref_name(&remote)?;
                 validate_push_branch(&branch)?;
@@ -3917,15 +4110,13 @@ fn plan_push_argv(
 /// branch's own `branch.<name>.remote` when it names a configured remote,
 /// else the same choice an unpublished branch makes.
 fn implicit_push_remote(repo: &Path) -> Result<String, CommandError> {
-    if let Ok(branch) = current_branch_name(repo) {
+    // Detached HEAD is an answer (no branch, so no branch remote); a HEAD or
+    // config read that failed is not, and must not fall through to a default.
+    if let Some(branch) = read_head_branch(repo)? {
         let key = format!("branch.{branch}.remote");
-        if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
-            let name = configured.trim();
-            if crate::engine::remotes::list_names(repo)?
-                .iter()
-                .any(|remote| remote == name)
-            {
-                return Ok(name.to_string());
+        if let Some(configured) = config_get_exact(repo, &key)? {
+            if crate::engine::remotes::list_names(repo)?.contains(&configured) {
+                return Ok(configured);
             }
         }
     }
@@ -4065,6 +4256,17 @@ pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
 //   `user.email`, `commit.gpgsign=false`) and cap/expiry eviction deletes refs via
 //   `git update-ref -d` without ever modifying `.git/config`.
 
+/// Identity flags for objects GitPulse writes on its own behalf (op-log
+/// snapshots, turn checkpoints): inline `-c`, never `.git/config`.
+pub(crate) const SNAPSHOT_IDENTITY_ARGS: [&str; 6] = [
+    "-c",
+    "user.name=GitPulse",
+    "-c",
+    "user.email=gitpulse@local",
+    "-c",
+    "commit.gpgsign=false",
+];
+
 /// Ref prefix under which pre-op agent snapshots are stored.
 pub const OP_REF_PREFIX: &str = "refs/gitpulse/ops/";
 /// Maximum number of retained snapshots per repository before oldest are evicted.
@@ -4155,7 +4357,7 @@ struct LiveRefRow {
     commit_oid: Option<String>,
 }
 
-fn absent_oid_for_len(oid_len: usize) -> &'static str {
+pub(crate) fn absent_oid_for_len(oid_len: usize) -> &'static str {
     if oid_len == 64 {
         "0000000000000000000000000000000000000000000000000000000000000000"
     } else {
@@ -4404,7 +4606,7 @@ fn op_snapshot_test_failures() -> &'static Mutex<Vec<(PathBuf, String)>> {
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn inject_next_op_snapshot_failure_for_test(repo_path: &str, reason: &str) {
     let canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| PathBuf::from(repo_path));
     op_snapshot_test_failures()
@@ -4422,16 +4624,64 @@ fn take_injected_op_snapshot_failure(repo: &Path) -> Option<String> {
     Some(guard.remove(pos).1)
 }
 
+/// The moment an op snapshot's asker stops waiting, read from a clock that a
+/// test can script. The asker lets its git write run at that moment, so state
+/// captured at or after it may already include the write.
+#[derive(Clone, Copy)]
+pub(crate) struct AskerDeadline {
+    expires_at: Instant,
+    now: fn() -> Instant,
+}
+
+impl AskerDeadline {
+    /// `budget` from `start`, on the real clock. Only the macOS op-record
+    /// handler builds one.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new(start: Instant, budget: Duration) -> Self {
+        Self {
+            expires_at: start + budget,
+            now: Instant::now,
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_clock(expires_at: Instant, now: fn() -> Instant) -> Self {
+        Self { expires_at, now }
+    }
+
+    /// The instant itself counts as passed: the asker's read deadline fires at
+    /// exactly the budget, so an answer at that instant is already unwanted.
+    fn has_passed(&self) -> bool {
+        (self.now)() >= self.expires_at
+    }
+}
+
+/// What an op snapshot's asker told the app: the request's id, which ties every
+/// ledger row for one write together, and the deadline it will stop waiting at.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OpAsk<'a> {
+    pub(crate) request_id: Option<&'a str>,
+    pub(crate) deadline: Option<AskerDeadline>,
+}
+
+/// The failure an app answers when the asker's deadline passed before the state
+/// to snapshot was captured. No ref and no snapshotted row exist for it.
+pub(crate) const OP_DEADLINE_PASSED: &str =
+    "the asker's op-snapshot deadline passed before the repository state was captured; no snapshot was recorded";
+
 impl GitWriter {
     /// Records an app-side pre-operation snapshot under `refs/gitpulse/ops/<n>`
-    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]).
-    pub fn record_op_snapshot(
+    /// using default retention ([`MAX_OPS`], [`OP_EXPIRY_SECS`]). Only the macOS
+    /// op-record handler calls it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn record_op_snapshot(
         repo_path: &str,
         command: &str,
         session_id: Option<&str>,
         task_id: Option<&str>,
+        ask: &OpAsk<'_>,
     ) -> Result<OpSnapshotSummary, CommandError> {
-        Self::record_op_snapshot_with_limits(
+        Self::record_op_snapshot_with_limits_asked(
             repo_path,
             command,
             session_id,
@@ -4439,10 +4689,12 @@ impl GitWriter {
             crate::ledger::ids::now_millis(),
             MAX_OPS,
             OP_EXPIRY_SECS,
+            ask,
         )
     }
 
-    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits.
+    /// [`Self::record_op_snapshot`] with explicit timestamp and retention limits,
+    /// for a caller with no asker waiting on it.
     pub fn record_op_snapshot_with_limits(
         repo_path: &str,
         command: &str,
@@ -4452,6 +4704,41 @@ impl GitWriter {
         max_ops: usize,
         expiry_secs: u64,
     ) -> Result<OpSnapshotSummary, CommandError> {
+        Self::record_op_snapshot_with_limits_asked(
+            repo_path,
+            command,
+            session_id,
+            task_id,
+            now_ms,
+            max_ops,
+            expiry_secs,
+            &OpAsk::default(),
+        )
+    }
+
+    /// The snapshot itself, for an asker that may have stopped waiting.
+    ///
+    /// The rule: a snapshot is a true pre-op state only if its state was
+    /// captured before the asker's deadline, because at the deadline the asker
+    /// lets its git write run. So the deadline is checked before the lock, after
+    /// the lock is acquired, and again once the state has been read and
+    /// immediately before the ref is written. A pass at any of them writes no
+    /// ref and no snapshotted row and answers [`OP_DEADLINE_PASSED`]. A ref
+    /// whose state was captured in time is a valid pre-op snapshot even if its
+    /// write finishes a moment past the deadline, and is kept as a normal one;
+    /// there are no late-marked refs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_op_snapshot_with_limits_asked(
+        repo_path: &str,
+        command: &str,
+        session_id: Option<&str>,
+        task_id: Option<&str>,
+        now_ms: u64,
+        max_ops: usize,
+        expiry_secs: u64,
+        ask: &OpAsk<'_>,
+    ) -> Result<OpSnapshotSummary, CommandError> {
+        let deadline_passed = || ask.deadline.is_some_and(|deadline| deadline.has_passed());
         if command.trim().is_empty() {
             return Err("Operation command must not be empty".into());
         }
@@ -4460,10 +4747,19 @@ impl GitWriter {
         if let Some(reason) = take_injected_op_snapshot_failure(&repo) {
             return Err(reason.into());
         }
+        // Cheap early refusal: no lock to wait for, no state to read.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
         let lock = repo_mutation_lock(&repo);
         let _guard = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The lock may have been held by another write for as long as it took
+        // for the asker to give up.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
 
         let head_ref = read_head_symbolic_ref(&repo)?;
         let head_oid = read_head_oid(&repo)?;
@@ -4515,16 +4811,11 @@ impl GitWriter {
             }
         }
 
-        let mut args: Vec<String> = vec![
-            "-c".into(),
-            "user.name=GitPulse".into(),
-            "-c".into(),
-            "user.email=gitpulse@local".into(),
-            "-c".into(),
-            "commit.gpgsign=false".into(),
-            "commit-tree".into(),
-            tree_oid,
-        ];
+        let mut args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
+            .iter()
+            .map(|a| (*a).to_string())
+            .chain(["commit-tree".to_string(), tree_oid])
+            .collect();
         for p in &parents {
             args.push("-p".into());
             args.push(p.clone());
@@ -4545,6 +4836,13 @@ impl GitWriter {
             .to_string();
         validate_oid(&snapshot_oid)?;
 
+        // The state was read above. If the asker has stopped waiting, its write
+        // may already have changed the repository, so what was read is not a
+        // pre-op state: leave the commit object unreferenced (git gc collects
+        // it) and write no ref.
+        if deadline_passed() {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
         let ref_run = git_captured(&repo, &["update-ref", &op_ref, &snapshot_oid, absent_oid])?;
         if !ref_run.success {
             return Err(format!(
@@ -4555,7 +4853,20 @@ impl GitWriter {
         }
 
         let keep = if max_ops > 0 { Some(next_seq) } else { None };
-        prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep)?;
+        // The ref is durable now, so the snapshot exists whatever retention
+        // does next: a failed prune is reported on the snapshot's own ledger
+        // row, never as a failed snapshot.
+        let prune_error =
+            match prune_op_snapshots_locked(&repo, created_at, max_ops, expiry_secs, keep) {
+                Ok(_) => None,
+                Err(err) => {
+                    log::warn!(
+                        "op snapshot {op_ref} was recorded but retention pruning failed: {}",
+                        err.message()
+                    );
+                    Some(err.message().to_string())
+                }
+            };
 
         crate::ledger::record_op_snapshot_event(
             repo_path,
@@ -4567,6 +4878,8 @@ impl GitWriter {
             next_seq,
             stash_oid.as_deref(),
             live_refs.len(),
+            prune_error.as_deref(),
+            ask.request_id,
             now_ms,
         );
 
@@ -4855,15 +5168,26 @@ impl GitWriter {
     /// Handles [`crate::desktop::instance::Request::RecordGitOp`] inside the
     /// primary desktop process. Snapshot failures append `"unsnapshotted"` to
     /// the ledger and return `snapshotted: false` so the hook never stays silent.
+    ///
+    /// `not_after_send` is an instant no later than the asker's send (the
+    /// mailbox takes it before greeting the asker). The asker waits a full
+    /// [`crate::desktop::instance::OP_RECORD_DEADLINE`] after its send, so the
+    /// same budget counted from this instant ends no later than the asker's
+    /// wait does: app start <= asker's send, asker waits >= budget after send,
+    /// so the app's deadline never falls after the asker gave up. A refusal for a passed deadline is
+    /// logged like any other failure (under the request's id), which is also
+    /// what settles the hook's "unknown" row for the same write.
+    #[cfg(target_os = "macos")]
     pub fn serve_op_record(
         request: &crate::desktop::instance::Request,
+        not_after_send: Instant,
     ) -> Result<serde_json::Value, String> {
         let crate::desktop::instance::Request::RecordGitOp {
+            id,
             cwd,
             command,
             session_id,
             task_id,
-            ..
         } = request
         else {
             return Err("not an op-record request".into());
@@ -4871,7 +5195,20 @@ impl GitWriter {
         let root = crate::engine::git_cli::find_git_root(Path::new(cwd))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| cwd.clone());
-        match Self::record_op_snapshot(&root, command, session_id.as_deref(), task_id.as_deref()) {
+        let ask = OpAsk {
+            request_id: Some(id.as_str()),
+            deadline: Some(AskerDeadline::new(
+                not_after_send,
+                crate::desktop::instance::OP_RECORD_DEADLINE,
+            )),
+        };
+        match Self::record_op_snapshot(
+            &root,
+            command,
+            session_id.as_deref(),
+            task_id.as_deref(),
+            &ask,
+        ) {
             Ok(summary) => Ok(serde_json::json!({
                 "snapshotted": true,
                 "seq": summary.seq,
@@ -4888,6 +5225,7 @@ impl GitWriter {
                     task_id.as_deref(),
                     head_before.as_deref(),
                     err.message(),
+                    Some(id.as_str()),
                     crate::ledger::ids::now_millis(),
                 );
                 Ok(serde_json::json!({
@@ -6743,6 +7081,211 @@ mod tests {
             .expect("stage must succeed after the contended lock is released");
     }
 
+    /// `feature`, `count` commits above `main`'s one commit, left checked out.
+    /// Returns the directory, `main`'s tip and the commits oldest first.
+    fn feature_ahead_of_main(count: usize) -> (tempfile::TempDir, String, Vec<String>) {
+        let dir = init_repo_with_commit();
+        let base = write_commit(&dir, "base.txt", "base\n", "base commit");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let commits = (0..count)
+            .map(|i| {
+                write_commit(
+                    &dir,
+                    &format!("f{i:02}.txt"),
+                    &format!("{i}\n"),
+                    &format!("feature {i:02}"),
+                )
+            })
+            .collect();
+        (dir, base, commits)
+    }
+
+    fn picks(commits: &[String]) -> Vec<RebaseStep> {
+        commits
+            .iter()
+            .map(|commit_id| RebaseStep {
+                commit_id: commit_id.clone(),
+                action: RebaseActionKind::Pick,
+            })
+            .collect()
+    }
+
+    fn commits_above(dir: &tempfile::TempDir, onto: &str) -> usize {
+        git_text(
+            dir.path(),
+            &["rev-list", "--count", &format!("{onto}..feature")],
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+    }
+
+    /// The modal plans from the newest 12 graph rows. On a branch 20 commits
+    /// ahead that plan used to succeed and `branch -f` dropped the 8 oldest.
+    #[test]
+    fn rebase_refuses_a_plan_that_covers_only_the_newest_part_of_the_range() {
+        let (dir, _base, commits) = feature_ahead_of_main(20);
+        let tip = head_oid(&dir);
+
+        let err = GitWriter::execute_rebase_sequence(
+            dir.path().to_str().unwrap(),
+            "main",
+            &picks(&commits[8..]),
+        )
+        .expect_err("a plan that omits the 8 oldest commits must be refused");
+
+        let message = err.message();
+        assert!(
+            message.contains("12") && message.contains("20"),
+            "the refusal names both counts: {message}"
+        );
+        assert_eq!(head_oid(&dir), tip, "feature must keep its tip");
+        assert_eq!(commits_above(&dir, "main"), 20);
+        let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "feature", "HEAD must stay on its branch");
+    }
+
+    /// A plan that names every commit still works, with drops and squashes,
+    /// and `onto` may be an oid.
+    #[test]
+    fn rebase_accepts_a_full_permutation_with_a_drop_and_a_squash() {
+        let (dir, base, commits) = feature_ahead_of_main(20);
+        let mut steps = picks(&commits);
+        steps[5].action = RebaseActionKind::Drop;
+        steps[7].action = RebaseActionKind::Squash;
+
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect("a plan naming all 20 commits is applied");
+
+        assert_eq!(
+            commits_above(&dir, &base),
+            18,
+            "20 less a drop and a squash"
+        );
+        assert!(
+            !dir.path().join("f05.txt").exists(),
+            "the dropped file is gone"
+        );
+        assert!(
+            dir.path().join("f07.txt").exists(),
+            "the squashed file is kept"
+        );
+    }
+
+    /// Abbreviated oids and a branch name for `onto` resolve to the same
+    /// range and are accepted.
+    #[test]
+    fn rebase_resolves_abbreviated_oids_and_a_branch_name_for_onto() {
+        let (dir, _base, commits) = feature_ahead_of_main(5);
+        let short: Vec<String> = commits.iter().map(|c| c[..12].to_string()).collect();
+
+        GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), "main", &picks(&short))
+            .expect("abbreviated oids naming the whole range are accepted");
+
+        assert_eq!(commits_above(&dir, "main"), 5);
+    }
+
+    #[test]
+    fn rebase_refuses_a_duplicated_step() {
+        let (dir, base, commits) = feature_ahead_of_main(4);
+        let tip = head_oid(&dir);
+        // Same length as the range, one commit twice and one missing.
+        let mut same_length = picks(&commits);
+        same_length[3].commit_id = commits[0].clone();
+        // Every commit once, then one of them again.
+        let mut longer = picks(&commits);
+        longer.push(RebaseStep {
+            commit_id: commits[1].clone(),
+            action: RebaseActionKind::Drop,
+        });
+
+        for steps in [same_length, longer] {
+            let result =
+                GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps);
+            assert!(
+                result.is_err(),
+                "a duplicated step was accepted: {result:?}"
+            );
+            assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        }
+    }
+
+    /// A commit from another branch, standing in for one of the range.
+    #[test]
+    fn rebase_refuses_a_commit_that_is_not_in_the_range() {
+        let (dir, base, commits) = feature_ahead_of_main(4);
+        let tip = head_oid(&dir);
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "other", &base]);
+        let foreign = write_commit(&dir, "other.txt", "x\n", "elsewhere");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "feature"]);
+        let mut steps = picks(&commits);
+        steps[2].commit_id = foreign;
+
+        let result =
+            GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps);
+
+        assert!(result.is_err(), "a foreign commit was accepted: {result:?}");
+        assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        assert!(!dir.path().join("other.txt").exists());
+    }
+
+    #[test]
+    fn rebase_refuses_when_the_range_is_empty() {
+        let (dir, _base, commits) = feature_ahead_of_main(3);
+        let tip = head_oid(&dir);
+
+        let result = GitWriter::execute_rebase_sequence(
+            dir.path().to_str().unwrap(),
+            &tip,
+            &picks(&commits[2..]),
+        );
+
+        assert!(result.is_err(), "an empty range was accepted: {result:?}");
+        assert_eq!(head_oid(&dir), tip);
+    }
+
+    /// The replay is cherry-pick based, which cannot carry a merge commit, so
+    /// a range holding one is refused before any state is touched.
+    #[test]
+    fn rebase_refuses_a_range_that_holds_a_merge_commit() {
+        let (dir, base, commits) = feature_ahead_of_main(2);
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "-b", "side", &base]);
+        write_commit(&dir, "side.txt", "s\n", "side work");
+        crate::test_support::git_in(dir.path(), &["checkout", "-q", "feature"]);
+        crate::test_support::git_in(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge side",
+                "side",
+            ],
+        );
+        let tip = head_oid(&dir);
+        let range = git_text(
+            dir.path(),
+            &["rev-list", "--reverse", &format!("{base}..HEAD")],
+        )
+        .unwrap();
+        let steps = picks(&range.lines().map(str::to_string).collect::<Vec<_>>());
+        assert!(steps.len() > commits.len(), "the range holds the merge too");
+
+        let err = GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
+            .expect_err("a merge commit in the range must be refused");
+
+        assert!(err.message().contains("merge"), "{}", err.message());
+        assert_eq!(head_oid(&dir), tip, "HEAD must not move");
+        let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch.trim(), "feature");
+    }
+
     #[test]
     fn rebase_rejects_squash_or_fixup_as_the_first_step() {
         let dir = init_repo_with_commit();
@@ -7213,7 +7756,7 @@ mod tests {
             // Spawns of fetch/pull/push fail loudly here, so an Err that names
             // the target and is not a spawn failure proves git never ran it.
             let forced = |arg: &str, body: &dyn Fn() -> Result<String, CommandError>| {
-                crate::engine::git_cli::with_forced_spawn_failure_of(arg, body)
+                crate::engine::process::with_forced_spawn_failure_of(arg, body)
             };
             let results: Vec<(&str, Result<String, CommandError>)> = vec![
                 (
@@ -7329,6 +7872,283 @@ mod tests {
         let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
             .unwrap_err();
         assert!(err.contains("victim.git"), "{err}", err = err.message());
+    }
+
+    /// A repository with `origin` (the default remote) and `team`, neither
+    /// fetched, on `main`. The bare repositories are returned so they outlive
+    /// the test body.
+    fn two_remote_repo() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let origin = init_bare();
+        let team = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            repo.path(),
+            &["remote", "add", "team", team.path().to_str().unwrap()],
+        );
+        (repo, origin, team)
+    }
+
+    const FORCE_PAIR: [&str; 2] = ["--force-with-lease", "--force-if-includes"];
+
+    fn plan_plain_and_forced(repo: &tempfile::TempDir) -> [Result<Vec<String>, CommandError>; 2] {
+        [false, true].map(|force| GitWriter::plan_push(&repo_path(repo), None, None, force))
+    }
+
+    #[test]
+    fn a_configured_upstream_whose_tracking_ref_is_missing_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        // Configured, never fetched: `@{upstream}` cannot resolve, the
+        // configuration still names `team` as the destination.
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        let mut expected = vec!["push".to_string()];
+        expected.extend(FORCE_PAIR.map(String::from));
+        assert_eq!(forced.unwrap(), expected);
+    }
+
+    #[test]
+    fn an_upstream_naming_a_remote_that_no_longer_exists_is_never_replaced_by_the_default() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "gone"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        for planned in plan_plain_and_forced(&repo) {
+            let argv = planned.unwrap();
+            assert!(!argv.iter().any(|arg| arg == "-u"), "{argv:?}");
+            assert!(!argv.iter().any(|arg| arg == "origin"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_local_upstream_stays_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["branch", "base"]);
+        git_in(repo.path(), &["config", "branch.main.remote", "."]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/base"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_branch_with_no_upstream_still_plans_set_upstream_to_the_default_remote() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+        assert_eq!(
+            forced.unwrap(),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "main"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_healthy_upstream_on_a_non_default_remote_is_a_plain_push() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["push", "-q", "-u", "team", "main"]);
+        let [plain, forced] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        assert!(!forced.unwrap().iter().any(|arg| arg == "-u"));
+    }
+
+    #[test]
+    fn a_half_configured_upstream_is_refused_and_never_replaced_by_the_default_remote() {
+        // (remote, merge) as configured; `None` leaves the key unset.
+        let cases: [(Option<&str>, Option<&str>); 8] = [
+            (Some("team"), None),
+            (None, Some("refs/heads/main")),
+            (Some(""), Some("refs/heads/main")),
+            (Some("team"), Some("")),
+            (Some("  "), Some("refs/heads/main")),
+            (Some("team"), Some("  ")),
+            (Some(""), Some("")),
+            (Some(""), None),
+        ];
+        for (remote, merge) in cases {
+            let (repo, _origin, _team) = two_remote_repo();
+            if let Some(remote) = remote {
+                git_in(repo.path(), &["config", "branch.main.remote", remote]);
+            }
+            if let Some(merge) = merge {
+                git_in(repo.path(), &["config", "branch.main.merge", merge]);
+            }
+            for planned in plan_plain_and_forced(&repo) {
+                let err = planned.unwrap_err();
+                assert!(
+                    err.contains("upstream"),
+                    "{remote:?}/{merge:?}: {err}",
+                    err = err.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_name_with_slashes_plans_by_its_own_upstream_configuration() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "-b", "feat/x/y"]);
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "feat/x/y"]);
+        git_in(repo.path(), &["config", "branch.feat/x/y.remote", "team"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.feat/x/y.merge", "refs/heads/feat/x/y"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+    }
+
+    #[test]
+    fn a_flag_shaped_configuration_value_never_reaches_the_planned_argv() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "--mirror"]);
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push"]);
+        // A default-remote setting that names no configured remote is not a
+        // destination; the unpublished path still resolves `origin`.
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(
+            repo.path(),
+            &["config", "checkout.defaultRemote", "--mirror"],
+        );
+        let [plain, _] = plan_plain_and_forced(&repo);
+        assert_eq!(plain.unwrap(), vec!["push", "-u", "origin", "main"]);
+    }
+
+    #[test]
+    fn a_detached_head_keeps_the_detached_refusal_whatever_the_branch_configuration_says() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(
+                err.contains("HEAD is detached"),
+                "{err}",
+                err = err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_configuration_plans_nothing() {
+        let (repo, _origin, _team) = two_remote_repo();
+        let config = repo.path().join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[branch \"main\"]\n\tremote = team\n\tmerge = refs/heads/main\n[bad\n");
+        std::fs::write(&config, text).unwrap();
+        for planned in plan_plain_and_forced(&repo) {
+            let err = planned.unwrap_err();
+            assert!(!err.message().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_config_read_separates_unset_from_empty_from_failed() {
+        let run = |code: i32, out: &str, err: &str, cancelled: bool| BoundedRun {
+            stdout: out.as_bytes().to_vec(),
+            stderr: err.as_bytes().to_vec(),
+            success: code == 0,
+            status_code: code,
+            signal: None,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled,
+        };
+        let key = "branch.main.remote";
+        assert_eq!(
+            config_get_outcome(key, run(0, "team\n", "", false)).unwrap(),
+            Some("team".into())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(0, "\n", "", false)).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            config_get_outcome(key, run(1, "", "", false)).unwrap(),
+            None
+        );
+        for failed in [
+            run(1, "", "error: invalid key: branch.main.re mote\n", false),
+            run(128, "", "fatal: bad config line 3\n", false),
+            run(139, "", "", false),
+            run(0, "team\n", "", true),
+        ] {
+            assert!(config_get_outcome(key, failed).is_err());
+        }
+    }
+
+    #[test]
+    fn an_upstream_read_that_cannot_run_is_undetermined_not_unconfigured() {
+        let missing = tempfile::TempDir::new().unwrap();
+        let err = branch_upstream(&missing.path().join("absent"), "main").unwrap_err();
+        assert!(
+            err.contains(PUSH_UPSTREAM_UNKNOWN),
+            "{err}",
+            err = err.message()
+        );
+        let (repo, _origin, _team) = two_remote_repo();
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Unconfigured
+        );
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let err = branch_upstream(repo.path(), "main").unwrap_err();
+        assert!(
+            err.contains("partly configured"),
+            "{err}",
+            err = err.message()
+        );
+        git_in(
+            repo.path(),
+            &["config", "branch.main.merge", "refs/heads/main"],
+        );
+        assert_eq!(
+            branch_upstream(repo.path(), "main").unwrap(),
+            BranchUpstream::Configured
+        );
+    }
+
+    #[test]
+    fn a_branch_named_alone_resolves_the_remote_its_own_configuration_names() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["config", "branch.main.remote", "team"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "team", "feat"]);
+        git_in(repo.path(), &["config", "--unset", "branch.main.remote"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("feat"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "feat"]);
+    }
+
+    #[test]
+    fn a_branch_named_alone_from_a_detached_head_still_plans() {
+        let (repo, _origin, _team) = two_remote_repo();
+        git_in(repo.path(), &["checkout", "-q", "--detach"]);
+        let argv = GitWriter::plan_push(&repo_path(&repo), None, Some("main"), false).unwrap();
+        assert_eq!(argv, vec!["push", "origin", "main"]);
     }
 
     #[test]
@@ -7754,7 +8574,7 @@ mod tests {
 
     /// Every `git config --get` child recorded for `repo` so far.
     fn config_get_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--get")
@@ -7800,7 +8620,7 @@ mod tests {
 
     /// Every `git config --list` child recorded for `repo` so far.
     fn config_list_spawns(repo: &std::path::Path) -> usize {
-        crate::engine::git_cli::spawn_log::spawns_in(repo)
+        crate::engine::process::spawn_log::spawns_in(repo)
             .iter()
             .filter(|argv| {
                 argv.iter().any(|arg| arg == "config") && argv.iter().any(|arg| arg == "--list")
@@ -8618,7 +9438,7 @@ mod tests {
                 .count()
         };
 
-        let (staged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (staged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()))
         });
         assert_eq!(staged_result.expect("stage").1, 300);
@@ -8629,7 +9449,7 @@ mod tests {
         );
         assert_eq!(staged(&dir), 300);
 
-        let (unstaged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (unstaged_result, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::change_index_with(&path, &files, IndexAction::Unstage, |_| Ok(()))
         });
         assert_eq!(unstaged_result.expect("unstage").1, 300);
@@ -8670,7 +9490,7 @@ mod tests {
             for file in &files {
                 std::fs::write(dir.path().join(file), "x\n").unwrap();
             }
-            let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
                 GitWriter::stage_files_attributed(&path, &files)
             });
             assert_eq!(outcomes.len(), count);
@@ -8693,7 +9513,7 @@ mod tests {
         for gone in [3usize, 17, 39] {
             std::fs::remove_file(dir.path().join(&files[gone])).unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         for (index, outcome) in outcomes.iter().enumerate() {
@@ -8723,7 +9543,7 @@ mod tests {
         let dir = init_repo_with_commit();
         let path = repo_path(&dir);
         let files: Vec<String> = (0..400).map(|i| format!("never-written-{i}.md")).collect();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_err));
@@ -8789,7 +9609,7 @@ mod tests {
         for file in &files {
             std::fs::write(dir.path().join(file), "x\n").unwrap();
         }
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
@@ -8812,7 +9632,7 @@ mod tests {
         }
         let lock = dir.path().join(".git/index.lock");
         std::fs::write(&lock, "").unwrap();
-        let (outcomes, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+        let (outcomes, labels) = crate::engine::process::spawn_labels_during(|| {
             GitWriter::stage_files_attributed(&path, &files)
         });
         std::fs::remove_file(&lock).unwrap();
@@ -9082,17 +9902,25 @@ mod bound_to_checked_state {
         let dir = repo_on("main");
         let p = dir.path();
         let c1 = commit_file(p, "a.txt");
-        commit_file(p, "b.txt");
+        let c2 = commit_file(p, "b.txt");
         let c3 = commit_file(p, "c.txt");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        // The plan covers all of c1..HEAD, so the refusal comes from the
+        // failed HEAD read and not from the plan check.
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_rebase_sequence(
                 p.to_str().unwrap(),
                 &c1,
-                &[RebaseStep {
-                    commit_id: c3.clone(),
-                    action: RebaseActionKind::Pick,
-                }],
+                &[
+                    RebaseStep {
+                        commit_id: c2.clone(),
+                        action: RebaseActionKind::Pick,
+                    },
+                    RebaseStep {
+                        commit_id: c3.clone(),
+                        action: RebaseActionKind::Pick,
+                    },
+                ],
             )
         });
 
@@ -9117,7 +9945,7 @@ mod bound_to_checked_state {
         commit_file(p, "m.txt");
         let main_tip = rev(p, "main");
 
-        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+        let result = crate::engine::process::with_forced_spawn_failure_of("symbolic-ref", || {
             GitWriter::execute_restack(p, "feature", "main", &main_tip)
         });
 
@@ -9373,6 +10201,136 @@ mod bound_to_checked_state {
             "pruning must write no .git/config"
         );
     }
+
+    /// A repository holding an expired snapshot 1 whose ref cannot be deleted:
+    /// a leftover `refs/gitpulse/ops/1.lock` makes `git update-ref -d` fail for
+    /// real, the way a concurrent or crashed git does. The next snapshot's
+    /// prune must evict snapshot 1, so it fails after the new ref is written.
+    fn repo_with_unprunable_expired_snapshot() -> (tempfile::TempDir, String) {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+        std::fs::write(p.join("file.txt"), "one\n").unwrap();
+        git_in(p, &["add", "--", "file.txt"]);
+        git_in(p, &["commit", "-q", "-m", "one"]);
+        let repo = p.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git commit --allow-empty -m old",
+            None,
+            None,
+            1_700_000_000_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("record the old snapshot");
+        std::fs::write(p.join(".git/refs/gitpulse/ops/1.lock"), b"").expect("plant ref lock");
+        (dir, repo)
+    }
+
+    #[test]
+    fn a_prune_failure_after_the_snapshot_ref_is_written_still_reports_the_snapshot() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+
+        let summary = GitWriter::record_op_snapshot_with_limits(
+            &repo,
+            "git rebase main",
+            None,
+            None,
+            crate::ledger::ids::now_millis(),
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("the snapshot exists once its ref is written, so the call succeeds");
+        assert_eq!(summary.seq, 2);
+        assert_eq!(summary.op_ref, "refs/gitpulse/ops/2");
+        let listed = GitWriter::list_op_snapshots(&repo, 50).expect("list snapshots");
+        let seqs: Vec<u64> = listed.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 1],
+            "the new ref exists; the locked one stayed"
+        );
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        let row = page
+            .events
+            .iter()
+            .find(|row| row.object.as_deref() == Some("refs/gitpulse/ops/2"))
+            .expect("the snapshot's own ledger row is written");
+        let detail = row.detail_json.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("\"prune_error\"") && detail.contains("refs/gitpulse/ops/1"),
+            "the row must carry the prune failure: {detail}"
+        );
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "an existing snapshot must not be logged as unsnapshotted"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn serve_op_record_answers_snapshotted_when_only_the_prune_failed() {
+        let (_dir, repo) = repo_with_unprunable_expired_snapshot();
+        let request = crate::desktop::instance::Request::RecordGitOp {
+            id: "op-1".to_string(),
+            cwd: repo.clone(),
+            command: "git reset --hard HEAD".to_string(),
+            session_id: None,
+            task_id: None,
+        };
+
+        let answer = GitWriter::serve_op_record(&request, Instant::now()).expect("served");
+        assert_eq!(answer["snapshotted"], true, "answer: {answer}");
+        assert_eq!(answer["seq"], 2);
+        assert_eq!(answer["op_ref"], "refs/gitpulse/ops/2");
+
+        let page = crate::ledger::query_readonly_page(
+            &repo,
+            &crate::ledger::EventQuery {
+                descending: true,
+                limit: 10,
+                ..Default::default()
+            },
+            64 * 1024,
+        )
+        .expect("query ledger")
+        .expect("ledger exists");
+        assert!(
+            page.events
+                .iter()
+                .all(|row| row.object.as_deref() != Some("unsnapshotted")),
+            "no unsnapshotted row for a snapshot that exists"
+        );
+        assert!(
+            page.events.iter().any(|row| {
+                row.object.as_deref() == Some("refs/gitpulse/ops/2")
+                    && row
+                        .detail_json
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("\"prune_error\"")
+            }),
+            "the prune failure is recorded on the snapshot's row"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9382,6 +10340,11 @@ mod adv_tests;
 #[cfg(test)]
 #[path = "git_writer_adv_l1_tests.rs"]
 mod adv_l1_tests;
+
+// Every case builds a `desktop::instance::Request`, which exists on macOS only.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "git_writer_op_deadline_tests.rs"]
+mod op_deadline_tests;
 
 #[cfg(test)]
 #[path = "git_writer_commit_graph_tests.rs"]

@@ -187,6 +187,7 @@ fn serve(
                             detached: false,
                             ending: false,
                             parent_session_id: None,
+                            quiet_ms: None,
                         })
                         .collect();
                     serde_json::to_value(sessions)
@@ -291,7 +292,7 @@ fn a_session_that_exited_is_no_longer_known() {
     let before = fake.calls();
 
     fake.end("term-live");
-    let held = || app.sessions.host.as_ref().unwrap().known_sessions();
+    let held = || app.sessions.host.known_sessions();
     let deadline = Instant::now() + Duration::from_secs(10);
     while held() > 0 {
         assert!(Instant::now() < deadline, "the exit was never recorded");
@@ -323,15 +324,15 @@ fn a_failed_first_listing_is_retried_in_the_background() {
     assert_eq!(fake.accepts(), 2, "one failed connection, one retry");
 }
 
-/// With the sessions in this process there is no host to ask, and no connection
-/// to wait on: the registry answers from its own map.
+/// An unconnected host client holds no session list and vouches for nothing,
+/// without dialing or spawning the host on a hot check.
 #[test]
-fn an_in_process_registry_knows_only_what_it_holds() {
-    let app = tauri::test::mock_builder().build(crate::context()).unwrap();
-    app.manage(TerminalSessions::default());
-    let host = crate::workbench::notifications::session_host(app.handle());
-    assert!(!host.knows("term-live"));
-    assert!(!host.knows(""));
+fn an_unconnected_host_registry_vouches_for_nothing_until_it_lists() {
+    let fake = FakeHost::start();
+    let app = fixture(&fake);
+    assert!(!app.host.knows("term-live"));
+    assert!(!app.host.knows(""));
+    assert_eq!(fake.accepts(), 0);
 }
 
 /// A connection that was marked closed by a failed write is not yet known to
@@ -344,7 +345,7 @@ fn a_new_connection_does_not_inherit_the_old_listing_when_its_own_fails() {
     let app = fixture(&fake);
     app.sessions.connect_host().unwrap();
     assert!(app.host.knows("term-live"));
-    let client = app.sessions.host.clone().unwrap();
+    let client = app.sessions.host.clone();
 
     // Closed as a failed write closes it: no shutdown, so the reader never wakes.
     client
@@ -375,7 +376,7 @@ fn delivered_exits_are_not_vouched_for_while_their_recording_is_pending() {
     *fake.listed.lock().unwrap() = ids.clone();
     let app = fixture(&fake);
     app.sessions.connect_host().unwrap();
-    let client = app.sessions.host.clone().unwrap();
+    let client = app.sessions.host.clone();
     let conn = client.inner.current().unwrap();
     let before = *lock(&conn.delivered);
 
@@ -427,5 +428,95 @@ fn timing_knows_against_the_list_it_replaced() {
             samples[samples.len() / 2],
             samples[samples.len() - 1]
         );
+    }
+}
+
+/// When the app cannot resolve a host socket directory, `HostClient::unavailable`
+/// fails closed with the configuration reason and surfaces it in `trouble()`.
+#[test]
+fn unavailable_host_client_fails_closed_and_reports_reason() {
+    let client = HostClient::unavailable(
+        "The terminal host has no directory: missing AppData".to_owned(),
+        Default::default(),
+        Default::default(),
+    );
+    assert_eq!(
+        client.trouble(),
+        vec!["The terminal host has no directory: missing AppData".to_owned()]
+    );
+    let err = client.connect().unwrap_err();
+    assert!(
+        err.contains("missing AppData"),
+        "expected unavailable reason in connect error, got: {err}"
+    );
+}
+
+/// Detach and shutdown on a cold host client (no live connection and no socket
+/// file on disk) return cleanly without trying to start or spawn a host.
+#[test]
+fn cold_detach_and_shutdown_do_not_spawn_host_when_socket_absent() {
+    let dir = tempfile::Builder::new()
+        .prefix("ph")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starts_seen = starts.clone();
+    let client = HostClient::for_unit_test_with_shared_state(
+        HostConfig {
+            dir: dir.path().to_path_buf(),
+            binary: None,
+            idle_exit: None,
+            log_dir: None,
+        },
+        Default::default(),
+        Default::default(),
+        move |_| {
+            starts_seen.fetch_add(1, Ordering::AcqRel);
+            Err("starter must not be called when host is cold".to_owned())
+        },
+    );
+    assert_eq!(client.detach_all(), Ok(0));
+    assert_eq!(client.stop_all(), Ok(()));
+    assert_eq!(starts.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn failed_host_start_records_trouble_for_every_launch_error() {
+    let dir = tempfile::Builder::new()
+        .prefix("ph")
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    let client = HostClient::new(HostConfig {
+        dir: dir.path().to_path_buf(),
+        binary: Some("/nonexistent/gitpulse-ptyd".into()),
+        idle_exit: None,
+        log_dir: None,
+    });
+    let err = client.connect().unwrap_err();
+    assert!(
+        err.contains("/nonexistent/gitpulse-ptyd"),
+        "expected missing binary path in connect error, got: {err}"
+    );
+    let trouble = client.trouble();
+    assert!(
+        !trouble.is_empty()
+            && trouble
+                .iter()
+                .any(|t| t.contains("/nonexistent/gitpulse-ptyd")),
+        "expected trouble to record missing binary launch failure, got: {trouble:?}"
+    );
+}
+
+#[test]
+fn rapid_disconnect_and_relaunch_never_refuses_successor_as_duplicate_window() {
+    let sessions = TerminalSessions::default();
+    let config = sessions.host.config().clone();
+    sessions.connect_host().unwrap();
+    sessions.disconnect_host();
+    for round in 0..25 {
+        let next = HostClient::new(config.clone());
+        next.connect()
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
+        next.disconnect();
     }
 }

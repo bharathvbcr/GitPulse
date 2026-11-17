@@ -16,6 +16,7 @@ mod merge_tree_adversarial_tests;
 mod merge_tree_tests;
 pub mod object_quarantine;
 pub mod portless;
+pub mod process;
 pub mod provenance;
 pub mod ref_cache;
 pub mod remotes;
@@ -25,6 +26,7 @@ pub mod stash;
 pub mod submodules;
 pub mod text_shape;
 pub mod tuning_apply;
+pub mod turn_checkpoint;
 pub mod worktree;
 #[cfg(all(test, unix))]
 mod worktree_family_adversarial_tests;

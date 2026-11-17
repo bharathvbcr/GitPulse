@@ -14,11 +14,13 @@ import {
   effectiveMode,
   isLiveRunLimit,
   isPermissionMode,
+  keepsTerminalsRunning,
   liveRunLimit,
   requiresAcknowledgement,
   canonicalSettingSources,
   sanitizeAgentDefaults,
   settingSources,
+  withKeepTerminalsRunning,
   type AgentDefaults,
 } from "./agentDefaults";
 import { readFileSync } from "node:fs";
@@ -209,5 +211,39 @@ describe("Claude settings sources", () => {
     expect(settingSources(narrowed)).toEqual(["user", "local"]);
     // Every source chosen is the CLI's default, stored as absence.
     expect(sanitizeAgentDefaults({ permission: {}, claude_setting_sources: ["user", "project", "local"] })).toEqual({ permission: {} });
+  });
+});
+
+describe("keep_terminals_running (managed runs)", () => {
+  it("defaults to enabled when absent and stores on as absence", () => {
+    expect(keepsTerminalsRunning({ permission: {} })).toBe(true);
+    expect(keepsTerminalsRunning({ permission: {}, keep_terminals_running: true })).toBe(true);
+    expect(keepsTerminalsRunning({ permission: {}, keep_terminals_running: false })).toBe(false);
+
+    const optedOut = withKeepTerminalsRunning({ permission: { claude: "edit" } }, false);
+    expect(optedOut).toEqual({ permission: { claude: "edit" }, keep_terminals_running: false });
+    expect(keepsTerminalsRunning(optedOut)).toBe(false);
+
+    const restored = withKeepTerminalsRunning(optedOut, true);
+    expect(restored).toEqual({ permission: { claude: "edit" } });
+    expect("keep_terminals_running" in restored).toBe(false);
+    expect(keepsTerminalsRunning(restored)).toBe(true);
+  });
+
+  it("drops a non-boolean stored value alone without dropping sibling defaults", () => {
+    for (const bad of ["yes", "false", 1, 0, null, {}, []]) {
+      const sanitized = sanitizeAgentDefaults({
+        permission: { claude: "edit" },
+        max_live_runs: 12,
+        keep_terminals_running: bad,
+      });
+      expect(sanitized).toEqual({ permission: { claude: "edit" }, max_live_runs: 12 });
+      expect("keep_terminals_running" in sanitized).toBe(false);
+      expect(keepsTerminalsRunning(sanitized)).toBe(true);
+    }
+    expect(sanitizeAgentDefaults({ permission: {}, keep_terminals_running: false })).toEqual({
+      permission: {},
+      keep_terminals_running: false,
+    });
   });
 });

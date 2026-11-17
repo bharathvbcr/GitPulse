@@ -35,7 +35,11 @@ export type DeadbranchSeverity = "fresh" | "moderate" | "stale";
 
 export interface StaleBranchInfo {
   name: string;
+  /** `refs/heads/x` or `refs/remotes/<remote>/x`: how a cleanup names this branch. */
+  full_ref: string;
   short_name: string;
+  /** The remote a remote-tracking branch belongs to; null for a local branch. */
+  remote_name: string | null;
   age_days: number;
   severity: DeadbranchSeverity;
   is_merged: boolean;
@@ -394,6 +398,8 @@ export interface WorktreeCreated {
   low_disk?: LowDisk | null;
   /** The volume's free space could not be read, so nothing is known to be plentiful. */
   disk_unknown?: boolean;
+  /** A Cargo target was not cloned because the build-cache clone budget was reached; advice. */
+  clone_budget?: string;
   /** A `post_create` hook failed, timed out, or was refused. */
   hook_error: string | null;
   /** Hooks were asked for but the repository's file was not approved, so none ran. */
@@ -412,6 +418,7 @@ export interface WorktreeCreated {
 export function worktreeSetupNotices(
   done: {
     cache_error?: string | null;
+    clone_budget?: string | null;
     hook_error?: string | null;
     hook_notice?: string | null;
     worktree_removed?: boolean;
@@ -435,6 +442,7 @@ export function worktreeSetupNotices(
     notices.push(`Merged and the worktree was removed, but the branch was kept: ${done.branch_error ?? "no reason was given"}`);
   }
   if (done.cache_error) notices.push(`The worktree was created, but its build caches were not copied: ${done.cache_error}`);
+  if (when === "create" && done.clone_budget) notices.push(done.clone_budget);
   if (done.hook_error) {
     notices.push(when === "create"
       ? `The worktree was created, but its post-create hook did not finish, so it may not be set up: ${done.hook_error}`

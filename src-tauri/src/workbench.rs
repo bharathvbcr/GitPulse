@@ -36,6 +36,7 @@ mod reconcile;
 pub(crate) mod retention;
 pub mod review;
 mod send_to_agent;
+pub(crate) mod store_probe;
 mod suggest;
 pub mod terminal_command;
 mod terminal_launch;
@@ -198,16 +199,28 @@ impl WorkbenchState {
     /// server, a shell sitting in the directory has no row, and with no
     /// workbench profile there are no rows to read. A process table that
     /// cannot be read refuses: it is not "nobody is there".
+    ///
+    /// The MCP teardowns (`gitpulse_worktree_prune`, the merge teardown) ask
+    /// the same process scan, `procscan::processes_using`, through
+    /// `engine::worktree::live_process_refusal`, and additionally refuse a lane
+    /// claim and an attributed live session (`engine::worktree::agent_hold`).
+    /// This path does not: the person's remove dialog is the confirmation an
+    /// MCP call has no channel for, and a stale claim must not make the app
+    /// unable to remove a worktree.
     pub(crate) fn refuse_if_in_use(&self, worktree_path: &str) -> Result<(), String> {
         self.refuse_if_run_working_in(worktree_path)?;
         let target = std::path::Path::new(worktree_path);
         let target = target
             .canonicalize()
             .unwrap_or_else(|_| target.to_path_buf());
-        match crate::terminal::foreground::working_in(&target) {
+        // Working directory, executable, arguments and environment: a build
+        // run with `--target-dir` inside the worktree from elsewhere has no
+        // process "working in" it. A process of the user's that cannot be read
+        // refuses, as an unreadable table does.
+        match crate::sysload::procscan::processes_using(&target) {
             Ok(pids) if pids.is_empty() => Ok(()),
             Ok(pids) => Err(format!(
-                "{} still working in this worktree ({}). Close {} before removing the worktree.",
+                "{} still using this worktree ({}). Close {} before removing the worktree.",
                 if pids.len() == 1 { "A process is" } else { "Processes are" },
                 crate::terminal::foreground::describe_pids(&pids),
                 if pids.len() == 1 { "it" } else { "them" },
@@ -1400,6 +1413,7 @@ pub async fn cmd_inbox_decompose_task(
             });
             let bus_msg = crate::engine::agent_bus::post_thread_message(
                 &repo_path,
+                crate::engine::agent_bus::MessageOrigin::Person,
                 "developer",
                 assign_agent.as_deref(),
                 Some(&thread_key),

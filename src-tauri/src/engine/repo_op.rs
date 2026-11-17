@@ -1307,7 +1307,7 @@ mod tests {
         // Plain, not `canonicalize`: `linked` is handed to git as an argument,
         // and git cannot create a worktree at a `\\?\` path.
         let plain =
-            |path: &std::path::Path| crate::engine::git_cli::canonicalize_plain(path).unwrap();
+            |path: &std::path::Path| crate::engine::process::canonicalize_plain(path).unwrap();
         let root = plain(main.path());
         git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
         let holder = tempfile::tempdir().unwrap();
@@ -1378,7 +1378,7 @@ mod tests {
         assert!(detect(&root).unwrap().is_none());
         // The log is keyed by working directory and this repository is fresh,
         // so nothing a concurrent test spawns can land here.
-        let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
+        let spawned = crate::engine::process::spawn_log::spawns_in(&root);
         assert!(spawned.is_empty(), "spawned: {spawned:?}");
     }
 
@@ -1407,10 +1407,10 @@ mod tests {
             } else {
                 0
             };
-            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let before = crate::engine::process::spawn_log::spawns_in(&root).len();
             let kind = detect_kind(&root).unwrap();
             assert_eq!(
-                crate::engine::git_cli::spawn_log::spawns_in(&root).len(),
+                crate::engine::process::spawn_log::spawns_in(&root).len(),
                 before + allowed,
                 "{probe}: reading the kind started the wrong number of processes"
             );

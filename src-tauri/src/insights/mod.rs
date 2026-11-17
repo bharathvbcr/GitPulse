@@ -32,10 +32,14 @@ pub use entity_collision::{
     classify_incoming, classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind,
     EntityCollisionVerdict, IncomingEdit, LineRange, OldSideHunk,
 };
+pub use live_sessions::{
+    sessions, AppStateFacet, SessionRow, SessionsReport, DEFAULT_SESSIONS_CAP,
+};
 
 use crate::codeintel::{self, CodeintelStatus};
-use crate::engine::git_cli::{current_admission, git_text, with_admission};
+use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
+use crate::engine::process::{current_admission, with_admission};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
 use crate::engine::worktree::{self, agent_layout, changed_paths_within, StatusRead, WorktreeInfo};
@@ -153,6 +157,12 @@ pub struct LiveSession {
     /// in the parent checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry_cwd: Option<String>,
+    /// Kernel-reported start time in microseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_us: Option<u64>,
+    /// True when this session is an ancestor of the process answering the query.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_caller: bool,
     /// Internal classification flag from `procscan` (`true` for IDE processes,
     /// `false` for CLI processes like `agy` / `claude`).
     #[serde(skip)]
@@ -191,7 +201,7 @@ pub struct LiveWorktree {
 }
 
 /// What one agent kind's detector established for this repository.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveKindStatus {
     pub kind: String,
     /// Whether this kind's sessions could be observed at all. `sessions: 0`
@@ -607,7 +617,7 @@ pub const RETRY_AFTER_FIELD: &str = "retry_after_ms";
 /// budget refills at a fixed rate, so this is derived from it rather than
 /// guessed; it is a floor, not a promise that the next attempt is admitted.
 pub fn deferral_retry_after_ms() -> u64 {
-    let (_burst, per_sec) = crate::engine::git_cli::production_spawn_rate();
+    let (_burst, per_sec) = crate::engine::process::production_spawn_rate();
     1000u64.div_ceil(u64::from(per_sec.max(1)))
 }
 
@@ -627,13 +637,13 @@ fn is_deferral_segment(segment: &str) -> bool {
         }
         _ => segment,
     };
-    crate::engine::git_cli::is_deferred_under_load(refusal)
-        || crate::engine::git_cli::is_deferred_under_load(segment)
+    crate::engine::process::is_deferred_under_load(refusal)
+        || crate::engine::process::is_deferred_under_load(segment)
 }
 
 /// True when `value` is a string the spawn gate's deferral wording (or the
 /// ledger's typed `deferred_worktree` code) produced. One predicate for the
-/// whole seam: [`crate::engine::git_cli::is_deferred_under_load`].
+/// whole seam: [`crate::engine::process::is_deferred_under_load`].
 fn is_deferral_text(value: &serde_json::Value) -> bool {
     value.as_str().is_some_and(|text| {
         text == crate::ledger::bindings::DEFERRED_WORKTREE
@@ -1052,6 +1062,13 @@ pub(crate) const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 /// and code graph. Individual facets fail independently.
 pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
     snapshot_within(repo_path, SNAPSHOT_DEADLINE, MAX_SNAPSHOT_WORKTREES)
+}
+
+/// [`snapshot`] bounded by `deadline` instead of [`SNAPSHOT_DEADLINE`], for a
+/// caller whose own budget is shorter (such as `SessionStart` after waiting on
+/// a slow app).
+pub(crate) fn snapshot_bounded(repo_path: &str, deadline: Duration) -> InsightsSnapshot {
+    snapshot_within(repo_path, deadline, MAX_SNAPSHOT_WORKTREES)
 }
 
 /// [`snapshot`] with the deadline and the worktree cap as arguments, so both
@@ -3184,7 +3201,7 @@ mod tests {
         }
         let count = |dirs: &[std::path::PathBuf]| -> usize {
             dirs.iter()
-                .map(|d| crate::engine::git_cli::spawn_log::spawns_in(d).len())
+                .map(|d| crate::engine::process::spawn_log::spawns_in(d).len())
                 .sum()
         };
         for round in 0..3 {
@@ -3203,7 +3220,7 @@ mod tests {
         }
         let mut by_argv: std::collections::BTreeMap<String, usize> = Default::default();
         for d in &dirs {
-            for argv in crate::engine::git_cli::spawn_log::spawns_in(d) {
+            for argv in crate::engine::process::spawn_log::spawns_in(d) {
                 *by_argv
                     .entry(argv.join(" ").chars().take(70).collect())
                     .or_default() += 1;
@@ -3665,7 +3682,7 @@ mod tests {
     fn a_snapshot_under_a_forced_deferral_marks_every_failed_facet_deferred() {
         let main = init_repo();
         let repo = main.path().to_str().unwrap();
-        let mut wire = crate::engine::git_cli::with_forced_deferral(|| json!(snapshot(repo)));
+        let mut wire = crate::engine::process::with_forced_deferral(|| json!(snapshot(repo)));
         assert!(mark_deferrals(&mut wire), "{wire}");
 
         let mut failed = Vec::new();
@@ -3736,7 +3753,7 @@ mod tests {
     /// tokens a second is one every 125 ms.
     #[test]
     fn the_retry_hint_is_one_refill_interval_of_the_spawn_budget() {
-        let (_, per_sec) = crate::engine::git_cli::production_spawn_rate();
+        let (_, per_sec) = crate::engine::process::production_spawn_rate();
         assert_eq!(
             deferral_retry_after_ms(),
             1000u64.div_ceil(u64::from(per_sec))
@@ -5908,7 +5925,7 @@ mod tests {
         fs::write(cwds[1].join("shared.txt"), "agent-edit").unwrap();
         let measured = |cwds: &[std::path::PathBuf]| {
             cwds.iter()
-                .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+                .flat_map(|cwd| crate::engine::process::spawn_log::spawns_in(cwd))
                 .filter(|argv| {
                     argv.iter()
                         .any(|arg| arg == "--shortstat" || arg == "rev-list" || arg == "--verify")
@@ -5983,8 +6000,8 @@ mod tests {
     /// spelled to the spawn.
     fn status_spawns_in(
         dir: &std::path::Path,
-    ) -> Vec<(Vec<String>, crate::engine::git_cli::Admission)> {
-        crate::engine::git_cli::spawn_log::classed_spawns_in(dir)
+    ) -> Vec<(Vec<String>, crate::engine::process::Admission)> {
+        crate::engine::process::spawn_log::classed_spawns_in(dir)
             .into_iter()
             .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
             .collect()
@@ -6034,7 +6051,7 @@ mod tests {
     /// statuses competed as refresh traffic.
     #[test]
     fn the_collision_scan_keeps_the_callers_admission_class() {
-        use crate::engine::git_cli::{with_admission, Admission};
+        use crate::engine::process::{with_admission, Admission};
         let (main, _parent, linked) = repo_with_linked_worktrees(10);
         let root = main.path().canonicalize().unwrap();
         let risk = with_admission(Admission::Background, || {
@@ -6075,7 +6092,7 @@ mod tests {
         let git_dir = fs::read_to_string(parked.join(".git")).unwrap();
         let git_dir = std::path::PathBuf::from(git_dir.trim().trim_start_matches("gitdir: "));
         fs::write(git_dir.join("MERGE_HEAD"), head).unwrap();
-        let before = crate::engine::git_cli::spawn_log::spawns_in(parked).len();
+        let before = crate::engine::process::spawn_log::spawns_in(parked).len();
 
         let snap = snapshot(root.to_str().unwrap());
         let row = snap
@@ -6088,7 +6105,7 @@ mod tests {
         assert!(row.operation_ok, "{row:?}");
         assert_eq!(snap.worktrees.blocked, 1, "{:?}", snap.worktrees);
 
-        let beyond_status: Vec<_> = crate::engine::git_cli::spawn_log::spawns_in(parked)
+        let beyond_status: Vec<_> = crate::engine::process::spawn_log::spawns_in(parked)
             .into_iter()
             .skip(before)
             .filter(|argv| !argv.iter().any(|arg| arg == "status"))

@@ -29,7 +29,7 @@
  */
 /**
  * The reads that accept a `requestId`, so the backend can stop one whose
- * callers have all gone (`engine/git_cli/read_cancel.rs`).
+ * callers have all gone (`engine/process/read_cancel.rs`).
  *
  * Only reads a newer click really supersedes and whose git child runs long
  * enough for the kill to matter: the graph window and the commit, compare and

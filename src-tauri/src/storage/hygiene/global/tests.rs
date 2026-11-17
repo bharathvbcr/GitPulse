@@ -1,14 +1,16 @@
 use super::{
     eligible_candidates, Cleaner, CleanerCandidate, CleanerConfig, CleanerRun, Saved, VERSION,
 };
+use crate::procguard::LockedSpawn;
 use crate::storage::hygiene::discovery;
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 fn fixture() -> (tempfile::TempDir, Arc<Cleaner>, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
+    let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
     let code = root.join("code");
     fs::create_dir(&code).unwrap();
     let cleaner = Arc::new(Cleaner::new(root.join("state")));
@@ -143,7 +145,7 @@ fn discovery_deduplicates_overlapping_roots_preserves_exclusions_and_finds_close
 #[test]
 fn discovery_accepts_a_repo_whose_validate_repo_root_is_verbatim() {
     let (_temp, _cleaner, root) = fixture();
-    let walked = crate::engine::git_cli::canonicalize_plain(&repo(&root, "a")).unwrap();
+    let walked = crate::engine::process::canonicalize_plain(&repo(&root, "a")).unwrap();
     let validated = crate::engine::git_cli::validate_repo(walked.to_str().unwrap()).unwrap();
     #[cfg(windows)]
     {
@@ -204,6 +206,8 @@ fn restart_reports_unfinished_history_as_interrupted_without_replaying_it() {
                 partial: false,
                 issues: vec![],
                 items: vec![],
+                unlisted: 0,
+                unexamined: 0,
             });
             Ok(())
         })
@@ -239,6 +243,67 @@ fn a_disabled_or_future_schedule_cannot_start_or_mutate_history() {
         .is_err());
     assert!(!cleaner.active.load(std::sync::atomic::Ordering::SeqCst));
 }
+/// A due scheduled run held back for the host says so in the status the panel
+/// reads: the reason while it waits, nothing once the run starts, the schedule
+/// is no longer due, or it is disabled. In memory only.
+#[cfg(unix)]
+#[test]
+fn a_waiting_scheduled_run_says_why_and_stops_saying_it_when_it_stops_waiting() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, root) = fixture();
+    let now = crate::storage::hygiene::now();
+    let mut c = config(&cleaner, &root);
+    c.enabled = true;
+    c.next_run_at = now;
+    cleaner.save(c).unwrap();
+    let reason = "the kernel reports memory pressure";
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    let waiting = cleaner.state().unwrap();
+    assert_eq!(waiting.scheduled_wait.as_deref(), Some(reason));
+    assert!(waiting.history.is_empty(), "nothing started");
+    // Not persisted: a second handle on the same directory does not see it.
+    assert_eq!(
+        Cleaner::new(cleaner.dir.clone())
+            .state()
+            .unwrap()
+            .scheduled_wait,
+        None
+    );
+
+    // No longer due (the person moved the schedule): it is not "due and waiting".
+    let mut later = cleaner.state().unwrap().config;
+    later.next_run_at = now + 3600;
+    cleaner.save(later).unwrap();
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    // Due again and waiting, then disabled.
+    let mut due = cleaner.state().unwrap().config;
+    due.next_run_at = now;
+    cleaner.save(due).unwrap();
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert!(cleaner.state().unwrap().scheduled_wait.is_some());
+    let mut off = cleaner.state().unwrap().config;
+    off.enabled = false;
+    cleaner.save(off).unwrap();
+    assert_eq!(cleaner.state().unwrap().scheduled_wait, None);
+
+    // Due and waiting, then the host clears: the run starts and the reason goes.
+    let mut on = cleaner.state().unwrap().config;
+    on.enabled = true;
+    on.next_run_at = now;
+    cleaner.save(on).unwrap();
+    cleaner.clock_tick(Some(reason.into()), false, now);
+    assert!(cleaner.state().unwrap().scheduled_wait.is_some());
+    cleaner.clock_tick(None, false, now);
+    let started = wait(&cleaner);
+    assert_eq!(started.scheduled_wait, None);
+    assert_eq!(started.history.len(), 1, "the run started: {started:?}");
+}
+
 #[cfg(not(unix))]
 #[test]
 fn enabled_schedules_are_refused_on_this_platform() {
@@ -339,6 +404,8 @@ fn a_worker_finishing_during_a_status_read_is_never_reported_interrupted() {
                 partial: false,
                 issues: vec![],
                 items: vec![],
+                unlisted: 0,
+                unexamined: 0,
             });
             Ok(())
         })
@@ -458,7 +525,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("execution-state"),
     );
@@ -509,6 +576,8 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -696,6 +765,8 @@ fn policy_edits_inside_the_execution_gate_preserve_real_artifacts() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -742,6 +813,8 @@ fn incomplete_discovery_blocks_every_mutation() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     assert!(cleaner
         .perform_with_gate(&saved.config, &mut run, |_, _, _| panic!(
@@ -872,6 +945,10 @@ fn an_incomplete_repository_does_not_veto_the_complete_ones() {
         path: path.into(),
         provider: "cargo".into(),
         bytes: 1,
+        scope: super::SCOPE_REPOSITORY.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: Vec::new(),
     };
     let candidates = vec![
         candidate("/w/trusted", "target"),
@@ -905,6 +982,10 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
         path: "target".into(),
         provider: "cargo".into(),
         bytes: 1,
+        scope: super::SCOPE_REPOSITORY.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: Vec::new(),
     }];
     let incomplete = ["/w/untrusted".to_string()].into_iter().collect();
     let (eligible, skipped) = eligible_candidates(candidates, &incomplete);
@@ -962,7 +1043,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("mixed-state"),
     );
@@ -1023,6 +1104,8 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1141,7 +1224,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("inside-state"),
     );
@@ -1208,6 +1291,8 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1295,7 +1380,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("truncated-state"),
     );
@@ -1396,6 +1481,8 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1451,7 +1538,7 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
-        crate::engine::git_cli::canonicalize_plain(temp.path())
+        crate::engine::process::canonicalize_plain(temp.path())
             .unwrap()
             .join("all-unread-state"),
     );
@@ -1483,6 +1570,8 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
         partial: false,
         issues: vec![],
         items: vec![],
+        unlisted: 0,
+        unexamined: 0,
     };
     cleaner
         .update(|s| {
@@ -1509,4 +1598,2539 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
         r.join("__pycache__/module.pyc").is_file(),
         "and the tree survives on disk"
     );
+}
+
+/// A committed repository holding one aged, ignored `__pycache__` per entry of
+/// `dirs` ("" for the repository root), each `bytes` long.
+#[cfg(unix)]
+fn aged_bytecode_repo(
+    root: &std::path::Path,
+    name: &str,
+    dirs: &[&str],
+    bytes: usize,
+) -> std::path::PathBuf {
+    let r = repo(root, name);
+    fs::write(r.join(".gitignore"), "__pycache__/\n").unwrap();
+    fs::write(r.join("source.py"), "print('preserve')").unwrap();
+    crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+    crate::engine::git_cli::git_text(
+        &r,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )
+    .unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+    for dir in dirs {
+        let cache = r.join(dir).join("__pycache__");
+        fs::create_dir_all(&cache).unwrap();
+        let file = cache.join("module.pyc");
+        fs::write(&file, vec![b'x'; bytes]).unwrap();
+        for p in [file, cache] {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+    }
+    r
+}
+
+/// A journaled, running history entry for `perform_with_gate` to fill.
+fn journaled_run(cleaner: &Cleaner, id: &str) -> CleanerRun {
+    let run = CleanerRun {
+        id: id.into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+        unlisted: 0,
+        unexamined: 0,
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    run
+}
+
+/// Measured 2026-11-14: twenty consecutive scheduled runs reclaimed nothing,
+/// each one filled to `max_targets` with refused rows. A refused candidate is
+/// not an attempted removal, so it must not use up the run's target count.
+#[cfg(unix)]
+#[test]
+fn refused_candidates_do_not_use_up_the_target_count() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("refusals-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    // Larger trees sort first, so the two dirty repositories are reached
+    // before the clean one.
+    for name in ["dirty-a", "dirty-b"] {
+        let r = aged_bytecode_repo(&root, name, &[""], 4096);
+        fs::write(r.join("source.py"), "print('edited')").unwrap();
+    }
+    let clean = aged_bytecode_repo(&root, "clean", &[""], 100);
+    let mut c = config(&cleaner, &root);
+    c.max_targets = 1;
+    let saved = cleaner.save(c).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "refusals-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+
+    assert!(
+        !clean.join("__pycache__").exists(),
+        "the clean repository's output is removed: {run:?}"
+    );
+    for name in ["dirty-a", "dirty-b"] {
+        assert!(root.join(name).join("__pycache__/module.pyc").is_file());
+    }
+    assert_eq!(
+        run.items.iter().filter(|r| r.status == "completed").count(),
+        1,
+        "{run:?}"
+    );
+    assert_eq!(
+        run.items
+            .iter()
+            .filter(|r| r.message.contains("uncommitted work"))
+            .count(),
+        2,
+        "{run:?}"
+    );
+}
+
+/// Once refused rows stop counting against `max_targets`, one run can refuse
+/// hundreds of candidates. `read` refuses a history holding a run of more than
+/// `MAX_RUN_ITEMS` rows, so an unbounded list would make every later run fail.
+#[cfg(unix)]
+#[test]
+fn a_run_of_many_refusals_keeps_its_history_readable_and_counts_what_it_did_not_list() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("many-refusals-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.quiet_override = Some(|_| Err("Repository has active task leases".into()));
+    let cleaner = Arc::new(service);
+    let dirs: Vec<String> = (0..50).map(|i| format!("pkg{i:02}")).collect();
+    let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    for name in ["r1", "r2", "r3"] {
+        aged_bytecode_repo(&root, name, &dirs, 100);
+    }
+    let mut c = config(&cleaner, &root);
+    c.max_targets = 20;
+    let saved = cleaner.save(c).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "many-refusals-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| {
+            panic!("a refused repository is never gated")
+        })
+        .unwrap();
+
+    assert_eq!(run.items.len(), 80, "room is kept for 20 attempts");
+    assert_eq!(run.unlisted, 70, "150 refusals, 80 listed");
+    assert!(run.items.iter().all(|r| r.status == "skipped"));
+    assert!(
+        run.issues.iter().any(|i| i.contains("70 more")),
+        "{:?}",
+        run.issues
+    );
+    cleaner.record(&run).unwrap();
+    cleaner
+        .read()
+        .expect("the saved history stays readable after the run");
+}
+
+/// A check the host-load governor refused, typed as the spawn gate types it.
+fn shed() -> crate::ipc_error::CommandError {
+    crate::ipc_error::CommandError::typed(
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        "git status deferred under load after 0.000s: reactive work is shed while the host is under memory pressure",
+    )
+}
+
+/// Measured 2026-11-14: 14 of 20 rows read "skipped ... deferred under load".
+/// A check that never ran is not a refusal, and must not read like one.
+#[cfg(unix)]
+#[test]
+fn a_check_the_host_shed_is_reported_unexamined_not_skipped() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("shed-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.quiet_override = Some(|repo| {
+        if repo.ends_with("/loaded") {
+            Err(shed())
+        } else {
+            super::quiet_repo(repo)
+        }
+    });
+    let cleaner = Arc::new(service);
+    let loaded = aged_bytecode_repo(&root, "loaded", &[""], 4096);
+    let calm = aged_bytecode_repo(&root, "calm", &[""], 100);
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "shed-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+
+    let row = run
+        .items
+        .iter()
+        .find(|r| r.repo_path.ends_with("/loaded"))
+        .expect("the shed candidate has a row");
+    assert_eq!(row.status, "unexamined", "{row:?}");
+    assert!(row.message.starts_with("Could not examine"), "{row:?}");
+    assert_eq!(run.unexamined, 1);
+    assert!(loaded.join("__pycache__/module.pyc").is_file());
+    assert!(!calm.join("__pycache__").exists(), "{run:?}");
+}
+
+static SHED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A host that sheds a check briefly is asked again within the same run
+/// instead of leaving the tree for a whole interval.
+#[cfg(unix)]
+#[test]
+fn a_briefly_shed_check_is_asked_again_within_the_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("brief-shed-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    SHED_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    service.quiet_override = Some(|repo| {
+        if SHED_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            Err(shed())
+        } else {
+            super::quiet_repo(repo)
+        }
+    });
+    let cleaner = Arc::new(service);
+    let r = aged_bytecode_repo(&root, "only", &[""], 100);
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "brief-shed-run");
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |_, _, _| Ok(()))
+        .unwrap();
+    assert!(!r.join("__pycache__").exists(), "{run:?}");
+    assert_eq!(run.unexamined, 0, "{run:?}");
+    assert!(SHED_CALLS.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+}
+
+/// A shed run brings an enabled schedule forward, backing off, and gives up
+/// after `MAX_DEFERRAL_RETRIES` in a row; a run that examined everything
+/// resets the count.
+#[cfg(unix)]
+#[test]
+fn a_shed_run_brings_the_schedule_forward_with_a_bounded_backoff() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, root) = fixture();
+    let now = crate::storage::hygiene::now();
+    let mut c = config(&cleaner, &root);
+    c.enabled = true;
+    c.interval_hours = 24;
+    c.next_run_at = now + 86_400;
+    let saved = cleaner.save_with_background(c, |_| Ok(())).unwrap();
+    let ran_with = saved.config;
+    let mut run = journaled_run(&cleaner, "shed-schedule-run");
+    run.unexamined = 3;
+    for step in 0..super::MAX_DEFERRAL_RETRIES {
+        // Each attempt is judged against the policy it ran with.
+        let current = cleaner.state().unwrap().config;
+        let mut ran = ran_with.clone();
+        ran.revision = current.revision;
+        let moved = cleaner
+            .retry_sooner_after_shedding(&ran, &run, now)
+            .unwrap();
+        let delay = super::DEFERRAL_RETRY_FIRST_SECS << step;
+        assert_eq!(
+            moved,
+            Some(now + delay).filter(|at| *at < current.next_run_at)
+        );
+    }
+    let current = cleaner.state().unwrap().config;
+    assert_eq!(current.next_run_at, now + super::DEFERRAL_RETRY_FIRST_SECS);
+    let mut ran = ran_with.clone();
+    ran.revision = current.revision;
+    assert_eq!(
+        cleaner
+            .retry_sooner_after_shedding(&ran, &run, now)
+            .unwrap(),
+        None,
+        "a host that stays loaded falls back to the interval"
+    );
+    assert_eq!(
+        cleaner.read().unwrap().deferral_retries,
+        super::MAX_DEFERRAL_RETRIES
+    );
+    run.unexamined = 0;
+    cleaner
+        .retry_sooner_after_shedding(&ran, &run, now)
+        .unwrap();
+    assert_eq!(cleaner.read().unwrap().deferral_retries, 0);
+    // A policy edited since the run is never moved by it.
+    run.unexamined = 1;
+    ran.revision = ran.revision.wrapping_sub(1);
+    assert_eq!(
+        cleaner
+            .retry_sooner_after_shedding(&ran, &run, now)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn every_reclaim_scope_is_off_by_default_and_absent_from_saved_state() {
+    let config = CleanerConfig::default();
+    assert!(!config.scopes.any());
+    assert_eq!(config.scopes.worktree_idle_days, 7);
+    assert_eq!(
+        config.clone_budget.max_target_clones,
+        super::DEFAULT_MAX_TARGET_CLONES
+    );
+    let json = serde_json::to_string(&Saved::default()).unwrap();
+    for field in [
+        "scopes",
+        "clone_budget",
+        "previewed_scopes",
+        "deferral_retries",
+    ] {
+        assert!(
+            !json.contains(field),
+            "a default {field} must not be written, so an older build can read the file: {json}"
+        );
+    }
+    let mut short = CleanerConfig::default();
+    short.scopes.worktree_idle_days = 3;
+    assert!(
+        short.validate().is_err(),
+        "the worktree scopes keep DevCouncil's scheduled 7-day minimum"
+    );
+}
+
+fn set_old(path: &std::path::Path) {
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+    fs::File::open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+}
+
+/// A Cargo repository on `main` with one linked worktree under
+/// `.claude/worktrees/` (a dot directory discovery never enters, as the
+/// measured agent worktrees are) whose `target/` is an aged, ignored Cargo
+/// build directory. Its payload is cloned from a file outside the repository
+/// where the volume supports clones, so its logical size overstates what
+/// removing it frees.
+#[cfg(unix)]
+fn worktree_with_cargo_target(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let r = repo(root, "cargo-repo");
+    crate::engine::git_cli::git_text(&r, &["checkout", "-q", "-b", "main"]).unwrap();
+    fs::write(r.join(".gitignore"), "target/\n.claude/\n").unwrap();
+    fs::write(r.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+    crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+    // Committed long ago, so the worktree made from it is idle, not unstarted.
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ])
+        .current_dir(&r)
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .status_locked()
+        .unwrap();
+    assert!(status.success());
+    let wt = r.join(".claude/worktrees/agent-x");
+    fs::create_dir_all(wt.parent().unwrap()).unwrap();
+    crate::engine::git_cli::git_text(
+        &r,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent-x",
+            wt.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    // Trust is per repository: a linked worktree is granted on its own.
+    crate::test_support::trust_repo(&wt);
+    set_old(&r.join(".git/worktrees/agent-x/index"));
+    let target = wt.join("target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+    let anchor = root.join("anchor.bin");
+    let payload: Vec<u8> = (0..4 * 1024 * 1024usize)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 | 1)
+        .collect();
+    fs::write(&anchor, &payload).unwrap();
+    fs::File::open(&anchor).unwrap().sync_all().unwrap();
+    let blob = target.join("debug/blob.bin");
+    #[cfg(target_os = "macos")]
+    {
+        let src = std::ffi::CString::new(anchor.to_str().unwrap()).unwrap();
+        let dst = std::ffi::CString::new(blob.to_str().unwrap()).unwrap();
+        // SAFETY: both are valid NUL-terminated paths.
+        assert_eq!(unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) }, 0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    fs::copy(&anchor, &blob).unwrap();
+    for p in [
+        target.join("debug/blob.bin"),
+        target.join("CACHEDIR.TAG"),
+        target.join(".rustc_info.json"),
+        target.join("debug"),
+        target.clone(),
+    ] {
+        set_old(&p);
+    }
+    (r, wt)
+}
+
+fn scoped(
+    cleaner: &Arc<Cleaner>,
+    root: &std::path::Path,
+    scopes: super::ReclaimScopes,
+) -> CleanerConfig {
+    let mut c = config(cleaner, root);
+    c.scopes = scopes;
+    cleaner.save(c).unwrap().config
+}
+
+fn run_now(cleaner: &Arc<Cleaner>, config: &CleanerConfig, id: &str) -> CleanerRun {
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(cleaner, id);
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    let outcome = cleaner.perform_with_gate(config, &mut run, |_, _, _| Ok(()));
+    assert!(outcome.is_ok(), "{outcome:?}: {:?}", run.issues);
+    run
+}
+
+/// The worktree-cache scope reaches a linked worktree's cloned `target/`,
+/// budgets it by what removing it frees, and is used by no run until a person
+/// has previewed the enabled set; changing the set needs a fresh preview.
+#[cfg(unix)]
+#[test]
+fn a_worktree_cache_is_reclaimed_only_after_its_scope_was_previewed() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("scope-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let (_repo, wt) = worktree_with_cargo_target(&root);
+    let scopes = super::ReclaimScopes {
+        worktree_caches: true,
+        ..Default::default()
+    };
+    let mut c = config(&cleaner, &root);
+    c.scopes = scopes;
+    // Logical 4 MiB, cloned: it fits a 1 MiB budget only by private bytes.
+    c.max_run_bytes = if cfg!(target_os = "macos") {
+        1024 * 1024
+    } else {
+        64 * 1024 * 1024
+    };
+    let saved = cleaner.save(c).unwrap().config;
+    assert!(!cleaner.state().unwrap().scopes_previewed);
+
+    // Without the scope nothing here is eligible. The main checkout's walk
+    // reads as partial with a linked worktree inside it (an existing
+    // property of `walk_worktree`), so the run may end in the ordinary
+    // "nothing eligible and something unread" refusal; either way nothing in
+    // the worktree is touched.
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "unpreviewed-run");
+    {
+        let _run_lock = cleaner.lock("run.lock").unwrap();
+        let outcome = cleaner.perform_with_gate(&saved, &mut run, |_, _, _| {
+            panic!("an unpreviewed scope offers nothing to gate")
+        });
+        assert!(
+            outcome
+                .as_ref()
+                .map_or_else(|e| e.message().contains("Incomplete inventory"), |()| true),
+            "{outcome:?}"
+        );
+    }
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(
+        run.issues
+            .iter()
+            .any(|i| i.contains("have not been previewed")),
+        "{:?}",
+        run.issues
+    );
+
+    let preview = cleaner.inventory().unwrap();
+    let candidate = preview
+        .candidates
+        .iter()
+        .find(|c| c.scope == "worktree-cache")
+        .unwrap_or_else(|| panic!("the preview names the worktree cache: {preview:?}"));
+    assert_eq!(candidate.path, "target");
+    #[cfg(target_os = "macos")]
+    assert!(
+        candidate.private_bytes.unwrap() < candidate.bytes / 4,
+        "{candidate:?}"
+    );
+    assert!(cleaner.state().unwrap().scopes_previewed);
+
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "previewed-run");
+    assert!(!wt.join("target").exists(), "{run:?}");
+    assert!(wt.join("Cargo.toml").is_file(), "the worktree itself stays");
+
+    // A changed scope set is unseen again.
+    let mut c = cleaner.state().unwrap().config;
+    c.scopes.prune_worktrees = true;
+    cleaner.save(c).unwrap();
+    assert!(!cleaner.state().unwrap().scopes_previewed);
+}
+
+/// The task store is per checkout. A lane's lease may live in the main
+/// checkout's store (naming the lane's branch) or in the lane's own; the
+/// worktree scopes read both. Before, only the worktree's own store was read,
+/// so a lease the main checkout held for the lane's branch was never seen.
+#[cfg(unix)]
+#[test]
+fn a_lease_on_the_worktrees_branch_in_either_task_store_holds_its_cache() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("lease-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".devcouncil/\n").unwrap();
+    let lease = |checkout: &std::path::Path, id: &str, branch: Option<&str>| {
+        let db = crate::tasks::store_path(checkout.to_str().unwrap());
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO task_leases (id, task_id, owner, lease_token, status, branch, created_at, expires_at)
+                 VALUES (?1, ?1, 'agent', 'token', 'active', ?2, '2026-01-01T00:00:00Z', '2999-01-01T00:00:00Z')",
+                rusqlite::params![id, branch],
+            )
+            .unwrap();
+        db
+    };
+    let scopes = super::ReclaimScopes {
+        worktree_caches: true,
+        ..Default::default()
+    };
+    scoped(&cleaner, &root, scopes);
+
+    // The main checkout's store leases the lane's branch.
+    let main_store = lease(&repo, "main-held", Some("agent-x"));
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "main-lease-run");
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(
+        run.items
+            .iter()
+            .any(|item| item.message.contains("active task leases")),
+        "{run:?}"
+    );
+    fs::remove_dir_all(main_store.parent().unwrap()).unwrap();
+
+    // The lane's own store holds a lease, whatever branch it names.
+    lease(&wt, "own-held", Some("some-other-branch"));
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "own-lease-run");
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(
+        run.items
+            .iter()
+            .any(|item| item.message.contains("active task leases")),
+        "{run:?}"
+    );
+}
+
+/// The worktree scopes judge the worktree, not the repository: uncommitted
+/// work in the main checkout does not hold a clean worktree's cache, and
+/// uncommitted work in the worktree does.
+#[cfg(unix)]
+#[test]
+fn the_worktree_scope_vetoes_on_the_worktree_not_the_main_checkout() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("veto-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join("Cargo.toml"), "edited in the main checkout").unwrap();
+    fs::write(wt.join("Cargo.toml"), "edited in the worktree").unwrap();
+    scoped(
+        &cleaner,
+        &root,
+        super::ReclaimScopes {
+            worktree_caches: true,
+            ..Default::default()
+        },
+    );
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "dirty-worktree-run");
+    assert!(wt.join("target/debug/blob.bin").is_file(), "{run:?}");
+    assert!(run
+        .items
+        .iter()
+        .any(|r| r.message.contains("Worktree has uncommitted work")));
+
+    crate::engine::git_cli::git_text(&wt, &["checkout", "--", "Cargo.toml"]).unwrap();
+    let run = run_now(&cleaner, &saved, "clean-worktree-run");
+    assert!(
+        !wt.join("target").exists(),
+        "the main checkout's edit does not hold it: {run:?}"
+    );
+}
+
+/// `per_tree_vetoes` refuses output only for uncommitted work in the project
+/// that produced it; off, any uncommitted work in the repository refuses.
+#[cfg(unix)]
+#[test]
+fn per_tree_vetoes_judge_the_producing_project_only() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("per-tree-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let r = aged_bytecode_repo(&root, "mono", &["quiet", "busy"], 100);
+    fs::create_dir_all(r.join("elsewhere")).unwrap();
+    fs::write(r.join("elsewhere/notes.md"), "untracked work").unwrap();
+    fs::write(r.join("busy/edit.py"), "untracked work in the project").unwrap();
+
+    let saved = scoped(&cleaner, &root, super::ReclaimScopes::default());
+    let run = run_now(&cleaner, &saved, "repo-veto-run");
+    assert!(r.join("quiet/__pycache__").exists(), "{run:?}");
+
+    scoped(
+        &cleaner,
+        &root,
+        super::ReclaimScopes {
+            per_tree_vetoes: true,
+            ..Default::default()
+        },
+    );
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "tree-veto-run");
+    assert!(!r.join("quiet/__pycache__").exists(), "{run:?}");
+    assert!(
+        r.join("busy/__pycache__/module.pyc").is_file(),
+        "its own project has uncommitted work: {run:?}"
+    );
+}
+
+/// The prune scope removes an integrated, clean, unused linked worktree with
+/// an unforced `git worktree remove`, and leaves a dirty one.
+#[cfg(unix)]
+#[test]
+fn the_prune_scope_removes_only_a_stale_worktree_and_never_forces() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("prune-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+    let (repo, stale) = worktree_with_cargo_target(&root);
+    let dirty = repo.join(".claude/worktrees/agent-y");
+    crate::engine::git_cli::git_text(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent-y",
+            dirty.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&dirty);
+    fs::write(dirty.join("Cargo.toml"), "uncommitted").unwrap();
+    scoped(
+        &cleaner,
+        &root,
+        super::ReclaimScopes {
+            prune_worktrees: true,
+            ..Default::default()
+        },
+    );
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .filter(|c| c.scope == "prune-worktree")
+            .count(),
+        1,
+        "{preview:?}"
+    );
+    let saved = cleaner.state().unwrap().config;
+    let mut gated = vec![];
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = journaled_run(&cleaner, "prune-run");
+    {
+        let _run_lock = cleaner.lock("run.lock").unwrap();
+        cleaner
+            .perform_with_gate(&saved, &mut run, |_, argv, _| {
+                gated.push(argv.map(<[String]>::to_vec));
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert!(!stale.exists(), "{run:?}");
+    assert!(dirty.join("Cargo.toml").is_file());
+    let argv = gated
+        .iter()
+        .flatten()
+        .find(|argv| argv.iter().any(|a| a == "remove"))
+        .expect("the removal was gated with its argv");
+    assert!(
+        !argv.iter().any(|a| a == "--force" || a == "-f"),
+        "{argv:?}"
+    );
+}
+
+/// Read-only: what the reclaim scopes WOULD offer in a real repository, with
+/// private bytes. Runs only when `GITPULSE_DRY_RUN_ROOT` names a directory,
+/// under the test process's hermetic HOME (its trust grants and cleaner state
+/// are temporary, never the owner's), with a temporary state directory instead
+/// of `service()`. It inventories and measures; it never prepares, gates or
+/// removes anything. Prints one tab-separated row per candidate and per
+/// linked worktree.
+#[test]
+#[ignore = "reads a real repository; run by hand with GITPULSE_DRY_RUN_ROOT"]
+fn dry_run_reclaim_table() {
+    let Some(root) = std::env::var_os("GITPULSE_DRY_RUN_ROOT") else {
+        return;
+    };
+    let root = crate::engine::process::canonicalize_plain(std::path::Path::new(&root)).unwrap();
+    crate::test_support::trust_repo(&root);
+    let infos = crate::engine::worktree::list_worktrees_lite(root.to_str().unwrap()).unwrap();
+    for info in infos.iter().filter(|i| !i.is_main) {
+        crate::test_support::trust_repo(std::path::Path::new(&info.path));
+    }
+    let state = tempfile::tempdir().unwrap();
+    let cleaner = Cleaner::new(state.path().join("hygiene"));
+    let mut config = CleanerConfig {
+        roots: vec![root.to_string_lossy().into_owned()],
+        ..CleanerConfig::default()
+    };
+    config.scopes = super::ReclaimScopes {
+        worktree_caches: true,
+        per_tree_vetoes: false,
+        prune_worktrees: true,
+        worktree_idle_days: 7,
+        ..Default::default()
+    };
+    let inventory = cleaner.inspect(&config, config.scopes, true).unwrap();
+    println!("DRY\tscope\trepo\tpath\tlogical\tprivate\tage_gate");
+    for c in &inventory.candidates {
+        let target = if c.scope == "prune-worktree" {
+            std::path::PathBuf::from(&c.path)
+        } else {
+            std::path::Path::new(&c.repo_path).join(&c.path)
+        };
+        let age = if c.scope == "prune-worktree" {
+            "n/a".to_string()
+        } else {
+            let days = if c.scope == "worktree-cache" {
+                config.scopes.worktree_idle_days
+            } else {
+                config.retention_days
+            };
+            match crate::storage::hygiene::tree::snapshot(&target, true, &AtomicBool::new(false)) {
+                Ok(snap) => match crate::storage::hygiene::tree::require_age(
+                    &snap,
+                    days,
+                    std::time::SystemTime::now(),
+                ) {
+                    Ok(()) => format!("passes {days}d"),
+                    Err(_) => format!("newer than {days}d"),
+                },
+                Err(e) => format!("unread: {e}"),
+            }
+        };
+        println!(
+            "DRY\t{}\t{}\t{}\t{}\t{}\t{}",
+            c.scope,
+            c.repo_path,
+            c.path,
+            c.bytes,
+            c.private_bytes.map_or("unread".into(), |b| b.to_string()),
+            age
+        );
+    }
+    for issue in &inventory.issues {
+        println!("ISSUE\t{issue}");
+    }
+    let stale = crate::storage::stale_worktrees::stale_worktrees_with(
+        root.to_str().unwrap(),
+        7,
+        &crate::sysload::procscan::working_in,
+        false,
+        super::current_time(),
+    )
+    .unwrap();
+    for w in &stale.worktrees {
+        let target = std::path::Path::new(&w.path).join("src-tauri/target");
+        let usage = target.is_dir().then(|| {
+            crate::storage::measure_linked_worktree(
+                target.to_str().unwrap(),
+                "target",
+                None,
+                std::time::Instant::now() + std::time::Duration::from_secs(20),
+            )
+        });
+        println!(
+            "WT\t{}\tprocs={:?}\tclean={:?}\tintegrated={:?}\tidle_days={:?}\tstale={}\ttarget_logical={}\ttarget_private={}\ttarget_truncated={}\t{}",
+            w.path,
+            w.processes,
+            w.clean,
+            w.integrated,
+            w.idle_days,
+            w.stale,
+            usage.as_ref().map_or(0, |u| u.bytes),
+            usage
+                .as_ref()
+                .and_then(|u| u.private_bytes)
+                .map_or("unread".into(), |b| b.to_string()),
+            usage.as_ref().is_some_and(|u| u.truncated),
+            w.reasons.join("; ")
+        );
+    }
+}
+
+/// An inspection cut short (here by a cancellation, in the third dry run on
+/// 2026-11-14 by the 120-second budget) never showed some scope's candidates,
+/// so it is not their preview: a later, calmer run would act on worktrees
+/// nobody was shown.
+#[cfg(unix)]
+#[test]
+fn an_inspection_cut_short_does_not_count_as_a_preview() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("cut-short-state"),
+    );
+    let cleaner = Arc::new(service);
+    worktree_with_cargo_target(&root);
+    let scopes = super::ReclaimScopes {
+        prune_worktrees: true,
+        ..Default::default()
+    };
+    let config = scoped(&cleaner, &root, scopes);
+    cleaner
+        .cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cut = cleaner.inspect(&config, scopes, true).unwrap();
+    assert!(!cut.scopes_complete, "{cut:?}");
+    assert_eq!(super::previewed_by(&cut, scopes), None);
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let whole = cleaner.inspect(&config, scopes, true).unwrap();
+    assert!(whole.scopes_complete, "{:?}", whole.issues);
+    assert_eq!(super::previewed_by(&whole, scopes), Some(scopes));
+    assert_eq!(
+        super::previewed_by(&whole, super::ReclaimScopes::default()),
+        None,
+        "nothing enabled is nothing previewed"
+    );
+}
+
+/// The worktree veto asks who uses the worktree, not only who stands in it: a
+/// build whose working directory is elsewhere and whose arguments name the
+/// worktree refuses its removal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_process_naming_a_worktree_refuses_the_worktree_veto() {
+    let (_temp, _cleaner, code) = fixture();
+    let worktree = repo(&code, "lane");
+    let elsewhere = code.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let mut child =
+        crate::sysload::procscan::tests::directory_use_child(&worktree, &elsewhere, true);
+    let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+        crate::sysload::procscan::processes_using(&worktree).is_ok_and(|pids| !pids.is_empty())
+    });
+    let verdict = super::quiet_worktree(worktree.to_str().unwrap(), None);
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(seen, "the fixture process was never visible to the scan");
+    let refused = verdict.expect_err("a process names the worktree");
+    assert!(
+        refused.message().contains("process(es) use this worktree"),
+        "{}",
+        refused.message()
+    );
+}
+
+/// A task store that cannot be read refuses the worktree-cache scope with a
+/// plain error (row "skipped"), as it always has: a corrupt store does not
+/// clear on its own, so it must not look like the host shedding work (backoff
+/// sleeps, a bring-forward, the retry counter).
+#[test]
+fn an_unreadable_task_store_is_a_plain_refusal_not_a_deferral() {
+    let (_temp, _cleaner, code) = fixture();
+    let worktree = repo(&code, "lane");
+    // Ignored, so the worktree reads clean and the lease check is reached.
+    fs::write(worktree.join(".git/info/exclude"), ".devcouncil/\n").unwrap();
+    fs::create_dir_all(worktree.join(".devcouncil")).unwrap();
+    fs::write(
+        worktree.join(".devcouncil/state.sqlite"),
+        b"this is not a database",
+    )
+    .unwrap();
+    let path = worktree.to_str().unwrap();
+    let leases = super::leases_clear(path, None).expect_err("the store cannot be read");
+    assert!(!super::shed_under_load(&leases), "{}", leases.message());
+    assert!(
+        leases.message().contains("could not be checked"),
+        "{}",
+        leases.message()
+    );
+    let quiet = super::quiet_worktree(path, None).expect_err("the store cannot be read");
+    assert!(!super::shed_under_load(&quiet), "{}", quiet.message());
+}
+
+/// A full or filling disk makes an enabled schedule due, once per gap. Any
+/// other reason the host sheds work, a disabled schedule and a run in
+/// progress change nothing. It moves the schedule and nothing else: scopes
+/// and checks are those the saved policy already names.
+#[test]
+fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
+    let (_temp, cleaner, root) = fixture();
+    let later = super::current_time() + 86_400;
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = true;
+            saved.config.roots = vec![root.to_string_lossy().into_owned()];
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    let now = super::current_time();
+    let next = |c: &Cleaner| c.state().unwrap().config.next_run_at;
+    // The argument is `disk_remedy_due()`: false for any other cause, for a
+    // disk shed Elevated or by projection with something else pressed, and
+    // with no governor.
+    assert_eq!(cleaner.bring_forward_for_disk(false, now).unwrap(), None);
+    assert_eq!(next(&cleaner), later, "remedy not due");
+    assert!(
+        !crate::sysload::disk_remedy_due(),
+        "this process has no governor, so the scheduler's own call is false"
+    );
+    let before = cleaner.state().unwrap().config.revision;
+    assert_eq!(
+        cleaner.bring_forward_for_disk(true, now).unwrap(),
+        Some(now)
+    );
+    assert_eq!(next(&cleaner), now);
+    assert_eq!(
+        cleaner.state().unwrap().config.revision,
+        before,
+        "the schedule moving is not an edit of the policy a person's open page is compared against"
+    );
+    // A save carrying the revision read before the bring-forward still lands.
+    let mut open_page = cleaner.state().unwrap().config;
+    open_page.next_run_at = later;
+    assert!(cleaner.save(open_page).is_ok());
+    // Due now, and not asked again within the gap, whatever the cause.
+    cleaner
+        .update(|saved| {
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        cleaner.bring_forward_for_disk(true, now + 60).unwrap(),
+        None,
+        "bounded: once per gap"
+    );
+    assert_eq!(
+        cleaner
+            .bring_forward_for_disk(true, now + super::DISK_FORWARD_MIN_GAP_SECS)
+            .unwrap(),
+        Some(now + super::DISK_FORWARD_MIN_GAP_SECS)
+    );
+    // Disabled: nothing moves.
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = false;
+            saved.config.next_run_at = later;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(cleaner.bring_forward_for_disk(true, later).unwrap(), None);
+    assert_eq!(next(&cleaner), later);
+}
+
+/// Every scope ships off, and a saved policy written before the agent scratch
+/// scope existed reads with it off.
+#[test]
+fn the_agent_scratch_scope_ships_off_and_an_older_policy_reads_it_off() {
+    let defaults = super::ReclaimScopes::default();
+    assert!(!defaults.agent_scratch_builds);
+    assert!(!defaults.any());
+    assert!(defaults.is_default());
+    let older = r#"{"worktree_caches":true,"per_tree_vetoes":false,"prune_worktrees":false,"worktree_idle_days":7}"#;
+    let read: super::ReclaimScopes = serde_json::from_str(older).unwrap();
+    assert!(!read.agent_scratch_builds);
+    assert_eq!(read.agent_scratch_days, 7);
+    // Turning it on is a change a preview must acknowledge before any run
+    // uses it.
+    let on = super::ReclaimScopes {
+        agent_scratch_builds: true,
+        ..defaults
+    };
+    assert!(on.any());
+    let now = 1_000_000_000;
+    assert!(!on.effective(None, now, now).agent_scratch_builds);
+    assert!(!on.effective(Some(defaults), now, now).agent_scratch_builds);
+    assert!(on.effective(Some(on), now, now).agent_scratch_builds);
+}
+
+/// What an older build (one whose state reader refuses unknown fields) reads.
+/// It is the parent's shape: no agent scope, no `previewed_at`, no bring-forward
+/// stamp.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentScopes {
+    #[serde(default)]
+    worktree_caches: bool,
+    #[serde(default)]
+    per_tree_vetoes: bool,
+    #[serde(default)]
+    prune_worktrees: bool,
+    #[serde(default)]
+    worktree_idle_days: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentConfig {
+    version: u32,
+    revision: u64,
+    roots: Vec<String>,
+    exclusions: Vec<String>,
+    enabled: bool,
+    #[serde(default)]
+    run_when_closed: bool,
+    interval_hours: u32,
+    next_run_at: u64,
+    retention_days: u32,
+    max_run_bytes: u64,
+    max_targets: u32,
+    #[serde(default)]
+    scopes: Option<ParentScopes>,
+    #[serde(default)]
+    clone_budget: Option<serde_json::Value>,
+}
+
+impl ParentScopes {
+    fn read(&self) -> u64 {
+        u64::from(self.worktree_caches)
+            + u64::from(self.per_tree_vetoes)
+            + u64::from(self.prune_worktrees)
+            + u64::from(self.worktree_idle_days)
+    }
+}
+
+impl ParentConfig {
+    fn read(&self) -> u64 {
+        u64::from(self.version)
+            + self.revision
+            + self.roots.len() as u64
+            + self.exclusions.len() as u64
+            + u64::from(self.enabled)
+            + u64::from(self.run_when_closed)
+            + u64::from(self.interval_hours)
+            + self.next_run_at
+            + u64::from(self.retention_days)
+            + self.max_run_bytes
+            + u64::from(self.max_targets)
+            + self.scopes.as_ref().map_or(0, ParentScopes::read)
+            + u64::from(self.clone_budget.is_some())
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentSaved {
+    config: ParentConfig,
+    history: Vec<serde_json::Value>,
+    cancel_run: Option<String>,
+    #[serde(default)]
+    background_error: Option<String>,
+    #[serde(default)]
+    deferral_retries: u32,
+    #[serde(default)]
+    previewed_scopes: Option<ParentScopes>,
+}
+
+impl ParentSaved {
+    fn read(&self) -> u64 {
+        self.config.read()
+            + self.history.len() as u64
+            + u64::from(self.cancel_run.is_some())
+            + u64::from(self.background_error.is_some())
+            + u64::from(self.deferral_retries)
+            + self.previewed_scopes.as_ref().map_or(0, ParentScopes::read)
+    }
+}
+
+/// A state this build writes stays readable by the build before it, until a
+/// person turns the new scope on: no agent field, no preview stamp and no
+/// bring-forward stamp is written at its default or once it no longer limits
+/// anything. Turning the scope on does write them, and the older build then
+/// refuses the state, which the docs say.
+#[test]
+fn state_written_with_the_new_scope_off_is_readable_by_the_parents_reader() {
+    let (_temp, cleaner, root) = fixture();
+    let read = |cleaner: &Cleaner| -> Result<ParentSaved, String> {
+        let bytes = fs::read(cleaner.dir.join("state.json")).map_err(|e| e.to_string())?;
+        let parsed: ParentSaved = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        parsed.read();
+        Ok(parsed)
+    };
+    let later = super::current_time() + 86_400;
+    cleaner
+        .update(|saved| {
+            saved.config.enabled = true;
+            saved.config.roots = vec![root.to_string_lossy().into_owned()];
+            saved.config.next_run_at = later;
+            saved.config.scopes.worktree_caches = true;
+            saved.previewed_scopes = Some(saved.config.scopes);
+            Ok(())
+        })
+        .unwrap();
+    read(&cleaner).expect("old scopes on, new scope off");
+    // One bring-forward writes its stamp; it is not written once the gap passed.
+    let now = super::current_time();
+    cleaner.bring_forward_for_disk(true, now).unwrap();
+    assert!(
+        read(&cleaner).is_err(),
+        "a pending bring-forward is written"
+    );
+    cleaner
+        .bring_forward_for_disk(false, now + super::DISK_FORWARD_MIN_GAP_SECS)
+        .unwrap();
+    read(&cleaner).expect("the stamp is dropped once its gap has passed");
+    // The new scope on writes its fields.
+    cleaner
+        .update(|saved| {
+            saved.config.scopes.agent_scratch_builds = true;
+            saved.config.scopes.agent_scratch_days = 14;
+            Ok(())
+        })
+        .unwrap();
+    assert!(read(&cleaner).is_err());
+}
+
+/// The agent scratch approval is bound to what it was shown, and lapses.
+#[test]
+fn a_preview_dated_in_the_future_or_never_taken_lapses_like_an_old_one() {
+    let scopes = super::ReclaimScopes {
+        agent_scratch_builds: true,
+        ..super::ReclaimScopes::default()
+    };
+    let now = 1_800_000_000u64;
+    let used = |at: u64| scopes.effective(Some(scopes), at, now).agent_scratch_builds;
+    assert!(used(now), "taken now");
+    assert!(
+        used(now - super::AGENT_PREVIEW_VALID_SECS),
+        "exactly 30 days"
+    );
+    assert!(
+        !used(now - super::AGENT_PREVIEW_VALID_SECS - 1),
+        "past 30 days"
+    );
+    assert!(!used(now + 1), "stamped after now: the clock was set back");
+    assert!(!used(now + 365 * 86_400), "a year ahead");
+    assert!(!used(0), "never previewed by this version");
+}
+
+#[test]
+fn a_previewed_agent_scope_is_cleared_by_roots_or_exclusions_and_lapses_after_thirty_days() {
+    let (_temp, cleaner, root) = fixture();
+    // A sibling of the root: a nested one would be folded into it.
+    let other = root.parent().unwrap().join("other-root");
+    fs::create_dir(&other).unwrap();
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    let saved = cleaner.save(c).unwrap().config;
+    let now = super::current_time();
+    let approve = |cleaner: &Cleaner, at: u64| {
+        cleaner
+            .update(|saved| {
+                saved.previewed_scopes = Some(saved.config.scopes);
+                saved.previewed_at = at;
+                Ok(())
+            })
+            .unwrap();
+    };
+    approve(&cleaner, now);
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    // Changing the roots clears it, then the exclusions, with the scopes alone
+    // unchanged.
+    let mut c = cleaner.state().unwrap().config;
+    c.roots = vec![
+        root.to_string_lossy().into_owned(),
+        other.to_string_lossy().into_owned(),
+    ];
+    cleaner.save(c).unwrap();
+    assert!(!cleaner.state().unwrap().scopes_previewed, "roots");
+    approve(&cleaner, now);
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    let mut c = cleaner.state().unwrap().config;
+    c.exclusions = vec![other.to_string_lossy().into_owned()];
+    cleaner.save(c).unwrap();
+    assert!(!cleaner.state().unwrap().scopes_previewed, "exclusions");
+    // Saving the same roots and exclusions again keeps an approval.
+    approve(&cleaner, now);
+    let same = cleaner.state().unwrap().config;
+    cleaner.save(same).unwrap();
+    assert!(cleaner.state().unwrap().scopes_previewed, "unchanged");
+    let _ = saved;
+    // The lapse is the agent scope's alone, and a lapsed scope is not used.
+    let scopes = cleaner.state().unwrap().config.scopes;
+    let thirty = 30 * 86_400;
+    assert!(
+        scopes
+            .effective(Some(scopes), now, now + thirty)
+            .agent_scratch_builds
+    );
+    assert!(
+        !scopes
+            .effective(Some(scopes), now, now + thirty + 1)
+            .agent_scratch_builds
+    );
+    assert!(!scopes.effective(Some(scopes), 0, now).agent_scratch_builds);
+    let worktrees = super::ReclaimScopes {
+        worktree_caches: true,
+        agent_scratch_builds: true,
+        ..Default::default()
+    };
+    let lapsed = worktrees.effective(Some(worktrees), now, now + thirty + 1);
+    assert!(lapsed.worktree_caches && !lapsed.agent_scratch_builds);
+    approve(&cleaner, now - thirty - 5);
+    cleaner
+        .update(|saved| {
+            saved.config.scopes = worktrees;
+            saved.previewed_scopes = Some(worktrees);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        !cleaner.state().unwrap().scopes_previewed,
+        "a lapsed approval is not shown as previewed"
+    );
+}
+
+/// The agent arms of the state veto and of the veto cache key: a session
+/// scratchpad has no repository state to read, scratch output in a repository
+/// is kept only by an active lease and never by a dirty tree, and the cache
+/// key keeps two scratchpads apart while folding a repository's targets.
+#[test]
+fn the_agent_scopes_have_their_own_state_veto_and_veto_key() {
+    let (_temp, cleaner, root) = fixture();
+    let dirty = repo(&root, "dirty-repo");
+    fs::write(dirty.join("uncommitted.txt"), "work").unwrap();
+    let candidate = |scope: &str, repo_path: &Path, path: &str| CleanerCandidate {
+        repo_path: repo_path.to_string_lossy().into_owned(),
+        path: path.into(),
+        provider: String::new(),
+        bytes: 1,
+        scope: scope.into(),
+        private_bytes: None,
+        branch: None,
+        evidence: vec![],
+    };
+    let scopes = super::ReclaimScopes::default();
+    let session = candidate(
+        "agent-session-scratch",
+        &root.join("nowhere"),
+        "/tmp/claude-1/p/s1/scratchpad/t",
+    );
+    assert!(cleaner.quiet_tree(&session, scopes).is_ok());
+    for scope in ["agent-repo-scratch", "agent-claude-target"] {
+        let scratch = candidate(scope, &dirty, &dirty.join("tmp/a/target").to_string_lossy());
+        assert!(
+            cleaner.quiet_tree(&scratch, scopes).is_ok(),
+            "{scope}: a dirty tree elsewhere is no reason to keep ignored scratch output"
+        );
+    }
+    let other = candidate(
+        "agent-session-scratch",
+        &root,
+        "/tmp/claude-1/p/s2/scratchpad/t",
+    );
+    assert_ne!(
+        super::veto_key(&session, scopes),
+        super::veto_key(&other, scopes)
+    );
+    let one = candidate("agent-repo-scratch", &dirty, "/x/a");
+    let two = candidate("agent-repo-scratch", &dirty, "/x/b");
+    assert_eq!(super::veto_key(&one, scopes), super::veto_key(&two, scopes));
+    let claude = candidate("agent-claude-target", &dirty, "/x/c");
+    assert_eq!(
+        super::veto_key(&claude, scopes),
+        super::veto_key(&one, scopes)
+    );
+}
+
+/// A read-only probe of this machine, never part of a normal run: the real
+/// `inspect` with production wiring (real process table, real agent registries,
+/// real `/tmp`) over the roots in `GITPULSE_PROBE_ROOTS` (a `:`-separated
+/// list), the cleaner's state in a temp directory, and no removal path called.
+///
+/// What it reads: the process table, the Claude registries under the config
+/// directories derived from `GITPULSE_PROBE_HOME` (handed to the detector through
+/// `GITPULSE_CLAUDE_CONFIG_DIRS`), the system temp directory and the roots. What
+/// it writes: only files in its own temporary directory (the cleaner's state and
+/// the test trust store); repository trust is granted in that test store, not the
+/// real one. It prints `PROBE` lines (scope completeness, candidates by scope,
+/// kept reasons, issues, process counts, and per live session folder whether it
+/// came up as a candidate), which is the before/after table a change to the
+/// cleaner's rules is judged by; any live session's folder showing as a candidate
+/// is a defect.
+/// `GITPULSE_PROBE_HOME=$HOME GITPULSE_PROBE_ROOTS=<a>:<b> cargo test --lib -- --ignored --nocapture probe_the_real_machine`.
+#[cfg(unix)]
+#[test]
+#[ignore = "reads the real machine; run by hand"]
+fn probe_the_real_machine_with_production_wiring() {
+    let roots: Vec<String> = std::env::var("GITPULSE_PROBE_ROOTS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert!(!roots.is_empty(), "set GITPULSE_PROBE_ROOTS");
+    // The test build runs under a hermetic HOME, so the Claude config
+    // directories production would resolve with the real one are resolved here
+    // from `GITPULSE_PROBE_HOME` and handed to the detector. Reads only.
+    let real_home = std::env::var("GITPULSE_PROBE_HOME").expect("set GITPULSE_PROBE_HOME");
+    let dirs = crate::workbench::conversation::config_dirs_in(
+        None,
+        None,
+        None,
+        Some(Path::new(&real_home)),
+    );
+    eprintln!("PROBE config dirs: {:?} error={:?}", dirs.dirs, dirs.error);
+    let serial = crate::test_support::env::env_serial();
+    let _env = crate::test_support::env::bind_env(&serial).set(
+        "GITPULSE_CLAUDE_CONFIG_DIRS",
+        std::env::join_paths(&dirs.dirs).unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = crate::engine::process::canonicalize_plain(temp.path())
+        .unwrap()
+        .join("state");
+    let cleaner = Cleaner::new(state_dir);
+    let mut config = cleaner.state().unwrap().config;
+    config.roots = roots;
+    config.scopes.agent_scratch_builds = true;
+    // The test build keeps its own repository-trust store, so none of the
+    // owner's repositories is trusted in it. Trusting what discovery finds
+    // here changes only that test store, never the real one, and stands for
+    // the owner having opened and trusted these repositories in the app.
+    let probe_roots = discovery::roots(&config.roots, false).unwrap();
+    let grant = |dir: &Path| {
+        let plain = dir.to_string_lossy().into_owned();
+        if let Ok(preview) = crate::repository_trust::inspect(&plain) {
+            let _ = crate::repository_trust::grant(&plain, &preview.identity, false);
+        }
+    };
+    for root in &probe_roots {
+        grant(root);
+    }
+    for _ in 0..3 {
+        let found = discovery::discover(&probe_roots, &[], &AtomicBool::new(false));
+        for repo in &found.repos {
+            grant(repo);
+        }
+    }
+    let started = std::time::Instant::now();
+    let inventory = cleaner.inspect(&config, config.scopes, true).unwrap();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "PROBE elapsed={elapsed:?} scopes_complete={} partial={} repositories={} candidates={} kept={} shed_repos={}",
+        inventory.scopes_complete,
+        inventory.partial,
+        inventory.repositories,
+        inventory.candidates.len(),
+        inventory.kept.len(),
+        inventory.shed_repos
+    );
+    let mut by_scope = std::collections::BTreeMap::<String, usize>::new();
+    for c in &inventory.candidates {
+        *by_scope.entry(c.scope.clone()).or_default() += 1;
+    }
+    eprintln!("PROBE candidates by scope: {by_scope:?}");
+    for c in inventory
+        .candidates
+        .iter()
+        .filter(|c| c.scope.starts_with("agent-"))
+    {
+        eprintln!("PROBE CANDIDATE {} {} {}", c.scope, c.bytes, c.path);
+    }
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for k in &inventory.kept {
+        let head: String = k.reason.chars().take(60).collect();
+        *reasons.entry(format!("{} | {head}", k.scope)).or_default() += 1;
+    }
+    for (reason, n) in &reasons {
+        eprintln!("PROBE KEPT x{n}: {reason}");
+    }
+    for issue in inventory.issues.iter().take(40) {
+        let head: String = issue.chars().take(220).collect();
+        eprintln!("PROBE ISSUE {head}");
+    }
+    let table = crate::sysload::procscan::read_use_table().unwrap();
+    let mine: Vec<_> = table.iter().filter(|p| p.mine).collect();
+    eprintln!(
+        "PROBE processes total={} mine={} mine_cwd_unreadable={} mine_argv_unreadable={} mine_env_unreadable={} mine_env_empty={}",
+        table.len(),
+        mine.len(),
+        mine.iter().filter(|p| p.cwd.is_none()).count(),
+        mine.iter().filter(|p| p.argv.is_none()).count(),
+        mine.iter().filter(|p| p.env.is_none()).count(),
+        mine.iter()
+            .filter(|p| p.env.as_ref().is_some_and(Vec::is_empty))
+            .count()
+    );
+    let live = super::super::agent::LiveSessions::observe();
+    eprintln!(
+        "PROBE live claude ids={} unidentified={} incomplete={:?}",
+        live.ids.len(),
+        live.unidentified,
+        live.incomplete
+    );
+    // What the unidentified sessions are, by shape only: executable, flag
+    // names and the names (never values) of session-related variables.
+    for kind in crate::insights::live_sessions::observe()
+        .iter()
+        .filter(|k| k.kind == "claude")
+    {
+        eprintln!(
+            "PROBE claude detector ok={} live={} unverified={}",
+            kind.ok,
+            kind.live.len(),
+            kind.unverified.len()
+        );
+        for session in kind.live.iter().filter(|s| s.session_id.is_none()) {
+            let row = table
+                .iter()
+                .find(|p| i64::from(p.pid) == i64::from(session.pid));
+            let flags: Vec<String> = row
+                .and_then(|p| p.argv.as_ref())
+                .map(|argv| {
+                    argv.iter()
+                        .filter(|a| a.starts_with('-'))
+                        .map(|a| a.split('=').next().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let names: Vec<String> = row
+                .and_then(|p| p.env.as_ref())
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|e| e.split_once('=').map(|(n, _)| n.to_string()))
+                        .filter(|n| {
+                            let upper = n.to_uppercase();
+                            upper.contains("SESSION") || upper.starts_with("CLAUDE")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "PROBE UNIDENTIFIED pid={} entrypoint={:?} status={:?} tree={:?} exe={:?} flags={flags:?} env_names={names:?}",
+                session.pid,
+                session.entrypoint,
+                session.status,
+                session.tree,
+                row.and_then(|p| p.exe.clone())
+            );
+        }
+    }
+    // Every live session's folder must read as in use, never as a candidate.
+    let base = Path::new("/private/tmp/claude-501");
+    let mut live_as_candidate = 0;
+    if let Ok(projects) = fs::read_dir(base) {
+        for project in projects.flatten() {
+            for id in live.ids.iter() {
+                let folder = project.path().join(id);
+                if !folder.is_dir() {
+                    continue;
+                }
+                let as_candidate = inventory
+                    .candidates
+                    .iter()
+                    .any(|c| Path::new(&c.path).starts_with(&folder));
+                let kept: Vec<&str> = inventory
+                    .kept
+                    .iter()
+                    .filter(|k| Path::new(&k.path).starts_with(&folder))
+                    .map(|k| k.reason.as_str())
+                    .collect();
+                eprintln!(
+                    "PROBE LIVE {} candidate={as_candidate} kept={:?}",
+                    folder.display(),
+                    kept.iter()
+                        .map(|r| r.chars().take(70).collect::<String>())
+                        .collect::<Vec<_>>()
+                );
+                if as_candidate {
+                    live_as_candidate += 1;
+                }
+            }
+        }
+    }
+    eprintln!("PROBE live sessions whose folder is a candidate: {live_as_candidate}");
+}
+
+/// A Cargo target as Cargo writes one, every entry last modified 30 days ago.
+fn old_cargo_target(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join("debug")).unwrap();
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    fs::write(dir.join(".rustc_info.json"), "{}").unwrap();
+    fs::write(dir.join("debug/.cargo-lock"), "").unwrap();
+    fs::write(dir.join("debug/app.o"), vec![b'x'; 4096]).unwrap();
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    for path in [
+        dir.join("debug/app.o"),
+        dir.join("debug/.cargo-lock"),
+        dir.join("CACHEDIR.TAG"),
+        dir.join(".rustc_info.json"),
+        dir.join("debug"),
+        dir.to_path_buf(),
+    ] {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+}
+
+/// Preview, then run, through `inventory` and `perform_with_gate` with the
+/// injected gate: scope 1 (a finished session's scratchpad under a stand-in
+/// temp root), scope 2 (a linked worktree's `.gitpulse/scratch`, which
+/// discovery never reaches) and scope 3 (`.claude` targets in the checkout and
+/// in the worktree). Only the targets go; the scratchpad, `.claude/skills` and
+/// every other file stay. A lapsed approval skips the scope and says so.
+#[cfg(unix)]
+#[test]
+fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
+    use crate::sysload::procscan::DirUse;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let temp_root = crate::engine::process::canonicalize_plain(temp.path())
+        .unwrap()
+        .join("faketmp");
+    fs::create_dir_all(&temp_root).unwrap();
+    let mut service = Cleaner::new(
+        crate::engine::process::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("agent-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: |_| Ok(DirUse::default()),
+        temp_root: temp_root.clone(),
+    });
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".gitpulse/\ntmp/\n").unwrap();
+    let scratch_in_worktree = wt.join(".gitpulse/scratch/target-a");
+    old_cargo_target(&scratch_in_worktree);
+    fs::write(wt.join(".gitpulse/scratch/notes.txt"), "keep").unwrap();
+    let claude_main = repo.join(".claude/x-target");
+    old_cargo_target(&claude_main);
+    fs::create_dir_all(repo.join(".claude/skills")).unwrap();
+    fs::write(repo.join(".claude/skills/a.md"), "skill").unwrap();
+    let claude_wt = wt.join(".claude/y-target");
+    old_cargo_target(&claude_wt);
+    let uid = super::super::agent::current_uid();
+    let pad = temp_root.join(format!(
+        "claude-{uid}/proj/session-0001-aaaaaaaa/scratchpad"
+    ));
+    let session_target = pad.join("target-s");
+    old_cargo_target(&session_target);
+    fs::write(pad.join("notes.txt"), "keep").unwrap();
+    quiet_session_folder(&pad);
+
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    let scopes: std::collections::BTreeSet<&str> = preview
+        .candidates
+        .iter()
+        .map(|c| c.scope.as_str())
+        .collect();
+    for scope in [
+        "agent-session-scratch",
+        "agent-repo-scratch",
+        "agent-claude-target",
+    ] {
+        assert!(scopes.contains(scope), "{scope}: {preview:?}");
+    }
+    let offered: Vec<&str> = preview.candidates.iter().map(|c| c.path.as_str()).collect();
+    for expected in [
+        &scratch_in_worktree,
+        &claude_main,
+        &claude_wt,
+        &session_target,
+    ] {
+        assert!(
+            offered.iter().any(|p| Path::new(p) == expected.as_path()),
+            "{} not offered: {offered:?} / kept {:?} / issues {:?}",
+            expected.display(),
+            preview.kept,
+            preview.issues
+        );
+    }
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "{:?}",
+        preview.issues
+    );
+
+    // A lapsed approval: nothing is removed and the run says why.
+    let day = 86_400;
+    cleaner
+        .update(|saved| {
+            saved.previewed_at = super::current_time() - 31 * day;
+            Ok(())
+        })
+        .unwrap();
+    let saved = cleaner.state().unwrap().config;
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut lapsed = journaled_run(&cleaner, "lapsed-run");
+    {
+        let _run_lock = cleaner.lock("run.lock").unwrap();
+        // With nothing eligible and part of the repository unread the run may
+        // end in the ordinary refusal; nothing is removed either way.
+        let _ = cleaner.perform_with_gate(&saved, &mut lapsed, |_, _, _| {
+            panic!("a lapsed scope offers nothing to gate")
+        });
+    }
+    assert!(
+        lapsed.issues.iter().any(|i| i.contains("30 days")),
+        "{:?}",
+        lapsed.issues
+    );
+    assert!(session_target.is_dir() && claude_main.is_dir());
+
+    // A fresh preview approves it again, and the run removes exactly them.
+    cleaner.inventory().unwrap();
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "agent-run");
+    for gone in [
+        &scratch_in_worktree,
+        &claude_main,
+        &claude_wt,
+        &session_target,
+    ] {
+        assert!(!gone.exists(), "{} survived: {run:?}", gone.display());
+    }
+    assert!(
+        pad.join("notes.txt").is_file(),
+        "the scratchpad's files stay"
+    );
+    assert!(wt.join(".gitpulse/scratch/notes.txt").is_file());
+    assert!(repo.join(".claude/skills/a.md").is_file());
+    assert!(wt.join("Cargo.toml").is_file());
+}
+
+/// Makes a session folder look like a finished one's: its own time, its
+/// scratchpad's and what is directly in the scratchpad 30 days old (a build
+/// folder's contents are aged by the fixture that made it).
+fn quiet_session_folder(scratchpad: &std::path::Path) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    let set = |p: &std::path::Path| {
+        if let Ok(file) = fs::File::open(p) {
+            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
+        }
+    };
+    for entry in fs::read_dir(scratchpad).into_iter().flatten().flatten() {
+        set(&entry.path());
+    }
+    set(scratchpad);
+    if let Some(session) = scratchpad.parent() {
+        set(session);
+    }
+}
+
+/// A cleaner whose home, Claude configuration directories, process table and
+/// `/tmp` are the test's, with one removable scratch build in a worktree.
+fn long_lived_fixture() -> (
+    tempfile::TempDir,
+    Arc<Cleaner>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    use crate::sysload::procscan::DirUse;
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let home = base.join("home");
+    let temp_root = base.join("faketmp");
+    fs::create_dir_all(&temp_root).unwrap();
+    fs::create_dir_all(home.join(".cache/huggingface/hub")).unwrap();
+    fs::write(
+        home.join(".cache/huggingface/hub/model.bin"),
+        vec![b'm'; 4096],
+    )
+    .unwrap();
+    let mut service = Cleaner::new(base.join("ll-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: |_| Ok(DirUse::default()),
+        temp_root,
+    });
+    service.long_lived_machine = Some((home.clone(), vec![home.join(".claude")]));
+    let cleaner = Arc::new(service);
+    let (repo, wt) = worktree_with_cargo_target(&root);
+    fs::write(repo.join(".git/info/exclude"), ".gitpulse/\ntmp/\n").unwrap();
+    let scratch = wt.join(".gitpulse/scratch/target-a");
+    old_cargo_target(&scratch);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    (temp, cleaner, root, repo, scratch)
+}
+
+fn candidate_paths(inventory: &super::CleanerInventory) -> Vec<String> {
+    let mut paths: Vec<String> = inventory
+        .candidates
+        .iter()
+        .map(|c| c.path.clone())
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Whatever the long-lived list names, including a directory inside a reclaim
+/// root and the very folder a scope offers, it is only reported: the candidates
+/// are the ones the scopes alone would offer, a reported directory that is not a
+/// candidate survives a run, and nothing the run records names it.
+#[test]
+fn long_lived_data_is_reported_and_never_a_candidate_or_removed() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, repo, scratch) = long_lived_fixture();
+    let baseline = cleaner.inventory().unwrap();
+    assert!(!baseline.candidates.is_empty(), "{baseline:?}");
+    assert!(
+        baseline
+            .long_lived
+            .iter()
+            .any(|r| r.label == "Hugging Face cache" && r.bytes == Some(4096)),
+        "{:?}",
+        baseline.long_lived
+    );
+    let keep = repo.join("data-store");
+    fs::create_dir_all(&keep).unwrap();
+    fs::write(keep.join("precious.db"), "do not delete").unwrap();
+    let mut c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![
+        keep.to_string_lossy().into_owned(),
+        scratch.to_string_lossy().into_owned(),
+    ];
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        candidate_paths(&preview),
+        candidate_paths(&baseline),
+        "the list neither adds nor removes a candidate"
+    );
+    let keep_text = keep.to_string_lossy().into_owned();
+    assert!(
+        !preview
+            .candidates
+            .iter()
+            .any(|c| c.path == keep_text || Path::new(&c.path).starts_with(&keep)),
+        "{preview:?}"
+    );
+    assert!(preview
+        .long_lived
+        .iter()
+        .any(|r| r.path == keep_text && r.bytes == Some(13)));
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "long-lived-run");
+    assert!(
+        !scratch.exists(),
+        "the scope's own candidate is still removed: {run:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(keep.join("precious.db")).unwrap(),
+        "do not delete"
+    );
+    assert!(
+        !format!("{run:?}").contains("data-store"),
+        "a reported path is not an item of the run: {run:?}"
+    );
+}
+
+/// A walk that could not read part of a path is a floor in the report, and it
+/// leaves the approval of the scope exactly as the same preview without it.
+#[cfg(unix)]
+#[test]
+fn a_cut_short_long_lived_walk_is_a_floor_and_leaves_the_approval_alone() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, repo, _scratch) = long_lived_fixture();
+    let without = cleaner.inventory().unwrap();
+    assert!(cleaner.state().unwrap().scopes_previewed);
+    let data = repo.join("big-data");
+    fs::create_dir_all(data.join("sealed")).unwrap();
+    fs::write(data.join("a.bin"), vec![b'a'; 100]).unwrap();
+    fs::write(data.join("sealed/b.bin"), vec![b'b'; 900]).unwrap();
+    let mut c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![data.to_string_lossy().into_owned()];
+    cleaner.save(c).unwrap();
+    let _sealed = deny(&data.join("sealed"));
+    let preview = cleaner.inventory().unwrap();
+    let row = preview
+        .long_lived
+        .iter()
+        .find(|r| r.path == data.to_string_lossy())
+        .unwrap();
+    assert!(row.at_least && row.bytes == Some(100), "{row:?}");
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "the approval stands"
+    );
+    assert_eq!(preview.partial, without.partial);
+    assert_eq!(preview.scopes_complete, without.scopes_complete);
+    assert_eq!(candidate_paths(&preview), candidate_paths(&without));
+}
+
+/// The list is validated where it is saved, with the reason.
+#[test]
+fn the_long_lived_list_is_validated_when_saved() {
+    let (_temp, cleaner, root) = fixture();
+    let home = root.parent().unwrap().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut service = Cleaner::new(root.parent().unwrap().join("v-state"));
+    service.long_lived_machine = Some((home.clone(), vec![]));
+    let _ = cleaner;
+    let save = |paths: Vec<String>| {
+        let mut c = config(&service, &root);
+        c.long_lived_paths = paths;
+        service.save(c)
+    };
+    let ok = home.join("models");
+    fs::create_dir_all(&ok).unwrap();
+    assert!(save(vec![ok.to_string_lossy().into_owned()]).is_ok());
+    for (path, why) in [
+        ("relative", "absolute"),
+        ("/", "filesystem root"),
+        (home.to_str().unwrap(), "home directory"),
+        (root.to_str().unwrap(), "contains the repository root"),
+        ("/definitely/not/here", "cannot be read"),
+    ] {
+        let error = save(vec![path.to_string()]).expect_err(path);
+        assert!(error.message().contains(why), "{path}: {}", error.message());
+    }
+    let too_many: Vec<String> = (0..=super::super::long_lived::MAX_USER_PATHS)
+        .map(|n| format!("/x/{n}"))
+        .collect();
+    assert!(save(too_many).is_err());
+}
+
+/// A state with no long-lived paths is readable by the build before the field
+/// existed; adding one writes a field that build refuses, like a scope.
+#[test]
+fn an_empty_long_lived_list_keeps_the_state_readable_by_the_older_build() {
+    let (_temp, cleaner, root) = fixture();
+    let read = |cleaner: &Cleaner| -> Result<ParentSaved, String> {
+        let bytes = fs::read(cleaner.dir.join("state.json")).map_err(|e| e.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    };
+    let data = root.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let mut c = config(&cleaner, &root);
+    cleaner.save(c.clone()).unwrap();
+    read(&cleaner).expect("an empty list writes no field");
+    c = cleaner.state().unwrap().config;
+    c.long_lived_paths = vec![data.to_string_lossy().into_owned()];
+    cleaner.save(c.clone()).unwrap();
+    assert!(
+        read(&cleaner).is_err(),
+        "a listed path writes a field the older build refuses"
+    );
+    c = cleaner.state().unwrap().config;
+    c.long_lived_paths.clear();
+    cleaner.save(c).unwrap();
+    read(&cleaner).expect("emptied again, readable again");
+}
+
+static TOUCH_AT_CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static USE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNREADABLE_FROM_CALL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The process table as these end-to-end tests drive it: unreadable on demand,
+/// and, at the numbered call, a build touching the session's `.rustc_info.json`
+/// (a file the removal unlinks last), which is how a removal is made to stop
+/// part way. Statics because the machine seam is a plain function.
+fn scripted_use(dir: &Path) -> Result<crate::sysload::procscan::DirUse, String> {
+    use std::sync::atomic::Ordering;
+    let call = USE_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    let from = UNREADABLE_FROM_CALL.load(Ordering::SeqCst);
+    if from > 0 && call >= from {
+        return Err("the process table could not be read".into());
+    }
+    if call == TOUCH_AT_CALL.load(Ordering::SeqCst) {
+        let _ = fs::write(
+            dir.join("scratchpad/target-a/.rustc_info.json"),
+            "{\"touched\":true}",
+        );
+    }
+    Ok(crate::sysload::procscan::DirUse::default())
+}
+
+/// Two finished sessions, each with a 4,141-byte build folder, a cleaner with
+/// the agent scope on and previewed, and the scripted process table.
+fn two_session_cleaner(cap: u64) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    use std::sync::atomic::Ordering;
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let temp_root = base.join("faketmp");
+    let uid = super::super::agent::current_uid();
+    let mut targets = Vec::new();
+    for id in ["session-0001-aaaaaaaa", "session-0002-bbbbbbbb"] {
+        let pad = temp_root.join(format!("claude-{uid}/proj/{id}/scratchpad"));
+        let target = pad.join("target-a");
+        old_cargo_target(&target);
+        quiet_session_folder(&pad);
+        targets.push(target);
+    }
+    let mut service = Cleaner::new(base.join("two-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: scripted_use,
+        temp_root,
+    });
+    service.long_lived_machine = Some((base.join("home"), vec![]));
+    let cleaner = Arc::new(service);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    c.max_run_bytes = cap;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .filter(|c| c.scope == "agent-session-scratch")
+            .count(),
+        2,
+        "{preview:?}"
+    );
+    (temp, cleaner, targets)
+}
+
+/// One finished session whose scratchpad holds the given marked targets (paths
+/// relative to the scratchpad; `wrap/t0` is a child of a wrapper folder), a
+/// cleaner with the agent scope on and previewed, and the scripted process
+/// table. Returns the targets in the order given.
+fn one_session_cleaner(
+    layout: &[&str],
+) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    one_session_cleaner_with(layout, |_| {})
+}
+
+/// [`one_session_cleaner`], with `shape` run on each target after it is built
+/// and before the scratchpad is aged and previewed.
+fn one_session_cleaner_with(
+    layout: &[&str],
+    shape: impl Fn(&std::path::Path),
+) -> (tempfile::TempDir, Arc<Cleaner>, Vec<std::path::PathBuf>) {
+    use std::sync::atomic::Ordering;
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let (temp, _old, root) = fixture();
+    let base = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+    let temp_root = base.join("faketmp");
+    let uid = super::super::agent::current_uid();
+    let pad = temp_root.join(format!(
+        "claude-{uid}/proj/session-0001-aaaaaaaa/scratchpad"
+    ));
+    let mut targets = Vec::new();
+    for relative in layout {
+        let target = pad.join(relative);
+        old_cargo_target(&target);
+        shape(&target);
+        targets.push(target);
+    }
+    quiet_session_folder(&pad);
+    let mut service = Cleaner::new(base.join("one-state"));
+    service.activity_override = Some(|_| Ok(()));
+    service.agent_machine = Some(super::AgentMachine {
+        live: super::super::agent::LiveSessions::default,
+        use_of: scripted_use,
+        temp_root,
+    });
+    service.long_lived_machine = Some((base.join("home"), vec![]));
+    let cleaner = Arc::new(service);
+    let mut c = config(&cleaner, &root);
+    c.scopes.agent_scratch_builds = true;
+    cleaner.save(c).unwrap();
+    let preview = cleaner.inventory().unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .filter(|c| c.scope == "agent-session-scratch")
+            .count(),
+        layout.len(),
+        "{preview:?}"
+    );
+    (temp, cleaner, targets)
+}
+
+/// Removing one target changes its parent folder's modification time. The
+/// recency guard is judged again for every candidate at delete time, so without
+/// the run knowing what it removed itself, the second target of the same
+/// finished session would be refused as "too recent" for a whole retention
+/// period: one folder freed per session per retention period.
+#[test]
+fn a_finished_session_with_two_targets_is_cleared_in_one_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "two-targets-run");
+    let done = run.items.iter().filter(|i| i.status == "completed").count();
+    assert_eq!(done, 2, "{:?}", run.items);
+    assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
+}
+
+/// A removal that stops part way (something changed in the target, which is
+/// what a live build looks like) leaves the target itself with a new time. That
+/// is not the run's doing in the sense the guard excuses: the folder shows life,
+/// so the session's other target is kept for this retention period and says so.
+#[test]
+fn a_partly_removed_target_keeps_its_sibling_this_period() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    USE_CALLS.store(0, Ordering::SeqCst);
+    // Calls 1 and 2 are the run's own inspection, 3 the first delete-time
+    // judgement and 4 the re-check right before its first unlink.
+    TOUCH_AT_CALL.store(4, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "partial-sibling-run");
+    TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    let row = |name: &str| {
+        run.items
+            .iter()
+            .find(|i| i.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name}: {:?}", run.items))
+    };
+    assert_eq!(
+        row("target-a").status,
+        "partially_removed",
+        "{:?}",
+        run.items
+    );
+    let sibling = row("target-b");
+    assert_eq!(sibling.status, "skipped", "{sibling:?}");
+    assert!(sibling.message.contains("too recent"), "{sibling:?}");
+    assert!(targets[1].join("debug/app.o").exists());
+}
+
+/// Cargo hard-links heavily: an uplifted `debug/foo` beside its `debug/deps`
+/// copy, an `incremental` object beside the `build` one. A real target must
+/// end `completed`, not stop at the first pair as `partially_removed`.
+#[cfg(unix)]
+#[test]
+fn a_target_shaped_like_a_real_cargo_target_with_hard_links_is_completed() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let shape = |target: &std::path::Path| {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let set = |p: &std::path::Path| {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        };
+        for dir in ["debug/deps", "debug/incremental/crate-1", "debug/build/out"] {
+            fs::create_dir_all(target.join(dir)).unwrap();
+        }
+        fs::write(target.join("debug/deps/foo-1234"), vec![b'f'; 2000]).unwrap();
+        fs::hard_link(target.join("debug/deps/foo-1234"), target.join("debug/foo")).unwrap();
+        fs::write(
+            target.join("debug/incremental/crate-1/x.o"),
+            vec![b'o'; 3000],
+        )
+        .unwrap();
+        fs::hard_link(
+            target.join("debug/incremental/crate-1/x.o"),
+            target.join("debug/build/out/x.o"),
+        )
+        .unwrap();
+        for path in [
+            "debug/deps/foo-1234",
+            "debug/foo",
+            "debug/incremental/crate-1/x.o",
+            "debug/build/out/x.o",
+            "debug/deps",
+            "debug/incremental/crate-1",
+            "debug/incremental",
+            "debug/build/out",
+            "debug/build",
+            "debug",
+        ] {
+            set(&target.join(path));
+        }
+    };
+    let (_temp, cleaner, targets) = one_session_cleaner_with(&["target-a"], shape);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "hard-link-run");
+    let row = run
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("target-a"))
+        .unwrap_or_else(|| panic!("{:?}", run.items));
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert!(!targets[0].exists());
+    // 4096 (app.o) + 2000 + 3000 + 45 (the marker files): each file once,
+    // however many names it had.
+    assert!(
+        row.message.contains("9141 bytes"),
+        "files counted once: {}",
+        row.message
+    );
+}
+
+/// The same, one level down: the wrapper folder is itself a top-level entry of
+/// `scratchpad/`, and removing a child changes the wrapper's time.
+#[test]
+fn a_wrapper_with_two_children_is_cleared_in_one_run() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-wrap/t0", "target-wrap/t1"]);
+    let saved = cleaner.state().unwrap().config;
+    let run = run_now(&cleaner, &saved, "wrapper-run");
+    let done = run.items.iter().filter(|i| i.status == "completed").count();
+    assert_eq!(done, 2, "{:?}", run.items);
+    assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
+}
+
+/// A removal that stops at 90% leaves its bytes gone, and they count: the run
+/// charges them, records the row as partly removed (not skipped), and the next
+/// candidate meets what is left of the cap. Charging only completed removals let
+/// a second 40 GB candidate in under a 50 GB cap.
+#[test]
+fn a_partly_removed_candidate_is_charged_and_the_next_one_meets_the_cap() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = two_session_cleaner(6_000);
+    let saved = cleaner.state().unwrap().config;
+    USE_CALLS.store(0, Ordering::SeqCst);
+    // Calls 1 and 2 are the run's own inspection; 3 is the first delete-time
+    // re-judgement and 4 the re-check right before its first unlink.
+    TOUCH_AT_CALL.store(4, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "partial-run");
+    let session_rows: Vec<_> = run
+        .items
+        .iter()
+        .filter(|i| i.path.contains("target-a"))
+        .collect();
+    let partial: Vec<_> = session_rows
+        .iter()
+        .filter(|i| i.status == "partially_removed")
+        .collect();
+    assert_eq!(partial.len(), 1, "{:?}", run.items);
+    assert!(partial[0].bytes_before >= 4096, "{:?}", partial[0]);
+    // The size after is unknown, not zero: the row must not read as emptied.
+    assert_eq!(partial[0].bytes_after, None, "{:?}", partial[0]);
+    assert!(partial[0]
+        .message
+        .contains("count against the run's byte limit"));
+    let refused: Vec<_> = session_rows
+        .iter()
+        .filter(|i| i.status == "skipped")
+        .collect();
+    assert_eq!(refused.len(), 1, "{:?}", run.items);
+    assert!(
+        refused[0]
+            .message
+            .contains("exceeds the remaining byte budget"),
+        "{:?}",
+        refused[0]
+    );
+    let intact = targets
+        .iter()
+        .filter(|t| t.join("debug/app.o").exists())
+        .count();
+    assert_eq!(intact, 1, "the second candidate was never touched");
+    assert_eq!(run.status, "completed_with_skips");
+}
+
+/// One folder GitPulse may not read is an answer about that folder: it is kept
+/// and listed, and the agent scope can still be previewed and approved. It used
+/// to clear the one shared "complete" flag, which approves no scope at all.
+#[cfg(unix)]
+#[test]
+fn a_folder_gitpulse_may_not_read_does_not_stop_the_scopes_being_approved() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = one_session_cleaner(&["target-a"]);
+    let claude_dir = targets[0]
+        .ancestors()
+        .nth(4)
+        .expect("<claude-uid>/<project>/<session>/scratchpad/<target>")
+        .to_path_buf();
+    let sealed = claude_dir.join("sealed-project");
+    fs::create_dir_all(&sealed).unwrap();
+    let _held = deny(&sealed);
+    let inventory = cleaner.inventory().unwrap();
+    assert!(inventory.scopes_complete, "{:?}", inventory.issues);
+    assert_eq!(inventory.unchecked_folders, 0);
+    assert!(
+        cleaner.state().unwrap().scopes_previewed,
+        "the preview counts: {:?}",
+        inventory.issues
+    );
+    let item = inventory
+        .kept
+        .iter()
+        .find(|k| k.path.ends_with("sealed-project"))
+        .unwrap_or_else(|| panic!("listed as kept: {:?}", inventory.kept));
+    assert!(item.reason.contains("may not read"), "{item:?}");
+}
+
+/// A folder a check could not run for (the process table unreadable) is not
+/// "the host was shedding work under load" and is not advice to wait for the
+/// host to be less busy; the run says what it is.
+#[test]
+fn folders_that_could_not_be_checked_are_not_reported_as_host_load() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _targets) = one_session_cleaner(&["target-a", "target-b"]);
+    let saved = cleaner.state().unwrap().config;
+    // The first candidate is read, every later reading fails.
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(2, Ordering::SeqCst);
+    let inventory = cleaner.inventory().unwrap();
+    assert!(!inventory.scopes_complete);
+    assert!(
+        inventory
+            .issues
+            .iter()
+            .all(|i| !i.contains("less busy") && !i.contains("under load")),
+        "{:?}",
+        inventory.issues
+    );
+    USE_CALLS.store(0, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "unchecked-run");
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    assert!(run.unexamined >= 1, "{run:?}");
+    assert!(
+        run.issues
+            .iter()
+            .any(|i| i.contains("agent scratch folder(s) could not be checked")),
+        "{:?}",
+        run.issues
+    );
+    assert!(
+        run.issues
+            .iter()
+            .all(|i| !i.contains("shedding work under load")),
+        "{:?}",
+        run.issues
+    );
+}
+
+/// A check that could not run at delete time is an unexamined row, counted, and
+/// nothing is removed: the process table unreadable after a good preview.
+#[test]
+fn a_check_that_could_not_run_at_delete_time_is_an_unexamined_row() {
+    use std::sync::atomic::Ordering;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, targets) = two_session_cleaner(10 * 1024 * 1024 * 1024);
+    let saved = cleaner.state().unwrap().config;
+    // The run's own inspection reads the table twice (one candidate each); the
+    // third reading is the first delete-time re-judgement, and every later one
+    // fails.
+    USE_CALLS.store(0, Ordering::SeqCst);
+    UNREADABLE_FROM_CALL.store(3, Ordering::SeqCst);
+    let run = run_now(&cleaner, &saved, "unexamined-run");
+    UNREADABLE_FROM_CALL.store(0, Ordering::SeqCst);
+    let rows: Vec<_> = run
+        .items
+        .iter()
+        .filter(|i| i.path.contains("target-a"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{:?}", run.items);
+    for row in rows {
+        assert_eq!(row.status, "unexamined", "{row:?}");
+        assert!(row.message.contains("Could not examine"), "{row:?}");
+    }
+    assert!(run.unexamined >= 2, "{run:?}");
+    assert!(
+        targets.iter().all(|t| t.join("debug/app.o").exists()),
+        "nothing was removed"
+    );
+}
+
+/// A due scheduled run waits while the host sheds background work for a reason
+/// other than the disk, runs when the disk alone is the reason, and runs when
+/// nothing is shed. With no governor in the process (the headless run) it never
+/// waits. Through the real accessors, with a governor that has history.
+#[test]
+fn a_due_scheduled_run_waits_for_every_pressure_but_the_disk() {
+    use crate::sysload::{inject_governor_with_history, GovernorInput, Level, Reading, Readings};
+    let history =
+        |input: GovernorInput| inject_governor_with_history(std::iter::repeat_n(input, 10));
+    let low_disk = || GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(8 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    };
+    assert!(
+        !super::scheduled_wait_reason().is_some(),
+        "no governor in this thread: it runs"
+    );
+    {
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        assert!(crate::sysload::shed().background, "the fixture sheds");
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "memory Severe: it waits"
+        );
+    }
+    {
+        let _disk = history(low_disk());
+        assert!(crate::sysload::shed().background);
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "the disk alone: it runs"
+        );
+    }
+    {
+        // A nearly full disk brings memory pressure with it: below the Severe
+        // floor the clean proceeds whatever else is pressed.
+        let mut both = low_disk();
+        both.level = Some(Level::Critical);
+        let _both = history(both);
+        assert!(crate::sysload::shed().background);
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "disk below the Severe floor and memory pressed: it runs"
+        );
+    }
+    {
+        // Low disk Elevated (24 GiB, between the floors) is not enough.
+        let mut elevated = low_disk();
+        elevated.readings.free_disk = Reading::Value(24 << 30);
+        elevated.level = Some(Level::Critical);
+        let _elevated = history(elevated);
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "disk Elevated and memory pressed: it waits"
+        );
+    }
+    {
+        // The fill projection alone, with space well above the floor.
+        let mut filling = GovernorInput::test_pressure(Level::Critical);
+        filling.readings.free_disk = Reading::Value(40 << 30);
+        filling.readings.disk_fill_sustained = Reading::Value(10 << 30);
+        let _filling = history(filling);
+        assert!(
+            super::scheduled_wait_reason().is_some(),
+            "a fill projection alone with memory pressed: it waits"
+        );
+    }
+    {
+        let _clear = history(GovernorInput::test_pressure(Level::Normal));
+        assert!(
+            !super::scheduled_wait_reason().is_some(),
+            "nothing shed: it runs"
+        );
+    }
+}
+
+/// What the scheduler loop does with a due schedule, through the one function
+/// it calls and the real governor accessors: nothing starts while the host
+/// sheds for a reason the run does not relieve (and the state says why), a run
+/// starts when nothing is shed or the disk remedy is due, and a schedule that
+/// is not due starts nothing.
+#[cfg(unix)]
+#[test]
+fn the_scheduler_loop_holds_a_due_run_back_only_when_the_remedy_is_not_due() {
+    use crate::sysload::{inject_governor_with_history, GovernorInput, Level, Reading};
+    let _serial = crate::storage::hygiene::tests::serial();
+    let due = |cleaner: &Arc<Cleaner>, root: &std::path::Path| {
+        let now = crate::storage::hygiene::now();
+        let mut c = config(cleaner, root);
+        c.enabled = true;
+        c.next_run_at = now;
+        cleaner.save(c).unwrap();
+        now
+    };
+    let history =
+        |input: GovernorInput| inject_governor_with_history(std::iter::repeat_n(input, 10));
+    // Memory Severe with plenty of disk: a due run waits and says why.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        super::scheduler_tick(&cleaner, now);
+        let state = cleaner.state().unwrap();
+        assert!(state.scheduled_wait.is_some(), "{state:?}");
+        assert!(state.history.is_empty(), "nothing started");
+    }
+    // The same pressure with free disk below the Severe floor: it starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let mut input = GovernorInput::test_pressure(Level::Critical);
+        input.readings.free_disk = Reading::Value(8 << 30);
+        let _both = history(input);
+        super::scheduler_tick(&cleaner, now);
+        let state = wait(&cleaner);
+        assert_eq!(state.scheduled_wait, None);
+        assert_eq!(state.history.len(), 1, "the run started: {state:?}");
+    }
+    // Nothing shed: it starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let _clear = history(GovernorInput::test_pressure(Level::Normal));
+        super::scheduler_tick(&cleaner, now);
+        let state = wait(&cleaner);
+        assert_eq!(state.history.len(), 1, "{state:?}");
+    }
+    // Not due, with memory Severe: nothing waits and nothing starts.
+    {
+        let (_temp, cleaner, root) = fixture();
+        let now = due(&cleaner, &root);
+        let mut later = cleaner.state().unwrap().config;
+        later.next_run_at = now + 3600;
+        cleaner.save(later).unwrap();
+        let _memory = history(GovernorInput::test_pressure(Level::Critical));
+        super::scheduler_tick(&cleaner, now);
+        let state = cleaner.state().unwrap();
+        assert_eq!(state.scheduled_wait, None);
+        assert!(state.history.is_empty());
+    }
+}
+
+/// Only a preview that measures reports; a run, which does not, carries none.
+#[test]
+fn a_run_inspection_does_not_build_the_long_lived_list() {
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (_temp, cleaner, _root, _repo, _scratch) = long_lived_fixture();
+    let config = cleaner.state().unwrap().config;
+    let run_view = cleaner.inspect(&config, config.scopes, false).unwrap();
+    assert!(run_view.long_lived.is_empty(), "{:?}", run_view.long_lived);
+    assert!(!cleaner.inventory().unwrap().long_lived.is_empty());
 }

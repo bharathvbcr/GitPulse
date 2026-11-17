@@ -1,0 +1,445 @@
+//! The working-tree scan's choice of engine: the in-process scanner always,
+//! Kingfisher as a second opinion only on an explicit scan, and a scan with
+//! holes never clean.
+
+use super::primary::{merge_second_opinion, scan_primary, scan_working_tree_with};
+use super::run::failed_report;
+use super::{
+    ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation, SecretsReport, MAX_FINDINGS,
+};
+use crate::leak_scan::worktree::WorktreeLimits;
+use crate::leak_scan::{ENGINE, MAX_REPORTED_HITS};
+use crate::test_support::{git_in, git_repo, write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+/// Assembled at run time so this file carries no token a scanner would stop.
+fn token() -> String {
+    format!("ghp_{}", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5")
+}
+
+fn path_of(dir: &TempDir) -> String {
+    dir.path().to_str().expect("utf-8 temp path").to_string()
+}
+
+/// A stub `kingfisher` that records that it ran and reports a clean tree.
+fn stub(dir: &Path) -> PathBuf {
+    stub_with(dir, "", "exit 0")
+}
+
+/// A stub `kingfisher` whose scan prints `findings` (JSON array elements, with
+/// `$ROOT` standing for the scanned directory) and then runs `ending`.
+fn stub_with(dir: &Path, findings: &str, ending: &str) -> PathBuf {
+    let path = dir.join("kingfisher");
+    let marker = dir.join("ran");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'kingfisher 9.9.9'; exit 0; fi\n\
+         ROOT=\"$3\"\ntouch '{marker}'\ncat <<EOF\n\
+         {{\"findings\":[{findings}],\"audit\":{{\"summary\":{{\"scan_partial\":0,\
+         \"scan_failed\":0,\"pending\":0}},\"repositories\":[{{\"scan\":{{\"status\":\
+         \"completed\"}}}}]}}}}\nEOF\n{ending}\n",
+        marker = marker.display(),
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// One Kingfisher finding at `$ROOT/<path>:<line>`, for [`stub_with`].
+fn kf_row(path: &str, line: u32) -> String {
+    format!(
+        "{{\"rule\":{{\"id\":\"betterleaks.github-pat\",\"name\":\"github-pat\"}},\
+         \"finding\":{{\"path\":\"$ROOT/{path}\",\"line\":{line},\"confidence\":\"high\",\
+         \"snippet\":\"[REDACTED:aaaaaaaa]\"}}}}"
+    )
+}
+
+fn repo_with_plants() -> TempDir {
+    let dir = git_repo();
+    write(
+        dir.path(),
+        "src/app.rs",
+        &format!("let t = \"{}\";\n", token()),
+    );
+    git_in(dir.path(), &["add", "src/app.rs"]);
+    write(dir.path(), "notes.txt", &format!("{}\n", token()));
+    dir
+}
+
+#[test]
+fn without_kingfisher_the_scan_still_completes_with_the_in_house_engine() {
+    let dir = repo_with_plants();
+    let report = scan_working_tree_with(&path_of(&dir), false, || None).expect("scan runs");
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.error, None);
+    assert_eq!(report.engine, ENGINE);
+    assert!(!report.kingfisher_present);
+    assert_eq!(report.second_opinion, SecondOpinion::NotInstalled);
+    assert_eq!(report.completeness, ScanCompleteness::Complete);
+    assert_eq!(report.findings_total, 2);
+    assert!(report.git_status_known);
+    let location = |p: &str| {
+        report
+            .findings
+            .iter()
+            .find(|f| f.path == p)
+            .unwrap()
+            .location
+    };
+    assert_eq!(location("src/app.rs"), SecretLocation::Tracked);
+    assert_eq!(location("notes.txt"), SecretLocation::Untracked);
+    let wire = serde_json::to_string(&report).unwrap();
+    assert!(
+        !wire.contains(&token()) && !wire.contains(&token()[..12]),
+        "{wire}"
+    );
+}
+
+#[test]
+fn an_automatic_scan_never_starts_kingfisher_but_reports_that_it_is_installed() {
+    let dir = repo_with_plants();
+    let bin = TempDir::new().unwrap();
+    let kingfisher = stub(bin.path());
+    let report = scan_working_tree_with(&path_of(&dir), false, || Some(kingfisher.clone()))
+        .expect("scan runs");
+    assert_eq!(report.engine, ENGINE);
+    assert!(report.kingfisher_present);
+    assert_eq!(report.second_opinion, SecondOpinion::NotRun);
+    assert!(!bin.path().join("ran").exists(), "the stub was started");
+}
+
+#[test]
+fn a_scan_with_skips_is_partial_and_names_what_it_skipped() {
+    let dir = git_repo();
+    write(dir.path(), "big.txt", &"x".repeat(2_000));
+    write(dir.path(), "ok.txt", "fine\n");
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(
+        &repo,
+        WorktreeLimits {
+            file_bytes: 1_000,
+            ..WorktreeLimits::DEFAULT
+        },
+        false,
+    );
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.findings_total, 0);
+    assert_eq!(report.completeness, ScanCompleteness::Partial);
+    assert_eq!(report.skipped_total, 1);
+    assert_eq!(report.skipped[0].path, "big.txt");
+    assert_eq!(report.skipped[0].bytes, Some(2_000));
+}
+
+#[test]
+fn a_listing_failure_is_a_failed_scan_not_a_clean_one() {
+    // Not a repository: git cannot list it, so there is no verdict to give.
+    let dir = TempDir::new().unwrap();
+    let report = scan_primary(dir.path(), WorktreeLimits::DEFAULT, false);
+    assert!(!report.ok, "{report:?}");
+    assert!(report.error.is_some());
+    assert_eq!(report.completeness, ScanCompleteness::Unverified);
+    assert_eq!(report.engine, ENGINE);
+}
+
+#[test]
+fn an_explicit_scan_runs_kingfisher_after_the_in_process_scan_and_keeps_both() {
+    let dir = repo_with_plants();
+    let bin = TempDir::new().unwrap();
+    let kingfisher = stub(bin.path());
+    let report = scan_working_tree_with(&path_of(&dir), true, || Some(kingfisher.clone()))
+        .expect("scan runs");
+    assert!(
+        bin.path().join("ran").exists(),
+        "the stub was never started: {report:?}"
+    );
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.engine, ENGINE);
+    assert_eq!(report.findings_total, 2, "the primary's findings stand");
+    assert_eq!(report.completeness, ScanCompleteness::Complete);
+    assert_eq!(report.kingfisher_version.as_deref(), Some("9.9.9"));
+    assert_eq!(
+        report.second_opinion,
+        SecondOpinion::Ran {
+            completeness: ScanCompleteness::Complete,
+            version: Some("9.9.9".into()),
+            findings_total: 0,
+            confirmed: 0,
+            added: 0,
+        }
+    );
+}
+
+#[test]
+fn kingfisher_rows_are_the_union_and_a_shared_path_and_line_is_one_row() {
+    let dir = repo_with_plants();
+    write(dir.path(), ".gitignore", "local.env\n");
+    write(dir.path(), "local.env", "x\n");
+    let bin = TempDir::new().unwrap();
+    // src/app.rs:1 and notes.txt:1 are the primary's; notes.txt:2 and the
+    // ignored file are not.
+    let rows = [
+        kf_row("src/app.rs", 1),
+        kf_row("notes.txt", 1),
+        kf_row("notes.txt", 2),
+        kf_row("local.env", 1),
+    ]
+    .join(",");
+    let kingfisher = stub_with(bin.path(), &rows, "exit 200");
+    let report = scan_working_tree_with(&path_of(&dir), true, || Some(kingfisher.clone()))
+        .expect("scan runs");
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.findings_total, 4, "{report:?}");
+    assert_eq!(report.findings.len(), 4, "{report:?}");
+    match &report.second_opinion {
+        SecondOpinion::Ran {
+            findings_total,
+            confirmed,
+            added,
+            ..
+        } => assert_eq!((*findings_total, *confirmed, *added), (4, 2, 2)),
+        other => panic!("{other:?}"),
+    }
+    let at = |p: &str, l: u32| {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.path == p && f.line == Some(l))
+            .count()
+    };
+    assert_eq!(at("src/app.rs", 1), 1, "kept once");
+    assert_eq!(at("notes.txt", 1), 1, "kept once");
+    assert_eq!(at("notes.txt", 2), 1);
+    let ignored = report
+        .findings
+        .iter()
+        .find(|f| f.path == "local.env")
+        .unwrap();
+    assert_eq!(ignored.location, SecretLocation::Ignored);
+}
+
+#[test]
+fn a_failed_kingfisher_never_changes_the_primary_result() {
+    let dir = repo_with_plants();
+    let clean = scan_working_tree_with(&path_of(&dir), false, || None).expect("scan runs");
+    // Exit 1 is not a success exit; a signal death and a missing envelope are
+    // the other shapes of a Kingfisher that did not finish.
+    for ending in ["exit 1", "kill -9 $$", "exit 0"] {
+        let bin = TempDir::new().unwrap();
+        let findings = if ending == "exit 0" { "not json" } else { "" };
+        let kingfisher = stub_with(bin.path(), findings, ending);
+        let report = scan_working_tree_with(&path_of(&dir), true, || Some(kingfisher.clone()))
+            .expect("scan runs");
+        assert!(bin.path().join("ran").exists(), "{ending}: stub never ran");
+        assert!(report.ok, "{ending}: {report:?}");
+        assert_eq!(report.error, None, "{ending}");
+        assert_eq!(report.engine, ENGINE, "{ending}");
+        assert_eq!(report.findings, clean.findings, "{ending}");
+        assert_eq!(report.findings_total, clean.findings_total, "{ending}");
+        assert_eq!(report.completeness, clean.completeness, "{ending}");
+        assert!(
+            matches!(&report.second_opinion, SecondOpinion::Unavailable { reason } if !reason.is_empty()),
+            "{ending}: {:?}",
+            report.second_opinion
+        );
+    }
+}
+
+#[test]
+fn every_way_kingfisher_can_fail_leaves_the_primary_findings_alone() {
+    let dir = repo_with_plants();
+    let base = scan_working_tree_with(&path_of(&dir), false, || None).expect("scan runs");
+    for reason in [
+        "kingfisher did not finish within 300s",
+        "kingfisher output was truncated",
+        "kingfisher output could not be read to the end",
+        "superseded by a newer secrets scan",
+        "kingfisher exited with status 3",
+    ] {
+        let mut report = base.clone();
+        merge_second_opinion(&mut report, failed_report(reason, Some("9.9.9".into())));
+        assert_eq!(
+            report.second_opinion,
+            SecondOpinion::Unavailable {
+                reason: reason.into()
+            }
+        );
+        let mut expected = base.clone();
+        expected.second_opinion = report.second_opinion.clone();
+        assert_eq!(report, expected, "{reason}: more than the opinion changed");
+    }
+}
+
+#[test]
+fn an_explicit_scan_without_kingfisher_is_the_primary_result_and_not_installed() {
+    let dir = repo_with_plants();
+    let report = scan_working_tree_with(&path_of(&dir), true, || None).expect("scan runs");
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.engine, ENGINE);
+    assert_eq!(report.findings_total, 2);
+    assert_eq!(report.second_opinion, SecondOpinion::NotInstalled);
+    assert!(!report.kingfisher_present);
+}
+
+#[test]
+fn a_scan_that_left_a_nested_repository_unread_is_partial_and_names_it() {
+    let dir = git_repo();
+    write(dir.path(), "top.txt", "fine\n");
+    let inner = dir.path().join("vendor/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    git_in(&inner, &["init", "-q", "-b", "main"]);
+    write(&inner, "k.txt", &format!("{}\n", token()));
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(&repo, WorktreeLimits::DEFAULT, false);
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.findings_total, 0, "the nested file was not read");
+    assert_eq!(report.skipped_total, 0, "it is named, not a skip");
+    assert_eq!(report.excluded_paths, vec!["vendor/inner/".to_string()]);
+    assert_eq!(
+        report.completeness,
+        ScanCompleteness::Partial,
+        "a scan that did not read a nested repository is not complete"
+    );
+}
+
+fn synthetic_finding(path: String, line: u32) -> SecretFinding {
+    SecretFinding {
+        rule_id: "betterleaks.github-pat".into(),
+        rule_name: String::new(),
+        path,
+        line: Some(line),
+        confidence: String::new(),
+        location: SecretLocation::Tracked,
+        secret_group: 0,
+    }
+}
+
+/// A clean, complete in-process report to hang synthetic findings on.
+fn clean_report() -> SecretsReport {
+    let dir = git_repo();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    scan_primary(&repo, WorktreeLimits::DEFAULT, true)
+}
+
+#[test]
+fn a_scan_past_the_hit_cap_lists_the_cap_and_says_the_list_is_cut() {
+    let dir = git_repo();
+    let lines = MAX_REPORTED_HITS + 50;
+    write(
+        dir.path(),
+        "many.txt",
+        &format!("{}\n", token()).repeat(lines),
+    );
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(&repo, WorktreeLimits::DEFAULT, false);
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.findings.len(), MAX_REPORTED_HITS);
+    assert_eq!(
+        report.findings_total as usize, lines,
+        "every hit is counted"
+    );
+    assert!(
+        report.findings_truncated,
+        "a list shorter than the count must say it was cut"
+    );
+}
+
+#[test]
+fn a_scan_under_the_hit_cap_is_not_marked_cut() {
+    let dir = repo_with_plants();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(&repo, WorktreeLimits::DEFAULT, false);
+    assert_eq!(report.findings_total, 2);
+    assert!(!report.findings_truncated);
+}
+
+#[test]
+fn a_capped_primary_makes_the_union_total_an_upper_bound_and_stays_cut() {
+    let mut primary = clean_report();
+    primary.findings = (1..=3)
+        .map(|n| synthetic_finding("a.txt".into(), n))
+        .collect();
+    primary.findings_total = 10;
+    primary.findings_truncated = true;
+    // Kingfisher's row at a.txt:9 may be one of the seven hits the primary
+    // counted and did not list; it cannot be matched, so it is an addition.
+    let mut second = clean_report();
+    second.findings = vec![
+        synthetic_finding("a.txt".into(), 1),
+        synthetic_finding("a.txt".into(), 9),
+    ];
+    second.findings_total = 2;
+    merge_second_opinion(&mut primary, second);
+    assert!(primary.findings_truncated, "{primary:?}");
+    assert_eq!(primary.findings.len(), 4);
+    assert_eq!(
+        primary.findings_total, 11,
+        "an upper bound, never below the rows"
+    );
+    assert!(primary.findings_total as usize >= primary.findings.len());
+}
+
+#[test]
+fn a_union_longer_than_the_display_cap_says_rows_were_dropped() {
+    let mut primary = clean_report();
+    primary.findings = (0..MAX_FINDINGS)
+        .map(|n| synthetic_finding(format!("p{n}.txt"), 1))
+        .collect();
+    primary.findings_total = MAX_FINDINGS as u32;
+    let mut second = clean_report();
+    second.findings = (0..5)
+        .map(|n| synthetic_finding(format!("k{n}.txt"), 1))
+        .collect();
+    second.findings_total = 5;
+    merge_second_opinion(&mut primary, second);
+    assert_eq!(primary.findings.len(), MAX_FINDINGS);
+    assert_eq!(primary.findings_total as usize, MAX_FINDINGS + 5);
+    assert!(
+        primary.findings_truncated,
+        "rows were dropped to fit the cap and the report did not say so"
+    );
+}
+
+#[test]
+fn a_union_that_fits_the_display_cap_is_not_marked_cut() {
+    let mut primary = clean_report();
+    primary.findings = vec![synthetic_finding("a.txt".into(), 1)];
+    primary.findings_total = 1;
+    let mut second = clean_report();
+    second.findings = vec![synthetic_finding("b.txt".into(), 1)];
+    second.findings_total = 1;
+    merge_second_opinion(&mut primary, second);
+    assert!(!primary.findings_truncated);
+}
+
+#[test]
+fn the_unavailable_reason_is_fixed_wording_never_kingfisher_output() {
+    let dir = repo_with_plants();
+    let secret = token();
+    // Each stub writes the planted token to stdout and stderr, then ends the
+    // way a failing Kingfisher can.
+    for (label, findings, ending) in [
+        ("exit 3", "", "echo \"$T\" >&2; echo \"$T\"; exit 3"),
+        ("signal", "", "echo \"$T\" >&2; kill -9 $$"),
+        ("not json", "{{{ $T", "exit 0"),
+        ("not an envelope", "", "echo \"$T\"; exit 0"),
+    ] {
+        let bin = TempDir::new().unwrap();
+        let kingfisher = stub_with(bin.path(), findings, ending);
+        let text = std::fs::read_to_string(&kingfisher).unwrap();
+        std::fs::write(
+            &kingfisher,
+            text.replacen("ROOT=", &format!("T={secret}\nROOT="), 1),
+        )
+        .unwrap();
+        let report = scan_working_tree_with(&path_of(&dir), true, || Some(kingfisher.clone()))
+            .expect("scan runs");
+        let SecondOpinion::Unavailable { reason } = &report.second_opinion else {
+            panic!("{label}: {:?}", report.second_opinion);
+        };
+        assert!(!reason.contains(&secret[..12]), "{label}: {reason}");
+        assert!(reason.starts_with("kingfisher"), "{label}: {reason}");
+        let wire = serde_json::to_string(&report).unwrap();
+        assert!(!wire.contains(&secret[..12]), "{label}: {wire}");
+    }
+}

@@ -4,7 +4,7 @@
 
 This is the detailed feature reference. Start with the guides above for a first
 session; use the sections below for controls, prerequisites, and limits.
-[Open qualification](QUALIFICATION.md) tracks verification that remains outstanding.
+[Open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md) tracks verification that remains outstanding.
 
 ## Find a workflow
 
@@ -31,7 +31,7 @@ GitPulse provides 4 application views — **Work**, **Code**, **History** and **
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for the Code → Map code graph. See [Module integration](MODULE_INTEGRATION.md).
 
-On macOS, GitPulse automatically uses [glass surfaces and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
+On macOS, GitPulse automatically uses [glass surfaces, theme presets, saved themes, window wallpapers, and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
 
 The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
 and Help**. **Go** opens all 11 sections directly. **View** includes Zoom In,
@@ -226,7 +226,8 @@ menu build or an old deep link lands on Overview.
 
 **In Settings → Agents**
 - **Manvi Policy** and **Capability Boundary**: connection status, posture and what the gate can and cannot see, beside the external CLI installer.
-- **Local Model Servers**: scan, pick, and the Claude model Manvi uses.
+- **Local Model Servers & Anthropic Account Registry**: scan and pick local model servers, and configure the Claude model Manvi uses. When `~/.anthropic-accounts` exists, GitPulse launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi` without reading or storing an Anthropic API key, and the status-bar pill displays `Cloud · <model>` (`HarnessBadge.svelte`).
+- **Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`, on by default): keeps managed Codex and Claude runs alive in a detached `manvi serve --listen` process across app restarts (while Unix PTY terminal sessions always live in `gitpulse-ptyd`).
 - **Branch naming** for the work in progress moved beside the new-branch field of the **Worktrees** panel.
 
 **Underneath**
@@ -241,17 +242,15 @@ The header's Manvi chip opens **Settings → Agents → Manvi policy**, its verd
 Work → Tasks shows tasks linked to the active repository. The **Tasks** button
 beside Fleet opens global and saved-workspace scopes over the same records.
 
-- **Organize**: Board/list layouts with swimlanes (grouped by owner or first label),
+- **Organize**: Two-row board header (a title row for search, syntax help, **Inbox** / **Archive** / **Refresh**, and **New task**, and a toolbar row for `Board | List`, **Filters**, **Views**, **View**, **Suggest next**, **Organize**, and **Auto (Manvi)**), board/list layouts with swimlanes (grouped by owner or first label),
   saved views, column WIP limits, full-text search with structured query filters
   (`is:bug`, `priority:high`, `status:open`, `repo:name`, `owner:`, `label:`, `severity:`, `due:` with `-` negation),
   quick filter chips, multi-selection, context menus, and drag or keyboard moves.
+- **Attention Inbox**: Each notice in the **Inbox** drawer (`AttentionInbox.svelte`, `attentionDismiss.ts`) can be opened or dismissed out of **Active** / **Unread** and restored from **All**.
 - **Checklists & Task Links**: Task checklists with individual completion states, and
   relational links between tasks (parent, blocks, related, duplicate of) edited in the task sheet
   and surfaced in agent handoff briefs.
-- **Know the scope**: Facets and Select all operate on loaded cards; column counts and
-  **Load more** reveal additional results. Each column also provides **Load all**,
-  which reads beyond the initial 30 cards in 200-card pages up to `MAX_CANDIDATES` (2,000 cards)
-  or until stopped. Loaded column counts are preserved across board refreshes (`reloadSize`),
+- **Know the scope**: Facets and Select all operate on loaded cards; after the initial 30-card read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards across columns in 200-card chunks up to `MAX_CANDIDATES` (2,000 cards) while the column cursor matches, and each column also provides manual **Load all** / **Stop**. Live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused) so external agent writes appear immediately. Loaded column counts are preserved across board refreshes (`reloadSize`),
   and card verdict queries are automatically chunked in batches of 256 IDs (`getBoardVerdicts`)
   so large boards never trigger host refusals or cleared verdicts. When tasks from hidden
   repositories are omitted from the board, the notification banner explicitly names the
@@ -354,7 +353,7 @@ flowchart TD
     end
 ```
 
-- **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates. Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
+- **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates, with hover tooltips across files, symbols, and subsystems (`RepoMapPanel.svelte`). Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
 - **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.
 - **Repo docs vault**: Built from `git ls-files` of markdown (git is the authority — no ignored / vendor walk). Full-text search, broken-link report, and backlinks in the markdown viewer. Caps and skips are reported on the status strip.
 - **Freshness & build**: Status strip from `devmap status --json` (generation, freshness, `schema_outdated`, coverage gaps). Build / Refresh shell out to the installed `devmap` CLI. Watcher-driven incremental refresh runs when the index is stale, one build per repo at a time.
@@ -385,7 +384,7 @@ the commit you had just selected.
 
 - **GPU Canvas Rendering**: High-performance commit graph capable of rendering repositories with 100,000+ commits smoothly.
 - **Topological Lane Solver**: Rust-powered stable-column lane solving with nogap lookback guarantees to avoid visual discontinuities. The default branch (`main`, or the repository's own default; `origin/main` when it is ahead) is pinned to the leftmost column in one colour for the whole loaded window, so merged feature branches peel off and close back into a straight mainline instead of displacing it. Hovering the rail names the branch it belongs to.
-- **Author Avatars & Badges**: Automatic display of author avatars or initials with one-click filter isolation.
+- **Author Avatars & Badges**: Automatic display of GitHub author avatars (`src-tauri/src/github/avatars.rs`, `AuthorAvatar.svelte`) or initials fallback with one-click filter isolation.
 - **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
 - **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter in History's section bar, which filters all three sections from one walk. From any other view it switches to History first; in Code, ⌘F still searches the open file — whether the Blame gutter toggle is active or not, because Blame annotates that same file's lines.
 - **Filters That Keep The Graph Connected**: Every filter term — `author:`, `sha:`, `type:` or a `fix:`-style prefix, free text, and `path:` — is applied by the backend before lanes are solved. A commit the filter drops hands its lineage to its children, the way `git log --parents -- path` rewrites parents, so the survivors stay connected to their nearest kept ancestors, a survivor with no kept ancestors becomes a root of the filtered view, and the straight main-branch rail stays straight, anchored on the first surviving commit of the default branch's chain. A fading stub therefore always means one thing: the parent is past the loaded window, and the tooltip says so.
@@ -517,13 +516,13 @@ rather than presenting a floor as a total.
 
 Secrets was its own Insights section until it folded into Health, which gave it the shared verdict and agent bar. A session that had Secrets open restores onto Health.
 
-- **Kingfisher Secrets Scanner**: Discovers exposed API keys, private tokens, passwords, and secrets across repository files via an integrated Kingfisher scan.
+- **In-Process Secrets Scan**: Discovers exposed API keys and private tokens in every tracked file and every untracked file git does not ignore, with GitPulse's own scanner (no external program, so it works with Kingfisher absent). The panel names the engine that produced the result. Rescan also asks Kingfisher, when it is installed, for a **second opinion**: it recognises many more credential shapes and also reads ignored files, its findings are merged (one row per path and line), and the panel says whether it ran or why it was unavailable. The green "No secrets reported" headline needs both engines to have read everything and found nothing; the in-process scan alone reads "No known secret shapes matched".
 - **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
 - **Located Findings**: Rows are sorted with the actionable ones first, so a token in committed source does not sit among build output. Location chips (tracked, untracked, ignored, `.git` metadata, nested repository) filter the list, rows that hold the same value are marked, and each row can be revealed in the file manager.
 - **Stated Scope and Age**: The panel says what a scan covers — the working tree only, the file-size limit, symlinks, and inline ignores — and the header shows the scan's age. A result older than five minutes refreshes when the section is reopened.
 - **One Scan at a Time**: Opening Health runs one secrets scan beside the dependency scan, and a newer scan cancels an older one, so switching repositories never queues scanners. The section is drawn whether the dependency scan is loading, failed or done; moving between those states joins the scan already running instead of starting another. Every location of a repeated value is listed rather than deduplicated away.
 - **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
-- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that Kingfisher itself marked partial (an unreadable file) reports explicitly as unverified / not clean, never as an all-clear.
+- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that left any file unread (over the size cap, past the byte or time budget, unreadable, a nested repository left unread, or one Kingfisher itself marked partial) reports explicitly as unverified / not clean, never as an all-clear.
 
 ### 4.5 Storage
 
@@ -564,14 +563,14 @@ Health remediation plan, a failing test, the diff you are about to commit.
 - **Browser sessions (macOS)**: a **Browser** session type shows a local dev server's page (loopback only) in a native webview with no route to GitPulse's commands and its own non-persistent storage, placed over the tab and hidden whenever the tab is off screen or something of GitPulse's is drawn over it ([Terminal](TERMINAL.md#browser-sessions)).
 - **Explicit agent sessions**: Local AI suggestions and the policy sidecar do not read or write ordinary shell sessions. Choosing Claude, Manvi or Codex, or launching a saved task, starts a separate user-controlled agent session in the existing dock; that process receives input in its own PTY.
 - **Diagnostic Preservation**: Preserves command output, exit status, and failure context across builds.
-- **Lifecycle Supervision**: Switching views or repositories and hiding the dock preserve sessions. Closing a terminal tab or repository tab terminates the sessions it owns; failed cleanup remains visible.
-- **Resizable**: Drag the separator or nudge it with `↑`/`↓`; the height is remembered, and clamped so the dock can never grow to swallow the view above it.
+- **Lifecycle Supervision & Unix Terminal Host**: Switching views or repositories and hiding the dock preserve sessions. On Unix (`#[cfg(unix)]`), PTY sessions run in `gitpulse-ptyd` ([Terminal host](TERMINAL_HOST.md)) and survive app restarts or crashes. Closing a terminal tab or repository tab terminates the sessions it owns; failed cleanup remains visible.
+- **Resizable**: Drag the separator or nudge it with `↑`/`↓`, or double-click a page header or empty background to minimize an expanded dock (`panelDismiss.ts`); the height is remembered, and clamped so the dock can never grow to swallow the view above it.
 
 ### 5.2 Agents (MCP 2.0 / Codex / Agent Plugins 1.0)
 
 - **Protocol**: `gitpulse-mcp` implements [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — `server/discover`, per-request `_meta`, `resultType` on results, cacheable tool lists. Dual-era: legacy `initialize` (2024-11-05 / 2025-11-25) still works.
-- **Package**: one canonical package at `plugins/gitpulse/` — native Codex `.codex-plugin/plugin.json` + `.mcp.json`, Claude Code compatibility files, closed Agent Plugins 1.0 manifests, and one shared `skills/` tree. The Tauri app copies this package into `Contents/Resources/plugin`.
-- **Tools**: Read-only inspection tools (`readOnlyHint: true`) — `gitpulse_insights`, `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar` (3-layer claims + 1-hop CSR call-graph + ODB merge-tree radar), plus ledger, tasks, in-process `gitpulse_codeintel_*` / `devmap_*`, `gitpulse_provenance`, and `gitpulse_landed`. Repository-trust-gated write tools cover the task board (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and parallel agent worktree lifecycle & coordination (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with Git mutations gated through the Manvi policy harness. `gitpulse_browser_open` (macOS) asks the running app to open a Browser session on a loopback URL in a trusted repository's terminal dock; it opens a page and nothing more.
+- **Package**: one canonical package at `plugins/gitpulse/` — native Codex `.codex-plugin/plugin.json` + `.mcp.json`, Claude Code compatibility files, closed Agent Plugins 1.0 manifests, and one shared `skills/` tree, plus the Antigravity bundle at `plugins/gitpulse-agy/`. The Tauri app copies this package into `Contents/Resources/plugin`.
+- **Tools**: Read-only inspection tools (`readOnlyHint: true`) — `gitpulse_insights`, `gitpulse_sessions` (zero-git live session attribution, `is_caller`, `run_id`, and `state`), `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar` (3-layer claims + 1-hop CSR call-graph + ODB merge-tree radar), plus ledger, tasks, in-process `gitpulse_codeintel_*` / `devmap_*`, `gitpulse_provenance`, and `gitpulse_landed`. Repository-trust-gated write tools cover the task board (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and parallel agent worktree lifecycle & coordination (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with Git mutations gated through the Manvi policy harness. `gitpulse_browser_open` (macOS) asks the running app to open a Browser session on a loopback URL in a trusted repository's terminal dock; it opens a page and nothing more.
 - **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
 - **Linux Signal Guard on Linux**: Models Linux process inspection tools (`procps pkill`/`pgrep`, `psmisc killall`, `pidof`) natively on Linux, checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect GitPulse and agent sessions.
 - **Durable Hook Notify Drop Record**: When notifications miss their timeout budget, timed records are appended to `<socket>.drops` beside the socket, rotated at 32 KiB, tightened to `0600` best-effort, and surfaced in Settings after 7-day expiration.

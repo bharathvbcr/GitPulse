@@ -55,11 +55,14 @@
  *   --bin <path>       probe this server instead of resolving PATH
  *   --hook-bin <path>  probe this hook binary instead of resolving PATH
  *   --expect <ver>     compare against this version instead of package.json
+ *   --claude-dir <p>   read the installed plugin cache from this Claude config
+ *                      directory (default $CLAUDE_CONFIG_DIR, else ~/.claude)
  *   --timeout <ms>     identity budget (default 10000)
  *   --json             machine-readable result
  */
-import { spawn } from "node:child_process";
-import { accessSync, constants, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { accessSync, constants, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
@@ -665,8 +668,220 @@ export function classifyProvenance({ record, treeDigest, treeFileCount, binPaths
   return { status: "ok", violations: [] };
 }
 
+
+/* ── the installed plugin cache ──────────────────────────────────────────── */
+
+/** The plugin's id in `installed_plugins.json`: `<plugin>@<marketplace>`. */
+export const PLUGIN_ID = "gitpulse@gitpulse";
+
+/** Where Claude Code keeps its plugin state. */
+export function claudeConfigDir(env = process.env) {
+  return env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.length > 0
+    ? env.CLAUDE_CONFIG_DIR
+    : path.join(homedir(), ".claude");
+}
+
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null } }} result
+ * JSON with every object's keys in order, so two spellings of one file compare equal.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(/** @type {Record<string, unknown>} */ (value)[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * The `hooks/hooks.json` of every installed copy of the plugin, found the way
+ * Claude Code finds them: `installed_plugins.json` names each install path.
+ * Nothing is written, here or anywhere in this doctor: the cache is the
+ * host's, and refreshing it is `claude plugin update`.
+ *
+ * @param {string} [configDir]
+ * @returns {{ registry: "missing" | "unreadable" | "ok", registryError: string | null, installs: { installPath: string, hooks: unknown | null, error: string | null }[] }}
+ */
+export function readInstalledPluginHooks(configDir = claudeConfigDir()) {
+  const registryPath = path.join(configDir, "plugins", "installed_plugins.json");
+  let registry;
+  try {
+    registry = JSON.parse(readFileSync(registryPath, "utf8"));
+  } catch (err) {
+    const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+    return code === "ENOENT"
+      ? { registry: "missing", registryError: null, installs: [] }
+      : { registry: "unreadable", registryError: `${registryPath}: ${/** @type {Error} */ (err).message}`, installs: [] };
+  }
+  const entries = isRecord(registry) && isRecord(registry.plugins) ? registry.plugins[PLUGIN_ID] : undefined;
+  if (!Array.isArray(entries)) return { registry: "ok", registryError: null, installs: [] };
+  const installs = [];
+  for (const entry of entries) {
+    const installPath = isRecord(entry) && typeof entry.installPath === "string" ? entry.installPath : null;
+    if (installPath === null) continue;
+    const file = path.join(installPath, "hooks", "hooks.json");
+    try {
+      installs.push({ installPath, hooks: JSON.parse(readFileSync(file, "utf8")), error: null });
+    } catch (err) {
+      installs.push({ installPath, hooks: null, error: `${file}: ${/** @type {Error} */ (err).message}` });
+    }
+  }
+  return { registry: "ok", registryError: null, installs };
+}
+
+/**
+ * Compares the plugin's hooks as the host has them installed with the hooks
+ * this tree ships. Four outcomes, never folded together:
+ *
+ * - **ok** — every installed copy declares exactly the hooks this tree does.
+ * - **drift** — one differs. The events that exist on only one side, and the
+ *   ones whose handlers differ, are named. An installed cache that lacks a
+ *   hook the repo has means that hook never runs in any session that loads
+ *   the plugin from the cache, and nothing else says so.
+ * - **unverifiable** — the registry or an installed hooks file could not be
+ *   read, so nothing was compared. Never `ok`.
+ * - **absent** — the plugin is not installed from the host's cache, so there
+ *   is nothing to drift. Reported as such and never as a pass.
+ *
+ * @param {{ registry: string, registryError: string | null, installs: { installPath: string, hooks: unknown | null, error: string | null }[] }} installed
+ * @param {unknown} repoHooks
+ * @returns {{ status: "ok" | "drift" | "unverifiable" | "absent", violations: string[], installPaths: string[] }}
+ */
+export function classifyPluginCache(installed, repoHooks) {
+  const installPaths = installed.installs.map((install) => install.installPath);
+  if (installed.registry === "unreadable") {
+    return { status: "unverifiable", violations: [`could not read the plugin registry: ${installed.registryError}`], installPaths };
+  }
+  if (installed.installs.length === 0) {
+    return {
+      status: "absent",
+      violations: [`${PLUGIN_ID} is not installed from the host's plugin cache, so there is no cached hooks.json to compare`],
+      installPaths,
+    };
+  }
+  const repoEvents = isRecord(repoHooks) && isRecord(repoHooks.hooks) ? repoHooks.hooks : null;
+  if (repoEvents === null) {
+    return { status: "unverifiable", violations: [`${HOOKS_MANIFEST} in this tree has no "hooks" object`], installPaths };
+  }
+  /** @type {string[]} */
+  const violations = [];
+  let unreadable = false;
+  for (const install of installed.installs) {
+    if (install.hooks === null) {
+      unreadable = true;
+      violations.push(`could not read an installed copy: ${install.error}`);
+      continue;
+    }
+    const cached = isRecord(install.hooks) && isRecord(install.hooks.hooks) ? install.hooks.hooks : {};
+    const names = [...new Set([...Object.keys(repoEvents), ...Object.keys(cached)])].sort();
+    const missing = names.filter((name) => name in repoEvents && !(name in cached));
+    const extra = names.filter((name) => name in cached && !(name in repoEvents));
+    const changed = names.filter(
+      (name) => name in repoEvents && name in cached && canonical(repoEvents[name]) !== canonical(cached[name]),
+    );
+    if (missing.length + extra.length + changed.length === 0) continue;
+    violations.push(`${install.installPath}/hooks/hooks.json differs from ${HOOKS_MANIFEST}:`);
+    if (missing.length > 0) violations.push(`  declared here, missing from the installed cache (these hooks never run from it): ${missing.join(", ")}`);
+    if (changed.length > 0) violations.push(`  declared differently: ${changed.join(", ")}`);
+    if (extra.length > 0) violations.push(`  installed but no longer declared here: ${extra.join(", ")}`);
+  }
+  if (violations.length === 0) return { status: "ok", violations: [], installPaths };
+  if (unreadable && !violations.some((line) => line.includes("differs from"))) {
+    return { status: "unverifiable", violations, installPaths };
+  }
+  violations.push("update the installed plugin with the host's plugin update (this doctor never edits the cache)");
+  return { status: "drift", violations, installPaths };
+}
+
+/** This tree's shipped hooks manifest, parsed; `null` when it cannot be read. */
+export function readRepoHooks(root = REPO_ROOT) {
+  try {
+    return JSON.parse(readFileSync(path.join(root, HOOKS_MANIFEST), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+
+/**
+ * Where the app keeps its per-user state (`tool_config::default_config_dir`).
+ *
+ * @param {{ home?: string, platform?: string, xdg?: string | undefined }} [env]
+ */
+export function appConfigDir({ home = homedir(), platform = process.platform, xdg = process.env.XDG_CONFIG_HOME } = {}) {
+  if (platform === "darwin") return path.join(home, "Library", "Application Support", "GitPulse");
+  return path.join(xdg || path.join(home, ".config"), "gitpulse");
+}
+
+/**
+ * Whether a `cargo` an agent runs would go through GitPulse's build-lease
+ * wrapper: `lease-bin/cargo` is a link the app makes, and an agent's PATH
+ * starts with that folder. Whether it still does by the time a shell runs the
+ * build is a question for a login shell (a profile that puts another `cargo`
+ * ahead, such as the owner's own slot-gate shim, shadows it), so `resolved` is
+ * what such a shell finds for `cargo` with the folder put first.
+ *
+ *   gated      the shell finds the wrapper's link first
+ *   shadowed   it finds another cargo first (named): builds are not leased
+ *   absent     the app has not made the link (not running, or never installed)
+ *   unverifiable  the shell could not be asked
+ *
+ * Only `gated` is a pass. `absent` is a note that this half did not run, as
+ * for the plugin cache; `shadowed` and `unverifiable` fail.
+ *
+ * @param {{ binDir: string, linkTarget: string | null, resolved: string | null, error: string | null }} observed
+ * @returns {{ status: "gated" | "shadowed" | "absent" | "unverifiable", detail: string }}
+ */
+export function classifyLease({ binDir, linkTarget, resolved, error }) {
+  const link = path.join(binDir, "cargo");
+  if (linkTarget === null) {
+    return { status: "absent", detail: `${link} does not exist: GitPulse has not made its lease links, so builds are not leased` };
+  }
+  if (resolved === null) {
+    return { status: "unverifiable", detail: `could not ask a login shell which cargo it runs${error ? ` (${error})` : ""}` };
+  }
+  if (resolved === link) return { status: "gated", detail: `cargo resolves to ${link}` };
+  return {
+    status: "shadowed",
+    detail: `a login shell runs ${resolved} before ${link}: builds through it are not leased (put ${binDir} ahead of it in the profile, or retire that shim)`,
+  };
+}
+
+/**
+ * Asks a login shell what `cargo` is with the lease folder put first, the way
+ * an agent's PATH is set, so a profile that prepends another folder shows.
+ *
+ * @param {string} binDir
+ * @param {{ shell?: string, timeoutMs?: number }} [opts]
+ */
+export function probeLease(binDir, { shell = process.env.SHELL || "/bin/zsh", timeoutMs = 15_000 } = {}) {
+  /** @type {string | null} */
+  let linkTarget = null;
+  try {
+    linkTarget = realpathSync(path.join(binDir, "cargo"));
+    readlinkSync(path.join(binDir, "cargo"));
+  } catch {
+    linkTarget = null;
+  }
+  if (linkTarget === null) return { binDir, linkTarget, resolved: null, error: null };
+  const asked = spawnSync(shell, ["-lc", "command -v cargo"], {
+    env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
+    encoding: "utf8",
+    timeout: timeoutMs,
+  });
+  const out = (asked.stdout ?? "").trim().split("\n").pop() ?? "";
+  if (asked.error || asked.status !== 0 || out === "") {
+    return { binDir, linkTarget, resolved: null, error: asked.error?.message ?? `exit ${asked.status}` };
+  }
+  return { binDir, linkTarget, resolved: out, error: null };
+}
+
+/**
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] } }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
@@ -701,6 +916,21 @@ export function formatReport(result) {
       for (const violation of provenance.violations) lines.push(`    - ${violation}`);
     }
   }
+  const pluginCache = result.pluginCache;
+  if (pluginCache) {
+    lines.push("", "  installed plugin cache", "");
+    lines.push(`  ${"installed copies".padEnd(26)} : ${pluginCache.installPaths.join(", ") || "<none>"}`);
+    if (pluginCache.violations.length > 0) {
+      lines.push("", pluginCache.status === "absent" ? "  note:" : "  violations:");
+      for (const violation of pluginCache.violations) lines.push(`    ${pluginCache.status === "absent" ? "" : "- "}${violation}`);
+    }
+  }
+  const lease = result.lease;
+  if (lease) {
+    lines.push("", "  build leases", "");
+    lines.push(`  ${"lease: ".trim().padEnd(26)} : ${lease.status === "gated" ? "gated" : lease.status === "shadowed" ? `shadowed by ${lease.resolved}` : lease.status}`);
+    lines.push(`  ${"detail".padEnd(26)} : ${lease.detail}`);
+  }
   // Each half gets its own verdict line. Collapsing them into one would let a
   // healthy server report a clean pass over silently disabled hooks, which is
   // the exact substitution this doctor exists to refuse.
@@ -724,6 +954,24 @@ export function formatReport(result) {
         : `FAIL (${provenance.status}): the code running inside those binaries is not this tree's — version alone cannot see this.`,
     );
   }
+  if (pluginCache) {
+    lines.push(
+      pluginCache.status === "ok"
+        ? "OK: the installed plugin cache declares the hooks this tree ships."
+        : pluginCache.status === "absent"
+          ? "NOTE (absent): no installed plugin cache to compare, so this half did not run; it is not a pass."
+          : `FAIL (${pluginCache.status}): the hooks the host loads from its plugin cache are not the ones this tree ships.`,
+    );
+  }
+  if (lease) {
+    lines.push(
+      lease.status === "gated"
+        ? "OK: a login shell runs GitPulse's lease wrapper for cargo, so heavy builds take a slot."
+        : lease.status === "absent"
+          ? "NOTE (absent): no lease links to check, so this half did not run; it is not a pass."
+          : `FAIL (${lease.status}): heavy cargo builds from an agent session are not leased.`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -735,6 +983,10 @@ export function parseArgs(argv) {
   let hookBin;
   /** @type {string | undefined} */
   let expect;
+  /** @type {string | undefined} */
+  let claudeDir;
+  /** @type {string | undefined} */
+  let configDir;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let json = false;
 
@@ -750,6 +1002,8 @@ export function parseArgs(argv) {
     else if (arg === "--bin") bin = path.resolve(next(arg));
     else if (arg === "--hook-bin") hookBin = path.resolve(next(arg));
     else if (arg === "--expect") expect = next(arg);
+    else if (arg === "--claude-dir") claudeDir = path.resolve(next(arg));
+    else if (arg === "--config-dir") configDir = path.resolve(next(arg));
     else if (arg === "--timeout") {
       const raw = next(arg);
       const parsed = Number(raw);
@@ -759,7 +1013,7 @@ export function parseArgs(argv) {
       timeoutMs = parsed;
     } else throw new Error(`unknown argument: ${arg}`);
   }
-  return { bin, hookBin, expect, timeoutMs, json };
+  return { bin, hookBin, expect, claudeDir, configDir, timeoutMs, json };
 }
 
 export function usage() {
@@ -770,11 +1024,13 @@ export function usage() {
       { flag: "--bin <path>", description: `probe this executable instead of resolving ${SERVER_BIN} on PATH` },
       { flag: "--hook-bin <path>", description: `probe this executable instead of resolving ${HOOK_BIN} on PATH` },
       { flag: "--expect <ver>", description: "version to require instead of package.json's" },
+      { flag: "--claude-dir <path>", description: "Claude config directory holding plugins/ (default $CLAUDE_CONFIG_DIR, else ~/.claude)" },
+      { flag: "--config-dir <path>", description: "GitPulse's per-user config directory holding lease-bin/ (default: the app's own)" },
       { flag: "--timeout <ms>", description: `handshake budget (default ${DEFAULT_TIMEOUT_MS})` },
       { flag: "--json", description: "print the result as JSON" },
       { flag: "--help, -h", description: "print this message and exit 0" },
     ],
-    exits: "0 the installed server matches · 1 absent, stale, unresponsive, or unverifiable · 2 the check could not run",
+    exits: "0 the installed server matches · 1 absent, stale, unresponsive, unverifiable, the installed plugin cache has drifted, or a login shell would not run the lease wrapper for cargo · 2 the check could not run",
   });
 }
 
@@ -833,6 +1089,27 @@ export async function main(argv = process.argv.slice(2)) {
       ok: provenanceVerdict.status === "ok",
     };
 
+    // Read-only: the host's cache is never written by this doctor.
+    const repoHooks = readRepoHooks();
+    const cacheVerdict = classifyPluginCache(readInstalledPluginHooks(opts.claudeDir), repoHooks);
+    const pluginCache = {
+      status: cacheVerdict.status,
+      violations: cacheVerdict.violations,
+      installPaths: cacheVerdict.installPaths,
+      // An absent cache is neither a pass nor a failure: there is nothing to drift.
+      ok: cacheVerdict.status === "ok" || cacheVerdict.status === "absent",
+    };
+
+    const leaseProbe = probeLease(path.join(opts.configDir ?? appConfigDir(), "lease-bin"));
+    const leaseVerdict = classifyLease(leaseProbe);
+    const lease = {
+      status: leaseVerdict.status,
+      detail: leaseVerdict.detail,
+      resolved: leaseProbe.resolved,
+      // Absent is neither a pass nor a failure: the app has made no links.
+      ok: leaseVerdict.status === "gated" || leaseVerdict.status === "absent",
+    };
+
     const result = {
       binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema,
       status, violations,
@@ -841,7 +1118,9 @@ export async function main(argv = process.argv.slice(2)) {
       serverOk: status === "ok",
       hook,
       provenance,
-      ok: status === "ok" && hook.ok && provenance.ok,
+      pluginCache,
+      lease,
+      ok: status === "ok" && hook.ok && provenance.ok && pluginCache.ok && lease.ok,
     };
     if (opts.json) console.log(JSON.stringify(result, null, 2));
     else console.log(formatReport(result));

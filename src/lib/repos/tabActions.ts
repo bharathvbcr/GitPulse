@@ -47,16 +47,14 @@ import {
 import { type TabColor } from "./tabColors";
 import {
   computeTabLayout,
+  normalizeGroupName,
   type GroupingOptions,
   type StackingOptions,
 } from "./tabGroups";
 import {
   activateTab as activateWorkspaceTab,
   arrangeTabs as arrangeWorkspaceTabs,
-  closeGroup as closeWorkspaceGroup,
-  closeOtherTabs as closeOtherWorkspaceTabs,
   closeTab as closeWorkspaceTab,
-  closeTabsToTheRight as closeWorkspaceTabsToTheRight,
   collapseAllGroups as collapseWorkspaceAllGroups,
   collapseInactiveGroups as collapseWorkspaceInactiveGroups,
   expandAllGroups as expandWorkspaceAllGroups,
@@ -75,6 +73,7 @@ import {
   setTabGroup as setWorkspaceTabGroup,
   toggleGroupCollapsed as toggleWorkspaceGroupCollapsed,
   ungroupTabs as ungroupWorkspaceTabs,
+  type TabRecord,
   type WorkspaceTabs,
 } from "./tabModel";
 import { confirmTerminalLoss } from "./terminalLoss";
@@ -619,6 +618,53 @@ export function createTabActions(deps: TabActionsDeps) {
     });
   }
 
+  /**
+   * The one path behind "Close Other Tabs", "Close Tabs to the Right" and
+   * "Close Group". `pick` names the tabs from the workspace as it is when the
+   * person is asked, and the confirmation covers exactly those. The dialog can
+   * stay up while the workspace changes (an agent opens a worktree, another
+   * route closes a tab), so after it resolves only the tabs that were listed
+   * and are still open are closed, each released through `retireClosedTabs`.
+   * A tab opened meanwhile was never listed, so it stays open: closing it
+   * unasked would lose a terminal nobody agreed to end, and asking again would
+   * make the person confirm a list they already answered.
+   *
+   * `anchorId` is the tab the action is relative to. It is where the active
+   * tab goes when the active one closes, and the action is void if it was
+   * closed behind the dialog.
+   */
+  async function closeShownTabs(
+    pick: (workspace: WorkspaceTabs) => readonly TabRecord[],
+    anchorId: string | null,
+  ): Promise<void> {
+    const listed = deps.getInternal().workspace;
+    if (anchorId !== null && !listed.tabs.some((tab) => tab.id === anchorId)) return;
+    const shown = pick(listed);
+    if (shown.length === 0) return;
+    if (!(await confirmTerminalLoss(terminals, shown.map((tab) => tab.path)))) return;
+    const before = deps.getInternal().workspace;
+    if (anchorId !== null && !before.tabs.some((tab) => tab.id === anchorId)) return;
+    const shownIds = new Set(shown.map((tab) => tab.id));
+    let workspace = before;
+    const closed: { id: string; path: string }[] = [];
+    for (const tab of before.tabs) {
+      if (!shownIds.has(tab.id)) continue;
+      const result = closeWorkspaceTab(workspace, tab.id);
+      if (result.reason === "missing") continue;
+      workspace = result.workspace;
+      closed.push({ id: tab.id, path: tab.path });
+    }
+    if (closed.length === 0) return;
+    if (anchorId !== null && closed.some((tab) => tab.id === before.activeId)) {
+      workspace = activateWorkspaceTab(workspace, anchorId);
+    }
+    await retireClosedTabs({
+      nextWorkspace: workspace,
+      closedTabs: closed,
+      closedPaths: closed.map((tab) => tab.path),
+    });
+  }
+
   function arrangeTabs(
     orderedIds: readonly string[],
     regroup?: { ids: readonly string[]; group: string | null },
@@ -703,42 +749,16 @@ export function createTabActions(deps: TabActionsDeps) {
       const id = deps.getInternal().workspace.activeId;
       if (id) await closeTab(id);
     },
-    closeOtherTabs: async (id: string) => {
-      const keep = deps.getInternal().sessions[id];
-      if (!keep) return;
-      const removed = deps.getInternal().workspace.tabs.filter((tab) => tab.id !== id);
-      if (
-        !(await confirmTerminalLoss(
-          terminals,
-          removed.map((tab) => tab.path),
-        ))
-      ) {
-        return;
-      }
-      await retireClosedTabs({
-        nextWorkspace: closeOtherWorkspaceTabs(deps.getInternal().workspace, id),
-        closedTabs: removed.map((tab) => ({ id: tab.id, path: tab.path })),
-        closedPaths: removed.map((tab) => tab.path),
-      });
-    },
-    closeTabsToTheRight: async (id: string) => {
-      const index = deps.getInternal().workspace.tabs.findIndex((tab) => tab.id === id);
-      if (index < 0) return;
-      const removed = deps.getInternal().workspace.tabs.slice(index + 1);
-      if (
-        !(await confirmTerminalLoss(
-          terminals,
-          removed.map((tab) => tab.path),
-        ))
-      ) {
-        return;
-      }
-      await retireClosedTabs({
-        nextWorkspace: closeWorkspaceTabsToTheRight(deps.getInternal().workspace, id),
-        closedTabs: removed.map((tab) => ({ id: tab.id, path: tab.path })),
-        closedPaths: removed.map((tab) => tab.path),
-      });
-    },
+    closeOtherTabs: (id: string) =>
+      closeShownTabs(
+        (workspace) => workspace.tabs.filter((tab) => tab.id !== id),
+        id,
+      ),
+    closeTabsToTheRight: (id: string) =>
+      closeShownTabs((workspace) => {
+        const index = workspace.tabs.findIndex((tab) => tab.id === id);
+        return index < 0 ? [] : workspace.tabs.slice(index + 1);
+      }, id),
     nextTab: async () => {
       if (!beginShortcut()) return;
       const activeId = deps.getInternal().workspace.activeId;
@@ -834,31 +854,13 @@ export function createTabActions(deps: TabActionsDeps) {
       deps.publish();
       deps.flushPersist();
     },
-    closeGroup: async (groupName: string) => {
-      const groupTabs = deps.getInternal().workspace.tabs.filter(
-        (t) => t.group === groupName,
+    closeGroup: (groupName: string) => {
+      const group = normalizeGroupName(groupName);
+      if (!group) return Promise.resolve();
+      return closeShownTabs(
+        (workspace) => workspace.tabs.filter((tab) => tab.group === group),
+        null,
       );
-      if (groupTabs.length === 0) return;
-      if (
-        !(await confirmTerminalLoss(
-          terminals,
-          groupTabs.map((t) => t.path),
-        ))
-      ) {
-        return;
-      }
-      const { workspace, closedPaths } = closeWorkspaceGroup(
-        deps.getInternal().workspace,
-        groupName,
-      );
-      const closedSet = new Set(closedPaths);
-      await retireClosedTabs({
-        nextWorkspace: workspace,
-        closedTabs: groupTabs
-          .filter((tab) => closedSet.has(tab.path))
-          .map((tab) => ({ id: tab.id, path: tab.path })),
-        closedPaths: groupTabs.map((tab) => tab.path),
-      });
     },
     renameGroup: (oldName: string, newName: string) => {
       deps.commitEdit();

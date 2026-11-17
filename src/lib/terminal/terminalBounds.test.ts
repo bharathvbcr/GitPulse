@@ -14,6 +14,7 @@ import { CONTEXT_READ_MS, CONTROL_QUICK_MS, FAMILY_LOOKUP_MS, KEEP_MS, KILL_HARD
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..", "..");
 const rust = readFileSync(join(root, "src-tauri", "src", "terminal", "mod.rs"), "utf8");
+const hostClient = readFileSync(join(root, "src-tauri", "src", "terminal", "host", "client.rs"), "utf8");
 
 /** Text of a Rust item from `start` to the first closing brace in column 0. */
 function item(start: string): string {
@@ -33,11 +34,24 @@ const SCANS_ON_KILL_PATH = 4;
 const SWEEP_AND_REAP_MS = 2 * 20 + 4 * 50;
 
 function killSleepsMs(): number {
+  const facade = item("pub fn kill_session(");
+  expect(facade).toContain("state.host.kill(session_id)");
+  expect(facade).toContain("engine_kill_session(&state.engine, session_id)");
   const grace = /pub\(crate\) const HANGUP_GRACE: Duration = Duration::from_millis\((\d+)\);/.exec(rust);
   expect(grace, "HANGUP_GRACE moved or changed shape").not.toBeNull();
-  const poll = /Instant::now\(\) \+ Duration::from_secs\((\d+)\)/.exec(item("pub fn kill_session("));
-  expect(poll, "kill_session's cleanup poll moved or changed shape").not.toBeNull();
+  const poll = /Instant::now\(\) \+ Duration::from_secs\((\d+)\)/.exec(
+    item("pub(in crate::terminal) fn engine_kill_session("),
+  );
+  expect(poll, "engine_kill_session's cleanup poll moved or changed shape").not.toBeNull();
   return Number(grace![1]) + Number(poll![1]) * 1000 + SWEEP_AND_REAP_MS;
+}
+
+function hostKillDeadlineMs(): number {
+  const kill = /const KILL_DEADLINE: Duration = Duration::from_secs\((\d+)\);/.exec(hostClient);
+  const exit = /const EXIT_RECORD_DEADLINE: Duration = Duration::from_secs\((\d+)\);/.exec(hostClient);
+  expect(kill, "KILL_DEADLINE moved or changed shape in host/client.rs").not.toBeNull();
+  expect(exit, "EXIT_RECORD_DEADLINE moved or changed shape in host/client.rs").not.toBeNull();
+  return (Number(kill![1]) + Number(exit![1])) * 1000;
 }
 
 /** The top-level arguments of every `terminalDeadline(...)` call in `source`, found by walking the parentheses. */
@@ -65,6 +79,7 @@ describe("the terminal command bounds against the backend they wait for", () => 
     expect(sleeps).toBe(4740);
     expect(KILL_SOFT_MS).toBeGreaterThan(sleeps);
     expect(KILL_HARD_MS).toBeGreaterThanOrEqual(sleeps + SCANS_ON_KILL_PATH * MEASURED_SCAN_MS);
+    expect(KILL_HARD_MS).toBeGreaterThan(hostKillDeadlineMs());
     // Headroom, not just coverage: the worst case is not a measurement.
     expect(KILL_HARD_MS).toBeGreaterThanOrEqual(2.5 * (sleeps + SCANS_ON_KILL_PATH * MEASURED_SCAN_MS) - 1);
   });

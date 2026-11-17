@@ -42,7 +42,7 @@
 //! The kind list is mirrored by `IPC_ERROR_KINDS` in `src/lib/ipc/invoke.ts`
 //! and pinned against it by `scripts/enum-variant-contract.test.ts`.
 
-use crate::engine::git_cli::{self, Admission, RunError};
+use crate::engine::process::{self, Admission, RunError};
 use crate::ledger::LedgerError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -79,12 +79,18 @@ pub enum IpcErrorKind {
     /// (`git_cli::read_cancel`), or was cancelled while it queued. Nobody is
     /// waiting for the answer, so the frontend never shows it as a fault.
     ReadCancelled,
+    /// A commit was refused by the secret scan of the staged changes: a
+    /// credential shape, a staged file the scan could not read, or a scan that
+    /// could not run. `detail` lists the rule, path and line of each finding
+    /// (never the value) and each skipped file; the commit view offers a person
+    /// "commit anyway".
+    SecretScanBlocked,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -94,6 +100,7 @@ impl IpcErrorKind {
         Self::LedgerFailed,
         Self::AiEndpointUnconfirmed,
         Self::ReadCancelled,
+        Self::SecretScanBlocked,
     ];
 }
 
@@ -391,7 +398,7 @@ pub(crate) fn run_command<T, E: Into<CommandError>>(
     run_command_as(None, body)
 }
 
-/// Runs one command body ([`git_cli::run_command_scope`]) and types its error.
+/// Runs one command body ([`crate::engine::process::run_command_scope`]) and types its error.
 ///
 /// The kind is the one the error carries (see [`CommandError`]), so nothing is
 /// remembered on the pool thread between commands. `command` is the command's
@@ -403,9 +410,9 @@ pub(crate) fn run_command_as<T, E: Into<CommandError>>(
 ) -> Result<T, IpcError> {
     let replay_safe = command.is_some_and(|name| REPLAY_SAFE_READS.contains(&name));
     let mut user_action = false;
-    let result = git_cli::run_command_scope(|| {
+    let result = process::run_command_scope(|| {
         let result = body().map_err(Into::into);
-        user_action = git_cli::current_admission() == Admission::Interactive;
+        user_action = process::current_admission() == Admission::Interactive;
         result
     });
     result.map_err(|error| error.into_ipc(replay_safe, user_action))

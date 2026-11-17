@@ -20,6 +20,16 @@ describe("AttentionInbox", () => {
     expect(source).not.toContain("Snooze 1h");
   });
 
+  it("lets every row be dismissed, and a dismissed row restored", () => {
+    expect(source).toContain('aria-label="Dismiss notification"');
+    expect(source).toContain('setDismissed(item, "dismiss")');
+    expect(source).toContain('setDismissed(item, "restore")');
+    // Both row shapes carry the control: a notice this build cannot read is still one the reader can clear.
+    expect(source.match(/\{@render dismissControl\(item\)\}/g)).toHaveLength(2);
+    expect(source).toContain("withAttentionUpdate(result, updated, filter)");
+    expect(source).toContain("onchange?.()");
+  });
+
   it("stacks loaded notices instead of listing every row", () => {
     const style = source.slice(source.indexOf("<style>"));
     expect(source).toContain("notificationPile");

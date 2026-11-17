@@ -115,6 +115,11 @@ pub struct CacheSelection {
     pub include_virtualenvs: bool,
     pub caps: CowCaps,
     pub free_space: FreeSpace,
+    /// Linked worktrees of the anchor's repository that may hold a cloned
+    /// Cargo `target` at once; 0 is no limit. At the limit the new worktree
+    /// gets none and `CacheReport::clone_budget` says why. Zero here; real
+    /// worktree creation reads the policy through [`Self::for_new_worktree`].
+    pub max_target_clones: u32,
 }
 
 impl Default for CacheSelection {
@@ -123,6 +128,19 @@ impl Default for CacheSelection {
             include_virtualenvs: false,
             caps: CowCaps::DEFAULT,
             free_space: free_bytes,
+            max_target_clones: 0,
+        }
+    }
+}
+
+impl CacheSelection {
+    /// The selection a new worktree is made with: the defaults plus the
+    /// build-cache clone budget from the cleaner policy, which the app, the
+    /// MCP server and the `WorktreeCreate` hook all read from the same file.
+    pub fn for_new_worktree() -> Self {
+        Self {
+            max_target_clones: crate::storage::hygiene::global::clone_budget().max_target_clones,
+            ..Self::default()
         }
     }
 }
@@ -141,6 +159,9 @@ pub struct CacheReport {
     /// The files `.worktreeinclude` named that were copied, relative to the
     /// worktree root ([`worktree_include`]).
     pub included: Vec<String>,
+    /// A Cargo `target` was not cloned because the clone budget was reached:
+    /// advice, not a failure, naming the count and the setting.
+    pub clone_budget: Option<String>,
 }
 
 impl CacheReport {
@@ -1574,6 +1595,33 @@ pub fn reflink_ignored_caches(
     }
 }
 
+/// The anchor repository's linked worktrees other than `worktree`, by path. A
+/// listing that fails counts nobody: the budget then cannot refuse, and the
+/// clone proceeds as it did before the budget existed.
+fn other_worktrees(anchor: &Path, worktree: &Path) -> Vec<PathBuf> {
+    let Some(anchor_text) = anchor.to_str() else {
+        return vec![];
+    };
+    match crate::engine::worktree::list_worktrees_lite(anchor_text) {
+        Ok(infos) => infos
+            .into_iter()
+            .filter(|info| !info.is_main && !info.is_bare)
+            .map(|info| PathBuf::from(info.path))
+            .filter(|path| {
+                crate::engine::process::canonicalize_plain(path).ok()
+                    != crate::engine::process::canonicalize_plain(worktree).ok()
+            })
+            .collect(),
+        Err(error) => {
+            log::warn!(
+                "Clone budget not applied: the worktree list could not be read: {}",
+                error.message()
+            );
+            vec![]
+        }
+    }
+}
+
 /// [`reflink_ignored_caches`], reporting a skip for want of disk apart from a
 /// failure. Free space is read on the worktree's volume before each cache: a
 /// volume below [`LOW_DISK_FLOOR`] gets no copy, and a byte-copied tree may
@@ -1611,6 +1659,9 @@ pub fn clone_ignored_caches(
     }
 
     let mut skipped: Vec<String> = Vec::new();
+    // Other linked worktrees of the anchor's repository, listed once and
+    // only when a budget applies.
+    let mut siblings: Option<Vec<PathBuf>> = None;
     let mut cause = LowDiskCause::BelowFloor;
     let mut free_seen: Option<u64> = None;
     let mut cap_seen: Option<u64> = None;
@@ -1620,6 +1671,20 @@ pub fn clone_ignored_caches(
         let worktree_dir = worktree.join(dir_name);
         if !anchor_dir.is_dir() || worktree_dir.symlink_metadata().is_ok() {
             continue;
+        }
+        if *is_cargo_target && selection.max_target_clones > 0 {
+            let siblings = siblings.get_or_insert_with(|| other_worktrees(anchor, worktree));
+            let holding = siblings
+                .iter()
+                .filter(|sibling| sibling.join(dir_name).is_dir())
+                .count();
+            if holding >= selection.max_target_clones as usize {
+                report.clone_budget = Some(format!(
+                    "'{dir_name}' was not cloned: {holding} other worktree(s) already hold one and the build-cache clone budget is {}. A build here starts cold. Change it in Settings → Repo hygiene → Build-cache clones.",
+                    selection.max_target_clones
+                ));
+                continue;
+            }
         }
         match ignored_in(worktree, dir_name) {
             Ok(true) => {}
@@ -2062,7 +2127,7 @@ mod tests {
         let anchor = main.path().canonicalize().unwrap();
         fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
         fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
-        let synced = crate::engine::git_cli::with_forced_spawn_failure_of("check-ignore", || {
+        let synced = crate::engine::process::with_forced_spawn_failure_of("check-ignore", || {
             reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
         });
         let error = synced.expect_err("an unchecked cache was copied or skipped silently");
@@ -2188,6 +2253,44 @@ mod tests {
         fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
         fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
         (main, parent, anchor, worktree, script)
+    }
+
+    /// Measured 2026-11-14: `target` was cloned into every new worktree with
+    /// no count or total budget. At the budget, a new worktree gets none and
+    /// is told why; one more allowed and it is cloned as before.
+    #[test]
+    fn a_new_worktree_gets_no_cloned_target_once_the_clone_budget_is_reached() {
+        let (main, _parent, linked) = crate::test_support::repo_with_worktrees(3);
+        fs::create_dir_all(main.path().join(".git/info")).unwrap();
+        fs::write(main.path().join(".git/info/exclude"), "target/\n").unwrap();
+        let anchor = main.path().canonicalize().unwrap();
+        fs::create_dir_all(anchor.join("target/debug/deps")).unwrap();
+        fs::write(anchor.join("target/debug/deps/libserde-1a2b.rlib"), "rlib").unwrap();
+        for held in &linked[..2] {
+            fs::create_dir_all(held.join("target")).unwrap();
+        }
+        let fresh = &linked[2];
+
+        let at_budget = CacheSelection {
+            max_target_clones: 2,
+            ..CacheSelection::default()
+        };
+        let report = clone_ignored_caches(&anchor, fresh, &at_budget).expect("synced");
+        assert!(!fresh.join("target").exists(), "{report:?}");
+        assert!(
+            report.failures.is_empty(),
+            "advice, not a failure: {report:?}"
+        );
+        let advice = report.clone_budget.expect("the skip is explained");
+        assert!(advice.contains("2 other worktree(s)"), "{advice}");
+
+        let roomier = CacheSelection {
+            max_target_clones: 3,
+            ..CacheSelection::default()
+        };
+        let report = clone_ignored_caches(&anchor, fresh, &roomier).expect("synced");
+        assert!(report.clone_budget.is_none(), "{report:?}");
+        assert!(fresh.join("target/debug/deps/libserde-1a2b.rlib").is_file());
     }
 
     /// A cloned `target/` reuses the anchor's compiled dependencies, but

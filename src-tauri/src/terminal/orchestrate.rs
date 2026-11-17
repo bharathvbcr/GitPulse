@@ -22,6 +22,7 @@ use crate::terminal::{
     bounded_pty_size, detach_session, is_session_id, spawn_at, write_input, OutputSink, Place,
     SessionEvents, SharedSessionTelemetry, TerminalSessions,
 };
+#[cfg(unix)]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1028,9 +1029,7 @@ fn build_agent_child_args(
 
 #[cfg(unix)]
 fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str) {
-    let Some(host) = &state.host else {
-        return;
-    };
+    let host = &state.host;
     let (dims, seen_bytes) = {
         let inner = state.orchestration.lock();
         let Some(rec) = inner.sessions.get(child_session_id) else {

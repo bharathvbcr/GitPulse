@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adv_b2073_tests;
 // Unix only: it writes `#!/bin/sh` wrappers and sets `PermissionsExt` modes.
 #[cfg(all(test, unix))]
 mod adv_w3gb2_tests;
@@ -7,6 +9,7 @@ mod adv_w3gb2_tests;
 mod adv_w3l2_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod adv_w4b_tests;
+mod agent_connect;
 mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
@@ -35,6 +38,7 @@ pub mod ingest;
 pub mod insights;
 pub mod ipc_error;
 pub mod lappi;
+pub mod leak_scan;
 pub mod ledger;
 pub mod limits;
 #[cfg(unix)]
@@ -102,6 +106,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
     options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
     options.profile_choice = Box::new(|| tool_config::host_load_settings().profile);
+    options.thresholds = Box::new(|| tool_config::host_load_settings().thresholds);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {
         if let Err(error) = emitter.emit("host-load-pulse", pulse) {
@@ -113,6 +118,28 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         // it, because the process exiting is what stops it.
         Ok(handle) => std::mem::forget(handle),
         Err(error) => log::warn!(target: "host_load", "host-load sampler not started: {error}"),
+    }
+}
+
+/// Makes the `cargo` and `go` links an agent's PATH starts with
+/// (`sysload::lease::bin_dir`), pointing at the `gitpulse-hook` beside this
+/// executable. A failure is logged and shown by Health ("not gated"); the
+/// builds then run unleased, never blocked.
+#[cfg(unix)]
+fn install_lease_links() {
+    let Some(config) = tool_config::default_config_dir() else {
+        log::warn!(target: "leases", "no per-user config directory; build leases have no links");
+        return;
+    };
+    let hook = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("gitpulse-hook")));
+    let Some(hook) = hook else {
+        log::warn!(target: "leases", "cannot locate gitpulse-hook; build leases have no links");
+        return;
+    };
+    if let Err(error) = sysload::lease::ensure_links(&config, &hook) {
+        log::warn!(target: "leases", "build lease links not installed: {error}");
     }
 }
 
@@ -332,6 +359,8 @@ pub fn run() {
             // that). A second GitPulse beside this one loses the snapshot's
             // writer election and reads instead.
             start_host_load_sampler(app.handle());
+            #[cfg(unix)]
+            install_lease_links();
             alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
             workbench::agy_plugin::apply_from_settings();
             crate::tool_install::set_app_handle(app.handle().clone());
@@ -485,6 +514,7 @@ pub fn run() {
             cmd_scan_deps_health,
             cmd_scan_secrets,
             cmd_storage_scan,
+            cmd_storage_stale_worktrees,
             cmd_commit_graph_write_plan,
             cmd_commit_graph_write,
             cmd_commit_graph_write_cancel,
@@ -693,6 +723,8 @@ pub fn run() {
             cmd_move_path,
             cmd_delete_path,
             cmd_mcp_info,
+            cmd_agent_connect_plan,
+            cmd_agent_connect_apply,
             cmd_external_tools_status,
             cmd_external_tool_install,
             cmd_external_tool_install_cancel,
@@ -711,6 +743,9 @@ pub fn run() {
             cmd_lappi_settings,
             cmd_lappi_settings_save,
             cmd_host_load_status,
+            cmd_host_load_leases,
+            cmd_host_load_idle,
+            cmd_host_load_park,
             cmd_host_load_terminate_orphan,
             cmd_host_load_admit_anyway,
             cmd_host_load_settings,

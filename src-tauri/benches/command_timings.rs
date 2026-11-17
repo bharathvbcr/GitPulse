@@ -32,6 +32,7 @@ use common::fixture::{build_repo, count_git_processes, git_process_argvs, Repo, 
 use common::{interleave, require_no_failed_facets, Case, Report, Sample};
 use gitpulse_lib::engine::git_reader::GitReader;
 use gitpulse_lib::engine::worktree::ScanDepth;
+use gitpulse_lib::hooks::{self, HookInput, PermissionDecision};
 use gitpulse_lib::{docs, ingest, insights};
 use serde_json::json;
 use std::path::Path;
@@ -448,8 +449,103 @@ fn head(repo: &Repo) -> String {
         .to_string()
 }
 
+fn hook_edit_input(repo: &Repo, rel: &str) -> HookInput {
+    let file_path = repo.main.join(rel);
+    let line0 = std::fs::read_to_string(&file_path)
+        .expect("read fixture file")
+        .lines()
+        .next()
+        .expect("fixture file has line 0")
+        .to_string();
+    HookInput::from_value(&json!({
+        "hook_event_name": "PreToolUse",
+        "cwd": repo.path(),
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": file_path.to_string_lossy(),
+            "old_string": line0,
+            "new_string": "// bench edit"
+        }
+    }))
+}
+
+fn assert_uncontended_decision(out: &hooks::HookOutput) {
+    assert!(
+        !out.is_silent(),
+        "expected incomplete-scan notice on 18-worktree fixture: {:?}",
+        out.render()
+    );
+    let decision = out
+        .hook_specific_output
+        .as_ref()
+        .and_then(|h| h.permission_decision.as_ref());
+    assert_eq!(decision, None, "uncontended path must not ask or deny");
+}
+
+fn assert_contended_decision(out: &hooks::HookOutput) {
+    let decision = out
+        .hook_specific_output
+        .as_ref()
+        .and_then(|h| h.permission_decision.as_ref());
+    assert_eq!(
+        decision,
+        Some(&PermissionDecision::Ask),
+        "contended path must Ask: {:?}",
+        out.render()
+    );
+}
+
+fn hook_collision_cases(repo: &Repo) -> Vec<Case<'static>> {
+    let uncontended_input = hook_edit_input(repo, "d001/f000001.ts");
+    let contended_input = hook_edit_input(repo, "d000/f000000.rs");
+
+    // Warm one untimed call each so family/binary caches settle before counting git children.
+    assert_uncontended_decision(&hooks::run_collision_guard(&uncontended_input));
+    assert_contended_decision(&hooks::run_collision_guard(&contended_input));
+
+    let (warm_u, uncontended_procs) =
+        count_git_processes(|| hooks::run_collision_guard(&uncontended_input));
+    assert_uncontended_decision(&warm_u);
+    let (warm_c, contended_procs) =
+        count_git_processes(|| hooks::run_collision_guard(&contended_input));
+    assert_contended_decision(&warm_c);
+
+    vec![
+        Case::new("hook collision guard uncontended", move || {
+            let started = std::time::Instant::now();
+            let out = hooks::run_collision_guard(&uncontended_input);
+            let elapsed = started.elapsed();
+            assert_uncontended_decision(&out);
+            assert!(
+                elapsed < hooks::BUDGET,
+                "uncontended hook guard exceeded {:?}: {elapsed:?}",
+                hooks::BUDGET
+            );
+            Sample::default()
+                .counter("git_processes", uncontended_procs)
+                .counter("asked", 0)
+                .elapsed(elapsed)
+        }),
+        Case::new("hook collision guard contended", move || {
+            let started = std::time::Instant::now();
+            let out = hooks::run_collision_guard(&contended_input);
+            let elapsed = started.elapsed();
+            assert_contended_decision(&out);
+            assert!(
+                elapsed < hooks::BUDGET,
+                "contended hook guard exceeded {:?}: {elapsed:?}",
+                hooks::BUDGET
+            );
+            Sample::default()
+                .counter("git_processes", contended_procs)
+                .counter("asked", 1)
+                .elapsed(elapsed)
+        }),
+    ]
+}
+
 fn main() {
-    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    gitpulse_lib::engine::process::run_process_with_unlimited_spawn_rate();
     let mut report = Report::new("command_timings");
     let temp = tempfile::tempdir().expect("temp dir");
 
@@ -480,6 +576,44 @@ fn main() {
         "git did not pass its preflight ({:?})",
         preflight.message
     );
+    if std::env::var_os("GITPULSE_BENCH_HOOK_COLLISION_ONLY").is_some() {
+        let repo = build_repo(&temp.path().join("fixture"), &SPEC);
+        let pre_w6_path = repo.path().to_string();
+        report.note(format!(
+            "fixture: {} files, {} commits, {} worktrees ({} dirty), hermetic HOME, production spawn rate lifted",
+            SPEC.files,
+            SPEC.extra_commits + 1,
+            SPEC.linked_worktrees + 1,
+            SPEC.linked_worktrees
+        ));
+        let warm_pre = insights::collision_risk(&pre_w6_path);
+        assert!(warm_pre.ok, "{}", warm_pre.error);
+        let (counted_pre, pre_w6_procs) =
+            count_git_processes(|| insights::collision_risk(&pre_w6_path));
+        assert!(counted_pre.ok, "{}", counted_pre.error);
+
+        let mut cases = hook_collision_cases(&repo);
+        cases.push(Case::new("hook collision repo-wide (pre-W6)", move || {
+            let started = std::time::Instant::now();
+            let risk = insights::collision_risk(&pre_w6_path);
+            let elapsed = started.elapsed();
+            assert!(risk.ok, "{}", risk.error);
+            std::hint::black_box(&risk);
+            Sample::default()
+                .counter("git_processes", pre_w6_procs)
+                .counter("scanned_worktrees", risk.scanned_worktrees as u64)
+                .counter("overlapping_files", risk.overlapping_files as u64)
+                .elapsed(elapsed)
+        }));
+        let rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
+        let (unrecorded, recorded): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.name == "hook collision repo-wide (pre-W6)");
+        report.extend(recorded);
+        report.extend_unrecorded(unrecorded);
+        report.finish();
+        return;
+    }
     // The ref-listing rows: a repository with 220 branches, 60 tags and 8
     // worktrees, every ref at a different commit so ahead-behind has real work.
     // A ref is moved before every timed call, outside the span: the ref cache
@@ -853,6 +987,7 @@ fn main() {
                 .counter("git_processes", details_procs)
         }),
     ]);
+    cases.extend(hook_collision_cases(&repo));
     let mut rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
 
     // The cold pass: a fresh repository and transcript set per sample, built

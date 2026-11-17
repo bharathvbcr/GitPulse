@@ -21,9 +21,27 @@ zero telemetry.
 [Getting started](docs/GETTING_STARTED.md) ·
 [Documentation](docs/README.md) ·
 [Website](https://gitpulse.vbcr.dev/) ·
-[Release notes](CHANGELOG.md)
+[Release notes](CHANGELOG.md) ·
+[v2.0 Beta notes](docs/RELEASE_NOTES_v2.0.0.md)
 
 ![GitPulse on macOS: commit graph and selected commit diff](docs/assets/screenshot-graph.png)
+
+## GitPulse 2.0 — Coming Soon
+
+GitPulse 2.0 (currently in beta on `main` as `1.99.0` — the first release since `v1.3.1`, rolling in all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)) brings a redesigned desktop shell, out-of-process terminal and agent hosting, pre-operation Git recovery snapshots, and full multi-agent worktree orchestration:
+
+- **Streamlined 4 views & 11 sections with floating glass cards:**
+  - **Work (`Overview · Remote · Tasks`)**: Inline 3-way conflict editor leading Overview whenever a merge or rebase is parked, plus folded stale-branch cleanup with tip backups, policy activity, outgoing-commit checks, and release tag publishing.
+  - **Code (`Explorer · Map`)**: Inline Search (`git grep`) and Blame toggles inside Explorer, and a Map overview of repository size, caps, and critical files with `[n/5]` live build progress and hover tooltips across files, symbols, and subsystems.
+  - **History (`Graph · Diff`)**: Unified `Commits | HEAD moves | Suspects` switcher on Graph, a **History (`⌥H`)** commit-graph rail tab right inside Diff, rich commit hover cards (full message body, `git notes`, recorded verification), and `Shift+click` `older..newer` commit-to-commit comparisons.
+  - **Insights (`Pulse · Coverage · Health · Storage`)**: in-process Secrets scan (Kingfisher as the opt-in deep scan) folded into Health under one health verdict, five-row previewed report lists (`Show all N`), and Storage on-demand `git commit-graph write`.
+- **Theme preset gallery, saved themes shelf & macOS window wallpapers:** Seventeen built-in `gitpulse-theme/1` presets across Standard (*Neural HUD*, *Reactor*, *Pure Black*, *Crimson*, *Phosphor*, *Synthwave*, *Paper*), Developer (*Amber CRT*, *Blueprint*, *Midnight IDE*, *Arctic*, *Solar Dark*, *Daylight*), and Sci-Fi (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*); a **My themes** shelf for up to 24 saved or imported themes; and eleven seeded static SVG backdrops or custom raster wallpapers (`<= 2560px` JPEG in IndexedDB, macOS only).
+- **Stacked worktree tabs & collapsible repository groups:** Every checkout of a repository shares one tab with a checkout switcher, and inactive repository groups (and inactive tabs within groups) can collapse from the tab bar, Settings, or Command Palette.
+- **Always-on Unix terminal host (`gitpulse-ptyd`), WebGL rendering & hosted Manvi runs:** PTY terminal sessions on Unix unconditionally live in `gitpulse-ptyd` ([Terminal host](docs/TERMINAL_HOST.md)) with transcript recovery (`512 KiB`), a durable 64-row session ledger (`terminal-sessions.v1.jsonl`, `TerminalResume --fork`), default-on detached `manvi serve --listen` hosting for managed Codex and Claude runs, GPU WebGL rendering (`@xterm/addon-webgl` with 5-minute context hold and 3-strike DOM fallback), DEC 2026 synchronized output, `@xterm/addon-unicode11`, kernel-event exit waiting, and **Send to agent** live-session wakeups (`gitpulse-hook deliver`).
+- **Pre-operation Git snapshots (`refs/gitpulse/ops/<n>`) & agent turn checkpoints (`refs/gitpulse/turns/`):** Allowed agent Git mutations record pre-operation snapshots with CAS-checked undo (`cmd_undo_op_snapshot`) in Reflog, while opt-in turn checkpoints capture working-tree state at agent turn start and end (inspectable over MCP via `gitpulse_turn_checkpoints`).
+- **Zero-copy agentic worktrees, Claude Code hooks, Codex ledger & live MCP control plane:** Eleven `gitpulse_worktree_*` MCP tools, `gitpulse-worktree` CLI, `gitpulse-rustc` build cache, `.worktreeinclude`, and `WorktreeCreate`/`WorktreeRemove` plugin hooks provision `claude --worktree` and isolated subagents with CoW-seeded DevMap stores (`~1.2 s` query-ready vs `~7.6 s` cold). `gitpulse_sessions` and `agents.live` report live Claude Code, Codex, Antigravity, DevCouncil, and Manvi sessions (`0` `git` spawns on `gitpulse_sessions`), alongside Codex rollout ledger ingestion, per-run activity timelines, agent thread trees, `gitpulse_merge_conflicts`, `gitpulse_landed`, `gitpulse_provenance`, and inode-bound ledger adoption.
+- **Workbench schema 17 & faster Tasks board:** Merges the Inbox column into Backlog (five columns: *Backlog*, *Ready*, *In progress*, *Review*, *Done*), adds cross-repo queues, a two-way GitHub issue sync outbox, and DAG launch readiness, automatically fills board columns up to 2,000 cards (`fillBoard`), refreshes live while the window is on screen even when unfocused (`liveOnScreen`), and adds a two-row header, subtask progress, due-date/status filters, attention inbox dismiss/restore, card merge/delete, `expected_revision` CAS protection on `gitpulse_add_task`, and CI watching on agent branches.
+- **Manvi Anthropic account registry, host-load governor, Firebase diagnostics & PR review:** Launches `manvi serve` via `~/.anthropic-accounts` (`anthropic-account exec --no-fallback`) with `Cloud · <model>` pill display, governs agent launches under severe host memory pressure (`sysload::governor`) with class-tiered Git spawn budgets (`spawn-budget.v2`), adds GitHub PR review/approve/merge actions, classifies Firebase App Hosting CLI failures with redacted *Copy diagnostics*, renders GitHub commit author avatars in Graph, and expands `dc-redact` secret detection (`ya29.`, `1//`, `GOCSPX-`, GitLab `gldt-`/`glft-`/`glrt-`/`glwt-`, Slack `xoxe-`, AWS `ABIA`/`ACCA`/`A3T`, HuggingFace `api_org_`).
 
 ## Get started
 
@@ -37,6 +55,61 @@ zero telemetry.
 GitHub CLI, DevMap, Manvi, and local model servers are optional; install the
 ones needed for the features you use. The [first repository guide](docs/GETTING_STARTED.md)
 walks through a review, task creation, and optional setup.
+
+## Quick install & agent setup
+
+If you installed the packaged desktop app, **Settings → Agents → Connect** (or its **Copy setup prompt**) symlinks the bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin` without needing a source checkout or Rust toolchain, and **Help → Set Up Optional Tools** installs DevMap, the analysis suite, or Manvi interactively.
+
+To build and wire up **GitPulse**, **DevCouncil** (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`), **Manvi** (`manvi`), and MCP integrations from source (requires **Git**, **Bun 1.4.2**, **Rust 1.100+**, and **Go 1.27.4+**), paste this prompt into Claude Code, Codex, Antigravity, or Cursor (or run the fenced commands directly):
+
+````text
+Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain on this machine, then verify every binary, schema, and host integration without skipping failing checks:
+
+1. Preflight tools and checkouts:
+   - Confirm `git`, `bun`, `rustc`/`cargo`, and `go` are on `PATH` (and `~/.local/bin` / Cargo / Go bin dirs are reachable).
+   - Check whether sibling `GitPulse`, `DevCouncil`, and `Manvi` checkouts already exist; otherwise ask where to clone `https://github.com/bharathvbcr/GitPulse.git` (and optionally `DevCouncil` / `Manvi`), and do not install system packages outside Cargo/Go/Bun user bins without asking.
+
+2. Install GitPulse MCP, hooks, and worktree/cache CLIs (`gitpulse-mcp`, `gitpulse-hook`, `gitpulse-worktree`, `gitpulse-rustc`):
+   - From a `GitPulse` checkout (or after `git clone https://github.com/bharathvbcr/GitPulse.git && cd GitPulse`):
+     ```sh
+     bun install --frozen-lockfile
+     bun run mcp:install
+     cargo install --path crates/gitpulse-worktree --locked --force
+     ```
+   - Skip rebuilding `gitpulse-mcp` / `gitpulse-hook` from source if I already linked them from the packaged app via Settings -> Agents -> Connect in `~/.local/bin`.
+
+3. Install all DevCouncil components (`devmap`, `dcstore`, `dcverify`, `dcgrep`, `devcouncil`):
+   - If a local `DevCouncil` checkout is present, run `bash scripts/install.sh`; otherwise install from GitHub:
+     ```sh
+     cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force devmap-cli
+     cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcstore dc-store
+     cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcverify dc-verify
+     cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked --force --bin dcgrep dc-grep
+     go install github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/cmd/devcouncil@latest
+     ```
+
+4. Install Manvi (`manvi` policy harness, workbench host, and managed agent runner):
+   - From a local `Manvi` checkout run `go -C manvi install ./cmd/manvi`, or install remotely:
+     ```sh
+     go install github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest
+     ```
+
+5. Configure MCP servers and agent plugins cleanly (preview before writing; preserve existing user-owned configs):
+   - Register **either** the GitPulse plugin (`plugins/gitpulse/` for Claude Code/Codex/Cursor or `plugins/gitpulse-agy/` for Antigravity) **or** a direct `gitpulse` MCP registration (`gitpulse-mcp`), **never both** — the plugin already registers the `gitpulse` server (repo insights, worktree coordination, collision radar, task board, and in-process `devmap_*`).
+   - Run `devmap integrate <host> --dry-run` (and `devcouncil integrate <host> --dry-run` if using the orchestrator MCP) for my active agent client(s) (`claude`, `codex`, `cursor`, `antigravity`), show me the planned file changes (noting any `not_ours` protected files), and apply only with my approval (`--apply`) so `devmap mcp` (code graph) and `devcouncil mcp` (orchestrator/leases) sit cleanly alongside `gitpulse-mcp`.
+
+6. Verify end-to-end and report exact tool outputs:
+   ```sh
+   bun run mcp:doctor
+   bun run check:schema-parity
+   devmap doctor && devcouncil doctor && manvi doctor
+   dcstore --version && dcverify --version && dcgrep --help >/dev/null
+   ```
+   - Ensure `mcp:doctor` reports matching digests for `gitpulse-mcp` and `gitpulse-hook`, and `check:schema-parity` agrees across vendored crates, `devmap`, `dcstore`, `gitpulse-mcp`, and `manvi`.
+   - In the target repository, run `devmap paths --json` and `devmap status --json` (and `devmap build --manifest` if missing or stale).
+
+Report what succeeded, what could not run, exact paths of installed binaries, and any MCP/plugin config changes made or awaiting approval.
+````
 
 ## Four views, one workspace
 
@@ -78,7 +151,7 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
 - **Inspect the repository.** Universal coverage reports across 6 formats (LCOV, Cobertura,
   Go cover, Istanbul, JaCoCo, Clover), multi-ecosystem dependency audits (`cargo-audit`,
   `npm audit`, `pip-audit`, `govulncheck`) with `cargo deny` and `cargo crev` parsers,
-  Kingfisher redacted secrets scanning that locates each finding against Git, storage
+  redacted secrets scanning (in-process by default, Kingfisher as the deep scan) that locates each finding against Git, storage
   cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
   Capped results identify their limits.
 - **Work from the desktop.** Native menus, a command palette (`⌘K`), a docked PTY terminal
@@ -88,7 +161,7 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   frequent actions close. Background windows stop their timers instead of polling.
 
 The [feature reference](docs/FEATURES.md) describes each surface and its limits.
-The [changelog](CHANGELOG.md) records release changes; [open qualification](docs/QUALIFICATION.md)
+The [changelog](CHANGELOG.md) records release changes; [open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md)
 tracks remaining platform, provider, and performance checks.
 
 ![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)
@@ -133,7 +206,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]
-        Bridge["invoke('cmd_*') — 328 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+        Bridge["invoke('cmd_*') — 334 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -198,7 +271,7 @@ bun run tauri dev
 | `bun run test:webkit:all` | The same regressions under WKWebView (macOS only) |
 | `bun run build` | Build the frontend bundle |
 | `bun run tauri build` | Build native bundles for the host |
-| `bun run ci:local` | The gates in `scripts/ci-local.mjs`: contracts, both renderers, format, clippy, Rust and frontend tests, coverage floors and the gusset check. It does not run `bun audit`, `cargo deny` (`bun-audit.yml`), the Go `vet` and `-race` jobs, the scheduled deep and parallel-test workflows, or the Linux and Windows builds, which only CI runs |
+| `bun run ci:local` | The gates in `scripts/ci-local.mjs`: contracts, both renderers, format, clippy, Rust and frontend tests, coverage floors and the gusset check. It deletes the ~50 GiB instrumented coverage build when it is done with it; set `CI_LOCAL_KEEP_COVERAGE_BUILD=1` to keep it. It does not run `bun audit`, `cargo deny` (`bun-audit.yml`), the Go `vet` and `-race` jobs, the scheduled deep and parallel-test workflows, or the Linux and Windows builds, which only CI runs |
 
 The browser regressions run twice in CI — under Chrome on Linux and under
 WKWebView on macOS — because the two engines disagree often enough to matter: a
@@ -275,7 +348,7 @@ types.
 
 ## License & Acknowledgements
 
-Distributed under the [MIT License](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions.
+Distributed under the [MIT License](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions. The GitPulse name and logo are not covered by the MIT License; see [TRADEMARKS.md](TRADEMARKS.md).
 
 - **[The Tauri Programme (`tauri-apps`)](https://github.com/tauri-apps/tauri)** (`tauri`, `wry`, `tao`, `muda` — Apache-2.0 OR MIT) — Desktop shell runtime and patched crates under `src-tauri/framework/`.
 - **[webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs)** (`The Gtk-rs Project Developers` & `Antoni Boucher`, MIT), **[libappindicator-rs](https://github.com/qDot/libappindicator-rs)** (`Kyle Machulis / qDot`), and **[notify](https://github.com/notify-rs/notify)** (`Félix Saparelli & contributors`).

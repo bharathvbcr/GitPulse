@@ -1,10 +1,9 @@
 //! `gitpulse-ptyd` — the process that holds GitPulse's terminals.
 //!
-//! The app starts it (in a session of its own) when "Keep terminals running
-//! when GitPulse quits" is on, and talks to it over a private unix socket.
-//! Because the PTY masters live here, a GitPulse that quits, crashes or is
-//! killed takes no terminal with it; the next GitPulse finds them again. See
-//! `docs/TERMINAL_HOST.md`.
+//! On Unix the app starts it unconditionally (in a session of its own) and
+//! talks to it over a private unix socket. Because the PTY masters live here,
+//! a GitPulse that quits, crashes or is killed takes no terminal with it; the
+//! next GitPulse finds them again. See `docs/TERMINAL_HOST.md`.
 //!
 //! It is not meant to be run by hand, but it can be: `--dir` names the host
 //! directory (socket, lock, receipts, transcripts), and a host with no app and no sessions
@@ -88,7 +87,7 @@ fn parse(argv: &[String]) -> Parsed {
 fn main() {
     // From the per-user spawn budget every GitPulse process shares, before any
     // spawn builds the gate.
-    gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
+    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
     // Two descriptors per terminal, for every terminal the user has open.

@@ -787,6 +787,10 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
             }
         }
     }
+
+    fn state_snapshot_path(&self) -> Option<std::path::PathBuf> {
+        crate::alerts::default_state_snapshot_path()
+    }
 }
 
 /// The delivery host for [`crate::alerts::start`].

@@ -22,7 +22,8 @@
 
 use crate::devmap::init::ensure_dir_excluded;
 use crate::engine::cow_clone::reflink_copy_file;
-use crate::engine::git_cli::{git_captured, validate_repo, BoundedRun};
+use crate::engine::git_cli::{git_captured, validate_repo};
+use crate::engine::process::BoundedRun;
 use crate::ipc_error::CommandError;
 use devmap_query::WorktreeOverlay;
 use devmap_store::{IncrementalDigestEngine, Store};
@@ -1062,7 +1063,7 @@ pub(super) fn is_sparse_worktree(repo: &Path) -> bool {
 pub(crate) const HEAD_SHA_SOURCE: &str = "codeintel.overlay.head_sha";
 
 fn head_sha_of(repo: &Path) -> Option<String> {
-    crate::engine::git_cli::with_spawn_source(HEAD_SHA_SOURCE, || {
+    crate::engine::process::with_spawn_source(HEAD_SHA_SOURCE, || {
         git_captured(repo, &["rev-parse", "--verify", "HEAD"])
     })
     .ok()
@@ -2060,10 +2061,10 @@ mod tests {
     fn head_sha_of_attributes_its_rev_parse_to_its_own_source() {
         let repo = crate::test_support::git_repo();
         crate::test_support::git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
-        let before = crate::engine::git_cli::rev_parse_launches_from(HEAD_SHA_SOURCE);
+        let before = crate::engine::process::rev_parse_launches_from(HEAD_SHA_SOURCE);
         assert!(head_sha_of(repo.path()).is_some(), "the head must resolve");
         assert!(
-            crate::engine::git_cli::rev_parse_launches_from(HEAD_SHA_SOURCE) > before,
+            crate::engine::process::rev_parse_launches_from(HEAD_SHA_SOURCE) > before,
             "head_sha_of's rev-parse was not attributed to {HEAD_SHA_SOURCE}"
         );
     }
@@ -3229,6 +3230,7 @@ mod tests {
             stderr: b"fatal: not a git repository".to_vec(),
             success: false,
             status_code: 128,
+            signal: None,
             incomplete: None,
             stderr_incomplete: None,
             cancelled: false,
@@ -3243,6 +3245,7 @@ mod tests {
             stderr: Vec::new(),
             success: true,
             status_code: 0,
+            signal: None,
             incomplete: None,
             stderr_incomplete: None,
             cancelled: false,

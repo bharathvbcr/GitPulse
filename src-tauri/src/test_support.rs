@@ -59,13 +59,14 @@ impl Drop for IsolatedHarnessGuard {
     }
 }
 
-/// Re-executes a libtest filter from a copy of this harness.
+/// Re-executes a libtest filter from a second name for this harness.
 ///
 /// `cargo llvm-cov --workspace` can unlink the running `current_exe()` while
 /// later cases still need to spawn it. `Command::spawn` then fails with
-/// `NotFound` even though this process is still mapped. Copying beside the
+/// `NotFound` even though this process is still mapped. Linking beside the
 /// original keeps `@rpath` intact and gives the child a path cargo will not
-/// replace. Keep the guard alive until the child exits.
+/// replace, without writing the image again (a copy is the fallback where
+/// linking fails). Keep the guard alive until the child exits.
 #[cfg(test)]
 pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnessGuard) {
     let src = std::env::current_exe().expect("test executable");
@@ -84,21 +85,30 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
         std::process::id(),
         HARNESS_CLONE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::copy(&src, &path).unwrap_or_else(|error| {
-        panic!(
-            "copy test harness for isolation spawn: {} -> {}: {error}",
-            src.display(),
-            path.display()
-        );
-    });
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&path)
-            .expect("cloned harness metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("cloned harness executable");
+    // A hard link names the same file under a second name, which is all the
+    // isolation needs (`cargo llvm-cov` unlinks the original's *name*; the file
+    // lives on under this one) and writes no bytes. A copy writes the whole
+    // test image, hundreds of MB, every call: free on macOS (APFS clones it) but
+    // 410 MiB a call on Linux, where a serial run of the `devmap::live` tests
+    // alone averaged 164 MiB/s and was aborted by the disk-write watchdog. The
+    // copy remains the fallback for a filesystem that cannot link.
+    if fs::hard_link(&src, &path).is_err() {
+        fs::copy(&src, &path).unwrap_or_else(|error| {
+            panic!(
+                "copy test harness for isolation spawn: {} -> {}: {error}",
+                src.display(),
+                path.display()
+            );
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)
+                .expect("cloned harness metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("cloned harness executable");
+        }
     }
     let mut command = Command::new(&path);
     command.args(["--exact", filter, "--nocapture"]);
@@ -168,7 +178,7 @@ pub(crate) use env::{coverage_relaxed, wait_until};
 /// directory are the caller's. Only stdin is closed. The exit status is left
 /// to the caller.
 ///
-/// A budget past the runner's ceiling ([`crate::engine::git_cli::NETWORK_TIMEOUT`])
+/// A budget past the runner's ceiling ([`crate::engine::process::NETWORK_TIMEOUT`])
 /// is held to it: [`coverage_relaxed`] scales budgets by instrumentation and
 /// host load, and an unclamped 60 s reached 1,920 s on a loaded instrumented
 /// run, which the runner refuses without starting the helper.
@@ -177,9 +187,9 @@ pub(crate) fn run_within(
     cmd: Command,
     label: &str,
     budget: std::time::Duration,
-) -> crate::engine::git_cli::BoundedRun {
-    let budget = budget.min(crate::engine::git_cli::NETWORK_TIMEOUT);
-    crate::engine::git_cli::run_bounded(cmd, label, budget, None)
+) -> crate::engine::process::BoundedRun {
+    let budget = budget.min(crate::engine::process::NETWORK_TIMEOUT);
+    crate::engine::process::run_bounded(cmd, label, budget, None)
         .and_then(|run| run.require_complete(label))
         .unwrap_or_else(|why| {
             panic!(
@@ -209,8 +219,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         && dir.join(".githooks/pre-commit").is_file()
     {
         panic!(
-            "refusing to persist {} in {}; this checkout rejects fixture identities",
-            args[1],
+            "refusing to persist a fixture identity in {}; this checkout rejects it",
             dir.display()
         );
     }
@@ -240,8 +249,8 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "git {args:?} failed with {}",
+        output.status
     );
     if args.first() == Some(&"init") {
         trust_repo(&dir);
@@ -259,7 +268,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
 /// is removed by name; [`pin_git`] also sweeps every inherited `GIT_*` for the
 /// names this host's git does not list but a newer one may.
 ///
-/// [`STRIPPED_GIT_ENV`]: crate::engine::git_cli
+/// [`STRIPPED_GIT_ENV`]: crate::engine::process
 #[cfg(test)]
 const FIXTURE_STRIPPED_GIT_ENV: &[&str] = &[
     "GIT_CEILING_DIRECTORIES",
@@ -327,10 +336,10 @@ const FIXTURE_STRIPPED_GIT_ENV: &[&str] = &[
 /// sets afterwards (an author date, a template) is the caller's choice and
 /// survives.
 ///
-/// [`strip_injected_git_env`]: crate::engine::git_cli::strip_injected_git_env
+/// [`strip_injected_git_env`]: crate::engine::process::strip_injected_git_env
 #[cfg(test)]
 pub(crate) fn pin_git(command: &mut Command) -> &mut Command {
-    crate::engine::git_cli::strip_injected_git_env(command);
+    crate::engine::process::strip_injected_git_env(command);
     for name in FIXTURE_STRIPPED_GIT_ENV {
         command.env_remove(name);
     }
@@ -435,7 +444,7 @@ pub(crate) fn repo_with_worktrees(linked: usize) -> (TempDir, TempDir, Vec<PathB
                 ],
             );
             trust_repo(&path);
-            crate::engine::git_cli::canonicalize_plain(&path).unwrap()
+            crate::engine::process::canonicalize_plain(&path).unwrap()
         })
         .collect();
     (main, parent, paths)
@@ -765,7 +774,7 @@ mod tests {
     fn run_within_runs_a_helper_whose_budget_is_past_the_runners_ceiling() {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "printf ran"]);
-        let past = crate::engine::git_cli::NETWORK_TIMEOUT + Duration::from_secs(120);
+        let past = crate::engine::process::NETWORK_TIMEOUT + Duration::from_secs(120);
         let run = run_within(cmd, "relaxed-helper", past);
         assert_eq!(run.stdout.as_slice(), &b"ran"[..]);
         assert!(run.success);
@@ -782,6 +791,34 @@ mod tests {
         );
         assert_ne!(guard.path(), src.as_path());
         assert_eq!(guard.path().parent(), src.parent());
+    }
+
+    /// The harness image is hundreds of MB. A copy of it per call wrote 410 MiB
+    /// each on Linux (APFS clones it for free, which hid this on macOS), so the
+    /// serial Ubuntu run was aborted by the disk-write watchdog. The isolated
+    /// name must be a second name for the same file, not a second file.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_harness_is_a_second_name_for_the_image_not_a_copy_of_it() {
+        use std::os::unix::fs::MetadataExt;
+        let (_command, guard) = isolated_libtest_command("does-not-need-to-exist");
+        let src = std::env::current_exe().expect("test executable");
+        let (image, isolated) = (
+            std::fs::metadata(&src).expect("image metadata"),
+            std::fs::metadata(guard.path()).expect("isolated metadata"),
+        );
+        assert_eq!(
+            (image.dev(), image.ino()),
+            (isolated.dev(), isolated.ino()),
+            "the isolated harness is a separate file ({} bytes written)",
+            isolated.len()
+        );
+        assert!(isolated.nlink() >= 2, "no second name for the image");
+        assert_ne!(
+            isolated.mode() & 0o111,
+            0,
+            "the isolated harness cannot run"
+        );
     }
 
     /// A fixture git spawns under the inheritance lock, so it cannot inherit
@@ -985,8 +1022,10 @@ mod hermetic_canary {
         let _serial = env_serial();
         for key in [
             "GITPULSE_TRANSCRIPT_ROOT",
+            "GITPULSE_CLAUDE_CONFIG_DIRS",
             "GITPULSE_CODEX_TRANSCRIPT_ROOT",
             "CODEX_HOME",
+            "ANTIGRAVITY_HOME",
         ] {
             assert!(
                 std::env::var_os(key).is_none(),

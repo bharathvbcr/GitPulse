@@ -109,10 +109,12 @@ export interface AgentDefaults {
    */
   max_terminal_sessions?: number;
   /**
-   * Terminals are held by `gitpulse-ptyd`, a process of their own, and keep
-   * running when GitPulse quits or crashes (`docs/TERMINAL_HOST.md`). Absent
-   * is off. Read by the app when it starts, so a change applies to the next
-   * launch.
+   * Controls whether managed agent runs (Codex and Claude driven by Manvi)
+   * stay running in a hosted Manvi server when GitPulse quits or crashes.
+   * Absent is on (`true`); `false` keeps managed runs tied to the app. On Unix,
+   * terminal sessions themselves always run in `gitpulse-ptyd`
+   * (`docs/TERMINAL_HOST.md`). Read when starting the worker, so a change
+   * applies on the next launch.
    */
   keep_terminals_running?: boolean;
   /**
@@ -367,4 +369,24 @@ export function isLiveRunLimit(value: unknown): value is number {
 /** The limit a launch will pass: the stored one, or the store's default. */
 export function liveRunLimit(defaults: AgentDefaults): number {
   return isLiveRunLimit(defaults.max_live_runs) ? defaults.max_live_runs : DEFAULT_LIVE_RUNS;
+}
+
+/**
+ * Whether managed agent runs keep running when GitPulse quits.
+ *
+ * Absent means on (`true`), matching `AgentDefaults::keeps_terminals_running()`
+ * in Rust; only an explicit `false` opts out.
+ */
+export function keepsTerminalsRunning(defaults: AgentDefaults): boolean {
+  return defaults.keep_terminals_running !== false;
+}
+
+/**
+ * Returns `defaults` with `keep_terminals_running` updated so the on/default
+ * state (`true`) is stored as absence and `false` opts out explicitly.
+ */
+export function withKeepTerminalsRunning(defaults: AgentDefaults, keep: boolean): AgentDefaults {
+  const rest: AgentDefaults = { ...defaults };
+  delete rest.keep_terminals_running;
+  return keep ? rest : { ...rest, keep_terminals_running: false };
 }

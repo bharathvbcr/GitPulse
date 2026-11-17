@@ -6,20 +6,42 @@ It exposes GitPulse-owned surfaces (worktrees, ledger, collisions) and selected 
 
 Protocol: [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) (`server/discover`, per-request `_meta`, cacheable `tools/list`). Legacy `initialize` (2024-11-05 / 2025-11-25) still works.
 
-## Install the server
+## Connect an agent (app install)
 
-From a GitPulse checkout:
+Open **Settings → Agents → Connect your agent**. It is also the setup wizard's last step and the first-run card. It shows a plan first and changes nothing until you confirm. On confirm it:
+
+- symlinks the app's bundled `gitpulse-mcp` and `gitpulse-hook` into `~/.local/bin`, never overwriting a file or a link that points elsewhere;
+- registers the server with Claude Code (`claude mcp add --scope user gitpulse -- <full path>`) and Codex (`codex mcp add gitpulse -- <full path>`) through their own CLIs.
+
+An existing different registration or link is left alone. The plan shows the commands to switch it yourself (remove, then add). No source checkout or Rust toolchain is needed.
+
+**Plugin or direct registration, not both.** If the GitPulse Claude Code plugin is installed, it already provides the `gitpulse` server and the hooks, so Connect marks the Claude Code registration as done instead of adding a second one. The plugin starts `gitpulse-mcp` and `gitpulse-hook` by bare name, so `~/.local/bin` must be on the `PATH` of the shell Claude Code starts from. Connect does not install the plugin or the hooks:
+
+```sh
+claude plugin marketplace add bharathvbcr/GitPulse
+claude plugin install gitpulse@gitpulse
+```
+
+**Copy setup prompt** (same panel) gives your agent the same steps to run itself. Use it if you run Claude Code with a non-default `CLAUDE_CONFIG_DIR`, because Connect runs the `claude` CLI with its default profile.
+
+The hook is the binary that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal.
+
+### Settings copy buttons
+
+The packaged app also carries `plugins/gitpulse/` in `Contents/Resources/plugin`. The Agents card in Settings resolves `gitpulse-mcp` and `gitpulse-hook` beside the app, says `not reachable` for a hook binary it cannot find, and warns when either is not on `PATH`. Its `.codex-plugin/plugin.json`, `.mcp.json` and `hooks.json` buttons copy the manifests with those absolute paths filled in, for a client you wire by hand instead of using Connect. In the copied `hooks.json` the collision guard and command gate refuse the call when the binary is missing, and session start says the hooks are off.
+
+### Upgrading from `bun run mcp:install`
+
+`bun run mcp:install` is for a source checkout only: it `cargo install`s the binaries into `~/.cargo/bin` and records the source digest `bun run mcp:doctor` compares against. If you ran it before and now use the app, `~/.cargo/bin/gitpulse-mcp` and `gitpulse-hook` may shadow the app's copies on `PATH`, and an existing registration may point at the cargo copy. Connect leaves those alone and shows them. To switch to the app's copies, run `cargo uninstall gitpulse` and the remove/add commands the plan shows. If you develop GitPulse from source, keep the cargo copies, re-run `bun run mcp:install` after pulling, and use `bun run mcp:doctor`, which reports each binary separately as **absent**, **unresponsive**, **stale** or **matching** and exits non-zero if either is missing.
+
+### Install from a source checkout
 
 ```sh
 bun run mcp:install
 bun run mcp:doctor
 ```
 
-`mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. `mcp:doctor` reports each separately, distinguishing **absent**, **unresponsive**, and **stale** from **matching**. A missing binary must not look like a current one.
-
-Both are required, and the hook is the one that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal. `mcp:doctor` exits non-zero if either is missing.
-
-The packaged app copies `plugins/gitpulse/` into `Contents/Resources/plugin`. Settings resolves `gitpulse-mcp` and `gitpulse-hook` beside the app, says `not reachable` for a hook binary it cannot find, warns when either is not on `PATH`, and copies `.mcp.json` and `hooks.json` with the resolved absolute paths. A released app puts neither on `PATH`, which is why those copies, not the bare names in the plugin's own manifests, are what to install there. In the copied `hooks.json` the collision guard and command gate refuse the call when the binary is missing, and session start says the hooks are off.
+`mcp:install` puts this tree's `gitpulse-mcp` **and** `gitpulse-hook` on `PATH`. Both are required.
 
 Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
@@ -36,17 +58,20 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
 ## Hooks
 
-`plugins/gitpulse/hooks/hooks.json` registers seventeen hooks, all spawning `gitpulse-hook`:
+`plugins/gitpulse/hooks/hooks.json` registers nineteen hooks across twelve lifecycle events (including `WorktreeCreate` and `WorktreeRemove` via `plugins/gitpulse/hooks/gitpulse-worktree.sh`), all spawning `gitpulse-hook`:
 
 | Event | Subcommand | What it does |
 | --- | --- | --- |
-| `PreToolUse` on `Edit` / `MultiEdit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
-| `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push. |
-| `SessionStart` | `session-brief` | Adds a repository snapshot to the session's context. |
+| `PreToolUse` on `Edit` / `MultiEdit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file, or refuses (`deny`) when outside the bound task scope. |
+| `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push or an out-of-scope file write. |
+| `SessionStart` | `session-brief`, `peer-inbox` | Adds a repository snapshot (asking the running GitPulse app first before scanning worktrees directly) and unread peer inbox messages to the session's context. |
+| `WorktreeCreate`, `WorktreeRemove` | `worktree-create`, `worktree-remove` | Creates or removes Claude Code `.claude/worktrees/<name>` checkouts through GitPulse's CoW cache, `.worktreeinclude`, `post_create` hook, and DevMap clone path, falling back to plain `git` when untrusted or unavailable. |
 | `Notification`, one entry per matcher | `notify <matcher>` | Tells a running GitPulse that this agent wants the user, and why. |
 | `StopFailure` | `notify error` | Same, for a turn that ended on an error. |
-| `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended). |
+| `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` (plus `peer-inbox` on `PostToolUse` and `UserPromptSubmit`) | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended), plus synchronous peer-inbox delivery. |
 | `Stop`, a second entry with `asyncRewake` and a 1800 s timeout | `deliver` | Waits, in the background, for a message a person previewed and confirmed in GitPulse's **Send to agent**, and wakes the idle session with it (exit 2, text on stderr). |
+
+**Antigravity (`plugins/gitpulse-agy/hooks.json` and `plugins/gitpulse/hooks.json`):** Antigravity IDE 2.32.1 denied any `PreToolUse` tool call whose hook returned `{}` without `"decision":"allow"`, and answering `"allow"` would override the user's own approval settings. GitPulse therefore registers **no `PreToolUse` hooks** (`collision-guard` or `command-gate`) for Antigravity; Antigravity keeps `SessionStart` (`session-brief`, `peer-inbox`), `PreInvocation` (`peer-inbox`), `PostInvocation` (`peer-inbox`), `PostToolUse` (`notify tool_finished`), and `Stop` (`stop-or-notify`), and informational hook notices without a permission decision render as `{"reason": ...}` rather than `{"decision": "ask"}`.
 
 The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`, `elicitation_url_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
 
@@ -69,7 +94,7 @@ Four properties are deliberate:
 
 Where the transport does not exist (Windows has no Unix socket), `notify` reports `unsupported` once per invocation at info and exits 0, before it looks for a configuration directory, so an unset `APPDATA` is not a warning. That is a third outcome, not a delivery and not a failure; the bridge is not offered on Windows (ft-959d4d26).
 
-Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#platform-coverage).
+Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage).
 
 The command gate runs without a bound task scope, so it reaches the hard rungs (force-push, destructive commands) and not the scope rungs. That is a smaller gate than the desktop app's, and a real one.
 
@@ -87,7 +112,7 @@ In a checkout bound to a task, both hooks judge writes against the task's plan. 
 One canonical package: [`plugins/gitpulse/`](https://github.com/bharathvbcr/GitPulse/tree/main/plugins/gitpulse)
 
 - Codex: `.codex-plugin/plugin.json` + `.mcp.json`
-- Cursor: `.cursor-plugin/plugin.json` (identity and logo only; no hooks entry, because Cursor's documented plugin `hooks/hooks.json` is a different format from ours and the fields ours rely on are undocumented there: [plugin hooks per agent host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#plugin-hooks-per-agent-host))
+- Cursor: `.cursor-plugin/plugin.json` (identity and logo only; no hooks entry, because Cursor's documented plugin `hooks/hooks.json` is a different format from ours and the fields ours rely on are undocumented there: [plugin hooks per agent host](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#plugin-hooks-per-agent-host))
 - Claude Code compatibility files
 - Agent Plugins 1.0 manifests
 - Shared `skills/`
@@ -98,7 +123,8 @@ Pass an **absolute** `repo_path` on every call.
 
 | Tool | When |
 | --- | --- |
-| `gitpulse_insights` | First look at a repo |
+| `gitpulse_insights` | First look at a repo (includes `agents.live` per-worktree running sessions and `served_by` when answered from the running app's shared reads) |
+| `gitpulse_sessions` | Who is running here, which session is me (`is_caller`), `run_id`, and live `state` (`working`/`blocked`/`done`/`idle`/`unknown`) without spawning `git` |
 | `gitpulse_status` | Narrower: ledger + worktrees + codeintel |
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
@@ -114,7 +140,7 @@ Pass an **absolute** `repo_path` on every call.
 | `gitpulse_list_tasks` / `_get_task` | Read the GitPulse task board and a task's brief |
 | `gitpulse_add_task` / `_import_tasks` / `_complete_task` | Trust-gated task-board writes: file a task, import a `tasks/` folder, mark the launched task done |
 | `gitpulse_delete_task` / `_merge_tasks` | Destructive board writes (both end in the store's soft delete) and annotated `destructiveHint: true` |
-| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null (and `verified` false) when the commit has no verification note. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with none, even when `gitpulse_landed` finds its work on the base |
+| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `verified` is true only when the commit's verification note records a pass of the whole suite; `confidence` is null (and `verified` false) when there is no note or the note records a failure, an affected-tests-only pass (`passed-affected`) or an unrecognised verdict, which `verification.verdict` names. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with none, even when `gitpulse_landed` finds its work on the base |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `landed: false` only when absence is provable; otherwise null with a `reason` (`partial_clone_fetch_required`, `search_depth_exceeded`, `content_not_provable`, ...). `reverted` is true only when a revert commit is found by ancestry; `landed_at` comes from the base branch's own reflog (never `HEAD`'s). Never writes to the repository: the content comparison (`git merge-tree --write-tree`) runs in a quarantined object directory deleted afterwards |
 | `gitpulse_browser_open` | Ask the running desktop app over the single-instance mailbox to open a loopback URL in a supervised Browser session (refuses untrusted repos and non-loopback URLs) |
 | `gitpulse_terminal_spawn` / `_open_file` / `_list` / `_wait` / `_read` / `_send` / `_close` | Supervised PTY sessions inside GitPulse's terminal dock: spawn shells or open files (`_open_file`), list, wait on output/exit, read bounded buffers, send input, and close |

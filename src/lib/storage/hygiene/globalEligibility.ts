@@ -1,4 +1,4 @@
-import type { CleanerInventory } from "./globalTypes";
+import type { CleanerInventory, CleanerRun } from "./globalTypes";
 
 /**
  * The front end's half of one policy: whether a saved inventory offers the host
@@ -39,4 +39,42 @@ export function coverageNotice(inventory: CleanerInventory | null): string | nul
     return "Incomplete inventory, and nothing eligible was found. Cleanup needs at least one directory it read in full; what couldn't be read is named below.";
   }
   return "Incomplete inventory: part of the workspace couldn't be read. That does not hold up the rest — every directory listed below was read in full and stays eligible. What couldn't be read is named below and is left alone.";
+}
+
+/**
+ * The words for one row's status. `unexamined` is not a refusal: the host shed
+ * the checks under load and nothing was judged, so it must never read like a
+ * row the policy looked at and turned down.
+ */
+export function itemStatusLabel(status: string): string {
+  if (status === "unexamined") return "couldn't examine";
+  // Some of it is gone and the rest stays: neither "completed" nor "skipped".
+  if (status === "partially_removed") return "partly removed";
+  return status.replaceAll("_", " ");
+}
+
+/**
+ * The sentence for a due scheduled clean that is waiting for the host, or null.
+ * The reason is the load governor's own phrase (in memory only, never saved),
+ * present only while the schedule is enabled, due and idle.
+ */
+export function scheduledWaitNotice(state: { scheduled_wait?: string | null }): string | null {
+  const reason = state.scheduled_wait?.trim();
+  if (!reason) return null;
+  return `The scheduled clean is due and waiting: ${reason}. It runs when that clears, or run it now.`;
+}
+
+/**
+ * What a run's row count covers. A run lists at most 100 rows; refused or
+ * unexamined candidates past that are counted in `unlisted`, never dropped
+ * silently.
+ */
+export function runRowsSummary(run: CleanerRun): string {
+  const listed = `${run.items.length} targets reported`;
+  const parts = [listed];
+  if (run.unlisted) parts.push(`${run.unlisted} more not listed`);
+  // Not "under load": a folder that could not be checked is not always the
+  // host shedding work. The run's issues say which reason applied.
+  if (run.unexamined) parts.push(`${run.unexamined} couldn't be examined`);
+  return parts.join(" · ");
 }

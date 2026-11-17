@@ -110,7 +110,7 @@ fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerErro
     // one we looked at and rejected.
     let code = if crate::repository_trust::refused(&message) {
         "untrusted_worktree"
-    } else if crate::engine::git_cli::is_deferred_under_load(&message) {
+    } else if crate::engine::process::is_deferred_under_load(&message) {
         // The same shape as trust: Git never ran, because the spawn gate
         // declined to start it under load. Nothing about the worktree was
         // examined, so it is neither invalid nor unrelated, and asking
@@ -728,10 +728,13 @@ impl BindingHistory {
 /// * a repository with no ledger in any checkout costs no Git at all;
 /// * the ledger is read through a read-only connection: no directory or file
 ///   chmod, no WAL or synchronous pragma, no schema DDL, no cached handle;
-/// * legacy sibling ledgers are never migrated from here. If one holds rows
-///   the anchor has not imported, the binding cannot be ruled out, so the
-///   lookup refuses (`legacy_ledger_unconsolidated`) until GitPulse — which
-///   consolidates whenever it resolves the repository — has run there.
+/// * legacy sibling ledgers are never migrated from here. If one holds an
+///   unimported row the import would keep as a bind or unbind, the binding
+///   cannot be ruled out, so the lookup refuses (`legacy_ledger_unconsolidated`)
+///   until GitPulse — which consolidates whenever it resolves the repository —
+///   has run there. Unimported rows that cannot set a binding (anything but a
+///   bind or unbind, or one the import keeps as history only) do not refuse:
+///   the anchor already holds the answer consolidation would give.
 pub(crate) fn resolve_binding_readonly(
     repo_path: &str,
     worktree_path: &str,
@@ -746,8 +749,8 @@ pub(crate) fn resolve_binding_readonly(
         return Err(LedgerError::new(
             "legacy_ledger_unconsolidated",
             format!(
-                "the worktree ledger at {} holds history not yet consolidated into this \
-                 repository's ledger, so its task binding cannot be ruled out; open this \
+                "the worktree ledger at {} holds bind/unbind history not yet consolidated \
+                 into this repository's ledger, so its task binding cannot be ruled out; open this \
                  repository in GitPulse to consolidate it",
                 source.display()
             ),
@@ -833,7 +836,7 @@ mod tests {
     /// every wording it has: shed at once (`0.000s`, background work) and
     /// refused after waiting out the rate budget (any duration).
     fn gate_deferrals() -> Vec<String> {
-        use crate::engine::git_cli::{refusal_message, Refusal};
+        use crate::engine::process::{refusal_message, Refusal};
         vec![
             refusal_message("git worktree", Refusal::Shed).into_message(),
             refusal_message(
@@ -857,7 +860,7 @@ mod tests {
             let error = classify(&path, &path, message.clone());
             assert_eq!(error.code, DEFERRED_WORKTREE, "{message}");
             assert!(
-                crate::engine::git_cli::is_deferred_under_load(&error.message),
+                crate::engine::process::is_deferred_under_load(&error.message),
                 "the cause stays in the message: {error}"
             );
         }
@@ -911,7 +914,7 @@ mod tests {
         bind(&path, &path, "TASK-1").unwrap();
         let (_linked_parent, linked) = linked_worktree(std::path::Path::new(&path));
         let error =
-            crate::engine::git_cli::with_forced_deferral(|| resolve_binding(&path, &linked))
+            crate::engine::process::with_forced_deferral(|| resolve_binding(&path, &linked))
                 .expect_err("a shed read must not resolve");
         assert_eq!(error.code, DEFERRED_WORKTREE, "{error}");
         assert_ne!(error.code, "untrusted_worktree");
@@ -927,7 +930,7 @@ mod tests {
         // code reaches it unchanged and it still refuses exactly as before
         // (hard `task.scope_unavailable`, rendered as Deny). CARD 13's hook
         // half changes this; until it lands, this is the pinned behavior.
-        let judged = crate::engine::git_cli::with_forced_deferral(|| {
+        let judged = crate::engine::process::with_forced_deferral(|| {
             crate::harness::check_command_in_scope(
                 crate::harness::sidecar::Lane::Shared,
                 &linked,
@@ -1849,7 +1852,7 @@ mod tests {
 #[cfg(test)]
 mod readonly_tests {
     use super::*;
-    use crate::engine::git_cli::spawn_log;
+    use crate::engine::process::spawn_log;
     use crate::test_support::git_in;
 
     pub(super) fn fresh_repo() -> tempfile::TempDir {
@@ -2056,10 +2059,98 @@ mod readonly_tests {
         let resolved = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
         assert_eq!(resolved.map(|b| b.task_id).as_deref(), Some("TASK-LEGACY"));
 
-        // A later legacy row is unimported history again.
+        // Later rows in the sibling's own ledger are unimported again, but
+        // none of them can set a binding: a commit never could, and once the
+        // family's initial pass is over a sibling's bind is imported as
+        // history only. So they no longer refuse every command in every
+        // checkout; the answer is the one consolidation gives.
         record(&worktree);
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            task_id: Some("TASK-LATER".to_string()),
+            action: BIND.to_string(),
+            object: Some(worktree.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("a sibling bind after the initial pass");
+        let before = resolve_binding_readonly(&worktree, &worktree)
+            .expect("rows that cannot set a binding must not refuse");
+        assert_eq!(
+            before.as_ref().map(|b| b.task_id.as_str()),
+            Some("TASK-LEGACY")
+        );
+        repository_address(&repo).expect("GitPulse consolidates again");
+        let after = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+        assert_eq!(
+            before, after,
+            "the read-only answer differs from the consolidated one"
+        );
+    }
+
+    /// The refusal is for history that could decide the binding, not for any
+    /// unimported row. A sibling ledger holding only rows the import can never
+    /// turn into a binding answers now what GitPulse answers after
+    /// consolidating it — even before the family's initial pass, when a
+    /// sibling's bind rows would still count.
+    #[test]
+    fn unimported_history_that_cannot_bind_answers_as_consolidation_would() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        record(&worktree);
+
+        let before = resolve_binding_readonly(&worktree, &worktree)
+            .expect("a sibling holding no binding row must not refuse");
+        assert_eq!(before, None);
+        assert!(
+            !super::super::is_initialised(&repo),
+            "the hook lookup consolidated (created the anchor ledger)"
+        );
+
+        repository_address(&repo).expect("GitPulse consolidates");
+        let after = resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+        assert_eq!(
+            before, after,
+            "the read-only answer differs from the consolidated one"
+        );
+    }
+
+    /// A sibling ledger that shrank below its import marker was replaced, and
+    /// consolidation re-reads it from the start under its recorded legacy
+    /// bound, so a bind or unbind inside that bound may still set a binding:
+    /// the lookup keeps refusing until GitPulse has re-read it.
+    #[test]
+    fn a_replaced_sibling_with_a_binding_row_inside_its_legacy_bound_refuses() {
+        let dir = fresh_repo();
+        let repo = canonical(dir.path());
+        let (_parent, worktree) = linked(dir.path());
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            task_id: Some("TASK-LEGACY".to_string()),
+            action: BIND.to_string(),
+            object: Some(worktree.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy binding row");
+        record(&worktree);
+        record(&worktree);
+        repository_address(&repo).expect("GitPulse consolidates");
+        resolve_binding_readonly(&worktree, &worktree).expect("consolidated");
+
+        let conn = rusqlite::Connection::open(crate::ledger::ledger_path(&worktree))
+            .expect("open the sibling ledger");
+        conn.execute("DELETE FROM events WHERE id > 1", [])
+            .expect("shrink the sibling below its marker");
+        drop(conn);
+
         let error = resolve_binding_readonly(&worktree, &worktree)
-            .expect_err("a new unimported row refuses again");
+            .expect_err("a re-read source may hold a binding row within its bound");
         assert_eq!(error.code, "legacy_ledger_unconsolidated", "{error}");
     }
 
@@ -2209,6 +2300,127 @@ mod family_cost_tests {
         assert_eq!(resolved.expect("warm binding lookup"), None);
         assert!(spawned.is_empty(), "a warm lookup spawned git: {spawned:?}");
         assert_eq!(sibling_opens(), opens, "a warm read reopened a sibling");
+    }
+
+    fn hash_objects(spawned: &[Vec<String>]) -> usize {
+        spawned
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "hash-object"))
+            .count()
+    }
+
+    /// `git hash-object --stdin` asked directly, the authority a key must equal.
+    fn real_key(repo: &str, source: &str) -> String {
+        use crate::procguard::LockedSpawn;
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let mut child = command
+            .args(["hash-object", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_locked()
+            .expect("git hash-object");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("output");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    /// Siblings that keep writing are imported again on every pass (their
+    /// stamp moved), and each pass used to spawn a `git hash-object` per
+    /// sibling to re-derive a key it had already derived. Once a sibling has
+    /// been imported, a later pass in the same process spawns none.
+    #[test]
+    fn a_second_consolidation_pass_over_moved_siblings_spawns_no_hash_object() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        let (first, spawned) = spawned_by(&repo, || repository_address(&repo));
+        first.expect("first pass");
+        assert_eq!(hash_objects(&spawned), 3, "one key per never-seen sibling");
+
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        let (second, spawned) = spawned_by(&repo, || repository_address(&repo));
+        let second = second.expect("second pass");
+        let rows = crate::ledger::tail(&second.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 6, "the moved siblings were not imported again");
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a second pass spawned git to re-key a known sibling: {spawned:?}"
+        );
+    }
+
+    /// A hook is a process of its own with no memo to warm, so the keys must
+    /// come from what the anchor persisted. After the first pass, a process
+    /// that starts empty spawns no `git hash-object` for any sibling, whether
+    /// it consolidates them or only asks whether one is unconsolidated.
+    #[test]
+    fn a_cold_process_takes_the_sibling_keys_from_the_persisted_rows() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
+        repository_address(&repo).expect("first pass");
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        crate::ledger::tests_support::forget_family_keys();
+
+        let (address, spawned) = spawned_by(&repo, || repository_address(&repo));
+        let address = address.expect("cold pass");
+        let rows = crate::ledger::tail(&address.anchor, 0, 100).expect("tail");
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a cold consolidation re-keyed a persisted sibling: {spawned:?}"
+        );
+
+        for (_, worktree) in &siblings {
+            record(worktree);
+        }
+        crate::ledger::tests_support::forget_family_keys();
+        let members: Vec<std::path::PathBuf> = siblings
+            .iter()
+            .map(|(_, worktree)| std::path::PathBuf::from(worktree))
+            .collect();
+        let (pending, spawned) = spawned_by(&repo, || {
+            crate::ledger::unconsolidated_legacy_ledger(&address.anchor, &members)
+        });
+        pending.expect("cold readonly check");
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a cold readonly check re-keyed a persisted sibling: {spawned:?}"
+        );
+    }
+
+    /// The key is what Git's own `hash-object --stdin` returns: persisted rows
+    /// are keyed by it, so no path to a key may disagree with it.
+    #[test]
+    fn a_sibling_key_is_the_object_id_git_gives_the_path() {
+        let (_dir, repo, siblings) = family_with_legacy_ledgers(2);
+        repository_address(&repo).expect("first pass");
+        let anchor = std::path::Path::new(&repo);
+        for (_, worktree) in &siblings {
+            let want = real_key(&repo, worktree);
+            let hashed = crate::ledger::tests_support::hashed_key(anchor, worktree);
+            assert_eq!(hashed, want, "a freshly hashed key differs from git's");
+            let stored = crate::ledger::tests_support::stored_key(&repo, worktree);
+            assert_eq!(
+                stored.as_deref(),
+                Some(want.as_str()),
+                "a persisted key differs from git's"
+            );
+        }
     }
 
     /// Gating consolidation on change must not turn into never consolidating:

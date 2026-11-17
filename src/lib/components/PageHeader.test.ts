@@ -72,6 +72,20 @@ describe("PageHeader", () => {
     expect(at("desc</p>")).toBeLessThan(at("<u>A</u>"));
   });
 
+  it("renders a toolbar as a full-width second row inside the same header, and nothing when absent", () => {
+    const body = bar({ actions: snippet("<u>A</u>"), toolbar: snippet("<s>T</s>") });
+    const header = /<header[\s\S]*<\/header>/.exec(body)?.[0] ?? "";
+    expect(header).toContain("<s>T</s>");
+    expect(body.indexOf("<u>A</u>")).toBeLessThan(body.indexOf("<s>T</s>"));
+    const row = /<div [^>]*data-page-header-toolbar[^>]*>/.exec(body)?.[0] ?? "";
+    expect(row).toContain("flex-basis: 100%");
+    expect(row).toContain("flex-wrap: wrap");
+    expect(/<header[^>]*>/.exec(body)?.[0]).toContain("padding-top: var(--gp-space-2)");
+    const plain = bar({ actions: snippet("<u>A</u>") });
+    expect(plain).not.toContain("data-page-header-toolbar");
+    expect(/<header[^>]*>/.exec(plain)?.[0]).not.toContain("padding-top");
+  });
+
   it("keeps the bar's minimum height from density and lets the row wrap instead of clipping", () => {
     const body = bar({});
     expect(body).toContain("min-height: var(--gp-header-h)");

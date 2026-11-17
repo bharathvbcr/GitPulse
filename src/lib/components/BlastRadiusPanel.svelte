@@ -24,6 +24,8 @@
   import { blastGlance, confidenceLabel } from "../codeintel/blastGlance";
   import { nodeLabel } from "../codeintel/codeMap";
   import { ChevronDown, ChevronRight, Loader2 } from "@lucide/svelte";
+  import { currentRepoPath } from "../stores/repoStore";
+  import MissingToolNotice from "./MissingToolNotice.svelte";
 
   let {
     blast,
@@ -104,6 +106,18 @@
         <ChevronRight size={13} class="shrink-0 text-textMuted" />
       {/if}
     </button>
+
+    <!-- A missing code map is the one cause of "couldn't be measured" the
+         reader can fix from here, so it gets the fix and not only the
+         headline. Any other cause adds nothing: the headline already says it. -->
+    {#if !blast.available}
+      <MissingToolNotice
+        inset
+        repoPath={$currentRepoPath}
+        reason={blast.reason}
+        feature="impact for this change"
+      />
+    {/if}
 
     {#if open}
       <div class="flex flex-col gap-2 px-2.5 py-2">

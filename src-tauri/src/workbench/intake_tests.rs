@@ -745,6 +745,49 @@ fn an_overwrite_never_rewrites_a_field_the_person_locked() {
     );
 }
 
+/// A revision the caller holds an overwrite to is checked at the owner, not
+/// only by the MCP schema: the desktop path and any future caller get the same
+/// refusals, and a refused call leaves nothing behind, not even a registered
+/// repository.
+#[test]
+fn a_held_overwrite_is_refused_at_the_owner_and_leaves_nothing_behind() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let identity = resolve(repo_path).unwrap().identity;
+
+    let unknown = add_task_guarded(&store, repo_path, task("gp-x", "X"), true, &[], Some(1))
+        .expect_err("no task to hold");
+    assert_eq!(unknown.code, "not_found", "{}", unknown.message);
+    assert!(
+        find(&store, &identity).unwrap().is_none(),
+        "the refusal registered the repository"
+    );
+
+    let first = add_task(&store, repo_path, task("gp-x", "X"), false, &[]).unwrap();
+    let id = first["item_id"].as_str().unwrap();
+    for bad in [0, -1, i64::MIN] {
+        let error = add_task_guarded(&store, repo_path, task("gp-x", "Y"), true, &[], Some(bad))
+            .expect_err("below the first revision");
+        assert_eq!(error.code, "invalid_input", "{bad}: {}", error.message);
+    }
+    let error = add_task_guarded(&store, repo_path, task("gp-x", "Y"), false, &[], Some(1))
+        .expect_err("only an overwrite can be held");
+    assert_eq!(error.code, "invalid_input", "{}", error.message);
+    assert_eq!(live(&store, id).unwrap()["title"], "X");
+
+    let ahead = add_task_guarded(&store, repo_path, task("gp-x", "Y"), true, &[], Some(2))
+        .expect_err("the card is at revision 1");
+    assert_eq!(ahead.code, "revision_conflict", "{}", ahead.message);
+    assert!(ahead.message.contains("revision 1"), "{}", ahead.message);
+    assert_eq!(live(&store, id).unwrap()["revision"], 1);
+
+    let held = add_task_guarded(&store, repo_path, task("gp-x", "Y"), true, &[], Some(1)).unwrap();
+    assert_eq!(held["outcome"], "updated");
+    assert_eq!(held["revision"], 2);
+}
+
 /// Another agent's attempt on the task is live: deleting it would pull the
 /// task out from under that agent. Refused unless the caller says so.
 #[test]

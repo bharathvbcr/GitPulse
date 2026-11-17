@@ -1056,7 +1056,9 @@ fn record_poll_skip_into(logger: &RingLogger, line: &str) {
     logger.write_entry(Level::Info, "watcher", line);
 }
 
-#[tauri::command]
+/// Off the GUI thread: the diagnostics view polls this, and a tail read that
+/// waits on a slow disk must not freeze the window.
+#[tauri::command(async)]
 pub fn cmd_diagnostic_log_tail(max_lines: Option<usize>) -> Vec<String> {
     record_poll_skip();
     diagnostic_tail(max_lines.unwrap_or(DEFAULT_TAIL_LINES))

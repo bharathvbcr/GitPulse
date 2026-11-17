@@ -7,7 +7,8 @@
 //! the same resolved binary every other call does and says, in one sentence
 //! a user can act on, what is wrong.
 
-use super::{classify_tool_probe, git_command, run_bounded, CapturedOutput, ToolProbe};
+use super::git_command;
+use crate::engine::process::{classify_tool_probe, run_bounded, CapturedOutput, ToolProbe};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;

@@ -6,11 +6,22 @@ import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
+  DEFAULT_IDLE,
+  DEFAULT_LEASES,
+  DEFAULT_THRESHOLDS,
+  thresholdsAreDefault,
+  ensureHostLoadSettings,
+  hostLoadSettings,
+  DEFAULT_HOST_LOAD_SETTINGS,
+  updateHostLoadSettings,
   HOST_LOAD_PULSE_EVENT,
   PROFILE_RETRY_BASE_MS,
   PROFILE_RETRY_CAP_MS,
   hostLoadPulse,
   hostPressure,
+  loadIdleReport,
+  loadLeaseStatus,
+  parkSession,
   pulseOf,
   refreshHostLoad,
   resetHostLoadForTests,
@@ -30,7 +41,7 @@ vi.mock("../platform", () => ({ isTauri: () => true }));
 const calmGovernor: HostLoadStatus["governor"] = {
   verdict: {
     admit: true,
-    shed: { background: false, reactive: false },
+    shed: { background: false, reactive: false, cause: null },
     reason: "healthy",
     tier: "clear",
     binding: null,
@@ -77,6 +88,7 @@ function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
     procs: null,
     tick: { ticks: 1, overruns: 0, missed: 0, last_us: 1, max_us: 1, cpu_ns: 1 },
     problems: [],
+    previous_boot: null,
     ...over,
   };
 }
@@ -167,17 +179,47 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    vi.mocked(invoke).mockResolvedValue({ enabled: false, govern_launches: true, profile: "auto" });
-    await expect(
-      saveHostLoadSettings({ enabled: false, govern_launches: true, profile: "auto" }),
-    ).resolves.toEqual({
-      enabled: false,
-      govern_launches: true,
-      profile: "auto",
+    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    vi.mocked(invoke).mockResolvedValue(stored);
+    await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
+    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
+  });
+
+  it("saves one row's change on top of the latest settings, not a stale copy", async () => {
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    // A row saves a new swap rule; the store takes what the backend returns.
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap } });
+    // A toggle elsewhere carries only its own change: the swap edit survives.
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ govern_launches: false });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap }, profile: "auto" },
     });
-    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: false, govern_launches: true, profile: "auto" },
+    expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
+  });
+
+  it("saves the command gate's mode on top of the latest settings, and defaults to enforcing", async () => {
+    expect(DEFAULT_HOST_LOAD_SETTINGS.hook_mode).toBe("enforce");
+    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ hook_mode: "advise" });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { ...first, hook_mode: "advise" },
     });
+    expect(get(hostLoadSettings)?.hook_mode).toBe("advise");
+  });
+
+  it("reads the settings once however many rows ask at the same time", async () => {
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS });
+    await Promise.all([ensureHostLoadSettings(), ensureHostLoadSettings(), ensureHostLoadSettings()]);
+    expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings")).toHaveLength(1);
   });
 
   it("has no resource profile until a status arrives, then carries the backend's", async () => {
@@ -204,10 +246,10 @@ describe("hostLoadStore", () => {
     };
     vi.mocked(invoke).mockImplementation(async (cmd: string) =>
       cmd === "cmd_host_load_settings_save"
-        ? { enabled: true, govern_launches: true, profile: "roomy" }
+        ? { ...DEFAULT_HOST_LOAD_SETTINGS, profile: "roomy" }
         : status({ profile: roomy }),
     );
-    await saveHostLoadSettings({ enabled: true, govern_launches: true, profile: "roomy" });
+    await saveHostLoadSettings({ ...DEFAULT_HOST_LOAD_SETTINGS, profile: "roomy" });
     await vi.waitFor(() => expect(get(resourceProfile)?.tier).toBe("roomy"));
     expect(invoke).toHaveBeenCalledWith("cmd_host_load_status");
   });
@@ -219,7 +261,7 @@ describe("hostLoadStore", () => {
         verdict: {
           ...calmGovernor.verdict,
           admit: false,
-          shed: { background: true, reactive: true },
+          shed: { background: true, reactive: true, cause: null },
           reason: "pressure",
           tier: "severe",
           binding: "compressor_thrash",
@@ -358,6 +400,75 @@ describe("hostLoadStore", () => {
     expect(get(hostPressure)).toBe("unavailable");
   });
 
+  it("reads build slots and idle sessions from their own commands and parks by terminal session id", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_host_load_leases") return { on: true, holders: [] } as never;
+      if (cmd === "cmd_host_load_idle") return { sessions: [], idle: 0 } as never;
+      if (cmd === "cmd_host_load_park") return "Parked." as never;
+      return undefined as never;
+    });
+    expect(await loadLeaseStatus()).toMatchObject({ on: true });
+    expect(await loadIdleReport()).toMatchObject({ idle: 0 });
+    expect(await parkSession("term-1")).toBe("Parked.");
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_park", { sessionId: "term-1" });
+    // The terminal pill asks for the queue alone: no process-table read.
+    await loadLeaseStatus(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: true });
+    await loadLeaseStatus();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("cmd_host_load_leases", { queueOnly: false });
+  });
+
+  it("does not swallow a refused park: a No or a changed session rejects", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_host_load_park") throw new Error("not confirmed");
+      return undefined as never;
+    });
+    await expect(parkSession("term-1")).rejects.toThrow("not confirmed");
+  });
+
+  it("keeps the automatic disk floors on a round trip that never touched them", async () => {
+    // The backend shows the automatic floors as numbers for this computer.
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: shown };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    await updateHostLoadSettings({ thresholds: { ...get(hostLoadSettings)!.thresholds, swap } });
+    const saved = get(hostLoadSettings)!.thresholds;
+    expect(saved.disk_auto).toBe(true);
+    expect(saved.disk_guard).toEqual(DEFAULT_THRESHOLDS.disk_guard);
+    expect(saved.swap).toEqual(swap);
+  });
+
+  it("calls the thresholds default by what is stored, never by the numbers the automatic floors show", () => {
+    expect(thresholdsAreDefault(DEFAULT_THRESHOLDS)).toBe(true);
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    expect(thresholdsAreDefault(shown)).toBe(true);
+    expect(thresholdsAreDefault({ ...shown, disk: { ...shown.disk, mode: "shed" } })).toBe(false);
+    // The same numbers a person set are theirs, and not the default.
+    expect(thresholdsAreDefault({ ...shown, disk_auto: false })).toBe(false);
+    expect(thresholdsAreDefault({ ...DEFAULT_THRESHOLDS, disk_auto: false })).toBe(false);
+    const guard = { ...DEFAULT_THRESHOLDS.disk_guard, coverage: { mode: "refuse" as const, headroom_gib: 80 } };
+    expect(thresholdsAreDefault({ ...shown, disk_guard: guard })).toBe(false);
+  });
+
+  it("carries the memory profile on a save, defaults it to automatic, and rereads the status after", async () => {
+    expect(DEFAULT_HOST_LOAD_SETTINGS.profile).toBe("auto");
+    const first = { ...DEFAULT_HOST_LOAD_SETTINGS, govern_launches: false };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) =>
+      cmd === "cmd_host_load_settings_save" ? ((args as { settings: unknown }).settings as never) : (status() as never),
+    );
+    await updateHostLoadSettings({ profile: "compact" });
+    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", {
+      settings: { ...first, profile: "compact" },
+    });
+    expect(get(hostLoadSettings)?.profile).toBe("compact");
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("cmd_host_load_status"));
+  });
+
   describe("rereading an unknown or unreadable profile", () => {
     type Handler = (e: { payload: HostLoadPulse }) => void;
     const unreadable = () =>
@@ -451,7 +562,7 @@ describe("hostLoadStore", () => {
     });
 
     it("lets a person's change of setting start the retries over", async () => {
-      const saved = { enabled: true, govern_launches: true, profile: "auto" } as const;
+      const saved = { ...DEFAULT_HOST_LOAD_SETTINGS };
       reads = [];
       vi.mocked(invoke).mockImplementation(async (cmd: string) => {
         if (cmd === "cmd_host_load_settings_save") return saved as never;

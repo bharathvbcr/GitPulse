@@ -33,6 +33,12 @@ export function createSessionBook(
   const snapshotRuns = new Map<string, number>();
   /** Per tab: the newest status poll. */
   const pollRuns = new Map<string, number>();
+  /**
+   * Per tab: how many status polls have applied their read. A snapshot read
+   * that started before one of them holds statuses older than the poll's, so
+   * it must not apply them (`hydrateFacet`).
+   */
+  const statusPollApplied = new Map<string, number>();
   /** Tabs whose branch stats are being read now. */
   const statsInflight = new Set<string>();
   /**
@@ -60,6 +66,7 @@ export function createSessionBook(
     familyUnknown,
     snapshotRuns,
     pollRuns,
+    statusPollApplied,
     statsInflight,
     mutationEchoUntil,
     hydrates,
@@ -70,6 +77,7 @@ export function createSessionBook(
       familyUnknown.delete(id);
       snapshotRuns.delete(id);
       pollRuns.delete(id);
+      statusPollApplied.delete(id);
       statsInflight.delete(id);
       hydrates.forget(id);
       hydratedAt.delete(id);
@@ -83,6 +91,7 @@ export function createSessionBook(
         familyUnknown.size +
         snapshotRuns.size +
         pollRuns.size +
+        statusPollApplied.size +
         statsInflight.size +
         mutationEchoUntil.size +
         hydrates.busy().length +

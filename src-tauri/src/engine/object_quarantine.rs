@@ -15,7 +15,7 @@
 //! - the directory is removed when the [`ObjectQuarantine`] is dropped, which
 //!   covers a normal return, an early `?`, a deadline and a panic unwinding.
 //!
-//! The commands run through [`crate::engine::git_cli`], which owns the spawn
+//! The commands run through [`crate::engine::git_cli`] (over [`crate::engine::process`]), which enforce the spawn
 //! gate, the output caps, the scrubbed environment and the repository-trust
 //! check; the redirect is the one environment override that seam accepts, and
 //! the deadline is the caller's. A merge in a repository that cannot be read
@@ -29,9 +29,9 @@
 //! with this value.
 
 use crate::engine::git_cli::{
-    git_captured, git_captured_quarantined, git_text_with_timeout, is_run_timeout,
-    resolve_git_common_dir, BoundedRun, DEFAULT_TIMEOUT,
+    git_captured, git_captured_quarantined, git_text_with_timeout, resolve_git_common_dir,
 };
+use crate::engine::process::{is_run_timeout, BoundedRun, DEFAULT_TIMEOUT};
 use crate::ipc_error::CommandError;
 use std::ffi::OsString;
 use std::fmt;
