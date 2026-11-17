@@ -197,3 +197,31 @@ fn the_explicit_root_override_still_reads_only_itself() {
     assert_eq!(out.transcripts, 1, "{out:?}");
     assert_eq!(out.recorded, 1, "{out:?}");
 }
+
+/// What an override that is not a directory does today, pinned so a change to
+/// it is a decision: a root a person named stays as quiet as it always was.
+/// The pass finds nothing to read and reports no error; only a root found by
+/// looking (a config directory) is told about when it cannot be read.
+#[test]
+fn an_explicit_override_that_is_a_file_keeps_its_silence() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = repo_dir();
+    let repo = repo.path().to_str().unwrap();
+    transcript_in(&home.path().join(".claude"), repo, "S-default");
+    let file = home.path().join("not-a-directory");
+    std::fs::write(&file, "x").unwrap();
+
+    let serial = crate::test_support::env::env_serial();
+    let _env = crate::test_support::env::bind_env(&serial)
+        .set("HOME", home.path())
+        .set("GITPULSE_TRANSCRIPT_ROOT", &file)
+        .remove("CODEX_HOME")
+        .remove("GITPULSE_CODEX_TRANSCRIPT_ROOT");
+    let out = ingest_transcripts(repo);
+
+    assert_eq!(
+        out.recorded, 0,
+        "the override replaces the config dirs: {out:?}"
+    );
+    assert_eq!(out.error, "", "{out:?}");
+}

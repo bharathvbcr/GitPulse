@@ -231,9 +231,9 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     if home_hidden::on_this_thread() {
         return None;
     }
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|home| !home.is_empty())
+    let var = |name: &str| std::env::var_os(name).filter(|home| !home.is_empty());
+    var("HOME")
+        .or_else(|| var("USERPROFILE"))
         .map(std::path::PathBuf::from)
 }
 
@@ -3223,6 +3223,9 @@ mod watermark_tests {
 mod catch_up_progress_tests;
 #[cfg(test)]
 mod codex_tests;
+#[cfg(test)]
+#[path = "config_dir_adv_tests.rs"]
+mod config_dir_adv_tests;
 #[cfg(test)]
 mod config_dir_tests;
 #[cfg(test)]

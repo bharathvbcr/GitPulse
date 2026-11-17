@@ -336,6 +336,9 @@ fn ingest_family(
     let mut active: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
     // What could not be read of a source's root, for `error`.
     let mut gaps: Vec<String> = Vec::new();
+    // The active roots a person named by override, whose problems stay as quiet
+    // as they always were; every root found by looking is told about.
+    let mut explicit_roots: HashSet<std::path::PathBuf> = HashSet::new();
     // A root that is absent where it should not be: the listing is then not the
     // whole corpus, whatever the roots that are there say.
     let mut missing_root = false;
@@ -368,7 +371,7 @@ fn ingest_family(
         let note = source.reports_unwalkable_root();
         // A root that is not an absolute path would be read against whatever
         // directory the app happens to be in.
-        if note && !root.path.is_absolute() {
+        if (note || !root.explicit) && !root.path.is_absolute() {
             missing_root = true;
             blocks_forget |= !source.optional();
             gaps.push(format!(
@@ -380,7 +383,12 @@ fn ingest_family(
         // that exists and cannot be read is said whichever source it is: only a
         // named override and an absent default keep Claude's older silence.
         match std::fs::metadata(&root.path) {
-            Ok(meta) if meta.is_dir() => active.push((source, root.path)),
+            Ok(meta) if meta.is_dir() => {
+                if root.explicit {
+                    explicit_roots.insert(root.path.clone());
+                }
+                active.push((source, root.path));
+            }
             Ok(_) => {
                 missing_root = true;
                 blocks_forget |= !source.optional();
@@ -397,6 +405,12 @@ fn ingest_family(
                     if root.explicit && note {
                         gaps.push(format!(
                             "the {name} transcript root {shown} does not exist, so its transcripts were not read"
+                        ));
+                    } else if !root.explicit && is_dangling_link(&root.path) {
+                        // Something is there and leads nowhere (a volume not
+                        // mounted): not a directory that was never made.
+                        gaps.push(format!(
+                            "the {name} transcript root {shown} is a link to a path that does not exist, so its transcripts were not read"
                         ));
                     }
                 }
@@ -472,7 +486,10 @@ fn ingest_family(
         let walked = super::collect_jsonl_until(root, &mut listed_here, 0, &mut || expired(&out));
         let counted_unlisted =
             walked.unlisted_depth > 0 || walked.unlisted_cap > 0 || walked.unlisted_lower_bound;
-        if source.reports_unwalkable_root() && !walked.complete && !walked.cut && !counted_unlisted
+        if (source.reports_unwalkable_root() || !explicit_roots.contains(root))
+            && !walked.complete
+            && !walked.cut
+            && !counted_unlisted
         {
             gaps.push(format!(
                 "the {} transcript root {} could not be read in full",
@@ -961,6 +978,12 @@ fn marker_text(roots: &[(String, u32)]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether something is at `path` although it cannot be followed: a link whose
+/// target is not there. Asked only of a path that `metadata` found absent.
+fn is_dangling_link(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// Whether `root` is confirmed gone: the filesystem says it does not exist.

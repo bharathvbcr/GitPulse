@@ -120,7 +120,9 @@ pub(super) trait TranscriptSource: Sync {
 
     /// Whether a root that cannot be walked is an error to report. Every source
     /// reports an override that points nowhere; a source that adopted this
-    /// after shipping without it (Claude) keeps the silence it had.
+    /// after shipping without it (Claude) keeps the silence it had for an
+    /// override. A root found by looking, rather than named, is reported
+    /// whatever this says: nobody asked for it, so nobody would know.
     fn reports_unwalkable_root(&self) -> bool;
 
     /// Whether the agent may simply not be installed: its default directory
@@ -163,6 +165,15 @@ pub(super) const RESUME_PASS_BYTES: u64 = 256 << 20;
 /// observation uses.
 ///
 /// [`conversation::claude_config_dirs`]: crate::workbench::conversation::claude_config_dirs
+///
+/// Known limit: a configuration directory that held transcripts and then
+/// vanishes (an unmounted volume) is not remembered. Cursors are keyed by a
+/// hash of the file path, so nothing says which cursors lay under it, and the
+/// next complete pass forgets them; when the directory returns each file is
+/// read again once and every row is refused as a duplicate, none recorded
+/// twice. Codex's roots are remembered (`pass::track_roots`) because its marker
+/// cursor was added with it; adding one for Claude changes the cursor count
+/// that existing readers and tests expect, so it needs a ledger field instead.
 pub(super) struct ClaudeSource;
 
 struct ClaudeParser(transcript::Reader);
@@ -202,7 +213,7 @@ impl TranscriptSource for ClaudeSource {
     }
 
     fn roots(&self) -> SourceRoots {
-        if let Some(path) = std::env::var_os("GITPULSE_TRANSCRIPT_ROOT") {
+        if let Some(path) = std::env::var_os("GITPULSE_TRANSCRIPT_ROOT").filter(|p| !p.is_empty()) {
             return SourceRoots::one(Some(SourceRoot {
                 path: PathBuf::from(path),
                 explicit: true,
@@ -245,7 +256,11 @@ fn claude_roots(configs: ClaudeConfigDirs) -> SourceRoots {
     let first = configs.dirs.first().map(|dir| dir.join("projects"));
     for dir in &configs.dirs {
         let path = dir.join("projects");
-        if matches!(std::fs::metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        // Absent, and nothing there: a seat that never ran Claude. A link to
+        // nowhere is something there: it stays, and the pass reports it.
+        if matches!(std::fs::metadata(&path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            && std::fs::symlink_metadata(&path).is_err()
+        {
             continue;
         }
         let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
