@@ -27,13 +27,21 @@
       // Knobs for healthChecks.js; all null/zero outside its scenarios.
       const ipcLog = [], aiCalls = [], runs = [];
       const knobs = { scanDelay: 0, deps: null, dead: null, secrets: null, fixHandler: null, runHandler: null, runDelay: 0, openFail: false, severity: "HIGH", hostLoad: null };
-      // Health's secrets section scans on open. A complete, empty scan by
-      // default, so every other check reads a verdict secrets does not move.
-      const secretsReport = (findings = []) => ({
-        ok: true, error: null, diagnostic: null, kingfisher_present: true, kingfisher_version: "2.7.0",
-        kingfisher_version_rejected: false, nested_repos_scanned: true, completeness: "complete",
+      // Health's secrets section scans on open. A complete, empty scan that
+      // Kingfisher's second opinion corroborated by default, so every other
+      // check reads a verdict secrets does not move. Only a corroborated scan
+      // may read as clear; `uncorroborated` is the in-process engine alone.
+      const corroborated = findings => ({
+        state: "ran", completeness: "complete", version: "2.7.0",
+        findings_total: findings.length, confirmed: findings.length, added: 0,
+      });
+      const secretsReport = (findings = [], secondOpinion = corroborated(findings)) => ({
+        ok: true, engine: "dc-redact 0.2.5 (devcouncil@b9b2314d)", error: null, diagnostic: null,
+        kingfisher_present: true, kingfisher_version: "2.7.0", kingfisher_version_rejected: false,
+        nested_repos_scanned: true, excluded_paths: [], completeness: "complete",
         findings, findings_total: findings.length, findings_unreadable: 0, findings_truncated: false,
         git_status_known: true, max_file_size_mb: 256, scanned_at_ms: Date.now(), duration_ms: 3,
+        skipped_total: 0, skipped: [], second_opinion: secondOpinion,
       });
       const delayed = answer => knobs.scanDelay ? new Promise(resolve => setTimeout(() => resolve(answer), knobs.scanDelay)) : answer;
 

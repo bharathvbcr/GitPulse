@@ -371,6 +371,14 @@ export async function runHealthChecks(ctx) {
       secretsScans(REPO) === 1 && secretsScans("/fixture/Other") === 1);
     check("a clean secrets scan reads as clear in the summary", () =>
       has(section("summary"), "Secrets none") && has(section("secrets"), "No secrets reported"));
+    // The in-process engine found nothing and Kingfisher never ran: no finding,
+    // and nothing corroborated, so the facet is not clear either.
+    knobs.secrets = () => secretsReport([], { state: "not_run" });
+    button("Rescan secrets").click();
+    await until(() => !button("Rescan secrets").disabled && has(section("secrets"), "No known secret shapes matched"));
+    await wait();
+    check("an uncorroborated clean secrets scan reads as none matched, never clear", () =>
+      has(section("summary"), "Secrets none matched") && !has(section("secrets"), "No secrets reported"));
     knobs.secrets = () => {
       const findings = Array.from({ length: 12 }, (_, i) => finding(i));
       return { ...secretsReport(findings) };
