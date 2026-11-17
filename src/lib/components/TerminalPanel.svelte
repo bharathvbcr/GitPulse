@@ -131,6 +131,7 @@
     tabFor,
     paneOnScreen,
     setTabAutoWake,
+    setTabPurpose,
     setTabResume,
     setTabStartDir,
     type ResumeLaunch,
@@ -1155,12 +1156,14 @@
     autoWake = false,
     resume?: ResumeLaunch,
     customName?: string,
+    purpose?: "commit",
   ): boolean {
     if (!repoPath || !canCreateKind(launcher)) return false;
     const prevActive = tabState.activeId;
     focusTabStrip = false;
     tabState = openTab(tabState, launcher, initialPrompt);
     if (autoWake && tabState.activeId) tabState = setTabAutoWake(tabState, tabState.activeId, true);
+    if (purpose && tabState.activeId) tabState = setTabPurpose(tabState, tabState.activeId, purpose);
     if (resume && tabState.activeId) tabState = setTabResume(tabState, tabState.activeId, resume, customName);
     if (splitRoot && prevActive && tabState.activeId && tabState.activeId !== prevActive && !hasPane(splitRoot, tabState.activeId)) {
       splitRoot = replacePane(splitRoot, prevActive, tabState.activeId);
@@ -1269,6 +1272,7 @@
         claimed.autoWake === true,
         claimed.resume,
         claimed.name,
+        claimed.purpose,
       );
       const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
@@ -2992,6 +2996,7 @@
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}
               initialAutoWake={tab.autoWake ?? false}
+              purpose={tab.purpose}
               startDir={tab.startDir}
               active={visible && tab.id === tabState.activeId && mode === "shell"}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}

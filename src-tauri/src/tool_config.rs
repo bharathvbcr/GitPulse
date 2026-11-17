@@ -116,6 +116,14 @@ pub struct AgentDefaults {
     /// not affected — Manvi builds that command line.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub models: std::collections::BTreeMap<String, ModelChoice>,
+    /// The model an agent CLI starts with when GitPulse launches it to write a
+    /// commit (`purpose: "commit"` on `cmd_terminal_spawn`), keyed by launcher
+    /// like [`Self::models`]. An entry REPLACES the launcher's `models` entry
+    /// whole for that launch — fields are never merged, because a merge could
+    /// pair a small model with a main-model advisor that Claude Code refuses
+    /// at runtime. Absent means the launcher's `models` entry, unchanged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub commit_models: std::collections::BTreeMap<String, ModelChoice>,
 }
 
 /// One launcher's model settings. Every field is optional and absent means
@@ -255,6 +263,12 @@ impl AgentDefaults {
         for (launcher, choice) in &self.models {
             crate::workbench::terminal_command::validate_model_choice(launcher, choice)?;
         }
+        if self.commit_models.len() > MAX_MODEL_ENTRIES {
+            return Err("Too many agent commit model settings".into());
+        }
+        for (launcher, choice) in &self.commit_models {
+            crate::workbench::terminal_command::validate_model_choice(launcher, choice)?;
+        }
         Ok(())
     }
 
@@ -263,6 +277,52 @@ impl AgentDefaults {
         self.models
             .get(launcher.trim())
             .filter(|choice| !choice.is_empty())
+    }
+
+    /// The model choice for a commit launch of `launcher`, if one is stored.
+    pub fn commit_model_for(&self, launcher: &str) -> Option<&ModelChoice> {
+        self.commit_models
+            .get(launcher.trim())
+            .filter(|choice| !choice.is_empty())
+    }
+
+    /// The model choice one launch applies. A commit launch takes the commit
+    /// entry whole when there is one and the main entry otherwise; any other
+    /// launch takes the main entry.
+    pub fn model_for_launch(
+        &self,
+        launcher: &str,
+        purpose: Option<LaunchPurpose>,
+    ) -> Option<&ModelChoice> {
+        match purpose {
+            Some(LaunchPurpose::Commit) => self
+                .commit_model_for(launcher)
+                .or_else(|| self.model_for(launcher)),
+            None => self.model_for(launcher),
+        }
+    }
+}
+
+/// What a terminal launch is for, when that changes the model it starts on.
+/// It selects the model and nothing else: permission mode, hooks and resume
+/// do not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchPurpose {
+    Commit,
+}
+
+impl LaunchPurpose {
+    /// Reads the wire value: absent is no purpose, `"commit"` is a commit, and
+    /// anything else is refused rather than ignored, so a typo cannot launch
+    /// on the wrong model unannounced.
+    pub fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
+        match raw {
+            None => Ok(None),
+            Some("commit") => Ok(Some(Self::Commit)),
+            Some(other) => Err(format!(
+                "{other:?} is not a terminal launch purpose (only \"commit\")"
+            )),
+        }
     }
 }
 
@@ -296,13 +356,17 @@ pub struct StoredAgentLaunch {
     pub keep_terminals_running: Option<bool>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub models: std::collections::BTreeMap<String, ModelChoice>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub commit_models: std::collections::BTreeMap<String, ModelChoice>,
 }
 
-/// `agent_launch.models`, read launcher by launcher: an entry this build
+/// A model map (`agent_launch.models` or `agent_launch.commit_models`, named
+/// by `label`), read launcher by launcher: an entry this build
 /// cannot read costs that launcher's model setting and nothing else, and a
 /// key inside an entry that a newer build added is skipped rather than
 /// costing the fields this build does know.
 fn lenient_models(
+    label: &str,
     value: Option<&serde_json::Value>,
 ) -> std::collections::BTreeMap<String, ModelChoice> {
     let mut models = std::collections::BTreeMap::new();
@@ -310,12 +374,12 @@ fn lenient_models(
         return models;
     };
     let serde_json::Value::Object(entries) = value else {
-        log::warn!(target: "tool_config", "ignoring agent_launch.models: not an object");
+        log::warn!(target: "tool_config", "ignoring agent_launch.{label}: not an object");
         return models;
     };
     for (launcher, entry) in entries {
         let serde_json::Value::Object(fields) = entry else {
-            log::warn!(target: "tool_config", "ignoring agent_launch.models.{launcher}: not an object");
+            log::warn!(target: "tool_config", "ignoring agent_launch.{label}.{launcher}: not an object");
             continue;
         };
         let known: serde_json::Map<String, serde_json::Value> = fields
@@ -323,7 +387,7 @@ fn lenient_models(
             .filter(|(key, _)| {
                 let known = crate::workbench::terminal_command::MODEL_FIELDS.contains(&key.as_str());
                 if !known {
-                    log::warn!(target: "tool_config", "ignoring agent_launch.models.{launcher}.{key}: not a field this build knows");
+                    log::warn!(target: "tool_config", "ignoring agent_launch.{label}.{launcher}.{key}: not a field this build knows");
                 }
                 known
             })
@@ -335,7 +399,7 @@ fn lenient_models(
             }
             Err(error) => log::warn!(
                 target: "tool_config",
-                "ignoring unreadable agent_launch.models.{launcher}, keeping the other agent settings: {error}"
+                "ignoring unreadable agent_launch.{label}.{launcher}, keeping the other agent settings: {error}"
             ),
         }
     }
@@ -376,7 +440,8 @@ impl<'de> Deserialize<'de> for StoredAgentLaunch {
             claude_setting_sources: field(&fields, "claude_setting_sources"),
             max_terminal_sessions: field(&fields, "max_terminal_sessions"),
             keep_terminals_running: field(&fields, "keep_terminals_running"),
-            models: lenient_models(fields.get("models")),
+            models: lenient_models("models", fields.get("models")),
+            commit_models: lenient_models("commit_models", fields.get("commit_models")),
         })
     }
 }
@@ -1789,6 +1854,35 @@ pub fn session_alerts() -> SessionAlertSettings {
         .unwrap_or_default()
 }
 
+/// Drops what a launch could not apply from one model map: all of it when it
+/// is oversized, otherwise each empty or invalid entry on its own.
+fn retain_valid_models(
+    label: &str,
+    models: &mut std::collections::BTreeMap<String, ModelChoice>,
+) {
+    if models.len() > MAX_MODEL_ENTRIES {
+        log::warn!(target: "tool_config", "ignoring oversized agent {label} settings");
+        models.clear();
+    }
+    models.retain(|launcher, choice| {
+        if choice.is_empty() {
+            return false;
+        }
+        match crate::workbench::terminal_command::validate_model_choice(launcher, choice) {
+            Ok(()) => true,
+            Err(error) => {
+                // Costs that launcher's model setting, not a terminal tab:
+                // the launch would refuse a choice it cannot apply in full.
+                log::warn!(
+                    target: "tool_config",
+                    "ignoring stored {label} setting for {launcher}: {error}"
+                );
+                false
+            }
+        }
+    });
+}
+
 /// The stored agent defaults, or the shipped ones.
 ///
 /// Validated on the way out as well as on the way in. `tools.json` is a plain
@@ -1808,28 +1902,10 @@ pub fn agent_defaults() -> AgentDefaults {
         max_terminal_sessions: cfg.agent_launch.max_terminal_sessions,
         keep_terminals_running: cfg.agent_launch.keep_terminals_running,
         models: cfg.agent_launch.models,
+        commit_models: cfg.agent_launch.commit_models,
     };
-    if defaults.models.len() > MAX_MODEL_ENTRIES {
-        log::warn!(target: "tool_config", "ignoring oversized agent model settings");
-        defaults.models.clear();
-    }
-    defaults.models.retain(|launcher, choice| {
-        if choice.is_empty() {
-            return false;
-        }
-        match crate::workbench::terminal_command::validate_model_choice(launcher, choice) {
-            Ok(()) => true,
-            Err(error) => {
-                // Costs that launcher's model setting, not a terminal tab:
-                // the launch would refuse a choice it cannot apply in full.
-                log::warn!(
-                    target: "tool_config",
-                    "ignoring stored model setting for {launcher}: {error}"
-                );
-                false
-            }
-        }
-    });
+    retain_valid_models("models", &mut defaults.models);
+    retain_valid_models("commit_models", &mut defaults.commit_models);
     defaults.permission.retain(|launcher, mode| {
         let ok = crate::workbench::terminal_command::validate_permission_default(launcher, mode)
             .is_ok();
@@ -1897,6 +1973,11 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
             keep_terminals_running: next.keep_terminals_running,
             models: next
                 .models
+                .into_iter()
+                .filter(|(_, choice)| !choice.is_empty())
+                .collect(),
+            commit_models: next
+                .commit_models
                 .into_iter()
                 .filter(|(_, choice)| !choice.is_empty())
                 .collect(),
@@ -3682,6 +3763,139 @@ mod model_setting_tests {
             let read = agent_defaults();
             assert!(read.models.is_empty());
             assert_eq!(read.live_runs(), 5);
+        });
+    }
+
+    fn model_choice(model: &str, advisor: Option<&str>) -> ModelChoice {
+        ModelChoice {
+            model: Some(model.into()),
+            advisor: advisor.map(str::to_owned),
+            ..ModelChoice::default()
+        }
+    }
+
+    /// The flags a `claude` launch of `purpose` carries for its model choice,
+    /// built the way `cmd_terminal_spawn` builds them.
+    fn claude_model_flags(defaults: &AgentDefaults, purpose: Option<&str>) -> Vec<String> {
+        let purpose = LaunchPurpose::parse(purpose).expect("a purpose this build accepts");
+        crate::workbench::terminal_command::launch_flags(
+            "claude",
+            &crate::workbench::terminal_command::LaunchOptions {
+                notify: false,
+                setting_sources: None,
+                model: defaults.model_for_launch("claude", purpose),
+                hook: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn main_and_commit_defaults() -> AgentDefaults {
+        let mut defaults = AgentDefaults::default();
+        defaults
+            .models
+            .insert("claude".into(), model_choice("opus", Some("fable")));
+        defaults
+            .commit_models
+            .insert("claude".into(), model_choice("sonnet", None));
+        defaults
+    }
+
+    #[test]
+    fn a_commit_launch_takes_the_commit_models_flags_whole() {
+        let defaults = main_and_commit_defaults();
+        let flags = claude_model_flags(&defaults, Some("commit"));
+        assert!(flags.iter().any(|f| f == "sonnet"), "{flags:?}");
+        assert!(!flags.iter().any(|f| f == "opus"), "{flags:?}");
+        // Replaced, not merged: the main entry's advisor must not ride along
+        // with the smaller model, which Claude Code refuses at runtime.
+        assert!(!flags.iter().any(|f| f.contains("fable")), "{flags:?}");
+    }
+
+    #[test]
+    fn a_commit_launch_without_a_commit_entry_takes_the_main_model() {
+        let mut defaults = main_and_commit_defaults();
+        defaults.commit_models.clear();
+        let commit = claude_model_flags(&defaults, Some("commit"));
+        assert_eq!(commit, claude_model_flags(&defaults, None));
+        assert!(commit.iter().any(|f| f == "opus"), "{commit:?}");
+    }
+
+    #[test]
+    fn a_launch_without_a_purpose_ignores_the_commit_model() {
+        let defaults = main_and_commit_defaults();
+        let flags = claude_model_flags(&defaults, None);
+        assert!(flags.iter().any(|f| f == "opus"), "{flags:?}");
+        assert!(!flags.iter().any(|f| f == "sonnet"), "{flags:?}");
+    }
+
+    #[test]
+    fn an_unknown_launch_purpose_is_refused() {
+        for bad in ["", "Commit", "commit ", "review", "main"] {
+            assert!(LaunchPurpose::parse(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(LaunchPurpose::parse(None), Ok(None));
+        assert_eq!(
+            LaunchPurpose::parse(Some("commit")),
+            Ok(Some(LaunchPurpose::Commit))
+        );
+    }
+
+    #[test]
+    fn commit_models_round_trip_through_tools_json() {
+        with_temp_config(|path| {
+            set_agent_defaults(main_and_commit_defaults()).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["commit_models"]["claude"]["model"], "sonnet");
+            assert_eq!(written["agent_launch"]["models"]["claude"]["model"], "opus");
+            assert_eq!(agent_defaults(), main_and_commit_defaults());
+        });
+    }
+
+    #[test]
+    fn a_malformed_commit_entry_is_skipped_without_losing_the_main_models() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"agent_launch":{"models":{"claude":{"model":"opus"}},"commit_models":{"claude":"sonnet","agy":{"model":"fast","bogus":1}}}}"#,
+            );
+            let read = agent_defaults();
+            assert_eq!(read.model_for("claude").unwrap().model.as_deref(), Some("opus"));
+            assert!(read.commit_model_for("claude").is_none());
+            assert_eq!(read.commit_model_for("agy").unwrap().model.as_deref(), Some("fast"));
+
+            write_raw(
+                path,
+                r#"{"version":1,"agent_launch":{"models":{"claude":{"model":"opus"}},"commit_models":[1,2]}}"#,
+            );
+            let read = agent_defaults();
+            assert_eq!(read.model_for("claude").unwrap().model.as_deref(), Some("opus"));
+            assert!(read.commit_models.is_empty());
+        });
+    }
+
+    #[test]
+    fn an_oversized_commit_model_map_is_dropped_and_refused_on_save() {
+        with_temp_config(|path| {
+            let mut defaults = AgentDefaults::default();
+            for i in 0..=MAX_MODEL_ENTRIES {
+                defaults.commit_models.insert(format!("l{i}"), model_choice("m", None));
+            }
+            assert!(set_agent_defaults(defaults).is_err());
+            let entries: Vec<String> = (0..=MAX_MODEL_ENTRIES)
+                .map(|i| format!(r#""l{i}":{{"model":"m"}}"#))
+                .collect();
+            write_raw(
+                path,
+                &format!(
+                    r#"{{"version":1,"agent_launch":{{"models":{{"claude":{{"model":"opus"}}}},"commit_models":{{{}}}}}}}"#,
+                    entries.join(",")
+                ),
+            );
+            let read = agent_defaults();
+            assert!(read.commit_models.is_empty());
+            assert!(read.model_for("claude").is_some());
         });
     }
 }

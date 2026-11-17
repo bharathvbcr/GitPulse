@@ -18,6 +18,8 @@ import {
   liveRunLimit,
   requiresAcknowledgement,
   canonicalSettingSources,
+  modelChoiceOf,
+  withModelChoice,
   sanitizeAgentDefaults,
   settingSources,
   withKeepTerminalsRunning,
@@ -245,5 +247,31 @@ describe("keep_terminals_running (managed runs)", () => {
       permission: {},
       keep_terminals_running: false,
     });
+  });
+});
+
+describe("commit models", () => {
+  it("are kept and edited apart from the main models, and an empty choice removes the entry", () => {
+    const base = { permission: {}, models: { claude: { model: "opus", advisor: "fable" } } };
+    const withCommit = withModelChoice(base, "claude", { model: "sonnet" }, "commit_models");
+    expect(withCommit.models).toEqual(base.models);
+    expect(withCommit.commit_models).toEqual({ claude: { model: "sonnet" } });
+    expect(modelChoiceOf(withCommit, "claude", "commit_models")).toEqual({ model: "sonnet" });
+    expect(modelChoiceOf(withCommit, "claude")).toEqual(base.models.claude);
+
+    const cleared = withModelChoice(withCommit, "claude", {}, "commit_models");
+    expect("commit_models" in cleared).toBe(false);
+    expect(cleared.models).toEqual(base.models);
+  });
+
+  it("are sanitized like the main models: unknown launchers and malformed entries are dropped alone", () => {
+    const sanitized = sanitizeAgentDefaults({
+      permission: {},
+      models: { claude: { model: "opus" } },
+      commit_models: { claude: { model: "sonnet" }, nonsense: { model: "x" }, agy: "text" },
+    });
+    expect(sanitized.models).toEqual({ claude: { model: "opus" } });
+    expect(sanitized.commit_models).toEqual({ claude: { model: "sonnet" } });
+    expect("commit_models" in sanitizeAgentDefaults({ permission: {}, commit_models: [1] })).toBe(false);
   });
 });

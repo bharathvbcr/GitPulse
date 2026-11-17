@@ -33,10 +33,16 @@ pub async fn cmd_terminal_spawn(
     resume: Option<crate::terminal::TerminalResume>,
     session_id: Option<String>,
     reopen_row_id: Option<String>,
+    purpose: Option<String>,
     on_output: crate::terminal::OutputChannel,
 ) -> Result<crate::terminal::TerminalSpawned, IpcError> {
     let state = state.inner().clone();
     off_thread(move || {
+        // Judged first, before anything reads settings or spawns: a purpose
+        // this build does not know is refused, never ignored. It selects the
+        // model (`model_for_launch`) and nothing else below.
+        let purpose = crate::tool_config::LaunchPurpose::parse(purpose.as_deref())
+            .map_err(CommandError::plain)?;
         // Expanded here, at the boundary, rather than in the caller: the flags
         // for a mode and for resuming/starting a conversation are the
         // workbench's single table (`terminal_command::interactive_args`) and
@@ -72,7 +78,7 @@ pub async fn cmd_terminal_spawn(
                 setting_sources: sources.as_deref(),
                 model: program
                     .as_deref()
-                    .and_then(|launcher| defaults.model_for(launcher)),
+                    .and_then(|launcher| defaults.model_for_launch(launcher, purpose)),
                 hook: hook.binary(),
             },
             &checkout_for_resume,

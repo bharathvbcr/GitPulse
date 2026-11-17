@@ -14,6 +14,7 @@ import {
   openFileTab,
   normalizePaneFilePath,
   tabFor,
+  setTabPurpose,
   setTabTitle,
   tabLabel,
   terminalTabChord,
@@ -535,5 +536,15 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
       name: "Claude · agent-1",
     });
     expect(created.taskRunId).toBeUndefined();
+  });
+});
+
+describe("setTabPurpose", () => {
+  it("marks one tab as a commit launch and ignores an unknown id", () => {
+    const opened = openTab(initialState(), "claude");
+    const id = opened.activeId!;
+    expect(setTabPurpose(opened, id, "commit").tabs.find((t) => t.id === id)?.purpose).toBe("commit");
+    expect(setTabPurpose(opened, "missing", "commit")).toBe(opened);
+    expect(opened.tabs.find((t) => t.id === id)?.purpose).toBeUndefined();
   });
 });
