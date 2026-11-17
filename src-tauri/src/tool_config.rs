@@ -1856,10 +1856,7 @@ pub fn session_alerts() -> SessionAlertSettings {
 
 /// Drops what a launch could not apply from one model map: all of it when it
 /// is oversized, otherwise each empty or invalid entry on its own.
-fn retain_valid_models(
-    label: &str,
-    models: &mut std::collections::BTreeMap<String, ModelChoice>,
-) {
+fn retain_valid_models(label: &str, models: &mut std::collections::BTreeMap<String, ModelChoice>) {
     if models.len() > MAX_MODEL_ENTRIES {
         log::warn!(target: "tool_config", "ignoring oversized agent {label} settings");
         models.clear();
@@ -3847,7 +3844,10 @@ mod model_setting_tests {
             set_agent_defaults(main_and_commit_defaults()).unwrap();
             let written: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            assert_eq!(written["agent_launch"]["commit_models"]["claude"]["model"], "sonnet");
+            assert_eq!(
+                written["agent_launch"]["commit_models"]["claude"]["model"],
+                "sonnet"
+            );
             assert_eq!(written["agent_launch"]["models"]["claude"]["model"], "opus");
             assert_eq!(agent_defaults(), main_and_commit_defaults());
         });
@@ -3861,16 +3861,25 @@ mod model_setting_tests {
                 r#"{"version":1,"agent_launch":{"models":{"claude":{"model":"opus"}},"commit_models":{"claude":"sonnet","agy":{"model":"fast","bogus":1}}}}"#,
             );
             let read = agent_defaults();
-            assert_eq!(read.model_for("claude").unwrap().model.as_deref(), Some("opus"));
+            assert_eq!(
+                read.model_for("claude").unwrap().model.as_deref(),
+                Some("opus")
+            );
             assert!(read.commit_model_for("claude").is_none());
-            assert_eq!(read.commit_model_for("agy").unwrap().model.as_deref(), Some("fast"));
+            assert_eq!(
+                read.commit_model_for("agy").unwrap().model.as_deref(),
+                Some("fast")
+            );
 
             write_raw(
                 path,
                 r#"{"version":1,"agent_launch":{"models":{"claude":{"model":"opus"}},"commit_models":[1,2]}}"#,
             );
             let read = agent_defaults();
-            assert_eq!(read.model_for("claude").unwrap().model.as_deref(), Some("opus"));
+            assert_eq!(
+                read.model_for("claude").unwrap().model.as_deref(),
+                Some("opus")
+            );
             assert!(read.commit_models.is_empty());
         });
     }
@@ -3880,7 +3889,9 @@ mod model_setting_tests {
         with_temp_config(|path| {
             let mut defaults = AgentDefaults::default();
             for i in 0..=MAX_MODEL_ENTRIES {
-                defaults.commit_models.insert(format!("l{i}"), model_choice("m", None));
+                defaults
+                    .commit_models
+                    .insert(format!("l{i}"), model_choice("m", None));
             }
             assert!(set_agent_defaults(defaults).is_err());
             let entries: Vec<String> = (0..=MAX_MODEL_ENTRIES)
