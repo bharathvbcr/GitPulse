@@ -17,6 +17,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The DevCouncil commit `devmap` is built from for the tests that drive the CLI:
+  # the one the vendored devmap crates were synced to (store schema 29). A new
+  # re-vendor moves this with it; `bun run check:vendor-schema` below fails the
+  # job when they disagree.
+  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+
 jobs:
   # One job per OS used to run everything in a row: the contract checks, the
   # frontend suites, the browser sweeps, clippy, and the Rust suite. Every one of
@@ -305,6 +312,47 @@ jobs:
       - name: Frontend Vite Build
         run: bun run build
 
+      # The worktree-overlay and agent-bus radar tests drive the real `devmap`
+      # CLI, which no runner has: eight of them failed on every macOS shard with
+      # "devmap is not installed". It is built from DevCouncil at DEVMAP_REV and
+      # cached on that SHA; the step after it fails the job when the CLI's schema
+      # and the vendored one differ, so a stale pin cannot pass quietly. Not on
+      # Windows, where this leg does not build yet.
+      # Restore and save are separate steps: `actions/cache` saves in a post step
+      # that runs only when the whole job succeeded, and this job's suite is red
+      # on a runner more often than not, so the build would never be kept. It is
+      # saved the moment the schema check passes, whatever the tests do after. Saving over
+      # an existing key is a logged no-op, so no step-level `if` is needed to skip it.
+      - name: Cache devmap
+        if: ${{ runner.os != 'Windows' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        if: ${{ runner.os != 'Windows' }}
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        if: ${{ runner.os != 'Windows' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
       - name: Rust Unit & Integration Tests
         if: ${{ !cancelled() }}
         # --no-fail-fast: without it cargo stops at the first failing test
@@ -407,6 +455,33 @@ jobs:
       - name: Frontend Vite Build
         run: bun run build
 
+      # The CLI the worktree-overlay and radar tests drive, as in rust-test.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
       # This shard's bucket of the suite. `--profile ci` is one test at a time
       # and writes target/nextest/ci/junit.xml, which the completeness job reads.
       - name: Rust Unit & Integration Tests (nextest shard)
@@ -473,6 +548,34 @@ jobs:
 
       - name: Frontend Vite Build
         run: bun run build
+
+      # The worktree crate's `cli_e2e` tests drive the real `devmap`; without it
+      # both fail with "devmap is not installed". Built and kept as in rust-test.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       # nextest does not run doctests.
       - name: Rust Doctests
