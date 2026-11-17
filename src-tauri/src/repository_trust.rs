@@ -104,6 +104,35 @@ impl DirectoryIdentity {
     }
 }
 
+/// What makes two spellings of a directory one directory, for comparing them
+/// inside this process: the device and inode on Unix, the volume serial and file
+/// id on Windows. Not persisted, and not a grant: a grant also pins the birth
+/// time and the path (`DirectoryIdentity::same_persisted_object`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DirectoryKey {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    file_identity: (u64, [u8; 16]),
+}
+
+/// The [`DirectoryKey`] of the directory at `path`, read the way a grant reads
+/// it (`directory`), so two paths that resolve to one directory give one key
+/// whatever their spelling or case.
+pub(crate) fn directory_key(path: &Path) -> Result<DirectoryKey, CommandError> {
+    let identity = directory(path)?;
+    Ok(DirectoryKey {
+        #[cfg(unix)]
+        device: identity.device,
+        #[cfg(unix)]
+        inode: identity.inode,
+        #[cfg(windows)]
+        file_identity: identity.file_identity,
+    })
+}
+
 impl Identity {
     /// Persisted match for a pre-repository record. `version` stays with the
     /// caller, because version 1 is what that scheme means.

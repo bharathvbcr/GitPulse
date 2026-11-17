@@ -1230,13 +1230,33 @@ fn lexical(path: &str) -> std::borrow::Cow<'_, str> {
     })
 }
 
-/// Whether `path` lies under `root`, by whole components, after both are
-/// resolved lexically: `/repo-other` and `/repo/../repo-other` are not under
-/// `/repo`, and `/repo/../other/x` is not either.
+/// Whether `path` lies under `root`, by whole components: `/repo-other` and
+/// `/repo/../repo-other` are not under `/repo`, and `/repo/../other/x` is not
+/// either.
+///
+/// Compared in three steps, each only when the one before said no:
+/// 1. lexically, after `.`, `..` and empty components are resolved by text;
+/// 2. as Windows paths when both are spelled so (a drive letter or `\\`),
+///    where `\` separates and case does not matter: `C:\repo\src\a.rs` is
+///    under `c:/Repo`, and `C:\repo-other\x` is not under `C:\repo`;
+/// 3. as the files they name, when the paths exist: `/tmp/x` and
+///    `/private/tmp/x` are one directory, and `/work/Repo` is `/work/repo` on a
+///    volume that ignores case (probed, never assumed from the OS).
 fn under(path: &str, root: &str) -> bool {
     if root.is_empty() || path.is_empty() {
         return false;
     }
+    match (windows_form(path), windows_form(root)) {
+        (Some(path), Some(root)) => return under_windows(&path, &root),
+        (None, None) => {}
+        // A Windows path and a POSIX one never name the same place.
+        _ => return false,
+    }
+    under_lexical(path, root) || under_resolved(path, root)
+}
+
+/// [`under`] by text alone, for POSIX-spelled paths.
+fn under_lexical(path: &str, root: &str) -> bool {
     let (path, root) = (lexical(path), lexical(root));
     let (path, root) = (path.as_ref(), root.as_ref());
     // A root is an absolute path. A relative one (or one that resolves to
@@ -1249,6 +1269,170 @@ fn under(path: &str, root: &str) -> bool {
         return true;
     }
     path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/')
+}
+
+/// `path` as a Windows path in one comparable spelling (`/` separators, lower
+/// case), or `None` when it is not spelled as one: a drive letter and a
+/// separator (`C:\repo`, `c:/repo`), or a UNC prefix (`\\server\share`). A path
+/// like `/a\b` is a POSIX path with a backslash in a name, and stays one.
+fn windows_form(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let drive = bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    if !(drive || path.starts_with("\\\\")) {
+        return None;
+    }
+    Some(path.replace('\\', "/").to_lowercase())
+}
+
+/// [`under`] for two paths already in [`windows_form`]: the same drive (or UNC
+/// prefix), then whole components.
+fn under_windows(path: &str, root: &str) -> bool {
+    let split = |text: &str| -> (String, String) {
+        if text.starts_with('/') {
+            (String::new(), text.to_string())
+        } else {
+            let (drive, rest) = text.split_at(2);
+            (drive.to_string(), rest.to_string())
+        }
+    };
+    let ((path_drive, path_rest), (root_drive, root_rest)) = (split(path), split(root));
+    path_drive == root_drive && under_lexical(&path_rest, &root_rest)
+}
+
+/// Roots and directories already resolved, so a pass asks the filesystem once
+/// per distinct one rather than once per call it attributes. Only answers that
+/// were found are kept, so a root created later is found; a full table is
+/// emptied rather than grown.
+struct Resolved {
+    roots: std::collections::HashMap<String, (String, bool)>,
+    dirs: std::collections::HashMap<String, String>,
+}
+
+const MAX_RESOLVED: usize = 4096;
+
+static RESOLVED: std::sync::Mutex<Option<Resolved>> = std::sync::Mutex::new(None);
+
+fn with_resolved<T>(f: impl FnOnce(&mut Resolved) -> T) -> T {
+    let mut guard = RESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+    let table = guard.get_or_insert_with(|| Resolved {
+        roots: std::collections::HashMap::new(),
+        dirs: std::collections::HashMap::new(),
+    });
+    if table.roots.len() >= MAX_RESOLVED || table.dirs.len() >= MAX_RESOLVED {
+        table.roots.clear();
+        table.dirs.clear();
+    }
+    f(table)
+}
+
+/// Whether `a` and `b` are one file or directory.
+fn same_object(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+    }
+}
+
+/// Whether the volume holding the directory `canonical` ignores case: its last
+/// component spelled with the case of every letter flipped names the same
+/// directory. A name with no letters says nothing, and reads as case-sensitive.
+fn ignores_case(canonical: &std::path::Path) -> bool {
+    let (Some(parent), Some(name)) = (canonical.parent(), canonical.file_name()) else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let flipped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_lowercase() {
+                c.to_uppercase().next().unwrap_or(c)
+            } else if c.is_uppercase() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect();
+    flipped != name && same_object(canonical, &parent.join(flipped))
+}
+
+/// The directory `root` really is, and whether its volume ignores case; `None`
+/// when it does not exist (nothing to resolve).
+fn resolve_root(root: &str) -> Option<(String, bool)> {
+    if let Some(found) = with_resolved(|t| t.roots.get(root).cloned()) {
+        return Some(found);
+    }
+    let canonical = std::fs::canonicalize(root).ok()?;
+    let found = (canonical.to_str()?.to_string(), ignores_case(&canonical));
+    with_resolved(|t| t.roots.insert(root.to_string(), found.clone()));
+    Some(found)
+}
+
+/// `path` with its nearest existing ancestor resolved: the file itself may be
+/// gone (a deleted file's edit is still attributed), its directory is not.
+fn resolve_path(path: &str) -> Option<String> {
+    let (dir, name) = path.rsplit_once('/')?;
+    let dir = if dir.is_empty() { "/" } else { dir };
+    if let Some(found) = with_resolved(|t| t.dirs.get(dir).cloned()) {
+        return Some(join_name(&found, name));
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut here = std::path::Path::new(dir);
+    let canonical = loop {
+        match std::fs::canonicalize(here) {
+            Ok(found) => break found,
+            Err(_) => {
+                kept.push(here.file_name()?.to_str()?);
+                here = here.parent()?;
+            }
+        }
+    };
+    let mut resolved = canonical.to_str()?.to_string();
+    for component in kept.iter().rev() {
+        resolved = join_name(&resolved, component);
+    }
+    with_resolved(|t| t.dirs.insert(dir.to_string(), resolved.clone()));
+    Some(join_name(&resolved, name))
+}
+
+fn join_name(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// [`under`] for two POSIX-spelled paths that text could not tell apart: both
+/// resolved against the filesystem, and compared without case where the root's
+/// volume ignores it.
+fn under_resolved(path: &str, root: &str) -> bool {
+    let (path, root) = (lexical(path), lexical(root));
+    if !root.starts_with('/') || !path.starts_with('/') {
+        return false;
+    }
+    let Some((root, ignores_case)) = resolve_root(&root) else {
+        return false;
+    };
+    let Some(path) = resolve_path(&path) else {
+        return false;
+    };
+    if ignores_case {
+        under_lexical(&path.to_lowercase(), &root.to_lowercase())
+    } else {
+        under_lexical(&path, &root)
+    }
 }
 
 #[cfg(test)]
@@ -1664,10 +1848,82 @@ mod adv2_under_tests {
         }
     }
 
+    /// The card's criterion replaces the earlier pin ("a backslash path is never
+    /// under, by the byte rule"): a transcript written on Windows names its
+    /// files `C:\repo\src\a.rs`, and a rule that can never match one drops
+    /// every edit made there. A path with no drive letter or UNC prefix keeps
+    /// the byte rule (`u03b`).
     #[test]
-    fn u03_backslash_paths_are_never_under_by_the_documented_byte_rule() {
-        assert!(!under("C:\\w1\\f", "C:\\w1"));
-        assert!(!under("C:\\w1\\..\\w2", "C:\\w1"));
+    fn u03_windows_paths_are_under_their_root_by_whole_components() {
+        for (path, root, want) in [
+            ("C:\\repo\\src\\a.rs", "C:\\repo", true),
+            ("C:\\repo-other\\x", "C:\\repo", false),
+            ("C:\\repo", "C:\\repo\\", true),
+            ("C:\\repo\\..\\other\\x", "C:\\repo", false),
+            ("C:\\repo\\a\\..\\b", "C:\\repo", true),
+            ("c:/Repo/a.rs", "C:\\repo", true),
+            ("D:\\repo\\a.rs", "C:\\repo", false),
+            ("C:\\x", "C:\\", true),
+            ("\\\\srv\\share\\dir\\f", "\\\\srv\\share", true),
+            ("\\\\srv\\share2\\f", "\\\\srv\\share", false),
+            ("C:\\repo\\a.rs", "/repo", false),
+            ("/repo/a.rs", "C:\\repo", false),
+        ] {
+            assert_eq!(under(path, root), want, "under({path:?}, {root:?})");
+        }
+    }
+
+    #[test]
+    fn u03b_a_backslash_in_a_posix_name_is_not_a_separator() {
+        assert!(!under("/a\\b/f", "/a"));
+        assert!(under("/a\\b/f", "/a\\b"));
+    }
+
+    /// `/var/...` and `/private/var/...` are one directory on macOS; a root
+    /// reached through a link owns what is under its target.
+    #[test]
+    fn u04_a_path_under_the_real_directory_is_under_a_root_spelled_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap();
+        let spelled = tmp.path().to_str().unwrap();
+        let file = real.join("sub").join("a.rs");
+        assert!(under(file.to_str().unwrap(), spelled), "{file:?} {spelled}");
+        assert!(!under(real.parent().unwrap().to_str().unwrap(), spelled));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u04b_a_symlinked_root_owns_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let file = real.join("gone.rs");
+        assert!(under(file.to_str().unwrap(), link.to_str().unwrap()));
+        let through = link.join("gone.rs");
+        assert!(under(through.to_str().unwrap(), real.to_str().unwrap()));
+        let sibling = real.parent().unwrap().join("real-other").join("x");
+        assert!(!under(sibling.to_str().unwrap(), link.to_str().unwrap()));
+    }
+
+    /// Case is ignored exactly where the root's volume ignores it, found by
+    /// asking the volume, so the same test holds on a case-sensitive one.
+    #[test]
+    fn u05_case_is_ignored_only_where_the_volume_ignores_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("MixedCase");
+        std::fs::create_dir_all(&root).unwrap();
+        let flipped = root.parent().unwrap().join("mIXEDcASE");
+        let ignores = flipped.exists();
+        let file = flipped.join("a.rs");
+        assert_eq!(
+            under(file.to_str().unwrap(), root.to_str().unwrap()),
+            ignores,
+            "volume ignores case: {ignores}"
+        );
+        let other = root.parent().unwrap().join("MixedCase-other").join("a.rs");
+        assert!(!under(other.to_str().unwrap(), root.to_str().unwrap()));
     }
 }
 

@@ -200,9 +200,28 @@ fn unique_labels(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
             pending = next;
             depth = depth.saturating_add(1);
             if depth > 64 {
-                // Pathological: fall back to full path strings.
+                // Pathological: fall back to full path strings. Labels are
+                // lowercased, so two directories that differ only by case (two
+                // repositories on a case-sensitive volume) would share one and
+                // the second would replace the first; those keep their exact
+                // spelling, which differs.
+                let mut by_lowered: HashMap<String, Vec<PathBuf>> = HashMap::new();
                 for root in pending {
-                    out.push((root.to_string_lossy().to_lowercase(), root));
+                    by_lowered
+                        .entry(root.to_string_lossy().to_lowercase())
+                        .or_default()
+                        .push(root);
+                }
+                for (lowered, roots) in by_lowered {
+                    if roots.len() == 1 {
+                        out.extend(roots.into_iter().map(|root| (lowered.clone(), root)));
+                    } else {
+                        out.extend(
+                            roots
+                                .into_iter()
+                                .map(|root| (root.to_string_lossy().into_owned(), root)),
+                        );
+                    }
                 }
                 break;
             }
@@ -301,6 +320,24 @@ pub fn unregister(
 /// The registry host is not a member that can be skipped. The file is written
 /// into that repository, so a refused host returns the trust error and writes
 /// nothing.
+/// What makes two members one: the directory they are, by the identity the
+/// trust store pins (`repository_trust::directory_key`), so
+/// `/work/Repo` and `/work/repo` are two on a volume that tells them apart and
+/// one on a volume that does not, whatever the spelling. A directory whose
+/// identity cannot be read is told apart by its canonical path, exactly.
+#[derive(PartialEq, Eq, Hash)]
+enum MemberKey {
+    Directory(crate::repository_trust::DirectoryKey),
+    Path(PathBuf),
+}
+
+fn member_key(member: &Path) -> MemberKey {
+    match crate::repository_trust::directory_key(member) {
+        Ok(key) => MemberKey::Directory(key),
+        Err(_) => MemberKey::Path(member.to_path_buf()),
+    }
+}
+
 pub fn sync_open_tabs(
     registry_root: &str,
     repo_paths: &[String],
@@ -314,13 +351,12 @@ pub fn sync_open_tabs(
     for path in repo_paths {
         match resolve_member_root(path) {
             Ok(member) => {
-                let key = member.to_string_lossy().to_lowercase();
-                if seen.insert(key) {
+                if seen.insert(member_key(&member)) {
                     members.push(member);
                 }
             }
             Err(error) => {
-                if !skipped_keys.insert(path.to_lowercase()) {
+                if !skipped_keys.insert(path.clone()) {
                     continue;
                 }
                 if crate::repository_trust::refused(error.message()) {
@@ -333,8 +369,7 @@ pub fn sync_open_tabs(
     }
     // Always include the registry host itself so a search from an open tab
     // never omits the repository holding the file.
-    let host_key = root.to_string_lossy().to_lowercase();
-    if seen.insert(host_key) {
+    if seen.insert(member_key(&root)) {
         members.push(root.clone());
     }
 
@@ -728,5 +763,76 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&host);
         let _ = fs::remove_dir_all(&other);
+    }
+
+    /// Two repositories whose paths differ only by case are two repositories
+    /// on a volume that tells them apart (Linux, a case-sensitive APFS), and are
+    /// both kept. The volume is probed, not assumed: where the second spelling
+    /// is the first directory there is nothing to test.
+    #[test]
+    fn sync_open_tabs_keeps_repositories_that_differ_only_by_case() {
+        let host = scratch("case-host");
+        let parent = scratch("case-pair");
+        let upper = parent.join("Repo");
+        let lower = parent.join("repo");
+        fs::create_dir_all(&upper).unwrap();
+        if fs::create_dir(&lower).is_err() {
+            let _ = fs::remove_dir_all(&host);
+            let _ = fs::remove_dir_all(&parent);
+            return;
+        }
+        init_git_repo(&host);
+        init_git_repo(&upper);
+        init_git_repo(&lower);
+
+        let snap = sync_open_tabs(
+            host.to_str().unwrap(),
+            &[
+                upper.to_string_lossy().into_owned(),
+                lower.to_string_lossy().into_owned(),
+            ],
+        )
+        .expect("sync");
+
+        let roots: HashSet<_> = snap
+            .repos
+            .iter()
+            .map(|entry| Path::new(&entry.root).canonicalize().unwrap())
+            .collect();
+        assert!(roots.contains(&upper.canonicalize().unwrap()), "{roots:?}");
+        assert!(roots.contains(&lower.canonicalize().unwrap()), "{roots:?}");
+        assert_eq!(snap.repos.len(), 3, "{:?}", snap.repos);
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Two spellings of one repository are one member: a path through `..`, and
+    /// on a volume that ignores case the same name in another case.
+    #[test]
+    fn sync_open_tabs_collapses_two_spellings_of_one_repository() {
+        let host = scratch("spell-host");
+        let parent = scratch("spell-pair");
+        let repo = parent.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&host);
+        init_git_repo(&repo);
+        let detour = parent.join("elsewhere").join("..").join("repo");
+        let mut spellings = vec![
+            repo.to_string_lossy().into_owned(),
+            detour.to_string_lossy().into_owned(),
+        ];
+        let shouted = parent.join("REPO");
+        if shouted.exists() {
+            spellings.push(shouted.to_string_lossy().into_owned());
+        }
+        fs::create_dir_all(parent.join("elsewhere")).unwrap();
+
+        let snap = sync_open_tabs(host.to_str().unwrap(), &spellings).expect("sync");
+
+        assert_eq!(snap.repos.len(), 2, "host and one member: {:?}", snap.repos);
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&parent);
     }
 }
