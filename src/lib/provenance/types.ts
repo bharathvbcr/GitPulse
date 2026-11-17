@@ -52,9 +52,9 @@ export interface ProvenanceFreshness {
    */
   distance: number | null;
   /**
-   * How much a recorded verification still counts; decays with distance.
-   * `null` when the commit has no verification note (`verified` is false) or
-   * the distance could not be measured.
+   * How much a recorded pass still counts; decays with distance. `null` when
+   * `verified` is false (no note, or a note recording a failure, a narrowed
+   * run or an unrecognised verdict) or the distance could not be measured.
    */
   confidence: number | null;
   /** True only when the distance was measured *and* is zero. */
@@ -72,9 +72,11 @@ export interface ProvenanceFreshness {
    */
   notes_readable: boolean;
   /**
-   * Whether a verification note is attached. It says a verification was
-   * recorded, not what it found (`verification.verdict` does). `confidence` is
-   * `null` whenever this is `false`.
+   * Whether a verification note is attached *and* records a pass of the whole
+   * suite (a verdict in `PASS_VERDICTS`). A failed, narrowed or unrecognised
+   * note is `false` here; `verification` still carries it, and the badge
+   * classifies it from `verification.verdict`. `confidence` is `null`
+   * whenever this is `false`.
    */
   verified: boolean;
   verification: VerificationNote | null;
