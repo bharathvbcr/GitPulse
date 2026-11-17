@@ -610,7 +610,7 @@ fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
         let started = Instant::now();
         let problem = lease::links_problem(&bin, None);
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(15)),
             "{kind}: the probe is bounded"
         );
         let problem = problem.unwrap_or_else(|| panic!("{kind}: reported as working"));
