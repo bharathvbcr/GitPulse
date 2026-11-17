@@ -584,11 +584,11 @@ describe("the lease row", () => {
   const link = "/c/lease-bin/cargo";
 
   it("passes only when a login shell finds the wrapper's own link first", () => {
-    expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: link, error: null }).status).toBe("gated");
+    expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", servesLease: true, resolved: link, error: null }).status).toBe("gated");
   });
 
   it("never prints ok for a cargo that shadows the link", () => {
-    const verdict = classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", resolved: "/home/u/.claude-bin/cargo", error: null });
+    const verdict = classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", servesLease: true, resolved: "/home/u/.claude-bin/cargo", error: null });
     expect(verdict.status).toBe("shadowed");
     expect(verdict.detail).toContain("/home/u/.claude-bin/cargo");
     const report = formatReport({
@@ -602,7 +602,9 @@ describe("the lease row", () => {
 
   it("says absent when the app made no links, and unverifiable when the shell could not be asked", () => {
     expect(classifyLease({ binDir, linkTarget: null, resolved: null, error: null }).status).toBe("absent");
-    expect(classifyLease({ binDir, linkTarget: "/x", resolved: null, error: "exit 1" }).status).toBe("unverifiable");
+    expect(classifyLease({ binDir, linkTarget: "/x", servesLease: true, resolved: null, error: "exit 1" }).status).toBe("unverifiable");
+    // A link target that could not be asked what it is is not a pass either.
+    expect(classifyLease({ binDir, linkTarget: "/x", servesLease: null, resolved: link, error: null }).status).toBe("unverifiable");
   });
 
   it("asks a real login shell, and sees a profile that puts another cargo first", async () => {
@@ -612,7 +614,7 @@ describe("the lease row", () => {
     await mkdir(bin);
     await mkdir(other);
     const hook = path.join(root, "gitpulse-hook");
-    await writeFile(hook, "#!/bin/sh\n");
+    await writeFile(hook, "#!/bin/sh\nprintf 'gitpulse-hook 9.9.9\\nsubcommands: collision-guard, lease\\n'\n");
     await chmod(hook, 0o755);
     const { symlink } = await import("node:fs/promises");
     await symlink(hook, path.join(bin, "cargo"));
@@ -633,5 +635,34 @@ describe("the lease row", () => {
     expect(classifyLease(probeLease(bin, { shell: plain })).status).toBe("gated");
     // No link: absent, and the shell is never run.
     expect(classifyLease(probeLease(path.join(root, "nowhere"), { shell })).status).toBe("absent");
+  });
+});
+
+describe("the lease row's link target", () => {
+  it("fails a link to a gitpulse-hook that cannot be the lease wrapper, however the shell resolves cargo", async () => {
+    const root = await scratchDir("lease-stale");
+    const bin = path.join(root, "lease-bin");
+    await mkdir(bin);
+    // gitpulse-hook from before build leases: run as cargo, it exits 0 and builds nothing.
+    const stale = path.join(root, "gitpulse-hook");
+    await writeFile(
+      stale,
+      "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gitpulse-hook 0.4.0\\nsubcommands: collision-guard, command-gate\\n'; fi\nexit 0\n",
+    );
+    await chmod(stale, 0o755);
+    const { symlink } = await import("node:fs/promises");
+    await symlink(stale, path.join(bin, "cargo"));
+    const plain = path.join(root, "plainshell");
+    await writeFile(plain, '#!/bin/sh\nexec /bin/sh -c "$2"\n');
+    await chmod(plain, 0o755);
+    const verdict = classifyLease(probeLease(bin, { shell: plain }));
+    expect(verdict.status).toBe("stale");
+    expect(verdict.detail).toContain("lease");
+    const report = formatReport({
+      binPath: null, version: null, storeSchema: null, expected: "1", expectedSchema: 1, status: "absent", violations: [],
+      lease: { ...verdict, resolved: path.join(bin, "cargo"), ok: false },
+    } as never);
+    expect(report).toContain("FAIL (stale)");
+    expect(report).not.toContain("a login shell runs GitPulse's lease wrapper");
   });
 });

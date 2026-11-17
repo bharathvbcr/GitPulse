@@ -349,7 +349,7 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("config");
     let hook = temp.path().join("gitpulse-hook");
-    std::fs::write(&hook, "x").unwrap();
+    crate::test_support::fake_lease_hook(&hook);
     let env_file = temp.path().join("env");
     std::fs::write(&env_file, "export KEEP=1\n").unwrap();
 
@@ -417,7 +417,7 @@ fn session_brief_writes_lease_path_to_claude_env_file() {
 fn routed(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let config = temp.path().join("config");
     let hook = temp.path().join("gitpulse-hook");
-    std::fs::write(&hook, "x").unwrap();
+    crate::test_support::fake_lease_hook(&hook);
     lease::ensure_links(&config, &hook).unwrap();
     (config, temp.path().join("env"))
 }

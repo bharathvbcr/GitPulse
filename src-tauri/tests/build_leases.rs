@@ -471,3 +471,158 @@ fn a_leased_build_does_not_inherit_an_ignored_sigpipe() {
         "the build must start with SIGPIPE at its default"
     );
 }
+
+/// Writes an executable at `path` by rename, so nothing runs it half written.
+fn install_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("tmp-script");
+    std::fs::write(&tmp, body).unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// `gitpulse-hook` as it was before build leases: `--version` names no
+/// `lease`, and an argument it does not know (`build`) is answered with exit 0
+/// and nothing done. Run as `cargo`, every build "passes" without running.
+const STALE_HOOK: &str = "#!/bin/sh\n\
+if [ \"$1\" = --version ]; then\n\
+  printf 'gitpulse-hook 0.4.0\\nsubcommands: collision-guard, command-gate, session-brief\\n'\n\
+fi\n\
+exit 0\n";
+
+/// The PATH value in `env`, from `launch_env`.
+fn path_of(env: &[(&'static str, Option<std::ffi::OsString>)]) -> Option<std::ffi::OsString> {
+    env.iter()
+        .find(|(name, _)| *name == "PATH")
+        .and_then(|(_, value)| value.clone())
+}
+
+/// Runs `cargo build` the way an agent's shell does: by PATH lookup.
+fn shell_build(world: &World, path: &std::ffi::OsStr, tag: &str) -> std::process::Output {
+    Command::new("/bin/sh")
+        .args(["-c", "cargo build"])
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", &world.home)
+        .env("TMPDIR", &world.tmp)
+        .env("XDG_CONFIG_HOME", world.home.join(".config"))
+        .env("GITPULSE_TOOL_CONFIG", &world.tools)
+        .env(gitpulse_lib::logging::LOG_DIR_ENV, world.home.join("logs"))
+        .env("LOG", &world.log)
+        .env("RELEASE", &world.release)
+        .env("TAG", tag)
+        .env("NO_WAIT", "1")
+        .stdin(Stdio::null())
+        .output_locked()
+        .expect("run a shell")
+}
+
+#[test]
+fn a_stale_hook_behind_the_links_never_passes_a_build_it_did_not_run() {
+    use gitpulse_lib::sysload::lease;
+    use std::ffi::OsStr;
+    let world = World::new(r#"{"slots":2}"#);
+    let config = config_dir(&world.home);
+    let app = world.home.join("App");
+    std::fs::create_dir_all(&app).unwrap();
+    let hook = app.join("gitpulse-hook");
+    std::os::unix::fs::symlink(HOOK, &hook).unwrap();
+    lease::ensure_links(&config, &hook).expect("a current hook is linked");
+    let bin = lease::bin_dir(&config);
+    let base = format!("{}:/usr/bin:/bin", world.bin.display());
+    // The PATH an agent GitPulse launches is given, from the product.
+    let routed = path_of(&lease::launch_env(
+        Some(&config),
+        Some(OsStr::new(&base)),
+        true,
+    ))
+    .expect("the links work, so a launched session is routed through them");
+    assert_eq!(std::env::split_paths(&routed).next().unwrap(), bin);
+
+    // The app's gitpulse-hook is replaced by one from before leases (a
+    // downgrade, or a tree that rebuilt the app and not the hook), and the app
+    // starts again, which is when it makes its links.
+    std::fs::remove_file(&hook).unwrap();
+    install_script(&hook, STALE_HOOK);
+    let relinked = lease::ensure_links(&config, &hook);
+
+    // A session routed before the swap runs a build. Either the real cargo
+    // runs, or the call fails loudly: never exit 0 with nothing built.
+    let out = shell_build(&world, &routed, "stale");
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        world.started() == ["stale"] || (!out.status.success() && !said.is_empty()),
+        "a build through a stale gitpulse-hook exited {:?} having run nothing (stderr: {said:?}); ensure_links said {relinked:?}",
+        out.status.code()
+    );
+    assert_eq!(out.status.code(), Some(0), "the real cargo ran: {said}");
+
+    let refused = relinked.expect_err("a hook without lease mode is never linked");
+    assert!(refused.contains("lease"), "{refused}");
+    for name in ["cargo", "go"] {
+        assert!(
+            bin.join(name).symlink_metadata().is_err(),
+            "the {name} link to a binary that is not a lease wrapper is removed"
+        );
+    }
+    let problem = lease::links_problem(&bin, None).expect("the links do not work");
+    assert!(problem.contains("does not exist"), "{problem}");
+    assert!(
+        path_of(&lease::launch_env(
+            Some(&config),
+            Some(OsStr::new(&base)),
+            true
+        ))
+        .is_none(),
+        "a new session is not routed through a folder with no wrapper in it"
+    );
+}
+
+#[test]
+fn a_link_whose_target_went_stale_is_reported_and_not_routed() {
+    use gitpulse_lib::sysload::lease;
+    use std::ffi::OsStr;
+    let world = World::new(r#"{"slots":2}"#);
+    let config = config_dir(&world.home);
+    let bin = lease::bin_dir(&config);
+    std::fs::create_dir_all(&bin).unwrap();
+    // Links the app made earlier, to a binary that is now a stale hook, a
+    // binary that prints something else, or one that never answers.
+    let bodies = [
+        ("stale", STALE_HOOK.to_string()),
+        (
+            "garbage",
+            "#!/bin/sh\necho 'cargo 1.91.0 (not gitpulse)'\nexit 0\n".to_string(),
+        ),
+        ("hangs", "#!/bin/sh\nexec sleep 30\n".to_string()),
+    ];
+    for (kind, body) in bodies {
+        let target = world.home.join(format!("hook-{kind}"));
+        install_script(&target, &body);
+        for name in ["cargo", "go"] {
+            let link = bin.join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        }
+        let started = Instant::now();
+        let problem = lease::links_problem(&bin, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{kind}: the probe is bounded"
+        );
+        let problem = problem.unwrap_or_else(|| panic!("{kind}: reported as working"));
+        assert!(
+            problem.contains("not verified as a build-lease wrapper"),
+            "{kind}: {problem}"
+        );
+        assert!(
+            path_of(&lease::launch_env(
+                Some(&config),
+                Some(OsStr::new("/usr/bin:/bin")),
+                true
+            ))
+            .is_none(),
+            "{kind}: not routed"
+        );
+    }
+}
