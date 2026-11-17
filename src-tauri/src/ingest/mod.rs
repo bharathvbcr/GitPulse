@@ -217,7 +217,12 @@ pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts c
 pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     source::sources()
         .iter()
-        .map(|source| (source.name(), source.root().map(|root| root.path)))
+        .map(|source| {
+            (
+                source.name(),
+                source.roots().list.into_iter().next().map(|root| root.path),
+            )
+        })
         .collect()
 }
 
@@ -226,7 +231,21 @@ fn dirs_home() -> Option<std::path::PathBuf> {
     if home_hidden::on_this_thread() {
         return None;
     }
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The Claude configuration directories to read transcripts under, from the
+/// one resolver live-session observation uses. Nothing when the machine has no
+/// home directory and no override, as [`dirs_home`] says it for the others.
+fn claude_config_dirs() -> crate::workbench::conversation::ClaudeConfigDirs {
+    #[cfg(test)]
+    if home_hidden::on_this_thread() {
+        return Default::default();
+    }
+    crate::workbench::conversation::claude_config_dirs()
 }
 
 /// A test's way to say "this machine has no home directory" to the transcript
@@ -3204,6 +3223,8 @@ mod watermark_tests {
 mod catch_up_progress_tests;
 #[cfg(test)]
 mod codex_tests;
+#[cfg(test)]
+mod config_dir_tests;
 #[cfg(test)]
 mod event_time_tests;
 #[cfg(test)]

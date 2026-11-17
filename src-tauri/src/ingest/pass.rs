@@ -347,8 +347,21 @@ fn ingest_family(
     // is ordinary: "never installed" and "gone since the last pass" are told apart
     // by the source's marker, below.
     let mut any_root = false;
+    // Every place every source looks: Claude has one per config directory.
+    let mut located: Vec<(&'static dyn TranscriptSource, source::SourceRoot)> = Vec::new();
     for source in source::sources() {
-        let Some(root) = source.root() else { continue };
+        let found = source.roots();
+        if let Some(gap) = found.gap {
+            // Part of the corpus could not be located: what is read is not all
+            // of it, and no offset may be forgotten on that account.
+            any_root = true;
+            missing_root = true;
+            blocks_forget |= !source.optional();
+            gaps.push(gap);
+        }
+        located.extend(found.list.into_iter().map(|root| (source, root)));
+    }
+    for (source, root) in located {
         any_root = true;
         let name = source.name();
         let shown = root.path.display();
@@ -363,12 +376,15 @@ fn ingest_family(
             ));
             continue;
         }
+        // A root found by looking (a config directory under the home directory)
+        // that exists and cannot be read is said whichever source it is: only a
+        // named override and an absent default keep Claude's older silence.
         match std::fs::metadata(&root.path) {
             Ok(meta) if meta.is_dir() => active.push((source, root.path)),
             Ok(_) => {
                 missing_root = true;
                 blocks_forget |= !source.optional();
-                if note {
+                if note || !root.explicit {
                     gaps.push(format!(
                         "the {name} transcript root {shown} is not a directory, so its transcripts were not read"
                     ));
@@ -391,7 +407,7 @@ fn ingest_family(
             Err(e) => {
                 missing_root = true;
                 blocks_forget |= !source.optional();
-                if note {
+                if note || !root.explicit {
                     gaps.push(format!(
                         "the {name} transcript root {shown} could not be read ({}), so its transcripts were not read",
                         e.kind()
