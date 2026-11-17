@@ -126,6 +126,26 @@ pub(crate) fn format_claimed_message(
     repo_root: Option<&Path>,
     reader_id: Option<&str>,
 ) -> String {
+    let text = render_message(envelope, repo_root);
+    acknowledge_read(envelope, repo_root, reader_id);
+    text
+}
+
+/// The trusted repository a peer envelope's bus copy lives in: the hook's own
+/// when it has one, otherwise the one the sender recorded.
+fn trusted_bus_root(repo_root: Option<&Path>, recorded: &str) -> Option<std::path::PathBuf> {
+    repo_root
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            (!recorded.trim().is_empty()).then(|| std::path::PathBuf::from(recorded.trim()))
+        })
+        .filter(|root| crate::repository_trust::require(root).is_ok())
+}
+
+/// The text that delivers `envelope`, hydrating a truncated peer preview from
+/// the bus. It changes nothing: acknowledging the read is
+/// [`acknowledge_read`], done once the text is actually going out.
+pub(crate) fn render_message(envelope: &ClaimedEnvelope, repo_root: Option<&Path>) -> String {
     match &envelope.provenance {
         EnvelopeProvenance::HumanConfirmed => human_reminder(&envelope.claim.text),
         EnvelopeProvenance::PeerAgent {
@@ -140,28 +160,14 @@ pub(crate) fn format_claimed_message(
             repo_root: prov_repo_root,
         } => {
             let mut body = envelope.claim.text.clone();
-            let resolved_root = repo_root
-                .map(|p| p.to_path_buf())
-                .or_else(|| {
-                    (!prov_repo_root.trim().is_empty())
-                        .then(|| std::path::PathBuf::from(prov_repo_root.trim()))
-                })
-                .filter(|root| crate::repository_trust::require(root).is_ok());
-            if let Some(root) = resolved_root.as_deref() {
-                let repo_str = root.to_string_lossy();
-                if *truncated_in_bus {
-                    if let Ok(Some(full)) =
-                        crate::engine::agent_bus::get_message_by_id(&repo_str, msg_id)
-                    {
+            if *truncated_in_bus {
+                if let Some(root) = trusted_bus_root(repo_root, prov_repo_root) {
+                    if let Ok(Some(full)) = crate::engine::agent_bus::get_message_by_id(
+                        &root.to_string_lossy(),
+                        msg_id,
+                    ) {
                         body = full.body;
                     }
-                }
-                if let Some(reader) = reader_id.filter(|r| !r.is_empty()) {
-                    let _ = crate::engine::agent_bus::ack_messages(
-                        &repo_str,
-                        reader,
-                        std::slice::from_ref(msg_id),
-                    );
                 }
             }
             format_peer_xml(
@@ -169,6 +175,35 @@ pub(crate) fn format_claimed_message(
             )
         }
     }
+}
+
+/// Marks a peer envelope read on the bus by `reader_id`. A human-confirmed
+/// message has no bus copy, so there is nothing to mark. Call it only for a
+/// message that is being delivered: it is what tells the sender it was read.
+pub(crate) fn acknowledge_read(
+    envelope: &ClaimedEnvelope,
+    repo_root: Option<&Path>,
+    reader_id: Option<&str>,
+) {
+    let EnvelopeProvenance::PeerAgent {
+        msg_id,
+        repo_root: prov_repo_root,
+        ..
+    } = &envelope.provenance
+    else {
+        return;
+    };
+    let (Some(root), Some(reader)) = (
+        trusted_bus_root(repo_root, prov_repo_root),
+        reader_id.filter(|r| !r.is_empty()),
+    ) else {
+        return;
+    };
+    let _ = crate::engine::agent_bus::ack_messages(
+        &root.to_string_lossy(),
+        reader,
+        std::slice::from_ref(msg_id),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

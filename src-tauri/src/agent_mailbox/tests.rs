@@ -918,3 +918,220 @@ fn a_lost_provenance_sidecar_never_reads_as_human_confirmed() {
         "a lost sidecar must not upgrade an agent message to human-confirmed: {claimed:?}"
     );
 }
+
+fn peer_provenance(id: &str, hop: u32, max_hops: u32) -> EnvelopeProvenance {
+    EnvelopeProvenance::PeerAgent {
+        msg_id: id.into(),
+        from_peer: "claude:coder".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop,
+        max_hops,
+        truncated_in_bus: false,
+        repo_root: "/tmp/repo".into(),
+    }
+}
+
+#[test]
+fn a_prepared_delivery_consumes_nothing_until_it_is_committed() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "ui-1", "the person approved this", now)
+        .unwrap();
+
+    let prepared = mailbox
+        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.to_uppercase())
+        .unwrap();
+    assert!(!prepared.is_empty());
+    assert_eq!(mailbox.pending(SESSION), 1, "preparing is a peek");
+
+    // A caller cut off while it built its text just lets go of the delivery.
+    drop(prepared);
+    assert_eq!(mailbox.pending(SESSION), 1, "dropping consumes nothing");
+    assert_eq!(mailbox.status(SESSION, "ui-1"), Delivery::Pending);
+
+    let prepared = mailbox
+        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.to_uppercase())
+        .unwrap();
+    let won = prepared.commit().unwrap();
+    assert_eq!(won.len(), 1);
+    assert_eq!(won[0].0.claim.request_id, "ui-1");
+    assert_eq!(won[0].1, "THE PERSON APPROVED THIS");
+    assert_eq!(mailbox.pending(SESSION), 0);
+    assert_eq!(mailbox.status(SESSION, "ui-1"), Delivery::Claimed);
+}
+
+#[test]
+fn two_consumers_prepared_from_one_message_deliver_it_once_between_them() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox.deposit(SESSION, "ui-1", "only once", now).unwrap();
+    let first = mailbox
+        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.clone())
+        .unwrap();
+    let second = mailbox
+        .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.clone())
+        .unwrap();
+    assert!(!first.is_empty() && !second.is_empty());
+
+    let from_first = first.commit().unwrap();
+    let from_second = second.commit().unwrap();
+    assert_eq!(
+        from_first.len() + from_second.len(),
+        1,
+        "{from_first:?} {from_second:?}"
+    );
+}
+
+#[test]
+fn many_threads_committing_one_message_deliver_it_exactly_once() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox.deposit(SESSION, "ui-1", "only once", now).unwrap();
+    let deliveries: Vec<_> = (0..8)
+        .map(|_| {
+            mailbox
+                .prepare_delivery(SESSION, 8, now, |_| true, |env| env.claim.text.clone())
+                .unwrap()
+        })
+        .collect();
+    let won = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for delivery in deliveries {
+            let won = &won;
+            scope.spawn(move || {
+                won.fetch_add(delivery.commit().unwrap().len(), Ordering::SeqCst);
+            });
+        }
+    });
+    assert_eq!(won.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_filter_that_chose_what_to_prepare_also_gates_the_commit() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "peer-1",
+            "a peer message",
+            peer_provenance("peer-1", 1, DEFAULT_MAX_HOPS),
+            now,
+        )
+        .unwrap();
+    // The filter takes the message when the delivery is prepared and refuses it
+    // by the time of the commit: nothing may be consumed.
+    let open = std::sync::atomic::AtomicBool::new(true);
+    let prepared = mailbox
+        .prepare_delivery(
+            SESSION,
+            8,
+            now,
+            |_| open.load(Ordering::SeqCst),
+            |env| env.claim.text.clone(),
+        )
+        .unwrap();
+    assert!(!prepared.is_empty());
+    open.store(false, Ordering::SeqCst);
+    assert!(prepared.commit().unwrap().is_empty());
+    assert_eq!(
+        mailbox.pending(SESSION),
+        1,
+        "a message the filter refuses stays pending"
+    );
+}
+
+#[test]
+fn a_filter_that_refuses_a_message_at_prepare_time_leaves_it_out_and_pending() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "peer-1",
+            "at the hop limit",
+            peer_provenance("peer-1", DEFAULT_MAX_HOPS, DEFAULT_MAX_HOPS),
+            now,
+        )
+        .unwrap();
+    let prepared = mailbox
+        .prepare_delivery(
+            SESSION,
+            8,
+            now,
+            |prov| {
+                !matches!(
+                    prov,
+                    EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if hop >= max_hops
+                )
+            },
+            |env| env.claim.text.clone(),
+        )
+        .unwrap();
+    assert!(prepared.is_empty());
+    assert!(prepared.commit().unwrap().is_empty());
+    assert_eq!(mailbox.pending(SESSION), 1);
+}
+
+#[test]
+fn a_commit_takes_only_what_was_prepared() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for (n, id) in ["m-1", "m-2", "m-3"].into_iter().enumerate() {
+        mailbox
+            .deposit(
+                SESSION,
+                id,
+                &format!("text {id}"),
+                now + Duration::from_secs(n as u64),
+            )
+            .unwrap();
+    }
+    let prepared = mailbox
+        .prepare_delivery(SESSION, 2, now, |_| true, |env| env.claim.text.clone())
+        .unwrap();
+    // A message deposited after the peek is not in the delivery either.
+    mailbox
+        .deposit(SESSION, "m-4", "late", now + Duration::from_secs(9))
+        .unwrap();
+    let won = prepared.commit().unwrap();
+    let ids: Vec<_> = won
+        .iter()
+        .map(|(env, _)| env.claim.request_id.as_str())
+        .collect();
+    assert_eq!(ids, ["m-1", "m-2"]);
+    assert_eq!(mailbox.pending(SESSION), 2);
+}
+
+#[test]
+fn an_unreadable_envelope_is_skipped_without_hiding_the_readable_ones_behind_it() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for (n, id) in ["u-1", "u-2", "u-3"].into_iter().enumerate() {
+        mailbox
+            .deposit(
+                SESSION,
+                id,
+                &format!("text {id}"),
+                now + Duration::from_secs(n as u64),
+            )
+            .unwrap();
+    }
+    let key = session_key(SESSION).unwrap();
+    std::fs::remove_file(mailbox.meta_path(&key, "u-1")).unwrap();
+
+    let peeked = mailbox.peek_pending(SESSION, 2, now).unwrap();
+    let ids: Vec<_> = peeked
+        .iter()
+        .map(|env| env.claim.request_id.as_str())
+        .collect();
+    assert_eq!(ids, ["u-2", "u-3"], "the unreadable one takes no slot");
+    assert_eq!(
+        mailbox.pending(SESSION),
+        3,
+        "an unreadable envelope is left in place, not deleted"
+    );
+}

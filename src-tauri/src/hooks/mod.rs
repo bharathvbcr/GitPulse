@@ -75,6 +75,10 @@ pub const BUDGET: Duration = Duration::from_secs(5);
 /// in `hooks.json`, leaving `HOST_TIMEOUT_MARGIN` (`2s`) intact).
 pub const PEER_INBOX_BUDGET: Duration = Duration::from_secs(2);
 
+/// What `peer-inbox` waits for the bus acknowledgement of a message it has
+/// already taken: past it the message is still printed, unacknowledged.
+const PEER_INBOX_ACK_BUDGET: Duration = Duration::from_millis(400);
+
 /// Wall-clock ceiling for the whole process, from the moment `main` starts.
 ///
 /// [`BUDGET`] bounds one wait, but a hook makes several in a row (stdin, then
@@ -3974,10 +3978,18 @@ fn upsert_hook_peer(root: &Path, input: &HookInput, turn_state: &str) -> Option<
 /// Synchronous `0ms` boundary delivery (`SessionStart`, `UserPromptSubmit` /
 /// `PreInvocation`, `PostToolUse` / `PostInvocation`) across Claude Code, `agy`
 /// CLI, and Antigravity IDE.
+///
+/// Two phases, so that nothing is consumed that was not printed. The budgeted
+/// work only READS the mailbox and builds the text; the messages are taken
+/// (`p-*` -> `c-*`) here, on the calling thread, after the work answered inside
+/// its budget. A budget that runs out abandons the worker but cannot make it
+/// consume anything later, so the messages are still pending and the next hook
+/// call delivers them: a human-confirmed message has no copy on the bus.
 pub fn run_peer_inbox(input: &HookInput) -> HookOutput {
     let owned = input.clone();
-    let output = within_budget(PEER_INBOX_BUDGET, move || peer_inbox_in_default(&owned))
-        .unwrap_or_else(HookOutput::silent);
+    let output = deliver_within(PEER_INBOX_BUDGET, input, move || {
+        peer_inbox_in_default(&owned)
+    });
     if input.hook_event_name == "UserPromptSubmit" {
         let _ = turn_checkpoint::at_turn_start(input);
     }
@@ -4023,14 +4035,50 @@ fn advance_turn_boundary(mailbox: &crate::agent_mailbox::Mailbox, input: &HookIn
     }
 }
 
-fn peer_inbox_in_default(input: &HookInput) -> HookOutput {
-    if trusted_hook_root(input).is_none() {
-        return HookOutput::silent();
+/// What the `peer-inbox` hook delivers: every provenance, a peer message at its
+/// hop limit included (only a `Stop` waiter pauses at the limit, see
+/// [`deliver::wake_filter`]; this hook runs while the agent is already working).
+/// The one filter both for choosing what to prepare and for gating the claim.
+fn peer_inbox_accepts(_: &crate::agent_mailbox::EnvelopeProvenance) -> bool {
+    true
+}
+
+/// Messages read and rendered but not yet taken off the mailbox, and what
+/// [`peer_inbox_commit`] needs to take and acknowledge them.
+struct PeerInboxReady {
+    mailbox: crate::agent_mailbox::Mailbox,
+    delivery: crate::agent_mailbox::PendingDelivery<
+        String,
+        fn(&crate::agent_mailbox::EnvelopeProvenance) -> bool,
+    >,
+    root: PathBuf,
+    reader_id: String,
+}
+
+/// Runs `work`, which only reads and renders, inside `budget`, then takes the
+/// messages it prepared. A missed budget is logged and consumes nothing.
+fn deliver_within(
+    budget: Duration,
+    input: &HookInput,
+    work: impl FnOnce() -> Option<PeerInboxReady> + Send + 'static,
+) -> HookOutput {
+    match within_budget_typed(budget, work) {
+        Ok(Some(ready)) => peer_inbox_commit(input, ready),
+        Ok(None) => HookOutput::silent(),
+        Err(miss) => {
+            log::warn!(
+                target: "hook",
+                "peer-inbox missed its budget ({miss:?}); no message was consumed, so the next hook call delivers what is pending"
+            );
+            HookOutput::silent()
+        }
     }
-    let Ok(mailbox) = crate::agent_mailbox::Mailbox::at_default() else {
-        return HookOutput::silent();
-    };
-    let (output, fresh_user_turn) = peer_inbox_in_with_boundary(&mailbox, input);
+}
+
+fn peer_inbox_in_default(input: &HookInput) -> Option<PeerInboxReady> {
+    trusted_hook_root(input)?;
+    let mailbox = crate::agent_mailbox::Mailbox::at_default().ok()?;
+    let (ready, fresh_user_turn) = peer_inbox_prepare(&mailbox, input, &|| {});
     if input.is_antigravity() && session_env().is_some() && fresh_user_turn {
         let mut active = input.clone();
         active.fully_idle = Some(false);
@@ -4042,41 +4090,58 @@ fn peer_inbox_in_default(input: &HookInput) -> HookOutput {
             Some(Duration::from_millis(300)),
         );
     }
-    output
+    ready
 }
 
+/// The synchronous form, for tests that are not about the budget: prepare, then
+/// take.
 #[cfg(test)]
 pub(crate) fn peer_inbox_in(
     mailbox: &crate::agent_mailbox::Mailbox,
     input: &HookInput,
 ) -> HookOutput {
-    peer_inbox_in_with_boundary(mailbox, input).0
+    match peer_inbox_prepare(mailbox, input, &|| {}).0 {
+        Some(ready) => peer_inbox_commit(input, ready),
+        None => HookOutput::silent(),
+    }
 }
 
-fn peer_inbox_in_with_boundary(
+/// The hook inside `budget`, with `checkpoint` called once after the mailbox
+/// was read and before the text is built: the point a test parks the worker at
+/// to let the budget run out.
+#[cfg(test)]
+pub(crate) fn peer_inbox_budgeted<S: Fn() + Send + 'static>(
+    mailbox: crate::agent_mailbox::Mailbox,
+    input: &HookInput,
+    budget: Duration,
+    checkpoint: S,
+) -> HookOutput {
+    let owned = input.clone();
+    deliver_within(budget, input, move || {
+        peer_inbox_prepare(&mailbox, &owned, &checkpoint).0
+    })
+}
+
+/// Phase one: reads the pending messages and renders their text. Consumes
+/// nothing and acknowledges nothing on the bus. Also reports whether this event
+/// began a fresh user turn.
+fn peer_inbox_prepare(
     mailbox: &crate::agent_mailbox::Mailbox,
     input: &HookInput,
-) -> (HookOutput, bool) {
+    checkpoint: &dyn Fn(),
+) -> (Option<PeerInboxReady>, bool) {
     let Some(root) = (!input.cwd.is_empty())
         .then(|| find_git_root(Path::new(&input.cwd)))
         .flatten()
         .filter(|root| crate::repository_trust::require(root).is_ok())
     else {
-        return (HookOutput::silent(), false);
+        return (None, false);
     };
 
     let reader_id = upsert_hook_peer(&root, input, "working");
     let fresh_user_turn = advance_turn_boundary(mailbox, input);
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
-        return (HookOutput::silent(), fresh_user_turn);
-    }
-
-    let Ok(claimed) = mailbox.try_claim_batch(&input.session_id, 8, std::time::SystemTime::now())
-    else {
-        return (HookOutput::silent(), fresh_user_turn);
-    };
-    if claimed.is_empty() {
-        return (HookOutput::silent(), fresh_user_turn);
+        return (None, fresh_user_turn);
     }
 
     let fallback_reader = format!(
@@ -4084,20 +4149,68 @@ fn peer_inbox_in_with_boundary(
         peer_provider_and_surface(input).0,
         input.session_id.to_ascii_lowercase()
     );
-    let effective_reader = reader_id.as_deref().unwrap_or(&fallback_reader);
-    let mut parts = Vec::with_capacity(claimed.len());
-    let mut any_wakeable = false;
-    for env in &claimed {
-        if deliver::wake_filter(&env.provenance) {
-            any_wakeable = true;
+    let reader_id = reader_id.unwrap_or(fallback_reader);
+    let announced = std::cell::Cell::new(false);
+    let prepared = mailbox.prepare_delivery(
+        &input.session_id,
+        8,
+        std::time::SystemTime::now(),
+        peer_inbox_accepts as fn(&crate::agent_mailbox::EnvelopeProvenance) -> bool,
+        |envelope| {
+            if !announced.replace(true) {
+                checkpoint();
+            }
+            deliver::render_message(envelope, Some(&root))
+        },
+    );
+    let delivery = match prepared {
+        Ok(delivery) if !delivery.is_empty() => delivery,
+        Ok(_) => return (None, fresh_user_turn),
+        Err(error) => {
+            log::warn!(target: "hook", "peer-inbox could not read the mailbox, so pending messages stay pending: {error}");
+            return (None, fresh_user_turn);
         }
-        parts.push(deliver::format_claimed_message(
-            env,
-            Some(&root),
-            Some(effective_reader),
-        ));
+    };
+    (
+        Some(PeerInboxReady {
+            mailbox: mailbox.clone(),
+            delivery,
+            root,
+            reader_id,
+        }),
+        fresh_user_turn,
+    )
+}
+
+/// Phase two, run only once the text is ready to print and the budget held:
+/// takes exactly the messages that were prepared, and prints those this call
+/// won. A message another hook process took first, or that the filter no longer
+/// accepts, prints nothing here.
+fn peer_inbox_commit(input: &HookInput, ready: PeerInboxReady) -> HookOutput {
+    let PeerInboxReady {
+        mailbox,
+        delivery,
+        root,
+        reader_id,
+    } = ready;
+    let claimed = match delivery.commit() {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            log::warn!(target: "hook", "peer-inbox could not claim what it had read, so those messages stay pending: {error}");
+            return HookOutput::silent();
+        }
+    };
+    if claimed.is_empty() {
+        return HookOutput::silent();
     }
-    let combined = parts.join("\n");
+    let any_wakeable = claimed
+        .iter()
+        .any(|(envelope, _)| deliver::wake_filter(&envelope.provenance));
+    let combined = claimed
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let hook_event_name = if input.is_antigravity() && input.hook_event_name == "PostInvocation" {
         let under_cap = mailbox
@@ -4116,18 +4229,30 @@ fn peer_inbox_in_with_boundary(
         input.hook_event_name.clone()
     };
 
-    (
-        HookOutput {
-            hook_specific_output: Some(HookSpecificOutput {
-                hook_event_name,
-                permission_decision: None,
-                permission_decision_reason: None,
-                additional_context: Some(combined),
-            }),
-            system_message: None,
-        },
-        fresh_user_turn,
-    )
+    // Acknowledging on the bus says the message was read, so it comes only now,
+    // for the messages this call took. It is a repository-trust check and a bus
+    // write, run here after the claim, so it gets its own short budget: the
+    // answer is printed whether or not the acknowledgement finished.
+    let taken: Vec<crate::agent_mailbox::ClaimedEnvelope> =
+        claimed.iter().map(|(envelope, _)| envelope.clone()).collect();
+    if within_budget(PEER_INBOX_ACK_BUDGET, move || {
+        for envelope in &taken {
+            deliver::acknowledge_read(envelope, Some(&root), Some(&reader_id));
+        }
+    })
+    .is_none()
+    {
+        log::warn!(target: "hook", "peer-inbox delivered without finishing its bus acknowledgement");
+    }
+    HookOutput {
+        hook_specific_output: Some(HookSpecificOutput {
+            hook_event_name,
+            permission_decision: None,
+            permission_decision_reason: None,
+            additional_context: Some(combined),
+        }),
+        system_message: None,
+    }
 }
 
 /// Antigravity `Stop` handler: checks the narrow window between `PostInvocation`
@@ -5032,6 +5157,8 @@ mod notify_protocol_tests;
 mod notify_record_tests;
 #[cfg(test)]
 mod notify_routes_tests;
+#[cfg(test)]
+mod peer_inbox_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

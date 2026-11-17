@@ -752,12 +752,10 @@ impl Mailbox {
                     }
                 }
             }
-            let claimed = format!("c-{}", &name[2..]);
-            match crate::fs_entry::rename_noreplace(&dir.join(&name), &dir.join(&claimed)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(io("could not claim a message", &e)),
+            if !rename_to_claimed(&dir, &name)? {
+                continue;
             }
+            let claimed = format!("c-{}", &name[2..]);
             let id = parse_message_name(&claimed)
                 .map(|(_, _, id)| id.to_owned())
                 .unwrap_or_default();
@@ -793,6 +791,30 @@ impl Mailbox {
         max_items: usize,
         now: SystemTime,
     ) -> Result<Vec<ClaimedEnvelope>, MailboxError> {
+        Ok(self
+            .peek_named(session, max_items, now, |_| true)?
+            .into_iter()
+            .map(|(_, envelope)| envelope)
+            .collect())
+    }
+
+    /// The oldest `max_items` pending envelopes whose provenance `accept`
+    /// takes, each with the `p-*` file it was read from. Nothing is renamed.
+    ///
+    /// An envelope that cannot be read (its text or its provenance sidecar is
+    /// gone or unusable) is skipped and logged rather than counted against
+    /// `max_items`: it stays on disk until it expires, and cannot hide the
+    /// readable messages behind it.
+    fn peek_named<F>(
+        &self,
+        session: &str,
+        max_items: usize,
+        now: SystemTime,
+        accept: F,
+    ) -> Result<Vec<(String, ClaimedEnvelope)>, MailboxError>
+    where
+        F: Fn(&EnvelopeProvenance) -> bool,
+    {
         if max_items == 0 {
             return Ok(Vec::new());
         }
@@ -812,24 +834,74 @@ impl Mailbox {
             .collect();
         pending.sort();
         let mut out = Vec::new();
-        for name in pending.into_iter().take(max_items) {
+        for name in pending {
+            if out.len() >= max_items {
+                break;
+            }
             let Some((_, _, id)) = parse_message_name(&name) else {
                 continue;
             };
-            if let (Ok(text), Ok(provenance)) = (
+            match (
                 read_message(&dir.join(&name)),
                 self.read_provenance(&key, id),
             ) {
-                out.push(ClaimedEnvelope {
-                    claim: Claim {
-                        request_id: id.to_owned(),
-                        text,
-                    },
-                    provenance,
-                });
+                (Ok(text), Ok(provenance)) => {
+                    if accept(&provenance) {
+                        out.push((
+                            name.clone(),
+                            ClaimedEnvelope {
+                                claim: Claim {
+                                    request_id: id.to_owned(),
+                                    text,
+                                },
+                                provenance,
+                            },
+                        ));
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    log::warn!(target: "mailbox", "left an unreadable pending message in place: {error}");
+                }
             }
         }
         Ok(out)
+    }
+
+    /// First half of a two-phase delivery: reads the oldest pending envelopes
+    /// that `accept` takes and builds, for each, whatever `build` makes of it
+    /// (the text that will be shown), WITHOUT consuming any of them. Nothing
+    /// leaves `p-*` until [`PendingDelivery::commit`], so a caller that is cut
+    /// off while it builds (a budget that ran out, a crash) has lost nothing.
+    pub(crate) fn prepare_delivery<T, F>(
+        &self,
+        session: &str,
+        max_items: usize,
+        now: SystemTime,
+        accept: F,
+        mut build: impl FnMut(&ClaimedEnvelope) -> T,
+    ) -> Result<PendingDelivery<T, F>, MailboxError>
+    where
+        F: Fn(&EnvelopeProvenance) -> bool,
+    {
+        let key = session_key(session)?;
+        let items = self
+            .peek_named(session, max_items, now, &accept)?
+            .into_iter()
+            .map(|(file, envelope)| {
+                let built = build(&envelope);
+                PendingItem {
+                    file,
+                    envelope,
+                    built,
+                }
+            })
+            .collect();
+        Ok(PendingDelivery {
+            mailbox: self.clone(),
+            key,
+            items,
+            accept,
+        })
     }
 
     /// Atomically marks a specific pending `request_id` (`msg_id`) as claimed
@@ -858,12 +930,7 @@ impl Mailbox {
         for (name, _) in regular_files(&dir) {
             if let Some(('p', _, id)) = parse_message_name(&name) {
                 if id == request_id {
-                    let claimed = format!("c-{}", &name[2..]);
-                    match crate::fs_entry::rename_noreplace(&dir.join(&name), &dir.join(&claimed)) {
-                        Ok(()) => return Ok(true),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                        Err(e) => return Err(io("could not mark message claimed", &e)),
-                    }
+                    return rename_to_claimed(&dir, &name);
                 }
             }
         }
@@ -1210,6 +1277,94 @@ impl Mailbox {
             ));
         }
         Ok(None)
+    }
+}
+
+/// Renames one pending `p-*` file to its `c-*` name. `Ok(false)` means the file
+/// was no longer there: another consumer took it first, or it expired.
+fn rename_to_claimed(dir: &Path, pending_name: &str) -> Result<bool, MailboxError> {
+    let claimed = format!("c-{}", &pending_name[2..]);
+    match crate::fs_entry::rename_noreplace(&dir.join(pending_name), &dir.join(claimed)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io("could not claim a message", &e)),
+    }
+}
+
+struct PendingItem<T> {
+    file: String,
+    envelope: ClaimedEnvelope,
+    built: T,
+}
+
+/// Envelopes read and prepared for delivery but not yet consumed; see
+/// [`Mailbox::prepare_delivery`]. Dropping it consumes nothing.
+pub(crate) struct PendingDelivery<T, F> {
+    mailbox: Mailbox,
+    key: String,
+    items: Vec<PendingItem<T>>,
+    accept: F,
+}
+
+impl<T, F> PendingDelivery<T, F>
+where
+    F: Fn(&EnvelopeProvenance) -> bool,
+{
+    /// Whether there was nothing to deliver.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Second half of the delivery: consumes (`p-*` -> `c-*`) exactly the
+    /// envelopes prepared, and hands back each one this call took, with what was
+    /// built for it. Call it only when the built text is about to be printed.
+    ///
+    /// Under the session lock each envelope's provenance is read again, and the
+    /// envelope is taken only if it is still the one that was prepared and
+    /// `accept` still takes it: the filter that chose what to prepare also gates
+    /// what is consumed. An envelope another consumer already took, or that
+    /// expired, is not returned, so two consumers prepared from the same
+    /// envelope deliver it once between them.
+    ///
+    /// An error before anything was taken is returned and leaves every envelope
+    /// pending. An error after some were taken returns those, and leaves the
+    /// rest pending.
+    pub(crate) fn commit(self) -> Result<Vec<(ClaimedEnvelope, T)>, MailboxError> {
+        let Self {
+            mailbox,
+            key,
+            items,
+            accept,
+        } = self;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dir = mailbox.root.join(&key);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => private_dir(&dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io("could not look at the session's mailbox", &e)),
+        }
+        let _session_lock = mailbox.lock_session(&key)?;
+        let mut won = Vec::new();
+        for item in items {
+            let unchanged = mailbox
+                .read_provenance(&key, &item.envelope.claim.request_id)
+                .is_ok_and(|held| held == item.envelope.provenance && accept(&held));
+            if !unchanged {
+                continue;
+            }
+            match rename_to_claimed(&dir, &item.file) {
+                Ok(true) => won.push((item.envelope, item.built)),
+                Ok(false) => {}
+                Err(error) if won.is_empty() => return Err(error),
+                Err(error) => {
+                    log::warn!(target: "mailbox", "stopped claiming after one message: {error}");
+                    break;
+                }
+            }
+        }
+        Ok(won)
     }
 }
 
