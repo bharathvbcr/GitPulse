@@ -9,6 +9,7 @@ import { MANVI_FOCUS_IDS } from "../ui/manviFocus";
 import {
   harnessStore,
   type AiStatus,
+  type ManviStatus,
   type HarnessState,
   type HarnessStatus,
   type PolicyVerdict,
@@ -53,6 +54,15 @@ function chipTag(body: string): string {
   return body.match(/<button\b[^>]*data-manvi-chip[^>]*>/)?.[0] ?? "";
 }
 
+function manviStatus(over: Partial<ManviStatus>): ManviStatus {
+  return {
+    state: "ready", detail: "", mode: "cloud", provider: "anthropic", provider_from: "config", model: "claude-sonnet-5-5",
+    model_from: "config", shadowed_by: [], user_config: "", local_base_url: "http://localhost:11434/v1", local_model: "chat",
+    cloud_model: "claude-sonnet-5-5", warnings: [], unsupported: "", selection: { provider: "anthropic", model: "claude-sonnet-5-5" },
+    ...over,
+  };
+}
+
 const ready: AiStatus = {
   harness: { available: true, binary: "manvi", protocol: 1, posture: "guarded", ops: [], error: "", error_code: "" },
   endpoints: [
@@ -62,6 +72,7 @@ const ready: AiStatus = {
   ],
   selected: { base_url: "http://localhost:11434/v1", model: "chat" },
   model_info: null, model_detail: "", ready: true, detail: "Ready",
+  manvi: manviStatus({ state: "not_installed", mode: "", provider: "", model: "", selection: null }),
 };
 
 describe("HarnessBadge destinations", () => {
@@ -417,10 +428,11 @@ describe("HarnessBadge model options", () => {
 
 describe("HarnessBadge cloud mode", () => {
   const empty: AiStatus = { ...ready, endpoints: [], ready: false, selected: null };
-  const cloud = { manviClaude: { model: "claude-sonnet-5-5" } };
+  const onCloud: AiStatus = { ...empty, manvi: manviStatus({}) };
+  const onLocal: AiStatus = { ...empty, manvi: manviStatus({ mode: "local", provider: "local", model: "chat", selection: { provider: "local", base_url: "http://localhost:11434/v1", model: "chat" } }) };
 
   it("shows Cloud on the pill instead of local discovery when Manvi is on Claude", () => {
-    const body = renderState({ ai: empty, ...cloud }, false);
+    const body = renderState({ ai: onCloud }, false);
     const chip = body.slice(body.indexOf("data-manvi-chip"), body.indexOf("</button>", body.indexOf("data-manvi-chip")));
     expect(chip).toContain("data-manvi-cloud");
     expect(chip).toContain("Cloud");
@@ -432,23 +444,30 @@ describe("HarnessBadge cloud mode", () => {
     expect(chipTag(body)).toContain("Manvi uses cloud: claude-sonnet-5-5");
   });
 
-  it("keeps the local face on the pill when Manvi is on a local model", () => {
-    const body = renderState({ ai: empty, manviClaude: null }, false);
+  it("shows Manvi's local mode on the pill, from Manvi's own status", () => {
+    const body = renderState({ ai: onLocal }, false);
+    expect(body).not.toContain("data-manvi-cloud");
+    expect(body).toContain("Local · chat");
+  });
+
+  it("keeps local discovery's face on the pill when Manvi cannot be read", () => {
+    const body = renderState({ ai: empty }, false);
     expect(body).not.toContain("data-manvi-cloud");
     expect(body).toContain("No models");
   });
 
-  it("puts Manvi's cloud model first in the menu and labels the local picker for GitPulse AI", () => {
-    const body = renderState({ ai: empty, ...cloud }, true);
+  it("puts Manvi's cloud model in the menu and hides the local picker, which would switch Manvi to local", () => {
+    const body = renderState({ ai: onCloud }, true);
     const menu = body.slice(body.indexOf("data-manvi-menu"));
     expect(menu).toContain("data-manvi-cloud-row");
     expect(menu).toContain("Cloud · claude-sonnet-5-5");
-    const cloudAt = menu.search(/Manvi(?:'|&#39;|&apos;)s model</);
-    const localAt = menu.indexOf("Local model · GitPulse AI");
-    expect(cloudAt).toBeGreaterThan(-1);
-    expect(localAt).toBeGreaterThan(cloudAt);
-    // The local picker keeps describing local discovery, never "Cloud".
-    expect(menu).toMatch(/data-manvi-face="No models"/);
     expect(menu).toMatch(/Change Manvi(?:'|&#39;|&apos;)s model/);
+    expect(menu).not.toContain('aria-label="Local model"');
+    expect(menu).not.toContain("data-manvi-face");
+  });
+
+  it("shows the local picker when Manvi is on a local model", () => {
+    const menu = renderState({ ai: onLocal }, true);
+    expect(menu).toContain('aria-label="Local model"');
   });
 });

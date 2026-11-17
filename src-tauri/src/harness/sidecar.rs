@@ -56,6 +56,10 @@ pub const MANAGED_CONTINUE_TIMEOUT: Duration = Duration::from_secs(65);
 /// How long `work.enhancements.refine` may take: Manvi's model-call budget
 /// (150 s) plus the 30 s it allows for grounding and board reads around it.
 pub const REFINE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long `work.assist.complete` may take: Manvi's 150 s model-call deadline
+/// plus the 30 s it allows around it. The op has its own lane in Manvi, so it
+/// never waits behind an enhancement.
+pub const ASSIST_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long `work.scan.gaps` may take to *claim* a scan. The scan itself runs
 /// on after the answer; this covers git, the index status and the lane's own
 /// minute, which is Manvi's deadline for the request.
@@ -71,6 +75,7 @@ pub(crate) fn op_deadline(op: &str) -> Duration {
         "work.runs.managed.stop" => MANAGED_STOP_TIMEOUT,
         "work.runs.managed.continue" => MANAGED_CONTINUE_TIMEOUT,
         "work.enhancements.refine" => REFINE_TIMEOUT,
+        "work.assist.complete" => ASSIST_TIMEOUT,
         "work.scan.gaps" => SCAN_START_TIMEOUT,
         _ => DEFAULT_CALL_TIMEOUT,
     }
@@ -1355,6 +1360,22 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
         && withheld.is_some_and(|names| names.iter().any(|name| name == CLAUDE_KEY_ENV))
 }
 
+/// A one-shot `manvi <args>` the host asks a question with: the environment
+/// cleared and rebuilt from [`sidecar_ambient_env`] (the same set a worker
+/// gets, so a `MANVI_*` setting that would shadow Manvi's config is visible to
+/// the question), and run from the temp directory so no checkout's own
+/// settings are read. The one owner of that shape for `manvi version --json`
+/// and `manvi use`.
+pub(crate) fn manvi_probe_command(binary: &str, args: &[&str]) -> Command {
+    let mut probe = Command::new(binary);
+    probe.args(args).env_clear();
+    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
+        probe.env(name, value);
+    }
+    probe.current_dir(std::env::temp_dir());
+    probe
+}
+
 /// The Claude credential for a spawn of `binary`, or why it may not have one.
 ///
 /// Manvi runs a model-driven tool loop in a repository the user may not trust,
@@ -1369,12 +1390,7 @@ fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) ->
 /// never a quiet fall back to GitPulse's own key, which may belong to another
 /// organisation.
 fn claude_credential_for(binary: &str) -> Result<ClaudeCredential, HarnessError> {
-    let mut probe = Command::new(binary);
-    probe.args(["version", "--json"]).env_clear();
-    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
-        probe.env(name, value);
-    }
-    probe.current_dir(std::env::temp_dir());
+    let probe = manvi_probe_command(binary, &["version", "--json"]);
     let run = crate::engine::process::run_bounded_capped(
         probe,
         "manvi version",
@@ -1797,7 +1813,11 @@ const HOSTED_OPS: [&str; 2] = [OP_SERVE_STATUS, OP_SERVE_STOP_ALL];
 
 /// Ops whose answer depends on the model the server was started with.
 #[cfg(unix)]
-const MODEL_BOUND_OPS: [&str; 2] = ["work.enhancements.generate", "work.enhancements.refine"];
+const MODEL_BOUND_OPS: [&str; 3] = [
+    "work.enhancements.generate",
+    "work.enhancements.refine",
+    "work.assist.complete",
+];
 
 /// How the profile worker came to ask for a hosted server.
 #[cfg(unix)]
@@ -2573,6 +2593,7 @@ fn missing_op_message(op: &str) -> String {
             "managed runs"
         }
         "work.runs.managed.continue" => "follow-ups to a managed run",
+        "work.assist.complete" => "GitPulse's AI features through Manvi",
         _ => "task enhancements",
     };
     format!("This Manvi binary does not advertise {op}. Update Manvi to use {feature}.")
@@ -2764,6 +2785,7 @@ impl ProfileConnection {
                 | "work.verify.task"
                 | "work.verify.get"
                 | "work.enhancements.refine"
+                | "work.assist.complete"
                 | "work.scan.gaps"
                 | "work.scan.get"
                 | "work.scan.cancel"

@@ -3,6 +3,8 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import {
     harnessStore,
+    aiReadiness,
+    describeAiTarget,
     verdictDetail,
     verdictLabel,
     type AiGeneration,
@@ -46,7 +48,8 @@
   let stagedFiles = $derived($repoStore.statuses.filter((s) => s.is_staged));
   let dirtyCount = $derived($repoStore.statuses.length);
   let conflictedCount = $derived($repoStore.conflictedCount);
-  let aiReady = $derived($harnessStore.ai?.ready ?? false);
+  let aiReady = $derived($aiReadiness.ready);
+  let aiTarget = $derived(describeAiTarget($aiReadiness));
   let apple = $state<AppleIntelligenceStatus | null>(null);
   $effect(() => {
     let live = true;
@@ -270,7 +273,7 @@
     void handleCommit();
   }
 
-  /** "1.4s", "820ms" — a local model's latency is worth showing plainly. */
+  /** "1.4s", "820ms" — a model's latency is worth showing plainly. */
   function duration(ms: number): string {
     return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
   }
@@ -289,7 +292,9 @@
       title={stagedFiles.length === 0
         ? "Stage a change to describe"
         : aiReady
-          ? "Write a message for the staged diff with the local model"
+          ? `Write a message for the staged diff with ${aiTarget}`
+          : $aiReadiness.target === "cloud"
+            ? `Write a message from the staged diff. ${$aiReadiness.reason} Until Claude is ready, GitPulse assembles it from the change.`
           : appleReady(apple)
             ? "Write the message on-device. The patch is classified in the app; Apple Intelligence only phrases the subject."
             : "Write a message from the staged diff. No model is running, so GitPulse assembles it from the change."}

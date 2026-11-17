@@ -1,14 +1,27 @@
-//! Local AI features: commit messages, commit explanations, branch names.
+//! GitPulse's own AI features: commit messages, commit explanations, branch
+//! names, health plans and coverage reports.
 //!
-//! Explanations, branch names, health plans and coverage reports run against a
-//! model server on this machine. Commit messages are classified from the staged
+//! Manvi's own config decides what they run on (`manvi use`: cloud, meaning
+//! Claude through the Anthropic API, or a local model server), and in either
+//! mode they go through Manvi's `work.assist.complete` op as a
+//! [`Route::Manvi`]. That route never sweeps, probes or touches loopback from
+//! this process. GitPulse's own loopback client ([`Route::Local`]) is the
+//! fallback for a Manvi that is not installed, lacks the op, or has no chosen
+//! mode (its built-in default, cloud, is not a choice anyone made), and a
+//! request never goes both ways. Commit messages are classified from the staged
 //! patch first (`commit_brief`); a model only phrases that classification, and
 //! the classified text is the message when no model can be reached. The pieces
 //! are split three ways, and the split is the point:
 //!
 //! * `discovery` and `http` find the server and carry the request. Loopback
 //!   only — the transport itself refuses any other address, so a diff cannot
-//!   leave the machine through a mistyped setting.
+//!   leave the machine through a mistyped setting. They are the fallback
+//!   path. When Manvi is on its cloud mode the request goes to the Claude API
+//!   through Manvi: that is the one deliberate way a diff leaves the machine.
+//!   It takes a saved choice of cloud (or `MANVI_*` environment or a flag), not
+//!   just Manvi's answer: an unset Manvi config reports cloud with
+//!   `provider_from: default`, which GitPulse reads as `not_chosen` and routes
+//!   to the loopback client behind its consent dialog instead.
 //! * The MANVI harness answers the questions a host cannot answer for itself:
 //!   how large this model's context really is and where that number came from
 //!   (`capability.probe`), whether the assembled request fits (`chat.prepare`),
@@ -43,7 +56,7 @@ pub mod prompt;
 
 use crate::ipc_error::CommandError;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +96,87 @@ pub struct AiSelection {
     pub model: String,
 }
 
+/// The Manvi op that carries every Manvi-routed request, in both modes.
+pub const OP_ASSIST_COMPLETE: &str = "work.assist.complete";
+/// Manvi's own bounds on `work.assist.complete` input, mirrored so an oversized
+/// request is refused here instead of by the worker.
+const ASSIST_MAX_SYSTEM_BYTES: usize = 32_768;
+const ASSIST_MAX_USER_BYTES: usize = 2_097_152;
+/// What the user reads when Manvi predates the op.
+pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to run GitPulse's AI features through it.";
+
+/// A failed `work.assist.complete` call: the worker's code and message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManviError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ManviError {
+    /// The sentence shown to the user. A worker that does not serve the op gets
+    /// the one clear update instruction instead of a transport message.
+    fn user_message(&self) -> String {
+        if self.code == "unsupported_operation" {
+            OLD_MANVI_MESSAGE.to_string()
+        } else if self.code == "E_BUSY" {
+            "Manvi is busy with two other AI requests; try again.".to_string()
+        } else {
+            format!("Manvi: {}", self.message)
+        }
+    }
+}
+
+/// How a Manvi-routed request reaches Manvi. The app wires the profile worker
+/// in; a test wires a fake, so this module is testable without Manvi.
+pub type ManviComplete = Arc<dyn Fn(Value) -> Result<Value, ManviError> + Send + Sync>;
+
+/// The Manvi route: what Manvi runs the request on, and the way to call it.
+#[derive(Clone)]
+pub struct ManviRoute {
+    /// The model id the request is for.
+    pub model: String,
+    /// The provider Manvi must answer from: `anthropic` or `local`. A reply
+    /// from any other is refused rather than shown as this model's.
+    pub provider: &'static str,
+    /// Where a generation says it went ("Claude API via Manvi").
+    pub destination: String,
+    pub complete: ManviComplete,
+}
+
+impl std::fmt::Debug for ManviRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManviRoute")
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where one request goes. One value decides it, so no code path can choose
+/// both Manvi and the loopback client.
+#[derive(Debug, Clone)]
+pub enum Route {
+    /// GitPulse's own loopback client. Only the fallback for a Manvi that is
+    /// not installed, lacks `work.assist.complete`, or has no chosen mode;
+    /// `None` means nothing was chosen and the consent gate
+    /// ([`resolve_target`]) applies.
+    Local(Option<AiSelection>),
+    /// Manvi's `work.assist.complete`, on whatever Manvi is set to run on.
+    Manvi(ManviRoute),
+}
+
+impl From<Option<AiSelection>> for Route {
+    fn from(selection: Option<AiSelection>) -> Self {
+        Route::Local(selection)
+    }
+}
+
+impl From<ManviRoute> for Route {
+    fn from(cloud: ManviRoute) -> Self {
+        Route::Manvi(cloud)
+    }
+}
+
 /// What the AI panel shows: what is installed, what is running, what it serves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiStatus {
@@ -96,6 +190,10 @@ pub struct AiStatus {
     /// True when a request could be made right now.
     pub ready: bool,
     pub detail: String,
+    /// What Manvi itself is set to run on (`manvi use`), which decides where
+    /// GitPulse's own AI features go. Independent of the loopback discovery
+    /// above, which is what applies when Manvi cannot be used.
+    pub manvi: crate::harness::manvi_use::ManviStatus,
 }
 
 /// The token budget a request went out under.
@@ -336,7 +434,29 @@ fn test_probe_override(base_url: &str, model: &str) -> Option<Result<ProbeResult
 }
 
 /// Discovers what is available, without sending a prompt anywhere.
-pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) -> AiStatus {
+///
+/// When Manvi is on its local mode with a server GitPulse can use, that server
+/// and model are what discovery checks (Manvi's choice replaces the caller's),
+/// so the readiness shown is the readiness of what Manvi would actually use.
+pub fn status(
+    explicit_base_url: Option<&str>,
+    preferred_model: Option<&str>,
+    manvi: crate::harness::manvi_use::ManviStatus,
+) -> AiStatus {
+    let manvi_local = manvi
+        .selection
+        .as_ref()
+        .filter(|_| manvi.state == "ready" && manvi.mode == "local")
+        .and_then(|wire| {
+            Some((
+                wire.get("base_url")?.as_str()?.to_string(),
+                wire.get("model")?.as_str()?.to_string(),
+            ))
+        });
+    let (explicit_base_url, preferred_model) = match &manvi_local {
+        Some((base_url, model)) => (Some(base_url.as_str()), Some(model.as_str())),
+        None => (explicit_base_url, preferred_model),
+    };
     let harness = HarnessStatus::probe();
     let endpoints = discovery::sweep(explicit_base_url);
     let chosen = discovery::choose(&endpoints, preferred_model);
@@ -385,6 +505,7 @@ pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) ->
         model_detail,
         ready,
         detail,
+        manvi,
     }
 }
 
@@ -558,12 +679,203 @@ struct Turn {
     diff: prompt::BudgetedDiff,
 }
 
-/// Runs one feature end to end.
+/// Runs one feature end to end on the route the caller chose.
 fn run(
+    feature: Feature,
+    repo_path: &str,
+    route: Route,
+    build: impl Fn(usize) -> Result<Turn, String>,
+) -> Result<AiGeneration, CommandError> {
+    run_with(feature, repo_path, route, build, || discovery::sweep(None))
+}
+
+/// [`run`] with the discovery sweep injected, so a test can prove a Claude
+/// route never calls it and a local route still does.
+fn run_with(
+    feature: Feature,
+    repo_path: &str,
+    route: Route,
+    build: impl Fn(usize) -> Result<Turn, String>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
+) -> Result<AiGeneration, CommandError> {
+    match route {
+        Route::Local(selection) => run_local(feature, repo_path, selection, build, sweep),
+        Route::Manvi(cloud) => run_manvi(feature, &cloud, build),
+    }
+}
+
+/// The warning for a reply the model stopped at its output cap.
+const TRUNCATED_REPLY_WARNING: &str =
+    "The model stopped at the output cap, so the reply is incomplete.";
+
+/// The warning for context cut to fit the window, or `None` when none was.
+fn diff_truncation_warning(diff: &prompt::BudgetedDiff) -> Option<String> {
+    diff.truncated.then(|| {
+        format!(
+            "Attached context exceeded the window: {} of {} bytes were shown{}.",
+            diff.used_bytes,
+            diff.total_bytes,
+            if diff.omitted_files > 0 {
+                format!(", {} file(s) not shown", diff.omitted_files)
+            } else {
+                String::new()
+            }
+        )
+    })
+}
+
+/// What `work.assist.complete` answers (both for `dry_run` and for a real call).
+#[derive(Debug, Default, Deserialize)]
+struct AssistReply {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    context_window: i64,
+    #[serde(default)]
+    max_output_tokens: i64,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    stop_reason: String,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
+}
+
+fn assist_call(cloud: &ManviRoute, params: Value) -> Result<AssistReply, CommandError> {
+    let raw = (cloud.complete)(params).map_err(|e| CommandError::from(e.user_message()))?;
+    let reply: AssistReply = serde_json::from_value(raw)
+        .map_err(|e| CommandError::from(format!("Manvi returned an unreadable reply: {e}")))?;
+    if !reply.ok {
+        return Err("Manvi did not accept the request.".into());
+    }
+    Ok(reply)
+}
+
+/// The Claude route: capability first (no model call), then one real call.
+/// Never sweeps, probes or touches loopback; nothing here falls back to it.
+fn run_manvi(
+    feature: Feature,
+    cloud: &ManviRoute,
+    build: impl Fn(usize) -> Result<Turn, String>,
+) -> Result<AiGeneration, CommandError> {
+    let started = Instant::now();
+    let mut warnings: Vec<String> = Vec::new();
+    let feature_cap = feature.max_output_tokens();
+
+    // 1. How much it holds and what output cap applies: Manvi's adapter says.
+    let capability = assist_call(
+        cloud,
+        serde_json::json!({
+            "max_output_tokens": feature_cap,
+            "dry_run": true,
+        }),
+    )?;
+    let context_window = capability.context_window.max(1_024);
+    let max_output = if capability.max_output_tokens > 0 {
+        capability.max_output_tokens.min(feature_cap)
+    } else {
+        feature_cap
+    };
+
+    // 2. Budget the context against the window, then keep it inside Manvi's
+    //    own input bounds (halving, as the local path does when over).
+    //    Manvi refuses a request when ceil((len(system)+len(user)) bytes / 3)
+    //    plus max_output_tokens exceeds the window, so the loop applies that
+    //    same bytes/3 estimate rather than this module's usual tokens-per-byte
+    //    guess, and halves the context until the request passes it.
+    let fits = |turn: &Turn| {
+        let estimate = ((turn.system.len() + turn.user.len()) as i64 + 2) / 3;
+        estimate + max_output <= context_window && turn.user.len() <= ASSIST_MAX_USER_BYTES
+    };
+    let mut budget_bytes = prompt::diff_budget_bytes(context_window, RESERVED_TOKENS + max_output);
+    let mut turn = build(budget_bytes)?;
+    for _ in 0..8 {
+        if fits(&turn) {
+            break;
+        }
+        budget_bytes /= 2;
+        turn = build(budget_bytes)?;
+    }
+    if turn.system.len() > ASSIST_MAX_SYSTEM_BYTES || !fits(&turn) {
+        return Err(
+            "The request does not fit the model's context window under Manvi's size check.".into(),
+        );
+    }
+
+    // 3. The call itself.
+    let reply = assist_call(
+        cloud,
+        serde_json::json!({
+            "system": turn.system,
+            "user": turn.user,
+            "max_output_tokens": max_output,
+        }),
+    )?;
+    if !reply.provider.is_empty() && reply.provider != cloud.provider {
+        return Err(format!(
+            "Manvi answered from provider '{}' when {} was asked for; the reply was not used.",
+            reply.provider, cloud.provider
+        )
+        .into());
+    }
+
+    // 4. Reasoning never arrives in `text`; tags are stripped as the local
+    //    fallback does, so a stray one never reaches the user.
+    let visible = prompt::split_think(&reply.text);
+    if visible.ended_in_reasoning {
+        warnings.push(REPLY_ENDED_IN_REASONING.into());
+    }
+    // Manvi returns a result only for `end_turn` and `max_tokens`; every other
+    // stop reason arrives as an error. Its `redactions` field is always 0 (no
+    // prompt-redaction owner exists there), so nothing here claims redaction.
+    let truncated = reply.truncated || reply.stop_reason == "max_tokens";
+    if truncated {
+        warnings.push(TRUNCATED_REPLY_WARNING.into());
+    }
+    warnings.extend(diff_truncation_warning(&turn.diff));
+
+    Ok(AiGeneration {
+        text: visible.text,
+        reasoning: reply.reasoning,
+        model: if reply.model.is_empty() {
+            cloud.model.clone()
+        } else {
+            reply.model
+        },
+        base_url: cloud.destination.clone(),
+        context_window,
+        context_source: format!(
+            "{context_window} tokens (from Manvi's {} adapter)",
+            cloud.provider
+        ),
+        prompt_tokens: reply.input_tokens,
+        completion_tokens: reply.output_tokens,
+        truncated,
+        diff_truncated: turn.diff.truncated,
+        diff_used_bytes: turn.diff.used_bytes as i64,
+        diff_total_bytes: turn.diff.total_bytes as i64,
+        budget: BudgetReport::default(),
+        warnings,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+fn run_local(
     feature: Feature,
     repo_path: &str,
     selection: Option<AiSelection>,
     build: impl Fn(usize) -> Result<Turn, String>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
     let mut warnings: Vec<String> = Vec::new();
@@ -571,7 +883,7 @@ fn run(
 
     // 1. Where to send it: only where the user chose. A discovered server is
     //    offered for confirmation, never used.
-    let selection = match resolve_target(selection, || discovery::sweep(None))? {
+    let selection = match resolve_target(selection, sweep)? {
         Target::Confirmed(selection) => selection,
         Target::NoServer(endpoints) => {
             let tried: Vec<String> = endpoints
@@ -721,20 +1033,9 @@ fn run(
         warnings.push(note.clone());
     }
     if truncated {
-        warnings.push("The model stopped at the output cap, so the reply is incomplete.".into());
+        warnings.push(TRUNCATED_REPLY_WARNING.into());
     }
-    if turn.diff.truncated {
-        warnings.push(format!(
-            "Attached context exceeded the window: {} of {} bytes were shown{}.",
-            turn.diff.used_bytes,
-            turn.diff.total_bytes,
-            if turn.diff.omitted_files > 0 {
-                format!(", {} file(s) not shown", turn.diff.omitted_files)
-            } else {
-                String::new()
-            }
-        ));
-    }
+    warnings.extend(diff_truncation_warning(&turn.diff));
 
     Ok(AiGeneration {
         text,
@@ -957,6 +1258,8 @@ fn read_staged_patch(repo_path: &str) -> Result<(Vec<u8>, bool), CommandError> {
 #[derive(Debug)]
 enum CommitEngine {
     Local(AiSelection),
+    /// Claude through Manvi: chosen by the route, never by `choose_commit_engine`.
+    Manvi(ManviRoute),
     OnDevice,
     Patch,
 }
@@ -1029,16 +1332,32 @@ fn working_diff(repo_path: &str) -> Result<String, CommandError> {
 /// message is the result — a missing model is not an empty composer.
 pub fn generate_commit_message(
     repo_path: &str,
-    selection: Option<AiSelection>,
+    route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
-    generate_commit_message_with(repo_path, selection, || discovery::sweep(None))
+    generate_commit_message_with(repo_path, Ok(route.into()), || discovery::sweep(None))
 }
 
-/// [`generate_commit_message`] with the discovery sweep injected, so a test can
-/// point it at a server it controls instead of the fixed loopback ports.
+/// [`generate_commit_message`] for a route that may not have resolved: the
+/// app's command passes what choosing the route answered. A commit message
+/// never fails for want of a model. When no route could be chosen (cloud mode
+/// with no Claude credential, a Manvi without `work.assist.complete`, a mode
+/// GitPulse cannot use) the message is the one written from the patch, with a
+/// warning naming why. Nothing is sent anywhere on that path. Errors that are
+/// not about the route still reach the caller: nothing staged, an unreadable
+/// patch, and the loopback consent refusal.
+pub fn generate_commit_message_routed(
+    repo_path: &str,
+    route: Result<Route, CommandError>,
+) -> Result<AiGeneration, CommandError> {
+    generate_commit_message_with(repo_path, route, || discovery::sweep(None))
+}
+
+/// [`generate_commit_message_routed`] with the discovery sweep injected, so a
+/// test can point it at a server it controls instead of the fixed loopback
+/// ports, and prove a Claude route never calls it.
 fn generate_commit_message_with(
     repo_path: &str,
-    selection: Option<AiSelection>,
+    route: Result<Route, CommandError>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
@@ -1113,52 +1432,89 @@ fn generate_commit_message_with(
     // thread. With both Lappi settings off it reads only the cached config.
     crate::lappi::consult_on_commit_type(repo_path, &patch, &mut draft);
 
-    let (explicit, on_device) = match resolve_target(selection, sweep)? {
-        Target::Confirmed(selection) => (Some(selection), false),
-        // A cut patch is not something the small model should phrase: the brief
-        // would be missing files and the subject would overclaim.
-        Target::NoServer(_) => (
-            None,
-            should_ask_on_device(
-                true,
-                !patch_truncated && !draft.high_confidence && apple::status().ready(),
-                patch_truncated,
-                draft.high_confidence,
-            ),
-        ),
+    let engine = match route {
+        // No route could be chosen: no model runs, nothing is sent, and the
+        // classified message is the answer.
+        Err(why) => {
+            return Ok(generation_from_patch(
+                &draft,
+                started,
+                Some(&format!(
+                    "No model was used ({}). The message was written from the patch.",
+                    why.message()
+                )),
+            ));
+        }
+        // Manvi's chosen mode: no sweep, no consent gate, no loopback. A
+        // failed call falls back to the patch message below.
+        Ok(Route::Manvi(cloud)) => CommitEngine::Manvi(cloud),
+        Ok(Route::Local(selection)) => {
+            let (explicit, on_device) = match resolve_target(selection, sweep)? {
+                Target::Confirmed(selection) => (Some(selection), false),
+                // A cut patch is not something the small model should phrase:
+                // the brief would be missing files and the subject would
+                // overclaim.
+                Target::NoServer(_) => (
+                    None,
+                    should_ask_on_device(
+                        true,
+                        !patch_truncated && !draft.high_confidence && apple::status().ready(),
+                        patch_truncated,
+                        draft.high_confidence,
+                    ),
+                ),
+            };
+            choose_commit_engine(explicit, on_device)
+        }
     };
 
-    match choose_commit_engine(explicit, on_device) {
-        CommitEngine::Local(selection) => Ok(finish_with_local_model(
-            repo_path, selection, &draft, &style, &branch, &diff, started,
+    match engine {
+        CommitEngine::Local(selection) => Ok(finish_with_model(
+            repo_path,
+            Route::Local(Some(selection)),
+            &draft,
+            &style,
+            &branch,
+            &diff,
+            started,
+        )),
+        CommitEngine::Manvi(cloud) => Ok(finish_with_model(
+            repo_path,
+            Route::Manvi(cloud),
+            &draft,
+            &style,
+            &branch,
+            &diff,
+            started,
         )),
         CommitEngine::OnDevice => Ok(finish_on_device(&draft, started)),
         CommitEngine::Patch => Ok(generation_from_patch(&draft, started, None)),
     }
 }
 
-fn finish_with_local_model(
+/// Phrases the message with the model the route names, falling back to the
+/// message already written from the patch when it cannot.
+fn finish_with_model(
     repo_path: &str,
-    selection: AiSelection,
+    route: Route,
     draft: &commit_brief::CommitDraft,
     style: &str,
     branch: &str,
     diff: &str,
     started: Instant,
 ) -> AiGeneration {
-    let outcome = run(
-        Feature::CommitMessage,
-        repo_path,
-        Some(selection),
-        |budget| {
-            let budgeted = prompt::budget_diff(diff, budget);
-            Ok(Turn {
-                system: prompt::commit_message_system(style),
-                user: prompt::commit_message_user(branch, &draft.brief, &budgeted.text),
-                diff: budgeted,
-            })
-        },
-    );
+    let destination = match &route {
+        Route::Local(_) => "The model".to_string(),
+        Route::Manvi(manvi) => manvi.destination.clone(),
+    };
+    let outcome = run(Feature::CommitMessage, repo_path, route, |budget| {
+        let budgeted = prompt::budget_diff(diff, budget);
+        Ok(Turn {
+            system: prompt::commit_message_system(style),
+            user: prompt::commit_message_user(branch, &draft.brief, &budgeted.text),
+            diff: budgeted,
+        })
+    });
     match outcome {
         Ok(mut generation) => {
             match commit_brief::guard_local_message(&generation.text, draft) {
@@ -1192,7 +1548,7 @@ fn finish_with_local_model(
             draft,
             started,
             Some(&format!(
-                "The model could not be reached ({}). The message was written from the patch.",
+                "{destination} could not be reached ({}). The message was written from the patch.",
                 error.message()
             )),
         ),
@@ -1284,7 +1640,7 @@ fn generation_from_patch(
 pub fn explain_commit(
     repo_path: &str,
     commit_id: &str,
-    selection: Option<AiSelection>,
+    route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
     let details = GitReader::get_commit_details(repo_path, commit_id)?;
     // `.text` only: the AI budget already trims the diff to the model's
@@ -1298,7 +1654,7 @@ pub fn explain_commit(
     let date = details.author_date.clone();
     let body = details.body.clone();
 
-    let mut generation = run(Feature::ExplainCommit, repo_path, selection, |budget| {
+    let mut generation = run(Feature::ExplainCommit, repo_path, route.into(), |budget| {
         let budgeted = prompt::budget_diff(&diff, budget);
         Ok(Turn {
             system: prompt::explain_system(),
@@ -1329,7 +1685,7 @@ pub fn explain_commit(
 /// Suggests a branch name for the work in progress.
 pub fn suggest_branch_name(
     repo_path: &str,
-    selection: Option<AiSelection>,
+    route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
     let diff = working_diff(repo_path)?;
     if diff.trim().is_empty() {
@@ -1337,7 +1693,7 @@ pub fn suggest_branch_name(
             "The working tree is clean, so there is no work to name a branch after.".into(),
         );
     }
-    let mut generation = run(Feature::BranchName, repo_path, selection, |budget| {
+    let mut generation = run(Feature::BranchName, repo_path, route.into(), |budget| {
         let budgeted = prompt::budget_diff(&diff, budget.min(24_000));
         Ok(Turn {
             system: prompt::branch_name_system(),
@@ -1357,7 +1713,7 @@ pub fn suggest_branch_name(
     Ok(generation)
 }
 
-/// Asks the local model for a remediation plan for a dependency-health report.
+/// Asks the selected model for a remediation plan for a dependency-health report.
 ///
 /// The report arrives already rendered by the frontend's formatter; this only
 /// budgets it against the context window. The plan is advisory output — no
@@ -1365,13 +1721,14 @@ pub fn suggest_branch_name(
 pub fn fix_health(
     repo_path: &str,
     report_text: &str,
-    selection: Option<AiSelection>,
+    route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
     if report_text.trim().is_empty() {
         return Err("The health report is empty, so there is nothing to plan a fix for.".into());
     }
+    let route: Route = route.into();
     run_advisory_with_empty_retry("remediation plan", |retry| {
-        run(Feature::HealthFix, repo_path, selection.clone(), |budget| {
+        run(Feature::HealthFix, repo_path, route.clone(), |budget| {
             let budgeted = prompt::budget_text(report_text, budget.min(48_000));
             let mut system = prompt::health_fix_system();
             append_visible_answer_retry(&mut system, retry);
@@ -1384,7 +1741,7 @@ pub fn fix_health(
     })
 }
 
-/// Asks the local model for an analysis of a rendered test-coverage report.
+/// Asks the selected model for an analysis of a rendered test-coverage report.
 ///
 /// The report arrives already rendered by the frontend's formatter; this only
 /// budgets it against the context window. The output is advisory — GitPulse
@@ -1392,16 +1749,17 @@ pub fn fix_health(
 pub fn coverage_report(
     repo_path: &str,
     report_text: &str,
-    selection: Option<AiSelection>,
+    route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
     if report_text.trim().is_empty() {
         return Err("The coverage report is empty, so there is nothing to analyze.".into());
     }
+    let route: Route = route.into();
     run_advisory_with_empty_retry("coverage analysis", |retry| {
         run(
             Feature::CoverageReport,
             repo_path,
-            selection.clone(),
+            route.clone(),
             |budget| {
                 let budgeted = prompt::budget_text(report_text, budget.min(48_000));
                 let mut system = prompt::coverage_report_system();
@@ -1503,6 +1861,7 @@ mod tests {
     use super::*;
 
     mod consent_adversarial_tests;
+    mod manvi_route_tests;
     use crate::procguard::LockedSpawn;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1831,7 +2190,11 @@ mod tests {
 
         let error = crate::ipc_error::run_command(|| {
             with_isolated_tools_config(|| {
-                generate_commit_message_with(&repo.path().to_string_lossy(), None, sweep)
+                generate_commit_message_with(
+                    &repo.path().to_string_lossy(),
+                    Ok(Route::Local(None)),
+                    sweep,
+                )
             })
         })
         .expect_err("no preferred selection: the first send needs confirmation");
@@ -2380,7 +2743,12 @@ mod tests {
     /// discovery, no sidecar, no HTTP — with the coverage-specific error.
     #[test]
     fn coverage_report_rejects_a_whitespace_only_report_without_a_server() {
-        let err = coverage_report("/definitely/not/a/repository", "   \n\t ", None).unwrap_err();
+        let err = coverage_report(
+            "/definitely/not/a/repository",
+            "   \n\t ",
+            None::<AiSelection>,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "The coverage report is empty, so there is nothing to analyze."

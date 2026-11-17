@@ -60,13 +60,28 @@ describe("selectionWire", () => {
 describe("Claude selections", () => {
   const claude = { provider: "anthropic" as const, model: "claude-sonnet-5-5" };
 
-  it("wins over a local selection when the Manvi pane chose Claude", () => {
-    expect(effectiveSelection({ preferred: ok, ai: { selected: ok }, manviClaude: { model: "claude-sonnet-5-5" } })).toEqual(claude);
-    expect(effectiveSelection({ preferred: ok, ai: null, manviClaude: null })).toEqual(ok);
+  it("is Manvi's own choice when Manvi answered, whatever was saved locally", () => {
+    const ready = { state: "ready", selection: claude };
+    expect(effectiveSelection({ preferred: ok, ai: { selected: ok, manvi: ready } })).toEqual(claude);
+    expect(effectiveSelection({ preferred: null, ai: { selected: null, manvi: { state: "ready", selection: ok } } })).toEqual(ok);
   });
 
-  it("never falls back to a local model when the Claude choice is invalid", () => {
-    expect(effectiveSelection({ preferred: ok, ai: null, manviClaude: { model: "gpt-5" } })).toBeNull();
+  it("is none, never a local model nobody picked, when Manvi answered with a mode GitPulse cannot use", () => {
+    expect(effectiveSelection({ preferred: ok, ai: { selected: ok, manvi: { state: "ready", selection: null } } })).toBeNull();
+    expect(
+      effectiveSelection({
+        preferred: ok,
+        ai: { selected: ok, manvi: { state: "ready", selection: { provider: "anthropic", model: "gpt-5" } } },
+      }),
+    ).toBeNull();
+  });
+
+  it("falls back to the saved selection, then the scan, only when Manvi could not be read or has no chosen mode", () => {
+    for (const state of ["not_installed", "needs_update", "failed", "not_chosen"]) {
+      expect(effectiveSelection({ preferred: ok, ai: { selected: null, manvi: { state, selection: null } } })).toEqual(ok);
+    }
+    expect(effectiveSelection({ preferred: null, ai: { selected: ok } })).toEqual(ok);
+    expect(effectiveSelection({ preferred: null, ai: null })).toBeNull();
   });
 
   it("carries the provider on the wire and never a base_url", () => {

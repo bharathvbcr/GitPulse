@@ -21,7 +21,7 @@ describe("CoverageViewer", () => {
 
   it("always renders the Manvi toggle affordance in the header", () => {
     const { body } = render(CoverageViewer);
-    expect(body).toContain("Manvi: analyze coverage with the local model");
+    expect(body).toContain("Manvi: analyze coverage with the selected model");
   });
 
   it("always renders a copy-report affordance in the header", () => {

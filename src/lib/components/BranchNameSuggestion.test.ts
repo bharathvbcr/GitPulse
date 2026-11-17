@@ -16,7 +16,7 @@ describe("BranchNameSuggestion", () => {
     // than a permanently disabled button.
     expect(render(BranchNameSuggestion).body).not.toContain("Suggest a name");
     expect(source).toContain("{#if ready && $repoStore.currentPath}");
-    expect(source).toContain("Boolean($harnessStore.ai?.ready)");
+    expect(source).toContain("let ready = $derived($aiReadiness.ready);");
   });
 
   it("creates the suggested branch in the repository it was suggested for, and keeps it on failure", () => {

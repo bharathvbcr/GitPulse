@@ -2,7 +2,7 @@
  * Effective model selection for task enhancements.
  *
  * The sheet never owns a second model picker: the Manvi pane either names a
- * Claude model (`manviClaude`) or leaves Manvi on the "Local model servers"
+ * Claude model (`cloudChoice`) or leaves Manvi on the "Local model servers"
  * card, which pins `preferred` while discovery fills `ai.selected`. Host
  * methods carry the result so the sidecar can spawn with matching MANVI_* env.
  */
@@ -25,11 +25,18 @@ export type ModelSelection = LocalModelSelection | ClaudeModelSelection;
 /** The Claude models Manvi's Anthropic adapter knows, newest tier first. */
 export const CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"] as const;
 
+/** What `manvi use --json` told the backend, as far as a selection needs it. */
+export interface ManviChoice {
+  /** `ready` when Manvi answered; anything else means it could not be read. */
+  state: string;
+  /** The selection GitPulse spawns the worker with; null when it cannot use the mode. */
+  selection: ModelSelection | null;
+}
+
 export interface SelectionState {
+  /** The saved loopback selection: only the fallback when Manvi cannot be read. */
   preferred: LocalModelSelection | null;
-  ai: { selected: LocalModelSelection | null } | null;
-  /** Set when Manvi should use Claude instead of a local model. */
-  manviClaude?: { model: string } | null;
+  ai: { selected: LocalModelSelection | null; manvi?: ManviChoice } | null;
 }
 
 const CLAUDE_MODEL = /^claude-[a-z0-9.-]{1,120}$/;
@@ -42,12 +49,16 @@ export interface EnhancementFailureAdvice {
 const LOOPBACK = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?(\/.*)?$/i;
 
 /**
- * Claude when the Manvi pane chose it; otherwise preferred wins over the
- * auto-chosen scan result. A Claude choice that is not a valid model id falls
- * back to nothing rather than to a local model the person did not pick.
+ * Manvi's own choice (`manvi use`), cloud or local, which the backend already
+ * mapped to a selection. When Manvi answered but GitPulse cannot use its mode
+ * (another provider, a remote server, no model) the answer is none: never a
+ * local model the person did not pick. Only when Manvi could not be read at
+ * all does the old rule apply: the saved selection wins over the auto-chosen
+ * scan result.
  */
 export function effectiveSelection(state: SelectionState): ModelSelection | null {
-  if (state.manviClaude) return normalizeSelection({ provider: "anthropic", model: state.manviClaude.model });
+  const manvi = state.ai?.manvi;
+  if (manvi?.state === "ready") return normalizeSelection(manvi.selection);
   return normalizeSelection(state.preferred) ?? normalizeSelection(state.ai?.selected ?? null);
 }
 

@@ -19,6 +19,7 @@
       "serve.status",
       "serve.stop_all",
       "serve.takeover",
+      "work.assist.complete",
       "work.attention.get",
       "work.attention.list",
       "work.attention.update",
@@ -98,6 +99,82 @@
     ]
   },
   "types": {
+    "AssistCompleteParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "dry_run": {
+          "type": "boolean",
+          "required": false
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "system": {
+          "type": "string",
+          "required": false
+        },
+        "user": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "AssistCompleteResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "context_window": {
+          "type": "integer",
+          "required": true
+        },
+        "input_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "model": {
+          "type": "string",
+          "required": true
+        },
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "output_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required": true
+        },
+        "reasoning": {
+          "type": "string",
+          "required": true
+        },
+        "redactions": {
+          "type": "integer",
+          "required": true
+        },
+        "stop_reason": {
+          "type": "string",
+          "required": true
+        },
+        "text": {
+          "type": "string",
+          "required": true
+        },
+        "truncated": {
+          "type": "boolean",
+          "required": true
+        }
+      }
+    },
     "CommandCheckParams": {
       "type": "object",
       "required": false,

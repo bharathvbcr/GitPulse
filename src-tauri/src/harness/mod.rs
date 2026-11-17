@@ -12,6 +12,7 @@
 pub(crate) mod anthropic_account;
 pub(crate) mod claude_key;
 pub mod hosted;
+pub mod manvi_use;
 pub mod policy;
 pub mod protocol;
 pub(crate) mod review;

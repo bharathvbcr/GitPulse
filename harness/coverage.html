@@ -358,7 +358,7 @@
           // Plan steps and coverage scripts share one cancellation guard, so
           // neither may start while the other runs: the one cancelled stayed
           // "running" forever and disabled every run control with it.
-          button("Manvi: analyze coverage with the local model").click(); await tick();
+          button("Manvi: analyze coverage with the selected model").click(); await tick();
           byText("Generate AI report").click();
           await until(() => !!button("Execute this command step directly"));
           runDelay = 500;
@@ -372,7 +372,7 @@
           await until(() => !byText("Run Rust coverage").disabled);
           check("no run is left running once both finished", settled() && !region().textContent.includes("Running…"));
           runDelay = 0;
-          button("Manvi: analyze coverage with the local model").click(); await tick();
+          button("Manvi: analyze coverage with the selected model").click(); await tick();
           mode = "measured"; button("Measured coverage").click(); button("Rescan coverage artifacts").click();
           await until(() => !document.querySelector("[data-coverage-family-strip]") || !document.querySelector("[data-coverage-family]"));
 

@@ -217,7 +217,8 @@ function aiWith(model: string, harness: HarnessStatus = harnessOk): AiStatus {
     model_detail: "",
     ready: true,
     detail: "",
-  } as AiStatus;
+    manvi: { state: "not_installed", detail: "", selection: null },
+  } as unknown as AiStatus;
 }
 
 describe("probe token staleness", () => {

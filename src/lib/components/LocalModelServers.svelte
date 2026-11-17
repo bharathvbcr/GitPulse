@@ -6,7 +6,8 @@
    *
    * Distinct from Agent models above it in Settings → Agents: those are the
    * models an agent CLI starts with in a terminal; these are the models behind
-   * Manvi's planning and GitPulse's commit messages and explanations.
+   * Manvi's planning and GitPulse's commit messages and explanations (while
+   * Manvi is on Claude, both use Claude instead and this card is idle).
    */
   import { harnessStore, type AiSelection } from "../stores/harnessStore";
   import { invoke } from "../ipc/invoke";
@@ -147,9 +148,10 @@
           <div class="min-w-0 flex-1">
             {ai.detail || "No local model server answered."}
             <p class="mt-1.5 text-textMuted">
-              GitPulse only ever talks to a model server on this machine: the transport refuses
-              any address that is not loopback, so a diff cannot leave the machine through a
-              mistyped setting.
+              GitPulse talks to a model server on this machine only: the transport refuses
+              any address that is not loopback, so a diff cannot reach one through a
+              mistyped setting. Only choosing Claude in Manvi's model sends a diff
+              elsewhere: to the Claude API, through Manvi.
             </p>
           </div>
         </div>

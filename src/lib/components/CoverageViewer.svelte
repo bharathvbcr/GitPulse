@@ -72,6 +72,8 @@
   } from "../coverage/scripts";
   import {
     harnessStore,
+    aiReadiness,
+    describeAiTarget,
     type AiGeneration,
     verdictLabel,
   } from "../stores/harnessStore";
@@ -397,7 +399,8 @@
   let issueError = $state<string | null>(null);
   let issueUrl = $state<string | null>(null);
 
-  let aiReady = $derived($harnessStore.ai?.ready ?? false);
+  let aiReady = $derived($aiReadiness.ready);
+  let aiTarget = $derived(describeAiTarget($aiReadiness));
   /**
    * The single decision point for what coverage generation is offered. Both
    * the header strip and the empty-state sidebar render from this; neither
@@ -1545,8 +1548,8 @@
         type="button"
         class="gp-icon-btn" data-size="sm"
         class:text-accent={aiOpen}
-        title="Manvi: analyze coverage with the local model"
-        aria-label="Manvi: analyze coverage with the local model"
+        title="Manvi: analyze coverage with the selected model"
+        aria-label="Manvi: analyze coverage with the selected model"
         onclick={() => (aiOpen = !aiOpen)}
         disabled={!report}
       >
@@ -2149,8 +2152,8 @@
             data-variant="primary"
             data-size="md"
             title={aiReady
-              ? "Send the rendered coverage report to the local model through Manvi"
-              : "Needs a local model server. The exact error will be reported if none is reachable."}
+              ? `Send the rendered coverage report to ${aiTarget}`
+              : $aiReadiness.reason || "No model is available. The exact error will be reported if none is reachable."}
           >
             {#if generating}
               <LoaderCircle size={12} class="animate-spin" />
@@ -2165,7 +2168,7 @@
         {#if !aiReady}
           <div class="px-3 py-2 shrink-0">
             <div class="gp-notice text-meta" data-tone="info" role="status">
-              <div class="min-w-0 flex-1">No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan.</div>
+              <div class="min-w-0 flex-1">{$aiReadiness.target === "cloud" ? $aiReadiness.reason : "No local model server found. Start Ollama, LM Studio, llama.cpp, vLLM or Jan."}</div>
             </div>
           </div>
         {/if}
@@ -2184,7 +2187,7 @@
           {#if generating && !aiGeneration}
             <div class="flex items-center gap-2 text-textMuted py-2">
               <LoaderCircle size={14} class="animate-spin" />
-              Sending the coverage report to the local model…
+              Sending the coverage report to {aiTarget}…
             </div>
           {:else if aiGeneration}
             <p class="text-meta text-textMuted font-mono truncate" title="{aiGeneration.model} · {aiGeneration.context_source}">
@@ -2304,7 +2307,7 @@
             {/if}
           {:else}
             <p class="text-textMuted text-meta leading-relaxed">
-              Ask the local model what these results mean and which commands would raise coverage.
+              Ask the selected model what these results mean and which commands would raise coverage.
             </p>
           {/if}
         </div>
