@@ -2,10 +2,13 @@
 /**
  * Does every installed reader agree with the schemas DevCouncil writes?
  *
- * DevCouncil owns four schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
- * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`) and the
+ * DevCouncil owns five formats: the devmap store (`CURRENT_SCHEMA_VERSION`),
+ * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`), the
  * extraction payload (devmap-extract's `EXTRACTION_SCHEMA_VERSION`, a string
- * constant; a stored graph written at another version is reported obsolete). Every
+ * constant; a stored graph written at another version is reported obsolete) and
+ * the stacked-worktree lease (devmap-query's `STACK_FORMAT_VERSION`, which no
+ * schema number tracks: a devmap that reads another lease format rejects every
+ * stacked lane GitPulse provisions while the schemas all agree). Every
  * other app reads at least one of them, and each reads it through something
  * that can fall behind on its own:
  *
@@ -61,6 +64,7 @@ export const SCHEMAS = Object.freeze({
   dcStore: { label: "dc-store", constant: "SCHEMA_VERSION", file: "dc-store/src/lib.rs" },
   workbench: { label: "workbench", constant: "WORKBENCH_SCHEMA", file: "dc-store/src/workbench/mod.rs" },
   extract: { label: "devmap-extract", constant: "EXTRACTION_SCHEMA_VERSION", file: "devmap-extract/src/cache.rs" },
+  lease: { label: "stack lease", constant: "STACK_FORMAT_VERSION", file: "devmap-query/src/stacked.rs" },
 });
 
 /** @typedef {keyof typeof SCHEMAS} SchemaKey */
@@ -344,13 +348,16 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
   if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
-  return { reader, keys: ALL_KEYS, schemas };
+  // The manifest names no lease format yet, so this row is unverifiable for it
+  // until gitpulse-mcp's manifest reports `STACK_FORMAT_VERSION`.
+  return { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" };
 }
 
 /**
  * `devmap` on PATH. Its `--version` line names the store schema, and names the
- * extraction schema only once DevCouncil prints one (`extract schema N`); a
- * build that does not is unverifiable for it, never assumed to match.
+ * extraction schema and the lease format only once DevCouncil prints them
+ * (`extract schema N`, `stack lease format N`); a build that does not is
+ * unverifiable for them, never assumed to match.
  *
  * @param {ReturnType<typeof readCliSchema> | null} [cli]
  * @returns {Reading}
@@ -358,17 +365,22 @@ async function serverReading(reader, bin, absent, timeoutMs) {
 export function devmapReading(cli = resolveOnPath("devmap") === null ? null : readCliSchema()) {
   const reader = "devmap (PATH)";
   /** @type {SchemaKey[]} */
-  const keys = ["store", "extract"];
+  const keys = ["store", "extract", "lease"];
   if (cli === null) return { reader, keys, absent: "not on PATH" };
   if (!cli.available) return { reader, keys, error: cli.reason };
   /** @type {Schemas} */
   const schemas = { store: cli.expected };
   if (typeof cli.extract === "number") schemas.extract = cli.extract;
+  if (typeof cli.lease === "number") schemas.lease = cli.lease;
+  const unprinted = [
+    ...(schemas.extract === undefined ? ["the extraction schema (`extract schema N`)"] : []),
+    ...(schemas.lease === undefined ? ["the stack lease format (`stack lease format N`)"] : []),
+  ];
   return {
     reader,
     keys,
     schemas,
-    ...(schemas.extract === undefined ? { note: "devmap --version does not print the extraction schema; DevCouncil must add it" } : {}),
+    ...(unprinted.length > 0 ? { note: `devmap --version does not print ${unprinted.join(" or ")}; DevCouncil must add it` } : {}),
   };
 }
 

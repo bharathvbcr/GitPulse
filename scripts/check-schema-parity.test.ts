@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { wallClockBudget } from "../src/lib/testing/wallClock";
+import { readCliSchema } from "./check-vendor-schema.mjs";
 import {
   SCHEMAS,
   SERVE_CONTRACT,
@@ -21,8 +22,8 @@ import {
   summarize,
 } from "./check-schema-parity.mjs";
 
-const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94 };
-const ALL = ["store", "dcStore", "workbench", "extract"] as const;
+const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94, lease: 2 };
+const ALL = ["store", "dcStore", "workbench", "extract", "lease"] as const;
 
 const tempDirs: string[] = [];
 afterAll(() => {
@@ -35,13 +36,24 @@ function git(cwd: string, ...args: string[]): string {
   return out.stdout.trim();
 }
 
+/** An executable that answers `--version` with this line and refuses every other argument. */
+function fakeDevmap(versionLine: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "gitpulse-fake-devmap-"));
+  tempDirs.push(dir);
+  const bin = path.join(dir, "devmap");
+  writeFileSync(bin, `#!/bin/sh\n[ "$1" = "--version" ] && { echo '${versionLine}'; exit 0; }\nexit 1\n`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
 /** Writes DevCouncil's three schema files at these numbers under `rust/`. */
-function writeOwner(root: string, schemas: { store: number; dcStore: number; workbench: number; extract: number }) {
+function writeOwner(root: string, schemas: { store: number; dcStore: number; workbench: number; extract: number; lease?: number }) {
   const files: Record<string, string> = {
     [SCHEMAS.store.file]: `pub const CURRENT_SCHEMA_VERSION: i32 = ${schemas.store};\npub const MIN_READER_SCHEMA_VERSION: i32 = 25;\n`,
     [SCHEMAS.dcStore.file]: `pub const SCHEMA_VERSION: u32 = ${schemas.dcStore};\n`,
     [SCHEMAS.workbench.file]: `pub const WORKBENCH_SCHEMA: i64 = ${schemas.workbench};\n`,
     [SCHEMAS.extract.file]: `pub const EXTRACTION_SCHEMA_VERSION: &str = "${schemas.extract}";\n`,
+    [SCHEMAS.lease.file]: `pub const STACK_FORMAT_VERSION: u32 = ${schemas.lease ?? owner.lease};\n`,
   };
   for (const [file, text] of Object.entries(files)) {
     const full = path.join(root, "rust", file);
@@ -172,7 +184,7 @@ describe("judge", () => {
 });
 
 describe("devmapReading", () => {
-  const cli = (extract: number | null) => ({ available: true as const, expected: 27, versionLine: "devmap 0.2.4", source: "version", extract });
+  const cli = (extract: number | null, lease: number | null = owner.lease) => ({ available: true as const, expected: 27, versionLine: "devmap 0.2.4", source: "version", extract, lease });
 
   it("is unverifiable for extract while devmap --version does not print it, and says what to change", () => {
     const row = judge(owner, devmapReading(cli(null)));
@@ -184,6 +196,38 @@ describe("devmapReading", () => {
   it("matches once devmap prints the extraction schema, and is stale when it is behind", () => {
     expect(judge(owner, devmapReading(cli(94))).verdict).toBe("match");
     expect(judge(owner, devmapReading(cli(93))).verdict).toBe("stale");
+  });
+});
+
+describe("stack-lease format", () => {
+  const cli = (lease: number | null) => ({ available: true as const, expected: 27, versionLine: "devmap 0.2.5", source: "version", extract: 94, lease });
+
+  it("reads the vendored writer's STACK_FORMAT_VERSION from source", () => {
+    expect(rustConstant("pub const STACK_FORMAT_VERSION: u32 = 2;", "STACK_FORMAT_VERSION")).toBe(2);
+  });
+
+  it("calls a devmap that reads only lease format 1 stale against a writer of format 2", () => {
+    const row = judge(owner, devmapReading(cli(1)));
+    expect(row.verdict).toBe("stale");
+    expect(row.detail).toContain("stack lease 1, DevCouncil writes 2");
+  });
+
+  it("matches a devmap that reads format 2", () => {
+    expect(judge(owner, devmapReading(cli(2))).verdict).toBe("match");
+  });
+
+  it("is unverifiable, not skipped, for a devmap that cannot report its lease format, and says what to print", () => {
+    const row = judge(owner, devmapReading(cli(null)));
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("does not report stack lease");
+    expect(row.detail).toContain("stack lease format N");
+    expect(summarize([row]).ok).toBe(false);
+  });
+
+  it("asks an installed devmap through its --version line", () => {
+    const bin = fakeDevmap("devmap 0.2.5 (store schema 27, code graph schema 2, extract schema 94, stack lease format 1, build abc)");
+    expect(readCliSchema(bin).lease).toBe(1);
+    expect(readCliSchema(fakeDevmap("devmap 0.2.5 (store schema 27, extract schema 94, build abc)")).lease).toBeNull();
   });
 });
 
@@ -278,7 +322,7 @@ describe("pins", () => {
     git(root, "add", "-A");
     git(root, "commit", "-q", "-m", "early");
     const early = git(root, "rev-parse", "HEAD");
-    expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9, extract: 94 });
+    expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9, extract: 94, lease: 2 });
     const row = judge(owner, { reader: "Jarvis pin", keys: [...ALL], schemas: schemasAt(root, early) });
     expect(row.verdict).toBe("stale");
   });
