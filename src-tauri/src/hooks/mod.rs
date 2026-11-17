@@ -4139,6 +4139,12 @@ fn peer_inbox_in_with_boundary(
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
         return (HookOutput::silent(), fresh_user_turn);
     }
+    // This runs on every tool call: learn that nothing is waiting without the
+    // session lock. An error falls through to the claim, which reports nothing
+    // differently from before.
+    if matches!(mailbox.has_unclaimed(&input.session_id), Ok(false)) {
+        return (HookOutput::silent(), fresh_user_turn);
+    }
 
     let Ok(claimed) = mailbox.try_claim_batch(&input.session_id, 8, std::time::SystemTime::now())
     else {
@@ -4340,6 +4346,14 @@ fn run_notify(
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
 ) -> Result<HookOutput, HookError> {
+    // A Claude Code `Stop` arrives here as `notify turn_finished`, and never
+    // reaches `stop_continue_in` (Antigravity's stop path, which marks the peer
+    // idle itself), so without this the peer stayed "working" after its turn.
+    if argument == Some("turn_finished") {
+        if let Some(root) = trusted_hook_root(input) {
+            let _ = upsert_hook_peer(&root, input, "idle");
+        }
+    }
     let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
     if argument == Some("tool_finished") {
         report_agent_touched_file(input);
@@ -12726,5 +12740,77 @@ done
             .entries
             .is_empty());
         primary.shutdown();
+    }
+
+    /// The peer-inbox hook runs on every tool call. Once a session's mailbox
+    /// exists and holds nothing pending, it must not take the session lock to
+    /// find that out. And a Claude Code `Stop` (`notify turn_finished`) must
+    /// leave the peer idle rather than "working" until its next tool call; that
+    /// held only on Antigravity's stop path.
+    #[test]
+    fn an_empty_peer_inbox_takes_no_lock_and_a_claude_turn_finished_marks_the_peer_idle() {
+        let repo_dir = crate::codeintel::tests::repo_with_one_generation();
+        let repo_str = repo_dir.path().to_str().unwrap().to_owned();
+        crate::test_support::trust_repo(repo_dir.path());
+        let mb_dir = tempfile::tempdir().unwrap();
+        let mb_root = mb_dir.path().join("agent-mailbox");
+        let mailbox = crate::agent_mailbox::Mailbox::new(mb_root.clone());
+        let locks = mb_root.join(".locks");
+        let sid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let peer_state = || {
+            crate::engine::agent_bus::list_reconciled_peers(&repo_str)
+                .unwrap()
+                .into_iter()
+                .find(|p| p.record.provider_session_id.as_deref() == Some(sid))
+                .map(|p| p.record.turn_state)
+        };
+        let post_tool = parse_input(
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": sid,
+                "cwd": repo_str,
+                "tool_name": "Read",
+                "tool_input": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let stop = parse_input(
+            &json!({ "hook_event_name": "Stop", "session_id": sid, "cwd": repo_str }).to_string(),
+        )
+        .unwrap();
+
+        // A waiting message is delivered through the claim, which takes the lock.
+        mailbox
+            .deposit(sid, "msg-first", "ping", std::time::SystemTime::now())
+            .unwrap();
+        assert!(
+            !peer_inbox_in(&mailbox, &post_tool).is_silent(),
+            "a pending message must be delivered"
+        );
+        assert_eq!(peer_state().as_deref(), Some("working"));
+
+        // The session's mailbox now exists with nothing pending: the next tool
+        // call must answer that without the session lock.
+        std::fs::remove_dir_all(&locks).unwrap();
+        assert!(peer_inbox_in(&mailbox, &post_tool).is_silent());
+        assert!(
+            !locks.exists(),
+            "an empty session mailbox must be answered without the session lock"
+        );
+
+        let _ = run_notify(Some("turn_finished"), &stop, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            peer_state().as_deref(),
+            Some("idle"),
+            "a Claude Stop must mark the peer idle"
+        );
+
+        assert!(peer_inbox_in(&mailbox, &post_tool).is_silent());
+        assert_eq!(
+            peer_state().as_deref(),
+            Some("working"),
+            "the next tool call resumes it"
+        );
     }
 }

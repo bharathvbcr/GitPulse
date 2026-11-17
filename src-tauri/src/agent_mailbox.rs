@@ -698,6 +698,32 @@ impl Mailbox {
             .map(|env| env.claim))
     }
 
+    /// Whether `session` has a pending (`p-*`) envelope on disk, answered
+    /// without the session's `flock`, so the peer-inbox hook that runs on every
+    /// tool call does not take a cross-process lock to learn there is nothing
+    /// to read.
+    ///
+    /// It looks at the same first [`SCAN_LIMIT`] entries the claim does, and
+    /// counts a `p-*` name the claim might still skip (a foreign owner, a
+    /// symlink), so it can only say yes too often, never no when the claim
+    /// would have found one. Expired envelopes are left for the next claim to
+    /// remove; nothing is lost by not expiring them here.
+    pub(crate) fn has_unclaimed(&self, session: &str) -> Result<bool, MailboxError> {
+        let key = session_key(session)?;
+        let dir = self.root.join(&key);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io("could not look at the session's mailbox", &e)),
+        };
+        Ok(entries.take(SCAN_LIMIT).flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("p-") && parse_message_name(name).is_some())
+        }))
+    }
+
     /// Non-blocking batch claim of up to `max_items` oldest pending envelopes
     /// under the session's cross-process advisory `flock`.
     pub(crate) fn try_claim_batch(

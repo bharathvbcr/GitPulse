@@ -74,11 +74,25 @@ fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
     std::panic::catch_unwind(decide).unwrap_or_else(|_| {
         log::error!(target: "hook", "gitpulse-hook panicked; no decision");
         let code = hooks::worktree::exit_code_after_panic();
-        if code == 0 && hooks::is_antigravity_env() {
+        if code == 0
+            && is_agy_invocation_from(std::env::args().skip(1), hooks::is_antigravity_env())
+        {
             emit("{}\n".into());
         }
         code
     })
+}
+
+/// Whether this run serves Antigravity, which needs a JSON object on stdout
+/// even when the hook panicked: either the environment says so, or the hook
+/// was registered `--host=agy` (the plugin's `hooks.json` does, and Antigravity
+/// does not always set the environment the check reads).
+fn is_agy_invocation_from<I, S>(args: I, env_is_agy: bool) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    env_is_agy || args.into_iter().any(|arg| arg.as_ref() == "--host=agy")
 }
 
 /// Runs one hook invocation and returns its exit code, which
@@ -1099,5 +1113,21 @@ mod tests {
         )
         .expect_err("parent traversal");
         assert!(!traversal.is_empty());
+    }
+
+    /// A panic under a `--host=agy` registration must still answer `{}`, even
+    /// when the Antigravity environment variable is absent.
+    #[test]
+    fn host_agy_flag_identifies_antigravity_even_without_env() {
+        assert!(is_agy_invocation_from(
+            ["--host=agy", "session-brief"],
+            false
+        ));
+        assert!(!is_agy_invocation_from(["session-brief"], false));
+        assert!(is_agy_invocation_from(["session-brief"], true));
+        assert!(
+            !is_agy_invocation_from(["--host=agyx", "notify"], false),
+            "only the exact flag counts"
+        );
     }
 }

@@ -918,3 +918,34 @@ fn a_lost_provenance_sidecar_never_reads_as_human_confirmed() {
         "a lost sidecar must not upgrade an agent message to human-confirmed: {claimed:?}"
     );
 }
+
+/// The peer-inbox hook asks this on every tool call. An empty mailbox must be
+/// answered without the session `flock` (no `.locks` entry appears), a pending
+/// envelope must be seen, and a claimed one must not.
+#[test]
+fn has_unclaimed_takes_no_lock_and_sees_only_pending_envelopes() {
+    let (dir, mailbox) = mailbox();
+    assert!(!mailbox.has_unclaimed(SESSION).unwrap());
+    assert!(
+        !dir.path().join(".locks").exists(),
+        "the empty check must not take the session lock"
+    );
+
+    mailbox
+        .deposit(SESSION, "msg-fast-1", "ping", SystemTime::now())
+        .unwrap();
+    assert!(mailbox.has_unclaimed(SESSION).unwrap());
+
+    let claimed = mailbox
+        .try_claim_batch(SESSION, 4, SystemTime::now())
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        !mailbox.has_unclaimed(SESSION).unwrap(),
+        "a claimed c-* envelope is not unclaimed"
+    );
+    assert!(
+        mailbox.has_unclaimed("not a session").is_err(),
+        "an invalid session key is an error, not an empty mailbox"
+    );
+}
