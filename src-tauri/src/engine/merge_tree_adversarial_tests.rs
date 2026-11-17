@@ -12,7 +12,9 @@ use crate::engine::worktree::{
 };
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     git_text(cwd, args)

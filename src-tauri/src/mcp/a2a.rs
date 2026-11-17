@@ -18,7 +18,9 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +38,8 @@ pub const MAX_WAIT_CALLS: usize = 4;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 45_000;
 
 static ACTIVE_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+// Only the macOS branch of `reach_desktop_agent_deliver` mints a request id.
+#[cfg(target_os = "macos")]
 static RPC_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn in_process_bus_waker() -> &'static (Mutex<u64>, Condvar) {
@@ -95,6 +99,7 @@ impl Drop for WaitCallSlot<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn next_rpc_id(prefix: &str) -> String {
     let seq = RPC_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
     let ms = SystemTime::now()

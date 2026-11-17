@@ -16823,7 +16823,9 @@ mod scan_once_tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
             .unwrap();
-        // A changed path that cannot be read.
+        // A changed path that cannot be read. Unix only: the block below
+        // removes the directory's permissions, which Windows has no mode for.
+        #[cfg(unix)]
         let unreadable: Arc<str> = Arc::from(" M sub/f.txt\0");
         #[cfg(unix)]
         {
