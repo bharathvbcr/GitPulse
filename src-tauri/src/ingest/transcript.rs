@@ -1107,9 +1107,14 @@ pub fn candidate_path(call: &ToolCall) -> &str {
 /// The root of `roots` that owns `call`: the deepest one its path lies under,
 /// so a worktree nested in the repository takes its own calls and the
 /// repository keeps only what is not under any worktree. Roots are ranked by
-/// their length without trailing separators (`/` or `\`), so `/repo/` does not
-/// outrank `/repo`; equal depth keeps the first listed. A path longer than
-/// [`MAX_PATH_BYTES`] is unattributable, not read.
+/// the number of components of the spelling that matched the path, normalised
+/// (`.` and `..` folded, a Windows verbatim prefix stripped, separators unified,
+/// a link root by its real spelling when that is what matched), so neither
+/// `/repo/` nor `/repo/sub/..` outranks `/repo`, and a long link to a shallow
+/// directory does not outrank a deeper root. Roots of equal depth that both
+/// match name one directory, and the first listed wins. A path longer than
+/// [`MAX_PATH_BYTES`] without its trailing separators is unattributable, not
+/// read.
 ///
 /// Containment is by whole components, so `/repo-other` is never under `/repo`.
 /// What a path is compared with is decided once, when the [`RootSet`] is built
@@ -1121,21 +1126,28 @@ pub fn attribution_root<'a>(call: &ToolCall, roots: &RootSet<'a>) -> Option<&'a 
 
 /// The deepest root of `roots` that `path` lies under; see [`attribution_root`].
 pub fn deepest_root<'a>(path: &str, roots: &RootSet<'a>) -> Option<&'a str> {
-    if path.len() > MAX_PATH_BYTES {
+    if !within_cap(path) {
         return None;
     }
     let path = PathForm::new(path);
     roots
         .roots
         .iter()
-        .filter(|root| root.owns(&path))
-        .reduce(|best, root| if root.depth > best.depth { root } else { best })
-        .map(|root| root.raw)
+        .filter_map(|root| root.matched_depth(&path).map(|depth| (depth, root)))
+        .reduce(|best, found| if found.0 > best.0 { found } else { best })
+        .map(|(_, root)| root.raw)
 }
 
 /// A path longer than this is never attributed, and a call whose `cwd` is
 /// longer is never read as a removed worktree's.
 const MAX_PATH_BYTES: usize = 4096;
+
+/// Whether `path` is short enough to be read: at most [`MAX_PATH_BYTES`] without
+/// its trailing separators. The one test for every path a call is attributed
+/// by, so a call is never attributable by one reading and not by another.
+fn within_cap(path: &str) -> bool {
+    path.trim_end_matches('/').len() <= MAX_PATH_BYTES
+}
 /// Where isolation worktrees live below a checkout.
 const WORKTREES_DIR: &str = "/.claude/worktrees/";
 
@@ -1166,7 +1178,7 @@ pub struct Departed<'c, 'r> {
 pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &RootSet<'r>) -> Option<Departed<'c, 'r>> {
     let cwd = call.cwd.trim_end_matches('/');
     // Almost every call: nothing below its root has the shape.
-    if cwd.len() > MAX_PATH_BYTES || !cwd.contains(WORKTREES_DIR) {
+    if !within_cap(cwd) || !within_cap(candidate_path(call)) || !cwd.contains(WORKTREES_DIR) {
         return None;
     }
     let host = deepest_root(cwd, roots)?;
@@ -1241,9 +1253,15 @@ fn lexical(path: &str) -> std::borrow::Cow<'_, str> {
 /// * its real spelling, when it exists and differs (`/var/x` is
 ///   `/private/var/x` on macOS, a linked root is its target), so a path written
 ///   either way is under it;
-/// * whether its volume ignores case, probed by asking whether its last
-///   component in flipped case is the same directory, and never assumed from
-///   the OS; where it does, both sides compare without case;
+/// * whether its volume ignores case, probed by asking whether the deepest
+///   component with an ASCII letter, in flipped case, is the same directory,
+///   and never assumed from the OS; where it does, both sides compare with
+///   Rust's lower-casing. A root with no letter in any component leaves the
+///   volume unknown and compares exact-case. Limit: lower-casing is not what
+///   APFS folds, so `ß`/`SS`, `İ`, `é` composed or decomposed and a final
+///   sigma are false misses (never false matches), as byte-exact matching has
+///   always missed them; folding them needs Unicode normalisation, a new
+///   dependency and an owner decision;
 /// * for a root spelled as a Windows path (a drive letter, `\\server\share`,
 ///   `//server/share`, `\\?\C:\`), its drive or share and the components below,
 ///   compared without case.
@@ -1252,31 +1270,34 @@ fn lexical(path: &str) -> std::borrow::Cow<'_, str> {
 /// in the path itself (`/link/f.rs` where `/link` points into the root). The
 /// transcript's path is taken as written; resolving every line's path would ask
 /// the filesystem once per call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RootSet<'a> {
     roots: Vec<PreparedRoot<'a>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PreparedRoot<'a> {
     raw: &'a str,
-    /// The ranking measure: `raw` without trailing `/` or `\`.
-    depth: usize,
     forms: Vec<RootForm>,
 }
 
 /// One way a root can be spelled, ready to compare with a path.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RootForm {
     /// An absolute POSIX path, lexical, without a trailing `/`; lower case when
     /// `fold`, which is then how the path is compared too.
-    Posix { text: String, fold: bool },
+    Posix {
+        text: String,
+        fold: bool,
+        /// Components in `text`: how deep this spelling is, for ranking.
+        depth: usize,
+    },
     /// A Windows path, lower case with `/` separators: the drive (`c:`) or the
     /// `//server/share`, and the absolute rest.
-    Windows(WindowsForm),
+    Windows { form: WindowsForm, depth: usize },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowsForm {
     prefix: String,
     rest: String,
@@ -1290,6 +1311,13 @@ impl<'a> RootSet<'a> {
                 .iter()
                 .map(|&raw| PreparedRoot::new(raw, true))
                 .collect(),
+        }
+    }
+
+    /// The first `n` roots, already prepared: the filesystem is not asked again.
+    pub fn first(&self, n: usize) -> RootSet<'a> {
+        RootSet {
+            roots: self.roots.iter().take(n).cloned().collect(),
         }
     }
 
@@ -1334,40 +1362,49 @@ impl<'a> PreparedRoot<'a> {
                 forms.push(RootForm::Posix {
                     text: fold_text(text),
                     fold,
+                    depth: components(text),
                 });
                 if let Some(real) = real_text {
                     forms.push(RootForm::Posix {
+                        depth: components(&real),
                         text: fold_text(&real),
                         fold,
                     });
                 }
             }
-            if let Some(windows) = WindowsForm::of(raw) {
-                forms.push(RootForm::Windows(windows));
+            if let Some(form) = WindowsForm::of(raw) {
+                let depth = components(&form.prefix) + components(&form.rest);
+                forms.push(RootForm::Windows { form, depth });
             }
         }
-        PreparedRoot {
-            raw,
-            depth: raw.trim_end_matches(['/', '\\']).len(),
-            forms,
-        }
+        PreparedRoot { raw, forms }
     }
 
-    fn owns(&self, path: &PathForm<'_>) -> bool {
-        self.forms.iter().any(|form| match form {
-            RootForm::Posix { text, fold } => within(
-                if *fold {
-                    path.lowered()
-                } else {
-                    path.posix.as_ref()
-                },
-                text,
-            ),
-            RootForm::Windows(root) => path
-                .windows
-                .as_ref()
-                .is_some_and(|path| path.prefix == root.prefix && within(&path.rest, &root.rest)),
-        })
+    /// How deep the spelling that matches `path` is, or `None` when none does.
+    /// A root with two matching spellings (as written and real) is as deep as
+    /// the deeper.
+    fn matched_depth(&self, path: &PathForm<'_>) -> Option<usize> {
+        self.forms
+            .iter()
+            .filter_map(|form| match form {
+                RootForm::Posix { text, fold, depth } => within(
+                    if *fold {
+                        path.lowered()
+                    } else {
+                        path.posix.as_ref()
+                    },
+                    text,
+                )
+                .then_some(*depth),
+                RootForm::Windows { form, depth } => path
+                    .windows
+                    .as_ref()
+                    .is_some_and(|path| {
+                        path.prefix == form.prefix && within(&path.rest, &form.rest)
+                    })
+                    .then_some(*depth),
+            })
+            .max()
     }
 }
 
@@ -1451,7 +1488,23 @@ impl WindowsForm {
 fn absolute_lexical(text: &str) -> String {
     let rooted = format!("/{text}");
     let resolved = lexical(&rooted);
-    resolved.trim_end_matches('/').to_string()
+    // Windows ignores trailing dots and spaces in a component: `repo.` is
+    // `repo`. (`.` and `..` are already folded; a component that is nothing but
+    // dots and spaces is kept as written.)
+    resolved
+        .trim_end_matches('/')
+        .split('/')
+        .map(|part| match part.trim_end_matches(['.', ' ']) {
+            "" => part,
+            trimmed => trimmed,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// How many components `text` has (separated by `/`, empty ones not counted).
+fn components(text: &str) -> usize {
+    text.split('/').filter(|part| !part.is_empty()).count()
 }
 
 /// Whether `a` and `b` are one file or directory.
@@ -1470,34 +1523,41 @@ fn same_object(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
-/// Whether the volume holding the directory `canonical` ignores case: its last
-/// component spelled with the case of every letter flipped names the same
-/// directory. A name with no letters says nothing, and reads as case-sensitive.
+/// Whether the volume holding the directory `canonical` ignores case, asked of
+/// the deepest component that has an ASCII letter: that component spelled with
+/// the case of every letter flipped names the same directory. A root whose
+/// components have no letters at all (`/1/2`) says nothing: the volume is
+/// unknown and the comparison stays exact-case. The answer is the volume of the
+/// component asked, which is the root's unless a mount lies between them.
 fn ignores_case(canonical: &std::path::Path) -> bool {
-    let (Some(parent), Some(name)) = (canonical.parent(), canonical.file_name()) else {
-        return false;
-    };
-    let name = name.to_string_lossy();
-    let flipped: String = name
-        .chars()
-        .map(|c| {
-            if c.is_lowercase() {
-                c.to_uppercase().next().unwrap_or(c)
-            } else if c.is_uppercase() {
-                c.to_lowercase().next().unwrap_or(c)
-            } else {
-                c
-            }
-        })
-        .collect();
-    flipped != name && same_object(canonical, &parent.join(flipped))
+    let mut here = canonical;
+    while let (Some(parent), Some(name)) = (here.parent(), here.file_name()) {
+        let name = name.to_string_lossy();
+        let flipped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if flipped != name {
+            return same_object(here, &parent.join(flipped));
+        }
+        here = parent;
+    }
+    false
 }
 
 /// Whether `path` lies under `root`, by whole components, by text alone: the
 /// root as written, with no filesystem, case or link handling beyond what the
 /// spelling says (a Windows-spelled pair compares without case).
 fn under(path: &str, root: &str) -> bool {
-    PreparedRoot::new(root, false).owns(&PathForm::new(path))
+    PreparedRoot::new(root, false)
+        .matched_depth(&PathForm::new(path))
+        .is_some()
 }
 
 #[cfg(test)]

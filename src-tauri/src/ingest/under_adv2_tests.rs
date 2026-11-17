@@ -521,3 +521,292 @@ fn adv2_sync_open_tabs_collapses_a_symlinked_repo_and_labels_stay_unique() {
     let names: std::collections::HashSet<_> = snap.repos.iter().map(|r| r.name.clone()).collect();
     assert_eq!(names.len(), 3, "labels collide: {:?}", snap.repos);
 }
+
+// re-attack 7f7ed85c
+// Each test names the behaviour it holds. The Unicode folding cases are false
+// misses that need Unicode normalisation (a new dependency, an owner decision),
+// so they are `#[ignore]`d with that reason.
+
+mod reattack_7f7ed85c {
+    use super::*;
+    use crate::ingest::transcript::{attribution_root, departed_root, ToolCall};
+
+    fn same_dir(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    }
+
+    /// The filesystem is the oracle: if `<tmp>/b` is the directory `<tmp>/a`
+    /// made, a path under `b` is under root `a`, and if it is not, it is not.
+    fn fs_agrees(a: &str, b: &str) {
+        let tmp = canon_tmp();
+        let base = real(&tmp);
+        std::fs::create_dir(base.join(a)).unwrap();
+        let fs_same = same_dir(&base.join(a), &base.join(b));
+        let root = base.join(a).to_string_lossy().into_owned();
+        let path = format!("{}/f.rs", base.join(b).to_string_lossy());
+        let got = is_under(&path, &root);
+        assert_eq!(
+            got, fs_same,
+            "root {a:?} path {b:?}: fs says same={fs_same}, attribution says {got}"
+        );
+    }
+
+    #[test]
+    #[ignore = "owner decision: Unicode normalisation dependency (ss/eszett)"]
+    fn r01_eszett_vs_ss() {
+        fs_agrees("stra\u{df}e", "STRASSE");
+        fs_agrees("STRASSE", "stra\u{df}e");
+    }
+    #[test]
+    #[ignore = "owner decision: Unicode normalisation dependency (dotted capital I)"]
+    fn r02_dotted_capital_i() {
+        fs_agrees("\u{130}stanbul", "i\u{307}stanbul");
+        fs_agrees("\u{130}stanbul", "istanbul");
+    }
+    #[test]
+    #[ignore = "owner decision: Unicode normalisation dependency (NFC vs NFD)"]
+    fn r03_nfc_vs_nfd() {
+        fs_agrees("caf\u{e9}", "cafe\u{301}");
+        fs_agrees("cafe\u{301}", "caf\u{e9}");
+        fs_agrees("CAF\u{c9}", "cafe\u{301}");
+    }
+    #[test]
+    #[ignore = "owner decision: Unicode normalisation dependency (final sigma)"]
+    fn r04_greek_sigma_forms() {
+        fs_agrees(
+            "\u{39f}\u{394}\u{39f}\u{3a3}",
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c2}",
+        );
+        fs_agrees(
+            "\u{39f}\u{394}\u{39f}\u{3a3}",
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c3}",
+        );
+        fs_agrees("\u{3c2}", "\u{3c3}");
+    }
+    #[test]
+    fn r05_kelvin_and_ohm_signs() {
+        fs_agrees("\u{212a}it", "kit");
+        fs_agrees("kit", "\u{212a}it");
+        fs_agrees("\u{2126}", "\u{3c9}");
+    }
+
+    /// A root whose last component has no letters (a numbered worktree) takes
+    /// the volume from its deepest component that has one.
+    #[test]
+    fn r06_digit_named_root_on_insensitive_volume() {
+        let tmp = canon_tmp();
+        let base = real(&tmp);
+        std::fs::create_dir_all(base.join("Proj").join("2024")).unwrap();
+        let probe_alt = base.join("pROJ").join("2024");
+        if !same_dir(&base.join("Proj").join("2024"), &probe_alt) {
+            return; // case-sensitive volume: nothing to show
+        }
+        let root = base
+            .join("Proj")
+            .join("2024")
+            .to_string_lossy()
+            .into_owned();
+        let path = format!("{}/f.rs", probe_alt.to_string_lossy());
+        assert!(is_under(&path, &root), "fs: same dir; attribution: miss");
+    }
+
+    /// Ranking is by the depth of the spelling that matched, not the length of
+    /// the text: a long link to a shallow directory does not outrank a deeper
+    /// real root.
+    #[test]
+    fn r07_long_link_to_shallow_dir_outranks_deeper_root() {
+        let tmp = canon_tmp();
+        let base = real(&tmp);
+        let x = base.join("x");
+        std::fs::create_dir_all(x.join("sub")).unwrap();
+        let long = base.join("a-very-long-directory-name-to-pad-the-link");
+        std::fs::create_dir(&long).unwrap();
+        let link = long.join("link-to-x");
+        std::os::unix::fs::symlink(&x, &link).unwrap();
+        let (link_s, sub_s) = (
+            link.to_string_lossy().into_owned(),
+            x.join("sub").to_string_lossy().into_owned(),
+        );
+        let path = format!("{sub_s}/f.rs");
+        let got = deepest_root(&path, &RootSet::new(&[link_s.as_str(), sub_s.as_str()]));
+        assert_eq!(
+            got,
+            Some(sub_s.as_str()),
+            "the deeper real root must own it"
+        );
+    }
+
+    /// The same without links: `..`, `.` and a verbatim prefix in a root's text
+    /// do not make it deeper than the directory it names.
+    #[test]
+    fn r08_unresolved_root_text_outranks_deeper_root() {
+        let roots = ["/repo/sub/..", "/repo/wt"];
+        assert_eq!(
+            deepest_root("/repo/wt/f.rs", &RootSet::new(&roots)),
+            Some("/repo/wt")
+        );
+        let roots = [r"\\?\C:\repo", r"C:\repo\wt"];
+        assert_eq!(
+            deepest_root(r"C:\repo\wt\f.rs", &RootSet::new(&roots)),
+            Some(r"C:\repo\wt"),
+            "extended-length prefix must not make the shallower root deeper"
+        );
+    }
+
+    /// A root link created after the pass prepared its roots is not matched by
+    /// that pass (a root absent at prepare time keeps no real spelling) and is
+    /// by the next one. Two links to one directory answer the same whatever
+    /// the listing order, the first listed winning.
+    #[test]
+    fn r09_root_appearing_mid_pass_and_same_real_dir_twice() {
+        let tmp = canon_tmp();
+        let base = real(&tmp);
+        let target = base.join("Target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("late-link");
+        let link_s = link.to_string_lossy().into_owned();
+        let set = RootSet::new(&[link_s.as_str()]);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let via_real = format!("{}/f.rs", target.to_string_lossy());
+        assert!(
+            deepest_root(&via_real, &set).is_none(),
+            "this pass prepared before the link"
+        );
+        assert!(deepest_root(&via_real, &RootSet::new(&[link_s.as_str()])).is_some());
+        // Two links to one directory: the answer must not depend on listing order.
+        let l2 = base.join("late-link-2");
+        std::os::unix::fs::symlink(&target, &l2).unwrap();
+        let l2_s = l2.to_string_lossy().into_owned();
+        let ab = deepest_root(&via_real, &RootSet::new(&[link_s.as_str(), l2_s.as_str()]));
+        let ba = deepest_root(&via_real, &RootSet::new(&[l2_s.as_str(), link_s.as_str()]));
+        assert_eq!(ab, Some(link_s.as_str()));
+        assert_eq!(ba, Some(l2_s.as_str()));
+    }
+
+    fn call(cwd: &str, file: Option<&str>) -> ToolCall {
+        ToolCall {
+            cwd: cwd.to_string(),
+            file_path: file.map(str::to_string),
+            tool: "Edit".into(),
+            ..ToolCall::default()
+        }
+    }
+
+    #[test]
+    fn r10_cap_is_bytes_and_exact() {
+        let set = RootSet::new(&["/r"]);
+        let pad = |n: usize| format!("/r/{}", "a".repeat(n - 3));
+        assert!(
+            deepest_root(&pad(4096), &set).is_some(),
+            "4096 bytes is attributable"
+        );
+        assert!(
+            deepest_root(&pad(4097), &set).is_none(),
+            "4097 bytes is not"
+        );
+        // two-byte chars: 2048 chars = 4093 + 3 = counted in bytes
+        let multi = |n: usize| format!("/r/{}", "\u{e9}".repeat(n));
+        assert!(deepest_root(&multi(2046), &set).is_some()); // 3 + 4092 = 4095
+        assert!(deepest_root(&multi(2047), &set).is_none()); // 3 + 4094 = 4097
+    }
+
+    /// `departed_root` and `attribution_root` read a call's paths through one
+    /// cap: a call is never departed while unattributable, and trailing
+    /// separators count toward neither.
+    #[test]
+    fn r11_departed_and_attribution_agree_at_the_cap() {
+        let set = RootSet::new(&["/repo"]);
+        let cwd = "/repo/.claude/worktrees/wt";
+        let huge = format!("{cwd}/{}", "a".repeat(5000));
+        let c = call(cwd, Some(&huge));
+        let (att, dep) = (attribution_root(&c, &set), departed_root(&c, &set));
+        assert_eq!(
+            att.is_some(),
+            dep.is_some(),
+            "file_path 5000+ bytes: attr={att:?} departed={dep:?}"
+        );
+        let trailing = format!("{cwd}{}", "/".repeat(4096 - cwd.len() + 5));
+        let c = call(&trailing, None);
+        let (att, dep) = (attribution_root(&c, &set), departed_root(&c, &set));
+        assert_eq!(
+            att.is_some(),
+            dep.is_some(),
+            "cwd with trailing slashes: attr={att:?} departed={dep:?}"
+        );
+    }
+
+    #[test]
+    fn r12_windows_parsing_table() {
+        let owns = |root: &str, path: &str| is_under(path, root);
+        assert!(owns(r"C:\", "c:/x"));
+        assert!(!owns("C:", r"C:\x"), "bare drive names no directory");
+        assert!(owns(r"\\srv\share", r"\\?\UNC\srv\share\x"));
+        assert!(owns(r"\\srv\share", "//SRV/share/x"));
+        assert!(owns(r"\\srv\share", r"\\srv\share"));
+        assert!(!owns(r"\\srv", r"\\srv\share\x"), "no share, no repo");
+        assert!(!owns(r"\\srv\share", r"\\srv"));
+        assert!(
+            owns(r"\\srv\share", r"\\srv\share\..\x"),
+            "`..` stops at the share"
+        );
+        assert!(
+            !owns(r"C:\repo", r"\\.\C:\repo\f"),
+            "device path is not the drive"
+        );
+        assert!(!owns(r"C:\repo", r"\\.\c:\repo\f"));
+        assert!(!owns(r"\\?\C:\repo", r"\\.\C:\repo\f"));
+        // POSIX `//` spellings stay the POSIX root they are.
+        assert!(owns("/srv/share", "//srv/share/f"));
+        assert!(owns("//srv/share", "/srv/share/f"));
+        assert!(!owns("/srv/share", "/srv/share-other/f"));
+        // Windows ignores trailing dots and spaces in a component.
+        assert!(
+            owns(r"C:\repo", r"C:\repo.\f.rs"),
+            "`repo.` is `repo` on NTFS"
+        );
+    }
+
+    // The case probe only stats (metadata on the root and a flipped sibling):
+    // nothing is created, and the parent is unchanged.
+    #[test]
+    fn r13_prepare_writes_nothing_to_the_repo() {
+        let tmp = canon_tmp();
+        let base = real(&tmp);
+        let repo = base.join("Repo");
+        std::fs::create_dir(&repo).unwrap();
+        let listing = |p: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(p)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            v.sort();
+            v
+        };
+        let (before_base, before_repo) = (listing(&base), listing(&repo));
+        let mtime = std::fs::metadata(&base).unwrap().modified().unwrap();
+        let s = repo.to_string_lossy().into_owned();
+        let _ = RootSet::new(&[s.as_str(), s.as_str()]);
+        assert_eq!(listing(&base), before_base);
+        assert_eq!(listing(&repo), before_repo);
+        assert_eq!(std::fs::metadata(&base).unwrap().modified().unwrap(), mtime);
+    }
+
+    /// Two roots that name one directory by different spellings, in either
+    /// order: the first listed owns the call (equal depth keeps the first).
+    #[test]
+    fn two_spellings_of_one_directory_tie_to_the_first_listed() {
+        let path = "/repo/f.rs";
+        assert_eq!(
+            deepest_root(path, &RootSet::new(&["/repo/sub/..", "/repo"])),
+            Some("/repo/sub/..")
+        );
+        assert_eq!(
+            deepest_root(path, &RootSet::new(&["/repo", "/repo/sub/.."])),
+            Some("/repo")
+        );
+    }
+}

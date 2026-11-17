@@ -457,7 +457,7 @@ fn ingest_family(
     let paths = &roots[..roots.len().min(MAX_PARTICIPANTS)];
     // Prepared once for the pass: every call below is attributed by text alone.
     let root_set = transcript::RootSet::new(&roots);
-    let path_set = transcript::RootSet::new(paths);
+    let path_set = root_set.first(paths.len());
     let mut participants = match participants(ledger_repo, paths, &mut out, expired) {
         Some(participants) => participants,
         None => return out,
