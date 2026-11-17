@@ -11,7 +11,7 @@ import { readCliSchema } from "./check-vendor-schema.mjs";
 import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const C = "EXTRACTION_SCHEMA_VERSION";
-const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94 };
+const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94, lease: 2 };
 
 describe("rustConstant, extraction constant lookalikes", () => {
   it("reads CRLF files, &'static str and a leading-zero string", () => {
@@ -114,12 +114,12 @@ describe("schemasAt on a commit that predates the constant", () => {
 
 describe("devmap (PATH) extract reading", () => {
   it("a devmap whose --version omits extract is unverifiable, never a match", () => {
-    const row = judge(owner, devmapReading({ available: true, expected: 27, extract: null, versionLine: "x", source: "doctor" }));
+    const row = judge(owner, devmapReading({ available: true, expected: 27, extract: null, lease: null, versionLine: "x", source: "doctor" }));
     expect(row.verdict).toBe("unverifiable");
   });
 
   it("a devmap that prints extract 87 is stale", () => {
-    const row = judge(owner, devmapReading({ available: true, expected: 27, extract: 87, versionLine: "x", source: "doctor" }));
+    const row = judge(owner, devmapReading({ available: true, expected: 27, extract: 87, lease: null, versionLine: "x", source: "doctor" }));
     expect(row.verdict).toBe("stale");
   });
 });

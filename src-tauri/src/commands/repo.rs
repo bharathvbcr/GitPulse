@@ -40,14 +40,22 @@ pub async fn cmd_watch_repo(
     app: AppHandle,
     state: State<'_, WatcherState>,
     repo_path: String,
+    scope: Option<String>,
 ) -> Result<String, IpcError> {
+    // Absent is `narrow`, the default; `whole` is the whole-worktree scope and
+    // anything else is refused. The scope last asked for is what a live watch
+    // compares against, so repeating the same one changes nothing and a
+    // different one re-registers it.
+    let scope = crate::watcher::WatchScope::parse(scope.as_deref())
+        .map(Some)
+        .map_err(IpcError::from)?;
     // start_watch shells out to git (validate_repo, resolve_git_dir/common
     // dir) and installs OS watches — the same blocking profile as every other
     // reader command, so it belongs on the blocking pool rather than an async
     // worker thread. WatcherState is an Arc-backed Clone; snapshot it so the
     // 'static closure does not borrow the request-scoped State.
     let watcher_state = state.inner().clone();
-    off_thread(move || start_watch(app, &watcher_state, repo_path)).await
+    off_thread(move || start_watch(app, &watcher_state, repo_path, scope)).await
 }
 
 #[tauri::command(async)]

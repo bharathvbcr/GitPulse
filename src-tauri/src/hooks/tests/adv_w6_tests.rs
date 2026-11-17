@@ -9,6 +9,8 @@
 //! pins a hole.
 
 use super::*;
+// Its methods are called only by the macOS tests below.
+#[cfg(target_os = "macos")]
 use crate::procguard::LockedSpawn;
 use crate::test_support::git_in;
 use std::path::Path;
@@ -324,7 +326,10 @@ fn w6_a_slow_git_over_eighteen_worktrees_answers_inside_the_budget_and_partial()
     let took = started.elapsed();
     eprintln!("slow git x18: {took:?} -> {}", say(&output));
     assert!(
-        took < BUDGET + Duration::from_millis(300),
+        // The margin is a wall-clock limit like any other, so it is scaled by how
+        // oversubscribed the host is (`coverage_relaxed`): on a 3-core runner the
+        // hook answered in 5.44 s against a flat 300 ms margin.
+        took < BUDGET + crate::test_support::coverage_relaxed(Duration::from_millis(300)),
         "the hook took {took:?}; its budget is {BUDGET:?}"
     );
     not_silent("a slow git over 18 worktrees", &output);

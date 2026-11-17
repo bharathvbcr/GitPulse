@@ -27,6 +27,7 @@
   import { publishNativeRenderingStatus, setNativeRenderingBoot } from "../src/lib/desktop/nativeRendering";
   import { applyTransparency, TRANSPARENCY_ATTRIBUTE } from "../src/lib/ui/transparencyPreference";
   import { validateTheme } from "../src/lib/ui/appearance/themeSchema";
+  import { isFamilyInstalled } from "../src/lib/ui/appearance/fonts";
   import { get } from "svelte/store";
 
   const params = new URLSearchParams(location.search);
@@ -118,9 +119,19 @@
     check("Soft removes the override, back to 12px", () => !root.hasAttribute("data-radius-scale") && cs($("#probe-radius")).borderTopLeftRadius === "12px");
 
     // --- fonts ---------------------------------------------------------------
-    await setValue($('[data-setting="font-mono"] input'), "Menlo", ["change"]);
-    check("a code font lands in --font-mono, ahead of the system stack", () => cs(root).getPropertyValue("--font-mono").trim().startsWith('"Menlo", ui-monospace'));
-    check("the Markdown code font and font-mono utility follow it", () => { const probe = document.createElement("code"); probe.className = "font-mono"; document.body.append(probe); const family = cs(probe).fontFamily; probe.remove(); return family.includes("Menlo"); });
+    // A code font this machine has: Menlo is macOS's, the rest are what Linux and
+    // Windows hosts ship. The product measures real text to decide a family is
+    // installed, so a name hard-coded to one OS reads "isn't installed" on the
+    // others, which is correct, and made the check below fail on the Linux CI
+    // runner. Choosing with the product's own detector keeps the check about the
+    // wiring; a host with none of them fails the next check by name rather than
+    // passing a check that never ran.
+    const monoProbe = ["Menlo", "DejaVu Sans Mono", "Liberation Mono", "Consolas", "Courier New"].find((family) => isFamilyInstalled(family) === true);
+    check("this host has a monospace family to probe with", () => monoProbe !== undefined);
+    const probeFamily = monoProbe ?? "Menlo";
+    await setValue($('[data-setting="font-mono"] input'), probeFamily, ["change"]);
+    check("a code font lands in --font-mono, ahead of the system stack", () => cs(root).getPropertyValue("--font-mono").trim().startsWith(`"${probeFamily}", ui-monospace`));
+    check("the Markdown code font and font-mono utility follow it", () => { const probe = document.createElement("code"); probe.className = "font-mono"; document.body.append(probe); const family = cs(probe).fontFamily; probe.remove(); return family.includes(probeFamily); });
     check("an installed family is reported as installed", () => $('[data-setting="font-mono"] [role="status"]')?.textContent.includes("is installed"));
     await setValue($('[data-setting="font-ui"] input'), "Definitely Not A Real Font", ["change"]);
     check("a family that is not installed says so and falls back", () => $('[data-setting="font-ui"] [role="status"]')?.textContent.includes("isn't installed"));

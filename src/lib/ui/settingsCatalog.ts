@@ -457,6 +457,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "host load coverage build headroom cargo llvm-cov instrumented output free disk refuse command gate hook gib",
   },
   {
+    id: "watch-scope",
+    section: "agents",
+    label: "Watch scope",
+    keywords: "watch scope narrow whole worktree fsevents fseventsd file events macos build target node_modules ignored folders cpu cargo nested worktrees",
+    requires: "macos",
+  },
+  {
     id: "manvi-policy",
     section: "agents",
     label: "Manvi policy",

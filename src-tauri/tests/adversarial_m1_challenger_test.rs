@@ -28,6 +28,7 @@ fn test_adversarial_oversized_message_bodies() {
     let exact_16k = "a".repeat(MAX_MESSAGE_BODY_BYTES);
     let msg_exact = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("thread-exact-16k"),
@@ -43,6 +44,7 @@ fn test_adversarial_oversized_message_bodies() {
     let over_16k = "a".repeat(MAX_MESSAGE_BODY_BYTES + 1);
     let msg_over = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("thread-over-16k"),
@@ -61,6 +63,7 @@ fn test_adversarial_oversized_message_bodies() {
     let huge = "x".repeat(1024 * 1024);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("thread-huge"),
@@ -77,6 +80,7 @@ fn test_adversarial_oversized_message_bodies() {
     assert_eq!(utf8_boundary_ok.len(), 16384);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("thread-utf8-ok"),
@@ -92,6 +96,7 @@ fn test_adversarial_oversized_message_bodies() {
     assert_eq!(utf8_boundary_err.len(), 16385);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-tester",
         None,
         Some("thread-utf8-err"),
@@ -102,15 +107,41 @@ fn test_adversarial_oversized_message_bodies() {
     .is_err());
 
     // 5. Empty or whitespace-only bodies
-    assert!(post_thread_message(repo_path, "agent", None, None, "note", "", None).is_err());
-    assert!(
-        post_thread_message(repo_path, "agent", None, None, "note", "   \t\n  ", None).is_err()
-    );
+    assert!(post_thread_message(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent",
+        None,
+        None,
+        "note",
+        "",
+        None
+    )
+    .is_err());
+    assert!(post_thread_message(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent",
+        None,
+        None,
+        "note",
+        "   \t\n  ",
+        None
+    )
+    .is_err());
 
     // 6. Null byte in body
-    assert!(
-        post_thread_message(repo_path, "agent", None, None, "note", "hello\0world", None).is_err()
-    );
+    assert!(post_thread_message(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "agent",
+        None,
+        None,
+        "note",
+        "hello\0world",
+        None
+    )
+    .is_err());
 }
 
 #[test]
@@ -124,6 +155,7 @@ fn test_adversarial_ring_buffer_300_messages_wrapping_and_monotonicity() {
     for i in 1..=TOTAL_MESSAGES {
         let msg = post_thread_message(
             repo_path,
+            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
             "stream-agent",
             Some("collector"),
             Some(&format!("thread-{}", i % 5)),
@@ -198,6 +230,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     // 1. Missing thread_keys (None)
     let m1 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         None,
@@ -208,6 +241,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     .unwrap();
     let m2 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         None,
@@ -220,6 +254,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     // 2. Whitespace-only thread_key should normalize to None / standalone
     let m3 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("   "),
@@ -245,6 +280,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let complex_key = "feat/ui#issue-102:branch/sub-task.v1@beta [urgent]";
     let m4 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         Some("agent-2"),
         Some(complex_key),
@@ -259,6 +295,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let emoji_key = "🚀-launch-task-🔥";
     let m5 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(emoji_key),
@@ -273,6 +310,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let traversal_key = "../../../etc/passwd";
     let m6 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(traversal_key),
@@ -287,6 +325,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let key_80 = "k".repeat(80);
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(&key_80),
@@ -300,6 +339,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     let key_81 = "k".repeat(81);
     let err_81 = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some(&key_81),
@@ -318,6 +358,7 @@ fn test_adversarial_thread_grouping_edge_cases() {
     // 7. Null byte in thread_key must be rejected
     assert!(post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agent-1",
         None,
         Some("bad\0key"),
@@ -360,8 +401,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     // 1. DECIDE: decide -> answered
     // ==========================================
     let t_decide = "thread-ask-decide";
-    post_thread_message(
-        repo_path,
+    post_thread_message(repo_path, gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_decide),
@@ -376,7 +416,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     assert_eq!(d.ask_type.as_deref(), Some("decide"));
     assert_eq!(d.title, "Pick DB");
 
-    answer_ask(repo_path, "developer", t_decide, "Selected SQLite").unwrap();
+    answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Person,
+        "developer",
+        t_decide,
+        "Selected SQLite",
+    )
+    .unwrap();
     let th_answered = list_inbox_threads(repo_path, None, Some("answered")).unwrap();
     assert!(th_answered.iter().any(|t| t.thread_key == t_decide));
 
@@ -386,6 +433,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     let t_do = "thread-ask-do";
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_do),
@@ -401,7 +449,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     assert_eq!(d2.ask_type.as_deref(), Some("do"));
     assert_eq!(d2.title, "Run migrations");
 
-    answer_ask(repo_path, "developer", t_do, "Marked steps done").unwrap();
+    answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Person,
+        "developer",
+        t_do,
+        "Marked steps done",
+    )
+    .unwrap();
     let th_do_ans = list_inbox_threads(repo_path, None, Some("answered")).unwrap();
     assert!(th_do_ans.iter().any(|t| t.thread_key == t_do));
 
@@ -409,8 +464,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     // 3. ANSWER: answer -> answered
     // ==========================================
     let t_answer = "thread-ask-answer";
-    post_thread_message(
-        repo_path,
+    post_thread_message(repo_path, gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_answer),
@@ -424,7 +478,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     assert_eq!(d3.status, "open");
     assert_eq!(d3.ask_type.as_deref(), Some("answer"));
 
-    answer_ask(repo_path, "developer", t_answer, "Format is sk-live-...").unwrap();
+    answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Person,
+        "developer",
+        t_answer,
+        "Format is sk-live-...",
+    )
+    .unwrap();
     let th_ans_done = list_inbox_threads(repo_path, None, Some("answered")).unwrap();
     assert!(th_ans_done.iter().any(|t| t.thread_key == t_answer));
 
@@ -432,8 +493,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     // 4. REVIEW: review -> answered (approved or changes requested)
     // ==========================================
     let t_review = "thread-ask-review";
-    post_thread_message(
-        repo_path,
+    post_thread_message(repo_path, gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_review),
@@ -447,7 +507,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     assert_eq!(d4.status, "open");
     assert_eq!(d4.ask_type.as_deref(), Some("review"));
 
-    answer_ask(repo_path, "developer", t_review, "Approved: LGTM!").unwrap();
+    answer_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Person,
+        "developer",
+        t_review,
+        "Approved: LGTM!",
+    )
+    .unwrap();
     let th_rev_done = list_inbox_threads(repo_path, None, Some("answered")).unwrap();
     assert!(th_rev_done.iter().any(|t| t.thread_key == t_review));
 
@@ -457,6 +524,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     let t_withdraw = "thread-ask-withdraw";
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_withdraw),
@@ -466,7 +534,14 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     )
     .unwrap();
 
-    withdraw_ask(repo_path, "claude", t_withdraw, "Cancelled by user").unwrap();
+    withdraw_ask(
+        repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
+        "claude",
+        t_withdraw,
+        "Cancelled by user",
+    )
+    .unwrap();
     let th_withdrawn = list_inbox_threads(repo_path, None, Some("withdrawn")).unwrap();
     assert!(th_withdrawn.iter().any(|t| t.thread_key == t_withdraw));
 
@@ -479,6 +554,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     // ==========================================
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         Some("developer"),
         Some(t_withdraw),
@@ -502,6 +578,7 @@ fn test_adversarial_structured_ask_state_machine_transitions() {
     let t_raw = "thread-ask-malformed-json";
     post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "claude",
         None,
         Some(t_raw),
@@ -528,6 +605,7 @@ fn test_open_asks_survive_ring_buffer_note_flood_until_resolved() {
 
     let ask_msg = post_thread_message(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
         "agy-worker",
         Some("developer"),
         Some("critical-open-ask"),
@@ -542,6 +620,7 @@ fn test_open_asks_survive_ring_buffer_note_flood_until_resolved() {
     for i in 1..=300 {
         post_thread_message(
             repo_path,
+            gitpulse_lib::engine::agent_bus::MessageOrigin::Agent,
             "telemetry-bot",
             None,
             Some(&format!("chatter-{}", i % 8)),
@@ -567,6 +646,7 @@ fn test_open_asks_survive_ring_buffer_note_flood_until_resolved() {
     // Answering the open ask unpins seq 1 so subsequent compaction evicts it cleanly.
     answer_ask(
         repo_path,
+        gitpulse_lib::engine::agent_bus::MessageOrigin::Person,
         "developer",
         "critical-open-ask",
         "Decision selected: Yes",

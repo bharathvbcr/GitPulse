@@ -46,8 +46,17 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: package.json
+      # One advisory is accepted, by id, because no release can clear it:
+      # GHSA-gcqx-w48m-w2h4 (deepmerge mergeObject() prototype poisoning, low)
+      # has no patched version (firstPatchedVersion is null, and 4.3.1 is the
+      # latest deepmerge). Its only requirer in bun.lock is
+      # @sveltejs/vite-plugin-svelte (^4.3.1), a devDependency: `bun audit --prod`
+      # finds nothing across the 29 production packages, and deepmerge is absent
+      # from the built dist/. Every other advisory still fails this job.
+      # revisit by 2027-01-15, or as soon as deepmerge publishes a fix:
+      # scripts/bun-audit-ignores-contract.test.ts fails after that date.
       - name: bun audit
-        run: bun audit
+        run: bun audit --ignore=GHSA-gcqx-w48m-w2h4
 
   cargo-deny:
     name: cargo deny (src-tauri)

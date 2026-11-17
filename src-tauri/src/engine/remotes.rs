@@ -104,19 +104,29 @@ pub(crate) fn split_tracking_ref<'a>(
     remotes: &[String],
     rest: &'a str,
 ) -> Option<(&'a str, &'a str)> {
-    let owner = remotes
+    configured_owner(remotes, rest).or_else(|| rest.split_once('/'))
+}
+
+/// The strict half of [`split_tracking_ref`]: the remote that owns `rest` by
+/// the LONGEST configured name prefixing it, and `None` when no configured
+/// remote does. There is no first-segment fallback, so a caller that mutates
+/// on the answer (a remote delete) never retargets a ref to a remote that is
+/// not configured or to a shorter-named parent remote. A remote that exists
+/// only as a legacy `.git/remotes` file is not named here.
+pub(crate) fn configured_owner<'a>(
+    remotes: &[String],
+    rest: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    remotes
         .iter()
         .filter(|name| {
-            rest.len() > name.len()
+            rest.len() > name.len() + 1
                 && rest.starts_with(name.as_str())
                 && rest.as_bytes()[name.len()] == b'/'
         })
         .map(String::len)
-        .max();
-    match owner {
-        Some(len) => Some((&rest[..len], &rest[len + 1..])),
-        None => rest.split_once('/'),
-    }
+        .max()
+        .map(|len| (&rest[..len], &rest[len + 1..]))
 }
 
 /// Assembles remotes from config records and remote-tracking ref names.
@@ -210,31 +220,97 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
     RemoteList { remotes, truncated }
 }
 
-/// Lists configured remotes with their URLs and tracking-ref counts.
-pub fn list(repo_path: &str) -> Result<RemoteList, CommandError> {
-    let repo = validate_repo(repo_path)?;
-    // `--get-regexp` exits 1 with nothing on stderr when no key matches: a
-    // repository with no remotes, an honest empty answer. Any other outcome (a
-    // refused or timed-out spawn, a config git cannot parse, a cut-off stream)
-    // is a read that did not happen, and used to read as "no remotes".
-    let run = git_captured(
-        repo.as_path(),
-        &["config", "--get-regexp", "-z", "^remote\\..*"],
-    )?;
-    let records = if run.success && run.incomplete.is_none() {
-        parse_config_records(&String::from_utf8_lossy(&run.stdout))
+/// Reads every `remote.*` config record, duplicates kept (`fetch` repeats).
+///
+/// `--get-regexp` exits 1 with nothing on stderr when no key matches: a
+/// repository with no remotes, an honest empty answer. Any other outcome (a
+/// refused or timed-out spawn, a config git cannot parse, a cut-off stream)
+/// is a read that did not happen, and used to read as "no remotes".
+fn read_remote_records(repo: &Path) -> Result<Vec<(String, String)>, CommandError> {
+    let run = git_captured(repo, &["config", "--get-regexp", "-z", "^remote\\..*"])?;
+    if run.success && run.incomplete.is_none() {
+        Ok(parse_config_records(&String::from_utf8_lossy(&run.stdout)))
     } else if run.status_code == 1 && run.incomplete.is_none() && run.stderr.is_empty() {
-        Vec::new()
+        Ok(Vec::new())
     } else {
-        return Err(format!(
+        Err(format!(
             "Could not read the remote configuration: {}",
             match &run.incomplete {
                 Some(reason) => format!("git config {}", reason.describe()),
                 None => String::from_utf8_lossy(&run.stderr).trim().to_string(),
             }
         )
-        .into());
+        .into())
+    }
+}
+
+/// Which configured remotes' fetch refspecs write a given remote-tracking ref.
+///
+/// A remote with no `fetch` refspec is taken to have git's default,
+/// `+refs/heads/*:refs/remotes/<name>/*`. Matching is conservative: a refspec
+/// counts when its destination pattern could match the ref. Negative refspecs
+/// (`^...`) and ones with no destination write no tracking ref and claim none.
+pub(crate) struct FetchClaims(Vec<(String, String)>);
+
+impl FetchClaims {
+    /// Reads fresh config; an unreadable config is an error, never "no claims".
+    pub(crate) fn read(repo: &Path) -> Result<Self, CommandError> {
+        read_remote_records(repo).map(Self)
+    }
+
+    /// The remotes whose fetch refspecs map onto `refs/remotes/<rest>`, sorted.
+    pub(crate) fn claimants(&self, rest: &str) -> Vec<String> {
+        let target = format!("refs/remotes/{rest}");
+        let mut names: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for (key, value) in &self.0 {
+            let Some((name, field)) = split_remote_key(key) else {
+                continue;
+            };
+            let specs = names.entry(name).or_default();
+            if field == "fetch" {
+                specs.push(value);
+            }
+        }
+        names
+            .into_iter()
+            .filter(|(name, specs)| {
+                let default = format!("+refs/heads/*:refs/remotes/{name}/*");
+                if specs.is_empty() {
+                    destination_may_match(&default, &target)
+                } else {
+                    specs
+                        .iter()
+                        .any(|spec| destination_may_match(spec, &target))
+                }
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+/// Whether the destination side of fetch refspec `spec` could be `target`.
+fn destination_may_match(spec: &str, target: &str) -> bool {
+    if spec.starts_with('^') {
+        return false;
+    }
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    let Some((_, dst)) = spec.rsplit_once(':') else {
+        return false;
     };
+    match dst.split_once('*') {
+        None => !dst.is_empty() && dst == target,
+        Some((prefix, suffix)) => {
+            target.len() >= prefix.len() + suffix.len()
+                && target.starts_with(prefix)
+                && target.ends_with(suffix)
+        }
+    }
+}
+
+/// Lists configured remotes with their URLs and tracking-ref counts.
+pub fn list(repo_path: &str) -> Result<RemoteList, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    let records = read_remote_records(repo.as_path())?;
     let tracking: Vec<String> = git_text(
         repo.as_path(),
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
@@ -524,6 +600,48 @@ pub(crate) fn list_names(repo: &Path) -> Result<Vec<String>, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_claims_follow_refspec_destinations_conservatively() {
+        let claims = FetchClaims(records(&[
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("remote.origin/eu.url", "/x"),
+            ("remote.mirror.fetch", "^refs/heads/skip"),
+            (
+                "remote.mirror.fetch",
+                "refs/heads/only:refs/remotes/mirror/only",
+            ),
+            ("remote.tags.fetch", "refs/tags/*"),
+        ]));
+        // origin's default-shaped refspec and origin/eu's implied default both
+        // write refs/remotes/origin/eu/x.
+        assert_eq!(claims.claimants("origin/eu/x"), vec!["origin", "origin/eu"]);
+        assert_eq!(claims.claimants("origin/main"), vec!["origin"]);
+        assert_eq!(claims.claimants("mirror/only"), vec!["mirror"]);
+        assert!(claims.claimants("mirror/other").is_empty());
+        assert!(claims.claimants("tags/x").is_empty());
+    }
+
+    /// The strict owner has no first-segment fallback; the reading split keeps it.
+    #[test]
+    fn configured_owner_never_falls_back_to_the_first_segment() {
+        let names = vec!["team".to_string(), "team/fork".to_string()];
+        assert_eq!(
+            configured_owner(&names, "team/fork/main"),
+            Some(("team/fork", "main"))
+        );
+        assert_eq!(
+            configured_owner(&names, "team/main"),
+            Some(("team", "main"))
+        );
+        assert_eq!(configured_owner(&names, "other/main"), None);
+        assert_eq!(configured_owner(&[], "origin/main"), None);
+        assert_eq!(
+            split_tracking_ref(&[], "origin/main"),
+            Some(("origin", "main"))
+        );
+        assert_eq!(configured_owner(&names, "team/"), None);
+    }
 
     fn records(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

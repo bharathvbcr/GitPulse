@@ -24,6 +24,10 @@ mod hermetic_env;
 #[path = "common/nextest_list.rs"]
 mod nextest_list;
 
+#[cfg(target_os = "macos")]
+#[path = "common/quiet_app.rs"]
+mod quiet_app;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     if nextest_list::answer_list("native_quit_guard", false) {
@@ -188,7 +192,7 @@ mod child {
         let mut context = gitpulse_lib::context();
         context.config_mut().identifier = "com.gitpulse.tests.quit-guard".into();
         context.config_mut().app.windows.clear();
-        let app = tauri::Builder::default()
+        let mut app = tauri::Builder::default()
             .manage(DesktopState::default())
             .manage(gitpulse_lib::terminal::TerminalSessions::from_settings())
             .on_web_content_process_terminate(webcrash::on_terminated)
@@ -236,6 +240,7 @@ mod child {
             })
             .build(context)
             .expect("native test application builds");
+        super::quiet_app::out_of_the_way(&mut app);
 
         let handle = app.handle().clone();
         let answering = handle.clone();

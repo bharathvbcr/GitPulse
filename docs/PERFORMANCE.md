@@ -3303,3 +3303,56 @@ The vendors added to these lists by the helper planting: Alibaba, Azure storage,
 - a plant at minimum length only, which it finds at realistic length.
 
 **Report sections:** the funnel, the comparable table, the rules measured beside their helpers (with the helpers planted for each), every measured rule together, per-rule results for all three tools, the ranked vendor list (misses and not-measured rules), the reconstructed old method, every disagreement with its reason, and every rule without a plant with its reason.
+
+---
+
+## 2026-11-15: macOS watch scope keeps ignored build trees out of the FSEvents stream
+
+`fseventsd` pays for every event under a registered root, whether or not the client wants it. Exclusion paths do not change that; only the registered roots do. Every tab used to register its whole worktree, so a build under `target/` cost `fseventsd` once per covering tab, and a main checkout covered every nested worktree's `target/` too.
+
+**The default scope is Narrow.** It is set in Settings → Agents → Watch scope; Whole worktree is the old behaviour. Narrow leaves a directory out of the stream only when all of these hold:
+- `git check-ignore` names the directory itself;
+- `git ls-files` finds no tracked path under it;
+- it is build output, or holds another checkout.
+
+The rest of the directory's parent is registered entry by entry. A kqueue on those parents re-registers when their entry names change. The whole worktree is registered again when any of these happens:
+- a step fails;
+- the path count exceeds 256;
+- a status row lies under an excluded directory;
+- the poll convicts the watch.
+
+See `src-tauri/src/watcher/scope.rs` and the exception in `watcher/skip.rs`.
+
+### Measured
+
+One M-series Mac (macOS 27), with about 19 other sessions running. The storms are synthetic zero-byte files in a scratch repository whose `.gitignore` is `target/`.
+
+**Callback volume:** `cargo test --lib measure_callback_volume_by_watch_scope -- --ignored --nocapture`. One watcher, a 50,000-file storm under `target/`, n = 5, load 11.5 at start and 19.6 at end.
+
+| arm | native callbacks per storm |
+| --- | --- |
+| whole | 162,278 · 164,233 · 163,134 · 163,152 · 165,093 |
+| narrow | 0 · 0 · 0 · 0 · 0 |
+| whole (null pair) | 164,763 · 164,654 · 163,514 · 164,672 · 165,041 |
+
+**fseventsd CPU:** `cargo test --lib watcher::storm::measure_fseventsd_cpu_by_watch_scope -- --ignored --nocapture`. 24 watchers per arm, 200,000 files created and deleted under `target/`, and a 45 s settle. CPU was read with the setuid `/bin/ps`. n = 3, with the arm order rotated each repetition.
+
+| arm | fseventsd CPU seconds per storm | notes |
+| --- | --- | --- |
+| no watcher | 16.3 · 16.8 · 15.3 | |
+| whole | 152.5 · 146.3 | a third run (125.0) ended at load 33.1 and is not a result |
+| narrow | 23.8 · 22.5 · 18.6 | |
+| whole (null pair) | 224.7 · 136.2 · 124.3 | |
+
+- **Narrow takes out about 96% of what the whole scope adds** over no watcher.
+- **The sign held in every run:** narrow's highest run is far below whole's lowest.
+- **Narrow is not free.** It sits about 5 s above no watcher, which is outside the no-watcher spread. The cause is not established. Each watcher still registers `.git` recursively and about 75 top-level paths.
+
+**On the real checkouts** (2026-11-15):
+- The main checkout excludes `.claude/worktrees`, `.gitpulse/worktrees`, `tmp`, `target`, `src-tauri/target`, `node_modules` and `.claude/labs-target`. It registers 102 paths, and planning took 73 ms after a 36 ms listing.
+- Linked worktrees exclude their own `src-tauri/target` and register 73 to 76 paths.
+
+**Not measured:**
+- the installed app over wall-clock time;
+- fseventsd memory (the growth that motivated this was not reproduced by any arm on 2026-11-14);
+- Linux and Windows, which are unchanged by construction: their root watch is non-recursive.

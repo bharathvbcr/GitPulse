@@ -18,7 +18,9 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +38,8 @@ pub const MAX_WAIT_CALLS: usize = 4;
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 45_000;
 
 static ACTIVE_WAIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+// Only the macOS branch of `reach_desktop_agent_deliver` mints a request id.
+#[cfg(target_os = "macos")]
 static RPC_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn in_process_bus_waker() -> &'static (Mutex<u64>, Condvar) {
@@ -95,6 +99,7 @@ impl Drop for WaitCallSlot<'_> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn next_rpc_id(prefix: &str) -> String {
     let seq = RPC_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
     let ms = SystemTime::now()
@@ -356,13 +361,10 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     let target = agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer)
         .map_err(|e| e.into_command_error().into_message())?;
 
-    let is_human = matches!(
-        a.from_peer.trim(),
-        "developer" | "human" | "human-dev" | "user"
-    );
-    let hop = if is_human {
-        0
-    } else if let Some(explicit) = a.hop {
+    // An MCP caller is always an agent: it is never the person using GitPulse, whatever
+    // `from_peer` says. `post_peer_message` refuses the names reserved for a person.
+    let origin = agent_bus::MessageOrigin::Agent;
+    let requested_hop = if let Some(explicit) = a.hop {
         explicit
     } else if let Some(ref tk) = a.thread_key {
         agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
@@ -372,6 +374,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     } else {
         1
     };
+    let hop = origin.effective_hop(requested_hop);
     let max_hops = a.max_hops.unwrap_or(agent_bus::DEFAULT_MAX_HOPS);
 
     let root_repo = crate::engine::git_cli::find_git_root(Path::new(&a.repo_path))
@@ -380,6 +383,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 
     let message = agent_bus::post_peer_message(
         &a.repo_path,
+        origin,
         &a.from_peer,
         Some(&target.record.peer_id),
         a.thread_key.as_deref(),
@@ -409,20 +413,16 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
                 let (preview, truncated) =
                     crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
                 truncated_in_mailbox = truncated;
-                let provenance = if is_human {
-                    EnvelopeProvenance::HumanConfirmed
-                } else {
-                    EnvelopeProvenance::PeerAgent {
-                        msg_id: msg_id.clone(),
-                        from_peer: message.from_agent.clone(),
-                        provider: sender_provider,
-                        branch: message.branch.clone().unwrap_or_default(),
-                        thread_key: message.thread_key.clone().unwrap_or_default(),
-                        hop,
-                        max_hops,
-                        truncated_in_bus: truncated,
-                        repo_root: root_repo.clone(),
-                    }
+                let provenance = EnvelopeProvenance::PeerAgent {
+                    msg_id: msg_id.clone(),
+                    from_peer: message.from_agent.clone(),
+                    provider: sender_provider,
+                    branch: message.branch.clone().unwrap_or_default(),
+                    thread_key: message.thread_key.clone().unwrap_or_default(),
+                    hop,
+                    max_hops,
+                    truncated_in_bus: truncated,
+                    repo_root: root_repo.clone(),
                 };
                 let _ = mb.deposit_with_provenance(
                     sid,
@@ -437,7 +437,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 
     notify_in_process_waiters();
 
-    let delivery_outcome = if !is_human && hop >= max_hops {
+    let delivery_outcome = if hop >= max_hops {
         "paused_hop_limit".to_string()
     } else if target.liveness != "live" {
         if target.liveness == "resumable" {

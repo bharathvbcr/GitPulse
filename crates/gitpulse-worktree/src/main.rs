@@ -22,7 +22,7 @@ use gitpulse_lib::codeintel::{
 };
 use gitpulse_lib::engine::agent_bus::{
     list_lanes, post_message, read_messages, register_or_update_lane,
-    register_or_update_lane_with_conflicts, release_lane, scan_parallel_agent_radar,
+    register_or_update_lane_with_conflicts, release_lane, scan_parallel_agent_radar, MessageOrigin,
 };
 use gitpulse_lib::engine::cow_clone::{clone_ignored_caches, CacheSelection};
 use gitpulse_lib::engine::git_reader::compute_default_base;
@@ -1438,9 +1438,16 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let message =
-                post_message(&repo, &from, to.as_deref(), &kind, &body, branch.as_deref())
-                    .map_err(CommandError::into_message)?;
+            let message = post_message(
+                &repo,
+                MessageOrigin::Agent,
+                &from,
+                to.as_deref(),
+                &kind,
+                &body,
+                branch.as_deref(),
+            )
+            .map_err(CommandError::into_message)?;
             Ok(json!({
                 "ok": true,
                 "message": message,

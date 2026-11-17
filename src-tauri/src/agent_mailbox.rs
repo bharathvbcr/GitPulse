@@ -118,10 +118,9 @@ fn io(context: &str, error: &std::io::Error) -> MailboxError {
 
 /// Who originated a mailbox envelope, governing whether delivery frames it as
 /// human-confirmed instructions or untrusted peer-agent output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum EnvelopeProvenance {
-    #[default]
     HumanConfirmed,
     PeerAgent {
         msg_id: String,
@@ -480,8 +479,15 @@ impl Mailbox {
         }
         let file = match options.open(&path) {
             Ok(file) => file,
+            // Every deposit writes a sidecar, human ones included, so a missing one means the
+            // envelope's origin is unknown and it must not be read as a person's. Envelopes
+            // deposited before sidecars existed (59178b6c) lived at most `PENDING_TTL` plus
+            // `CLAIMED_TTL`, so none survives to be migrated; an older build that still
+            // deposits without a sidecar has its envelopes dropped, not trusted.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(EnvelopeProvenance::HumanConfirmed);
+                return Err(MailboxError::Invalid(
+                    "envelope provenance is missing; its origin is unknown".into(),
+                ));
             }
             Err(e) => return Err(io("could not open envelope provenance", &e)),
         };
@@ -686,17 +692,10 @@ impl Mailbox {
         session: &str,
         now: SystemTime,
     ) -> Result<Option<Claim>, MailboxError> {
-        Ok(self.claim_envelope_next(session, now)?.map(|env| env.claim))
-    }
-
-    /// Takes the oldest pending envelope along with its [`EnvelopeProvenance`].
-    pub(crate) fn claim_envelope_next(
-        &self,
-        session: &str,
-        now: SystemTime,
-    ) -> Result<Option<ClaimedEnvelope>, MailboxError> {
-        let mut batch = self.try_claim_batch(session, 1, now)?;
-        Ok(batch.pop())
+        Ok(self
+            .try_claim_batch(session, 1, now)?
+            .pop()
+            .map(|env| env.claim))
     }
 
     /// Non-blocking batch claim of up to `max_items` oldest pending envelopes
@@ -1156,7 +1155,11 @@ impl Mailbox {
             if let Some(reason) = self.peek_rejected_by(&key, &dir, SystemTime::now(), &accept)? {
                 return Ok(EnvelopeWait::Declined(reason));
             }
-            if let Some(envelope) = self.claim_envelope_next(&key, SystemTime::now())? {
+            // Claim through the filter the peek used: another consumer may have taken what
+            // was peeked, and an unfiltered claim would then hand over the next message even
+            // when it is a peer message at its hop limit.
+            let mut claimed = self.try_claim_batch_filtered(&key, 1, SystemTime::now(), &accept)?;
+            if let Some(envelope) = claimed.pop() {
                 return Ok(EnvelopeWait::Message(envelope));
             }
             let spent = started.elapsed();
@@ -1195,7 +1198,11 @@ impl Mailbox {
         let Some((_, _, id)) = parse_message_name(oldest) else {
             return Ok(None);
         };
-        let prov = self.read_provenance(session_uuid, id)?;
+        // An envelope whose origin cannot be read is not a hop-limit pause. The claim that
+        // follows drops it (`try_claim_batch_filtered`), so the waiter is not wedged on it.
+        let Ok(prov) = self.read_provenance(session_uuid, id) else {
+            return Ok(None);
+        };
         if !accept(&prov) {
             return Ok(Some(
                 "pending peer message paused at hop limit; leaving unclaimed for manual review"
