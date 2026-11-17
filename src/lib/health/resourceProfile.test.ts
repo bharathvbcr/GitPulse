@@ -35,6 +35,6 @@ describe("profileNote", () => {
 
   it("never presents an unreadable memory size as a derived answer", () => {
     const note = profileNote(profile({ basis: "memory_unreadable", tier: "standard", memory_bytes: null }));
-    expect(note).toBe("In use: standard, because this computer's memory could not be read.");
+    expect(note).toBe("In use: standard, because this computer's memory couldn't be read.");
   });
 });

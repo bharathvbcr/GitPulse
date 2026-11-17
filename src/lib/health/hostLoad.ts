@@ -533,7 +533,7 @@ export function profileNote(profile: ResourceProfile): string {
     case "override":
       return `In use: ${profile.tier}, as you chose.`;
     case "memory_unreadable":
-      return `In use: ${profile.tier}, because this computer's memory could not be read.`;
+      return `In use: ${profile.tier}, because this computer's memory couldn't be read.`;
     case "memory":
       return profile.memory_bytes === null
         ? `In use: ${profile.tier}.`
