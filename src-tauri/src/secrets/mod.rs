@@ -29,7 +29,9 @@ pub use run::{
     SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
 };
 
-#[cfg(test)]
+// Its Kingfisher stand-ins are `/bin/sh` scripts made executable with Unix
+// permissions, so the module builds on Unix only.
+#[cfg(all(test, unix))]
 mod primary_tests;
 
 #[cfg(test)]
