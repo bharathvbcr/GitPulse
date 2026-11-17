@@ -4,10 +4,12 @@ import { MAX_VISIBLE_SESSIONS } from "./attendance";
 import {
   createGpuRenderer,
   createGpuSlots,
+  GPU_CHURN_WINDOW_MS,
   GPU_HIDE_GRACE_MS,
   GPU_LOSS_BUDGET,
   GPU_LOSS_WINDOW_MS,
   GPU_RECOVER_DELAY_MS,
+  gpuPolicy,
   type GpuAddon,
   type GpuRenderer,
   type GpuSlots,
@@ -161,6 +163,9 @@ function session(page: FakePage, slots: GpuSlots, options: { failAttach?: () => 
       return addon;
     },
     slots,
+    // These suites are written against the roomy grace; the shared policy
+    // starts at the compact one until a resource profile arrives.
+    policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
     onChange: (state) => changes.push(state),
     refresh: () => {
       refreshes.count += 1;
@@ -513,7 +518,10 @@ describe("a loss is bounded, not final", () => {
         expect(slots.held()).toBe(0);
       }
       expect(s.renderer.sync(true)).toBe("webgl");
-      // An on-screen loss still counts: the budget is untouched by the holds.
+      // The holds above were a burst of creations, and a loss during a burst is the page's
+      // own churn (`gpuChurn.test.ts`). Once the burst has aged out, an on-screen loss
+      // still counts: the budget is untouched by the holds.
+      vi.advanceTimersByTime(GPU_CHURN_WINDOW_MS);
       for (let loss = 1; loss <= GPU_LOSS_BUDGET; loss += 1) {
         page.forceLose(s.current()!.canvas);
         expect(s.renderer.state(), `${engine} on-screen loss ${loss}`).toBe("reset");

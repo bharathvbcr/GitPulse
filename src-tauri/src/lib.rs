@@ -105,6 +105,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let mut options = sysload::SamplerOptions::new(dir);
     options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
     options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
+    options.profile_choice = Box::new(|| tool_config::host_load_settings().profile);
     options.thresholds = Box::new(|| tool_config::host_load_settings().thresholds);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {

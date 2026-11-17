@@ -1,0 +1,160 @@
+<!doctype html>
+<!--
+  Slow-switching WebGL context bench. NOT a regression page and not part of
+  `test:browser`: it runs for twenty minutes or more. Run it with
+  `node scripts/churn-bench.mjs` (see that file for the arguments).
+
+  One long-lived idle on-screen pane, five docks (one pane each) shown in turn
+  at a human pace, on the real pool and the real hide grace of a resource tier.
+  It records every context creation, every loss the engine forced (a loss we did
+  not ask for), which pane it hit, and the idle pane's final renderer.
+-->
+<html>
+  <head><meta charset="utf-8" /><title>GitPulse context churn bench</title></head>
+  <body style="margin:0">
+    <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
+    <script type="module">
+      import { Terminal } from "@xterm/xterm";
+      import { WebglAddon } from "@xterm/addon-webgl";
+      import "../src/app.css";
+      import { createGpuRenderer, createGpuSlots, gpuPolicy } from "../src/lib/terminal/gpuRenderer.ts";
+      import { MAX_VISIBLE_SESSIONS } from "../src/lib/terminal/attendance.ts";
+      import { COMPACT_BUDGETS } from "../src/lib/resourceBudgets.ts";
+
+      const params = new URLSearchParams(location.search);
+      const tier = params.get("tier") === "roomy" ? "roomy" : "compact";
+      const output = params.get("output") === "stream" ? "stream" : "idle";
+      /** "interval seconds:duration seconds" phases, in order. */
+      const phases = (params.get("phases") ?? "20:600,30:600").split(",").map((phase) => {
+        const [interval, duration] = phase.split(":").map(Number);
+        return { interval, duration };
+      });
+      const DOCKS = 5;
+      // The two tiers' numbers, as shipped (`sysload/profile.rs`): compact is
+      // `COMPACT_BUDGETS`; roomy is the old constants, cap 8 and a five-minute hold.
+      const budget = tier === "roomy"
+        ? { gpu_contexts: 8, gpu_hide_grace_ms: 5 * 60_000 }
+        : { gpu_contexts: COMPACT_BUDGETS.gpu_contexts, gpu_hide_grace_ms: COMPACT_BUDGETS.gpu_hide_grace_ms };
+      const slots = createGpuSlots(budget.gpu_contexts, MAX_VISIBLE_SESSIONS);
+      const policy = { ...gpuPolicy, hideGraceMs: budget.gpu_hide_grace_ms };
+
+      const startedAt = performance.now();
+      const at = () => Math.round((performance.now() - startedAt) / 1000);
+      const events = [];
+      const post = (suffix, body) => params.has("report")
+        ? fetch(params.get("report") + suffix, { method: "POST", body: typeof body === "string" ? body : JSON.stringify(body) }).catch(() => {})
+        : Promise.resolve();
+      const say = (line) => {
+        document.getElementById("result").textContent = line;
+        return post("/progress", line);
+      };
+
+      // A loss the page did not ask for is the engine's. Our own releases go
+      // through `loseContext`, so wrapping it tells the two apart.
+      const ours = new WeakSet();
+      const realGetExtension = WebGL2RenderingContext.prototype.getExtension;
+      WebGL2RenderingContext.prototype.getExtension = function (name) {
+        const ext = realGetExtension.call(this, name);
+        if (name !== "WEBGL_lose_context" || !ext) return ext;
+        return { loseContext: () => { ours.add(this); ext.loseContext(); }, restoreContext: () => ext.restoreContext() };
+      };
+
+      let phaseIndex = 0;
+      const tally = phases.map(() => ({ switches: 0, created: 0, forced: [] }));
+      const makePane = (label) => {
+        const host = document.createElement("div");
+        host.style.cssText = "position:fixed;left:0;top:0;width:360px;height:120px;opacity:0.01;pointer-events:none";
+        document.body.append(host);
+        const term = new Terminal({ cols: 40, rows: 6, allowProposedApi: true });
+        term.open(host);
+        const pane = { label, term, host, canvas: null, renderer: null };
+        pane.renderer = createGpuRenderer({
+          attach: () => {
+            const addon = new WebglAddon();
+            term.loadAddon(addon);
+            tally[phaseIndex].created += 1;
+            events.push({ t: at(), kind: "create", pane: label });
+            pane.canvas = [...term.element.querySelectorAll("canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            const gl = pane.canvas.getContext("webgl2");
+            pane.canvas.addEventListener("webglcontextlost", () => {
+              if (!ours.has(gl)) {
+                tally[phaseIndex].forced.push(label);
+                events.push({ t: at(), kind: "forced", pane: label });
+              }
+              pane.renderer.lose(pane.canvas);
+            }, true);
+            return {
+              canvas: pane.canvas,
+              dispose: () => addon.dispose(),
+              onContextLoss: (listener) => addon.onContextLoss(listener),
+              clearTextureAtlas: () => addon.clearTextureAtlas(),
+            };
+          },
+          slots,
+          policy,
+          refresh: () => term.refresh(0, term.rows - 1),
+        });
+        return pane;
+      };
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const idle = makePane("idle");
+      idle.term.write("idle pane, on screen, never written to again\r\n");
+      idle.renderer.sync(true);
+      // The idle pane's own first context is the baseline, not a creation by switching.
+      tally[0].created = 0;
+      const docks = Array.from({ length: DOCKS }, (_, n) => makePane(`dock${n}`));
+      for (const dock of docks) dock.term.write(`${dock.label}\r\n`);
+
+      // Steady output into whichever dock is shown, as a streaming agent writes.
+      let shown = -1;
+      let line = 0;
+      const stream = output === "stream" ? setInterval(() => {
+        if (shown < 0) return;
+        line += 1;
+        docks[shown].term.write(`${String(line).padStart(7, "0")} ${"streaming output ".repeat(4)}\r\n`);
+      }, 50) : null;
+
+      const lines = [];
+      for (phaseIndex = 0; phaseIndex < phases.length; phaseIndex += 1) {
+        const { interval, duration } = phases[phaseIndex];
+        const phaseEnd = performance.now() + duration * 1000;
+        while (performance.now() < phaseEnd) {
+          const next = (shown + 1) % DOCKS;
+          docks[next].renderer.sync(true);
+          if (shown >= 0) docks[shown].renderer.sync(false);
+          shown = next;
+          tally[phaseIndex].switches += 1;
+          const row = tally[phaseIndex];
+          await say(`t=${at()}s phase ${phaseIndex + 1}/${phases.length} (every ${interval}s): ${row.switches} switches, ${row.created} created, forced [${row.forced.join(",")}], idle ${idle.renderer.state()}`);
+          await sleep(interval * 1000);
+        }
+        lines.push({
+          every_s: interval,
+          minutes: Math.round(duration / 6) / 10,
+          switches: tally[phaseIndex].switches,
+          created: tally[phaseIndex].created,
+          forced: tally[phaseIndex].forced,
+        });
+      }
+      if (stream) clearInterval(stream);
+      const summary = {
+        tier,
+        output,
+        pool: { cap: budget.gpu_contexts, hold_ms: budget.gpu_hide_grace_ms, max: MAX_VISIBLE_SESSIONS },
+        phases: lines,
+        idle_final: idle.renderer.state(),
+        idle_context_lost: idle.canvas ? idle.canvas.getContext("webgl2").isContextLost() : null,
+        dock_final: docks.map((dock) => dock.renderer.state()),
+        total_created: tally.reduce((sum, row) => sum + row.created, 0),
+        total_forced: tally.reduce((sum, row) => sum + row.forced.length, 0),
+        elapsed_s: at(),
+        engine: navigator.userAgent,
+        events,
+      };
+      WebGL2RenderingContext.prototype.getExtension = realGetExtension;
+      await post("", summary);
+      document.documentElement.dataset.done = "1";
+    </script>
+  </body>
+</html>

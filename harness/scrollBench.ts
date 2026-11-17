@@ -31,7 +31,7 @@ import {
   type Arm, type Input, type Renderer,
 } from "./scrollScript";
 import { attachScrollGuard } from "../src/lib/terminal/scrollFeel";
-import { createGpuRenderer, createGpuSlots, gpuPolicy } from "../src/lib/terminal/gpuRenderer";
+import { createGpuRenderer, createGpuSlots, GPU_HIDE_GRACE_MS, gpuPolicy } from "../src/lib/terminal/gpuRenderer";
 
 export type { Arm, Input, Renderer };
 export { armsFor };
@@ -128,7 +128,8 @@ function openTerminal(host: HTMLElement, options: { smooth: number; sens: number
       };
     },
     slots: createGpuSlots(8),
-    policy: { ...gpuPolicy },
+    // The shared policy's grace follows the resource profile; a bench names the grace it means.
+    policy: { ...gpuPolicy, hideGraceMs: GPU_HIDE_GRACE_MS },
     refresh: () => term.refresh(0, term.rows - 1),
   });
   return { term, gpu, close: () => { gpu.dispose(); term.dispose(); host.replaceChildren(); } };

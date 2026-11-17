@@ -17,11 +17,13 @@
     hostLoadSettings,
     thresholdsAreDefault as defaultThresholds,
     loadHostLoadSettings,
+    resourceProfile,
     updateHostLoadSettings,
     type HostLoadHookMode,
     type LeaseMode,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
+  import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
   import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
@@ -99,6 +101,34 @@
     disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
+  <div class="space-y-1 pt-1">
+    <label class="text-textPrimary" for="gp-host-load-profile">Memory profile</label>
+    <select
+      id="gp-host-load-profile"
+      class="gp-select text-meta w-full min-w-0"
+      data-size="sm"
+      data-testid="host-load-profile"
+      disabled={busy || !readOk}
+      value={settings.profile}
+      onchange={(event) => void save({ profile: asProfileChoice(event.currentTarget.value) })}
+    >
+      {#each PROFILE_CHOICES as choice (choice.value)}
+        <option value={choice.value}>{choice.label}</option>
+      {/each}
+    </select>
+    <p class="text-textMuted text-micro leading-snug" data-testid="host-load-profile-note">
+      Sizes how much GitPulse keeps ready in memory. Every terminal you can see always keeps its GPU drawing
+      (up to 8, about 49 MB each), whatever you pick here. Only terminals that are out of sight are limited:
+      the number allowed to keep theirs is
+      {#if $resourceProfile}{$resourceProfile.budgets.gpu_contexts}{:else}this setting's limit{/if}
+      minus the terminals on screen, never below zero, and each is let go after a while. While you
+      switch terminals quickly (about six new ones in a minute), hidden terminals keep theirs for the full
+      hold time (15 seconds, 1 minute or 5 minutes, by size), up to 8 in all, and the limit applies again once you slow down. It also sets how many repositories
+      keep their commit graph.
+      It never changes your session limits or scrollback. Automatic picks from this computer's memory.
+      {#if $resourceProfile}{profileNote($resourceProfile)}{/if}
+    </p>
+  </div>
   <div class="space-y-1 pt-1" data-testid="host-load-hook-mode">
     <p class="text-text">Command gate: heavy commands in agent sessions</p>
     <p class="text-textMuted text-micro leading-snug">

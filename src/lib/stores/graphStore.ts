@@ -12,6 +12,7 @@ import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
 import { isRefScope, type RefScope } from "../graph/refScope";
 import { interfaceStore } from "./interfaceStore";
 import type { CommitSignatureCheck } from "../pulse/types";
+import { COMPACT_BUDGETS } from "../resourceBudgets";
 
 export type InvokeFn = <T>(
   cmd: string,
@@ -467,7 +468,7 @@ export function createGraphStore(
     cacheLimit?: number;
   } = {}
 ) {
-  const cacheLimit = Math.max(1, Math.floor(deps.cacheLimit ?? GRAPH_CACHE_LIMIT));
+  let cacheLimit = Math.max(1, Math.floor(deps.cacheLimit ?? GRAPH_CACHE_LIMIT));
   const invokeFn = deps.invoke ?? (invoke as InvokeFn);
   // Normalized at the seam: a persisted preference is user data, and the IPC
   // boundary must never receive a value the backend will refuse to
@@ -759,6 +760,20 @@ export function createGraphStore(
     },
     /** How many repositories hold rows right now (at most `cacheLimit`), for tests and diagnostics. */
     retainedGraphs: (): number => cache.size,
+    /** How many repositories may keep their rows now. */
+    cacheLimit: (): number => cacheLimit,
+    /**
+     * Changes how many repositories keep their rows (floored, at least one; a
+     * value that is not a finite number is ignored). A smaller limit sheds
+     * the least recently used repositories at once, through the same trim that
+     * enforces it after every load, and never the visible one; a larger one
+     * only lets later visits stay.
+     */
+    setCacheLimit: (next: number): void => {
+      if (!Number.isFinite(next)) return;
+      cacheLimit = Math.max(1, Math.floor(next));
+      trim();
+    },
     /** Everything held for a closed tab: rows, the shed view, and the ordering state. */
     evict: (path: string) => {
       cache.delete(path);
@@ -1122,4 +1137,5 @@ export function createGraphStore(
 
 export type GraphStoreApi = ReturnType<typeof createGraphStore>;
 
-export const graphStore = createGraphStore();
+/** Starts at the compact limit and follows the resource profile (`applyResourceBudgets`). */
+export const graphStore = createGraphStore({ cacheLimit: COMPACT_BUDGETS.graph_cache_repositories });

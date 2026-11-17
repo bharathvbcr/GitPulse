@@ -35,6 +35,13 @@ export function hostLoadStatusFixture(): HostLoadStatus {
       largest_foreign: null,
       override_remaining_s: null,
     },
+    profile: {
+      tier: "roomy",
+      basis: "memory",
+      memory_bytes: 36 * 2 ** 30,
+      logical_cores: 12,
+      budgets: { gpu_contexts: 8, gpu_hide_grace_ms: 300_000, graph_cache_repositories: 6 },
+    },
     snapshot_path: "/Users/fixture/Library/Application Support/GitPulse/host-load.v1",
     writer,
     writer_is_self: false,
@@ -104,6 +111,7 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
     hook_mode: "enforce",
     leases: { mode: "on", slots: 4, wait_max_s: 1800, wait_hard_s: 14400, incremental_off: false },
     idle: { idle_after_s: 900, park_after_s: 3600 },
+    profile: "auto",
     thresholds: {
       swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
       compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },

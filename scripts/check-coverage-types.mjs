@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 127 contracts over
- * 339 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 129 contracts over
+ * 341 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -281,6 +281,10 @@ export const CONTRACTS = Object.freeze([
   { label: "host-load-thresholds", rustPath: rust("sysload", "thresholds.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Rule", "ModeRule", "Thresholds", "DiskFill", "DiskGuard", "HorizonRule", "HeadroomRule"] },
   { label: "host-load-settings",rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings", "HostLoadLeases", "HostLoadIdle"] },
   { label: "host-load-governor", rustPath: rust("sysload", "governor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["GovernorVerdict", "GovernorReport", "GovernorPulse", "Shed"] },
+  // The resource profile the status carries, and the budgets the terminal's
+  // GPU pool and the graph cache are sized from (`resourceBudgets.ts`).
+  { label: "host-load-profile", rustPath: rust("sysload", "profile.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ResourceProfile"] },
+  { label: "host-load-profile-budgets", rustPath: rust("sysload", "profile.rs"), tsPath: ts("resourceBudgets.ts"), structs: ["ResourceBudgets"] },
   // Build leases and idle sessions: `cmd_host_load_leases` and
   // `cmd_host_load_idle`. A renamed field would blank the Build slots block or
   // read an unknown count as zero, and nothing would fail.

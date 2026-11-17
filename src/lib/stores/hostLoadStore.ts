@@ -1,10 +1,11 @@
-import { derived, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { refusalNotice } from "../health/hostLoad";
 import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
+import type { ResourceBudgets } from "../resourceBudgets";
 
 /**
  * Host load as the app's sampler publishes it (`src-tauri/src/sysload`,
@@ -377,6 +378,25 @@ export interface GovernorPulse {
   largest_foreign: number | null;
 }
 
+/** `sysload::ProfileTier`: how much headroom the machine has. */
+export type ProfileTier = "compact" | "standard" | "roomy";
+/** `host_load_profile`: `auto` derives the tier from memory, the others pin it. */
+export type ProfileChoice = "auto" | ProfileTier;
+/**
+ * `sysload::ProfileBasis`: how the tier was decided. `memory_unreadable` is a
+ * default (`standard`), not a derived answer.
+ */
+export type ProfileBasis = "memory" | "override" | "memory_unreadable";
+
+/** `sysload::ResourceProfile`: the capacity budgets this machine allows. */
+export interface ResourceProfile {
+  tier: ProfileTier;
+  basis: ProfileBasis;
+  memory_bytes: number | null;
+  logical_cores: number | null;
+  budgets: ResourceBudgets;
+}
+
 /** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
 export const HOST_PRESSURE_REFUSAL = "host_pressure";
 
@@ -442,6 +462,7 @@ export interface HostLoadStatus {
   sensor: SensorReport;
   pressure: PressureInput;
   governor: GovernorReport;
+  profile: ResourceProfile;
   snapshot_path: string | null;
   writer: WriterIdentity | null;
   writer_is_self: boolean;
@@ -542,6 +563,11 @@ export interface HostLoadSettings {
   thresholds: Thresholds;
   leases: HostLoadLeases;
   idle: HostLoadIdle;
+  /**
+   * Which resource profile sizes GitPulse's caches. Stored as the top-level
+   * `host_load_profile`, never inside `host_load`.
+   */
+  profile: ProfileChoice;
 }
 
 /** Mirrors `HostLoadLeases::default` in Rust. */
@@ -662,12 +688,40 @@ export function startHostLoad(): void {
   const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
     announceRefusal(event.payload);
+    rereadProfileIfUnsettled();
   }).catch((error) => {
     if (listening === attempt) listening = null;
     diagnostics.warn("hostLoad", `couldn't listen for the host-load pulse; will retry: ${String(error)}`);
     return null;
   });
   listening = attempt;
+  profileRetryNotBefore = Date.now() + PROFILE_RETRY_BASE_MS;
+  void refreshHostLoad().catch(() => undefined);
+}
+
+/** First wait before the profile is reread; each further wait doubles, up to the cap. */
+export const PROFILE_RETRY_BASE_MS = 2_000;
+export const PROFILE_RETRY_CAP_MS = 60_000;
+
+let profileRetries = 0;
+let profileRetryNotBefore = 0;
+
+/**
+ * The pulse does not carry the resource profile, so a start-up read that failed,
+ * or that said the computer's memory could not be read, would leave every
+ * consumer on a guessed tier until a restart. While the profile is unsettled
+ * (no status yet, or `memory_unreadable`) a pulse rereads it, but on a doubling
+ * wait that levels off at `PROFILE_RETRY_CAP_MS`: at most one read a minute for
+ * a read that never succeeds, never one per two-second tick, and never a stop
+ * that would strand the tier. A change of setting starts the waits over.
+ */
+function rereadProfileIfUnsettled(): void {
+  const held = get(statusStore);
+  if (held !== null && held.profile.basis !== "memory_unreadable") return;
+  const now = Date.now();
+  if (now < profileRetryNotBefore) return;
+  profileRetryNotBefore = now + Math.min(PROFILE_RETRY_CAP_MS, PROFILE_RETRY_BASE_MS * 2 ** profileRetries);
+  profileRetries += 1;
   void refreshHostLoad().catch(() => undefined);
 }
 
@@ -700,6 +754,8 @@ export function refreshHostLoad(): Promise<HostLoadStatus | null> {
  * reads again instead of joining it.
  */
 function refreshAfterChange(): void {
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   void (refreshing ?? Promise.resolve())
     .catch(() => undefined)
     .then(() => refreshHostLoad())
@@ -841,7 +897,7 @@ export async function parkSession(terminalSession: string): Promise<string> {
   return message;
 }
 
-/** Mirrors `HostLoadSettings::default` in Rust: on. */
+/** Mirrors `HostLoadSettings::default` in Rust: on, profile derived. */
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
@@ -849,6 +905,7 @@ export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   thresholds: DEFAULT_THRESHOLDS,
   leases: DEFAULT_LEASES,
   idle: DEFAULT_IDLE,
+  profile: "auto",
 };
 
 /**
@@ -874,6 +931,9 @@ export async function saveHostLoadSettings(settings: HostLoadSettings): Promise<
   }
   const saved = await invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
   settingsStore.set(saved);
+  // The profile is part of the status: reread it so a change of tier reaches
+  // every consumer now, not on a restart.
+  refreshAfterChange();
   return saved;
 }
 
@@ -911,6 +971,16 @@ export const hostLoadStatus: Readable<HostLoadStatus | null> = {
 };
 
 /**
+ * The resource profile the backend derived, or null until the first status
+ * arrives. A consumer sizing itself from it uses `COMPACT_BUDGETS` while it
+ * is null, never a roomy default (`resourceBudgets.ts`).
+ */
+export const resourceProfile: Readable<ResourceProfile | null> = derived(
+  statusStore,
+  (status) => status?.profile ?? null,
+);
+
+/**
  * The memory-pressure input for features that defer background work under
  * load (card 1c): a level only while the sensor may be acted on.
  */
@@ -924,6 +994,8 @@ export function resetHostLoadForTests(): void {
   listening = null;
   refreshing = null;
   noticeShown = false;
+  profileRetries = 0;
+  profileRetryNotBefore = 0;
   pulseStore.set(null);
   statusStore.set(null);
   settingsStore.set(null);
