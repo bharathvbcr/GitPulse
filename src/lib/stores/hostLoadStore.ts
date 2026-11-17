@@ -260,6 +260,7 @@ export type Binding =
   | "disk_filling"
   | "thermal"
   | "cpu_load"
+  | "exec_latency"
   | "battery";
 export type Tier = "clear" | "elevated" | "severe";
 export type Reason =
@@ -332,9 +333,26 @@ export interface DiskFill {
   tier: Tier;
 }
 
+/**
+ * `sysload::ExecLatency`: how long a trivial child takes to start, measured by
+ * the app's own probe. The median of the last `n` probes, and whether the
+ * latch (slow from 500 ms, clear below 300 ms) calls that slow.
+ */
+export interface ExecLatency {
+  median_ms: number;
+  n: number;
+  slow: boolean;
+}
+
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {
   verdict: GovernorVerdict;
+  /**
+   * The start-up time the governor last read, beside the memory pressure it
+   * reports. Absent or null when no probe runs in the process or it could not
+   * run: unknown, never fast.
+   */
+  exec_latency?: ExecLatency | null;
   /** Present while the fill-rate rule is on and the projection is at least elevated. */
   disk_fill?: DiskFill | null;
   refusing_for_s: number | null;

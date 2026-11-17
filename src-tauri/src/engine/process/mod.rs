@@ -22,6 +22,8 @@ mod thread_io;
 mod awaiting_adversarial_tests;
 #[cfg(test)]
 mod budget_churn_tests;
+#[cfg(test)]
+mod exec_probe_tests;
 #[cfg(all(test, unix))]
 mod grace_adversarial_tests;
 #[cfg(test)]
@@ -101,8 +103,8 @@ pub use runner::{
 pub(crate) use runner::{
     capture_command_scrubbed, capture_command_with_env, classify_tool_probe, is_run_timeout,
     is_timed_out, last_process_failure, note_process_failure, process_failures, run_bounded,
-    run_bounded_capped, run_observed, text_from_bytes, BoundedRun, ExitFacts, KeepDeadlinePrefix,
-    OutputStream, ProcessObserver, RunError, ToolProbe,
+    run_bounded_capped, run_observed, text_from_bytes, time_exec_probe, BoundedRun, ExecProbeRun,
+    ExitFacts, KeepDeadlinePrefix, OutputStream, ProcessObserver, RunError, ToolProbe,
 };
 #[cfg(test)]
 pub(crate) use runner::{

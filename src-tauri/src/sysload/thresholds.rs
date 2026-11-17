@@ -540,6 +540,11 @@ pub struct Readings {
     /// The sustained rate Severe decides on: one burst cannot fake it and a
     /// pause cannot hide it (`diskrate`).
     pub disk_fill_sustained: Reading<u64>,
+    /// How long a trivial child takes to start (`exec_probe`): the app's
+    /// sampler measures it in its own process, so it is not part of a host
+    /// sample and rides on the governor's input only. Unsupported wherever no
+    /// probe runs (a reader process, a platform with no trivial program).
+    pub exec_latency: Reading<super::exec_probe::ExecLatency>,
 }
 
 impl Readings {
@@ -555,6 +560,7 @@ impl Readings {
             segments: host.compressor_segments,
             disk_fill: Reading::default(),
             disk_fill_sustained: Reading::default(),
+            exec_latency: Reading::default(),
         }
     }
 
@@ -581,6 +587,11 @@ impl Readings {
             }),
             disk_fill: Reading::Value(0),
             disk_fill_sustained: Reading::Value(0),
+            exec_latency: Reading::Value(super::exec_probe::ExecLatency {
+                median_ms: 5,
+                n: 9,
+                slow: false,
+            }),
         }
     }
 
@@ -831,6 +842,22 @@ impl Thresholds {
             "CPU load",
             readings.load_per_cpu().map(|v| high_tier(v, &self.load)),
         );
+        // Not a Settings input: start-up time has one documented default
+        // (`exec_probe::ENTER_MS` and `EXIT_MS`, latched where the reading is
+        // made) and sheds background work only, never reactive work or a
+        // launch, so a slow start-up cannot by itself refuse anything.
+        take(
+            Binding::ExecLatency,
+            InputMode::Shed,
+            "process start-up time",
+            value_or_gap(readings.exec_latency).map(|latency| {
+                if latency.slow {
+                    Tier::Elevated
+                } else {
+                    Tier::Clear
+                }
+            }),
+        );
         take(
             Binding::Battery,
             self.battery.mode,
@@ -949,6 +976,25 @@ impl Thresholds {
                     format!("the thermal state is {other:?} (was serious or worse)").to_lowercase()
                 }
             },
+            Binding::ExecLatency => {
+                let latency = readings.exec_latency.value()?;
+                let took = format_latency(latency.median_ms);
+                let now = if latency.slow {
+                    format!(
+                        "at or above {}",
+                        format_latency(super::exec_probe::ENTER_MS)
+                    )
+                } else {
+                    format!(
+                        "now back under {}, held until it stays clear",
+                        format_latency(super::exec_probe::EXIT_MS)
+                    )
+                };
+                format!(
+                    "starting a process takes a median {took} over the last {} probes, {now}",
+                    latency.n
+                )
+            }
             Binding::Battery => match readings.power.value()? {
                 Power::Battery => "the computer is running on battery".to_string(),
                 Power::Ac => {
@@ -956,6 +1002,16 @@ impl Thresholds {
                 }
             },
         })
+    }
+}
+
+/// A start-up time in words: whole milliseconds under a second, else seconds
+/// to one decimal.
+pub(crate) fn format_latency(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.1} s", ms as f64 / 1_000.0)
     }
 }
 

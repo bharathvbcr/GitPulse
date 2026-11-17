@@ -141,13 +141,28 @@ pub(crate) fn refusal_message_at(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low{by}"
         )),
-        Refusal::Pressure { reactive, cause } => deferred(format!(
-            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}",
-            if reactive { "reactive" } else { "background" },
-            cause
-                .unwrap_or(crate::sysload::Binding::MemoryPressure)
-                .cause_phrase()
-        )),
+        Refusal::Pressure { reactive, cause } => {
+            let cause = cause.unwrap_or(crate::sysload::Binding::MemoryPressure);
+            // Slow start-up is the one cause with a number worth quoting in
+            // the sentence: how slow. It follows the phrase, after the marker
+            // every reader matches on.
+            let measured = match cause {
+                crate::sysload::Binding::ExecLatency => crate::sysload::exec_latency()
+                    .map(|latency| {
+                        format!(
+                            " (median {})",
+                            crate::sysload::format_latency(latency.median_ms)
+                        )
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            deferred(format!(
+                "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}{measured}",
+                if reactive { "reactive" } else { "background" },
+                cause.cause_phrase()
+            ))
+        }
     }
 }
 
@@ -332,6 +347,9 @@ thread_local! {
     /// the only thing the host is short of (see [`with_disk_relief`]). The ask
     /// alone admits nothing: the governor must say so too.
     static DISK_RELIEF: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread's spawn is the host-load exec probe (see
+    /// [`with_exec_probe`]).
+    static EXEC_PROBE: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's background spawns wait for budget; a thread
     /// starts in the process default, like [`ADMISSION`].
     static AWAITS_BUDGET: Cell<bool> =
@@ -481,11 +499,30 @@ pub(crate) fn with_disk_relief<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Runs `body` as the host-load exec probe: its one spawn is admitted outside
+/// the rate bucket and the load governor's verdict, and only that.
+///
+/// The probe measures how long a trivial child takes to start, and the
+/// governor sheds background work while that is slow. A probe the verdict could
+/// shed would stop measuring the moment it was needed and never see start-up
+/// recover; one that drew from the git rate bucket would be refused by an
+/// empty bucket (the 2026-11-16 shared bucket sat at zero) and read as no
+/// signal, or would spend tokens the git reads need. What still bounds it is
+/// the concurrency limit (it is `Background` and takes one of the background
+/// slots), its own deadline, and the one-in-flight cadence of its caller. Only
+/// `sysload::exec_probe` calls it, through [`super::runner::time_exec_probe`].
+pub(super) fn with_exec_probe<T>(body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(EXEC_PROBE.replace(true), |prev| {
+        EXEC_PROBE.set(prev);
+    });
+    body()
+}
+
 /// The load governor's verdict for one spawn of `class`, and the only reader of
 /// it: the refusal the gate gives under pressure, or `None` when the class is
 /// not shed (a user action never is) or the disk remedy's relief applies.
 fn pressure_refusal(class: Admission) -> Option<Refusal> {
-    if class == Admission::Interactive {
+    if class == Admission::Interactive || EXEC_PROBE.get() {
         return None;
     }
     let background = class == Admission::Background;
@@ -1225,7 +1262,8 @@ impl SpawnGate {
             return Err((refusal, None));
         }
         let rate_limited = self.refill_per_sec != u32::MAX
-            && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);
+            && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed)
+            && !EXEC_PROBE.get();
         let entered = self.clock.now();
         // Declared before the state guard so that, unwinding, the guard is
         // released first and the reservation can take the lock to give its

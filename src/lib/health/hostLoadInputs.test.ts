@@ -68,6 +68,7 @@ describe("every binding has words", () => {
     "low_disk",
     "thermal",
     "cpu_load",
+    "exec_latency",
     "battery",
   ];
   it("labels each binding and names it in the refusal notice", () => {

@@ -381,6 +381,8 @@ function bindingCause(binding: Binding | null): string {
       return "heat";
     case "cpu_load":
       return "heavy CPU load";
+    case "exec_latency":
+      return "slow process start-up";
     case "battery":
       return "battery power";
     case "memory_pressure":
@@ -406,12 +408,29 @@ export function bindingLabel(binding: Binding | null): string {
       return "heat";
     case "cpu_load":
       return "CPU load";
+    case "exec_latency":
+      return "slow start-up";
     case "battery":
       return "on battery";
     case "memory_pressure":
     case null:
       return "memory";
   }
+}
+
+/**
+ * Process start-up time in one line, to sit beside memory pressure in Health
+ * and in a diagnostics export. A probe that has not produced a reading says so
+ * rather than reading as fast.
+ */
+export function execLatencyLine(report: GovernorReport): string {
+  const latency = report.exec_latency;
+  if (latency === null || latency === undefined) {
+    return "Process start-up time: unknown (no probe reading).";
+  }
+  const took =
+    latency.median_ms < 1000 ? `${latency.median_ms} ms` : `${(latency.median_ms / 1000).toFixed(1)} s`;
+  return `Process start-up time: median ${took} over ${latency.n} probe${latency.n === 1 ? "" : "s"}${latency.slow ? " (slow: background work is shed)" : ""}.`;
 }
 
 /** What the governor adds to the status chip: refused launches outrank shedding. */

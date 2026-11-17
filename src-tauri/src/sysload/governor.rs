@@ -106,6 +106,11 @@ pub enum Binding {
     CpuLoad,
     /// Running on battery.
     Battery,
+    /// A trivial child takes a median of [`super::exec_probe::ENTER_MS`] or
+    /// more to start (`exec_probe`). Published to older readers as
+    /// [`Binding::CpuLoad`], the nearest binding they know that also only
+    /// sheds; see [`Binding::wire`].
+    ExecLatency,
 }
 
 impl Binding {
@@ -123,6 +128,7 @@ impl Binding {
             Some(Self::CpuLoad) => 7,
             Some(Self::Battery) => 8,
             Some(Self::DiskFilling) => 9,
+            Some(Self::ExecLatency) => 10,
         }
     }
 
@@ -140,6 +146,7 @@ impl Binding {
             7 => Some(Self::CpuLoad),
             8 => Some(Self::Battery),
             9 => Some(Self::DiskFilling),
+            10 => Some(Self::ExecLatency),
             _ => return None,
         })
     }
@@ -154,6 +161,7 @@ impl Binding {
     pub(super) fn wire(self) -> Self {
         match self {
             Self::DiskFilling => Self::LowDisk,
+            Self::ExecLatency => Self::CpuLoad,
             other => other,
         }
     }
@@ -196,6 +204,7 @@ impl Binding {
             Self::Thermal => "the Mac is thermally throttled",
             Self::CpuLoad => "the CPU load average is above GitPulse's limit for it",
             Self::Battery => "the Mac is running on battery",
+            Self::ExecLatency => "process start-up is slow",
         }
     }
 }
@@ -890,6 +899,14 @@ impl Governor {
         }
     }
 
+    /// The exec-latency reading of the last input, when it is a value: what a
+    /// refusal that names slow start-up quotes.
+    fn exec_latency(&self) -> Option<super::exec_probe::ExecLatency> {
+        self.last
+            .as_ref()
+            .and_then(|(_, input)| input.readings.exec_latency.value())
+    }
+
     /// Whether the disk is the only reason the host is shedding at `now`.
     /// True only when all of these hold, and false on any doubt:
     /// the host is shedding (`shed` has a class); at least
@@ -974,6 +991,11 @@ impl Governor {
         });
         GovernorReport {
             verdict,
+            exec_latency: self
+                .last
+                .as_ref()
+                .filter(|(_, input)| input.state.governs())
+                .and_then(|(_, input)| input.readings.exec_latency.value()),
             disk_fill,
             refusing_for_s: refusing_for.map(|d| d.as_secs()),
             notice: self.noticed && refusing,
@@ -991,6 +1013,10 @@ impl Governor {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GovernorReport {
     pub verdict: GovernorVerdict,
+    /// How long a trivial child last took to start, beside the memory
+    /// pressure the verdict reports. `None` when this process runs no probe or
+    /// the probe has no reading: unknown, never fast.
+    pub exec_latency: Option<super::exec_probe::ExecLatency>,
     /// Where the disk is heading, while the fill-rate rule is on and the
     /// projection is at least elevated: its rate and the minutes it leaves
     /// before the severe floor. Shown even when the rule's mode keeps it from
@@ -1014,6 +1040,7 @@ impl GovernorReport {
     fn ungoverned() -> Self {
         Self {
             disk_fill: None,
+            exec_latency: None,
             verdict: GovernorVerdict {
                 admit: true,
                 shed: Shed::default(),
@@ -1434,6 +1461,24 @@ fn shed_now() -> Shed {
     })
 }
 
+/// The median start-up time and sample count behind a slow-start shed, as this
+/// process's governor last read them, or `None` when this process has no
+/// governor or no reading. For the sentence a refusal says; it decides nothing.
+pub fn exec_latency() -> Option<super::exec_probe::ExecLatency> {
+    #[cfg(test)]
+    if let Some(latency) =
+        INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.exec_latency()))
+    {
+        return latency;
+    }
+    APP_GOVERNOR.get().and_then(|governor| {
+        governor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exec_latency()
+    })
+}
+
 /// What put the host in the tier that sheds, or `None` when nothing is shed.
 /// The same verdict [`shed`] answers from, for a caller that says why it
 /// refused and has no business scheduling by it (`tests/governor_sites.rs`
@@ -1641,6 +1686,8 @@ fn write_ledger(
 
 #[cfg(test)]
 mod adv2;
+#[cfg(test)]
+mod exec_latency_tests;
 #[cfg(test)]
 mod fill_tests;
 #[cfg(test)]
