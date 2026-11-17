@@ -346,7 +346,9 @@ fn base_test_step_name(name: &str) -> &str {
     }
 }
 
-/// Cargo integration-test target name for `tests/foo.rs` → `foo`.
+/// Cargo integration-test target name for `tests/foo.rs` → `foo`. Cargo names an
+/// auto-discovered target by its file stem verbatim, so `tests/my-test.rs` is
+/// `--test my-test`; `my_test` would be "no test target named".
 fn rust_integration_test_name(path: &str) -> Option<String> {
     let norm = path.replace('\\', "/");
     let file = norm.rsplit('/').next()?;
@@ -358,7 +360,39 @@ fn rust_integration_test_name(path: &str) -> Option<String> {
     if !in_tests_dir {
         return None;
     }
-    Some(file.trim_end_matches(".rs").replace('-', "_"))
+    Some(file.trim_end_matches(".rs").to_string())
+}
+
+/// The module-name filter for a unit-test file, or why there is none.
+///
+/// Only a file under a `src/` directory holds unit tests; `tests/sub/x.rs`
+/// (not a cargo target), `benches/`, `examples/` and `build.rs` do not, and a
+/// substring filter built from their stems would run something unrelated. The
+/// stem must also be a Rust identifier a test path can contain, and not one of
+/// the non-module stems in [`NON_FILTER_STEMS`].
+fn rust_unit_filter(path: &str) -> Result<String, String> {
+    let norm = path.replace('\\', "/");
+    let (parent, file) = norm.rsplit_once('/').unwrap_or(("", norm.as_str()));
+    let dirs: Vec<&str> = parent.split('/').collect();
+    let in_src = dirs.contains(&"src")
+        && !dirs
+            .iter()
+            .any(|d| matches!(*d, "tests" | "benches" | "examples"));
+    if !in_src {
+        return Err(format!(
+            "affected Rust file {path} is not a unit-test file under src/ or an integration target"
+        ));
+    }
+    let stem = file.strip_suffix(".rs").unwrap_or(file).replace('-', "_");
+    let identifier = !stem.is_empty()
+        && !stem.starts_with(|c: char| c.is_ascii_digit())
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !identifier || NON_FILTER_STEMS.contains(&stem.as_str()) {
+        return Err(format!(
+            "affected Rust unit-test file {path} has no module name a cargo filter could match"
+        ));
+    }
+    Ok(stem)
 }
 
 fn frontend_test_args(paths: &[String]) -> Vec<String> {
@@ -413,16 +447,7 @@ fn rust_scope(paths: &[String]) -> Result<RustScope, String> {
         ));
     }
     if let Some(path) = unit.first() {
-        let stem = Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().replace('-', "_"))
-            .filter(|s| !s.is_empty() && !NON_FILTER_STEMS.contains(&s.as_str()));
-        return match stem {
-            Some(stem) => Ok(RustScope::UnitFilter(stem)),
-            None => Err(format!(
-                "affected Rust unit-test file {path} has no module name a cargo filter could match"
-            )),
-        };
+        return rust_unit_filter(path).map(RustScope::UnitFilter);
     }
     Ok(RustScope::Integration(integration))
 }
@@ -744,27 +769,152 @@ fn outcome_count(line: &str) -> u64 {
         .sum()
 }
 
+/// Removes ECMA-48 control sequences: CSI (`ESC [` .. final byte 0x40-0x7E),
+/// string sequences OSC/DCS/SOS/PM/APC (`ESC ]`, `P`, `X`, `^`, `_` .. BEL or
+/// `ESC \`), an escape with intermediate bytes (`ESC ( B`), any other two-byte
+/// escape (`ESC 7`), and a lone trailing ESC. Ending an escape at the first
+/// letter instead would stop inside a hyperlink URL and eat the text after it.
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => {}
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
                 }
             }
-        } else {
-            out.push(c);
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        // ST is `ESC \`; any other escape also ends the string.
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+                while chars
+                    .next_if(|n| ('\u{20}'..='\u{2f}').contains(n))
+                    .is_some()
+                {}
+                chars.next();
+            }
+            Some(_) => {}
         }
     }
     out
 }
 
+/// `N word [tail]` as one summary item: the count, and what follows the word
+/// (empty or starting at a non-word token). `None` for any other shape, so a
+/// log line that merely contains "5 passed" is never a summary.
+fn counted<'a>(line: &'a str, word: &str) -> Option<(u64, &'a str)> {
+    let (n, rest) = line.trim().split_once(char::is_whitespace)?;
+    let n = n.parse().ok()?;
+    let tail = rest.trim_start().strip_prefix(word)?;
+    if tail.is_empty() || tail.starts_with(char::is_whitespace) {
+        Some((n, tail.trim()))
+    } else {
+        None
+    }
+}
+
+/// pytest's final summary: `=== 5 passed, 1 skipped in 0.12s ===` or the `-q`
+/// form `5 passed in 0.12s`, always the last non-empty line, every item a
+/// `N word`. Executed is passed + failed + xfailed + xpassed + errors; skipped
+/// and deselected tests did not run, so an all-skipped run is 0.
+fn pytest_executed(text: &str) -> Option<u64> {
+    let last = text.lines().rfind(|l| !l.trim().is_empty())?;
+    let core = last.trim().trim_matches('=').trim();
+    let (items, time) = core.rsplit_once(" in ")?;
+    if !time.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    if items == "no tests ran" {
+        return Some(0);
+    }
+    let mut executed = 0;
+    for item in items.split(',') {
+        let (n, word) = item.trim().split_once(' ')?;
+        let n: u64 = n.parse().ok()?;
+        match word.trim() {
+            "passed" | "failed" | "xfailed" | "xpassed" | "error" | "errors" => executed += n,
+            "skipped" | "deselected" | "warning" | "warnings" | "rerun" | "reruns" => {}
+            _ => return None,
+        }
+    }
+    Some(executed)
+}
+
+/// The last line of `text` for which `shape` yields a count.
+fn last_count(text: &str, shape: impl Fn(&str) -> Option<u64>) -> Option<u64> {
+    text.lines().rev().find_map(shape)
+}
+
+/// Summary of whatever `npm test` runs. Each runner is matched by its own
+/// final-summary line shape, never by "a line containing N passed".
+fn frontend_executed(text: &str) -> Option<u64> {
+    // vitest `Tests  4 passed | 1 skipped (5)`, jest `Tests:  4 passed, 5 total`.
+    let tests_line = |l: &str| {
+        let l = l.trim_start();
+        let rest = l.strip_prefix("Tests")?;
+        let rest = rest.strip_prefix(':').unwrap_or(rest);
+        (rest.starts_with(char::is_whitespace)
+            && rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .then(|| outcome_count(rest))
+    };
+    // node --test `ℹ pass 5` / TAP `# pass 5`, with `fail` beside it.
+    let node_item = |l: &str, key: &str| {
+        let l = l.trim();
+        let l = l.strip_prefix('ℹ').or_else(|| l.strip_prefix('#'))?;
+        match l.split_whitespace().collect::<Vec<_>>()[..] {
+            [k, n] if k == key => n.parse::<u64>().ok(),
+            _ => None,
+        }
+    };
+    // mocha `5 passing (10ms)` / `1 failing`; bun `5 pass` / `0 fail`.
+    let word_item = |l: &str, word: &str, tail_ok: fn(&str) -> bool| {
+        counted(l, word).filter(|(_, t)| tail_ok(t)).map(|(n, _)| n)
+    };
+    let bare = |t: &str| t.is_empty();
+    let mocha_pass = |t: &str| t.is_empty() || (t.starts_with('(') && t.ends_with(')'));
+    // playwright `5 passed (3.2s)`; the unit keeps it apart from vitest's `(5)`.
+    let timed = |t: &str| t.starts_with('(') && (t.ends_with("s)") || t.ends_with("m)"));
+
+    if let Some(n) = last_count(text, tests_line) {
+        return Some(n);
+    }
+    if let Some(pass) = last_count(text, |l| node_item(l, "pass")) {
+        return Some(pass + last_count(text, |l| node_item(l, "fail")).unwrap_or(0));
+    }
+    if let Some(pass) = last_count(text, |l| word_item(l, "pass", bare)) {
+        return Some(pass + last_count(text, |l| word_item(l, "fail", bare)).unwrap_or(0));
+    }
+    if let Some(pass) = last_count(text, |l| word_item(l, "passing", mocha_pass)) {
+        return Some(pass + last_count(text, |l| word_item(l, "failing", bare)).unwrap_or(0));
+    }
+    let play_pass = last_count(text, |l| word_item(l, "passed", timed))?;
+    Some(play_pass + last_count(text, |l| word_item(l, "failed", bare)).unwrap_or(0))
+}
+
 /// Tests the runner reports it executed, or `None` when the output carries no
-/// summary this module can read.
-fn executed_test_count(step_name: &str, stdout: &str) -> Option<u64> {
-    let text = strip_ansi(stdout);
+/// summary this module can read. `output` is stdout and stderr together: jest
+/// prints its summary to stderr.
+fn executed_test_count(step_name: &str, output: &str) -> Option<u64> {
+    let text = strip_ansi(output);
     match base_test_step_name(step_name) {
         // One `test result:` line per test binary and per doctest run.
         "Rust tests" => {
@@ -775,17 +925,8 @@ fn executed_test_count(step_name: &str, stdout: &str) -> Option<u64> {
                 .collect();
             (!lines.is_empty()).then(|| lines.iter().sum())
         }
-        // vitest `Tests  4 passed (5)`, jest `Tests:  4 passed, 5 total`.
-        "Frontend unit tests" => text
-            .lines()
-            .map(str::trim_start)
-            .rfind(|l| l.starts_with("Tests ") || l.starts_with("Tests:"))
-            .map(outcome_count),
-        // pytest `=== 5 passed, 1 skipped in 0.1s ===` or `no tests ran`.
-        "Python tests" => text
-            .lines()
-            .rfind(|l| l.contains("no tests ran") || outcome_count(l) > 0)
-            .map(outcome_count),
+        "Frontend unit tests" => frontend_executed(&text),
+        "Python tests" => pytest_executed(&text),
         _ => None,
     }
 }
@@ -803,7 +944,8 @@ fn unexecuted_tests(step: &CiStep, output: &CapturedOutput) -> Option<String> {
         return None;
     }
     let family = base_test_step_name(&step.name);
-    match executed_test_count(&step.name, &output.stdout_text()) {
+    let combined = format!("{}\n{}", output.stdout_text(), output.stderr_text());
+    match executed_test_count(&step.name, &combined) {
         Some(0) => Some(format!("{family} exited 0 but executed 0 tests")),
         None => Some(format!(
             "{family} exited 0 but printed no test summary this build can read"
@@ -1023,7 +1165,8 @@ pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'
 /// `provenance-verdict-contract` resolves the writer's verdicts from the string
 /// literals in its body, so no other literal may appear there.
 pub(crate) fn run_verdict(report: &CiLocalReport) -> &'static str {
-    if !report.steps.iter().all(|s| s.status == "passed") {
+    // No steps is not a pass: nothing ran, so nothing passed.
+    if report.steps.is_empty() || !report.steps.iter().all(|s| s.status == "passed") {
         "failed"
     } else if report.test_scope.is_narrowed() {
         "passed-affected"
@@ -2204,8 +2347,8 @@ mod verification_note_tests {
         );
         assert_eq!(
             run_verdict(&summarize(Vec::new(), 0, CiTestScope::default())),
-            "passed",
-            "an empty plan cannot reach here: run_ci_local refuses it earlier"
+            "failed",
+            "a run with no steps checked nothing, so it is not a pass"
         );
     }
 
@@ -2316,3 +2459,7 @@ mod verification_note_tests {
         assert!(reason.contains("changed while the run"), "got {reason:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "ci_local_adv_tests.rs"]
+mod adv_tests;
