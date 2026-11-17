@@ -20,6 +20,7 @@ import type { ProvenanceFreshness } from "./types";
 export type FreshnessKind =
   | "unknown"
   | "failed"
+  | "narrowed"
   | "unrecognised"
   | "unmeasured"
   | "fresh"
@@ -48,6 +49,15 @@ export interface FreshnessBadge {
  * with what GitPulse's own writer emits.
  */
 export const PASS_VERDICTS: readonly string[] = ["passed", "pass", "ok", "green", "success"];
+
+/**
+ * Verdict strings for a run that passed only part of the suite: every step
+ * passed, but the tests were narrowed to the files the change reaches. A third
+ * set, deliberately in neither of the others — it is not a pass of the whole
+ * suite and not a failure, and a badge that read it as either would be wrong in
+ * one direction or the other.
+ */
+export const NARROWED_VERDICTS: readonly string[] = ["passed-affected"];
 
 /** Verdict strings this build understands as a recorded failure. */
 export const FAIL_VERDICTS: readonly string[] = [
@@ -126,6 +136,23 @@ export function freshnessBadge(f: ProvenanceFreshness): FreshnessBadge {
         tone: "bad",
         label: "failed",
         detail: `verification recorded${verifiedBy(f)} as ${f.verification.verdict}`,
+      };
+    }
+
+    // 2b. A pass of the affected tests only. Warn, never good: it says nothing
+    //     about the rest of the suite, however fresh the commit is.
+    if (NARROWED_VERDICTS.includes(verdict)) {
+      return {
+        kind: "narrowed",
+        tone: "warn",
+        label: "verified · affected tests only",
+        detail:
+          `affected tests passed${verifiedBy(f)}; the rest of the suite was not run` +
+          (f.distance === null
+            ? ""
+            : f.distance === 0
+              ? ""
+              : `, and the base has gained ${plural(f.distance, "commit", "commits")} since`),
       };
     }
 

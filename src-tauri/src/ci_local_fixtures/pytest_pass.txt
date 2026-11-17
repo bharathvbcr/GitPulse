@@ -1,0 +1,7 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.4, pytest-8.2.2, pluggy-1.5.0
+collected 6 items
+
+tests/test_a.py ......                                                   [100%]
+
+========================= 5 passed, 1 skipped in 0.12s =========================

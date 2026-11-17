@@ -126,6 +126,12 @@ impl CiTestScope {
         }
     }
 
+    /// True when test steps ran only the affected files, so a pass says nothing
+    /// about the rest of the suite. A fail-closed run executed the full suite.
+    fn is_narrowed(&self) -> bool {
+        self.mode == "affected" && !self.fail_closed
+    }
+
     fn affected(test_files: Vec<String>, seeds: Vec<String>) -> Self {
         let n = test_files.len();
         Self {
@@ -340,7 +346,9 @@ fn base_test_step_name(name: &str) -> &str {
     }
 }
 
-/// Cargo integration-test target name for `tests/foo.rs` → `foo`.
+/// Cargo integration-test target name for `tests/foo.rs` → `foo`. Cargo names an
+/// auto-discovered target by its file stem verbatim, so `tests/my-test.rs` is
+/// `--test my-test`; `my_test` would be "no test target named".
 fn rust_integration_test_name(path: &str) -> Option<String> {
     let norm = path.replace('\\', "/");
     let file = norm.rsplit('/').next()?;
@@ -352,7 +360,39 @@ fn rust_integration_test_name(path: &str) -> Option<String> {
     if !in_tests_dir {
         return None;
     }
-    Some(file.trim_end_matches(".rs").replace('-', "_"))
+    Some(file.trim_end_matches(".rs").to_string())
+}
+
+/// The module-name filter for a unit-test file, or why there is none.
+///
+/// Only a file under a `src/` directory holds unit tests; `tests/sub/x.rs`
+/// (not a cargo target), `benches/`, `examples/` and `build.rs` do not, and a
+/// substring filter built from their stems would run something unrelated. The
+/// stem must also be a Rust identifier a test path can contain, and not one of
+/// the non-module stems in [`NON_FILTER_STEMS`].
+fn rust_unit_filter(path: &str) -> Result<String, String> {
+    let norm = path.replace('\\', "/");
+    let (parent, file) = norm.rsplit_once('/').unwrap_or(("", norm.as_str()));
+    let dirs: Vec<&str> = parent.split('/').collect();
+    let in_src = dirs.contains(&"src")
+        && !dirs
+            .iter()
+            .any(|d| matches!(*d, "tests" | "benches" | "examples"));
+    if !in_src {
+        return Err(format!(
+            "affected Rust file {path} is not a unit-test file under src/ or an integration target"
+        ));
+    }
+    let stem = file.strip_suffix(".rs").unwrap_or(file).replace('-', "_");
+    let identifier = !stem.is_empty()
+        && !stem.starts_with(|c: char| c.is_ascii_digit())
+        && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !identifier || NON_FILTER_STEMS.contains(&stem.as_str()) {
+        return Err(format!(
+            "affected Rust unit-test file {path} has no module name a cargo filter could match"
+        ));
+    }
+    Ok(stem)
 }
 
 fn frontend_test_args(paths: &[String]) -> Vec<String> {
@@ -361,40 +401,73 @@ fn frontend_test_args(paths: &[String]) -> Vec<String> {
     args
 }
 
-fn rust_test_args(manifest: &str, paths: &[String]) -> Vec<String> {
+/// How a narrowed `cargo test` can honestly name a set of affected Rust test
+/// files. Cargo has no multi-file path filter and `--test` excludes the lib
+/// target, so only two shapes exist; every other shape is [`Err`] so the planner
+/// widens to the full suite instead of silently running something smaller than
+/// what was asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum RustScope {
+    /// Integration targets only: `--test a --test b`.
+    Integration(Vec<String>),
+    /// Exactly one unit-test file, named by a module-path substring filter.
+    UnitFilter(String),
+}
+
+/// Stems that are not module names: `src/x/mod.rs`, `src/lib.rs` and
+/// `src/main.rs` would become the cargo filter `mod`/`lib`/`main`, which matches
+/// (nearly) no test, so the step would exit 0 having run nothing.
+const NON_FILTER_STEMS: &[&str] = &["mod", "lib", "main"];
+
+fn rust_scope(paths: &[String]) -> Result<RustScope, String> {
+    let mut integration = Vec::new();
+    let mut unit = Vec::new();
+    for path in paths {
+        match rust_integration_test_name(path) {
+            Some(name) => integration.push(name),
+            None => unit.push(path.as_str()),
+        }
+    }
+    integration.sort();
+    integration.dedup();
+    unit.sort_unstable();
+    unit.dedup();
+
+    if !integration.is_empty() && !unit.is_empty() {
+        return Err(format!(
+            "affected Rust tests mix integration targets ({}) with unit-test files ({}) — cargo cannot run both as one narrowed command",
+            integration.join(", "),
+            unit.join(", ")
+        ));
+    }
+    if unit.len() > 1 {
+        return Err(format!(
+            "affected Rust unit-test files cannot be path-filtered together ({})",
+            unit.join(", ")
+        ));
+    }
+    if let Some(path) = unit.first() {
+        return rust_unit_filter(path).map(RustScope::UnitFilter);
+    }
+    Ok(RustScope::Integration(integration))
+}
+
+fn rust_test_args(manifest: &str, scope: &RustScope) -> Vec<String> {
     let mut args = vec![
         "test".into(),
         "--manifest-path".into(),
         manifest.to_string(),
     ];
-    let mut integration = Vec::new();
-    let mut filters = Vec::new();
-    for path in paths {
-        if let Some(name) = rust_integration_test_name(path) {
-            integration.push(name);
-        } else if let Some(stem) = Path::new(path).file_stem() {
-            filters.push(stem.to_string_lossy().replace('-', "_"));
+    match scope {
+        RustScope::Integration(names) => {
+            for name in names {
+                args.push("--test".into());
+                args.push(name.clone());
+            }
         }
-    }
-    integration.sort();
-    integration.dedup();
-    filters.sort();
-    filters.dedup();
-    for name in &integration {
-        args.push("--test".into());
-        args.push(name.clone());
-    }
-    if !filters.is_empty() {
-        args.push("--".into());
-        // One OR-ish filter is not expressible; pass the first and rely on
-        // cargo's substring match. Multiple unit-test files fall back via the
-        // uncovered-family check when we cannot name them as `--test` targets.
-        if integration.is_empty() && filters.len() == 1 {
-            args.push(filters[0].clone());
-        } else if integration.is_empty() {
-            // Multiple lib-unit paths: cargo has no multi-file path filter.
-            // Callers must fail closed before reaching here.
-            args.push(filters.join("|"));
+        RustScope::UnitFilter(stem) => {
+            args.push("--".into());
+            args.push(stem.clone());
         }
     }
     args
@@ -477,30 +550,24 @@ pub fn plan_ci_from_affected(
         };
     }
 
-    // Multiple Rust unit-test files (not integration targets) cannot be
-    // expressed as a single honest cargo filter — fail closed rather than
-    // pretend `|` joins module paths.
-    if let Some(rust_paths) = by_family.get(&TestRunnerFamily::Rust) {
-        let unit_only: Vec<_> = rust_paths
-            .iter()
-            .filter(|p| rust_integration_test_name(p).is_none())
-            .collect();
-        if unit_only.len() > 1 {
-            let reason = format!(
-                "affected Rust unit-test files cannot be path-filtered together ({}) — running the full suite",
-                unit_only
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+    // A Rust path set cargo cannot name as one narrowed command (mixed
+    // integration + unit files, several unit files, a `mod`/`lib`/`main` stem)
+    // fails closed: narrowing it would drop a file or run zero tests.
+    let rust_scope = match by_family
+        .get(&TestRunnerFamily::Rust)
+        .map(|p| rust_scope(p))
+    {
+        Some(Err(why)) => {
+            let reason = format!("{why} — running the full suite");
             annotate_full_suite_steps(&mut steps, &reason);
             return CiPlan {
                 steps,
                 test_scope: CiTestScope::full_suite(reason, seed_owned),
             };
         }
-    }
+        Some(Ok(scope)) => Some(scope),
+        None => None,
+    };
 
     let has_frontend = steps.iter().any(|s| s.name == "Frontend unit tests");
     let has_rust = steps.iter().any(|s| s.name == "Rust tests");
@@ -554,11 +621,13 @@ pub fn plan_ci_from_affected(
                 }
             }
             "Rust tests" => {
-                if let (Some(paths), Some(manifest)) =
-                    (by_family.get(&TestRunnerFamily::Rust), manifest.as_deref())
-                {
+                if let (Some(paths), Some(scope), Some(manifest)) = (
+                    by_family.get(&TestRunnerFamily::Rust),
+                    rust_scope.as_ref(),
+                    manifest.as_deref(),
+                ) {
                     step.name = format!("Rust tests ({} affected)", paths.len());
-                    step.args = rust_test_args(manifest, paths);
+                    step.args = rust_test_args(manifest, scope);
                 }
             }
             "Python tests" => {
@@ -649,7 +718,13 @@ fn step_result(
     duration_ms: u64,
 ) -> CiStepResult {
     let (status, detail) = match outcome {
-        Ok(output) if output.success => ("passed", String::new()),
+        Ok(output) if output.success => match unexecuted_tests(step, &output) {
+            // Exit 0 with nothing executed is a check that did not happen, not
+            // one that passed: it takes the same "could not run" path a spawn
+            // failure does.
+            Some(why) => ("failed", format!("{COULD_NOT_RUN}{why}")),
+            None => ("passed", String::new()),
+        },
         Ok(output) => {
             // The detail is the capped output tail: enough to name the
             // failure without a terminal, never the whole log. When the
@@ -676,6 +751,206 @@ fn step_result(
         status: status.into(),
         detail,
         duration_ms,
+    }
+}
+
+/// Sum of the `passed` and `failed` counts a runner summary line reports, e.g.
+/// `1 failed, 4 passed, 5 total` or `4 passed (5)`. Skipped, ignored and
+/// filtered-out tests are deliberately not counted: they did not execute.
+fn outcome_count(line: &str) -> u64 {
+    let words: Vec<&str> = line
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| matches!(w[1], "passed" | "failed"))
+        .filter_map(|w| w[0].parse::<u64>().ok())
+        .sum()
+}
+
+/// Removes ECMA-48 control sequences: CSI (`ESC [` .. final byte 0x40-0x7E),
+/// string sequences OSC/DCS/SOS/PM/APC (`ESC ]`, `P`, `X`, `^`, `_` .. BEL or
+/// `ESC \`), an escape with intermediate bytes (`ESC ( B`), any other two-byte
+/// escape (`ESC 7`), and a lone trailing ESC. Ending an escape at the first
+/// letter instead would stop inside a hyperlink URL and eat the text after it.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => {}
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        // ST is `ESC \`; any other escape also ends the string.
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
+                while chars
+                    .next_if(|n| ('\u{20}'..='\u{2f}').contains(n))
+                    .is_some()
+                {}
+                chars.next();
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// `N word [tail]` as one summary item: the count, and what follows the word
+/// (empty or starting at a non-word token). `None` for any other shape, so a
+/// log line that merely contains "5 passed" is never a summary.
+fn counted<'a>(line: &'a str, word: &str) -> Option<(u64, &'a str)> {
+    let (n, rest) = line.trim().split_once(char::is_whitespace)?;
+    let n = n.parse().ok()?;
+    let tail = rest.trim_start().strip_prefix(word)?;
+    if tail.is_empty() || tail.starts_with(char::is_whitespace) {
+        Some((n, tail.trim()))
+    } else {
+        None
+    }
+}
+
+/// pytest's final summary: `=== 5 passed, 1 skipped in 0.12s ===` or the `-q`
+/// form `5 passed in 0.12s`, always the last non-empty line, every item a
+/// `N word`. Executed is passed + failed + xfailed + xpassed + errors; skipped
+/// and deselected tests did not run, so an all-skipped run is 0.
+fn pytest_executed(text: &str) -> Option<u64> {
+    let last = text.lines().rfind(|l| !l.trim().is_empty())?;
+    let core = last.trim().trim_matches('=').trim();
+    let (items, time) = core.rsplit_once(" in ")?;
+    if !time.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    if items == "no tests ran" {
+        return Some(0);
+    }
+    let mut executed = 0;
+    for item in items.split(',') {
+        let (n, word) = item.trim().split_once(' ')?;
+        let n: u64 = n.parse().ok()?;
+        match word.trim() {
+            "passed" | "failed" | "xfailed" | "xpassed" | "error" | "errors" => executed += n,
+            "skipped" | "deselected" | "warning" | "warnings" | "rerun" | "reruns" => {}
+            _ => return None,
+        }
+    }
+    Some(executed)
+}
+
+/// The last line of `text` for which `shape` yields a count.
+fn last_count(text: &str, shape: impl Fn(&str) -> Option<u64>) -> Option<u64> {
+    text.lines().rev().find_map(shape)
+}
+
+/// Summary of whatever `npm test` runs. Each runner is matched by its own
+/// final-summary line shape, never by "a line containing N passed".
+fn frontend_executed(text: &str) -> Option<u64> {
+    // vitest `Tests  4 passed | 1 skipped (5)`, jest `Tests:  4 passed, 5 total`.
+    let tests_line = |l: &str| {
+        let l = l.trim_start();
+        let rest = l.strip_prefix("Tests")?;
+        let rest = rest.strip_prefix(':').unwrap_or(rest);
+        (rest.starts_with(char::is_whitespace)
+            && rest.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .then(|| outcome_count(rest))
+    };
+    // node --test `ℹ pass 5` / TAP `# pass 5`, with `fail` beside it.
+    let node_item = |l: &str, key: &str| {
+        let l = l.trim();
+        let l = l.strip_prefix('ℹ').or_else(|| l.strip_prefix('#'))?;
+        match l.split_whitespace().collect::<Vec<_>>()[..] {
+            [k, n] if k == key => n.parse::<u64>().ok(),
+            _ => None,
+        }
+    };
+    // mocha `5 passing (10ms)` / `1 failing`; bun `5 pass` / `0 fail`.
+    let word_item = |l: &str, word: &str, tail_ok: fn(&str) -> bool| {
+        counted(l, word).filter(|(_, t)| tail_ok(t)).map(|(n, _)| n)
+    };
+    let bare = |t: &str| t.is_empty();
+    let mocha_pass = |t: &str| t.is_empty() || (t.starts_with('(') && t.ends_with(')'));
+    // playwright `5 passed (3.2s)`; the unit keeps it apart from vitest's `(5)`.
+    let timed = |t: &str| t.starts_with('(') && (t.ends_with("s)") || t.ends_with("m)"));
+
+    if let Some(n) = last_count(text, tests_line) {
+        return Some(n);
+    }
+    if let Some(pass) = last_count(text, |l| node_item(l, "pass")) {
+        return Some(pass + last_count(text, |l| node_item(l, "fail")).unwrap_or(0));
+    }
+    if let Some(pass) = last_count(text, |l| word_item(l, "pass", bare)) {
+        return Some(pass + last_count(text, |l| word_item(l, "fail", bare)).unwrap_or(0));
+    }
+    if let Some(pass) = last_count(text, |l| word_item(l, "passing", mocha_pass)) {
+        return Some(pass + last_count(text, |l| word_item(l, "failing", bare)).unwrap_or(0));
+    }
+    let play_pass = last_count(text, |l| word_item(l, "passed", timed))?;
+    Some(play_pass + last_count(text, |l| word_item(l, "failed", bare)).unwrap_or(0))
+}
+
+/// Tests the runner reports it executed, or `None` when the output carries no
+/// summary this module can read. `output` is stdout and stderr together: jest
+/// prints its summary to stderr.
+fn executed_test_count(step_name: &str, output: &str) -> Option<u64> {
+    let text = strip_ansi(output);
+    match base_test_step_name(step_name) {
+        // One `test result:` line per test binary and per doctest run.
+        "Rust tests" => {
+            let lines: Vec<u64> = text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("test result:"))
+                .map(outcome_count)
+                .collect();
+            (!lines.is_empty()).then(|| lines.iter().sum())
+        }
+        "Frontend unit tests" => frontend_executed(&text),
+        "Python tests" => pytest_executed(&text),
+        _ => None,
+    }
+}
+
+/// Why a successful exit does not count as a pass: the runner executed no
+/// tests, or printed no summary this module can read. `None` when tests ran,
+/// and for a non-test step.
+///
+/// Every test family is held to this, not only cargo. An unreadable summary is
+/// a check whose outcome is unknown, and that must never read as a pass; a
+/// runner whose summary is not parsed yet gets a parser in
+/// [`executed_test_count`], never an exemption.
+fn unexecuted_tests(step: &CiStep, output: &CapturedOutput) -> Option<String> {
+    if !is_test_step_name(&step.name) {
+        return None;
+    }
+    let family = base_test_step_name(&step.name);
+    let combined = format!("{}\n{}", output.stdout_text(), output.stderr_text());
+    match executed_test_count(&step.name, &combined) {
+        Some(0) => Some(format!("{family} exited 0 but executed 0 tests")),
+        None => Some(format!(
+            "{family} exited 0 but printed no test summary this build can read"
+        )),
+        Some(_) => None,
     }
 }
 
@@ -864,10 +1139,14 @@ pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'
     if report.recorded_commit.is_empty() {
         return None;
     }
-    Some(match run_verdict(report) {
-        "passed" => ("ci_passed", "success"),
-        _ => ("ci_failed", "failure"),
-    })
+    match run_verdict(report) {
+        "passed" => Some(("ci_passed", "success")),
+        // A narrowed pass is neither CI passing nor failing, and the signal
+        // vocabulary has no neutral kind, so the task is told nothing rather
+        // than being told the whole suite passed.
+        "passed-affected" => None,
+        _ => Some(("ci_failed", "failure")),
+    }
 }
 
 /// The verdict a completed run records.
@@ -875,13 +1154,24 @@ pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'
 /// Derived from the steps themselves, not from the counts. A future change to
 /// `run_plan` that introduced a fourth status would silently make a count-based
 /// verdict wrong in the direction that matters — everything not-failed reading
-/// as a pass — so "passed" here means every single step passed, and nothing
+/// as a pass — so a pass here means every single step passed, and nothing
 /// else does.
+///
+/// A pass whose tests were narrowed to the affected files is
+/// `"passed-affected"`, never `"passed"`: every step passed but the rest of the
+/// suite never ran, so a note about part of the suite must not read as one about
+/// all of it. `badge.ts` classifies it apart from both `PASS_VERDICTS` and
+/// `FAIL_VERDICTS`. The literal stays inside this function because
+/// `provenance-verdict-contract` resolves the writer's verdicts from the string
+/// literals in its body, so no other literal may appear there.
 pub(crate) fn run_verdict(report: &CiLocalReport) -> &'static str {
-    if report.steps.iter().all(|s| s.status == "passed") {
-        "passed"
-    } else {
+    // No steps is not a pass: nothing ran, so nothing passed.
+    if report.steps.is_empty() || !report.steps.iter().all(|s| s.status == "passed") {
         "failed"
+    } else if report.test_scope.is_narrowed() {
+        "passed-affected"
+    } else {
+        "passed"
     }
 }
 
@@ -1022,6 +1312,20 @@ mod tests {
         }
     }
 
+    /// Real output, captured from `npm test -- src/lib/provenance/badge.test.ts`
+    /// on this repository under `CI=1` (vitest 5.1.0, ANSI colour stripped).
+    const VITEST_PASS: &str = include_str!("ci_local_fixtures/vitest_run_pass.txt");
+    /// Real stdout of `cargo test --lib ci_local -- --test-threads=1` here.
+    const CARGO_PASS: &str = include_str!("ci_local_fixtures/cargo_test_pass.txt");
+    /// A cargo run whose filter matched nothing (the shape cargo prints for it).
+    const CARGO_NONE: &str = include_str!("ci_local_fixtures/cargo_test_none.txt");
+    /// vitest with no test files. NOT captured: the format is vitest's own.
+    const VITEST_NONE: &str = include_str!("ci_local_fixtures/vitest_none.txt");
+    /// pytest is not installed on this machine, so these two are written in
+    /// pytest's documented summary format, NOT captured from a run.
+    const PYTEST_PASS: &str = include_str!("ci_local_fixtures/pytest_pass.txt");
+    const PYTEST_NONE: &str = include_str!("ci_local_fixtures/pytest_none.txt");
+
     fn captured(success: bool, code: i32, stdout: &str, stderr: &str) -> CapturedOutput {
         CapturedOutput {
             stdout: stdout.as_bytes().to_vec(),
@@ -1033,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_successful_step_carries_no_detail() {
-        let r = step_result(&step(), Ok(captured(true, 0, "all good", "")), 120);
+        let r = step_result(&step(), Ok(captured(true, 0, VITEST_PASS, "")), 120);
         assert_eq!(r.status, "passed");
         assert_eq!(r.detail, "");
         assert_eq!(r.duration_ms, 120);
@@ -1202,7 +1506,7 @@ mod tests {
     #[test]
     fn the_status_vocabulary_is_exactly_these_three() {
         let produced: Vec<String> = vec![
-            step_result(&step(), Ok(captured(true, 0, "", "")), 1).status,
+            step_result(&step(), Ok(captured(true, 0, VITEST_PASS, "")), 1).status,
             step_result(&step(), Ok(captured(false, 1, "", "boom")), 1).status,
             step_result(&step(), Err("spawn failed".into()), 1).status,
             skipped_result(&step()).status,
@@ -1543,6 +1847,201 @@ mod tests {
             vec!["src/new.rs".to_string(), "src/old.rs".to_string()]
         );
     }
+
+    fn rust_dir() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"t\"\nversion=\"1.2.3\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn rust_step(plan: &CiPlan) -> Option<&CiStep> {
+        plan.steps.iter().find(|s| s.name.starts_with("Rust tests"))
+    }
+
+    /// `--test foo --` used to be emitted here: the `bar` unit filter was
+    /// dropped and the lib target (where `bar`'s tests live) was excluded.
+    #[test]
+    fn integration_targets_mixed_with_a_unit_file_fail_closed() {
+        let dir = rust_dir();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/bar.rs".into()],
+            &ok_affected(&["tests/foo.rs", "src/bar.rs"]),
+        );
+        assert!(plan.test_scope.fail_closed, "{}", plan.test_scope.reason);
+        assert_eq!(plan.test_scope.mode, "full_suite");
+        let rust = rust_step(&plan).expect("rust tests");
+        assert_eq!(
+            rust.args.len(),
+            3,
+            "full suite, no narrowing: {:?}",
+            rust.args
+        );
+    }
+
+    /// `mod`/`lib`/`main` as a cargo filter matches ~nothing, exits 0, and
+    /// the step "passes" having run no test.
+    #[test]
+    fn a_unit_file_named_mod_lib_or_main_fails_closed() {
+        for file in ["src/x/mod.rs", "src/lib.rs", "src/main.rs"] {
+            let dir = rust_dir();
+            let plan = plan_ci_from_affected(dir.path(), &[file.into()], &ok_affected(&[file]));
+            assert!(
+                plan.test_scope.fail_closed,
+                "{file}: {}",
+                plan.test_scope.reason
+            );
+            let rust = rust_step(&plan).expect("rust tests");
+            assert!(
+                !rust.args.contains(&"--".to_string()),
+                "{file}: {:?}",
+                rust.args
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_named_unit_file_still_narrows_to_its_filter() {
+        let dir = rust_dir();
+        let plan = plan_ci_from_affected(
+            dir.path(),
+            &["src/bar.rs".into()],
+            &ok_affected(&["src/bar.rs"]),
+        );
+        assert_eq!(plan.test_scope.mode, "affected");
+        let rust = rust_step(&plan).expect("rust tests");
+        assert_eq!(rust.args.last().map(String::as_str), Some("bar"));
+    }
+
+    fn rust_step_for_run() -> CiStep {
+        CiStep {
+            name: "Rust tests".into(),
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        }
+    }
+
+    #[test]
+    fn a_cargo_run_that_executed_zero_tests_is_not_a_pass() {
+        let out = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, out, "")), 1);
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        assert!(r.detail.starts_with(COULD_NOT_RUN), "{}", r.detail);
+    }
+
+    #[test]
+    fn a_cargo_run_with_tests_in_any_binary_is_a_pass() {
+        let out = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s\ntest result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.10s\n";
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, out, "")), 1);
+        assert_eq!(r.status, "passed", "{}", r.detail);
+    }
+
+    /// Each runner's real (or documented, see the constants) summary parses to
+    /// the number of tests it executed, so the zero check is judging real text.
+    #[test]
+    fn every_runner_summary_fixture_parses_to_its_executed_count() {
+        let count = |name: &str, out: &str| executed_test_count(name, out);
+        assert_eq!(count("Rust tests", CARGO_PASS), Some(40));
+        assert_eq!(count("Rust tests", CARGO_NONE), Some(0));
+        assert_eq!(count("Frontend unit tests", VITEST_PASS), Some(22));
+        assert_eq!(count("Frontend unit tests", VITEST_NONE), None);
+        assert_eq!(count("Python tests", PYTEST_PASS), Some(5));
+        assert_eq!(count("Python tests", PYTEST_NONE), Some(0));
+    }
+
+    #[test]
+    fn a_test_step_with_no_readable_summary_is_not_a_pass() {
+        for (name, program, out) in [
+            ("Frontend unit tests", "npm", "all good"),
+            ("Frontend unit tests", "npm", VITEST_NONE),
+            ("Python tests", "pytest", "ok"),
+            ("Rust tests", "cargo", "ok"),
+        ] {
+            let step = CiStep {
+                name: name.into(),
+                program: program.into(),
+                args: Vec::new(),
+            };
+            let r = step_result(&step, Ok(captured(true, 0, out, "")), 1);
+            assert_eq!(r.status, "failed", "{name}: {}", r.detail);
+            assert!(r.detail.starts_with(COULD_NOT_RUN), "{name}: {}", r.detail);
+        }
+        let build = CiStep {
+            name: "Frontend build".into(),
+            program: "npm".into(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            step_result(&build, Ok(captured(true, 0, "built", "")), 1).status,
+            "passed",
+            "only test steps are judged by a test summary"
+        );
+    }
+
+    #[test]
+    fn a_cargo_run_with_no_summary_is_not_a_pass() {
+        let r = step_result(&rust_step_for_run(), Ok(captured(true, 0, "ok", "")), 1);
+        assert_eq!(r.status, "failed");
+        assert!(r.detail.starts_with(COULD_NOT_RUN), "{}", r.detail);
+    }
+
+    #[test]
+    fn frontend_and_python_zero_test_summaries_are_not_a_pass() {
+        let vitest = CiStep {
+            name: "Frontend unit tests (2 affected)".into(),
+            program: "npm".into(),
+            args: vec!["test".into()],
+        };
+        let r = step_result(
+            &vitest,
+            Ok(captured(
+                true,
+                0,
+                " Test Files  1 skipped (1)\n      Tests  3 skipped (3)\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        let ok = step_result(
+            &vitest,
+            Ok(captured(
+                true,
+                0,
+                "      Tests  4 passed | 1 skipped (5)\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(ok.status, "passed", "{}", ok.detail);
+
+        let py = CiStep {
+            name: "Python tests".into(),
+            program: "pytest".into(),
+            args: Vec::new(),
+        };
+        let r = step_result(
+            &py,
+            Ok(captured(true, 0, "=== no tests ran in 0.01s ===\n", "")),
+            1,
+        );
+        assert_eq!(r.status, "failed", "{}", r.detail);
+        let ok = step_result(
+            &py,
+            Ok(captured(
+                true,
+                0,
+                "=== 5 passed, 1 skipped in 0.1s ===\n",
+                "",
+            )),
+            1,
+        );
+        assert_eq!(ok.status, "passed", "{}", ok.detail);
+    }
 }
 
 #[cfg(test)]
@@ -1848,9 +2347,58 @@ mod verification_note_tests {
         );
         assert_eq!(
             run_verdict(&summarize(Vec::new(), 0, CiTestScope::default())),
-            "passed",
-            "an empty plan cannot reach here: run_ci_local refuses it earlier"
+            "failed",
+            "a run with no steps checked nothing, so it is not a pass"
         );
+    }
+
+    fn narrowed(statuses: &[(&str, &str)]) -> CiLocalReport {
+        let mut r = report(statuses);
+        r.test_scope =
+            CiTestScope::affected(vec!["tests/foo.rs".into()], vec!["src/foo.rs".into()]);
+        r
+    }
+
+    /// A narrowed run's note must not read as a full-suite pass.
+    #[test]
+    fn a_narrowed_pass_is_not_a_full_pass() {
+        let full = run_verdict(&report(&[("Tests", "passed")]));
+        let narrow = run_verdict(&narrowed(&[("Tests", "passed")]));
+        assert_eq!(full, "passed");
+        assert_eq!(narrow, "passed-affected");
+        assert_ne!(narrow, full);
+        assert_eq!(
+            run_verdict(&narrowed(&[("Tests", "failed")])),
+            "failed",
+            "narrowing never softens a failure"
+        );
+        let mut closed = report(&[("Tests", "passed")]);
+        closed.test_scope = CiTestScope::full_suite("graph untrusted", Vec::new());
+        assert_eq!(
+            run_verdict(&closed),
+            "passed",
+            "a fail-closed run executed the full suite"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_pass_is_recorded_as_such_and_signals_neither_pass_nor_failure() {
+        let dir = repo();
+        let r = narrowed(&[("Tests", "passed")]);
+        let (commit, reason) =
+            record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
+        assert_eq!(reason, "");
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("a note");
+        assert_eq!(note.verdict, "passed-affected");
+
+        let mut recorded = narrowed(&[("Tests", "passed")]);
+        recorded.recorded_commit = commit;
+        assert_eq!(attempt_signal(&recorded), None);
     }
 
     /// A cleanliness check that could not run must not be read as "clean".
@@ -1911,3 +2459,7 @@ mod verification_note_tests {
         assert!(reason.contains("changed while the run"), "got {reason:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "ci_local_adv_tests.rs"]
+mod adv_tests;
