@@ -63,7 +63,9 @@ fn a_catch_up_pass_starts_its_git_children_in_the_background_class() {
 /// Git, delayed: a directory holding a `git` that sleeps `millis` and then runs
 /// the real one. A host whose process starts cost over a second (security
 /// scanning of every exec) behaves like this, and a fast fixture hides every
-/// bug in how a pass spends its budget.
+/// bug in how a pass spends its budget. The shim is a `/bin/sh` script, so it
+/// and the tests that run git through it are Unix only.
+#[cfg(unix)]
 fn slow_git_dir(millis: u64) -> tempfile::TempDir {
     slow_git_dir_for(millis, &[])
 }
@@ -71,6 +73,7 @@ fn slow_git_dir(millis: u64) -> tempfile::TempDir {
 /// [`slow_git_dir`] for the git subcommands in `verbs` only (every one when
 /// empty): a lookup that costs several of them can be made slow while the
 /// reflog reads stay fast.
+#[cfg(unix)]
 fn slow_git_dir_for(millis: u64, verbs: &[&str]) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
@@ -99,6 +102,7 @@ fn slow_git_dir_for(millis: u64, verbs: &[&str]) -> tempfile::TempDir {
 }
 
 /// A gate that answers nothing from the last pass, so passes run back to back.
+#[cfg(unix)]
 fn eager_gate() -> flight::Gate {
     flight::Gate::new(flight::Intervals {
         complete: std::time::Duration::ZERO,
@@ -120,6 +124,7 @@ fn git_count(dirs: &[std::path::PathBuf], verb: &[&str]) -> usize {
 /// must add up: each resumes where the last stopped, the transcripts get their
 /// own share of the budget rather than what the reflogs leave, and the pass
 /// that reads the last reflog is complete.
+#[cfg(unix)]
 #[test]
 fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() {
     let (main, _parent, linked) = repo_with_worktrees(20);
@@ -169,6 +174,7 @@ fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() 
 }
 
 /// A transcript root holding one session with one edit under `anchor`.
+#[cfg(unix)]
 fn one_transcript_corpus(anchor: &str) -> tempfile::TempDir {
     let corpus = tempfile::tempdir().expect("corpus");
     let transcript = corpus.path().join("slug").join("S1.jsonl");
@@ -199,6 +205,7 @@ fn one_transcript_corpus(anchor: &str) -> tempfile::TempDir {
 /// transcripts' share, and no transcript was read while the cache was cold.
 /// It now runs after the transcripts, the next passes read the branch it named,
 /// and the catch-up completes.
+#[cfg(unix)]
 #[test]
 fn a_slow_default_branch_lookup_does_not_spend_the_transcripts_share() {
     let (main, _parent, linked) = repo_with_worktrees(2);
@@ -304,6 +311,7 @@ fn a_twenty_worktree_family_is_read_whole_by_one_unhurried_pass() {
 /// A pass cut short after recording some refs must not record them again: the
 /// watermark advances in the transaction that writes the rows, so the pass that
 /// follows picks up only what the first never reached.
+#[cfg(unix)]
 #[test]
 fn a_pass_cut_short_leaves_its_recorded_refs_recorded_once() {
     let (main, _parent, linked) = repo_with_worktrees(12);
