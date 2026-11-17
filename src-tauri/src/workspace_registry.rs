@@ -777,6 +777,11 @@ mod tests {
         let lower = parent.join("repo");
         fs::create_dir_all(&upper).unwrap();
         if fs::create_dir(&lower).is_err() {
+            // A pass here checks nothing; say so in the test output.
+            eprintln!(
+                "skipped: {} ignores case, so Repo and repo are one directory",
+                parent.display()
+            );
             let _ = fs::remove_dir_all(&host);
             let _ = fs::remove_dir_all(&parent);
             return;

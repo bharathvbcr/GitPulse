@@ -1126,6 +1126,14 @@ pub fn attribution_root<'a>(call: &ToolCall, roots: &RootSet<'a>) -> Option<&'a 
 
 /// The deepest root of `roots` that `path` lies under; see [`attribution_root`].
 pub fn deepest_root<'a>(path: &str, roots: &RootSet<'a>) -> Option<&'a str> {
+    deepest_match(path, roots).map(|(_, raw)| raw)
+}
+
+/// The deepest root of `roots` that `path` lies under, with the number of
+/// components of the spelling that matched. The match is by that spelling (as
+/// written, real, case-folded or Windows), so the root's own text need not be a
+/// prefix of `path`; the count is what says how much of `path` the root covers.
+fn deepest_match<'a>(path: &str, roots: &RootSet<'a>) -> Option<(usize, &'a str)> {
     if !within_cap(path) {
         return None;
     }
@@ -1133,9 +1141,8 @@ pub fn deepest_root<'a>(path: &str, roots: &RootSet<'a>) -> Option<&'a str> {
     roots
         .roots
         .iter()
-        .filter_map(|root| root.matched_depth(&path).map(|depth| (depth, root)))
+        .filter_map(|root| root.matched_depth(&path).map(|depth| (depth, root.raw)))
         .reduce(|best, found| if found.0 > best.0 { found } else { best })
-        .map(|(_, root)| root.raw)
 }
 
 /// A path longer than this is never attributed, and a call whose `cwd` is
@@ -1173,25 +1180,40 @@ pub struct Departed<'c, 'r> {
 /// gone), so a deleted plain subdirectory stays with the live root around it.
 ///
 /// The call's own path must also lie under the removed worktree. A cwd with an
-/// empty, `.` or `..` segment, a NUL, or more than 4096 bytes is never read as
-/// departed.
+/// empty, `.` or `..` segment anywhere, a NUL, a backslash, a Windows verbatim
+/// prefix (`//?/`), or more than 4096 bytes is never read as departed.
+///
+/// The live root may have matched the cwd through another spelling (its real
+/// path, its case-folded form, its Windows form), so the root's text is not a
+/// prefix of the cwd. The cwd is cut after as many of its own components as the
+/// matching spelling has, which those checks make the same count.
 pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &RootSet<'r>) -> Option<Departed<'c, 'r>> {
     let cwd = call.cwd.trim_end_matches('/');
     // Almost every call: nothing below its root has the shape.
     if !within_cap(cwd) || !within_cap(candidate_path(call)) || !cwd.contains(WORKTREES_DIR) {
         return None;
     }
-    let host = deepest_root(cwd, roots)?;
-    let host_len = host.trim_end_matches('/').len();
-    let below = &cwd[host_len..];
+    let body = cwd.trim_start_matches('/');
+    let segments: Vec<&str> = body.split('/').collect();
+    let plain =
+        |segment: &&str| !matches!(*segment, "" | "." | "..") && !segment.contains(['\0', '\\']);
+    if !segments.iter().all(plain) || (cwd.starts_with("//") && segments[0] == "?") {
+        return None;
+    }
+    let (depth, host) = deepest_match(cwd, roots)?;
+    if depth > segments.len() {
+        return None;
+    }
     let (mut before_last, mut last) = ("", "");
-    let mut end = host_len;
+    // Byte offset in `cwd` just past the segment read, always at a separator or
+    // the end, so every slice below is on a character boundary.
+    let mut end = cwd.len() - body.len();
     let mut deepest = None;
-    for segment in below.split('/').skip(1) {
-        if matches!(segment, "" | "." | "..") || segment.contains('\0') {
-            return None;
+    for (index, segment) in segments.iter().enumerate() {
+        end += segment.len() + usize::from(index > 0);
+        if index < depth {
+            continue;
         }
-        end += 1 + segment.len();
         if before_last == ".claude" && last == "worktrees" {
             deepest = Some(end);
         }
@@ -1507,8 +1529,13 @@ fn components(text: &str) -> usize {
     text.split('/').filter(|part| !part.is_empty()).count()
 }
 
-/// Whether `a` and `b` are one file or directory.
+/// Whether `a` and `b` are one file or directory. `b` is not followed: a
+/// symlink at `b` is an entry of its own, even when it points at `a` (a sibling
+/// link `rEPO -> Repo` on a case-sensitive volume is not `Repo` in another case).
 fn same_object(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if std::fs::symlink_metadata(b).map_or(true, |meta| meta.file_type().is_symlink()) {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1876,6 +1903,133 @@ mod tests {
         ] {
             assert_eq!(departed(&command_in(cwd, None), &[REPO]), None, "{cwd:.60}");
         }
+    }
+
+    /// A departed worktree under a root the cwd reaches by another spelling:
+    /// the cwd is cut by its own components, never at the root's byte length.
+    fn departed_in(cwd: &str, roots: &[&str]) -> Option<String> {
+        let call = command_in(cwd, Some(&format!("{cwd}/a.rs")));
+        departed_root(&call, &RootSet::new(roots)).map(|d| d.root.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_matched_through_a_link_cuts_the_cwd_by_its_own_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let base = base.to_str().unwrap();
+        // A long link to a short directory: the root's text is longer than the
+        // part of the cwd it covers (this sliced past the cwd's end).
+        let short = format!("{base}/r");
+        std::fs::create_dir(&short).unwrap();
+        let long_link = format!("{base}/{}", "a-long-link-name-".repeat(6));
+        std::os::unix::fs::symlink(&short, &long_link).unwrap();
+        let wt = format!("{short}/.claude/worktrees/w");
+        assert_eq!(departed_in(&wt, &[&long_link]), Some(wt.clone()));
+        // A short link to a long directory: the root's text is shorter (this
+        // cut inside a name and invented a root).
+        let long = format!("{base}/{}", "a-long-real-name-".repeat(6));
+        std::fs::create_dir(&long).unwrap();
+        let short_link = format!("{base}/l");
+        std::os::unix::fs::symlink(&long, &short_link).unwrap();
+        let wt = format!("{long}/.claude/worktrees/abcdefg");
+        assert_eq!(
+            departed_in(&format!("{wt}/src"), &[&short_link]),
+            Some(wt.clone())
+        );
+        // The worktree spelled through the link is still found as written.
+        let via_link = format!("{short_link}/.claude/worktrees/abcdefg");
+        assert_eq!(
+            departed_in(&via_link, &[&short_link]),
+            Some(via_link.clone())
+        );
+    }
+
+    /// macOS's temporary directory is under `/var`, a link to `/private/var`.
+    #[test]
+    fn a_root_written_through_var_owns_a_cwd_written_through_private_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let written = tmp.path().join("repo");
+        std::fs::create_dir(&written).unwrap();
+        let real = written.canonicalize().unwrap();
+        let (written, real) = (written.to_str().unwrap(), real.to_str().unwrap());
+        if written == real {
+            eprintln!("skipped: {written} is already its real spelling");
+            return;
+        }
+        let wt = format!("{real}/.claude/worktrees/abcdefg");
+        assert_eq!(departed_in(&format!("{wt}/src"), &[written]), Some(wt));
+    }
+
+    #[test]
+    fn a_case_folded_match_never_slices_inside_a_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("Kx");
+        std::fs::create_dir(&root).unwrap();
+        let parent = root.parent().unwrap().to_str().unwrap().to_string();
+        let root = root.to_str().unwrap().to_string();
+        if !ignores_case(std::path::Path::new(&root)) {
+            eprintln!("skipped: {root} is on a volume that keeps case");
+            return;
+        }
+        // U+212A KELVIN SIGN lower-cases to `k` but is three bytes long.
+        let wt = format!("{parent}/\u{212A}x/.claude/worktrees/gone");
+        assert_eq!(departed_in(&wt, &[&root]), Some(wt.clone()));
+        let wt = format!("{parent}/KX/.claude/worktrees/gone");
+        assert_eq!(departed_in(&wt, &[&root]), Some(wt.clone()));
+    }
+
+    #[test]
+    fn a_root_written_with_dot_dot_is_cut_by_what_it_resolves_to() {
+        let root = format!("/r/{}/..", "x".repeat(40));
+        let wt = "/r/.claude/worktrees/w";
+        assert_eq!(departed_in(wt, &[&root]), Some(wt.to_string()));
+        assert_eq!(
+            departed_in("/r/.claude/worktrees/\u{e9}t\u{e9}", &[&root]),
+            Some("/r/.claude/worktrees/\u{e9}t\u{e9}".to_string())
+        );
+        // A cwd with `..` anywhere is not read as departed, before the root too.
+        for cwd in [
+            "/x/../r/.claude/worktrees/w",
+            "/r/a/../.claude/worktrees/w",
+            "/./r/.claude/worktrees/w",
+        ] {
+            assert_eq!(departed_in(cwd, &["/r"]), None, "{cwd}");
+        }
+    }
+
+    #[test]
+    fn a_windows_root_cuts_a_forward_slash_cwd_by_components() {
+        let wt = "c:/repo/.claude/worktrees/w";
+        assert_eq!(departed_in(wt, &[r"C:\Repo"]), Some(wt.to_string()));
+        assert_eq!(departed_in(wt, &[r"\\?\C:\REPO\"]), Some(wt.to_string()));
+        let unc = "//srv/share/repo/.claude/worktrees/w";
+        assert_eq!(
+            departed_in(unc, &[r"\\SRV\Share\Repo"]),
+            Some(unc.to_string())
+        );
+        // A verbatim or backslashed cwd is never read as departed.
+        for cwd in [
+            "//?/c:/repo/.claude/worktrees/w",
+            r"c:\repo/.claude/worktrees/w",
+            r"c:/repo/.claude/worktrees/w\x",
+        ] {
+            assert_eq!(departed_in(cwd, &[r"C:\Repo"]), None, "{cwd}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_link_in_flipped_case_does_not_make_a_volume_ignore_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let repo = base.join("Repo");
+        std::fs::create_dir(&repo).unwrap();
+        if std::os::unix::fs::symlink(&repo, base.join("rEPO")).is_err() {
+            eprintln!("skipped: {} ignores case, so rEPO is Repo", base.display());
+            return;
+        }
+        assert!(!ignores_case(&repo));
     }
 
     #[test]
