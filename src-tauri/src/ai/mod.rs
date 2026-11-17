@@ -1334,15 +1334,30 @@ pub fn generate_commit_message(
     repo_path: &str,
     route: impl Into<Route>,
 ) -> Result<AiGeneration, CommandError> {
-    generate_commit_message_with(repo_path, route.into(), || discovery::sweep(None))
+    generate_commit_message_with(repo_path, Ok(route.into()), || discovery::sweep(None))
 }
 
-/// [`generate_commit_message`] with the discovery sweep injected, so a test can
-/// point it at a server it controls instead of the fixed loopback ports, and
-/// prove a Claude route never calls it.
+/// [`generate_commit_message`] for a route that may not have resolved: the
+/// app's command passes what choosing the route answered. A commit message
+/// never fails for want of a model. When no route could be chosen (cloud mode
+/// with no Claude credential, a Manvi without `work.assist.complete`, a mode
+/// GitPulse cannot use) the message is the one written from the patch, with a
+/// warning naming why. Nothing is sent anywhere on that path. Errors that are
+/// not about the route still reach the caller: nothing staged, an unreadable
+/// patch, and the loopback consent refusal.
+pub fn generate_commit_message_routed(
+    repo_path: &str,
+    route: Result<Route, CommandError>,
+) -> Result<AiGeneration, CommandError> {
+    generate_commit_message_with(repo_path, route, || discovery::sweep(None))
+}
+
+/// [`generate_commit_message_routed`] with the discovery sweep injected, so a
+/// test can point it at a server it controls instead of the fixed loopback
+/// ports, and prove a Claude route never calls it.
 fn generate_commit_message_with(
     repo_path: &str,
-    route: Route,
+    route: Result<Route, CommandError>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
@@ -1418,10 +1433,22 @@ fn generate_commit_message_with(
     crate::lappi::consult_on_commit_type(repo_path, &patch, &mut draft);
 
     let engine = match route {
-        // The user chose Claude for Manvi: no sweep, no consent gate, no
-        // loopback. A failed call falls back to the patch message below.
-        Route::Manvi(cloud) => CommitEngine::Manvi(cloud),
-        Route::Local(selection) => {
+        // No route could be chosen: no model runs, nothing is sent, and the
+        // classified message is the answer.
+        Err(why) => {
+            return Ok(generation_from_patch(
+                &draft,
+                started,
+                Some(&format!(
+                    "No model was used ({}). The message was written from the patch.",
+                    why.message()
+                )),
+            ));
+        }
+        // Manvi's chosen mode: no sweep, no consent gate, no loopback. A
+        // failed call falls back to the patch message below.
+        Ok(Route::Manvi(cloud)) => CommitEngine::Manvi(cloud),
+        Ok(Route::Local(selection)) => {
             let (explicit, on_device) = match resolve_target(selection, sweep)? {
                 Target::Confirmed(selection) => (Some(selection), false),
                 // A cut patch is not something the small model should phrase:
@@ -2165,7 +2192,7 @@ mod tests {
             with_isolated_tools_config(|| {
                 generate_commit_message_with(
                     &repo.path().to_string_lossy(),
-                    Route::Local(None),
+                    Ok(Route::Local(None)),
                     sweep,
                 )
             })

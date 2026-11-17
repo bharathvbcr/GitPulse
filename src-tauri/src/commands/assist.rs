@@ -211,9 +211,15 @@ pub async fn cmd_ai_generate_commit_message(
 ) -> Result<crate::ai::AiGeneration, IpcError> {
     let workbench = workbench.inner().clone();
     off_thread(move || {
-        let (route, warning) = route_for(base_url, model, &workbench)?;
+        // Unlike the other features, a commit message does not fail when no
+        // route can be chosen: it is written from the patch, with the reason
+        // as a warning (`generate_commit_message_routed`).
+        let (route, warning) = match route_for(base_url, model, &workbench) {
+            Ok((route, warning)) => (Ok(route), warning),
+            Err(why) => (Err(why), None),
+        };
         with_route_warning(
-            crate::ai::generate_commit_message(&repo_path, route),
+            crate::ai::generate_commit_message_routed(&repo_path, route),
             warning,
         )
     })

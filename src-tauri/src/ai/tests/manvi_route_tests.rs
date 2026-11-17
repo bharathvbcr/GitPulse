@@ -241,7 +241,7 @@ fn a_commit_message_falls_back_to_the_patch_and_names_the_cloud_failure() {
     let generation = with_isolated_tools_config(|| {
         generate_commit_message_with(
             &repo.path().to_string_lossy(),
-            Route::Manvi(cloud),
+            Ok(Route::Manvi(cloud)),
             move || {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Vec::new()
@@ -267,13 +267,55 @@ fn a_commit_message_falls_back_to_the_patch_and_names_the_cloud_failure() {
 }
 
 #[test]
+fn a_commit_message_with_no_route_is_written_from_the_patch_and_names_why() {
+    let repo = repo_with_staged_change();
+    // What choosing the route answers in cloud mode with no Claude credential.
+    let no_route = CommandError::from("No Claude credential: add an API key in the Manvi pane.");
+
+    let generation = with_isolated_tools_config(|| {
+        generate_commit_message_with(&repo.path().to_string_lossy(), Err(no_route), no_sweep)
+    })
+    .expect("a commit message never fails for want of a route");
+
+    assert_eq!(generation.model, "gitpulse");
+    assert_eq!(
+        generation.context_source,
+        "written from the patch; no model ran"
+    );
+    assert!(!generation.text.trim().is_empty());
+    let joined = generation.warnings.join("\n");
+    assert!(joined.contains("No Claude credential"), "{joined}");
+    assert!(joined.contains("written from the patch"), "{joined}");
+
+    // Errors that are not about the route still reach the caller.
+    let empty = tempfile::TempDir::new().expect("tempdir");
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(empty.path())
+        .output_locked()
+        .expect("git init");
+    crate::test_support::trust_repo(empty.path());
+    let error = generate_commit_message_with(
+        &empty.path().to_string_lossy(),
+        Err(CommandError::from("no route")),
+        no_sweep,
+    )
+    .expect_err("nothing staged is still refused");
+    assert!(
+        error.message().contains("Nothing is staged"),
+        "{}",
+        error.message()
+    );
+}
+
+#[test]
 fn a_commit_message_from_claude_is_guarded_like_a_local_one() {
     let repo = repo_with_staged_change();
     let (cloud, calls) = fake_manvi(reply("docs: add a readme"), None, 200_000);
     let generation = with_isolated_tools_config(|| {
         generate_commit_message_with(
             &repo.path().to_string_lossy(),
-            Route::Manvi(cloud),
+            Ok(Route::Manvi(cloud)),
             no_sweep,
         )
     })
