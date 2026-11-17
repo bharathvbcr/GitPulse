@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adv_b2073_tests;
 // Unix only: it writes `#!/bin/sh` wrappers and sets `PermissionsExt` modes.
 #[cfg(all(test, unix))]
 mod adv_w3gb2_tests;
@@ -7,6 +9,7 @@ mod adv_w3gb2_tests;
 mod adv_w3l2_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod adv_w4b_tests;
+mod agent_connect;
 mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
@@ -35,6 +38,7 @@ pub mod ingest;
 pub mod insights;
 pub mod ipc_error;
 pub mod lappi;
+pub mod leak_scan;
 pub mod ledger;
 pub mod limits;
 #[cfg(unix)]
@@ -101,6 +105,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let mut options = sysload::SamplerOptions::new(dir);
     options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
     options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
+    options.thresholds = Box::new(|| tool_config::host_load_settings().thresholds);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {
         if let Err(error) = emitter.emit("host-load-pulse", pulse) {
@@ -484,6 +489,7 @@ pub fn run() {
             cmd_scan_deps_health,
             cmd_scan_secrets,
             cmd_storage_scan,
+            cmd_storage_stale_worktrees,
             cmd_commit_graph_write_plan,
             cmd_commit_graph_write,
             cmd_commit_graph_write_cancel,
@@ -693,6 +699,8 @@ pub fn run() {
             cmd_move_path,
             cmd_delete_path,
             cmd_mcp_info,
+            cmd_agent_connect_plan,
+            cmd_agent_connect_apply,
             cmd_external_tools_status,
             cmd_external_tool_install,
             cmd_external_tool_install_cancel,

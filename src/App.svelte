@@ -1342,6 +1342,7 @@
         <p class="text-meta text-textMuted leading-relaxed mb-2">
           Set up the code map (Code → Map) and
           Manvi (policy) when you want them — GitPulse works without either.
+          Connect Claude Code or Codex to GitPulse's MCP server too.
         </p>
         <div class="flex items-center gap-2">
           <button
@@ -1350,6 +1351,13 @@
             onclick={() => openSetupWizard("devmap", "explain")}
           >
             Set up
+          </button>
+          <button
+            type="button"
+            class="gp-btn text-meta px-2 py-0.5"
+            onclick={() => openSetupWizard("devmap", "connect")}
+          >
+            Connect agent
           </button>
           <button
             type="button"

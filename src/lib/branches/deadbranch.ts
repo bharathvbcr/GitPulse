@@ -1,3 +1,4 @@
+import { plural } from "../format";
 import { invoke } from "../ipc/invoke";
 import type {
   DeadbranchBackupInfo,
@@ -98,18 +99,24 @@ export function formatBackupTimestamp(timestampSec: number): string {
  * Filters branches based on user search term, age, and merge mode.
  */
 /**
- * The branches a fresh scan pre-selects for deletion: merged, and neither
- * protected nor in use. A gone upstream never selects a branch on its own — only
+ * The branches a fresh scan pre-selects for deletion, as full refs: merged,
+ * and neither protected nor in use. A gone upstream never selects a branch on its own — only
  * `is_merged` does, and the backend sets that from ancestry or a tree comparison.
  */
 export function preselectMerged(branches: StaleBranchInfo[]): Set<string> {
   const selected = new Set<string>();
   for (const b of branches) {
     if (!b.is_protected && !b.is_current_or_worktree && b.is_merged) {
-      selected.add(b.name);
+      selected.add(b.full_ref);
     }
   }
   return selected;
+}
+
+/** The success toast: what was deleted, against what was selected. */
+export function cleanedToast(deleted: number, selected: number): string {
+  if (deleted === selected) return `Cleaned ${plural(deleted, "branch", "branches")}.`;
+  return `Cleaned ${deleted} of ${selected} selected ${selected === 1 ? "branch" : "branches"}.`;
 }
 
 export function filterStaleBranches(

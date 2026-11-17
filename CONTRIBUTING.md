@@ -115,13 +115,70 @@ This validates the current host. Run it before opening a pull request; the
 platform jobs in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml`
 must still pass on their respective operating systems.
 
+The Rust test gate builds an instrumented copy of the crate (about 50 GiB in
+`<cargo target>/llvm-cov-target`). The runner deletes it itself once the coverage floor has
+read `lcov.info`, and also when a gate fails, or when something later in the run throws after
+the Rust test gate has returned. If that gate's own runner throws, nobody knows whether cargo
+ran, so the directory is left. It prints what it removed and how much it freed. A Ctrl-C or `kill` that stops
+the runner itself is not covered, so check for the directory after one. Set
+`CI_LOCAL_KEEP_COVERAGE_BUILD=1` (or `true`, `yes`; any other value, `0` and `no` included,
+deletes) to keep it: an incremental coverage rebuild is about 15 minutes faster, at the cost of
+the disk space.
+
+What it will delete, and when it will not:
+
+- It deletes the directory cargo-llvm-cov used: `CARGO_LLVM_COV_TARGET_DIR` (and
+  `CARGO_LLVM_COV_BUILD_DIR` beside it) if set, else `llvm-cov-target` under the target
+  directory `cargo metadata` reports. An empty variable counts as unset, as it does for
+  cargo-llvm-cov. A value with a `..` component is refused, because cargo-llvm-cov lets the OS
+  resolve it through symlinks and the runner will not guess where that leads.
+- Only a build this run wrote: the directory must not have existed before the Rust test gate,
+  or must have changed while it ran, and the gate must have got as far as running cargo (a
+  slot-gate give-up, exit 75, did not). A directory that predates the run unchanged is left
+  alone.
+- Inside the repository, `llvm-cov-target` is deleted. A symlink is never followed, and neither
+  the repository, your home directory, cargo's regular target directory nor anything that
+  looks like one is.
+- Outside the repository (a shared target directory), only `<CARGO_TARGET_DIR>/llvm-cov-target`
+  or the exact path `CARGO_LLVM_COV_TARGET_DIR` names, and only if it is named
+  `llvm-cov-target` and holds a cargo marker (`CACHEDIR.TAG` or `.rustc_info.json`). A target
+  moved outside the repository by `.cargo/config.toml` or `CARGO_BUILD_TARGET_DIR` rather than
+  `CARGO_TARGET_DIR` is refused, not followed. Because another worktree's coverage run may be
+  using a shared directory, it is also refused if any live process names it in its arguments or
+  runs an executable from inside it (a process's working directory is not checked), or if `ps`
+  cannot be read. The coverage run is serialised machine-wide but this delete happens after it,
+  so with a shared target directory prefer `CI_LOCAL_KEEP_COVERAGE_BUILD=1` while others are
+  building.
+
+Two ci:local runs, or a run and anything else, never delete each other's build because each
+run takes a lock file beside the directory (`llvm-cov-target.ci-local.lock`, created
+exclusively, holding its pid, its process start time and the resolved path) before the Rust
+test gate starts and removes it after cleanup, on every path including a throw. A lock whose
+process is alive and started when the lock says belongs to another run: this run refuses
+("another ci:local run (pid N) is using it") and leaves its lock alone. A lock whose process
+is gone, or whose pid was reused by a different process, is stale and is replaced, and the
+output says so. A lock that cannot be created (a read-only parent) is a refusal, never a
+removal. The lock applies inside and outside the repository, and the live-process check
+(every spelling of the path, including the `/private` form, on path boundaries) runs in both
+as a second guard. What stays uncovered: a bare `cargo llvm-cov` from another shell, which
+holds no lock, that is between child processes at that instant and reaches the directory
+through a symlink the runner does not resolve to the same path; and a lock file left by a
+crashed run whose pid is still alive and started at the recorded time is indistinguishable
+from a live one until that process exits.
+
+A build that could not be removed is reported as `COVERAGE BUILD NOT REMOVED` with the reason,
+in the run's log and its summary. That includes the case where the Rust test gate passed but
+nothing was found where the build should be. If every gate passed but the build was not
+removed, `ci:local` exits 4 rather than 0 (1 still means a gate failed); a build kept on request
+exits 0.
+
 > [!IMPORTANT]
 > **macOS is the platform this project is developed and hand-tested on.** CI
 > runs the automated suites elsewhere, but no one drives a running Windows or
 > Linux build regularly, so a change that only breaks there will not be caught
 > by a person — only by whatever assertion happens to cover it. If you are
 > touching anything platform-shaped, read
-> [platform coverage](docs/QUALIFICATION.md#platform-coverage) first: it
+> [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage) first: it
 > separates what is *known absent* off macOS from what is merely *unverified*,
 > and those need different treatment. Write the other platform's behaviour as a
 > `cfg` arm you can compile here rather than relying on a build nobody runs —
@@ -207,24 +264,24 @@ flowchart TD
 | `bun run test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `bun run test:tz` | Runs local-time frontend tests (due dates, pulse metrics, commit cadence) across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata` to catch timezone and DST regressions |
 | `bun run gusset:check` | Runs `go/cmd/gusset-check` (`Go 1.27.4`) against DevCouncil's umbrella archive when sibling `DevCouncil` and `gusset` checkouts are present |
-| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (329 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (332 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 121 contracts (311 structs, 2173 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 125 contracts (330 structs, 2308 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
 | `bun run check:coverage` | Validates both LCOV reports structurally and enforces the coverage floors (frontend 90% lines / 85% branches, Rust 80% lines); a report that cannot be parsed fails loudly rather than passing by default. `--json` emits the same verdict for a machine |
-| `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty) |
+| `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty). It also fails any job or step in a workflow the release gate reads (`ci.yml`, `coverage.yml`, taken from `release-state.mjs`) that can skip or fail silently — a job `if:`, `continue-on-error`, a `needs:` on a skippable job, a step `if:` other than `!cancelled()` or a platform selector, a matrix `exclude`, a job that calls a reusable workflow (`uses`) or has no `steps` — unless `RELEASE_GATE_ALLOWLIST` lists it with a reason, because the gate reads the run's conclusion and a skipped job leaves it `success` |
 | `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
 | `bun run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
-| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
+| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command, then deletes the ~50 GiB coverage build unless `CI_LOCAL_KEEP_COVERAGE_BUILD=1`; exits 4 if every gate passed but it could not be removed |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
-For the DevMap watcher/diagnostics boundary, run `bun run test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `bun run test:browser` and `bun run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [docs/QUALIFICATION.md](docs/QUALIFICATION.md); the dated DevMap verification ledger is [DEVMAP_AUDIT.md at commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md).
+For the DevMap watcher/diagnostics boundary, run `bun run test -- src/lib/diagnostics src/lib/codeintel src/lib/async/pacedQueue.test.ts src/lib/components/CodeGraphCanvas.test.ts src/lib/motion/__tests__/frameScheduler.test.ts`, then `cargo test --manifest-path src-tauri/Cargo.toml --lib devmap:: -- --test-threads=4` and the same Rust command with `watcher::`. These cover malformed status, explicit failed reports, busy-writer subprocess suppression, generated-state feedback, source/ref preservation, bounded scheduling, and 10,000 browser notifications without persistence writes. `bun run test:browser` and `bun run test:webkit` exercise the visible suppression counter and retain real application exceptions. Use the runtime and stress buttons in `harness/devmap.html` for the graph matrix; its error/rejection listeners must remain active through settled frames. Results and remaining gates are recorded in [QUALIFICATION.md at commit 90362c2e](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md); the dated DevMap verification ledger is [DEVMAP_AUDIT.md at commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DEVMAP_AUDIT.md).
 
 ### Contracts enforced by tests rather than scripts
 
@@ -239,7 +296,9 @@ several were added after the drift had already happened.
 | `view-menu-contract` | A registered view missing from the native menu, in either direction. This happened three times — `tab-manvi`, then Storage and Reflog — because view ids are derived from the registry in TypeScript and hand-written as constants in Rust. |
 | `agents-surface-contract` | The Agents surface becoming unreachable. Agents is a workspace surface like Fleet and Tasks, not a registered repository view, so `view-menu-contract` does not force its native action id, menu parse arm, tab-bar entry, palette command or handler into existence; this test does. |
 | `menu-state-contract` | A native-menu payload the Rust validator refuses. `cmd_set_menu_state` validates before it applies and a refusal applies nothing, so one malformed payload does not degrade the menu bar, the tray and the status popover — it freezes all three on the last state Rust accepted, while the frontend logs `desktop:menu-state` and retries. Nothing on the TypeScript side enforced the rules, so the suite could not tell a payload that renders from one that can never be sent. This reads every ceiling, enum, action id and refusal message out of `state.rs` and `actions.rs` and holds `menuContract.ts` to them; `menuContract.test.ts` then uses that mirror to prove `buildMenuState` is total. |
+| `blocking-command-async-contract` | A command that reads files or waits on a lock declared as a plain `#[tauri::command] pub fn`, which runs on the GUI thread: a slow disk on a loaded host then freezes the window while the diagnostics view polls it. The 2026-11-16 diagnostics showed this for `cmd_diagnostic_log_tail` and `cmd_daemon_status`. |
 | `check-schema-parity.adversarial` | The adversarial cases for `check-schema-parity`'s extraction-schema row: constants that only appear inside comments (the extractor is comment-blind), hostile manifest values, and fake `devmap` binaries that answer wrongly or not at all. |
+| `check-schema-parity.lease.adversarial` | The adversarial cases for `check-schema-parity`'s stack-lease format row: `rustConstant` shapes it must refuse (`pub(crate)`, underscores, hex, expressions, a missing constant), differing cfg-gated or `cfg(test)` copies, a pin from before the lease file existed (unverifiable, not a match or a crash), a failing `git show`, and a reader or writer on either side of the format |
 | `adv_w3b_sibling_scripts` | A bad `GITPULSE_VENDOR_GIT_TIMEOUT_MS` that `check-schema-parity` or `gusset-check` reports as a stack trace instead of one `FAIL:` line with exit 2, and a `git` that hangs inside `findSibling` and does the same. |
 | `adv_w5b_signal_guard` (`src-tauri/tests/`) | The signal guard answering silently for a command the real procps, psmisc or sysvinit tool turns into a signal on a protected process: regular-expression syntax and character-set differences, `pidof` by path, programs the shell reader does not resolve, a root sender reading other users' arguments, an executable that cannot be identified. Every test is `#[ignore]`d and refuses to run outside the Linux container `tests/fixtures/adv_w4a/run.sh` starts (it sends real signals), so an ordinary run reports them as not run. |
 | `adv_w5b_mac_diff` (`src-tauri/tests/`) | The macOS side of the same differential: it prints the guard's verdict for 198 lines of shell and a lab of 42 sleepers so a build of `1ba087a0` and a later build can be compared line by line (nothing asked about or refused may get quieter). `#[ignore]`d; reads the process table and signals nothing. |
@@ -273,6 +332,10 @@ several were added after the drift had already happened.
 | `a11y-suppression-contract` | A bare `svelte-ignore`. A suppressed rule and a rule that passed look identical in `bun run check` output. |
 | `greppable-source-contract` | A raw NUL byte in a source file. ripgrep and `grep` sniff for it, classify the whole file as binary and skip it in silence — so a search for a symbol that IS in the file reports that the file does not use it. `DiffViewer.svelte` carried four (cache keys joined on a literal NUL), `fileRail.ts`, `FleetView.svelte` and `operation.test.ts` one each, and every `rg` over them came back clean. The escape says the same thing in plain text. |
 | `terminal-isolation-contract` | An import that would give the AI or MANVI sidecar a route to the terminal PTY, which SECURITY.md says they cannot reach. |
+| `bun-audit-ignores-contract` | An advisory ignore that stops being a decision. `bun audit --ignore=<GHSA>` accepts a finding no release can clear, and an ignore with no reason and no end date is how a gate quietly stops gating. Each must be one GHSA id, named in the comment above it with why it is safe, and carry a `revisit by YYYY-MM-DD` that has not passed; a blanket `--audit-level` or `--prod` (which would hide every other advisory) is refused. Each rule is shown failing on its own mutation. |
+| `native-test-quiet-contract` | A native test putting an icon in the Dock and a menu bar on the screen of whoever ran it. Tao launches a real loop as a Regular application and activates it unless told otherwise, even when every window the test builds is hidden, so a `harness = false` target that runs one must call `tests/common/quiet_app.rs` between `build` and `run`. A detector self-test pins the shape before and after, because a scan that finds no targets passes. |
+| `ci-shards-contract` | The macOS Rust shards dropping part of the suite while every job is green. The shard count is spelled in the matrix, the `--partition hash:M/N` denominator, the job name, the completeness check's `--shards` and its report list, and none of them is compiled against another: a matrix of two with a denominator of three never runs a third of the tests. It also pins that a shard runs under the serial `ci` nextest profile, that the completeness job runs after a red shard rather than only a green one, and that Linux and Windows keep the in-process `--test-threads=1` gate. Each rule is shown failing on its own mutation. |
+| `devmap-pin-contract` | A stale or loose pin on the `devmap` CLI that CI builds for the tests driving it. The pin only protects anything while it is a full 40-character commit SHA (a branch or an abbreviation moves under the cache key), every `cargo install --git` uses it with `--locked`, the cache key moves with it, and every job that installs the CLI then runs `check:vendor-schema`, so a re-vendor that bumps the store schema fails the job instead of passing on an older CLI. The schema number the workflow comment states is also held against the vendored `CURRENT_SCHEMA_VERSION`. Each rule is shown failing on its own mutation. |
 | `update-privacy-contract` | The release check gaining a repository path or a credential flag, which SECURITY.md says it never sends. |
 | `diagnostics-contract` | The crash log going quiet. The panic hook captures its logger at install time, so installing it before `logging::init()` binds nothing and every later panic is recorded where no one can read it — a hook that looks installed and is inert. It also pins the reverse gap: a new `[[bin]]` inherits neither the logger nor the hook and is absent from `LOGGED_BINARIES`, so it writes no durable log, and nothing about a silent binary looks wrong. Both lists are derived from Cargo.toml rather than restated here. |
 | `plugin-contract` | The Agent Plugins 1.0 package drifting from the published schemas. A extra top-level field, a mismatched `$schema` version between `plugin.json` and `mcp.json`, or a `command` that is a shell string rather than one token, and a conformant client rejects or skips the package while Settings still copies it. |
@@ -305,6 +368,7 @@ several were added after the drift had already happened.
 | `codesign-shim-contract` | The macOS universal bundle that now *has* every helper still dies at codesign. Tauri copies every `[[bin]]` into `Contents/MacOS` and signs them in manifest order — main binary first. Once `Info.plist` is in the bundle, codesign treats that file as the bundle executable and every other Mach-O in the same directory as nested code that must already be signed. `lipo` produces unsigned helpers, so the main-binary sign fails with `code object is not signed at all / In subcomponent: <helper>`. A thin `tauri build` cannot see it: linker ad-hoc signatures survive a single-arch copy. `scripts/bin/codesign` signs every sibling Cargo.toml declares, with Tauri's own identity and flags, before the main binary. The contract drives that with a recorder, and on Darwin reproduces Apple's nested-code refusal against `/usr/bin/codesign` so a future codesign that stops caring would fail the characterisation rather than leave the shim looking load-bearing. |
 | `pre-push-hook-contract` | A release tag that publishes a tree nobody meant to ship. `release.yml` triggers on `v*`, checks the tag out, and builds *that* tree — so every gate it runs (version manifests, changelog section) is evaluated at the tagged commit, and a tag left behind on an older commit passes all of them. `v0.0.6` sat 26 commits back with its own self-consistent 0.0.6 manifests and a 30-line `[0.0.6]` changelog section, so nothing in CI could have objected. The job cannot know which commit you meant; only the machine holding both the tag and the work can, which is why the check is a pre-push hook (`git config core.hooksPath .githooks`). The contract exists because an unrun hook and a passing hook look identical, and it derives the guarded glob from the workflow's own trigger so widening one without the other fails here. |
 | `fixture-author-hook-contract` | A test-fixture identity becoming the author or committer of a real commit. A fixture that writes `user.email` into this checkout's git config signs every later commit with it, and `.githooks/pre-commit` is what refuses that — but an unrun hook looks the same as a passing one. The test drives the real hook against real `git commit`s: the contract identity and the other fixture addresses are refused as author, as committer, and on an amend that would keep a fixture author, and a real identity still commits. Only `git commit` runs pre-commit, so the test also drives `.githooks/pre-merge-commit` against a real merge and `.githooks/pre-push` against real pushes to a bare remote: a fixture commit that bypassed pre-commit is refused at push, on an existing or a new branch, while one the remote already holds does not block later pushes. Pushing to a second remote, annotated-tag taggers, forty refs in one push, a five-thousand-commit history, addresses holding spaces, and a pushed object that cannot be read (refused, never passed) are covered too. The rule lives in `.githooks/lib/fixture-identity.sh`; it and `GitWriter::is_fixture_author_email` are both tested against `.githooks/lib/fixture-identity.cases`. |
+| `crash-windows-contract` | The list of crash windows in three write paths (the ledger, the ops log in `git_writer.rs`, worktree merge) drifting from the Rust source. `scripts/crash-windows.json` ties each window to its injection point and the test that proves recovery, or lists it uncovered with the reason. The test fails on a test-only hook in the scanned files that no row names, a row naming a hook or test that is gone, a cited test that is `#[ignore]`d or cfg-gated without the row saying so, and a duplicate id. It reads source text and does not run the Rust tests. Its scope is those files only, not the codebase; `crash-windows` holds the checking logic and its unit tests. |
 
 Adding a contract test is preferred over adding a `check:*` script unless the
 check is something you would want to run on its own.
@@ -388,7 +452,7 @@ GitPulse/
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 ├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (329 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (332 handlers)
     ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

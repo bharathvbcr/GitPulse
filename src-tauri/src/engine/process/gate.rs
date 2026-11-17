@@ -141,11 +141,28 @@ pub(crate) fn refusal_message_at(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low{by}"
         )),
-        Refusal::Pressure { reactive } => deferred(format!(
-            "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
-             pressure",
-            if reactive { "reactive" } else { "background" }
-        )),
+        Refusal::Pressure { reactive, cause } => {
+            let cause = cause.unwrap_or(crate::sysload::Binding::MemoryPressure);
+            // Slow start-up is the one cause with a number worth quoting in
+            // the sentence: how slow. It follows the phrase, after the marker
+            // every reader matches on.
+            let measured = match cause {
+                crate::sysload::Binding::ExecLatency => crate::sysload::exec_latency()
+                    .map(|latency| {
+                        format!(
+                            " (median {})",
+                            crate::sysload::format_latency(latency.median_ms)
+                        )
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            deferred(format!(
+                "{label}{DEFERRED_MARKER}0.000s: {} work is shed while {}{measured}",
+                if reactive { "reactive" } else { "background" },
+                cause.cause_phrase()
+            ))
+        }
     }
 }
 
@@ -326,6 +343,13 @@ fn thread_default_admission() -> Admission {
 
 thread_local! {
     static ADMISSION: Cell<Admission> = Cell::new(thread_default_admission());
+    /// Whether this thread asked for its spawns to be admitted while the disk is
+    /// the only thing the host is short of (see [`with_disk_relief`]). The ask
+    /// alone admits nothing: the governor must say so too.
+    static DISK_RELIEF: Cell<bool> = const { Cell::new(false) };
+    /// Whether this thread's spawn is the host-load exec probe (see
+    /// [`with_exec_probe`]).
+    static EXEC_PROBE: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's background spawns wait for budget; a thread
     /// starts in the process default, like [`ADMISSION`].
     static AWAITS_BUDGET: Cell<bool> =
@@ -415,6 +439,117 @@ pub(crate) fn with_background_budget_wait<T>(awaits: bool, body: impl FnOnce() -
         AWAITS_BUDGET.set(prev);
     });
     body()
+}
+
+/// Whether this thread's spawn is admitted although the host is shedding: the
+/// thread asked for disk relief (see [`with_disk_relief`]) and the governor says
+/// the disk remedy is due ([`crate::sysload::disk_remedy_due`]: the disk is the
+/// only thing the host is short of, or free disk is below the Severe floor
+/// whatever else is pressed, because a nearly full disk brings memory
+/// pressure with it). The relief flag is read first, so a thread that never
+/// asked costs no governor lock.
+fn disk_relief_applies() -> bool {
+    if !DISK_RELIEF.get() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(forced) = DISK_ONLY_FOR_TEST.get() {
+        return forced;
+    }
+    crate::sysload::disk_remedy_due()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the governor's answer: the injected governor has no
+    /// history, so it can only answer false. Thread-local, set by
+    /// `with_disk_only_answer`.
+    static DISK_ONLY_FOR_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_disk_only_answer<T>(answer: bool, body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(DISK_ONLY_FOR_TEST.replace(Some(answer)), |prev| {
+        DISK_ONLY_FOR_TEST.set(prev);
+    });
+    body()
+}
+
+/// Runs `body` with the cleaner's bounded, read-only checks admitted while the
+/// host sheds work for the disk remedy.
+///
+/// A full disk is the one pressure the cleaner exists to relieve, and the
+/// governor sheds reactive work under it like any other: a run started because
+/// the disk is full would then find every check refused and delete nothing.
+/// This admits only when `crate::sysload::disk_remedy_due()` holds; that
+/// function owns the definition (it is the governor's: the disk is the only
+/// reason the host sheds, or free disk is below the Severe floor on a fresh
+/// reading whatever else is pressed; it answers false on any doubt: no
+/// history for the first branch, an unavailable sensor, no governor in this
+/// process, as in the headless run, the MCP server or a hook). Low disk at
+/// Elevated, or the fill projection alone, with something else pressed, is not
+/// due. It changes nothing for a class that is not shed, and it
+/// never makes a spawn cheaper: the slot and rate budgets still apply. The
+/// caller must only spawn one read-only check inside it, never a scan: any
+/// other spawn on the same thread inside the body would be admitted too.
+pub(crate) fn with_disk_relief<T>(body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(DISK_RELIEF.replace(true), |prev| {
+        DISK_RELIEF.set(prev);
+    });
+    body()
+}
+
+/// Runs `body` as the host-load exec probe: its one spawn is admitted outside
+/// the rate bucket and the load governor's verdict, and only that.
+///
+/// The probe measures how long a trivial child takes to start, and the
+/// governor sheds background work while that is slow. A probe the verdict could
+/// shed would stop measuring the moment it was needed and never see start-up
+/// recover; one that drew from the git rate bucket would be refused by an
+/// empty bucket (the 2026-11-16 shared bucket sat at zero) and read as no
+/// signal, or would spend tokens the git reads need. What still bounds it is
+/// the concurrency limit (it is `Background` and takes one of the background
+/// slots), its own deadline, and the one-in-flight cadence of its caller. Only
+/// `sysload::exec_probe` calls it, through [`super::runner::time_exec_probe`].
+pub(super) fn with_exec_probe<T>(body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(EXEC_PROBE.replace(true), |prev| {
+        EXEC_PROBE.set(prev);
+    });
+    body()
+}
+
+/// The load governor's verdict for one spawn of `class`, and the only reader of
+/// it: the refusal the gate gives under pressure, or `None` when the class is
+/// not shed (a user action never is) or the disk remedy's relief applies.
+fn pressure_refusal(class: Admission) -> Option<Refusal> {
+    if class == Admission::Interactive || EXEC_PROBE.get() {
+        return None;
+    }
+    let background = class == Admission::Background;
+    let shed = crate::sysload::shed();
+    let disk_only = disk_relief_applies();
+    (!disk_only && ((background && shed.background) || (!background && shed.reactive))).then_some(
+        Refusal::Pressure {
+            reactive: !background,
+            cause: shed.cause,
+        },
+    )
+}
+
+/// Why a background spawn made now, under the disk remedy's relief, would be
+/// refused for pressure (the end of a sentence), or `None` when it would not.
+/// For a caller that must decide before it starts work: it asks the gate's own
+/// judgement, so "the work waits" and "its checks would be refused" cannot
+/// disagree.
+pub(crate) fn background_deferral_cause() -> Option<&'static str> {
+    match with_disk_relief(|| pressure_refusal(Admission::Background)) {
+        Some(Refusal::Pressure { cause, .. }) => Some(
+            cause
+                .unwrap_or(crate::sysload::Binding::MemoryPressure)
+                .cause_phrase(),
+        ),
+        _ => None,
+    }
 }
 
 /// Applies only inside a synchronous blocking operation.
@@ -585,11 +720,13 @@ pub(crate) enum Refusal {
     /// Background work refused without waiting: the rate budget was at or
     /// below the reserve kept for reactive reads.
     Shed,
-    /// Refused without waiting because the host is under memory pressure and
+    /// Refused without waiting because the host is under load (memory, swap or disk: see `cause`) and
     /// this class is shed while it lasts (`sysload::governor`). Carries the
     /// deferral marker, so the frontend retries it once the pressure clears.
     Pressure {
         reactive: bool,
+        /// What put the host in the tier that sheds, so the message names it.
+        cause: Option<crate::sysload::Binding>,
     },
     /// No concurrency slot became free before the command's own deadline.
     TimedOut {
@@ -1116,22 +1253,17 @@ impl SpawnGate {
         // memory pressure these classes are refused at once with the
         // deferral marker. A user action is never shed, and neither is a read
         // credited to one (`take_post_action_credit` promoted it already).
-        if !interactive {
-            let shed = crate::sysload::shed();
-            if (background && shed.background) || (!background && shed.reactive) {
-                let refusal = Refusal::Pressure {
-                    reactive: !background,
-                };
-                self.state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .counters[class.index()]
-                .count(refusal);
-                return Err((refusal, None));
-            }
+        if let Some(refusal) = pressure_refusal(class) {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .counters[class.index()]
+            .count(refusal);
+            return Err((refusal, None));
         }
         let rate_limited = self.refill_per_sec != u32::MAX
-            && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed);
+            && !PROCESS_UNLIMITED_RATE.load(std::sync::atomic::Ordering::Relaxed)
+            && !EXEC_PROBE.get();
         let entered = self.clock.now();
         // Declared before the state guard so that, unwinding, the guard is
         // released first and the reservation can take the lock to give its

@@ -1,6 +1,7 @@
 use super::*;
 use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
+use crate::sysload::Binding;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -290,15 +291,39 @@ fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resume
     drop(calm);
 
     let warn = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Warn));
-    assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
+    assert_eq!(
+        background(),
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
     assert_eq!((reactive(), interactive()), (None, None));
     drop(warn);
 
     let critical = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
-    assert_eq!(background(), Some(Refusal::Pressure { reactive: false }));
-    assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+    assert_eq!(
+        background(),
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
+    assert_eq!(
+        reactive(),
+        Some(Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::MemoryPressure)
+        })
+    );
     assert_eq!(interactive(), None, "a click is never shed");
-    let message = refusal_message("git status", Refusal::Pressure { reactive: true });
+    let message = refusal_message(
+        "git status",
+        Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::MemoryPressure),
+        },
+    );
     assert!(
         is_deferred_under_load(message.message()),
         "{message}",
@@ -319,14 +344,227 @@ fn memory_pressure_sheds_background_then_reactive_never_a_user_action_and_resume
         compressor_thrash: true,
         ..GovernorInput::test_pressure(Level::Normal)
     });
-    assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
+    assert_eq!(
+        reactive(),
+        Some(Refusal::Pressure {
+            reactive: true,
+            cause: Some(Binding::CompressorThrash)
+        })
+    );
     drop(thrash);
+
+    // A cause that is not memory is named, not called memory pressure.
+    let swap = crate::sysload::inject_governor(GovernorInput {
+        readings: crate::sysload::Readings {
+            swap_used: crate::sysload::Reading::Value(60 << 30),
+            ..crate::sysload::Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    });
+    let cause = background();
+    assert_eq!(
+        cause,
+        Some(Refusal::Pressure {
+            reactive: false,
+            cause: Some(Binding::Swap)
+        })
+    );
+    let message = refusal_message("git status", cause.unwrap());
+    assert!(
+        message.message().contains("swap") && !message.message().contains("memory pressure"),
+        "{}",
+        message.message()
+    );
+    drop(swap);
 
     // Cleared: everything resumes.
     let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
     assert_eq!(
         (background(), reactive(), interactive()),
         (None, None, None)
+    );
+}
+
+/// The cleaner's own checks are admitted while the disk is the only thing the
+/// host is short of, and shed like any other spawn under every other cause.
+/// Without `with_disk_relief` the same checks are shed under a full disk, so a
+/// run started because the disk is full would examine nothing.
+#[test]
+fn disk_relief_admits_checks_for_a_disk_cause_only() {
+    use super::{with_admission, with_background_processes, with_disk_relief, Admission, Refusal};
+    use crate::sysload::{GovernorInput, Level, Reading, Readings};
+    let gate = super::SpawnGate::new(8);
+    let far = || Instant::now() + Duration::from_secs(10);
+    let reactive = || {
+        with_admission(Admission::Reactive, || {
+            gate.acquire_until(far(), &|| false).err()
+        })
+    };
+    let background = || with_background_processes(|| gate.acquire_until(far(), &|| false).err());
+    let low_disk = GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(1 << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    };
+    let _disk = crate::sysload::inject_governor(low_disk);
+    assert_eq!(
+        crate::sysload::shed_cause(),
+        Some(Binding::LowDisk),
+        "the fixture must bind on the disk"
+    );
+    assert!(
+        matches!(reactive(), Some(Refusal::Pressure { reactive: true, .. })),
+        "without relief the check is shed under a full disk"
+    );
+    // Admission needs both: this thread asked for relief, and the governor says
+    // the disk is the only thing wrong. The injected governor has no history
+    // and answers false, so the governor's answer is forced here; its own
+    // answer is tested with the governor.
+    use super::with_disk_only_answer;
+    assert_eq!(
+        with_disk_only_answer(true, || with_disk_relief(reactive)),
+        None,
+        "relief asked and disk-only: admitted"
+    );
+    assert_eq!(
+        with_disk_only_answer(true, || with_disk_relief(background)),
+        None
+    );
+    assert!(
+        matches!(
+            with_disk_only_answer(false, || with_disk_relief(reactive)),
+            Some(Refusal::Pressure { reactive: true, .. })
+        ),
+        "relief asked, but another input is not clear (or there is no governor): shed"
+    );
+    assert!(
+        matches!(
+            with_disk_only_answer(true, reactive),
+            Some(Refusal::Pressure { reactive: true, .. })
+        ),
+        "disk-only, but the thread never asked for relief: shed"
+    );
+    assert_eq!(
+        with_disk_relief(reactive),
+        None,
+        "relief asked and the real accessor: free disk is under the Severe floor, so the remedy is due"
+    );
+    assert!(
+        with_disk_only_answer(true, reactive).is_some(),
+        "relief ends with its scope, on this thread"
+    );
+    drop(_disk);
+
+    for (name, input) in [
+        (
+            "swap",
+            GovernorInput {
+                readings: Readings {
+                    swap_used: Reading::Value(60 << 30),
+                    ..Readings::calm()
+                },
+                ..GovernorInput::test_pressure(Level::Normal)
+            },
+        ),
+        ("memory", GovernorInput::test_pressure(Level::Critical)),
+    ] {
+        let _held = crate::sysload::inject_governor(input);
+        assert!(
+            !matches!(
+                crate::sysload::shed_cause(),
+                Some(Binding::LowDisk | Binding::DiskFilling)
+            ),
+            "{name}: the fixture must not bind on the disk"
+        );
+        assert!(
+            matches!(with_disk_relief(background), Some(Refusal::Pressure { .. })),
+            "{name}: relief must not admit a spawn the host sheds for another cause"
+        );
+    }
+}
+
+/// The same admission through the process-wide accessor, with no seam: a
+/// governor that has history, as the app's sampler builds one. A relieved spawn
+/// is admitted when the disk alone is Severe, shed without relief, and shed with
+/// relief when anything else is wrong beside the disk.
+#[test]
+fn disk_relief_follows_the_real_accessor() {
+    use super::{with_admission, with_disk_relief, Admission, Refusal};
+    use crate::sysload::{
+        inject_governor_with_history, shed_is_disk_only, GovernorInput, Level, Reading, Readings,
+    };
+    let gate = super::SpawnGate::new(8);
+    let spawn = || {
+        with_admission(Admission::Reactive, || {
+            gate.acquire_until(Instant::now() + Duration::from_secs(10), &|| false)
+                .err()
+        })
+    };
+    let shed = |r: Option<Refusal>| matches!(r, Some(Refusal::Pressure { .. }));
+    let disk_only = |free_gib: u64| GovernorInput {
+        readings: Readings {
+            free_disk: Reading::Value(free_gib << 30),
+            ..Readings::calm()
+        },
+        ..GovernorInput::test_pressure(Level::Normal)
+    };
+    let _disk = inject_governor_with_history(std::iter::repeat_n(disk_only(8), 10));
+    assert!(shed_is_disk_only(), "the fixture is a disk-only Severe");
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "relieved and disk-only: admitted"
+    );
+    assert!(shed(spawn()), "the same spawn without relief is shed");
+    drop(_disk);
+
+    // CPU Elevated beside a Severe disk: not the disk alone, but free disk is
+    // below the Severe floor, so the remedy is due whatever else is pressed.
+    let mut busy = disk_only(8);
+    busy.readings.load = Reading::Value([4.0 * 18.0; 3]);
+    let _cpu = inject_governor_with_history(std::iter::repeat_n(busy, 10));
+    assert!(!shed_is_disk_only());
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "disk below the Severe floor and CPU Elevated: admitted"
+    );
+    drop(_cpu);
+
+    // Memory Critical beside a Severe disk: a nearly full disk brings memory
+    // pressure with it; the relieved check proceeds, an unrelieved one is shed.
+    let mut memory = disk_only(8);
+    memory.level = Some(Level::Critical);
+    let _memory = inject_governor_with_history(std::iter::repeat_n(memory, 10));
+    assert!(!shed_is_disk_only());
+    assert_eq!(
+        with_disk_relief(spawn),
+        None,
+        "disk below the Severe floor and memory Severe: admitted"
+    );
+    assert!(shed(spawn()), "without relief it is shed");
+    drop(_memory);
+
+    // Low disk only Elevated (24 GiB, between the floors) with memory Severe.
+    let mut elevated = disk_only(24);
+    elevated.level = Some(Level::Critical);
+    let _elevated = inject_governor_with_history(std::iter::repeat_n(elevated, 10));
+    assert!(
+        shed(with_disk_relief(spawn)),
+        "disk Elevated and memory Severe: relief admits nothing"
+    );
+    drop(_elevated);
+
+    // The fill projection alone (space well above the floor) with memory Severe.
+    let mut filling = GovernorInput::test_pressure(Level::Critical);
+    filling.readings.free_disk = Reading::Value(40 << 30);
+    filling.readings.disk_fill_sustained = Reading::Value(10 << 30);
+    let _filling = inject_governor_with_history(std::iter::repeat_n(filling, 10));
+    assert!(
+        shed(with_disk_relief(spawn)),
+        "a fill projection alone with memory Severe: relief admits nothing"
     );
 }
 
@@ -397,7 +635,10 @@ fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
         for refusal in [
             Refusal::Shed,
             Refusal::Refused { waited },
-            Refusal::Pressure { reactive: true },
+            Refusal::Pressure {
+                reactive: true,
+                cause: None,
+            },
         ] {
             let message = refusal_message(label, refusal);
             assert!(
@@ -1087,6 +1328,69 @@ fn audit_output_cap_cannot_disable_the_global_memory_bound() {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", "printf ok"]);
     assert!(run_bounded_capped(cmd, "sh", Duration::from_secs(5), None, usize::MAX).is_err());
+}
+
+/// A draining reader keeps no stdout, so it may declare a stream budget
+/// past the buffered limit and read past it, every byte still counted
+/// against that budget; a buffered read may not, and nor may a draining
+/// one past its own ceiling.
+#[cfg(unix)]
+#[test]
+fn only_a_draining_reader_may_stream_past_the_buffered_output_limit() {
+    #[derive(Default)]
+    struct Counting(usize);
+    impl ProcessObserver for Counting {
+        fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+            if matches!(stream, OutputStream::Stdout) {
+                self.0 += bytes.len();
+            }
+        }
+        fn drains_stdout(&self) -> bool {
+            true
+        }
+    }
+    let past = MAX_OUTPUT_BYTES + 1024;
+    let script = format!("head -c {past} /dev/zero");
+    let mut counting = Counting::default();
+    let run = run_observed(
+        Command::new("sh").args(["-c", &script]),
+        "sh",
+        Duration::from_secs(60),
+        None,
+        past,
+        &mut counting,
+    )
+    .expect("a draining reader may declare a budget past the buffered limit");
+    assert!(run.success && run.incomplete.is_none());
+    assert_eq!(counting.0, past, "every byte reached the observer");
+    assert!(run.stdout.len() < MAX_OUTPUT_BYTES, "and none was held");
+
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "printf ok"]);
+    assert!(run_bounded_capped(cmd, "sh", Duration::from_secs(5), None, past).is_err());
+    assert!(run_observed(
+        Command::new("sh").args(["-c", "printf ok"]),
+        "sh",
+        Duration::from_secs(5),
+        None,
+        MAX_DRAINED_OUTPUT_BYTES + 1,
+        &mut Counting::default(),
+    )
+    .is_err());
+
+    // The declared budget still bounds a draining read.
+    let mut short = Counting::default();
+    let run = run_observed(
+        Command::new("sh").args(["-c", &script]),
+        "sh",
+        Duration::from_secs(60),
+        None,
+        1024,
+        &mut short,
+    )
+    .expect("runs");
+    assert!(run.incomplete.is_some(), "cut at the declared budget");
+    assert!(short.0 <= 1024, "observer saw {} bytes", short.0);
 }
 
 /// A descendant retaining the write ends must not erase bytes the parent
@@ -5242,4 +5546,96 @@ fn run_options_custom_kill_grace_reaps_sigterm_ignoring_child_promptly() {
         "reaping with 20ms grace took {elapsed:?} (>= default {:?})",
         DEFAULT_KILL_GRACE
     );
+}
+
+/// Records what the runner says about how a child's wait ended.
+#[derive(Default)]
+struct RecordsExit {
+    facts: Option<ExitFacts>,
+    /// Cancels once the child has written something, which is after it started:
+    /// a cancel raised earlier is a spawn that never happened.
+    cancel_after_output: bool,
+    heard: bool,
+}
+
+impl ProcessObserver for RecordsExit {
+    fn cancelled(&self) -> bool {
+        self.cancel_after_output && self.heard
+    }
+    fn output(&mut self, _stream: OutputStream, bytes: &[u8]) {
+        self.heard |= !bytes.is_empty();
+    }
+    fn exited(&mut self, facts: &ExitFacts) {
+        assert!(self.facts.is_none(), "told twice");
+        self.facts = Some(*facts);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_observer_is_told_the_raw_wait_status_of_a_child_a_signal_ended() {
+    let mut observer = RecordsExit::default();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "kill -9 $$"]);
+    let run = run_observed(
+        &mut cmd,
+        "killed",
+        Duration::from_secs(20),
+        None,
+        1024,
+        &mut observer,
+    )
+    .unwrap();
+    let facts = observer.facts.expect("told how the wait ended");
+    assert_eq!(facts.raw_wait_status, Some(libc::SIGKILL));
+    assert_eq!(facts.signal, Some(libc::SIGKILL));
+    assert_eq!(run.signal, facts.signal);
+    assert!(!facts.core_dumped && facts.stopped_signal.is_none() && !facts.continued);
+    assert!(!facts.cancelled && !facts.deadline_expired);
+    assert!(
+        !facts.runner_signalled_group,
+        "the child killed itself; the runner signalled nothing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_observer_is_told_when_the_runner_itself_stopped_the_child() {
+    let mut cancelled = RecordsExit {
+        cancel_after_output: true,
+        ..RecordsExit::default()
+    };
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "echo started; sleep 30"]);
+    let run = run_observed(
+        &mut cmd,
+        "cancelled",
+        Duration::from_secs(60),
+        None,
+        1024,
+        &mut cancelled,
+    )
+    .unwrap();
+    assert!(run.cancelled);
+    let facts = cancelled.facts.expect("told how the wait ended");
+    assert!(facts.cancelled && facts.runner_signalled_group, "{facts:?}");
+    assert!(!facts.deadline_expired);
+
+    let mut late = RecordsExit::default();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 30"]);
+    let _ = run_observed(
+        &mut cmd,
+        "slow",
+        Duration::from_millis(200),
+        None,
+        1024,
+        &mut late,
+    );
+    let facts = late.facts.expect("told how the wait ended");
+    assert!(
+        facts.deadline_expired && facts.runner_signalled_group,
+        "{facts:?}"
+    );
+    assert_eq!(facts.raw_wait_status, None, "no status was read: {facts:?}");
 }

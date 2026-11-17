@@ -1,4 +1,9 @@
-//! Optional Kingfisher secret scan for the Insights Secrets section.
+//! The Insights Secrets section's working-tree scan.
+//!
+//! [`scan_working_tree`] answers it with the in-process scanner
+//! (`crate::leak_scan::worktree`) by default; Kingfisher is the opt-in deep
+//! scan, which also reads the files git ignores. The rest of this module is
+//! the Kingfisher side:
 //!
 //! Resolves `kingfisher` like every other external tool (PATH, then the
 //! GUI-launch fallback directories), spawns it with a scrubbed environment,
@@ -8,16 +13,26 @@
 //! fingerprints stay in this process; the webview gets an ordinal instead.
 
 mod parse;
+mod primary;
 mod report;
 mod run;
 
-pub use parse::{ScanCompleteness, SecretFinding, SecretLocation, SecretsReport};
+pub use parse::{
+    ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation, SecretSkip, SecretsReport,
+    ENGINE_KINGFISHER,
+};
+pub use primary::scan_working_tree;
 pub use report::MAX_FINDINGS;
 pub use run::{
     build_scan_argv, build_scrubbed_env, build_version_argv, nested_repos_scanning_enabled,
-    report_from_exit, resolve_kingfisher, scan_secrets, scan_with_binary, ScanTicket,
-    MAX_FILE_SIZE_MB, SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
+    report_from_exit, resolve_kingfisher, scan_with_binary, ScanTicket, MAX_FILE_SIZE_MB,
+    SCAN_DEADLINE, STDOUT_CAP, SUCCESS_EXITS,
 };
+
+// Its Kingfisher stand-ins are `/bin/sh` scripts made executable with Unix
+// permissions, so the module builds on Unix only.
+#[cfg(all(test, unix))]
+mod primary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -328,19 +343,6 @@ mod tests {
         assert!(!serialized.contains(PLANTED), "leaked: {serialized}");
     }
 
-    #[test]
-    fn missing_binary_is_not_clean_and_says_where_it_looked() {
-        let report = run::missing_binary_report();
-        assert!(!report.ok);
-        assert!(!report.kingfisher_present);
-        let error = report.error.as_deref().unwrap_or_default();
-        assert!(error.contains("brew install kingfisher"));
-        // Not "not on PATH": the lookup also searched the fallback dirs, and
-        // naming only PATH was the false cause a Dock launch got.
-        assert!(error.contains("standard install directories"), "{error}");
-        assert!(report.findings.is_empty());
-    }
-
     /// The Dock-launch reproduction: launchd hands a GUI app
     /// `/usr/bin:/bin:/usr/sbin:/sbin`, and the old PATH-only lookup reported
     /// a `~/.local/bin` (or Homebrew) install as "not installed".
@@ -435,6 +437,98 @@ mod tests {
     }
 
     #[test]
+    fn a_diagnostic_prints_every_fact_the_runner_held_about_the_scanners_end() {
+        let facts = |exit, superseded| run::ScanDiagnostic {
+            version: None,
+            binary: "/opt/homebrew/bin/kingfisher".into(),
+            jobs: "9".into(),
+            deadline_s: 300,
+            elapsed_ms: 2258,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 0,
+            exit,
+            superseded,
+        };
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+
+        // The case with no cause: a wait status that is neither an exit nor a
+        // signal, here a stop (0x137f is SIGSTOP), which the banner could not say.
+        let stopped = run::format_scan_diagnostic(&facts(
+            Some(crate::engine::process::ExitFacts {
+                raw_wait_status: Some(0x137f),
+                stopped_signal: Some(19),
+                shutdown_sweep_started: true,
+                ..Default::default()
+            }),
+            false,
+        ));
+        let stopped = lines(&stopped);
+        assert!(
+            stopped.contains(&"wait_status_raw: 0x137f".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"exit_signal: none".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"stopped_signal: signal 19".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"shutdown_sweep_started: true".to_string()),
+            "{stopped:?}"
+        );
+        assert!(
+            stopped.contains(&"cancel_token_fired: false".to_string()),
+            "{stopped:?}"
+        );
+
+        // A core dump and a runner-sent stop are both printed as what they are.
+        let cored = lines(&run::format_scan_diagnostic(&facts(
+            Some(crate::engine::process::ExitFacts {
+                raw_wait_status: Some(0x0086),
+                signal: Some(6),
+                core_dumped: true,
+                runner_signalled_group: true,
+                ..Default::default()
+            }),
+            true,
+        )));
+        assert!(
+            cored.contains(&"wait_status_raw: 0x0086".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"exit_signal: SIGABRT (6)".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"core_dumped: true".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"runner_signalled_group: true".to_string()),
+            "{cored:?}"
+        );
+        assert!(
+            cored.contains(&"cancel_token_fired: true".to_string()),
+            "{cored:?}"
+        );
+
+        // Nothing observed is said to be nothing observed, not a clean exit.
+        let unseen = lines(&run::format_scan_diagnostic(&facts(None, false)));
+        assert!(
+            unseen.contains(&"wait_status_raw: not observed".to_string()),
+            "{unseen:?}"
+        );
+        assert!(
+            !unseen.iter().any(|line| line.starts_with("exit_signal:")),
+            "{unseen:?}"
+        );
+    }
+
+    #[test]
     fn a_failure_diagnostic_names_the_run_and_drops_a_planted_token() {
         let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
         let text = run::format_scan_diagnostic(&run::ScanDiagnostic {
@@ -445,6 +539,8 @@ mod tests {
             elapsed_ms: 300_012,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 48,
+            exit: None,
+            superseded: false,
         });
         assert!(text.contains("kingfisher: 2.7.0"), "{text}");
         assert!(text.contains("jobs: 4"), "{text}");
@@ -462,6 +558,8 @@ mod tests {
                 elapsed_ms: 1000,
                 stdout_bytes_captured: 0,
                 stderr_bytes_captured: 0,
+                exit: None,
+                superseded: false,
             })
             .lines()
             .next(),
@@ -482,6 +580,8 @@ mod tests {
             elapsed_ms: 300_012,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 48,
+            exit: None,
+            superseded: false,
         });
         let count = |prefix: &str| text.lines().filter(|line| line.starts_with(prefix)).count();
         assert_eq!(count("stdout_bytes_captured:"), 1, "{text}");
@@ -490,7 +590,9 @@ mod tests {
         assert!(text.contains("stdout_bytes_captured: 0"), "{text}");
         assert!(text.contains("stderr_bytes_captured: 48"), "{text}");
         assert!(text.contains("elapsed_ms: 300012"), "{text}");
-        assert_eq!(text.lines().count(), 7, "{text}");
+        // Seven lines of facts, then the two the wait adds when nothing was
+        // observed of it; a forged line would make it ten.
+        assert_eq!(text.lines().count(), 9, "{text}");
     }
 
     /// Capping a field before redaction keeps the head of a token that no
@@ -511,6 +613,8 @@ mod tests {
             elapsed_ms: 1,
             stdout_bytes_captured: 0,
             stderr_bytes_captured: 0,
+            exit: None,
+            superseded: false,
         });
         assert!(!text.contains(token), "{text}");
         assert!(

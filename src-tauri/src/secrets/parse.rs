@@ -73,16 +73,74 @@ pub struct SecretFinding {
     pub secret_group: u32,
 }
 
-/// Result of an on-demand Kingfisher secrets scan.
+/// The `engine` of a report produced by Kingfisher's deep scan. The in-process
+/// scanner names itself with [`crate::leak_scan::ENGINE`].
+pub const ENGINE_KINGFISHER: &str = "kingfisher";
+
+/// One input the in-process scan did not read: a hole in the scan, listed so
+/// the panel can name it. Kingfisher's deep scan leaves no such trace (its
+/// audit is a count), so its reports carry none.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretSkip {
+    /// Repo-relative as git spelled it, or the first unreached file for a
+    /// scan that ran out of time.
+    pub path: String,
+    /// Why, in a sentence ([`crate::leak_scan::SkipReason::describe`]).
+    pub reason: String,
+    /// The input's size when it was known.
+    pub bytes: Option<u64>,
+}
+
+/// What Kingfisher said as the second opinion beside the in-process scan.
+///
+/// An automatic scan never starts Kingfisher (`NotRun`); a person's Rescan
+/// does, when it is installed. Whatever Kingfisher does, the in-process result
+/// beside this stands: a Kingfisher that failed, was killed, timed out or was
+/// truncated is `Unavailable` with the reason, and never changes the primary
+/// findings or their completeness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SecondOpinion {
+    /// Kingfisher is not installed, so there is no second opinion to ask for.
+    NotInstalled,
+    /// Not asked for: an automatic scan starts no process.
+    NotRun,
+    /// Asked for and not obtained. `reason` is fixed wording, never output.
+    Unavailable { reason: String },
+    /// Kingfisher finished and its rows are merged into `findings`.
+    Ran {
+        /// Kingfisher's own account of whether it read every input.
+        completeness: ScanCompleteness,
+        version: Option<String>,
+        /// Rows Kingfisher reported before the merge.
+        findings_total: u32,
+        /// Of its listed rows, those at a path and line the primary already
+        /// reported (kept once).
+        confirmed: u32,
+        /// Of its listed rows, those the primary had not reported.
+        added: u32,
+    },
+}
+
+/// Result of a working-tree secrets scan.
 ///
 /// `ok: false` means the scan did not complete successfully — missing binary,
 /// truncated stdout, bad JSON, timeout, a non-success exit, or a scan
 /// Kingfisher itself reported as failed. That must never render as a clean
 /// repository. `ok: true` with `completeness != complete` is a scan that ran
 /// and missed inputs: its findings are real, and they are a floor.
+///
+/// Two engines fill it. The in-process scanner (`crate::leak_scan`) is the
+/// default and leaves the Kingfisher-only fields empty rather than inventing
+/// them: no confidence, no value groups, no version. Kingfisher fills them
+/// when the deep scan is asked for.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretsReport {
     pub ok: bool,
+    /// Which scanner produced this report: [`crate::leak_scan::ENGINE`] or
+    /// [`ENGINE_KINGFISHER`]. A finding is only as good as the rules behind
+    /// it, so the panel names them.
+    pub engine: String,
     /// Fixed reason string only. Never carries Kingfisher stdout or stderr.
     pub error: Option<String>,
     /// Copyable facts about a failed run: version, binary, jobs, deadline,
@@ -112,7 +170,12 @@ pub struct SecretsReport {
     /// Entries in Kingfisher's findings array this parser could not read.
     /// They are counted, never silently dropped.
     pub findings_unreadable: u32,
-    /// True when Kingfisher itself omitted findings past its own report cap.
+    /// True when `findings` lists fewer rows than were found, from any source:
+    /// the in-process scan keeps its first `MAX_REPORTED_HITS` hits, Kingfisher
+    /// omits findings past its own report cap, and a merged list is cut to
+    /// [`super::MAX_FINDINGS`]. With a second opinion, `findings_total` is then
+    /// an upper bound: a Kingfisher row that matches a hit the in-process scan
+    /// counted but did not list cannot be recognised, so it is counted again.
     pub findings_truncated: bool,
     /// False when the Git listings behind `location` could not be read; every
     /// row that needed them is then `unknown`.
@@ -124,12 +187,20 @@ pub struct SecretsReport {
     /// scan ran.
     pub scanned_at_ms: u64,
     pub duration_ms: u64,
+    /// Inputs the scan did not read, all of them counted; `skipped` lists at
+    /// most [`crate::leak_scan::MAX_REPORTED_SKIPS`]. Any skip makes the
+    /// scan `partial`.
+    pub skipped_total: u32,
+    pub skipped: Vec<SecretSkip>,
+    /// Kingfisher beside the in-process scan; see [`SecondOpinion`].
+    pub second_opinion: SecondOpinion,
 }
 
 impl SecretsReport {
     fn not_ok(error: String, present: bool, version: Option<String>) -> Self {
         Self {
             ok: false,
+            engine: ENGINE_KINGFISHER.to_string(),
             error: Some(error),
             diagnostic: None,
             kingfisher_present: present,
@@ -146,11 +217,10 @@ impl SecretsReport {
             max_file_size_mb: super::run::MAX_FILE_SIZE_MB,
             scanned_at_ms: 0,
             duration_ms: 0,
+            skipped_total: 0,
+            skipped: Vec::new(),
+            second_opinion: SecondOpinion::NotRun,
         }
-    }
-
-    pub fn unavailable(error: impl Into<String>) -> Self {
-        Self::not_ok(error.into(), false, None)
     }
 
     pub fn failed(error: impl Into<String>, version: Option<String>) -> Self {

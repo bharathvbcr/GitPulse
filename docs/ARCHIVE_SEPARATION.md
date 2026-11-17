@@ -40,7 +40,7 @@ unchanged by any of them. The 10 → 11 rung (`workbench/items.sql`):
   existed read as not archived and not completed, so `archived=0` is a total
   predicate from the first migrated read;
 - indexes them (`work_items_archive`, `work_items_completed`);
-- adds `work_item_links` for task links (see [QUALIFICATION.md](QUALIFICATION.md));
+- adds `work_item_links` for task links (see [QUALIFICATION.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md));
 - **migrates every Done task to archived.** Every reader before schema 11 saw
   completed work in the archive; without this every profile's archive would
   empty itself on upgrade while the Done column doubled — the same work,

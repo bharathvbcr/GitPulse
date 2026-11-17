@@ -9,6 +9,9 @@
 //! pins a hole.
 
 use super::*;
+// Its methods are called only by the macOS tests below.
+#[cfg(target_os = "macos")]
+use crate::procguard::LockedSpawn;
 use crate::test_support::git_in;
 use std::path::Path;
 
@@ -323,7 +326,10 @@ fn w6_a_slow_git_over_eighteen_worktrees_answers_inside_the_budget_and_partial()
     let took = started.elapsed();
     eprintln!("slow git x18: {took:?} -> {}", say(&output));
     assert!(
-        took < BUDGET + Duration::from_millis(300),
+        // The margin is a wall-clock limit like any other, so it is scaled by how
+        // oversubscribed the host is (`coverage_relaxed`): on a 3-core runner the
+        // hook answered in 5.44 s against a flat 300 ms margin.
+        took < BUDGET + crate::test_support::coverage_relaxed(Duration::from_millis(300)),
         "the hook took {took:?}; its budget is {BUDGET:?}"
     );
     not_silent("a slow git over 18 worktrees", &output);
@@ -441,7 +447,11 @@ fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
         let _app = app_for(&farm.repo, true);
         std::fs::write(farm.sibling_dirs[0].join("fresh.txt"), "theirs\n").unwrap();
         let output = guard_here(&target(&farm, "Fresh.txt"));
-        assert!(asks(&output), "case variant via app should ask: {}", say(&output));
+        assert!(
+            asks(&output),
+            "case variant via app should ask: {}",
+            say(&output)
+        );
     }
 
     // 2. Untracked directory vs file: sibling dirties `fresh/inner.txt`, editor asks for `fresh`.
@@ -452,7 +462,11 @@ fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("inner.txt"), "theirs\n").unwrap();
         let output = guard_here(&target(&farm, "fresh"));
-        assert!(asks(&output), "dir-vs-file via app should ask: {}", say(&output));
+        assert!(
+            asks(&output),
+            "dir-vs-file via app should ask: {}",
+            say(&output)
+        );
     }
 
     // 3. Untracked file vs directory: sibling dirties `blocker`, editor asks for `blocker/inner.txt`.
@@ -461,7 +475,11 @@ fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
         let _app = app_for(&farm.repo, true);
         std::fs::write(farm.sibling_dirs[0].join("blocker"), "theirs\n").unwrap();
         let output = guard_here(&target(&farm, "blocker/inner.txt"));
-        assert!(asks(&output), "file-vs-dir via app should ask: {}", say(&output));
+        assert!(
+            asks(&output),
+            "file-vs-dir via app should ask: {}",
+            say(&output)
+        );
     }
 
     // 4. Dirty submodule: sibling has a tracked submodule `libsub` with dirty `s.txt`.
@@ -474,7 +492,7 @@ fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(
                 out.status.success(),
@@ -508,6 +526,10 @@ fn w6_app_served_scan_agrees_on_case_directory_and_submodule_holdings() {
         std::fs::write(sub_dst.join("s.txt"), "dirty\n").unwrap();
 
         let output = guard_here(&target(&farm, "libsub/s.txt"));
-        assert!(asks(&output), "submodule via app should ask: {}", say(&output));
+        assert!(
+            asks(&output),
+            "submodule via app should ask: {}",
+            say(&output)
+        );
     }
 }

@@ -297,6 +297,7 @@ mod tests {
                 stderr: Vec::new(),
                 success: true,
                 status_code: 0,
+                signal: None,
                 incomplete: None,
                 stderr_incomplete: None,
                 cancelled: false,

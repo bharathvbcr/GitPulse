@@ -74,6 +74,15 @@ const ALLOWED: &[(&str, &str)] = &[
          then hands it to `process::run_bounded_capped`",
     ),
     (
+        "src/agent_connect.rs",
+        "Connect your agent: the agents' own `claude`/`codex mcp get|add`. Its \
+         single `Command` is handed to `process::run_bounded_capped` with a 30s \
+         timeout and a 64 KiB cap, and runs in `std::env::temp_dir()` so a \
+         project `.mcp.json` cannot answer for the user scope. Not git, and \
+         app-level: no repository is involved, so the descriptor gate has \
+         nothing to scope",
+    ),
+    (
         "src/tool_install/components.rs",
         "DevCouncil component discovery, the same probe ladder as \
          `tool_install/mod.rs`: its single `Command` is handed to \

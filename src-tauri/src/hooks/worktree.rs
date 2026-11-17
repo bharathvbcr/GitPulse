@@ -401,12 +401,9 @@ pub(crate) fn create(input: &HookInput, gate: Gate<'_>, progress: &AtomicI32) ->
 
     mark_write_started(progress);
     if let Err(error) = crate::engine::worktree::ensure_gitpulse_lane_excluded(&plan.root) {
-        return Finished::failed(
-            notes,
-            format!("GitPulse failure: {}", error.into_message()),
-        );
+        return Finished::failed(notes, format!("GitPulse failure: {}", error.into_message()));
     }
-    let selection = CacheSelection::default();
+    let selection = CacheSelection::for_new_worktree();
     let created = match add_worktree_with_devmap(
         &root_text,
         &target,

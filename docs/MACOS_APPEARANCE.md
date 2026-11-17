@@ -248,6 +248,34 @@ backdrop, dark theme: `--c-text-muted` held **4.74:1 – 7.23:1** and body text
 **10.5:1 or better**. The `underWindowBackground` material darkens heavily in
 dark appearance, and the veil finishes the job.
 
+### Theme presets, saved themes, and window wallpapers
+
+**Settings → Appearance** includes a theme gallery (`ThemeGallery.svelte`,
+`src/lib/ui/appearance/presets.ts`), a **My themes** shelf (`savedThemes.ts`),
+and a macOS **Window wallpaper** picker (`WallpaperSettings.svelte`,
+`backdrops.ts`, `wallpaperStore.ts`):
+
+- **Theme presets (17 built-in).** Standard (*Neural HUD*, *Reactor*, *Pure
+  Black*, *Crimson*, *Phosphor*, *Synthwave*, *Paper*), Developer (*Amber CRT*,
+  *Blueprint*, *Midnight IDE*, *Arctic*, *Solar Dark*, *Daylight*), and Science
+  Fiction (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*). Every preset is a
+  validated `gitpulse-theme/1` palette paired with a default backdrop and
+  material intensity, checked by `presets.contract.test.ts` against the same
+  contrast guard and material floor as imported theme files. The material floor
+  is computed over the active palette (`materialModel.ts`), so high-contrast dark
+  palettes like *Pure Black* enforce their own minimum veil (`0.55`).
+- **My themes shelf.** Saves the current look or retains imported
+  `gitpulse-theme/1` files (bounded to 24 entries, re-validated on read, and
+  preserved across **Reset appearance**).
+- **Window wallpapers (macOS only).** Eleven seeded, static SVG backdrops (*Mesh*,
+  *Aurora*, *Topography*, *Prism*, *Dusk*, *CRT scanlines*, *Blueprint*,
+  *Nebula*, *Orbit*, *Skyline*, *Warp*) or a user-supplied raster image
+  re-encoded through an offscreen canvas to a JPEG of at most `2560px` and
+  stored in IndexedDB rather than the preference blob (SVG uploads are refused).
+  The backdrop paints on `body` beneath `--mac-shell-veil`, and is removed
+  automatically under Reduce Transparency, increased contrast, forced colors, or
+  the in-app **Reduced** material mode.
+
 ## Motion and rendering
 
 | Interaction | Mac behavior |

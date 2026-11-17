@@ -676,6 +676,7 @@ pub async fn cmd_inbox_post(
             };
         let message = crate::engine::agent_bus::post_thread_message(
             &repo_path,
+            crate::engine::agent_bus::MessageOrigin::Person,
             &from_agent,
             to_agent.as_deref(),
             Some(&thread_key),
@@ -709,6 +710,7 @@ pub async fn cmd_worktree_send_message(
         let effective_kind = kind.as_deref().unwrap_or("note");
         let message = crate::engine::agent_bus::post_thread_message(
             &repo_path,
+            crate::engine::agent_bus::MessageOrigin::Person,
             &from_agent,
             to_agent.as_deref(),
             thread_key.as_deref(),
@@ -736,8 +738,13 @@ pub async fn cmd_inbox_withdraw(
     off_thread(move || {
         crate::repository_trust::require(std::path::Path::new(&repo_path))?;
         crate::engine::process::mark_user_action(&repo_path);
-        let message =
-            crate::engine::agent_bus::withdraw_ask(&repo_path, &from_agent, &thread_key, &reason)?;
+        let message = crate::engine::agent_bus::withdraw_ask(
+            &repo_path,
+            crate::engine::agent_bus::MessageOrigin::Person,
+            &from_agent,
+            &thread_key,
+            &reason,
+        )?;
         Ok(InboxMessageReceipt {
             ok: true,
             thread_key: Some(thread_key),

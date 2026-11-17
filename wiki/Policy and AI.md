@@ -66,7 +66,11 @@ task handoffs start dedicated CLI sessions in the terminal dock, under those
 providers' permissions. Managed runs (Codex and Claude Code) use a separate Manvi protocol.
 
 Task title/description suggestions use the profile Manvi provider/model, are bound
-to saved revisions, respect field locks and require selected acceptance. See
+to saved revisions, respect field locks and require selected acceptance. When
+`~/.anthropic-accounts` is present (Manvi's `anthropic-account` registry), GitPulse
+launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi`,
+never reading or storing an Anthropic API key itself, and shows `Cloud · <model>`
+on the status-bar pill. See
 [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
 
 ## Grants

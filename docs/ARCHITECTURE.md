@@ -31,19 +31,19 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["329 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["332 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (329 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (332 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
             GraphSolver["Graph Solver & Nogap Bounds<br/><code>src-tauri/src/graph/</code>"]
             Analyzers["Analyzers (LOC, Coverage, Health)<br/><code>src-tauri/src/analyzer/</code>"]
-            SecretsScanner["Secrets Scanner (Kingfisher)<br/><code>src-tauri/src/secrets/</code>"]
+            SecretsScanner["Secrets Scanner (in-process, Kingfisher deep scan)<br/><code>src-tauri/src/secrets/</code>"]
             AIEngine["AI Phrasing & Commit Brief<br/><code>src-tauri/src/ai/</code>"]
             StorageAuditor["Storage Auditor & History<br/><code>src-tauri/src/storage/</code>"]
             OpsPlanner["Ops Planner & Releases<br/><code>src-tauri/src/ops.rs</code>"]
@@ -205,7 +205,7 @@ On the backend, a DevMap live refresh never holds its IPC command on the `devmap
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +329 Registered Handlers
+        +332 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -338,7 +338,7 @@ for contracts, regression evidence and platform verification limits.
   - `language.rs`: Multi-language classifier (60+ languages), GitHub Linguist color mappings, and fast line-of-code breakdown.
   - `coverage.rs`: Universal coverage artifact scanner (LCOV, Cobertura, Go cover, Istanbul, JaCoCo, Clover), toolchain installer detection, and file-level metrics.
   - `health.rs`: Ecosystem vulnerability checkers (`npm audit`, `cargo-audit`, `pip-audit`, `govulncheck`, `composer audit`, `bundler-audit`, GitHub Dependabot, GitHub Code Scanning), plus supply-chain parsers for `cargo deny` SARIF and `cargo crev` JSONL.
-- **`secrets/`**: Kingfisher scanner integration for working-tree secret discovery. Each finding crosses IPC as rule ID and name, repo-relative path, line, confidence, its Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal grouping rows that hold the same value; values, matched context, Kingfisher fingerprints and redaction hashes never leave Rust. Kingfisher's own audit decides completeness, so a partial scan is never reported clean; scanner stdout is unlogged; a newer scan cancels an older one, so at most one Kingfisher runs.
+- **`secrets/`**: working-tree secret discovery. The primary scan is `leak_scan::worktree` (the vendored `dc-redact` table, run in-process over every tracked and untracked, non-ignored file, bounded by a per-file cap, a byte budget and a time limit, with every unread input reported as a skip); Kingfisher is the opt-in deep scan (`cmd_scan_secrets` with `deep: true`), which also reads ignored files. The report names its `engine`. Each finding crosses IPC as rule ID and name, repo-relative path, line, confidence, its Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal grouping rows that hold the same value; values, matched context, Kingfisher fingerprints and redaction hashes never leave Rust. Kingfisher's own audit decides completeness, so a partial scan is never reported clean; scanner stdout is unlogged; a newer scan cancels an older one, so at most one Kingfisher runs.
 - **`ai/`**: Structured commit briefs classified from the patch (`commit_brief.rs`: type, scope, subject), loopback LLM completion transport, and optional on-device Apple Intelligence fallback for commit phrasing.
 - **`storage/`**: Deep disk-usage auditor (packfiles, loose objects, reflogs, LFS, submodules, caches, oversized files) with time-series history tracking. `storage/hygiene/` owns expiring cleanup previews, activity and filesystem revalidation, exact-entry local removal, and native shared-cache maintenance. The existing policy gate judges every mutation; the Storage UI reuses the inventory and never supplies executable commands. See [Repository hygiene](REPOSITORY_HYGIENE.md) for the contract and platform limits.
 - **Global hygiene**: Fleet/Settings invoke the native `storage/hygiene/global.rs` service. Versioned policy, explicit lock release, write-ahead history and cross-process cancellation are shared by the in-app timer and optional macOS headless worker. `devmap-query::hygiene` is the canonical DevCouncil policy; hosts retain mutation and scheduling. See [the hygiene contract](REPOSITORY_HYGIENE.md).
@@ -482,10 +482,10 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 329 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 2173 data fields, over 311 structs, in 121 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 332 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 2308 data fields, over 330 structs, in 125 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
-| **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
+| **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` (a source-checkout command) recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
 ### Typed Command Errors across IPC
 
@@ -970,5 +970,5 @@ The current implementation includes controlled-provider browser verification and
 real native-to-Go/provider transport tests. Broader managed-agent qualification,
 installed OS notification proof,
 the complete workspace/task interaction set and whole-application performance
-qualification remain open. See [the implementation contract](AGENTIC_WORKSPACES_PLAN.md)
+qualification remain open. See [the implementation contract](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md)
 for the complete scope and exact verification boundaries.

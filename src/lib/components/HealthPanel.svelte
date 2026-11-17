@@ -1,5 +1,6 @@
 <script module lang="ts">
   import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import { createScanJoin } from "../runtime/autoScan";
   import type {
     DepsHealthReport,
     DependabotReport,
@@ -20,10 +21,19 @@
     };
   }
 
+  /**
+   * The dependency audit running for each repository. Module-level so a panel
+   * left and reopened while an audit is still running joins it instead of
+   * starting a second one beside it.
+   */
+  const inflightAudits = createScanJoin<DepsHealthReport>();
+
   // Survives the per-tab remount so revisiting the Health view renders the
   // last scan instantly; the fetch then refreshes it in place.
   const healthCache = createRepoPanelCache<{
     deps: DepsHealthReport;
+    /** When `deps` was scanned (epoch ms), the stamp runtime/autoScan.ts judges freshness by. */
+    scannedAtMs: number;
     dependabot: DependabotReport | null;
     dependabotCheckedAt: number | null;
     dependabotRequestFailed: boolean;
@@ -34,10 +44,19 @@
 </script>
 
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
+  import {
+    activeScanBackoff,
+    clearScanFailure,
+    describeBackoff,
+    isScanStale,
+    noteScanFailure,
+    scheduleAutoScan,
+    type AutoScanBackoff,
+  } from "../runtime/autoScan";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
   import {
     ShieldAlert,
@@ -114,6 +133,7 @@
   import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
   import type { CodeintelDeadSymbol, CodeintelStatus } from "../codeintel/types";
   import Skeleton from "./Skeleton.svelte";
+  import MissingToolNotice from "./MissingToolNotice.svelte";
 
   /** Headlines of the two failures whose reason is the scanner's or the model's own text. */
   const SCAN_FAILED = describeFailure({ verb: "scan", object: "this repository" }, "").headline;
@@ -152,13 +172,24 @@
    * Whether this repository has a devmap code graph at all.
    *
    * Three features query it — impact edges in the diff pane, symbol search in
-   * the palette, dead symbols below — and each of them renders nothing when
-   * the graph is missing. Without this, "there is no code graph here" and
-   * "the graph is here and found nothing" are the same blank space, and a
-   * reader has no way to tell which they are looking at.
+   * the palette, dead symbols below. The diff pane, palette and Suspects each
+   * say so themselves through `MissingToolNotice`; this is the Health view of
+   * the same fact, so "there is no code graph here" and "the graph is here and
+   * found nothing" are never the same blank space.
    */
   let codegraph = $state<CodeintelStatus | null>(null);
+  /**
+   * Set when the status read itself failed (as opposed to answering that there
+   * is no graph). A read that could not run must not show the install prompt.
+   */
+  let codegraphReadError = $state<string | null>(null);
   let loading = $state(false);
+  /**
+   * The failure holding automatic audits off for this repository, when one is.
+   * It is printed, so an audit that could not complete never reads as a clean
+   * result or as "not scanned yet".
+   */
+  let held = $state<AutoScanBackoff | null>(null);
   let checkingGithub = $state(false);
   let errorMsg = $state<string | null>(null);
   /**
@@ -500,6 +531,8 @@
    */
   function recordScanFailure(repoPath: string, reason: unknown) {
     errorMsg = reportPanelError("health", reason);
+    noteScanFailure(`deps:${repoPath}`, errorMsg);
+    held = activeScanBackoff(`deps:${repoPath}`);
     if (!report || reportPath !== repoPath) {
       report = null;
       reportPath = null;
@@ -509,25 +542,78 @@
     scanned.path = "";
   }
 
-  async function scan(path?: string) {
+  /**
+   * An automatic scan waiting for this panel to settle (runtime/autoScan.ts).
+   * Any scan that starts, a click included, ends the wait.
+   */
+  let cancelPending: (() => void) | null = null;
+  let pending = $state(false);
+  function stopPending() {
+    cancelPending?.();
+    cancelPending = null;
+    pending = false;
+  }
+  onDestroy(stopPending);
+
+  /**
+   * `reuse` answers the dependency audit from a result that is still fresh
+   * instead of running it again; the code-map queries beside it are cheap and
+   * always run. A reused result keeps its original stamp, so reuse never
+   * renews itself.
+   */
+  function cacheFinishedAudit(repoPath: string, deps: DepsHealthReport) {
+    const prior = healthCache.get(repoPath);
+    healthCache.set(repoPath, {
+      deps,
+      scannedAtMs: Date.now(),
+      dependabot: prior?.dependabot ?? null,
+      dependabotCheckedAt: prior?.dependabotCheckedAt ?? null,
+      dependabotRequestFailed: prior?.dependabotRequestFailed ?? false,
+      codeScanning: prior?.codeScanning ?? null,
+      codeScanningCheckedAt: prior?.codeScanningCheckedAt ?? null,
+      codeScanningRequestFailed: prior?.codeScanningRequestFailed ?? false,
+    });
+  }
+
+  async function scan(path?: string, reuse?: { deps: DepsHealthReport; scannedAtMs: number }) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
+    stopPending();
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
     loading = true;
+    held = null;
     errorMsg = null;
     actionError = null;
     // Automatic local scans stay local. GitHub alerts use the GitHub CLI
     // and the network; they run through scanDependabot, not this path.
     const [deps, dead, graph] = await Promise.allSettled([
-      invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+      reuse
+        ? Promise.resolve(reuse.deps)
+        : inflightAudits.run(repoPath, () =>
+            invoke("cmd_scan_deps_health", { repoPath }).then(parseDepsHealthReport),
+          ),
       getDeadSymbols(repoPath),
       getCodeintelStatus(repoPath),
     ]);
-    if (!guard.isLive()) return;
+    if (!guard.isLive()) {
+      // The panel was left, or the repository changed, while this audit ran.
+      // What is on screen now is not this scan's to write, but the audit is a
+      // finished answer for `repoPath`: keeping it means the return does not
+      // run it again.
+      if (deps.status === "fulfilled" && !reuse) cacheFinishedAudit(repoPath, deps.value);
+      // The repository's record, not this pane's: a failure seen after the
+      // pane was left still holds the next automatic start off.
+      if (!reuse) {
+        if (deps.status === "fulfilled") clearScanFailure(`deps:${repoPath}`);
+        else noteScanFailure(`deps:${repoPath}`, formatError(deps.reason));
+      }
+      return;
+    }
     try {
       if (deps.status === "fulfilled") {
+        if (!reuse) clearScanFailure(`deps:${repoPath}`);
         report = deps.value;
         reportPath = repoPath;
         // A new scan supersedes whatever a plan was written against.
@@ -561,17 +647,19 @@
       // An IPC-level failure is folded into the same unavailable shape the
       // command itself uses, so "could not ask" never renders as "asked, and
       // there is no graph".
+      codegraphReadError = graph.status === "fulfilled" ? null : formatError(graph.reason);
       codegraph =
         graph.status === "fulfilled"
           ? graph.value
           : {
               available: false,
               db_path: "",
-              reason: formatError(graph.reason),
+              reason: codegraphReadError,
             };
       if (deps.status === "fulfilled") {
         healthCache.set(repoPath, {
           deps: deps.value,
+          scannedAtMs: reuse ? reuse.scannedAtMs : Date.now(),
           dependabot,
           dependabotCheckedAt,
           dependabotRequestFailed,
@@ -588,7 +676,8 @@
       deadSymbolsTruncated = false;
       deadSymbolsIncomplete = null;
       deadSymbolsReason = formatError(err);
-      codegraph = { available: false, db_path: "", reason: formatError(err) };
+      codegraphReadError = formatError(err);
+      codegraph = { available: false, db_path: "", reason: codegraphReadError };
     } finally {
       if (guard.isLive()) loading = false;
     }
@@ -612,6 +701,9 @@
     if (!deps) return;
     healthCache.set(repoPath, {
       deps,
+      // The audit itself did not rerun, so its stamp stays what it was. Unknown
+      // (0) reads as stale and is rescanned on the next visit.
+      scannedAtMs: healthCache.get(repoPath)?.scannedAtMs ?? 0,
       dependabot: result,
       dependabotCheckedAt: checkedAt,
       dependabotRequestFailed: requestFailed,
@@ -901,6 +993,7 @@
   $effect(() => {
     const path = $currentRepoPath;
     if (!path) {
+      stopPending();
       inflight?.cancel();
       dependabotInflight?.cancel();
       fixInflight?.cancel();
@@ -929,6 +1022,10 @@
     }
     if (path === scanned.path) return;
     scanned.path = path;
+    stopPending();
+    // The audit of the repository just left must not land on this one. It is
+    // not lost: it caches itself when it finishes (see `scan`).
+    inflight?.cancel();
     dependabotInflight?.cancel();
     cancelHealthAgentLaunch();
     untrack(() => {
@@ -941,6 +1038,12 @@
     const github = githubAlertsCache.get(path);
     untrack(() => {
       checkingGithub = false;
+      // The cancelled scan's `finally` no longer releases this; the next scan
+      // to start sets it again.
+      loading = false;
+      // Nothing said about the repository just left belongs on this one.
+      errorMsg = null;
+      held = null;
       if (cached) {
         report = cached.deps;
         reportPath = path;
@@ -966,6 +1069,7 @@
         deadSymbolsTruncated = false;
         deadSymbolsIncomplete = null;
         codegraph = null;
+        codegraphReadError = null;
       }
       if (github) {
         dependabot = github.dependabot;
@@ -976,7 +1080,34 @@
         codeScanningRequestFailed = github.codeScanningRequestFailed;
       }
     });
-    void scan(path);
+    // A still-fresh audit is reused and starts nothing. Otherwise the scan
+    // waits for the panel to stay put: a visit shorter than the settle pays
+    // for no audit, and a failed scan leaves `scanned.path` cleared so the
+    // next visit tries again.
+    if (cached && !isScanStale(cached.scannedAtMs, Date.now())) {
+      untrack(() => void scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs }));
+    } else if (inflightAudits.has(path)) {
+      // An audit for this repository is already running (this panel was left
+      // and reopened): listening to it costs nothing, so it is joined at once.
+      untrack(() => void scan(path));
+    } else if (activeScanBackoff(`deps:${path}`)) {
+      // The last audit failed a moment ago. Starting another would run the same
+      // audit into the same failure on every visit, so automatic scanning waits
+      // out the interval; the failure is shown, and Scan local retries now.
+      untrack(() => {
+        held = activeScanBackoff(`deps:${path}`);
+        errorMsg = held?.reason ?? null;
+      });
+    } else {
+      untrack(() => {
+        pending = true;
+        cancelPending = scheduleAutoScan({
+          key: `deps:${path}`,
+          stillNeeded: () => $currentRepoPath === path,
+          run: () => void scan(path),
+        });
+      });
+    }
     // Launch also fetches these; this call joins that in-flight request or
     // hydrates from its cache so opening Health after a warning is not empty.
     if ($interfaceStore.autoScanGithubAlerts && !github) void scanDependabot(path);
@@ -1000,7 +1131,8 @@
   {#snippet scanFailureBanner()}
     <div role="alert" class="gp-notice flex-wrap items-center justify-between" data-tone="danger">
       <span class="min-w-0 wrap-break-word"
-        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
+        ><span class="font-medium">{SCAN_FAILED}</span> {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}{#if held}
+          <span class="block opacity-80" data-testid="health-backoff">{describeBackoff(held)}</span>{/if}</span
       >
       <span class="flex items-center gap-2 shrink-0">
         <button type="button" onclick={() => scan()} disabled={loading} class="gp-btn" data-size="sm">
@@ -1339,7 +1471,7 @@
         <div class="min-w-0 flex-1">{actionError}</div>
       </div>
     {/if}
-    {#if loading && !report}
+    {#if (loading || pending) && !report}
       <div class="space-y-4">
         <div class="grid grid-cols-1 @2xl:grid-cols-3 gap-3">
           <Skeleton variant="card" count={3} />
@@ -1783,15 +1915,22 @@
             </p>
           </div>
         {:else if codegraph}
-          <div role="status" class="gp-notice" data-tone="warn">
-            <div class="min-w-0 flex-1">
-              No code map for this repository — impact edges, symbol search and dead-code
-              detection have nothing to read.
-              {#if codegraph.reason}
-                <span class="text-textMuted font-mono">({codegraph.reason})</span>
-              {/if}
+          {#if codegraphReadError}
+            <div role="status" class="gp-notice" data-tone="unknown">
+              <div class="min-w-0 flex-1">
+                Couldn't read the code map status: {codegraphReadError}. That is not the same as
+                there being no code map.
+              </div>
             </div>
-          </div>
+          {:else}
+            <MissingToolNotice
+              repoPath={$currentRepoPath}
+              graph={codegraph}
+              reason={codegraph.reason}
+              feature="impact edges, symbol search and dead-code detection"
+              onBuilt={() => void scan()}
+            />
+          {/if}
         {:else}
           <div role="status" class="gp-notice" data-tone="unknown">
             <div class="min-w-0 flex-1">Code map status has not been read for this repository.</div>
@@ -1847,6 +1986,13 @@
             total={deadSymbols.length}
             noun="candidates"
             bind:expanded={expandedLists["dead-code"]}
+          />
+        {:else if codegraph && !codegraph.available && !codegraphReadError}
+          <MissingToolNotice
+            repoPath={$currentRepoPath}
+            graph={codegraph}
+            feature="the dead-code table"
+            onBuilt={() => void scan()}
           />
         {:else}
           <div role="status" class="gp-notice" data-tone="unknown">

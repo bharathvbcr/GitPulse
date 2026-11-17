@@ -31,7 +31,7 @@ pub(super) fn set_user_initiated_qos() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::sensor::{
-        Compressor, Cores, HostSample, Level, Power, Reading, Thermal, Why,
+        Compressor, CompressorSegments, Cores, HostSample, Level, Power, Reading, Thermal, Why,
     };
     use std::ffi::{CStr, CString};
 
@@ -271,6 +271,7 @@ mod imp {
                 swap_total: self.swap().map(|s| s.1),
                 compressor: compressor(),
                 compressed_bytes: self.compressed_bytes(),
+                compressor_segments: compressor_segments(),
                 load: load(),
                 cores: self.cores,
                 memsize: self.memsize,
@@ -372,6 +373,23 @@ mod imp {
                     })
                     .unwrap_or(Why::Failed),
             ),
+        }
+    }
+
+    /// `vm.compressor.segment.total` against `vm.compressor.segment.limit`.
+    /// Both must read: one missing makes the pair unusable, with that
+    /// reading's reason, never a zero.
+    fn compressor_segments() -> Reading<CompressorSegments> {
+        match (
+            sysctl_uint(c"vm.compressor.segment.total"),
+            sysctl_uint(c"vm.compressor.segment.limit"),
+        ) {
+            (Reading::Value(total), Reading::Value(limit)) => {
+                Reading::Value(CompressorSegments { total, limit })
+            }
+            (Reading::Unavailable(why), _) | (_, Reading::Unavailable(why)) => {
+                Reading::Unavailable(why)
+            }
         }
     }
 
@@ -568,6 +586,7 @@ mod imp {
                 swap_total,
                 compressor: Reading::Unavailable(Why::Unsupported),
                 compressed_bytes: Reading::Unavailable(Why::Unsupported),
+                compressor_segments: Reading::Unavailable(Why::Unsupported),
                 load: match read_small("/proc/loadavg") {
                     Ok(text) => {
                         let mut it = text.split_whitespace().map(|v| v.parse::<f64>().ok());
@@ -708,6 +727,11 @@ mod tests {
             assert!(matches!(sample.pressure, Reading::Value(_)), "{sample:?}");
             if !virtualised {
                 assert!(matches!(sample.compressor, Reading::Value(_)), "{sample:?}");
+                // The segment sysctls read as plain integers in-process.
+                assert!(
+                    matches!(sample.compressor_segments, Reading::Value(s) if s.limit > 0 && s.total <= s.limit),
+                    "{sample:?}"
+                );
                 assert!(matches!(sample.thermal, Reading::Value(_)), "{sample:?}");
                 assert!(matches!(sample.power, Reading::Value(_)), "{sample:?}");
             }

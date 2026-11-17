@@ -6,6 +6,12 @@ import { toastStore } from "./toastStore";
 import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
+  DEFAULT_THRESHOLDS,
+  thresholdsAreDefault,
+  ensureHostLoadSettings,
+  hostLoadSettings,
+  DEFAULT_HOST_LOAD_SETTINGS,
+  updateHostLoadSettings,
   HOST_LOAD_PULSE_EVENT,
   hostLoadPulse,
   hostPressure,
@@ -26,7 +32,7 @@ vi.mock("../platform", () => ({ isTauri: () => true }));
 const calmGovernor: HostLoadStatus["governor"] = {
   verdict: {
     admit: true,
-    shed: { background: false, reactive: false },
+    shed: { background: false, reactive: false, cause: null },
     reason: "healthy",
     tier: "clear",
     binding: null,
@@ -66,6 +72,7 @@ function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
     procs: null,
     tick: { ticks: 1, overruns: 0, missed: 0, last_us: 1, max_us: 1, cpu_ns: 1 },
     problems: [],
+    previous_boot: null,
     ...over,
   };
 }
@@ -129,14 +136,47 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    vi.mocked(invoke).mockResolvedValue({ enabled: false, govern_launches: true });
-    await expect(saveHostLoadSettings({ enabled: false, govern_launches: true })).resolves.toEqual({
-      enabled: false,
-      govern_launches: true,
+    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValue(stored);
+    await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
+    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
+  });
+
+  it("saves one row's change on top of the latest settings, not a stale copy", async () => {
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    // A row saves a new swap rule; the store takes what the backend returns.
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ thresholds: { ...DEFAULT_THRESHOLDS, swap } });
+    // A toggle elsewhere carries only its own change: the swap edit survives.
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ govern_launches: false });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", thresholds: { ...DEFAULT_THRESHOLDS, swap } },
     });
-    expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", {
-      settings: { enabled: false, govern_launches: true },
+    expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
+  });
+
+  it("saves the command gate's mode on top of the latest settings, and defaults to enforcing", async () => {
+    expect(DEFAULT_HOST_LOAD_SETTINGS.hook_mode).toBe("enforce");
+    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, thresholds: DEFAULT_THRESHOLDS };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    await updateHostLoadSettings({ hook_mode: "advise" });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+      settings: { ...first, hook_mode: "advise" },
     });
+    expect(get(hostLoadSettings)?.hook_mode).toBe("advise");
+  });
+
+  it("reads the settings once however many rows ask at the same time", async () => {
+    vi.mocked(invoke).mockClear();
+    vi.mocked(invoke).mockResolvedValue({ enabled: true, govern_launches: true, hook_mode: "enforce", thresholds: DEFAULT_THRESHOLDS });
+    await Promise.all([ensureHostLoadSettings(), ensureHostLoadSettings(), ensureHostLoadSettings()]);
+    expect(vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings")).toHaveLength(1);
   });
 
   it("carries the governor's verdict from the status into the pulse", () => {
@@ -146,7 +186,7 @@ describe("hostLoadStore", () => {
         verdict: {
           ...calmGovernor.verdict,
           admit: false,
-          shed: { background: true, reactive: true },
+          shed: { background: true, reactive: true, cause: null },
           reason: "pressure",
           tier: "severe",
           binding: "compressor_thrash",
@@ -283,5 +323,32 @@ describe("hostLoadStore", () => {
     vi.mocked(invoke).mockRejectedValue(new Error("backend down"));
     await expect(refreshHostLoad()).rejects.toThrow("backend down");
     expect(get(hostPressure)).toBe("unavailable");
+  });
+
+  it("keeps the automatic disk floors on a round trip that never touched them", async () => {
+    // The backend shows the automatic floors as numbers for this computer.
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, thresholds: shown };
+    vi.mocked(invoke).mockResolvedValueOnce(first);
+    await ensureHostLoadSettings();
+    vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
+    const swap = { mode: "shed" as const, elevated_at: 0.4, severe_at: 0.9 };
+    await updateHostLoadSettings({ thresholds: { ...get(hostLoadSettings)!.thresholds, swap } });
+    const saved = get(hostLoadSettings)!.thresholds;
+    expect(saved.disk_auto).toBe(true);
+    expect(saved.disk_guard).toEqual(DEFAULT_THRESHOLDS.disk_guard);
+    expect(saved.swap).toEqual(swap);
+  });
+
+  it("calls the thresholds default by what is stored, never by the numbers the automatic floors show", () => {
+    expect(thresholdsAreDefault(DEFAULT_THRESHOLDS)).toBe(true);
+    const shown = { ...DEFAULT_THRESHOLDS, disk: { mode: "refuse" as const, elevated_at: 32, severe_at: 16 } };
+    expect(thresholdsAreDefault(shown)).toBe(true);
+    expect(thresholdsAreDefault({ ...shown, disk: { ...shown.disk, mode: "shed" } })).toBe(false);
+    // The same numbers a person set are theirs, and not the default.
+    expect(thresholdsAreDefault({ ...shown, disk_auto: false })).toBe(false);
+    expect(thresholdsAreDefault({ ...DEFAULT_THRESHOLDS, disk_auto: false })).toBe(false);
+    const guard = { ...DEFAULT_THRESHOLDS.disk_guard, coverage: { mode: "refuse" as const, headroom_gib: 80 } };
+    expect(thresholdsAreDefault({ ...shown, disk_guard: guard })).toBe(false);
   });
 });

@@ -33,6 +33,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_status` | Narrower status (ledger + worktrees + codeintel) |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
+| `gitpulse_turn_checkpoints` | This worktree's turn checkpoints (files at each agent turn boundary, when the person enabled `turn_checkpoints`): the list, or with `id` a bounded patch. A checkpoint with `omissions.untracked_omitted` above 0 is partial. Read-only; nothing is restored |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |
 | `gitpulse_codeintel_*` | Symbol search, impact, dependencies, trace, dead symbols |
 | `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |
@@ -44,13 +45,17 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null and `verified` false for a commit with no verification note; a verification does not survive a rewrite |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `false` only when absence is provable, otherwise null with a `reason` code; `reverted` from a revert commit by ancestry; `landed_at` from the base branch's reflog. Refuses in a partial clone. Writes nothing (the content check runs in a quarantined object directory) |
 
+## Host load
+
+The SessionStart brief that `gitpulse_insights` accompanies carries a `host load:` line read from the host-load snapshot (tier, what is binding, Claude and Codex sessions launched and observed). It is not a `gitpulse_insights` facet. Before a heavy build or test, and whenever a command is refused for load, follow the `gitpulse-load` skill.
+
 ## Honesty rules this server already enforces
 
 - Unscanned worktrees are counted, never implied clean.
 - A missing code graph is `available: false` with a reason, not an empty hit list.
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
 - `agents.ok: false` is "the worktree listing failed", not "no agents"; `agents.truncated: true` means the counts came from a capped sample, so `agents.sessions` is a floor and a kind whose worktrees all fall past the cap is absent from `agents.kinds` rather than undercounted.
-- An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running Claude Code sessions per worktree with their status. A kind that keeps no readable registry (Codex) is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
+- An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running agent sessions per worktree (discovered via the host process scan across Claude Code, Codex, Antigravity, DevCouncil, and Manvi, enriched with Claude Code's session registry). On platforms without a process scan, any kind that keeps no readable registry is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
 - `gitpulse_sessions` spawns no `git` and reports each attributed session's `is_caller`, `run_id`, `tree`, `task_id`, `state`, `state_source` (`hub` | `registry` | `none` | `unknown`), and `state_age_s`, bounded by `(cap, total, returned, truncated)` (caller first). When the desktop app is not running, `app_state.ok` is `false` with a reason and the tool still answers from the process scan and Claude registry; Codex sessions with no hub entry report `state: "unknown"` (never `"idle"`), and sessions with no registry or hub entry report `state_source: "none"`.
 
 Pass `repo_path` as an absolute filesystem path on every call. The protocol is MCP `2026-07-28`: include `_meta.io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on each request. Legacy `initialize` still works for older clients.

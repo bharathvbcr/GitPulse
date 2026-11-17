@@ -7,7 +7,8 @@ use super::env::{
 };
 use super::gate::{
     current_admission, is_deferred_under_load, is_slot_wait_timeout, refusal_message_at,
-    spawn_gate, strip_code_prefix, with_admission, Admission, Refusal, SpawnGate, TIMEOUT_MARKER,
+    spawn_gate, strip_code_prefix, with_admission, with_exec_probe, Admission, Refusal, SpawnGate,
+    TIMEOUT_MARKER,
 };
 #[cfg(test)]
 use super::gate::{refusal_message, spawn_log};
@@ -33,6 +34,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
 /// keeps [`DEFAULT_TIMEOUT`].
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Stream budget a run may declare when its observer drains stdout
+/// ([`ProcessObserver::drains_stdout`]): the bytes are dropped as they are
+/// seen, so [`MAX_OUTPUT_BYTES`]' reason — what a buffered read costs to
+/// hold — does not apply, but the stream is still bounded, and every byte
+/// still counts against the declared cap.
+pub const MAX_DRAINED_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -503,6 +510,65 @@ fn is_runner_timeout_shape(body: &str) -> bool {
     plain_label && digits > 0 && after[digits..].starts_with('s')
 }
 
+/// What [`time_exec_probe`] saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecProbeRun {
+    /// The child was admitted, ran and exited zero; this long from admission
+    /// to reaped.
+    Ran(Duration),
+    /// The child started and was still running at its deadline. The slowest
+    /// outcome there is, so a caller reads it as a sample of the deadline.
+    DeadlineHit,
+    /// No timing: the gate refused it or no slot came free, it failed to
+    /// spawn, or it exited non-zero.
+    Failed,
+}
+
+/// Starts `program` (a child that does nothing) and times it from the moment
+/// the spawn gate admits it to the moment the runner has reaped it, for
+/// `sysload::exec_probe`.
+///
+/// It runs through the same funnel as every other child (`run_admitted`), so
+/// it is bounded by `deadline`, counted in the gate report as `exec probe`, and
+/// held to the concurrency limit as a `Background` spawn; it is exempt from
+/// the rate bucket and the load verdict ([`with_exec_probe`] says why). It runs
+/// at standard QoS whatever its class: the signal stands for the reactive reads
+/// a person is waiting on, and a background-band child is throttled by design.
+/// The wait for a slot is not part of the time.
+pub(crate) fn time_exec_probe(program: &Path, deadline: Duration) -> ExecProbeRun {
+    let Some(program) = program.to_str() else {
+        return ExecProbeRun::Failed;
+    };
+    // The seam's own constructor: the same scrubbed environment as every other
+    // captured child, so the probe times what a git read would pay.
+    let mut cmd = build_capture_command(program, &[], None, &[], None, None);
+    let mut options = RunOptions::new(deadline);
+    options.qos = Some(QosTier::Standard);
+    let admitted = Cell::new(None);
+    let result = with_admission(Admission::Background, || {
+        with_exec_probe(|| {
+            run_admitted(
+                &mut cmd,
+                "exec probe",
+                options,
+                None,
+                1024,
+                &mut (),
+                spawn_gate(),
+                &|| admitted.set(Some(Instant::now())),
+            )
+        })
+    });
+    match result {
+        Ok(run) if run.success && run.incomplete.is_none() => admitted
+            .get()
+            .map_or(ExecProbeRun::Failed, |at| ExecProbeRun::Ran(at.elapsed())),
+        Ok(_) => ExecProbeRun::Failed,
+        Err(error) if is_run_timeout(error.message()) => ExecProbeRun::DeadlineHit,
+        Err(_) => ExecProbeRun::Failed,
+    }
+}
+
 /// True when `err` is a child that started and ran past its deadline: not a
 /// deferral, not a refused slot wait, not a spawn failure.
 pub(crate) fn is_run_timeout(err: &str) -> bool {
@@ -630,12 +696,88 @@ pub(crate) struct BoundedRun {
     pub stderr: Vec<u8>,
     pub success: bool,
     pub status_code: i32,
+    /// The signal that ended the child, on Unix, when one did. `status_code`
+    /// is -1 for that death and for "no status at all" alike, so a caller that
+    /// must tell a crash from a deadline or a cancel reads this.
+    pub signal: Option<i32>,
     /// Why `stdout` is a prefix, when it is; `None` when it is the whole
     /// stream. Carried as a reason rather than a flag so no caller has to
     /// guess which of the two causes it is looking at.
     pub incomplete: Option<Incomplete>,
     pub stderr_incomplete: Option<Incomplete>,
     pub cancelled: bool,
+}
+
+/// Everything the runner itself knows about how a child's life ended, for an
+/// observer that has to explain a death `BoundedRun` flattens to a status of -1.
+///
+/// Nothing here is inferred: each field is read from the wait status, from a
+/// branch the runner took, or from the process-wide shutdown flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExitFacts {
+    /// The raw wait status word (`wait(2)`) on Unix, the exit code elsewhere.
+    /// `None` when the child was never waited on to a status: a deadline that
+    /// ended it.
+    pub raw_wait_status: Option<i32>,
+    /// The signal that ended the child, when the status says one did.
+    pub signal: Option<i32>,
+    /// Whether the status says the child dumped core.
+    pub core_dumped: bool,
+    /// The signal that stopped the child, when the status says it stopped
+    /// rather than exited.
+    pub stopped_signal: Option<i32>,
+    /// Whether the status says the child was continued after a stop.
+    pub continued: bool,
+    /// The observer's cancel fired while the runner waited.
+    pub cancelled: bool,
+    /// The runtime deadline ran out while the runner waited.
+    pub deadline_expired: bool,
+    /// The runner itself asked the child's group to stop and then killed it.
+    /// True exactly for a cancel or a deadline, the only two places the runner
+    /// signals a child it has not been told to give up on.
+    pub runner_signalled_group: bool,
+    /// [`crate::procguard::reap_all`] had started when the wait ended, so the
+    /// shutdown sweep may have signalled the child.
+    pub shutdown_sweep_started: bool,
+}
+
+impl ExitFacts {
+    fn of(
+        status: Option<std::process::ExitStatus>,
+        cancelled: bool,
+        deadline_expired: bool,
+    ) -> Self {
+        #[cfg(unix)]
+        let (raw_wait_status, signal, core_dumped, stopped_signal, continued) = {
+            use std::os::unix::process::ExitStatusExt;
+            (
+                status.map(ExitStatusExt::into_raw),
+                status.and_then(|status| status.signal()),
+                status.is_some_and(|status| status.core_dumped()),
+                status.and_then(|status| status.stopped_signal()),
+                status.is_some_and(|status| status.continued()),
+            )
+        };
+        #[cfg(not(unix))]
+        let (raw_wait_status, signal, core_dumped, stopped_signal, continued) = (
+            status.and_then(|status| status.code()),
+            None,
+            false,
+            None,
+            false,
+        );
+        Self {
+            raw_wait_status,
+            signal,
+            core_dumped,
+            stopped_signal,
+            continued,
+            cancelled,
+            deadline_expired,
+            runner_signalled_group: cancelled || deadline_expired,
+            shutdown_sweep_started: crate::procguard::shutdown_started(),
+        }
+    }
 }
 
 impl BoundedRun {
@@ -674,6 +816,10 @@ pub(crate) trait ProcessObserver {
         None
     }
     fn output(&mut self, _stream: OutputStream, _bytes: &[u8]) {}
+    /// Told once, on the waiter, how the child's wait ended, just before the
+    /// run is returned. Not called when the run fails with an error instead of
+    /// producing a [`BoundedRun`].
+    fn exited(&mut self, _facts: &ExitFacts) {}
     /// True when the observer keeps what it needs from stdout itself, so the
     /// run need not retain it: each chunk is dropped once `output` has seen it
     /// and the returned [`BoundedRun::stdout`] holds only the unseen tail
@@ -1128,13 +1274,16 @@ fn run_admitted_inner(
         )
         .into());
     }
-    if stdout_cap > MAX_OUTPUT_BYTES
-        || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
+    let stdout_limit = if observer.drains_stdout() {
+        MAX_DRAINED_OUTPUT_BYTES
+    } else {
+        MAX_OUTPUT_BYTES
+    };
+    if stdout_cap > stdout_limit || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
     {
-        return Err(format!(
-            "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
-        )
-        .into());
+        return Err(
+            format!("{label} input/output budget exceeds the {stdout_limit} byte limit").into(),
+        );
     }
     let queue_deadline = gate.clock.now() + timeout;
     if stdin_bytes.is_some() {
@@ -1422,6 +1571,11 @@ fn run_admitted_inner(
     } else {
         unread.map(Incomplete::Unread)
     };
+    observer.exited(&ExitFacts::of(
+        status,
+        cancelled,
+        deadline_message.is_some(),
+    ));
     Ok(BoundedRun {
         stdout: stdout.bytes,
         stderr: stderr.bytes,
@@ -1429,8 +1583,23 @@ fn run_admitted_inner(
             && status.is_some_and(|status| status.success())
             && !cancelled,
         status_code: status.and_then(|status| status.code()).unwrap_or(-1),
+        signal: terminating_signal(status),
         incomplete,
         stderr_incomplete,
         cancelled,
     })
+}
+
+/// The signal that ended a child, where the platform reports one.
+fn terminating_signal(status: Option<std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }

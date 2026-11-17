@@ -966,11 +966,17 @@ pub fn strip_outbox_marker(body: &str) -> String {
         let Some(start) = trimmed_end.rfind(OUTBOX_MARKER_PREFIX) else {
             break;
         };
-        if !trimmed_end.ends_with(OUTBOX_MARKER_SUFFIX) {
+        let Some(without_suffix) = trimmed_end.strip_suffix(OUTBOX_MARKER_SUFFIX) else {
             break;
-        }
-        let inner = &trimmed_end
-            [start + OUTBOX_MARKER_PREFIX.len()..trimmed_end.len() - OUTBOX_MARKER_SUFFIX.len()];
+        };
+        // The prefix ends with a space and the suffix begins with one, so a body
+        // that is the prefix followed by `-->` ends with the suffix while the
+        // inner text would start after it ends. `get` refuses that range (and
+        // any cut that is not a character boundary) where indexing panicked on
+        // issue text GitPulse did not write.
+        let Some(inner) = without_suffix.get(start + OUTBOX_MARKER_PREFIX.len()..) else {
+            break;
+        };
         if inner.contains("-->") || inner.contains('\n') || inner.contains('\r') {
             break;
         }
@@ -5921,6 +5927,20 @@ mod non_ascii_tail_tests {
         assert_eq!(detail.labels, vec!["bug", "ui"]);
         assert_eq!(strip_outbox_marker(&detail.body), "Body text");
         assert!(outbox_marker("key-1").contains("gitpulse-outbox-idempotency: key-1"));
+    }
+
+    #[test]
+    fn a_body_whose_marker_prefix_and_suffix_share_a_space_is_left_alone_not_a_panic() {
+        // Prefix + "-->" ends with the suffix (the prefix's last space is the
+        // suffix's first), so the inner range used to run from byte 34 to byte 33.
+        let overlapping = format!("{OUTBOX_MARKER_PREFIX}-->");
+        assert_eq!(strip_outbox_marker(&overlapping), overlapping);
+        // And a marker with nothing inside still strips, as a whole one does.
+        let empty = format!("Body\n\n{OUTBOX_MARKER_PREFIX}{OUTBOX_MARKER_SUFFIX}");
+        assert_eq!(strip_outbox_marker(&empty), "Body");
+        // Multibyte text around a real marker is untouched by the cut.
+        let multibyte = format!("é ünï {}", outbox_marker("clé-1"));
+        assert_eq!(strip_outbox_marker(&multibyte), "é ünï");
     }
 
     #[test]

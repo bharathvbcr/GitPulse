@@ -1172,6 +1172,7 @@ measurement.
 | --- | --- | --- |
 | `mcp_protocol` | protocol layer, validation, rejected call, `gitpulse_status` / `sessions` / `collision_risk` / `insights` on a generated 400-file, 3-worktree repository | G-tests-perf-03; C-mcp-07; S3-04 `ft-9cfa5274` (protocol overhead + zero-git `gitpulse_sessions`; the codeintel deadline overhead needs a DevMap store and is not measured) |
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
+| `leak_scan` | the commit gate's staged-diff secret scan end to end (24 staged files, ~1,000 added lines; with a same-code null pair; plus a staged 256 KiB binary, and a 24 MiB binary read through the streamed path), `Tally::scan_blob` / `parse_patch` on 4 MiB of generated input, and the push gate's range scan (`resolve_push` + `scan_range`) of 20 unpushed commits with a same-code null pair and of 500 commits | in-house secret scan (target: staged scan about 50 ms; measured 2026-11-15: push range 20 commits 228 ms p50 against a 230 ms null pair, 500 commits 792 ms p50) |
 | `graph_window` | `assemble_commit_graph` (lane solve plus payload), `serde_json` encode and decode, and the size of the `unchanged` token answer, on generated 5k / 30k / 100k-commit windows, with payload bytes | perf1109-graph-blame-reads (lane-solve time and IPC bytes for a 100k-row window) |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
@@ -3135,3 +3136,223 @@ Where: Apple Silicon macOS release build (`host_load` 15 fresh cold processes ea
 
 The cold-process `insights::sessions` call tracks `ft-7ba9b4b2`'s ~10 ms `observe_sessions` baseline (`min` 11.90 ms vs 9.73 ms on this host) and spawns 0 `git` processes (verified via git `trace2` in both `mcp_protocol` and `tests/mcp_sessions.rs`), compared to 10 `git` processes for `gitpulse_insights`. On `mcp_protocol -- --smoke`, load average was 74.1 across 18 CPUs, so absolute times reflect shared host load while `min`, relative ratios, `facets_ok`, and `git_processes=0` establish the comparison.
 
+---
+
+## 2026-11-15: commit secret scan recall against Kingfisher and Betterleaks
+
+How much of what Kingfisher finds does the commit gate's scan (`leak_scan`, the vendored `dc_redact::find_secret` table) find? This is the measurement that drives which shapes go upstream into DevCouncil `rust/dc-redact`.
+
+### Reproduce
+
+Kingfisher and Betterleaks must be installed (PATH, the GUI fallback directories, or `GITPULSE_KINGFISHER` / `GITPULSE_BETTERLEAKS`). Neither validates anything live.
+
+```bash
+GITPULSE_LEAK_RECALL_OUT=/tmp/leak-recall.md cargo test --manifest-path src-tauri/Cargo.toml --lib leak_scan::recall_tests::measure_recall -- --ignored --exact --nocapture
+```
+
+The run takes about 15 s after the build.
+
+- **How plants are made:** `src-tauri/src/leak_scan/plant_sampler.rs` samples candidates from each visible Kingfisher rule's own regex. It makes four at minimum length and two with the secret at a realistic length, seeded by the rule id. Each must match the rule as the `regex` crate reads it.
+- **What counts as a plant:** Kingfisher scans the candidates once, and a rule's plant is the first candidate it reports as that rule. **Kingfisher is therefore 100% by construction.**
+- **Rules that need a helper:** some rules are reported only when one of Kingfisher's hidden helper rules also matches the same file, for example `aikido-client-secret` beside `aikido-client-id`. Betterleaks behaves the same on those files.
+  - A rule Kingfisher confirms on no candidate alone is planted again, after one sample of each hidden helper rule with the same vendor stem. Kingfisher then scans those files a second time.
+  - Those plants are reported in their own table and never added to the comparable one.
+  - On them, Betterleaks and dc-redact are credited only for a hit on the secret's lines. Several helpers are secrets themselves, and a hit on a helper line is named in the report and not credited.
+  - Choosing helpers by stem is a heuristic. A confirmation beside them shows that the rule needs a helper on the same input.
+- **Scoring:** Betterleaks and dc-redact (through `Tally`, the gate's own entry point) are then scored on the same files.
+- **No committed tokens:** plants live in a temporary directory, and both oracles run with `--redact`. The report names rules only, and `assert_no_plant_in` refuses to print or write it if any 16-character run of a plant appears in it.
+- **Fails loudly, never scores zero:** a missing binary, an unexpected exit status, a missing or unparseable report, or an oracle that finds nothing in a non-empty corpus fails the run. Betterleaks exits 0 on a directory that does not exist, which is why the directory is checked first.
+- **Spread:** `GITPULSE_LEAK_RECALL_SALT=<n>` draws a different deterministic corpus, for measuring how much the numbers move.
+- **Stderr in failures:** a failure message carries the oracle's stderr with every run of 16 or more token characters redacted.
+
+**Old-table column.** Swap the older table in, run the command above, then restore:
+
+```bash
+git checkout 7583a7b0 -- src-tauri/vendored/dc-redact
+```
+
+```bash
+git checkout HEAD -- src-tauri/vendored/dc-redact
+```
+
+- **Which commit holds the old table:** `7583a7b0`. Its `lib.rs` is byte-identical to `b07f2d9b`, the commit this was first measured from, which now survives only in backup refs after a history rewrite.
+- **Telling runs apart:** the report header's detector line comes from `ENGINE`, a constant, so it names the current table even in an old-table run. Use the table fingerprint, an FNV-1a of the vendored source:
+  - `1c12c06020db8cec`: the old table;
+  - `8d1f4ea6dc4a1dc0`: `cbd51369`;
+  - `c7355cc99cbb070d`: `b9b2314d`, the current table.
+- **`cbd51369` is no longer on the branch.** Its vendor commit carried plaintext test credentials and was folded away. Its column below is kept as measured.
+
+### Measured (kingfisher 2.16.0, betterleaks 1.10.1, salt 0)
+
+Kingfisher lists 454 visible rules (368 high, 86 medium), plus 47 helper rules it never reports on their own.
+
+| confidence | plants | Kingfisher | Betterleaks | dc-redact, old table (`b07f2d9b`) | dc-redact, DevCouncil `cbd51369` | dc-redact, DevCouncil `b9b2314d` (current) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| high | 316 | 316/316 | 306/316 | 42/316 | 49/316 | **60/316** |
+| medium | 76 | 76/76 | 58/76 | 9/76 | 10/76 | **10/76** |
+
+**Spread over five corpora (salts 0–4, same build):**
+
+| table | high | medium |
+| --- | --- | --- |
+| old | 42, 40, 42, 44, 41 | 9, 10, 10, 10, 10 |
+| `cbd51369` | 49, 47, 48, 50, 48 | 10, 11, 11, 11, 11 |
+| `b9b2314d` | 60, 58, 59, 61, 59 | 10, 11, 11, 11, 11 |
+
+- **`cbd51369` over the old table:** gains 6 to 7 high plants and 1 medium plant on every one of the five corpora.
+- **`b9b2314d` over `cbd51369`:** gains exactly 11 high plants on every corpus, and the same medium. The 11 are the formats this measurement listed as missing for vendors dc-redact already named:
+  - AWS Bedrock long- and short-lived keys;
+  - Gemini;
+  - GitLab incoming-mail token, runner registration token and session cookie;
+  - four Slack formats;
+  - `stripe-access-token`.
+
+**Rules measured beside their helper rules** (not part of the table above; all are high confidence):
+
+| salt | plants | Kingfisher | Betterleaks | dc-redact, any of the three tables |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 30 | 30/30 | 30/30 | 0/30 |
+| 1 | 31 | 31/31 | 30/31 | 0/31 |
+| 2 | 30 | 30/30 | 29/30 | 0/30 |
+| 3 | 30 | 30/30 | 29/30 | 0/30 |
+| 4 | 30 | 30/30 | 30/30 | 0/30 |
+
+- **What these rules are:** client secrets, API secrets and tokens whose id, URL or account name is a separate helper match. Examples: Alibaba, Azure storage account key, PayPal, MongoDB Atlas, PlanetScale, Snowflake, Supabase, Auth0, Salesforce.
+- **dc-redact finds none of them** on any salt, on any of the three tables.
+- **Where line attribution mattered:**
+  - On salts 3 and 4, dc-redact flagged a Polymarket helper line (the helper is itself a secret), not the `polymarket-api-key` plant.
+  - On salts 1 to 3, Betterleaks reported a Tableau helper line, not the token.
+  - Neither is credited.
+- **Every measured rule, salt 0:**
+
+  | confidence | plants | Betterleaks | dc-redact, `cbd51369` | dc-redact, `b9b2314d` |
+  | --- | ---: | ---: | ---: | ---: |
+  | high | 346 | 336 | 49 | 60 |
+  | medium | 76 | 58 | 10 | 10 |
+
+**Against the lost 2026-11-14 corpus (41/308 high, 14/75 medium):**
+- **High reproduces:** 42/316 on the old table is 13.3%, the same as 41/308.
+- **Medium does not reproduce with this table's method.** It comes out at 9–10 out of 76–77 on every salt, not 14.
+- **One reconstruction comes close but not exactly** (the report's "reconstructed" section). It counts a plant when Kingfisher reports any rule on it, and bins it by that finding's confidence.
+  - On the old table this gives dc-redact **14/83** medium, which matches 14.
+  - But it gives 83 plants, not 75, and Betterleaks 65, not the earlier 62.
+  - The extra medium hits are high-confidence Betterleaks rules whose bytes Kingfisher hands to a medium Veles rule (npm, DigitalOcean, OpenRouter).
+  - So the earlier corpus probably counted sibling-claimed plants under medium. That is inferred, not established, since the generator is lost.
+  - On `cbd51369` and on `b9b2314d` the reconstruction gives 15/83.
+
+**Rules without a confirmed plant: 32 (22 high, 10 medium), down from 62 before helper rules were planted.** None of them is measured. The ranked list in the report shows them per vendor in a "not measured" column, so a vendor is never read as covered because its rules went unplanted. Each rule's reason is in the report:
+
+| reason | rules |
+| --- | ---: |
+| Kingfisher reported nothing, and no hidden helper shares the vendor, so the cause is not established. Examples: `slack-webhook-url`, `twilio-api-key`, `gcp-application-default-credentials`, `kubernetes-secret-yaml`, `resend-api-key`. | 17 |
+| A sibling rule claims the bytes. For example, Kingfisher reports the Veles npm rule instead of Betterleaks' `npm-access-token`, and `generic-credential-uri` instead of `sidekiq-sensitive-url`. | 7 |
+| Not confirmed alone or beside the helpers planted: `aws-session-token`, `azure-ad-client-secret`, `browserstack-access-key`, `ovh-application-secret`. For Azure, the sampler could not produce `azure-client-id` or `azure-tenant-id`, so only `azure-storage-account-name` was planted. | 4 |
+| No sample matched the rule's own regex. | 3 |
+| Its only helper (`canva-client-id`) could not be sampled, so nothing was planted. | 1 |
+
+Unmeasured rules for common vendors include:
+- AWS: `aws-session-token`, CodeCommit and CodeCatalyst git credentials;
+- Azure AD client secret;
+- `gcp-application-default-credentials`;
+- Twilio;
+- `slack-webhook-url`.
+
+Each of the three helpers that could not be sampled has a `\b` beside a lazy gap, for example `client_id\b(?s:.{0,24}?)<uuid>` or `id(?:.|[\n\r]){0,16}?\b(OC-…)`. At minimum length the sampler draws that gap empty, so the boundary falls between two word characters and the sample never matches.
+- This is inferred from the patterns; the sampler does not report why a draw failed.
+- Teaching `plant_sampler.rs` to keep such a gap non-empty would let these rules be tried properly.
+
+### Where dc-redact misses (current table, `b9b2314d`)
+
+- **Length artefacts:** 8 misses are found once the secret is at a realistic length, for example Slack bot and app tokens whose minimum-length plant is under dc-redact's floor. The report labels these and keeps them out of the ranking.
+- **Real misses:** 344 rules, grouped by vendor.
+  - That is 314 measured alone, plus the 30 measured beside their helpers.
+  - On `cbd51369` it was 355; `b9b2314d` closed 11.
+
+| tier | vendors missed | rules missed |
+| --- | ---: | ---: |
+| cloud | 20 | 33 |
+| CI, source and packages | 38 | 62 |
+| payments and finance | 30 | 43 |
+| AI providers | 32 | 38 |
+| databases and data | 21 | 31 |
+| messaging and email | 20 | 27 |
+| observability and on-call | 11 | 20 |
+| identity and secret managers | 8 | 9 |
+| generic and context | 3 | 4 |
+| other SaaS | 60 | 77 |
+
+Each tier is ranked by how common the credential is (the order of `VENDORS` in `recall_tests.rs`).
+
+**Formats missing for vendors dc-redact already names:**
+- OpenRouter's Veles form, `sk-or-v<n>-` with a free body. dc-redact only has `v1` with a 64-hex body.
+- The other ten on this list for `cbd51369` (Bedrock, Gemini, GitLab, Slack and Stripe formats) are found by `b9b2314d`.
+- **Heuristic error:** "persona" matches inside dc-redact's "digitalocean personal access token", so the report says dc-redact names Persona. It does not.
+
+**Vendors with no shape at all, first in each tier:**
+- **Cloud:** Azure (Teams webhook, storage account key), Alibaba (2), Cloudflare (4), Heroku (2), Vercel (6), Netlify, Fly.io, IBM Cloud, Exoscale.
+- **CI and packages:** Bitbucket (3), Docker (4), RubyGems, NuGet, crates.io, Packagist (3), Gitea, CircleCI (3), Travis, Buildkite (2), HashiCorp Terraform and Vault (3), Pulumi, Artifactory (2).
+- **Payments:** Square, Plaid (3), Coinbase, Flutterwave (3), Paddle, GoCardless, PayPal, Razorpay, Ramp.
+- **AI providers:** Cohere, Groq, Mistral, Perplexity, DeepSeek, Together, Cerebras, NVIDIA, Langfuse.
+- **Databases:** PlanetScale (3), MongoDB Atlas, Snowflake, ClickHouse, Supabase (2), Upstash, Neon, Databricks, Elastic, Confluent (2), and the four Kingfisher connection-string password rules.
+
+The vendors added to these lists by the helper planting: Alibaba, Azure storage, Exoscale, Artifactory, PayPal, Razorpay, Ramp, Langfuse, MongoDB Atlas, Snowflake, ClickHouse, Supabase, Upstash, and a third PlanetScale rule.
+
+**Betterleaks misses 10 high and 18 medium plants in the comparable table**, and none of the 30 beside their helpers at salt 0. Each is named in the report, as one of three cases:
+- a Veles or Kingfisher-native rule it has no counterpart for;
+- a rule it has, whose filters drop the plant;
+- a plant at minimum length only, which it finds at realistic length.
+
+**Report sections:** the funnel, the comparable table, the rules measured beside their helpers (with the helpers planted for each), every measured rule together, per-rule results for all three tools, the ranked vendor list (misses and not-measured rules), the reconstructed old method, every disagreement with its reason, and every rule without a plant with its reason.
+
+---
+
+## 2026-11-15: macOS watch scope keeps ignored build trees out of the FSEvents stream
+
+`fseventsd` pays for every event under a registered root, whether or not the client wants it. Exclusion paths do not change that; only the registered roots do. Every tab used to register its whole worktree, so a build under `target/` cost `fseventsd` once per covering tab, and a main checkout covered every nested worktree's `target/` too.
+
+**The default scope is Narrow.** It is set in Settings → Agents → Watch scope; Whole worktree is the old behaviour. Narrow leaves a directory out of the stream only when all of these hold:
+- `git check-ignore` names the directory itself;
+- `git ls-files` finds no tracked path under it;
+- it is build output, or holds another checkout.
+
+The rest of the directory's parent is registered entry by entry. A kqueue on those parents re-registers when their entry names change. The whole worktree is registered again when any of these happens:
+- a step fails;
+- the path count exceeds 256;
+- a status row lies under an excluded directory;
+- the poll convicts the watch.
+
+See `src-tauri/src/watcher/scope.rs` and the exception in `watcher/skip.rs`.
+
+### Measured
+
+One M-series Mac (macOS 27), with about 19 other sessions running. The storms are synthetic zero-byte files in a scratch repository whose `.gitignore` is `target/`.
+
+**Callback volume:** `cargo test --lib measure_callback_volume_by_watch_scope -- --ignored --nocapture`. One watcher, a 50,000-file storm under `target/`, n = 5, load 11.5 at start and 19.6 at end.
+
+| arm | native callbacks per storm |
+| --- | --- |
+| whole | 162,278 · 164,233 · 163,134 · 163,152 · 165,093 |
+| narrow | 0 · 0 · 0 · 0 · 0 |
+| whole (null pair) | 164,763 · 164,654 · 163,514 · 164,672 · 165,041 |
+
+**fseventsd CPU:** `cargo test --lib watcher::storm::measure_fseventsd_cpu_by_watch_scope -- --ignored --nocapture`. 24 watchers per arm, 200,000 files created and deleted under `target/`, and a 45 s settle. CPU was read with the setuid `/bin/ps`. n = 3, with the arm order rotated each repetition.
+
+| arm | fseventsd CPU seconds per storm | notes |
+| --- | --- | --- |
+| no watcher | 16.3 · 16.8 · 15.3 | |
+| whole | 152.5 · 146.3 | a third run (125.0) ended at load 33.1 and is not a result |
+| narrow | 23.8 · 22.5 · 18.6 | |
+| whole (null pair) | 224.7 · 136.2 · 124.3 | |
+
+- **Narrow takes out about 96% of what the whole scope adds** over no watcher.
+- **The sign held in every run:** narrow's highest run is far below whole's lowest.
+- **Narrow is not free.** It sits about 5 s above no watcher, which is outside the no-watcher spread. The cause is not established. Each watcher still registers `.git` recursively and about 75 top-level paths.
+
+**On the real checkouts** (2026-11-15):
+- The main checkout excludes `.claude/worktrees`, `.gitpulse/worktrees`, `tmp`, `target`, `src-tauri/target`, `node_modules` and `.claude/labs-target`. It registers 102 paths, and planning took 73 ms after a 36 ms listing.
+- Linked worktrees exclude their own `src-tauri/target` and register 73 to 76 paths.
+
+**Not measured:**
+- the installed app over wall-clock time;
+- fseventsd memory (the growth that motivated this was not reproduced by any arm on 2026-11-14);
+- Linux and Windows, which are unchanged by construction: their root watch is non-recursive.

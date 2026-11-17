@@ -31,6 +31,11 @@ describe("Settings panels load once (SO-1)", () => {
     expect(source.match(/disabled=\{busy \|\| !readOk/g)).toHaveLength(2);
   });
 
+  it("the command-gate mode is not saved before a read has succeeded either", () => {
+    const source = read("HostLoadSetting.svelte");
+    expect(source).toContain("if (readOk && !busy) void save({ hook_mode: next })");
+  });
+
   it("the notification panel shows the store's load failure instead of the default form", () => {
     const source = read("SessionAlertSettings.svelte");
     expect(source).toContain("sessionAlertsLoadError");

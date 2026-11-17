@@ -2,10 +2,13 @@
 /**
  * Does every installed reader agree with the schemas DevCouncil writes?
  *
- * DevCouncil owns four schemas: the devmap store (`CURRENT_SCHEMA_VERSION`),
- * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`) and the
+ * DevCouncil owns five formats: the devmap store (`CURRENT_SCHEMA_VERSION`),
+ * dc-store (`SCHEMA_VERSION`), the workbench (`WORKBENCH_SCHEMA`), the
  * extraction payload (devmap-extract's `EXTRACTION_SCHEMA_VERSION`, a string
- * constant; a stored graph written at another version is reported obsolete). Every
+ * constant; a stored graph written at another version is reported obsolete) and
+ * the stacked-worktree lease (devmap-query's `STACK_FORMAT_VERSION`, which no
+ * schema number tracks: a devmap that reads another lease format rejects every
+ * stacked lane GitPulse provisions while the schemas all agree). Every
  * other app reads at least one of them, and each reads it through something
  * that can fall behind on its own:
  *
@@ -61,6 +64,7 @@ export const SCHEMAS = Object.freeze({
   dcStore: { label: "dc-store", constant: "SCHEMA_VERSION", file: "dc-store/src/lib.rs" },
   workbench: { label: "workbench", constant: "WORKBENCH_SCHEMA", file: "dc-store/src/workbench/mod.rs" },
   extract: { label: "devmap-extract", constant: "EXTRACTION_SCHEMA_VERSION", file: "devmap-extract/src/cache.rs" },
+  lease: { label: "stack lease", constant: "STACK_FORMAT_VERSION", file: "devmap-query/src/stacked.rs" },
 });
 
 /** @typedef {keyof typeof SCHEMAS} SchemaKey */
@@ -82,10 +86,22 @@ const ALL_KEYS = /** @type {SchemaKey[]} */ (Object.keys(SCHEMAS));
  * newlines kept. String and char literals are copied through untouched, so a
  * `//` inside a string is not a comment. Only live declarations remain.
  *
+ * With `blankStrings`, string contents are blanked as well (quotes and
+ * newlines kept), so a declaration quoted inside a string is not one. The one
+ * literal kept is a bare `"123"` right after `=`: devmap-extract declares its
+ * version as such a string.
+ *
  * @param {string} text
+ * @param {boolean} [blankStrings]
  * @returns {string}
  */
-export function withoutComments(text) {
+export function withoutComments(text, blankStrings = false) {
+  const blank = (/** @type {string} */ literal, /** @type {string} */ before) => {
+    if (!blankStrings || (/^"\d+"$/.test(literal) && /=\s*$/.test(before))) return literal;
+    const open = literal.indexOf('"');
+    const close = literal.lastIndexOf('"');
+    return close <= open ? literal : literal.slice(0, open + 1) + literal.slice(open + 1, close).replace(/[^\n]/g, " ") + literal.slice(close);
+  };
   let out = "";
   let i = 0;
   while (i < text.length) {
@@ -106,12 +122,12 @@ export function withoutComments(text) {
       const hashes = /^r(#*)"/.exec(text.slice(i, i + 40))?.[1] ?? "";
       const close = text.indexOf(`"${hashes}`, i + 2 + hashes.length);
       const end = close === -1 ? text.length : close + 1 + hashes.length;
-      out += text.slice(i, end);
+      out += blank(text.slice(i, end), out);
       i = end;
     } else if (text[i] === '"') {
       let end = i + 1;
       while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
-      out += text.slice(i, end + 1);
+      out += blank(text.slice(i, end + 1), out);
       i = end + 1;
     } else if (text[i] === "'" && /^'(?:\\.[^']*|[^\\'])'/.test(text.slice(i, i + 12))) {
       const literal = /^'(?:\\.[^']*|[^\\'])'/.exec(text.slice(i, i + 12))?.[0] ?? "'";
@@ -125,6 +141,42 @@ export function withoutComments(text) {
 }
 
 /**
+ * Rust source (comments and string contents already blanked) without the
+ * items gated by `#[cfg(test)]`: a test module's copy of a constant is not the
+ * one the build ships. The item runs to its matching `}`, or to `;` when it
+ * has no body.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function withoutTestItems(text) {
+  const gate = /#\[cfg\(\s*test\s*\)\]/g;
+  let out = "";
+  let at = 0;
+  for (let match = gate.exec(text); match !== null; match = gate.exec(text)) {
+    if (match.index < at) continue;
+    out += text.slice(at, match.index);
+    let i = match.index + match[0].length;
+    while (i < text.length && text[i] !== "{" && text[i] !== ";") i++;
+    if (text[i] === "{") {
+      let depth = 0;
+      do {
+        const quoted = /^'(?:\\.[^']*|[^\\'])'/.exec(text.slice(i, i + 12));
+        if (text[i] === "'" && quoted) i += quoted[0].length;
+        else {
+          if (text[i] === "{") depth++;
+          else if (text[i] === "}") depth--;
+          i++;
+        }
+      } while (depth > 0 && i < text.length);
+    } else i++;
+    at = i;
+    gate.lastIndex = i;
+  }
+  return out + text.slice(at);
+}
+
+/**
  * One `pub const NAME: <int type> = N;` from a Rust source file, or the
  * `pub const NAME: &str = "N";` form devmap-extract declares its version in.
  * A string that is not a whole number is not found, and so is a constant
@@ -135,7 +187,7 @@ export function withoutComments(text) {
  * @returns {number | null}
  */
 export function rustConstant(text, constant) {
-  text = withoutComments(text);
+  text = withoutTestItems(withoutComments(text, true));
   const integer = String.raw`[iu](?:8|16|32|64|size)\s*=\s*(\d+)`;
   const string = String.raw`&(?:'static\s+)?str\s*=\s*"(\d+)"`;
   const found = [...text.matchAll(new RegExp(String.raw`pub const ${constant}:\s*(?:${integer}|${string})\s*;`, "g"))].map((match) => Number(match[1] ?? match[2]));
@@ -344,13 +396,16 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
   if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
-  return { reader, keys: ALL_KEYS, schemas };
+  // The manifest names no lease format yet, so this row is unverifiable for it
+  // until gitpulse-mcp's manifest reports `STACK_FORMAT_VERSION`.
+  return { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" };
 }
 
 /**
  * `devmap` on PATH. Its `--version` line names the store schema, and names the
- * extraction schema only once DevCouncil prints one (`extract schema N`); a
- * build that does not is unverifiable for it, never assumed to match.
+ * extraction schema and the lease format only once DevCouncil prints them
+ * (`extract schema N`, `stack lease format N`); a build that does not is
+ * unverifiable for them, never assumed to match.
  *
  * @param {ReturnType<typeof readCliSchema> | null} [cli]
  * @returns {Reading}
@@ -358,17 +413,22 @@ async function serverReading(reader, bin, absent, timeoutMs) {
 export function devmapReading(cli = resolveOnPath("devmap") === null ? null : readCliSchema()) {
   const reader = "devmap (PATH)";
   /** @type {SchemaKey[]} */
-  const keys = ["store", "extract"];
+  const keys = ["store", "extract", "lease"];
   if (cli === null) return { reader, keys, absent: "not on PATH" };
   if (!cli.available) return { reader, keys, error: cli.reason };
   /** @type {Schemas} */
   const schemas = { store: cli.expected };
   if (typeof cli.extract === "number") schemas.extract = cli.extract;
+  if (typeof cli.lease === "number") schemas.lease = cli.lease;
+  const unprinted = [
+    ...(schemas.extract === undefined ? ["the extraction schema (`extract schema N`)"] : []),
+    ...(schemas.lease === undefined ? ["the stack lease format (`stack lease format N`)"] : []),
+  ];
   return {
     reader,
     keys,
     schemas,
-    ...(schemas.extract === undefined ? { note: "devmap --version does not print the extraction schema; DevCouncil must add it" } : {}),
+    ...(unprinted.length > 0 ? { note: `devmap --version does not print ${unprinted.join(" or ")}; DevCouncil must add it` } : {}),
   };
 }
 

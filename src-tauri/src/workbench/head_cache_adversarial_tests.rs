@@ -362,3 +362,99 @@ fn concurrent_readers_settle_on_the_truth_after_moves() {
     }
     crate::engine::ref_cache::eager(|| agrees(&r, "after the writer stopped"));
 }
+
+/// How many `HEAD^{commit}` reads of `repo` reached git, from the gate's log.
+fn head_spawns(repo: &Path) -> usize {
+    crate::engine::process::spawn_log::spawns_in(repo)
+        .iter()
+        .filter(|argv| argv.iter().any(|arg| arg == "HEAD^{commit}"))
+        .count()
+}
+
+/// The reason `current_head` is stamped by HEAD and the ref it names rather
+/// than the whole ref store: agents moving branches in this repository, in the
+/// checkout itself or in a sibling worktree, must not cost another worktree a
+/// process on its next read. Every move below is to a ref this HEAD does not
+/// name, and none of them may add a spawn; the answer stays the truth. (A
+/// `pack-refs` is not in the list: it rewrites `packed-refs`, which HEAD's
+/// answer is stamped by, so it is rightly a miss.)
+#[test]
+fn a_ref_moved_elsewhere_costs_the_worktree_no_new_head_read() {
+    let _held = crate::engine::ref_cache::retention();
+    let (main, _parent, linked) = crate::test_support::repo_with_worktrees(2);
+    let (a, b) = (linked[0].as_path(), linked[1].as_path());
+    crate::engine::ref_cache::eager(|| {
+        agrees(a, "first read of a");
+        let baseline = head_spawns(a);
+        assert_eq!(baseline, 1, "the first read is the only spawn");
+        let moves: [(&str, &dyn Fn()); 5] = [
+            ("a new branch", &|| {
+                git(main.path(), &["branch", "unrelated"])
+            }),
+            ("a sibling worktree's own branch", &|| {
+                commit(b, "a sibling worktree moves its own branch")
+            }),
+            ("a tag", &|| git(main.path(), &["tag", "t1"])),
+            ("a remote-tracking ref", &|| {
+                git(
+                    main.path(),
+                    &["update-ref", "refs/remotes/origin/x", "main"],
+                )
+            }),
+            ("the main checkout's branch", &|| {
+                commit(main.path(), "main moves")
+            }),
+        ];
+        for (what, make) in moves {
+            make();
+            assert_eq!(seen(a), truth(a), "after {what}");
+            assert_eq!(
+                head_spawns(a),
+                baseline,
+                "{what} was a miss, which is a git process"
+            );
+        }
+    });
+}
+
+/// The narrow stamp must still see every move of what HEAD does name: the
+/// worktree's own branch, a switch, a detach, a pack that leaves the ref only
+/// in `packed-refs`, and a symref to another namespace.
+#[test]
+fn moves_of_what_head_names_still_miss_and_answer_truthfully() {
+    let _held = crate::engine::ref_cache::retention();
+    let (main, _parent, linked) = crate::test_support::repo_with_worktrees(1);
+    let a = linked[0].as_path();
+    crate::engine::ref_cache::eager(|| {
+        agrees(a, "start");
+        let first = truth(a);
+        commit(a, "own branch");
+        agrees(a, "commit on the worktree's own branch");
+        git(a, &["branch", "side"]);
+        git(a, &["checkout", "-q", "side"]);
+        commit(a, "on side");
+        agrees(a, "switched branch and committed");
+        git(main.path(), &["pack-refs", "--all", "--prune"]);
+        agrees(a, "ref now only in packed-refs");
+        git(a, &["update-ref", "refs/heads/side", &first]);
+        agrees(a, "loose ref over the packed one");
+        git(main.path(), &["pack-refs", "--all", "--prune"]);
+        agrees(a, "repacked to the older commit");
+        git(a, &["checkout", "-q", "--detach"]);
+        agrees(a, "detached");
+        commit(a, "detached commit");
+        agrees(a, "commit while detached");
+        git(a, &["update-ref", "refs/remotes/origin/s", "main"]);
+        git(a, &["symbolic-ref", "HEAD", "refs/remotes/origin/s"]);
+        agrees(a, "symref to another namespace");
+        git(a, &["update-ref", "refs/remotes/origin/s", &first]);
+        agrees(a, "that ref moved");
+        git(
+            a,
+            &["symbolic-ref", "refs/remotes/origin/s", "refs/heads/main"],
+        );
+        agrees(a, "symref whose target is a symref");
+        git(main.path(), &["update-ref", "refs/heads/main", &first]);
+        agrees(a, "the end of the symref chain moved");
+    });
+}

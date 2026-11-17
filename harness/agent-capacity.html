@@ -43,6 +43,8 @@
         cmd_workspace_sync: () => null, cmd_repo_operation: () => null, cmd_watch_repo: () => null, cmd_set_recent_menu: () => null,
         cmd_last_fetch_at: () => null, cmd_devmap_maybe_refresh: () => null, cmd_devcouncil_init: () => null, cmd_agent_defaults: () => null,
         cmd_session_alerts_visible: () => null, cmd_note_tab_activated: () => null,
+        // The durable session ledger the terminal dock reads on mount: empty, so no reopen offers.
+        cmd_terminal_session_ledger: () => ({ offers: [], reopenable_count: 0, unreadable_count: 0 }),
         cmd_workbench_launch_terminal: (args) => {
           const { id } = JSON.parse(args.input); const run = runs.get(id);
           launches.set(id, (launches.get(id) ?? 0) + 1);

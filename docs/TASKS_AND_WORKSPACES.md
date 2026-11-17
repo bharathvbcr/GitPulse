@@ -132,7 +132,11 @@ it stays separate because launching something that will act on the work is a
 different decision from writing it. A new task has only the first pane and no
 tab strip.
 
-**View** above the board chooses the layout, how tightly cards pack, which of the
+The board header is organized into two rows (`PageHeader.svelte`, `TaskBoard.svelte`):
+a **title row** (search and syntax help, **Inbox** / **Archive** / **Refresh**, and
+**New task**) and a **toolbar row** (`Board | List`, **Filters**, **Views**, and
+**View** on the left; **Suggest next**, **Organize**, and **Auto (Manvi)** on the
+right). **View** chooses the layout, how tightly cards pack, which of the
 five columns are on screen and which chips a card carries. The choices are saved
 per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
@@ -140,14 +144,24 @@ currently off screen, and the board refuses to hide its last column. When tasks 
 hidden repositories are excluded, the notification banner explicitly names which
 repository is hidden.
 
-### Column paging and "Load all"
+**Inbox** opens the attention notification drawer (`AttentionInbox.svelte`,
+`attentionDismiss.ts`). Each notice row offers **Open** and **Dismiss**; a
+dismissed notice leaves **Active** and **Unread** while remaining under **All**,
+where **Restore** brings it back, and the board refreshes its unread corner
+badge immediately.
 
-When browsing, each column pages 30 tasks at a time. Selecting **Load all** in a
-column header reads remaining tasks in 200-card pages (the store's page limit), drawing
-each page as it lands, until the board holds `MAX_CANDIDATES` (2,000) cards or the
-user selects **Stop**. Loaded column depth is remembered across refreshes: `reloadSize`
-pages at the store's 200-card size once 20 standard column pages would not reach what
-was loaded. Card verification verdicts are queried in sequential chunks of 256 IDs
+### Column paging, automatic fill, and live on-screen refresh
+
+Each column initially reads 30 tasks, after which `fillBoard` (`boardPaging.ts`)
+automatically pages the rest of every column through `fillColumns` — 200 cards per
+request, one page from each column in turn, up to `MAX_CANDIDATES` (2,000) cards —
+folding each page in only while the column still ends at the cursor it was read from.
+Selecting **Load all** in a column header (or **Stop** while paging) controls manual
+column loading, and reloads of a filled column read 200 cards at a time. Live task
+surfaces (the board, archive dock, attention inbox, and Remote task list) use
+`liveOnScreen` (`liveLoader.ts`), pausing only when the document is hidden so agent
+writes arriving while the window is on screen (even unfocused) refresh the board in
+place. Card verification verdicts are queried in sequential chunks of 256 IDs
 (`getBoardVerdicts`), preventing host-side request rejection when the board displays
 large task volumes.
 
@@ -243,7 +257,9 @@ repository's by its path or remote as well, by the same rule as `repo:` — so
 in `.git`. The open board's row stays listed
 while it is filtered, workspace reordering waits until the box is cleared, and
 Escape clears it. It searches the rows the navigator has loaded; **More** loads
-the rest.
+the rest. The **Repositories** heading's sort menu orders loaded repository rows
+by **Name, A to Z** (the default), **Name, Z to A**, **Open first**, or
+**Recently added**, remembered per profile and restored by **Reset board view**.
 
 Click a card to edit it. Command/Ctrl-click toggles selection; Shift-click selects
 a visible range. Right-click a card, or press Shift+F10 on a focused card, for
@@ -465,7 +481,7 @@ Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
 delivery to the provider are separate states. Terminal handoffs do not produce
 those structured callbacks. Full crash recovery remains a qualification gap; see
-the [implementation contract](AGENTIC_WORKSPACES_PLAN.md) and
+the [implementation contract](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENTIC_WORKSPACES_PLAN.md) and
 [architecture](ARCHITECTURE.md#agentic-workbench-implemented-core-broader-qualification-in-progress).
 
 ### Reviewing an attempt before it is merged
@@ -477,7 +493,7 @@ on, merging or cherry-picking an attempt's branch — from the panels, the
 attempt's **Merge** button or the GitPulse terminal — is refused until someone
 approves exactly that range, or records a merge without review and says why.
 A commit after the approval needs a new one. See
-[AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md).
+[AGENT_OUTPUT_REVIEW.md](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/AGENT_OUTPUT_REVIEW.md).
 
 ### Providers with a managed lane
 
@@ -538,7 +554,7 @@ project context are unaffected; only settings files are scoped.
 > [!NOTE]
 > Managed runs are verified on macOS only. Neither adapter uses a Unix-specific
 > API, but both end-to-end tests are `#[cfg(unix)]`, so Windows is untried
-> rather than known-good. See [platform coverage](QUALIFICATION.md#platform-coverage).
+> rather than known-good. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md#platform-coverage).
 
 ## Keyboard controls
 

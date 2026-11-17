@@ -391,6 +391,51 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     assert!(!lane.exists());
 }
 
+/// Worktree teardown asks the same question the cleaner does: a process that
+/// names the worktree in its arguments (a build run from elsewhere with
+/// `--target-dir` inside it) has nothing "working in" it by cwd, and still
+/// keeps it from being removed. Before, only the working directory was read.
+#[test]
+fn a_process_naming_the_worktree_in_an_argument_refuses_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let lane = dir.path().join("lane");
+    git_text(
+        &root,
+        &["worktree", "add", "-b", "feature", lane.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&lane);
+    let state = host(&dir.path().join("profile.sqlite"));
+    let lane_path = crate::engine::process::canonicalize_plain(&lane).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("read line")
+        .arg("builder")
+        .arg(format!("--target-dir={}/target", lane_path.display()))
+        .current_dir(elsewhere.path())
+        .stdin(std::process::Stdio::piped())
+        .spawn_locked()
+        .unwrap();
+    let pid = child.id();
+    let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+        crate::sysload::procscan::processes_using(&lane_path)
+            .is_ok_and(|pids| pids.contains(&i32::try_from(pid).unwrap()))
+    });
+    let refused = state.refuse_if_in_use(lane_path.to_str().unwrap());
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(seen, "the child never showed in the process table");
+    let message = refused.expect_err("a process names the worktree");
+    assert!(
+        message.contains("still using this worktree") && message.contains(&format!("pid {pid}")),
+        "{message}"
+    );
+}
+
 fn allow_merge(_repo: &str, _argv: &[&str]) -> Result<crate::harness::PolicyVerdict, String> {
     use crate::harness::{PolicyStatus, PolicyVerdict};
     Ok(PolicyVerdict {

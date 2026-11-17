@@ -13,40 +13,67 @@ fn marker(path: &Path, prefix: &str) -> bool {
     file.take(1024).read_to_string(&mut text).is_ok() && text.starts_with(prefix)
 }
 
+/// Directory names that are persistent state or dependencies wherever they sit.
+fn protected_name(part: &str) -> bool {
+    matches!(
+        part.to_ascii_lowercase().as_str(),
+        ".git"
+            | ".venv"
+            | "venv"
+            | ".tox"
+            | "node_modules"
+            | "pods"
+            | ".terraform"
+            | ".devcouncil"
+            | ".devmap"
+            | ".gitnexus"
+            | ".claude"
+            | ".cursor"
+            | ".agents"
+            | ".gemini"
+            | ".antigravity"
+            | ".opencode"
+            | ".gopath"
+            | ".gomodcache"
+            | ".gradle"
+            | ".pnpm-store"
+            | ".npm-cache"
+            | ".yarn-cache"
+            | ".cache"
+            | "tmp"
+            | ".tmp"
+            | "temp"
+            | "logs"
+            | "log"
+    )
+}
+
+/// Names a package author can legitimately choose. Below Cargo's own layout a
+/// directory with one of these names is a crate (`build/log/<hash>/`), not a
+/// place where someone keeps state. Dot-names cannot be crate names, so
+/// `.tmp` and the VCS, environment and agent-state names are not listed.
+fn crate_name_shaped(part: &str) -> bool {
+    matches!(
+        part.to_ascii_lowercase().as_str(),
+        "tmp" | "temp" | "log" | "logs"
+    )
+}
+
+/// Directories Cargo creates under `<profile>/`, whose children it names.
+const CARGO_LAYOUT_DIRS: [&str; 4] = ["build", "deps", ".fingerprint", "incremental"];
+
 pub fn protected_artifact(path: &str) -> bool {
-    path.split(['/', '\\']).any(|part| {
-        matches!(
-            part.to_ascii_lowercase().as_str(),
-            ".git"
-                | ".venv"
-                | "venv"
-                | ".tox"
-                | "node_modules"
-                | "pods"
-                | ".terraform"
-                | ".devcouncil"
-                | ".devmap"
-                | ".gitnexus"
-                | ".claude"
-                | ".cursor"
-                | ".agents"
-                | ".gemini"
-                | ".antigravity"
-                | ".opencode"
-                | ".gopath"
-                | ".gomodcache"
-                | ".gradle"
-                | ".pnpm-store"
-                | ".npm-cache"
-                | ".yarn-cache"
-                | ".cache"
-                | "tmp"
-                | ".tmp"
-                | "temp"
-                | "logs"
-                | "log"
-        )
-    })
+    path.split(['/', '\\']).any(protected_name)
+}
+
+/// Whether `dir` is a Cargo target directory: Cargo's cache tag and the
+/// compiler-info file it writes at the root. The one definition shared by
+/// producer recognition and entry protection.
+pub fn is_cargo_target(dir: &Path) -> bool {
+    marker(
+        &dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    ) && dir.join(".rustc_info.json").is_file()
 }
 
 /// Recognized names are a discovery hint; producer evidence, the index, age,
@@ -78,11 +105,7 @@ pub fn local_provider(repo: &Path, relative: &str) -> Result<&'static str, Strin
     let has = |marker: &str| parent.join(marker).is_file();
     match name {
         n if (n == "target" || n.starts_with("target-")) && has("Cargo.toml") => {
-            if !marker(
-                &path.join("CACHEDIR.TAG"),
-                "Signature: 8a477f597d28d172789f06886806bc55",
-            ) || !path.join(".rustc_info.json").is_file()
-            {
+            if !is_cargo_target(&path) {
                 return Err(
                     "Cargo target markers are missing; this directory requires manual review."
                         .into(),
@@ -196,10 +219,109 @@ mod hygiene_tests {
 
 /// Conservative preservation of known state, credential and data formats.
 /// This is evidence of a refusal, not proof that other files are disposable.
+///
+/// With no knowledge of what the path sits in, every directory name is
+/// protected. Use [`protected_entry_in`] when the path is inside a candidate
+/// whose root is known.
 pub fn protected_entry(relative: &Path) -> bool {
-    if protected_artifact(&relative.to_string_lossy()) {
+    protected_artifact(&relative.to_string_lossy()) || protected_file(relative)
+}
+
+/// [`protected_entry`] for `relative` inside the candidate directory
+/// `candidate_root`.
+///
+/// Three waivers, each only below a recognised Cargo target
+/// ([`is_cargo_target`]: the candidate root or a nested directory with both
+/// markers, such as cargo-llvm-cov's `llvm-cov-target`):
+///
+/// - `tmp` directly inside the target. Cargo creates it itself
+///   (`CARGO_TARGET_TMPDIR`) and `cargo clean` removes it with the target.
+///   Protection resumes below it.
+/// - `tmp` at `<target>/<triple>/tmp`, where `cargo test --target` puts it.
+///   `<triple>` must not be a protected name and must have a directory with
+///   Cargo's `.cargo-lock` directly inside (at most 64 entries are inspected,
+///   and past that it fails closed). Protection resumes below it.
+/// - `log`, `logs`, `tmp` and `temp` below `<profile>/{build,deps,.fingerprint,
+///   incremental}` or `<triple>/<profile>/<same>`: there they are crate names
+///   chosen on crates.io (`target/release/build/log/<hash>/`). A profile or
+///   triple component that is itself a protected name does not open the layout.
+///
+/// Every other directory name, every file-name and extension protection and
+/// every directory outside a Cargo target keep their answer. A path with an
+/// empty, `.` or `..` component, an unreadable root and a path that is not
+/// UTF-8 fail closed.
+pub fn protected_entry_in(candidate_root: &Path, relative: &Path) -> bool {
+    if protected_file(relative) {
         return true;
     }
+    let text = relative.to_string_lossy();
+    let parts: Vec<&str> = text.split(['/', '\\']).collect();
+    if parts.iter().any(|p| matches!(*p, "" | "." | "..")) {
+        return parts.iter().any(|p| protected_name(p));
+    }
+    // The filesystem is consulted only for a protected name that the structure
+    // of the path could waive, so an ordinary entry costs no syscall.
+    parts
+        .iter()
+        .enumerate()
+        .any(|(at, part)| protected_name(part) && !waived(candidate_root, &parts, at))
+}
+
+/// Whether the protected name `parts[at]` is waived by a Cargo target that
+/// encloses it. Checks the nearest enclosing candidate first.
+fn waived(root: &Path, parts: &[&str], at: usize) -> bool {
+    let is_tmp = parts[at].eq_ignore_ascii_case("tmp");
+    let target_at = |base: usize| {
+        is_cargo_target(
+            &parts[..base]
+                .iter()
+                .fold(root.to_path_buf(), |dir, p| dir.join(p)),
+        )
+    };
+    (0..=at).rev().any(|base| {
+        let structural = (is_tmp && base == at)
+            || (crate_name_shaped(parts[at])
+                && [base + 1, base + 2].into_iter().any(|layout| {
+                    layout < at
+                        && CARGO_LAYOUT_DIRS.contains(&parts[layout])
+                        && !parts[base..layout].iter().any(|p| protected_name(p))
+                }));
+        // `cargo test --target <triple>` puts the scratch directory at
+        // `<target>/<triple>/tmp`. The triple is not guessed from its name: it
+        // must hold a profile directory with Cargo's profile lock.
+        let in_triple = is_tmp
+            && base + 1 == at
+            && !protected_name(parts[base])
+            && target_at(base)
+            && holds_profile_lock(
+                &parts[..=base]
+                    .iter()
+                    .fold(root.to_path_buf(), |dir, p| dir.join(p)),
+            );
+        (structural && target_at(base)) || in_triple
+    })
+}
+
+/// Most entries of a triple directory that are inspected; one past it fails closed.
+const TRIPLE_ENTRIES_INSPECTED: usize = 64;
+
+/// Whether a directory directly inside `dir` has Cargo's per-profile lock
+/// file (`<dir>/<profile>/.cargo-lock`), which Cargo creates in every profile
+/// directory it builds into.
+fn holds_profile_lock(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.take(TRIPLE_ENTRIES_INSPECTED).any(|entry| {
+        entry.is_ok_and(|e| {
+            e.file_type().is_ok_and(|t| t.is_dir())
+                && std::fs::symlink_metadata(e.path().join(".cargo-lock"))
+                    .is_ok_and(|m| m.is_file())
+        })
+    })
+}
+
+fn protected_file(relative: &Path) -> bool {
     let Some(name) = relative.file_name().and_then(|n| n.to_str()) else {
         return true;
     };
@@ -301,5 +423,468 @@ mod boundary_tests {
             .iter()
             .any(|v| v.contains("node_modules/package.json")));
         assert!(violations.iter().any(|v| v.contains("keys/id_ed25519")));
+    }
+}
+
+#[cfg(test)]
+mod cargo_target_tests {
+    use super::{protected_entry, protected_entry_in};
+    use std::path::{Path, PathBuf};
+
+    const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache dir\n";
+
+    /// A scratch directory that removes itself, so a failed assertion leaves nothing behind.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "devmap-hygiene-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cargo_target(scratch: &Scratch) -> PathBuf {
+        let root = scratch.0.join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        root
+    }
+
+    fn plain_target(scratch: &Scratch) -> PathBuf {
+        let root = scratch.0.join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const BUILD_SCRIPT_DIRS: [&str; 6] = [
+        "release/build/log/0123abcd/out",
+        "release/build/tmp/0123abcd/out/lib.rs",
+        "debug/build/logs/0123abcd",
+        "aarch64-apple-darwin/release/build/temp/0123abcd/out",
+        "x86_64-unknown-linux-gnu/debug/incremental/log/s-1-2",
+        "release/.fingerprint/temp/lib-temp.json",
+    ];
+
+    #[test]
+    fn current_behaviour_without_context_refuses_crate_named_build_directories() {
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(protected_entry(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn crate_named_directories_below_cargo_layout_are_not_protected_in_a_cargo_target() {
+        let scratch = Scratch::new("crate-named");
+        let root = cargo_target(&scratch);
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        for path in [
+            "debug/deps/tmp-0123abcd.d",
+            "debug/deps/libtemp-0123abcd.rlib",
+            "release/build/log-0123abcd/out",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_same_paths_stay_protected_without_cargo_target_markers() {
+        let scratch = Scratch::new("no-markers");
+        let root = plain_target(&scratch);
+        for path in BUILD_SCRIPT_DIRS {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        // One marker is not enough: both identify a Cargo target.
+        std::fs::write(root.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+        std::fs::remove_file(root.join("CACHEDIR.TAG")).unwrap();
+        std::fs::write(root.join(".rustc_info.json"), "{}").unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+        // A tag whose signature is not Cargo's does not count.
+        std::fs::write(root.join("CACHEDIR.TAG"), "Signature: other\n").unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("release/build/log/0123abcd")
+        ));
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_read_is_not_a_cargo_target() {
+        let scratch = Scratch::new("missing-root");
+        let missing = scratch.0.join("does-not-exist");
+        assert!(protected_entry_in(
+            &missing,
+            Path::new("release/build/log/0123abcd")
+        ));
+    }
+
+    #[test]
+    fn name_protection_keeps_applying_outside_the_layout_directories() {
+        let scratch = Scratch::new("outside-layout");
+        let root = cargo_target(&scratch);
+        for path in [
+            "logs",
+            "logs/run.txt",
+            "temp",
+            "temp/deps/x",
+            "log",
+            "tmp/build/log",
+            "tmp/log",
+            "log/build/x",
+            "release/log",
+            "release/tmp/x",
+            "release/examples/log/x",
+            "release/build/../log",
+            "release/build/node_modules/x",
+            "release/build/x/.git/config",
+            "release/build/x/.venv/bin/python",
+            "release/deps/.claude/state",
+            "release/build/x/.tmp/y",
+            "release/build/x/.cache/y",
+            "x/y/z/build/log",
+            "release",
+        ] {
+            let expected = !matches!(path, "release");
+            assert_eq!(
+                protected_entry_in(&root, Path::new(path)),
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_protections_apply_everywhere_inside_a_cargo_target() {
+        let scratch = Scratch::new("file-protections");
+        let root = cargo_target(&scratch);
+        for path in [
+            "release/build/x/out/.env",
+            "release/build/x/out/.env.local",
+            "release/build/x/out/credentials.json",
+            "release/build/x/out/service-account.json",
+            "release/build/x/out/id_rsa",
+            "release/build/x/out/id_ed25519",
+            "release/build/x/out/server.pem",
+            "release/build/x/out/server.KEY",
+            "release/build/x/out/model.safetensors",
+            "release/build/x/out/model.gguf",
+            "debug/deps/weights.pt",
+            "debug/deps/weights.pth",
+            "release/build/log/0123abcd/out/server.pem",
+            "release/build/log/0123abcd/out/.env",
+            "aarch64-apple-darwin/release/build/temp/0123abcd/out/id_rsa",
+            "release/build/x/out/pyvenv.cfg",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn empty_and_non_utf8_paths_keep_their_answer() {
+        let scratch = Scratch::new("odd-paths");
+        let root = cargo_target(&scratch);
+        assert!(protected_entry(Path::new("")));
+        assert!(protected_entry_in(&root, Path::new("")));
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(OsStr::from_bytes(b"release/build/log/\xff\xfe"));
+            assert!(protected_entry(odd));
+            assert!(protected_entry_in(&root, odd));
+        }
+    }
+
+    #[test]
+    fn a_cargo_target_is_not_widened_for_unrelated_paths() {
+        let scratch = Scratch::new("unrelated");
+        let root = cargo_target(&scratch);
+        for path in [
+            "release/build/x/out/lib.rs",
+            "debug/deps/libfoo.rlib",
+            "CACHEDIR.TAG",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn cargos_own_tmp_directory_is_not_protected_in_a_cargo_target() {
+        let scratch = Scratch::new("cargo-tmp");
+        let root = cargo_target(&scratch);
+        for path in ["tmp", "tmp/integration-0123abcd", "tmp/x/y/out.txt"] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        // The same names without markers, and without a readable root, stay protected.
+        let plain = Scratch::new("plain-tmp");
+        let bare = plain_target(&plain);
+        assert!(protected_entry_in(&bare, Path::new("tmp")));
+        assert!(protected_entry_in(&bare, Path::new("tmp/x")));
+        assert!(protected_entry_in(
+            &plain.0.join("missing"),
+            Path::new("tmp")
+        ));
+    }
+
+    #[test]
+    fn protection_resumes_below_cargos_tmp_directory() {
+        let scratch = Scratch::new("below-tmp");
+        let root = cargo_target(&scratch);
+        for path in [
+            "tmp/x/.git",
+            "tmp/x/.git/config",
+            "tmp/node_modules",
+            "tmp/.venv/bin/python",
+            "tmp/x/.env",
+            "tmp/x/server.pem",
+            "tmp/x/model.safetensors",
+            "tmp/x/id_rsa",
+            "tmp/log",
+            "tmp/x/logs/run.txt",
+            "tmp/temp",
+            "tmp/tmp",
+            "tmp/build/log",
+            "tmp/deps/tmp",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn only_tmp_is_waived_at_a_targets_top_level() {
+        let scratch = Scratch::new("top-level-names");
+        let root = cargo_target(&scratch);
+        for path in [
+            "temp",
+            "log",
+            "logs",
+            ".tmp",
+            ".cache",
+            "logs/run.txt",
+            "temp/x",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_nested_cargo_target_waives_relative_to_itself() {
+        let scratch = Scratch::new("nested");
+        let root = scratch.0.join("candidate");
+        std::fs::create_dir_all(&root).unwrap();
+        // The candidate is not itself a Cargo target; a directory inside it is.
+        let nested = root.join("llvm-cov-target");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(nested.join(".rustc_info.json"), "{}").unwrap();
+        for path in [
+            "llvm-cov-target/tmp",
+            "llvm-cov-target/tmp/x",
+            "llvm-cov-target/debug/build/log/0123abcd/out",
+            "llvm-cov-target/aarch64-apple-darwin/debug/build/log/0123abcd/out",
+            "llvm-cov-target/aarch64-apple-darwin/release/incremental/temp/s-1",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        for path in [
+            "llvm-cov-target/logs",
+            "llvm-cov-target/tmp/x/.git",
+            "llvm-cov-target/tmp/build/log",
+            "tmp",
+            "other/tmp",
+            "other/debug/build/log/0123abcd",
+            "llvm-cov-target/x/y/z/build/log",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn sideways_paths_never_open_a_waiver() {
+        let scratch = Scratch::new("sideways");
+        let root = cargo_target(&scratch);
+        for path in [
+            "tmp/../log",
+            "./tmp",
+            "tmp//x/.git",
+            "release/build/./log/x",
+            "release/build/../tmp/x",
+            "/tmp",
+            "release//build/log/x",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    /// `<dir>/<triple>/debug/.cargo-lock`, as `cargo test --target <triple>` leaves it.
+    fn triple_dir(dir: &Path, triple: &str) {
+        let profile = dir.join(triple).join("debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".cargo-lock"), "").unwrap();
+    }
+
+    #[test]
+    fn cargos_tmp_under_a_triple_directory_is_not_protected() {
+        let scratch = Scratch::new("triple-tmp");
+        let root = cargo_target(&scratch);
+        triple_dir(&root, "aarch64-apple-darwin");
+        for path in [
+            "aarch64-apple-darwin/tmp",
+            "aarch64-apple-darwin/tmp/scratch",
+            "aarch64-apple-darwin/tmp/scratch/x.txt",
+            "aarch64-apple-darwin/debug/build/log/0123abcd/out",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn protection_resumes_below_a_triple_directorys_tmp() {
+        let scratch = Scratch::new("below-triple-tmp");
+        let root = cargo_target(&scratch);
+        triple_dir(&root, "aarch64-apple-darwin");
+        for path in [
+            "aarch64-apple-darwin/tmp/x/.git",
+            "aarch64-apple-darwin/tmp/.env",
+            "aarch64-apple-darwin/tmp/node_modules",
+            "aarch64-apple-darwin/tmp/tmp",
+            "aarch64-apple-darwin/tmp/log",
+            "aarch64-apple-darwin/tmp/x/server.pem",
+            "aarch64-apple-darwin/temp",
+            "aarch64-apple-darwin/logs",
+            "aarch64-apple-darwin/.tmp",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_triple_tmp_needs_both_target_markers_and_a_profile_lock() {
+        // No profile lock under the triple directory.
+        let no_lock = Scratch::new("triple-no-lock");
+        let root = cargo_target(&no_lock);
+        std::fs::create_dir_all(root.join("aarch64-apple-darwin/debug")).unwrap();
+        std::fs::create_dir_all(root.join("aarch64-apple-darwin/tmp")).unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("aarch64-apple-darwin/tmp")
+        ));
+        assert!(protected_entry_in(
+            &root,
+            Path::new("aarch64-apple-darwin/tmp/scratch/x.txt")
+        ));
+        // A lock that is a directory, or a lock next to tmp rather than inside a profile.
+        std::fs::create_dir_all(root.join("aarch64-apple-darwin/debug/.cargo-lock")).unwrap();
+        std::fs::write(root.join("aarch64-apple-darwin/.cargo-lock"), "").unwrap();
+        assert!(protected_entry_in(
+            &root,
+            Path::new("aarch64-apple-darwin/tmp")
+        ));
+
+        // Each marker alone is not a Cargo target.
+        for missing in ["CACHEDIR.TAG", ".rustc_info.json"] {
+            let scratch = Scratch::new("triple-one-marker");
+            let root = cargo_target(&scratch);
+            std::fs::remove_file(root.join(missing)).unwrap();
+            triple_dir(&root, "aarch64-apple-darwin");
+            assert!(
+                protected_entry_in(&root, Path::new("aarch64-apple-darwin/tmp")),
+                "{missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_triple_tmp_needs_a_triple_that_is_not_a_protected_name() {
+        let scratch = Scratch::new("triple-names");
+        let root = cargo_target(&scratch);
+        for name in ["logs", ".git", "node_modules", "log", "temp", ".cache"] {
+            triple_dir(&root, name);
+            let path = format!("{name}/tmp");
+            assert!(protected_entry_in(&root, Path::new(&path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_triple_tmp_only_counts_two_levels_below_the_target() {
+        let scratch = Scratch::new("triple-depth");
+        let root = cargo_target(&scratch);
+        triple_dir(&root, "aarch64-apple-darwin");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        triple_dir(&root.join("a"), "b");
+        for path in [
+            "a/b/tmp",
+            "aarch64-apple-darwin/debug/tmp",
+            "aarch64-apple-darwin/x/tmp",
+            "aarch64-apple-darwin/tmp/x/tmp",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_nested_target_waives_a_triple_tmp_relative_to_itself() {
+        let scratch = Scratch::new("nested-triple");
+        let root = scratch.0.join("candidate");
+        let nested = root.join("llvm-cov-target");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        std::fs::write(nested.join(".rustc_info.json"), "{}").unwrap();
+        triple_dir(&nested, "aarch64-apple-darwin");
+        for path in [
+            "llvm-cov-target/aarch64-apple-darwin/tmp",
+            "llvm-cov-target/aarch64-apple-darwin/tmp/scratch/x.txt",
+        ] {
+            assert!(!protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+        for path in [
+            "aarch64-apple-darwin/tmp",
+            "llvm-cov-target/aarch64-apple-darwin/tmp/x/.git",
+            "other/aarch64-apple-darwin/tmp",
+        ] {
+            assert!(protected_entry_in(&root, Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_triple_directory_is_inspected_up_to_a_bound() {
+        let scratch = Scratch::new("triple-bound");
+        let root = cargo_target(&scratch);
+        let triple = root.join("aarch64-apple-darwin");
+        std::fs::create_dir_all(&triple).unwrap();
+        // More plain directories than the bound, none holding a lock, then one that does.
+        for i in 0..200 {
+            std::fs::create_dir_all(triple.join(format!("d{i:03}"))).unwrap();
+        }
+        std::fs::create_dir_all(triple.join("tmp")).unwrap();
+        let locked = triple.join("zz-profile");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join(".cargo-lock"), "").unwrap();
+        let answer = protected_entry_in(&root, Path::new("aarch64-apple-darwin/tmp"));
+        let early = std::fs::read_dir(&triple)
+            .unwrap()
+            .take(64)
+            .flatten()
+            .any(|e| e.file_name() == "zz-profile");
+        // Whatever order the filesystem lists, a lock past the 64th entry is not seen.
+        assert_eq!(answer, !early);
     }
 }

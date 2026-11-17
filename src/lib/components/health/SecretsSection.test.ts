@@ -50,8 +50,24 @@ describe("SecretsSection", () => {
     // Kingfisher run.
     const module = source.slice(0, source.indexOf("</script>"));
     expect(module).toContain("<script module");
-    expect(module).toContain("const inflightScans = new Map<string, Promise<SecretsReport>>()");
+    // The join itself (runtime/autoScan.ts) is shared with Health's dependency
+    // audit and unit-tested there; what is pinned here is that this section
+    // keeps it at module scope.
+    expect(module).toContain("const inflightScans = createScanJoin<SecretsReport>()");
     expect(source).toContain("inflightScans.has(path)");
+  });
+
+  it("starts an automatic scan only through the shared settle, and a click directly", () => {
+    // The wait and the freshness rule live in runtime/autoScan.ts so Health's
+    // dependency audit asks the same question. The mount effect must not call
+    // scan() itself outside the join of a scan already running.
+    expect(source).toContain("scheduleAutoScan({");
+    expect(source).toContain("stillNeeded:");
+    expect(source).toContain("onclick={() => scan(undefined, true)}");
+    const effect = source.slice(source.indexOf("$effect(() => {"), source.indexOf("function recordFailure"));
+    expect(effect.match(/scan\(path\)/g)).toHaveLength(2);
+    expect(effect.indexOf("inflightScans.has(path)")).toBeLessThan(effect.indexOf("void scan(path)"));
+    expect(effect).toContain("return () => {\n      stopPending();");
   });
 
   it("previews the findings table and keeps the cap disclosure", () => {
@@ -60,6 +76,24 @@ describe("SecretsSection", () => {
     expect(source).toContain("<ListPreviewToggle total={shownRows.length}");
     // The heading count is Kingfisher's, not the preview's.
     expect(source).toContain("total: report.findings_total");
+  });
+
+  it("names the engines and asks Kingfisher for a second opinion only on a click", () => {
+    // An automatic scan sends no `secondOpinion` argument; the Rescan click
+    // sends it, and there is no second button for the same thing.
+    expect(source).toContain(
+      'invoke<unknown>("cmd_scan_secrets", secondOpinion ? { repoPath, secondOpinion: true } : { repoPath })',
+    );
+    expect(source).toContain("onclick={() => scan(undefined, true)}");
+    expect(source).not.toContain("Deep scan with Kingfisher");
+    expect(source).not.toContain("offersDeepScan");
+    expect(source).toContain('data-testid="secrets-engine"');
+    expect(source).toContain("{engineLabel(report)}");
+    // A click never attaches itself to an automatic scan already running,
+    // which never starts Kingfisher.
+    expect(source).toContain("secondOpinion ? repoPath + SECOND_OPINION_KEY : repoPath");
+    // The automatic scan is still the primary one.
+    expect(source).toContain("run: () => void scan(path)");
   });
 
   it("is a Health section, between the GitHub alerts and the issues", () => {

@@ -69,7 +69,23 @@ describe("CommitComposer", () => {
   // a conflict disables Commit and the chord sends nothing.
   it("passes the amend choice through the staged-only commit", () => {
     // The fixture never amends.
-    expect(source).toContain("repoStore.commit(message, isAmending)");
+    expect(source).toContain("repoStore.commit(message, isAmending, allowSecrets)");
+  });
+
+  it("lets only the secret-scan refusal's own button commit past the scan", () => {
+    const branch = source.slice(
+      source.indexOf('{#if commitError?.kind === "secret_scan_blocked"}'),
+      source.indexOf('{:else if commitError?.kind === "identity_missing"}'),
+    );
+    expect(branch).toContain("Commit anyway");
+    expect(branch).toContain("handleCommit(lastAttemptQuick, true)");
+    // Every other call leaves the override at its default, false.
+    const calls = source.match(/handleCommit\([^)]*\)/g) ?? [];
+    const overriding = calls.filter((call) => /,\s*true\)$/.test(call));
+    expect(overriding).toEqual(["handleCommit(lastAttemptQuick, true)"]);
+    // It repeats the attempt the scan refused: commit-all stays commit-all.
+    expect(source).toContain("lastAttemptQuick = useQuick;");
+    expect(source).toContain("repoStore.quickCommit(message, allowSecrets)");
   });
   it("leaves an IME composition's Enter to the composition", () => {
     expect(source).toContain("isImeComposition");

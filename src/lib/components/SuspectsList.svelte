@@ -47,6 +47,7 @@
   import { formatRelativeTime, formatDate, shortHash } from "../format";
   import EmptyState from "./EmptyState.svelte";
   import SuspectsQueryBar from "./SuspectsQueryBar.svelte";
+  import MissingToolNotice from "./MissingToolNotice.svelte";
 
   const repoPath = $derived($currentRepoPath);
   // Another repository's answer is not this one's: the store drops it on a
@@ -122,9 +123,12 @@
         {@const reasonTitle = tooltipWalkIncomplete([answer.reason])}
         <!-- The clamp sits on an inner span: gp-notice's data-tone rule sets
              display:flex, which line-clamp on the notice itself would lose to. -->
-        <p class="gp-notice mx-0 mt-0 min-w-0" data-tone="warn" title={reasonTitle}>
-          <span class="min-w-0 line-clamp-3">Suspects unavailable{reasonTitle ? `: ${reasonTitle}` : ""} — not the same as no suspects.</span>
-        </p>
+        <MissingToolNotice
+          {repoPath}
+          reason={answer.reason}
+          feature="ranked suspects"
+          otherText={`Suspects unavailable${reasonTitle ? `: ${reasonTitle}` : ""} — not the same as no suspects.`}
+        />
       {:else if suspects.length === 0}
         <p class="gp-notice mx-0 mt-0 text-textSecondary">
           Nothing in the cone was touched in this window. The walk ran; it found

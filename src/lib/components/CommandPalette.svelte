@@ -18,7 +18,7 @@
   import { checkoutNameFor, highlightMatches } from "../branches/groupBranches";
   import LanguageLogo from "./LanguageLogo.svelte";
   import { scrollEdgeFade } from "../ui/scrollEdgeFade";
-  import { openSetupWizard } from "../tools/onboardingStore";
+  import MissingToolNotice from "./MissingToolNotice.svelte";
   import { buildCommands, helpCommands, repoUnavailable, worktreeUnavailable, type PaletteHostActions } from "../palette/catalog";
   import { PALETTE_MODES, PAGE_SIZE, MAX_QUERY_LENGTH, modeLandsOnRepositoryPage, parsePaletteQuery, rankItems, readFrecency, recordFrecency, actionFailure, type PaletteItem, type PaletteMode, type Frecency, type PaletteStorage } from "../palette/model";
   import { emptySearch, scheduleSearch, workspaceRoot } from "../palette/search";
@@ -312,12 +312,20 @@
 {#snippet cardBody()}
   <div class="palette-meta"><span>{mode === "commands" && !effectiveSearchText && history.size ? "Suggested & recent" : currentMode.label}</span><span id="{idp}-status" role="status" aria-live="polite">{resultSummary}</span></div>
   {#if unavailable}<div class="palette-notice" role="status">{unavailable}<button type="button" class="gp-btn" onclick={() => changeMode("repositories")}>Choose a repository</button></div>{/if}
-  {#if searchNote || historyNote}
+  {#if mode === "symbols" && searchResult.failed}
+    <!-- Only a missing CLI or index earns the Set up / Build button; a timeout
+         or a failed read keeps the note and Try again alone. -->
+    <!-- The notice prints the failure text itself (once): the install prompt
+         for a missing CLI or index, otherwise the note with Try again. -->
+    <MissingToolNotice repoPath={repoPath} reason={searchResult.note} otherText={searchNote} feature="symbol search" onBeforeSetup={async () => { closeForHandoff(); await tick(); }}>
+      {#if isRemoteSearch}<button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>{/if}
+    </MissingToolNotice>
+  {/if}
+  {#if (searchNote || historyNote) && !(mode === "symbols" && searchResult.failed)}
     <div class="palette-notice" class:palette-warning={searchResult.failed} role="status">
       <p>{searchNote ?? historyNote}</p>
       {#if isRemoteSearch}
         <button type="button" class="gp-btn" onclick={() => retrySignal += 1} disabled={searchResult.loading}>Try search again</button>
-        {#if mode === "symbols"}<button type="button" class="gp-btn" onclick={async () => { closeForHandoff(); await tick(); openSetupWizard("devmap", "explain"); }}>Set up code map</button>{/if}
       {/if}
       {#if mode === "workspace" || mode === "commits"}<button type="button" class="gp-btn" disabled={!repoPath} onclick={() => { showRepositoryPage(); repoStore.setActiveTab(mode === "workspace" ? "code" : "history", mode === "workspace" ? "map" : "graph"); close(); }}>Open {mode === "workspace" ? "Map" : "History"}</button>{/if}
     </div>

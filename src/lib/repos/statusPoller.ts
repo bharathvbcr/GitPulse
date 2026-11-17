@@ -45,6 +45,8 @@ export interface StatusPollerDeps {
   getPollRun(id: string): number | undefined;
   setPollRun(id: string, run: number): void;
   deletePollRun(id: string): void;
+  /** The poll's read is about to be applied; a snapshot read started earlier is now older than it. */
+  notePollApplied(id: string): void;
   acquireWatch(id: string, path: string, foreground: boolean): Promise<void>;
   hydrate(id: string, path: string, generation: number): Promise<void>;
   decideCadence?: (input: { baseMs: number; lagMs: number; paused: boolean }) => CadenceDecision;
@@ -204,6 +206,7 @@ export function createStatusPoller(deps: StatusPollerDeps) {
         lastDurationMs = now() - startedAt;
         if (deps.getPollRun(sessionId) !== currentRun) return;
         if (deps.snapshotRunOf(sessionId) !== snapshotRunAtStart) return;
+        deps.notePollApplied(sessionId);
         deps.applyToSession(sessionId, generation, (live) =>
           live.statusPollFailures === 0 && live.statusUnavailableSince === null
             ? {}

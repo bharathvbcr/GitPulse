@@ -164,3 +164,21 @@ describe("RungFilterControl", () => {
     expect(rung).toContain("rungHistogramLine");
   });
 });
+
+describe("BlastRadiusPanel missing-code-map notice", () => {
+  it("mounts the shared notice only for an unavailable answer", () => {
+    expect(blastSource).toContain("{#if !blast.available}");
+    expect(blastSource).toContain("<MissingToolNotice");
+  });
+
+  it("an available answer renders no notice markup", () => {
+    expect(html({ available: true })).not.toContain("missing-tool");
+  });
+
+  it("an unavailable answer keeps its headline and no install prompt before the cause is known", () => {
+    const body = html({ available: false, reason: "no graph", layers: [] });
+    expect(body).toContain("Impact couldn't be measured");
+    expect(body).not.toContain("Set up code map");
+    expect(body).not.toContain("Build index");
+  });
+});

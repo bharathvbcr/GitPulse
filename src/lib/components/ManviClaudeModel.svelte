@@ -175,7 +175,7 @@
       </div>
     {:else if accountError}
       <p class="text-danger" data-testid="manvi-claude-account-error">
-        ~/.anthropic-accounts exists but could not be read, so Manvi will not start on Claude: {accountError}
+        ~/.anthropic-accounts exists but couldn't be read, so Manvi will not start on Claude: {accountError}
       </p>
     {:else if keySaved}
       <div class="flex items-center gap-2">

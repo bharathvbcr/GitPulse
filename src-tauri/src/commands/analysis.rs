@@ -72,20 +72,52 @@ pub async fn cmd_get_file_coverage(
     off_thread(move || CoverageScanner::file_coverage(&repo_path, &file_path)).await
 }
 
-#[tauri::command(async)]
-pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, IpcError> {
-    off_thread(move || DepsScanner::scan(&repo_path)).await
+type DepsFlights =
+    crate::singleflight::SingleFlight<String, Result<DepsHealthReport, CommandError>>;
+
+/// A scan can spawn every auditor and wait on the registry, so a second panel
+/// or a re-click while one runs must join it, not start another full audit of
+/// the same repository.
+fn deps_flights() -> &'static DepsFlights {
+    static FLIGHTS: std::sync::OnceLock<DepsFlights> = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(DepsFlights::default)
 }
 
-/// On-demand Kingfisher secrets scan of the working tree.
+fn scan_deps_once<F>(
+    flights: &DepsFlights,
+    repo_path: &str,
+    scan: F,
+) -> Result<DepsHealthReport, CommandError>
+where
+    F: FnOnce() -> Result<DepsHealthReport, CommandError>,
+{
+    flights.run(repo_path.to_string(), scan)
+}
+
+#[tauri::command(async)]
+pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, IpcError> {
+    off_thread(move || scan_deps_once(deps_flights(), &repo_path, || DepsScanner::scan(&repo_path)))
+        .await
+}
+
+/// On-demand secrets scan of the working tree.
 ///
-/// Kingfisher stdout is parsed in memory and dropped — never logged. A missed
-/// or truncated scan returns `ok: false` and is never implied clean.
+/// The in-process scanner always answers. `second_opinion` (absent means
+/// false) is set by a person's Rescan click only: it then also runs
+/// Kingfisher, when installed, and merges its findings. An automatic scan
+/// starts no process. A failed Kingfisher never changes the in-process result;
+/// the report says it was unavailable and why. Kingfisher stdout is parsed in
+/// memory and dropped, never logged. A scan that skipped inputs is `partial`;
+/// no failure or gap is ever implied clean.
 #[tauri::command(async)]
 pub async fn cmd_scan_secrets(
     repo_path: String,
+    second_opinion: Option<bool>,
 ) -> Result<crate::secrets::SecretsReport, IpcError> {
-    off_thread(move || crate::secrets::scan_secrets(&repo_path)).await
+    off_thread(move || {
+        crate::secrets::scan_working_tree(&repo_path, second_opinion.unwrap_or(false))
+    })
+    .await
 }
 
 /// Full disk-usage scan of the repository (git internals, build/cache
@@ -96,6 +128,25 @@ pub async fn cmd_storage_scan(
     repo_path: String,
 ) -> Result<crate::storage::StorageReport, IpcError> {
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
+}
+
+/// Linked worktrees nobody is using, with what removing each would free.
+/// Read-only: removal is the person's click through `cmd_remove_worktree`.
+/// The idle threshold is the cleaner policy's `worktree_idle_days`, so the
+/// report and the opt-in prune scope judge staleness the same way.
+#[tauri::command(async)]
+pub async fn cmd_storage_stale_worktrees(
+    repo_path: String,
+) -> Result<crate::storage::stale_worktrees::StaleWorktreeReport, IpcError> {
+    off_thread(move || {
+        let idle_days = crate::storage::hygiene::global::service()?
+            .state()?
+            .config
+            .scopes
+            .worktree_idle_days;
+        crate::storage::stale_worktrees::stale_worktrees(&repo_path, idle_days)
+    })
+    .await
 }
 
 /// What the Storage panel's "Write commit-graph" click would run: the exact
@@ -238,3 +289,7 @@ pub async fn cmd_hygiene_execute(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "analysis_deps_flight_tests.rs"]
+mod deps_flight_tests;

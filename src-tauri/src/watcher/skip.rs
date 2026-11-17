@@ -10,6 +10,22 @@
 //! churning an ignored directory makes every poll read, exactly as before this
 //! existed, and an idle worktree skips.
 //!
+//! # The one exception: directories the stream does not cover
+//!
+//! Under the default [`super::scope::WatchScope::Narrow`] (macOS), a directory
+//! is left out of the stream entirely, so a write there moves no epoch and the
+//! poll may skip through it. That is a "cannot matter" claim, made on a
+//! narrower basis than the three that failed: git's own `check-ignore` names
+//! the directory ITSELF (not merely its contents, so nothing below it can be
+//! re-included), `ls-files` finds no tracked path under it, and it is build
+//! output or holds another checkout. It is checked again on every rules load
+//! and after every write to this checkout's index (`git add -f`). A status row
+//! under an excluded directory, or a conviction, puts the whole worktree back in
+//! the stream for the rest of that watch. What it still cannot see (a global
+//! excludes file un-ignoring the directory) is stale for at most
+//! [`KEPT_STATUS_MAX_AGE`] and then convicted, like any silent stream. Under
+//! `WatchScope::Whole` this exception does not exist.
+//!
 //! The epoch is taken BEFORE a read starts and the answer is kept under that
 //! number, so an event that lands while the read runs leaves it older than the
 //! epoch the watch reports next: a read in flight never covers an event.
@@ -303,6 +319,12 @@ impl PollSkip {
 
     pub(crate) fn epoch_now(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
+    }
+
+    /// True once the watch has been convicted (see the module comment). A
+    /// narrowed registration goes back to the whole worktree on it.
+    pub(crate) fn convicted(&self) -> bool {
+        self.lock().convicted
     }
 
     fn lock(&self) -> MutexGuard<'_, Trust> {
