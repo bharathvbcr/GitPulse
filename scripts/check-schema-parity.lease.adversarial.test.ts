@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { devmapReading, judge, rustConstant, schemasAt, summarize } from "./check-schema-parity.mjs";
 import { readCliSchema } from "./check-vendor-schema.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const C = "STACK_FORMAT_VERSION";
 const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94, lease: 2 };
@@ -118,7 +119,7 @@ if [ "$1" = "--version" ]; then ${body}; fi
     const b = await bin(`sleep 60`);
     const t = Date.now();
     expect((readCliSchema(b) as any).lease).toBeNull();
-    expect(Date.now() - t).toBeLessThan(25_000);
+    expect(Date.now() - t).toBeLessThan(wallClockBudget(25_000));
   }, 40_000);
 });
 
