@@ -781,7 +781,7 @@ mod tests {
     /// read before any tick (no snapshot behind it) already carries a tier
     /// derived from it, so a big machine is never left on `standard` while it
     /// waits for the sampler. A chosen tier is carried through as before.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_status_read_before_any_tick_already_derives_from_installed_memory() {
         use super::super::profile::ProfileBasis;

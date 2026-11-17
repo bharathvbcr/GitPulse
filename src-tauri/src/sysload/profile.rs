@@ -16,14 +16,15 @@
 //!
 //! [`derive`] is pure: installed memory, logical cores and the user's
 //! [`ProfileChoice`]. Installed memory is a fact about the machine, not a
-//! pressure sample, so [`installed_memory`] reads it directly (macOS
-//! `hw.memsize`, Linux `MemTotal`, Windows `GlobalMemoryStatusEx`) and the
-//! sampler is not involved: the tier is the same with the "Measure memory
-//! pressure" switch off, before the first tick, and on a platform that has no
-//! sensor. A memory read that fails (or returns a nonsensical zero) is not
-//! guessed from: the tier is `standard` and the basis says
-//! [`ProfileBasis::MemoryUnreadable`], so the page can tell "derived" from
-//! "could not tell".
+//! pressure sample, so it is read directly with [`super::physical_memory`],
+//! the one reader the automatic disk floors also scale with (`sysconf` page
+//! count times page size on macOS and Linux), and the sampler is not involved:
+//! the tier is the same with the "Measure memory pressure" switch off, before
+//! the first tick, and on a platform that has no sensor. A memory read that
+//! fails (or returns a nonsensical zero), and every platform that reader does
+//! not cover (Windows), is not guessed from: the tier is `standard` and the
+//! basis says [`ProfileBasis::MemoryUnreadable`], so the page can tell
+//! "derived" from "could not tell".
 //!
 //! The `roomy` budgets are the constants GitPulse shipped with before there
 //! was a profile, so a machine with more than 16 GiB behaves as it always did.
@@ -32,7 +33,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use super::sensor::Reading;
+use super::sensor::{Reading, Why};
 
 const GIB: u64 = 1 << 30;
 
@@ -164,21 +165,14 @@ pub fn derive(
     }
 }
 
-/// Installed physical memory in bytes, read from the operating system and
-/// remembered once it has been read: it does not change while GitPulse runs.
-/// A failed read is not remembered, so the next call tries again.
-pub fn installed_memory() -> Reading<u64> {
-    static INSTALLED: OnceLock<u64> = OnceLock::new();
-    if let Some(bytes) = INSTALLED.get() {
-        return Reading::Value(*bytes);
+/// [`super::physical_memory`] as a reading: `Unavailable` where it could not
+/// be read, or where there is no reader at all.
+fn memory() -> Reading<u64> {
+    match super::physical_memory() {
+        Some(bytes) => Reading::Value(bytes),
+        None if cfg!(unix) => Reading::Unavailable(Why::Failed),
+        None => Reading::Unavailable(Why::Unsupported),
     }
-    let read = super::probe::installed_memory();
-    if let Reading::Value(bytes) = read {
-        if bytes > 0 {
-            let _ = INSTALLED.set(bytes);
-        }
-    }
-    read
 }
 
 /// Logical cores this process may use, counted once.
@@ -194,12 +188,11 @@ fn logical_cores() -> Option<u16> {
 /// The profile of this machine under `choice`: [`derive`] over what the
 /// operating system says it has. Independent of the sampler.
 pub fn current(choice: ProfileChoice) -> ResourceProfile {
-    derive(installed_memory(), logical_cores(), choice)
+    derive(memory(), logical_cores(), choice)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::sensor::Why;
     use super::*;
 
     const GIB: u64 = 1 << 30;
@@ -250,15 +243,15 @@ mod tests {
 
     /// The installed-memory read is the operating system's own answer: it
     /// works with no sampler and no snapshot, and agrees with itself.
-    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[cfg(unix)]
     #[test]
     fn installed_memory_is_read_without_a_sampler() {
-        let first = installed_memory();
+        let first = memory();
         assert!(
             matches!(first, Reading::Value(bytes) if bytes >= 64 * 1024 * 1024),
             "{first:?}"
         );
-        assert_eq!(installed_memory(), first, "read once, remembered");
+        assert_eq!(memory(), first, "read once, remembered");
         let profile = current(ProfileChoice::Auto);
         assert_eq!(profile.basis, ProfileBasis::Memory);
         assert_eq!(profile.memory_bytes, first.value());

@@ -81,9 +81,8 @@ pub use procscan::{
     ScanContext, Scanner as ProcessScanner, SessionCount, SessionScan,
 };
 pub use profile::{
-    current as current_profile, derive as derive_profile, installed_memory, ProfileBasis,
-    ProfileChoice, ProfileTier, ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES,
-    STANDARD_MAX_BYTES,
+    current as current_profile, derive as derive_profile, ProfileBasis, ProfileChoice, ProfileTier,
+    ResourceBudgets, ResourceProfile, COMPACT_MAX_BYTES, STANDARD_MAX_BYTES,
 };
 pub use sampler::{
     profile, pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput,
