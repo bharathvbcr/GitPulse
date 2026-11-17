@@ -9667,12 +9667,17 @@ mod tests {
             let (_, _, spawned) = second_ask_over_unchanged_repo(&linked_path);
             assert_eq!(spawned, 0, "linked worktree");
 
-            let spelling = tempfile::TempDir::new().unwrap();
-            let link = spelling.path().join("via-link");
-            std::os::unix::fs::symlink(&main_path, &link).unwrap();
-            crate::test_support::trust_repo(&link);
-            let (_, _, spawned) = second_ask_over_unchanged_repo(&link);
-            assert_eq!(spawned, 0, "symlinked spelling of the repository");
+            // A directory symlink needs a Unix call (Windows gates it behind
+            // developer mode), so the second spelling is checked there only.
+            #[cfg(unix)]
+            {
+                let spelling = tempfile::TempDir::new().unwrap();
+                let link = spelling.path().join("via-link");
+                std::os::unix::fs::symlink(&main_path, &link).unwrap();
+                crate::test_support::trust_repo(&link);
+                let (_, _, spawned) = second_ask_over_unchanged_repo(&link);
+                assert_eq!(spawned, 0, "symlinked spelling of the repository");
+            }
         });
     }
 
