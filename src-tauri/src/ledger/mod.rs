@@ -3629,7 +3629,107 @@ fn same_event_payload(left: &LedgerEvent, right: &LedgerEvent) -> bool {
     left == right
 }
 
-fn family_source_key(anchor: &Path, source: &str) -> Result<String, LedgerError> {
+/// Keys already worked out, by anchor and source. A key is a pure function of
+/// the source's spelling and the anchor repository's object format, so it never
+/// changes while either does not; recomputing it is a `git hash-object` child,
+/// and a sibling that moved is imported again on every consolidation pass.
+const MAX_FAMILY_KEYS: usize = 4096;
+
+type FamilyKeys = Mutex<crate::lru_map::LruMap<(PathBuf, String), String>>;
+
+#[cfg(not(test))]
+fn family_keys() -> &'static FamilyKeys {
+    static KEYS: OnceLock<FamilyKeys> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(crate::lru_map::LruMap::new(MAX_FAMILY_KEYS)))
+}
+
+/// One memo per test thread, so a test that stands in for a fresh process
+/// (a hook) can empty it without taking another running test's answers away.
+#[cfg(test)]
+fn family_keys() -> &'static FamilyKeys {
+    thread_local! {
+        static KEYS: &'static FamilyKeys = Box::leak(Box::new(Mutex::new(
+            crate::lru_map::LruMap::new(MAX_FAMILY_KEYS),
+        )));
+    }
+    KEYS.with(|keys| *keys)
+}
+
+/// The key the anchor already stores for `source`, if exactly one row names it.
+///
+/// An import row's label is the source's path (behind a `legacy@<max>|` prefix
+/// for a sibling the initial pass saw), and its key is what [`family_source_key`]
+/// returned when the row was written, so the row answers the question without a
+/// process. This is what makes a hook, which lives for one invocation and has
+/// no memo to warm, spawn nothing for a sibling that was ever imported.
+///
+/// Labels are stored redacted, so a path redaction would change cannot be told
+/// from another source's label and is not looked up at all, and more than one
+/// matching row is not trusted. A miss only costs the spawn it replaces.
+fn stored_family_key(conn: &Connection, source: &str) -> Option<String> {
+    if redact::text(source) != source {
+        return None;
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT source_key FROM ledger_family_imports
+             WHERE source_label = ?1
+                OR (source_label LIKE ?2
+                    AND substr(source_label, instr(source_label, '|') + 1) = ?1)
+             LIMIT 2",
+        )
+        .ok()?;
+    let keys: Vec<String> = statement
+        .query_map(params![source, format!("{LEGACY_LABEL}%")], |row| {
+            row.get(0)
+        })
+        .ok()?
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match keys.as_slice() {
+        [key] if is_object_id(key) => Some(key.clone()),
+        _ => None,
+    }
+}
+
+fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The `ledger_family_imports` key of a sibling: the object id Git gives the
+/// source's spelling, so a key is stable for the repository's hash and cannot
+/// be mistaken for another sibling's.
+///
+/// Answered from this process's memo, then from the row the anchor already
+/// stores for the source (`stored`, asked only on a memo miss), and only for a
+/// source never seen does it spawn `git hash-object --stdin`: Git is the
+/// authority on the object format, and an id computed here would be a guess at it.
+fn family_source_key(
+    anchor: &Path,
+    source: &str,
+    stored: impl FnOnce() -> Option<String>,
+) -> Result<String, LedgerError> {
+    let memo_key = (anchor.to_path_buf(), source.to_string());
+    let remembered = family_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&memo_key)
+        .cloned();
+    if let Some(key) = remembered {
+        return Ok(key);
+    }
+    let key = match stored() {
+        Some(key) => key,
+        None => hash_family_source(anchor, source)?,
+    };
+    family_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(memo_key, key.clone());
+    Ok(key)
+}
+
+fn hash_family_source(anchor: &Path, source: &str) -> Result<String, LedgerError> {
     let output = crate::engine::git_cli::git_with_stdin(
         anchor,
         &["hash-object", "--stdin"],
@@ -3645,7 +3745,7 @@ fn family_source_key(anchor: &Path, source: &str) -> Result<String, LedgerError>
         )
     })?;
     let key = String::from_utf8_lossy(&output).trim().to_string();
-    if !matches!(key.len(), 40 | 64) || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_object_id(&key) {
         return Err(LedgerError::new(
             "legacy_source_key_failed",
             "git hash-object returned an invalid object id",
@@ -3959,7 +4059,11 @@ fn import_source(
     let mut demoted_total = 0usize;
     {
         let source_name = source.to_string_lossy().into_owned();
-        let source_key = family_source_key(anchor_path, &source_name)?;
+        let source_key = family_source_key(anchor_path, &source_name, || {
+            with_conn(anchor, |conn| Ok(stored_family_key(conn, &source_name)))
+                .ok()
+                .flatten()
+        })?;
         let stored = family_import_state(anchor, &source_key)?;
         let mut cursor = stored.as_ref().map_or(0, |(cursor, _)| *cursor);
         #[cfg(test)]
@@ -4596,7 +4700,9 @@ pub(crate) fn unconsolidated_legacy_ledger(
         }
         let (stored, epoch) = match anchor_imports.as_ref().and_then(Option::as_ref) {
             Some((conn, epoch)) => {
-                let key = family_source_key(&anchor_path, &source.to_string_lossy())?;
+                let name = source.to_string_lossy();
+                let key =
+                    family_source_key(&anchor_path, &name, || stored_family_key(conn, &name))?;
                 let stored = conn
                     .query_row(
                         "SELECT source_cursor, source_label FROM ledger_family_imports
@@ -6236,6 +6342,26 @@ mod schema_bump_adv_tests;
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    /// The key Git itself gives `source`, with no memo and no stored row.
+    pub fn hashed_key(anchor: &std::path::Path, source: &str) -> String {
+        super::hash_family_source(anchor, source).expect("git hash-object")
+    }
+
+    /// The key the anchor's import rows hold for `source`, if one does.
+    pub fn stored_key(anchor: &str, source: &str) -> Option<String> {
+        super::with_conn(anchor, |conn| Ok(super::stored_family_key(conn, source)))
+            .expect("anchor ledger")
+    }
+
+    /// Forgets every sibling key this thread has worked out, as a new process
+    /// (an agent hook) starts without any.
+    pub fn forget_family_keys() {
+        super::family_keys()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Drops `repo_path`'s cached connection, as a process restart would for
     /// that repository.
     ///
