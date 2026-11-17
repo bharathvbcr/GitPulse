@@ -47,8 +47,21 @@ describe("agent models", () => {
   });
 
   it("stores the CLI's own choice as absence and carries every other default through", () => {
-    expect(row).toContain("saveAgentDefaults(withModelChoice(view.defaults, launcher, next))");
+    expect(row).toContain("saveAgentDefaults(withModelChoice(view.defaults, launcher, next, slot))");
     expect(row).toContain('text === "" ? undefined');
+  });
+
+  it("offers the commit model beside the main one, through the same controls and the same save", () => {
+    expect(markup).toContain('{@render fieldGrid(row, "models")}');
+    expect(markup).toContain('{@render fieldGrid(row, "commit_models")}');
+    // One grid for both slots: a second copy of the controls could drift.
+    expect(markup.match(/<input\b/g)?.length).toBe(1);
+    expect(row).toContain("agent-commit-model");
+    // "Same as above" only while the commit entry is wholly empty: once any
+    // field is set the entry replaces the main one, so the rest are CLI defaults.
+    expect(markup).toContain('slot === "commit_models" && Object.keys(choice).length === 0');
+    expect(markup).toContain('{inherits ? "Same as above" : "CLI default"}');
+    expect(row).not.toContain("invoke(");
   });
 
   it("checks a value before saving it and restores the field when a save is refused", () => {

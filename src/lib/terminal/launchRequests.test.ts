@@ -200,3 +200,19 @@ it("validates fork resume options fail-closed and delivers resume and custom nam
   claimed?.complete();
   await expect(pending).resolves.toBeUndefined();
 });
+
+it("carries a commit purpose to the panel and leaves an ordinary launch without one", async () => {
+  const requests = createTerminalLaunchRequests();
+  const commit = requests.request("/repo", "claude", "Commit", undefined, { purpose: "commit" });
+  const claimed = requests.take("/repo");
+  expect(claimed?.purpose).toBe("commit");
+  claimed?.complete();
+  await commit;
+
+  const plain = requests.request("/repo", "claude", "Hello");
+  const plainClaimed = requests.take("/repo");
+  expect(plainClaimed).not.toBeNull();
+  expect("purpose" in (plainClaimed ?? {})).toBe(false);
+  plainClaimed?.complete();
+  await plain;
+});

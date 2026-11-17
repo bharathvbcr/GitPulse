@@ -19,6 +19,13 @@ export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" |
 /** The one text a canceled terminal start carries, so a caller that passes it on and a test that checks it cannot drift. */
 export const TERMINAL_SESSION_CANCELED = "Terminal session canceled";
 
+/**
+ * What a terminal launch is for, when that changes the model it starts on
+ * (`purpose` of `cmd_terminal_spawn`, judged by the backend). Only a commit
+ * today; it selects the model and nothing else.
+ */
+export type LaunchPurpose = "commit";
+
 export const PROMPT_LAUNCHERS: readonly PromptLauncher[] = ["claude", "codex", "grok", "agy"];
 
 export function isPromptLauncher(value: unknown): value is PromptLauncher {
@@ -84,6 +91,8 @@ interface LaunchRequest {
   resume?: ResumeLaunch;
   /** Optional custom tab label when opening this requested session. */
   name?: string;
+  /** What the launch is for; selects the model it starts on and nothing else. */
+  purpose?: LaunchPurpose;
   complete(error?: string): void;
 }
 
@@ -148,7 +157,7 @@ export function createTerminalLaunchRequests() {
       launcher: SessionKind,
       prompt?: string,
       signal?: AbortSignal,
-      options?: { autoWake?: boolean; resume?: ResumeLaunch; name?: string },
+      options?: { autoWake?: boolean; resume?: ResumeLaunch; name?: string; purpose?: LaunchPurpose },
     ): Promise<void> {
       // Validates here, at the boundary, so a bad prompt is refused before a
       // panel is asked to open a tab for it. A promptless launch returns null
@@ -175,6 +184,7 @@ export function createTerminalLaunchRequests() {
           ...(options?.autoWake ? { autoWake: true } : {}),
           ...(options?.resume ? { resume: { ...options.resume } } : {}),
           ...(trimmedName ? { name: trimmedName } : {}),
+          ...(options?.purpose ? { purpose: options.purpose } : {}),
         },
         signal,
       );

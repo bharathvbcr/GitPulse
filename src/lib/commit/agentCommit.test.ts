@@ -179,7 +179,8 @@ describe("agentCommit", () => {
       expect(res.ok).toBe(true);
       expect(res.notice).toContain("Antigravity session opened in terminal");
       expect(openTerminal).toHaveBeenCalledWith(true);
-      expect(requestSpy).toHaveBeenCalledWith("/repo", "agy", "Commit prompt", undefined);
+      // `purpose: "commit"` is what lets the backend start the commit model.
+      expect(requestSpy).toHaveBeenCalledWith("/repo", "agy", "Commit prompt", undefined, { purpose: "commit" });
 
       requestSpy.mockRestore();
     });
