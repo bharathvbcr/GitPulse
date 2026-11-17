@@ -199,6 +199,7 @@ export function procViewFixture(rates: [Reading<number>, Reading<number>, Readin
     tree,
     run_id: null,
     parent_pid: null,
+    cpu_rate: value(0),
     footprint: value(600 << 20),
     write_rate: rate,
     members: 3,
