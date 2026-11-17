@@ -1744,23 +1744,34 @@ describe("repoStore branch stats", () => {
     expect(state.statsPending).toBe(false);
   });
 
-  it("discards a stats response that lands after the session generation moved on", async () => {
-    const stats = deferred<unknown>();
-    const invoke = makeInvoke({ cmd_branch_stats: async () => stats.promise as never });
+  it("discards a stats response that lands after the session generation moved on, then asks again for the live one", async () => {
+    const stale = deferred<unknown>();
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async (_cmd, args) => {
+        if (args?.repoPath !== "/r/race-a") return statsFor(String(args?.repoPath)) as never;
+        calls += 1;
+        return (calls === 1 ? stale.promise : statsFor("/r/race-a")) as never;
+      },
+    });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-a");
     expect(get(store).statsPending).toBe(true);
 
     await store.openRepo("/r/race-b");
     await store.activateTab(get(store).openTabs[0].id);
-    stats.resolve(statsFor("/r/race-a"));
-    await flushMicro();
+    const staleReport = statsFor("/r/race-a");
+    staleReport.updates[0].additions = 99;
+    stale.resolve(staleReport);
+    await vi.waitFor(() => expect(get(store).statsPending).toBe(false));
 
     const state = get(store);
     expect(state.currentPath).toBe("/r/race-a");
-    expect(state.branches[0].additions).toBe(0);
-    expect(state.branches[0].compared_to).toBeUndefined();
-    expect(state.statsPending).toBe(false);
+    // The response that landed late was dropped; the numbers are the live generation's own.
+    expect(state.branches[0].additions).toBe(10);
+    expect(state.branches[0].compared_to).toBe("/r/race-a-main");
+    // One drain for the old generation, one hand-over to the live one; no duplicate.
+    expect(calls).toBe(2);
   });
 
   it("runs one stats fetch while refreshes race and merges once it settles", async () => {
@@ -2025,23 +2036,29 @@ describe("repoStore branch stats", () => {
   });
 
   it("does not mark the active session statsFailed when an orphaned fetch aborts on generation", async () => {
-    const stats = deferred<unknown>();
-    const invoke = makeInvoke({ cmd_branch_stats: async () => stats.promise as never });
+    const aborted = deferred<unknown>();
+    let calls = 0;
+    const invoke = makeInvoke({
+      cmd_branch_stats: async () => {
+        calls += 1;
+        return (calls === 1 ? aborted.promise : statsFor("/r/race-fail")) as never;
+      },
+    });
     const { store } = makeStore(invoke);
     await store.openRepo("/r/race-fail");
     expect(get(store).statsPending).toBe(true);
 
     await store.openRepo("/r/race-other");
     await store.activateTab(get(store).openTabs[0].id);
-    stats.reject(new Error("aborted"));
-    await flushMicro();
+    aborted.reject(new Error("aborted"));
+    await vi.waitFor(() => expect(get(store).statsPending).toBe(false));
 
     const state = get(store);
     expect(state.currentPath).toBe("/r/race-fail");
-    expect(state.statsPending).toBe(false);
-    // The abort is not a failure of THIS session's data; nothing was lost.
+    // The abort is not a failure of THIS session's data; the live generation drained on its own.
     expect(state.statsFailed).toBe(false);
     expect(state.error).toBeNull();
+    expect(state.branches[0].compared_to).toBe("/r/race-fail-main");
   });
 });
 
