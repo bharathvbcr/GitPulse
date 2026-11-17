@@ -94,6 +94,7 @@
   import HostLoadSetting from "./HostLoadSetting.svelte";
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
   import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
+  import WatchScopeSetting from "./WatchScopeSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -1227,6 +1228,11 @@
                   </div>
                   <div data-setting="host-load-disk-coverage" hidden={!shown("host-load-disk-coverage")}>
                     <HostLoadDiskGuardSetting guard="coverage" active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["watch-scope"])}>
+                  <div data-setting="watch-scope" hidden={!shown("watch-scope")}>
+                    <WatchScopeSetting />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["mcp-plugin"])}>
