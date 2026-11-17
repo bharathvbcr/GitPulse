@@ -93,10 +93,11 @@ pub struct ProvenanceFreshness {
     /// the base is *measured* (how far the base moved since they forked) and
     /// reports a number, not `None`.
     pub distance: Option<u32>,
-    /// How much a recorded verification still counts: it decays with
-    /// `distance`. `None` when there is no verification to decay (`verified`
-    /// is false: a commit nobody verified is not confident, however fresh)
-    /// and when the distance could not be measured. Owner decision 5.
+    /// How much a recorded pass still counts: it decays with `distance`.
+    /// `None` whenever `verified` is false (no note, or a note recording a
+    /// failure, a narrowed run or an unrecognised verdict: none of those is
+    /// confident, however fresh) and when the distance could not be measured.
+    /// Owner decision 5.
     pub confidence: Option<f32>,
     /// True only when the distance was measured *and* is zero. As `distance`,
     /// it does not mean the commit is on the base: a commit ahead of the base
@@ -411,7 +412,7 @@ fn decayed_confidence(
     verification: Option<&VerificationNote>,
     distance: Option<u32>,
 ) -> Option<f32> {
-    if !verification.is_some_and(VerificationNote::passed_in_full) {
+    if !passed_verification(verification) {
         return None;
     }
     distance.map(|d| 1.0 / (1.0 + 0.1 * d as f32))
