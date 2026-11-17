@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   filterStaleBranches,
   formatBackupTimestamp,
+  cleanedToast,
   formatBranchAge,
   preselectMerged,
   severityBadge,
@@ -9,9 +10,11 @@ import {
 import type { StaleBranchInfo } from "./types";
 
 function sampleBranch(overrides: Partial<StaleBranchInfo> = {}): StaleBranchInfo {
-  return {
+  const branch: StaleBranchInfo = {
     name: "feature/auth",
+    full_ref: "",
     short_name: "feature/auth",
+    remote_name: null,
     age_days: 45,
     severity: "moderate",
     is_merged: false,
@@ -27,6 +30,10 @@ function sampleBranch(overrides: Partial<StaleBranchInfo> = {}): StaleBranchInfo
     last_summary: "Add auth login flow",
     ...overrides,
   };
+  if (!overrides.full_ref) {
+    branch.full_ref = `${branch.is_remote ? "refs/remotes/" : "refs/heads/"}${branch.name}`;
+  }
+  return branch;
 }
 
 describe("deadbranch pre-selection", () => {
@@ -44,7 +51,34 @@ describe("deadbranch pre-selection", () => {
 
     expect(
       [...preselectMerged([merged, squashed, goneAhead, protectedBranch, inUse])].sort(),
-    ).toEqual(["gone-squash", "merged"]);
+    ).toEqual(["refs/heads/gone-squash", "refs/heads/merged"]);
+  });
+
+  it("keys a local branch and a same-named remote branch apart, by full ref", () => {
+    const local = sampleBranch({ name: "feature", is_merged: true });
+    const remote = sampleBranch({
+      name: "origin/feature",
+      short_name: "feature",
+      remote_name: "origin",
+      is_remote: true,
+      is_merged: true,
+    });
+    expect([...preselectMerged([local, remote])]).toEqual([
+      "refs/heads/feature",
+      "refs/remotes/origin/feature",
+    ]);
+    // Selecting only the local row sends exactly the local ref.
+    expect([...preselectMerged([local, { ...remote, is_merged: false }])]).toEqual([
+      "refs/heads/feature",
+    ]);
+  });
+});
+
+describe("deadbranch clean toast", () => {
+  it("counts what was deleted against what was selected", () => {
+    expect(cleanedToast(1, 1)).toBe("Cleaned 1 branch.");
+    expect(cleanedToast(3, 3)).toBe("Cleaned 3 branches.");
+    expect(cleanedToast(2, 5)).toBe("Cleaned 2 of 5 selected branches.");
   });
 });
 

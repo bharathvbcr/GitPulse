@@ -35,7 +35,11 @@ export type DeadbranchSeverity = "fresh" | "moderate" | "stale";
 
 export interface StaleBranchInfo {
   name: string;
+  /** `refs/heads/x` or `refs/remotes/<remote>/x`: how a cleanup names this branch. */
+  full_ref: string;
   short_name: string;
+  /** The remote a remote-tracking branch belongs to; null for a local branch. */
+  remote_name: string | null;
   age_days: number;
   severity: DeadbranchSeverity;
   is_merged: boolean;

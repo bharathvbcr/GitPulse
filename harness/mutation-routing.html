@@ -33,7 +33,7 @@ const releaseAll = (cmd, value) => { const parked = held[cmd] ?? []; delete held
 const failNext = {};
 const locked = new Set();
 const parkIfHeld = async cmd => { if (held[cmd]) await new Promise(resolve => held[cmd].push(resolve)); };
-const branchOf = name => ({ name, short_name: name, age_days: 90, severity: "stale", is_merged: true, merged_by_tree: false, is_remote: false, is_protected: false, is_wip: false, is_current_or_worktree: false, last_commit_sha: "a".repeat(40), last_commit_timestamp: 0, last_author: "Ada", last_summary: "old work" });
+const branchOf = name => ({ name, full_ref: `refs/heads/${name}`, short_name: name, remote_name: null, age_days: 90, severity: "stale", is_merged: true, merged_by_tree: false, is_remote: false, is_protected: false, is_wip: false, is_current_or_worktree: false, last_commit_sha: "a".repeat(40), last_commit_timestamp: 0, last_author: "Ada", last_summary: "old work" });
 const scanFor = repo => ({ default_branch: "main", branches: [branchOf(repo === A ? "stale/from-a" : "stale/from-b")], total_scanned: 1, stale_count: 1, merged_count: 1, squash_merged_count: 0, warnings: [] });
 const backupsFor = repo => [{ filename: `${repo === A ? "a" : "b"}.json`, path: `${repo}/.backup/1.json`, timestamp: 1700000000, branch_count: 1, repo_name: repo }];
 const guarded = output => ({ policy: null, output });
