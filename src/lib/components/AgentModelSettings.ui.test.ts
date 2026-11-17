@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { SETTINGS_CATALOG } from "../ui/settingsCatalog";
+import { listedModel, type AgentModelCatalog, type CatalogState } from "../terminal/agentModelCatalog";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const row = readFileSync(join(here, "AgentModelSettings.svelte"), "utf8");
@@ -84,8 +85,28 @@ describe("agent models", () => {
   });
 
   it("warns about a stored model the listing does not know, and only from a successful listing", () => {
-    expect(markup).toContain("{#if listed && known === false}");
-    expect(markup).toContain("listedModel(catalogs[row.kind], choice.model)");
+    expect(markup).toContain('view.modelListing[launcher] === "listed" && listedModel(catalogs[launcher], model) === false');
+  });
+
+  it("warns about an unlisted commit model too, from the same check as the main one", () => {
+    // One snippet, rendered for both slots, reading each slot's own stored model.
+    expect(markup).toContain("{@const model = modelChoiceOf(view.defaults, launcher, slot).model}");
+    expect(markup).toContain('{@render unlistedWarning(row.kind, "models")}');
+    expect(markup).toContain('{@render unlistedWarning(row.kind, "commit_models")}');
+    expect(markup).toContain("agent-commit-models-${launcher}-unlisted");
+    expect(markup).toContain("agent-models-${launcher}-unlisted");
+    expect(markup).toContain('The commit model "{model}" is not in the list');
+    expect(markup.match(/is not in the list your account returned/g)?.length).toBe(2);
+  });
+
+  it("decides unlisted per model: a listed slug is not warned about, an unlisted one is", () => {
+    const catalog: AgentModelCatalog = {
+      launcher: "agy", models: [{ id: "gemini-4-hydrogen", label: null }], listing: "listed", command: "agy models",
+      cached: false, fetched_at: 1, skipped: 0, truncated: false, error: null,
+    } as unknown as AgentModelCatalog;
+    const state = { status: "ready", catalog } as unknown as CatalogState;
+    expect(listedModel(state, "gemini-4-hydrogen")).toBe(true);
+    expect(listedModel(state, "gemini-4-carbon")).toBe(false);
   });
 
   it("says what it cannot check and what it does not reach", () => {

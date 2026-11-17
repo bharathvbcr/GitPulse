@@ -191,6 +191,19 @@
 </script>
 
 <!-- One launcher's model controls for one slot: the main model, or the one a commit launch uses. -->
+<!-- The warning for a stored model the account's listing does not know, for the main slot or the commit one. -->
+{#snippet unlistedWarning(launcher: LauncherKind, slot: ModelSlot)}
+  {@const model = modelChoiceOf(view.defaults, launcher, slot).model}
+  {#if view.modelListing[launcher] === "listed" && listedModel(catalogs[launcher], model) === false}
+    <div class="flex items-start gap-1.5 text-warn text-micro" data-testid={slot === "models" ? `agent-models-${launcher}-unlisted` : `agent-commit-models-${launcher}-unlisted`}>
+      <AlertTriangle size={12} class="shrink-0 mt-px" />
+      <span>
+        {#if slot === "models"}"{model}" is not in the list your account returned. Antigravity would start with its default model instead.{:else}The commit model "{model}" is not in the list your account returned. Antigravity would start commits with its default model instead.{/if}
+      </span>
+    </div>
+  {/if}
+{/snippet}
+
 {#snippet fieldGrid(row: { kind: LauncherKind; fields: readonly ModelField[] }, slot: ModelSlot)}
   {@const choice = modelChoiceOf(view.defaults, row.kind, slot)}
   {@const prefix = slot === "models" ? "agent-model" : "agent-commit-model"}
@@ -253,7 +266,6 @@
   {:else}
     <div class="mt-1.5 flex flex-col gap-2.5" data-testid="agent-models">
       {#each rows as row (row.kind)}
-        {@const choice = modelChoiceOf(view.defaults, row.kind)}
         <div class="flex flex-col gap-1" data-testid={`agent-models-${row.kind}`}>
           <span class="text-meta text-textPrimary font-medium">{row.label}</span>
           {@render fieldGrid(row, "models")}
@@ -262,7 +274,6 @@
           {#if view.modelListing[row.kind]}
             {@const status = catalogStatus(row.kind)}
             {@const listed = view.modelListing[row.kind] === "listed"}
-            {@const known = listedModel(catalogs[row.kind], choice.model)}
             <div class="flex items-start gap-2 text-micro">
               {#if status}
                 <span class={status.problem ? "text-warn" : "text-textMuted"} data-testid={`agent-models-${row.kind}-catalog`}>{status.text}</span>
@@ -279,12 +290,8 @@
                 </button>
               {/if}
             </div>
-            {#if listed && known === false}
-              <div class="flex items-start gap-1.5 text-warn text-micro" data-testid={`agent-models-${row.kind}-unlisted`}>
-                <AlertTriangle size={12} class="shrink-0 mt-px" />
-                <span>"{choice.model}" is not in the list your account returned. Antigravity would start with its default model instead.</span>
-              </div>
-            {/if}
+            {@render unlistedWarning(row.kind, "models")}
+            {@render unlistedWarning(row.kind, "commit_models")}
           {/if}
           {#if errors[row.kind]}
             <div class="flex items-start gap-1.5 text-warn text-micro">
