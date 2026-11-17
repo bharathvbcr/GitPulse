@@ -67,6 +67,17 @@ const calmPulse: HostLoadPulse["governor"] = {
   largest_foreign: null,
 };
 
+/**
+ * The latest settings save. A save also rereads the status (the profile is part
+ * of it), so the save is not always the last call made.
+ */
+function lastSave(): unknown[] | undefined {
+  return vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "cmd_host_load_settings_save")
+    .at(-1);
+}
+
 function status(over: Partial<HostLoadStatus> = {}): HostLoadStatus {
   return {
     platform: "governed",
@@ -196,9 +207,9 @@ describe("hostLoadStore", () => {
     // A toggle elsewhere carries only its own change: the swap edit survives.
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
     await updateHostLoadSettings({ govern_launches: false });
-    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+    expect(lastSave()).toEqual(["cmd_host_load_settings_save", {
       settings: { enabled: true, govern_launches: false, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap }, profile: "auto" },
-    });
+    }]);
     expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
   });
 
@@ -209,9 +220,9 @@ describe("hostLoadStore", () => {
     await ensureHostLoadSettings();
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
     await updateHostLoadSettings({ hook_mode: "advise" });
-    expect(invoke).toHaveBeenLastCalledWith("cmd_host_load_settings_save", {
+    expect(lastSave()).toEqual(["cmd_host_load_settings_save", {
       settings: { ...first, hook_mode: "advise" },
-    });
+    }]);
     expect(get(hostLoadSettings)?.hook_mode).toBe("advise");
   });
 
