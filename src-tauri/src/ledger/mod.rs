@@ -31,6 +31,7 @@
 mod anchor;
 pub mod attribution;
 pub mod bindings;
+mod blob_id;
 mod cap;
 mod consolidated;
 pub mod freshness;
@@ -3692,6 +3693,38 @@ fn stored_family_key(conn: &Connection, source: &str) -> Option<String> {
     }
 }
 
+/// The key this process already worked out for `source`, without asking anyone.
+fn remembered_family_key(anchor: &Path, source: &str) -> Option<String> {
+    family_keys()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(anchor.to_path_buf(), source.to_string()))
+        .cloned()
+}
+
+/// A sibling's import row found by its path alone, for a read-only lookup that
+/// may start no process: the row is looked up under both names the path can
+/// have, its blob id in a SHA-1 and in a SHA-256 repository (see [`blob_id`]).
+///
+/// This names nothing: no key is chosen or stored here, so it is not the guess
+/// [`family_source_key`] refuses to make when it writes a row. The two lengths
+/// differ, and only the anchor's own format was ever written, so at most one
+/// name matches; were both to, the lower cursor answers, which can only make the
+/// caller see more unimported rows and refuse more.
+fn family_import_row_by_path(
+    conn: &Connection,
+    source: &str,
+) -> rusqlite::Result<Option<(i64, String)>> {
+    let ids = blob_id::BlobIds::of(source.as_bytes());
+    conn.query_row(
+        "SELECT source_cursor, source_label FROM ledger_family_imports
+         WHERE source_key IN (?1, ?2) ORDER BY source_cursor ASC LIMIT 1",
+        params![ids.sha1, ids.sha256],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+}
+
 fn is_object_id(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -3709,15 +3742,10 @@ fn family_source_key(
     source: &str,
     stored: impl FnOnce() -> Option<String>,
 ) -> Result<String, LedgerError> {
-    let memo_key = (anchor.to_path_buf(), source.to_string());
-    let remembered = family_keys()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&memo_key)
-        .cloned();
-    if let Some(key) = remembered {
+    if let Some(key) = remembered_family_key(anchor, source) {
         return Ok(key);
     }
+    let memo_key = (anchor.to_path_buf(), source.to_string());
     let key = match stored() {
         Some(key) => key,
         None => hash_family_source(anchor, source)?,
@@ -4700,18 +4728,28 @@ pub(crate) fn unconsolidated_legacy_ledger(
         }
         let (stored, epoch) = match anchor_imports.as_ref().and_then(Option::as_ref) {
             Some((conn, epoch)) => {
+                // A hook asks this on every tool call, so it starts no process:
+                // a key this process or the anchor already holds names the row,
+                // and otherwise the row is found by the path's blob ids. Only
+                // consolidation, which writes rows, asks Git for a key.
                 let name = source.to_string_lossy();
-                let key =
-                    family_source_key(&anchor_path, &name, || stored_family_key(conn, &name))?;
-                let stored = conn
-                    .query_row(
-                        "SELECT source_cursor, source_label FROM ledger_family_imports
-                         WHERE source_key = ?1",
-                        params![key],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?;
+                let marker_failed = |error: rusqlite::Error| {
+                    LedgerError::new("legacy_marker_failed", error.to_string())
+                };
+                let stored = match remembered_family_key(&anchor_path, &name)
+                    .or_else(|| stored_family_key(conn, &name))
+                {
+                    Some(key) => conn
+                        .query_row(
+                            "SELECT source_cursor, source_label FROM ledger_family_imports
+                             WHERE source_key = ?1",
+                            params![key],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(marker_failed)?,
+                    None => family_import_row_by_path(conn, &name).map_err(marker_failed)?,
+                };
                 (stored, *epoch)
             }
             None => (None, FamilyEpoch::Initial),
@@ -6351,6 +6389,16 @@ pub(crate) mod tests_support {
     pub fn stored_key(anchor: &str, source: &str) -> Option<String> {
         super::with_conn(anchor, |conn| Ok(super::stored_family_key(conn, source)))
             .expect("anchor ledger")
+    }
+
+    /// The import row the read-only lookup finds for `source` by its path's blob
+    /// ids alone, with no key from Git, the memo or a stored label.
+    pub fn row_by_path(anchor: &str, source: &str) -> Option<(i64, String)> {
+        super::with_conn(anchor, |conn| {
+            super::family_import_row_by_path(conn, source)
+                .map_err(|error| super::LedgerError::new("query_failed", error.to_string()))
+        })
+        .expect("anchor ledger")
     }
 
     /// Forgets every sibling key this thread has worked out, as a new process
