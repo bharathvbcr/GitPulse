@@ -72,9 +72,32 @@ pub async fn cmd_get_file_coverage(
     off_thread(move || CoverageScanner::file_coverage(&repo_path, &file_path)).await
 }
 
+type DepsFlights =
+    crate::singleflight::SingleFlight<String, Result<DepsHealthReport, CommandError>>;
+
+/// A scan can spawn every auditor and wait on the registry, so a second panel
+/// or a re-click while one runs must join it, not start another full audit of
+/// the same repository.
+fn deps_flights() -> &'static DepsFlights {
+    static FLIGHTS: std::sync::OnceLock<DepsFlights> = std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(DepsFlights::default)
+}
+
+fn scan_deps_once<F>(
+    flights: &DepsFlights,
+    repo_path: &str,
+    scan: F,
+) -> Result<DepsHealthReport, CommandError>
+where
+    F: FnOnce() -> Result<DepsHealthReport, CommandError>,
+{
+    flights.run(repo_path.to_string(), scan)
+}
+
 #[tauri::command(async)]
 pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, IpcError> {
-    off_thread(move || DepsScanner::scan(&repo_path)).await
+    off_thread(move || scan_deps_once(deps_flights(), &repo_path, || DepsScanner::scan(&repo_path)))
+        .await
 }
 
 /// On-demand Kingfisher secrets scan of the working tree.
@@ -257,3 +280,7 @@ pub async fn cmd_hygiene_execute(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "analysis_deps_flight_tests.rs"]
+mod deps_flight_tests;
