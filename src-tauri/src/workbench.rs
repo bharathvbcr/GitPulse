@@ -199,6 +199,14 @@ impl WorkbenchState {
     /// server, a shell sitting in the directory has no row, and with no
     /// workbench profile there are no rows to read. A process table that
     /// cannot be read refuses: it is not "nobody is there".
+    ///
+    /// The MCP teardowns (`gitpulse_worktree_prune`, the merge teardown) ask
+    /// the same process scan, `procscan::processes_using`, through
+    /// `engine::worktree::live_process_refusal`, and additionally refuse a lane
+    /// claim and an attributed live session (`engine::worktree::agent_hold`).
+    /// This path does not: the person's remove dialog is the confirmation an
+    /// MCP call has no channel for, and a stale claim must not make the app
+    /// unable to remove a worktree.
     pub(crate) fn refuse_if_in_use(&self, worktree_path: &str) -> Result<(), String> {
         self.refuse_if_run_working_in(worktree_path)?;
         let target = std::path::Path::new(worktree_path);
