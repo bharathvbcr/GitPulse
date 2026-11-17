@@ -90,9 +90,11 @@ pub(super) fn merge_second_opinion(primary: &mut SecretsReport, second: SecretsR
             added += 1;
         }
     }
-    // Rows Kingfisher counted but this report could not list (its own cap)
-    // cannot be matched against the primary's; they are counted as additions,
-    // so the total is an upper bound and the list is marked as cut.
+    // Rows that were counted but cannot be listed, on either side, cannot be
+    // matched: Kingfisher rows past its own cap, and Kingfisher rows that
+    // match a primary hit past the in-process cap (`findings_truncated` was
+    // already set), are counted as additions. Either way the union total is an
+    // upper bound, never below the rows listed, and the list is marked cut.
     let unlisted = (second.findings_total as usize).saturating_sub(listed);
     let unlisted = u32::try_from(unlisted).unwrap_or(u32::MAX);
     primary.findings.sort_by(|a, b| {
@@ -102,6 +104,7 @@ pub(super) fn merge_second_opinion(primary: &mut SecretsReport, second: SecretsR
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.rule_id.cmp(&b.rule_id))
     });
+    let dropped = primary.findings.len() > MAX_FINDINGS;
     primary.findings.truncate(MAX_FINDINGS);
     primary.findings_total = primary
         .findings_total
@@ -110,7 +113,7 @@ pub(super) fn merge_second_opinion(primary: &mut SecretsReport, second: SecretsR
     primary.findings_unreadable = primary
         .findings_unreadable
         .saturating_add(second.findings_unreadable);
-    primary.findings_truncated |= second.findings_truncated || unlisted > 0;
+    primary.findings_truncated |= second.findings_truncated || unlisted > 0 || dropped;
     if added > 0 {
         primary.git_status_known &= second.git_status_known;
     }
@@ -217,7 +220,9 @@ fn report_from_worktree(
         findings,
         findings_total: u32::try_from(tally.hits_total).unwrap_or(u32::MAX),
         findings_unreadable: 0,
-        findings_truncated: false,
+        // The tally counts every hit and keeps only the first
+        // `MAX_REPORTED_HITS` rows.
+        findings_truncated: tally.hits_total > tally.hits.len() as u64,
         git_status_known: true,
         max_file_size_mb: u32::try_from(limits.file_bytes / (1024 * 1024)).unwrap_or(u32::MAX),
         scanned_at_ms: now_ms(),

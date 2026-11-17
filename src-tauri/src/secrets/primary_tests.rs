@@ -4,9 +4,11 @@
 
 use super::primary::{merge_second_opinion, scan_primary, scan_working_tree_with};
 use super::run::failed_report;
-use super::{ScanCompleteness, SecondOpinion, SecretLocation};
+use super::{
+    ScanCompleteness, SecondOpinion, SecretFinding, SecretLocation, SecretsReport, MAX_FINDINGS,
+};
 use crate::leak_scan::worktree::WorktreeLimits;
-use crate::leak_scan::ENGINE;
+use crate::leak_scan::{ENGINE, MAX_REPORTED_HITS};
 use crate::test_support::{git_in, git_repo, write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -298,4 +300,146 @@ fn a_scan_that_left_a_nested_repository_unread_is_partial_and_names_it() {
         ScanCompleteness::Partial,
         "a scan that did not read a nested repository is not complete"
     );
+}
+
+fn synthetic_finding(path: String, line: u32) -> SecretFinding {
+    SecretFinding {
+        rule_id: "betterleaks.github-pat".into(),
+        rule_name: String::new(),
+        path,
+        line: Some(line),
+        confidence: String::new(),
+        location: SecretLocation::Tracked,
+        secret_group: 0,
+    }
+}
+
+/// A clean, complete in-process report to hang synthetic findings on.
+fn clean_report() -> SecretsReport {
+    let dir = git_repo();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    scan_primary(&repo, WorktreeLimits::DEFAULT, true)
+}
+
+#[test]
+fn a_scan_past_the_hit_cap_lists_the_cap_and_says_the_list_is_cut() {
+    let dir = git_repo();
+    let lines = MAX_REPORTED_HITS + 50;
+    write(
+        dir.path(),
+        "many.txt",
+        &format!("{}\n", token()).repeat(lines),
+    );
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(&repo, WorktreeLimits::DEFAULT, false);
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.findings.len(), MAX_REPORTED_HITS);
+    assert_eq!(
+        report.findings_total as usize, lines,
+        "every hit is counted"
+    );
+    assert!(
+        report.findings_truncated,
+        "a list shorter than the count must say it was cut"
+    );
+}
+
+#[test]
+fn a_scan_under_the_hit_cap_is_not_marked_cut() {
+    let dir = repo_with_plants();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let report = scan_primary(&repo, WorktreeLimits::DEFAULT, false);
+    assert_eq!(report.findings_total, 2);
+    assert!(!report.findings_truncated);
+}
+
+#[test]
+fn a_capped_primary_makes_the_union_total_an_upper_bound_and_stays_cut() {
+    let mut primary = clean_report();
+    primary.findings = (1..=3)
+        .map(|n| synthetic_finding("a.txt".into(), n))
+        .collect();
+    primary.findings_total = 10;
+    primary.findings_truncated = true;
+    // Kingfisher's row at a.txt:9 may be one of the seven hits the primary
+    // counted and did not list; it cannot be matched, so it is an addition.
+    let mut second = clean_report();
+    second.findings = vec![
+        synthetic_finding("a.txt".into(), 1),
+        synthetic_finding("a.txt".into(), 9),
+    ];
+    second.findings_total = 2;
+    merge_second_opinion(&mut primary, second);
+    assert!(primary.findings_truncated, "{primary:?}");
+    assert_eq!(primary.findings.len(), 4);
+    assert_eq!(
+        primary.findings_total, 11,
+        "an upper bound, never below the rows"
+    );
+    assert!(primary.findings_total as usize >= primary.findings.len());
+}
+
+#[test]
+fn a_union_longer_than_the_display_cap_says_rows_were_dropped() {
+    let mut primary = clean_report();
+    primary.findings = (0..MAX_FINDINGS)
+        .map(|n| synthetic_finding(format!("p{n}.txt"), 1))
+        .collect();
+    primary.findings_total = MAX_FINDINGS as u32;
+    let mut second = clean_report();
+    second.findings = (0..5)
+        .map(|n| synthetic_finding(format!("k{n}.txt"), 1))
+        .collect();
+    second.findings_total = 5;
+    merge_second_opinion(&mut primary, second);
+    assert_eq!(primary.findings.len(), MAX_FINDINGS);
+    assert_eq!(primary.findings_total as usize, MAX_FINDINGS + 5);
+    assert!(
+        primary.findings_truncated,
+        "rows were dropped to fit the cap and the report did not say so"
+    );
+}
+
+#[test]
+fn a_union_that_fits_the_display_cap_is_not_marked_cut() {
+    let mut primary = clean_report();
+    primary.findings = vec![synthetic_finding("a.txt".into(), 1)];
+    primary.findings_total = 1;
+    let mut second = clean_report();
+    second.findings = vec![synthetic_finding("b.txt".into(), 1)];
+    second.findings_total = 1;
+    merge_second_opinion(&mut primary, second);
+    assert!(!primary.findings_truncated);
+}
+
+#[test]
+fn the_unavailable_reason_is_fixed_wording_never_kingfisher_output() {
+    let dir = repo_with_plants();
+    let secret = token();
+    // Each stub writes the planted token to stdout and stderr, then ends the
+    // way a failing Kingfisher can.
+    for (label, findings, ending) in [
+        ("exit 3", "", "echo \"$T\" >&2; echo \"$T\"; exit 3"),
+        ("signal", "", "echo \"$T\" >&2; kill -9 $$"),
+        ("not json", "{{{ $T", "exit 0"),
+        ("not an envelope", "", "echo \"$T\"; exit 0"),
+    ] {
+        let bin = TempDir::new().unwrap();
+        let kingfisher = stub_with(bin.path(), findings, ending);
+        let text = std::fs::read_to_string(&kingfisher).unwrap();
+        std::fs::write(
+            &kingfisher,
+            text.replacen("ROOT=", &format!("T={secret}\nROOT="), 1),
+        )
+        .unwrap();
+        let report = scan_working_tree_with(&path_of(&dir), true, || Some(kingfisher.clone()))
+            .expect("scan runs");
+        let SecondOpinion::Unavailable { reason } = &report.second_opinion else {
+            panic!("{label}: {:?}", report.second_opinion);
+        };
+        assert!(!reason.contains(&secret[..12]), "{label}: {reason}");
+        assert!(reason.starts_with("kingfisher"), "{label}: {reason}");
+        let wire = serde_json::to_string(&report).unwrap();
+        assert!(!wire.contains(&secret[..12]), "{label}: {wire}");
+    }
 }

@@ -112,6 +112,14 @@ describe("verdict", () => {
     );
   });
 
+  it("says a cut list is cut without blaming one engine", () => {
+    const detail = verdict(
+      inHouse({ findings: [row()], findings_total: 250, findings_truncated: true }),
+    ).detail;
+    expect(detail).toContain("More findings were found than are listed.");
+    expect(detail).not.toContain("Kingfisher omitted");
+  });
+
   it("keeps a failed scan's findings in view", () => {
     const v = verdict(
       report({ ok: false, error: "Kingfisher reported that the scan failed.", findings: [row()], findings_total: 1 }),

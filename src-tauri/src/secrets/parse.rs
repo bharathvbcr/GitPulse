@@ -170,7 +170,12 @@ pub struct SecretsReport {
     /// Entries in Kingfisher's findings array this parser could not read.
     /// They are counted, never silently dropped.
     pub findings_unreadable: u32,
-    /// True when Kingfisher itself omitted findings past its own report cap.
+    /// True when `findings` lists fewer rows than were found, from any source:
+    /// the in-process scan keeps its first `MAX_REPORTED_HITS` hits, Kingfisher
+    /// omits findings past its own report cap, and a merged list is cut to
+    /// [`super::MAX_FINDINGS`]. With a second opinion, `findings_total` is then
+    /// an upper bound: a Kingfisher row that matches a hit the in-process scan
+    /// counted but did not list cannot be recognised, so it is counted again.
     pub findings_truncated: bool,
     /// False when the Git listings behind `location` could not be read; every
     /// row that needed them is then `unknown`.
@@ -216,10 +221,6 @@ impl SecretsReport {
             skipped: Vec::new(),
             second_opinion: SecondOpinion::NotRun,
         }
-    }
-
-    pub fn unavailable(error: impl Into<String>) -> Self {
-        Self::not_ok(error.into(), false, None)
     }
 
     pub fn failed(error: impl Into<String>, version: Option<String>) -> Self {

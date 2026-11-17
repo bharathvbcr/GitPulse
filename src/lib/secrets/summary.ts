@@ -254,7 +254,7 @@ function findingsDetail(report: SecretsReport): string {
   } else if (report.completeness === "unverified") {
     parts.push("The scan did not report whether it read every file.");
   }
-  if (report.findings_truncated) parts.push("Kingfisher omitted findings past its own report cap.");
+  if (report.findings_truncated) parts.push("More findings were found than are listed.");
   const second = secondOpinionNote(report);
   if (second) parts.push(second);
   const lost = report.findings_unreadable;

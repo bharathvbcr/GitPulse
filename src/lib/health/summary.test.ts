@@ -171,7 +171,7 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     );
     expect(found.tone).toBe("critical");
     expect(found.value).toBe("3+ found");
-    expect(found.caveat).toContain("Kingfisher omitted findings past its own report cap");
+    expect(found.caveat).toContain("More findings were found than are listed");
     const unscanned = facet(cleanInput({ secrets: null }), "secrets");
     expect(unscanned).toMatchObject({ tone: "unknown", value: "not scanned" });
     expect(facet(cleanInput(), "secrets")).toMatchObject({ tone: "clear", value: "none" });

@@ -2,7 +2,6 @@
 
 use super::parse::{parse_kingfisher_json, SecretsReport};
 use super::report::{assemble, git_view, scan_exclusions, RunFacts};
-use crate::engine::git_cli::validate_repo;
 use crate::engine::process::{run_observed, ExitFacts, Incomplete, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
@@ -29,8 +28,6 @@ pub const SUCCESS_EXITS: [i32; 3] = [0, 200, 205];
 /// with no entry in Kingfisher's audit (measured on 2.7.0).
 pub const MAX_FILE_SIZE_MB: u32 = 256;
 
-const INSTALL_HINT: &str = "kingfisher was not found on PATH or in the standard install \
-     directories. Install with: brew install kingfisher";
 const SUPERSEDED: &str = "superseded by a newer secrets scan";
 
 /// Kingfisher's `scan_nested_repos` defaults to true and lacks `ArgAction::Set`,
@@ -174,10 +171,6 @@ fn scrubbed_command(binary: &Path) -> Command {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     cmd
-}
-
-pub fn missing_binary_report() -> SecretsReport {
-    SecretsReport::unavailable(INSTALL_HINT)
 }
 
 pub fn failed_report(reason: &str, version: Option<String>) -> SecretsReport {
@@ -470,20 +463,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Probe version, scan the working tree, parse by allowlist, drop stdout.
-pub fn scan_secrets(repo_path: &str) -> Result<SecretsReport, CommandError> {
-    // Validate before claiming: a request the trust gate refuses must not
-    // cancel a trusted repository's scan on its way out.
-    let repo = validate_repo(repo_path)?;
-    let ticket = ScanTicket::claim();
-    let Some(binary) = resolve_kingfisher() else {
-        return Ok(missing_binary_report());
-    };
-    Ok(scan_with_binary(&repo, &binary, ticket, SCAN_DEADLINE))
-}
-
-/// [`scan_secrets`] past validation and lookup, with the binary and deadline
-/// injected so stub scanners can drive every path without touching `PATH`.
+/// Probe version, scan the working tree, parse by allowlist, drop stdout, with
+/// the binary and deadline injected so stub scanners can drive every path
+/// without touching `PATH`.
 /// `repo` must already have passed the trust gate.
 pub fn scan_with_binary(
     repo: &Path,
