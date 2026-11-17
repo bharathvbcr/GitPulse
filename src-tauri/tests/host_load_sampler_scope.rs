@@ -95,3 +95,70 @@ fn no_shipped_binary_but_the_app_reaches_the_sampler() {
         );
     }
 }
+
+/// The pre-crash trace is appended by the elected sampler and nobody else. The
+/// ring file's writer is named only by its own module (the sampler no longer
+/// holds one: its trace thread does, behind the feed), and the feed that owns
+/// that thread is named only by that module and the sampler, in production
+/// code, so no hook, no CLI and no second code path in the app can write the
+/// ring (and no reader process can: it never holds the election).
+///
+/// Rewritten when the append moved off the tick: it used to require the
+/// sampler to name `TraceWriter`; the same rule is now pinned on `TraceFeed`.
+#[test]
+fn only_the_elected_sampler_appends_to_the_trace() {
+    let mut files = Vec::new();
+    rust_files(&crate_dir().join("src"), &mut files);
+    let sysload = crate_dir().join("src").join("sysload");
+    let mut writer_namers = Vec::new();
+    let mut namers = Vec::new();
+    for file in &files {
+        let rel = file
+            .strip_prefix(crate_dir())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Test modules (`tests.rs`, `*_tests.rs`, `tests/`) exercise it.
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == "tests.rs" || name.ends_with("_tests.rs") || rel.contains("/tests/") {
+            continue;
+        }
+        let source = std::fs::read_to_string(file).unwrap();
+        let names = |word: &str| {
+            production(&source)
+                .lines()
+                .any(|line| line.split("//").next().unwrap_or("").contains(word))
+        };
+        if names("TraceWriter") {
+            writer_namers.push(rel.clone());
+        }
+        if names("TraceFeed") {
+            namers.push(rel);
+        }
+    }
+    writer_namers.sort();
+    namers.sort();
+    assert_eq!(
+        writer_namers,
+        ["src/sysload/trace.rs"],
+        "something besides the trace module names the ring writer"
+    );
+    assert_eq!(
+        namers,
+        ["src/sysload/sampler.rs", "src/sysload/trace.rs"],
+        "something besides the sampler names the trace feed"
+    );
+    // Inside the sampler, the feed is started only behind the election, and
+    // a record is offered only behind the election and the switch:
+    // `trace::due` takes both.
+    let sampler = std::fs::read_to_string(sysload.join("sampler.rs")).unwrap();
+    let production = production(&sampler);
+    assert!(
+        production.contains("writer.is_some() && trace_feed.is_none()"),
+        "the sampler no longer starts the trace feed only once it is the elected writer"
+    );
+    assert!(
+        production.contains("trace::due(writer.is_some(), enabled,"),
+        "the sampler no longer gates the append on being the elected writer"
+    );
+}

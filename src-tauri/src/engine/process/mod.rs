@@ -22,6 +22,8 @@ mod thread_io;
 mod awaiting_adversarial_tests;
 #[cfg(test)]
 mod budget_churn_tests;
+#[cfg(test)]
+mod exec_probe_tests;
 #[cfg(all(test, unix))]
 mod grace_adversarial_tests;
 #[cfg(test)]
@@ -58,17 +60,20 @@ pub(crate) use env::{developer_dirs, past_xcrun_git_shim, REAL_GIT_DIRS};
 #[cfg(not(test))]
 pub use gate::run_process_with_shared_spawn_budget;
 #[cfg(test)]
+pub(crate) use gate::with_disk_only_answer;
+pub(crate) use gate::{
+    background_deferral_cause, current_admission, grant_post_action_credit_now,
+    is_deferred_under_load, is_slot_wait_timeout, mark_user_action, production_spawn_rate,
+    run_command_scope, with_admission, with_background_processes, with_disk_relief,
+    with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
+};
+#[cfg(test)]
 pub(in crate::engine::process) use gate::{
     configured_spawn_gate, current_spawn_source, format_gate_report, grant_post_action_credit,
     mark_interactive, marked_repo_is_none, post_action_credits, refusal_message_at, report_label,
     spawn_gate, spawn_limit, AdmissionCounters, BucketLevel, LabelCounts, RefusingBucket,
     SpawnPermit, CANCELLED_BEFORE_SPAWN, POST_ACTION_CREDIT_REPOS, POST_ACTION_CREDIT_WINDOW,
     UNATTRIBUTED_SOURCE,
-};
-pub(crate) use gate::{
-    current_admission, grant_post_action_credit_now, is_deferred_under_load, is_slot_wait_timeout,
-    mark_user_action, production_spawn_rate, run_command_scope, with_admission,
-    with_background_processes, with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
 };
 pub use gate::{
     current_admission_name, run_process_as_background, run_process_awaiting_background_budget,
@@ -98,8 +103,8 @@ pub use runner::{
 pub(crate) use runner::{
     capture_command_scrubbed, capture_command_with_env, classify_tool_probe, is_run_timeout,
     is_timed_out, last_process_failure, note_process_failure, process_failures, run_bounded,
-    run_bounded_capped, run_observed, text_from_bytes, BoundedRun, KeepDeadlinePrefix,
-    OutputStream, ProcessObserver, RunError, ToolProbe,
+    run_bounded_capped, run_observed, text_from_bytes, time_exec_probe, BoundedRun, ExecProbeRun,
+    ExitFacts, KeepDeadlinePrefix, OutputStream, ProcessObserver, RunError, ToolProbe,
 };
 #[cfg(test)]
 pub(crate) use runner::{

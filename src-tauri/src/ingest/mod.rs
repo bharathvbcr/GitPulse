@@ -951,6 +951,88 @@ fn reflog_cycles() -> &'static std::sync::Mutex<std::collections::HashMap<String
     CYCLES.get_or_init(Default::default)
 }
 
+/// The default branch's ref each repository's last lookup named (`None`: the
+/// repository has none), and when it was looked up.
+type DefaultRefs = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+
+fn default_refs() -> &'static std::sync::Mutex<DefaultRefs> {
+    static REFS: std::sync::OnceLock<std::sync::Mutex<DefaultRefs>> = std::sync::OnceLock::new();
+    REFS.get_or_init(Default::default)
+}
+
+/// What a bounded pass knows of the default branch without asking git: the
+/// last lookup's answer and whether it is younger than [`REFLOG_CYCLE_FRESH`],
+/// or `None` when no lookup has answered yet.
+fn remembered_default_ref(ledger_repo: &str) -> Option<(bool, Option<String>)> {
+    default_refs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(ledger_repo)
+        .map(|(at, name)| (at.elapsed() < REFLOG_CYCLE_FRESH, name.clone()))
+}
+
+/// Asks git for the default branch (several processes on a cold cache) and
+/// remembers the answer for the passes after this one.
+fn look_up_default_ref(ledger_repo: &str) -> Result<Option<String>, String> {
+    let base = crate::engine::git_reader::default_base(std::path::Path::new(ledger_repo));
+    let name = match base.checked() {
+        Ok(base) => base.base.map(|(short, _)| format!("refs/heads/{short}")),
+        Err(reason) => return Err(reason.message().to_string()),
+    };
+    let mut refs = default_refs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refs.len() >= 64 && !refs.contains_key(ledger_repo) {
+        refs.clear();
+    }
+    refs.insert(
+        ledger_repo.to_string(),
+        (std::time::Instant::now(), name.clone()),
+    );
+    Ok(name)
+}
+
+/// What a bounded pass left of the default branch until its transcripts were
+/// read. When no lookup had named the branch, it is looked up now and its
+/// reflog read with whatever the pass has left; past the deadline it is left
+/// for the next pass, which reads the branch this lookup named. A stale answer
+/// is refreshed while time is left. The lookup may run past the deadline: the
+/// transcripts' share is spent by then, and its answer is what lets the next
+/// pass read the branch. A pass without a deadline looked the branch up in
+/// line.
+fn settle_default_ref(
+    ledger_repo: &str,
+    family: &Result<Vec<String>, String>,
+    budget: &Budget,
+    pass: &mut ReflogPass,
+) {
+    if family.is_err() || !pass.bounded {
+        return;
+    }
+    if pass.default_owed {
+        pass.default_owed = false;
+        match look_up_default_ref(ledger_repo) {
+            Ok(Some(name)) => pass.read(ledger_repo, ledger_repo, &name, budget),
+            Ok(None) => {}
+            Err(reason) => pass.default_unread(&reason),
+        }
+        return;
+    }
+    let stale = remembered_default_ref(ledger_repo).is_some_and(|(fresh, _)| !fresh);
+    if stale && !budget.expired() {
+        if let Err(reason) = look_up_default_ref(ledger_repo) {
+            // The branch the stale answer named was read this pass; a refresh
+            // that git refused is retried by the next one.
+            if !crate::engine::process::is_deferred_under_load(&reason) {
+                pass.total.absorb_reflog(CatchUp {
+                    error: format!("the default branch could not be read: {reason}"),
+                    ..CatchUp::default()
+                });
+            }
+        }
+    }
+}
+
 /// Replays one checkout's HEAD reflog into its repository-wide ledger.
 pub(crate) fn ingest_reflog_into(
     ledger_repo: &str,
@@ -960,14 +1042,144 @@ pub(crate) fn ingest_reflog_into(
     replay_ref(ledger_repo, worktree_path, "HEAD", max_entries, None)
 }
 
-/// Replays the HEAD reflog of every worktree in the family `worktree_path`
-/// belongs to, and the repository's default branch once, into the shared
+/// [`read_reflogs`] settled at once, with no default-branch lookup after a
+/// transcript pass: what a pass without transcripts reads.
+#[cfg(test)]
+fn ingest_reflogs(
+    ledger_repo: &str,
+    worktree_path: &str,
+    family: &Result<Vec<String>, String>,
+    max_worktrees: usize,
+    budget: &Budget,
+) -> CatchUp {
+    read_reflogs(ledger_repo, worktree_path, family, max_worktrees, budget).finish(ledger_repo)
+}
+
+/// One pass's reflog reads, not yet settled: under a deadline the default
+/// branch may still be looked up and read after the transcripts
+/// ([`settle_default_ref`]) before [`ReflogPass::finish`] decides what the
+/// pass left for the next one.
+struct ReflogPass {
+    total: CatchUp,
+    cycle: ReflogCycle,
+    bounded: bool,
+    /// Refs this pass left for the next: the slice ran out, or a read was cut
+    /// off or shed. Only these keep a cycle open. A ref that failed for its own
+    /// reasons, or the default branch being unreadable, is reported by this
+    /// pass and must not hold the others' reads for the length of a cycle.
+    left: usize,
+    /// Reads the spawn gate refused (Background work is shed while the budget
+    /// is low or the host is under pressure). Git never ran, so nothing was
+    /// read and nothing is wrong: they are counted as not read, which makes the
+    /// pass `truncated` and retried, and are not reported as errors.
+    deferred: usize,
+    /// No lookup had named the default branch when this bounded pass began,
+    /// and none has since: its reflog is still to be read.
+    default_owed: bool,
+}
+
+impl ReflogPass {
+    /// Replays `ref_name` of `worktree` within what `within` has left, unless
+    /// this cycle already read it.
+    fn read(&mut self, ledger_repo: &str, worktree: &str, ref_name: &str, within: &Budget) {
+        let key = (worktree.to_string(), ref_name.to_string());
+        if self.cycle.read.contains(&key) {
+            return;
+        }
+        if within.expired() {
+            self.total.reflog_refs_skipped += 1;
+            self.left += 1;
+            return;
+        }
+        let mut one = replay_ref(
+            ledger_repo,
+            worktree,
+            ref_name,
+            REFLOG_WINDOW,
+            within.remaining(),
+        );
+        if crate::engine::process::is_deferred_under_load(&one.error) {
+            self.total.reflog_refs_skipped += 1;
+            self.left += 1;
+            self.deferred += 1;
+            return;
+        }
+        // Only a clean read counts as read: one the slice cut off, one that
+        // failed and one with entries still pending are all tried again by the
+        // next pass, and none may let a later pass report complete without
+        // having been read. A failed read is reported by this pass either way.
+        let clean = one.error.is_empty() && !one.truncated;
+        let cut_off = !one.error.is_empty() && within.expired();
+        if cut_off {
+            // The slice's end killed it: that is this ref not read this pass,
+            // counted below, and not a failure. Its "timed out after 0.04s"
+            // at the head of the pass's error read as a broken git.
+            one.error.clear();
+        }
+        self.total.absorb_reflog(one);
+        if cut_off {
+            self.total.reflog_refs_skipped += 1;
+            self.left += 1;
+        } else if clean {
+            self.total.reflog_refs_read += 1;
+            self.cycle.read.insert(key);
+        }
+    }
+
+    /// A default-branch lookup that gave no answer: counted as not read, and
+    /// reported unless git was only deferred.
+    fn default_unread(&mut self, reason: &str) {
+        self.total.reflog_refs_skipped += 1;
+        if crate::engine::process::is_deferred_under_load(reason) {
+            self.deferred += 1;
+        } else {
+            self.total.absorb_reflog(CatchUp {
+                error: format!("the default branch could not be read: {reason}"),
+                ..CatchUp::default()
+            });
+        }
+    }
+
+    /// Keeps the cycle open for what this pass left, and says what it read.
+    fn finish(mut self, ledger_repo: &str) -> CatchUp {
+        if self.default_owed {
+            self.total.reflog_refs_skipped += 1;
+            self.left += 1;
+        }
+        keep_reflog_cycle(ledger_repo, self.cycle, self.bounded && self.left > 0);
+        let mut total = self.total;
+        // A read only moved the work forward if refs remain for the next pass
+        // to read: when the cycle ended, a pass that is still incomplete for
+        // another reason (a failed write, an unreadable default branch) re-read
+        // the same refs it read last time and made no progress.
+        if self.left == 0 {
+            total.reflog_refs_read = 0;
+        }
+        if total.reflog_refs_skipped > 0 {
+            total.mark_reflog_incomplete(format!(
+                "{} reflog(s) not read this pass{}",
+                total.reflog_refs_skipped,
+                if self.deferred > 0 {
+                    " (git was deferred under load)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        total
+    }
+}
+
+/// Replays, without settling what it left ([`ReflogPass::finish`]), the HEAD
+/// reflog of every worktree in the family `worktree_path` belongs to, and the repository's default branch once, into the shared
 /// ledger. `family` is [`family_siblings`]'s answer: unresolved, only the
 /// trigger's own HEAD is read (the default branch waits for a resolved family).
 ///
 /// Spawns at most `max_worktrees + 1` reflog children (two more per ref that
-/// had to look past its window), plus the default-base lookup the rest of the
-/// engine already caches.
+/// had to look past its window), plus, for a pass without a deadline, the
+/// default-base lookup the rest of the engine already caches. A pass with one
+/// reads the branch the last lookup named; until a lookup has answered, the
+/// branch's reflog is left for the next pass.
 ///
 /// Under a deadline the reflogs take [`REFLOG_SHARE_PERCENT`] of what is left
 /// and stop at it, a child still running at that point included. A family too
@@ -976,13 +1188,13 @@ pub(crate) fn ingest_reflog_into(
 /// pass that reads the last of them reports complete. That is a claim about
 /// the passes of the last few minutes, not about one, and a pass with no
 /// deadline never relies on it: it reads every ref and ends the cycle.
-fn ingest_reflogs(
+fn read_reflogs(
     ledger_repo: &str,
     worktree_path: &str,
     family: &Result<Vec<String>, String>,
     max_worktrees: usize,
     budget: &Budget,
-) -> CatchUp {
+) -> ReflogPass {
     let mut total = CatchUp::default();
     let mut worktrees = vec![worktree_path.to_string()];
     if let Ok(siblings) = family {
@@ -1003,108 +1215,45 @@ fn ingest_reflogs(
     worktrees.truncate(max_worktrees);
     total.reflog_refs_skipped = i64::try_from(skipped).unwrap_or(i64::MAX);
 
-    // Reads the spawn gate refused (Background work is shed while the budget is
-    // low or the host is under pressure). Git never ran, so nothing was read
-    // and nothing is wrong: they are counted as not read, which makes the pass
-    // `truncated` and retried, and are not reported as errors.
-    let mut deferred = 0usize;
     let mut refs: Vec<(String, String)> = worktrees
         .into_iter()
         .map(|worktree| (worktree, "HEAD".to_string()))
         .collect();
+    // Cut before anything here asks git, so what the transcripts are left is
+    // a share of the pass and not of whatever a lookup leaves over.
+    let slice = budget.share(REFLOG_SHARE_PERCENT);
+    let bounded = slice.remaining().is_some();
+    let mut pass = ReflogPass {
+        total,
+        cycle: take_reflog_cycle(ledger_repo, bounded),
+        bounded,
+        left: 0,
+        deferred: 0,
+        default_owed: false,
+    };
     if family.is_ok() {
         // The default branch's own reflog holds what no HEAD log does: a
         // fast-forward made from another worktree moves it without touching
-        // this one's HEAD.
-        let base = crate::engine::git_reader::default_base(std::path::Path::new(ledger_repo));
-        match base.checked() {
-            Ok(base) => {
-                if let Some((short, _)) = base.base {
-                    refs.push((ledger_repo.to_string(), format!("refs/heads/{short}")));
-                }
-            }
-            Err(reason) => {
-                total.reflog_refs_skipped += 1;
-                if crate::engine::process::is_deferred_under_load(reason.message()) {
-                    deferred += 1;
-                } else {
-                    total.absorb_reflog(CatchUp {
-                        error: format!(
-                            "the default branch could not be read: {reason}",
-                            reason = reason.message()
-                        ),
-                        ..CatchUp::default()
-                    });
-                }
-            }
+        // this one's HEAD. Finding it costs several git processes on a cold
+        // cache, over a second each on a host slow to start them, so a pass
+        // with a deadline reads the branch the last lookup named and leaves
+        // the lookup until its transcripts are read (`settle_default_ref`).
+        let known = if bounded {
+            remembered_default_ref(ledger_repo).map(|(_, name)| Ok(name))
+        } else {
+            Some(look_up_default_ref(ledger_repo))
+        };
+        match known {
+            Some(Ok(Some(name))) => refs.push((ledger_repo.to_string(), name)),
+            Some(Ok(None)) => {}
+            Some(Err(reason)) => pass.default_unread(&reason),
+            None => pass.default_owed = true,
         }
     }
-    let slice = budget.share(REFLOG_SHARE_PERCENT);
-    let bounded = slice.remaining().is_some();
-    let mut cycle = take_reflog_cycle(ledger_repo, bounded);
-    // Refs this pass left for the next: the slice ran out, or a read was cut
-    // off or shed. Only these keep a cycle open. A ref that failed for its own
-    // reasons, or the default branch being unreadable, is reported by this pass
-    // and must not hold the others' reads for the length of a cycle.
-    let mut left = 0usize;
     for (worktree, ref_name) in &refs {
-        let key = (worktree.clone(), ref_name.clone());
-        if cycle.read.contains(&key) {
-            continue;
-        }
-        if slice.expired() {
-            total.reflog_refs_skipped += 1;
-            left += 1;
-            continue;
-        }
-        let one = replay_ref(
-            ledger_repo,
-            worktree,
-            ref_name,
-            REFLOG_WINDOW,
-            slice.remaining(),
-        );
-        if crate::engine::process::is_deferred_under_load(&one.error) {
-            total.reflog_refs_skipped += 1;
-            left += 1;
-            deferred += 1;
-            continue;
-        }
-        // Only a clean read counts as read: one the slice cut off, one that
-        // failed and one with entries still pending are all tried again by the
-        // next pass, and none may let a later pass report complete without
-        // having been read. A failed read is reported by this pass either way.
-        let clean = one.error.is_empty() && !one.truncated;
-        let cut_off = !one.error.is_empty() && slice.expired();
-        total.absorb_reflog(one);
-        if cut_off {
-            total.reflog_refs_skipped += 1;
-            left += 1;
-        } else if clean {
-            total.reflog_refs_read += 1;
-            cycle.read.insert(key);
-        }
+        pass.read(ledger_repo, worktree, ref_name, &slice);
     }
-    keep_reflog_cycle(ledger_repo, cycle, bounded && left > 0);
-    // A read only moved the work forward if refs remain for the next pass to
-    // read: when the cycle ended, a pass that is still incomplete for another
-    // reason (a failed write, an unreadable default branch) re-read the same
-    // refs it read last time and made no progress.
-    if left == 0 {
-        total.reflog_refs_read = 0;
-    }
-    if total.reflog_refs_skipped > 0 {
-        total.mark_reflog_incomplete(format!(
-            "{} reflog(s) not read this pass{}",
-            total.reflog_refs_skipped,
-            if deferred > 0 {
-                " (git was deferred under load)"
-            } else {
-                ""
-            }
-        ));
-    }
-    total
+    pass
 }
 
 /// The cycle this pass resumes: the refs earlier passes of a bounded run read,
@@ -1852,15 +2001,17 @@ fn catch_up_with(
     // Resolved once: the reflogs of every worktree and the transcript pass
     // below both need the family.
     let family = family_siblings(ledger_repo, worktree_path);
-    let mut total = ingest_reflogs(
+    let mut reflogs = read_reflogs(
         ledger_repo,
         worktree_path,
         &family,
         MAX_REFLOG_WORKTREES,
         budget,
     );
-    progress.publish(&total);
+    progress.publish(&reflogs.total);
     if budget.expired() {
+        settle_default_ref(ledger_repo, &family, budget, &mut reflogs);
+        let mut total = reflogs.finish(ledger_repo);
         total.truncated = true;
         if total.error.is_empty() {
             total.error = "catch-up truncated: deadline elapsed after reflog".into();
@@ -1875,7 +2026,7 @@ fn catch_up_with(
     }
 
     progress.enter(Phase::Transcripts);
-    let base = total.clone();
+    let base = reflogs.total.clone();
     let mut checks = 0u32;
     let mut expired = |out: &CatchUp| {
         // Published often enough to say what a stalled pass had done, not on
@@ -1927,7 +2078,14 @@ fn catch_up_with(
         // the whole of it.
         Err(_) => pass::ingest_unresolved_family_until(ledger_repo, worktree_path, &mut expired),
     };
-    let mut total = total.with_transcripts(&transcripts);
+    // The default branch, when this pass did not know it, is looked up and read
+    // only now, so its lookup cannot spend the transcripts' share. The lookup
+    // may outlast the deadline, so what the pass has done is published first:
+    // a pass given up on during it reports the transcripts it read.
+    progress.publish(&reflogs.total.clone().with_transcripts(&transcripts));
+    progress.enter(Phase::Reflog);
+    settle_default_ref(ledger_repo, &family, budget, &mut reflogs);
+    let mut total = reflogs.finish(ledger_repo).with_transcripts(&transcripts);
     // Retention rides the pass every host already runs (the app on open, the
     // daemon on its interval), so the events table is bounded without a
     // second scheduler. A pass the deadline cut short spends no more time.

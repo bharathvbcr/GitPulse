@@ -20,6 +20,8 @@ import { terminalLaunchRequests } from "../src/lib/terminal/launchRequests";
 import { PROVIDER_LABELS } from "../src/lib/workbench/taskHandoff";
 import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
+import { hostLoadStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
+import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
 const REPO = "/fixture/GitPulse";
@@ -535,5 +537,119 @@ export async function runHealthChecks(ctx) {
   } finally {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     reset();
+  }
+}
+
+/**
+ * Health > Host load: "Before the last restart", rendered. The status is the
+ * typed fixture from hostLoadFixture.ts; `refreshHostLoad` is the same read the
+ * card's own timer makes, called here so a scenario does not wait four seconds.
+ */
+export async function runHostLoadChecks(ctx) {
+  const { check, root, section, has, flat, wait, until, tick, knobs } = ctx;
+  const DROP_TEXT = "dropped while the trace write was blocked or failing, so this history has gaps";
+  const previous = () => root.querySelector('[data-testid="host-load-previous-boot"]');
+  const card = () => section("host-load");
+  const show = async status => {
+    knobs.hostLoad = () => status;
+    await refreshHostLoad();
+    await tick();
+    await wait(120);
+  };
+  const overflows = node => node.scrollWidth > node.clientWidth + 1;
+  try {
+    await until(() => !!card());
+    // A calm host with no previous boot: nothing about a restart at all.
+    await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
+    check("with no previous boot there is no 'Before the last restart' block", () =>
+      !previous() && !has(card(), "Before the last restart"));
+    check("with no previous boot and no drops the card shows no problem line", () =>
+      !has(card(), "dropped while the trace write"));
+
+    // The previous boot, three readings, seven dropped, and the sampler saying drops are happening.
+    const problem = "trace: 4 reading(s) dropped while the trace write was blocked or failing (last 2 s ago); the ring has a gap";
+    await show({ ...hostLoadStatusFixture(), previous_boot: previousBootFixture(7), problems: [problem] });
+    check("a previous boot renders under its heading", () =>
+      !!previous() && previous().querySelector("h4")?.textContent.trim() === "Before the last restart");
+    check("the dropped count is stated, with the gap it leaves", () =>
+      has(previous(), `7 readings were ${DROP_TEXT}`));
+    check("the dropped line is the first line of the block", () =>
+      previous().querySelector("p")?.textContent.includes("7 readings were dropped"));
+    check("the block states when the boot ended and how long its last readings span", () =>
+      has(previous(), "its last 3 readings span 2 s") && /Ended .+; its last 3 readings/.test(flat(previous())));
+    check("the block names the highest memory pressure", () =>
+      has(previous(), "Highest memory pressure: critical."));
+    check("the block says launches were refused", () =>
+      has(previous(), "Governor: severe, launches were refused"));
+    check("the block reports swap, load, disk and heat peaks as numbers", () =>
+      has(previous(), "Swap used, at most 16.0 GB")
+        && has(previous(), "at most 0.91 of the limit")
+        && has(previous(), "1-minute load, at most 16.5")
+        && has(previous(), "Free disk, at least 42.0 GB")
+        && has(previous(), "Thermal state, worst fair"));
+    check("the last readings table has the three records, with the refused one marked", () => {
+      const rows = [...previous().querySelectorAll("tbody tr")];
+      return rows.length === 3 && rows[2].textContent.includes("severe: swap") && rows[2].textContent.includes("(refusing)") && !rows[0].textContent.includes("(refusing)");
+    });
+    check("the table's last readings show swap and load per row", () => {
+      const cells = [...previous().querySelectorAll("tbody tr")[0].querySelectorAll("td")].map(td => td.textContent.trim());
+      return cells.length === 7 && cells[3] === "10.0 GB" && cells[4] === "14.5" && cells[5] === "42.0 GB";
+    });
+    check("the sampler's own 'readings dropped' problem line is shown while drops are happening", () =>
+      has(card(), problem) && [...card().querySelectorAll("p.text-warn")].some(p => p.textContent.includes("the ring has a gap")));
+    check("the previous-boot block does not widen the card", () =>
+      !overflows(card()) && previous().getBoundingClientRect().right <= card().getBoundingClientRect().right + 1);
+
+    // Zero dropped: the block is there and the dropped line is not.
+    await show({ ...hostLoadStatusFixture(), previous_boot: previousBootFixture(0), problems: [] });
+    check("with nothing dropped the block renders without a dropped line", () =>
+      !!previous() && !has(previous(), "dropped while the trace write") && has(previous(), "Ended "));
+    check("with nothing dropped the card shows no problem line", () =>
+      card().querySelectorAll("p.text-warn").length === 0);
+    // One dropped reading is singular.
+    await show({ ...hostLoadStatusFixture(), previous_boot: previousBootFixture(1), problems: [] });
+    check("one dropped reading reads as singular", () =>
+      has(previous(), "1 reading was dropped") && !has(previous(), "1 readings"));
+
+    // The boot's trace couldn't be read: the reason, in the warning colour, and no table.
+    await show({ ...hostLoadStatusFixture(), previous_boot: { ...previousBootFixture(0), error: "the ring file is truncated", records: [] }, problems: [] });
+    check("an unreadable previous boot says why and shows no table or peaks", () =>
+      has(previous(), "The last boot's trace couldn't be read: the ring file is truncated.")
+        && previous().querySelector("tbody") === null && !has(previous(), "Swap used, at most")
+        && previous().querySelector("p.text-warn") !== null);
+
+    // And back to none: the block goes.
+    await show({ ...hostLoadStatusFixture(), previous_boot: null, problems: [] });
+    check("returning to no previous boot removes the block", () => !previous());
+
+    // Which session is writing to disk fastest. The rate is a floor and names
+    // a session, never a folder.
+    const fastest = () => root.querySelector('[data-testid="host-load-fastest-writer"]');
+    const rate = v => ({ status: "value", value: v });
+    const notYet = { status: "unavailable", value: "not_yet" };
+    const withProcs = (rates, truncated = false) =>
+      ({ ...hostLoadStatusFixture(), previous_boot: null, problems: [], procs: procViewFixture(rates, truncated) });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)]));
+    check("the session writing fastest is named with its pid, folder and a floor", () =>
+      !!fastest() && /^Writing fastest: Claude session 1202 in \/Users\/fixture\/code\/beta, at least 8\d(\.\d)? MB\/s$/.test(flat(fastest())));
+    check("the line says it is about a session, not a folder, and that the rate is a floor", () =>
+      has(card(), "not the folder that grew") && has(card(), "so the rate is a floor"));
+    check("each session row shows its own write rate as a floor", () => {
+      const rows = [...card().querySelectorAll("tbody tr")].filter(tr => /120[123]/.test(tr.textContent));
+      return rows.length === 3 && rows.filter(tr => tr.textContent.includes("at least")).length === 3 && !/NaN|undefined/.test(card().textContent);
+    });
+    await show(withProcs([rate(2 * 2 ** 20), rate(85 * 2 ** 20), rate(0)], true));
+    check("on a truncated session list the claim is only about the sessions shown", () =>
+      flat(fastest()).startsWith("Writing fastest of the sessions shown: Claude session 1202"));
+    await show(withProcs([rate(0), rate(0), rate(90 * 2 ** 20)]));
+    check("a session whose folder is unknown says so", () =>
+      has(fastest(), "Claude session 1203 in an unknown directory"));
+    await show(withProcs([notYet, notYet, notYet]));
+    check("with no baseline yet there is no fastest-writer line and no invented rate", () =>
+      !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
+    await show(withProcs([rate(0), rate(4096), rate(0)]));
+    check("when nobody writes above the threshold no session is named", () => !fastest());
+  } finally {
+    knobs.hostLoad = null;
   }
 }

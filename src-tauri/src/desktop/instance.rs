@@ -1659,6 +1659,31 @@ impl Ended {
         }
     }
 
+    /// A failure writing the answer to the op log. Its asker (a git write's
+    /// hook) waits [`OP_RECORD_DEADLINE`], lets the write run and leaves, by
+    /// design, so a snapshot that finishes after that is delivered to nobody. The
+    /// snapshot itself was taken, which is all the asker ever needed from the
+    /// owner, so that is not a refusal. Unlike [`Ended::after_ask`] this does
+    /// not insist the ask was read-only, because the answer is the only thing
+    /// the asker could have missed; unlike a delivery, nothing it acted on
+    /// depends on the asker hearing back.
+    ///
+    /// [`Unheard`] needs both signals: the write failed the way a departed peer
+    /// makes it fail, and the socket reads as hung up with nothing queued. An
+    /// error on a peer that is still connected stays a refusal.
+    ///
+    /// [`Unheard`]: Ended::Unheard
+    fn after_op_record(stream: &UnixStream, started: Instant, reason: String) -> Self {
+        let ms = started.elapsed().as_millis();
+        if write_says_peer_left(&reason) && crate::local_socket::peer_hung_up_silently(stream) {
+            Self::Unheard(format!(
+                "the asker of the op log left before its answer, {ms} ms after asking: {reason}"
+            ))
+        } else {
+            Self::Refused(format!("the op log, {ms} ms after asking: {reason}"))
+        }
+    }
+
     /// A failure with nothing of the peer's first frame read: a [`Probe`]
     /// only if the peer is provably gone and sent nothing. When that cannot be
     /// established it is a refusal, so an unexplained failure stays loud.
@@ -1671,6 +1696,19 @@ impl Ended {
             Self::Refused(reason)
         }
     }
+}
+
+/// Whether a failed write's `reason` (as [`write_frame`] words it) is one a
+/// peer that closed its end causes: a broken pipe, a reset, or a socket that is
+/// no longer connected. Read from the `os error` number rather than the text,
+/// which differs between macOS and Linux. A timeout is a peer that is still
+/// there and slow, and anything else is ours, so those are not this.
+fn write_says_peer_left(reason: &str) -> bool {
+    let code = reason
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once("(os error "))
+        .and_then(|(_, number)| number.parse::<i32>().ok());
+    matches!(code, Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN))
 }
 
 impl From<String> for Ended {
@@ -1772,7 +1810,7 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), Ended> {
     }
     if let Request::RecordGitOp { id, .. } = &request {
         return answer_op_record(stream, shared, id, &request, before_hello)
-            .map_err(Ended::Refused);
+            .map_err(|reason| Ended::after_op_record(stream, started, reason));
     }
     if let Request::RecordTurnCheckpoint { id, .. } = &request {
         return answer_turn_checkpoint(stream, shared, id, &request).map_err(|reason| {
@@ -1805,7 +1843,7 @@ fn answer_gate(
     cwd: &str,
     command: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the gate", || {
+    answer_asked(stream, shared, id, "the gate", true, || {
         attached(&shared.gate, "the gate")?(cwd, command)
     })
 }
@@ -1821,7 +1859,7 @@ fn answer_scan(
     repo: &str,
     path: &str,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the collision scan", || {
+    answer_asked(stream, shared, id, "the collision scan", true, || {
         attached(&shared.collision, "the collision scan")?(repo, path)
     })
 }
@@ -1838,7 +1876,7 @@ fn answer_insights(
     repo: &str,
 ) -> Result<(), String> {
     let reading = ReadSlot::take(shared);
-    answer_asked(stream, shared, id, "the insights read", || {
+    answer_asked(stream, shared, id, "the insights read", true, || {
         if reading.is_none() {
             return Err("the insights read is busy".to_string());
         }
@@ -1853,7 +1891,7 @@ fn answer_agent_deliver(
     request: &Request,
 ) -> Result<(), String> {
     let delivering = DeliverSlot::take(shared);
-    answer_asked(stream, shared, id, "the agent delivery", || {
+    answer_asked(stream, shared, id, "the agent delivery", false, || {
         if delivering.is_none() {
             return Err("the agent delivery is busy".to_string());
         }
@@ -1868,7 +1906,7 @@ fn answer_op_record(
     request: &Request,
     not_after_send: Instant,
 ) -> Result<(), String> {
-    answer_asked(stream, shared, id, "the op log", || {
+    answer_asked(stream, shared, id, "the op log", false, || {
         attached(&shared.op_record, "the op log")?(request, not_after_send)
     })
 }
@@ -1880,7 +1918,7 @@ fn answer_turn_checkpoint(
     request: &Request,
 ) -> Result<(), String> {
     let capturing = CheckpointSlot::take(shared);
-    answer_asked(stream, shared, id, "the turn checkpoint", || {
+    answer_asked(stream, shared, id, "the turn checkpoint", false, || {
         if capturing.is_none() {
             return Err("the turn checkpoint is busy".to_string());
         }
@@ -1917,15 +1955,31 @@ fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> 
         .ok_or_else(|| format!("{name} is not attached"))
 }
 
+/// What a read-only ask reports when its asker had already hung up by the time
+/// the owner got to it: [`Ended::after_ask`] reads it as the asker leaving.
+const ASKER_GONE: &str =
+    "the asker hung up before its answer was started, so no answer was worked out";
+
 /// Runs `call` for a request answered on its own connection, and writes its
 /// reply, or its error as a refusal. A reply that would not fit one frame is a
 /// refusal too: the asker reads it at once and reads for itself, instead of
 /// waiting out its deadline on a frame it cannot take.
+///
+/// `abandonable` is for an ask whose asker works the answer out itself when it
+/// gives up (a gate verdict, a collision scan, an insights read). Such an ask
+/// is not started once the socket reads as hung up with nothing queued, because
+/// the answer would be computed for nobody and again by the asker, which is
+/// what drained the git spawn budget under load. The check is `recv` with
+/// `MSG_PEEK`: only an end-of-file or a reset says the asker is gone, and
+/// anything else, including a failure of the check itself, computes the answer
+/// as it always did. An ask that acts for the world (a delivery, an op record,
+/// a checkpoint) is never abandonable: its work is not for the asker's ears.
 fn answer_asked(
     stream: &mut UnixStream,
     shared: &Shared,
     id: &str,
     name: &str,
+    abandonable: bool,
     call: impl FnOnce() -> Result<serde_json::Value, String>,
 ) -> Result<(), String> {
     let slot = GateSlot::take(shared);
@@ -1933,6 +1987,8 @@ fn answer_asked(
         Err("GitPulse is quitting".to_string())
     } else if slot.is_none() {
         Err(format!("{name} is busy"))
+    } else if abandonable && crate::local_socket::peer_hung_up_silently(stream) {
+        return Err(ASKER_GONE.to_string());
     } else {
         call()
     };

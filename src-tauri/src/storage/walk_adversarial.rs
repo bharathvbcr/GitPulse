@@ -223,7 +223,7 @@ fn break_unreadable_git_subdir_is_counted_once_per_walk_not_once() {
     write_file(&git_dir.join("logs/bad/x"), 10);
     let mut budget = WalkBudget::new();
     budget.fail_paths = vec![git_dir.join("logs/bad")];
-    let _ = size_tree_scoped(&git_dir, &mut budget, true);
+    let _ = size_tree_scoped(&git_dir, &mut budget, true, None);
     let _ = git_subdir_bytes(&git_dir, "logs", &mut budget);
     assert_eq!(budget.unreadable, 1, "one bad location, counted once");
 }

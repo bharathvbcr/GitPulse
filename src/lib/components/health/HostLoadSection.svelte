@@ -27,14 +27,18 @@
   } from "../../stores/hostLoadStore";
   import {
     admissionLine,
+    fillRateLine,
     governorLine,
     bytes,
     bytesPerSecond,
     describeReading,
+    fastestWriter,
     formatAge,
     levelLabel,
     memguardLine,
+    previousBootLines,
     sensorStateLabel,
+    traceRow,
   } from "../../health/hostLoad";
   import { describeFailure, type FailureAction, type FailureCopy } from "../../ui/copy/describeFailure";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
@@ -46,6 +50,16 @@
     { label: "Directory" },
     { label: "Started by" },
     { label: "Memory" },
+    { label: "Disk writes" },
+  ]);
+  const TRACE_COLUMNS = Object.freeze([
+    { label: "Time" },
+    { label: "Memory pressure" },
+    { label: "Governor" },
+    { label: "Swap used" },
+    { label: "Load" },
+    { label: "Free disk" },
+    { label: "Started here" },
   ]);
   const TREE_COLUMNS = Object.freeze([
     { label: "Run" },
@@ -84,7 +98,9 @@
   const status = $derived($hostLoadStatus);
   const snap = $derived(status?.snapshot ?? null);
   const host = $derived(snap?.host ?? null);
+  const fillLine = $derived(status ? fillRateLine(snap, status.governor.disk_fill) : null);
   const procs = $derived(status?.procs ?? null);
+  const fastest = $derived(procs ? fastestWriter(procs.sessions, procs.sessions_truncated) : null);
 
   async function refresh() {
     try {
@@ -197,6 +213,9 @@
     <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
       <p class="text-textPrimary font-medium" data-testid="host-load-governor-shedding">{governorLine(status.governor)}</p>
       <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-warn'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
+      {#if fillLine}
+        <p class="{status.governor.disk_fill?.tier === 'severe' ? 'text-warn' : 'text-textMuted'}" data-testid="host-load-disk-fill">{fillLine}</p>
+      {/if}
       {#if status.governor.verdict.reason === "sensor_unavailable"}
         <p class="text-warn">New runs are admitted and nothing extra is shed while the sensor cannot be read.</p>
       {/if}
@@ -222,6 +241,7 @@
       <dl class="grid grid-cols-2 @2xl:grid-cols-4 gap-2" data-testid="host-load-readings">
         <div><dt class="text-textMuted">Swap used</dt><dd class="text-textPrimary">{describeReading(host.swap_used, bytes)} of {describeReading(host.swap_total, bytes)}</dd></div>
         <div><dt class="text-textMuted">Compressor</dt><dd class="text-textPrimary">{describeReading(host.compressed_bytes, bytes)}{snap.compressor_thrash ? " · thrashing" : ""}</dd></div>
+        <div><dt class="text-textMuted">Compressor segments</dt><dd class="text-textPrimary" data-testid="host-load-segments">{describeReading(host.compressor_segments, (s) => `${s.total.toLocaleString()} of ${s.limit.toLocaleString()}`)}</dd></div>
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>
         <div><dt class="text-textMuted">CPUs</dt><dd class="text-textPrimary">{describeReading(host.cores, (c) => c.levels > 0 ? `${c.logical} (${c.perf0} + ${c.perf1} by level)` : `${c.logical}`)}</dd></div>
         <div><dt class="text-textMuted">Open files</dt><dd class="text-textPrimary">{describeReading(host.open_files, String)} of {describeReading(host.max_files, String)}</dd></div>
@@ -254,6 +274,13 @@
       {/each}
 
       {#if procs.sessions.length > 0}
+        {#if fastest}
+          <p class="text-textPrimary" data-testid="host-load-fastest-writer">{fastest.line}</p>
+          <p class="text-textMuted">
+            This is the session whose processes wrote the most over the last tick, not the folder that grew. A
+            process that started and ended between two ticks is not counted, so the rate is a floor.
+          </p>
+        {/if}
         <HealthTable caption="Agent sessions running on this machine" columns={SESSION_COLUMNS}>
           {#each keyedList(previewSlice(procs.sessions, expanded.sessions, LIST_PREVIEW_ROWS), (s) => `${s.pid}:${s.start_us}`) as { item: session, key } (key)}
             <tr>
@@ -262,6 +289,7 @@
               <td class="px-3 py-1.5 font-mono text-textMuted break-all">{session.cwd ?? "unknown"}</td>
               <td class="px-3 py-1.5 text-textMuted">{session.tree ? (session.run_id ? `task ${session.run_id}` : "GitPulse terminal") : "elsewhere"}</td>
               <td class="px-3 py-1.5 text-textMuted">{describeReading(session.footprint, bytes)}{session.unreadable_members > 0 ? ` (+${session.unreadable_members} unreadable)` : ""}</td>
+              <td class="px-3 py-1.5 text-textMuted">{describeReading(session.write_rate, (rate) => `at least ${bytesPerSecond(rate)}`)}</td>
             </tr>
           {/each}
         </HealthTable>
@@ -338,6 +366,26 @@
       {#if outcome}
         <p class="text-textMuted" data-testid="host-load-terminate-outcome">{outcome}</p>
       {/if}
+    {/if}
+
+    {#if status.previous_boot}
+      <div class="space-y-1" data-testid="host-load-previous-boot">
+        <h4 class="gp-label">Before the last restart</h4>
+        {#each previousBootLines(status.previous_boot) as line (line)}
+          <p class="{status.previous_boot.error ? 'text-warn' : 'text-textMuted'}">{line}</p>
+        {/each}
+        {#if status.previous_boot.records.length > 0}
+          <HealthTable caption="The last readings before the previous boot ended" columns={TRACE_COLUMNS}>
+            {#each status.previous_boot.records as record, at (`${record.mono_ms}:${at}`)}
+              <tr>
+                {#each traceRow(record) as cell, at (at)}
+                  <td class="px-3 py-1.5 {at === 0 ? 'text-textPrimary' : 'text-textMuted'}">{cell}</td>
+                {/each}
+              </tr>
+            {/each}
+          </HealthTable>
+        {/if}
+      </div>
     {/if}
 
     <p class="text-textMuted" data-testid="host-load-sampler">

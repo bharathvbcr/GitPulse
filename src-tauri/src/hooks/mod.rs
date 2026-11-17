@@ -48,6 +48,8 @@ use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
 pub mod deliver;
+mod heavy_commands;
+mod load_gate;
 pub(crate) mod notify_drops;
 mod notify_input;
 mod notify_outcome;
@@ -1365,6 +1367,20 @@ pub const BYPASS_PERMISSIONS: &str = "bypassPermissions";
 /// nothing they found goes unsaid: the person gets a notice and the model gets
 /// the reason as context. A waived refusal therefore never reads as a check
 /// that passed.
+///
+/// One exception, and it is deliberate: the host-load refusal
+/// (`load_gate`) is **not** passed through here. The refusals above are
+/// permission questions, which bypass mode exists to stop asking. A load refusal
+/// protects the machine from every session at once, not a permission the person
+/// waived, and the sessions that hung this Mac on 2026-11-14 ran in bypass mode.
+/// A person turns it down in Settings → Agents → Host load → Command gate
+/// (Advise says the same thing and refuses nothing; Off says nothing).
+///
+/// The host is documented to enforce a hook `deny` in this mode: "A hook deny
+/// applies even in `bypassPermissions` mode."
+/// (`https://code.claude.com/docs/en/agent-sdk/permissions`, fetched 2026-11-15).
+/// That is the documentation only; it has not been exercised against a live
+/// bypass session.
 fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
     if input.permission_mode != BYPASS_PERMISSIONS {
         return output;
@@ -2165,12 +2181,30 @@ fn command_gate_call(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
+    command_gate_call_with(input, run, || load_gate::gather_live(&input.cwd))
+}
+
+/// [`command_gate_call`] with what the load stage reads from the world
+/// injected, so a test can put a verdict in front of it.
+///
+/// The load stage is answered before the harness is asked, and folded in after
+/// the guard and the gate are combined: the harness has a budget that can
+/// expire, which must not take the host-load refusal with it, and
+/// [`signal_guard::combine`] keeps its first argument's decision, which an
+/// advice-only answer must not displace. Bypass mode does not waive it (see
+/// `load_gate`).
+fn command_gate_call_with(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+    gather: impl FnOnce() -> load_gate::Gathered,
+) -> HookOutput {
     let guard = under_bypass(input, signal_guard::run(input));
     if signal_guard::refuses(&guard) {
         return guard;
     }
+    let load = load_gate::judge(input, gather);
     let gate = command_gate_with(input, run);
-    signal_guard::combine(guard, gate)
+    load_gate::fold(signal_guard::combine(guard, gate), load)
 }
 
 /// Judges one command line the way the hook does, on `lane`'s sidecar.
@@ -3356,16 +3390,33 @@ fn shared_dirt_clause(snapshot: &InsightsSnapshot, shared: &insights::SharedWork
 /// `git status` that never ran would be the same lie this module refuses to
 /// tell about collisions, one line further down the page.
 pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> String {
-    session_brief_served(snapshot, here, source, None)
+    session_brief_with(snapshot, here, source, None, None)
 }
 
-/// [`session_brief`] with the running app's fact source and age (`age_ms`)
-/// included when the snapshot came from the app.
-pub fn session_brief_served(
+/// Where throwaway build output goes, as an absolute path under the session's
+/// own checkout. `.gitpulse/` is per repository, on the repository's own
+/// volume, ignored by git here and not on DevCouncil's preserved-name list
+/// (`tmp`, `.cache` and `.claude` are), and the cleaner's agent scratch scope
+/// knows it, so output kept there is accounted for. The path is absolute
+/// because a relative `--target-dir` or `CARGO_TARGET_DIR` is invisible to the
+/// check that a build is still running in it.
+fn scratch_build_line(checkout: &str) -> String {
+    let root = checkout.trim_end_matches('/');
+    format!(
+        "scratch builds: put throwaway build output in {root}/.gitpulse/scratch/target-<label>, as an absolute --target-dir or CARGO_TARGET_DIR (a relative one is resolved against the build's working directory); never put build output directly inside a checkout's .claude/ folder, because new session worktrees are seeded with a copy of it"
+    )
+}
+
+/// [`session_brief`] with two more lines right under the header, so they are
+/// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
+/// says (`load_gate::brief_line_live`), and the running app's fact source and
+/// age (`app_age_ms`) when the snapshot came from the app.
+fn session_brief_with(
     snapshot: &InsightsSnapshot,
     here: &str,
     source: &str,
     app_age_ms: Option<u64>,
+    load: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -3377,9 +3428,15 @@ pub fn session_brief_served(
         },
         snapshot.repo_path
     ));
+    if let Some(load) = load {
+        out.push_str(load);
+        out.push('\n');
+    }
     if let Some(age_ms) = app_age_ms {
         out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
     }
+    out.push_str(&scratch_build_line(here));
+    out.push('\n');
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
     // have filled are partial rather than empty.
@@ -3596,7 +3653,13 @@ fn run_session_brief_with(
         ));
     };
     report_agent_session_meta(&here, input);
-    let brief = session_brief_served(&snapshot, &here, &input.source, app_age_ms);
+    let brief = session_brief_with(
+        &snapshot,
+        &here,
+        &input.source,
+        app_age_ms,
+        Some(&load_gate::brief_line_live()),
+    );
     // A worktree the WorktreeCreate hook handed over with its setup failed:
     // the one place that reaches the session (`worktree::setup_failure`).
     let brief = match worktree::setup_failure(&root) {
@@ -9018,6 +9081,77 @@ done
         assert!(detached_brief.contains("detached or bare"));
         assert!(unknown_brief.contains("UNKNOWN (not established)"));
         assert_ne!(detached_brief, unknown_brief);
+    }
+
+    /// The host-load line goes under the header, where the cap never cuts, and
+    /// a brief without one is the brief it always was.
+    #[test]
+    fn the_brief_carries_the_load_line_under_its_header_even_when_the_cap_cuts() {
+        let plain = snapshot_fixture();
+        assert_eq!(
+            session_brief(&plain, "/repo", "startup"),
+            session_brief_with(&plain, "/repo", "startup", None, None)
+        );
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let line =
+            "host load: elevated, swap in use is above GitPulse's limit for it (sensor fresh)";
+        let brief = session_brief_with(&snapshot, "/repo", "startup", None, Some(line));
+        assert!(brief.len() <= BRIEF_LIMIT);
+        assert!(brief.ends_with("… truncated"));
+        assert_eq!(brief.lines().nth(2), Some(line), "{brief}");
+    }
+
+    /// Agents put scratch builds wherever they like unless the brief names a
+    /// place; the one place GitPulse accounts for is named once, short, and
+    /// survives the cap that cuts the long lists below it.
+    #[test]
+    fn the_brief_names_the_scratch_build_root_once() {
+        let brief = session_brief(&snapshot_fixture(), "/repo", "startup");
+        let named: Vec<&str> = brief
+            .lines()
+            .filter(|l| l.contains(".gitpulse/scratch/target-"))
+            .collect();
+        assert_eq!(named.len(), 1, "{brief}");
+        assert!(named[0].len() < 350, "{}", named[0]);
+        assert!(
+            named[0].contains("/repo/.gitpulse/scratch/target-<label>"),
+            "the root is absolute and under the session's own checkout: {}",
+            named[0]
+        );
+        assert!(named[0].contains("absolute --target-dir"), "{}", named[0]);
+        assert!(
+            named[0].contains("never put build output directly inside a checkout's .claude/")
+                && named[0].contains("seeded with a copy"),
+            "{}",
+            named[0]
+        );
+        let other = session_brief(&snapshot_fixture(), "/work/lane/", "startup");
+        assert!(
+            other.contains("/work/lane/.gitpulse/scratch/target-<label>"),
+            "{other}"
+        );
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let cut = session_brief(&snapshot, "/repo", "startup");
+        assert!(cut.ends_with("… truncated"));
+        assert!(cut.contains(".gitpulse/scratch/target-"), "{cut}");
     }
 
     #[test]

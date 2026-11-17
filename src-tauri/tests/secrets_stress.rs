@@ -310,6 +310,38 @@ fn malformed_and_failed_runs_fail_closed() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_scan_that_died_carries_what_the_runner_knew_about_its_end() {
+    // A "terminated before it finished" with no cause was seen twice in the
+    // field, 2 s into a 300 s deadline with nothing captured. The banner is
+    // unchanged; the copyable diagnostic names the raw wait status, the signal,
+    // whether a core was dumped, whether the cancel token fired and whether the
+    // runner itself signalled the group, so the next occurrence has a cause to
+    // read instead of a guess.
+    let _serial = serial();
+    let (_dir, root) = repo();
+    let tools = TempDir::new().unwrap();
+    let report = scan(&root, &stub(tools.path(), "kill -9 $$"));
+    assert!(!report.ok);
+    let diagnostic = report.diagnostic.as_deref().expect("a diagnostic");
+    for line in [
+        "wait_status_raw: 0x0009",
+        "exit_signal: SIGKILL (9)",
+        "core_dumped: false",
+        "stopped_signal: none",
+        "cancel_token_fired: false",
+        "runner_signalled_group: false",
+        "shutdown_sweep_started: false",
+    ] {
+        assert!(
+            diagnostic.lines().any(|found| found == line),
+            "missing `{line}` in:\n{diagnostic}"
+        );
+    }
+    assert_failure_diagnostic(&report);
+}
+
 #[test]
 fn a_partial_scan_is_reported_as_partial() {
     let _serial = serial();

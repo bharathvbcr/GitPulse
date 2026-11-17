@@ -65,6 +65,13 @@ fn a_catch_up_pass_starts_its_git_children_in_the_background_class() {
 /// scanning of every exec) behaves like this, and a fast fixture hides every
 /// bug in how a pass spends its budget.
 fn slow_git_dir(millis: u64) -> tempfile::TempDir {
+    slow_git_dir_for(millis, &[])
+}
+
+/// [`slow_git_dir`] for the git subcommands in `verbs` only (every one when
+/// empty): a lookup that costs several of them can be made slow while the
+/// reflog reads stay fast.
+fn slow_git_dir_for(millis: u64, verbs: &[&str]) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
         .map(|dir| dir.join("git"))
@@ -73,12 +80,18 @@ fn slow_git_dir(millis: u64) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("shim dir");
     let shim = dir.path().join("git");
     let seconds = millis as f64 / 1000.0;
+    let delay = if verbs.is_empty() {
+        format!("sleep {seconds}\n")
+    } else {
+        let patterns: Vec<String> = verbs.iter().map(|verb| format!("*\" {verb} \"*")).collect();
+        format!(
+            "case \" $* \" in {}) sleep {seconds} ;; esac\n",
+            patterns.join("|")
+        )
+    };
     std::fs::write(
         &shim,
-        format!(
-            "#!/bin/sh\nsleep {seconds}\nexec \"{}\" \"$@\"\n",
-            real.display()
-        ),
+        format!("#!/bin/sh\n{delay}exec \"{}\" \"$@\"\n", real.display()),
     )
     .expect("write the shim");
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -111,25 +124,7 @@ fn git_count(dirs: &[std::path::PathBuf], verb: &[&str]) -> usize {
 fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() {
     let (main, _parent, linked) = repo_with_worktrees(20);
     let anchor = plain(main.path());
-    let corpus = tempfile::tempdir().expect("corpus");
-    let transcript = corpus.path().join("slug").join("S1.jsonl");
-    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-    std::fs::write(
-        &transcript,
-        serde_json::json!({
-            "type": "assistant",
-            "sessionId": "S1",
-            "timestamp": "2026-09-01T12:00:01.000Z",
-            "version": "2.1.241",
-            "cwd": anchor,
-            "message": { "content": [
-                { "type": "tool_use", "name": "Edit", "input": { "file_path": format!("{anchor}/a.rs") } }
-            ]}
-        })
-        .to_string()
-            + "\n",
-    )
-    .unwrap();
+    let corpus = one_transcript_corpus(&anchor);
 
     let shim = slow_git_dir(150);
     let path = std::env::join_paths(
@@ -170,6 +165,86 @@ fn passes_over_a_slow_git_and_twenty_worktrees_add_up_to_a_completed_catch_up() 
         .filter(|event| transcript::ACTIONS.contains(&event.action.as_str()))
         .collect();
     assert_eq!(recorded.len(), 1, "the transcript was never ingested");
+    let _ = linked;
+}
+
+/// A transcript root holding one session with one edit under `anchor`.
+fn one_transcript_corpus(anchor: &str) -> tempfile::TempDir {
+    let corpus = tempfile::tempdir().expect("corpus");
+    let transcript = corpus.path().join("slug").join("S1.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "S1",
+            "timestamp": "2026-09-01T12:00:01.000Z",
+            "version": "2.1.241",
+            "cwd": anchor,
+            "message": { "content": [
+                { "type": "tool_use", "name": "Edit", "input": { "file_path": format!("{anchor}/a.rs") } }
+            ]}
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    corpus
+}
+
+/// The default branch is found with several git processes (the config, the
+/// remote's HEAD, the candidate branches). On a cold cache, on a host where
+/// each process takes over a second to start, that lookup alone outlasts a
+/// pass, and it ran before the reflogs' slice was cut: it spent the
+/// transcripts' share, and no transcript was read while the cache was cold.
+/// It now runs after the transcripts, the next passes read the branch it named,
+/// and the catch-up completes.
+#[test]
+fn a_slow_default_branch_lookup_does_not_spend_the_transcripts_share() {
+    let (main, _parent, linked) = repo_with_worktrees(2);
+    let anchor = plain(main.path());
+    let corpus = one_transcript_corpus(&anchor);
+    // Five lookups at this cost are well past the five-second pass; the reflog
+    // reads and the address are not slowed.
+    let shim = slow_git_dir_for(1500, &["config", "symbolic-ref"]);
+    let path = std::env::join_paths(
+        std::iter::once(shim.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let serial = crate::test_support::env::env_serial();
+    let _env = crate::test_support::env::bind_env(&serial)
+        .set("GITPULSE_TRANSCRIPT_ROOT", corpus.path())
+        .set("PATH", &path);
+
+    let gate = eager_gate();
+    let first = catch_up_through(&gate, &anchor);
+    assert!(
+        first.transcripts > 0,
+        "the default-branch lookup spent the transcripts' share: {first:?}"
+    );
+    let mut passes = vec![first];
+    for _ in 0..8 {
+        let last = passes.last().unwrap();
+        if !last.truncated && last.error.is_empty() {
+            break;
+        }
+        passes.push(catch_up_through(&gate, &anchor));
+    }
+    let last = passes.last().unwrap();
+    assert!(
+        !last.truncated && last.error.is_empty(),
+        "{} passes did not complete the catch-up: {passes:#?}",
+        passes.len()
+    );
+    let default_reads = git_count(
+        &[std::path::PathBuf::from(&anchor)],
+        &["reflog", "refs/heads/main"],
+    );
+    assert!(
+        default_reads > 0,
+        "the default branch's reflog was never read: {passes:#?}"
+    );
     let _ = linked;
 }
 

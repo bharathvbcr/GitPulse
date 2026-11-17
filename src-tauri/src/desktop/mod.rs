@@ -1077,12 +1077,21 @@ where
         }
     })
     .map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        receiver.recv_timeout(std::time::Duration::from_secs(10))
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| format!("The main-thread update did not finish: {error}"))?
+    wait_for_main_thread(receiver)
+        .await?
+        .map_err(|error| format!("The main-thread update did not finish: {error}"))?
+}
+
+/// Waits, off the async runtime, up to [`MAIN_THREAD_WAIT`] for what the main
+/// thread sends back. Every main-thread caller waits through this one blocking
+/// start, so a stalled AppKit loop costs each caller one pool thread for a
+/// bounded time and never more.
+async fn wait_for_main_thread<T: Send + 'static>(
+    receiver: std::sync::mpsc::Receiver<T>,
+) -> Result<Result<T, std::sync::mpsc::RecvTimeoutError>, String> {
+    tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(MAIN_THREAD_WAIT))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The newest menu presentation waiting for the main thread, and the callers
@@ -1182,11 +1191,7 @@ impl MenuStateSlot {
 async fn await_menu_outcome(
     receiver: std::sync::mpsc::Receiver<Result<(), String>>,
 ) -> Result<(), String> {
-    let outcome =
-        tauri::async_runtime::spawn_blocking(move || receiver.recv_timeout(MAIN_THREAD_WAIT))
-            .await
-            .map_err(|error| error.to_string())?;
-    match outcome {
+    match wait_for_main_thread(receiver).await? {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             log::warn!(
@@ -1454,12 +1459,15 @@ mod tests {
         assert_eq!(*confirmations.lock().unwrap(), 1);
     }
 
+    /// The main-thread dispatches a test captured instead of running them.
+    type JobQueue = std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
     /// A stalled main thread must not collect one closure per update: ten
     /// updates queue exactly one, and the newest state is the one applied.
     #[test]
     fn menu_updates_behind_a_stalled_main_thread_queue_one_closure_and_apply_the_newest() {
         let slot = std::sync::Arc::new(MenuStateSlot::default());
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let applied: std::sync::Arc<Mutex<Vec<MenuState>>> = Default::default();
         let mut receivers = Vec::new();
         for index in 0..10 {
@@ -1499,7 +1507,7 @@ mod tests {
     #[test]
     fn a_menu_apply_failure_reaches_every_waiting_caller_and_frees_the_slot() {
         let slot = std::sync::Arc::new(MenuStateSlot::default());
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let submit = |slot: &std::sync::Arc<MenuStateSlot>| {
             let queue = std::sync::Arc::clone(&queue);
             MenuStateSlot::submit(
@@ -1543,7 +1551,7 @@ mod tests {
             std::sync::Arc::new(|_| Ok(())),
         );
         assert_eq!(refused.err(), Some("event loop closed".to_string()));
-        let queue: std::sync::Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Default::default();
+        let queue: JobQueue = Default::default();
         let sink = std::sync::Arc::clone(&queue);
         MenuStateSlot::submit(
             &slot,

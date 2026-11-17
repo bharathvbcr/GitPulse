@@ -244,6 +244,13 @@ fn shutting_down() -> bool {
     SHUTTING_DOWN.load(Ordering::SeqCst)
 }
 
+/// Whether [`reap_all`] has started, which is when this process signals every
+/// child it has registered. A child that died after this was possibly signalled
+/// by the sweep, not by anything it did itself.
+pub(crate) fn shutdown_started() -> bool {
+    shutting_down()
+}
+
 /// The repository trust refusal, carried inside the `io::Error` a refused
 /// spawn returns. It reads as the refusal's own text, as the plain message it
 /// replaced did, and [`trust_refusal`] gives the runner that words the spawn

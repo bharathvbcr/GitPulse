@@ -18,7 +18,7 @@ import { diagnostics } from "../diagnostics/diagnostics";
  * reads.
  */
 
-export type Why = "unsupported" | "unreadable" | "failed" | "not_yet";
+export type Why = "unsupported" | "unreadable" | "failed" | "not_yet" | "disabled" | "older";
 /** `sysload::Reading<T>`: a value, or why there is none. */
 export type Reading<T> = { status: "value"; value: T } | { status: "unavailable"; value: Why };
 export type Level = "normal" | "warn" | "critical";
@@ -74,6 +74,12 @@ export interface CompressorDelta {
   major_compaction_segments_freed: number;
 }
 
+/** `sysload::CompressorSegments`: segments in use against the compressor's limit. */
+export interface CompressorSegments {
+  total: number;
+  limit: number;
+}
+
 export interface Cores {
   logical: number;
   levels: number;
@@ -87,6 +93,7 @@ export interface HostSample {
   swap_total: Reading<number>;
   compressor: Reading<Compressor>;
   compressed_bytes: Reading<number>;
+  compressor_segments: Reading<CompressorSegments>;
   load: Reading<[number, number, number]>;
   cores: Reading<Cores>;
   memsize: Reading<number>;
@@ -128,6 +135,30 @@ export interface Snapshot {
   memguard_pid: number;
   orphans: number;
   tick: TickStats;
+  /**
+   * Bytes of free disk lost per minute, as the writer measured it (the quick
+   * rate, which Elevated decides on). Optional only for a record an older build
+   * wrote: this backend always emits it, and says why when there is no value.
+   */
+  disk_fill_rate?: Reading<number>;
+  /** The sustained rate, which Severe decides on: one burst cannot fake it. */
+  disk_fill_sustained?: Reading<number>;
+  /**
+   * The app's held governor verdict, for readers with no history (the hook,
+   * `gitpulse-mcp`). One tick behind the readings: the sampler publishes, then
+   * counts the sample. Pending on a writer's first tick; unsupported in a
+   * record an older build wrote.
+   */
+  verdict: Reading<PublishedVerdict>;
+}
+
+/** `sysload::PublishedVerdict`. */
+export interface PublishedVerdict {
+  tier: Tier;
+  binding: Binding | null;
+  admit: boolean;
+  shed_background: boolean;
+  shed_reactive: boolean;
 }
 
 export interface AgentSession {
@@ -143,6 +174,13 @@ export interface AgentSession {
    */
   parent_pid: number | null;
   footprint: Reading<number>;
+  /**
+   * Bytes per second the session's own process and its attached descendants
+   * wrote since the previous tick. A floor, never the whole: a process that
+   * started and exited between two ticks is never read. It names who wrote,
+   * not which folder the bytes went to.
+   */
+  write_rate: Reading<number>;
   members: number;
   unreadable_members: number;
 }
@@ -213,7 +251,17 @@ export interface ProcView {
 }
 
 /** What the governor says is binding (`sysload::Binding`). */
-export type Binding = "memory_pressure" | "compressor_thrash";
+export type Binding =
+  | "memory_pressure"
+  | "compressor_thrash"
+  | "compressor_segments"
+  | "swap"
+  | "low_disk"
+  | "disk_filling"
+  | "thermal"
+  | "cpu_load"
+  | "exec_latency"
+  | "battery";
 export type Tier = "clear" | "elevated" | "severe";
 export type Reason =
   | "healthy"
@@ -228,6 +276,8 @@ export type Reason =
 export interface Shed {
   background: boolean;
   reactive: boolean;
+  /** What put the host in the tier that sheds; null when nothing is shed. */
+  cause: Binding | null;
 }
 
 export interface GovernorVerdict {
@@ -271,9 +321,40 @@ export type Advisory =
   | { reason: "disk_unknown" }
   | { reason: "several"; items: Advisory[] };
 
+/** `sysload::DiskFill`: where the disk is heading. */
+export interface DiskFill {
+  /** Bytes of free space lost per minute. */
+  rate_bytes_per_min: number;
+  /** Minutes until free space reaches the severe floor at that rate; 0 when it is there. */
+  eta_min: number;
+  free_bytes: number;
+  floor_bytes: number;
+  /** The tier the projection alone reaches, before the rule's mode caps it. */
+  tier: Tier;
+}
+
+/**
+ * `sysload::ExecLatency`: how long a trivial child takes to start, measured by
+ * the app's own probe. The median of the last `n` probes, and whether the
+ * latch (slow from 500 ms, clear below 300 ms) calls that slow.
+ */
+export interface ExecLatency {
+  median_ms: number;
+  n: number;
+  slow: boolean;
+}
+
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {
   verdict: GovernorVerdict;
+  /**
+   * The start-up time the governor last read, beside the memory pressure it
+   * reports. Absent or null when no probe runs in the process or it could not
+   * run: unknown, never fast.
+   */
+  exec_latency?: ExecLatency | null;
+  /** Present while the fill-rate rule is on and the projection is at least elevated. */
+  disk_fill?: DiskFill | null;
   refusing_for_s: number | null;
   notice: boolean;
   largest_foreign: number | null;
@@ -296,6 +377,62 @@ export interface GovernorPulse {
 /** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
 export const HOST_PRESSURE_REFUSAL = "host_pressure";
 
+/** `sysload::TraceRecord`: one sample of the pre-crash ring; null is unreadable, never zero. */
+export interface TraceRecord {
+  wall_s: number;
+  mono_ms: number;
+  boot_id: number;
+  pressure: Level | null;
+  tier: Tier | null;
+  binding: Binding | null;
+  admit: boolean | null;
+  swap_used: number | null;
+  compressed_bytes: number | null;
+  load_1m: number | null;
+  free_disk: number | null;
+  /** Bytes of free space lost per minute, or null when it was not measured. */
+  disk_fill_rate?: number | null;
+  /** The sustained rate Severe decides on, or null when it was not measured. */
+  disk_fill_sustained?: number | null;
+  launched_sessions: number | null;
+  observed_sessions: number | null;
+  largest_foreign: number | null;
+  launched_footprint: number | null;
+  thermal: Thermal | null;
+  power: Power | null;
+  segment_fraction: number | null;
+  /** Readings lost while the trace write was blocked or failing, since the previous record that landed. */
+  dropped_before: number;
+  /** The same count since the trace feed started. */
+  dropped_total: number;
+}
+
+/** `sysload::TracePeaks`: the worst of each reading over a window; null when none could be read. */
+export interface TracePeaks {
+  records: number;
+  max_tier: Tier | null;
+  refused: boolean;
+  max_swap_used: number | null;
+  max_compressed_bytes: number | null;
+  max_load_1m: number | null;
+  min_free_disk: number | null;
+  max_launched_footprint: number | null;
+  max_largest_foreign: number | null;
+  max_segment_fraction: number | null;
+  worst_thermal: Thermal | null;
+  max_pressure: Level | null;
+}
+
+/** `sysload::PreviousBoot`: what the last boot's trace ended with. */
+export interface PreviousBoot {
+  ended_wall_s: number | null;
+  records: TraceRecord[];
+  peaks: TracePeaks;
+  /** Readings dropped while a trace write was blocked, summed over every record the ring still holds. */
+  dropped: number;
+  error: string | null;
+}
+
 export interface HostLoadStatus {
   platform: Platform;
   role: Role;
@@ -309,6 +446,8 @@ export interface HostLoadStatus {
   procs: ProcView | null;
   tick: TickStats;
   problems: string[];
+  /** The tail of the previous boot's trace; null when there is none. */
+  previous_boot: PreviousBoot | null;
 }
 
 export interface HostLoadPulse {
@@ -322,10 +461,97 @@ export interface HostLoadPulse {
   governor: GovernorPulse;
 }
 
+/** `sysload::InputMode`: what one input may do to the governor's verdict. */
+export type InputMode = "off" | "shed" | "refuse";
+
+/** `sysload::Rule`: a mode and two thresholds (disk is GiB free, lower is worse). */
+export interface Rule {
+  mode: InputMode;
+  elevated_at: number;
+  severe_at: number;
+}
+
+/** `sysload::ModeRule`: an input whose states are fixed. */
+export interface ModeRule {
+  mode: InputMode;
+}
+
+/** `sysload::HorizonRule`: how soon the disk is projected to reach its severe floor. */
+export interface HorizonRule {
+  mode: InputMode;
+  elevated_within_min: number;
+  severe_within_min: number;
+}
+
+/** `sysload::HeadroomRule`: the free space a coverage build needs before it starts. */
+export interface HeadroomRule {
+  mode: InputMode;
+  headroom_gib: number;
+}
+
+/** `sysload::DiskGuard`: the disk guards beyond the level. */
+export interface DiskGuard {
+  fill: HorizonRule;
+  coverage: HeadroomRule;
+}
+
+/** `sysload::Thresholds`: every input the governor decides on besides pressure. */
+export interface Thresholds {
+  swap: Rule;
+  compressor_segments: Rule;
+  load: Rule;
+  thermal: ModeRule;
+  battery: ModeRule;
+  /** While `disk_auto`, the numbers are the automatic floors shown, not stored. */
+  disk: Rule;
+  /** Whether the disk floors follow physical memory (swap shares the free-space pool). */
+  disk_auto: boolean;
+  disk_guard: DiskGuard;
+}
+
+/** What the command gate does with a heavy command while the host is overloaded (`HostLoadHookMode`). */
+export type HostLoadHookMode = "enforce" | "advise" | "off";
+
 export interface HostLoadSettings {
   enabled: boolean;
   /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
   govern_launches: boolean;
+  /** Stored as the top-level `host_load_hook_mode`, never inside `host_load`. */
+  hook_mode: HostLoadHookMode;
+  thresholds: Thresholds;
+}
+
+/**
+ * Mirrors `Thresholds::default` in Rust. Provisional: each default was set
+ * from the 2026-11-14 incident alone (see `sysload/thresholds.rs`).
+ */
+export const DEFAULT_THRESHOLDS: Thresholds = {
+  swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
+  compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },
+  load: { mode: "shed", elevated_at: 3, severe_at: 6 },
+  thermal: { mode: "shed" },
+  battery: { mode: "off" },
+  disk: { mode: "refuse", elevated_at: 20, severe_at: 10 },
+  disk_auto: true,
+  disk_guard: {
+    fill: { mode: "refuse", elevated_within_min: 30, severe_within_min: 10 },
+    coverage: { mode: "refuse", headroom_gib: 60 },
+  },
+};
+
+/**
+ * Whether the settings equal the defaults, as the backend stores them. The
+ * automatic disk floors are shown as numbers for this computer's memory, so
+ * while they are automatic only the disk mode is compared, never its numbers.
+ */
+export function thresholdsAreDefault(thresholds: Thresholds): boolean {
+  const base = DEFAULT_THRESHOLDS;
+  const disk = (value: Thresholds) =>
+    value.disk_auto ? { auto: true, mode: value.disk.mode } : { auto: false, ...value.disk };
+  return (
+    JSON.stringify({ ...thresholds, disk: disk(thresholds) }) ===
+    JSON.stringify({ ...base, disk: disk(base) })
+  );
 }
 
 /** The event the app's sampler emits after every tick. */
@@ -470,16 +696,62 @@ export async function admitAnyway(): Promise<string> {
 export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   enabled: true,
   govern_launches: true,
+  hook_mode: "enforce",
+  thresholds: DEFAULT_THRESHOLDS,
 };
+
+/**
+ * The settings as last read or saved, shared by every Settings row that edits
+ * them. Each row saves through {@link updateHostLoadSettings}, which merges
+ * onto this and not onto a component's older copy, so a toggle never saves
+ * stale thresholds over a row's edit. Null until a read has succeeded.
+ */
+const settingsStore = writable<HostLoadSettings | null>(null);
+export const hostLoadSettings: Readable<HostLoadSettings | null> = { subscribe: settingsStore.subscribe };
 
 export async function loadHostLoadSettings(): Promise<HostLoadSettings> {
   if (!isTauri()) return DEFAULT_HOST_LOAD_SETTINGS;
-  return invoke<HostLoadSettings>("cmd_host_load_settings");
+  const settings = await invoke<HostLoadSettings>("cmd_host_load_settings");
+  settingsStore.set(settings);
+  return settings;
 }
 
 export async function saveHostLoadSettings(settings: HostLoadSettings): Promise<HostLoadSettings> {
-  if (!isTauri()) return settings;
-  return invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  if (!isTauri()) {
+    settingsStore.set(settings);
+    return settings;
+  }
+  const saved = await invoke<HostLoadSettings>("cmd_host_load_settings_save", { settings });
+  settingsStore.set(saved);
+  return saved;
+}
+
+let loadingSettings: Promise<HostLoadSettings> | null = null;
+
+/**
+ * The settings, read once however many Settings rows ask at the same time.
+ * A row that mounts after a read has succeeded gets the stored copy.
+ */
+export function ensureHostLoadSettings(): Promise<HostLoadSettings> {
+  let have: HostLoadSettings | null = null;
+  settingsStore.subscribe((value) => (have = value))();
+  if (have) return Promise.resolve(have);
+  if (!loadingSettings) {
+    const flight = loadHostLoadSettings().finally(() => {
+      if (loadingSettings === flight) loadingSettings = null;
+    });
+    loadingSettings = flight;
+  }
+  return loadingSettings;
+}
+
+/** Saves `change` on top of the latest settings read or saved anywhere. */
+export function updateHostLoadSettings(change: Partial<HostLoadSettings>): Promise<HostLoadSettings> {
+  let latest: HostLoadSettings = DEFAULT_HOST_LOAD_SETTINGS;
+  settingsStore.subscribe((value) => {
+    if (value) latest = value;
+  })();
+  return saveHostLoadSettings({ ...latest, ...change });
 }
 
 export const hostLoadPulse: Readable<HostLoadPulse | null> = { subscribe: pulseStore.subscribe };
@@ -503,4 +775,5 @@ export function resetHostLoadForTests(): void {
   noticeShown = false;
   pulseStore.set(null);
   statusStore.set(null);
+  settingsStore.set(null);
 }

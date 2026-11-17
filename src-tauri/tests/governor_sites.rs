@@ -111,9 +111,11 @@ fn admit_is_asked_only_where_a_launch_starts() {
 fn shed_is_read_only_by_the_spawn_gate() {
     assert_eq!(
         call_sites(&["sysload::shed("]),
-        ["src/engine/process/gate.rs:acquire_judged"],
+        ["src/engine/process/gate.rs:pressure_refusal"],
         "shedding rides the existing admission classes; a second reader of the verdict \
-         would be a second scheduler"
+         would be a second scheduler. The reader is `pressure_refusal`, which \
+         `acquire_judged` and the cleaner's `background_deferral_cause` both ask, so the \
+         scheduler's wait and the gate's refusal cannot disagree"
     );
 }
 

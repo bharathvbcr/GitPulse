@@ -305,6 +305,22 @@ impl PruneOutcome {
     }
 }
 
+/// Why a worktree is not removed out from under a live process: one stands in
+/// it, runs from it, or names it in its arguments or environment. A process
+/// table that could not be read in full refuses too.
+fn worktree_in_use(path: &std::path::Path) -> Option<String> {
+    match crate::sysload::procscan::processes_using(path) {
+        Err(e) => Some(format!("could not check for live processes: {e}")),
+        Ok(pids) if !pids.is_empty() => Some(format!(
+            "{} live process(es) use it (pids {pids:?}): their working directory, executable, \
+             arguments or environment is inside or names it; stop them, or pass \
+             reap_processes: true to terminate those standing in it",
+            pids.len()
+        )),
+        Ok(_) => None,
+    }
+}
+
 fn prune_one(
     repo_path: &str,
     anchor: &std::path::Path,
@@ -366,16 +382,24 @@ fn prune_one(
         }
     } else {
         // Not removing a worktree out from under a process that is working in it.
-        match crate::sysload::procscan::working_in(std::path::Path::new(&wt.path)) {
-            Err(e) => return skipped(format!("could not check for live processes: {e}")),
-            Ok(pids) if !pids.is_empty() => {
-                return skipped(format!(
-                    "{} live process(es) have their working directory inside (pids {pids:?}); \
-                     stop them, or pass reap_processes: true to terminate them",
-                    pids.len()
-                ))
+        if let Some(reason) = worktree_in_use(std::path::Path::new(&wt.path)) {
+            return skipped(reason);
+        }
+    }
+    if reap && !dry_run {
+        // Reaping signals only processes standing in the worktree. One that
+        // merely names it (a build run from elsewhere) is not signalled, and
+        // one that was is given a moment to exit: removal waits for neither.
+        let mut reason = worktree_in_use(std::path::Path::new(&wt.path));
+        for _ in 0..20 {
+            if reason.is_none() {
+                break;
             }
-            Ok(_) => {}
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            reason = worktree_in_use(std::path::Path::new(&wt.path));
+        }
+        if let Some(reason) = reason {
+            return skipped(format!("after terminating processes: {reason}"));
         }
     }
     if dry_run {
@@ -4375,7 +4399,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .is_some_and(|dirs| dirs.iter().any(|d| d == ".venv" || d == "venv"));
             let selection = crate::engine::cow_clone::CacheSelection {
                 include_virtualenvs,
-                ..Default::default()
+                ..crate::engine::cow_clone::CacheSelection::for_new_worktree()
             };
             let anchor = &family.anchor;
             let target = &family.worktree;
@@ -5547,6 +5571,36 @@ pub fn run(ready: Ready) -> JsonRpcResponse {
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+
+    /// Pruning asks who uses the worktree: a process standing elsewhere whose
+    /// arguments name it, and a process table that cannot be read, both skip.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn prune_skips_a_worktree_a_process_names_in_its_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let worktree = root.join("lane");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let idle = worktree_in_use(&worktree);
+        assert!(idle.is_none(), "nothing uses an empty directory: {idle:?}");
+        let mut child =
+            crate::sysload::procscan::tests::directory_use_child(&worktree, &elsewhere, true);
+        let mut reason = None;
+        let seen = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+            reason = worktree_in_use(&worktree);
+            reason.is_some()
+        });
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "the fixture process was never visible to the scan");
+        assert!(
+            reason.is_some_and(|r| r.contains("live process(es) use it")),
+            "a process naming the worktree is a reason to keep it"
+        );
+    }
 
     fn modern_meta() -> Value {
         json!({

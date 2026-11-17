@@ -167,7 +167,8 @@ fn discard_is_never_shed_under_memory_pressure() {
         crate::sysload::shed(),
         crate::sysload::Shed {
             background: true,
-            reactive: true
+            reactive: true,
+            cause: Some(crate::sysload::Binding::MemoryPressure)
         },
         "the injected governor sheds reactive work"
     );

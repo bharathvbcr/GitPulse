@@ -103,6 +103,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let mut options = sysload::SamplerOptions::new(dir);
     options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
     options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
+    options.thresholds = Box::new(|| tool_config::host_load_settings().thresholds);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {
         if let Err(error) = emitter.emit("host-load-pulse", pulse) {
@@ -486,6 +487,7 @@ pub fn run() {
             cmd_scan_deps_health,
             cmd_scan_secrets,
             cmd_storage_scan,
+            cmd_storage_stale_worktrees,
             cmd_commit_graph_write_plan,
             cmd_commit_graph_write,
             cmd_commit_graph_write_cancel,

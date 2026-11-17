@@ -125,6 +125,25 @@ pub async fn cmd_storage_scan(
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 
+/// Linked worktrees nobody is using, with what removing each would free.
+/// Read-only: removal is the person's click through `cmd_remove_worktree`.
+/// The idle threshold is the cleaner policy's `worktree_idle_days`, so the
+/// report and the opt-in prune scope judge staleness the same way.
+#[tauri::command(async)]
+pub async fn cmd_storage_stale_worktrees(
+    repo_path: String,
+) -> Result<crate::storage::stale_worktrees::StaleWorktreeReport, IpcError> {
+    off_thread(move || {
+        let idle_days = crate::storage::hygiene::global::service()?
+            .state()?
+            .config
+            .scopes
+            .worktree_idle_days;
+        crate::storage::stale_worktrees::stale_worktrees(&repo_path, idle_days)
+    })
+    .await
+}
+
 /// What the Storage panel's "Write commit-graph" click would run: the exact
 /// argv and the common directory it writes under. Reads files only; refused
 /// when no write is offered (graph present and fresh, no history, state
@@ -267,59 +286,5 @@ pub async fn cmd_hygiene_execute(
 }
 
 #[cfg(test)]
-mod deps_flight_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    fn failing() -> Result<DepsHealthReport, CommandError> {
-        Err(CommandError::from("scan stub".to_string()))
-    }
-
-    /// The defect: every caller ran its own full audit of the repository.
-    #[test]
-    fn concurrent_scans_of_one_repository_share_one_audit() {
-        let flights = Arc::new(DepsFlights::default());
-        let runs = Arc::new(AtomicUsize::new(0));
-        let leader = {
-            let (flights, runs) = (Arc::clone(&flights), Arc::clone(&runs));
-            std::thread::spawn(move || {
-                scan_deps_once(&flights, "/repo", || {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    // Wait for the second caller to either join this scan or
-                    // (the defect) start a scan of its own, so a regression
-                    // fails the count below instead of hanging here.
-                    while flights.followers(&"/repo".to_string()) == 0
-                        && runs.load(Ordering::SeqCst) == 1
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    failing()
-                })
-            })
-        };
-        while runs.load(Ordering::SeqCst) == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let follower = scan_deps_once(&flights, "/repo", || {
-            runs.fetch_add(1, Ordering::SeqCst);
-            failing()
-        });
-        assert!(follower.is_err());
-        assert!(leader.join().unwrap().is_err());
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn different_repositories_scan_independently() {
-        let flights = DepsFlights::default();
-        let runs = AtomicUsize::new(0);
-        for repo in ["/a", "/b"] {
-            let _ = scan_deps_once(&flights, repo, || {
-                runs.fetch_add(1, Ordering::SeqCst);
-                failing()
-            });
-        }
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-    }
-}
+#[path = "analysis_deps_flight_tests.rs"]
+mod deps_flight_tests;

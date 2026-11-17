@@ -115,6 +115,63 @@ This validates the current host. Run it before opening a pull request; the
 platform jobs in `.github/workflows/ci.yml` and `.github/workflows/coverage.yml`
 must still pass on their respective operating systems.
 
+The Rust test gate builds an instrumented copy of the crate (about 50 GiB in
+`<cargo target>/llvm-cov-target`). The runner deletes it itself once the coverage floor has
+read `lcov.info`, and also when a gate fails, or when something later in the run throws after
+the Rust test gate has returned. If that gate's own runner throws, nobody knows whether cargo
+ran, so the directory is left. It prints what it removed and how much it freed. A Ctrl-C or `kill` that stops
+the runner itself is not covered, so check for the directory after one. Set
+`CI_LOCAL_KEEP_COVERAGE_BUILD=1` (or `true`, `yes`; any other value, `0` and `no` included,
+deletes) to keep it: an incremental coverage rebuild is about 15 minutes faster, at the cost of
+the disk space.
+
+What it will delete, and when it will not:
+
+- It deletes the directory cargo-llvm-cov used: `CARGO_LLVM_COV_TARGET_DIR` (and
+  `CARGO_LLVM_COV_BUILD_DIR` beside it) if set, else `llvm-cov-target` under the target
+  directory `cargo metadata` reports. An empty variable counts as unset, as it does for
+  cargo-llvm-cov. A value with a `..` component is refused, because cargo-llvm-cov lets the OS
+  resolve it through symlinks and the runner will not guess where that leads.
+- Only a build this run wrote: the directory must not have existed before the Rust test gate,
+  or must have changed while it ran, and the gate must have got as far as running cargo (a
+  slot-gate give-up, exit 75, did not). A directory that predates the run unchanged is left
+  alone.
+- Inside the repository, `llvm-cov-target` is deleted. A symlink is never followed, and neither
+  the repository, your home directory, cargo's regular target directory nor anything that
+  looks like one is.
+- Outside the repository (a shared target directory), only `<CARGO_TARGET_DIR>/llvm-cov-target`
+  or the exact path `CARGO_LLVM_COV_TARGET_DIR` names, and only if it is named
+  `llvm-cov-target` and holds a cargo marker (`CACHEDIR.TAG` or `.rustc_info.json`). A target
+  moved outside the repository by `.cargo/config.toml` or `CARGO_BUILD_TARGET_DIR` rather than
+  `CARGO_TARGET_DIR` is refused, not followed. Because another worktree's coverage run may be
+  using a shared directory, it is also refused if any live process names it in its arguments or
+  runs an executable from inside it (a process's working directory is not checked), or if `ps`
+  cannot be read. The coverage run is serialised machine-wide but this delete happens after it,
+  so with a shared target directory prefer `CI_LOCAL_KEEP_COVERAGE_BUILD=1` while others are
+  building.
+
+Two ci:local runs, or a run and anything else, never delete each other's build because each
+run takes a lock file beside the directory (`llvm-cov-target.ci-local.lock`, created
+exclusively, holding its pid, its process start time and the resolved path) before the Rust
+test gate starts and removes it after cleanup, on every path including a throw. A lock whose
+process is alive and started when the lock says belongs to another run: this run refuses
+("another ci:local run (pid N) is using it") and leaves its lock alone. A lock whose process
+is gone, or whose pid was reused by a different process, is stale and is replaced, and the
+output says so. A lock that cannot be created (a read-only parent) is a refusal, never a
+removal. The lock applies inside and outside the repository, and the live-process check
+(every spelling of the path, including the `/private` form, on path boundaries) runs in both
+as a second guard. What stays uncovered: a bare `cargo llvm-cov` from another shell, which
+holds no lock, that is between child processes at that instant and reaches the directory
+through a symlink the runner does not resolve to the same path; and a lock file left by a
+crashed run whose pid is still alive and started at the recorded time is indistinguishable
+from a live one until that process exits.
+
+A build that could not be removed is reported as `COVERAGE BUILD NOT REMOVED` with the reason,
+in the run's log and its summary. That includes the case where the Rust test gate passed but
+nothing was found where the build should be. If every gate passed but the build was not
+removed, `ci:local` exits 4 rather than 0 (1 still means a gate failed); a build kept on request
+exits 0.
+
 > [!IMPORTANT]
 > **macOS is the platform this project is developed and hand-tested on.** CI
 > runs the automated suites elsewhere, but no one drives a running Windows or
@@ -207,12 +264,12 @@ flowchart TD
 | `bun run test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
 | `bun run test:tz` | Runs local-time frontend tests (due dates, pulse metrics, commit cadence) across `America/New_York`, `Pacific/Auckland`, and `Asia/Kolkata` to catch timezone and DST regressions |
 | `bun run gusset:check` | Runs `go/cmd/gusset-check` (`Go 1.27.4`) against DevCouncil's umbrella archive when sibling `DevCouncil` and `gusset` checkouts are present |
-| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (330 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (331 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 121 contracts (311 structs, 2172 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 125 contracts (329 structs, 2300 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -220,7 +277,7 @@ flowchart TD
 | `bun run check:workflows` | Lints every workflow with actionlint; a missing actionlint exits 2 (could not run) rather than 1 (workflows are faulty). It also fails any job or step in a workflow the release gate reads (`ci.yml`, `coverage.yml`, taken from `release-state.mjs`) that can skip or fail silently — a job `if:`, `continue-on-error`, a `needs:` on a skippable job, a step `if:` other than `!cancelled()` or a platform selector, a matrix `exclude`, a job that calls a reusable workflow (`uses`) or has no `steps` — unless `RELEASE_GATE_ALLOWLIST` lists it with a reason, because the gate reads the run's conclusion and a skipped job leaves it `success` |
 | `bun run release:notes -- --tag vX.Y.Z` | Prints the changelog section the release workflow will use as the release body; exits 1 if that tag has no section |
 | `bun run release:ready` | Checks that CI and coverage already succeeded for this commit, without creating or mutating a draft. Requires `RELEASE_TAG`, `RELEASE_COMMIT`, and `GH_REPO`. Run this before moving a `v*` tag; prepare cannot wait out an in-flight matrix |
-| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command |
+| `bun run ci:local` | Executes the complete local CI suite (format, clippy, tests, builds, coverage floors) in one command, then deletes the ~50 GiB coverage build unless `CI_LOCAL_KEEP_COVERAGE_BUILD=1`; exits 4 if every gate passed but it could not be removed |
 | `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` | Rust linting (warnings treated as errors) |
 | `cargo test --manifest-path src-tauri/Cargo.toml` | Rust backend test suite |
 
@@ -239,6 +296,7 @@ several were added after the drift had already happened.
 | `view-menu-contract` | A registered view missing from the native menu, in either direction. This happened three times — `tab-manvi`, then Storage and Reflog — because view ids are derived from the registry in TypeScript and hand-written as constants in Rust. |
 | `agents-surface-contract` | The Agents surface becoming unreachable. Agents is a workspace surface like Fleet and Tasks, not a registered repository view, so `view-menu-contract` does not force its native action id, menu parse arm, tab-bar entry, palette command or handler into existence; this test does. |
 | `menu-state-contract` | A native-menu payload the Rust validator refuses. `cmd_set_menu_state` validates before it applies and a refusal applies nothing, so one malformed payload does not degrade the menu bar, the tray and the status popover — it freezes all three on the last state Rust accepted, while the frontend logs `desktop:menu-state` and retries. Nothing on the TypeScript side enforced the rules, so the suite could not tell a payload that renders from one that can never be sent. This reads every ceiling, enum, action id and refusal message out of `state.rs` and `actions.rs` and holds `menuContract.ts` to them; `menuContract.test.ts` then uses that mirror to prove `buildMenuState` is total. |
+| `blocking-command-async-contract` | A command that reads files or waits on a lock declared as a plain `#[tauri::command] pub fn`, which runs on the GUI thread: a slow disk on a loaded host then freezes the window while the diagnostics view polls it. The 2026-11-16 diagnostics showed this for `cmd_diagnostic_log_tail` and `cmd_daemon_status`. |
 | `check-schema-parity.adversarial` | The adversarial cases for `check-schema-parity`'s extraction-schema row: constants that only appear inside comments (the extractor is comment-blind), hostile manifest values, and fake `devmap` binaries that answer wrongly or not at all. |
 | `adv_w3b_sibling_scripts` | A bad `GITPULSE_VENDOR_GIT_TIMEOUT_MS` that `check-schema-parity` or `gusset-check` reports as a stack trace instead of one `FAIL:` line with exit 2, and a `git` that hangs inside `findSibling` and does the same. |
 | `adv_w5b_signal_guard` (`src-tauri/tests/`) | The signal guard answering silently for a command the real procps, psmisc or sysvinit tool turns into a signal on a protected process: regular-expression syntax and character-set differences, `pidof` by path, programs the shell reader does not resolve, a root sender reading other users' arguments, an executable that cannot be identified. Every test is `#[ignore]`d and refuses to run outside the Linux container `tests/fixtures/adv_w4a/run.sh` starts (it sends real signals), so an ordinary run reports them as not run. |
@@ -389,7 +447,7 @@ GitPulse/
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 ├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (330 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (331 handlers)
     ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

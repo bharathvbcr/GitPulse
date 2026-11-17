@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 121 contracts over
- * 311 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 125 contracts over
+ * 329 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -109,7 +109,9 @@ const rust = (...parts) => path.join(REPO_ROOT, "src-tauri", "src", ...parts);
 const ts = (...parts) => path.join(REPO_ROOT, "src", "lib", ...parts);
 
 export const CONTRACTS = Object.freeze([
-  { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
+  { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["ReclaimScopes", "CloneBudget", "CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
+  { label: "agent-scratch", rustPath: rust("storage", "hygiene", "agent.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["KeptItem", "LeakedTemp"] },
+  { label: "stale-worktrees", rustPath: rust("storage", "stale_worktrees.rs"), tsPath: ts("storage", "staleWorktreeTypes.ts"), structs: ["StaleWorktree", "StaleWorktreeReport"] },
   { label: "hygiene", rustPath: rust("storage", "hygiene", "mod.rs"), tsPath: ts("storage", "hygiene", "types.ts"), structs: ["CacheEntry", "CacheInventory", "HygienePlan", "HygieneOutcome"] },
   { label: "workbench", rustPath: rust("workbench.rs"), tsPath: ts("workbench", "client.ts"), structs: ["WorkbenchError"] },
   { label: "attempt-review", rustPath: rust("workbench", "review.rs"), tsPath: ts("workbench", "attemptReview.ts"), structs: ["AttemptReview"] },
@@ -272,10 +274,12 @@ export const CONTRACTS = Object.freeze([
   // all — the "could not look" that must never pass for "nothing there".
   { label: "host-load-sampler", rustPath: rust("sysload", "sampler.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadStatus", "HostLoadPulse"] },
   { label: "host-load-sensor", rustPath: rust("sysload.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["SensorReport", "Clock"] },
-  { label: "host-load-snapshot", rustPath: rust("sysload", "snapshot.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Snapshot", "WriterIdentity", "TickStats"] },
-  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores"] },
+  { label: "host-load-snapshot", rustPath: rust("sysload", "snapshot.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Snapshot", "WriterIdentity", "TickStats", "PublishedVerdict"] },
+  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores", "CompressorSegments"] },
   { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
-  { label: "host-load-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
+  { label: "host-load-trace", rustPath: rust("sysload", "trace.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["TraceRecord", "TracePeaks", "PreviousBoot"] },
+  { label: "host-load-thresholds", rustPath: rust("sysload", "thresholds.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Rule", "ModeRule", "Thresholds", "DiskFill", "DiskGuard", "HorizonRule", "HeadroomRule"] },
+  { label: "host-load-settings",rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
   { label: "host-load-governor", rustPath: rust("sysload", "governor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["GovernorVerdict", "GovernorReport", "GovernorPulse", "Shed"] },
   // What an agent CLI starts with in a terminal tab, and which modes this
   // build can expand. `modes` and `launchers` are what the chooser renders, so
