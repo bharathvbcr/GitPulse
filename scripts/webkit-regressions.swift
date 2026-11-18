@@ -94,6 +94,15 @@ window.alphaValue = 0
 window.ignoresMouseEvents = true
 window.collectionBehavior = [.transient, .ignoresCycle]
 window.orderFrontRegardless()
+// WebKit matches `:focus` only in a key window, so the focus-style checks need
+// one. An unattended runner has no person to take focus from, and there a
+// window that is never activated never becomes key (probed on the macos-26
+// runner: passive gave hasFocus false and no `:focus` match; activating gave
+// both). CI asks for it; a run on a developer's Mac stays passive.
+if ProcessInfo.processInfo.environment["GITPULSE_WEBKIT_TAKE_FOCUS"] == "1" {
+    app.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+}
 webview.load(URLRequest(url: url))
 Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { _ in
     fputs("WebKit regression deadline expired\n", stderr)
