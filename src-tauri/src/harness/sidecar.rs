@@ -37,6 +37,7 @@ use serde_json::Value;
 use super::claude_key::CLAUDE_KEY_ENV;
 use super::hosted;
 use super::protocol::*;
+use super::scratch::{self, ScratchDir};
 
 /// How long a single request may take before the child is considered wedged.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -294,6 +295,9 @@ struct Sidecar {
     /// the stdout pump: from then on frames nobody will read are discarded
     /// instead of faulting a full queue (see [`spawn_stdout_pump`]).
     shutting_down: std::sync::Arc<AtomicBool>,
+    /// The state directory this child was started in, which only a stdio child
+    /// has. Removed by [`Sidecar::terminate`] once the child is reaped.
+    scratch: Option<ScratchDir>,
 }
 
 impl Drop for Sidecar {
@@ -527,15 +531,24 @@ fn spawn_pump<R: std::io::Read + Send + 'static>(
 /// reason `procguard` puts each child in a group of its own, and this was the
 /// one shutdown path that never used it: observed with a stub harness whose
 /// helper survived the test binary that started it, reparented to init.
+///
+/// Returns whether the child was confirmed reaped: only then is anything it
+/// was using safe to remove.
 fn shutdown_child<W>(
     child: &mut Child,
     stdin: Option<W>,
     grace: Duration,
     guard: &crate::procguard::Registration,
-) {
+) -> bool {
     // Dropping the write end is what sends EOF; there is no explicit close.
     drop(stdin);
-    let _ = guard.stop_and_reap(child, grace);
+    match guard.stop_and_reap(child, grace) {
+        Ok(_) => true,
+        Err(why) => {
+            log::warn!(target: "harness", "could not confirm the sidecar child was reaped: {why}");
+            false
+        }
+    }
 }
 
 impl Sidecar {
@@ -555,7 +568,17 @@ impl Sidecar {
         match &self.peer {
             Peer::Child { child, guard } => {
                 let mut child = relock(child);
-                shutdown_child(&mut child, stdin, self.shutdown_grace, guard);
+                let reaped = shutdown_child(&mut child, stdin, self.shutdown_grace, guard);
+                // After the reap, never before: the child may be using it until
+                // it is gone. A child that could not be confirmed gone keeps
+                // its directory for the next sweep.
+                if let Some(scratch) = &self.scratch {
+                    if reaped {
+                        scratch.remove();
+                    } else if let Some(path) = scratch.path() {
+                        log::warn!(target: "harness", "kept harness state dir {}: its child was not confirmed reaped", path.display());
+                    }
+                }
             }
             // A hosted server is disconnected from, never stopped: it holds
             // runs that are meant to outlive this connection. Ending them is
@@ -965,8 +988,11 @@ use std::os::unix::fs::DirBuilderExt;
 /// is not ours to touch and is visible to any other process running as the
 /// local user; this per-boot directory is process-unique, private
 /// (`0o700` on Unix), and refuses to traverse a symlink at its own path.
-/// Old directories are deliberately not cleaned up: best-effort deletion of
-/// unknown-provenance paths is riskier than the few kilobytes they hold.
+/// The sidecar that made it removes it once its child is reaped
+/// ([`Sidecar::terminate`]); one a process left behind (a hook exits without
+/// running destructors, a crash runs none) is removed by a later process's
+/// first spawn ([`sweep_stale_scratch_once`]), which keeps anything it cannot
+/// prove is a dead process's own.
 fn scratch_dir() -> Result<PathBuf, HarnessError> {
     let unique = {
         use std::hash::{Hash, Hasher};
@@ -978,8 +1004,41 @@ fn scratch_dir() -> Result<PathBuf, HarnessError> {
             .hash(&mut hasher);
         format!("{}-{:016x}", std::process::id(), hasher.finish())
     };
-    create_scratch_under(&std::env::temp_dir(), &unique)
+    create_scratch_under(&scratch_root(), &unique)
         .map_err(|e| HarnessError::Unavailable(format!("could not prepare harness state dir: {e}")))
+}
+
+/// Where scratch directories live: the temp directory, or in a test the root it
+/// bound ([`bind_test_scratch_root`]).
+fn scratch_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_SCRATCH_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return root;
+    }
+    std::env::temp_dir()
+}
+
+/// The root last swept, so each root is swept by the first spawn that uses it
+/// and a hook process pays for one directory read, not one per spawn.
+static SWEPT_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Removes the stale scratch directories under [`scratch_root`] the first time
+/// a spawn uses that root. A sweep that fails is logged and never fails the
+/// spawn: it is housekeeping, not part of starting a sidecar.
+fn sweep_stale_scratch_once() {
+    let root = scratch_root();
+    {
+        let mut swept = relock(&SWEPT_ROOT);
+        if swept.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        *swept = Some(root.clone());
+    }
+    scratch::sweep_stale(&root, scratch::current_uid(), scratch::pid_alive);
 }
 
 /// Creates `<root>/gitpulse-harness-<unique>` fail-closed: refuses an
@@ -1084,6 +1143,8 @@ pub fn resolve_binary_absence() -> String {
 /// parallel; this stays inside `cfg(test)` builds only.
 #[cfg(test)]
 static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_SCRATCH_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static SLOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1273,6 +1334,32 @@ pub(crate) fn bind_test_binary(
     // slot is dropped on the way in as well as on the way out.
     reset();
     TestBinaryBinding
+}
+
+/// Points scratch directories (and the sweep of them) at `root` for the whole
+/// process, until this is dropped. Needs the serial guard for the reason
+/// [`TestBinaryBinding`] does.
+#[cfg(test)]
+pub(crate) struct TestScratchRoot;
+
+#[cfg(test)]
+pub(crate) fn bind_test_scratch_root(
+    _serial: &SidecarTestGuard,
+    root: impl Into<PathBuf>,
+) -> TestScratchRoot {
+    *TEST_SCRATCH_ROOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root.into());
+    TestScratchRoot
+}
+
+#[cfg(test)]
+impl Drop for TestScratchRoot {
+    fn drop(&mut self) {
+        *TEST_SCRATCH_ROOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 #[cfg(test)]
@@ -1650,7 +1737,9 @@ fn spawn_with_profile(
         Some(ModelSelection::Claude { .. }) => Some(claude_credential_for(&binary)?),
         _ => None,
     };
+    sweep_stale_scratch_once();
     let dir = scratch_dir()?;
+    let scratch = ScratchDir::new(dir.clone());
     let mut command = sidecar_command(&binary, &dir, selection, claude.as_ref());
     if let Some(profile) = profile {
         let store = crate::tool_install::components::verified_store_binary();
@@ -1658,9 +1747,17 @@ fn spawn_with_profile(
     }
     // Its own process group, and registered, so this long-lived child dies
     // with us rather than outliving the app that started it.
-    let (mut child, guard) = crate::procguard::spawn(&mut command, "manvi serve").map_err(|e| {
-        HarnessError::Unavailable(format!("could not start `{} serve`: {}", binary, e))
-    })?;
+    let (mut child, guard) = match crate::procguard::spawn(&mut command, "manvi serve") {
+        Ok(started) => started,
+        Err(e) => {
+            // Nothing was started, so nothing can be using the directory.
+            scratch.remove();
+            return Err(HarnessError::Unavailable(format!(
+                "could not start `{} serve`: {}",
+                binary, e
+            )));
+        }
+    };
 
     let stdin = child
         .stdin
@@ -1726,6 +1823,7 @@ fn spawn_with_profile(
             SHUTDOWN_GRACE
         },
         shutting_down,
+        scratch: Some(scratch),
     };
     handshake_sidecar(sidecar, claude.is_some())
 }
@@ -1886,6 +1984,7 @@ fn socket_sidecar(
         write_deadline: WRITE_DEADLINE,
         shutdown_grace: Duration::ZERO,
         shutting_down,
+        scratch: None,
     })
 }
 
@@ -3481,6 +3580,7 @@ mod tests {
             write_deadline,
             shutdown_grace: SHUTDOWN_GRACE,
             shutting_down,
+            scratch: None,
         }
     }
 
@@ -5490,6 +5590,120 @@ mod scratch_dir_tests {
             "an existing entry must never be adopted"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod scratch_lifecycle_tests {
+    use super::*;
+
+    /// A fake `manvi serve` that answers every request and exits when its
+    /// stdin closes, so ending it costs no shutdown grace.
+    const FAKE_ANSWERING_SH: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  case "$line" in
+    *'"op":"hello"'*) printf '{"id":"%s","ok":true,"result":{"protocol":1,"ops":["hello"],"posture":"host"}}\n' "$id" ;;
+    *) printf '{"id":"%s","ok":true,"result":{}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    struct Fixture {
+        _bin_dir: tempfile::TempDir,
+        root: tempfile::TempDir,
+        _binary: TestBinaryBinding,
+        _scratch: TestScratchRoot,
+    }
+
+    fn fixture(serial: &SidecarTestGuard) -> Fixture {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = tempfile::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let binary = bin_dir.path().join("answering-sidecar");
+        std::fs::write(&binary, FAKE_ANSWERING_SH).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bound = bind_test_binary(serial, binary.to_str().unwrap());
+        let scratch = bind_test_scratch_root(serial, root.path());
+        Fixture {
+            _bin_dir: bin_dir,
+            root,
+            _binary: bound,
+            _scratch: scratch,
+        }
+    }
+
+    fn harness_dirs(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("gitpulse-harness-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_terminated_and_dropped_sidecar_leaves_no_state_directory() {
+        let serial = test_serial();
+        let fixture = fixture(&serial);
+        let sidecar = spawn().expect("spawn the fake");
+        assert_eq!(harness_dirs(fixture.root.path()).len(), 1);
+        sidecar.terminate();
+        drop(sidecar);
+        assert_eq!(harness_dirs(fixture.root.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_hundred_one_shot_shared_judgements_leave_no_net_new_directories() {
+        let serial = test_serial();
+        let fixture = fixture(&serial);
+        for round in 0..100 {
+            let verdict: Value = call_policy_on(
+                Lane::Shared,
+                "policy.check.command",
+                serde_json::json!({"command": "ls"}),
+                Duration::from_secs(10),
+            )
+            .unwrap_or_else(|e| panic!("judgement {round}: {e:?}"));
+            assert!(verdict.is_object());
+            assert_eq!(
+                harness_dirs(fixture.root.path()).len(),
+                1,
+                "judgement {round}: the live sidecar has exactly one directory"
+            );
+            // One hook process ends here, with its sidecar.
+            reset();
+        }
+        assert_eq!(harness_dirs(fixture.root.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_first_spawn_on_a_root_sweeps_a_dead_owners_directory_and_keeps_a_live_one() {
+        let serial = test_serial();
+        let fixture = fixture(&serial);
+        let stale = fixture
+            .root
+            .path()
+            .join("gitpulse-harness-4000001-0123456789abcdef");
+        std::fs::create_dir(&stale).unwrap();
+        let live = fixture.root.path().join(format!(
+            "gitpulse-harness-{}-0123456789abcdef",
+            std::process::id()
+        ));
+        std::fs::create_dir(&live).unwrap();
+
+        let sidecar = spawn().expect("spawn the fake");
+
+        assert!(
+            !stale.exists(),
+            "the dead owner's directory survived the sweep"
+        );
+        assert!(live.is_dir(), "a live owner's directory was swept");
+        sidecar.terminate();
+        drop(sidecar);
+        assert!(live.is_dir());
     }
 }
 

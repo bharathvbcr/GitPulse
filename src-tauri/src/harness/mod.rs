@@ -15,6 +15,7 @@ pub mod hosted;
 pub mod manvi_use;
 pub mod policy;
 pub mod protocol;
+mod scratch;
 pub(crate) mod review;
 pub mod sidecar;
 
