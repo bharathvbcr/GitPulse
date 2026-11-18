@@ -17,7 +17,10 @@
    * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, ChevronDown, LayoutList, ChevronRight, CircleAlert, FolderOpen, Inbox, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { Bot, ChevronDown, LayoutList, ChevronRight, CircleAlert, FileDiff, FolderOpen, Inbox, ListChecks, Play, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { agentRowActions, type AgentRowAction } from "../agents/rowActions";
+  import { terminalLaunchRequests } from "../terminal/launchRequests";
+  import type { SessionKind } from "../terminal/tabs";
   import AgentInbox from "./AgentInbox.svelte";
   import PageHeader from "./PageHeader.svelte";
   import { tick, untrack } from "svelte";
@@ -116,6 +119,8 @@
   const scoped = $derived(scopeToRepository(plane.roots, $agentsRepositoryScope, pathOpts));
   const visible = $derived(applyAgentTree(scoped, filter));
   const entries = $derived(flattenAgentTree(visible, collapsed));
+  /** Every drawn row by id, so a child process's actions can name its parent. */
+  const rowsById = $derived(new Map(entries.map((entry) => [entry.row.id, entry.row])));
   const scopeLabel = $derived($agentsRepositoryScope ? displayName($agentsRepositoryScope) : "");
   const headline = $derived(planeHeadline(plane, countAgentRows(visible)));
   // Exactly one row is in the tab order (a roving tabindex), and it is the one
@@ -209,6 +214,64 @@
     if (!row.checkoutPath) return;
     interfaceStore.setGlobalSurface("repository");
     void repoStore.openRepo(row.checkoutPath);
+  }
+
+  /** The row whose start is in flight; one at a time, as the launch channel holds one request. */
+  let starting = $state<string | null>(null);
+
+  /**
+   * Starts `launcher` in the row's checkout, the way the Worktrees panel's
+   * fork does: trust, open the checkout as the active tab, show its dock, then
+   * hand the launch to that dock's panel (`terminalLaunchRequests`).
+   */
+  async function startIn(row: AgentRow, launcher: SessionKind) {
+    const path = row.checkoutPath;
+    if (!path || starting !== null) return;
+    starting = row.id;
+    try {
+      if (!(await repoStore.trustRepo(path))) return;
+      interfaceStore.setGlobalSurface("repository");
+      let readyPath: string | null = null;
+      const opened = await repoStore.openRepo(path, { activate: true, onReady: (canonical) => { readyPath = canonical; } });
+      const at = opened ? (readyPath ?? path) : null;
+      if (!at) {
+        toastStore.error(`Couldn't open ${path}, so nothing was started.`);
+        return;
+      }
+      const launched = terminalLaunchRequests.request(at, launcher);
+      repoStore.setTerminalOpen(true);
+      await launched;
+    } catch (cause) {
+      toastStore.error(failure("start", launcher === "shell" ? "the terminal" : agentKindLabel(launcher), cause));
+    } finally {
+      starting = null;
+    }
+  }
+
+  async function reviewChanges(row: AgentRow) {
+    if (!row.checkoutPath) return;
+    try {
+      await repoStore.previewUncommitted(row.checkoutPath);
+      interfaceStore.setGlobalSurface("repository");
+    } catch (cause) {
+      toastStore.error(failure("open", "the changes", cause));
+    }
+  }
+
+  function runAction(action: AgentRowAction) {
+    const row = action.target;
+    switch (action.kind) {
+      case "terminal":
+        return void showTerminal(row);
+      case "task":
+        return void openTask(row);
+      case "start":
+        return void startIn(row, action.launcher ?? "shell");
+      case "review":
+        return void reviewChanges(row);
+      case "checkout":
+        return openCheckout(row);
+    }
   }
 
   function setExpanded(id: string, open: boolean) {
@@ -566,40 +629,24 @@
                 <span class="block font-medium text-textPrimary">{row.session}</span>
                 <span class="block text-textMuted">{agentKindLabel(row.kind)} · {row.repoLabel}</span>
                 <span class="mt-1 flex flex-wrap gap-1" data-testid="agents-row-actions">
-                  {#if row.liveKey || row.taskRunId}
+                  {#each agentRowActions(row, row.parentId ? rowsById.get(row.parentId) ?? null : null, $interfaceStore.terminalLauncher) as action (action.kind)}
                     <button
                       type="button"
                       class="gp-btn" data-size="sm"
-                      aria-label="Show terminal for {row.session}"
-                      onclick={() => showTerminal(row)}
+                      data-action={action.kind}
+                      aria-label={action.ariaLabel}
+                      title={action.title}
+                      disabled={action.kind === "start" && starting !== null}
+                      onclick={() => runAction(action)}
                     >
-                      <SquareTerminal size={11} />
-                      <span>Show terminal</span>
+                      {#if action.kind === "terminal"}<SquareTerminal size={11} />
+                      {:else if action.kind === "task"}<ListChecks size={11} />
+                      {:else if action.kind === "start"}<Play size={11} />
+                      {:else if action.kind === "review"}<FileDiff size={11} />
+                      {:else}<FolderOpen size={11} />{/if}
+                      <span>{action.kind === "start" && starting === action.target.id ? "Starting…" : action.label}</span>
                     </button>
-                  {/if}
-                  {#if row.taskRunId}
-                    <button
-                      type="button"
-                      class="gp-btn" data-size="sm"
-                      aria-label="Open task for {row.session}"
-                      onclick={() => openTask(row)}
-                    >
-                      <ListChecks size={11} />
-                      <span>Open task</span>
-                    </button>
-                  {/if}
-                  {#if row.checkoutPath}
-                    <button
-                      type="button"
-                      class="gp-btn" data-size="sm"
-                      aria-label="Open checkout {row.checkout} for {row.session}"
-                      title={row.checkoutPath}
-                      onclick={() => openCheckout(row)}
-                    >
-                      <FolderOpen size={11} />
-                      <span>Open checkout</span>
-                    </button>
-                  {/if}
+                  {/each}
                 </span>
                   </span>
                 </span>

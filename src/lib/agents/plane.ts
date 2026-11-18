@@ -263,6 +263,13 @@ export interface AgentRow {
   dirtyKnown: boolean;
   liveKey: string | null;
   taskRunId: string | null;
+  /**
+   * Top-level agent processes the process table shows in this row's checkout
+   * with no GitPulse launch behind them (no `tree`): an agent started outside
+   * this window. Counted on agent checkout rows only; 0 elsewhere, and 0 when
+   * no probe listed live sessions, which is unknown rather than idle.
+   */
+  outsideSessions: number;
 }
 
 export interface AgentPlane {
@@ -820,6 +827,33 @@ function placeSessions(
   return { placed, unplaced };
 }
 
+/**
+ * Counts, on each agent checkout row, the top-level agent processes running in
+ * that checkout that no GitPulse launch accounts for (no `tree`). A checkout
+ * row says "On disk"; this is what keeps that from reading as "idle" when an
+ * agent started outside this window is working there. A process with an agent
+ * above it is a child row, not an occupant, and is not counted here.
+ */
+function countOutsideSessions(
+  processes: ReadonlyMap<number, LiveProcess>,
+  checkouts: ReadonlyMap<string, Draft>,
+  rowOf: ReadonlyMap<Draft, AgentRow>,
+  kept: ReadonlySet<AgentRow>,
+  paths: PathIdentityOptions,
+): void {
+  for (const process of processes.values()) {
+    if (process.parentPid !== null || process.tree !== null) continue;
+    const host = nearestContaining(checkouts, process.cwd, paths);
+    const row = host ? rowOf.get(host) : undefined;
+    if (!row || !kept.has(row)) continue;
+    row.outsideSessions += 1;
+  }
+  for (const row of kept) {
+    if (row.outsideSessions === 0 || row.presence !== "on-disk") continue;
+    row.presenceDetail = `A checkout on disk. The process table shows ${plural(row.outsideSessions, "agent process", "agent processes")} running in it that no terminal or task run here started.`;
+  }
+}
+
 function childSessionRow(id: string, process: LiveProcess, above: AgentRow): AgentRow {
   const status = clean(process.status, 40);
   return {
@@ -846,6 +880,7 @@ function childSessionRow(id: string, process: LiveProcess, above: AgentRow): Age
     dirtyKnown: false,
     liveKey: null,
     taskRunId: null,
+    outsideSessions: 0,
   };
 }
 
@@ -1186,6 +1221,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       dirtyKnown: draft.dirtyKnown,
       liveKey: draft.liveKey,
       taskRunId: draft.taskRunId,
+      outsideSessions: 0,
     };
     finished.push(row);
     draftOf.set(row, draft);
@@ -1216,6 +1252,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     parentRow.children.push(row);
   }
   const lineage = collectProcesses(readProbes.map((entry) => entry.snapshot));
+  countOutsideSessions(lineage, checkouts, rowOf, kept, paths);
   const placed = placeSessions(lineage, rows, draftOf, checkouts, rowOf, paths, used);
   if (placed.unplaced > 0) {
     gaps.push({
