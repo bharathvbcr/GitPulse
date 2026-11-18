@@ -20,8 +20,9 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 
 ## 1. One workspace for every project
 
-- **Repository tabs**, up to 1,000 open, with collapsible groups that survive a restart. At most 32
-  repositories are watched at once (a pool of 24 active watches; the rest are parked), and 24 recent
+- **Repository tabs**, up to 1,000 open, with collapsible groups that survive a restart. At most 24
+  repositories are watched at once (the rest are parked; the native layer allows 32 watch sessions, and the
+  difference is room for evictions), and 24 recent
   repositories are remembered. Source: `MAX_OPEN_TABS`, `MAX_WATCHES` and `MAX_RECENT_REPOS` in the code.
 - **Worktree tab stacks**: every checkout of a repository shares one tab, with a switcher.
 - **Fleet** (`⌘⇧F`): a grid that compares repositories on churn, sync and health. Every cell is a value,
@@ -33,7 +34,7 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 
 ## 2. Agent control plane
 
-- **Launchers**: six (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab, from the dock.
+- **Launchers**: six (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), from the dock.
   Each launcher has a default model, effort, advisor and commit model in **Settings → Agents**.
 - **Live session detection**, including sessions GitPulse did not launch (Claude, Codex, Antigravity,
   DevCouncil and Manvi), over MCP as `gitpulse_sessions`. The Agents plane (`⌘⇧A`) draws the checkouts,
@@ -79,8 +80,8 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 
 ## 5. Task board
 
-- Five columns (Backlog, Ready, In progress, Review, Done), swimlanes, WIP limits and filters. A column fills
-  up to 2,000 cards.
+- Five columns (Backlog, Ready, In progress, Review, Done), swimlanes, WIP limits and filters. Filling a column
+  pages in cards until the board holds 2,000, a budget its columns share.
 - Cross-repository and saved-workspace boards.
 - Quick add, compose from notes, due dates, relations (blocks, depends, related, duplicate) and merging duplicates.
 - **Manvi assist**: refine, suggest and field locks.

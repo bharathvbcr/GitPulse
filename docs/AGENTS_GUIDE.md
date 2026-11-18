@@ -32,7 +32,9 @@ and the Settings card both report that.
 The board is where you start agents. In **Work → Tasks**, or the global **Tasks** board, choose
 **Send to agent** on a card. The form asks for:
 
-- **Agent**: Claude, Codex, Grok, Antigravity or Manvi. Shell sessions are for your own use.
+- **Agent**: Claude, Codex, Grok or Antigravity, and how it runs: **Terminal** (a task-bound session in the
+  dock) or **Managed** (Manvi supervises the run and shows its requests in GitPulse; the form says which
+  agents support it). Shell sessions are for your own use.
 - **Working checkout**: an open repository tab, or the folder beside that repository's git directory.
 - **Permission mode**: remembered for next time, except `Bypass permissions`, which you must choose again,
   with its acknowledgement, for every attempt.
