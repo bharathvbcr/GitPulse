@@ -168,7 +168,7 @@ fn runs_ended_on_a_connection_with_no_worker_starts_none() {
     let connection =
         ProfileConnection::new(fixture.root.path().join("profile.sqlite"), None).unwrap();
     connection.runs_ended(&["x".to_string()]);
-    assert_eq!(connection.hosted_runs(), Vec::<String>::new());
+    assert_eq!(connection.hosted_runs(), Some(Vec::<String>::new()));
     assert_eq!(connection.child_pid(), None);
     assert_eq!(
         dirs(fixture.root.path()),
@@ -187,14 +187,14 @@ fn an_ended_run_that_is_prepared_again_counts_as_hosted_again() {
         .call("work.runs.managed.prepare", serde_json::json!({"id": "r"}))
         .unwrap();
     connection.runs_ended(&["r".to_string()]);
-    assert_eq!(connection.hosted_runs(), Vec::<String>::new());
+    assert_eq!(connection.hosted_runs(), Some(Vec::<String>::new()));
     connection
         .call("work.runs.managed.prepare", serde_json::json!({"id": "r"}))
         .unwrap();
-    assert_eq!(connection.hosted_runs(), vec!["r".to_string()]);
+    assert_eq!(connection.hosted_runs(), Some(vec!["r".to_string()]));
     // A late runs_ended for an id that is not hosted changes nothing.
     connection.runs_ended(&["other".to_string()]);
-    assert_eq!(connection.hosted_runs(), vec!["r".to_string()]);
+    assert_eq!(connection.hosted_runs(), Some(vec!["r".to_string()]));
     connection.shutdown();
 }
 
@@ -222,7 +222,7 @@ fn a_prepare_racing_runs_ended_for_the_same_id_never_leaves_a_phantom_or_loses_t
     connection
         .call("work.runs.managed.prepare", serde_json::json!({"id": "r"}))
         .unwrap();
-    assert_eq!(connection.hosted_runs(), vec!["r".to_string()]);
+    assert_eq!(connection.hosted_runs(), Some(vec!["r".to_string()]));
     connection.shutdown();
 }
 

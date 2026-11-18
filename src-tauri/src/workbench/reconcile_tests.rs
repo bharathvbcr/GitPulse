@@ -1283,13 +1283,16 @@ fn a_sweep_stops_counting_runs_the_store_has_over_as_hosted() {
             .call("work.runs.managed.prepare", json!({"id": id}))
             .unwrap();
     }
-    assert_eq!(worker.hosted_runs(), ["ghost", "held", "over"]);
+    assert_eq!(
+        worker.hosted_runs(),
+        Some(vec!["ghost".into(), "held".into(), "over".into()])
+    );
 
     assert_eq!(state.reconcile_stale_runs().unwrap(), 1);
 
     assert_eq!(
         worker.hosted_runs(),
-        ["held"],
+        Some(vec!["held".into()]),
         "only the run the store still holds is hosted"
     );
     worker.shutdown();
@@ -1309,6 +1312,7 @@ fn a_run_hosted_by_a_child_that_went_silent_is_recorded_released_once_it_is_repl
     seed(&state, &root);
     let (_bound, worker) = fake_worker(&serial, dir.path());
     *state.0.worker.lock().unwrap() = Some((None, worker.clone()));
+    super::watch_lost_runs(&state, &worker);
     state
         .request(
             "runs.prepare_managed",
@@ -1331,7 +1335,7 @@ fn a_run_hosted_by_a_child_that_went_silent_is_recorded_released_once_it_is_repl
         .unwrap();
     // Its Manvi is alive and answering: the run is kept.
     assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
-    assert_eq!(worker.hosted_runs(), ["managed"]);
+    assert_eq!(worker.hosted_runs(), Some(vec!["managed".into()]));
 
     // The Manvi stops answering. The run it hosts keeps it for a while, then
     // no longer.
@@ -1353,9 +1357,93 @@ fn a_run_hosted_by_a_child_that_went_silent_is_recorded_released_once_it_is_repl
     );
     assert!(replaced_after > 1, "the keep was not applied at all");
 
-    assert_eq!(state.reconcile_stale_runs().unwrap(), 1);
+    // Nothing here runs a sweep: the replacement itself does, promptly.
+    let released = crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+        state.request("runs.get", r#"{"id":"managed"}"#).unwrap()["item"]["state"] == "exited"
+    });
     let item = state.request("runs.get", r#"{"id":"managed"}"#).unwrap()["item"].clone();
-    assert_eq!(item["state"], "exited", "{item}");
+    assert!(released, "the lost run was not recorded: {item}");
     assert!(item["reason"].as_str().unwrap().contains("Manvi process"));
+    worker.shutdown();
+}
+
+/// The race the walk-based decision lost: a run moves from prepared to
+/// starting after the hosted runs were read and before they are judged. It is
+/// live, and stays hosted.
+#[cfg(unix)]
+#[test]
+fn a_run_that_starts_while_the_sweep_decides_stays_hosted() {
+    let serial = crate::harness::sidecar::test_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let state = host(&dir.path().join("profile.sqlite"));
+    seed(&state, &root);
+    let (_bound, worker) = fake_worker(&serial, dir.path());
+    *state.0.worker.lock().unwrap() = Some((None, worker.clone()));
+    state
+        .request(
+            "runs.prepare_managed",
+            &json!({"id":"x","request_id":"prepare-x","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"ask","repo_path":root}).to_string(),
+        )
+        .unwrap();
+    worker
+        .call("work.runs.managed.prepare", json!({"id":"x"}))
+        .unwrap();
+    assert_eq!(worker.hosted_runs(), Some(vec!["x".into()]));
+
+    super::sweep_pages_with(&state, 8, || {
+        state
+            .with_store(|store| {
+                query(
+                    store,
+                    "runs.claim",
+                    &json!({"id":"x","request_id":"claim-x","expected_revision":1,"kind":"managed","owner_id":format!("manvi-{}-{}-ab12", std::process::id(), now()),"session_id":"s"}).to_string(),
+                )
+            })
+            .unwrap();
+    })
+    .unwrap();
+
+    let item = state.request("runs.get", r#"{"id":"x"}"#).unwrap()["item"].clone();
+    assert_eq!(item["state"], "starting", "{item}");
+    assert_eq!(
+        worker.hosted_runs(),
+        Some(vec!["x".into()]),
+        "a run that was starting was forgotten"
+    );
+    worker.shutdown();
+}
+
+/// A read that fails, or a run whose state cannot be read, is never taken for
+/// "over": the run stays hosted.
+#[cfg(unix)]
+#[test]
+fn a_hosted_run_that_cannot_be_read_stays_hosted() {
+    let serial = crate::harness::sidecar::test_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let (_bound, worker) = fake_worker(&serial, dir.path());
+    for id in ["busy", "blank", "gone", "done"] {
+        worker
+            .call("work.runs.managed.prepare", json!({"id": id}))
+            .unwrap();
+    }
+    super::forget_ended_hosted(
+        &worker,
+        vec!["busy".into(), "blank".into(), "gone".into(), "done".into()],
+        |id| match id {
+            "busy" => Err(crate::workbench::WorkbenchError::new(
+                "store_busy",
+                "locked",
+            )),
+            "blank" => Ok(json!({"item": {}})),
+            "gone" => Err(crate::workbench::WorkbenchError::new("not_found", "none")),
+            _ => Ok(json!({"item": {"state": "exited"}})),
+        },
+    );
+    assert_eq!(
+        worker.hosted_runs(),
+        Some(vec!["blank".into(), "busy".into()])
+    );
     worker.shutdown();
 }

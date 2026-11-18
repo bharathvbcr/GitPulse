@@ -32,7 +32,7 @@ use super::process_birth::{self, Liveness};
 use super::{query, WorkbenchError, WorkbenchState};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -251,6 +251,77 @@ fn note_ended(state: &WorkbenchState, run: &Value) {
             worker.runs_ended(&[id.to_owned()]);
         }
     }
+}
+
+/// How many hosted runs one pass reads. A child hosts a handful; past this the
+/// rest wait for the next pass and the log says so.
+const MAX_HOSTED_READS: usize = 256;
+
+/// Tells `worker` which of the `hosted` runs `read` shows are over: terminal,
+/// or unknown to the store. A run that is live, or whose read failed for any
+/// other reason, stays hosted; failures are logged, never skipped quietly.
+fn forget_ended_hosted(
+    worker: &crate::harness::sidecar::ProfileConnection,
+    hosted: Vec<String>,
+    read: impl Fn(&str) -> Result<Value, WorkbenchError>,
+) {
+    if hosted.len() > MAX_HOSTED_READS {
+        log::warn!(target: "workbench", "{} runs are hosted; only the first {MAX_HOSTED_READS} were checked this pass", hosted.len());
+    }
+    let mut ended = Vec::new();
+    for id in hosted.iter().take(MAX_HOSTED_READS) {
+        match read(id) {
+            Ok(saved) => match saved["item"]["state"].as_str() {
+                Some(state) if state != "prepared" && !HELD.contains(&state) => {
+                    ended.push(id.clone());
+                }
+                Some(_) => {}
+                None => {
+                    log::warn!(target: "workbench", "run {id} has no readable state; it stays counted as hosted");
+                }
+            },
+            Err(error) if error.code == "not_found" => ended.push(id.clone()),
+            Err(error) => {
+                log::warn!(target: "workbench", "could not read hosted run {id}: {}: {}; it stays counted as hosted", error.code, error.message);
+            }
+        }
+    }
+    worker.runs_ended(&ended);
+}
+
+/// Has `worker` tell this host when a replaced child took runs with it, and
+/// answers with one reconcile pass on a thread of its own: the runs are over
+/// the moment their Manvi is, and should be recorded then, not at the next
+/// capacity refusal. Passes started by a burst of losses coalesce.
+pub(super) fn watch_lost_runs(
+    state: &WorkbenchState,
+    worker: &crate::harness::sidecar::ProfileConnection,
+) {
+    let inner = Arc::downgrade(&state.0);
+    let pending = Arc::new(AtomicBool::new(false));
+    worker.on_runs_lost(Arc::new(move |runs| {
+        log::warn!(target: "workbench", "the agent runtime was replaced after it stopped answering; run(s) it may have hosted: {}", runs.join(", "));
+        if pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (inner, flag) = (inner.clone(), pending.clone());
+        let started = crate::supervisor::spawn_once(
+            "workbench-lost-runs",
+            "lost run reconciliation",
+            move || {
+                flag.store(false, Ordering::Release);
+                if let Some(inner) = inner.upgrade() {
+                    if let Err(error) = sweep(&WorkbenchState(inner)) {
+                        log::warn!(target: "workbench", "reconciling runs lost with their Manvi failed: {}: {}", error.code, error.message);
+                    }
+                }
+            },
+        );
+        if let Err(error) = started {
+            pending.store(false, Ordering::Release);
+            log::warn!(target: "workbench", "could not start reconciling runs lost with their Manvi: {error}");
+        }
+    }));
 }
 
 /// One identity per reconciling write, never equal to any launch owner.
@@ -698,44 +769,43 @@ pub(super) fn sweep(state: &WorkbenchState) -> Result<Swept, WorkbenchError> {
 }
 
 fn sweep_pages(state: &WorkbenchState, max_pages: usize) -> Result<Swept, WorkbenchError> {
+    sweep_pages_with(state, max_pages, || {})
+}
+
+/// [`sweep_pages`] with `between` run after the hosted runs are read and before
+/// any is judged, so a test can move a run where the old decision, made from a
+/// walk, would have lost it.
+fn sweep_pages_with(
+    state: &WorkbenchState,
+    max_pages: usize,
+    between: impl FnOnce(),
+) -> Result<Swept, WorkbenchError> {
     // Receipts that storage refused when their runs ended are stored first,
     // so a recorded exit code is never overwritten by `outcome_uncertain`.
     super::receipts::replay(state, None);
-    // Read before any run is, so a run prepared while this pass walks the store
-    // cannot be in it and be mistaken for one the store no longer holds.
+    // Read before any run is judged, so a run prepared while this pass works
+    // is never one it decides about.
     let worker = live_worker(state);
-    let hosted_before = worker.as_ref().map(|w| w.hosted_runs()).unwrap_or_default();
+    let hosted_before = worker.as_ref().and_then(|w| w.hosted_runs());
+    between();
+    // A hosted run the store records as over ended without any `managed.stop`.
+    // Each is read and judged on its own state, now: a run that moved from
+    // prepared to starting while this pass walked is live, and absence from a
+    // walk (that may have been cut, or run before the move) proves nothing.
+    if let (Some(worker), Some(hosted)) = (&worker, hosted_before) {
+        forget_ended_hosted(worker, hosted, |id| {
+            state.with_store(|store| query(store, "runs.get", &json!({"id": id}).to_string()))
+        });
+    }
     let mut ids = Vec::new();
-    let mut live: HashSet<String> = HashSet::new();
     let mut complete = true;
     for held in HELD {
         complete &= walk_pages(state, held, false, max_pages, |run| {
             if let Some(id) = run["id"].as_str() {
                 ids.push(id.to_owned());
-                live.insert(id.to_owned());
             }
             true
         })?;
-    }
-    // What the worker's Manvi hosts that the store no longer holds live was
-    // over without any `managed.stop`: it ended by itself. Only a complete
-    // walk can say a run is absent.
-    if let Some(worker) = &worker {
-        if !hosted_before.is_empty() {
-            let prepared = walk_pages(state, "prepared", false, max_pages, |run| {
-                if let Some(id) = run["id"].as_str() {
-                    live.insert(id.to_owned());
-                }
-                true
-            });
-            if matches!(prepared, Ok(true)) && complete {
-                let ended: Vec<String> = hosted_before
-                    .into_iter()
-                    .filter(|id| !live.contains(id))
-                    .collect();
-                worker.runs_ended(&ended);
-            }
-        }
     }
     if !complete {
         log::warn!(target: "workbench", "run reconciliation stopped at its page cap; some held runs were not examined");
