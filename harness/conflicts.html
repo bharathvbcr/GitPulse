@@ -19,6 +19,7 @@ function reportStartupFailure(event) {
 import "../src/app.css";
 import {mount,unmount,tick} from "svelte";
 import {themeStore} from "../src/lib/stores/themeStore";
+import { setThemeAndLand } from "./theme";
 import {repoStore} from "../src/lib/stores/repoStore";
 import {conflictSessions} from "../src/lib/diff/conflictSession";
 import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
@@ -26,7 +27,7 @@ import WorkOverviewPane from "../src/lib/components/WorkOverviewPane.svelte";
 import {openConflicts} from "../src/lib/ui/workConflicts";
 const params = new URLSearchParams(location.search);
 if(params.has("check"))conflictSessions.clear();
-themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+await setThemeAndLand(themeStore, params.get("theme") === "light" ? "light" : "dark");
 const results=[], crashes=[], writes=[], calls=[], unexpected=[];
 let failedRead=false, failedPreview=false, failedStage=false, delayedRead=null, delayedPreview=null, delayedWrite=null;
 const makeChunk=(index, ours, theirs, base=null)=>({chunk_index:index,start_line:4+index*12,end_line:10+index*12,ours_label:"HEAD · main",theirs_label:"feature/workspace",ours_content:ours,theirs_content:theirs,base_content:base,resolution:"Unresolved",ours_crlf:[],theirs_crlf:[],base_crlf:base===null?null:[],local_crlf:false});
