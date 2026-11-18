@@ -30,8 +30,37 @@ afterAll(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
+/**
+ * Identity and signing come from the environment so a fixture repository
+ * needs no `git config` spawns: these tests' cost is serial process spawns.
+ */
+const FIXTURE_GIT_ENV = {
+  ...process.env,
+  GIT_AUTHOR_NAME: "fixture",
+  GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+  GIT_COMMITTER_NAME: "fixture",
+  GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "commit.gpgsign",
+  GIT_CONFIG_VALUE_0: "false",
+};
+
+/**
+ * What one serial `git` spawn may cost before a test is called hung. The pin
+ * tests below do 10 to 30 spawns and no CPU work, so their time is the host's
+ * process-spawn cost: about 55 ms here, and about 470 ms on the Windows runner
+ * (a 22-spawn test took 8.9 s there against vitest's flat 5 s). The budget is
+ * per spawn, the way `SHELL_CASE_BUDGET_MS` is in agentCommit.stress.test.ts, so
+ * a hung `git` still fails the test by name, just not before it could finish.
+ */
+const GIT_SPAWN_BUDGET_MS = 1_500;
+/** `git init`, then add + commit + rev-parse three times, in `devcouncilFixture`. */
+const FIXTURE_SPAWNS = 10;
+/** `schemasAt` is one `cat-file` and one `show` per schema; a test may call it a few times. */
+const PIN_TEST_TIMEOUT_MS = wallClockBudget((FIXTURE_SPAWNS + 20) * GIT_SPAWN_BUDGET_MS);
+
 function git(cwd: string, ...args: string[]): string {
-  const out = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const out = spawnSync("git", args, { cwd, encoding: "utf8", env: FIXTURE_GIT_ENV });
   if (out.status !== 0) throw new Error(`git ${args.join(" ")}: ${out.stderr}`);
   return out.stdout.trim();
 }
@@ -67,9 +96,6 @@ function devcouncilFixture() {
   const root = mkdtempSync(path.join(tmpdir(), "gitpulse-schema-parity-"));
   tempDirs.push(root);
   git(root, "init", "-q");
-  git(root, "config", "user.email", "fixture@example.invalid");
-  git(root, "config", "user.name", "fixture");
-  git(root, "config", "commit.gpgsign", "false");
   writeOwner(root, { ...owner, store: 26 });
   git(root, "add", "-A");
   git(root, "commit", "-q", "-m", "store 26");
@@ -268,7 +294,7 @@ describe("pins", () => {
     const { root, old, bump } = devcouncilFixture();
     expect(schemasAt(root, old)).toEqual({ ...owner, store: 26 });
     expect(schemasAt(root, bump)).toEqual(owner);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("calls a pin whose schemas DevCouncil has since moved stale", () => {
     const { root, old, head } = devcouncilFixture();
@@ -278,7 +304,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("stale");
     expect(row.detail).toContain("devmap store 26, DevCouncil writes 27");
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("calls a pin behind HEAD with the same schemas a match, and says it is behind", () => {
     const { root, bump, head } = devcouncilFixture();
@@ -288,7 +314,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("match");
     expect(row.detail).toContain(`pins ${bump.slice(0, 8)}, DevCouncil HEAD is ${head.slice(0, 8)}`);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reports a pin the local clone does not have as unverifiable, not stale or matching", () => {
     const { root, head } = devcouncilFixture();
@@ -298,7 +324,7 @@ describe("pins", () => {
     const row = judge(owner, pinReading("Jarvis pin", root, head, consumer, "upstream.lock.json", jarvisPin));
     expect(row.verdict).toBe("unverifiable");
     expect(row.detail).toMatch(/fetch it/);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reads a pin from before the extract constant existed as unverifiable for it, not a crash", () => {
     const { root, old } = devcouncilFixture();
@@ -308,15 +334,12 @@ describe("pins", () => {
     const row = judge(owner, { reader: "Manvi pin", keys: [...ALL], schemas: schemasAt(root, git(root, "rev-parse", "HEAD")) });
     expect(row.verdict).toBe("unverifiable");
     expect(schemasAt(root, old)).toHaveProperty("extract", 94);
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reads a pin from before a schema was versioned as stale on what it did declare", () => {
     const root = mkdtempSync(path.join(tmpdir(), "gitpulse-schema-early-"));
     tempDirs.push(root);
     git(root, "init", "-q");
-    git(root, "config", "user.email", "fixture@example.invalid");
-    git(root, "config", "user.name", "fixture");
-    git(root, "config", "commit.gpgsign", "false");
     writeOwner(root, { store: 23, dcStore: 9, workbench: 0, extract: 94 });
     // Before the workbench schema existed: no constant in its file.
     writeFileSync(path.join(root, "rust", SCHEMAS.workbench.file), "const SCHEMA: &str = \"\";\n");
@@ -326,7 +349,7 @@ describe("pins", () => {
     expect(schemasAt(root, early)).toEqual({ store: 23, dcStore: 9, extract: 94, lease: 2 });
     const row = judge(owner, { reader: "Jarvis pin", keys: [...ALL], schemas: schemasAt(root, early) });
     expect(row.verdict).toBe("stale");
-  });
+  }, PIN_TEST_TIMEOUT_MS);
 
   it("reports a consumer that is not checked out here as absent", () => {
     const row = judge(owner, pinReading("Jarvis pin", "/nowhere", "", null, "upstream.lock.json", jarvisPin));
