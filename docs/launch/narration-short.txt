@@ -1,0 +1,30 @@
+GitPulse — short video narration (75 s)
+For Google or Grok TTS. One block per shot; the time is the slot the line must fit.
+Pace target: about 150 words per minute. Leave the blank lines as pauses.
+
+[0:00–0:06]
+Many agents. Many repositories. One person.
+
+[0:06–0:14]
+Most agent tools give you a chat window. GitPulse gives you the whole workspace.
+
+[0:14–0:26]
+Write a task, pick an agent, launch. Each one gets its own worktree.
+
+[0:26–0:36]
+When an agent finds more work, it files it on your board. Nothing gets lost.
+
+[0:36–0:46]
+Two agents on one file? GitPulse warns you first, and they can message each other.
+
+[0:46–0:54]
+Claude Code and Codex commands pass a policy gate before they run.
+
+[0:54–1:02]
+DevMap shows what a change touches, and runs only the tests it affects.
+
+[1:02–1:09]
+Plus a full git client, and a terminal built for power users.
+
+[1:09–1:15]
+GitPulse. Free, open source, built for the agentic era.
