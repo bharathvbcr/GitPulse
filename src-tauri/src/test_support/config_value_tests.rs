@@ -6,7 +6,19 @@
 //! checked here on every host through `git config --file`.
 
 use super::env::{git_config_value, write_git_config};
+use crate::procguard::LockedSpawn;
 use std::process::Command;
+
+fn git_get(file: &std::path::Path) -> std::process::Output {
+    let mut command = Command::new("git");
+    super::pin_git(&mut command);
+    command
+        .args(["config", "--file"])
+        .arg(file)
+        .args(["--get", "probe.value"])
+        .output_locked()
+        .expect("spawn git")
+}
 
 fn read_back(value_text: &str) -> String {
     let dir = tempfile::TempDir::new().unwrap();
@@ -16,12 +28,7 @@ fn read_back(value_text: &str) -> String {
         &format!("[probe]\n\tvalue = {}\n", git_config_value(value_text)),
     )
     .unwrap();
-    let output = Command::new("git")
-        .args(["config", "--file"])
-        .arg(&file)
-        .args(["--get", "probe.value"])
-        .output()
-        .expect("spawn git");
+    let output = git_get(&file);
     assert!(
         output.status.success(),
         "git rejected {value_text:?}: {}",
@@ -64,12 +71,7 @@ fn the_unquoted_spelling_is_what_git_rejects_or_corrupts() {
     let dir = tempfile::TempDir::new().unwrap();
     let file = dir.path().join("cfg");
     write_git_config(&file, "[probe]\n\tvalue = C:\\Users\\x\n").unwrap();
-    let output = Command::new("git")
-        .args(["config", "--file"])
-        .arg(&file)
-        .args(["--get", "probe.value"])
-        .output()
-        .expect("spawn git");
+    let output = git_get(&file);
     let got = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success() || got.trim_end() != r"C:\Users\x",

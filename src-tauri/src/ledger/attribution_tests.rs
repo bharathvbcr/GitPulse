@@ -3214,13 +3214,26 @@ fn w9w_windows_paths_read_as_text_in_one_spelling() {
 #[test]
 fn w9w_a_plain_commit_in_a_windows_worktree_is_proved_to_run_there() {
     let w = Path::new(r"C:\Users\runneradmin\Temp\.tmpAbC");
-    assert_eq!(command_target("git commit -m x", w), Target::Here);
     assert_eq!(
-        command_target(r"git -C c:/users/RUNNERADMIN/temp/.tmpabc commit -m x", w),
+        read_command_from("git commit -m x", w, Some(w)).0,
         Target::Here
     );
     assert_eq!(
-        command_target(r"git -C C:/Users/runneradmin/Temp/other commit -m x", w),
+        read_command_from(
+            r"git -C c:/users/RUNNERADMIN/temp/.tmpabc commit -m x",
+            w,
+            Some(w),
+        )
+        .0,
+        Target::Here
+    );
+    assert_eq!(
+        read_command_from(
+            r"git -C C:/Users/runneradmin/Temp/other commit -m x",
+            w,
+            Some(w),
+        )
+        .0,
         Target::Unknown
     );
 }
