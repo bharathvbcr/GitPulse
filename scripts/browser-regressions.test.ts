@@ -13,7 +13,8 @@ describe("browser regression gate", () => {
     expect(paths.sort()).toEqual([...BROWSER_HARNESSES].sort());
   });
   it("gives a long page its own deadline and keeps the minute for every other page", () => {
-    expect(harnessDeadlineSeconds("tasks")).toBe(150);
+    expect(harnessDeadlineSeconds("tasks")).toBe(300);
+    expect(harnessDeadlineSeconds("health")).toBe(120);
     for (const harness of BROWSER_HARNESSES.filter(name => !(name in HARNESS_DEADLINE_SECONDS))) expect(harnessDeadlineSeconds(harness)).toBe(DEFAULT_DEADLINE_SECONDS);
     expect(DEFAULT_DEADLINE_SECONDS).toBe(60);
     // Every override names a real page, and the WebKit runner is told the number.

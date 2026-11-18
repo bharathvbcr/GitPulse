@@ -19,6 +19,8 @@
  * after it did not run.
  */
 
+import { reportProgress } from "./progress";
+
 export interface CheckRow {
   name: string;
   pass: boolean;
@@ -42,6 +44,7 @@ export function createChecks() {
       threw = ` — threw ${error}`;
     }
     results.push({ name: `${name}${threw}`, pass });
+    reportProgress(results.length, name);
     if (!pass) throw new CheckFailed(`${name}${threw}`);
   }
 
