@@ -10,6 +10,8 @@
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
 
+<p align="center"><sub>Tested on macOS; Windows and Linux builds are available but not yet tested.</sub></p>
+
 **Fast, local-first Git desktop client, code intelligence suite, and task workspace.**
 
 Review changes with GPU acceleration, resolve 3-way conflicts, follow branch and commit
