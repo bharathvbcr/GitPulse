@@ -232,7 +232,7 @@
   $effect(() => {
     if (sidebarView === "files") explorerMounted = true;
     setSidebarExplorerDocked(
-      Boolean($repoStore.currentPath && !overlay && !collapsed && sidebarView === "files"),
+      Boolean($currentRepoPath && !overlay && !collapsed && sidebarView === "files"),
     );
   });
 
@@ -249,7 +249,7 @@
   let loadedDropZones: import("../terminal/dropZoneRegistry").DropZoneRegistry | null = null;
 
   $effect(() => {
-    if ($repoStore.currentPath && !loadedDropZones) {
+    if ($currentRepoPath && !loadedDropZones) {
       void import("../terminal/dropZoneRegistry").then(({ terminalDropZones }) => {
         loadedDropZones = terminalDropZones;
       });

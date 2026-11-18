@@ -63,6 +63,28 @@ export async function copyText(
   }
 }
 
+export type ClipboardRead =
+  | { ok: true; text: string }
+  | { ok: false; reason: "unavailable" | "failed" };
+
+/**
+ * Reads text from the OS clipboard through the webview. There is no fallback
+ * for reading: `unavailable` means this webview has no read API, `failed`
+ * that it refused (permission or focus).
+ */
+export async function readClipboardText(
+  deps: { clipboard?: { readText?(): Promise<string> } | null } = {},
+): Promise<ClipboardRead> {
+  const clipboard =
+    deps.clipboard !== undefined ? deps.clipboard : typeof navigator !== "undefined" ? navigator.clipboard : null;
+  if (!clipboard?.readText) return { ok: false, reason: "unavailable" };
+  try {
+    return { ok: true, text: await clipboard.readText() };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
+}
+
 /**
  * A "Copied" indicator that lights for `ms` after a successful copy and goes
  * out on its own. A second copy restarts the countdown, and `dispose` cancels

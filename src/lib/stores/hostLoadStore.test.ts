@@ -802,7 +802,9 @@ describe("hostLoadStore", () => {
       for (let at = 0; at < seconds; at += 2) {
         vi.setSystemTime(Date.now() + 2_000);
         handler({ payload: pulseOf(status()) } as never);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        // setImmediate, not setTimeout(0): a 0 ms timeout waits out the clock tick
+        // (about 15 ms on Windows), and the 1,800 pulses of an hour then outlast the test timeout.
+        await new Promise((resolve) => setImmediate(resolve));
       }
     }
 

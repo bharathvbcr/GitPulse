@@ -29,6 +29,9 @@ import { codeOnly, svelteFiles } from "./sourceScan";
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+/** A path under SRC with forward slashes, so the lists below read the same on Windows. */
+const rel = (file: string) => relative(SRC, file).replaceAll("\\", "/");
+
 interface EffectRead {
   line: number;
   read: string;
@@ -207,7 +210,7 @@ describe("array operations on $repoStore", () => {
     const found: Record<string, number> = {};
     for (const file of svelteFiles(SRC)) {
       const count = reads(readFileSync(file, "utf8"));
-      if (count > 0) found[relative(SRC, file)] = count;
+      if (count > 0) found[rel(file)] = count;
     }
     expect(found).toEqual(KNOWN);
   });
@@ -268,13 +271,13 @@ describe("effects never read $repoStore", () => {
     const copies = svelteFiles(SRC).filter((file) =>
       /\$derived\(\s*\$repoStore\.currentPath\s*\)/.test(readFileSync(file, "utf8")),
     );
-    expect(copies.map((file) => relative(SRC, file))).toEqual([]);
+    expect(copies.map(rel)).toEqual([]);
   });
 
   it("holds for every component", () => {
     const offenders = svelteFiles(SRC).flatMap((file) =>
       effectStoreReads(readFileSync(file, "utf8")).map(
-        ({ line, read }) => `${relative(SRC, file)}:${line} ${read}`,
+        ({ line, read }) => `${rel(file)}:${line} ${read}`,
       ),
     );
     expect(offenders).toEqual([]);

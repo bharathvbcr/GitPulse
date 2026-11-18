@@ -22,6 +22,11 @@ describe("stripMarkupComments", () => {
     expect(stripMarkupComments("<!<!---->-->")).toBe("");
     expect(stripMarkupComments("<!<!---->--> kept")).toBe(" kept");
   });
+
+  it("closes `<!-->` and `<!--->` at once, as the HTML parser does", () => {
+    expect(stripMarkupComments("a<!-->b")).toBe("ab");
+    expect(stripMarkupComments("a<!--->b-->")).toBe("ab-->");
+  });
 });
 
 describe("stripMarkupTags", () => {

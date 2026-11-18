@@ -116,7 +116,10 @@
   let logoBrowseId = $state<string | null>(null);
   /** The tab that opened the menu, for focus to go back to when the browser closes. */
   let logoBrowseReturn = $state.raw<HTMLElement | null>(null);
-  const logoBrowseTab = $derived(logoBrowseId ? ($repoStore.openTabs.find((item) => item.id === logoBrowseId) ?? null) : null);
+  // The field store: it notifies only when the tab list is replaced, not on
+  // every repository publish (repoStoreEffects.contract.test.ts).
+  const openTabsStore = repoStore.openTabs;
+  const logoBrowseTab = $derived(logoBrowseId ? ($openTabsStore.find((item) => item.id === logoBrowseId) ?? null) : null);
   // Measured menu box feeds the shared clamp so the tab menu can never open
   // off-screen (the old innerWidth-200 guess overflowed on short windows).
   let menuEl: HTMLDivElement | undefined = $state();
@@ -311,9 +314,6 @@
    * are not looking at still reaches you (E1). Unknown stays unknown: a tab
    * draws a mark only for a request, never for "not read".
    */
-  // The field store: it notifies only when the tab list is replaced, not on
-  // every repository publish (repoStoreEffects.contract.test.ts).
-  const openTabsStore = repoStore.openTabs;
   const agentStates = $derived(
     new Map(
       $openTabsStore.map((tab) => [

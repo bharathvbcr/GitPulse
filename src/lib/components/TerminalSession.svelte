@@ -148,7 +148,7 @@
   import { createSyncFrameWriter } from "../terminal/syncFrames";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
-  import { copyText, createCopyFlash } from "../desktop/clipboard";
+  import { copyText, createCopyFlash, readClipboardText } from "../desktop/clipboard";
   import {
     createSelectToCopyController,
     formatSelectionForAgent,
@@ -1807,16 +1807,15 @@
 
   async function pasteFromContextMenu() {
     contextMenu = null;
-    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
-      warning = "Clipboard paste is unavailable in this environment.";
+    const read = await readClipboardText();
+    if (!read.ok) {
+      warning =
+        read.reason === "unavailable"
+          ? "Clipboard paste is unavailable in this environment."
+          : "Couldn't read clipboard for paste.";
       return;
     }
-    try {
-      const raw = await navigator.clipboard.readText();
-      if (raw) insertText(raw, { focus: true });
-    } catch {
-      warning = "Couldn't read clipboard for paste.";
-    }
+    if (read.text) insertText(read.text, { focus: true });
   }
 
   export async function exportOutput() {

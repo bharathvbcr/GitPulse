@@ -574,14 +574,16 @@ describe("the installed plugin cache", () => {
     const repo = readRepoHooks() as { hooks: Record<string, unknown> };
     expect(Object.keys(repo.hooks)).toContain("PreToolUse");
     expect(classifyPluginCache(install(repo), repo).status).toBe("ok");
-    expect(parseArgs(["--claude-dir", "/tmp/x"]).claudeDir).toBe("/tmp/x");
+    // parseArgs resolves the flag, which on Windows adds a drive letter and backslashes.
+    expect(parseArgs(["--claude-dir", "/tmp/x"]).claudeDir).toBe(path.resolve("/tmp/x"));
     expect(parseArgs([]).claudeDir).toBeUndefined();
   });
 });
 
 describe("the lease row", () => {
   const binDir = "/c/lease-bin";
-  const link = "/c/lease-bin/cargo";
+  // classifyLease builds the link with path.join, so the expected value must too.
+  const link = path.join(binDir, "cargo");
 
   it("passes only when a login shell finds the wrapper's own link first", () => {
     expect(classifyLease({ binDir, linkTarget: "/app/gitpulse-hook", servesLease: true, resolved: link, error: null }).status).toBe("gated");
@@ -607,7 +609,8 @@ describe("the lease row", () => {
     expect(classifyLease({ binDir, linkTarget: "/x", servesLease: null, resolved: link, error: null }).status).toBe("unverifiable");
   });
 
-  it("asks a real login shell, and sees a profile that puts another cargo first", async () => {
+  // POSIX-only: runs sh scripts as the login shell and makes a symlink to a shebang script.
+  it.skipIf(process.platform === "win32")("asks a real login shell, and sees a profile that puts another cargo first", async () => {
     const root = await scratchDir("lease");
     const bin = path.join(root, "lease-bin");
     const other = path.join(root, "other");
@@ -639,7 +642,8 @@ describe("the lease row", () => {
 });
 
 describe("the lease row's link target", () => {
-  it("fails a link to a gitpulse-hook that cannot be the lease wrapper, however the shell resolves cargo", async () => {
+  // POSIX-only: a symlink to a shebang script, run through `sh -lc`.
+  it.skipIf(process.platform === "win32")("fails a link to a gitpulse-hook that cannot be the lease wrapper, however the shell resolves cargo", async () => {
     const root = await scratchDir("lease-stale");
     const bin = path.join(root, "lease-bin");
     await mkdir(bin);

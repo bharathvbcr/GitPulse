@@ -13,8 +13,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { devNull, homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   EXIT_SCRATCH_NOT_REMOVED,
@@ -378,7 +378,7 @@ beforeEach(() => {
  */
 const guardedRemove = (dir: string) => {
   const real = realpathSync(dir);
-  if (![root, outside].some((base) => real.startsWith(`${base}/`))) {
+  if (![root, outside].some((base) => real.startsWith(`${base}${sep}`))) {
     throw new Error(`test guard: refusing to really delete ${dir}, which is not inside a temp directory this test made`);
   }
   rmSync(real, { recursive: true, force: false });
@@ -1215,7 +1215,8 @@ describe("a run lock keeps two ci:local runs from deleting each other's build", 
     expect(readFileSync(lockFile(), "utf8")).toBe("not json");
   });
 
-  it.skipIf(process.getuid?.() === 0)("reports a lock that cannot be created as a refusal, never as removed", () => {
+  // POSIX-only: a read-only directory is how this makes the lock unwritable; chmod does not do that on Windows.
+  it.skipIf(process.getuid?.() === 0 || process.platform === "win32")("reports a lock that cannot be created as a refusal, never as removed", () => {
     const parent = join(root, "src-tauri", "target");
     plant(defaultDir());
     chmodSync(parent, 0o555);
@@ -1268,7 +1269,8 @@ describe("the live-process check matches every spelling of the path, on path bou
     expect(existsSync(build())).toBe(true);
   });
 
-  it("sees the /private spelling of the same path", () => {
+  // macOS-only: `/private` is the prefix macOS puts on /tmp, /var and /etc.
+  it.skipIf(process.platform !== "darwin")("sees the /private spelling of the same path", () => {
     expect(withListing(` 77 ${alias()}/debug/deps/gitpulse_lib --nocapture\n`).status).toBe("refused");
   });
 
@@ -1561,12 +1563,15 @@ const sandbox = () => {
   sandboxes.push(dir);
   return dir;
 };
+// Node's `devNull` on Windows is a `\\.\nul` path, which Git for Windows rejects ("unable to
+// access"); Git maps `/dev/null` to the null device on every platform.
+const GIT_NULL_CONFIG = "/dev/null";
 const isolatedEnv = (): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (!key.startsWith("GIT_")) env[key] = value;
   }
-  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull };
+  return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: GIT_NULL_CONFIG };
 };
 const git = (cwd: string, ...args: string[]): string => {
   const result = spawnSync(

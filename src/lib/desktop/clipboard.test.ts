@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyText, createCopyFlash, type WebClipboard } from "./clipboard";
+import { copyText, createCopyFlash, readClipboardText, type WebClipboard } from "./clipboard";
 
 function fakeDocument(execResult: boolean) {
   const removed: string[] = [];
@@ -53,6 +53,19 @@ describe("copyText", () => {
 
   it("fails closed with no clipboard and no document", async () => {
     expect(await copyText("text", { clipboard: null, document: null })).toBe(false);
+  });
+});
+
+describe("readClipboardText", () => {
+  it("returns the clipboard's text", async () => {
+    expect(await readClipboardText({ clipboard: { readText: async () => "pasted" } })).toEqual({ ok: true, text: "pasted" });
+  });
+
+  it("says unavailable when there is no clipboard or no read API, and failed when the read throws", async () => {
+    expect(await readClipboardText({ clipboard: null })).toEqual({ ok: false, reason: "unavailable" });
+    expect(await readClipboardText({ clipboard: {} })).toEqual({ ok: false, reason: "unavailable" });
+    const refused = { readText: () => Promise.reject(new Error("NotAllowedError")) };
+    expect(await readClipboardText({ clipboard: refused })).toEqual({ ok: false, reason: "failed" });
   });
 });
 
