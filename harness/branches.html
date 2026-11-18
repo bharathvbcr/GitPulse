@@ -7,6 +7,7 @@ import "../src/app.css";
 import { mount, unmount, tick } from "svelte";
 import { get } from "svelte/store";
 import { themeStore } from "../src/lib/stores/themeStore";
+import { setThemeAndLand } from "./theme";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { filterStore } from "../src/lib/stores/filterStore";
 import { toastStore } from "../src/lib/stores/toastStore";
@@ -18,7 +19,7 @@ import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 import Tooltip from "../src/lib/components/Tooltip.svelte";
 import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 const params = new URLSearchParams(location.search);
-themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+await setThemeAndLand(themeStore, params.get("theme") === "light" ? "light" : "dark");
 const results = [], crashes = [], merges = [], copies = [], unexpected = [], transfers = [];
 const branchDeletes = [], tagDeletes = [], branchCreates = [], wtRemovals = [], wtCreates = [], hookApprovals = [];
 // The repository's hooks file as the host would read it; `approved` follows the last approval.
