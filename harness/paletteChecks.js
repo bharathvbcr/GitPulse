@@ -154,6 +154,13 @@ if (params.has("check")) {
   await key("Enter"); await settle(); await new Promise(resolve => setTimeout(resolve, 100));
   check("a palette command with no prompt runs in the repository in front, through the store", (f => f.length === 1 && f[0].args.repoPath === origin)(calls.filter(c => c.cmd === "cmd_fetch").slice(fetchesBefore)));
   await idle(); if (!input()) await open();
+  await type("%");
+  const activeRepoOption = [...root.querySelectorAll("[role=option]")].find(el => el.querySelector("[data-palette-badge]")?.textContent?.trim() === "Active");
+  check("active repository row shows an Active badge while keeping its path visible", Boolean(activeRepoOption) && activeRepoOption.textContent.includes(origin) && activeRepoOption.getAttribute("aria-disabled") === "true");
+  activeRepoOption?.click(); await settle();
+  check("switching to the active repository shows inline feedback and keeps the palette open", Boolean(input()) && document.activeElement === input() && root.querySelector("[data-palette-notice]")?.textContent?.includes("Already on"));
+  await key("Home");
+  check("moving selection clears the inline notice", !root.querySelector("[data-palette-notice]"));
   await type("?"); check("help is filtered by its search text", Boolean(option("Type #")));
   await type("?workspace"); check("help search narrows the mode list", Boolean(option("Type ::")) && !option("Type #"));
   await key("Escape"); localStorage.setItem(FRECENCY_KEY,"null"); await open(); check("malformed history cannot crash reopening", Boolean(input()));

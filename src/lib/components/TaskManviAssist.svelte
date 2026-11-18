@@ -3,7 +3,7 @@
    * One Manvi section for the task sheet and Quick Enhance.
    * Model choice lives in Local model servers; this surface only summarizes it.
    */
-  import { onMount, untrack } from "svelte";
+  import { onMount, untrack, type Snippet } from "svelte";
   import { Sparkles } from "@lucide/svelte";
   import { get } from "svelte/store";
   import {
@@ -75,6 +75,8 @@
     onEngine = (_name: string) => {},
     onStatus = (_status: { state: string | null; uncertain: boolean }) => {},
     onEditing = (_editing: boolean) => {},
+    onFillNotes,
+    notesExtra,
   }: {
     task: Task | null;
     notes?: string;
@@ -129,6 +131,15 @@
      * what lets it ask instead.
      */
     onEditing?: (editing: boolean) => void;
+    /**
+     * Cmd+Enter in the notes when no model can draft yet: the host fills its
+     * fields from the notes instead, and returns whether it did. Without it the
+     * shortcut only reported that the model was not ready, though the notes
+     * could already be turned into the task.
+     */
+    onFillNotes?: () => boolean;
+    /** Drawn directly under the notes box: the sheet's live preview of what saving the notes writes. */
+    notesExtra?: Snippet;
   } = $props();
 
   const labels = ENHANCEMENT_STATE_LABELS;
@@ -292,6 +303,19 @@
     engine === "apple"
       ? disabled || acting || liveAttempt || available.length === 0 || Boolean(gate) || !appleAsk.ok || !manviGate.ok
       : disabled || acting || liveAttempt || configPending || available.length === 0 || Boolean(gate) || !manviReady || !manviGate.ok,
+  );
+  /**
+   * No model is there to draft with: Manvi has no provider and model (its
+   * configuration read, and empty or failed), or the on-device model reported
+   * itself unavailable. Narrower than `askDisabled`, which also covers a
+   * reader who unticked every field or an attempt already running — those are
+   * choices or waits, not a missing model, and Cmd+Enter keeps refusing them.
+   * Not `!appleAsk.ok`: that is also false for the input (no field chosen,
+   * notes too long), which is the same choice the Manvi side refuses.
+   */
+  const noModel = $derived(
+    !disabled && !acting && !liveAttempt
+      && (engine === "apple" ? apple !== null && apple.state !== "available" : !configPending && !manviReady),
   );
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
@@ -562,6 +586,10 @@
     if (quick && (liveAttempt || disabled || controlsLocked || !available.length || !task)) return;
     if (quick && engine !== "apple" && !manviReady) return;
     busy = true; epoch++; error = ""; note = "";
+    // Read before the draft is saved: saving consumes the notes into the
+    // fields, which would turn an "extract from notes" request into an
+    // "improve" with nothing in it — not what the button promised.
+    const asked = { kind: askKind, notes };
     try {
       const saved = quick ? task : await prepareTask();
       if (disposed) return;
@@ -591,8 +619,8 @@
       }
       const result = engine === "apple"
         ? await runAppleEnhancement(saved, available, {
-            kind: askKind,
-            notes,
+            kind: asked.kind,
+            notes: asked.notes,
             title,
             description,
             context: appleContext({ kind: saved.kind, repositories: [...repositoryNames], labels: saved.labels }),
@@ -697,7 +725,7 @@
       <Sparkles size={13} class="text-accent shrink-0" />
       <div class="min-w-0">
         <p class="assist-title">{compose ? "What do you need?" : "Improve this task"}</p>
-        <p class="assist-hint">{compose ? "Notes become a title and description you accept below." : "Ask for a better title and description, or paste notes to rewrite them."}</p>
+        <p class="assist-hint">{compose ? `Paste what you know. Saving turns it into the fields below, or ask ${engineName} to draft them.` : "Ask for a better title and description, or paste notes to rewrite them."}</p>
       </div>
     </div>
     <label class="notes-label">
@@ -713,11 +741,15 @@
         onkeydown={(event) => {
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.preventDefault();
+            if (noModel && onFillNotes?.()) return;
             void generate();
           }
         }}
       ></textarea>
     </label>
+    <!-- What the notes will write, drawn by the sheet, which owns the save.
+         It sits under the box it describes, above the model controls. -->
+    {@render notesExtra?.()}
   {/if}
 
   {#if appleOffered}

@@ -4,7 +4,7 @@
   import { describeError } from "../ui/copy/describeFailure";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { LAYERS } from "../ui/layers";
-  import { SquareTerminal } from "@lucide/svelte";
+  import { Eye, EyeOff, Plus, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { onDestroy, tick, untrack } from "svelte";
   import { portal } from "../dom/portal";
@@ -15,10 +15,14 @@
   import { CONTEXT_READ_MS } from "../terminal/inputQueue";
   import { contextReadOf, type TerminalContext } from "../terminal/sessionContext";
   import { focusTerminalSession } from "../terminal/sessionFocus";
+  import { panelTabCounts } from "../terminal/panelTabCounts";
+  import { activityAttentionLabel, sessionActivity } from "../terminal/sessionActivity";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { terminalPillView } from "../terminal/statusPill";
-  import { launcherLabel } from "../terminal/tabs";
+  import { isGenericLauncherTitle, launcherLabel } from "../terminal/tabs";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
+  import LauncherIcon from "./LauncherIcon.svelte";
+  import RepoLogo from "./RepoLogo.svelte";
 
   /**
    * How long the pointer may spend between the pill and its portaled menu
@@ -40,22 +44,41 @@
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
 
   let pillSessions = $derived(
-    $terminalSessions.map((session) => ({
-      key: session.key,
-      repoPath: session.repoPath,
-      label: session.label,
-      status: session.status,
-      title: session.title,
-      checkout: session.checkout,
-      sessionId: session.sessionId,
-      canReveal: typeof session.reveal === "function",
-    })),
+    $terminalSessions.map((session) => {
+      const launcher = session.launcher ?? "shell";
+      const liveAct = session.sessionId ? $sessionActivity.get(session.sessionId) : undefined;
+      const registryTitle =
+        session.title && !isGenericLauncherTitle(session.title, launcher)
+          ? session.title
+          : undefined;
+      const liveTitle =
+        liveAct?.title && !isGenericLauncherTitle(liveAct.title, launcher)
+          ? liveAct.title
+          : undefined;
+      return {
+        key: session.key,
+        repoPath: session.repoPath,
+        label: session.label,
+        launcher,
+        status: session.status,
+        title: registryTitle ?? liveTitle,
+        checkout: session.checkout,
+        sessionId: session.sessionId,
+        canReveal: typeof session.reveal === "function",
+        isActive: session.isActive,
+        splitSlot: session.splitSlot,
+        attention: session.attention ?? activityAttentionLabel(liveAct),
+      };
+    }),
   );
+  let openDockTabs = $derived(panelTabCounts.countFor($panelTabCounts, $repoStore.currentPath));
   let terminalPill = $derived(
     terminalPillView(pillSessions, {
       open: $repoStore.terminalOpen,
       repoPath: $repoStore.currentPath,
       activity,
+      openTabs: openDockTabs,
+      checkouts: $repoStore.openTabs ?? [],
       buildQueue,
     }),
   );
@@ -185,9 +208,9 @@
       place: "below" as const,
       align: "end" as const,
     },
-    estimate: { width: 256, height: 180 },
+    estimate: { width: 320, height: 240 },
     inset: 8,
-    revision: `${terminalPill.detail}:${terminalPill.alive}:${launchError ?? ""}`,
+    revision: `${terminalPill.detail}:${terminalPill.alive}:${launchError ?? ""}:${terminalPill.sessions.map((s) => `${s.key}:${s.displayTitle ?? ""}:${s.phrase ?? ""}`).join("|")}`,
     dismiss: {
       inside: "[data-terminal-pill], [data-terminal-pill-menu]",
       pointer: "pointerdown" as const,
@@ -317,6 +340,9 @@
       <SquareTerminal size={12} class="shrink-0" />
       <span>Terminal</span>
       {#if terminalPill.summary}
+        {#if terminalPill.highlightedLauncher}
+          <LauncherIcon kind={terminalPill.highlightedLauncher} size={11} class="shrink-0" />
+        {/if}
         <span class="min-w-0 max-w-[8rem] truncate font-mono opacity-80" data-testid="terminal-pill-summary">{terminalPill.summary}</span>
       {/if}
       {#if terminalPill.alive > 0}
@@ -346,23 +372,78 @@
       onfocusin={showMenu}
       onfocusout={onPillFocusOut}
       onkeydown={onMenuKeydown}
-      class="fixed w-64 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1 text-meta font-sans text-textPrimary"
+      class="fixed w-80 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-meta font-sans text-textPrimary"
       style="z-index: {LAYERS.MENU}"
     >
-      <p class="px-2.5 py-1 text-textMuted" data-testid="terminal-pill-detail">{terminalPill.detail}</p>
-      {#if terminalPill.sessions.length === 1 && terminalPill.sessions[0]?.where}
-        <p class="px-2.5 pb-1 truncate text-textMuted" title={terminalPill.sessions[0]?.cwd}>{terminalPill.sessions[0]?.where}</p>
-      {/if}
+      <div class="flex items-center justify-between gap-2 px-2 py-1">
+        <span class="inline-flex min-w-0 items-center gap-1.5 truncate font-medium text-textSecondary" data-testid="terminal-pill-detail">
+          {#if terminalPill.highlightedLauncher}
+            <LauncherIcon kind={terminalPill.highlightedLauncher} size={12} class="shrink-0" />
+          {:else}
+            <SquareTerminal size={12} class="shrink-0 text-accent" />
+          {/if}
+          <span class="truncate">{terminalPill.detail}</span>
+        </span>
+        <span class="shrink-0 font-mono text-micro text-textMuted">{shortcutTextLabel('⌃`', $hostPlatform.os)}</span>
+      </div>
       {#if launchError}
         <p class="px-2.5 py-1 text-danger" role="alert">{launchError}</p>
       {/if}
+      {#if terminalPill.sessions.length > 0}
+        <div class="gp-menu-sep" role="separator"></div>
+        <div class="max-h-60 overflow-y-auto flex flex-col gap-0.5 py-0.5" data-testid="terminal-pill-session-list">
+          {#each terminalPill.sessions as session (session.key)}
+            <button
+              type="button"
+              class="gp-menu-item flex-col! items-stretch! gap-1 py-1.5! text-meta {session.isActive && session.isCurrentRepo ? 'bg-accent/10' : ''}"
+              data-testid="terminal-pill-session"
+              disabled={!session.canReveal}
+              title={`${session.agentLabel}${session.displayTitle ? ` — ${session.displayTitle}` : ""} · ${session.cwd ?? session.checkout ?? session.repoPath}`}
+              onclick={() => void focusListed(session.key)}
+            >
+              <span class="flex w-full min-w-0 items-center gap-1.5">
+                <LauncherIcon kind={session.launcherKind} size={14} />
+                <span class="min-w-0 flex-1 truncate font-medium text-textPrimary" data-testid="terminal-pill-session-title">
+                  <span class="sr-only">Switch to {" "}</span>{session.displayTitle ?? session.agentLabel}
+                </span>
+                {#if session.splitSlot}
+                  <span class="gp-chip shrink-0 tabular-nums" data-tone={session.isActive ? "accent" : "neutral"} data-testid="terminal-pill-session-split">#{session.splitSlot}</span>
+                {/if}
+                {#if session.isActive}
+                  <span class="gp-chip shrink-0" data-tone="accent" data-testid="terminal-pill-session-active">Active</span>
+                {/if}
+                {#if session.attention}
+                  <span class="gp-chip shrink-0" data-tone={session.attention === "Failed" ? "danger" : "warn"} data-testid="terminal-pill-session-attention">{session.attention}</span>
+                {/if}
+              </span>
+              <span class="flex w-full min-w-0 items-center gap-1 text-micro text-textMuted">
+                <RepoLogo path={session.logoPath} name={session.repository} size={12} />
+                <span class="shrink-0 max-w-[8rem] truncate font-medium text-textSecondary" data-testid="terminal-pill-session-repo">{session.repository}</span>
+                {#if session.checkoutName}
+                  <span class="min-w-0 truncate font-mono text-textMuted" data-testid="terminal-pill-session-checkout">/{session.checkoutName}</span>
+                {:else if session.where && (session.where.includes("/") || session.where !== session.repository)}
+                  <span class="min-w-0 truncate font-mono text-textMuted">/{session.where}</span>
+                {/if}
+                {#if session.displayTitle}
+                  <span class="shrink-0 text-textMuted" data-testid="terminal-pill-session-agent">· {session.agentLabel}</span>
+                {/if}
+                {#if !session.attention && session.phrase}
+                  <span class="ml-auto shrink-0 max-w-[9rem] truncate text-textMuted" title={session.phrase} data-testid="terminal-pill-session-phrase">{session.phrase}</span>
+                {/if}
+              </span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+      <div class="gp-menu-sep" role="separator"></div>
       <button
         type="button"
         class="gp-menu-item text-meta"
         data-testid="terminal-pill-toggle"
         onclick={() => { toggleDock(); closeMenu(); }}
       >
-        {$repoStore.terminalOpen ? "Hide terminal" : "Show terminal"}
+        {#if $repoStore.terminalOpen}<EyeOff size={13} class="shrink-0 text-textMuted" />{:else}<Eye size={13} class="shrink-0 text-textMuted" />{/if}
+        <span>{$repoStore.terminalOpen ? "Hide terminal" : "Show terminal"}</span>
       </button>
       {#if terminalPill.focusKey}
         <button
@@ -371,7 +452,8 @@
           data-testid="terminal-pill-focus"
           onclick={() => { if (terminalPill.focusKey) void focusListed(terminalPill.focusKey); }}
         >
-          Focus session
+          <SquareTerminal size={13} class="shrink-0 text-accent" />
+          <span>Focus session</span>
         </button>
       {/if}
       <button
@@ -381,26 +463,10 @@
         disabled={launching}
         onclick={() => void newTerminal()}
       >
-        New {launcherLabel($interfaceStore.terminalLauncher)} session
+        <LauncherIcon kind={$interfaceStore.terminalLauncher} size={13} />
+        <span class="flex-1 truncate text-left">New {launcherLabel($interfaceStore.terminalLauncher)} session</span>
+        <Plus size={12} class="shrink-0 text-textMuted" />
       </button>
-      {#if terminalPill.sessions.length > 1}
-        <div class="gp-menu-sep" role="separator"></div>
-        {#each terminalPill.sessions as session (session.key)}
-          <button
-            type="button"
-            class="gp-menu-item text-meta"
-            data-testid="terminal-pill-session"
-            disabled={!session.canReveal}
-            title={session.cwd ?? session.repoPath}
-            onclick={() => void focusListed(session.key)}
-          >
-            <span class="min-w-0 flex-1 truncate">Switch to {session.name}</span>
-            {#if session.phrase}
-              <span class="shrink-0 text-textMuted">{session.phrase}</span>
-            {/if}
-          </button>
-        {/each}
-      {/if}
     </div>
   {/if}
 {/if}

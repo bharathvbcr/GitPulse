@@ -38,11 +38,16 @@
     Columns2,
     Rows2,
     FolderTree,
+    PanelLeftClose,
+    FileText,
+    ExternalLink,
+    Send,
+    GitBranch,
+    Pencil,
     Settings2,
     ChevronLeft,
     ChevronRight,
     ChevronsUpDown,
-    Globe,
     Eye,
     RotateCw,
   } from "@lucide/svelte";
@@ -54,6 +59,24 @@
   import TerminalSession from "./TerminalSession.svelte";
   import BrowserSession from "./BrowserSession.svelte";
   import TerminalFilePane from "./TerminalFilePane.svelte";
+  import ExplorerRail from "./files/ExplorerRail.svelte";
+  import {
+    clampExplorerSidebarWidth,
+    resolveExplorerFileAction,
+    TERMINAL_EXPLORER_WIDTH_DEFAULT,
+    TERMINAL_EXPLORER_WIDTH_MAX,
+    TERMINAL_EXPLORER_WIDTH_MIN,
+    terminalExplorerSidebar,
+    type ExplorerOpenTarget,
+  } from "../terminal/explorerSidebar";
+  import {
+    NO_FOLLOW_TARGET,
+    adoptFollowPane,
+    decideFollow,
+    followPaneOpen,
+    type FollowPaneCandidate,
+    type FollowTarget,
+  } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
@@ -61,6 +84,8 @@
   import { groupSessionsByRepository, sessionRow, summarizeCheckout, type CheckoutTab } from "../terminal/checkoutLabel";
   import { sessionCountLabel, sessionIsLive, sessionListCommand, sessionListNotice, sessionStatusLabel } from "../terminal/sessionList";
   import { forgetEndedTail } from "../terminal/endedBuffer";
+  import { panelTabCounts } from "../terminal/panelTabCounts";
+  import { activityAttentionLabel, activityToAgentStatus, sessionActivity } from "../terminal/sessionActivity";
   import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
   import { detachedAdoptionSettled, reclaimAdoptedSession } from "../terminal/detachedSessions";
   import { isTauri } from "../platform";
@@ -90,33 +115,71 @@
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import {
     adjacentPane,
+    allGroupedPaneIds,
+    applyTabStripDrop,
+    buildTabStripSegments,
+    chooseSplitPartner,
+    pairJoinTargets,
+    type PairJoinTarget,
+    chooseSplitReplacementSlot,
+    classifyTabStripDropZone,
+    coLocateTabsForGroups,
     computeSplitLayout,
+    computeTabDropHint,
+    cycleSplitGroup,
+    cycleVisibleSplitPane,
+    detachTabToStripEnd,
     equalizeSplits,
+    findGroupForPane,
+    flipSplitOrientation,
     hasPane,
     leafPaneIds,
+    MAX_PERSISTED_SNIPPET_CHARS,
     MAX_SPLIT_PANES,
     minimumSplitHeight,
     movePaneToSplit,
+    moveSplitGroupByStep,
+    moveSplitGroupToStripEnd,
+    moveTabWithGroups,
+    normalizeSplitGroups,
+    orderGroupsByTabOrder,
     parsePersistedSplitWorkspace,
-    remapSplitTree,
-    removePane,
+    recordGroupActivePane,
+    remapSplitGroups,
+    removePaneFromGroups,
+    removeSplitGroup,
+    renameSplitGroup,
+    reorderSplitGroupInStrip,
     replacePane,
     resizeBranch,
     serializeSplitWorkspace,
+    splitGroupDisplayLabel,
     splitPane,
+    summarizeHiddenSplitSiblings,
+    summarizeSplitGroupAttention,
+    swapPanes,
+    swapWithAdjacentSplitPane,
     terminalSplitChord,
+    upsertSplitGroup,
     visiblePaneIds,
     type PersistedSplitLeafMeta,
     type SashDescriptor,
     type SplitDirection,
+    type SplitGroup,
     type SplitNode,
+    type TabDropZone,
+    type TabStripDropMode,
   } from "../terminal/splitTree";
   import ScrollCue from "./ScrollCue.svelte";
+  import LauncherIcon from "./LauncherIcon.svelte";
+  import RepoLogo from "./RepoLogo.svelte";
   import {
     activateTab,
     buildPairHandoffPrompt,
     childTabsForParent,
-    offeredSessionKind,
+    dockTabTypesFor,
+    offeredDockTabKind,
+    resolvePairHandoffTargets,
     sessionTypesFor,
     canOpenTab,
     MAX_STRIP_TABS,
@@ -134,18 +197,26 @@
     setTabPurpose,
     setTabResume,
     setTabStartDir,
+    setTabInitialCommand,
+    type BrowserPageState,
+    type PairHandoffTarget,
     type ResumeLaunch,
     setTabTitle,
     setTabUrl,
+    toggleTabPinned,
     browserTabFor,
     openBrowserTab,
     fileTabFor,
+    normalizePaneFilePath,
     openFileTab,
     openSnippetTab,
     setTabFile,
     renameTab,
-    moveTab,
+    tabDisplayTitle,
     tabLabel,
+    effectiveSessionTitle,
+    isGenericLauncherTitle,
+    stripTitleSpinner,
     terminalTabChord,
     terminalTabDestination,
     type SessionKind,
@@ -255,6 +326,43 @@
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
   let adoptionTimedOut = $state(false);
   let followAgent = $state(false);
+  /**
+   * The one pane Follow Agent drives (`terminal/followAgent.ts`). Follow
+   * never navigates a pane it did not open or get handed, never opens a
+   * second one, and ends when the user closes that pane or opens a file of
+   * their own in it — otherwise every later agent edit popped a new split.
+   */
+  let followTarget = $state<FollowTarget>(NO_FOLLOW_TARGET);
+  const followPaneFile = (tab: FollowPaneCandidate) => normalizePaneFilePath(tab.filePath) ?? null;
+
+  /** Turns follow on, owning `paneId` (a preset's empty file pane) or nothing yet. */
+  function startFollowing(paneId: string | null = null) {
+    followTarget = paneId ? { paneId, filePath: null } : NO_FOLLOW_TARGET;
+    followAgent = true;
+  }
+
+  function stopFollowing() {
+    followAgent = false;
+    followTarget = NO_FOLLOW_TARGET;
+  }
+
+  /** Records the pane follow just pointed (or opened) as its own, with the file now in it. */
+  function adoptFollowPaneById(paneId: string | undefined) {
+    followTarget = adoptFollowPane(
+      paneId ? tabState.tabs.find((tab) => tab.id === paneId) : undefined,
+      followPaneFile,
+    );
+  }
+
+  // Closing follow's pane ends follow at once, so the toggle never reads
+  // "following" while nothing will be. A takeover is judged at the next edit
+  // (`decideFollow`), since follow itself repoints the pane between edits.
+  $effect(() => {
+    const target = followTarget;
+    const tabs = tabState.tabs;
+    if (!followAgent || target.paneId === null) return;
+    if (!followPaneOpen(target, tabs)) untrack(stopFollowing);
+  });
 
   onMount(() => {
     inputEl?.focus();
@@ -273,7 +381,10 @@
       onTouchedFile: handleAgentTouchedFile,
     });
     const unsubSessionLedger = subscribeSessionLedger();
+    window.addEventListener("pagehide", flushPendingSplitPersist);
     return () => {
+      window.removeEventListener("pagehide", flushPendingSplitPersist);
+      flushPendingSplitPersist();
       unsubAgentPanel();
       unsubSessionLedger();
       if (adoptionFallbackTimer !== null) clearTimeout(adoptionFallbackTimer);
@@ -303,7 +414,13 @@
   let mode = $state<PtyMode>("shell");
   function initialTabs(): TabState {
     const launch = get(terminalLaunchRequests);
-    if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) return { tabs: [], activeId: null };
+    if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) {
+      const needsAnchorShell =
+        launch.launcher === "file" &&
+        launch.fileOpenMode !== "tab" &&
+        get(terminalSessions).length < get(terminalSessionLimit);
+      if (!needsAnchorShell) return { tabs: [], activeId: null };
+    }
     // A panel mounted for a queued request starts empty: the request opener
     // below opens its tab, through the same admission as every other.
     if (requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts)) return { tabs: [], activeId: null };
@@ -311,7 +428,6 @@
   }
   let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
-  const activeTitle = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.title);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
   /**
    * Browser tabs, apart from `sessions` on purpose: a browser runs no process,
@@ -323,31 +439,272 @@
   let panesContainerEl = $state<HTMLDivElement | null>(null);
   /** The session types this host can open; browser sessions are macOS-only. */
   const sessionTypes = $derived(sessionTypesFor($hostPlatform.browser_sessions));
+  /** All dock tab kinds selectable in Session Typer, including File Explorer. */
+  const dockTabTypes = $derived(dockTabTypesFor($hostPlatform.browser_sessions));
   /** What the reader chose last; shown as `nextLauncher` once this host is known to offer it. */
-  let chosenLauncher = $state<SessionKind>(get(interfaceStore).terminalLauncher);
-  const nextLauncher = $derived(offeredSessionKind(chosenLauncher, $hostPlatform.browser_sessions));
+  let chosenLauncher = $state<TabKind>(get(interfaceStore).terminalLauncher);
+  const nextLauncher = $derived(offeredDockTabKind(chosenLauncher, $hostPlatform.browser_sessions));
   const activeLauncher = $derived(tabState.tabs.find((tab) => tab.id === activeId)?.launcher ?? null);
   const activeIsNonTerminal = $derived(activeLauncher === "browser" || activeLauncher === "file");
-  let splitRoot = $state<SplitNode | null>(null);
+  let splitGroups = $state<SplitGroup[]>([]);
   let zoomedPaneId = $state<string | null>(null);
   let draggedTabId = $state<string | null>(null);
-  let tabDropHint = $state<{ paneId: string; direction: SplitDirection; position: "before" | "after" } | null>(null);
+  let draggedGroupId = $state<string | null>(null);
+  let tabDropHint = $state<TabDropZone | null>(null);
+  let tabStripDropHint = $state<{
+    tabId?: string;
+    groupId?: string;
+    detach?: boolean;
+    splitDropzone?: boolean;
+    mode: TabStripDropMode;
+  } | null>(null);
   let fileDropHint = $state<{ paneId: string; region: DropRegion } | null>(null);
+  let tabContextMenu = $state<{ tabId: string; x: number; y: number } | null>(null);
+  let tabContextMenuOpener: HTMLElement | null = null;
+  let splitContextMenu = $state<{
+    x: number;
+    y: number;
+    direction: SplitDirection;
+    position: "before" | "after";
+  } | null>(null);
+  let splitContextMenuOpener: HTMLElement | null = null;
+  let groupContextMenu = $state<{ groupId: string; x: number; y: number } | null>(null);
+  let groupContextMenuOpener: HTMLElement | null = null;
+  const explorerSidebarOpen = $derived($terminalExplorerSidebar.open);
+  const explorerOpenTarget = $derived<ExplorerOpenTarget>($terminalExplorerSidebar.target);
+  const explorerSidebarWidth = $derived($terminalExplorerSidebar.width);
+  let explorerResizing = $state(false);
+  let selectedExplorerFile = $state<string | null>(null);
+  let lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
+  let inlineRenameTabId = $state<string | null>(null);
+  let inlineRenameSurface = $state<"tab" | "pane" | null>(null);
+  let inlineRenameDraft = $state("");
+  let inlineRenameInput = $state<HTMLInputElement | null>(null);
+  let inlineRenameGroupId = $state<string | null>(null);
+  let inlineRenameGroupDraft = $state("");
+  let inlineRenameGroupInput = $state<HTMLInputElement | null>(null);
+  const pinnedTabIds = $derived(new Set(tabState.tabs.filter((tab) => tab.pinned).map((tab) => tab.id)));
+  const groupedTabIds = $derived(allGroupedPaneIds(splitGroups));
+  const activeGroup = $derived(findGroupForPane(splitGroups, activeId));
+  const activeGroupIndex = $derived(
+    activeGroup ? splitGroups.findIndex((group) => group.id === activeGroup.id) : -1,
+  );
+  const activeGroupLabel = $derived(
+    activeGroup && activeGroupIndex >= 0
+      ? splitGroupDisplayLabel(activeGroup, activeGroupIndex, splitGroups.length)
+      : null,
+  );
+  const splitRoot = $derived<SplitNode | null>(activeGroup?.tree ?? null);
   const visibleIds = $derived(visiblePaneIds(splitRoot, activeId, zoomedPaneId));
   const splitIds = $derived(splitRoot ? visibleIds : null);
   const splitLayout = $derived(computeSplitLayout(splitRoot, activeId, zoomedPaneId));
+  const allSplitLeafIds = $derived(splitRoot ? leafPaneIds(splitRoot) : []);
+  const splitSlotByTabId = $derived.by(() => {
+    const map: Record<string, number> = {};
+    allSplitLeafIds.forEach((id, index) => {
+      map[id] = index + 1;
+    });
+    return map;
+  });
+  const groupMetaByTabId = $derived.by(() => {
+    const map: Record<
+      string,
+      {
+        group: SplitGroup;
+        groupIndex: number;
+        label: string;
+        slot: number;
+        totalSlots: number;
+      }
+    > = {};
+    splitGroups.forEach((group, groupIdx) => {
+      const label = splitGroupDisplayLabel(group, groupIdx, splitGroups.length);
+      const leaves = leafPaneIds(group.tree);
+      leaves.forEach((id, leafIdx) => {
+        map[id] = {
+          group,
+          groupIndex: groupIdx + 1,
+          label,
+          slot: leafIdx + 1,
+          totalSlots: leaves.length,
+        };
+      });
+    });
+    return map;
+  });
+  const tabStripSegments = $derived(buildTabStripSegments(tabState.tabs, splitGroups));
+  const orderedStripTabs = $derived(coLocateTabsForGroups(tabState.tabs, splitGroups));
+  const activeSplitSlot = $derived(activeId ? splitSlotByTabId[activeId] ?? null : null);
   /** The pane canvas's least height; below it the pane area scrolls (`minimumSplitHeight`). */
   const paneCanvasMinHeight = $derived(minimumSplitHeight(splitRoot, activeId, zoomedPaneId));
+  const visibleFileTab = $derived(
+    tabState.tabs.find(
+      (tab) =>
+        tab.launcher === "file" &&
+        !tab.snippet &&
+        (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
+    ) ?? null,
+  );
   const hasVisibleFilePane = $derived(
     tabState.tabs.some(
       (tab) => tab.launcher === "file" && (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
     ),
   );
+  const activeExplorerFile = $derived(selectedExplorerFile ?? visibleFileTab?.filePath ?? null);
+  const stripPairDropTargetId = $derived.by(() => {
+    if (!draggedTabId || tabState.tabs.length < 2 || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) {
+      return null;
+    }
+    if (splitRoot && hasPane(splitRoot, draggedTabId)) return null;
+    if (activeId && activeId !== draggedTabId) return activeId;
+    return tabState.tabs.find((tab) => tab.id !== draggedTabId)?.id ?? null;
+  });
   let sashDragging = $state(false);
-  const layoutDragging = $derived(dockDragging || sashDragging);
+  const layoutDragging = $derived(dockDragging || sashDragging || explorerResizing);
+
+  function applyGroupsAndCoLocate(
+    nextGroups: readonly SplitGroup[],
+    nextTabState: TabState = tabState,
+  ) {
+    const validIds = new Set(nextTabState.tabs.map((tab) => tab.id));
+    const normalized = normalizeSplitGroups(nextGroups, validIds);
+    const coLocated = coLocateTabsForGroups(nextTabState.tabs, normalized);
+    const orderedGroups = recordGroupActivePane(
+      orderGroupsByTabOrder(normalized, coLocated),
+      nextTabState.activeId,
+    );
+    const tabsChanged =
+      coLocated !== nextTabState.tabs || nextTabState.activeId !== tabState.activeId;
+    if (tabsChanged || nextTabState !== tabState) {
+      tabState =
+        coLocated === nextTabState.tabs
+          ? nextTabState
+          : { tabs: coLocated, activeId: nextTabState.activeId };
+    }
+    splitGroups = orderedGroups;
+  }
+
+  function setActiveSplitTree(nextTree: SplitNode | null) {
+    if (!nextTree || nextTree.kind !== "branch") {
+      if (activeGroup) applyGroupsAndCoLocate(removeSplitGroup(splitGroups, activeGroup.id));
+      return;
+    }
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: activeGroup?.id,
+        name: activeGroup?.name,
+        activePaneId: activeId,
+      }),
+    );
+  }
+
+  function upsertGroupForAnchor(
+    anchorPaneId: string,
+    nextTree: SplitNode | null,
+    nextTabState: TabState = tabState,
+    preferredActivePaneId?: string | null,
+  ) {
+    const owner = findGroupForPane(splitGroups, anchorPaneId);
+    const targetActive = preferredActivePaneId ?? nextTabState.activeId;
+    const stateWithFocus =
+      targetActive && nextTabState.activeId !== targetActive
+        ? activateTab(nextTabState, targetActive)
+        : nextTabState;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: owner?.id,
+        name: owner?.name,
+        activePaneId: targetActive,
+      }),
+      stateWithFocus,
+    );
+  }
+
+  function ungroupPair(groupId: string) {
+    if (activeGroup?.id === groupId) zoomedPaneId = null;
+    if (inlineRenameGroupId === groupId) inlineRenameGroupId = null;
+    applyGroupsAndCoLocate(removeSplitGroup(splitGroups, groupId));
+  }
+
+  /**
+   * Adds `tabId` to the pair `target` names and shows that pair — the menu
+   * form of dropping the tab on the pair's badge, through the same
+   * `applyTabStripDrop` so the two cannot disagree.
+   */
+  function joinPair(tabId: string, target: PairJoinTarget) {
+    zoomedPaneId = null;
+    const outcome = applyTabStripDrop(tabState.tabs, splitGroups, {
+      movingTabId: tabId,
+      targetTabId: target.anchorPaneId,
+      mode: "pair",
+      pinnedIds: pinnedTabIds,
+    });
+    if (outcome.refusedReason) {
+      sessionError = outcome.refusedReason;
+      return;
+    }
+    const nextState = outcome.activeTabId
+      ? activateTab({ ...tabState, tabs: outcome.tabs }, outcome.activeTabId)
+      : { ...tabState, tabs: outcome.tabs };
+    tabState = nextState;
+    splitGroups = recordGroupActivePane(outcome.groups, nextState.activeId);
+    void tick().then(() => revealTab(nextState.activeId ?? tabId));
+  }
+
+  function moveTabInStrip(id: string, step: -1 | 1) {
+    const moved = moveTabWithGroups(tabState.tabs, splitGroups, id, step);
+    if (moved.tabs !== tabState.tabs) {
+      tabState = { ...tabState, tabs: moved.tabs };
+    }
+    if (moved.groups !== splitGroups) {
+      splitGroups = moved.groups;
+    }
+  }
+
+  $effect(() => {
+    if (!repoPath) return;
+    panelTabCounts.report(repoPath, tabState.tabs.length, pathOpts);
+  });
 
   function splitStorageKey(path: string | null | undefined): string | null {
     return path ? `gitpulse.terminal.splitLayout:${path}` : null;
+  }
+
+  function applyPersistedLeafMeta(
+    state: TabState,
+    tabId: string,
+    meta: PersistedSplitLeafMeta | undefined,
+  ): TabState {
+    if (!meta) return state;
+    let next = state;
+    const current = next.tabs.find((tab) => tab.id === tabId);
+    if (!current) return next;
+    if (meta.launchName && !current.launchName) {
+      next = {
+        ...next,
+        tabs: next.tabs.map((tab) =>
+          tab.id === tabId
+            ? { ...tab, launchName: meta.launchName, ...(tab.name ? {} : { name: meta.launchName }) }
+            : tab,
+        ),
+      };
+    }
+    if (meta.userNamed && meta.name && !current.userNamed) {
+      next = renameTab(next, tabId, meta.name);
+    } else if (meta.name && !current.name && !current.userNamed) {
+      next = {
+        ...next,
+        tabs: next.tabs.map((tab) => (tab.id === tabId ? { ...tab, name: tab.name ?? meta.name } : tab)),
+      };
+    }
+    const latest = next.tabs.find((tab) => tab.id === tabId);
+    if (meta.title && latest && !latest.title) {
+      next = setTabTitle(next, tabId, meta.title);
+    }
+    if (meta.pinned) {
+      next = toggleTabPinned(next, tabId, true);
+    }
+    return next;
   }
 
   let hydratedSplitForRepo: string | null = null;
@@ -358,23 +715,40 @@
     if (!key || !readyToHydrate || hydratedSplitForRepo === key || ids.size === 0) return;
     hydratedSplitForRepo = key;
     untrack(() => {
-      if (splitRoot) return;
+      if (splitGroups.length > 0) return;
       try {
         const stored = globalThis.localStorage?.getItem(key);
         const parsed = parsePersistedSplitWorkspace(stored);
-        if (!parsed) return;
+        if (!parsed || parsed.groups.length === 0) return;
         const paneIdMap = new Map<string, string>();
         for (const id of ids) paneIdMap.set(id, id);
         let nextState = tabState;
         const usedCurrentTabs = new Set<string>();
-        for (const leafId of leafPaneIds(parsed.tree)) {
+        const allPersistedLeaves = parsed.groups.flatMap((group) => leafPaneIds(group.tree));
+        for (const leafId of allPersistedLeaves) {
+          if (usedCurrentTabs.has(leafId)) continue;
+          const meta = parsed.leaves[leafId];
           if (paneIdMap.has(leafId)) {
             usedCurrentTabs.add(leafId);
+            nextState = applyPersistedLeafMeta(nextState, leafId, meta);
             continue;
           }
-          const meta = parsed.leaves[leafId];
           if (!meta) continue;
           if (meta.launcher === "file") {
+            if (meta.snippet) {
+              const openedSnippet = openSnippetTab(nextState, {
+                title: meta.snippet.title,
+                content: meta.snippet.content,
+                reuseExisting: false,
+                focus: false,
+              });
+              if (openedSnippet.id) {
+                nextState = applyPersistedLeafMeta(openedSnippet.state, openedSnippet.id, meta);
+                paneIdMap.set(leafId, openedSnippet.id);
+                usedCurrentTabs.add(openedSnippet.id);
+              }
+              continue;
+            }
             const opened = openFileTab(nextState, {
               filePath: meta.filePath,
               checkout: meta.checkout,
@@ -384,7 +758,7 @@
               focus: false,
             });
             if (opened.id) {
-              nextState = opened.state;
+              nextState = applyPersistedLeafMeta(opened.state, opened.id, meta);
               paneIdMap.set(leafId, opened.id);
               usedCurrentTabs.add(opened.id);
             }
@@ -394,7 +768,11 @@
             if ($hostPlatform.browser_sessions) {
               const opened = openBrowserTab(nextState, meta.url);
               if (opened.id) {
-                nextState = { ...opened.state, activeId: nextState.activeId ?? opened.id };
+                nextState = applyPersistedLeafMeta(
+                  { ...opened.state, activeId: nextState.activeId ?? opened.id },
+                  opened.id,
+                  meta,
+                );
                 paneIdMap.set(leafId, opened.id);
                 usedCurrentTabs.add(opened.id);
               }
@@ -408,11 +786,15 @@
                 sessionId: reclaimed.sessionId,
                 parentSessionId: meta.parentSessionId,
                 launcher: reclaimed.launcher,
-                title: reclaimed.title ?? null,
+                title: meta.parentSessionId ? (reclaimed.title ?? null) : null,
                 focus: false,
               });
               if (attached.id) {
-                nextState = attached.state;
+                let hydrated = attached.state;
+                if (!meta.parentSessionId && reclaimed.title) {
+                  hydrated = setTabTitle(hydrated, attached.id, reclaimed.title);
+                }
+                nextState = applyPersistedLeafMeta(hydrated, attached.id, meta);
                 paneIdMap.set(leafId, attached.id);
                 usedCurrentTabs.add(attached.id);
                 continue;
@@ -423,45 +805,156 @@
             (tab) => !usedCurrentTabs.has(tab.id) && tab.launcher === meta.launcher,
           );
           if (fallbackExisting) {
+            nextState = applyPersistedLeafMeta(nextState, fallbackExisting.id, meta);
             paneIdMap.set(leafId, fallbackExisting.id);
             usedCurrentTabs.add(fallbackExisting.id);
           }
         }
-        if (nextState !== tabState) tabState = nextState;
-        const restored = remapSplitTree(parsed.tree, paneIdMap);
-        if (restored) splitRoot = restored;
+        const restoredGroups = remapSplitGroups(parsed.groups, paneIdMap);
+        if (restoredGroups.length > 0) {
+          const targetGroup =
+            (parsed.activeGroupId
+              ? restoredGroups.find((group) => group.id === parsed.activeGroupId)
+              : null) ?? restoredGroups[0];
+          const preferredPane =
+            targetGroup.activePaneId ?? leafPaneIds(targetGroup.tree)[0];
+          if (preferredPane && parsed.activeGroupId !== null) {
+            nextState = activateTab(nextState, preferredPane);
+          }
+          applyGroupsAndCoLocate(restoredGroups, nextState);
+        } else if (nextState !== tabState) {
+          tabState = nextState;
+        }
       } catch {
         /* localStorage unavailable */
       }
     });
   });
 
-  $effect(() => {
-    const key = splitStorageKey(repoPath);
-    const currentRoot = splitRoot;
-    const currentTabs = tabState.tabs;
-    if (!key || hydratedSplitForRepo !== key) return;
-    const leaves: Record<string, PersistedSplitLeafMeta> = {};
-    currentTabs.forEach((tab, slotIndex) => {
-      const backendId = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
-      leaves[tab.id] = {
-        launcher: tab.launcher,
-        slotIndex,
-        ...(backendId ? { backendSessionId: backendId } : {}),
-        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
-        ...(tab.filePath ? { filePath: tab.filePath } : {}),
-        ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
-        ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
-        ...(tab.url ? { url: tab.url } : {}),
-        ...(tab.checkout ? { checkout: tab.checkout } : {}),
-      };
-    });
-    const serialized = serializeSplitWorkspace(currentRoot, leaves);
+  let lastPersistedSplitKey: string | null = null;
+  let lastPersistedSplitJson: string | null = null;
+  let lastPersistedStructuralJson: string | null = null;
+  let pendingSplitWrite: {
+    key: string;
+    serialized: string | null;
+    structuralJson: string | null;
+  } | null = null;
+  let splitPersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function writeSplitStorage(
+    key: string,
+    serialized: string | null,
+    structuralJson: string | null,
+  ) {
+    lastPersistedSplitKey = key;
+    lastPersistedSplitJson = serialized;
+    lastPersistedStructuralJson = structuralJson;
     try {
       if (serialized) globalThis.localStorage?.setItem(key, serialized);
       else globalThis.localStorage?.removeItem(key);
     } catch {
       /* localStorage unavailable */
+    }
+  }
+
+  function flushPendingSplitPersist() {
+    if (splitPersistTimer !== null) {
+      clearTimeout(splitPersistTimer);
+      splitPersistTimer = null;
+    }
+    const pending = pendingSplitWrite;
+    if (!pending) return;
+    pendingSplitWrite = null;
+    writeSplitStorage(pending.key, pending.serialized, pending.structuralJson);
+  }
+
+  $effect(() => {
+    const key = splitStorageKey(repoPath);
+    const currentGroups = splitGroups;
+    const currentActiveGroupId = activeGroup?.id ?? null;
+    if (pendingSplitWrite && pendingSplitWrite.key !== key) {
+      flushPendingSplitPersist();
+    }
+    if (!key || hydratedSplitForRepo !== key) return;
+    if (currentGroups.length === 0) {
+      if (pendingSplitWrite?.key === key) {
+        if (splitPersistTimer !== null) {
+          clearTimeout(splitPersistTimer);
+          splitPersistTimer = null;
+        }
+        pendingSplitWrite = null;
+      }
+      if (
+        lastPersistedSplitKey !== key ||
+        lastPersistedSplitJson !== null ||
+        lastPersistedStructuralJson !== null
+      ) {
+        writeSplitStorage(key, null, null);
+      }
+      return;
+    }
+
+    const currentTabs = tabState.tabs;
+    const draggingSash = sashDragging;
+    const groupedLeaves = allGroupedPaneIds(currentGroups);
+    const leaves: Record<string, PersistedSplitLeafMeta> = {};
+    const structuralLeaves: Record<string, PersistedSplitLeafMeta> = {};
+    currentTabs.forEach((tab, slotIndex) => {
+      if (!groupedLeaves.has(tab.id)) return;
+      const backendId = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
+      const structuralMeta: PersistedSplitLeafMeta = {
+        launcher: tab.launcher,
+        slotIndex,
+        ...(tab.name ? { name: tab.name } : {}),
+        ...(tab.launchName ? { launchName: tab.launchName } : {}),
+        ...(tab.userNamed ? { userNamed: true } : {}),
+        ...(tab.pinned ? { pinned: true } : {}),
+        ...(backendId ? { backendSessionId: backendId } : {}),
+        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
+        ...(tab.filePath ? { filePath: tab.filePath } : {}),
+        ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
+        ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
+        ...(tab.snippet
+          ? {
+              snippet: {
+                title: tab.snippet.title,
+                content: tab.snippet.content.slice(0, MAX_PERSISTED_SNIPPET_CHARS),
+              },
+            }
+          : {}),
+        ...(tab.url ? { url: tab.url } : {}),
+        ...(tab.checkout ? { checkout: tab.checkout } : {}),
+      };
+      leaves[tab.id] = tab.title ? { ...structuralMeta, title: tab.title } : structuralMeta;
+      if (!draggingSash) structuralLeaves[tab.id] = structuralMeta;
+    });
+
+    const serialized = serializeSplitWorkspace(currentGroups, leaves, currentActiveGroupId);
+    const structuralJson = draggingSash
+      ? lastPersistedStructuralJson
+      : serializeSplitWorkspace(currentGroups, structuralLeaves, currentActiveGroupId);
+    const latestKey = pendingSplitWrite ? pendingSplitWrite.key : lastPersistedSplitKey;
+    const latestSerialized = pendingSplitWrite
+      ? pendingSplitWrite.serialized
+      : lastPersistedSplitJson;
+    if (latestKey === key && latestSerialized === serialized) return;
+
+    if (
+      !draggingSash &&
+      (lastPersistedSplitKey !== key || structuralJson !== lastPersistedStructuralJson)
+    ) {
+      if (splitPersistTimer !== null) {
+        clearTimeout(splitPersistTimer);
+        splitPersistTimer = null;
+      }
+      pendingSplitWrite = null;
+      writeSplitStorage(key, serialized, structuralJson);
+      return;
+    }
+
+    pendingSplitWrite = { key, serialized, structuralJson };
+    if (splitPersistTimer === null) {
+      splitPersistTimer = setTimeout(flushPendingSplitPersist, 250);
     }
   });
 
@@ -489,42 +982,107 @@
   let sessionListHighlight = $state<number | null>(null);
   let renameValue = $state("");
   let tabStatuses = $state<Record<string, string>>({});
+  /** The loose tab a plain Split re-pairs with the active one, if any. */
+  const splitPartner = $derived(
+    chooseSplitPartner(
+      tabState.tabs,
+      splitGroups,
+      activeId,
+      nextLauncher,
+      Object.keys(tabStatuses).filter((id) => tabStatuses[id] === "exited" || tabStatuses[id] === "error"),
+    ),
+  );
+  const splitPartnerTab = $derived(
+    splitPartner ? tabState.tabs.find((tab) => tab.id === splitPartner) ?? null : null,
+  );
+  /** What a plain Split will put in the new pane, for its tooltip and menu. */
+  const splitWithLabel = $derived(
+    splitPartnerTab
+      ? tabLabel(splitPartnerTab)
+      : `new ${nextLauncher === "file" ? "File Explorer" : launcherLabel(nextLauncher)}`,
+  );
+  const canPlainSplit = $derived(
+    Boolean(activeId) && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES && (Boolean(splitPartner) || canCreateKind(nextLauncher)),
+  );
   let tabAgentStatuses = $state<Record<string, AgentOscStatus | null>>({});
+  let tabBrowserStates = $state<Record<string, BrowserPageState>>({});
   let unread = $state(new Set<string>());
   const checkoutInfo = $derived(repoPath ? summarizeCheckout(repoPath, checkouts, pathOpts) : null);
   const activeTab = $derived(tabState.tabs.find((tab) => tab.id === activeId));
-  const activeBackendSessionId = $derived.by(() => {
-    if (!activeTab) return null;
-    void tabStatuses[activeTab.id];
-    const reg = $terminalSessions.find(
-      (entry) =>
-        entry.key === activeTab.id &&
-        (!repoPath || sameRepo(entry.repoPath, repoPath, pathOpts)),
-    );
-    return (
-      reg?.sessionId ||
-      sessions[activeTab.id]?.backendSessionId?.() ||
-      activeTab.attachSessionId ||
-      null
-    );
+  const backendSessionIdByTabId = $derived.by(() => {
+    const map: Record<string, string> = {};
+    for (const entry of $terminalSessions) {
+      if (entry.sessionId && (!repoPath || sameRepo(entry.repoPath, repoPath, pathOpts))) {
+        map[entry.key] = entry.sessionId;
+      }
+    }
+    for (const tab of tabState.tabs) {
+      void tabStatuses[tab.id];
+      if (!map[tab.id]) {
+        const fallback = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
+        if (fallback) map[tab.id] = fallback;
+      }
+    }
+    return map;
   });
+  let prevEffectiveAgentStatuses: Record<string, AgentOscStatus | null> = {};
+  const effectiveAgentStatuses = $derived.by(() => {
+    const activityMap = $sessionActivity;
+    const next: Record<string, AgentOscStatus | null> = {};
+    for (const tab of tabState.tabs) {
+      if (tabStatuses[tab.id] === "exited") continue;
+      const osc = tabAgentStatuses[tab.id];
+      if (osc) {
+        next[tab.id] = osc;
+        continue;
+      }
+      const backendId = backendSessionIdByTabId[tab.id];
+      const fallback = backendId ? activityToAgentStatus(activityMap.get(backendId)) : null;
+      if (fallback) next[tab.id] = fallback;
+    }
+    const prevKeys = Object.keys(prevEffectiveAgentStatuses);
+    const nextKeys = Object.keys(next);
+    if (
+      prevKeys.length === nextKeys.length &&
+      nextKeys.every(
+        (key) =>
+          prevEffectiveAgentStatuses[key]?.state === next[key]?.state &&
+          prevEffectiveAgentStatuses[key]?.detail === next[key]?.detail,
+      )
+    ) {
+      return prevEffectiveAgentStatuses;
+    }
+    prevEffectiveAgentStatuses = next;
+    return next;
+  });
+  const activeDisplay = $derived(
+    activeTab ? tabDisplayTitle(activeTab, effectiveAgentStatuses[activeTab.id], tabBrowserStates[activeTab.id]) : null,
+  );
+  const hiddenSplitSummary = $derived(
+    summarizeHiddenSplitSiblings(splitRoot, zoomedPaneId, unread, effectiveAgentStatuses),
+  );
+  const groupAttentions = $derived.by(() => {
+    const map: Record<string, ReturnType<typeof summarizeSplitGroupAttention>> = {};
+    for (const group of splitGroups) {
+      map[group.id] = summarizeSplitGroupAttention(
+        group,
+        activeGroup?.id === group.id,
+        unread,
+        effectiveAgentStatuses,
+      );
+    }
+    return map;
+  });
+  const activeBackendSessionId = $derived(
+    activeTab ? (backendSessionIdByTabId[activeTab.id] ?? null) : null,
+  );
   const activeChildTabs = $derived(
     childTabsForParent(tabState, activeBackendSessionId, tabStatuses),
   );
-  const pairHandoffTarget = $derived.by(() => {
-    if (!splitRoot || !activeTab) return null;
-    if (activeTab.launcher !== "claude" && activeTab.launcher !== "agy") return null;
-    const wantedPartner = activeTab.launcher === "claude" ? "agy" : "claude";
-    return (
-      tabState.tabs.find(
-        (candidate) =>
-          candidate.id !== activeTab.id &&
-          visibleIds.includes(candidate.id) &&
-          candidate.launcher === wantedPartner &&
-          tabStatuses[candidate.id] !== "exited",
-      ) ?? null
-    );
-  });
+  const pairHandoffTargets = $derived(
+    splitRoot ? resolvePairHandoffTargets(tabState.tabs, visibleIds, activeId, tabStatuses) : [],
+  );
+  const pairHandoffTarget = $derived(pairHandoffTargets[0] ?? null);
   let collisionSummary = $state<CollisionRisk | null>(null);
 
   $effect(() => {
@@ -568,6 +1126,13 @@
         return null;
     }
   }
+
+  function oscAttentionLabel(status: AgentOscStatus | null | undefined): string | null {
+    if (!status) return null;
+    if (status.state === "blocked") return "Needs input";
+    if (status.state === "error") return "Failed";
+    return null;
+  }
   // Reads the live limit, so raising it in Settings lets a waiting task
   // terminal open at once rather than when a session next closes.
   // Two bounds, each saying itself: live sessions (the user's limit, across
@@ -601,9 +1166,14 @@
   }
   let focusTabStrip = false;
   const tabExtras = $derived.by(() => {
-    const extras: Record<string, { status?: string; unread?: boolean }> = {};
+    const extras: Record<string, { status?: string; unread?: boolean; agentDetail?: string; groupLabel?: string }> = {};
     for (const tab of tabState.tabs) {
-      extras[tab.id] = { status: tabStatuses[tab.id], unread: unread.has(tab.id) };
+      extras[tab.id] = {
+        status: tabStatuses[tab.id],
+        unread: unread.has(tab.id),
+        agentDetail: effectiveAgentStatuses[tab.id]?.detail ?? undefined,
+        groupLabel: groupMetaByTabId[tab.id]?.label,
+      };
     }
     return extras;
   });
@@ -628,7 +1198,7 @@
     );
     return focused >= 0 ? focused : 0;
   });
-  const filteredLaunchers = $derived(filterLaunchers(sessionTypes, launcherQuery));
+  const filteredLaunchers = $derived(filterLaunchers(dockTabTypes, launcherQuery));
   /**
    * Compact overlay, not an in-flow chrome row. A full-width `terminal-popover`
    * shoved the PTY down by the height of the type list. The other chrome
@@ -637,9 +1207,9 @@
    */
   const launcherMenuDismissal = $derived({
     anchor: { kind: "element" as const, element: launcherTriggerEl, gap: 6 },
-    estimate: { width: 208, height: 260 },
+    estimate: { width: 240, height: 320 },
     inset: 8,
-    revision: `${launcherQuery}:${filteredLaunchers.length}`,
+    revision: `${launcherQuery}:${filteredLaunchers.length}:${explorerSidebarOpen}`,
     dismiss: {
       inside: "[data-terminal-launcher], [data-terminal-launcher-popup]",
       resize: true,
@@ -651,11 +1221,182 @@
     },
   });
 
+  const tabContextMenuPopover = $derived({
+    anchor: {
+      kind: "point" as const,
+      x: tabContextMenu?.x ?? 0,
+      y: tabContextMenu?.y ?? 0,
+    },
+    estimate: { width: 224, height: 340 },
+    inset: 8,
+    revision: tabContextMenu ? `${tabContextMenu.tabId}:${tabContextMenu.x}:${tabContextMenu.y}` : "",
+    dismiss: {
+      inside: "[data-terminal-tab-context-menu]",
+      resize: true,
+      scroll: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      const opener = tabContextMenuOpener;
+      tabContextMenu = null;
+      tabContextMenuOpener = null;
+      if (reason === "escape") restoreFocusTo(opener);
+    },
+  });
+
+  const splitContextMenuPopover = $derived({
+    anchor: {
+      kind: "point" as const,
+      x: splitContextMenu?.x ?? 0,
+      y: splitContextMenu?.y ?? 0,
+    },
+    estimate: { width: 248, height: 340 },
+    inset: 8,
+    revision: splitContextMenu
+      ? `${splitContextMenu.direction}:${splitContextMenu.position}:${splitContextMenu.x}:${splitContextMenu.y}:${splitRoot !== null}:${tabState.tabs.length}`
+      : "",
+    dismiss: {
+      inside: "[data-terminal-split-context-menu]",
+      resize: true,
+      scroll: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      const opener = splitContextMenuOpener;
+      splitContextMenu = null;
+      splitContextMenuOpener = null;
+      if (reason === "escape") restoreFocusTo(opener);
+    },
+  });
+
+  const groupContextMenuPopover = $derived({
+    anchor: {
+      kind: "point" as const,
+      x: groupContextMenu?.x ?? 0,
+      y: groupContextMenu?.y ?? 0,
+    },
+    estimate: { width: 224, height: 280 },
+    inset: 8,
+    revision: groupContextMenu ? `${groupContextMenu.groupId}:${groupContextMenu.x}:${groupContextMenu.y}` : "",
+    dismiss: {
+      inside: "[data-terminal-group-context-menu]",
+      resize: true,
+      scroll: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => {
+      const opener = groupContextMenuOpener;
+      groupContextMenu = null;
+      groupContextMenuOpener = null;
+      if (reason === "escape") restoreFocusTo(opener);
+    },
+  });
+
+  function resolveContextMenuPoint(
+    event: MouseEvent | KeyboardEvent,
+    fallbackEl: HTMLElement | null,
+  ): { x: number; y: number } {
+    if (event instanceof MouseEvent && (event.clientX > 0 || event.clientY > 0)) {
+      return { x: event.clientX, y: event.clientY };
+    }
+    const rect = fallbackEl?.getBoundingClientRect();
+    return {
+      x: Math.round((rect?.left ?? 16) + 8),
+      y: Math.round((rect?.bottom ?? 16) + 4),
+    };
+  }
+
+  function openTabContextMenu(
+    tabId: string,
+    event: MouseEvent | KeyboardEvent,
+    anchorEl?: HTMLElement | null,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const opener = anchorEl ?? (event.currentTarget instanceof HTMLElement ? event.currentTarget : null);
+    const point = resolveContextMenuPoint(event, opener);
+    closeChrome();
+    tabContextMenuOpener = opener;
+    tabContextMenu = { tabId, x: point.x, y: point.y };
+  }
+
+  function openSplitContextMenu(
+    direction: SplitDirection,
+    event: MouseEvent | KeyboardEvent,
+    anchorEl?: HTMLElement | null,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const opener = anchorEl ?? (event.currentTarget instanceof HTMLElement ? event.currentTarget : null);
+    const point = resolveContextMenuPoint(event, opener);
+    closeChrome();
+    splitContextMenuOpener = opener;
+    splitContextMenu = {
+      x: point.x,
+      y: point.y,
+      direction,
+      position: "after",
+    };
+  }
+
+  function openGroupContextMenu(
+    groupId: string,
+    event: MouseEvent | KeyboardEvent,
+    anchorEl?: HTMLElement | null,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    const opener = anchorEl ?? (event.currentTarget instanceof HTMLElement ? event.currentTarget : null);
+    const point = resolveContextMenuPoint(event, opener);
+    closeChrome();
+    groupContextMenuOpener = opener;
+    groupContextMenu = { groupId, x: point.x, y: point.y };
+  }
+
+  function handleContextMenuKeydown(event: KeyboardEvent) {
+    if (
+      event.key !== "ArrowDown" &&
+      event.key !== "ArrowUp" &&
+      event.key !== "Home" &&
+      event.key !== "End"
+    ) {
+      return;
+    }
+    const items = Array.from(
+      event.currentTarget instanceof HTMLElement
+        ? event.currentTarget.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)')
+        : [],
+    );
+    if (items.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Home") {
+      items[0]?.focus();
+      return;
+    }
+    if (event.key === "End") {
+      items[items.length - 1]?.focus();
+      return;
+    }
+    const currentIdx = items.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIdx =
+      event.key === "ArrowDown"
+        ? (currentIdx + 1) % items.length
+        : (currentIdx - 1 + items.length) % items.length;
+    items[nextIdx]?.focus();
+  }
+
   function closeChrome() {
     tabOptions = false;
     sessionListOpen = false;
     sessionSearchOpen = false;
     launcherMenuOpen = false;
+    tabContextMenu = null;
+    tabContextMenuOpener = null;
+    splitContextMenu = null;
+    splitContextMenuOpener = null;
+    groupContextMenu = null;
+    groupContextMenuOpener = null;
   }
 
   function toggleSessionList() {
@@ -715,20 +1456,79 @@
 
   function openLauncherMenu() {
     launcherQuery = "";
-    launcherHighlight = Math.max(0, sessionTypes.findIndex((launcher) => launcher.kind === nextLauncher));
+    launcherHighlight = Math.max(0, dockTabTypes.findIndex((launcher) => launcher.kind === nextLauncher));
     closeChrome();
     launcherMenuOpen = true;
     void tick().then(() => launcherSearchInput?.focus());
   }
 
-  function chooseLauncher(kind: SessionKind) {
+  function chooseLauncher(kind: TabKind) {
     chosenLauncher = kind;
-    interfaceStore.setTerminalLauncher(kind);
+    if (kind !== "file") {
+      interfaceStore.setTerminalLauncher(kind);
+    }
     launcherMenuOpen = false;
   }
 
   function preferredPresetAgent(): LauncherKind {
     return isPromptLauncher(nextLauncher) ? nextLauncher : "claude";
+  }
+
+  function openShellPairPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 2 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor("shell");
+      return;
+    }
+    mode = "shell";
+    const dir = activeTab?.launcher === "shell" ? (activeTab.startDir ?? null) : null;
+    const afterFirst = openTab(tabState, "shell");
+    const firstId = afterFirst.activeId;
+    const afterSecond = openTab(afterFirst, "shell");
+    const secondId = afterSecond.activeId;
+    if (!firstId || !secondId || firstId === secondId) return;
+    const nextState = dir
+      ? setTabStartDir(setTabStartDir(afterSecond, firstId, dir), secondId, dir)
+      : afterSecond;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    const tree = splitPane(null, firstId, secondId, "row", "after", 0.5);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, tree, { activePaneId: firstId }),
+      activateTab(nextState, firstId),
+    );
+  }
+
+  function openAgentShellPairPreset() {
+    launcherMenuOpen = false;
+    if (!repoPath) return;
+    const agentKind = preferredPresetAgent();
+    if (
+      tabState.tabs.length + 2 > MAX_STRIP_TABS ||
+      $terminalSessions.length + 2 > $terminalSessionLimit
+    ) {
+      sessionError = capacityTitleFor(agentKind);
+      return;
+    }
+    mode = "shell";
+    const dir = activeTab?.launcher === "shell" ? (activeTab.startDir ?? null) : null;
+    const afterAgent = openTab(tabState, agentKind);
+    const agentId = afterAgent.activeId;
+    const afterShell = openTab(afterAgent, "shell");
+    const shellId = afterShell.activeId;
+    if (!agentId || !shellId || agentId === shellId) return;
+    const nextState = dir ? setTabStartDir(afterShell, shellId, dir) : afterShell;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+    const tree = splitPane(null, agentId, shellId, "row", "after", 0.5);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, tree, { activePaneId: agentId }),
+      activateTab(nextState, agentId),
+    );
   }
 
   function openAgentDiffPreset() {
@@ -746,14 +1546,17 @@
     const afterAgent = openTab(tabState, agentKind);
     const agentId = afterAgent.activeId;
     if (!agentId) return;
-    const afterFile = openFileTab(afterAgent, { reuseExisting: true, focus: false });
+    const afterFile = openFileTab(afterAgent, { reuseExisting: false, focus: false });
     const fileId = afterFile.id;
     if (!fileId || fileId === agentId) return;
     focusTabStrip = false;
     zoomedPaneId = null;
-    followAgent = true;
-    tabState = activateTab(afterFile.state, agentId);
-    splitRoot = splitPane(null, agentId, fileId, "row", "after", 0.5);
+    startFollowing(fileId);
+    const tree = splitPane(null, agentId, fileId, "row", "after", 0.5);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, tree, { activePaneId: agentId }),
+      activateTab(afterFile.state, agentId),
+    );
   }
 
   function openPairSplit() {
@@ -774,8 +1577,11 @@
     if (!firstId || !secondId || firstId === secondId) return;
     focusTabStrip = false;
     zoomedPaneId = null;
-    tabState = activateTab(afterSecond, firstId);
-    splitRoot = splitPane(null, firstId, secondId, "row", "after", 0.5);
+    const tree = splitPane(null, firstId, secondId, "row", "after", 0.5);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, tree, { activePaneId: firstId }),
+      activateTab(afterSecond, firstId),
+    );
   }
 
   function openFullStackPreset() {
@@ -808,8 +1614,10 @@
     }
     focusTabStrip = false;
     zoomedPaneId = null;
-    tabState = activateTab(nextState, agentId);
-    splitRoot = tree;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, tree, { activePaneId: agentId }),
+      activateTab(nextState, agentId),
+    );
   }
 
   let creatingWorktreePreset = $state(false);
@@ -881,15 +1689,24 @@
       }
       const openedFile = openFileTab(openedAgent.state, {
         checkout: checkoutPath,
-        reuseExisting: true,
+        reuseExisting: false,
         focus: false,
       });
       focusTabStrip = false;
       zoomedPaneId = null;
-      followAgent = true;
-      tabState = activateTab(openedFile.state, openedAgent.id);
+      startFollowing(openedFile.id && openedFile.id !== openedAgent.id ? openedFile.id : null);
+      const focusedAgent = activateTab(openedFile.state, openedAgent.id);
       if (openedFile.id && openedFile.id !== openedAgent.id) {
-        splitRoot = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
+        const tree = splitPane(null, openedAgent.id, openedFile.id, "row", "after", 0.5);
+        applyGroupsAndCoLocate(
+          upsertSplitGroup(splitGroups, tree, {
+            name: `${launcherLabel(agentKind)} · ${slug}`,
+            activePaneId: openedAgent.id,
+          }),
+          focusedAgent,
+        );
+      } else {
+        tabState = focusedAgent;
       }
     } catch (err) {
       sessionError = `Couldn't create the isolated worktree: ${describeError(err, "terminal")}`;
@@ -1157,18 +1974,17 @@
     resume?: ResumeLaunch,
     customName?: string,
     purpose?: "commit",
-  ): boolean {
-    if (!repoPath || !canCreateKind(launcher)) return false;
-    const prevActive = tabState.activeId;
+  ): string | null {
+    if (!repoPath || !canCreateKind(launcher)) return null;
     focusTabStrip = false;
-    tabState = openTab(tabState, launcher, initialPrompt);
-    if (autoWake && tabState.activeId) tabState = setTabAutoWake(tabState, tabState.activeId, true);
-    if (purpose && tabState.activeId) tabState = setTabPurpose(tabState, tabState.activeId, purpose);
-    if (resume && tabState.activeId) tabState = setTabResume(tabState, tabState.activeId, resume, customName);
-    if (splitRoot && prevActive && tabState.activeId && tabState.activeId !== prevActive && !hasPane(splitRoot, tabState.activeId)) {
-      splitRoot = replacePane(splitRoot, prevActive, tabState.activeId);
-    }
-    return true;
+    const openedState = openTab(tabState, launcher, initialPrompt);
+    const created = openedState.tabs.find((tab) => !tabState.tabs.includes(tab));
+    if (!created) return null;
+    tabState = openedState;
+    if (autoWake) tabState = setTabAutoWake(tabState, created.id, true);
+    if (purpose) tabState = setTabPurpose(tabState, created.id, purpose);
+    if (resume) tabState = setTabResume(tabState, created.id, resume, customName);
+    return created.id;
   }
 
   /**
@@ -1177,13 +1993,22 @@
    * repository, which is the only place a session may start. An agent CLI
    * treats its working directory as the project root, so it keeps the root.
    */
-  async function openBeside(launcher: SessionKind): Promise<boolean> {
+  async function openBeside(launcher: TabKind): Promise<boolean> {
+    if (!repoPath || !canCreateKind(launcher)) return false;
+    if (launcher === "file") {
+      focusTabStrip = false;
+      const opened = openFileTab(tabState, { reuseExisting: false, focus: true });
+      if (!opened.id) return false;
+      tabState = opened.state;
+      return true;
+    }
     const fromId = tabState.activeId;
     // An unreadable context offers no directory, so the tab starts at the root.
     const read = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
     const dir = startDirFrom(read ?? CONTEXT_UNKNOWN);
-    if (!newTab(launcher)) return false;
-    if (dir && tabState.activeId) tabState = setTabStartDir(tabState, tabState.activeId, dir);
+    const createdId = newTab(launcher);
+    if (!createdId) return false;
+    if (dir) tabState = setTabStartDir(tabState, createdId, dir);
     return true;
   }
 
@@ -1261,12 +2086,22 @@
         return;
       }
       if (claimed.launcher === "file") {
+        if (claimed.fileOpenMode === "tab") {
+          claimed.complete(
+            openFileTabFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
+              focus: claimed.fileFocus ?? true,
+            }),
+          );
+          return;
+        }
         claimed.complete(
-          openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, { focus: false }),
+          openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
+            focus: claimed.fileFocus ?? false,
+          }),
         );
         return;
       }
-      const opened = newTab(
+      const createdId = newTab(
         claimed.launcher,
         claimed.prompt,
         claimed.autoWake === true,
@@ -1274,41 +2109,107 @@
         claimed.name,
         claimed.purpose,
       );
-      const id = tabState.activeId;
       // Only a prompt-carrying launch is an AGENT session; a plain shell
       // started from the palette must not appear in the agent list that
       // Coverage's "View agent session" reads.
       const agent = isPromptLauncher(claimed.launcher) ? claimed.launcher : null;
-      if (opened && id && agent && (claimed.prompt !== undefined || claimed.resume !== undefined)) terminalLaunchRequests.remember({
-        id, repoPath: claimed.repoPath, launcher: agent, status: "starting",
+      if (createdId && agent && (claimed.prompt !== undefined || claimed.resume !== undefined)) terminalLaunchRequests.remember({
+        id: createdId, repoPath: claimed.repoPath, launcher: agent, status: "starting",
         reveal() {
           mode = "shell";
-          selectTab(id);
-          void tick().then(() => revealTab(id));
+          selectTab(createdId);
+          void tick().then(() => revealTab(createdId));
         },
       });
-      claimed.complete(opened ? undefined : capacityTitleFor(claimed.launcher));
+      claimed.complete(createdId ? undefined : capacityTitleFor(claimed.launcher));
     });
   });
 
   onDestroy(() => {
+    flushPendingSplitPersist();
     for (const tab of tabState.tabs) {
       terminalLaunchRequests.forget(tab.id);
       forgetEndedTail(tab.id);
       scrollbackSnapshots.forget(tab.id);
     }
+    if (repoPath) panelTabCounts.forget(repoPath, pathOpts);
     releaseTaskTerminal(holder);
   });
 
+  function openTabInSplit(
+    id: string,
+    direction: SplitDirection = "row",
+    position: "before" | "after" = "after",
+  ) {
+    if (!tabState.tabs.some((tab) => tab.id === id)) return;
+    focusTabStrip = false;
+    const anchor = activeId && activeId !== id ? activeId : tabState.tabs.find((t) => t.id !== id)?.id ?? null;
+    const anchorGroup = anchor ? findGroupForPane(splitGroups, anchor) : null;
+    if (zoomedPaneId) zoomedPaneId = null;
+
+    let baseGroups = removePaneFromGroups(splitGroups, id);
+    const refreshedAnchorGroup = anchor ? findGroupForPane(baseGroups, anchor) : null;
+    const baseTree = refreshedAnchorGroup?.tree ?? null;
+
+    if (baseTree && anchor) {
+      if (hasPane(baseTree, id)) {
+        applyGroupsAndCoLocate(baseGroups, activateTab(tabState, id));
+        return;
+      }
+      if (leafPaneIds(baseTree).length < MAX_SPLIT_PANES) {
+        const target = hasPane(baseTree, anchor)
+          ? anchor
+          : leafPaneIds(baseTree).at(-1) ?? anchor;
+        const nextTree = splitPane(baseTree, target, id, direction, position, 0.5);
+        applyGroupsAndCoLocate(
+          upsertSplitGroup(baseGroups, nextTree, {
+            groupId: refreshedAnchorGroup?.id,
+            name: refreshedAnchorGroup?.name,
+            activePaneId: id,
+          }),
+          activateTab(tabState, id),
+        );
+        return;
+      }
+      const choice = chooseSplitReplacementSlot(baseTree, anchor, pinnedTabIds);
+      if (choice?.mode === "replace") {
+        const nextTree = replacePane(baseTree, choice.targetPaneId, id);
+        applyGroupsAndCoLocate(
+          upsertSplitGroup(baseGroups, nextTree, {
+            groupId: refreshedAnchorGroup?.id,
+            name: refreshedAnchorGroup?.name,
+            activePaneId: id,
+          }),
+          activateTab(tabState, id),
+        );
+        return;
+      }
+      sessionError = "All split panes are pinned at the 8-pane limit — unpin or remove a pane first.";
+      return;
+    }
+
+    if (anchor) {
+      const nextTree = splitPane(null, anchor, id, direction, position, 0.5);
+      applyGroupsAndCoLocate(
+        upsertSplitGroup(baseGroups, nextTree, {
+          groupId: anchorGroup?.id,
+          name: anchorGroup?.name,
+          activePaneId: id,
+        }),
+        activateTab(tabState, id),
+      );
+      return;
+    }
+
+    tabState = activateTab(tabState, id);
+  }
+
   function selectTab(id: string, keepStripFocus = false) {
     focusTabStrip = keepStripFocus;
-    const prevActive = tabState.activeId;
     if (zoomedPaneId && zoomedPaneId !== id) zoomedPaneId = null;
-    if (splitRoot && !hasPane(splitRoot, id)) {
-      const slotToReplace = prevActive && hasPane(splitRoot, prevActive) ? prevActive : leafPaneIds(splitRoot).at(-1);
-      if (slotToReplace) splitRoot = replacePane(splitRoot, slotToReplace, id);
-    }
     tabState = activateTab(tabState, id);
+    const updatedGroups = recordGroupActivePane(splitGroups, id);
+    if (updatedGroups !== splitGroups) splitGroups = updatedGroups;
   }
 
   /**
@@ -1337,16 +2238,26 @@
     }
     focusTabStrip = false;
     if (zoomedPaneId === id) zoomedPaneId = null;
-    const remainingSplitLeaves = hasPane(splitRoot, id)
-      ? leafPaneIds(splitRoot).filter((other) => other !== id)
+    if (inlineRenameTabId === id) {
+      inlineRenameTabId = null;
+      inlineRenameSurface = null;
+    }
+    const ownerGroup = findGroupForPane(splitGroups, id);
+    const remainingSplitLeaves = ownerGroup
+      ? leafPaneIds(ownerGroup.tree).filter((other) => other !== id)
       : [];
     const partner = remainingSplitLeaves[0] ?? null;
-    if (hasPane(splitRoot, id)) splitRoot = removePane(splitRoot, id);
+    if (ownerGroup && remainingSplitLeaves.length < 2 && inlineRenameGroupId === ownerGroup.id) {
+      inlineRenameGroupId = null;
+    }
+    splitGroups = removePaneFromGroups(splitGroups, id);
     tabState = closeTab(tabState, id, partner);
     const { [id]: _status, ...statuses } = tabStatuses;
     tabStatuses = statuses;
     const { [id]: _osc, ...oscStatuses } = tabAgentStatuses;
     tabAgentStatuses = oscStatuses;
+    const { [id]: _bstate, ...bstates } = tabBrowserStates;
+    tabBrowserStates = bstates;
     unread = new Set([...unread].filter((key) => key !== id));
     const { [id]: _gone, ...rest } = sessions;
     sessions = rest;
@@ -1375,12 +2286,31 @@
     const opened = openBrowserTab(tabState, url);
     if (!opened.id) return capacityTitleFor("browser");
     focusTabStrip = false;
-    tabState = opened.state;
-    if (prevActive && opened.id !== prevActive && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+    const anchorGroup = prevActive ? findGroupForPane(splitGroups, prevActive) : null;
+    const baseTree = anchorGroup?.tree ?? null;
+    if (prevActive && opened.id !== prevActive && leafPaneIds(baseTree).length < MAX_SPLIT_PANES) {
       zoomedPaneId = null;
-      splitRoot = splitPane(splitRoot, prevActive, opened.id, "row", "after", 0.5);
-    } else if (splitRoot && prevActive && !hasPane(splitRoot, opened.id)) {
-      splitRoot = replacePane(splitRoot, prevActive, opened.id);
+      const target = baseTree
+        ? (hasPane(baseTree, prevActive) ? prevActive : leafPaneIds(baseTree)[0])
+        : prevActive;
+      const nextTree = target ? splitPane(baseTree, target, opened.id, "row", "after", 0.5) : null;
+      upsertGroupForAnchor(prevActive, nextTree, opened.state, opened.id);
+    } else if (baseTree && prevActive && !hasPane(baseTree, opened.id)) {
+      const choice = chooseSplitReplacementSlot(baseTree, prevActive, pinnedTabIds);
+      if (choice?.mode === "replace") {
+        const nextTree = replacePane(baseTree, choice.targetPaneId, opened.id);
+        upsertGroupForAnchor(prevActive, nextTree, opened.state, opened.id);
+      } else if (choice?.mode === "blocked") {
+        const preserved = hasPane(baseTree, prevActive)
+          ? activateTab(opened.state, prevActive)
+          : opened.state;
+        tabState = preserved;
+        sessionError = "Opened browser tab in the background because all 8 split panes are pinned — unpin or remove a pane to show it.";
+      } else {
+        tabState = opened.state;
+      }
+    } else {
+      tabState = opened.state;
     }
     return undefined;
   }
@@ -1400,44 +2330,112 @@
       fallbackPath?: string;
       direction?: SplitDirection;
       position?: "before" | "after";
+      /** Reuse only a pane already showing `filePath`, never repoint another file pane (Follow Agent). */
+      reuseSameFileOnly?: boolean;
     },
   ): string | undefined {
     if (!repoPath) return "Open a repository first";
-    const anchorId = options?.anchorId ?? tabState.activeId;
+    const prevActive = tabState.activeId;
+    const anchorId = options?.anchorId ?? prevActive;
     const direction = options?.direction ?? "row";
     const position = options?.position ?? "after";
     const shouldFocus = options?.focus ?? false;
-    const existing = fileTabFor(tabState, filePath, options?.checkout);
-    if (!existing && !canCreateKind("file")) return capacityTitleFor("file");
-    const result = openFileTab(tabState, {
-      filePath,
-      fallbackPath: options?.fallbackPath,
-      checkout: options?.checkout,
-      line,
-      column,
-      reuseExisting: true,
-      focus: shouldFocus,
-    });
+    const anchorGroup = anchorId ? findGroupForPane(splitGroups, anchorId) : null;
+    const cleanCheckout = options?.checkout?.trim() || undefined;
+    const groupFileTab = anchorGroup
+      ? fileTabFor(
+          {
+            tabs: tabState.tabs.filter((t) => hasPane(anchorGroup.tree, t.id)),
+            activeId: anchorId,
+          },
+          filePath,
+          cleanCheckout,
+        )
+      : undefined;
+    const ungroupedFileTab = !groupFileTab
+      ? fileTabFor(
+          {
+            tabs: tabState.tabs.filter((t) => !groupedTabIds.has(t.id)),
+            activeId: anchorId,
+          },
+          filePath,
+          cleanCheckout,
+        )
+      : undefined;
+    const anyFileTab = groupFileTab ?? ungroupedFileTab;
+    const reuseCandidate =
+      options?.reuseSameFileOnly && anyFileTab?.filePath !== normalizePaneFilePath(filePath)
+        ? undefined
+        : anyFileTab;
+    if (!reuseCandidate && !canCreateKind("file")) return capacityTitleFor("file");
+    const result = reuseCandidate
+      ? (() => {
+          const updated = setTabFile(
+            tabState,
+            reuseCandidate.id,
+            filePath ?? reuseCandidate.filePath,
+            line,
+            column,
+            { checkout: cleanCheckout, fallbackPath: options?.fallbackPath },
+          );
+          return {
+            state: shouldFocus ? activateTab(updated, reuseCandidate.id) : updated,
+            id: reuseCandidate.id,
+          };
+        })()
+      : openFileTab(tabState, {
+          filePath,
+          fallbackPath: options?.fallbackPath,
+          checkout: cleanCheckout,
+          line,
+          column,
+          reuseExisting: false,
+          focus: shouldFocus,
+        });
     if (!result.id) return capacityTitleFor("file");
     focusTabStrip = false;
-    tabState = result.state;
-    if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
-    if (anchorId && result.id !== anchorId && !hasPane(splitRoot, result.id)) {
-      const splitTarget = splitRoot
-        ? (hasPane(splitRoot, anchorId) ? anchorId : leafPaneIds(splitRoot)[0])
+    const baseTree = anchorGroup?.tree ?? null;
+    const targetActive = shouldFocus ? result.id : prevActive;
+    if (anchorId && result.id !== anchorId && !hasPane(baseTree, result.id)) {
+      const splitTarget = baseTree
+        ? (hasPane(baseTree, anchorId) ? anchorId : leafPaneIds(baseTree)[0])
         : anchorId;
-      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
-        splitRoot = splitPane(splitRoot, splitTarget, result.id, direction, position, 0.5);
-      } else if (splitRoot && splitTarget) {
-        splitRoot = replacePane(splitRoot, splitTarget, result.id);
+      if (splitTarget && leafPaneIds(baseTree).length < MAX_SPLIT_PANES) {
+        if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+        const nextTree = splitPane(baseTree, splitTarget, result.id, direction, position, 0.5);
+        upsertGroupForAnchor(anchorId, nextTree, result.state, targetActive);
+      } else if (baseTree && splitTarget) {
+        const choice = chooseSplitReplacementSlot(baseTree, splitTarget, pinnedTabIds);
+        if (choice?.mode === "replace") {
+          if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+          const nextTree = replacePane(baseTree, choice.targetPaneId, result.id);
+          upsertGroupForAnchor(anchorId, nextTree, result.state, targetActive);
+        } else if (choice?.mode === "blocked") {
+          tabState =
+            shouldFocus && prevActive && hasPane(baseTree, prevActive)
+              ? activateTab(result.state, prevActive)
+              : result.state;
+          sessionError = "Opened file tab in the background because all 8 split panes are pinned — unpin or remove a pane to show it.";
+        } else {
+          tabState = result.state;
+        }
+      } else {
+        tabState = result.state;
       }
-    } else if (
-      options?.direction &&
-      anchorId &&
-      result.id !== anchorId &&
-      hasPane(splitRoot, result.id)
-    ) {
-      splitRoot = movePaneToSplit(splitRoot, result.id, anchorId, direction, position);
+    } else {
+      if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+      if (
+        options?.direction &&
+        anchorId &&
+        result.id !== anchorId &&
+        baseTree &&
+        hasPane(baseTree, result.id)
+      ) {
+        const nextTree = movePaneToSplit(baseTree, result.id, anchorId, direction, position);
+        upsertGroupForAnchor(anchorId, nextTree, result.state, targetActive);
+      } else {
+        tabState = result.state;
+      }
     }
     return undefined;
   }
@@ -1472,16 +2470,20 @@
     }
     focusTabStrip = false;
     mode = "shell";
-    tabState = result.state;
-    if (payload.split && parentTabId && parentTabId !== result.id && !hasPane(splitRoot, result.id)) {
-      const splitTarget = splitRoot
-        ? (hasPane(splitRoot, parentTabId) ? parentTabId : leafPaneIds(splitRoot)[0])
+    const parentGroup = parentTabId ? findGroupForPane(splitGroups, parentTabId) : null;
+    const parentTree = parentGroup?.tree ?? null;
+    if (payload.split && parentTabId && parentTabId !== result.id && !hasPane(parentTree, result.id)) {
+      const splitTarget = parentTree
+        ? (hasPane(parentTree, parentTabId) ? parentTabId : leafPaneIds(parentTree)[0])
         : parentTabId;
-      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
+      if (splitTarget && leafPaneIds(parentTree).length < MAX_SPLIT_PANES) {
         if (zoomedPaneId && zoomedPaneId !== parentTabId) zoomedPaneId = null;
-        splitRoot = splitPane(splitRoot, splitTarget, result.id, "row", "after", 0.5);
+        const nextTree = splitPane(parentTree, splitTarget, result.id, "row", "after", 0.5);
+        upsertGroupForAnchor(parentTabId, nextTree, result.state, result.state.activeId);
+        return;
       }
     }
+    tabState = result.state;
   }
 
   function handleChildClosed(payload: TerminalChildClosedPayload) {
@@ -1508,8 +2510,8 @@
     }
   }
 
-  function handOffToPairPartner() {
-    const partner = pairHandoffTarget;
+  function handOffToPairPartner(target: PairHandoffTarget | null = pairHandoffTarget) {
+    const partner = target;
     if (!activeTab || !partner) return;
     const visibleFileTab = tabState.tabs.find(
       (tab) => tab.launcher === "file" && visibleIds.includes(tab.id) && tab.filePath,
@@ -1520,6 +2522,9 @@
       "";
     const prompt = buildPairHandoffPrompt({
       fromLauncher: activeTab.launcher,
+      fromSlot: partner.fromSlot,
+      toLauncher: partner.launcher,
+      toSlot: partner.slot,
       checkoutBranch: checkoutInfo?.currentBranch ?? null,
       openFilePath: visibleFileTab?.filePath ?? null,
       openFileLine: visibleFileTab?.revealLine ?? null,
@@ -1528,7 +2533,7 @@
     selectTab(partner.id);
     const inserted = sessions[partner.id]?.insertText(prompt, { focus: true }) ?? false;
     if (!inserted) {
-      sessionError = `${launcherLabel(partner.launcher)} session is not ready to receive input yet.`;
+      sessionError = `${partner.label} session is not ready to receive input yet.`;
     }
   }
 
@@ -1570,48 +2575,80 @@
       return;
     }
 
+    // Follow drives one pane of its own (`terminal/followAgent.ts`). It used
+    // to repoint whichever file pane was visible — the user's own — and, once
+    // that was closed, open a fresh split for every edit.
+    const decision = decideFollow(followTarget, tabState.tabs, followPaneFile);
+    if (decision.kind === "stop") {
+      stopFollowing();
+      return;
+    }
+
     if (payload.artifact) {
-      if (sourceTabId) {
-        void sessions[sourceTabId]?.openAgentArtifact();
-      }
+      if (sourceTabId) void followAgentArtifact(sourceTabId);
       return;
     }
 
     const checkout = sourceTab?.checkout;
-    const existingVisibleFile = tabState.tabs.find(
-      (t) =>
-        t.launcher === "file" &&
-        visibleIds.includes(t.id) &&
-        sameRepo(t.checkout ?? repoPath, payload.repo_path, pathOpts),
-    );
-    if (existingVisibleFile) {
-      if (existingVisibleFile.filePath !== payload.path) {
-        tabState = setTabFile(tabState, existingVisibleFile.id, payload.path, 1, null);
+    if (decision.kind === "retarget") {
+      const paneId = decision.paneId;
+      const pane = tabState.tabs.find((t) => t.id === paneId);
+      if (
+        pane &&
+        (pane.filePath !== normalizePaneFilePath(payload.path) ||
+          (pane.checkout || undefined) !== (checkout || undefined))
+      ) {
+        tabState = setTabFile(tabState, paneId, payload.path, 1, null, { checkout: checkout ?? "" });
       }
-      void tick().then(() => filePanes[existingVisibleFile.id]?.reloadIfClean());
+      adoptFollowPaneById(paneId);
+      void tick().then(() => filePanes[paneId]?.reloadIfClean());
       return;
     }
 
+    const before = new Set(tabState.tabs.map((tab) => tab.id));
     const err = openFileSplitFor(payload.path, 1, null, {
       focus: false,
       anchorId: sourceTabId ?? tabState.activeId ?? undefined,
       checkout,
+      reuseSameFileOnly: true,
     });
     if (err) {
       sessionError = err;
       return;
     }
-    void tick().then(() => {
-      const target = fileTabFor(tabState, payload.path, checkout);
-      if (target) filePanes[target.id]?.reloadIfClean();
-    });
+    const shown = fileTabFor(tabState, payload.path, checkout);
+    if (!shown || shown.filePath !== normalizePaneFilePath(payload.path)) return;
+    // Only a pane follow itself opened becomes follow's. One the user already
+    // had on this file was reused for the reveal and stays theirs.
+    if (!before.has(shown.id)) adoptFollowPaneById(shown.id);
+    void tick().then(() => filePanes[shown.id]?.reloadIfClean());
   }
 
-  function handleFileDropOnPane(paneId: string, paths: string[], region: DropRegion): boolean {
+  /**
+   * A plan artifact goes where the session's own opener puts it: follow's
+   * pane (repointed) or a new split. Either way that pane is follow's now,
+   * so closing it ends follow instead of the next plan edit reopening it.
+   */
+  async function followAgentArtifact(sourceTabId: string) {
+    const before = new Set(tabState.tabs.map((tab) => tab.id));
+    const owned = followTarget.paneId;
+    await sessions[sourceTabId]?.openAgentArtifact();
+    if (!followAgent) return;
+    const added = tabState.tabs.find((tab) => !before.has(tab.id) && tab.launcher === "file");
+    const pane = added?.id ?? owned ?? undefined;
+    if (pane) adoptFollowPaneById(pane);
+  }
+
+  function handleFileDropOnPane(
+    paneId: string,
+    paths: string[],
+    region: DropRegion,
+    filesOnly = true,
+  ): boolean {
     if (!repoPath || paths.length === 0) return false;
     const tab = tabState.tabs.find((candidate) => candidate.id === paneId);
     const paneRepo = tab?.checkout ?? repoPath;
-    if (region !== "center" && paths.length === 1) {
+    if (filesOnly && region !== "center" && paths.length === 1) {
       const rel = relativeToRepo(paths[0], paneRepo);
       if (rel && rel !== ".") {
         const direction: SplitDirection = region === "left" || region === "right" ? "row" : "col";
@@ -1630,7 +2667,7 @@
 
     if (!tab) return false;
     if (tab.launcher === "file") {
-      const rel = relativeToRepo(paths[0], paneRepo);
+      const rel = filesOnly && paths.length === 1 ? relativeToRepo(paths[0], paneRepo) : null;
       if (rel && rel !== ".") {
         tabState = setTabFile(tabState, tab.id, rel, 1, null);
         selectTab(tab.id);
@@ -1704,14 +2741,223 @@
     };
   }
 
-  function toggleFilePaneSplit() {
-    const existing = tabState.tabs.find((tab) => tab.launcher === "file");
-    if (existing && splitRoot && hasPane(splitRoot, existing.id)) {
-      void requestClose(existing.id);
+  function openFileTabFor(
+    filePath?: string,
+    line: number | null = null,
+    column: number | null = null,
+    options?: { focus?: boolean },
+  ): string | undefined {
+    if (!repoPath) return "Open a repository first";
+    const shouldFocus = options?.focus ?? true;
+    const checkout = activeTab?.checkout;
+    const visibleFile =
+      tabState.tabs.find(
+        (tab) =>
+          tab.launcher === "file" &&
+          !tab.snippet &&
+          (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId) &&
+          (tab.checkout || undefined) === (checkout?.trim() || undefined),
+      ) ??
+      tabState.tabs.find(
+        (tab) =>
+          tab.launcher === "file" &&
+          !tab.snippet &&
+          (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
+      );
+    if (visibleFile && filePath) {
+      const updated = setTabFile(tabState, visibleFile.id, filePath, line, column, { checkout });
+      tabState = shouldFocus ? activateTab(updated, visibleFile.id) : updated;
+      return undefined;
+    }
+    if (!canCreateKind("file") && !fileTabFor(tabState, filePath, checkout)) {
+      return capacityTitleFor("file");
+    }
+    focusTabStrip = false;
+    const opened = openFileTab(tabState, {
+      filePath,
+      checkout,
+      line,
+      column,
+      reuseExisting: true,
+      focus: shouldFocus,
+    });
+    if (!opened.id) return capacityTitleFor("file");
+    if (shouldFocus && zoomedPaneId && zoomedPaneId !== opened.id) zoomedPaneId = null;
+    tabState = opened.state;
+    return undefined;
+  }
+
+  function toggleExplorerSidebar() {
+    terminalExplorerSidebar.toggle();
+    if (activeId) {
+      void tick().then(() => revealTab(activeId));
+    }
+  }
+
+  function setExplorerOpenTarget(target: ExplorerOpenTarget) {
+    terminalExplorerSidebar.setTarget(target);
+  }
+
+  function dockFileTabToSidebar(id: string) {
+    const targetTab = tabState.tabs.find((candidate) => candidate.id === id);
+    if (targetTab?.filePath) {
+      selectedExplorerFile = targetTab.filePath;
+    }
+    terminalExplorerSidebar.setOpen(true);
+    if (!targetTab || targetTab.launcher !== "file") return;
+    if (!targetTab.filePath && !targetTab.snippet && tabState.tabs.length > 1) {
+      void requestClose(id);
       return;
     }
-    const err = openFileSplitFor(undefined, null, null, { focus: true });
-    if (err) sessionError = err;
+    if (findGroupForPane(splitGroups, id)) {
+      removePaneFromSplit(id);
+    }
+  }
+
+  function focusFirstContextMenuItem(node: HTMLElement) {
+    void tick().then(() => {
+      node.querySelector<HTMLButtonElement>('button[role="menuitem"]:not(:disabled)')?.focus({ preventScroll: true });
+    });
+  }
+
+  function openFromExplorerSidebar(
+    filePath: string,
+    line: number | null = null,
+    column: number | null = null,
+  ) {
+    if (!filePath || !repoPath) return;
+    const mods = lastExplorerMod;
+    lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
+    selectedExplorerFile = filePath;
+    const checkout = activeTab?.checkout;
+    const action = resolveExplorerFileAction({
+      defaultTarget: explorerOpenTarget,
+      altKey: mods.altKey,
+      metaOrCtrlKey: mods.metaOrCtrlKey,
+      hasVisibleFilePane,
+    });
+
+    if (action === "open-code" && onOpenInCodeView) {
+      onOpenInCodeView(filePath, line);
+      return;
+    }
+    if (action === "open-split") {
+      const err = openFileSplitFor(filePath, line, column, {
+        focus: false,
+        checkout,
+      });
+      if (err) sessionError = err;
+      return;
+    }
+    if (action === "update-visible-pane") {
+      const visibleFile =
+        tabState.tabs.find(
+          (tab) =>
+            tab.launcher === "file" &&
+            !tab.snippet &&
+            (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId) &&
+            (tab.checkout || undefined) === (checkout?.trim() || undefined),
+        ) ??
+        tabState.tabs.find(
+          (tab) =>
+            tab.launcher === "file" &&
+            !tab.snippet &&
+            (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
+        );
+      if (visibleFile) {
+        tabState = setTabFile(tabState, visibleFile.id, filePath, line, column, { checkout });
+        return;
+      }
+    }
+    if (!canCreateKind("file") && !fileTabFor(tabState, filePath, checkout)) {
+      sessionError = capacityTitleFor("file");
+      return;
+    }
+    focusTabStrip = false;
+    const opened = openFileTab(tabState, {
+      filePath,
+      checkout,
+      line,
+      column,
+      reuseExisting: true,
+      focus: true,
+    });
+    if (!opened.id) {
+      sessionError = capacityTitleFor("file");
+      return;
+    }
+    if (zoomedPaneId && zoomedPaneId !== opened.id) zoomedPaneId = null;
+    tabState = opened.state;
+  }
+
+  function startExplorerResize(event: PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const handle = event.currentTarget as HTMLElement | null;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startWidth = explorerSidebarWidth;
+    handle?.setPointerCapture?.(pointerId);
+    explorerResizing = true;
+
+    const onMove = (moveEvent: PointerEvent) => {
+      terminalExplorerSidebar.setWidthLive(startWidth + (moveEvent.clientX - startX));
+    };
+
+    const finish = () => {
+      handle?.releasePointerCapture?.(pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      explorerResizing = false;
+      terminalExplorerSidebar.setWidth(explorerSidebarWidth);
+      if (activeId) void tick().then(() => revealTab(activeId));
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  }
+
+  function handleExplorerSashKeydown(event: KeyboardEvent) {
+    const step = event.shiftKey ? 32 : 16;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      event.stopPropagation();
+      terminalExplorerSidebar.setWidth(
+        clampExplorerSidebarWidth(explorerSidebarWidth + (event.key === "ArrowRight" ? step : -step)),
+      );
+    } else if (event.key === "Enter" || event.key === "Home") {
+      event.preventDefault();
+      event.stopPropagation();
+      terminalExplorerSidebar.setWidth(TERMINAL_EXPLORER_WIDTH_DEFAULT);
+    }
+  }
+
+  function replaceActiveSplitPaneWith(id: string) {
+    if (!splitRoot || !activeGroup || hasPane(splitRoot, id)) return;
+    const choice = chooseSplitReplacementSlot(splitRoot, activeId, pinnedTabIds);
+    if (!choice || choice.mode === "blocked") {
+      sessionError = "All split panes are pinned at the 8-pane limit — unpin or remove a pane first.";
+      return;
+    }
+    const baseGroups = removePaneFromGroups(splitGroups, id);
+    const refreshed = findGroupForPane(baseGroups, activeGroup.id === findGroupForPane(baseGroups, activeId)?.id ? activeId : leafPaneIds(activeGroup.tree)[0]);
+    const targetTree = refreshed?.tree ?? splitRoot;
+    const nextTree =
+      choice.mode === "replace"
+        ? replacePane(targetTree, choice.targetPaneId, id)
+        : splitPane(targetTree, choice.anchorPaneId, id, "row", "after", 0.5);
+    zoomedPaneId = null;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(baseGroups, nextTree, {
+        groupId: refreshed?.id ?? activeGroup.id,
+        name: refreshed?.name ?? activeGroup.name,
+        activePaneId: id,
+      }),
+      activateTab(tabState, id),
+    );
   }
 
   function preferredRecipientSessionTab() {
@@ -1769,12 +3015,42 @@
       if (splitAction === "split-right") void splitActive("row");
       else if (splitAction === "split-down") void splitActive("col");
       else if (splitAction === "zoom-pane") toggleZoomPane();
-      else if (
+      else if (splitAction === "unsplit") closeSplit();
+      else if (splitAction === "focus-next-pane" || splitAction === "focus-prev-pane") {
+        if (splitRoot) {
+          if (zoomedPaneId) zoomedPaneId = null;
+          const nextPane = cycleVisibleSplitPane(
+            splitRoot,
+            activeId,
+            splitAction === "focus-next-pane" ? 1 : -1,
+          );
+          if (nextPane) selectTab(nextPane);
+        }
+      } else if (splitAction === "focus-next-group" || splitAction === "focus-prev-group") {
+        const nextGroup = cycleSplitGroup(
+          splitGroups,
+          activeGroup?.id ?? null,
+          splitAction === "focus-next-group" ? 1 : -1,
+        );
+        if (nextGroup) {
+          zoomedPaneId = null;
+          selectTab(nextGroup.targetPaneId);
+          void tick().then(() => revealTab(nextGroup.targetPaneId));
+        }
+      } else if (splitAction.startsWith("focus-pane-")) {
+        const slot = Number.parseInt(splitAction.slice("focus-pane-".length), 10);
+        const targetPane = splitRoot && slot >= 1 ? allSplitLeafIds[slot - 1] : undefined;
+        if (targetPane) {
+          if (zoomedPaneId && zoomedPaneId !== targetPane) zoomedPaneId = null;
+          selectTab(targetPane);
+        }
+      } else if (
         splitAction === "focus-left" ||
         splitAction === "focus-right" ||
         splitAction === "focus-up" ||
         splitAction === "focus-down"
       ) {
+        if (zoomedPaneId) zoomedPaneId = null;
         const dir = splitAction.slice("focus-".length) as "left" | "right" | "up" | "down";
         const neighbor = activeId ? adjacentPane(splitRoot, activeId, dir) : null;
         if (neighbor) selectTab(neighbor);
@@ -1797,7 +3073,12 @@
 
   function handlePanelKey(event: KeyboardEvent) {
     if (!visible || event.defaultPrevented) return;
-    if (event.key === "Escape" && !isImeComposition(event) && (tabOptions || sessionListOpen || sessionSearchOpen || launcherMenuOpen)) {
+    if (event.target instanceof HTMLElement && event.target.hasAttribute("data-inline-rename")) return;
+    if (
+      event.key === "Escape" &&
+      !isImeComposition(event) &&
+      (tabOptions || sessionListOpen || sessionSearchOpen || launcherMenuOpen || tabContextMenu || splitContextMenu || groupContextMenu)
+    ) {
       const sessionsWereOpen = sessionListOpen;
       closeChrome();
       event.preventDefault(); event.stopPropagation();
@@ -1812,7 +3093,17 @@
   }
 
   async function handleTabKey(event: KeyboardEvent) {
-    if (isImeComposition(event) || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (isImeComposition(event)) return;
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      const opener = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+      const targetTabId =
+        opener?.closest("[data-terminal-tab]")?.getAttribute("data-terminal-tab") ?? activeId;
+      if (targetTabId) {
+        openTabContextMenu(targetTabId, event, opener);
+      }
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
     const id = terminalTabDestination(tabState, event.key);
     if (!id) return;
     event.preventDefault();
@@ -1854,10 +3145,32 @@
     });
   });
 
+  // Any split sibling brought on screen (unzooming `zoomedPaneId`, splitting an
+  // unread background tab into view) clears its unread marker without refocusing.
+  $effect(() => {
+    if (!visible || mode !== "shell") return;
+    const shown = visibleIds;
+    untrack(() => {
+      if (unread.size === 0) return;
+      let changed = false;
+      for (const id of shown) {
+        if (unread.has(id)) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        const shownSet = new Set(shown);
+        unread = new Set([...unread].filter((key) => !shownSet.has(key)));
+      }
+    });
+  });
+
   // OSC titles can widen a tab after it is selected. Keep its entire control
   // (including Close) visible without refocusing the shell on every title.
   $effect(() => {
-    activeTitle;
+    const activeScrollLabel = activeTab ? tabLabel(activeTab) : "";
+    void activeScrollLabel;
     if (!visible || mode !== "shell") return;
     const id = activeId;
     const scroller = tabScroller;
@@ -1875,36 +3188,403 @@
     });
   });
 
-  async function splitActive(direction: SplitDirection = "row") {
+  async function splitActive(
+    direction: SplitDirection = "row",
+    position: "before" | "after" = "after",
+  ) {
     const first = activeId;
     if (!first) return;
     zoomedPaneId = null;
     if (leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) return;
-    const currentlyShown = new Set(splitRoot ? leafPaneIds(splitRoot) : [first]);
-    let second = tabState.tabs.find((tab) => !currentlyShown.has(tab.id))?.id;
+    // Only a loose tab of the chosen kind re-pairs (so 1× then Split restores
+    // the pair); anything else is a new session. `splitPartner` names it in
+    // the button's tooltip, so the user sees which before clicking.
+    const second = splitPartner;
     if (!second) {
-      const savedRoot = splitRoot;
-      const fromId = tabState.activeId;
-      const read = nextLauncher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
-      const dir = startDirFrom(read ?? CONTEXT_UNKNOWN);
-      if (!repoPath || !canCreateKind(nextLauncher)) return;
-      focusTabStrip = false;
-      const created = openTab(tabState, nextLauncher);
-      const added = created.tabs.find((tab) => !tabState.tabs.includes(tab));
-      if (!added) return;
-      tabState = dir ? setTabStartDir(created, added.id, dir) : created;
-      splitRoot = savedRoot;
-      second = added.id;
+      await splitPaneWithNewKind(first, nextLauncher, direction, position);
+      return;
     }
-    if (second && second !== first && tabState.tabs.some((tab) => tab.id === first)) {
-      splitRoot = splitPane(splitRoot, first, second, direction, "after", 0.5);
+    focusTabStrip = false;
+    const nextTree = splitPane(splitRoot, first, second, direction, position, 0.5);
+    const owner = findGroupForPane(splitGroups, first);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: owner?.id,
+        name: owner?.name,
+        activePaneId: first,
+      }),
+      activateTab(tabState, first),
+    );
+  }
+
+  async function splitPaneWithNewKind(
+    anchorPaneId: string,
+    kind: TabKind,
+    direction: SplitDirection = "row",
+    position: "before" | "after" = "after",
+    options?: { startDir?: string | null; initialCommand?: string | null },
+  ): Promise<void> {
+    if (!repoPath || !tabState.tabs.some((tab) => tab.id === anchorPaneId)) return;
+    if (!canCreateKind(kind)) {
+      sessionError = capacityTitleFor(kind);
+      return;
     }
+    const initialOwner = findGroupForPane(splitGroups, anchorPaneId);
+    if (leafPaneIds(initialOwner?.tree ?? null).length >= MAX_SPLIT_PANES) return;
+
+    const read =
+      kind === "shell" && options?.startDir === undefined
+        ? await sessions[anchorPaneId]?.readContext()
+        : undefined;
+    if (!repoPath || !tabState.tabs.some((tab) => tab.id === anchorPaneId)) return;
+    if (!canCreateKind(kind)) {
+      sessionError = capacityTitleFor(kind);
+      return;
+    }
+    const owner = findGroupForPane(splitGroups, anchorPaneId);
+    const baseTree = owner?.tree ?? null;
+    if (leafPaneIds(baseTree).length >= MAX_SPLIT_PANES) return;
+
+    const anchorTab = tabState.tabs.find((tab) => tab.id === anchorPaneId);
+    const dir =
+      kind === "shell"
+        ? (options?.startDir ?? startDirFrom(read ?? CONTEXT_UNKNOWN))
+        : null;
+    focusTabStrip = false;
+    zoomedPaneId = null;
+
+    let nextState = tabState;
+    let createdId: string | null = null;
+    if (kind === "file") {
+      const opened = openFileTab(nextState, {
+        checkout: anchorTab?.checkout,
+        reuseExisting: false,
+        focus: false,
+      });
+      if (!opened.id) {
+        sessionError = capacityTitleFor("file");
+        return;
+      }
+      nextState = opened.state;
+      createdId = opened.id;
+    } else if (kind === "browser") {
+      const opened = openBrowserTab(nextState, undefined);
+      if (!opened.id) {
+        sessionError = capacityTitleFor("browser");
+        return;
+      }
+      nextState = opened.state;
+      createdId = opened.id;
+    } else if (anchorTab?.checkout) {
+      const opened = openCheckoutTab(nextState, kind, {
+        checkout: anchorTab.checkout,
+        startDir: dir,
+      });
+      if (!opened.id) {
+        sessionError = capacityTitleFor(kind);
+        return;
+      }
+      nextState = opened.state;
+      createdId = opened.id;
+    } else {
+      const created = openTab(nextState, kind);
+      const added = created.tabs.find((tab) => !nextState.tabs.includes(tab));
+      if (!added) {
+        sessionError = capacityTitleFor(kind);
+        return;
+      }
+      nextState = dir ? setTabStartDir(created, added.id, dir) : created;
+      createdId = added.id;
+    }
+
+    if (!createdId || createdId === anchorPaneId) return;
+    if (kind === "shell" && options?.initialCommand) {
+      nextState = setTabInitialCommand(nextState, createdId, options.initialCommand);
+    }
+    const nextTree = splitPane(baseTree, anchorPaneId, createdId, direction, position, 0.5);
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: owner?.id,
+        name: owner?.name,
+        activePaneId: createdId,
+      }),
+      activateTab(nextState, createdId),
+    );
+  }
+
+  async function runCommandInNewSplitShell(
+    anchorTabId: string,
+    command: string,
+    startDir?: string | null,
+  ): Promise<void> {
+    const cleaned = command.trim();
+    if (!cleaned || !repoPath) return;
+    if (!canCreateKind("shell")) {
+      sessionError = capacityTitleFor("shell");
+      return;
+    }
+    const owner = findGroupForPane(splitGroups, anchorTabId);
+    if (
+      tabState.tabs.some((tab) => tab.id === anchorTabId) &&
+      leafPaneIds(owner?.tree ?? null).length < MAX_SPLIT_PANES
+    ) {
+      await splitPaneWithNewKind(anchorTabId, "shell", "row", "after", {
+        startDir,
+        initialCommand: cleaned,
+      });
+      return;
+    }
+    const anchorTab = tabState.tabs.find((tab) => tab.id === anchorTabId);
+    let createdId: string | null = null;
+    if (anchorTab?.checkout) {
+      const opened = openCheckoutTab(tabState, "shell", {
+        checkout: anchorTab.checkout,
+        startDir: startDir ?? undefined,
+      });
+      if (!opened.id) {
+        sessionError = capacityTitleFor("shell");
+        return;
+      }
+      tabState = opened.state;
+      createdId = opened.id;
+    } else {
+      createdId = newTab("shell");
+      if (!createdId) {
+        sessionError = capacityTitleFor("shell");
+        return;
+      }
+      if (startDir) tabState = setTabStartDir(tabState, createdId, startDir);
+    }
+    tabState = setTabInitialCommand(tabState, createdId, cleaned);
+  }
+
+  function flipGroupOrientation(groupId: string, targetPaneId?: string | null) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    const nextTree = flipSplitOrientation(group.tree, targetPaneId);
+    if (!nextTree || nextTree === group.tree || nextTree.kind !== "branch") return;
+    if (zoomedPaneId && hasPane(group.tree, zoomedPaneId)) zoomedPaneId = null;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: group.id,
+        name: group.name,
+        activePaneId: group.activePaneId,
+      }),
+    );
+  }
+
+  function swapPaneInGroup(groupId: string, paneId?: string | null) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    const anchor =
+      paneId && hasPane(group.tree, paneId)
+        ? paneId
+        : (group.activePaneId ?? leafPaneIds(group.tree)[0]);
+    if (!anchor) return;
+    const nextTree = swapWithAdjacentSplitPane(group.tree, anchor);
+    if (!nextTree || nextTree === group.tree || nextTree.kind !== "branch") return;
+    if (zoomedPaneId && hasPane(group.tree, zoomedPaneId)) zoomedPaneId = null;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: group.id,
+        name: group.name,
+        activePaneId: group.activePaneId,
+      }),
+    );
+  }
+
+  function equalizeGroupSplits(groupId: string) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    const nextTree = equalizeSplits(group.tree);
+    if (!nextTree || nextTree === group.tree || nextTree.kind !== "branch") return;
+    if (zoomedPaneId && hasPane(group.tree, zoomedPaneId)) zoomedPaneId = null;
+    applyGroupsAndCoLocate(
+      upsertSplitGroup(splitGroups, nextTree, {
+        groupId: group.id,
+        name: group.name,
+        activePaneId: group.activePaneId,
+      }),
+    );
+  }
+
+  function ungroupAllPairs() {
+    zoomedPaneId = null;
+    inlineRenameGroupId = null;
+    applyGroupsAndCoLocate([]);
+  }
+
+  function setGroupPinned(groupId: string, pinned: boolean) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    let nextState = tabState;
+    for (const leafId of leafPaneIds(group.tree)) {
+      nextState = toggleTabPinned(nextState, leafId, pinned);
+    }
+    tabState = nextState;
+  }
+
+  function moveGroupInStrip(groupId: string, step: -1 | 1) {
+    const moved = moveSplitGroupByStep(tabState.tabs, splitGroups, groupId, step);
+    if (moved.tabs !== tabState.tabs) {
+      tabState = { ...tabState, tabs: moved.tabs };
+    }
+    if (moved.groups !== splitGroups) {
+      splitGroups = moved.groups;
+    }
+  }
+
+  async function closeTabsBatch(ids: readonly string[]) {
+    for (const id of ids) {
+      if (!tabState.tabs.some((candidate) => candidate.id === id)) continue;
+      await requestClose(id);
+      if (tabState.tabs.some((candidate) => candidate.id === id)) break;
+    }
+  }
+
+  async function closeOtherTabs(keepId: string) {
+    const ids = orderedStripTabs
+      .filter((tab) => tab.id !== keepId && !tab.pinned)
+      .map((tab) => tab.id);
+    await closeTabsBatch(ids);
+  }
+
+  async function closeTabsToRight(anchorId: string) {
+    const anchorIdx = orderedStripTabs.findIndex((tab) => tab.id === anchorId);
+    if (anchorIdx < 0) return;
+    const ids = orderedStripTabs
+      .slice(anchorIdx + 1)
+      .filter((tab) => !tab.pinned)
+      .map((tab) => tab.id);
+    await closeTabsBatch(ids);
+  }
+
+  async function closeEndedTabs() {
+    const ids = orderedStripTabs
+      .filter((tab) => tabStatuses[tab.id] === "exited")
+      .map((tab) => tab.id);
+    await closeTabsBatch(ids);
+  }
+
+  async function closePairTabs(groupId: string) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    await closeTabsBatch(leafPaneIds(group.tree));
+  }
+
+  function closeSplit() {
+    if (!activeGroup) return;
+    zoomedPaneId = null;
+    ungroupPair(activeGroup.id);
+  }
+
+  function activateSplitGroup(groupId: string) {
+    const group = splitGroups.find((candidate) => candidate.id === groupId);
+    if (!group) return;
+    const attention = groupAttentions[group.id];
+    const targetId =
+      attention?.urgentPaneId ??
+      (group.activePaneId && hasPane(group.tree, group.activePaneId)
+        ? group.activePaneId
+        : leafPaneIds(group.tree)[0]);
+    if (!targetId) return;
+    mode = "shell";
+    zoomedPaneId = null;
+    selectTab(targetId);
+    void tick().then(() => revealTab(targetId));
+  }
+
+  function revealHiddenSplitUrgent() {
+    const urgentId = hiddenSplitSummary.urgentPaneId;
+    zoomedPaneId = null;
+    if (urgentId && tabState.tabs.some((tab) => tab.id === urgentId)) {
+      selectTab(urgentId);
+      void tick().then(() => revealTab(urgentId));
+    } else if (activeId) {
+      void tick().then(() => revealTab(activeId));
+    }
+  }
+
+  function startInlineRename(id: string, surface: "tab" | "pane") {
+    const target = tabState.tabs.find((tab) => tab.id === id);
+    if (!target) return;
+    inlineRenameGroupId = null;
+    inlineRenameTabId = id;
+    inlineRenameSurface = surface;
+    inlineRenameDraft = target.userNamed ? (target.name ?? "") : tabLabel(target);
+    void tick().then(() => {
+      inlineRenameInput?.focus();
+      inlineRenameInput?.select();
+    });
+  }
+
+  function startGroupInlineRename(groupId: string) {
+    const idx = splitGroups.findIndex((candidate) => candidate.id === groupId);
+    if (idx < 0) return;
+    inlineRenameTabId = null;
+    inlineRenameSurface = null;
+    inlineRenameGroupId = groupId;
+    inlineRenameGroupDraft = splitGroupDisplayLabel(splitGroups[idx], idx, splitGroups.length);
+    void tick().then(() => {
+      inlineRenameGroupInput?.focus();
+      inlineRenameGroupInput?.select();
+    });
+  }
+
+  function commitGroupInlineRename(groupId: string, restoreFocus = false) {
+    if (inlineRenameGroupId !== groupId) return;
+    const draft = inlineRenameGroupDraft;
+    inlineRenameGroupId = null;
+    splitGroups = renameSplitGroup(splitGroups, groupId, draft);
+    if (restoreFocus) {
+      void tick().then(() => {
+        tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-pair-badge-${groupId}"]`)?.focus();
+      });
+    }
+  }
+
+  function cancelGroupInlineRename(restoreFocus = false) {
+    const groupId = inlineRenameGroupId;
+    inlineRenameGroupId = null;
+    if (restoreFocus && groupId) {
+      void tick().then(() => {
+        tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-pair-badge-${groupId}"]`)?.focus();
+      });
+    }
+  }
+
+  function restoreFocusAfterInlineRename(id: string | null, surface: "tab" | "pane" | null) {
+    if (!id || !surface) return;
+    void tick().then(() => {
+      if (surface === "tab") {
+        tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
+      } else {
+        revealTab(id);
+      }
+    });
+  }
+
+  function commitInlineRename(id: string, restoreFocus = false) {
+    if (inlineRenameTabId !== id) return;
+    const draft = inlineRenameDraft;
+    const surface = inlineRenameSurface;
+    inlineRenameTabId = null;
+    inlineRenameSurface = null;
+    tabState = renameTab(tabState, id, draft);
+    if (restoreFocus) restoreFocusAfterInlineRename(id, surface);
+  }
+
+  function cancelInlineRename(restoreFocus = false) {
+    const id = inlineRenameTabId;
+    const surface = inlineRenameSurface;
+    inlineRenameTabId = null;
+    inlineRenameSurface = null;
+    if (restoreFocus) restoreFocusAfterInlineRename(id, surface);
   }
 
   async function toggleSplit() {
     if (splitRoot) {
-      zoomedPaneId = null;
-      splitRoot = null;
+      closeSplit();
       return;
     }
     await splitActive("row");
@@ -1918,6 +3598,26 @@
     });
   }
 
+  function zoomSplitPane(id: string) {
+    if (!splitRoot || !hasPane(splitRoot, id)) return;
+    if (activeId !== id) selectTab(id);
+    zoomedPaneId = zoomedPaneId === id ? null : id;
+    void tick().then(() => {
+      revealTab(id);
+    });
+  }
+
+  function removePaneFromSplit(id: string) {
+    const ownerGroup = findGroupForPane(splitGroups, id);
+    if (!ownerGroup) return;
+    const remainingIds = leafPaneIds(ownerGroup.tree).filter((leafId) => leafId !== id);
+    if (zoomedPaneId === id || remainingIds.length < 2) zoomedPaneId = null;
+    applyGroupsAndCoLocate(removePaneFromGroups(splitGroups, id));
+    if (activeId === id && remainingIds.length > 0) {
+      selectTab(remainingIds[0]);
+    }
+  }
+
   function startSashDrag(event: PointerEvent, sash: SashDescriptor) {
     if (event.button !== 0 || !panesContainerEl) return;
     event.preventDefault();
@@ -1928,17 +3628,17 @@
     sashDragging = true;
 
     const onMove = (moveEvent: PointerEvent) => {
-      if (!panesContainerEl) return;
+      if (!panesContainerEl || !splitRoot) return;
       const rect = panesContainerEl.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
       if (sash.direction === "row") {
         const relX = (moveEvent.clientX - rect.left) / rect.width;
         const localRatio = sash.parentBox.width > 0 ? (relX - sash.parentBox.left) / sash.parentBox.width : 0.5;
-        splitRoot = resizeBranch(splitRoot, sash.branchId, localRatio);
+        setActiveSplitTree(resizeBranch(splitRoot, sash.branchId, localRatio));
       } else {
         const relY = (moveEvent.clientY - rect.top) / rect.height;
         const localRatio = sash.parentBox.height > 0 ? (relY - sash.parentBox.top) / sash.parentBox.height : 0.5;
-        splitRoot = resizeBranch(splitRoot, sash.branchId, localRatio);
+        setActiveSplitTree(resizeBranch(splitRoot, sash.branchId, localRatio));
       }
     };
 
@@ -1956,38 +3656,27 @@
   }
 
   function handleSashKeydown(event: KeyboardEvent, sash: SashDescriptor) {
+    if (!splitRoot) return;
     const step = event.shiftKey ? 0.1 : 0.05;
     if (sash.direction === "row" && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
       event.preventDefault();
       event.stopPropagation();
-      splitRoot = resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowRight" ? step : -step));
+      setActiveSplitTree(resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowRight" ? step : -step)));
     } else if (sash.direction === "col" && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
       event.preventDefault();
       event.stopPropagation();
-      splitRoot = resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowDown" ? step : -step));
+      setActiveSplitTree(resizeBranch(splitRoot, sash.branchId, sash.ratio + (event.key === "ArrowDown" ? step : -step)));
     } else if (event.key === "Enter" || event.key === "Home") {
       event.preventDefault();
       event.stopPropagation();
-      splitRoot = equalizeSplits(splitRoot, sash.branchId);
+      setActiveSplitTree(equalizeSplits(splitRoot, sash.branchId));
     }
   }
 
-  function computeTabDropHint(event: DragEvent, paneId: string): { paneId: string; direction: SplitDirection; position: "before" | "after" } | null {
+  function resolveTabDropZone(event: DragEvent, paneId: string): TabDropZone | null {
     const el = event.currentTarget;
     if (!(el instanceof HTMLElement)) return null;
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    const rx = (event.clientX - rect.left) / rect.width;
-    const ry = (event.clientY - rect.top) / rect.height;
-    const distLeft = rx;
-    const distRight = 1 - rx;
-    const distTop = ry;
-    const distBottom = 1 - ry;
-    const min = Math.min(distLeft, distRight, distTop, distBottom);
-    if (min === distLeft) return { paneId, direction: "row", position: "before" };
-    if (min === distRight) return { paneId, direction: "row", position: "after" };
-    if (min === distTop) return { paneId, direction: "col", position: "before" };
-    return { paneId, direction: "col", position: "after" };
+    return computeTabDropHint(el.getBoundingClientRect(), event.clientX, event.clientY, paneId);
   }
 
   function paneBoxStyle(id: string): string {
@@ -1997,7 +3686,8 @@
   }
 
   function showTabOptions() {
-    renameValue = tabState.tabs.find((tab) => tab.id === activeId)?.name ?? "";
+    const current = tabState.tabs.find((tab) => tab.id === activeId);
+    renameValue = current?.userNamed ? (current.name ?? "") : "";
     const next = !tabOptions;
     closeChrome();
     tabOptions = next;
@@ -2011,22 +3701,71 @@
 
   function openSnippetSplitFor(title: string, content: string): string | undefined {
     if (!repoPath) return "Open a repository first";
-    if (!canCreateKind("file")) return capacityTitleFor("file");
     const anchorId = tabState.activeId;
-    const result = openSnippetTab(tabState, { title, content, focus: false });
+    const anchorGroup = anchorId ? findGroupForPane(splitGroups, anchorId) : null;
+    const cleanTitle = title.trim() || "Command output";
+    const groupSnippet = anchorGroup
+      ? tabState.tabs.find(
+          (tab) => tab.launcher === "file" && !tab.filePath && hasPane(anchorGroup.tree, tab.id),
+        )
+      : undefined;
+    const ungroupedSnippet = !groupSnippet
+      ? tabState.tabs.find(
+          (tab) => tab.launcher === "file" && !tab.filePath && !groupedTabIds.has(tab.id),
+        )
+      : undefined;
+    const reuseCandidate = groupSnippet ?? ungroupedSnippet;
+    if (!reuseCandidate && !canCreateKind("file")) return capacityTitleFor("file");
+    const result = reuseCandidate
+      ? {
+          state: {
+            ...tabState,
+            tabs: tabState.tabs.map((tab) =>
+              tab.id === reuseCandidate.id
+                ? {
+                    ...tab,
+                    filePath: undefined,
+                    ...(tab.userNamed ? { userNamed: false, name: tab.launchName } : {}),
+                    snippet: { title: cleanTitle.slice(0, 64), content: content.slice(0, 256 * 1024) },
+                    revealLine: 1,
+                    revealColumn: null,
+                    revealSeq: (tab.revealSeq ?? 0) + 1,
+                  }
+                : tab,
+            ),
+          },
+          id: reuseCandidate.id,
+        }
+      : openSnippetTab(tabState, { title, content, reuseExisting: false, focus: false });
     if (!result.id) return capacityTitleFor("file");
     focusTabStrip = false;
-    tabState = result.state;
-    if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
-    if (anchorId && result.id !== anchorId && !hasPane(splitRoot, result.id)) {
-      const splitTarget = splitRoot
-        ? (hasPane(splitRoot, anchorId) ? anchorId : leafPaneIds(splitRoot)[0])
+    const baseTree = anchorGroup?.tree ?? null;
+    if (anchorId && result.id !== anchorId && !hasPane(baseTree, result.id)) {
+      const splitTarget = baseTree
+        ? (hasPane(baseTree, anchorId) ? anchorId : leafPaneIds(baseTree)[0])
         : anchorId;
-      if (splitTarget && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES) {
-        splitRoot = splitPane(splitRoot, splitTarget, result.id, "row", "after", 0.5);
-      } else if (splitRoot && splitTarget) {
-        splitRoot = replacePane(splitRoot, splitTarget, result.id);
+      if (splitTarget && leafPaneIds(baseTree).length < MAX_SPLIT_PANES) {
+        if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+        const nextTree = splitPane(baseTree, splitTarget, result.id, "row", "after", 0.5);
+        upsertGroupForAnchor(anchorId, nextTree, result.state, result.state.activeId);
+      } else if (baseTree && splitTarget) {
+        const choice = chooseSplitReplacementSlot(baseTree, splitTarget, pinnedTabIds);
+        if (choice?.mode === "replace") {
+          if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+          const nextTree = replacePane(baseTree, choice.targetPaneId, result.id);
+          upsertGroupForAnchor(anchorId, nextTree, result.state, result.state.activeId);
+        } else {
+          tabState = result.state;
+          if (choice?.mode === "blocked") {
+            sessionError = "Opened snippet tab in the background because all 8 split panes are pinned — unpin or remove a pane to show it.";
+          }
+        }
+      } else {
+        tabState = result.state;
       }
+    } else {
+      if (zoomedPaneId && zoomedPaneId !== result.id) zoomedPaneId = null;
+      tabState = result.state;
     }
     return undefined;
   }
@@ -2036,7 +3775,19 @@
     const session = sessions[activeId], action = event.currentTarget.value;
     event.currentTarget.value = "";
     if (action === "selection") void session?.copySelection();
-    else if (action === "copy") void session?.copyOutput();
+    else if (action === "copy-md") {
+      void Promise.resolve(session?.copyAsMarkdown()).then((copied) => {
+        if (!copied) sessionError = "No terminal output available to copy as Markdown.";
+      });
+    } else if (action === "last-cmd") {
+      void Promise.resolve(session?.copyLastCommand()).then((copied) => {
+        if (!copied) sessionError = "No completed shell command recorded yet.";
+      });
+    } else if (action === "run-last-new-shell") {
+      if (!session?.runSelectionOrLastCommandInNewShell()) {
+        sessionError = "Select a command or run a shell command first.";
+      }
+    } else if (action === "copy") void session?.copyOutput();
     else if (action === "export") session?.exportOutput();
     else if (action === "last-copy") {
       void Promise.resolve(session?.copyLastCommandOutput()).then((copied) => {
@@ -2264,6 +4015,111 @@
           </span>
         {/if}
       {/if}
+      {#if activeTab && activeDisplay}
+        {@const activeOscBadge = oscStatusBadge(effectiveAgentStatuses[activeTab.id])}
+        {#if mode === "shell"}
+          <span
+            class="inline-flex items-center gap-1.5 min-w-0 max-w-72 px-2 py-0.5 rounded border border-border/65 bg-surface text-micro text-textPrimary"
+            data-testid="terminal-active-session-summary"
+            title={`${launcherLabel(activeTab.launcher)} — ${activeDisplay.fullTitle}`}
+          >
+            <LauncherIcon kind={activeTab.launcher} size={11} class="shrink-0" />
+            <span class="font-medium truncate">{activeDisplay.primary}</span>
+            {#if activeDisplay.secondary}
+              <span class="text-textMuted truncate max-w-28">· {activeDisplay.secondary}</span>
+            {/if}
+            {#if activeOscBadge}
+              <span class="shrink-0 {activeOscBadge.cls}">· {activeOscBadge.label}</span>
+            {/if}
+          </span>
+        {:else}
+          <button
+            type="button"
+            class="inline-flex items-center gap-1.5 min-w-0 max-w-72 px-2 py-0.5 rounded border border-border/65 bg-surface hover:bg-surfaceHover text-micro text-textPrimary cursor-pointer transition-colors"
+            data-testid="terminal-active-session-summary"
+            title={`Show active ${launcherLabel(activeTab.launcher)} session — ${activeDisplay.fullTitle}`}
+            onclick={() => {
+              mode = "shell";
+              if (activeId) void tick().then(() => revealTab(activeId));
+            }}
+          >
+            <LauncherIcon kind={activeTab.launcher} size={11} class="shrink-0" />
+            <span class="font-medium truncate">{activeDisplay.primary}</span>
+            {#if activeDisplay.secondary}
+              <span class="text-textMuted truncate max-w-28">· {activeDisplay.secondary}</span>
+            {/if}
+            {#if activeOscBadge}
+              <span class="shrink-0 {activeOscBadge.cls}">· {activeOscBadge.label}</span>
+            {/if}
+            <span class="text-accent shrink-0">→ Shell</span>
+          </button>
+        {/if}
+        {#if mode === "shell" && splitRoot && allSplitLeafIds.length > 1}
+          <span
+            class="gp-chip shrink-0 tabular-nums"
+            data-tone="accent"
+            data-testid="terminal-header-split-indicator"
+            title={zoomedPaneId ? "Split pane zoomed — other split panes stay warm" : `${allSplitLeafIds.length} split panes visible`}
+          >
+            {#if activeGroup && (splitGroups.length > 1 || activeGroup.name)}
+              {activeGroupLabel} · 
+            {/if}
+            {#if activeSplitSlot}
+              Pane {activeSplitSlot} of {allSplitLeafIds.length}{#if zoomedPaneId} · Zoomed{/if}
+            {:else}
+              {allSplitLeafIds.length} split panes
+            {/if}
+          </span>
+          {#if hiddenSplitSummary.badgeLabel}
+            <button
+              type="button"
+              class="gp-chip shrink-0 cursor-pointer"
+              data-tone={hiddenSplitSummary.tone ?? "accent"}
+              data-testid="terminal-hidden-split-alert"
+              title="Hidden split pane activity while zoomed — click to restore split panes and show"
+              onclick={revealHiddenSplitUrgent}
+            >
+              Hidden: {hiddenSplitSummary.badgeLabel}
+            </button>
+          {/if}
+        {/if}
+        {#if mode === "shell" && splitGroups.length > 0 && (splitGroups.length > 1 || !activeGroup)}
+          <div
+            class="inline-flex items-center gap-1 shrink-0"
+            role="group"
+            aria-label="Terminal pairs"
+            data-testid="terminal-pair-switcher"
+          >
+            {#each splitGroups as grp, grpIdx (grp.id)}
+              {@const isGrpActive = activeGroup?.id === grp.id}
+              {@const grpLabel = splitGroupDisplayLabel(grp, grpIdx, splitGroups.length)}
+              {@const att = groupAttentions[grp.id]}
+              <button
+                type="button"
+                class="gp-chip shrink-0 cursor-pointer tabular-nums"
+                data-tone={isGrpActive ? "accent" : (att?.tone ?? "neutral")}
+                data-testid="terminal-pair-switcher-btn"
+                data-group-id={grp.id}
+                data-group-attention={att?.tone ?? "none"}
+                aria-pressed={isGrpActive}
+                title={!isGrpActive && att?.badgeLabel ? `${grpLabel} — ${att.badgeLabel} · Right-click for pair options` : `Switch to ${grpLabel} · Right-click for pair options`}
+                onclick={() => activateSplitGroup(grp.id)}
+                oncontextmenu={(event) => {
+                  openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
+                }}
+                onkeydown={(event) => {
+                  if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                    openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
+                  }
+                }}
+              >
+                <Columns2 size={10} class="shrink-0" aria-hidden="true" />
+                {grpLabel}{#if !isGrpActive && att?.badgeLabel}<span class="ml-0.5">●</span>{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      {/if}
     </div>
     <div class="flex items-center gap-1 shrink-0">
       <div class="gp-segmented" role="group" aria-label="Terminal mode">
@@ -2366,6 +4222,13 @@
             {@const where = session.checkout ?? session.repoPath}
             {@const index = sessionListFlat.findIndex((candidate) => candidate.key === session.key)}
             {@const focused = session.key === activeId && row.here}
+            {@const rowLiveAct = session.sessionId ? $sessionActivity.get(session.sessionId) : undefined}
+            {@const rowAttention = session.attention ?? (session.sessionId ? activityAttentionLabel($sessionActivity.get(session.sessionId)) : null)}
+            {@const rowLauncher = session.launcher ?? "shell"}
+            {@const cleanedSessionTitle = session.title ? stripTitleSpinner(session.title).replace(/^[✳✦★•]+\s+/u, "").trim() : ""}
+            {@const cleanedLiveTitle = rowLiveAct?.title ? stripTitleSpinner(rowLiveAct.title).replace(/^[✳✦★•]+\s+/u, "").trim() : ""}
+            {@const rawRowTitle = (cleanedSessionTitle && !isGenericLauncherTitle(cleanedSessionTitle, rowLauncher)) ? cleanedSessionTitle : (cleanedLiveTitle && !isGenericLauncherTitle(cleanedLiveTitle, rowLauncher)) ? cleanedLiveTitle : ""}
+            {@const rowMainTitle = rawRowTitle || session.label.trim() || "Shell"}
             <div
               id="terminal-session-option-{index}"
               class="session-row {focused ? 'bg-accent/10 rounded-lg' : ''} {index === sessionListIndex ? 'ring-1 ring-inset ring-accent/40 rounded-lg' : ''}"
@@ -2388,16 +4251,21 @@
               }}
             >
               {#if indexInGroup === 0}
-                <div class="session-group-head flex items-baseline gap-2 pt-1.5 pb-0.5" data-testid="session-group">
+                <div class="session-group-head flex items-center gap-2 pt-1.5 pb-0.5" data-testid="session-group">
+                  <RepoLogo path={session.repoPath} name={group.repository} size={16} />
                   <span class="font-medium" data-testid="session-repository">{group.repository}</span>
                   <span class="text-textMuted">{group.sessions.length} {group.sessions.length === 1 ? "session" : "sessions"}</span>
                   {#if group.here}<span class="text-textMuted">This repository</span>{/if}
                 </div>
               {/if}
               <span class="min-w-0 flex items-center gap-1.5">
-                {#if row.agent}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
+                <LauncherIcon kind={rowLauncher} size={13} />
+                {#if session.splitSlot}<span class="gp-chip shrink-0 tabular-nums" data-tone="neutral" data-testid="session-split-slot" title={`Visible in split pane #${session.splitSlot}`}>#{session.splitSlot}</span>{/if}
+                {#if session.isActive}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-active-badge">Active</span>{/if}
+                {#if rowAttention}<span class="gp-chip shrink-0" data-tone={rowAttention === "Failed" ? "danger" : "warn"} data-testid="session-attention-badge">{rowAttention}</span>{/if}
+                {#if row.agent && rawRowTitle && rawRowTitle.toLowerCase() !== row.agent.toLowerCase()}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
                 <span class="min-w-0 truncate">
-                  <span class="font-medium text-textPrimary">{session.title?.trim() || session.label.trim() || "Shell"}</span>
+                  <span class="font-medium text-textPrimary">{rowMainTitle}</span>
                   {#if row.checkout}<span class="text-textMuted" aria-hidden="true"> · </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
                   <span class="text-textMuted"> · <span data-testid="session-status">{sessionStatusLabel(session.status)}</span></span>
                   <span class="sr-only">{session.status}</span>
@@ -2490,16 +4358,25 @@
       <ul class="space-y-1 max-h-40 overflow-y-auto">
         {#each repoLedgerOffers as offer (offer.row_id)}
           {@const rowErr = ledgerRowErrors[offer.row_id] ?? offer.last_error ?? (offer.end_state !== "unreadable" && offer.launcher !== "shell" && !offer.resumable ? offer.reason : null)}
+          {@const ledgerTitle = offer.title ? stripTitleSpinner(offer.title).replace(/^[✳✦★•]+\s+/u, "").trim() : ""}
           <li
-            class="flex items-start justify-between gap-2 rounded-lg border border-border/60 bg-surface/60 px-2 py-1 text-micro"
+            class="flex items-start justify-between gap-2 rounded-lg border border-border/65 bg-surface/60 px-2 py-1 text-micro"
             data-testid="terminal-ledger-row"
             data-end-state={offer.end_state}
           >
             <div class="min-w-0 flex-1 space-y-0.5">
               <div class="flex items-center gap-1.5 flex-wrap">
+                {#if offer.end_state !== "unreadable"}
+                  <LauncherIcon kind={offer.launcher as LauncherKind} size={12} class="shrink-0" />
+                {/if}
                 <span class="font-medium text-textPrimary">
                   {offer.end_state === "unreadable" ? "Corrupt ledger entry" : launcherLabel(offer.launcher as LauncherKind)}
                 </span>
+                {#if ledgerTitle && !isGenericLauncherTitle(ledgerTitle, offer.launcher as TabKind)}
+                  <span class="text-textPrimary truncate max-w-64" data-testid="terminal-ledger-row-title" title={ledgerTitle}>
+                    “{ledgerTitle}”
+                  </span>
+                {/if}
                 <span class="gp-chip" data-tone={offer.end_state === "unreadable" ? "danger" : "neutral"}>
                   {describeEndState(offer.end_state, offer.signal)}
                 </span>
@@ -2553,55 +4430,230 @@
        Console, because unmounting a session kills the shell — the same
        hide-don't-kill rule TerminalDock applies to the whole dock. -->
     <div
-      class="shrink-0 flex items-stretch gap-2 px-2 h-9 min-w-0"
+      class="terminal-strip-row shrink-0 flex items-stretch gap-1 px-2 h-9 min-w-0"
       class:hidden={mode !== "shell"}
       data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
     >
+      <div class="flex items-center shrink-0">
+        <button
+          type="button"
+          class="gp-icon-btn {explorerSidebarOpen ? 'text-accent bg-accent/15' : ''}"
+          data-testid="terminal-explorer-sidebar-toggle"
+          aria-label={explorerSidebarOpen ? "Hide file explorer sidebar" : "Show file explorer sidebar"}
+          aria-pressed={explorerSidebarOpen}
+          disabled={!repoPath}
+          title={explorerSidebarOpen ? "Hide docked File Explorer sidebar" : "Dock File Explorer sidebar beside terminal (never forces a 3rd split pane)"}
+          onclick={toggleExplorerSidebar}
+        >
+          {#if explorerSidebarOpen}
+            <PanelLeftClose size={13} />
+          {:else}
+            <FolderTree size={13} />
+          {/if}
+        </button>
+      </div>
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
            behind an `ml-auto`, so past a handful of tabs the way to open one
            more scrolled off the right edge. -->
       <div class="relative flex-1 min-w-0 self-stretch">
-      <div
-        bind:this={tabScroller}
-        data-terminal-tab-scroller
-        class="terminal-tab-scroller h-full flex items-stretch gap-1 overflow-x-auto overflow-y-hidden"
-        role="tablist"
-        aria-label="Terminal sessions"
-      >
-      {#each tabState.tabs as tab (tab.id)}
+      {#snippet tabItem(tab: (typeof tabState.tabs)[number])}
+        {@const isActiveTab = tab.id === tabState.activeId}
+        {@const inVisibleSplit = Boolean(splitRoot && visibleIds.includes(tab.id))}
+        {@const inActiveSplitGroup = Boolean(splitRoot && hasPane(splitRoot, tab.id))}
+        {@const groupMeta = groupMetaByTabId[tab.id]}
+        {@const splitSlot = groupMeta?.slot ?? splitSlotByTabId[tab.id]}
+        {@const display = tabDisplayTitle(tab, effectiveAgentStatuses[tab.id], tabBrowserStates[tab.id])}
+        {@const isRenamingThisTab = inlineRenameTabId === tab.id && inlineRenameSurface === "tab"}
+        {@const canOpenInSplit = tabState.tabs.length >= 2 && (splitRoot ? !inActiveSplitGroup : !isActiveTab) && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES}
+        {@const stripHint = tabStripDropHint?.tabId === tab.id ? tabStripDropHint.mode : null}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           data-terminal-tab={tab.id}
-          class="group flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-meta shrink-0 transition-colors {tab.id ===
-          tabState.activeId
-            ? 'bg-surface border-edgeStrong text-textPrimary'
-            : splitRoot && visibleIds.includes(tab.id)
-              ? 'bg-surface/40 border-border/65 text-textPrimary'
-              : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
+          data-group-id={groupMeta?.group.id}
+          data-active={isActiveTab ? "true" : "false"}
+          data-in-split={inVisibleSplit ? "true" : "false"}
+          data-pinned={tab.pinned ? "true" : "false"}
+          oncontextmenu={(event) => {
+            if (isRenamingThisTab) return;
+            openTabContextMenu(tab.id, event, event.currentTarget as HTMLElement);
+          }}
+          ondragover={(event) => {
+            if (draggedGroupId) {
+              if (groupMeta?.group.id === draggedGroupId) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              if (rect.width <= 0) return;
+              const rx = (event.clientX - rect.left) / rect.width;
+              event.preventDefault();
+              event.stopPropagation();
+              if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+              tabStripDropHint = { tabId: tab.id, mode: rx < 0.5 ? "before" : "after" };
+              return;
+            }
+            if (!draggedTabId || draggedTabId === tab.id) return;
+            const rect = event.currentTarget.getBoundingClientRect();
+            if (rect.width <= 0) return;
+            const rx = (event.clientX - rect.left) / rect.width;
+            const dropMode = classifyTabStripDropZone(rx, event.altKey);
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+            tabStripDropHint = { tabId: tab.id, mode: dropMode };
+          }}
+          ondragleave={(event) => {
+            if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+            if (tabStripDropHint?.tabId === tab.id) tabStripDropHint = null;
+          }}
+          ondrop={(event) => {
+            if (draggedGroupId) {
+              const movingGroup = draggedGroupId;
+              const hint = tabStripDropHint?.tabId === tab.id && tabStripDropHint.mode === "after" ? "after" : "before";
+              draggedGroupId = null;
+              draggedTabId = null;
+              tabDropHint = null;
+              tabStripDropHint = null;
+              if (!movingGroup || groupMeta?.group.id === movingGroup) return;
+              event.preventDefault();
+              event.stopPropagation();
+              const reordered = reorderSplitGroupInStrip(tabState.tabs, splitGroups, movingGroup, tab.id, hint);
+              tabState = { ...tabState, tabs: reordered.tabs };
+              splitGroups = reordered.groups;
+              return;
+            }
+            const moving = draggedTabId;
+            const rect = event.currentTarget.getBoundingClientRect();
+            const fallbackMode = rect.width > 0
+              ? classifyTabStripDropZone((event.clientX - rect.left) / rect.width, event.altKey)
+              : "after";
+            const hint = tabStripDropHint?.tabId === tab.id ? tabStripDropHint.mode : fallbackMode;
+            draggedTabId = null;
+            draggedGroupId = null;
+            tabDropHint = null;
+            tabStripDropHint = null;
+            if (!moving || moving === tab.id) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (hint === "pair") zoomedPaneId = null;
+            const outcome = applyTabStripDrop(tabState.tabs, splitGroups, {
+              movingTabId: moving,
+              targetTabId: tab.id,
+              mode: hint,
+              pinnedIds: pinnedTabIds,
+            });
+            if (outcome.refusedReason) {
+              sessionError = outcome.refusedReason;
+              return;
+            }
+            if (zoomedPaneId && !outcome.groups.some((g) => hasPane(g.tree, zoomedPaneId ?? ""))) {
+              zoomedPaneId = null;
+            }
+            const nextState = outcome.activeTabId
+              ? activateTab({ ...tabState, tabs: outcome.tabs }, outcome.activeTabId)
+              : { ...tabState, tabs: outcome.tabs };
+            tabState = nextState;
+            splitGroups = recordGroupActivePane(outcome.groups, nextState.activeId);
+          }}
+          class="group relative flex items-center gap-1 pl-2 pr-1 my-1 rounded-lg border text-meta shrink-0 transition-colors {stripHint === 'pair' ? 'ring-1 ring-inset ring-accent bg-accent/15' : ''} {isActiveTab
+            ? 'bg-surface border-accent/65 text-textPrimary font-medium'
+            : inVisibleSplit
+              ? 'bg-surface/60 border-border/65 text-textPrimary'
+              : groupMeta
+                ? 'bg-surface/35 border-border/35 text-textMuted hover:bg-surface/70 hover:text-textPrimary'
+                : 'bg-transparent border-transparent text-textMuted hover:bg-surface/70 hover:text-textPrimary'}"
         >
+          {#if stripHint === "before"}
+            <span
+              aria-hidden="true"
+              data-testid="terminal-tab-drop-before"
+              class="pointer-events-none absolute -left-[3px] top-0.5 bottom-0.5 w-0.5 rounded-full bg-accent"
+              style:z-index={LAYERS.STICKY}
+            ></span>
+          {:else if stripHint === "after"}
+            <span
+              aria-hidden="true"
+              data-testid="terminal-tab-drop-after"
+              class="pointer-events-none absolute -right-[3px] top-0.5 bottom-0.5 w-0.5 rounded-full bg-accent"
+              style:z-index={LAYERS.STICKY}
+            ></span>
+          {/if}
+          {#if isActiveTab}
+            <span aria-hidden="true" class="w-0.5 h-3.5 rounded-full bg-accent shrink-0"></span>
+          {/if}
+          {#if isRenamingThisTab}
+            <input
+              bind:this={inlineRenameInput}
+              bind:value={inlineRenameDraft}
+              data-inline-rename
+              data-testid="terminal-inline-rename-input"
+              aria-label="Rename terminal tab"
+              maxlength="64"
+              class="gp-field h-6 px-1.5 py-0 min-w-20 w-36 text-micro"
+              onpointerdown={(event) => event.stopPropagation()}
+              onclick={(event) => event.stopPropagation()}
+              onkeydown={(event) => {
+                if (isImeComposition(event)) return;
+                event.stopPropagation();
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitInlineRename(tab.id, true);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  cancelInlineRename(true);
+                }
+              }}
+              onblur={() => commitInlineRename(tab.id)}
+            />
+          {/if}
           <button
             type="button"
             role="tab"
             id={`terminal-tab-${tab.id}`}
             aria-controls={`terminal-pane-${tab.id}`}
-            aria-selected={tab.id === tabState.activeId}
-            tabindex={tab.id === tabState.activeId ? 0 : -1}
-            draggable="true"
+            aria-selected={isActiveTab}
+            tabindex={isActiveTab ? 0 : -1}
+            draggable={!isRenamingThisTab}
             ondragstart={(event) => {
+              draggedGroupId = null;
               draggedTabId = tab.id;
               event.dataTransfer?.setData("application/x-gitpulse-terminal-tab", tab.id);
               if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
             }}
             ondragend={() => {
               draggedTabId = null;
+              draggedGroupId = null;
               tabDropHint = null;
+              tabStripDropHint = null;
             }}
             class="terminal-tab-label truncate"
-            onclick={() => selectTab(tab.id)}
+            class:hidden={isRenamingThisTab}
+            onclick={(event) => {
+              if (event.altKey && (splitRoot ? !inActiveSplitGroup : !isActiveTab)) {
+                openTabInSplit(tab.id);
+                return;
+              }
+              selectTab(tab.id);
+            }}
+            ondblclick={() => startInlineRename(tab.id, "tab")}
             onkeydown={handleTabKey}
-            title={`${launcherLabel(tab.launcher)} — ${tab.title?.trim().slice(0, 256) || tabLabel(tab)}`}
+            title={`${launcherLabel(tab.launcher)} — ${display.fullTitle}${groupMeta ? ` (${groupMeta.label} #${groupMeta.slot}${isActiveTab ? ", active" : ""})` : isActiveTab ? " (Active)" : ""}${tab.pinned ? " · Pinned in split" : ""}${canOpenInSplit ? " · Drag to reorder · Alt+Drag or Alt+Click to split · Right-click for options" : " · Drag to reorder · Right-click for options"}`}
           >
-            {#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(tabAgentStatuses[tab.id])}{@const badge = oscStatusBadge(tabAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={tabAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
+            <LauncherIcon kind={tab.launcher} size={12} class="mr-1 align-[-2px]" />{#if splitSlot}<span aria-hidden="true" data-testid="terminal-tab-split-slot" class="inline-flex items-center justify-center min-w-3.5 h-3.5 px-1 mr-1 rounded text-micro tabular-nums align-[1px] {isActiveTab ? 'bg-accent/15 text-accent border border-accent/65 font-semibold' : 'bg-surfaceHover text-textMuted border border-border/65'}">{splitSlot}</span>{/if}{#if tab.pinned}<span aria-hidden="true" data-testid="terminal-tab-pinned-icon" class="inline-flex mr-1 align-[-1px] text-accent"><Pin size={10} /></span>{/if}{#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(effectiveAgentStatuses[tab.id])}{@const badge = oscStatusBadge(effectiveAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={effectiveAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
+          {#if canOpenInSplit}
+            <button
+              type="button"
+              class="gp-icon-btn opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-accent"
+              data-size="sm"
+              data-testid="terminal-tab-open-in-split"
+              onclick={(event) => {
+                event.stopPropagation();
+                openTabInSplit(tab.id);
+              }}
+              aria-label={`Open ${tabLabel(tab)} in split`}
+              title={`Open ${tabLabel(tab)} side-by-side in split (Alt+Click)`}
+            >
+              <Columns2 size={11} />
+            </button>
+          {/if}
           <button
             type="button"
             class="gp-icon-btn opacity-50 group-hover:opacity-100 focus-visible:opacity-100 hover:text-danger"
@@ -2613,12 +4665,318 @@
             <X size={11} />
           </button>
         </div>
+      {/snippet}
+      <!-- svelte-ignore a11y_interactive_supports_focus -->
+      <div
+        bind:this={tabScroller}
+        data-terminal-tab-scroller
+        data-crowded={crowdedTabStrip(tabState.tabs.length) ? "true" : "false"}
+        class="terminal-tab-scroller h-full flex items-stretch gap-1 overflow-x-auto overflow-y-hidden"
+        role="tablist"
+        aria-label="Terminal sessions"
+        ondragover={(event) => {
+          if (event.target !== event.currentTarget) return;
+          if (!draggedTabId && !draggedGroupId) return;
+          event.preventDefault();
+          if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+          tabStripDropHint = { detach: Boolean(draggedTabId), mode: "after" };
+        }}
+        ondragleave={(event) => {
+          if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+          if (tabStripDropHint?.detach) tabStripDropHint = null;
+        }}
+        ondrop={(event) => {
+          if (event.target !== event.currentTarget) return;
+          const moving = draggedTabId;
+          const movingGroup = draggedGroupId;
+          draggedTabId = null;
+          draggedGroupId = null;
+          tabDropHint = null;
+          tabStripDropHint = null;
+          if (movingGroup) {
+            event.preventDefault();
+            const movedGroup = moveSplitGroupToStripEnd(tabState.tabs, splitGroups, movingGroup);
+            tabState = { ...tabState, tabs: movedGroup.tabs };
+            splitGroups = movedGroup.groups;
+            return;
+          }
+          if (!moving) return;
+          event.preventDefault();
+          const detached = detachTabToStripEnd(tabState.tabs, splitGroups, moving);
+          if (zoomedPaneId && (zoomedPaneId === moving || !detached.groups.some((g) => hasPane(g.tree, zoomedPaneId ?? "")))) {
+            zoomedPaneId = null;
+          }
+          tabState = { ...tabState, tabs: detached.tabs };
+          splitGroups = recordGroupActivePane(detached.groups, tabState.activeId);
+        }}
+      >
+      {#each tabStripSegments as segment (segment.kind === "group" ? segment.group.id : segment.tab.id)}
+        {#if segment.kind === "group"}
+          {@const isGroupActive = activeGroup?.id === segment.group.id}
+          {@const segLabel = splitGroupDisplayLabel(segment.group, segment.groupIndex - 1, splitGroups.length)}
+          {@const groupAtt = groupAttentions[segment.group.id]}
+          {@const groupDropHint = tabStripDropHint?.groupId === segment.group.id ? tabStripDropHint.mode : null}
+          <div
+            data-testid="terminal-tab-group"
+            data-group-id={segment.group.id}
+            data-group-active={isGroupActive ? "true" : "false"}
+            class="relative flex items-center gap-0.5 px-1 my-0.5 rounded-lg border shrink-0 transition-colors {groupDropHint === 'pair' ? 'ring-1 ring-inset ring-accent bg-accent/15' : ''} {isGroupActive ? 'bg-accent/10 border-accent/65' : 'bg-surface/40 border-border/65 hover:border-border/90'}"
+          >
+            {#if groupDropHint === "before"}
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute -left-[3px] top-0.5 bottom-0.5 w-0.5 rounded-full bg-accent"
+                style:z-index={LAYERS.STICKY}
+              ></span>
+            {:else if groupDropHint === "after"}
+              <span
+                aria-hidden="true"
+                class="pointer-events-none absolute -right-[3px] top-0.5 bottom-0.5 w-0.5 rounded-full bg-accent"
+                style:z-index={LAYERS.STICKY}
+              ></span>
+            {/if}
+            {#if inlineRenameGroupId === segment.group.id}
+              <input
+                bind:this={inlineRenameGroupInput}
+                bind:value={inlineRenameGroupDraft}
+                data-inline-rename
+                data-testid="terminal-group-rename-input"
+                aria-label="Rename terminal pair"
+                maxlength="48"
+                class="gp-field h-6 px-1.5 py-0 min-w-16 w-28 text-micro"
+                onpointerdown={(event) => event.stopPropagation()}
+                onclick={(event) => event.stopPropagation()}
+                onkeydown={(event) => {
+                  if (isImeComposition(event)) return;
+                  event.stopPropagation();
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitGroupInlineRename(segment.group.id, true);
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelGroupInlineRename(true);
+                  }
+                }}
+                onblur={() => commitGroupInlineRename(segment.group.id)}
+              />
+            {:else}
+              <button
+                type="button"
+                id={`terminal-pair-badge-${segment.group.id}`}
+                data-testid="terminal-tab-group-badge"
+                data-group-attention={groupAtt?.tone ?? "none"}
+                draggable={inlineRenameGroupId !== segment.group.id}
+                ondragstart={(event) => {
+                  draggedTabId = null;
+                  draggedGroupId = segment.group.id;
+                  event.dataTransfer?.setData("application/x-gitpulse-terminal-group", segment.group.id);
+                  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+                }}
+                ondragend={() => {
+                  draggedGroupId = null;
+                  draggedTabId = null;
+                  tabDropHint = null;
+                  tabStripDropHint = null;
+                }}
+                ondragover={(event) => {
+                  if (draggedGroupId && draggedGroupId !== segment.group.id) {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    const rx = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+                    tabStripDropHint = { groupId: segment.group.id, mode: rx < 0.5 ? "before" : "after" };
+                    return;
+                  }
+                  if (draggedTabId && !segment.tabs.some((t) => t.id === draggedTabId)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+                    tabStripDropHint = { groupId: segment.group.id, mode: "pair" };
+                  }
+                }}
+                ondragleave={(event) => {
+                  if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+                  if (tabStripDropHint?.groupId === segment.group.id) tabStripDropHint = null;
+                }}
+                ondrop={(event) => {
+                  if (draggedGroupId && draggedGroupId !== segment.group.id) {
+                    const movingGroup = draggedGroupId;
+                    const pos = tabStripDropHint?.groupId === segment.group.id && tabStripDropHint.mode === "after" ? "after" : "before";
+                    draggedGroupId = null;
+                    draggedTabId = null;
+                    tabStripDropHint = null;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const reordered = reorderSplitGroupInStrip(tabState.tabs, splitGroups, movingGroup, segment.group.id, pos);
+                    tabState = { ...tabState, tabs: reordered.tabs };
+                    splitGroups = reordered.groups;
+                    return;
+                  }
+                  if (draggedTabId && !segment.tabs.some((t) => t.id === draggedTabId)) {
+                    const moving = draggedTabId;
+                    const anchorId = segment.group.activePaneId ?? segment.tabs[0]?.id;
+                    draggedTabId = null;
+                    draggedGroupId = null;
+                    tabStripDropHint = null;
+                    if (!anchorId) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    zoomedPaneId = null;
+                    const outcome = applyTabStripDrop(tabState.tabs, splitGroups, {
+                      movingTabId: moving,
+                      targetTabId: anchorId,
+                      mode: "pair",
+                      pinnedIds: pinnedTabIds,
+                    });
+                    if (outcome.refusedReason) {
+                      sessionError = outcome.refusedReason;
+                      return;
+                    }
+                    const nextState = outcome.activeTabId
+                      ? activateTab({ ...tabState, tabs: outcome.tabs }, outcome.activeTabId)
+                      : { ...tabState, tabs: outcome.tabs };
+                    tabState = nextState;
+                    splitGroups = recordGroupActivePane(outcome.groups, nextState.activeId);
+                  }
+                }}
+                class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro font-medium cursor-grab active:cursor-grabbing transition-colors {isGroupActive ? 'text-accent hover:bg-accent/15' : 'text-textMuted hover:text-textPrimary hover:bg-surfaceHover'}"
+                onclick={() => activateSplitGroup(segment.group.id)}
+                ondblclick={(event) => {
+                  event.stopPropagation();
+                  startGroupInlineRename(segment.group.id);
+                }}
+                oncontextmenu={(event) => {
+                  openGroupContextMenu(segment.group.id, event, event.currentTarget as HTMLElement);
+                }}
+                onkeydown={(event) => {
+                  if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                    openGroupContextMenu(segment.group.id, event, event.currentTarget as HTMLElement);
+                  }
+                }}
+                title={`Switch to ${segLabel} (${segment.tabs.length} panes) — drag badge to reorder pair, drop a tab here to join pair, double-click to rename, right-click for pair options`}
+              >
+                <Columns2 size={10} class="shrink-0" />
+                <span>{segLabel}</span>
+                {#if !isGroupActive && groupAtt?.badgeLabel}
+                  <span
+                    data-testid="terminal-tab-group-attention"
+                    aria-label={`${segLabel}: ${groupAtt.badgeLabel}`}
+                    class={groupAtt.tone === "danger" ? "text-danger" : groupAtt.tone === "warn" ? "text-warn" : "text-accent"}
+                  >●</span>
+                {/if}
+              </button>
+            {/if}
+            {#each segment.tabs as tab (tab.id)}
+              {@render tabItem(tab)}
+            {/each}
+            <button
+              type="button"
+              class="gp-icon-btn opacity-60 hover:opacity-100 hover:text-textPrimary"
+              data-size="sm"
+              data-testid="terminal-tab-group-unsplit"
+              onclick={(event) => {
+                event.stopPropagation();
+                ungroupPair(segment.group.id);
+              }}
+              aria-label={`Ungroup ${segLabel}`}
+              title={`Ungroup ${segLabel} (keeps sessions open)`}
+            >
+              1×
+            </button>
+          </div>
+        {:else}
+          {@render tabItem(segment.tab)}
+        {/if}
       {/each}
+      {#if stripPairDropTargetId}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          data-testid="terminal-tab-split-dropzone"
+          ondragover={(event) => {
+            if (!draggedTabId || !stripPairDropTargetId) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+            tabStripDropHint = { splitDropzone: true, mode: "pair" };
+          }}
+          ondragleave={() => {
+            if (tabStripDropHint?.splitDropzone) tabStripDropHint = null;
+          }}
+          ondrop={(event) => {
+            const moving = draggedTabId;
+            const targetId = stripPairDropTargetId;
+            draggedTabId = null;
+            draggedGroupId = null;
+            tabDropHint = null;
+            tabStripDropHint = null;
+            if (!moving || !targetId || moving === targetId) return;
+            event.preventDefault();
+            event.stopPropagation();
+            zoomedPaneId = null;
+            const outcome = applyTabStripDrop(tabState.tabs, splitGroups, {
+              movingTabId: moving,
+              targetTabId: targetId,
+              mode: "pair",
+              pinnedIds: pinnedTabIds,
+            });
+            if (outcome.refusedReason) {
+              sessionError = outcome.refusedReason;
+              return;
+            }
+            const nextState = outcome.activeTabId
+              ? activateTab({ ...tabState, tabs: outcome.tabs }, outcome.activeTabId)
+              : { ...tabState, tabs: outcome.tabs };
+            tabState = nextState;
+            splitGroups = recordGroupActivePane(outcome.groups, nextState.activeId);
+          }}
+          class="inline-flex items-center gap-1 px-2 my-1 rounded-lg border border-dashed text-micro shrink-0 transition-colors {tabStripDropHint?.splitDropzone ? 'border-accent/90 bg-accent/15 text-accent' : 'border-border/65 text-textMuted'}"
+        >
+          <Columns2 size={11} class="shrink-0" />
+          <span>{activeGroup ? `Join ${activeGroupLabel ?? "Pair"}` : "Split"}</span>
+        </div>
+      {/if}
+      {#if draggedTabId && groupedTabIds.has(draggedTabId)}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          data-testid="terminal-tab-detach-dropzone"
+          ondragover={(event) => {
+            if (!draggedTabId) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+            tabStripDropHint = { detach: true, mode: "after" };
+          }}
+          ondragleave={() => {
+            if (tabStripDropHint?.detach) tabStripDropHint = null;
+          }}
+          ondrop={(event) => {
+            const moving = draggedTabId;
+            draggedTabId = null;
+            draggedGroupId = null;
+            tabDropHint = null;
+            tabStripDropHint = null;
+            if (!moving) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const detached = detachTabToStripEnd(tabState.tabs, splitGroups, moving);
+            if (zoomedPaneId && (zoomedPaneId === moving || !detached.groups.some((g) => hasPane(g.tree, zoomedPaneId ?? "")))) {
+              zoomedPaneId = null;
+            }
+            tabState = { ...tabState, tabs: detached.tabs };
+            splitGroups = recordGroupActivePane(detached.groups, tabState.activeId);
+          }}
+          class="inline-flex items-center gap-1 px-2 my-1 rounded-lg border border-dashed text-micro shrink-0 transition-colors {tabStripDropHint?.detach ? 'border-accent/90 bg-accent/15 text-accent' : 'border-border/65 text-textMuted'}"
+        >
+          <Minimize2 size={11} class="shrink-0" />
+          <span>Detach</span>
+        </div>
+      {/if}
       </div>
       <ScrollCue target={tabScroller} axis="x" />
       </div>
 
-      <div class="flex items-center gap-1 shrink-0 pl-2">
+      <div class="flex items-center gap-1 shrink-0 pl-1.5">
         {#if activeChildTabs.length > 0}
           <button
             type="button"
@@ -2628,15 +4986,15 @@
             onclick={() => void stopActiveChildren()}
           >Stop children ({activeChildTabs.length})</button>
         {/if}
-        {#if pairHandoffTarget}
+        {#each pairHandoffTargets as target (target.id)}
           <button
             type="button"
             class="gp-btn py-0! px-1.5! text-micro!"
             data-testid="terminal-pair-handoff-btn"
-            title={`Send bounded context handoff to ${launcherLabel(pairHandoffTarget.launcher)}`}
-            onclick={handOffToPairPartner}
-          >Hand off → {launcherLabel(pairHandoffTarget.launcher)}</button>
-        {/if}
+            title={`Send bounded context handoff to ${target.label}`}
+            onclick={() => handOffToPairPartner(target)}
+          ><LauncherIcon kind={target.launcher} size={11} class="shrink-0" />Hand off → {target.label}</button>
+        {/each}
         <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
         <button
           type="button"
@@ -2645,49 +5003,100 @@
           aria-pressed={followAgent}
           disabled={!repoPath}
           data-testid="terminal-follow-agent-toggle"
-          title={followAgent ? "Following agent edits — live-opens or refreshes modified files & plans" : "Follow agent — auto-open modified files & plans in split pane"}
-          onclick={() => { followAgent = !followAgent; }}
+          title={followAgent ? "Following agent edits in one split — closing that split stops following" : "Follow agent — show modified files & plans in one split pane"}
+          onclick={() => { if (followAgent) stopFollowing(); else startFollowing(); }}
         ><Eye size={13} /></button>
-        <button
-          type="button"
-          class="gp-icon-btn"
-          aria-label={hasVisibleFilePane ? "Close files split" : "Open files beside terminal"}
-          aria-pressed={hasVisibleFilePane}
-          disabled={!repoPath || (!hasVisibleFilePane && !canCreateKind("file"))}
-          title={hasVisibleFilePane ? "Close files split" : "Open files & Markdown beside terminal"}
-          onclick={toggleFilePaneSplit}
-        ><FolderTree size={13} /></button>
-        <button
-          type="button"
-          class="gp-icon-btn"
-          aria-label="Split terminal right"
-          disabled={!activeId || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES || (tabState.tabs.length <= visibleIds.length && !canCreateKind(nextLauncher))}
-          title={`Split right (${platformChord("⌘D", "Ctrl+Shift+D", $hostPlatform.os)})`}
-          onclick={() => void splitActive("row")}
-        ><Columns2 size={13} /></button>
-        <button
-          type="button"
-          class="gp-icon-btn"
-          aria-label="Split terminal down"
-          disabled={!activeId || leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES || (tabState.tabs.length <= visibleIds.length && !canCreateKind(nextLauncher))}
-          title={`Split down (${platformChord("⌘⇧D", "Ctrl+Shift+Alt+D", $hostPlatform.os)})`}
-          onclick={() => void splitActive("col")}
-        ><Rows2 size={13} /></button>
+        <!-- Justified: captures right-click split menu even when the inner button's default launcher is disabled. -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <span
+          class="inline-flex shrink-0"
+          oncontextmenu={(event) => {
+            if (!repoPath || !activeId) return;
+            openSplitContextMenu("row", event, event.currentTarget as HTMLElement);
+          }}
+        >
+          <button
+            type="button"
+            class="gp-icon-btn"
+            aria-label="Split terminal right"
+            disabled={!canPlainSplit}
+            title={`Split right with ${splitWithLabel} (${platformChord("⌘D", "Ctrl+Shift+D", $hostPlatform.os)}) · Right-click to choose what opens`}
+            onclick={() => void splitActive("row")}
+            oncontextmenu={(event) => {
+              if (!repoPath || !activeId) return;
+              openSplitContextMenu("row", event, event.currentTarget as HTMLElement);
+            }}
+            onkeydown={(event) => {
+              if (!repoPath || !activeId) return;
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                openSplitContextMenu("row", event, event.currentTarget as HTMLElement);
+              }
+            }}
+          ><Columns2 size={13} /></button>
+        </span>
+        <!-- Justified: captures right-click split menu even when the inner button's default launcher is disabled. -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <span
+          class="inline-flex shrink-0"
+          oncontextmenu={(event) => {
+            if (!repoPath || !activeId) return;
+            openSplitContextMenu("col", event, event.currentTarget as HTMLElement);
+          }}
+        >
+          <button
+            type="button"
+            class="gp-icon-btn"
+            aria-label="Split terminal down"
+            disabled={!canPlainSplit}
+            title={`Split down with ${splitWithLabel} (${platformChord("⌘⇧D", "Ctrl+Shift+Alt+D", $hostPlatform.os)}) · Right-click to choose what opens`}
+            onclick={() => void splitActive("col")}
+            oncontextmenu={(event) => {
+              if (!repoPath || !activeId) return;
+              openSplitContextMenu("col", event, event.currentTarget as HTMLElement);
+            }}
+            onkeydown={(event) => {
+              if (!repoPath || !activeId) return;
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                openSplitContextMenu("col", event, event.currentTarget as HTMLElement);
+              }
+            }}
+          ><Rows2 size={13} /></button>
+        </span>
         {#if splitRoot}
           <button
             type="button"
             class="gp-icon-btn px-1.5! text-micro!"
             aria-label={zoomedPaneId ? "Restore split panes" : "Zoom active pane"}
             aria-pressed={Boolean(zoomedPaneId)}
-            title={zoomedPaneId ? `Restore split panes (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})` : `Zoom active pane (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)})`}
+            title={zoomedPaneId ? `Restore split panes (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)}) · Right-click for split options` : `Zoom active pane (${platformChord("⌘⇧Enter", "Ctrl+Shift+Enter", $hostPlatform.os)}) · Right-click for split options`}
             onclick={toggleZoomPane}
-          >{zoomedPaneId ? "Unzoom" : "Zoom"}</button>
+            oncontextmenu={(event) => {
+              if (!repoPath || !activeId) return;
+              openSplitContextMenu(splitRoot?.kind === "branch" ? splitRoot.direction : "row", event, event.currentTarget as HTMLElement);
+            }}
+            onkeydown={(event) => {
+              if (!repoPath || !activeId) return;
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                openSplitContextMenu(splitRoot?.kind === "branch" ? splitRoot.direction : "row", event, event.currentTarget as HTMLElement);
+              }
+            }}
+          >{zoomedPaneId ? (hiddenSplitSummary.badgeLabel ? `Unzoom · ${hiddenSplitSummary.badgeLabel}` : "Unzoom") : "Zoom"}</button>
           <button
             type="button"
             class="gp-icon-btn px-1.5! text-micro!"
             aria-label="Close split view"
-            title="Unsplit all panes (keeps tabs open)"
+            title="Unsplit all panes (keeps tabs open) · Right-click for split options"
             onclick={toggleSplit}
+            oncontextmenu={(event) => {
+              if (!repoPath || !activeId) return;
+              openSplitContextMenu(splitRoot?.kind === "branch" ? splitRoot.direction : "row", event, event.currentTarget as HTMLElement);
+            }}
+            onkeydown={(event) => {
+              if (!repoPath || !activeId) return;
+              if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                openSplitContextMenu(splitRoot?.kind === "branch" ? splitRoot.direction : "row", event, event.currentTarget as HTMLElement);
+              }
+            }}
           >1×</button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
@@ -2695,19 +5104,32 @@
           <button
             bind:this={launcherTriggerEl}
             type="button"
-            class="gp-btn max-w-28 truncate" data-size="sm"
+            class="gp-btn max-w-32 truncate" data-size="sm"
             aria-label="New session type"
             aria-haspopup="listbox"
             aria-expanded={launcherMenuOpen}
             aria-controls="terminal-launcher-menu"
-            title="Choose what the next session runs"
+            title="Choose what the next session or tab opens"
             onclick={() => launcherMenuOpen ? closeChrome() : openLauncherMenu()}
           >
-            {launcherLabel(nextLauncher)}
-            <ChevronDown size={11} />
+            <LauncherIcon kind={nextLauncher} size={12} class="shrink-0" />
+            <span class="terminal-launcher-label truncate">{nextLauncher === "file" ? "File Explorer" : launcherLabel(nextLauncher)}</span>
+            <ChevronDown size={11} class="shrink-0" />
           </button>
         </div>
-        <button type="button" class="gp-icon-btn" data-terminal-new disabled={!repoPath || !canCreateKind(nextLauncher)} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitleFor(nextLauncher)}><Plus size={14} /></button>
+        <button
+          type="button"
+          class="gp-icon-btn"
+          data-terminal-new
+          disabled={!repoPath || !canCreateKind(nextLauncher)}
+          onclick={() => void openBeside(nextLauncher)}
+          oncontextmenu={(event) => {
+            if (!repoPath || !activeId) return;
+            openSplitContextMenu("row", event, event.currentTarget as HTMLElement);
+          }}
+          aria-label={nextLauncher === "file" ? "New File Explorer tab" : `New ${launcherLabel(nextLauncher)} session`}
+          title={capacityTitleFor(nextLauncher)}
+        ><Plus size={14} /></button>
       </div>
     </div>
 
@@ -2725,6 +5147,9 @@
         />
         <div class="max-h-40 overflow-auto" role="listbox" aria-label="Matching terminals">
           {#each filteredTabs as tab, index (tab.id)}
+            {@const display = tabDisplayTitle(tab, effectiveAgentStatuses[tab.id], tabBrowserStates[tab.id])}
+            {@const splitSlot = splitSlotByTabId[tab.id]}
+            {@const groupMeta = groupMetaByTabId[tab.id]}
             <button
               type="button"
               role="option"
@@ -2732,8 +5157,11 @@
               class="flex w-full items-center gap-2 py-0.5 px-1 rounded text-left {index === sessionHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted hover:bg-surfaceHover'}"
               onclick={() => chooseSearchedTab(tab.id)}
             >
-              <span class="flex-1 min-w-0 truncate">{tabLabel(tab)}</span>
-              <span class="shrink-0 text-micro">{launcherLabel(tab.launcher)}{#if tabStatuses[tab.id] === "exited"} · Ended{:else if tabStatuses[tab.id] === "error"} · Error{/if}{#if unread.has(tab.id)} · Unread{/if}</span>
+              <LauncherIcon kind={tab.launcher} size={12} />
+              <span class="flex-1 min-w-0 truncate">
+                {display.primary}{#if display.secondary}<span class="text-textMuted"> · {display.secondary}</span>{/if}
+              </span>
+              <span class="shrink-0 text-micro">{launcherLabel(tab.launcher)}{#if tab.id === tabState.activeId} · Active{/if}{#if groupMeta} · {groupMeta.label} #{groupMeta.slot}{:else if splitSlot} · Pane #{splitSlot}{/if}{#if tabStatuses[tab.id] === "exited"} · Ended{:else if tabStatuses[tab.id] === "error"} · Error{/if}{#if unread.has(tab.id)} · Unread{/if}</span>
             </button>
           {:else}
             <span class="text-textMuted">No terminals match.</span>
@@ -2743,12 +5171,13 @@
     {/if}
 
     {#if launcherMenuOpen && mode === "shell"}
+      {@const presetAgentKind = preferredPresetAgent()}
       <div
         id="terminal-launcher-menu"
         use:portal={"body"}
         use:popover={launcherMenuDismissal} out:popoverExit
         data-terminal-launcher-popup
-        class="fixed w-52 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1.5 text-meta text-textPrimary"
+        class="fixed w-60 max-w-[calc(100vw-16px)] max-h-[min(23rem,calc(100vh-24px))] overflow-y-auto gp-menu gp-pop p-1.5 text-meta text-textPrimary"
         style="z-index: {LAYERS.MENU}"
         role="dialog"
         aria-label="New session type menu"
@@ -2773,15 +5202,74 @@
               class="gp-menu-item {index === launcherHighlight ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
               onclick={() => chooseLauncher(launcher.kind)}
             >
-              {launcher.label}
+              <LauncherIcon kind={launcher.kind} size={13} class="shrink-0" />
+              <span class="truncate">{launcher.label}</span>
+              {#if launcher.kind === nextLauncher}
+                <Check size={12} class="ml-auto text-accent shrink-0" />
+              {/if}
             </button>
           {:else}
             <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
         </div>
         <div class="gp-menu-sep my-1"></div>
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Sidebar and file explorer">
+          <span class="gp-label px-2.5 py-0.5">Sidebar &amp; File Explorer</span>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-launcher-toggle-explorer"
+            disabled={!repoPath}
+            title="Dock or hide the dedicated File Explorer sidebar beside terminal panes (never forces a 3rd split pane)"
+            onclick={() => {
+              launcherMenuOpen = false;
+              toggleExplorerSidebar();
+            }}
+          >
+            <FolderTree size={13} class="text-accent shrink-0" />
+            <span class="truncate">{explorerSidebarOpen ? "Hide File Explorer Sidebar" : "Show File Explorer Sidebar"}</span>
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-launcher-split-file"
+            disabled={!repoPath || (!hasVisibleFilePane && !canCreateKind("file"))}
+            title="Open a File Explorer & Markdown pane in a side-by-side split"
+            onclick={() => {
+              launcherMenuOpen = false;
+              const err = openFileSplitFor(undefined, null, null, { focus: true });
+              if (err) sessionError = err;
+            }}
+          >
+            <Columns2 size={13} class="text-textMuted shrink-0" />
+            <span class="truncate">Open File Explorer in Split</span>
+          </button>
+        </div>
+        <div class="gp-menu-sep my-1"></div>
         <div class="flex flex-col gap-0.5" role="group" aria-label="Workspace split presets">
           <span class="gp-label px-2.5 py-0.5">Split presets</span>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-shell-pair"
+            disabled={!repoPath || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 2 > $terminalSessionLimit}
+            title="Open a paired group of two interactive shells side-by-side"
+            onclick={openShellPairPreset}
+          >
+            <LauncherIcon kind="shell" size={13} class="shrink-0" />
+            <span class="truncate">New Shell Pair</span>
+          </button>
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-preset-agent-shell-pair"
+            disabled={!repoPath || tabState.tabs.length + 2 > MAX_STRIP_TABS || $terminalSessions.length + 2 > $terminalSessionLimit}
+            title="Open a paired coding agent beside an interactive shell"
+            onclick={openAgentShellPairPreset}
+          >
+            <LauncherIcon kind={presetAgentKind} size={13} class="shrink-0" />
+            <span class="truncate">Agent + Shell Pair</span>
+          </button>
           <button
             type="button"
             class="gp-menu-item text-textMuted"
@@ -2790,7 +5278,8 @@
             title="Open coding agent beside a live Follow-Agent file/diff split"
             onclick={openAgentDiffPreset}
           >
-            Agent + Live Diff
+            <LauncherIcon kind="file" size={13} class="shrink-0" />
+            <span class="truncate">Agent + Live Diff</span>
           </button>
           <button
             type="button"
@@ -2800,7 +5289,8 @@
             title="Open Claude Code and Antigravity side-by-side in a 50/50 split"
             onclick={openPairSplit}
           >
-            Pair split: Claude + Antigravity
+            <Columns2 size={13} class="shrink-0 text-accent" />
+            <span class="truncate">Pair split: Claude + Antigravity</span>
           </button>
           <button
             type="button"
@@ -2810,7 +5300,8 @@
             title="Open coding agent left with Shell + Browser stacked on the right"
             onclick={openFullStackPreset}
           >
-            Full-Stack: Agent + Shell + Browser
+            <LauncherIcon kind="browser" size={13} class="shrink-0" />
+            <span class="truncate">Full-Stack: Agent + Shell + Browser</span>
           </button>
           <button
             type="button"
@@ -2820,26 +5311,1053 @@
             title="Provision a fresh sibling Git worktree (CoW caches + the code map) and open an agent + live diff split inside it"
             onclick={() => void openWorktreeAgentPreset()}
           >
-            Isolated Worktree Agent Split…
+            <GitBranch size={13} class="shrink-0 text-accent" />
+            <span class="truncate">Isolated Worktree Agent Split…</span>
           </button>
         </div>
       </div>
+    {/if}
+
+    {#if tabContextMenu && mode === "shell"}
+      {@const ctxTab = tabState.tabs.find((candidate) => candidate.id === tabContextMenu?.tabId)}
+      {#if ctxTab}
+        {@const ctxInActiveSplitGroup = Boolean(splitRoot && hasPane(splitRoot, ctxTab.id))}
+        {@const ctxGroup = findGroupForPane(splitGroups, ctxTab.id)}
+        {@const ctxGroupMeta = groupMetaByTabId[ctxTab.id]}
+        {@const ctxCanPairWithActive = tabState.tabs.length >= 2 && (splitRoot ? !ctxInActiveSplitGroup : ctxTab.id !== activeId) && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES}
+        {@const ctxCanReplaceActive = Boolean(splitRoot && !ctxInActiveSplitGroup)}
+        {@const ctxJoinTargets = pairJoinTargets(splitGroups, ctxTab.id).filter((target) => !(ctxCanPairWithActive && target.groupId === activeGroup?.id))}
+        {@const canSplitPaneWithNew = Boolean(repoPath && leafPaneIds(ctxGroup?.tree ?? null).length < MAX_SPLIT_PANES && canCreateKind(ctxTab.launcher))}
+        {@const ctxKindLabel = ctxTab.launcher === "file" ? "File Explorer" : launcherLabel(ctxTab.launcher)}
+        {@const ctxStripIdx = orderedStripTabs.findIndex((candidate) => candidate.id === ctxTab.id)}
+        {@const closableOtherIds = orderedStripTabs.filter((candidate) => candidate.id !== ctxTab.id && !candidate.pinned).map((candidate) => candidate.id)}
+        {@const closableRightIds = ctxStripIdx >= 0 ? orderedStripTabs.slice(ctxStripIdx + 1).filter((candidate) => !candidate.pinned).map((candidate) => candidate.id) : []}
+        {@const endedTabIds = orderedStripTabs.filter((candidate) => tabStatuses[candidate.id] === "exited").map((candidate) => candidate.id)}
+        <div
+          {@attach focusFirstContextMenuItem}
+          use:portal={"body"}
+          use:popover={tabContextMenuPopover} out:popoverExit
+          data-terminal-tab-context-menu
+          data-testid="terminal-tab-context-menu"
+          class="fixed w-56 max-w-[calc(100vw-16px)] max-h-[min(28rem,calc(100vh-24px))] overflow-y-auto gp-menu gp-pop p-1 text-meta text-textPrimary"
+          style="z-index: {LAYERS.MENU}"
+          role="menu"
+          aria-label={`Tab actions for ${tabLabel(ctxTab)}`}
+          tabindex="-1"
+          onkeydown={handleContextMenuKeydown}
+        >
+          <div class="px-2.5 py-1 flex items-center gap-1.5 text-micro text-textMuted truncate">
+            <LauncherIcon kind={ctxTab.launcher} size={11} class="shrink-0" />
+            <span class="font-medium text-textPrimary truncate flex-1">{tabLabel(ctxTab)}</span>
+            {#if ctxGroupMeta}
+              <span class="gp-chip shrink-0 tabular-nums" data-tone={ctxGroup?.id === activeGroup?.id ? "accent" : "neutral"}>
+                {ctxGroupMeta.label} #{ctxGroupMeta.slot}
+              </span>
+            {/if}
+          </div>
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          {#if ctxCanPairWithActive}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-right"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                openTabInSplit(targetId, "row", "after");
+              }}
+            >
+              <Columns2 size={13} class="shrink-0" />
+              <span>Open in Split Right</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-left"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                openTabInSplit(targetId, "row", "before");
+              }}
+            >
+              <Columns2 size={13} class="shrink-0" />
+              <span>Open in Split Left</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-down"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                openTabInSplit(targetId, "col", "after");
+              }}
+            >
+              <Rows2 size={13} class="shrink-0" />
+              <span>Open in Split Down</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-up"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                openTabInSplit(targetId, "col", "before");
+              }}
+            >
+              <Rows2 size={13} class="shrink-0" />
+              <span>Open in Split Up</span>
+            </button>
+          {:else}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-new-right"
+              disabled={!canSplitPaneWithNew}
+              onclick={() => {
+                const targetId = ctxTab.id;
+                const launcher = ctxTab.launcher;
+                closeChrome();
+                void splitPaneWithNewKind(targetId, launcher, "row", "after");
+              }}
+            >
+              <Columns2 size={13} class="shrink-0" />
+              <span class="truncate">Split Right with New {ctxKindLabel}</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-split-new-down"
+              disabled={!canSplitPaneWithNew}
+              onclick={() => {
+                const targetId = ctxTab.id;
+                const launcher = ctxTab.launcher;
+                closeChrome();
+                void splitPaneWithNewKind(targetId, launcher, "col", "after");
+              }}
+            >
+              <Rows2 size={13} class="shrink-0" />
+              <span class="truncate">Split Down with New {ctxKindLabel}</span>
+            </button>
+          {/if}
+          {#if ctxCanReplaceActive}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                replaceActiveSplitPaneWith(targetId);
+              }}
+            >
+              <SquareTerminal size={13} class="shrink-0" />
+              <span>Replace Active Split Pane</span>
+            </button>
+          {/if}
+          {#each ctxJoinTargets as target (target.groupId)}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-join-pair"
+              data-group-id={target.groupId}
+              onclick={() => {
+                const tabId = ctxTab.id;
+                closeChrome();
+                joinPair(tabId, target);
+              }}
+            >
+              <Columns2 size={13} class="shrink-0" />
+              <span class="truncate">{ctxGroup ? "Move to" : "Add to"} {target.label}</span>
+            </button>
+          {/each}
+          {#if ctxGroup}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-flip-orientation"
+              onclick={() => {
+                const gId = ctxGroup.id;
+                const targetId = ctxTab.id;
+                closeChrome();
+                flipGroupOrientation(gId, targetId);
+              }}
+            >
+              <RotateCw size={13} class="shrink-0" />
+              <span>Flip Split Orientation</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-swap-panes"
+              onclick={() => {
+                const gId = ctxGroup.id;
+                const targetId = ctxTab.id;
+                closeChrome();
+                swapPaneInGroup(gId, targetId);
+              }}
+            >
+              <Columns2 size={13} class="shrink-0" />
+              <span>Swap Split Panes</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-equalize"
+              onclick={() => {
+                const gId = ctxGroup.id;
+                closeChrome();
+                equalizeGroupSplits(gId);
+              }}
+            >
+              <Rows2 size={13} class="shrink-0" />
+              <span>Equalize Split Sizes</span>
+            </button>
+            {#if ctxGroup.id === activeGroup?.id}
+              <button
+                type="button"
+                role="menuitem"
+                class="gp-menu-item text-textMuted"
+                data-testid="terminal-tab-ctx-zoom"
+                onclick={() => {
+                  const targetId = ctxTab.id;
+                  closeChrome();
+                  zoomSplitPane(targetId);
+                }}
+              >
+                {#if zoomedPaneId === ctxTab.id}
+                  <Minimize2 size={13} class="shrink-0" />
+                  <span>Restore Split Panes</span>
+                {:else}
+                  <Maximize2 size={13} class="shrink-0" />
+                  <span>Zoom Pane</span>
+                {/if}
+              </button>
+            {/if}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                removePaneFromSplit(targetId);
+              }}
+            >
+              <Minimize2 size={13} class="shrink-0" />
+              <span>Remove from Split</span>
+            </button>
+          {/if}
+          {#if ctxTab.launcher === "file" && !explorerSidebarOpen}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-dock-explorer-sidebar"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                dockFileTabToSidebar(targetId);
+              }}
+            >
+              <FolderTree size={13} class="shrink-0 text-accent" />
+              <span>Move to Explorer Sidebar</span>
+            </button>
+          {/if}
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-tab-ctx-duplicate-kind"
+            disabled={!repoPath || !canCreateKind(ctxTab.launcher)}
+            onclick={() => {
+              const launcher = ctxTab.launcher;
+              closeChrome();
+              void openBeside(launcher);
+            }}
+          >
+            <Plus size={13} class="shrink-0" />
+            <span class="truncate">New {ctxKindLabel} Tab</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              tabState = toggleTabPinned(tabState, targetId);
+            }}
+          >
+            {#if ctxTab.pinned}
+              <PinOff size={13} class="shrink-0" />
+              <span>Unpin Tab</span>
+            {:else}
+              <Pin size={13} class="shrink-0" />
+              <span>Pin Tab</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              startInlineRename(targetId, "tab");
+            }}
+          >
+            <Pencil size={13} class="shrink-0" />
+            <span>Rename Tab</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            disabled={orderedStripTabs[0]?.id === ctxTab.id}
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              moveTabInStrip(targetId, -1);
+            }}
+          >
+            <ChevronLeft size={13} class="shrink-0" />
+            <span>Move Tab Left</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            disabled={orderedStripTabs.at(-1)?.id === ctxTab.id}
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              moveTabInStrip(targetId, 1);
+            }}
+          >
+            <ChevronRight size={13} class="shrink-0" />
+            <span>Move Tab Right</span>
+          </button>
+          {#if ctxTab.launcher !== "browser" && ctxTab.launcher !== "file" && sessions[ctxTab.id]}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                selectTab(targetId);
+                void tick().then(() => sessions[targetId]?.openFind());
+              }}
+            >
+              <Search size={13} class="shrink-0" />
+              <span>Find in Terminal</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                sessions[targetId]?.clearScrollback();
+              }}
+            >
+              <Trash2 size={13} class="shrink-0" />
+              <span>Clear Scrollback</span>
+            </button>
+          {/if}
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-danger"
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              void requestClose(targetId);
+            }}
+          >
+            <X size={13} class="shrink-0" />
+            <span>Close Tab</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-tab-ctx-close-others"
+            disabled={closableOtherIds.length === 0}
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              void closeOtherTabs(targetId);
+            }}
+          >
+            <X size={13} class="shrink-0" />
+            <span>Close Other Tabs</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-tab-ctx-close-right"
+            disabled={closableRightIds.length === 0}
+            onclick={() => {
+              const targetId = ctxTab.id;
+              closeChrome();
+              void closeTabsToRight(targetId);
+            }}
+          >
+            <ChevronRight size={13} class="shrink-0" />
+            <span>Close Tabs to the Right</span>
+          </button>
+          {#if endedTabIds.length > 0}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-close-ended"
+              onclick={() => {
+                closeChrome();
+                void closeEndedTabs();
+              }}
+            >
+              <Trash2 size={13} class="shrink-0" />
+              <span>Close Ended Tabs ({endedTabIds.length})</span>
+            </button>
+          {/if}
+        </div>
+      {/if}
+    {/if}
+
+    {#if splitContextMenu && mode === "shell"}
+      {@const splitMenuDir = splitContextMenu.direction}
+      {@const splitMenuPos = splitContextMenu.position}
+      {@const canSplitHere = canPlainSplit}
+      {@const canSplitCustomHere = Boolean(repoPath && activeId && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES)}
+      {@const pairableTabs = orderedStripTabs.filter((candidate) => candidate.id !== activeId && !hasPane(splitRoot, candidate.id)).slice(0, 8)}
+      <div
+        {@attach focusFirstContextMenuItem}
+        use:portal={"body"}
+        use:popover={splitContextMenuPopover} out:popoverExit
+        data-terminal-split-context-menu
+        data-testid="terminal-split-context-menu"
+        class="fixed w-60 max-w-[calc(100vw-16px)] max-h-[min(28rem,calc(100vh-24px))] overflow-y-auto gp-menu gp-pop p-1 text-meta text-textPrimary"
+        style="z-index: {LAYERS.MENU}"
+        role="menu"
+        aria-label="Split terminal options"
+        tabindex="-1"
+        onkeydown={handleContextMenuKeydown}
+      >
+        <div class="px-1.5 py-1 flex flex-col gap-1">
+          <span class="gp-label px-1">Placement</span>
+          <div
+            class="inline-flex w-full items-center gap-0.5 p-0.5 rounded-lg bg-background/70 border border-border/65"
+            role="group"
+            aria-label="Split placement direction"
+          >
+            <button
+              type="button"
+              class="flex-1 px-1.5 py-0.5 rounded text-micro transition-colors {splitMenuDir === 'row' && splitMenuPos === 'after' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+              aria-pressed={splitMenuDir === "row" && splitMenuPos === "after"}
+              data-testid="terminal-split-ctx-place-right"
+              onclick={() => {
+                if (splitContextMenu) splitContextMenu = { ...splitContextMenu, direction: "row", position: "after" };
+              }}
+            >Right</button>
+            <button
+              type="button"
+              class="flex-1 px-1.5 py-0.5 rounded text-micro transition-colors {splitMenuDir === 'row' && splitMenuPos === 'before' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+              aria-pressed={splitMenuDir === "row" && splitMenuPos === "before"}
+              data-testid="terminal-split-ctx-place-left"
+              onclick={() => {
+                if (splitContextMenu) splitContextMenu = { ...splitContextMenu, direction: "row", position: "before" };
+              }}
+            >Left</button>
+            <button
+              type="button"
+              class="flex-1 px-1.5 py-0.5 rounded text-micro transition-colors {splitMenuDir === 'col' && splitMenuPos === 'after' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+              aria-pressed={splitMenuDir === "col" && splitMenuPos === "after"}
+              data-testid="terminal-split-ctx-place-down"
+              onclick={() => {
+                if (splitContextMenu) splitContextMenu = { ...splitContextMenu, direction: "col", position: "after" };
+              }}
+            >Down</button>
+            <button
+              type="button"
+              class="flex-1 px-1.5 py-0.5 rounded text-micro transition-colors {splitMenuDir === 'col' && splitMenuPos === 'before' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+              aria-pressed={splitMenuDir === "col" && splitMenuPos === "before"}
+              data-testid="terminal-split-ctx-place-up"
+              onclick={() => {
+                if (splitContextMenu) splitContextMenu = { ...splitContextMenu, direction: "col", position: "before" };
+              }}
+            >Up</button>
+          </div>
+        </div>
+        <div class="gp-menu-sep my-0.5" role="separator"></div>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item text-textMuted"
+          data-testid="terminal-split-ctx-right"
+          disabled={!canSplitHere}
+          onclick={() => {
+            closeChrome();
+            void splitActive("row", "after");
+          }}
+        >
+          <Columns2 size={13} class="shrink-0" />
+          <span class="truncate">Split Right · {splitWithLabel}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item text-textMuted"
+          data-testid="terminal-split-ctx-left"
+          disabled={!canSplitHere}
+          onclick={() => {
+            closeChrome();
+            void splitActive("row", "before");
+          }}
+        >
+          <Columns2 size={13} class="shrink-0" />
+          <span class="truncate">Split Left · {splitWithLabel}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item text-textMuted"
+          data-testid="terminal-split-ctx-down"
+          disabled={!canSplitHere}
+          onclick={() => {
+            closeChrome();
+            void splitActive("col", "after");
+          }}
+        >
+          <Rows2 size={13} class="shrink-0" />
+          <span class="truncate">Split Down · {splitWithLabel}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item text-textMuted"
+          data-testid="terminal-split-ctx-up"
+          disabled={!canSplitHere}
+          onclick={() => {
+            closeChrome();
+            void splitActive("col", "before");
+          }}
+        >
+          <Rows2 size={13} class="shrink-0" />
+          <span class="truncate">Split Up · {splitWithLabel}</span>
+        </button>
+        <div class="gp-menu-sep my-0.5" role="separator"></div>
+        <span class="gp-label block px-2.5 py-0.5">New Split With…</span>
+        {#each dockTabTypes as item (item.kind)}
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid={`terminal-split-ctx-new-${item.kind}`}
+            disabled={!canSplitCustomHere || !canCreateKind(item.kind)}
+            onclick={() => {
+              const targetId = activeId;
+              const kind = item.kind;
+              const dir = splitMenuDir;
+              const pos = splitMenuPos;
+              closeChrome();
+              if (targetId) void splitPaneWithNewKind(targetId, kind, dir, pos);
+            }}
+          >
+            <LauncherIcon kind={item.kind} size={13} class="shrink-0" />
+            <span class="truncate">New {item.label}</span>
+          </button>
+        {/each}
+        {#if pairableTabs.length > 0}
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          <span class="gp-label block px-2.5 py-0.5">Pair With Open Tab…</span>
+          <div class="max-h-36 overflow-y-auto">
+            {#each pairableTabs as candidate (candidate.id)}
+              <button
+                type="button"
+                role="menuitem"
+                class="gp-menu-item text-textMuted"
+                data-testid="terminal-split-ctx-pair-tab"
+                disabled={leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES}
+                onclick={() => {
+                  const targetId = candidate.id;
+                  const dir = splitMenuDir;
+                  const pos = splitMenuPos;
+                  closeChrome();
+                  openTabInSplit(targetId, dir, pos);
+                }}
+              >
+                <LauncherIcon kind={candidate.launcher} size={12} class="shrink-0" />
+                <span class="truncate">{tabLabel(candidate)}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#if activeGroup && splitRoot}
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          <span class="gp-label block px-2.5 py-0.5">Active Split Layout</span>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-split-ctx-flip"
+            onclick={() => {
+              const gId = activeGroup.id;
+              const paneTarget = activeId;
+              closeChrome();
+              flipGroupOrientation(gId, paneTarget);
+            }}
+          >
+            <RotateCw size={13} class="shrink-0" />
+            <span>Flip Split Orientation</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-split-ctx-swap"
+            onclick={() => {
+              const gId = activeGroup.id;
+              const paneTarget = activeId;
+              closeChrome();
+              swapPaneInGroup(gId, paneTarget);
+            }}
+          >
+            <Columns2 size={13} class="shrink-0" />
+            <span>Swap Split Panes</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-split-ctx-equalize"
+            onclick={() => {
+              const gId = activeGroup.id;
+              closeChrome();
+              equalizeGroupSplits(gId);
+            }}
+          >
+            <Rows2 size={13} class="shrink-0" />
+            <span>Equalize Split Sizes</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-split-ctx-zoom"
+            onclick={() => {
+              closeChrome();
+              toggleZoomPane();
+            }}
+          >
+            {#if zoomedPaneId}
+              <Minimize2 size={13} class="shrink-0" />
+              <span>Restore Split Panes</span>
+            {:else}
+              <Maximize2 size={13} class="shrink-0" />
+              <span>Zoom Active Pane</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-split-ctx-unsplit"
+            onclick={() => {
+              closeChrome();
+              closeSplit();
+            }}
+          >
+            <Minimize2 size={13} class="shrink-0" />
+            <span>Ungroup Split (Keep Tabs)</span>
+          </button>
+          {#if splitGroups.length > 1}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-split-ctx-unsplit-all"
+              onclick={() => {
+                closeChrome();
+                ungroupAllPairs();
+              }}
+            >
+              <X size={13} class="shrink-0" />
+              <span>Ungroup All Pairs ({splitGroups.length})</span>
+            </button>
+          {/if}
+        {/if}
+      </div>
+    {/if}
+
+    {#if groupContextMenu && mode === "shell"}
+      {@const targetGroup = splitGroups.find((candidate) => candidate.id === groupContextMenu?.groupId)}
+      {#if targetGroup}
+        {@const targetIdx = splitGroups.indexOf(targetGroup)}
+        {@const targetLabel = splitGroupDisplayLabel(targetGroup, targetIdx, splitGroups.length)}
+        {@const groupLeaves = leafPaneIds(targetGroup.tree)}
+        {@const allGroupPinned = groupLeaves.length > 0 && groupLeaves.every((leafId) => pinnedTabIds.has(leafId))}
+        {@const groupSegIdx = tabStripSegments.findIndex((seg) => seg.kind === "group" && seg.group.id === targetGroup.id)}
+        <div
+          {@attach focusFirstContextMenuItem}
+          use:portal={"body"}
+          use:popover={groupContextMenuPopover} out:popoverExit
+          data-terminal-group-context-menu
+          data-testid="terminal-group-context-menu"
+          class="fixed w-56 max-w-[calc(100vw-16px)] gp-menu gp-pop p-1 text-meta text-textPrimary"
+          style="z-index: {LAYERS.MENU}"
+          role="menu"
+          aria-label={`Pair actions for ${targetLabel}`}
+          tabindex="-1"
+          onkeydown={handleContextMenuKeydown}
+        >
+          <div class="px-2.5 py-1 flex items-center gap-1.5 text-micro text-textMuted truncate">
+            <Columns2 size={11} class="shrink-0 text-accent" />
+            <span class="font-medium text-textPrimary truncate">{targetLabel}</span>
+            <span class="ml-auto text-textMuted shrink-0">{groupLeaves.length} panes</span>
+          </div>
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          {#if activeGroup?.id !== targetGroup.id}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              onclick={() => {
+                const gId = targetGroup.id;
+                closeChrome();
+                activateSplitGroup(gId);
+              }}
+            >
+              <Eye size={13} class="shrink-0 text-accent" />
+              <span class="truncate">Switch to {targetLabel}</span>
+            </button>
+          {/if}
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-rename"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              startGroupInlineRename(gId);
+            }}
+          >
+            <Pencil size={13} class="shrink-0" />
+            <span>Rename Pair…</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-flip"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              flipGroupOrientation(gId);
+            }}
+          >
+            <RotateCw size={13} class="shrink-0" />
+            <span>Flip Split Orientation</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-swap"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              swapPaneInGroup(gId);
+            }}
+          >
+            <Columns2 size={13} class="shrink-0" />
+            <span>Swap Panes in Pair</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-equalize"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              equalizeGroupSplits(gId);
+            }}
+          >
+            <Rows2 size={13} class="shrink-0" />
+            <span>Equalize Split Sizes</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-pin-all"
+            onclick={() => {
+              const gId = targetGroup.id;
+              const nextPinned = !allGroupPinned;
+              closeChrome();
+              setGroupPinned(gId, nextPinned);
+            }}
+          >
+            {#if allGroupPinned}
+              <PinOff size={13} class="shrink-0" />
+              <span>Unpin All Panes in Pair</span>
+            {:else}
+              <Pin size={13} class="shrink-0" />
+              <span>Pin All Panes in Pair</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            disabled={groupSegIdx <= 0}
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              moveGroupInStrip(gId, -1);
+            }}
+          >
+            <ChevronLeft size={13} class="shrink-0" />
+            <span>Move Pair Left</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            disabled={groupSegIdx < 0 || groupSegIdx >= tabStripSegments.length - 1}
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              moveGroupInStrip(gId, 1);
+            }}
+          >
+            <ChevronRight size={13} class="shrink-0" />
+            <span>Move Pair Right</span>
+          </button>
+          <div class="gp-menu-sep my-0.5" role="separator"></div>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-group-ctx-ungroup"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              ungroupPair(gId);
+            }}
+          >
+            <Minimize2 size={13} class="shrink-0" />
+            <span>Ungroup Pair (Keep Tabs)</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="gp-menu-item text-danger"
+            data-testid="terminal-group-ctx-close-all"
+            onclick={() => {
+              const gId = targetGroup.id;
+              closeChrome();
+              void closePairTabs(gId);
+            }}
+          >
+            <X size={13} class="shrink-0" />
+            <span>Close All Tabs in Pair</span>
+          </button>
+        </div>
+      {/if}
     {/if}
 
     {#if tabOptions && mode === "shell" && activeId}
       <form class="terminal-popover px-3 py-1.5 flex flex-wrap items-center gap-2 bg-surface" onsubmit={saveTabName}>
         <input aria-label="Terminal tab name" bind:value={renameValue} maxlength="64" placeholder="Use automatic title" class="gp-field min-w-0 w-36" />
         <button type="submit" class="gp-btn" data-size="sm">Rename</button>
-        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={tabState.tabs[0]?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, -1))}><ChevronLeft size={13} /></button>
-        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={tabState.tabs.at(-1)?.id === activeId} onclick={() => activeId && (tabState = moveTab(tabState, activeId, 1))}><ChevronRight size={13} /></button>
+        {#if activeTab}
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            data-testid="terminal-tab-pin-toggle"
+            aria-pressed={Boolean(activeTab.pinned)}
+            title={activeTab.pinned ? "Unpin tab so background tab clicks can replace its split slot" : "Pin tab in split so selecting background tabs will not evict it"}
+            onclick={() => {
+              if (activeId) tabState = toggleTabPinned(tabState, activeId);
+            }}
+          >
+            {#if activeTab.pinned}<PinOff size={11} /> Unpin{:else}<Pin size={11} /> Pin{/if}
+          </button>
+        {/if}
+        {#if activeGroup}
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            data-testid="terminal-options-ungroup-btn"
+            onclick={() => {
+              ungroupPair(activeGroup.id);
+              tabOptions = false;
+            }}
+          >
+            Ungroup pair
+          </button>
+        {/if}
+        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab left" disabled={orderedStripTabs[0]?.id === activeId} onclick={() => activeId && moveTabInStrip(activeId, -1)}><ChevronLeft size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Move terminal tab right" disabled={orderedStripTabs.at(-1)?.id === activeId} onclick={() => activeId && moveTabInStrip(activeId, 1)}><ChevronRight size={13} /></button>
         {#if !activeIsNonTerminal}
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            data-testid="terminal-tab-opt-copy-on-select"
+            aria-pressed={$interfaceStore.terminalCopyOnSelect}
+            title="Copy selected terminal text to the clipboard as soon as selection finishes"
+            onclick={() => {
+              interfaceStore.setTerminalCopyOnSelect(!$interfaceStore.terminalCopyOnSelect);
+            }}
+          >
+            Select-to-Copy: {$interfaceStore.terminalCopyOnSelect ? "On" : "Off"}
+          </button>
           <select aria-label="Terminal output actions" onchange={outputAction} class="gp-select">
-            <option value="">Output actions</option><option value="selection">Copy selection</option><option value="last-copy">Copy last command output</option><option value="last-split">Open last output in split</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
+            <option value="">Output actions</option><option value="selection">Copy selection</option><option value="copy-md">Copy as Markdown</option><option value="last-copy">Copy last command output</option><option value="last-cmd">Copy last command</option><option value="run-last-new-shell">Run in new split shell</option><option value="last-split">Open last output in split</option><option value="copy">Copy retained output</option><option value="export">Export retained output…</option>
           </select>
         {/if}
       </form>
     {/if}
-    <div class="terminal-panes flex-1 min-h-0 relative" data-split={splitRoot !== null ? "true" : "false"} class:hidden={mode !== "shell"}>
+
+    <div class="flex-1 min-h-0 min-w-0 flex overflow-hidden" class:hidden={mode !== "shell"}>
+      {#if explorerSidebarOpen && repoPath}
+        <aside
+          data-testid="terminal-explorer-sidebar"
+          aria-label="Terminal file explorer sidebar"
+          style:width={`${explorerSidebarWidth}px`}
+          class="gp-float-card shrink-0 flex flex-col min-h-0 max-w-[45%] overflow-hidden"
+          onpointerdowncapture={(event) => {
+            lastExplorerMod = { altKey: event.altKey, metaOrCtrlKey: event.metaKey || event.ctrlKey };
+          }}
+        >
+          <div class="h-8 shrink-0 px-2 bg-surface/80 flex items-center justify-between gap-1 select-none">
+            <div class="flex items-center gap-1.5 min-w-0 text-micro font-medium text-textPrimary">
+              <FolderTree size={12} class="text-accent shrink-0" />
+              <span class="truncate">Explorer</span>
+            </div>
+            <div class="flex items-center gap-0.5 shrink-0">
+              <div
+                class="inline-flex items-center gap-0.5 p-0.5 rounded-md bg-background/80 border border-border/65"
+                role="group"
+                aria-label="Open files in"
+              >
+                <button
+                  type="button"
+                  data-testid="terminal-explorer-target-tab"
+                  aria-pressed={explorerOpenTarget === "tab"}
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'tab' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  title="Open clicked files in a Files tab (or update an already-visible file pane) without adding a 3rd split pane · Alt+Click splits · ⌘/Ctrl+Click opens in Code view"
+                  onclick={() => setExplorerOpenTarget("tab")}
+                >
+                  <FileText size={10} class="shrink-0" />
+                  <span>Tab</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="terminal-explorer-target-split"
+                  aria-pressed={explorerOpenTarget === "split"}
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'split' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  title="Open clicked files side-by-side in split view · ⌘/Ctrl+Click opens in Code view"
+                  onclick={() => setExplorerOpenTarget("split")}
+                >
+                  <Columns2 size={10} class="shrink-0" />
+                  <span>Split</span>
+                </button>
+                {#if onOpenInCodeView}
+                  <button
+                    type="button"
+                    data-testid="terminal-explorer-target-code"
+                    aria-pressed={explorerOpenTarget === "code"}
+                    class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'code' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                    title="Open clicked files in the full Code view · ⌘/Ctrl+Click opens a Files tab · Alt+Click splits"
+                    onclick={() => setExplorerOpenTarget("code")}
+                  >
+                    <ExternalLink size={10} class="shrink-0" />
+                    <span>Code</span>
+                  </button>
+                {/if}
+              </div>
+              {#if activeExplorerFile}
+                <button
+                  type="button"
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  data-testid="terminal-explorer-send-file"
+                  aria-label={`Send @${activeExplorerFile} to session`}
+                  title={`Attach @${activeExplorerFile} to active agent or shell`}
+                  onclick={() => activeExplorerFile && sendReferenceToAgent(`@${activeExplorerFile} `)}
+                >
+                  <Send size={11} />
+                </button>
+              {/if}
+              <button
+                type="button"
+                class="gp-icon-btn"
+                data-size="sm"
+                aria-label="Close file explorer sidebar"
+                title="Hide docked File Explorer sidebar"
+                onclick={toggleExplorerSidebar}
+              >
+                <PanelLeftClose size={12} />
+              </button>
+            </div>
+          </div>
+          <div class="flex-1 min-h-0 overflow-hidden">
+            <ExplorerRail
+              repoPath={activeTab?.checkout ?? repoPath}
+              selectedFile={activeExplorerFile}
+              onSelectFile={(p) => openFromExplorerSidebar(p, null, null)}
+              onPinFile={(p) => openFromExplorerSidebar(p, null, null)}
+              onSelectMatch={(p, line, col) => openFromExplorerSidebar(p, line, col)}
+            />
+          </div>
+        </aside>
+        <!-- Justified: WAI-ARIA 1.2 Window Splitter pattern requires a focusable separator with arrow-key resizing; Svelte's static check classifies role="separator" as non-interactive. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <div
+          role="separator"
+          tabindex="0"
+          aria-orientation="vertical"
+          aria-label="Resize file explorer sidebar (double-click to reset)"
+          aria-valuenow={explorerSidebarWidth}
+          aria-valuemin={TERMINAL_EXPLORER_WIDTH_MIN}
+          aria-valuemax={TERMINAL_EXPLORER_WIDTH_MAX}
+          data-testid="terminal-explorer-sidebar-sash"
+          class="w-1.5 shrink-0 flex items-center justify-center cursor-col-resize select-none group"
+          onpointerdown={startExplorerResize}
+          ondblclick={() => {
+            terminalExplorerSidebar.setWidth(TERMINAL_EXPLORER_WIDTH_DEFAULT);
+          }}
+          onkeydown={handleExplorerSashKeydown}
+        >
+          <span class="pointer-events-none w-px h-full transition-colors bg-border group-hover:bg-accent/70 group-hover:w-0.5 group-focus-visible:bg-accent"></span>
+        </div>
+      {/if}
+    <div class="terminal-panes flex-1 min-h-0 min-w-0 relative" data-split={splitRoot !== null ? "true" : "false"}>
       <!-- Pane boxes are fractions of this canvas, which is never shorter
            than every pane's minimum: a short dock scrolls its panes instead
            of squeezing a split to grids with no rows. Sash drags measure it. -->
@@ -2851,15 +6369,32 @@
       {:else if tabState.tabs.length === 0}
         <div class="h-full flex flex-col items-center justify-center gap-3 text-textMuted text-xs">
           <span>No sessions open.</span>
-          <div class="flex items-center gap-2">
-            <button type="button" class="gp-btn" data-size="sm" onclick={() => newTab("shell")}>
-              <SquareTerminal size={12} /> New shell
-            </button>
-            {#if $hostPlatform.browser_sessions}
-              <button type="button" class="gp-btn" data-size="sm" data-terminal-new-browser onclick={() => newTab("browser")} title={capacityTitleFor("browser")}>
-                <Globe size={12} /> New browser
+          <div class="flex flex-wrap items-center justify-center gap-2 px-4">
+            {#each sessionTypes as launcher (launcher.kind)}
+              <button
+                type="button"
+                class="gp-btn"
+                data-size="sm"
+                data-testid={`terminal-empty-launch-${launcher.kind}`}
+                data-terminal-new-browser={launcher.kind === "browser" ? "" : undefined}
+                disabled={!canCreateKind(launcher.kind)}
+                title={capacityTitleFor(launcher.kind)}
+                onclick={() => newTab(launcher.kind)}
+              >
+                <LauncherIcon kind={launcher.kind} size={12} /> {launcher.label}
               </button>
-            {/if}
+            {/each}
+            <button
+              type="button"
+              class="gp-btn"
+              data-size="sm"
+              data-testid="terminal-empty-launch-file"
+              disabled={!canCreateKind("file")}
+              title={capacityTitleFor("file")}
+              onclick={() => void openBeside("file")}
+            >
+              <LauncherIcon kind="file" size={12} /> File Explorer
+            </button>
           </div>
         </div>
       {:else}
@@ -2868,22 +6403,33 @@
                at zero height would have its xterm reflow to a 1-row grid and
                tell the shell about it. -->
           {@const isVisiblePane = splitIds ? splitIds.includes(tab.id) : tab.id === tabState.activeId}
+          {@const isFocusedPane = tab.id === tabState.activeId}
+          {@const paneSlot = splitSlotByTabId[tab.id]}
+          {@const paneDisplay = tabDisplayTitle(tab, effectiveAgentStatuses[tab.id], tabBrowserStates[tab.id])}
+          {@const paneOscBadge = oscStatusBadge(effectiveAgentStatuses[tab.id])}
+          {@const paneSubdirRaw = tab.startDir ? relativeToRepo(tab.startDir, tab.checkout ?? repoPath ?? "") : null}
+          {@const paneSubdir = paneSubdirRaw && paneSubdirRaw !== "." ? paneSubdirRaw : null}
+          {@const paneCheckout = tab.checkout ? (tab.checkout.split(/[\\/]/).filter(Boolean).pop() ?? tab.checkout) : null}
+          {@const paneLocation = paneCheckout ?? paneSubdir}
+          {@const isRenamingThisPane = inlineRenameTabId === tab.id && inlineRenameSurface === "pane"}
           <div
             use:paneDropZone={tab.id}
-            class="terminal-pane absolute overflow-hidden {splitRoot && !zoomedPaneId && tab.id === tabState.activeId ? 'ring-1 ring-inset ring-accent/40' : ''}"
+            class="terminal-pane absolute overflow-hidden flex flex-col {splitRoot && !zoomedPaneId ? (isFocusedPane ? 'ring-1 ring-inset ring-accent/65' : 'ring-1 ring-inset ring-border/35') : ''}"
             style={paneBoxStyle(tab.id)}
             data-pane-id={tab.id}
-            data-split-active={splitRoot && tab.id === tabState.activeId ? "true" : "false"}
+            data-split-active={splitRoot && isFocusedPane ? "true" : "false"}
             class:hidden={!isVisiblePane}
             onfocusin={() => { if (activeId !== tab.id) selectTab(tab.id); }}
             onpointerdown={() => { if (splitRoot && activeId !== tab.id) selectTab(tab.id); }}
             ondragover={(event) => {
               if (draggedTabId) {
                 if (draggedTabId === tab.id) return;
-                if (!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) return;
+                const hint = resolveTabDropZone(event, tab.id);
+                if (!hint) return;
+                if (hint.mode !== "swap" && !hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) return;
                 event.preventDefault();
                 if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-                tabDropHint = computeTabDropHint(event, tab.id);
+                tabDropHint = hint;
                 return;
               }
               const inApp = terminalDropZones.currentInAppDrag();
@@ -2913,20 +6459,74 @@
             ondrop={(event) => {
               if (draggedTabId) {
                 if (draggedTabId === tab.id) return;
-                if (!hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES) {
+                const hint = resolveTabDropZone(event, tab.id);
+                if (!hint || (hint.mode !== "swap" && !hasPane(splitRoot, draggedTabId) && leafPaneIds(splitRoot).length >= MAX_SPLIT_PANES)) {
                   draggedTabId = null;
                   tabDropHint = null;
                   return;
                 }
                 event.preventDefault();
-                const hint = computeTabDropHint(event, tab.id);
                 const moving = draggedTabId;
                 draggedTabId = null;
                 tabDropHint = null;
-                if (hint) {
-                  zoomedPaneId = null;
-                  splitRoot = movePaneToSplit(splitRoot, moving, tab.id, hint.direction, hint.position);
-                  selectTab(moving);
+                tabStripDropHint = null;
+                zoomedPaneId = null;
+                if (hint.mode === "swap") {
+                  if (!splitRoot) {
+                    selectTab(moving);
+                  } else if (hasPane(splitRoot, moving) && hasPane(splitRoot, tab.id)) {
+                    const swapped = swapPanes(splitRoot, moving, tab.id);
+                    applyGroupsAndCoLocate(
+                      upsertSplitGroup(splitGroups, swapped, {
+                        groupId: activeGroup?.id,
+                        name: activeGroup?.name,
+                        activePaneId: moving,
+                      }),
+                      activateTab(tabState, moving),
+                    );
+                  } else if (hasPane(splitRoot, tab.id)) {
+                    const baseGroups = removePaneFromGroups(splitGroups, moving);
+                    const refreshedTarget = findGroupForPane(baseGroups, tab.id);
+                    const baseTree = refreshedTarget?.tree ?? splitRoot;
+                    let nextTree: SplitNode | null = baseTree;
+                    if (pinnedTabIds.has(tab.id)) {
+                      const choice = chooseSplitReplacementSlot(baseTree, tab.id, pinnedTabIds);
+                      if (choice?.mode === "replace") nextTree = replacePane(baseTree, choice.targetPaneId, moving);
+                      else if (choice?.mode === "split") nextTree = splitPane(baseTree, choice.anchorPaneId, moving, "row", "after", 0.5);
+                      else {
+                        sessionError = "That split pane is pinned and all 8 split slots are full — unpin or remove a pane first.";
+                        return;
+                      }
+                    } else {
+                      nextTree = replacePane(baseTree, tab.id, moving);
+                    }
+                    applyGroupsAndCoLocate(
+                      upsertSplitGroup(baseGroups, nextTree, {
+                        groupId: refreshedTarget?.id ?? activeGroup?.id,
+                        name: refreshedTarget?.name ?? activeGroup?.name,
+                        activePaneId: moving,
+                      }),
+                      activateTab(tabState, moving),
+                    );
+                  }
+                } else {
+                  const baseGroups = removePaneFromGroups(splitGroups, moving);
+                  const refreshedTarget = findGroupForPane(baseGroups, tab.id);
+                  const nextTree = movePaneToSplit(
+                    refreshedTarget?.tree ?? null,
+                    moving,
+                    tab.id,
+                    hint.direction,
+                    hint.position,
+                  );
+                  applyGroupsAndCoLocate(
+                    upsertSplitGroup(baseGroups, nextTree, {
+                      groupId: refreshedTarget?.id,
+                      name: refreshedTarget?.name,
+                      activePaneId: moving,
+                    }),
+                    activateTab(tabState, moving),
+                  );
                 }
                 return;
               }
@@ -2936,7 +6536,8 @@
               if (paths.length === 0) return;
               event.preventDefault();
               const el = event.currentTarget;
-              const allowEdges = Boolean((inApp?.filesOnly ?? true) && canEdgeSplitDrop(paths, tab.id));
+              const filesOnly = inApp?.filesOnly ?? true;
+              const allowEdges = Boolean(filesOnly && canEdgeSplitDrop(paths, tab.id));
               const region =
                 el instanceof HTMLElement
                   ? classifyDropRegion(
@@ -2947,7 +6548,7 @@
                   : "center";
               fileDropHint = null;
               terminalDropZones.endInAppDrag();
-              handleFileDropOnPane(tab.id, paths, region ?? "center");
+              handleFileDropOnPane(tab.id, paths, region ?? "center", filesOnly);
             }}
             role="tabpanel"
             tabindex="-1"
@@ -2955,6 +6556,188 @@
             aria-labelledby={`terminal-tab-${tab.id}`}
             aria-label={tabLabel(tab)}
           >
+            {#if splitRoot}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div
+                class="h-7 shrink-0 px-2 flex items-center gap-1.5 min-w-0 select-none text-micro transition-colors {isRenamingThisPane ? '' : 'cursor-grab active:cursor-grabbing'} {isFocusedPane ? 'bg-accent/10 text-textPrimary' : 'bg-surface/80 text-textMuted'}"
+                data-testid="terminal-split-pane-header"
+                data-pane-focused={isFocusedPane ? "true" : "false"}
+                data-pane-pinned={tab.pinned ? "true" : "false"}
+                draggable={!isRenamingThisPane}
+                ondragstart={(event) => {
+                  if (event.target instanceof HTMLElement && event.target.closest("button, input")) {
+                    event.preventDefault();
+                    return;
+                  }
+                  draggedGroupId = null;
+                  draggedTabId = tab.id;
+                  event.dataTransfer?.setData("application/x-gitpulse-terminal-tab", tab.id);
+                  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+                }}
+                ondragend={() => {
+                  draggedTabId = null;
+                  draggedGroupId = null;
+                  tabDropHint = null;
+                }}
+                ondblclick={(event) => {
+                  if (event.target instanceof HTMLElement && event.target.closest("button, input, [data-testid='terminal-split-pane-title']")) {
+                    return;
+                  }
+                  zoomSplitPane(tab.id);
+                }}
+                oncontextmenu={(event) => {
+                  if (isRenamingThisPane) return;
+                  if (event.target instanceof HTMLElement && event.target.closest("input")) return;
+                  openTabContextMenu(tab.id, event, event.currentTarget as HTMLElement);
+                }}
+              >
+                <span
+                  aria-hidden="true"
+                  class="w-1.5 h-1.5 rounded-full shrink-0 {isFocusedPane ? 'bg-accent' : 'bg-border'}"
+                ></span>
+                {#if paneSlot}
+                  <span class="font-mono tabular-nums shrink-0 {isFocusedPane ? 'text-accent font-semibold' : 'text-textMuted'}">
+                    #{paneSlot}
+                  </span>
+                {/if}
+                <LauncherIcon kind={tab.launcher} size={11} class="shrink-0" />
+                {#if tab.parentSessionId}
+                  <span class="text-accent shrink-0" title="Child session spawned by parent agent">↳</span>
+                {/if}
+                {#if isRenamingThisPane}
+                  <input
+                    bind:this={inlineRenameInput}
+                    bind:value={inlineRenameDraft}
+                    data-inline-rename
+                    data-testid="terminal-inline-rename-input"
+                    aria-label="Rename split pane"
+                    maxlength="64"
+                    class="gp-field h-5 px-1.5 py-0 min-w-16 w-36 text-micro"
+                    onpointerdown={(event) => event.stopPropagation()}
+                    onclick={(event) => event.stopPropagation()}
+                    onkeydown={(event) => {
+                      if (isImeComposition(event)) return;
+                      event.stopPropagation();
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        commitInlineRename(tab.id, true);
+                      } else if (event.key === "Escape") {
+                        event.preventDefault();
+                        cancelInlineRename(true);
+                      }
+                    }}
+                    onblur={() => commitInlineRename(tab.id)}
+                  />
+                {:else}
+                  <span
+                    data-testid="terminal-split-pane-title"
+                    class="split-pane-primary truncate min-w-8 {isFocusedPane ? 'font-semibold text-textPrimary' : 'font-medium text-textMuted'}"
+                    title={`${launcherLabel(tab.launcher)} — ${paneDisplay.fullTitle} (double-click to rename)`}
+                    ondblclick={(event) => {
+                      event.stopPropagation();
+                      startInlineRename(tab.id, "pane");
+                    }}
+                  >
+                    {paneDisplay.primary}
+                  </span>
+                {/if}
+                {#if paneDisplay.secondary}
+                  <span class="split-pane-secondary truncate max-w-36 text-textMuted">· {paneDisplay.secondary}</span>
+                {/if}
+                {#if paneLocation}
+                  <span
+                    class="split-pane-location px-1 rounded border border-border/65 bg-surface font-mono text-textMuted truncate max-w-28 shrink-0"
+                    title={tab.checkout ?? paneSubdir ?? undefined}
+                  >
+                    {paneLocation}
+                  </span>
+                {/if}
+                {#if tabStatuses[tab.id] === "exited"}
+                  <span class="text-textMuted shrink-0">· Ended</span>
+                {:else if tabStatuses[tab.id] === "error"}
+                  <span class="text-danger shrink-0">· Error</span>
+                {:else if paneOscBadge}
+                  <span class="shrink-0 {paneOscBadge.cls}" title={effectiveAgentStatuses[tab.id]?.detail ?? paneOscBadge.label}>
+                    · {paneOscBadge.label}
+                  </span>
+                {/if}
+                <span class="flex-1"></span>
+                {#if zoomedPaneId === tab.id && hiddenSplitSummary.badgeLabel}
+                  <button
+                    type="button"
+                    class="gp-chip shrink-0 cursor-pointer"
+                    data-tone={hiddenSplitSummary.tone ?? "accent"}
+                    data-testid="terminal-zoomed-hidden-alert"
+                    onpointerdown={(event) => event.stopPropagation()}
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      revealHiddenSplitUrgent();
+                    }}
+                    title="Hidden split sibling activity — click to restore split panes and show"
+                  >
+                    {hiddenSplitSummary.badgeLabel}
+                  </button>
+                {/if}
+                {#if isFocusedPane}
+                  <span class="split-pane-active-marker gp-chip shrink-0" data-tone="accent" data-testid="terminal-split-active-badge">
+                    Active
+                  </span>
+                {/if}
+                <button
+                  type="button"
+                  class="gp-icon-btn shrink-0 {tab.pinned ? 'text-accent bg-accent/15' : ''}"
+                  data-size="sm"
+                  data-testid="terminal-split-pin-btn"
+                  aria-pressed={Boolean(tab.pinned)}
+                  onpointerdown={(event) => event.stopPropagation()}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    tabState = toggleTabPinned(tabState, tab.id);
+                  }}
+                  aria-label={tab.pinned ? `Unpin ${tabLabel(tab)} pane` : `Pin ${tabLabel(tab)} pane`}
+                  title={tab.pinned ? "Pinned in split — background tab selection will not evict this pane" : "Pin pane so selecting background tabs will not evict it"}
+                >
+                  {#if tab.pinned}
+                    <PinOff size={11} />
+                  {:else}
+                    <Pin size={11} />
+                  {/if}
+                </button>
+                <button
+                  type="button"
+                  class="gp-icon-btn shrink-0"
+                  data-size="sm"
+                  onpointerdown={(event) => event.stopPropagation()}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    zoomSplitPane(tab.id);
+                  }}
+                  aria-label={zoomedPaneId === tab.id ? `Restore ${tabLabel(tab)} split size` : `Zoom ${tabLabel(tab)} pane`}
+                  title={zoomedPaneId === tab.id ? "Restore split panes (or double-click header)" : "Zoom this pane (or double-click header)"}
+                >
+                  {#if zoomedPaneId === tab.id}
+                    <Minimize2 size={11} />
+                  {:else}
+                    <Maximize2 size={11} />
+                  {/if}
+                </button>
+                <button
+                  type="button"
+                  class="gp-icon-btn shrink-0"
+                  data-size="sm"
+                  onpointerdown={(event) => event.stopPropagation()}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    removePaneFromSplit(tab.id);
+                  }}
+                  aria-label={`Remove ${tabLabel(tab)} from split`}
+                  title="Keep session running in background tab and remove from split view"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            {/if}
+            <div class="relative flex-1 min-h-0 min-w-0">
             {#if tab.launcher === "browser"}
             <BrowserSession
               bind:this={browsers[tab.id]}
@@ -2963,6 +6746,11 @@
               onTitle={(title) => (tabState = setTabTitle(tabState, tab.id, title))}
               initialUrl={tab.url}
               onUrl={(url) => (tabState = setTabUrl(tabState, tab.id, url))}
+              onPageState={(pageState) => {
+                const prev = tabBrowserStates[tab.id];
+                if (prev?.loading === pageState.loading && prev?.error === pageState.error) return;
+                tabBrowserStates = { ...tabBrowserStates, [tab.id]: pageState };
+              }}
               onSendToAgent={sendReferenceToAgent}
             />
             {:else if tab.launcher === "file"}
@@ -2976,10 +6764,12 @@
               revealLine={tab.revealLine ?? null}
               revealColumn={tab.revealColumn ?? null}
               revealSeq={tab.revealSeq ?? 0}
+              defaultExplorerOpen={explorerSidebarOpen ? false : undefined}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
               onSelectFile={(fp, line, col) => (tabState = setTabFile(tabState, tab.id, fp, line ?? null, col ?? null))}
               onResolvedPath={(fp) => (tabState = setTabFile(tabState, tab.id, fp, null, null, { preserveReveal: true }))}
               onOpenInCodeView={onOpenInCodeView}
+              onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
             />
             {:else}
@@ -2995,6 +6785,7 @@
               tabId={tab.id}
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}
+              initialCommand={tab.initialCommand}
               initialAutoWake={tab.autoWake ?? false}
               purpose={tab.purpose}
               startDir={tab.startDir}
@@ -3005,22 +6796,52 @@
               onOpenFileSplit={(path, line, column, fallbackPath) => Boolean(openFileSplitFor(path, line, column, { focus: false, anchorId: tab.id, checkout: tab.checkout, fallbackPath }) === undefined)}
               onOpenSnippetSplit={(title, content) => openSnippetSplitFor(title, content) === undefined}
               onSendToAgent={sendReferenceToAgent}
+              onRunInNewShell={(cmd, sub) => void runCommandInNewSplitShell(tab.id, cmd, sub)}
               onAgentStatus={(st) => { tabAgentStatuses = { ...tabAgentStatuses, [tab.id]: st }; }}
               revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
               confirmCloseSelf={() => confirmClose(tab.id)}
-              title={tab.name}
+              title={effectiveSessionTitle(tab, effectiveAgentStatuses[tab.id])}
+              userNamed={Boolean(tab.userNamed)}
+              isActive={tab.id === tabState.activeId}
+              splitSlot={paneSlot ?? null}
+              attentionLabel={oscAttentionLabel(effectiveAgentStatuses[tab.id])}
               onStatus={(status) => { tabStatuses = { ...tabStatuses, [tab.id]: status }; terminalLaunchRequests.update(tab.id, status); }}
               onActivity={() => { if (paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })) return; if (!unread.has(tab.id)) unread = new Set([...unread, tab.id]); }}
             />
             {/if}
+            </div>
             {#if tabDropHint?.paneId === tab.id}
-              <div
-                class="pointer-events-none absolute bg-accent/20 border-2 border-accent/65 transition-opacity"
-                style:z-index={LAYERS.SCROLL_CUE}
-                style={tabDropHint.direction === "row"
-                  ? (tabDropHint.position === "before" ? "left:0;top:0;width:50%;height:100%;" : "left:50%;top:0;width:50%;height:100%;")
-                  : (tabDropHint.position === "before" ? "left:0;top:0;width:100%;height:50%;" : "left:0;top:50%;width:100%;height:50%;")}
-              ></div>
+              {#if tabDropHint.mode === "swap"}
+                <div
+                  data-testid="terminal-tab-drop-swap"
+                  class="pointer-events-none absolute flex items-center justify-center bg-accent/15 border-2 border-dashed border-accent/65 rounded-lg transition-opacity"
+                  style:z-index={LAYERS.SCROLL_CUE}
+                  style="left:8px;top:8px;right:8px;bottom:8px;"
+                >
+                  <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/65 text-meta font-medium text-textPrimary shadow-sm">
+                    {!splitRoot
+                      ? "Switch to tab"
+                      : draggedTabId && hasPane(splitRoot, draggedTabId)
+                        ? "Swap split panes"
+                        : "Place in split pane"}
+                  </span>
+                </div>
+              {:else}
+                <div
+                  data-testid="terminal-tab-drop-split"
+                  class="pointer-events-none absolute flex items-center justify-center bg-accent/20 border-2 border-accent/65 transition-opacity"
+                  style:z-index={LAYERS.SCROLL_CUE}
+                  style={tabDropHint.direction === "row"
+                    ? (tabDropHint.position === "before" ? "left:0;top:0;width:50%;height:100%;" : "left:50%;top:0;width:50%;height:100%;")
+                    : (tabDropHint.position === "before" ? "left:0;top:0;width:100%;height:50%;" : "left:0;top:50%;width:100%;height:50%;")}
+                >
+                  <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/65 text-meta font-medium text-textPrimary shadow-sm">
+                    {tabDropHint.direction === "row"
+                      ? (tabDropHint.position === "before" ? "Split left" : "Split right")
+                      : (tabDropHint.position === "before" ? "Split top" : "Split bottom")}
+                  </span>
+                </div>
+              {/if}
             {/if}
             {#if fileDropHint?.paneId === tab.id}
               <div
@@ -3032,17 +6853,17 @@
                   : fileDropHint.region === "left"
                     ? "left:0;top:0;width:50%;height:100%;"
                     : fileDropHint.region === "right"
-                      ? "left:50%;top:0;width:50%;height:100%;"
-                      : fileDropHint.region === "top"
-                        ? "left:0;top:0;width:100%;height:50%;"
-                        : "left:0;top:50%;width:100%;height:50%;"}
+                       ? "left:50%;top:0;width:50%;height:100%;"
+                       : fileDropHint.region === "top"
+                         ? "left:0;top:0;width:100%;height:50%;"
+                         : "left:0;top:50%;width:100%;height:50%;"}
               >
                 <span class="px-2.5 py-1 rounded-md bg-surface/95 border border-accent/65 text-meta font-medium text-textPrimary shadow-sm">
                   {fileDropHint.region !== "center"
                     ? "Split & open file"
                     : isPromptLauncher(tab.launcher)
                       ? `Attach @path to ${launcherLabel(tab.launcher)}`
-                      : tab.launcher === "file"
+                      : tab.launcher === "file" && (terminalDropZones.currentInAppDrag()?.filesOnly ?? true)
                         ? "Open file in pane"
                         : "Insert path into shell"}
                 </span>
@@ -3069,7 +6890,7 @@
               ? `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; height: ${(sash.box.height * 100).toFixed(4)}%;`
               : `left: ${(sash.box.left * 100).toFixed(4)}%; top: ${(sash.box.top * 100).toFixed(4)}%; width: ${(sash.box.width * 100).toFixed(4)}%;`}
             onpointerdown={(event) => startSashDrag(event, sash)}
-            ondblclick={() => { splitRoot = equalizeSplits(splitRoot, sash.branchId); }}
+            ondblclick={() => { if (splitRoot) setActiveSplitTree(equalizeSplits(splitRoot, sash.branchId)); }}
             onkeydown={(event) => handleSashKeydown(event, sash)}
           >
             <span
@@ -3079,6 +6900,7 @@
         {/each}
       {/if}
       </div>
+    </div>
     </div>
 
   {#if mode === "console"}
@@ -3302,13 +7124,45 @@
     padding: 0.125rem 0;
   }
   .session-path { min-width: 0; }
+  .terminal-strip-row {
+    container-type: inline-size;
+    container-name: terminal-strip;
+  }
   .terminal-tab-scroller {
     overscroll-behavior-x: contain;
     scrollbar-width: thin;
   }
   .terminal-tab-label { max-width: 14rem; }
   [data-crowded="true"] .terminal-tab-label { max-width: 7rem; }
+  @container terminal-strip (max-width: 520px) {
+    .terminal-launcher-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .terminal-tab-scroller[data-crowded="true"] .terminal-tab-label {
+      max-width: 4rem;
+    }
+  }
   .terminal-panes { container-type: inline-size; overflow: auto; }
+  .terminal-pane { container-type: inline-size; container-name: split-pane; }
+  @container split-pane (max-width: 380px) {
+    .split-pane-location,
+    .split-pane-active-marker {
+      display: none;
+    }
+  }
+  @container split-pane (max-width: 280px) {
+    .split-pane-secondary {
+      display: none;
+    }
+  }
   /* Each pane keeps at least MIN_PANE_HEIGHT_PX through the canvas's
      min-height (`minimumSplitHeight`), so Find, warnings and the footer leave
      a readable grid and short docks scroll their panes instead. */

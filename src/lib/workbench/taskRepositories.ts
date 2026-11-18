@@ -11,6 +11,9 @@
  *    out from under the pointer that just checked it.
  */
 
+import { tabMatchesRegistered, type OpenTabRef } from "./openMembership";
+import type { PathIdentityOptions } from "../repos/paths";
+
 export interface PickerRepository {
   id: string;
   name: string;
@@ -209,4 +212,98 @@ export function outsiderLine(outsiders: readonly string[], workspaceName: string
 export function workspaceMembershipLabel(count: number): string {
   if (count <= 0) return "no repositories yet";
   return `${count} ${count === 1 ? "repository" : "repositories"}`;
+}
+
+/** How the Tasks scope navigator orders its Repositories list. */
+export const TASK_REPOSITORY_SORTS = ["name-asc", "name-desc", "open", "recent"] as const;
+export type TaskRepositorySort = (typeof TASK_REPOSITORY_SORTS)[number];
+export const DEFAULT_TASK_REPOSITORY_SORT: TaskRepositorySort = "name-asc";
+
+export const TASK_REPOSITORY_SORT_LABELS: Record<TaskRepositorySort, string> = {
+  "name-asc": "Name, A to Z",
+  "name-desc": "Name, Z to A",
+  open: "Open first",
+  recent: "Recently added",
+};
+
+export function isTaskRepositorySort(value: unknown): value is TaskRepositorySort {
+  return TASK_REPOSITORY_SORTS.some((sort) => sort === value);
+}
+
+export interface SortableNavigatorRepository {
+  id: string;
+  name: string;
+  identity_key: string;
+  updated_at: number;
+}
+
+const repositoryNameCollator = new Intl.Collator("en", { sensitivity: "base", numeric: true });
+
+function compareCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareRepositoryIdentity(a: SortableNavigatorRepository, b: SortableNavigatorRepository): number {
+  return compareCodeUnit(a.identity_key, b.identity_key) || compareCodeUnit(a.id, b.id);
+}
+
+function compareByNameAsc(a: SortableNavigatorRepository, b: SortableNavigatorRepository): number {
+  return (
+    repositoryNameCollator.compare(a.name, b.name) ||
+    compareCodeUnit(a.name, b.name) ||
+    compareRepositoryIdentity(a, b)
+  );
+}
+
+function safeTime(value: number): number {
+  return Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Return a new array of navigator repositories ordered by `sort`, never
+ * mutating `repositories`. Unknown sort keys fall back to `name-asc`.
+ */
+export function sortNavigatorRepositories<T extends SortableNavigatorRepository>(
+  repositories: readonly T[],
+  sort: TaskRepositorySort,
+  openTabs: readonly Pick<OpenTabRef, "path">[] = [],
+  pathOptions: PathIdentityOptions = { caseInsensitive: false },
+): T[] {
+  const mode: TaskRepositorySort = isTaskRepositorySort(sort) ? sort : DEFAULT_TASK_REPOSITORY_SORT;
+  if (mode === "open") {
+    const openRank = new Map<string, number>();
+    for (const repo of repositories) {
+      if (openRank.has(repo.id)) continue;
+      for (let i = 0; i < openTabs.length; i += 1) {
+        if (tabMatchesRegistered(openTabs[i].path, repo.identity_key, pathOptions)) {
+          openRank.set(repo.id, i);
+          break;
+        }
+      }
+    }
+    return [...repositories].sort((a, b) => {
+      const rankA = openRank.get(a.id);
+      const rankB = openRank.get(b.id);
+      if (rankA !== undefined && rankB !== undefined) {
+        return rankA - rankB || compareByNameAsc(a, b);
+      }
+      if (rankA !== undefined) return -1;
+      if (rankB !== undefined) return 1;
+      return compareByNameAsc(a, b);
+    });
+  }
+  if (mode === "recent") {
+    return [...repositories].sort(
+      (a, b) => safeTime(b.updated_at) - safeTime(a.updated_at) || compareByNameAsc(a, b),
+    );
+  }
+  if (mode === "name-desc") {
+    return [...repositories].sort(
+      (a, b) =>
+        repositoryNameCollator.compare(b.name, a.name) ||
+        compareCodeUnit(b.name, a.name) ||
+        compareRepositoryIdentity(a, b),
+    );
+  }
+  return [...repositories].sort(compareByNameAsc);
 }

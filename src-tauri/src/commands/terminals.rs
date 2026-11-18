@@ -544,3 +544,29 @@ pub async fn cmd_terminal_session_ledger_reopen_check(
     })
     .await
 }
+
+/// Persists a stabilized live or user-renamed session title in the durable
+/// session ledger so detached listings and crash/quit recovery offers retain
+/// the session's human-meaningful title across reloads and restarts.
+#[tauri::command(async)]
+pub async fn cmd_terminal_set_title(
+    app: AppHandle,
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    title: Option<String>,
+    user_named: Option<bool>,
+) -> Result<bool, IpcError> {
+    let state = state.inner().clone();
+    off_thread(move || {
+        let (changed, offer_changed) = state.session_ledger().set_title(
+            &session_id,
+            title.as_deref(),
+            user_named.unwrap_or(false),
+        );
+        if offer_changed {
+            state.session_ledger().emit_view(&app);
+        }
+        Ok(changed)
+    })
+    .await
+}

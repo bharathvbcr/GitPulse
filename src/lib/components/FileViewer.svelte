@@ -68,6 +68,7 @@
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import LazyView from "./LazyView.svelte";
   import { explorerLens, toggleBlameLens } from "../files/explorerLens";
+  import { sidebarExplorerDocked } from "../sidebar/layoutStore";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -161,9 +162,19 @@
       ? { actual: diskBase }
       : null;
   });
+  const outerExplorerDocked = $derived($sidebarExplorerDocked);
+  let explorerForcedWithOuterSidebar = $state(false);
+  $effect(() => {
+    if (!outerExplorerDocked) {
+      explorerForcedWithOuterSidebar = false;
+    }
+  });
+  const effectiveExplorerOpen = $derived(
+    explorerOpen && (!outerExplorerDocked || explorerForcedWithOuterSidebar),
+  );
   let paneLayout = $derived(resolveFilePaneLayout({
     containerWidth: fileViewWidth,
-    explorerRequested: explorerOpen,
+    explorerRequested: effectiveExplorerOpen,
     dashboardRequested: dashboardOpen,
     preferredPane: preferredSidePane,
     compactPane,
@@ -541,7 +552,7 @@
   // column again — this re-runs and shows it. The flag clears once the search
   // box has taken focus, which needs the column on screen.
   $effect(() => {
-    if (!$explorerLens.searchFocusPending || paneLayout.explorerVisible) return;
+    if (!$explorerLens.searchFocusPending || paneLayout.explorerVisible || outerExplorerDocked) return;
     untrack(() => toggleSidePane("explorer"));
   });
 
@@ -557,7 +568,7 @@
   }
 
   function toggleSidePane(pane: FileSidePane) {
-    const requested = pane === "explorer" ? explorerOpen : dashboardOpen;
+    const requested = pane === "explorer" ? effectiveExplorerOpen : dashboardOpen;
     const visible = pane === "explorer"
       ? paneLayout.explorerVisible
       : paneLayout.dashboardVisible;
@@ -569,7 +580,11 @@
         // editor without erasing the user's wide-window pane preference.
         compactPane = null;
       } else if (pane === "explorer") {
-        explorerOpen = false;
+        if (outerExplorerDocked && explorerForcedWithOuterSidebar) {
+          explorerForcedWithOuterSidebar = false;
+        } else {
+          explorerOpen = false;
+        }
       } else {
         dashboardOpen = false;
       }
@@ -578,8 +593,14 @@
     }
 
     if (!requested) {
-      if (pane === "explorer") explorerOpen = true;
-      else dashboardOpen = true;
+      if (pane === "explorer") {
+        explorerOpen = true;
+        if (outerExplorerDocked) explorerForcedWithOuterSidebar = true;
+      } else {
+        dashboardOpen = true;
+      }
+    } else if (pane === "explorer" && outerExplorerDocked) {
+      explorerForcedWithOuterSidebar = true;
     }
     // Ignored when the pane fits beside the editor; used as a full-workspace
     // fallback when it does not.

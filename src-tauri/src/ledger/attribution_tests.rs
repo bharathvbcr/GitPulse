@@ -1696,7 +1696,12 @@ fn r2_cap_hidden_row_with_empty_ts_but_in_window_event() {
             );
         });
         let got = link(&repo, &sha(1));
-        eprintln!("hidden-B ts={ts:?}: {:?} {:?}", got.basis, got.session_id);
+        assert_eq!(
+            got.session_id.as_deref(),
+            Some("A"),
+            "hidden ts={ts:?} basis={:?}",
+            got.basis
+        );
     }
 }
 

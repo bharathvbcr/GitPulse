@@ -44,7 +44,50 @@ function fnBody(source: string, name: string): string {
 }
 
 const APPLY = /cmd_tuning_apply(?!_cancel)\b/;
-const strip = (source: string) => source.replace(/\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->|\/\/.*/g, "");
+
+/** Drops block, HTML, and line comments. The earliest opener wins. */
+function strip(source: string): string {
+  let out = "";
+  let i = 0;
+  while (i < source.length) {
+    const block = source.indexOf("/*", i);
+    const html = source.indexOf("<!--", i);
+    const line = source.indexOf("//", i);
+    let at = -1;
+    let kind: "block" | "html" | "line" = "line";
+    if (block !== -1) {
+      at = block;
+      kind = "block";
+    }
+    if (html !== -1 && (at === -1 || html < at)) {
+      at = html;
+      kind = "html";
+    }
+    if (line !== -1 && (at === -1 || line < at)) {
+      at = line;
+      kind = "line";
+    }
+    if (at === -1) {
+      out += source.slice(i);
+      break;
+    }
+    out += source.slice(i, at);
+    if (kind === "block") {
+      const end = source.indexOf("*/", at + 2);
+      if (end === -1) break;
+      i = end + 2;
+    } else if (kind === "html") {
+      const end = source.indexOf("-->", at + 4);
+      if (end === -1) break;
+      i = end + 3;
+    } else {
+      const end = source.indexOf("\n", at + 2);
+      if (end === -1) break;
+      i = end;
+    }
+  }
+  return out;
+}
 
 describe("the frontend reaches the tuning apply from one place", () => {
   const frontend = sources("src", (name) => /\.(ts|svelte)$/.test(name) && !isTest(name));

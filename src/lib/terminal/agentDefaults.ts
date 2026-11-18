@@ -118,6 +118,12 @@ export interface AgentDefaults {
    */
   keep_terminals_running?: boolean;
   /**
+   * Whether authenticated agents (MCP / `gitpulse-hook term`) may list and
+   * read secret-scrubbed screen output from user-opened shell tabs in the same
+   * trusted repository (`include_repo_shells: true`). Off by default (`false`).
+   */
+  allow_agent_shell_reads?: boolean;
+  /**
    * Which model each agent CLI starts with, by launcher. Absent means the
    * CLI's own choice; an entry is never stored empty. Names and levels only —
    * which flag carries them is `model_control` in `terminal_command.rs`.
@@ -333,6 +339,7 @@ export function sanitizeAgentDefaults(
   if (isLiveRunLimit(raw.max_live_runs)) sanitized.max_live_runs = raw.max_live_runs;
   if (isTerminalSessionLimit(raw.max_terminal_sessions)) sanitized.max_terminal_sessions = raw.max_terminal_sessions;
   if (typeof raw.keep_terminals_running === "boolean") sanitized.keep_terminals_running = raw.keep_terminals_running;
+  if (typeof raw.allow_agent_shell_reads === "boolean") sanitized.allow_agent_shell_reads = raw.allow_agent_shell_reads;
   const sources = canonicalSettingSources(raw.claude_setting_sources);
   if (sources) sanitized.claude_setting_sources = sources;
   for (const slot of ["models", "commit_models"] as const) {
@@ -405,4 +412,22 @@ export function withKeepTerminalsRunning(defaults: AgentDefaults, keep: boolean)
   const rest: AgentDefaults = { ...defaults };
   delete rest.keep_terminals_running;
   return keep ? rest : { ...rest, keep_terminals_running: false };
+}
+
+/**
+ * Whether authenticated agents may read secret-scrubbed output from
+ * user-opened shells in the same trusted repository. Absent means off (`false`).
+ */
+export function allowsAgentShellReads(defaults: AgentDefaults): boolean {
+  return defaults.allow_agent_shell_reads === true;
+}
+
+/**
+ * Returns `defaults` with `allow_agent_shell_reads` updated so the default off
+ * state (`false`) is stored as absence and `true` opts in explicitly.
+ */
+export function withAllowAgentShellReads(defaults: AgentDefaults, allow: boolean): AgentDefaults {
+  const rest: AgentDefaults = { ...defaults };
+  delete rest.allow_agent_shell_reads;
+  return allow ? { ...rest, allow_agent_shell_reads: true } : rest;
 }

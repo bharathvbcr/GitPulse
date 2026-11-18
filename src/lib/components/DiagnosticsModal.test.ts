@@ -8,8 +8,9 @@ import DiagnosticsModal, {
   groupDomId,
   hiddenByFilterNotice,
   isCurrentBackendLoad,
+  selectedDiagnosticEntries,
 } from "./DiagnosticsModal.svelte";
-import { diagnostics } from "../diagnostics/diagnostics";
+import { diagnostics, formatDiagnosticReport, groupDiagnostics } from "../diagnostics/diagnostics";
 import { withBackendLogSection } from "../diagnostics/report";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -208,6 +209,9 @@ describe("DiagnosticsModal backend log context", () => {
   });
 
   it("bounds the whole dialog and lets only its content region scroll", () => {
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+    expect(body).toContain("max-w-4xl");
+    expect(body).not.toContain("max-w-xl");
     expect(source).toContain("max-h-[calc(100vh-2rem)] min-h-0");
     expect(source).toContain("min-h-0 flex-1 overflow-y-auto");
   });
@@ -254,5 +258,62 @@ describe("DiagnosticsModal empty state under a severity filter", () => {
     expect(body).toContain("No frontend diagnostics recorded.");
     // "Show all only" is the filter button's own tooltip; the button is the label.
     expect(body).not.toMatch(/Show all\s*<\/button>/);
+  });
+});
+
+describe("DiagnosticsModal selective copying", () => {
+  it("collects entries only for selected groups and formats only those entries", () => {
+    const groups = groupDiagnostics([
+      { id: 1, at: 1000, severity: "error", source: "repo", message: "clone failed", count: 1 },
+      { id: 2, at: 2000, severity: "warning", source: "console", message: "slow tick", count: 1 },
+      { id: 3, at: 3000, severity: "error", source: "pane-crash", message: "graph blew up", count: 1 },
+    ]);
+    const crashGroup = groups.find((g) => g.source === "pane-crash")!;
+    const cloneGroup = groups.find((g) => g.source === "repo")!;
+
+    const picked = selectedDiagnosticEntries(groups, {
+      [crashGroup.key]: true,
+      [cloneGroup.key]: false,
+      unknown: true,
+    });
+    expect(picked.map((entry) => entry.id)).toEqual([3]);
+
+    const report = formatDiagnosticReport(picked, new Date("2026-01-01T00:00:00Z"), "1.99.0");
+    expect(report).toContain("1 error(s), 0 warning(s), 1 distinct");
+    expect(report).toContain("graph blew up");
+    expect(report).not.toContain("clone failed");
+    expect(report).not.toContain("slow tick");
+  });
+
+  it("renders selection checkboxes and per-diagnostic copy buttons when entries exist", () => {
+    diagnostics.clear();
+    diagnostics.error("repo", "clone failed");
+    diagnostics.warn("console", "watch out");
+
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body).toContain('aria-label="Select all visible diagnostics"');
+    expect(body).toContain('aria-label="Select error from repo"');
+    expect(body).toContain('aria-label="Select warning from console"');
+    expect(body).toContain('aria-label="Copy error from repo"');
+    expect(body).toContain('aria-label="Copy warning from console"');
+    diagnostics.clear();
+  });
+
+  it("hides selection controls when no visible diagnostics exist", () => {
+    diagnostics.clear();
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+
+    expect(body).not.toContain('aria-label="Select all visible diagnostics"');
+    expect(body).not.toContain("Copy only this diagnostic");
+    expect(body).toContain("<span>Copy report</span>");
+  });
+
+  it("wires Copy selected and per-group copy to formatDiagnosticReport without backend logs", () => {
+    expect(source).toContain("selectedDiagnosticEntries(visibleGroups, selected)");
+    expect(source).toContain("`Copy selected (${selectedGroups.length})`");
+    expect(source).toContain('"Copy full report"');
+    expect(source).toContain("formatDiagnosticReport(entriesToCopy, new Date(), APP_VERSION)");
+    expect(source).toContain("formatDiagnosticReport(group.entries, new Date(), APP_VERSION)");
   });
 });

@@ -103,4 +103,49 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("overflow-auto gp-scroll");
     expect(source).not.toContain("overflow-y-auto gp-scroll bg-background");
   });
+
+  it("adapts split, outline, and toolbar density from measured container size instead of viewport breakpoints", () => {
+    expect(source).toContain("resolveMarkDevLayout");
+    expect(source).toContain("observeResize");
+    expect(source).toContain("@container/markdev");
+    expect(source).toContain("@container/md-preview");
+    expect(source).not.toContain("md:block");
+    expect(source).toContain("data-markdev-split={layout.splitDirection}");
+    // One switcher, placed by the measured width: inline in the toolbar row,
+    // or on its own row under it so a narrow pane never scrolls it away.
+    expect(source.match(/\{@render modeSwitch\(\)\}/g)?.length).toBe(2);
+    expect(source).toContain('{#if layout.toolbar === "inline"}');
+    expect(source).toContain('{#if layout.toolbar === "stacked"}');
+    expect(source).toContain("data-markdev-mode-row");
+    expect(source).toContain("data-markdev-split-raw");
+    expect(source).toContain("data-markdev-split-preview");
+
+    const rawTag = source.slice(
+      source.lastIndexOf("<div", source.indexOf("data-markdev-split-raw")),
+      source.indexOf(">", source.indexOf("data-markdev-split-raw")) + 1,
+    );
+    // Stacked panes share the height and scroll themselves; side by side, each
+    // keeps a minimum width and the row scrolls sideways.
+    expect(rawTag).toContain("'w-full min-w-0 min-h-0'");
+    expect(rawTag).toContain("min-w-[260px]");
+    expect(rawTag).toContain("layout.splitDirection === 'vertical'");
+    // Mutually exclusive min-* branches: static class before the split expression must not set min-h-0 or min-w-0.
+    expect(rawTag.slice(rawTag.indexOf('class="'), rawTag.indexOf("{layout.splitDirection"))).not.toMatch(
+      /\bmin-[hw]-0\b/,
+    );
+
+    const previewTag = source.slice(
+      source.lastIndexOf("<div", source.indexOf("data-markdev-split-preview")),
+      source.indexOf(">", source.indexOf("data-markdev-split-preview")) + 1,
+    );
+    expect(previewTag).toContain("'w-full min-w-0 min-h-0'");
+    expect(previewTag).toContain("min-w-[260px]");
+    // A stacked split must not be one scroller around both panes: every pane
+    // scroller contains overscroll, so the wheel would never reach it.
+    expect(source).toContain("? 'flex-col overflow-hidden'");
+    expect(source).not.toContain("flex-col overflow-y-auto overflow-x-hidden");
+    expect(previewTag.slice(previewTag.indexOf('class="'), previewTag.indexOf("{layout.splitDirection"))).not.toMatch(
+      /\bmin-[hw]-0\b/,
+    );
+  });
 });

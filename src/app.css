@@ -1590,6 +1590,9 @@ html.macos {
   /* The wallpaper input. `none` until ui/appearance/apply.ts writes a
      `url("…")` inline; drawn only by the body rule below the shell. */
   --gp-backdrop: none;
+  /* How far the wallpaper is faded toward the ground colour, 0..0.9: the
+     Wallpaper intensity input, written inline by apply.ts below 100%. */
+  --gp-backdrop-dim: 0;
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
   /* An inset area inside a panel -- a diff preview, a code block, an
@@ -1684,13 +1687,168 @@ html.macos .gp-shell {
    only from down here. Painted on the shell itself it would sit above the
    veil (an image layer paints over the element's own background colour) and
    the proof would no longer hold. `--gp-backdrop` is the input written
-   inline by ui/appearance/apply.ts; this rule is the only place it is drawn.
-   Static: one composited image, no animation, no filter. */
+   inline by ui/appearance/apply.ts; this rule and the moving layer below are
+   the only places it is drawn. No filter, ever. */
 html.macos[data-backdrop] body {
   background-image: var(--gp-backdrop);
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
+}
+
+/* Wallpaper intensity below 100%: the picture faded toward the ground colour
+   by `--gp-backdrop-dim`. Only present when apply.ts writes the attribute, so
+   full strength draws exactly the rule above. Fading toward a flat colour
+   stays inside the any-desktop proof. */
+html.macos[data-backdrop][data-backdrop-dim] body {
+  background-image:
+    linear-gradient(rgb(var(--c-bg) / var(--gp-backdrop-dim)), rgb(var(--c-bg) / var(--gp-backdrop-dim))),
+    var(--gp-backdrop);
+}
+
+/* The moving wallpaper (ui/appearance/wallpaperMotion.ts). While the host has
+   room for it, a single fixed layer under `body` takes over from the still:
+   negative z-index in the root stacking context, so it paints beneath every
+   in-flow box, the shell veil included, exactly where the still stood. Its
+   first frame is the still (same picture, same cover crop, accents starting
+   transparent), so the hand-over cannot be seen. It moves only `transform` and
+   `opacity`: textures rasterise once and the compositor moves them, so no
+   frame repaints a full-window picture. The same fade as the still sits on
+   top through `::after`. */
+html.macos[data-backdrop][data-backdrop-motion] body {
+  background-image: none;
+}
+
+.gp-wallpaper-motion {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;
+}
+
+html:not(.macos) .gp-wallpaper-motion,
+html:not([data-backdrop]) .gp-wallpaper-motion,
+html:not([data-backdrop-motion]) .gp-wallpaper-motion {
+  display: none;
+}
+
+.gp-wallpaper-motion > * {
+  /* How long a spinning accent takes to appear, so frame one stays the still. */
+  --gp-wp-in: 4s;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.gp-wallpaper-motion > video {
+  object-fit: cover;
+}
+
+.gp-wallpaper-motion > .gp-wp-accent {
+  opacity: 0;
+}
+
+.gp-wallpaper-motion::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-color: rgb(var(--c-bg) / var(--gp-backdrop-dim, 0));
+}
+
+/* The movement itself exists only where motion is welcome; under Reduce Motion
+   (system or app) every layer holds its first frame, which is the still. */
+@media (prefers-reduced-motion: no-preference) {
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > * {
+    will-change: transform, opacity;
+  }
+
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > .gp-wp-drift {
+    animation: gp-wp-drift var(--gp-wp-dur, 90s) ease-in-out infinite alternate;
+  }
+
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > .gp-wp-fade {
+    animation: gp-wp-fade var(--gp-wp-dur, 6s) ease-in-out var(--gp-wp-delay, 0s) infinite;
+  }
+
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > .gp-wp-sweep {
+    animation: gp-wp-sweep var(--gp-wp-dur, 10s) linear var(--gp-wp-delay, 0s) infinite;
+  }
+
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > .gp-wp-spin {
+    animation:
+      gp-wp-spin var(--gp-wp-dur, 90s) linear infinite,
+      gp-wp-in var(--gp-wp-in, 4s) ease-out var(--gp-wp-delay, 0s) forwards;
+  }
+
+  html:not([data-motion="reduced"]) .gp-wallpaper-motion > .gp-wp-rush {
+    animation: gp-wp-rush var(--gp-wp-dur, 5s) ease-in var(--gp-wp-delay, 0s) infinite;
+  }
+}
+
+@keyframes gp-wp-drift {
+  from {
+    transform: none;
+  }
+  to {
+    transform: scale(1.06) translate(-1%, -0.6%);
+  }
+}
+
+@keyframes gp-wp-fade {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes gp-wp-sweep {
+  0% {
+    opacity: 0;
+    transform: translateY(-30%);
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(110%);
+  }
+}
+
+@keyframes gp-wp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes gp-wp-in {
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes gp-wp-rush {
+  0% {
+    opacity: 0;
+    transform: scale(1);
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.7);
+  }
 }
 
 html.macos :is(.gp-glass, .gp-menu, .gp-card.shadow-float) {
@@ -2141,9 +2299,17 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
 
   /* The wallpaper too: a picture behind solid surfaces is the half-finished
      state these preferences exist to avoid. Same selector as the rule that
-     draws it, and later, so it wins. */
+     draws it, and later, so it wins; the faded and moving forms with it. */
   html.macos[data-backdrop] body {
     background-image: none;
+  }
+
+  html.macos[data-backdrop][data-backdrop-dim] body {
+    background-image: none;
+  }
+
+  html.macos .gp-wallpaper-motion {
+    display: none;
   }
 
   /* The window itself stays transparent -- that is fixed at build time -- so
@@ -2220,6 +2386,14 @@ html.macos[data-transparency="reduced"] .gp-shell {
 
 html.macos[data-transparency="reduced"][data-backdrop] body {
   background-image: none;
+}
+
+html.macos[data-transparency="reduced"][data-backdrop][data-backdrop-dim] body {
+  background-image: none;
+}
+
+html.macos[data-transparency="reduced"] .gp-wallpaper-motion {
+  display: none;
 }
 
 html.macos[data-transparency="reduced"],

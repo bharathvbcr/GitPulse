@@ -3,6 +3,7 @@
   import {
     PanelLeftClose,
     PanelLeftOpen,
+    FolderTree,
     ExternalLink,
     Copy,
     Check,
@@ -54,10 +55,12 @@
     revealColumn = null,
     revealSeq = 0,
     initialViewMode = "code",
+    defaultExplorerOpen = undefined,
     onscreen = false,
     onSelectFile,
     onResolvedPath,
     onOpenInCodeView,
+    onDockToSidebar,
     onSendToAgent,
   }: {
     tabId: string;
@@ -69,17 +72,41 @@
     revealColumn?: number | null;
     revealSeq?: number;
     initialViewMode?: "code" | "diff";
+    defaultExplorerOpen?: boolean;
     onscreen?: boolean;
     onSelectFile?: (path: string, line?: number | null, column?: number | null) => void;
     onResolvedPath?: (resolvedPath: string) => void;
     onOpenInCodeView?: (path: string, line: number | null) => void;
+    onDockToSidebar?: () => void;
     onSendToAgent?: (reference: string) => void;
   } = $props();
 
   const draftOwner = $derived(`terminal-file:${tabId}`);
 
-  // Start with the explorer open when opened without a target path or snippet, or compact when opened from a link click / snippet.
-  let explorerOpen = $state(untrack(() => !filePath && !snippet));
+  // Start with the explorer open when opened without a target path or snippet, unless overridden by the docked sidebar.
+  let explorerOpen = $state(untrack(() => defaultExplorerOpen ?? (!filePath && !snippet)));
+  let explorerTouchedByUser = $state(false);
+  let prevDefaultExplorerOpen = $state<boolean | undefined>(untrack(() => defaultExplorerOpen));
+
+  $effect(() => {
+    const desired = defaultExplorerOpen;
+    const empty = !filePath && !snippet;
+    untrack(() => {
+      const prev = prevDefaultExplorerOpen;
+      prevDefaultExplorerOpen = desired;
+      if (desired === false && prev !== false) {
+        explorerTouchedByUser = false;
+        if (explorerOpen) explorerOpen = false;
+        return;
+      }
+      if (prev === false && desired !== false) {
+        if (empty && !explorerTouchedByUser && !explorerOpen) explorerOpen = true;
+        return;
+      }
+      if (desired === undefined || !empty || explorerTouchedByUser) return;
+      if (explorerOpen !== desired) explorerOpen = desired;
+    });
+  });
   let viewMode = $state<"code" | "diff">(untrack(() => initialViewMode));
   let activeBlob = $state<FileBlob | null>(null);
   let isLoading = $state(false);
@@ -538,7 +565,10 @@
         aria-pressed={explorerOpen}
         title={explorerOpen ? "Hide file tree" : "Browse repository files"}
         data-testid="terminal-file-pane-explorer-toggle"
-        onclick={() => (explorerOpen = !explorerOpen)}
+        onclick={() => {
+          explorerTouchedByUser = true;
+          explorerOpen = !explorerOpen;
+        }}
       >
         {#if explorerOpen}<PanelLeftClose size={13} />{:else}<PanelLeftOpen size={13} />{/if}
       </button>
@@ -643,6 +673,22 @@
             <ExternalLink size={12} />
           </button>
         {/if}
+      {/if}
+      {#if onDockToSidebar}
+        <button
+          type="button"
+          class="gp-icon-btn p-1!"
+          aria-label="Move to Explorer sidebar"
+          title="Dock File Explorer into the terminal's left sidebar"
+          data-testid="terminal-file-dock-sidebar"
+          onclick={() => {
+            explorerOpen = false;
+            explorerTouchedByUser = false;
+            onDockToSidebar();
+          }}
+        >
+          <FolderTree size={12} />
+        </button>
       {/if}
     </div>
   </div>

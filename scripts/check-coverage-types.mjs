@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 129 contracts over
- * 341 structs, spanning both wire surfaces: command returns and event payloads.
+ * 344 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -275,7 +275,7 @@ export const CONTRACTS = Object.freeze([
   { label: "host-load-sampler", rustPath: rust("sysload", "sampler.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadStatus", "HostLoadPulse"] },
   { label: "host-load-sensor", rustPath: rust("sysload.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["SensorReport", "Clock"] },
   { label: "host-load-snapshot", rustPath: rust("sysload", "snapshot.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Snapshot", "WriterIdentity", "TickStats", "PublishedVerdict"] },
-  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores", "CompressorSegments"] },
+  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores", "CompressorSegments", "CpuUsage", "GpuSample", "MemorySample"] },
   { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
   { label: "host-load-trace", rustPath: rust("sysload", "trace.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["TraceRecord", "TracePeaks", "PreviousBoot"] },
   { label: "host-load-thresholds", rustPath: rust("sysload", "thresholds.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Rule", "ModeRule", "Thresholds", "DiskFill", "DiskGuard", "HorizonRule", "HeadroomRule"] },

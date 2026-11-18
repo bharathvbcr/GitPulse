@@ -94,11 +94,23 @@ export interface AppearancePrefs {
    * reader's own image (stored apart from these preferences; see wallpaperStore.ts).
    */
   readonly backdrop: BackdropId;
+  /**
+   * How strongly the wallpaper shows, 0.1..1 (`WALLPAPER_INTENSITY_RANGE`). Below 1 the picture
+   * (still or moving) is faded toward the theme's ground colour; 1 writes nothing.
+   */
+  readonly wallpaperIntensity: number;
+  /**
+   * Whether a wallpaper that can move may: the built-ins drift and glint, a
+   * video plays. Only while the host has room for it (wallpaperMotion.ts).
+   */
+  readonly wallpaperMotion: boolean;
   /** The reader's theme shelf. `customTheme` is the applied one; these are the ones kept. */
   readonly savedThemes: readonly GitPulseTheme[];
 }
 
 export const FLOAT_BLUR_SHIPPED = 34;
+/** The wallpaper intensity slider's range. Never above 1: intensity only fades. */
+export const WALLPAPER_INTENSITY_RANGE = { min: 0.1, max: 1 } as const;
 export const FLOAT_BLUR_MAX = 40;
 export const FIELD_HUE_RANGE = { min: 0, max: 360 } as const;
 export const SHIPPED_RADIUS_SCALE = 1;
@@ -117,6 +129,8 @@ export const APPEARANCE_DEFAULTS: AppearancePrefs = {
   fieldHue: 0,
   reduceTransparency: false,
   backdrop: "none",
+  wallpaperIntensity: 1,
+  wallpaperMotion: false,
   savedThemes: [],
 };
 
@@ -207,6 +221,12 @@ export function sanitizeAppearance(raw: Readonly<Record<string, unknown>>): Appe
     fieldHue: normalizeHue(finite(raw.fieldHue, 0)),
     reduceTransparency: raw.reduceTransparency === true,
     backdrop: isBackdropId(raw.backdrop) ? raw.backdrop : APPEARANCE_DEFAULTS.backdrop,
+    wallpaperIntensity: clamp(
+      finite(raw.wallpaperIntensity, APPEARANCE_DEFAULTS.wallpaperIntensity),
+      WALLPAPER_INTENSITY_RANGE.min,
+      WALLPAPER_INTENSITY_RANGE.max,
+    ),
+    wallpaperMotion: raw.wallpaperMotion === true,
     savedThemes: readSavedThemes(raw.savedThemes),
   };
 }
@@ -345,6 +365,7 @@ export const MANAGED_VARS: readonly string[] = [
   "--mac-hue-d",
   "--mac-hue-gain",
   "--gp-backdrop",
+  "--gp-backdrop-dim",
 ];
 
 export const MANAGED_ATTRIBUTES: readonly string[] = [
@@ -352,6 +373,7 @@ export const MANAGED_ATTRIBUTES: readonly string[] = [
   "data-radius-scale",
   "data-float-blur",
   "data-backdrop",
+  "data-backdrop-dim",
 ];
 
 function themeInputs(theme: GitPulseTheme, accent: string): DeriveInputs {
@@ -495,6 +517,7 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
   // Material, float blur, background field: the `html.macos` tokens.
   attributes["data-float-blur"] = null;
   attributes["data-backdrop"] = null;
+  attributes["data-backdrop-dim"] = null;
   if (context.nativeMaterial) {
     const floor = materialFloor;
     const wanted = prefs.materialIntensity[theme];
@@ -527,6 +550,13 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
     if (css !== null) {
       vars["--gp-backdrop"] = css;
       attributes["data-backdrop"] = prefs.backdrop;
+      // Fades the picture, still or moving, toward the ground colour by the
+      // same amount, so a gate flip between the two never changes brightness.
+      const dim = backdropDim(prefs.wallpaperIntensity);
+      if (dim > 0) {
+        vars["--gp-backdrop-dim"] = String(dim);
+        attributes["data-backdrop-dim"] = "";
+      }
       if (prefs.reduceTransparency) {
         notes.push({
           id: "backdrop-hidden",
@@ -569,6 +599,12 @@ export function planAppearance(prefs: AppearancePrefs, context: AppearanceContex
     materialFloor,
     notes,
   };
+}
+
+/** The fade a wallpaper intensity asks for: 0 at full strength, never negative or above 0.9. */
+export function backdropDim(intensity: number): number {
+  const held = clamp(finite(intensity, 1), WALLPAPER_INTENSITY_RANGE.min, WALLPAPER_INTENSITY_RANGE.max);
+  return Number((1 - held).toFixed(3));
 }
 
 /** The URL a wallpaper choice draws, or null when there is nothing to draw (yet). */

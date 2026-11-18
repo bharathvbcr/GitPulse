@@ -30,6 +30,9 @@
       let cloneCalls = 0;
       let diffuseDiagnostics = "";
       addEventListener("error", (event) => errors.push(event.message));
+      // Logo lookups are remembered per origin; start from none, as a fresh
+      // install does, so the lookup counts below are this run's own.
+      try { localStorage.removeItem("gitpulse.repoLogos.v1"); } catch {}
       addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
 
       // Three repositories. GitPulse has its primary checkout and two agent
@@ -58,6 +61,36 @@
         last_author: "Alex", last_summary: "Work",
       });
       const dirty = new Set([WT_A]);
+      // Repository logos: GitPulse ships a Tauri icon, Api a root SVG, Site
+      // nothing, so the strip draws two logos and one set of initials. Every
+      // listing is counted, so the checks can see that a repository's
+      // checkouts share one lookup.
+      const PNG_1PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      // GitPulse's checkouts also hold images no automatic pick would take
+      // (a mark deep in art/, a fake PNG), for the logo browser to walk.
+      const BROWSE_FILES = ["src-tauri/icons/128x128.png", "art/brand/mark.png", "art/brand/fake.png", "docs/shot.svg"];
+      const LOGO_FILES = {
+        [MAIN]: [...BROWSE_FILES, "src/main.ts"], [WT_A]: BROWSE_FILES, [WT_B]: BROWSE_FILES,
+        [API]: ["assets/logo.svg", "README.md"], [API_FEATURE]: ["assets/logo.svg"],
+        [SITE]: ["index.html"], [SITE_WT]: ["index.html"],
+      };
+      const LOGO_BLOBS = {
+        "src-tauri/icons/128x128.png": { path: "src-tauri/icons/128x128.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: PNG_1PX, invalid_utf8_bytes: 0 },
+        "assets/logo.svg": {
+          path: "assets/logo.svg", is_binary: false, is_image: true, mime: "image/svg+xml",
+          text: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#2563eb"/></svg>',
+          base64: null, invalid_utf8_bytes: 0,
+        },
+        "art/brand/mark.png": { path: "art/brand/mark.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGO4o6b2HwAFMgIozFXxQQAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 },
+        // Named a PNG, but its bytes are not one: shown, never usable.
+        "art/brand/fake.png": { path: "art/brand/fake.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: "AAAAAAAAAAAA", invalid_utf8_bytes: 0 },
+        "docs/shot.svg": {
+          path: "docs/shot.svg", is_binary: false, is_image: true, mime: "image/svg+xml",
+          text: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#16a34a"/></svg>',
+          base64: null, invalid_utf8_bytes: 0,
+        },
+      };
+      const listings = [];
       const watched = new Set();
       let peakWatched = 0;
       const fixtures = {
@@ -65,6 +98,12 @@
           path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: COMMON[a.repoPath] ?? null,
         }),
         cmd_list_branches: (a) => [branch(BRANCH[a.repoPath] ?? "main")],
+        cmd_list_repo_files: (a) => { listings.push(a.repoPath); return LOGO_FILES[a.repoPath] ?? []; },
+        cmd_get_file_blob: (a) => {
+          const blob = LOGO_BLOBS[a.filePath];
+          if (!blob) throw new Error(`No such file: ${a.filePath}`);
+          return blob;
+        },
         cmd_get_status: (a) => dirty.has(a.repoPath)
           ? [{ path: "src/a.ts", is_staged: false, status_code: "M", is_conflicted: false, additions: 1, deletions: 1 }]
           : [],
@@ -117,6 +156,11 @@
       const settle = async () => {
         await tick(); await wait(); await tick();
         for (let i = 0; i < 30 && finite().length > 0; i += 1) await wait(20);
+        // An exit's animation can read "finished" a while before Svelte removes
+        // its element (the onfinish callback waits on a frame, which a loaded
+        // host delivers late), so also wait out every unit still marked inert
+        // by its exit. Bounded: a unit that never leaves still fails its check.
+        for (let i = 0; i < 100 && document.querySelector("[data-tab-motion][inert]"); i += 1) await wait(20);
       };
       const $ = (selector, root = document) => root.querySelector(selector);
       const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -184,6 +228,36 @@
             stackShell("GitPulse").getBoundingClientRect().height <= 32);
           check("the strip fits its container without a horizontal scroll", () =>
             scroller().scrollWidth <= scroller().clientWidth + 1);
+
+          // ---- every repository carries a mark: its logo, else its initials ----
+          for (let i = 0; i < 40 && $$("[data-repo-logo][data-logo-state='image']", strip()).length < 2; i += 1) await wait(25);
+          const markOf = (el) => $("[data-repo-logo]", el);
+          check("every repository on the strip carries a mark", () =>
+            [...shells(), ...pills()].every((el) => markOf(el) !== null));
+          check("a repository with a logo draws it as an image from a data URL", () => {
+            const gitpulse = markOf(stackShell("GitPulse"));
+            const img = gitpulse && $("img:not([hidden])", gitpulse);
+            return gitpulse?.dataset.logoState === "image" && !!img && img.getAttribute("src").startsWith("data:image/png;base64,");
+          });
+          check("an SVG logo is drawn through an image element, never as markup from the repository", () => {
+            const api = markOf(stackShell("Api"));
+            const img = api && $("img:not([hidden])", api);
+            return !!img && img.getAttribute("src").startsWith("data:image/svg+xml;base64,") && $$(".repo-logo-tile svg", strip()).length === 0;
+          });
+          check("a repository with no logo draws its initials on a tile", () => {
+            const site = pills().find((el) => el.textContent.includes("site"));
+            const mark = site && markOf(site);
+            return mark?.dataset.logoState === "initials" && $("[data-logo-initials]", mark)?.dataset.logoInitials === "S";
+          });
+          check("the mark is decorative: hidden from assistive technology", () =>
+            $$("[data-repo-logo]", strip()).every((el) => el.getAttribute("aria-hidden") === "true"));
+          // Measured before any menu opens: the tab menu's logo picker lists
+          // the repository on purpose, which is not a lookup.
+          check("the checkouts of one repository share one logo lookup", () => {
+            const gitpulse = listings.filter((path) => path === MAIN || path === WT_A || path === WT_B).length;
+            const api = listings.filter((path) => path === API || path === API_FEATURE).length;
+            return gitpulse === 1 && api === 1;
+          });
           check("the title bar is one tablist, Workspace, and holds Fleet, Agents and Tasks as tabs before the repositories", () => {
             const tabs = $$('[role="tab"]', strip());
             const surfaces = tabs.filter((el) => el.hasAttribute("data-surface-tab"));
@@ -540,9 +614,108 @@
           key(tabBtn(WT_B), { key: "p" });
           await settle();
           check("P pins the focused tab", () => rec(WT_B).pinned === true);
+          check("a pinned tab keeps its mark and badges it, rather than swapping it for a pin", () => {
+            const mark = $("[data-repo-logo]", shellOf(WT_B));
+            return !!mark && !!$("[data-logo-pinned]", mark);
+          });
           key(tabBtn(WT_B), { key: "p" });
           await settle();
           check("and P again unpins it", () => rec(WT_B).pinned !== true);
+
+          // ---- choosing a logo by browsing the repository's images ----------
+          const browser = () => $("[data-logo-browser]");
+          const tile = (attr, value) => $(`[${attr}="${CSS.escape(value)}"]`, browser());
+          const imgOf = (path) => $("img", $("[data-repo-logo]", shellOf(path)))?.getAttribute("src") ?? "";
+          const settleThumbs = async () => {
+            for (let i = 0; i < 60 && $$("[data-browse-thumb='loading'], [data-browse-thumb='waiting']", browser()).length > 0; i += 1) await wait(20);
+          };
+          const autoLogo = imgOf(WT_B);
+          m = await openTabMenu(WT_B);
+          for (let i = 0; i < 40 && !$("[data-logo-choice='browse']", m); i += 1) await wait(20);
+          const browseItem = $("[data-logo-choice='browse']", m);
+          check("the tab menu's Logo row offers to browse the repository's images, as a menuitem", () =>
+            browseItem?.getAttribute("role") === "menuitem" && /Browse/.test(browseItem.getAttribute("aria-label") ?? ""));
+          browseItem?.click();
+          await settle();
+          for (let i = 0; i < 40 && !$("[data-browse-grid]"); i += 1) await wait(20);
+          check("Browse closes the menu and opens a dialog named for the repository", () => {
+            const dialog = browser()?.closest('[role="dialog"]');
+            return !repoMenu() && !!dialog && /Choose a logo for/.test(dialog.textContent ?? "");
+          });
+          check("…with the filter focused", () => document.activeElement === $("[data-browse-filter]"));
+          check("it opens in the folder of the logo in use, and its breadcrumb leads back to the root", () =>
+            !!tile("data-browse-file", "src-tauri/icons/128x128.png") && !!$('[data-browse-crumb="src-tauri/icons"][aria-current="location"]', browser()) &&
+            !!$('[data-browse-crumb=""]', browser()));
+          $('[data-browse-crumb=""]', browser()).click();
+          await settle();
+          check("the root lists folders with image counts, a single-folder chain as one step", () =>
+            words(tile("data-browse-folder", "art/brand") ?? document.body).includes("2 images") &&
+            !!tile("data-browse-folder", "src-tauri/icons") && !!tile("data-browse-folder", "docs"));
+          tile("data-browse-folder", "art/brand").click();
+          await settle(); await settleThumbs();
+          check("opening a folder shows its images as thumbnails drawn from data URLs", () =>
+            tile("data-browse-file", "art/brand/mark.png")?.dataset.browseThumb === "ready" &&
+            ($("img", tile("data-browse-file", "art/brand/mark.png"))?.getAttribute("src") ?? "").startsWith("data:image/png;base64,"));
+          check("an image whose bytes are not what its name says is shown but can't be used", () => {
+            const fake = tile("data-browse-file", "art/brand/fake.png");
+            fake?.click();
+            return fake?.dataset.browseThumb === "unusable" && fake.getAttribute("aria-pressed") === "false" &&
+              $("[data-browse-use]", browser()?.closest('[role="dialog"]'))?.disabled === true;
+          });
+          const filter = $("[data-browse-filter]");
+          filter.focus();
+          key(filter, { key: "Backspace" });
+          await settle();
+          check("Backspace in an empty filter goes up a folder, past one that only leads on", () => !!tile("data-browse-folder", "art/brand") && !!$('[data-browse-crumb=""][aria-current="location"]', browser()));
+          filter.value = "shot";
+          filter.dispatchEvent(new Event("input", { bubbles: true }));
+          await settle(); await settleThumbs();
+          check("the filter finds images in any folder below, saying where each sits", () =>
+            !!tile("data-browse-file", "docs/shot.svg") && !tile("data-browse-folder", "art/brand") &&
+            words(tile("data-browse-file", "docs/shot.svg")).includes("docs"));
+          filter.value = "mark";
+          filter.dispatchEvent(new Event("input", { bubbles: true }));
+          await settle(); await settleThumbs();
+          tile("data-browse-file", "art/brand/mark.png").click();
+          await settle();
+          const useButton = $("[data-browse-use]", browser()?.closest('[role="dialog"]'));
+          check("selecting a usable image enables Use as logo", () =>
+            useButton?.disabled === false && tile("data-browse-file", "art/brand/mark.png")?.getAttribute("aria-pressed") === "true");
+          useButton?.click();
+          await settle();
+          for (let i = 0; i < 40 && browser(); i += 1) await wait(20);
+          for (let i = 0; i < 40 && imgOf(WT_B) === autoLogo; i += 1) await wait(20);
+          check("Use as logo closes the dialog and the tab draws the chosen image", () =>
+            !browser() && imgOf(WT_B) !== autoLogo && imgOf(WT_B).startsWith("data:image/png;base64,"));
+          check("…for every checkout of that repository", () => imgOf(WT_A) === imgOf(WT_B) && imgOf(MAIN) === imgOf(WT_B));
+          for (let i = 0; i < 20 && document.activeElement !== tabBtn(WT_B); i += 1) await wait(20);
+          check("…and focus returns to the tab whose menu opened it", () => document.activeElement === tabBtn(WT_B));
+          m = await openTabMenu(WT_B);
+          for (let i = 0; i < 40 && !$("[data-logo-choice='browse']", m); i += 1) await wait(20);
+          // The repository's images are few, so mark.png is also one of the
+          // row's own thumbnails, and that thumbnail carries the selection.
+          for (let i = 0; i < 40 && !$('[data-logo-choice="art/brand/mark.png"]', m); i += 1) await wait(20);
+          check("the menu then names the chosen file and marks it selected", () =>
+            /Using mark\.png/.test(words($("[data-logo-choices]", m))) &&
+            /selected/.test($('[data-logo-choice="art/brand/mark.png"]', m)?.getAttribute("aria-label") ?? "") &&
+            !/selected/.test($("[data-logo-choice='browse']", m)?.getAttribute("aria-label") ?? ""));
+          $("[data-logo-choice='auto']", m).click();
+          await settle();
+          for (let i = 0; i < 40 && imgOf(WT_B) !== autoLogo; i += 1) await wait(20);
+          check("Find automatically goes back to the automatic pick", () => imgOf(WT_B) === autoLogo);
+          key(repoMenu() ?? document.body, { key: "Escape" });
+          await settle();
+          m = await openTabMenu(WT_B);
+          for (let i = 0; i < 40 && !$("[data-logo-choice='browse']", m); i += 1) await wait(20);
+          $("[data-logo-choice='browse']", m)?.click();
+          await settle();
+          for (let i = 0; i < 40 && !browser(); i += 1) await wait(20);
+          key(browser().closest('[role="dialog"]'), { key: "Escape" });
+          await settle();
+          for (let i = 0; i < 40 && browser(); i += 1) await wait(20);
+          check("Escape closes the browser and changes nothing", () => !browser() && imgOf(WT_B) === autoLogo);
+          for (let i = 0; i < 20 && document.activeElement !== tabBtn(WT_B); i += 1) await wait(20);
+          check("…and returns focus to the tab", () => document.activeElement === tabBtn(WT_B));
 
           // ---- labels render in full, in a plate, with Open beside them ----
           const LONG = "/code/long/a-remarkably-long-repository-name-that-used-to-clip";
@@ -755,8 +928,12 @@
           check("a tab outside any group offers Add to group and no group-wide or strip-wide actions", () =>
             tabLabels.includes("Add to group…") && !tabLabels.includes("Remove from group") &&
             !tabLabels.some((label) => /^(Move to group|Group all by parent folder|Collapse|Expand|Ungroup|Close group|Open repository)/.test(label)));
-          // The colour swatches are menuitems too; they share one row.
-          check("the tab menu stays short", () => items(m).filter((el) => !el.hasAttribute("data-color-choice")).length <= 12);
+          // The colour swatches are menuitems too; they share one row. The logo
+          // choices are one row as well, however many images a repository has,
+          // so that row counts once.
+          check("the tab menu stays short", () =>
+            items(m).filter((el) => !el.hasAttribute("data-color-choice") && !el.hasAttribute("data-logo-choice")).length +
+              ($("[data-logo-choices]", m) ? 1 : 0) <= 12);
           itemNamed(m, "Add to group…").click();
           await settle(); await wait(20);
           check("Add to group asks for a name and names the groups it could join", () =>
@@ -887,6 +1064,10 @@
             get(repoStore).openTabs.length === before + MANY && !get(repoStore).error);
           check("every one of them has a tab on the strip", () =>
             Array.from({ length: MANY }, (_, i) => domTab(manyPath(i))).every(Boolean));
+          // Off-screen marks ask for nothing until scrolled into view, so two
+          // hundred restored tabs are not two hundred file listings.
+          check("logo lookups are bounded: of the 200 opened repositories, only those on screen were listed", () =>
+            listings.filter((path) => path.startsWith("/code/many/")).length < 40);
           check("the native watch table stays within the pool", () =>
             watched.size <= WATCH_POOL_SIZE && peakWatched <= WATCH_POOL_SIZE + 1);
           const parkedPaths = get(repoStore).openTabs.filter((t) => t.watch === "parked").map((t) => t.path);

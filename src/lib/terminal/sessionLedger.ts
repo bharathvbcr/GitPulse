@@ -51,6 +51,7 @@ export interface SessionLedgerOffer {
   resumable: boolean;
   reason: string | null;
   last_error: string | null;
+  title?: string;
 }
 
 /** Snapshot of durable recovery offers returned by the backend ledger. */
@@ -116,12 +117,20 @@ export function setSessionLedgerViewForTest(view: SessionLedgerView): void {
   ledgerStore.set(recomputeCounts(view.offers));
 }
 
+export function normalizeSessionLedgerView(raw: unknown): SessionLedgerView {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return EMPTY_VIEW;
+  const candidate = raw as Partial<SessionLedgerView>;
+  if (!Array.isArray(candidate.offers)) return EMPTY_VIEW;
+  return recomputeCounts(candidate.offers);
+}
+
 /** Reads the current durable session ledger from the backend. */
 export async function refreshSessionLedger(): Promise<SessionLedgerView> {
   if (!isTauri()) {
     return get(ledgerStore);
   }
-  const view = await invoke<SessionLedgerView>("cmd_terminal_session_ledger");
+  const raw = await invoke<unknown>("cmd_terminal_session_ledger");
+  const view = normalizeSessionLedgerView(raw);
   ledgerStore.set(view);
   return view;
 }
@@ -138,8 +147,8 @@ export function subscribeSessionLedger(): () => void {
   subscriberCount += 1;
   if (subscriberCount === 1 && isTauri()) {
     const epoch = ++listenEpoch;
-    void listen<SessionLedgerView>(SESSION_LEDGER_EVENT, (event) => {
-      ledgerStore.set(event.payload);
+    void listen<unknown>(SESSION_LEDGER_EVENT, (event) => {
+      ledgerStore.set(normalizeSessionLedgerView(event.payload));
     })
       .then((unlisten) => {
         if (epoch !== listenEpoch || subscriberCount === 0) {
@@ -297,12 +306,13 @@ export async function reopenSessionLedgerOffer(
         return { reopened: false, offer: updated, error };
       }
     }
+    const reopenedTitle = latest.title?.trim() || launcherLabel(provider);
     repo.setTerminalOpen(true);
     enqueue({
       runId: "",
       repoPath: latest.repo_path,
       provider,
-      title: launcherLabel(provider),
+      title: reopenedTitle,
       resume: {
         sessionId: latest.native_id,
         mode,

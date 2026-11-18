@@ -77,6 +77,8 @@ pub struct SessionLedgerOffer {
     pub resumable: bool,
     pub reason: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Current snapshot of durable recovery offers pushed via `SESSION_LEDGER_EVENT`
@@ -111,6 +113,10 @@ struct StoredRow {
     signal: Option<String>,
     exit_code: Option<i32>,
     last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    title_pinned: bool,
     #[serde(default)]
     withdrawn: bool,
 }
@@ -211,6 +217,24 @@ impl SessionLedger {
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_owned);
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inherited_title: Option<String> = None;
+        let mut inherited_pinned = false;
+        if let Some(reopen_id) = spec.reopen_row_id.as_deref() {
+            for entry in &mut guard.entries {
+                if let Entry::Valid(existing) = entry {
+                    if existing.row_id == reopen_id {
+                        inherited_title = existing.title.clone();
+                        inherited_pinned = existing.title_pinned && inherited_title.is_some();
+                        existing.withdrawn = true;
+                        existing.last_error = None;
+                    }
+                }
+            }
+        }
         let row = StoredRow {
             v: LEDGER_SCHEMA_VERSION,
             row_id: row_id.clone(),
@@ -227,26 +251,96 @@ impl SessionLedger {
             signal: None,
             exit_code: None,
             last_error: None,
+            title: inherited_title,
+            title_pinned: inherited_pinned,
             withdrawn: false,
         };
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(reopen_id) = spec.reopen_row_id.as_deref() {
-            for entry in &mut guard.entries {
-                if let Entry::Valid(existing) = entry {
-                    if existing.row_id == reopen_id {
-                        existing.withdrawn = true;
-                        existing.last_error = None;
-                    }
-                }
-            }
-        }
         guard.entries.push(Entry::Valid(Box::new(row)));
         enforce_bound(&mut guard.entries);
         self.persist_locked(&guard.entries);
         row_id
+    }
+
+    /// Updates the stabilized live or user-renamed session title for `terminal_id`.
+    /// Returns `(changed_on_disk, offer_view_changed)` so live running updates do
+    /// not churn disk when unchanged or emit unnecessary recovery-banner events.
+    pub fn set_title(
+        &self,
+        terminal_id: &str,
+        title: Option<&str>,
+        user_named: bool,
+    ) -> (bool, bool) {
+        let normalized = title
+            .map(crate::alerts::scan::sanitize_osc_title)
+            .filter(|t| !t.is_empty());
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        let mut offer_changed = false;
+        for entry in guard.entries.iter_mut().rev() {
+            let Entry::Valid(row) = entry else { continue };
+            if row.terminal_id.as_deref() != Some(terminal_id) {
+                continue;
+            }
+            if !user_named && row.title_pinned && row.title.is_some() {
+                return (false, false);
+            }
+            let next_pinned = user_named && normalized.is_some();
+            if row.title != normalized || row.title_pinned != next_pinned {
+                row.title = normalized;
+                row.title_pinned = next_pinned;
+                changed = true;
+                offer_changed = !row.withdrawn && is_offer_end_state(row.end_state);
+            }
+            break;
+        }
+        if changed {
+            self.persist_locked(&guard.entries);
+        }
+        (changed, offer_changed)
+    }
+
+    /// Resolves the best known session title for `terminal_id` by combining a
+    /// live host `OSC 0`/`OSC 2` title with the durable ledger's stored (or
+    /// user-pinned) title, syncing new host titles into the ledger row.
+    pub fn resolved_title_for_terminal(
+        &self,
+        terminal_id: &str,
+        live_title: Option<&str>,
+    ) -> Option<String> {
+        let live_clean = live_title
+            .map(crate::alerts::scan::sanitize_osc_title)
+            .filter(|t| !t.is_empty());
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut persist = false;
+        let mut resolved: Option<String> = None;
+        for entry in guard.entries.iter_mut().rev() {
+            let Entry::Valid(row) = entry else { continue };
+            if row.terminal_id.as_deref() != Some(terminal_id) {
+                continue;
+            }
+            if row.title_pinned && row.title.is_some() {
+                resolved = row.title.clone();
+            } else if let Some(ref fresh) = live_clean {
+                if row.title.as_deref() != Some(fresh.as_str()) {
+                    row.title = Some(fresh.clone());
+                    persist = true;
+                }
+                resolved = Some(fresh.clone());
+            } else {
+                resolved = row.title.clone();
+            }
+            break;
+        }
+        if persist {
+            self.persist_locked(&guard.entries);
+        }
+        resolved.or(live_clean)
     }
 
     /// Associates a validated conversation UUID (from hook `SessionStart` /
@@ -755,6 +849,7 @@ fn project_corrupt_row(row_id: &str, detail: &str) -> SessionLedgerOffer {
         resumable: false,
         reason: Some("unreadable".to_owned()),
         last_error: Some(detail.to_owned()),
+        title: None,
     }
 }
 
@@ -799,6 +894,7 @@ fn project_valid_row_with_status(
         resumable: status.resumable,
         reason,
         last_error: row.last_error.clone(),
+        title: row.title.clone(),
     }
 }
 
@@ -1319,5 +1415,72 @@ mod tests {
         ));
         let after = reloaded.view_with(|_, _| Transcript::Found);
         assert!(after.offers.is_empty());
+    }
+
+    #[test]
+    fn title_persists_across_quit_crash_user_pin_and_v1_rows_without_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let ledger = SessionLedger::open(&ledger_path);
+        ledger.record_spawn(spawn_spec("term-osc", "claude", Some(UUID_1), &repo, None));
+        ledger.record_spawn(spawn_spec("term-pinned", "agy", Some(UUID_2), &repo, None));
+
+        // Spinner frames normalize and repeated identical titles do not re-write disk.
+        assert_eq!(
+            ledger.set_title("term-osc", Some("⠋ Auditing split panes"), false),
+            (true, false)
+        );
+        assert_eq!(
+            ledger.set_title("term-osc", Some("⠙ Auditing split panes"), false),
+            (false, false)
+        );
+
+        // User-pinned custom title resists subsequent non-user OSC title overwrites.
+        assert_eq!(
+            ledger.set_title("term-pinned", Some("Auth Reviewer"), true),
+            (true, false)
+        );
+        assert_eq!(
+            ledger.set_title("term-pinned", Some("claude ~"), false),
+            (false, false)
+        );
+        assert_eq!(
+            ledger.resolved_title_for_terminal("term-pinned", Some("claude ~")),
+            Some("Auth Reviewer".into())
+        );
+
+        assert_eq!(ledger.mark_app_quit(), 2);
+        drop(ledger);
+
+        let reloaded = SessionLedger::open(&ledger_path);
+        let view = reloaded.view_with(|_, _| Transcript::Found);
+        let osc_offer = view
+            .offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some("term-osc"))
+            .unwrap();
+        assert_eq!(osc_offer.title.as_deref(), Some("Auditing split panes"));
+        let pinned_offer = view
+            .offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some("term-pinned"))
+            .unwrap();
+        assert_eq!(pinned_offer.title.as_deref(), Some("Auth Reviewer"));
+
+        // Reopening inherits the saved title onto the newly spawned row.
+        reloaded.record_spawn(spawn_spec(
+            "term-reopened-pinned",
+            "agy",
+            Some(UUID_2),
+            &repo,
+            Some(&pinned_offer.row_id),
+        ));
+        assert_eq!(
+            reloaded.resolved_title_for_terminal("term-reopened-pinned", None),
+            Some("Auth Reviewer".into())
+        );
     }
 }

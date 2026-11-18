@@ -79,6 +79,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
   { id: "agent-live-runs", section: "agents", label: "Agents running at once", keywords: "concurrent parallel simultaneous many multiple agents sessions tasks attempts at once limit capacity managed manvi worktree" },
   { id: "terminal-sessions", section: "agents", label: "Terminal sessions open at once", keywords: "terminal sessions shells tabs pty open at once concurrent parallel many limit capacity maximum console agent tabs task terminals" },
   { id: "keep-terminals", section: "agents", label: "Keep managed agent runs running when GitPulse quits", keywords: "terminal host ptyd keep running survive quit crash restart detach reattach background sessions agents persist outlive managed manvi codex claude runs adopt" },
+  { id: "agent-shell-reads", section: "agents", label: "Allow agents to read repository shell outputs", keywords: "terminal shell output read inspect mcp agent logs errors stdout scrollback user shells opt in" },
   { id: "agent-setting-sources", section: "agents", label: "Claude Code settings files", keywords: "claude settings sources setting-sources project local user settings.json settings.local.json hooks allow list permissions repository trust power advanced" },
   { id: "agent-models", section: "agents", label: "Agent models", keywords: "model models claude antigravity agy codex grok opus sonnet haiku fable opusplan gemini effort reasoning thinking fallback advisor routing --model --effort --fallback-model advisorModel" },
   { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
@@ -94,14 +95,14 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Theme presets",
     keywords:
-      "theme presets gallery templates skins looks hud neural reactor pure black oled amoled crimson red phosphor green synthwave paper amber crt blueprint midnight ide arctic solar dark daylight developer editor nebula orbital neon city hyperspace sci-fi space my themes saved library save current",
+      "theme presets gallery templates skins looks hud neural reactor pure black oled amoled crimson red phosphor green synthwave paper amber crt blueprint midnight ide arctic solar dark daylight developer editor nebula orbital neon city hyperspace sci-fi space default remove clear reset no theme current look",
   },
   {
     id: "theme-file",
     section: "appearance",
-    label: "Theme file",
+    label: "My themes",
     keywords:
-      "theme import export file json custom share gitpulse-theme load save palette colors base contrast",
+      "my themes saved library save current look delete remove theme import export file json custom share gitpulse-theme load palette colors base contrast",
   },
   {
     id: "accent",
@@ -159,7 +160,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Wallpaper",
     keywords:
-      "wallpaper background image picture photo custom upload behind window desktop backdrop neural reactor hex circuit horizon crt scanlines blueprint nebula stars space orbit planet skyline city warp",
+      "wallpaper background image picture photo custom upload behind window desktop backdrop neural reactor hex circuit horizon crt scanlines blueprint nebula stars space orbit planet skyline city warp intensity strength fade dim brightness animate animated animation motion moving live video mp4 webm mov plugged battery",
     requires: "nativeMaterial",
   },
   {
@@ -221,6 +222,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     section: "appearance",
     label: "Smooth mouse-wheel scrolling",
     keywords: "terminal smooth mouse wheel scroll scrolling glide animate animation notch trackpad shell console",
+  },
+  {
+    id: "terminal-copy-on-select",
+    section: "appearance",
+    label: "Select to copy in terminals",
+    keywords: "terminal select to copy selection auto copy mouse highlight clipboard xterm shell console",
   },
   {
     id: "terminal-scrollback",

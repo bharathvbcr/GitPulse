@@ -130,7 +130,7 @@
   import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
-  import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink, FileText } from "@lucide/svelte";
+  import { AlertCircle, AlertTriangle, Check, Clipboard, Copy, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink, FileText, Send, Terminal } from "@lucide/svelte";
   import { get } from "svelte/store";
   import { interfaceStore } from "../stores/interfaceStore";
   import { harnessStore } from "../stores/harnessStore";
@@ -148,10 +148,17 @@
   import { createSyncFrameWriter } from "../terminal/syncFrames";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
-  import { copyText } from "../desktop/clipboard";
+  import { copyText, createCopyFlash } from "../desktop/clipboard";
+  import {
+    createSelectToCopyController,
+    formatSelectionForAgent,
+    formatTerminalMarkdownBlock,
+    normalizeSelectedText,
+    parseOsc52,
+  } from "../terminal/copyActions";
   import { saveExport } from "../desktop/saveFile";
   import { ptyBus } from "../terminal/ptyBus.tauri";
-  import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
+  import { createTitleCoalescer, launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
   import { AGY_CONTINUE_SENTINEL, conversationForStart, hostedClaude, resolveTranscriptAnswer, resumers, settleConversation, unindexedExitOffer, type ExitFacts, type ResumeOutcome } from "../terminal/hostedAgent";
   import type { TerminalResume } from "../terminal/sessionLedger";
@@ -194,7 +201,9 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
+  import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
+  import { popover, popoverExit, type PopoverOptions } from "../ui/popover";
   import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
   import { clipboardImageToPngBase64, clipboardMayHoldFiles, extractClipboardImageFile } from "../terminal/clipboardImage";
   import {
@@ -258,8 +267,14 @@
     onOpenFileSplit,
     onOpenSnippetSplit,
     onSendToAgent,
+    onRunInNewShell,
     onAgentStatus,
+    initialCommand,
     title,
+    userNamed = false,
+    isActive = false,
+    splitSlot = null,
+    attentionLabel = null,
   }: {
     /** The repository tab hosting this session: its slot, its Sessions row, its close. */
     repoPath: string;
@@ -316,10 +331,22 @@
     onOpenSnippetSplit?: (title: string, content: string) => boolean;
     /** Sends a reference or formatted failing-command payload to the active/paired agent session. */
     onSendToAgent?: (text: string) => void;
+    /** Runs a command inside a new split shell (or shell tab fallback). */
+    onRunInNewShell?: (command: string, startDir?: string | null) => void;
+    /** One-shot shell command written once when a fresh shell PTY starts. */
+    initialCommand?: string;
     /** Reports Herdr-compatible OSC 7501 agent status updates for the tab badge. */
     onAgentStatus?: (status: AgentOscStatus | null) => void;
     /** What this session is about (a task title), for the Sessions list. */
     title?: string;
+    /** True when the reader explicitly named this tab, pinning its ledger title. */
+    userNamed?: boolean;
+    /** True when this session is the focused pane in its repository's dock. */
+    isActive?: boolean;
+    /** 1-based visible split slot index when shown in a split layout, or null. */
+    splitSlot?: number | null;
+    /** Urgent agent attention label (e.g. "Needs input", "Error"), or null. */
+    attentionLabel?: string | null;
   } = $props();
 
   /** Where the process runs and whose files its output names. */
@@ -397,9 +424,57 @@
   /** Live artifact directory reported by Antigravity `SessionStart`, when present. */
   let agentArtifactDir = $state<string | null>(null);
   let lastExitCode = $state<number | null>(null);
+  let hasActiveSelection = $state(false);
+  let hasCompletedBlock = $state(false);
+  let copiedLabel = $state<string | null>(null);
+  let contextMenu = $state<{ x: number; y: number } | null>(null);
+  let consumedInitialCommand = false;
+  let suppressSelectToCopy = false;
+  const copyFlash = createCopyFlash((on) => {
+    if (!on) copiedLabel = null;
+  }, 1500);
   const commandBlocks = createCommandBlockTracker();
   const commandDecorations = createCommandDecorationRing(64);
   const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+
+  function takeInitialCommand(): string | null {
+    if (consumedInitialCommand || launcher !== "shell" || attachSessionId) return null;
+    const trimmed = initialCommand?.trim() ?? "";
+    consumedInitialCommand = true;
+    return trimmed || null;
+  }
+
+  async function copyAndFlash(
+    text: string,
+    flashLabel: string,
+    failWarning: string,
+  ): Promise<boolean> {
+    if (!text) return false;
+    const ok = await copyText(text);
+    if (ok) {
+      warning = null;
+      copiedLabel = flashLabel;
+      copyFlash.flash();
+    } else {
+      warning = failWarning;
+    }
+    return ok;
+  }
+
+  const selectToCopy = createSelectToCopyController({
+    enabled: () => $interfaceStore.terminalCopyOnSelect && !suppressSelectToCopy,
+    hasSelection: () => Boolean(term?.hasSelection()),
+    getSelection: () => term?.getSelection() ?? "",
+    copy: async (text) => {
+      const ok = await copyText(text);
+      if (ok) {
+        warning = null;
+        copiedLabel = "Copied selection";
+        copyFlash.flash();
+      }
+      return ok;
+    },
+  });
 
   export async function openAgentArtifact() {
     if (!nativeSessionId) return;
@@ -442,6 +517,10 @@
   let disposed = false;
   /** Outstanding PTY output credit for this view. Released on paint, or on teardown when paint will not happen. */
   const credit = createOutputCredit();
+  const titleCoalescer = createTitleCoalescer((stabilized) => {
+    onTitle(stabilized);
+    if (nativeSessionId) sessionActivity.title(nativeSessionId, stabilized);
+  }, 150);
 
   function termTheme(): Record<string, string> {
     const css = getComputedStyle(document.documentElement);
@@ -731,6 +810,7 @@
         commandBlocks.onMark(mark, () => created.registerMarker(0));
         if (mark.kind === "command_finished") {
           lastExitCode = mark.exitCode;
+          hasCompletedBlock = commandBlocks.lastCompletedBlock() !== null;
           const detail = commandBlocks.lastFinishedDetail();
           if (detail && created.buffer.active.type !== "alternate" && detail.promptMarker.line >= 0) {
             const cursorAbs = created.buffer.active.baseY + created.buffer.active.cursorY;
@@ -773,55 +853,125 @@
                     : `✓${dur || " ok"}`;
                   el.appendChild(badge);
 
-                  if (failed) {
-                    const askBtn = document.createElement("button");
-                    askBtn.type = "button";
-                    askBtn.setAttribute("data-testid", "terminal-osc133-ask-agent");
-                    askBtn.textContent = "Ask agent";
-                    askBtn.title = "Send failing command and output to active agent terminal";
-                    askBtn.style.marginLeft = "2px";
-                    askBtn.style.padding = "0 4px";
-                    askBtn.style.borderRadius = "3px";
-                    askBtn.style.background = "rgba(244, 63, 94, 0.22)";
-                    askBtn.style.color = "#ffe4e6";
-                    askBtn.style.cursor = "pointer";
-                    askBtn.addEventListener("mousedown", (ev) => ev.stopPropagation());
-                    askBtn.addEventListener("click", (ev) => {
+                  const readDetailBlock = () => {
+                    if (disposed || !term || detail.promptMarker.isDisposed) return null;
+                    const cmd = extractBlockCommand(term.buffer.active, {
+                      promptLine: detail.promptMarker.line,
+                      outputStartLine: detail.outputStartMarker && !detail.outputStartMarker.isDisposed
+                        ? detail.outputStartMarker.line
+                        : null,
+                    });
+                    const out =
+                      detail.outputStartMarker &&
+                      !detail.outputStartMarker.isDisposed &&
+                      detail.outputEndMarker &&
+                      !detail.outputEndMarker.isDisposed
+                        ? extractBlockOutput(term.buffer.active, {
+                            outputStartLine: detail.outputStartMarker.line,
+                            outputEndLine: detail.outputEndMarker.line,
+                          })
+                        : "";
+                    return { cmd, out: normalizeSelectedText(out) };
+                  };
+
+                  const makeBlockBtn = (
+                    testId: string,
+                    label: string,
+                    titleText: string,
+                    bg: string,
+                    textColor: string,
+                    onPress: (ev: MouseEvent) => void,
+                  ) => {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.setAttribute("data-testid", testId);
+                    btn.textContent = label;
+                    btn.title = titleText;
+                    btn.style.marginLeft = "2px";
+                    btn.style.padding = "0 4px";
+                    btn.style.borderRadius = "3px";
+                    btn.style.background = bg;
+                    btn.style.color = textColor;
+                    btn.style.cursor = "pointer";
+                    btn.addEventListener("mousedown", (ev) => ev.stopPropagation());
+                    btn.addEventListener("click", (ev) => {
                       ev.preventDefault();
                       ev.stopPropagation();
-                      if (disposed || !term || detail.promptMarker.isDisposed) return;
-                      const cmd = extractBlockCommand(term.buffer.active, {
-                        promptLine: detail.promptMarker.line,
-                        outputStartLine: detail.outputStartMarker && !detail.outputStartMarker.isDisposed
-                          ? detail.outputStartMarker.line
-                          : null,
-                      });
-                      const out =
-                        detail.outputStartMarker &&
-                        !detail.outputStartMarker.isDisposed &&
-                        detail.outputEndMarker &&
-                        !detail.outputEndMarker.isDisposed
-                          ? extractBlockOutput(term.buffer.active, {
-                              outputStartLine: detail.outputStartMarker.line,
-                              outputEndLine: detail.outputEndMarker.line,
-                            })
-                          : "";
-                      const formatted = formatFailedCommandForAgent({
-                        command: cmd,
-                        exitCode: detail.exitCode,
-                        durationMs: detail.durationMs,
-                        cwd: activeCwdSubdir,
-                        output: out,
-                      });
-                      if (onSendToAgent) {
-                        onSendToAgent(`${formatted}\n`);
-                      } else {
-                        void copyText(formatted).then((ok) => {
-                          if (ok) toastStore.info("Copied failing command & output to clipboard");
-                        });
-                      }
+                      onPress(ev);
                     });
-                    el.appendChild(askBtn);
+                    el.appendChild(btn);
+                  };
+
+                  makeBlockBtn(
+                    "terminal-osc133-copy-block",
+                    "Copy",
+                    "Copy command output (Shift+Click to include $ command)",
+                    "rgba(148, 163, 184, 0.16)",
+                    "inherit",
+                    (ev) => {
+                      const blk = readDetailBlock();
+                      if (!blk) return;
+                      const payload = ev.shiftKey && blk.cmd
+                        ? normalizeSelectedText(`$ ${blk.cmd}\n${blk.out}`)
+                        : (blk.out || blk.cmd);
+                      if (!payload) {
+                        warning = "Command block produced no copyable output.";
+                        return;
+                      }
+                      void copyAndFlash(
+                        payload,
+                        ev.shiftKey && blk.cmd ? "Copied cmd+output" : "Copied block",
+                        "Couldn't copy command block output.",
+                      );
+                    },
+                  );
+
+                  if (onRunInNewShell) {
+                    makeBlockBtn(
+                      "terminal-osc133-rerun-shell",
+                      "↻ Shell",
+                      "Run this command in a new split shell",
+                      "rgba(148, 163, 184, 0.16)",
+                      "inherit",
+                      () => {
+                        const blk = readDetailBlock();
+                        if (!blk?.cmd) {
+                          warning = "No command text recorded for this block.";
+                          return;
+                        }
+                        onRunInNewShell(blk.cmd, activeCwdSubdir);
+                      },
+                    );
+                  }
+
+                  if (failed) {
+                    makeBlockBtn(
+                      "terminal-osc133-ask-agent",
+                      "Ask agent",
+                      "Send failing command and output to active agent terminal",
+                      "rgba(244, 63, 94, 0.22)",
+                      "#ffe4e6",
+                      () => {
+                        const blk = readDetailBlock();
+                        if (!blk) return;
+                        const formatted = formatFailedCommandForAgent({
+                          command: blk.cmd,
+                          exitCode: detail.exitCode,
+                          durationMs: detail.durationMs,
+                          cwd: activeCwdSubdir,
+                          output: blk.out,
+                        });
+                        if (onSendToAgent) {
+                          onSendToAgent(`${formatted}\n`);
+                        } else {
+                          void copyAndFlash(
+                            formatted,
+                            "Copied failure",
+                            "Couldn't copy failing command & output.",
+                          );
+                        }
+                      },
+                    );
                   }
                 });
               }
@@ -844,7 +994,7 @@
     // OSC 0/2: what the running program calls itself. A shell configured to
     // report its directory, or an agent CLI reporting its task, then names its
     // own tab — which is the whole reason a tab strip beats a session counter.
-    created.onTitleChange((title) => { onTitle(title); if (nativeSessionId) sessionActivity.title(nativeSessionId, title); });
+    created.onTitleChange((nextTitle) => { titleCoalescer.push(nextTitle); });
     // xterm forwards nearly every keystroke to the PTY, so a tab chord typed
     // with the terminal focused — which is where it will always be typed —
     // reaches the shell instead of the strip unless it is intercepted here.
@@ -854,6 +1004,17 @@
       if (event.type !== "keydown") return true;
       if (handleViewChord(event)) return false;
       return !onChord(event);
+    });
+    created.onSelectionChange(() => {
+      hasActiveSelection = created.hasSelection();
+      selectToCopy.onSelectionChange();
+    });
+    created.parser.registerOscHandler(52, (payload) => {
+      const decoded = parseOsc52(payload);
+      if (decoded !== null) {
+        void copyAndFlash(decoded, "Copied via OSC 52", "Couldn't copy terminal OSC 52 payload.");
+      }
+      return true;
     });
     term = created;
     appliedTheme = termTheme();
@@ -1249,6 +1410,10 @@
           nativeSessionId = spawned.id;
           activePtyId = spawned.id;
           boundRunThreadId = null;
+          const startupCmd = takeInitialCommand();
+          if (startupCmd) {
+            lifecycle?.write(startupCmd.endsWith("\n") ? startupCmd : `${startupCmd}\n`);
+          }
           if (hostedId) {
             hostedClaude.bind(hostedId, spawned.id);
             hostedLive = true;
@@ -1339,7 +1504,7 @@
             syncFrames.flush();
             rafWrites.flushSync();
             term.write("", () => {
-              if (!disposed) { commandDecorations.clear(); commandBlocks.clear(); term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
+              if (!disposed) { commandDecorations.clear(); commandBlocks.clear(); hasCompletedBlock = false; term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
               resolve();
             });
           });
@@ -1455,9 +1620,9 @@
   }
 
   export async function copySelection() {
-    const text = term?.getSelection() ?? "";
+    const text = normalizeSelectedText(term?.getSelection() ?? "");
     if (!text) warning = "Select terminal text to copy.";
-    else warning = await copyText(text) ? null : "Couldn't copy terminal selection.";
+    else await copyAndFlash(text, "Copied", "Couldn't copy terminal selection.");
   }
 
   export function retainedOutput(): string {
@@ -1473,16 +1638,137 @@
   }
 
   export async function copyOutput() {
-    warning = await copyText(retainedOutput()) ? null : "Couldn't copy retained terminal output.";
+    await copyAndFlash(retainedOutput(), "Copied output", "Couldn't copy retained terminal output.");
   }
 
-  export function lastCommandOutput(): { output: string; exitCode: number | null } | null {
+  export async function copyAsMarkdown(): Promise<boolean> {
+    if (term?.hasSelection()) {
+      const sel = normalizeSelectedText(term.getSelection());
+      if (sel) {
+        const md = formatTerminalMarkdownBlock({
+          text: sel,
+          cwd: activeCwdSubdir,
+        });
+        return copyAndFlash(md, "Copied Markdown", "Couldn't copy terminal Markdown.");
+      }
+    }
+    const last = lastCommandOutput();
+    if (last) {
+      const md = formatTerminalMarkdownBlock({
+        command: last.command,
+        text: last.output,
+        exitCode: last.exitCode,
+        cwd: activeCwdSubdir,
+      });
+      return copyAndFlash(md, "Copied Markdown", "Couldn't copy terminal Markdown.");
+    }
+    const all = normalizeSelectedText(retainedOutput());
+    if (!all) {
+      warning = "No terminal output to copy as Markdown.";
+      return false;
+    }
+    return copyAndFlash(
+      formatTerminalMarkdownBlock({ text: all, cwd: activeCwdSubdir }),
+      "Copied Markdown",
+      "Couldn't copy terminal Markdown.",
+    );
+  }
+
+  export async function copyLastCommand(): Promise<boolean> {
+    const cmd = lastCommandOutput()?.command?.trim() ?? "";
+    if (!cmd) {
+      warning = "No completed shell command recorded yet.";
+      return false;
+    }
+    return copyAndFlash(cmd, "Copied command", "Couldn't copy shell command.");
+  }
+
+  export function selectLastCommandOutput(): boolean {
+    if (!term) return false;
+    const block = commandBlocks.lastCompletedBlock();
+    if (!block || block.outputStartLine === null) {
+      warning = "No completed shell command recorded yet.";
+      return false;
+    }
+    const start = Math.max(0, block.outputStartLine);
+    const end = Math.max(start, block.outputEndLine ?? start);
+    term.selectLines(start, end);
+    hasActiveSelection = term.hasSelection();
+    term.scrollToLine(start);
+    return hasActiveSelection;
+  }
+
+  export function sendSelectionOrLastOutputToAgent(): boolean {
+    if (!onSendToAgent) return false;
+    if (term?.hasSelection()) {
+      const formatted = formatSelectionForAgent({
+        text: term.getSelection(),
+        cwd: activeCwdSubdir,
+      });
+      if (formatted) {
+        onSendToAgent(formatted);
+        warning = null;
+        return true;
+      }
+    }
+    const last = lastCommandOutput();
+    if (last && (last.command || last.output)) {
+      const formatted =
+        last.exitCode !== null && last.exitCode !== 0
+          ? formatFailedCommandForAgent({
+              command: last.command ?? "",
+              exitCode: last.exitCode,
+              durationMs: null,
+              output: last.output,
+              cwd: activeCwdSubdir,
+            })
+          : formatTerminalMarkdownBlock({
+              command: last.command,
+              text: last.output,
+              exitCode: last.exitCode,
+              cwd: activeCwdSubdir,
+            });
+      onSendToAgent(`${formatted}\n`);
+      warning = null;
+      return true;
+    }
+    warning = "Select terminal text or run a command first.";
+    return false;
+  }
+
+  export function runSelectionOrLastCommandInNewShell(): boolean {
+    if (!onRunInNewShell) return false;
+    const candidate = term?.hasSelection()
+      ? normalizeSelectedText(term.getSelection())
+      : (lastCommandOutput()?.command?.trim() ?? "");
+    if (!candidate) {
+      warning = "Select a command or run a shell command first.";
+      return false;
+    }
+    onRunInNewShell(candidate, activeCwdSubdir);
+    return true;
+  }
+
+  export function lastCommandOutput(): {
+    output: string;
+    exitCode: number | null;
+    command?: string;
+    outputStartLine?: number;
+    outputEndLine?: number;
+  } | null {
     const buffer = term?.buffer.normal;
     if (!buffer) return null;
     const block = commandBlocks.lastCompletedBlock();
     if (!block) return null;
-    const output = extractBlockOutput(buffer, block);
-    return { output, exitCode: block.exitCode };
+    const output = normalizeSelectedText(extractBlockOutput(buffer, block));
+    const command = extractBlockCommand(buffer, block) || undefined;
+    return {
+      output,
+      exitCode: block.exitCode,
+      command,
+      outputStartLine: block.outputStartLine ?? undefined,
+      outputEndLine: block.outputEndLine ?? undefined,
+    };
   }
 
   export async function copyLastCommandOutput(): Promise<boolean> {
@@ -1491,9 +1777,46 @@
       warning = "No completed command output recorded yet.";
       return false;
     }
-    const ok = await copyText(last.output);
-    warning = ok ? null : "Couldn't copy the last command output.";
-    return ok;
+    return copyAndFlash(last.output, "Copied command output", "Couldn't copy the last command output.");
+  }
+
+  const viewportMenuPopover = $derived<PopoverOptions | null>(
+    contextMenu
+      ? {
+          anchor: { kind: "point", x: contextMenu.x, y: contextMenu.y },
+          dismiss: {
+            pointer: "pointerdown",
+            contextmenu: true,
+            scroll: true,
+            resize: true,
+            escape: "capture",
+          },
+          onDismiss: () => {
+            contextMenu = null;
+            if (active) term?.focus();
+          },
+        }
+      : null,
+  );
+
+  function closeContextMenu(then?: () => void) {
+    contextMenu = null;
+    then?.();
+    if (active) term?.focus();
+  }
+
+  async function pasteFromContextMenu() {
+    contextMenu = null;
+    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
+      warning = "Clipboard paste is unavailable in this environment.";
+      return;
+    }
+    try {
+      const raw = await navigator.clipboard.readText();
+      if (raw) insertText(raw, { focus: true });
+    } catch {
+      warning = "Couldn't read clipboard for paste.";
+    }
   }
 
   export async function exportOutput() {
@@ -1596,8 +1919,13 @@
         activeMatchBorder: "#809eff", activeMatchColorOverviewRuler: "#809eff",
       },
     };
-    if (backwards) searchAddon.findPrevious(query, options);
-    else searchAddon.findNext(query, options);
+    suppressSelectToCopy = true;
+    try {
+      if (backwards) searchAddon.findPrevious(query, options);
+      else searchAddon.findNext(query, options);
+    } finally {
+      suppressSelectToCopy = false;
+    }
   }
 
   function handleFindKey(event: KeyboardEvent) {
@@ -1654,9 +1982,17 @@
     }
     const chord = terminalViewChord(event, $hostPlatform.os);
     if (!chord) return false;
+    if (chord === "copy-selection") {
+      if (!term?.hasSelection() && $hostPlatform.os === "macos") return false;
+      event.preventDefault();
+      event.stopPropagation();
+      void copySelection();
+      return true;
+    }
     event.preventDefault();
     event.stopPropagation();
-    if (chord === "find") void openFind();
+    if (chord === "copy-last-output") void copyLastCommandOutput();
+    else if (chord === "find") void openFind();
     else if (chord === "zoom-reset") setFontSize(TERMINAL_FONT_DEFAULT);
     else setFontSize(fontSize + (chord === "zoom-in" ? 1 : -1));
     return true;
@@ -1666,6 +2002,7 @@
     searchAddon?.clearDecorations();
     commandDecorations.clear();
     commandBlocks.clear();
+    hasCompletedBlock = false;
     term?.clear();
     if (findOpen) runFind(false, true);
     else if (active) term?.focus();
@@ -1728,6 +2065,46 @@
      * Captured on the host because the event does not bubble.
      */
     const onContextLost = (event: Event) => gpu?.lose(event.target);
+    const onCopyCapture = (event: ClipboardEvent) => {
+      if (!term) return;
+      if (!term.hasSelection()) {
+        // Prevent xterm's internal copy handler from writing "" to the clipboard when nothing is selected.
+        event.stopPropagation();
+        return;
+      }
+      const normalized = normalizeSelectedText(term.getSelection());
+      if (!normalized) {
+        event.stopPropagation();
+        return;
+      }
+      if (event.clipboardData) {
+        event.clipboardData.setData("text/plain", normalized);
+        event.preventDefault();
+        event.stopPropagation();
+        warning = null;
+        copiedLabel = "Copied";
+        copyFlash.flash();
+      }
+    };
+    const onHostPointerDown = (event: PointerEvent) => {
+      if (event.button === 0) selectToCopy.onPointerDown(event.button);
+    };
+    const onWindowPointerUp = () => {
+      selectToCopy.onPointerUp();
+    };
+    const onViewportContextMenu = (event: MouseEvent) => {
+      const mouseTrackingMode = (
+        term as unknown as { modes?: { mouseTrackingMode?: string } } | null
+      )?.modes?.mouseTrackingMode;
+      if (mouseTrackingMode && mouseTrackingMode !== "none" && !event.shiftKey && !event.altKey) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      hasActiveSelection = Boolean(term?.hasSelection());
+      hasCompletedBlock = commandBlocks.lastCompletedBlock() !== null;
+      contextMenu = { x: event.clientX, y: event.clientY };
+    };
     const pastePlainText = (raw: string, current: XTerm) => {
       const plan = planPaste(raw, current.modes.bracketedPasteMode);
       if (!plan.question) { current.paste(plan.text); return; }
@@ -1864,6 +2241,11 @@
       for (const type of ERASE_CAPTURE_EVENTS) host.addEventListener(type, onEraseCapture, true);
       host.addEventListener("paste", onPasteCapture, true);
       host.addEventListener("webglcontextlost", onContextLost, true);
+      host.addEventListener("copy", onCopyCapture, true);
+      host.addEventListener("pointerdown", onHostPointerDown, true);
+      window.addEventListener("pointerup", onWindowPointerUp);
+      window.addEventListener("pointercancel", onWindowPointerUp);
+      host.addEventListener("contextmenu", onViewportContextMenu);
       const t = ensureTerm();
       t?.open(host);
       if (t) scrollFeel = createScrollFeel(t, { enabled: () => get(interfaceStore).terminalSmoothWheel, onSample: wheelDiagnostic() });
@@ -1961,11 +2343,19 @@
         }
         void spawnPty();
       });
+    window.addEventListener("pagehide", flushBackendTitleSync);
     return () => {
+      window.removeEventListener("pagehide", flushBackendTitleSync);
+      flushBackendTitleSync();
       if (host) {
         for (const type of ERASE_CAPTURE_EVENTS) host.removeEventListener(type, onEraseCapture, true);
         host.removeEventListener("paste", onPasteCapture, true);
         host.removeEventListener("webglcontextlost", onContextLost, true);
+        host.removeEventListener("copy", onCopyCapture, true);
+        host.removeEventListener("pointerdown", onHostPointerDown, true);
+        window.removeEventListener("pointerup", onWindowPointerUp);
+        window.removeEventListener("pointercancel", onWindowPointerUp);
+        host.removeEventListener("contextmenu", onViewportContextMenu);
       }
       observedHelper?.removeEventListener("keydown", onXtermKeydown, true);
       observedHelper?.removeEventListener("blur", onHelperBlur);
@@ -1977,6 +2367,9 @@
       if (peerWakeTimer) { clearTimeout(peerWakeTimer); peerWakeTimer = null; }
       if (peerFallbackTimer) { clearTimeout(peerFallbackTimer); peerFallbackTimer = null; }
       disposed = true;
+      selectToCopy.reset();
+      copyFlash.dispose();
+      titleCoalescer.dispose();
       // Closing the tab is the reader's own end of it, not an incident. A
       // process still running is kept (`lifecycle.dispose`), and so is its
       // conversation's record: the tab that shows it next finds it there.
@@ -2037,6 +2430,84 @@
     if (!term) return;
     term.options.macOptionIsMeta = options.macOptionIsMeta;
     term.options.macOptionClickForcesSelection = options.macOptionClickForcesSelection;
+  });
+
+  /** Keep the cross-repository session record's title and durable backend ledger aligned with live OSC and custom tab titles. */
+  const BACKEND_TITLE_SYNC_DEBOUNCE_MS = 1_500;
+  let lastSyncedBackendTitleKey = "";
+  let lastSyncedBackendPinned = false;
+  let backendTitleSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingBackendTitleSync: {
+    sessionId: string;
+    title: string | null;
+    userNamed: boolean;
+    syncKey: string;
+  } | null = null;
+
+  function sendBackendTitleSync(item: {
+    sessionId: string;
+    title: string | null;
+    userNamed: boolean;
+    syncKey: string;
+  }) {
+    lastSyncedBackendTitleKey = item.syncKey;
+    lastSyncedBackendPinned = item.userNamed;
+    void invoke("cmd_terminal_set_title", {
+      sessionId: item.sessionId,
+      title: item.title,
+      userNamed: item.userNamed,
+    }).catch(() => {});
+  }
+
+  function flushBackendTitleSync() {
+    if (backendTitleSyncTimer !== null) {
+      clearTimeout(backendTitleSyncTimer);
+      backendTitleSyncTimer = null;
+    }
+    const pending = pendingBackendTitleSync;
+    if (!pending) return;
+    pendingBackendTitleSync = null;
+    sendBackendTitleSync(pending);
+  }
+
+  $effect(() => {
+    lifecycle?.retitle(title);
+    const sessionId = activePtyId;
+    const normalizedTitle = title?.trim() || null;
+    const pinned = Boolean(userNamed);
+    if (pendingBackendTitleSync && pendingBackendTitleSync.sessionId !== sessionId) {
+      flushBackendTitleSync();
+    }
+    if (!sessionId || !isTauri()) return;
+    const syncKey = `${sessionId}\0${pinned ? "1" : "0"}\0${normalizedTitle ?? ""}`;
+    if (syncKey === (pendingBackendTitleSync?.syncKey ?? lastSyncedBackendTitleKey)) return;
+    if (pinned || pinned !== lastSyncedBackendPinned) {
+      if (backendTitleSyncTimer !== null) {
+        clearTimeout(backendTitleSyncTimer);
+        backendTitleSyncTimer = null;
+      }
+      pendingBackendTitleSync = null;
+      sendBackendTitleSync({ sessionId, title: normalizedTitle, userNamed: pinned, syncKey });
+      return;
+    }
+    pendingBackendTitleSync = {
+      sessionId,
+      title: normalizedTitle,
+      userNamed: false,
+      syncKey,
+    };
+    if (backendTitleSyncTimer === null) {
+      backendTitleSyncTimer = setTimeout(flushBackendTitleSync, BACKEND_TITLE_SYNC_DEBOUNCE_MS);
+    }
+  });
+
+  /** Keep cross-surface placement metadata (active focus, split slot, urgent attention) synchronized. */
+  $effect(() => {
+    lifecycle?.setPlacement({
+      isActive,
+      splitSlot,
+      attention: attentionLabel,
+    });
   });
 
   /**
@@ -2600,6 +3071,12 @@
           </button>
         {/if}
       {/if}
+      {#if copiedLabel}
+        <span data-testid="terminal-copied-flash" class="inline-flex items-center gap-1 text-micro text-ok shrink-0 whitespace-nowrap">
+          <Check size={11} aria-hidden="true" />
+          <span>{copiedLabel}</span>
+        </span>
+      {/if}
       {#if renderer === "reset" || renderer === "lost"}
         <!-- A lost WebGL context is not blank (the DOM renderer is already
              drawing the same rows), but it is slower; say why. -->
@@ -2620,3 +3097,172 @@
     </div>
   {/if}
 </div>
+
+{#if contextMenu && viewportMenuPopover}
+  <div
+    use:portal={"body"}
+    use:popover={viewportMenuPopover}
+    out:popoverExit
+    data-terminal-viewport-context-menu
+    data-testid="terminal-viewport-context-menu"
+    class="fixed w-60 max-w-[calc(100vw-16px)] max-h-[min(28rem,calc(100vh-24px))] overflow-y-auto gp-menu gp-pop p-1 text-meta text-textPrimary"
+    style="z-index: {LAYERS.MENU}"
+    role="menu"
+    aria-label="Terminal viewport actions"
+    tabindex="-1"
+  >
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy"
+      disabled={!hasActiveSelection}
+      onclick={() => closeContextMenu(() => { void copySelection(); })}
+    >
+      <Copy size={12} class="shrink-0" />
+      <span>Copy</span>
+      <span class="ml-auto text-micro text-textMuted">{platformChord("⌘C", "Ctrl+Shift+C", $hostPlatform.os)}</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy-markdown"
+      onclick={() => closeContextMenu(() => { void copyAsMarkdown(); })}
+    >
+      <FileText size={12} class="shrink-0" />
+      <span>Copy as Markdown</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-paste"
+      onclick={() => void pasteFromContextMenu()}
+    >
+      <Clipboard size={12} class="shrink-0" />
+      <span>Paste</span>
+      <span class="ml-auto text-micro text-textMuted">{platformChord("⌘V", "Ctrl+Shift+V", $hostPlatform.os)}</span>
+    </button>
+    <div class="gp-menu-sep my-0.5" role="separator"></div>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy-last-output"
+      disabled={!hasCompletedBlock}
+      onclick={() => closeContextMenu(() => { void copyLastCommandOutput(); })}
+    >
+      <Copy size={12} class="shrink-0" />
+      <span>Copy Last Command Output</span>
+      <span class="ml-auto text-micro text-textMuted">{platformChord("⌘⇧C", "Ctrl+Alt+C", $hostPlatform.os)}</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy-last-command"
+      disabled={!hasCompletedBlock}
+      onclick={() => closeContextMenu(() => { void copyLastCommand(); })}
+    >
+      <Terminal size={12} class="shrink-0" />
+      <span>Copy Last Command</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-select-last-output"
+      disabled={!hasCompletedBlock}
+      onclick={() => closeContextMenu(() => { selectLastCommandOutput(); })}
+    >
+      <Check size={12} class="shrink-0" />
+      <span>Select Last Command Output</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy-all"
+      onclick={() => closeContextMenu(() => { void copyOutput(); })}
+    >
+      <Copy size={12} class="shrink-0" />
+      <span>Copy All Retained Output</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-select-all"
+      onclick={() => closeContextMenu(() => { term?.selectAll(); hasActiveSelection = Boolean(term?.hasSelection()); })}
+    >
+      <Check size={12} class="shrink-0" />
+      <span>Select All</span>
+    </button>
+    {#if onSendToAgent || onRunInNewShell}
+      <div class="gp-menu-sep my-0.5" role="separator"></div>
+      {#if onSendToAgent}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="terminal-ctx-send-to-agent"
+          disabled={!hasActiveSelection && !hasCompletedBlock}
+          onclick={() => closeContextMenu(() => { sendSelectionOrLastOutputToAgent(); })}
+        >
+          <Send size={12} class="shrink-0" />
+          <span>Send Selection / Output to Agent</span>
+        </button>
+      {/if}
+      {#if onRunInNewShell}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="terminal-ctx-run-new-shell"
+          disabled={!hasActiveSelection && !hasCompletedBlock}
+          onclick={() => closeContextMenu(() => { runSelectionOrLastCommandInNewShell(); })}
+        >
+          <Terminal size={12} class="shrink-0" />
+          <span>Run in New Split Shell</span>
+        </button>
+      {/if}
+    {/if}
+    <div class="gp-menu-sep my-0.5" role="separator"></div>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-find"
+      onclick={() => { contextMenu = null; void openFind(); }}
+    >
+      <Search size={12} class="shrink-0" />
+      <span>Find…</span>
+      <span class="ml-auto text-micro text-textMuted">{platformChord("⌘F", "Ctrl+Shift+F", $hostPlatform.os)}</span>
+    </button>
+    <button
+      type="button"
+      role="menuitem"
+      class="gp-menu-item"
+      data-testid="terminal-ctx-clear"
+      onclick={() => closeContextMenu(() => { clearScrollback(); })}
+    >
+      <X size={12} class="shrink-0" />
+      <span>Clear Scrollback</span>
+    </button>
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={$interfaceStore.terminalCopyOnSelect}
+      class="gp-menu-item"
+      data-testid="terminal-ctx-copy-on-select"
+      onclick={() => {
+        interfaceStore.setTerminalCopyOnSelect(!$interfaceStore.terminalCopyOnSelect);
+      }}
+    >
+      <Copy size={12} class="shrink-0" />
+      <span>Select-to-Copy</span>
+      <span class="ml-auto text-micro text-textMuted">{$interfaceStore.terminalCopyOnSelect ? "On" : "Off"}</span>
+    </button>
+  </div>
+{/if}

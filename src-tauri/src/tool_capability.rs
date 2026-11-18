@@ -194,6 +194,7 @@ pub fn invalidate(tool: ExternalTool) {
 
 pub fn invalidate_all() {
     CACHE.invalidate_all();
+    crate::engine::dcgrep::invalidate_cache();
 }
 
 /// Resolve through the cache: miss or stale, probe, store (including Absent).
@@ -252,9 +253,7 @@ impl<T: Clone> BinaryProbeCache<T> {
         }
     }
 
-    /// Forgets every answer, so a test that forces a probe to fail is not
-    /// served an earlier test's cached success.
-    #[cfg(test)]
+    /// Forgets every cached probe result so refreshes see updated binaries.
     pub(crate) fn clear(&self) {
         if let Some(entries) = self.entries.get() {
             entries

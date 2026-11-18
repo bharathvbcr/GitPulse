@@ -14,6 +14,7 @@ export interface PaletteItem {
   filePath?: string;
   shortcut?: string;
   category: string;
+  badge?: string;
   disabledReason?: string;
   /** A mode change stays open; a dialog handoff closes before taking focus. */
   keepOpen?: boolean;
@@ -64,7 +65,7 @@ function usageScore(usage: Usage | undefined, now: number): number {
 }
 
 /** Match all tokens, weight labels above metadata, and never let usage beat relevance. */
-export function rankItems<T extends Pick<PaletteItem, "id" | "label" | "description" | "keywords" | "category" | "disabledReason">>(
+export function rankItems<T extends Pick<PaletteItem, "id" | "label" | "description" | "keywords" | "category" | "badge" | "disabledReason">>(
   items: readonly T[], query: string, history: Frecency = new Map(), now = Date.now(),
 ): T[] {
   const text = query.trim().toLowerCase().slice(0, MAX_QUERY_LENGTH);
@@ -75,7 +76,7 @@ export function rankItems<T extends Pick<PaletteItem, "id" | "label" | "descript
     if (seen.has(item.id)) return;
     seen.add(item.id);
     const label = item.label.toLowerCase();
-    const metadata = `${item.description ?? ""} ${item.keywords ?? ""} ${item.category}`.toLowerCase();
+    const metadata = `${item.description ?? ""} ${item.keywords ?? ""} ${item.category} ${item.badge ?? ""}`.toLowerCase();
     let score = 0;
     for (const token of tokens) {
       if (label === token) score += 120;

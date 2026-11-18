@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
 import RepoMapPanel, { settleMapBeforeStatus } from "./RepoMapPanel.svelte";
+import { stripMarkupTags } from "../dom/markupText";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "RepoMapPanel.svelte"), "utf8");
@@ -359,7 +360,7 @@ describe("RepoMapPanel map view tablist", () => {
       /\brole="tab"/.test(match[1] ?? ""),
     );
     expect(tabs).toHaveLength(7);
-    expect(tabs.map((match) => (match[2] ?? "").replace(/<[^>]+>/g, "").trim())).toEqual(labels);
+    expect(tabs.map((match) => stripMarkupTags(match[2] ?? "").trim())).toEqual(labels);
     expect(tabs[0]?.[1]).toContain('aria-selected="true"');
     expect(tabs[0]?.[1]).toContain('tabindex="0"');
     for (const tab of tabs.slice(1)) {
@@ -870,7 +871,7 @@ describe("RepoMapPanel graph view descriptions", () => {
     const region = body.slice(at, body.indexOf('role="tabpanel"', at));
     const tabs = new Map(
       [...region.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].map((match) => [
-        (match[2] ?? "").replace(/<[^>]+>/g, "").trim(),
+        stripMarkupTags(match[2] ?? "").trim(),
         match[1] ?? "",
       ]),
     );

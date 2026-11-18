@@ -818,6 +818,7 @@ mod tests {
                 "gitpulse_worktree_send_message",
                 "gitpulse_browser_open",
                 "gitpulse_terminal_spawn",
+                "gitpulse_terminal_exec",
                 "gitpulse_terminal_open_file",
                 "gitpulse_terminal_send",
                 "gitpulse_terminal_close",

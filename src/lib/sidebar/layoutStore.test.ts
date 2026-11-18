@@ -3,11 +3,16 @@ import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { get } from "svelte/store";
 import {
   SECTION_STORAGE_KEY,
+  SIDEBAR_NAV_STORAGE_KEY,
   STORAGE_KEY,
   createLayoutStore,
+  createSidebarNavStore,
   loadLayout,
   loadSections,
+  loadSidebarNav,
+  resolveSidebarFileAction,
   saveSections,
+  saveSidebarNav,
 } from "./layoutStore";
 import {
   SIDEBAR_DEFAULT_WIDTH,
@@ -313,6 +318,46 @@ describe("loadLayout fuzz/stress", () => {
       const sections = loadSections(raw.slice(0, 300));
       expect(typeof sections.staged).toBe("boolean");
       expect(typeof sections.unstaged).toBe("boolean");
+    }
+  });
+
+  it("persists sidebar navigation view and explicit file open target safely without guessing", () => {
+    for (const raw of [null, "", "{bad", "[]", "42", '{"view":"bogus","openTarget":"guess"}']) {
+      expect(loadSidebarNav(raw)).toEqual({ view: "git", openTarget: "code" });
+    }
+    expect(loadSidebarNav('{"view":"files","openTarget":"split"}')).toEqual({
+      view: "files",
+      openTarget: "split",
+    });
+    expect(loadSidebarNav('{"view":"files","openTarget":"tab"}')).toEqual({
+      view: "files",
+      openTarget: "tab",
+    });
+
+    expect(resolveSidebarFileAction({ defaultTarget: "code" })).toBe("code");
+    expect(resolveSidebarFileAction({ defaultTarget: "tab" })).toBe("tab");
+    expect(resolveSidebarFileAction({ defaultTarget: "split" })).toBe("split");
+    expect(resolveSidebarFileAction({ defaultTarget: "code", altKey: true })).toBe("split");
+    expect(resolveSidebarFileAction({ defaultTarget: "split", metaOrCtrlKey: true })).toBe("code");
+    expect(resolveSidebarFileAction({ defaultTarget: "code", metaOrCtrlKey: true })).toBe("tab");
+
+    const backing: Record<string, string> = {};
+    const restore = installStorage(backing);
+    try {
+      saveSidebarNav({ view: "files", openTarget: "tab" });
+      expect(JSON.parse(backing[SIDEBAR_NAV_STORAGE_KEY])).toEqual({
+        view: "files",
+        openTarget: "tab",
+      });
+      const navStore = createSidebarNavStore();
+      expect(get(navStore)).toEqual({ view: "files", openTarget: "tab" });
+      navStore.setOpenTarget("split");
+      navStore.setView("git");
+      expect(get(navStore)).toEqual({ view: "git", openTarget: "split" });
+      navStore.reset();
+      expect(get(navStore)).toEqual({ view: "git", openTarget: "code" });
+    } finally {
+      restore();
     }
   });
 });

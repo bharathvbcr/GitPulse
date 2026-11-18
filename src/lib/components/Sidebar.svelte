@@ -58,6 +58,7 @@
   import WorktreesPanel from "./WorktreesPanel.svelte";
   import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import LazyView from "./LazyView.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { hasUnstagedChanges, statusForSide, summarizeStatuses } from "../files/fileStatus";
   import {
@@ -65,7 +66,10 @@
     loadSections,
     readSectionsRaw,
     saveSections,
+    setSidebarExplorerDocked,
+    sidebarNavStore,
     type SidebarSections,
+    type SidebarView,
   } from "../sidebar/layoutStore";
   import {
     SIDEBAR_COLLAPSED_WIDTH,
@@ -84,6 +88,7 @@
     ChevronRight,
     DownloadCloud,
     FolderGit2,
+    FolderTree,
     GitBranch,
     Minus,
     PanelLeftClose,
@@ -211,6 +216,7 @@
 
   onDestroy(() => {
     endSlide();
+    setSidebarExplorerDocked(false);
   });
 
   // An agent can touch thousands of files in one pass; lists mount a window
@@ -218,6 +224,69 @@
   const FILE_LIST_STEP = 300;
 
   /* --- Persisted shell + section state ------------------------------------ */
+
+  const loadSidebarExplorer = () => import("./SidebarExplorerPane.svelte");
+  let sidebarView = $derived<SidebarView>($sidebarNavStore.view);
+  let explorerMounted = $state($sidebarNavStore.view === "files");
+
+  $effect(() => {
+    if (sidebarView === "files") explorerMounted = true;
+    setSidebarExplorerDocked(
+      Boolean($repoStore.currentPath && !overlay && !collapsed && sidebarView === "files"),
+    );
+  });
+
+  function selectSidebarView(view: SidebarView) {
+    sidebarNavStore.setView(view);
+  }
+
+  function selectRailView(view: SidebarView) {
+    sidebarNavStore.setView(view);
+    if (collapsed) layoutStore.toggleCollapsed();
+  }
+
+  let activeFileDragSeq = 0;
+  let loadedDropZones: import("../terminal/dropZoneRegistry").DropZoneRegistry | null = null;
+
+  $effect(() => {
+    if ($repoStore.currentPath && !loadedDropZones) {
+      void import("../terminal/dropZoneRegistry").then(({ terminalDropZones }) => {
+        loadedDropZones = terminalDropZones;
+      });
+    }
+  });
+
+  function startSidebarFileDrag(event: DragEvent, relPath: string) {
+    const base = ($repoStore.currentPath ?? "").replace(/[\\/]+$/, "");
+    const sep = base.includes("\\") ? "\\" : "/";
+    const fullPath = base ? `${base}${sep}${relPath}` : relPath;
+    event.dataTransfer?.setData("application/x-gitpulse-filepath", fullPath);
+    event.dataTransfer?.setData("text/plain", relPath);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "copy";
+    const seq = ++activeFileDragSeq;
+    if (loadedDropZones) {
+      loadedDropZones.beginInAppDrag([fullPath], true);
+      return;
+    }
+    void import("../terminal/dropZoneRegistry").then(({ terminalDropZones }) => {
+      loadedDropZones = terminalDropZones;
+      if (seq === activeFileDragSeq) {
+        terminalDropZones.beginInAppDrag([fullPath], true);
+      }
+    });
+  }
+
+  function endSidebarFileDrag() {
+    activeFileDragSeq += 1;
+    if (loadedDropZones) {
+      loadedDropZones.endInAppDrag();
+      return;
+    }
+    void import("../terminal/dropZoneRegistry").then(({ terminalDropZones }) => {
+      loadedDropZones = terminalDropZones;
+      terminalDropZones.endInAppDrag();
+    });
+  }
 
   let sections = $state<SidebarSections>(loadSections(readSectionsRaw()));
 
@@ -489,6 +558,46 @@
     </div>
 
     {#if $repoStore.currentPath}
+      <div class="px-3 pb-1 shrink-0">
+        <div
+          class="gp-segmented flex w-full"
+          role="group"
+          aria-label="Sidebar view"
+          data-testid="sidebar-view-switcher"
+        >
+          <button
+            type="button"
+            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
+            data-testid="sidebar-view-git"
+            data-active={sidebarView === "git" ? "true" : "false"}
+            aria-pressed={sidebarView === "git"}
+            title="Show Git branches, worktrees, and changes"
+            onclick={() => selectSidebarView("git")}
+          >
+            <GitBranch size={12} class="shrink-0" />
+            <span>Git</span>
+          </button>
+          <button
+            type="button"
+            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
+            data-testid="sidebar-view-files"
+            data-active={sidebarView === "files" ? "true" : "false"}
+            aria-pressed={sidebarView === "files"}
+            title="Browse and search repository files"
+            onclick={() => selectSidebarView("files")}
+          >
+            <FolderTree size={12} class="shrink-0" />
+            <span>Explorer</span>
+          </button>
+        </div>
+      </div>
+    {/if}
+
+    <div
+      class="flex-1 min-h-0 flex flex-col"
+      class:hidden={$repoStore.currentPath !== null && sidebarView !== "git"}
+    >
+    {#if $repoStore.currentPath}
       <!-- At-a-glance repo pulse strip -->
       <div class="mx-3 mt-2 rounded-xl border border-edge bg-surface p-2.5 space-y-1.5">
         <div class="flex items-center gap-1.5 min-w-0">
@@ -709,6 +818,9 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
+                    draggable="true"
+                    ondragstart={(e) => startSidebarFileDrag(e, f.path)}
+                    ondragend={endSidebarFileDrag}
                     class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, true)}
                     title={f.path}
@@ -791,6 +903,9 @@
                   <LanguageLogo filePath={f.path} size={13} class="shrink-0" />
                   <button
                     type="button"
+                    draggable="true"
+                    ondragstart={(e) => startSidebarFileDrag(e, f.path)}
+                    ondragend={endSidebarFileDrag}
                     class="flex-1 min-w-0 truncate text-left font-mono text-meta {pathClass(f.is_conflicted)}"
                     onclick={() => repoStore.selectFileDiff(f.path, false)}
                     title={f.path}
@@ -832,6 +947,21 @@
     </div>
 
     <CommitComposer />
+    </div>
+
+    {#if $repoStore.currentPath && explorerMounted}
+      <div
+        class="flex-1 min-h-0 flex flex-col"
+        class:hidden={sidebarView !== "files"}
+        data-testid="sidebar-explorer-container"
+      >
+        <LazyView
+          load={loadSidebarExplorer}
+          name="the file explorer"
+          props={{ repoPath: $repoStore.currentPath }}
+        />
+      </div>
+    {/if}
 {/snippet}
 
 {#snippet rail()}
@@ -847,8 +977,29 @@
       >
         <PanelLeftOpen size={15} />
       </button>
-      <FolderGit2 size={15} class="text-accent shrink-0" />
+      <button
+        type="button"
+        onclick={() => selectRailView("git")}
+        title="Show Git in sidebar"
+        aria-label="Show Git in sidebar"
+        aria-pressed={sidebarView === "git"}
+        data-testid="sidebar-rail-git"
+        class="gp-icon-btn {sidebarView === 'git' ? 'text-accent bg-accent/15' : 'hover:text-accent'}"
+      >
+        <FolderGit2 size={15} />
+      </button>
       {#if $repoStore.currentPath}
+        <button
+          type="button"
+          onclick={() => selectRailView("files")}
+          title="Show File Explorer in sidebar"
+          aria-label="Show File Explorer in sidebar"
+          aria-pressed={sidebarView === "files"}
+          data-testid="sidebar-rail-files"
+          class="gp-icon-btn {sidebarView === 'files' ? 'text-accent bg-accent/15' : 'hover:text-accent'}"
+        >
+          <FolderTree size={15} />
+        </button>
         <button type="button" onclick={() => void repoStore.previewUncommitted()}
           class="text-micro font-mono font-semibold px-1 py-0 rounded-full min-w-[18px] text-center {dirtyCount > 0
             ? 'bg-warn/15 text-warn border border-warn/35'

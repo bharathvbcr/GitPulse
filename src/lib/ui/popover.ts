@@ -338,13 +338,47 @@ export function popover(node: HTMLElement, options: PopoverOptions = {}) {
   syncListeners();
   place();
 
+  // Svelte 5 calls action `update()` before inner conditional blocks settle layout,
+  // and live-updating popovers can also change box size between ticks. Observe
+  // the panel's layout box so upward/clamped placement re-anchors after layout.
+  let rafId = 0;
+  const schedulePlace = () => {
+    if (rafId || typeof window.requestAnimationFrame !== "function") return;
+    rafId = window.requestAnimationFrame(() => {
+      rafId = 0;
+      place();
+    });
+  };
+  let prevW = node.offsetWidth;
+  let prevH = node.offsetHeight;
+  let resizeObserver: ResizeObserver | null = null;
+  if (typeof ResizeObserver !== "undefined") {
+    resizeObserver = new ResizeObserver(() => {
+      if (!config.anchor) return;
+      const nextW = node.offsetWidth;
+      const nextH = node.offsetHeight;
+      if (nextW === prevW && nextH === prevH) return;
+      prevW = nextW;
+      prevH = nextH;
+      place();
+    });
+    resizeObserver.observe(node);
+  }
+
   return {
     update(next: PopoverOptions) {
       config = next;
       syncListeners();
       place();
+      schedulePlace();
     },
     destroy() {
+      if (rafId && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      resizeObserver?.disconnect();
+      resizeObserver = null;
       for (const remove of active.values()) remove();
       active.clear();
     },

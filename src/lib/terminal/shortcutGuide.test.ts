@@ -59,4 +59,23 @@ describe("terminal guide shortcuts", () => {
     expect(terminalGuideShortcuts("macos").some((row) => row.description === "Start of the line")).toBe(true);
     expect(terminalGuideShortcuts("linux").some((row) => row.description === "Start of the line")).toBe(false);
   });
+
+  it("documents split creation, zoom, directional focus, cycling, slot jumps, and close-split on every host", () => {
+    const mac = terminalGuideShortcuts("macos");
+    expect(mac.find((r) => r.description === "Split terminal right")?.keys).toEqual(["⌘", "D"]);
+    expect(mac.find((r) => r.description === "Split terminal down")?.keys).toEqual(["⌘", "⇧", "D"]);
+    expect(mac.find((r) => r.description === "Zoom or restore split pane")?.keys).toEqual(["⌘", "⇧", "Enter"]);
+    expect(mac.find((r) => r.description === "Focus adjacent split pane")?.keys).toEqual(["⌘", "⌥", "←/→/↑/↓"]);
+    expect(mac.find((r) => r.description === "Previous / next visible split pane")?.keys).toEqual(["⌘", "⌥", "[ / ]"]);
+    expect(mac.find((r) => r.description === "Previous / next terminal pair")?.keys).toEqual(["⌘", "⌥", "⇧", "[ / ]"]);
+    expect(mac.find((r) => r.description === "Jump directly to split pane 1–8")?.keys).toEqual(["⌘", "⌥", "1–8"]);
+    expect(mac.find((r) => r.description === "Close split view and keep active session")?.keys).toEqual(["⌘", "⌥", "0"]);
+
+    const win = terminalGuideShortcuts("windows");
+    expect(win.find((r) => r.description === "Split terminal right")?.keys).toEqual(["Ctrl", "Shift", "D"]);
+    expect(win.find((r) => r.description === "Zoom or restore split pane")?.keys).toEqual(["Ctrl", "Shift", "Enter"]);
+    expect(win.find((r) => r.description === "Previous / next visible split pane")?.keys).toEqual(["Ctrl", "Alt", "[ / ]"]);
+    expect(win.find((r) => r.description === "Jump directly to split pane 1–8")?.keys).toEqual(["Ctrl", "Alt", "1–8"]);
+    expect(win.find((r) => r.description === "Close split view and keep active session")?.keys).toEqual(["Ctrl", "Alt", "0"]);
+  });
 });

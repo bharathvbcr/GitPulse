@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { dropElements, stripMarkupComments, stripMarkupTags } from "../dom/markupText";
 import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import { folderToggleAction } from "../branches/flattenRows";
@@ -40,13 +41,8 @@ function sourceButton(header: string, aria: string): string {
 
 /** Text a reader sees. Attributes, icon markup, and `{...}` expressions are not the title. */
 function visibleLabel(buttonHtml: string): string {
-  return buttonHtml
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
-    .replace(/\{[\s\S]*?\}/g, "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const withoutIcons = dropElements(stripMarkupComments(buttonHtml), "svg").replace(/\{[\s\S]*?\}/g, "");
+  return stripMarkupTags(withoutIcons, " ").replace(/\s+/g, " ").trim();
 }
 
 describe("BranchList header", () => {

@@ -18,7 +18,9 @@ use super::diskrate::FillTracker;
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::profile::{current as current_profile, ProfileChoice, ResourceProfile};
-use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor, Why};
+use super::sensor::{
+    CompressorTrend, HostSample, Level, OsSensor, Power, Reading, Sensor, Thermal, Why,
+};
 use super::snapshot::{self, PublishedVerdict, Snapshot, TickStats, Writer, WriterIdentity};
 use super::trace::{self, PreviousBoot, TraceFeed, TraceRecord};
 use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
@@ -107,21 +109,103 @@ pub struct HostLoadPulse {
     pub compressor_thrash: bool,
     pub role: Role,
     pub governor: GovernorPulse,
+    /// What the machine runs on, from the last snapshot. `None` when there is
+    /// no snapshot or the reading is unavailable; a consumer treats that as
+    /// unknown, never as mains power. Read by features that spend only when the
+    /// host has room for it (the moving wallpaper).
+    pub power: Option<Power>,
+    /// `NSProcessInfo.thermalState` from the last snapshot, or `None`.
+    pub thermal: Option<Thermal>,
+    /// The one-minute load average divided by the logical core count, or
+    /// `None` when either reading is unavailable or the count is zero.
+    pub load_per_core: Option<f64>,
+    /// CPU utilization percentage (`0.0..=100.0`), or `None`.
+    pub cpu_pct: Option<f64>,
+    /// GPU device utilization percentage (`0.0..=100.0`), or `None`.
+    pub gpu_pct: Option<f64>,
+    /// Physical memory used (Activity Monitor formula on macOS,
+    /// `MemTotal - MemAvailable` on Linux), in bytes.
+    pub mem_used_bytes: Option<u64>,
+    /// Total physical RAM in bytes.
+    pub mem_total_bytes: Option<u64>,
+    /// Swap currently used in bytes.
+    pub swap_used_bytes: Option<u64>,
+    /// SoC die temperature in degrees Celsius, or `None`.
+    pub thermal_temp_c: Option<f64>,
+    /// Free disk bytes available to this user on the state volume.
+    pub disk_free_bytes: Option<u64>,
+    /// Total capacity of the state volume in bytes.
+    pub disk_total_bytes: Option<u64>,
+    /// Bytes per second written by launched agent trees together.
+    pub disk_write_rate: Option<u64>,
+    /// Short-horizon disk fill rate in bytes per minute.
+    pub disk_fill_rate: Option<u64>,
+    /// Sequence number of the snapshot this pulse was built from, when a
+    /// snapshot is present (`None` when absent, omitted from JSON so older
+    /// test fixtures remain unchanged).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<u64>,
+}
+
+/// The host-room readings the pulse carries: power source, thermal state and
+/// one-minute load per logical core, each `None` when it cannot be read.
+fn room_of(host: &HostSample) -> (Option<Power>, Option<Thermal>, Option<f64>) {
+    let load_per_core = match (host.load.value(), host.cores.value()) {
+        (Some(load), Some(cores)) if cores.logical > 0 && load[0].is_finite() && load[0] >= 0.0 => {
+            Some((load[0] / f64::from(cores.logical) * 100.0).round() / 100.0)
+        }
+        _ => None,
+    };
+    (host.power.value(), host.thermal.value(), load_per_core)
 }
 
 pub fn pulse_of(status: &HostLoadStatus) -> HostLoadPulse {
+    let enabled = status.sensor.enabled.unwrap_or(false);
+    let live = enabled && status.sensor.state.governs();
+    let snap = if live {
+        status.snapshot.as_ref().filter(|s| s.enabled)
+    } else {
+        None
+    };
+    let effective_live = live && status.snapshot.as_ref().is_none_or(|s| s.enabled);
+    let (power, thermal, load_per_core) = snap.map_or((None, None, None), |s| room_of(&s.host));
     HostLoadPulse {
         state: status.sensor.state,
-        pressure: status.pressure,
+        pressure: if effective_live {
+            status.pressure
+        } else {
+            PressureInput::Unavailable
+        },
         level: status.sensor.level,
         age_ms: status.sensor.age_ms,
-        enabled: status.sensor.enabled.unwrap_or(false),
-        compressor_thrash: status
-            .snapshot
-            .as_ref()
-            .is_some_and(|s| s.compressor_thrash),
+        enabled,
+        compressor_thrash: snap.is_some_and(|s| s.compressor_thrash),
         role: status.role,
         governor: GovernorPulse::of(&status.governor),
+        snapshot_seq: status.snapshot.as_ref().map(|s| s.seq),
+        power,
+        thermal,
+        load_per_core,
+        cpu_pct: snap
+            .and_then(|s| s.host.cpu_usage.value())
+            .map(|c| c.total_pct)
+            .filter(|v| v.is_finite() && *v >= 0.0),
+        gpu_pct: snap
+            .and_then(|s| s.host.gpu.value())
+            .map(|g| g.utilization_pct)
+            .filter(|v| v.is_finite() && *v >= 0.0),
+        mem_used_bytes: snap
+            .and_then(|s| s.host.memory.value())
+            .map(|m| m.used_bytes),
+        mem_total_bytes: snap.and_then(|s| s.host.memsize.value()),
+        swap_used_bytes: snap.and_then(|s| s.host.swap_used.value()),
+        thermal_temp_c: snap
+            .and_then(|s| s.host.thermal_temp_c.value())
+            .filter(|t| t.is_finite()),
+        disk_free_bytes: snap.and_then(|s| s.host.free_disk.value()),
+        disk_total_bytes: snap.and_then(|s| s.host.total_disk.value()),
+        disk_write_rate: snap.and_then(|s| s.launched_write_rate.value()),
+        disk_fill_rate: snap.and_then(|s| s.disk_fill_rate.value()),
     }
 }
 
@@ -603,9 +687,10 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                     snap.disk_fill_sustained = rates.sustained;
                     procs = Some(view);
                 } else {
-                    // Off is not calm: the next run starts its thrash count
-                    // and its free-space history from nothing rather than from
-                    // samples hours old.
+                    // Off is not calm: the next run starts its probe delta,
+                    // thrash count and free-space history from nothing rather
+                    // than from samples hours old.
+                    sensor.reset();
                     trend = CompressorTrend::default();
                     fill_tracker.reset();
                     // Said as what it is: not an older build, not a calm disk.
@@ -619,7 +704,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 snap.verdict = if enabled {
                     held_verdict
                 } else {
-                    Reading::default()
+                    Reading::Unavailable(Why::Disabled)
                 };
                 if let Err(why) = w.publish(&snap) {
                     tick_problems.push(format!("publish: {why}"));
@@ -675,7 +760,11 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 );
             }
             status.governor = governor.report(Instant::now());
-            held_verdict = Reading::Value(PublishedVerdict::of(&status.governor.verdict));
+            held_verdict = if enabled {
+                Reading::Value(PublishedVerdict::of(&status.governor.verdict))
+            } else {
+                Reading::Unavailable(Why::NotYet)
+            };
         }
 
         // One record every fifth tick (10 s), from the elected writer only.
@@ -775,6 +864,282 @@ mod tests {
         // A new writer that restarted its sequence, or a new boot.
         assert!(new_sample(&mut last, Some(&record(8, 300, 1))));
         assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
+    }
+
+    /// The pulse's host-room readings: each is a value only when it was read,
+    /// and load per core needs both the load and a non-zero core count.
+    #[test]
+    fn host_room_is_read_only_from_readings_that_exist() {
+        use super::super::sensor::Cores;
+        let unread = HostSample::default();
+        assert_eq!(
+            room_of(&unread),
+            (None, None, None),
+            "nothing read is nothing claimed"
+        );
+
+        let cores = |logical| Cores {
+            logical,
+            levels: 1,
+            perf0: logical,
+            perf1: 0,
+        };
+        let read = HostSample {
+            load: Reading::Value([6.0, 4.0, 2.0]),
+            cores: Reading::Value(cores(8)),
+            power: Reading::Value(Power::Ac),
+            thermal: Reading::Value(Thermal::Fair),
+            ..HostSample::default()
+        };
+        assert_eq!(
+            room_of(&read),
+            (Some(Power::Ac), Some(Thermal::Fair), Some(0.75))
+        );
+
+        let no_cores = HostSample {
+            cores: Reading::Value(cores(0)),
+            ..read
+        };
+        assert_eq!(
+            room_of(&no_cores).2,
+            None,
+            "a zero core count divides nothing"
+        );
+        let bad_load = HostSample {
+            load: Reading::Value([f64::NAN, 0.0, 0.0]),
+            ..read
+        };
+        assert_eq!(
+            room_of(&bad_load).2,
+            None,
+            "a non-finite load is not a reading"
+        );
+        let battery = HostSample {
+            power: Reading::Value(Power::Battery),
+            ..read
+        };
+        assert_eq!(room_of(&battery).0, Some(Power::Battery));
+    }
+
+    #[test]
+    fn pulse_carries_metrics_when_present_and_none_when_absent() {
+        use super::super::sensor::{CpuUsage, GpuSample, MemorySample};
+        let empty = HostLoadStatus {
+            platform: Platform::Governed,
+            role: Role::Writer,
+            sensor: SensorReport {
+                state: SensorState::Fresh,
+                age_ms: Some(100),
+                level: Some(Level::Normal),
+                enabled: Some(true),
+                reason: None,
+            },
+            pressure: PressureInput::Normal,
+            governor: super::governor::report(),
+            profile: super::super::profile::derive(
+                Reading::Value(16 << 30),
+                Some(8),
+                ProfileChoice::Auto,
+            ),
+            snapshot_path: None,
+            writer: None,
+            writer_is_self: true,
+            snapshot: None,
+            procs: None,
+            tick: TickStats::default(),
+            problems: Vec::new(),
+            previous_boot: None,
+        };
+        let empty_pulse = pulse_of(&empty);
+        assert_eq!(empty_pulse.cpu_pct, None);
+        assert_eq!(empty_pulse.gpu_pct, None);
+        assert_eq!(empty_pulse.mem_used_bytes, None);
+        assert_eq!(empty_pulse.mem_total_bytes, None);
+        assert_eq!(empty_pulse.swap_used_bytes, None);
+        assert_eq!(empty_pulse.thermal_temp_c, None);
+        assert_eq!(empty_pulse.disk_free_bytes, None);
+        assert_eq!(empty_pulse.disk_total_bytes, None);
+        assert_eq!(empty_pulse.disk_write_rate, None);
+        assert_eq!(empty_pulse.disk_fill_rate, None);
+
+        let mut with_snap = empty;
+        let mut snap = Snapshot::empty(
+            Clock {
+                wall_ms: 1,
+                mono_ns: 1,
+                boot_id: 1,
+            },
+            snapshot::WriterIdentity::default(),
+            true,
+        );
+        snap.host.cpu_usage = Reading::Value(CpuUsage {
+            total_pct: 37.5,
+            user_pct: 25.0,
+            system_pct: 12.5,
+        });
+        snap.host.gpu = Reading::Value(GpuSample {
+            utilization_pct: 14.0,
+            renderer_pct: Some(11.0),
+            tiler_pct: None,
+            memory_in_use: Some(512 << 20),
+            memory_allocated: None,
+        });
+        snap.host.memory = Reading::Value(MemorySample {
+            used_bytes: 28 << 30,
+            app_bytes: Some(16 << 30),
+            wired_bytes: Some(5 << 30),
+            compressed_bytes: Some(7 << 30),
+            cached_bytes: Some(10 << 30),
+        });
+        snap.host.memsize = Reading::Value(64 << 30);
+        snap.host.swap_used = Reading::Value(2 << 30);
+        snap.host.thermal_temp_c = Reading::Value(68.2);
+        snap.host.free_disk = Reading::Value(220 << 30);
+        snap.host.total_disk = Reading::Value(926 << 30);
+        snap.launched_write_rate = Reading::Value(4 << 20);
+        snap.disk_fill_rate = Reading::Value(128 << 20);
+        with_snap.snapshot = Some(snap);
+
+        let p = pulse_of(&with_snap);
+        assert_eq!(p.cpu_pct, Some(37.5));
+        assert_eq!(p.gpu_pct, Some(14.0));
+        assert_eq!(p.mem_used_bytes, Some(28 << 30));
+        assert_eq!(p.mem_total_bytes, Some(64 << 30));
+        assert_eq!(p.swap_used_bytes, Some(2 << 30));
+        assert_eq!(p.thermal_temp_c, Some(68.2));
+        assert_eq!(p.disk_free_bytes, Some(220 << 30));
+        assert_eq!(p.disk_total_bytes, Some(926 << 30));
+        assert_eq!(p.disk_write_rate, Some(4 << 20));
+        assert_eq!(p.disk_fill_rate, Some(128 << 20));
+        assert_eq!(
+            p.snapshot_seq,
+            Some(with_snap.snapshot.as_ref().unwrap().seq)
+        );
+    }
+
+    #[test]
+    fn pulse_of_clears_live_scalars_when_disabled_or_non_governing() {
+        use super::super::sensor::{Cores, CpuUsage, GpuSample, MemorySample};
+        let mut snap = Snapshot::empty(
+            Clock {
+                wall_ms: 1,
+                mono_ns: 1,
+                boot_id: 1,
+            },
+            snapshot::WriterIdentity::default(),
+            true,
+        );
+        snap.seq = 42;
+        snap.compressor_thrash = true;
+        snap.host.power = Reading::Value(Power::Ac);
+        snap.host.thermal = Reading::Value(Thermal::Fair);
+        snap.host.load = Reading::Value([4.0, 2.0, 1.0]);
+        snap.host.cores = Reading::Value(Cores {
+            logical: 8,
+            levels: 1,
+            perf0: 8,
+            perf1: 0,
+        });
+        snap.host.cpu_usage = Reading::Value(CpuUsage {
+            total_pct: 52.0,
+            user_pct: 32.0,
+            system_pct: 20.0,
+        });
+        snap.host.gpu = Reading::Value(GpuSample {
+            utilization_pct: 25.0,
+            renderer_pct: None,
+            tiler_pct: None,
+            memory_in_use: None,
+            memory_allocated: None,
+        });
+        snap.host.memory = Reading::Value(MemorySample {
+            used_bytes: 16 << 30,
+            app_bytes: Some(10 << 30),
+            wired_bytes: Some(3 << 30),
+            compressed_bytes: Some(3 << 30),
+            cached_bytes: Some(2 << 30),
+        });
+        snap.host.memsize = Reading::Value(32 << 30);
+        snap.host.swap_used = Reading::Value(1 << 30);
+        snap.host.thermal_temp_c = Reading::Value(71.5);
+        snap.host.free_disk = Reading::Value(100 << 30);
+        snap.host.total_disk = Reading::Value(500 << 30);
+        snap.launched_write_rate = Reading::Value(8 << 20);
+        snap.disk_fill_rate = Reading::Value(64 << 20);
+
+        let base = HostLoadStatus {
+            platform: Platform::Governed,
+            role: Role::Reader,
+            sensor: SensorReport {
+                state: SensorState::Fresh,
+                age_ms: Some(100),
+                level: Some(Level::Normal),
+                enabled: Some(true),
+                reason: None,
+            },
+            pressure: PressureInput::Normal,
+            governor: super::governor::report(),
+            profile: super::super::profile::derive(
+                Reading::Value(16 << 30),
+                Some(8),
+                ProfileChoice::Auto,
+            ),
+            snapshot_path: None,
+            writer: None,
+            writer_is_self: false,
+            snapshot: Some(snap),
+            procs: None,
+            tick: TickStats::default(),
+            problems: Vec::new(),
+            previous_boot: None,
+        };
+
+        let stale_recent = pulse_of(&HostLoadStatus {
+            sensor: SensorReport {
+                state: SensorState::StaleRecent,
+                ..base.sensor.clone()
+            },
+            ..base.clone()
+        });
+        assert_eq!(stale_recent.cpu_pct, Some(52.0));
+        assert!(stale_recent.compressor_thrash);
+        assert_eq!(stale_recent.snapshot_seq, Some(42));
+
+        for (state, enabled) in [
+            (SensorState::StaleOld, true),
+            (SensorState::Dead, true),
+            (SensorState::Fresh, false),
+        ] {
+            let p = pulse_of(&HostLoadStatus {
+                sensor: SensorReport {
+                    state,
+                    enabled: Some(enabled),
+                    ..base.sensor.clone()
+                },
+                pressure: PressureInput::Critical,
+                ..base.clone()
+            });
+            assert_eq!(p.snapshot_seq, Some(42));
+            assert_eq!(
+                p.pressure,
+                PressureInput::Unavailable,
+                "{state:?} enabled={enabled}"
+            );
+            assert!(!p.compressor_thrash, "{state:?} enabled={enabled}");
+            assert_eq!(p.power, None);
+            assert_eq!(p.thermal, None);
+            assert_eq!(p.load_per_core, None);
+            assert_eq!(p.cpu_pct, None);
+            assert_eq!(p.gpu_pct, None);
+            assert_eq!(p.mem_used_bytes, None);
+            assert_eq!(p.mem_total_bytes, None);
+            assert_eq!(p.swap_used_bytes, None);
+            assert_eq!(p.thermal_temp_c, None);
+            assert_eq!(p.disk_free_bytes, None);
+            assert_eq!(p.disk_total_bytes, None);
+            assert_eq!(p.disk_write_rate, None);
+            assert_eq!(p.disk_fill_rate, None);
+        }
     }
 
     /// Installed memory is a fact about the machine, not a sample: a status
@@ -891,10 +1256,42 @@ mod tests {
         options.on_tick = Some(Box::new(move |pulse| seen.lock().unwrap().push(pulse)));
         let first = start(options).unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ticks.lock().unwrap().len() < 3 && Instant::now() < deadline {
+        while Instant::now() < deadline {
+            let ready = {
+                let guard = ticks.lock().unwrap();
+                guard.len() >= 3
+                    && (!cfg!(target_os = "macos")
+                        || guard.last().is_some_and(|p| p.cpu_pct.is_some()))
+            };
+            if ready {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         let status = first.status().expect("a status after three ticks");
+        // The pulse a real tick emits carries the host-room readings the
+        // moving wallpaper reads. A pulse built from a status without its
+        // snapshot would carry None and hold the wallpaper still forever,
+        // while every test of `room_of` on a hand-built sample passed.
+        let last = *ticks.lock().unwrap().last().expect("a pulse per tick");
+        #[cfg(target_os = "macos")]
+        {
+            assert!(last.power.is_some(), "{last:?}");
+            assert!(last.thermal.is_some(), "{last:?}");
+            assert!(
+                last.load_per_core.is_some_and(|load| load >= 0.0),
+                "{last:?}"
+            );
+            assert!(
+                last.cpu_pct.is_some_and(|cpu| (0.0..=100.0).contains(&cpu)),
+                "{last:?}"
+            );
+            assert!(last.mem_used_bytes.is_some_and(|u| u > 0), "{last:?}");
+            assert!(last.mem_total_bytes.is_some_and(|t| t > 0), "{last:?}");
+            assert!(last.disk_free_bytes.is_some(), "{last:?}");
+            assert!(last.disk_total_bytes.is_some_and(|t| t > 0), "{last:?}");
+        }
+        let _ = last;
         assert_eq!(status.role, Role::Writer, "{:?}", status.problems);
         assert!(status.writer_is_self);
         assert_eq!(
@@ -1218,8 +1615,106 @@ mod tests {
         assert_eq!(status.pressure, PressureInput::Unavailable);
         let snap = status.snapshot.unwrap();
         assert!(!snap.enabled);
-        assert_eq!(snap.host.pressure, Reading::default());
+        assert_eq!(snap.host.pressure, Reading::Unavailable(Why::Disabled));
+        assert_eq!(snap.host.cpu_usage, Reading::Unavailable(Why::Disabled));
+        assert_eq!(snap.verdict, Reading::Unavailable(Why::Disabled));
         assert!(status.procs.is_none());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_resets_sensor_baseline_when_switched_off_and_re_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join(snapshot::SNAPSHOT_FILE_NAME);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let switch = enabled.clone();
+        let seen = Arc::new(Mutex::new(Vec::<(
+            HostLoadPulse,
+            Option<Reading<super::snapshot::PublishedVerdict>>,
+        )>::new()));
+        let rec = seen.clone();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(80);
+        options.enabled = Box::new(move || switch.load(Ordering::SeqCst));
+        options.on_tick = Some(Box::new(move |pulse| {
+            let verdict = snapshot::read(&snap_path).ok().map(|s| s.verdict);
+            rec.lock().unwrap().push((pulse, verdict));
+        }));
+        let sampler = start(options).unwrap();
+        let limit = crate::test_support::coverage_relaxed(Duration::from_secs(20));
+        let deadline = Instant::now() + limit;
+
+        // Wait until the live probe has published at least one CPU reading and verdict.
+        while Instant::now() < deadline {
+            if seen.lock().unwrap().iter().any(|(p, v)| {
+                p.enabled && p.cpu_pct.is_some() && matches!(v, Some(Reading::Value(_)))
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p.enabled && p.cpu_pct.is_some()),
+            "expected live CPU reading before toggle"
+        );
+
+        // Switch off and wait for at least one disabled heartbeat tick.
+        enabled.store(false, Ordering::SeqCst);
+        while Instant::now() < deadline {
+            if seen.lock().unwrap().iter().any(|(p, _)| !p.enabled) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let disabled_idx = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .rposition(|(p, _)| !p.enabled)
+            .expect("disabled tick");
+
+        // Re-enable and wait for at least two enabled ticks after turning back on.
+        enabled.store(true, Ordering::SeqCst);
+        while Instant::now() < deadline {
+            let guard = seen.lock().unwrap();
+            if guard[disabled_idx..]
+                .iter()
+                .filter(|(p, _)| p.enabled)
+                .count()
+                >= 2
+                && guard[disabled_idx..]
+                    .iter()
+                    .any(|(p, _)| p.enabled && p.cpu_pct.is_some())
+            {
+                break;
+            }
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sampler.stop();
+
+        let guard = seen.lock().unwrap();
+        let after_off: Vec<_> = guard[disabled_idx..]
+            .iter()
+            .filter(|(p, _)| p.enabled)
+            .copied()
+            .collect();
+        assert!(
+            after_off.len() >= 2,
+            "expected >= 2 re-enabled ticks, got {after_off:?}"
+        );
+        assert_eq!(
+            after_off[0].0.cpu_pct, None,
+            "first re-enabled tick must re-establish baseline (Why::NotYet) instead of diffing across disabled gap"
+        );
+        assert_eq!(
+            after_off[0].1,
+            Some(Reading::Unavailable(Why::NotYet)),
+            "first re-enabled tick must not publish stale verdict from before disabled spell"
+        );
     }
 
     /// Counts activities begun and still alive; dropping one ends it.

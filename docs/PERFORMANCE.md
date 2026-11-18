@@ -3356,3 +3356,45 @@ One M-series Mac (macOS 27), with about 19 other sessions running. The storms ar
 - the installed app over wall-clock time;
 - fseventsd memory (the growth that motivated this was not reproduced by any arm on 2026-11-14);
 - Linux and Windows, which are unchanged by construction: their root watch is non-recursive.
+
+## 2026-11-17: Explorer search, dcgrep against the git fallback
+
+Explorer's content search (`cmd_search_content`) and its file listing (`cmd_list_repo_files`) ask DevCouncil's `dcgrep` first when a compatible one is installed. Compatible means `dcgrep health` reports `schema_version: 1` and all nine capabilities `engine::dcgrep::health_supports_explorer` requires. Otherwise they use git: `git grep --untracked`, plus a second pass over tracked-but-ignored paths, and `git ls-files --cached --others --exclude-standard`. See `src-tauri/src/engine/dcgrep.rs`.
+
+### Reproduce
+
+`node scripts/bench-dcgrep.mjs --repo <path> [--rounds 15] [--dcgrep <bin>] [--json <file>]`. Each arm runs the request or argv GitPulse sends, without its spawn gate.
+
+- **Parity is checked before timing.** Both arms must agree, unlimited, on each case's match count, and the dcgrep listing unioned with the index must equal `git ls-files`. A case that disagrees is reported and not timed, and the exit code is 1.
+- **Interleaving.** Rounds are interleaved ABBA after one discarded warm-up. A dcgrep-against-itself arm ("null") gives the spread on the same host.
+- **The git search arm is cut at 500 records**, as GitPulse's observer cuts it (`DEFAULT_MAX_MATCHES`).
+- **The dcgrep listing arm is `dcgrep files` alone.** GitPulse also reads `.git/index` in-process and unions the two, so that arm is a lower bound.
+
+### Measured
+
+GitPulse main checkout, about 4,000 files. dcgrep 0.2.5 (`~/.local/bin/dcgrep`), git 2.56.0, one M-series Mac. 15 rounds, warm page cache, about 30 other agent sessions and a cargo build on the host, load 14.2 at start and 19.0 at end. Times are min / p50 in ms.
+
+| case | matches (dcgrep / git) | dcgrep | git | null | git ÷ dcgrep (min) |
+| --- | --- | --- | --- | --- | --- |
+| rare literal `search_working_tree` | 17 / 17 | 44.0 / 48.5 | 124.2 / 132.9 | 44.0 / 46.6 | 2.8× |
+| common literal `let` (stops at 500) | ≥5,000 / 129,175 | 26.5 / 35.8 | 96.8 / 155.9 | 27.3 / 28.6 | 3.6× |
+| regex `fn [a-z_]+_tests?[ (<]` | 42 / 42 | 49.9 / 78.2 | 190.3 / 249.9 | 67.8 / 81.7 | 3.8× |
+| case-insensitive literal `DCGREP` | 186 / 186 | 55.1 / 73.1 | 151.3 / 216.8 | 55.1 / 69.1 | 2.7× |
+| file listing | 4,024 / 4,024 paths | 66.4 / 77.6 | 27.3 / 32.0 | 75.4 / 85.1 | **0.4×** |
+
+An earlier run of the same comparison at load 8–12, from a shell prototype of the script, gave the same shape: search 2.4–3.8× faster with dcgrep, listing 52 vs 21 ms min.
+
+- **Content search: dcgrep is 2.7–3.8× faster** by minimum on every case. Medians differ by more than the null arm's spread in every case.
+- **File listing: dcgrep is 2.4× slower** than `git ls-files`, and GitPulse's dcgrep listing path also reads the index on top of it.
+- **Cold cache and repositories larger than this one were not measured**, nor was the installed app. The installed GitPulse.app predates the dcgrep wiring.
+
+### Why the listing is slower
+
+Process start is not the cost: `dcgrep health` takes 3.5 ms (min of 12). For comparison, `rg --files --hidden` (ripgrep 15.2.0) uses the same `ignore` walker and takes 19 ms in parallel, 32 ms with `-j1`. dcgrep's `list_files` (DevCouncil `rust/dc-grep/src/lib.rs`) took 53.5 ms in that comparison.
+
+- **It walks serially**, with `walker.build()` rather than `build_parallel()`.
+- **It stats every file again.** `entry.metadata()` runs for every regular file, even when `include_oversized` makes the size unused. On unix, walkdir 2.5.0's `DirEntry::metadata()` is a fresh `lstat` (`src/dent.rs:139`), contrary to the comment beside the call.
+- **It probes every directory for `.git`**, about 395 of them here.
+- **It answers a larger question than GitPulse asks.** GitPulse takes tracked paths from the index and needs only the untracked ones from dcgrep. dcgrep still walks all of them, while `git ls-files --others --exclude-standard` alone takes 22 ms.
+
+The split of the ~21 ms above `rg -j1` between the second and third causes is inferred, not profiled. The work is filed as ft-2dbd0e846139e15afef8d63a90db01f7: keep the listing on git unless a dcgrep listing measures faster, and fix the upstream walk.

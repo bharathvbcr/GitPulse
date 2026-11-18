@@ -2,7 +2,7 @@
   import { onMount, tick, untrack } from "svelte";
   import { get } from "svelte/store";
   import { fade, scale } from "svelte/transition";
-  import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
+  import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle, Info } from "@lucide/svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -59,6 +59,7 @@
   let page = $state(0);
   let pendingAction = $state<string | null>(null);
   let actionError = $state<string | null>(null);
+  let actionNotice = $state<string | null>(null);
   let retrySignal = $state(0);
   let searchResult = $state(emptySearch());
   let history = $state<Frecency>(new Map());
@@ -100,6 +101,7 @@
   function changeMode(next: PaletteMode) {
     setQuery(PALETTE_MODES.find(entry => entry.mode === next)?.prefix ?? ">");
     actionError = null;
+    actionNotice = null;
     focusInput();
   }
 
@@ -154,7 +156,7 @@
 
   $effect(() => {
     void query; void repoPath;
-    untrack(() => { page = 0; highlighted = 0; actionError = null; });
+    untrack(() => { page = 0; highlighted = 0; actionError = null; actionNotice = null; });
   });
   $effect(() => {
     if (page >= pageCount) untrack(() => { page = pageCount - 1; });
@@ -182,12 +184,20 @@
 
   async function run(index: number) {
     const command = filteredCommands[index];
-    if (!command || command.disabledReason || pendingAction) return;
+    if (!command || pendingAction) return;
+    if (command.disabledReason) {
+      highlighted = index;
+      actionError = null;
+      actionNotice = command.disabledReason;
+      focusInput();
+      return;
+    }
     // The mode the result was listed under; typing during the action may change it.
     const lands = modeLandsOnRepositoryPage(mode);
     const epoch = openEpoch;
     pendingAction = command.id;
     actionError = null;
+    actionNotice = null;
     try {
       if (command.closeBefore) { closeForHandoff(); await tick(); }
       const result = await command.action();
@@ -214,7 +224,7 @@
     if (modalOccupied()) return;
     openEpoch += 1;
     history = readFrecency(storage());
-    dialogQuery = ""; page = 0; highlighted = 0; actionError = null;
+    dialogQuery = ""; page = 0; highlighted = 0; actionError = null; actionNotice = null;
     dialogOpen = true;
     inputEl?.focus();
   }
@@ -222,7 +232,15 @@
   function changePage(next: number) {
     page = Math.max(0, Math.min(next, pageCount - 1));
     highlighted = 0;
+    actionNotice = null;
     focusInput();
+  }
+
+  function setHighlight(next: number) {
+    if (next !== highlighted) {
+      highlighted = next;
+      actionNotice = null;
+    }
   }
 
   function handleKeyDown(event: KeyboardEvent) {
@@ -246,10 +264,10 @@
     if (event.target !== (dropdown ? dropdown.input : inputEl) || event.metaKey || event.ctrlKey || event.altKey) return;
     if (!["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp", "Enter"].includes(event.key)) return;
     event.preventDefault(); event.stopImmediatePropagation();
-    if (event.key === "ArrowDown") highlighted = Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1));
-    else if (event.key === "ArrowUp") highlighted = Math.max(0, highlighted - 1);
-    else if (event.key === "Home") highlighted = 0;
-    else if (event.key === "End") highlighted = Math.max(0, filteredCommands.length - 1);
+    if (event.key === "ArrowDown") setHighlight(Math.min(highlighted + 1, Math.max(0, filteredCommands.length - 1)));
+    else if (event.key === "ArrowUp") setHighlight(Math.max(0, highlighted - 1));
+    else if (event.key === "Home") setHighlight(0);
+    else if (event.key === "End") setHighlight(Math.max(0, filteredCommands.length - 1));
     else if (event.key === "PageDown") changePage(page + 1);
     else if (event.key === "PageUp") changePage(page - 1);
     else void run(highlighted);
@@ -269,7 +287,7 @@
     untrack(() => {
       openEpoch += 1;
       history = readFrecency(storage());
-      page = 0; highlighted = 0; actionError = null;
+      page = 0; highlighted = 0; actionError = null; actionNotice = null;
     });
   });
   // The field carries the combobox; it names the highlighted option.
@@ -337,10 +355,10 @@
       {#each filteredCommands as cmd, i (cmd.id)}
         <button id={`${idp}-option-${i}`} type="button" role="option" aria-selected={i === highlighted} aria-disabled={Boolean(cmd.disabledReason) || Boolean(pendingAction)} aria-label={cmd.label} aria-describedby={`${idp}-description-${i}`}
           tabindex="-1" data-highlighted={i === highlighted ? "true" : "false"} class="palette-option" class:palette-disabled={Boolean(cmd.disabledReason)}
-          onclick={() => void run(i)} onpointermove={() => { highlighted = i; }}>
+          onclick={() => void run(i)} onpointermove={() => setHighlight(i)}>
           <span class="palette-icon">{#if pendingAction === cmd.id}<LoaderCircle size={17} class="palette-spinner" />{:else if cmd.filePath}<LanguageLogo filePath={cmd.filePath} size={17} />{:else}<cmd.icon size={17} />{/if}</span>
-          <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`${idp}-description-${i}`}>{cmd.disabledReason ?? cmd.description ?? cmd.category}</span></span>
-          <span class="palette-trailing">{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
+          <span class="palette-copy"><span class="palette-label">{#each highlightMatches(cmd.label, effectiveSearchText) as part}{#if part.matched}<b>{part.text}</b>{:else}{part.text}{/if}{/each}</span><span class="palette-description" id={`${idp}-description-${i}`}>{cmd.badge ? (cmd.description ?? cmd.disabledReason ?? cmd.category) : (cmd.disabledReason ?? cmd.description ?? cmd.category)}</span></span>
+          <span class="palette-trailing">{#if cmd.badge}<span class="gp-chip shrink-0" data-kind="label" data-tone="accent" data-palette-badge="">{cmd.badge}</span>{/if}{#if cmd.shortcut}<kbd class="gp-keycap">{shortcutTextLabel(cmd.shortcut, $hostPlatform.os)}</kbd>{:else}<span class="palette-category">{cmd.category}</span>{/if}{#if i === highlighted && !cmd.disabledReason}<ArrowRight size={13} />{/if}</span>
         </button>
       {/each}
       {#if filteredCommands.length === 0}
@@ -349,6 +367,14 @@
     {/if}
   </div>
   {#if actionError}<div role="alert" class="palette-notice palette-warning">{actionError}</div>{/if}
+  {#if actionNotice}
+    <div class="palette-feedback">
+      <div role="status" aria-live="polite" class="gp-notice items-center" data-tone="info" data-palette-notice="">
+        <Info size={14} class="shrink-0" style="color: var(--gp-notice-ink)" aria-hidden="true" />
+        <span class="min-w-0 flex-1">{actionNotice}</span>
+      </div>
+    </div>
+  {/if}
   <div id="{idp}-detail" class="palette-detail" title={activeCommand?.description ?? ""}>{pendingAction ? "Action in progress…" : activeCommand?.disabledReason ?? activeCommand?.description ?? currentMode.hint}</div>
   <footer class="palette-footer"><span><kbd>↑↓</kbd> Navigate <kbd>↵</kbd> {activeCommand?.keepOpen ? "Explore" : "Run"} <kbd>Esc</kbd> Close</span>
     {#if pageCount > 1}<span class="palette-pages"><button type="button" aria-label="Previous results" disabled={page === 0} onclick={() => changePage(page - 1)}>←</button><span>{page + 1} / {pageCount}</span><button type="button" aria-label="Next results" disabled={page + 1 >= pageCount} onclick={() => changePage(page + 1)}>→</button></span>{:else}<kbd>{platformChord("⌘K", "Ctrl+K", $hostPlatform.os)}</kbd>{/if}
@@ -433,6 +459,7 @@
   .palette-notice p { margin:0 0 6px; }
   .palette-notice button { margin:2px 6px 0 0; font-size:var(--text-micro); }
   .palette-warning { color:var(--color-textPrimary); border-left:3px solid var(--color-accent); background:var(--mac-fill-bg, rgb(var(--c-bg))); }
+  .palette-feedback { padding:4px 18px 8px; flex-shrink:0; }
   .palette-detail { padding:9px 18px; min-height:34px; font-size:var(--text-micro); color:var(--color-textMuted); border-top:1px solid var(--color-border); overflow-wrap:anywhere; max-height:75px; overflow-y:auto; flex-shrink:0; }
   .palette-footer { justify-content:space-between; flex-shrink:0; padding:10px 18px; font-size:var(--text-micro); color:var(--color-textMuted); gap:8px; }
   .palette-footer kbd { margin:0 3px 0 6px; font-size:var(--text-micro); }

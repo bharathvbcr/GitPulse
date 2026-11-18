@@ -28,6 +28,9 @@ const fixtures={
  // code index, no on-device model. Refusing them as unconfigured failed the
  // whole suite on commands it never meant to test.
  cmd_get_head_id:()=>"0000000000000000000000000000000000000001",
+ // The tab strip's repository logo looks for one in the file listing; this
+ // fixture has none, so the tab shows its initials.
+ cmd_list_repo_files:()=>["src/shared.ts","notes.md"],
  cmd_codeintel_symbols_for_file:a=>({available:false,head_matches:false,file_path:a.filePath,requested_head_sha:a.headSha,items:[],reason:"no code index in this fixture"}),
  cmd_apple_intelligence_status:()=>({compiled:false,state:"unsupported_os",reason:"not_compiled",detail:"Not built into this fixture."}),
  cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),

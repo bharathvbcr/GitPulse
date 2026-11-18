@@ -340,4 +340,36 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("formatPathParts");
     expect(source).toContain("filePath={f.path}");
   });
+
+  it("switches between Git and File Explorer in both expanded header and collapsed rail, keeps Explorer lazy, and supports drag-to-terminal", () => {
+    const explorerPaneSource = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "SidebarExplorerPane.svelte"),
+      "utf8",
+    );
+    // Expanded switcher + collapsed rail navigation buttons with icons
+    expect(source).toContain('data-testid="sidebar-view-switcher"');
+    expect(source).toContain('data-testid="sidebar-view-git"');
+    expect(source).toContain('data-testid="sidebar-view-files"');
+    expect(source).toContain('data-testid="sidebar-rail-git"');
+    expect(source).toContain('data-testid="sidebar-rail-files"');
+    expect(source).toContain("FolderTree");
+    // Lazy-loaded Explorer chunk so main stays under the 640 kB budget
+    expect(source).toContain('const loadSidebarExplorer = () => import("./SidebarExplorerPane.svelte")');
+    expect(source).not.toContain('from "./files/ExplorerRail.svelte"');
+    expect(source).toContain("load={loadSidebarExplorer}");
+    // Explicit user control over where clicked files open (Code | Tab | Split) + 1-click Dock in Terminal
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-code"');
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-tab"');
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-split"');
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-dock-terminal"');
+    expect(explorerPaneSource).toContain("resolveSidebarFileAction(");
+    expect(explorerPaneSource).toContain("terminalExplorerSidebar.setOpen(true)");
+    expect(explorerPaneSource).toContain("terminalExplorerSidebar.setOpen(false)");
+    expect(explorerPaneSource).toContain("new AbortController()");
+    expect(explorerPaneSource).toContain("TERMINAL_SESSION_CANCELED");
+    // Staged & unstaged file rows can also be dragged directly into terminal panes
+    expect((source.match(/startSidebarFileDrag\(e, f\.path\)/g) ?? []).length).toBe(2);
+    expect(source).toContain("terminalDropZones.beginInAppDrag(");
+    expect(source).toContain("setSidebarExplorerDocked(");
+  });
 });

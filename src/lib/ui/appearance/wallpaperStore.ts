@@ -1,5 +1,5 @@
 /**
- * The reader's own wallpaper image.
+ * The reader's own wallpaper: an image, or a video and its first frame.
  *
  * It does NOT live in the interface preferences: that blob is written whole to
  * localStorage on every change and its quota failure is swallowed, so a
@@ -12,6 +12,14 @@
  * browser's image decoder and re-encoded through a canvas as a bounded JPEG:
  * metadata is gone, the size is capped, and an SVG (which is a document, not a
  * picture) is refused before it is decoded.
+ *
+ * A video is kept as picked (a browser cannot re-encode one), bounded by
+ * `MAX_WALLPAPER_VIDEO_BYTES`, and accepted only once this window has decoded
+ * its first frame: the decoder decides, not the MIME type, since WKWebView and
+ * Chrome play different codecs. That frame is re-encoded like any image and
+ * stored as the still, so a video wallpaper draws through the same image path
+ * whenever it is not allowed to move. It plays from an object URL
+ * (`media-src 'self' blob:`), muted, only when wallpaperMotion.ts says so.
  */
 import { readable, writable, type Readable } from "svelte/store";
 
@@ -23,6 +31,18 @@ export const WALLPAPER_QUALITY = 0.86;
 
 /** Raster types the decoder is asked to read. SVG is deliberately absent. */
 export const WALLPAPER_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"] as const;
+/** Video types offered to the decoder; the decoder still has the last word. */
+export const WALLPAPER_VIDEO_TYPES = ["video/mp4", "video/webm", "video/quicktime"] as const;
+/** Largest video kept. It is stored as picked, so this bounds the IndexedDB entry. */
+export const MAX_WALLPAPER_VIDEO_BYTES = 150 * 1024 * 1024;
+/** Where the still is taken from: a hair past zero, so a decoded frame exists. */
+const FIRST_FRAME_SEEK_S = 0.05;
+/** How long that seek may take before the frame in hand is used. */
+const SEEK_TIMEOUT_MS = 3_000;
+/** How long a video may take to show its first frame before it is refused. */
+export const VIDEO_FIRST_FRAME_TIMEOUT_MS = 15_000;
+/** What the file picker offers: every image and video type above. */
+export const WALLPAPER_ACCEPT = [...WALLPAPER_TYPES, ...WALLPAPER_VIDEO_TYPES].join(",");
 
 const DB_NAME = "gitpulse-wallpaper";
 const DB_VERSION = 1;
@@ -30,12 +50,28 @@ const STORE = "images";
 const KEY = "custom";
 
 export interface StoredWallpaper {
-  readonly blob: Blob;
+  /**
+   * The still: the re-encoded image, or a video's first frame. Saved as bytes
+   * (an ArrayBuffer with `blobType`), since WebKit refuses Blobs in IndexedDB
+   * in a non-persistent store; a Blob here is a record from before that, and
+   * still reads.
+   */
+  readonly blob: Blob | ArrayBuffer;
+  /** The still's media type when `blob` is bytes. */
+  readonly blobType?: string;
   /** The picked file's name, for the settings row. */
   readonly name: string;
   readonly width: number;
   readonly height: number;
   readonly savedAt: number;
+  /**
+   * The video's bytes, when the wallpaper is one; `blob` is then its first
+   * frame. Bytes, like the still. Absent on every record saved before videos
+   * existed, which load as images.
+   */
+  readonly video?: ArrayBuffer;
+  /** The video's media type, so the bytes play back as what they are. */
+  readonly videoType?: string;
 }
 
 export type WallpaperState =
@@ -49,21 +85,33 @@ export type WallpaperState =
       readonly name: string;
       readonly width: number;
       readonly height: number;
+      /** The video's object URL, or null for an image. `url` is the still either way. */
+      readonly videoUrl: string | null;
     };
 
 export type WallpaperRefusal = { readonly ok: false; readonly reason: string };
 
 /** Whether `file` may be decoded at all. Pure, so the rule is tested without a browser. */
 export function checkWallpaperFile(file: { readonly type: string; readonly size: number; readonly name: string }):
-  | { readonly ok: true }
+  | { readonly ok: true; readonly kind: "image" | "video" }
   | WallpaperRefusal {
   if (file.type === "image/svg+xml" || /\.svgz?$/i.test(file.name)) {
     return { ok: false, reason: "SVG files can't be used as a wallpaper. Use a PNG, JPEG, WebP, GIF or AVIF image." };
   }
+  if ((WALLPAPER_VIDEO_TYPES as readonly string[]).includes(file.type)) {
+    if (file.size === 0) return { ok: false, reason: "The file is empty." };
+    if (file.size > MAX_WALLPAPER_VIDEO_BYTES) {
+      return {
+        ok: false,
+        reason: `The video is larger than ${MAX_WALLPAPER_VIDEO_BYTES / (1024 * 1024)} MB. Use a shorter or smaller copy.`,
+      };
+    }
+    return { ok: true, kind: "video" };
+  }
   if (!(WALLPAPER_TYPES as readonly string[]).includes(file.type)) {
     return {
       ok: false,
-      reason: `“${file.name}” isn't an image this window can use. Use a PNG, JPEG, WebP, GIF or AVIF image.`,
+      reason: `“${file.name}” isn't an image or video this window can use. Use a PNG, JPEG, WebP, GIF or AVIF image, or an MP4, WebM or MOV video.`,
     };
   }
   if (file.size > MAX_WALLPAPER_SOURCE_BYTES) {
@@ -73,7 +121,7 @@ export function checkWallpaperFile(file: { readonly type: string; readonly size:
     };
   }
   if (file.size === 0) return { ok: false, reason: "The file is empty." };
-  return { ok: true };
+  return { ok: true, kind: "image" };
 }
 
 /** The size the image is re-encoded at: the longest edge held to `MAX_WALLPAPER_EDGE`, never upscaled. */
@@ -99,6 +147,62 @@ async function reencode(file: Blob): Promise<{ blob: Blob; width: number; height
     return { blob, width: size.width, height: size.height };
   } finally {
     bitmap.close();
+  }
+}
+
+/**
+ * Decodes a video far enough to draw its first frame, and re-encodes that frame
+ * as the still. Rejects when this window cannot decode the video at all, or
+ * cannot within `VIDEO_FIRST_FRAME_TIMEOUT_MS`.
+ */
+async function firstFrame(file: Blob): Promise<{ blob: Blob; width: number; height: number }> {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`it showed no picture within ${VIDEO_FIRST_FRAME_TIMEOUT_MS / 1000} seconds`)),
+        VIDEO_FIRST_FRAME_TIMEOUT_MS,
+      );
+      video.addEventListener("loadeddata", () => (clearTimeout(timer), resolve()), { once: true });
+      video.addEventListener(
+        "error",
+        () => {
+          clearTimeout(timer);
+          const detail = video.error ? ` (${video.error.code}${video.error.message ? `: ${video.error.message}` : ""})` : "";
+          reject(new Error(`this window can't decode it${detail}`));
+        },
+        { once: true },
+      );
+      video.src = url;
+    });
+    if (video.videoWidth === 0 || video.videoHeight === 0) throw new Error("it has no picture");
+    // WebKit can report data loaded before any frame is decoded, and draws
+    // black from it. A small seek and its `seeked` mean a decoded frame; a seek
+    // that never lands within the bound draws whatever there is.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, SEEK_TIMEOUT_MS);
+      video.addEventListener("seeked", () => (clearTimeout(timer), resolve()), { once: true });
+      video.currentTime = FIRST_FRAME_SEEK_S;
+    });
+    const size = fitWithin(video.videoWidth, video.videoHeight);
+    const canvas = document.createElement("canvas");
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("this window couldn't draw its first frame");
+    context.drawImage(video, 0, 0, size.width, size.height);
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", WALLPAPER_QUALITY));
+    if (!blob) throw new Error("this window couldn't encode its first frame");
+    return { blob, width: size.width, height: size.height };
+  } finally {
+    // Release the decoder before the URL.
+    video.removeAttribute("src");
+    video.load();
+    URL.revokeObjectURL(url);
   }
 }
 
@@ -133,23 +237,33 @@ async function withStore<T>(
       request.onsuccess = () => {
         value = request.result;
       };
+      // The request's own error names the cause (a quota, a value this store
+      // cannot hold); the transaction's is often null by the time it aborts.
+      const cause = (fallback: string) => {
+        const error = request.error ?? transaction.error;
+        return error ? new Error(`${fallback} (${error.name}${error.message ? `: ${error.message}` : ""})`) : new Error(fallback);
+      };
       transaction.oncomplete = () => resolve(value);
-      transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB refused the change."));
-      transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB aborted the change."));
+      transaction.onerror = () => reject(cause("IndexedDB refused the change."));
+      transaction.onabort = () => reject(cause("IndexedDB aborted the change."));
     });
   } finally {
     db.close();
   }
 }
 
-function isStored(value: unknown): value is StoredWallpaper {
+/** Whether an IndexedDB value is a wallpaper record, old (image only) or new. */
+export function isStored(value: unknown): value is StoredWallpaper {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return (
-    record.blob instanceof Blob &&
+    (record.blob instanceof Blob ||
+      (record.blob instanceof ArrayBuffer && typeof record.blobType === "string" && record.blobType.startsWith("image/"))) &&
     typeof record.name === "string" &&
     typeof record.width === "number" &&
-    typeof record.height === "number"
+    typeof record.height === "number" &&
+    (record.video === undefined ||
+      (record.video instanceof ArrayBuffer && typeof record.videoType === "string" && record.videoType.startsWith("video/")))
   );
 }
 
@@ -157,16 +271,29 @@ function isStored(value: unknown): value is StoredWallpaper {
 
 const state = writable<WallpaperState>({ status: "loading" });
 let currentUrl: string | null = null;
+let currentVideoUrl: string | null = null;
 
 function publish(stored: StoredWallpaper | null): void {
   if (currentUrl !== null) URL.revokeObjectURL(currentUrl);
+  if (currentVideoUrl !== null) URL.revokeObjectURL(currentVideoUrl);
   currentUrl = null;
+  currentVideoUrl = null;
   if (stored === null) {
     state.set({ status: "none" });
     return;
   }
-  currentUrl = URL.createObjectURL(stored.blob);
-  state.set({ status: "ready", url: currentUrl, name: stored.name, width: stored.width, height: stored.height });
+  currentUrl = URL.createObjectURL(
+    stored.blob instanceof Blob ? stored.blob : new Blob([stored.blob], { type: stored.blobType }),
+  );
+  currentVideoUrl = stored.video ? URL.createObjectURL(new Blob([stored.video], { type: stored.videoType })) : null;
+  state.set({
+    status: "ready",
+    url: currentUrl,
+    name: stored.name,
+    width: stored.width,
+    height: stored.height,
+    videoUrl: currentVideoUrl,
+  });
 }
 
 function message(error: unknown): string {
@@ -205,17 +332,37 @@ export async function saveWallpaper(file: File): Promise<{ readonly ok: true } |
   if (!allowed.ok) return allowed;
   let encoded: { blob: Blob; width: number; height: number };
   try {
-    encoded = await reencode(file);
+    encoded = allowed.kind === "video" ? await firstFrame(file) : await reencode(file);
   } catch (error) {
-    return { ok: false, reason: `Couldn't read “${file.name}” as an image: ${message(error)}` };
+    return {
+      ok: false,
+      reason:
+        allowed.kind === "video"
+          ? `Couldn't use “${file.name}” as a video wallpaper: ${message(error)}.`
+          : `Couldn't read “${file.name}” as an image: ${message(error)}`,
+    };
   }
-  const stored: StoredWallpaper = {
-    blob: encoded.blob,
+  let still: ArrayBuffer;
+  try {
+    still = await encoded.blob.arrayBuffer();
+  } catch (error) {
+    return { ok: false, reason: `Couldn't read the encoded picture: ${message(error)}` };
+  }
+  let stored: StoredWallpaper = {
+    blob: still,
+    blobType: encoded.blob.type || "image/jpeg",
     name: file.name.slice(0, 120),
     width: encoded.width,
     height: encoded.height,
     savedAt: Date.now(),
   };
+  if (allowed.kind === "video") {
+    try {
+      stored = { ...stored, video: await file.arrayBuffer(), videoType: file.type };
+    } catch (error) {
+      return { ok: false, reason: `Couldn't read “${file.name}”: ${message(error)}` };
+    }
+  }
   try {
     await withStore("readwrite", (store) => store.put(stored, KEY));
   } catch (error) {

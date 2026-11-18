@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
-   * The GitPulse mark: a commit lane that spikes into a heartbeat and ends on a
-   * branch node.
+   * The GitPulse mark: a commit ring that opens into a G, whose crossbar is a
+   * heartbeat and whose tip is a branch node.
    *
    * Two variants, because one drawing cannot do both jobs. `badge` is the app
    * icon — the same rounded square that sits in the dock — and is what belongs
@@ -10,9 +10,13 @@
    * have a container of their own.
    *
    * The geometry is tuned for the small end rather than the large one. At 20px
-   * a hairline branch and a 2px node disappear, so the strokes are heavy
-   * relative to the box and the node is oversized; at 96px that reads as
+   * a hairline ring and a 2px node disappear, so the stroke is heavy relative
+   * to the box and the pulse has only one beat; at 96px that reads as
    * confident rather than crude, which is the trade a mark should make.
+   *
+   * The same drawing is written out in index.html (the boot screen) and in
+   * public/gitpulse-mark.svg and public/gitpulse-icon.svg, none of which can
+   * import this component. Logo.contract.test.ts holds the four together.
    */
   let {
     size = 28,
@@ -35,7 +39,7 @@
   // Derived, not computed once: a `const` here would freeze the transform at
   // whatever variant the component first mounted with.
   const artTransform = $derived(
-    variant === "badge" ? "translate(4.6 4.3) scale(0.71)" : "translate(1.6 1.3) scale(0.9)"
+    variant === "badge" ? "translate(3.04 3.04) scale(0.81)" : "translate(-2.4 -2.4) scale(1.15)"
   );
 </script>
 
@@ -55,44 +59,45 @@
       <stop offset="52%" stop-color="#58a6ff" />
       <stop offset="100%" stop-color="#a371f7" />
     </linearGradient>
-    <linearGradient id="{uid}-branch" x1="19" y1="22" x2="30" y2="8" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#6ea8ff" />
-      <stop offset="100%" stop-color="#a371f7" />
-    </linearGradient>
     {#if variant === "badge"}
       <linearGradient id="{uid}-badge" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
         <stop offset="0%" stop-color="#151d2b" />
         <stop offset="100%" stop-color="#0a0d14" />
       </linearGradient>
+      <!-- A soft light behind the mark, so the badge has a centre rather than
+           being a flat plate. A gradient, not a filter: it costs no extra
+           paint when a list draws several. -->
+      <radialGradient id="{uid}-glow" cx="16" cy="16" r="15" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#58a6ff" stop-opacity="0.24" />
+        <stop offset="100%" stop-color="#58a6ff" stop-opacity="0" />
+      </radialGradient>
     {/if}
   </defs>
 
   {#if variant === "badge"}
     <rect width="32" height="32" rx="10" fill="url(#{uid}-badge)" />
+    <rect width="32" height="32" rx="10" fill="url(#{uid}-glow)" />
     <rect
-      x="0.5"
-      y="0.5"
-      width="31"
-      height="31"
+      x="0.3"
+      y="0.3"
+      width="31.4"
+      height="31.4"
       rx="9.7"
       fill="none"
       stroke="#ffffff"
-      stroke-opacity="0.1"
+      stroke-opacity="0.12"
+      stroke-width="0.6"
     />
   {/if}
 
   <g transform={artTransform}>
-    <!-- The branch peeling off the trunk, drawn behind it. -->
+    <!-- One stroke: the ring from its tip round to three o'clock, then the
+         crossbar inward as a single beat. `pathLength` makes the trace's dash
+         a hundred units whatever the geometry is, so redrawing the mark cannot
+         leave the animation measuring the old one. -->
     <path
-      d="M20.8 20.4C24.6 20.4 24.8 12.8 27.4 10.4"
-      stroke="url(#{uid}-branch)"
-      stroke-width="3.2"
-      stroke-linecap="round"
-    />
-
-    <!-- Trunk: lane in, pulse, lane out. -->
-    <path
-      d="M3.6 20.4H9.2L12.6 9.6L16.4 26.4L19.2 20.4H20.8"
+      d="M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8"
+      pathLength="100"
       stroke="url(#{uid}-stroke)"
       stroke-width="3.4"
       stroke-linecap="round"
@@ -100,18 +105,18 @@
       class={animated ? "gitpulse-trace" : ""}
     />
 
-    <!-- The commit the branch ends on. Deliberately large: at 20px this is the
-         one element that says "git" rather than "waveform". -->
-    <circle cx="28" cy="9.4" r="3.6" fill="url(#{uid}-branch)" />
+    <!-- The commit the ring's tip ends on. Larger than the stroke on purpose:
+         at 20px this is the one element that says "git" rather than "letter". -->
+    <circle cx="24.04" cy="9.25" r="2.9" fill="url(#{uid}-stroke)" />
   </g>
 </svg>
 
 <style>
-  /* The pulse traces itself once, then rests: a loop in a title bar is a
+  /* The mark traces itself once, then rests: a loop in a title bar is a
      distraction, a single trace is a greeting. */
   .gitpulse-trace {
-    stroke-dasharray: 64;
-    stroke-dashoffset: 64;
+    stroke-dasharray: 100;
+    stroke-dashoffset: 100;
     animation: gitpulse-draw calc(var(--gp-dur-emphasis) * 2) var(--gp-ease-effect) forwards;
   }
 

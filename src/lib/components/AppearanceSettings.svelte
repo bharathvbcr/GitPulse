@@ -31,6 +31,11 @@
    * Theme, Colors, Type, Shape, Material, Motion and Density, plus the terminal
    * and interface rows that were already on this page.
    *
+   * The Theme group holds everything that sets the look in one place: the
+   * light/dark mode, what is in force with its Remove, the presets, the
+   * wallpaper and the reader's own themes and theme files. The wallpaper row is
+   * still gated on `nativeMaterial` through `shown`, as the catalog requires.
+   *
    * Every control applies live through `interfaceStore`; the document follows
    * from `ui/appearance/apply.ts`. The Material rows are gated by the host's
    * `native_material` capability, and the group says why when they are absent
@@ -290,8 +295,12 @@
 
 <div class="flex flex-col gap-4" data-appearance-settings>
   <!-- Theme -->
-  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["theme", "theme-gallery", "theme-file"])} data-group="theme">
-    <h3 class="gp-label">Theme</h3>
+  <section
+    class="gp-card p-4 flex flex-col gap-4"
+    hidden={!any(["theme", "theme-gallery", "wallpaper", "theme-file"])}
+    data-group="theme"
+  >
+    <h3 class="gp-label">Theme and wallpaper</h3>
     <div data-setting="theme" hidden={!shown("theme")}>
       <SettingSegment
         ariaLabel="Theme appearance"
@@ -302,6 +311,9 @@
     </div>
     <div data-setting="theme-gallery" hidden={!shown("theme-gallery")}>
       <ThemeGallery />
+    </div>
+    <div data-setting="wallpaper" hidden={!shown("wallpaper")}>
+      <WallpaperSettings />
     </div>
     <div data-setting="theme-file" hidden={!shown("theme-file")}>
       <ThemeFileSettings />
@@ -489,7 +501,7 @@
   <section
     class="gp-card p-4 flex flex-col gap-3"
     hidden={nativeMaterial
-      ? !any(["material-intensity", "float-blur", "background-field", "wallpaper", "transparency", "native-glass"])
+      ? !any(["material-intensity", "float-blur", "background-field", "transparency", "native-glass"])
       : filtering}
     data-group="material"
   >
@@ -561,10 +573,6 @@
         The color glowing behind the window. Vivid is the shipped strength and the ceiling; the hue turns all four
         colors together.
       </p>
-    </div>
-
-    <div data-setting="wallpaper" hidden={!shown("wallpaper")}>
-      <WallpaperSettings />
     </div>
 
     <div data-setting="transparency" hidden={!shown("transparency")} class="flex flex-col gap-1.5">
@@ -646,6 +654,7 @@
       "terminal-gpu",
       "terminal-option-as-meta",
       "terminal-smooth-wheel",
+      "terminal-copy-on-select",
       "terminal-scrollback",
     ])}
     data-group="terminal"
@@ -706,6 +715,20 @@
       <p class="text-micro text-textMuted">
         On by default. A trackpad always scrolls directly, and a system setting for reduced motion turns the glide
         off whatever this says. Applies to open terminals at once.
+      </p>
+    </div>
+
+    <div data-setting="terminal-copy-on-select" hidden={!shown("terminal-copy-on-select")}>
+      <SettingToggle
+        label="Select to copy in terminals"
+        description="Selecting text in a terminal copies it to your clipboard on mouse release, stripping trailing padding."
+        ariaLabel="Select to copy in terminals"
+        checked={prefs.terminalCopyOnSelect}
+        onchange={(next) => interfaceStore.setTerminalCopyOnSelect(next)}
+      />
+      <p class="text-micro text-textMuted">
+        On by default. Applies to open terminals at once. You can also toggle it per pane from the terminal context
+        menu or tab options.
       </p>
     </div>
 

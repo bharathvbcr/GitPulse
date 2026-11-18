@@ -467,4 +467,145 @@ describe("what answers a request", () => {
       ).toBe(false);
     });
   });
+
+  describe("spinner frame normalization on sessionActivity.title", () => {
+    it("strips Braille/quarter-circle spinner glyphs without republishing unchanged titles while preserving static icons", async () => {
+      const { stripTitleSpinner } = await import("./sessionActivity");
+      expect(stripTitleSpinner("⠋ Running tests")).toBe("Running tests");
+      expect(stripTitleSpinner("Running tests ◓")).toBe("Running tests");
+      expect(stripTitleSpinner("✳ Reviewing diff")).toBe("✳ Reviewing diff");
+      expect(stripTitleSpinner("⠋")).toBe("");
+      expect(stripTitleSpinner("✢ Refactoring split panes")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("✶ Refactoring split panes")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("✻ Refactoring split panes")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("✽ Refactoring split panes")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("· Refactoring split panes")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("Refactoring split panes ✻")).toBe("Refactoring split panes");
+      expect(stripTitleSpinner("✶")).toBe("");
+      expect(stripTitleSpinner("·")).toBe("");
+      expect(stripTitleSpinner("✳ All tests green")).toBe("✳ All tests green");
+      expect(stripTitleSpinner("api · worker")).toBe("api · worker");
+      expect(stripTitleSpinner("·claude")).toBe("·claude");
+
+      vi.useFakeTimers();
+      try {
+        let now = 20_000;
+        const activity = createSessionActivity(() => now);
+        let publishes = 0;
+        const stop = activity.subscribe(() => {
+          publishes += 1;
+        });
+        publishes = 0;
+
+        activity.title("term-spin", "⠋ Compiling crate");
+        expect(publishes).toBe(1);
+        expect(get(activity).get("term-spin")?.title).toBe("Compiling crate");
+
+        // Within ACTIVITY_PUBLISH_MS (9 Braille frames + 5 starburst/dot frames at 50ms = 700ms < 1000ms), zero republishes or scheduled timers fire!
+        for (const glyph of ["⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]) {
+          now += 50;
+          activity.title("term-spin", `${glyph} Compiling crate`);
+        }
+        vi.advanceTimersByTime(ACTIVITY_PUBLISH_MS * 2);
+        expect(publishes).toBe(1);
+        expect(get(activity).get("term-spin")?.title).toBe("Compiling crate");
+
+        // Starburst and dot frames immediately following do not republish either.
+        const beforeStarburst = publishes;
+        for (const glyph of ["·", "✢", "✶", "✻", "✽"]) {
+          now += 50;
+          activity.title("term-spin", `${glyph} Compiling crate`);
+        }
+        expect(publishes).toBe(beforeStarburst);
+        expect(get(activity).get("term-spin")?.title).toBe("Compiling crate");
+
+        // Across multiple seconds of spinner frames, liveness heartbeats stay bounded to <= 1/sec while title stays normalized.
+        for (const glyph of ["◐", "◓", "◑", "◒"]) {
+          now += 400;
+          activity.title("term-spin", `${glyph} Compiling crate`);
+        }
+        vi.advanceTimersByTime(ACTIVITY_PUBLISH_MS * 2);
+        expect(publishes).toBeLessThanOrEqual(3);
+        expect(get(activity).get("term-spin")?.title).toBe("Compiling crate");
+
+        // Actual title change publishes cleanly.
+        const beforeChange = publishes;
+        now += ACTIVITY_PUBLISH_MS;
+        activity.title("term-spin", "✳ All tests green");
+        expect(publishes).toBe(beforeChange + 1);
+        expect(get(activity).get("term-spin")?.title).toBe("✳ All tests green");
+        stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("native hook attention bridging to split/pill agent status", () => {
+    it("maps needs-you, error, finished, and opt-in bell attention to agent status and zoomed hidden-sibling warnings", async () => {
+      const { activityAttentionLabel, activityToAgentStatus } = await import("./sessionActivity");
+      const { splitPane, summarizeHiddenSplitSiblings } = await import("./splitTree");
+      const activity = createSessionActivity(() => 50_000);
+
+      activity.announce({
+        session: "pty-claude",
+        channel: "claude-hooks",
+        event: "permission_prompt",
+        detail: "Bash: cargo test",
+      });
+      const mappedBlocked = activityToAgentStatus(get(activity).get("pty-claude"));
+      expect(mappedBlocked).toEqual({ state: "blocked", detail: "Bash: cargo test" });
+      expect(activityAttentionLabel(get(activity).get("pty-claude"))).toBe("Needs input");
+
+      // Drives zoomed hidden-sibling alert even when no Herdr OSC 7501 sequence was emitted
+      const tree = splitPane(null, "pane-1", "pane-2", "row");
+      const summary = summarizeHiddenSplitSiblings(tree, "pane-1", new Set(), {
+        "pane-2": mappedBlocked,
+      });
+      expect(summary.blockedCount).toBe(1);
+      expect(summary.badgeLabel).toBe("Needs input");
+      expect(summary.tone).toBe("warn");
+      expect(summary.urgentPaneId).toBe("pane-2");
+
+      // Error and finished mappings
+      activity.announce({
+        session: "pty-claude",
+        channel: "claude-hooks",
+        event: "error",
+      });
+      expect(activityToAgentStatus(get(activity).get("pty-claude"))).toEqual({
+        state: "error",
+        detail: "Stopped on an error",
+      });
+      expect(activityAttentionLabel(get(activity).get("pty-claude"))).toBe("Failed");
+
+      activity.announce({
+        session: "pty-claude",
+        channel: "claude-hooks",
+        event: "turn_finished",
+      });
+      expect(activityToAgentStatus(get(activity).get("pty-claude"))).toEqual({
+        state: "done",
+        detail: "Finished its turn",
+      });
+      expect(activityAttentionLabel(get(activity).get("pty-claude"))).toBeNull();
+
+      // Bell (`signalled`) respects `setSignalledAsksForReader`
+      setSignalledAsksForReader(false);
+      activity.announce({
+        session: "pty-bell",
+        channel: "bell",
+      });
+      expect(activityToAgentStatus(get(activity).get("pty-bell"))).toBeNull();
+      setSignalledAsksForReader(true);
+      try {
+        expect(activityToAgentStatus(get(activity).get("pty-bell"))).toEqual({
+          state: "blocked",
+          detail: "Signalled",
+        });
+      } finally {
+        setSignalledAsksForReader(false);
+      }
+    });
+  });
 });

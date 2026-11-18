@@ -163,8 +163,29 @@ describe("TaskRelations Linear-style subtask breakdown & collaboration", () => {
   });
 
   it("passes task, acceptanceCriteria, repositories, openTabs, and repositoryPath from TaskEditor into TaskRelations", () => {
-    expect(editorSource).toMatch(/<TaskRelations[\s\S]*?task=\{current\}/);
-    expect(editorSource).toMatch(/<TaskRelations[\s\S]*?acceptanceCriteria=\{criteriaList\}/);
-    expect(editorSource).toMatch(/<TaskRelations[\s\S]*?repositories=\{known\}/);
+    // `[^>]*?` keeps each match inside the one <TaskRelations ...> tag, so a
+    // prop dropped from it cannot be satisfied by a later element's attribute.
+    expect(editorSource).toMatch(/<TaskRelations[^>]*?\btask=\{current\}/);
+    // Split writes real child cards, so it reads the saved criteria: passing the
+    // sheet's live list created children for criteria the parent never kept
+    // when the edits were then discarded. The sheet says when they differ.
+    expect(editorSource).toMatch(/<TaskRelations[^>]*?acceptanceCriteria=\{current\?\.acceptance_criteria \?\? \[\]\}/);
+    expect(editorSource).toMatch(/<TaskRelations[^>]*?criteriaUnsaved=\{criteriaList\.join\("\\n"\) !== \(current\?\.acceptance_criteria \?\? \[\]\)\.join\("\\n"\)\}/);
+    expect(editorSource).toMatch(/<TaskRelations[^>]*?\brepositories=\{known\}/);
+  });
+
+  it("says what each list is for, and draws no breakdown before the task exists", () => {
+    const saved = render(TaskRelations, {
+      props: { checklist: [], links: [], taskId: savedParent.id, task: savedParent, acceptanceCriteria: [], onchange: () => {} },
+    }).body;
+    expect(saved).toContain('data-testid="task-checklist-hint"');
+    expect(saved).toContain('data-testid="task-breakdown-hint"');
+    // A draft has no card to hang children on: the block would only offer
+    // buttons that cannot work yet.
+    const draft = render(TaskRelations, {
+      props: { checklist: [], links: [], taskId: null, task: null, acceptanceCriteria: [], onchange: () => {} },
+    }).body;
+    expect(draft).toContain('data-testid="task-checklist-hint"');
+    expect(draft).not.toContain('data-testid="task-breakdown-section"');
   });
 });

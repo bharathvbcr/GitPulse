@@ -63,20 +63,58 @@ export function tipGuideOf(el: TipHost): string | null {
  *
  * Idempotent: once migrated, the element carries no `title` and later calls
  * read straight from `data-tip-text`.
+ *
+ * A `title` present on an already-migrated element is newer than the stored
+ * text, never older: a renderer writes it back whenever the text it binds
+ * changes (a branch row's relative age, its ahead/behind counts). So `title`
+ * wins and is migrated again. Reading the stored text first left that `title`
+ * on the element — the OS bubble came back over the styled one — and showed
+ * the text from before the change.
  */
 export function tipTextOf(el: TipHost): string {
-  const migrated = el.getAttribute("data-tip-text");
-  if (migrated !== null) return migrated;
-
   const native = el.getAttribute("title");
-  if (native === null) return "";
+  if (native === null) return el.getAttribute("data-tip-text") ?? "";
 
   el.setAttribute("data-tip-text", native);
-  if (native.trim().length > 0 && !declaresAccessibleName(el)) {
+  if (el.getAttribute(MIRROR_MARK) !== null) {
+    // The label is the copy an earlier migration made, so it follows the text.
+    if (native.trim().length > 0) el.setAttribute("aria-label", native);
+    else {
+      el.removeAttribute("aria-label");
+      el.removeAttribute(MIRROR_MARK);
+    }
+  } else if (native.trim().length > 0 && !declaresAccessibleName(el)) {
     el.setAttribute("aria-label", native);
+    el.setAttribute(MIRROR_MARK, "");
   }
   el.removeAttribute("title");
   return native;
+}
+
+/**
+ * Marks an `aria-label` this module copied from a `title`, so a later `title`
+ * may update it. A label the author wrote carries no mark and is never
+ * touched, even when its words happen to match the title.
+ */
+const MIRROR_MARK = "data-tip-label";
+
+/**
+ * Takes a `title` back off an anchor the tooltip has already taken over, when
+ * a renderer writes one again. Returns the anchor's tip text when it acted,
+ * or null for an element that was never taken over: those keep the lazy rule
+ * and migrate on their first hover or focus, which is early enough, because
+ * the OS bubble waits far longer than the pointer event that migrates them.
+ * An anchor resting under the pointer gets no new pointer event, so without
+ * this its native bubble returned after the OS delay.
+ */
+export function remigrateTitle(el: TipHost): string | null {
+  if (el.getAttribute("title") === null) return null;
+  if (tipGuideOf(el)) {
+    suppressNativeTitle(el);
+    return null;
+  }
+  if (el.getAttribute("data-tip-text") === null) return null;
+  return tipTextOf(el);
 }
 
 function isTooltipPointerTarget(value: unknown): value is TooltipPointerTarget {

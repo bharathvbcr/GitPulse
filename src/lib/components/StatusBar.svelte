@@ -27,9 +27,8 @@
   import { resolveStatusBarMode } from "../ui/statusBarMode";
   import { hostLoadPulse, startHostLoad } from "../stores/hostLoadStore";
   import { diagnostics } from "../diagnostics/diagnostics";
-  import { statusChip } from "../health/hostLoad";
   import { onMount } from "svelte";
-  import { Gauge } from "@lucide/svelte";
+  import HostLoadSegment from "./HostLoadSegment.svelte";
 
   let {
     onOpenShortcuts,
@@ -72,12 +71,6 @@
   let watchState = $derived($repoStore.watch);
   let statusUnavailableSince = $derived($repoStore.statusUnavailableSince ?? null);
 
-  /**
-   * Host memory pressure, said only when it matters: pressure up, the
-   * compressor thrashing, or the sampler stopped. A quiet machine adds
-   * nothing to the bar (`health/hostLoad.ts` owns the rule).
-   */
-  let loadChip = $derived(statusChip($hostLoadPulse));
   onMount(() => {
     startHostLoad();
     // Loaded, not imported: the wiring reaches the terminal's GPU renderer,
@@ -96,22 +89,42 @@
 
   /**
    * The bar owns its own visibility rather than App.svelte, because only it
-   * knows the four signals that override a hidden preference: a parked
-   * operation, unresolved conflicts, a degraded watcher, and a status poll
-   * that stopped answering.
+   * knows the five signals that override a hidden preference: a parked
+   * operation, unresolved conflicts, a degraded watcher, a status poll that
+   * stopped answering, and the host-load governor actively refusing launches.
    */
+  let hostLoadRefusing = $derived(
+    Boolean(
+      $hostLoadPulse &&
+        $hostLoadPulse.enabled &&
+        ($hostLoadPulse.state === "fresh" || $hostLoadPulse.state === "stale_recent") &&
+        $hostLoadPulse.role !== "unsupported" &&
+        $hostLoadPulse.role !== "not_sampling" &&
+        !$hostLoadPulse.governor.admit &&
+        !$hostLoadPulse.governor.overridden,
+    ),
+  );
   let resolved = $derived(
     resolveStatusBarMode($interfaceStore.statusBarMode, {
       operationParked: Boolean(operationMarker),
       conflictedCount,
       watchDegraded: Boolean(watchLabel),
       statusUnavailable: statusUnavailableSince !== null,
+      hostLoadRefusing,
     }),
   );
   let detail = $derived(resolved.mode);
   let forcedTip = $derived(
     resolved.forced
-      ? "Shown despite the hidden status-bar setting: this repository needs attention."
+      ? hostLoadRefusing &&
+        !(
+          Boolean(operationMarker) ||
+          conflictedCount > 0 ||
+          Boolean(watchLabel) ||
+          statusUnavailableSince !== null
+        )
+        ? "Shown despite the hidden status-bar setting: agent launches are paused under host load."
+        : "Shown despite the hidden status-bar setting: this repository needs attention."
       : undefined,
   );
 
@@ -184,25 +197,6 @@
         <AlertTriangle size={11} class="shrink-0" />
         <span>Status unavailable</span>
       </span>
-    {/if}
-
-    <!-- Host memory pressure. Absent while the machine is fine. -->
-    {#if loadChip}
-      <button
-        type="button"
-        onclick={() => repoStore.setActiveTab("insights", "health")}
-        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.2 font-medium transition-colors {loadChip.tone ===
-        'danger'
-          ? 'border-danger/65 bg-danger/10 text-danger hover:bg-danger/20'
-          : loadChip.tone === 'warn'
-            ? 'border-warn/65 bg-warn/10 text-warn hover:bg-warn/20'
-            : 'border-edge bg-surfaceHover text-textMuted hover:text-textPrimary'}"
-        title={loadChip.title}
-        data-testid="status-host-load"
-      >
-        <Gauge size={11} class="shrink-0" />
-        <span>{loadChip.text}</span>
-      </button>
     {/if}
 
     <!-- Parked operation: merge / rebase / cherry-pick / revert / bisect -->
@@ -337,6 +331,7 @@
          stays mounted at zero height, and a pill left in it would be a second,
          invisible but focusable Manvi chip beside the title bar's. -->
     {#if $interfaceStore.globalSurface === "repository"}
+      <HostLoadSegment detail={detail === "full" ? "full" : "minimal"} />
       <HarnessBadge variant="full" />
     {/if}
   </div>

@@ -22,6 +22,8 @@ import {
   withModelChoice,
   sanitizeAgentDefaults,
   settingSources,
+  allowsAgentShellReads,
+  withAllowAgentShellReads,
   withKeepTerminalsRunning,
   type AgentDefaults,
 } from "./agentDefaults";
@@ -247,6 +249,31 @@ describe("keep_terminals_running (managed runs)", () => {
       permission: {},
       keep_terminals_running: false,
     });
+  });
+
+  it("defaults allow_agent_shell_reads to off, stores off as absence, and drops corrupt values alone", () => {
+    expect(allowsAgentShellReads({ permission: {} })).toBe(false);
+    expect(allowsAgentShellReads({ permission: {}, allow_agent_shell_reads: true })).toBe(true);
+    expect(allowsAgentShellReads({ permission: {}, allow_agent_shell_reads: false })).toBe(false);
+
+    const optedIn = withAllowAgentShellReads({ permission: { claude: "edit" } }, true);
+    expect(optedIn).toEqual({ permission: { claude: "edit" }, allow_agent_shell_reads: true });
+    expect(allowsAgentShellReads(optedIn)).toBe(true);
+
+    const optedOut = withAllowAgentShellReads(optedIn, false);
+    expect(optedOut).toEqual({ permission: { claude: "edit" } });
+    expect("allow_agent_shell_reads" in optedOut).toBe(false);
+
+    for (const bad of ["yes", "true", 1, 0, null, {}, []]) {
+      const sanitized = sanitizeAgentDefaults({
+        permission: { claude: "edit" },
+        max_live_runs: 12,
+        allow_agent_shell_reads: bad,
+      });
+      expect(sanitized).toEqual({ permission: { claude: "edit" }, max_live_runs: 12 });
+      expect("allow_agent_shell_reads" in sanitized).toBe(false);
+      expect(allowsAgentShellReads(sanitized)).toBe(false);
+    }
   });
 });
 

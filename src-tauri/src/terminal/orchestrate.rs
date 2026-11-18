@@ -47,14 +47,15 @@ pub const CHILD_CLOSED_EVENT: &str = "terminal-child-closed";
 
 pub const MAX_WAIT_TIMEOUT_MS: u64 = 25_000;
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 10_000;
-pub const MAX_READ_LINES: usize = 200;
+pub const MAX_READ_LINES: usize = 1_000;
 pub const DEFAULT_READ_LINES: usize = 80;
-pub const MAX_READ_BYTES: usize = 32 * 1024;
+pub const MAX_READ_BYTES: usize = 64 * 1024;
 pub const MAX_SEND_BYTES: usize = 16 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 8 * 1024;
 pub const MAX_PATTERN_BYTES: usize = 512;
 pub const MAX_CHILD_TITLE_BYTES: usize = 120;
 pub const MAX_CHILDREN_PER_PARENT: usize = 8;
+pub const MAX_EXTERNAL_ORCHESTRATED_CHILDREN: usize = 16;
 const PARSER_SCROLLBACK_ROWS: usize = MAX_READ_LINES * 2;
 const MAX_ENDED_CHILDREN: usize = 32;
 const HEX_TOKEN_LEN: usize = 64;
@@ -62,6 +63,25 @@ const FULL_TOKEN_LEN: usize = SESSION_TOKEN_PREFIX.len() + HEX_TOKEN_LEN;
 
 const CREDENTIAL_REFUSAL: &str = "invalid or expired terminal session credentials";
 const LINEAGE_REFUSAL: &str = "child terminal session is not owned by this caller";
+const MAX_RECORDED_BLOCKS: usize = 16;
+const MAX_BLOCK_CMD_BYTES: usize = 4 * 1024;
+const MAX_BLOCK_RAW_BYTES: usize = MAX_READ_BYTES * 2;
+const MAX_EXTERNAL_CALLER_SUFFIX_LEN: usize = 48;
+
+pub(crate) fn is_valid_external_caller_id(id: &str) -> bool {
+    let suffix = if let Some(s) = id.strip_prefix("mcp-") {
+        s
+    } else if let Some(s) = id.strip_prefix("ext-") {
+        s
+    } else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= MAX_EXTERNAL_CALLER_SUFFIX_LEN
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// Allowed child launchers for `Spawn`.
 pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
@@ -265,6 +285,232 @@ fn discard_sink() -> OutputSink {
     OutputSink::from_fn(|_, _| Ok(()))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedCommandBlock {
+    command: Option<String>,
+    output: String,
+    exit_code: Option<i32>,
+    tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OscCaptureState {
+    #[default]
+    Ground,
+    Esc,
+    Osc,
+    OscEsc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BlockCapturePhase {
+    #[default]
+    Idle,
+    Command,
+    Output,
+}
+
+#[derive(Debug, Default)]
+struct CommandBlockRecorder {
+    osc_state: OscCaptureState,
+    osc_buf: Vec<u8>,
+    osc_overflow: bool,
+    phase: BlockCapturePhase,
+    cmd_buf: Vec<u8>,
+    out_buf: Vec<u8>,
+    pending_cmd: Option<String>,
+    blocks: VecDeque<RecordedCommandBlock>,
+    total_recorded: u64,
+}
+
+impl CommandBlockRecorder {
+    fn render_fragment(raw: &[u8], rows: u16, cols: u16) -> String {
+        if raw.is_empty() {
+            return String::new();
+        }
+        let mut parser = vt100::Parser::new(
+            nz_u16(rows.max(4)),
+            nz_u16(cols.max(20)),
+            PARSER_SCROLLBACK_ROWS,
+        );
+        parser.process(raw);
+        let mut lines = extract_parser_logical_lines(&parser);
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        scrub_screen_text(&lines.join("\n"))
+    }
+
+    fn push_raw_byte(&mut self, byte: u8) {
+        match self.phase {
+            BlockCapturePhase::Idle => {}
+            BlockCapturePhase::Command => {
+                if self.cmd_buf.len() < MAX_BLOCK_CMD_BYTES {
+                    self.cmd_buf.push(byte);
+                }
+            }
+            BlockCapturePhase::Output => {
+                if self.out_buf.len() < MAX_BLOCK_RAW_BYTES {
+                    self.out_buf.push(byte);
+                }
+            }
+        }
+    }
+
+    fn handle_osc(&mut self, cols: u16) {
+        if self.osc_overflow {
+            return;
+        }
+        let Ok(raw) = std::str::from_utf8(&self.osc_buf) else {
+            return;
+        };
+        let Some(rest) = raw.strip_prefix("133;") else {
+            return;
+        };
+        let mut parts = rest.trim().split(';');
+        match parts.next() {
+            Some("A") => {
+                self.phase = BlockCapturePhase::Idle;
+                self.cmd_buf.clear();
+                self.pending_cmd = None;
+            }
+            Some("B") => {
+                self.phase = BlockCapturePhase::Command;
+                self.cmd_buf.clear();
+                self.out_buf.clear();
+                self.pending_cmd = None;
+            }
+            Some("C") => {
+                if self.phase == BlockCapturePhase::Command && !self.cmd_buf.is_empty() {
+                    let rendered = Self::render_fragment(&self.cmd_buf, 8, cols);
+                    let trimmed = rendered
+                        .lines()
+                        .last()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    self.pending_cmd = trimmed;
+                }
+                self.cmd_buf.clear();
+                self.out_buf.clear();
+                self.phase = BlockCapturePhase::Output;
+            }
+            Some("D") => {
+                if self.phase != BlockCapturePhase::Output {
+                    return;
+                }
+                let exit_code = parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<i32>().ok());
+                let tag = parts
+                    .next()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let mut output = Self::render_fragment(&self.out_buf, 24, cols);
+                if output.len() > MAX_READ_BYTES {
+                    let mut cut = output.len().saturating_sub(MAX_READ_BYTES);
+                    while cut < output.len() && !output.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    output = output[cut..].to_string();
+                }
+                self.blocks.push_back(RecordedCommandBlock {
+                    command: self.pending_cmd.take(),
+                    output,
+                    exit_code,
+                    tag,
+                });
+                while self.blocks.len() > MAX_RECORDED_BLOCKS {
+                    self.blocks.pop_front();
+                }
+                self.total_recorded = self.total_recorded.saturating_add(1);
+                self.out_buf.clear();
+                self.phase = BlockCapturePhase::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8], cols: u16) {
+        for &byte in bytes {
+            match self.osc_state {
+                OscCaptureState::Ground => {
+                    if byte == 0x1b {
+                        self.osc_state = OscCaptureState::Esc;
+                    } else {
+                        self.push_raw_byte(byte);
+                    }
+                }
+                OscCaptureState::Esc => {
+                    if byte == b']' {
+                        self.osc_state = OscCaptureState::Osc;
+                        self.osc_buf.clear();
+                        self.osc_overflow = false;
+                    } else {
+                        self.push_raw_byte(0x1b);
+                        if byte == 0x1b {
+                            // Keep Esc state for sequential ESC ESC bytes.
+                        } else {
+                            self.push_raw_byte(byte);
+                            self.osc_state = OscCaptureState::Ground;
+                        }
+                    }
+                }
+                OscCaptureState::Osc => {
+                    if byte == 0x07 {
+                        self.handle_osc(cols);
+                        self.osc_state = OscCaptureState::Ground;
+                    } else if byte == 0x1b {
+                        self.osc_state = OscCaptureState::OscEsc;
+                    } else if self.osc_buf.len() < 512 {
+                        self.osc_buf.push(byte);
+                    } else {
+                        self.osc_overflow = true;
+                    }
+                }
+                OscCaptureState::OscEsc => {
+                    if byte == b'\\' {
+                        self.handle_osc(cols);
+                        self.osc_state = OscCaptureState::Ground;
+                    } else if byte == 0x1b {
+                        self.push_osc_byte(0x1b);
+                    } else {
+                        self.push_osc_byte(0x1b);
+                        self.push_osc_byte(byte);
+                        self.osc_state = OscCaptureState::Osc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_osc_byte(&mut self, byte: u8) {
+        if self.osc_buf.len() < 512 {
+            self.osc_buf.push(byte);
+        } else {
+            self.osc_overflow = true;
+        }
+    }
+
+    fn last_completed(&self) -> Option<&RecordedCommandBlock> {
+        self.blocks.back()
+    }
+
+    fn find_by_tag(&self, tag: &str) -> Option<&RecordedCommandBlock> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|blk| blk.tag.as_deref() == Some(tag))
+    }
+
+    fn has_tag(&self, tag: &str) -> bool {
+        self.find_by_tag(tag).is_some()
+    }
+}
+
 struct OrchestratedRecord {
     token_hash: Option<[u8; 32]>,
     parent_session_id: Option<String>,
@@ -280,6 +526,7 @@ struct OrchestratedRecord {
     baseline_event_seq: u64,
     parser: Option<vt100::Parser>,
     host_scanner: Option<crate::alerts::scan::Scanner>,
+    blocks: Option<CommandBlockRecorder>,
     telemetry: SharedSessionTelemetry,
 }
 
@@ -343,21 +590,20 @@ impl OrchestrationRegistry {
             .to_string_lossy()
             .into_owned();
         let size = bounded_pty_size(rows, cols);
-        let (parent_session_id, effective_launcher, title, parser, host_scanner) = match child_meta
-        {
-            Some(meta) => (
-                Some(meta.parent_session_id),
-                meta.launcher,
-                meta.title,
-                Some(vt100::Parser::new(
-                    nz_u16(size.rows),
-                    nz_u16(size.cols),
-                    PARSER_SCROLLBACK_ROWS,
-                )),
-                Some(crate::alerts::scan::Scanner::new()),
-            ),
-            None => (None, launcher.to_owned(), None, None, None),
+        let (parent_session_id, effective_launcher, title) = match child_meta {
+            Some(meta) => (Some(meta.parent_session_id), meta.launcher, meta.title),
+            None => (None, launcher.to_owned(), None),
         };
+        let track_screen = parent_session_id.is_some() || effective_launcher == "shell";
+        let parser = track_screen.then(|| {
+            vt100::Parser::new(
+                nz_u16(size.rows),
+                nz_u16(size.cols),
+                PARSER_SCROLLBACK_ROWS,
+            )
+        });
+        let host_scanner = track_screen.then(crate::alerts::scan::Scanner::new);
+        let blocks = track_screen.then(CommandBlockRecorder::default);
         let mut inner = self.lock();
         inner.sessions.insert(
             session_id.to_owned(),
@@ -376,6 +622,7 @@ impl OrchestrationRegistry {
                 baseline_event_seq: 0,
                 parser,
                 host_scanner,
+                blocks,
                 telemetry,
             },
         );
@@ -402,6 +649,9 @@ impl OrchestrationRegistry {
                     nz_u16(size.cols),
                     PARSER_SCROLLBACK_ROWS,
                 ));
+                if record.blocks.is_some() {
+                    record.blocks = Some(CommandBlockRecorder::default());
+                }
                 record.observed_bytes = 0;
             }
         }
@@ -443,7 +693,12 @@ impl OrchestrationRegistry {
                 }
                 continue;
             }
+            let effective_launcher = snap
+                .child_launcher
+                .clone()
+                .unwrap_or_else(|| snap.launcher.clone());
             let is_child = snap.parent_session_id.is_some();
+            let track_screen = is_child || effective_launcher == "shell";
             let telemetry = crate::terminal::new_shared_telemetry();
             *telemetry
                 .0
@@ -456,10 +711,7 @@ impl OrchestrationRegistry {
                     parent_session_id: snap.parent_session_id.clone(),
                     repo_path: canonical_repo,
                     cwd: snap.cwd.clone(),
-                    launcher: snap
-                        .child_launcher
-                        .clone()
-                        .unwrap_or_else(|| snap.launcher.clone()),
+                    launcher: effective_launcher,
                     title: snap.child_title.clone(),
                     rows: size.rows,
                     cols: size.cols,
@@ -467,14 +719,15 @@ impl OrchestrationRegistry {
                     exit_code: snap.telemetry.last_exit_code,
                     observed_bytes: 0,
                     baseline_event_seq: snap.telemetry.event_seq,
-                    parser: is_child.then(|| {
+                    parser: track_screen.then(|| {
                         vt100::Parser::new(
                             nz_u16(size.rows),
                             nz_u16(size.cols),
                             PARSER_SCROLLBACK_ROWS,
                         )
                     }),
-                    host_scanner: is_child.then(crate::alerts::scan::Scanner::new),
+                    host_scanner: track_screen.then(crate::alerts::scan::Scanner::new),
+                    blocks: track_screen.then(CommandBlockRecorder::default),
                     telemetry,
                 },
             );
@@ -505,8 +758,12 @@ impl OrchestrationRegistry {
         let Some(record) = inner.sessions.get_mut(session_id) else {
             return;
         };
+        let cols = record.cols;
         if let Some(parser) = record.parser.as_mut() {
             parser.process(bytes);
+            if let Some(blocks) = record.blocks.as_mut() {
+                blocks.feed(bytes, cols);
+            }
             record.observed_bytes = record.observed_bytes.saturating_add(bytes.len() as u64);
             drop(inner);
             self.changed.notify_all();
@@ -527,10 +784,14 @@ impl OrchestrationRegistry {
             let Some(record) = inner.sessions.get_mut(session_id) else {
                 return;
             };
+            let cols = record.cols;
             let Some(parser) = record.parser.as_mut() else {
                 return;
             };
             parser.process(bytes);
+            if let Some(blocks) = record.blocks.as_mut() {
+                blocks.feed(bytes, cols);
+            }
             record.observed_bytes = record.observed_bytes.saturating_add(bytes.len() as u64);
             record.host_scanner.as_mut().map(|scanner| {
                 apply_scanner_telemetry(scanner, &record.telemetry, bytes);
@@ -562,26 +823,24 @@ impl OrchestrationRegistry {
     /// can complete a post-exit `wait` or `read`.
     pub(crate) fn mark_ended(&self, session_id: &str, exit_code: Option<i32>) {
         let mut inner = self.lock();
-        let is_child = match inner.sessions.get_mut(session_id) {
+        let retain = match inner.sessions.get_mut(session_id) {
             Some(record) => {
                 record.token_hash = None;
                 record.ended = true;
                 record.exit_code = exit_code;
-                record.parent_session_id.is_some()
+                record.parent_session_id.is_some() || record.launcher == "shell"
             }
             None => return,
         };
-        if is_child {
+        if retain {
             if !inner.ended_children.iter().any(|id| id == session_id) {
                 inner.ended_children.push_back(session_id.to_owned());
             }
             while inner.ended_children.len() > MAX_ENDED_CHILDREN {
                 if let Some(evicted) = inner.ended_children.pop_front() {
-                    if inner
-                        .sessions
-                        .get(&evicted)
-                        .is_some_and(|rec| rec.ended && rec.parent_session_id.is_some())
-                    {
+                    if inner.sessions.get(&evicted).is_some_and(|rec| {
+                        rec.ended && (rec.parent_session_id.is_some() || rec.launcher == "shell")
+                    }) {
                         inner.sessions.remove(&evicted);
                     }
                 }
@@ -620,8 +879,12 @@ impl OrchestrationRegistry {
 pub enum OrchestrateCall {
     Spawn {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launcher: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -639,10 +902,40 @@ pub enum OrchestrateCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cols: Option<u16>,
     },
+    Exec {
+        repo_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_open: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_lines: Option<usize>,
+    },
     OpenFile {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         line: Option<u32>,
@@ -651,13 +944,23 @@ pub enum OrchestrateCall {
     },
     List {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include_repo_shells: Option<bool>,
     },
     Wait {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         child_session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
@@ -670,16 +973,30 @@ pub enum OrchestrateCall {
     },
     Read {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         child_session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_lines: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_lines: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grep: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_command_only: Option<bool>,
     },
     Send {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         child_session_id: String,
         input: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,17 +1004,21 @@ pub enum OrchestrateCall {
     },
     Close {
         repo_path: String,
-        caller_session_id: String,
-        caller_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_caller_id: Option<String>,
         child_session_id: String,
     },
 }
 
 impl OrchestrateCall {
-    /// Socket reply deadline for `Secondary` callers (`timeout_ms + 5s` on `Wait`).
+    /// Socket reply deadline for `Secondary` callers (`timeout_ms + 5s` on `Wait` and `Exec`).
     pub fn reply_deadline(&self) -> Duration {
         match self {
-            Self::Wait { timeout_ms, .. } => {
+            Self::Wait { timeout_ms, .. } | Self::Exec { timeout_ms, .. } => {
                 let bounded = timeout_ms
                     .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
                     .clamp(1, MAX_WAIT_TIMEOUT_MS);
@@ -709,7 +1030,11 @@ impl OrchestrateCall {
 
     /// Structural wire validation run at the socket boundary before dispatch.
     pub fn validate(&self) -> Result<(), String> {
-        let check_common = |repo: &str, sid: &str, tok: &str| -> Result<(), String> {
+        let check_common = |repo: &str,
+                            sid: Option<&str>,
+                            tok: Option<&str>,
+                            ext: Option<&str>|
+         -> Result<(), String> {
             if repo.is_empty()
                 || repo.len() > 4096
                 || repo.contains('\0')
@@ -717,11 +1042,26 @@ impl OrchestrateCall {
             {
                 return Err("orchestrate repo_path must be an absolute path".into());
             }
-            if sid.is_empty() || sid.len() > 64 || sid.chars().any(char::is_control) {
-                return Err("orchestrate caller_session_id is invalid".into());
+            if sid.is_some() != tok.is_some() {
+                return Err(
+                    "orchestrate caller_session_id and caller_token must be provided together"
+                        .into(),
+                );
             }
-            if tok.is_empty() || tok.len() > 128 || tok.chars().any(char::is_control) {
-                return Err("orchestrate caller_token is invalid".into());
+            if let (Some(sid), Some(tok)) = (sid, tok) {
+                if sid.is_empty() || sid.len() > 64 || sid.chars().any(char::is_control) {
+                    return Err("orchestrate caller_session_id is invalid".into());
+                }
+                if tok.is_empty() || tok.len() > 128 || tok.chars().any(char::is_control) {
+                    return Err("orchestrate caller_token is invalid".into());
+                }
+            } else {
+                let Some(ext) = ext else {
+                    return Err(CREDENTIAL_REFUSAL.into());
+                };
+                if !is_valid_external_caller_id(ext) {
+                    return Err(CREDENTIAL_REFUSAL.into());
+                }
             }
             Ok(())
         };
@@ -731,12 +1071,19 @@ impl OrchestrateCall {
             }
             Ok(())
         };
+        let check_pattern = |pat: &str, label: &str| -> Result<(), String> {
+            if pat.is_empty() || pat.len() > MAX_PATTERN_BYTES || pat.contains('\0') {
+                return Err(format!("orchestrate {label} is empty or exceeds 512 bytes"));
+            }
+            Ok(())
+        };
 
         match self {
             Self::Spawn {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 launcher,
                 cwd,
                 command,
@@ -744,7 +1091,12 @@ impl OrchestrateCall {
                 title,
                 ..
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 if let Some(l) = launcher {
                     if !ALLOWED_CHILD_LAUNCHERS.contains(&l.trim()) {
                         return Err(format!(
@@ -777,15 +1129,74 @@ impl OrchestrateCall {
                 }
                 Ok(())
             }
+            Self::Exec {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                cwd,
+                command,
+                timeout_ms,
+                pattern,
+                title,
+                max_lines,
+                ..
+            } => {
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
+                if let Some(cid) = child_session_id {
+                    check_child(cid)?;
+                }
+                if let Some(dir) = cwd {
+                    if dir.len() > 1024 || dir.contains('\0') {
+                        return Err("orchestrate cwd is invalid".into());
+                    }
+                }
+                if command.is_empty() || command.len() > MAX_SEND_BYTES {
+                    return Err("orchestrate command is empty or exceeds 16 KiB".into());
+                }
+                if timeout_ms.is_some_and(|ms| ms == 0 || ms > MAX_WAIT_TIMEOUT_MS) {
+                    return Err(format!(
+                        "orchestrate timeout_ms must be in 1..={MAX_WAIT_TIMEOUT_MS}"
+                    ));
+                }
+                if let Some(pat) = pattern {
+                    check_pattern(pat, "pattern")?;
+                }
+                if let Some(t) = title {
+                    if t.len() > MAX_CHILD_TITLE_BYTES || t.chars().any(char::is_control) {
+                        return Err(
+                            "orchestrate title exceeds 120 bytes or has control chars".into()
+                        );
+                    }
+                }
+                if max_lines.is_some_and(|n| n == 0 || n > MAX_READ_LINES) {
+                    return Err(format!(
+                        "orchestrate max_lines must be in 1..={MAX_READ_LINES}"
+                    ));
+                }
+                Ok(())
+            }
             Self::OpenFile {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 path,
                 line,
                 column,
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 let candidate = Path::new(path);
                 if path.trim().is_empty()
                     || path.len() > 4096
@@ -817,17 +1228,30 @@ impl OrchestrateCall {
                 repo_path,
                 caller_session_id,
                 caller_token,
-            } => check_common(repo_path, caller_session_id, caller_token),
+                external_caller_id,
+                ..
+            } => check_common(
+                repo_path,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
+            ),
             Self::Wait {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 timeout_ms,
                 pattern,
                 ..
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 check_child(child_session_id)?;
                 if timeout_ms.is_some_and(|ms| ms == 0 || ms > MAX_WAIT_TIMEOUT_MS) {
                     return Err(format!(
@@ -835,9 +1259,7 @@ impl OrchestrateCall {
                     ));
                 }
                 if let Some(pat) = pattern {
-                    if pat.is_empty() || pat.len() > MAX_PATTERN_BYTES || pat.contains('\0') {
-                        return Err("orchestrate pattern is empty or exceeds 512 bytes".into());
-                    }
+                    check_pattern(pat, "pattern")?;
                 }
                 Ok(())
             }
@@ -845,15 +1267,32 @@ impl OrchestrateCall {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 max_lines,
+                offset_lines,
+                grep,
+                ..
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 check_child(child_session_id)?;
                 if max_lines.is_some_and(|n| n == 0 || n > MAX_READ_LINES) {
                     return Err(format!(
                         "orchestrate max_lines must be in 1..={MAX_READ_LINES}"
                     ));
+                }
+                if offset_lines.is_some_and(|o| o > PARSER_SCROLLBACK_ROWS) {
+                    return Err(format!(
+                        "orchestrate offset_lines must be in 0..={PARSER_SCROLLBACK_ROWS}"
+                    ));
+                }
+                if let Some(pat) = grep {
+                    check_pattern(pat, "grep")?;
                 }
                 Ok(())
             }
@@ -861,11 +1300,17 @@ impl OrchestrateCall {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 input,
                 ..
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 check_child(child_session_id)?;
                 if input.is_empty() || input.len() > MAX_SEND_BYTES {
                     return Err("orchestrate input is empty or exceeds 16 KiB".into());
@@ -876,9 +1321,15 @@ impl OrchestrateCall {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
             } => {
-                check_common(repo_path, caller_session_id, caller_token)?;
+                check_common(
+                    repo_path,
+                    caller_session_id.as_deref(),
+                    caller_token.as_deref(),
+                    external_caller_id.as_deref(),
+                )?;
                 check_child(child_session_id)
             }
         }
@@ -940,50 +1391,107 @@ fn canonical_trusted_repo(repo_path: &str) -> Result<std::path::PathBuf, String>
     Ok(std::fs::canonicalize(&validated).unwrap_or(validated))
 }
 
+#[derive(Debug, Clone)]
+enum CallerIdentity {
+    Session(String),
+    External(String),
+}
+
+impl CallerIdentity {
+    fn parent_key(&self) -> &str {
+        match self {
+            Self::Session(id) | Self::External(id) => id.as_str(),
+        }
+    }
+
+    fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+}
+
 fn authorize_caller(
     registry: &OrchestrationRegistry,
-    caller_session_id: &str,
-    caller_token: &str,
+    caller_session_id: Option<&str>,
+    caller_token: Option<&str>,
+    external_caller_id: Option<&str>,
     canonical_repo: &str,
-) -> Result<(), String> {
-    if !is_session_id(caller_session_id) {
+) -> Result<CallerIdentity, String> {
+    if caller_session_id.is_some() != caller_token.is_some() {
         return Err(CREDENTIAL_REFUSAL.to_string());
     }
-    let provided = hash_token(caller_token)?;
-    let inner = registry.lock();
-    let Some(record) = inner.sessions.get(caller_session_id) else {
+    if let (Some(sid), Some(tok)) = (caller_session_id, caller_token) {
+        if !is_session_id(sid) {
+            return Err(CREDENTIAL_REFUSAL.to_string());
+        }
+        let provided = hash_token(tok)?;
+        let inner = registry.lock();
+        let Some(record) = inner.sessions.get(sid) else {
+            return Err(CREDENTIAL_REFUSAL.to_string());
+        };
+        if record.ended || record.repo_path != canonical_repo {
+            return Err(CREDENTIAL_REFUSAL.to_string());
+        }
+        let Some(stored) = &record.token_hash else {
+            return Err(CREDENTIAL_REFUSAL.to_string());
+        };
+        if !ct_eq_32(stored, &provided) {
+            return Err(CREDENTIAL_REFUSAL.to_string());
+        }
+        return Ok(CallerIdentity::Session(sid.to_owned()));
+    }
+
+    let Some(ext) = external_caller_id else {
         return Err(CREDENTIAL_REFUSAL.to_string());
     };
-    if record.ended || record.repo_path != canonical_repo {
+    if !is_valid_external_caller_id(ext) {
         return Err(CREDENTIAL_REFUSAL.to_string());
     }
-    let Some(stored) = &record.token_hash else {
-        return Err(CREDENTIAL_REFUSAL.to_string());
-    };
-    if !ct_eq_32(stored, &provided) {
-        return Err(CREDENTIAL_REFUSAL.to_string());
-    }
-    Ok(())
+    Ok(CallerIdentity::External(ext.to_owned()))
 }
 
 fn authorize_child<'a>(
     inner: &'a RegistryInner,
-    caller_session_id: &str,
+    caller_key: &str,
     child_session_id: &str,
     canonical_repo: &str,
 ) -> Result<&'a OrchestratedRecord, String> {
-    if !is_session_id(child_session_id) || child_session_id == caller_session_id {
+    if !is_session_id(child_session_id) || child_session_id == caller_key {
         return Err(LINEAGE_REFUSAL.to_string());
     }
     let Some(record) = inner.sessions.get(child_session_id) else {
         return Err(LINEAGE_REFUSAL.to_string());
     };
-    if record.parent_session_id.as_deref() != Some(caller_session_id)
+    if record.parent_session_id.as_deref() != Some(caller_key)
         || record.repo_path != canonical_repo
     {
         return Err(LINEAGE_REFUSAL.to_string());
     }
     Ok(record)
+}
+
+fn authorize_readable_session<'a>(
+    inner: &'a RegistryInner,
+    caller_key: &str,
+    target_session_id: &str,
+    canonical_repo: &str,
+    allow_repo_shells: bool,
+) -> Result<(&'a OrchestratedRecord, bool), String> {
+    if !is_session_id(target_session_id) || target_session_id == caller_key {
+        return Err(LINEAGE_REFUSAL.to_string());
+    }
+    let Some(record) = inner.sessions.get(target_session_id) else {
+        return Err(LINEAGE_REFUSAL.to_string());
+    };
+    if record.repo_path != canonical_repo {
+        return Err(LINEAGE_REFUSAL.to_string());
+    }
+    if record.parent_session_id.as_deref() == Some(caller_key) {
+        return Ok((record, true));
+    }
+    if allow_repo_shells && record.parent_session_id.is_none() && record.launcher == "shell" {
+        return Ok((record, false));
+    }
+    Err(LINEAGE_REFUSAL.to_string())
 }
 
 fn build_agent_child_args(
@@ -1035,7 +1543,7 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
         let Some(rec) = inner.sessions.get(child_session_id) else {
             return;
         };
-        if rec.parent_session_id.is_none() {
+        if rec.parser.is_none() {
             return;
         }
         ((rec.rows, rec.cols), rec.observed_bytes)
@@ -1086,8 +1594,12 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                         && rec.parser.is_some()
                     {
                         let suffix = &raw[raw.len() - delta as usize..];
+                        let cols = rec.cols;
                         if let Some(parser) = rec.parser.as_mut() {
                             parser.process(suffix);
+                        }
+                        if let Some(blocks) = rec.blocks.as_mut() {
+                            blocks.feed(suffix, cols);
                         }
                         if !remote_tel_synced {
                             if let Some(scanner) = rec.host_scanner.as_mut() {
@@ -1102,6 +1614,9 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                         );
                         parser.process(&raw);
                         rec.parser = Some(parser);
+                        let mut blocks = CommandBlockRecorder::default();
+                        blocks.feed(&raw, dims.1);
+                        rec.blocks = Some(blocks);
                         if !remote_tel_synced {
                             let mut scanner = crate::alerts::scan::Scanner::new();
                             apply_scanner_telemetry(&mut scanner, &rec.telemetry, &raw);
@@ -1118,49 +1633,94 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
     }
 }
 
-fn render_redacted_screen(
+fn extract_parser_logical_lines(parser: &vt100::Parser) -> Vec<String> {
+    let mut logical_lines: Vec<String> = Vec::new();
+    let mut screen = parser.screen().clone();
+    let (rows_nz, cols_nz) = screen.size();
+    let viewport_rows = usize::from(rows_nz.get());
+    let cols = cols_nz.get();
+    let sb_len = screen.scrollback_len();
+    let total_physical_rows = sb_len + viewport_rows;
+    let mut next_global_row = 0usize;
+    let mut pending = String::new();
+
+    while next_global_row < total_physical_rows {
+        let (offset, skip) = if next_global_row <= sb_len {
+            (sb_len - next_global_row, 0usize)
+        } else {
+            (0usize, next_global_row - sb_len)
+        };
+        screen.set_scrollback(offset);
+        let window_rows: Vec<(String, bool)> = screen
+            .rows(0, cols)
+            .enumerate()
+            .map(|(r, text)| (text, screen.row_wrapped(r as u16)))
+            .collect();
+        let count = window_rows.len().saturating_sub(skip);
+        if count == 0 {
+            break;
+        }
+        for (text, wrapped) in window_rows.into_iter().skip(skip) {
+            pending.push_str(&text);
+            if !wrapped {
+                logical_lines.push(std::mem::take(&mut pending));
+            }
+        }
+        next_global_row += count;
+    }
+    if !pending.is_empty() {
+        logical_lines.push(pending);
+    }
+    logical_lines
+}
+
+fn select_scrubbed_lines(
+    scrubbed_lines: Vec<String>,
+    max_lines: usize,
+    offset_lines: usize,
+    grep: Option<&str>,
+) -> (String, usize, usize, bool) {
+    let matched: Vec<String> = match grep {
+        Some(pat) => scrubbed_lines
+            .into_iter()
+            .filter(|line| line.contains(pat))
+            .collect(),
+        None => scrubbed_lines,
+    };
+    let total_lines = matched.len();
+    let cap = max_lines.clamp(1, MAX_READ_LINES);
+    let offset = offset_lines.min(total_lines);
+    let end = total_lines.saturating_sub(offset);
+    let start = end.saturating_sub(cap);
+    let mut truncated = start > 0;
+    let mut text = matched[start..end].join("\n");
+    if text.len() > MAX_READ_BYTES {
+        truncated = true;
+        let mut cut = text.len().saturating_sub(MAX_READ_BYTES);
+        while cut < text.len() && !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text = text[cut..].to_string();
+    }
+    let lines_returned = if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    };
+    (text, lines_returned, total_lines, truncated)
+}
+
+fn render_redacted_screen_filtered(
     record: &OrchestratedRecord,
     max_lines: usize,
+    offset_lines: usize,
+    grep: Option<&str>,
 ) -> (String, usize, usize, bool) {
-    let mut logical_lines: Vec<String> = Vec::new();
-    if let Some(parser) = record.parser.as_ref() {
-        let mut screen = parser.screen().clone();
-        let (rows_nz, cols_nz) = screen.size();
-        let viewport_rows = usize::from(rows_nz.get());
-        let cols = cols_nz.get();
-        let sb_len = screen.scrollback_len();
-        let total_physical_rows = sb_len + viewport_rows;
-        let mut next_global_row = 0usize;
-        let mut pending = String::new();
-
-        while next_global_row < total_physical_rows {
-            let (offset, skip) = if next_global_row <= sb_len {
-                (sb_len - next_global_row, 0usize)
-            } else {
-                (0usize, next_global_row - sb_len)
-            };
-            screen.set_scrollback(offset);
-            let window_rows: Vec<(String, bool)> = screen
-                .rows(0, cols)
-                .enumerate()
-                .map(|(r, text)| (text, screen.row_wrapped(r as u16)))
-                .collect();
-            let count = window_rows.len().saturating_sub(skip);
-            if count == 0 {
-                break;
-            }
-            for (text, wrapped) in window_rows.into_iter().skip(skip) {
-                pending.push_str(&text);
-                if !wrapped {
-                    logical_lines.push(std::mem::take(&mut pending));
-                }
-            }
-            next_global_row += count;
-        }
-        if !pending.is_empty() {
-            logical_lines.push(pending);
-        }
-    }
+    let mut logical_lines = record
+        .parser
+        .as_ref()
+        .map(extract_parser_logical_lines)
+        .unwrap_or_default();
 
     while logical_lines
         .last()
@@ -1168,41 +1728,480 @@ fn render_redacted_screen(
     {
         logical_lines.pop();
     }
-    let total_lines = logical_lines.len();
-    let cap = max_lines.clamp(1, MAX_READ_LINES);
-    let mut truncated = total_lines > cap;
-    let slice = if total_lines > cap {
-        &logical_lines[total_lines - cap..]
+    // Redact before `grep` so secret substrings can never become a grep oracle.
+    let scrubbed = scrub_screen_text(&logical_lines.join("\n"));
+    let scrubbed_lines: Vec<String> = if scrubbed.is_empty() {
+        Vec::new()
     } else {
-        &logical_lines[..]
+        scrubbed.lines().map(str::to_owned).collect()
     };
-    let joined = slice.join("\n");
-    let mut scrubbed = scrub_screen_text(&joined);
-    if scrubbed.len() > MAX_READ_BYTES {
-        truncated = true;
-        let mut cut = scrubbed.len().saturating_sub(MAX_READ_BYTES);
-        while cut < scrubbed.len() && !scrubbed.is_char_boundary(cut) {
-            cut += 1;
-        }
-        scrubbed = scrubbed[cut..].to_string();
-    }
-    let lines_returned = if scrubbed.is_empty() {
-        0
-    } else {
-        scrubbed.lines().count()
-    };
-    (scrubbed, lines_returned, total_lines, truncated)
+    select_scrubbed_lines(scrubbed_lines, max_lines, offset_lines, grep)
+}
+
+fn render_redacted_screen(
+    record: &OrchestratedRecord,
+    max_lines: usize,
+) -> (String, usize, usize, bool) {
+    render_redacted_screen_filtered(record, max_lines, 0, None)
 }
 
 fn herdr_state_str(status: &Option<crate::alerts::scan::HerdrStatus>) -> Option<String> {
     status.as_ref().map(|h| h.state.as_str().to_owned())
 }
 
-/// Executes one [`OrchestrateCall`] against `state` under Option A lineage rules.
+fn encode_exec_wrapper(command: &str, exec_tag: &str, exit_after: bool) -> String {
+    let body = if !command.contains('\n') && !command.contains('\r') {
+        let escaped = command.replace('\'', "'\\''");
+        format!("eval '{escaped}'")
+    } else {
+        let mut encoded = String::with_capacity(command.len() + 16);
+        for ch in command.chars() {
+            match ch {
+                '\\' => encoded.push_str("\\\\"),
+                '\'' => encoded.push_str("\\047"),
+                '\n' => encoded.push_str("\\n"),
+                '\r' => encoded.push_str("\\r"),
+                _ => encoded.push(ch),
+            }
+        }
+        format!("eval \"$(printf '%b' '{encoded}')\"")
+    };
+    if exit_after {
+        format!(
+            "printf '\\033]133;C\\007'; {body}; __gp_ec=$?; printf '\\033]133;D;%d;%s\\007' \"$__gp_ec\" \"{exec_tag}\"; exit \"$__gp_ec\"\n"
+        )
+    } else {
+        format!(
+            "printf '\\033]133;C\\007'; {body}; __gp_ec=$?; printf '\\033]133;D;%d;%s\\007' \"$__gp_ec\" \"{exec_tag}\"\n"
+        )
+    }
+}
+
+struct SpawnParams {
+    launcher: Option<String>,
+    cwd: Option<String>,
+    command: Option<String>,
+    prompt: Option<String>,
+    title: Option<String>,
+    split: Option<bool>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+}
+
+struct SpawnResult {
+    canonical_repo: String,
+    child_session_id: String,
+    launcher: String,
+    cwd: String,
+    split: bool,
+    gate_checked: bool,
+    gate_notice: Option<String>,
+}
+
+fn spawn_child_internal(
+    state: &TerminalSessions,
+    ui: &dyn OrchestrateUiSink,
+    caller: &CallerIdentity,
+    repo_buf: &Path,
+    canonical_repo: &str,
+    params: SpawnParams,
+) -> Result<SpawnResult, String> {
+    {
+        let inner = state.orchestration.lock();
+        let active_children = inner
+            .sessions
+            .values()
+            .filter(|rec| {
+                !rec.ended && rec.parent_session_id.as_deref() == Some(caller.parent_key())
+            })
+            .count();
+        if active_children >= MAX_CHILDREN_PER_PARENT {
+            return Err(format!(
+                "parent terminal session already has {active_children} active child sessions (limit {MAX_CHILDREN_PER_PARENT}); wait for or close an existing child before spawning another"
+            ));
+        }
+        if caller.is_external() {
+            let active_external = inner
+                .sessions
+                .values()
+                .filter(|rec| {
+                    !rec.ended
+                        && rec
+                            .parent_session_id
+                            .as_deref()
+                            .is_some_and(is_valid_external_caller_id)
+                })
+                .count();
+            if active_external >= MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
+                return Err(format!(
+                    "external terminal orchestrators already have {active_external} active child sessions (limit {MAX_EXTERNAL_ORCHESTRATED_CHILDREN}); close an existing child before spawning another"
+                ));
+            }
+        }
+    }
+
+    let launcher = params
+        .launcher
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("shell")
+        .to_owned();
+    if !ALLOWED_CHILD_LAUNCHERS.contains(&launcher.as_str()) {
+        return Err(format!("unsupported child launcher '{launcher}'"));
+    }
+
+    let start_dir = params
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let resolved_cwd = match &start_dir {
+        Some(sub) => sandbox_join_canonical(repo_buf, sub)?,
+        None => repo_buf.to_path_buf(),
+    };
+    if !resolved_cwd.is_dir() {
+        return Err("requested child cwd is not an existing directory inside repo_path".into());
+    }
+    let resolved_cwd_str = resolved_cwd.to_string_lossy().into_owned();
+
+    let (program, args, initial_shell_cmd, gate_checked, gate_notice) = if launcher == "shell" {
+        if params.prompt.is_some() {
+            return Err("prompt applies only to agent launchers; pass command for shell".into());
+        }
+        if let Some(cmd) = params.command {
+            validate_child_input_bytes(&cmd)?;
+            let (checked, notice) = gate_lines(&resolved_cwd_str, &cmd)?;
+            (None, None, Some(cmd), checked, notice)
+        } else {
+            (None, None, None, true, None)
+        }
+    } else {
+        if params.command.is_some() {
+            return Err(
+                "command applies only to shell launcher; pass prompt for agent launchers".into(),
+            );
+        }
+        let agent_args = build_agent_child_args(&launcher, params.prompt.as_deref())?;
+        (Some(launcher.clone()), agent_args, None, true, None)
+    };
+
+    let clean_title = params
+        .title
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
+    let want_split = params.split.unwrap_or(true);
+    let pty_rows = params.rows.unwrap_or(28);
+    let pty_cols = params.cols.unwrap_or(100);
+    let events = ui.session_events(state);
+
+    let spawned = spawn_at(
+        state,
+        Place::Repo {
+            repo_path: canonical_repo.to_owned(),
+            start_dir,
+        },
+        pty_rows,
+        pty_cols,
+        program,
+        args,
+        None,
+        discard_sink(),
+        events,
+        None,
+        Some(ChildSpawnMeta {
+            parent_session_id: caller.parent_key().to_owned(),
+            launcher: launcher.clone(),
+            title: clean_title.clone(),
+        }),
+    )
+    .map_err(|e| e.into_message())?;
+
+    // Immediately detach the discard sink so an adopting frontend tab can
+    // attach cleanly without hitting "already shown in a tab".
+    let _ = detach_session(state, &spawned.id);
+
+    if let Some(cmd) = initial_shell_cmd {
+        let mut line = cmd;
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        write_input(state, &spawned.id, line.as_bytes())?;
+    }
+
+    ui.child_spawned(TerminalChildSpawnedPayload {
+        id: spawned.id.clone(),
+        parent_session_id: caller.parent_key().to_owned(),
+        repo_path: canonical_repo.to_owned(),
+        cwd: spawned.cwd.clone(),
+        shell: spawned.shell.clone(),
+        launcher: launcher.clone(),
+        title: clean_title,
+        split: want_split,
+    });
+
+    Ok(SpawnResult {
+        canonical_repo: canonical_repo.to_owned(),
+        child_session_id: spawned.id,
+        launcher,
+        cwd: spawned.cwd,
+        split: want_split,
+        gate_checked,
+        gate_notice,
+    })
+}
+
+struct WaitOutcome {
+    matched: bool,
+    timed_out: bool,
+    matched_reason: &'static str,
+    event_seq: u64,
+    ended: bool,
+    exit_code: Option<i32>,
+    command_running: bool,
+    last_exit_code: Option<i32>,
+    herdr_status: Option<String>,
+    dev_server_url: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_child_internal(
+    state: &TerminalSessions,
+    caller_key: &str,
+    child_session_id: &str,
+    canonical_repo: &str,
+    timeout_ms: Option<u64>,
+    pattern: Option<&str>,
+    wait_for_idle: Option<bool>,
+    since_seq: Option<u64>,
+    required_exec_tag: Option<&str>,
+    allow_repo_shells: bool,
+) -> Result<WaitOutcome, String> {
+    let wait_idle = wait_for_idle.unwrap_or(true);
+    let bounded_ms = timeout_ms
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+        .clamp(1, MAX_WAIT_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(bounded_ms);
+
+    let effective_since = {
+        let inner = state.orchestration.lock();
+        let (rec, _) = authorize_readable_session(
+            &inner,
+            caller_key,
+            child_session_id,
+            canonical_repo,
+            allow_repo_shells,
+        )?;
+        since_seq.unwrap_or(rec.baseline_event_seq)
+    };
+
+    let mut last_port_probe: Option<Instant> = None;
+    loop {
+        #[cfg(unix)]
+        refresh_detached_host_screen(state, child_session_id);
+
+        if required_exec_tag.is_none()
+            && wait_idle
+            && last_port_probe.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+        {
+            last_port_probe = Some(Instant::now());
+            let needs_port = {
+                let inner = state.orchestration.lock();
+                inner.sessions.get(child_session_id).is_some_and(|rec| {
+                    !rec.ended
+                        && rec
+                            .telemetry
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .dev_server_url
+                            .is_none()
+                })
+            };
+            if needs_port {
+                if let Ok(ports) = crate::terminal::session_listening_ports(state, child_session_id)
+                {
+                    if let Some(&port) = ports.first() {
+                        let inner = state.orchestration.lock();
+                        if let Some(rec) = inner.sessions.get(child_session_id) {
+                            let mut guard = rec
+                                .telemetry
+                                .0
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if guard.dev_server_url.is_none() {
+                                guard.dev_server_url = Some(format!("http://localhost:{port}"));
+                                guard.event_seq = guard.event_seq.saturating_add(1);
+                                guard.last_dev_event_seq = guard.event_seq;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut inner = state.orchestration.lock();
+        let (rec, owned) = authorize_readable_session(
+            &inner,
+            caller_key,
+            child_session_id,
+            canonical_repo,
+            allow_repo_shells,
+        )?;
+        let tel = rec
+            .telemetry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let ended = rec.ended || tel.ended;
+        let exit_code = rec.exit_code.or(tel.last_exit_code);
+        let herdr = herdr_state_str(&tel.herdr_status);
+
+        let matched_reason = if let Some(tag) = required_exec_tag {
+            if let Some(pat) = pattern {
+                let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
+                if screen.contains(pat) {
+                    Some("pattern")
+                } else if rec.blocks.as_ref().is_some_and(|b| b.has_tag(tag)) {
+                    Some("command_finished")
+                } else if ended {
+                    Some("ended")
+                } else {
+                    None
+                }
+            } else if rec.blocks.as_ref().is_some_and(|b| b.has_tag(tag)) {
+                Some("command_finished")
+            } else if ended {
+                Some("ended")
+            } else {
+                None
+            }
+        } else if let Some(pat) = pattern {
+            let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
+            if screen.contains(pat) {
+                Some("pattern")
+            } else if ended {
+                Some("ended")
+            } else {
+                None
+            }
+        } else if ended {
+            Some("ended")
+        } else if tel.last_herdr_event_seq > effective_since
+            && matches!(herdr.as_deref(), Some("done" | "idle" | "blocked" | "error"))
+        {
+            Some("herdr_status")
+        } else if wait_idle
+            && tel.last_command_event_seq > effective_since
+            && !tel.command_running
+        {
+            Some("command_finished")
+        } else if wait_idle
+            && tel.last_dev_event_seq > effective_since
+            && tel.dev_server_url.is_some()
+        {
+            Some("dev_server_ready")
+        } else {
+            None
+        };
+
+        if let Some(reason) = matched_reason {
+            if owned {
+                if let Some(rec_mut) = inner.sessions.get_mut(child_session_id) {
+                    rec_mut.baseline_event_seq = rec_mut.baseline_event_seq.max(tel.event_seq);
+                }
+            }
+            let matched = pattern.is_none_or(|_| reason == "pattern");
+            return Ok(WaitOutcome {
+                matched,
+                timed_out: false,
+                matched_reason: reason,
+                event_seq: tel.event_seq,
+                ended,
+                exit_code,
+                command_running: tel.command_running,
+                last_exit_code: tel.last_exit_code,
+                herdr_status: herdr,
+                dev_server_url: tel.dev_server_url,
+            });
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(WaitOutcome {
+                matched: false,
+                timed_out: true,
+                matched_reason: "timeout",
+                event_seq: tel.event_seq,
+                ended,
+                exit_code,
+                command_running: tel.command_running,
+                last_exit_code: tel.last_exit_code,
+                herdr_status: herdr,
+                dev_server_url: tel.dev_server_url,
+            });
+        }
+
+        let wait_slice = (deadline - now).min(Duration::from_millis(50));
+        let _ = state
+            .orchestration
+            .changed
+            .wait_timeout(inner, wait_slice)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+fn close_child_internal(
+    state: &TerminalSessions,
+    ui: &dyn OrchestrateUiSink,
+    caller_key: &str,
+    child_session_id: &str,
+    canonical_repo: &str,
+) -> Result<bool, String> {
+    let already_ended = {
+        let inner = state.orchestration.lock();
+        let rec = authorize_child(&inner, caller_key, child_session_id, canonical_repo)?;
+        let tel_ended = rec
+            .telemetry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended;
+        rec.ended || tel_ended
+    };
+
+    if !already_ended {
+        crate::terminal::kill_session(state, child_session_id)?;
+        state.orchestration.mark_ended(child_session_id, None);
+    }
+
+    ui.child_closed(TerminalChildClosedPayload {
+        id: child_session_id.to_owned(),
+        parent_session_id: caller_key.to_owned(),
+        repo_path: canonical_repo.to_owned(),
+    });
+
+    Ok(already_ended)
+}
+
+/// Executes one [`OrchestrateCall`] against `state` under Option A lineage
+/// rules (with optional external MCP/hook callers and opt-in user shell reads).
 pub fn execute(
     state: &TerminalSessions,
     ui: &dyn OrchestrateUiSink,
     call: OrchestrateCall,
+) -> Result<Value, String> {
+    let allow_repo_shells = crate::tool_config::agent_defaults().allows_agent_shell_reads();
+    execute_with_shell_reads(state, ui, call, allow_repo_shells)
+}
+
+pub(crate) fn execute_with_shell_reads(
+    state: &TerminalSessions,
+    ui: &dyn OrchestrateUiSink,
+    call: OrchestrateCall,
+    allow_repo_shells: bool,
 ) -> Result<Value, String> {
     call.validate()?;
     match call {
@@ -1210,6 +2209,7 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             launcher,
             cwd,
             command,
@@ -1221,138 +2221,235 @@ pub fn execute(
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
-            {
+            let res = spawn_child_internal(
+                state,
+                ui,
+                &caller,
+                &repo_buf,
+                &canonical_repo,
+                SpawnParams {
+                    launcher,
+                    cwd,
+                    command,
+                    prompt,
+                    title,
+                    split,
+                    rows,
+                    cols,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "repo_path": res.canonical_repo,
+                "child_session_id": res.child_session_id,
+                "launcher": res.launcher,
+                "cwd": res.cwd,
+                "split": res.split,
+                "baseline_seq": 0,
+                "gate_checked": res.gate_checked,
+                "gate_notice": res.gate_notice,
+            }))
+        }
+
+        OrchestrateCall::Exec {
+            repo_path,
+            caller_session_id,
+            caller_token,
+            external_caller_id,
+            child_session_id,
+            cwd,
+            command,
+            timeout_ms,
+            pattern,
+            keep_open,
+            split,
+            title,
+            max_lines,
+        } => {
+            let repo_buf = canonical_trusted_repo(&repo_path)?;
+            let canonical_repo = repo_buf.to_string_lossy().into_owned();
+            let caller = authorize_caller(
+                &state.orchestration,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
+                &canonical_repo,
+            )?;
+            validate_child_input_bytes(&command)?;
+            let keep = keep_open.unwrap_or(true);
+
+            let (target_id, spawned_new, effective_cwd) = if let Some(cid) = child_session_id {
+                #[cfg(unix)]
+                refresh_detached_host_screen(state, &cid);
                 let inner = state.orchestration.lock();
-                let active_children = inner
-                    .sessions
-                    .values()
-                    .filter(|rec| {
-                        !rec.ended
-                            && rec.parent_session_id.as_deref() == Some(caller_session_id.as_str())
-                    })
-                    .count();
-                if active_children >= MAX_CHILDREN_PER_PARENT {
-                    return Err(format!(
-                        "parent terminal session already has {active_children} active child sessions (limit {MAX_CHILDREN_PER_PARENT}); wait for or close an existing child before spawning another"
-                    ));
+                let rec =
+                    authorize_child(&inner, caller.parent_key(), &cid, &canonical_repo)?;
+                if rec.ended {
+                    return Err("child terminal session has already ended".into());
                 }
-            }
-
-            let launcher = launcher
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("shell")
-                .to_owned();
-            if !ALLOWED_CHILD_LAUNCHERS.contains(&launcher.as_str()) {
-                return Err(format!("unsupported child launcher '{launcher}'"));
-            }
-
-            let start_dir = cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            let resolved_cwd = match &start_dir {
-                Some(sub) => sandbox_join_canonical(&repo_buf, sub)?,
-                None => repo_buf.clone(),
-            };
-            if !resolved_cwd.is_dir() {
-                return Err(
-                    "requested child cwd is not an existing directory inside repo_path".into(),
-                );
-            }
-            let resolved_cwd_str = resolved_cwd.to_string_lossy().into_owned();
-
-            let (program, args, initial_shell_cmd, gate_checked, gate_notice) =
-                if launcher == "shell" {
-                    if prompt.is_some() {
-                        return Err(
-                            "prompt applies only to agent launchers; pass command for shell".into(),
-                        );
-                    }
-                    if let Some(cmd) = command {
-                        validate_child_input_bytes(&cmd)?;
-                        let (checked, notice) = gate_lines(&resolved_cwd_str, &cmd)?;
-                        (None, None, Some(cmd), checked, notice)
-                    } else {
-                        (None, None, None, true, None)
-                    }
-                } else {
-                    if command.is_some() {
-                        return Err(
-                        "command applies only to shell launcher; pass prompt for agent launchers"
+                if rec.launcher != "shell" {
+                    return Err(
+                        "exec targets only 'shell' child sessions; use spawn/send for agent launchers"
                             .into(),
                     );
-                    }
-                    let agent_args = build_agent_child_args(&launcher, prompt.as_deref())?;
-                    (Some(launcher.clone()), agent_args, None, true, None)
-                };
-
-            let clean_title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
-            let want_split = split.unwrap_or(true);
-            let pty_rows = rows.unwrap_or(28);
-            let pty_cols = cols.unwrap_or(100);
-            let events = ui.session_events(state);
-
-            let spawned = spawn_at(
-                state,
-                Place::Repo {
-                    repo_path: canonical_repo.clone(),
-                    start_dir,
-                },
-                pty_rows,
-                pty_cols,
-                program,
-                args,
-                None,
-                discard_sink(),
-                events,
-                None,
-                Some(ChildSpawnMeta {
-                    parent_session_id: caller_session_id.clone(),
-                    launcher: launcher.clone(),
-                    title: clean_title.clone(),
-                }),
-            )
-            .map_err(|e| e.into_message())?;
-
-            // Immediately detach the discard sink so an adopting frontend tab can
-            // attach cleanly without hitting "already shown in a tab".
-            let _ = detach_session(state, &spawned.id);
-
-            if let Some(cmd) = initial_shell_cmd {
-                let mut line = cmd;
-                if !line.ends_with('\n') {
-                    line.push('\n');
                 }
-                write_input(state, &spawned.id, line.as_bytes())?;
-            }
+                let tel = rec
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let dir = tel.cwd.clone().unwrap_or_else(|| rec.cwd.clone());
+                (cid, false, dir)
+            } else {
+                let res = spawn_child_internal(
+                    state,
+                    ui,
+                    &caller,
+                    &repo_buf,
+                    &canonical_repo,
+                    SpawnParams {
+                        launcher: Some("shell".into()),
+                        cwd,
+                        command: None,
+                        prompt: None,
+                        title,
+                        split: Some(split.unwrap_or(keep)),
+                        rows: None,
+                        cols: None,
+                    },
+                )?;
+                (res.child_session_id, true, res.cwd)
+            };
 
-            ui.child_spawned(TerminalChildSpawnedPayload {
-                id: spawned.id.clone(),
-                parent_session_id: caller_session_id,
-                repo_path: canonical_repo.clone(),
-                cwd: spawned.cwd.clone(),
-                shell: spawned.shell.clone(),
-                launcher: launcher.clone(),
-                title: clean_title,
-                split: want_split,
-            });
+            let (gate_checked, gate_notice) = match gate_lines(&effective_cwd, &command) {
+                Ok(gated) => gated,
+                Err(err) => {
+                    if spawned_new {
+                        let _ = close_child_internal(
+                            state,
+                            ui,
+                            caller.parent_key(),
+                            &target_id,
+                            &canonical_repo,
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+
+            let baseline_seq = {
+                let mut inner = state.orchestration.lock();
+                let rec = inner
+                    .sessions
+                    .get_mut(&target_id)
+                    .ok_or_else(|| LINEAGE_REFUSAL.to_string())?;
+                let seq = rec
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .event_seq;
+                rec.baseline_event_seq = seq;
+                seq
+            };
+
+            let nonce = mint_session_token()?;
+            let exec_tag = format!("gpexec_{}", &nonce[SESSION_TOKEN_PREFIX.len()..21]);
+            let exit_after = !keep && spawned_new;
+            let wire = encode_exec_wrapper(&command, &exec_tag, exit_after);
+            write_input(state, &target_id, wire.as_bytes())?;
+
+            let wait = wait_child_internal(
+                state,
+                caller.parent_key(),
+                &target_id,
+                &canonical_repo,
+                timeout_ms,
+                pattern.as_deref(),
+                Some(true),
+                Some(baseline_seq),
+                Some(&exec_tag),
+                false,
+            )?;
+
+            let eff_max = max_lines.unwrap_or(DEFAULT_READ_LINES);
+            let (text, lines_returned, total_lines, truncated, cmd_exit_code, active_cwd, ended) = {
+                let inner = state.orchestration.lock();
+                let rec = authorize_child(&inner, caller.parent_key(), &target_id, &canonical_repo)?;
+                let tel = rec
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let active_cwd = tel.cwd.unwrap_or_else(|| rec.cwd.clone());
+                let blk = rec
+                    .blocks
+                    .as_ref()
+                    .and_then(|b| b.find_by_tag(&exec_tag))
+                    .cloned();
+                let (text, lines_returned, total_lines, truncated, code) = if let Some(b) = blk {
+                    let scrubbed = scrub_screen_text(&b.output);
+                    let raw_lines: Vec<String> = if scrubbed.is_empty() {
+                        Vec::new()
+                    } else {
+                        scrubbed.lines().map(str::to_owned).collect()
+                    };
+                    let (t, lr, tl, tr) = select_scrubbed_lines(raw_lines, eff_max, 0, None);
+                    let ec = b.exit_code.or(wait.last_exit_code).or(wait.exit_code);
+                    (t, lr, tl, tr, ec)
+                } else {
+                    let (t, lr, tl, tr) = render_redacted_screen(rec, eff_max);
+                    (t, lr, tl, tr, wait.exit_code.or(wait.last_exit_code))
+                };
+                (
+                    text,
+                    lines_returned,
+                    total_lines,
+                    truncated,
+                    code,
+                    active_cwd,
+                    rec.ended || tel.ended,
+                )
+            };
+
+            let closed_now = if !keep && !wait.timed_out {
+                let _ = close_child_internal(
+                    state,
+                    ui,
+                    caller.parent_key(),
+                    &target_id,
+                    &canonical_repo,
+                )?;
+                true
+            } else {
+                false
+            };
 
             Ok(json!({
                 "ok": true,
                 "repo_path": canonical_repo,
-                "child_session_id": spawned.id,
-                "launcher": launcher,
-                "cwd": spawned.cwd,
-                "split": want_split,
+                "child_session_id": target_id,
+                "spawned": spawned_new,
+                "kept_open": keep || wait.timed_out,
+                "timed_out": wait.timed_out,
+                "matched": wait.matched,
+                "matched_reason": wait.matched_reason,
+                "ended": ended || closed_now,
+                "exit_code": cmd_exit_code,
+                "text": text,
+                "lines_returned": lines_returned,
+                "total_lines": total_lines,
+                "truncated": truncated,
+                "cwd": active_cwd,
+                "dev_server_url": wait.dev_server_url,
                 "gate_checked": gate_checked,
                 "gate_notice": gate_notice,
             }))
@@ -1362,16 +2459,18 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             path,
             line,
             column,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
 
@@ -1392,7 +2491,7 @@ pub fn execute(
                 .join("/");
 
             ui.open_file_requested(TerminalOpenFileRequestPayload {
-                caller_session_id,
+                caller_session_id: caller.parent_key().to_owned(),
                 repo_path: canonical_repo.clone(),
                 path: rel.clone(),
                 line,
@@ -1412,26 +2511,37 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
+            include_repo_shells,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
+            let want_shells = include_repo_shells.unwrap_or(false) && allow_repo_shells;
 
-            let mut children: Vec<(String, Value)> = {
+            let mut children: Vec<(bool, String, Value)> = {
                 let inner = state.orchestration.lock();
                 inner
                     .sessions
                     .iter()
-                    .filter(|(_, rec)| {
-                        rec.parent_session_id.as_deref() == Some(caller_session_id.as_str())
-                            && rec.repo_path == canonical_repo
-                    })
-                    .map(|(cid, rec)| {
+                    .filter_map(|(cid, rec)| {
+                        if rec.repo_path != canonical_repo {
+                            return None;
+                        }
+                        let owned = rec.parent_session_id.as_deref() == Some(caller.parent_key());
+                        let readable_user_shell = want_shells
+                            && rec.parent_session_id.is_none()
+                            && rec.launcher == "shell"
+                            && cid != caller.parent_key();
+                        if !owned && !readable_user_shell {
+                            return None;
+                        }
                         let tel = rec
                             .telemetry
                             .0
@@ -1441,13 +2551,15 @@ pub fn execute(
                         let active_cwd = tel.cwd.unwrap_or_else(|| rec.cwd.clone());
                         let ended = rec.ended || tel.ended;
                         let exit_code = rec.exit_code.or(tel.last_exit_code);
-                        (
+                        Some((
+                            owned,
                             cid.clone(),
                             json!({
                                 "child_session_id": cid,
                                 "launcher": rec.launcher,
                                 "cwd": active_cwd,
                                 "title": rec.title,
+                                "owned": owned,
                                 "ended": ended,
                                 "exit_code": exit_code,
                                 "command_running": tel.command_running,
@@ -1455,16 +2567,17 @@ pub fn execute(
                                 "herdr_status": herdr_state_str(&tel.herdr_status),
                                 "dev_server_url": tel.dev_server_url,
                             }),
-                        )
+                        ))
                     })
                     .collect()
             };
-            children.sort_by(|a, b| a.0.cmp(&b.0));
-            let list: Vec<Value> = children.into_iter().map(|(_, v)| v).collect();
+            children.sort_by(|a, b| (!a.0).cmp(&!b.0).then_with(|| a.1.cmp(&b.1)));
+            let list: Vec<Value> = children.into_iter().map(|(_, _, v)| v).collect();
             let count = list.len();
             Ok(json!({
                 "ok": true,
                 "repo_path": canonical_repo,
+                "shell_reads_enabled": allow_repo_shells,
                 "total": count,
                 "children": list,
             }))
@@ -1474,6 +2587,7 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             child_session_id,
             timeout_ms,
             pattern,
@@ -1482,186 +2596,59 @@ pub fn execute(
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
-
-            let wait_idle = wait_for_idle.unwrap_or(true);
-            let bounded_ms = timeout_ms
-                .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
-                .clamp(1, MAX_WAIT_TIMEOUT_MS);
-            let deadline = Instant::now() + Duration::from_millis(bounded_ms);
-
-            let effective_since = {
-                let inner = state.orchestration.lock();
-                let rec = authorize_child(
-                    &inner,
-                    &caller_session_id,
-                    &child_session_id,
-                    &canonical_repo,
-                )?;
-                since_seq.unwrap_or(rec.baseline_event_seq)
-            };
-
-            let mut last_port_probe: Option<Instant> = None;
-            loop {
-                #[cfg(unix)]
-                refresh_detached_host_screen(state, &child_session_id);
-
-                if wait_idle
-                    && last_port_probe.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
-                {
-                    last_port_probe = Some(Instant::now());
-                    let needs_port = {
-                        let inner = state.orchestration.lock();
-                        inner.sessions.get(&child_session_id).is_some_and(|rec| {
-                            !rec.ended
-                                && rec
-                                    .telemetry
-                                    .0
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .dev_server_url
-                                    .is_none()
-                        })
-                    };
-                    if needs_port {
-                        if let Ok(ports) =
-                            crate::terminal::session_listening_ports(state, &child_session_id)
-                        {
-                            if let Some(&port) = ports.first() {
-                                let inner = state.orchestration.lock();
-                                if let Some(rec) = inner.sessions.get(&child_session_id) {
-                                    let mut guard = rec
-                                        .telemetry
-                                        .0
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    if guard.dev_server_url.is_none() {
-                                        guard.dev_server_url =
-                                            Some(format!("http://localhost:{port}"));
-                                        guard.event_seq = guard.event_seq.saturating_add(1);
-                                        guard.last_dev_event_seq = guard.event_seq;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let mut inner = state.orchestration.lock();
-                let rec = authorize_child(
-                    &inner,
-                    &caller_session_id,
-                    &child_session_id,
-                    &canonical_repo,
-                )?;
-                let tel = rec
-                    .telemetry
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let ended = rec.ended || tel.ended;
-                let exit_code = rec.exit_code.or(tel.last_exit_code);
-                let herdr = herdr_state_str(&tel.herdr_status);
-
-                let matched_reason = if let Some(pat) = pattern.as_deref() {
-                    let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
-                    if screen.contains(pat) {
-                        Some("pattern")
-                    } else if ended {
-                        Some("ended")
-                    } else {
-                        None
-                    }
-                } else if ended {
-                    Some("ended")
-                } else if tel.last_herdr_event_seq > effective_since
-                    && matches!(
-                        herdr.as_deref(),
-                        Some("done" | "idle" | "blocked" | "error")
-                    )
-                {
-                    Some("herdr_status")
-                } else if wait_idle
-                    && tel.last_command_event_seq > effective_since
-                    && !tel.command_running
-                {
-                    Some("command_finished")
-                } else if wait_idle
-                    && tel.last_dev_event_seq > effective_since
-                    && tel.dev_server_url.is_some()
-                {
-                    Some("dev_server_ready")
-                } else {
-                    None
-                };
-
-                if let Some(reason) = matched_reason {
-                    if let Some(rec_mut) = inner.sessions.get_mut(&child_session_id) {
-                        rec_mut.baseline_event_seq = rec_mut.baseline_event_seq.max(tel.event_seq);
-                    }
-                    let matched = pattern.as_deref().is_none_or(|_| reason == "pattern");
-                    return Ok(json!({
-                        "ok": true,
-                        "child_session_id": child_session_id,
-                        "matched": matched,
-                        "timed_out": false,
-                        "matched_reason": reason,
-                        "event_seq": tel.event_seq,
-                        "ended": ended,
-                        "exit_code": exit_code,
-                        "command_running": tel.command_running,
-                        "last_exit_code": tel.last_exit_code,
-                        "herdr_status": herdr,
-                        "dev_server_url": tel.dev_server_url,
-                    }));
-                }
-
-                let now = Instant::now();
-                if now >= deadline {
-                    return Ok(json!({
-                        "ok": true,
-                        "child_session_id": child_session_id,
-                        "matched": false,
-                        "timed_out": true,
-                        "matched_reason": "timeout",
-                        "event_seq": tel.event_seq,
-                        "ended": ended,
-                        "exit_code": exit_code,
-                        "command_running": tel.command_running,
-                        "last_exit_code": tel.last_exit_code,
-                        "herdr_status": herdr,
-                        "dev_server_url": tel.dev_server_url,
-                    }));
-                }
-
-                let wait_slice = (deadline - now).min(Duration::from_millis(50));
-                let _ = state
-                    .orchestration
-                    .changed
-                    .wait_timeout(inner, wait_slice)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
+            let outcome = wait_child_internal(
+                state,
+                caller.parent_key(),
+                &child_session_id,
+                &canonical_repo,
+                timeout_ms,
+                pattern.as_deref(),
+                wait_for_idle,
+                since_seq,
+                None,
+                allow_repo_shells,
+            )?;
+            Ok(json!({
+                "ok": true,
+                "child_session_id": child_session_id,
+                "matched": outcome.matched,
+                "timed_out": outcome.timed_out,
+                "matched_reason": outcome.matched_reason,
+                "event_seq": outcome.event_seq,
+                "ended": outcome.ended,
+                "exit_code": outcome.exit_code,
+                "command_running": outcome.command_running,
+                "last_exit_code": outcome.last_exit_code,
+                "herdr_status": outcome.herdr_status,
+                "dev_server_url": outcome.dev_server_url,
+            }))
         }
 
         OrchestrateCall::Read {
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             child_session_id,
             max_lines,
+            offset_lines,
+            grep,
+            last_command_only,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
 
@@ -1669,11 +2656,12 @@ pub fn execute(
             refresh_detached_host_screen(state, &child_session_id);
 
             let inner = state.orchestration.lock();
-            let rec = authorize_child(
+            let (rec, owned) = authorize_readable_session(
                 &inner,
-                &caller_session_id,
+                caller.parent_key(),
                 &child_session_id,
                 &canonical_repo,
+                allow_repo_shells,
             )?;
             let tel = rec
                 .telemetry
@@ -1681,17 +2669,56 @@ pub fn execute(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
-            let (text, lines_returned, total_lines, truncated) =
-                render_redacted_screen(rec, max_lines.unwrap_or(DEFAULT_READ_LINES));
+            let eff_max = max_lines.unwrap_or(DEFAULT_READ_LINES);
+            let offset = offset_lines.unwrap_or(0);
+            let latest_block = rec.blocks.as_ref().and_then(|b| b.last_completed());
+
+            let (text, lines_returned, total_lines, truncated, last_command, last_command_found) =
+                if last_command_only.unwrap_or(false) {
+                    if let Some(blk) = latest_block {
+                        let scrubbed = scrub_screen_text(&blk.output);
+                        let lines: Vec<String> = if scrubbed.is_empty() {
+                            Vec::new()
+                        } else {
+                            scrubbed.lines().map(str::to_owned).collect()
+                        };
+                        let (t, lr, tl, tr) =
+                            select_scrubbed_lines(lines, eff_max, offset, grep.as_deref());
+                        (t, lr, tl, tr, blk.command.clone(), true)
+                    } else {
+                        let (t, lr, tl, tr) = render_redacted_screen_filtered(
+                            rec,
+                            eff_max,
+                            offset,
+                            grep.as_deref(),
+                        );
+                        (t, lr, tl, tr, None, false)
+                    }
+                } else {
+                    let (t, lr, tl, tr) =
+                        render_redacted_screen_filtered(rec, eff_max, offset, grep.as_deref());
+                    (
+                        t,
+                        lr,
+                        tl,
+                        tr,
+                        latest_block.and_then(|b| b.command.clone()),
+                        latest_block.is_some(),
+                    )
+                };
             let ended = rec.ended || tel.ended;
             let exit_code = rec.exit_code.or(tel.last_exit_code);
             Ok(json!({
                 "ok": true,
                 "child_session_id": child_session_id,
+                "owned": owned,
                 "text": text,
                 "lines_returned": lines_returned,
                 "total_lines": total_lines,
+                "offset_lines": offset,
                 "truncated": truncated,
+                "last_command": last_command,
+                "last_command_found": last_command_found,
                 "ended": ended,
                 "exit_code": exit_code,
                 "command_running": tel.command_running,
@@ -1705,16 +2732,18 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             child_session_id,
             input,
             append_newline,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
             validate_child_input_bytes(&input)?;
@@ -1726,7 +2755,7 @@ pub fn execute(
                 let inner = state.orchestration.lock();
                 let rec = authorize_child(
                     &inner,
-                    &caller_session_id,
+                    caller.parent_key(),
                     &child_session_id,
                     &canonical_repo,
                 )?;
@@ -1785,44 +2814,26 @@ pub fn execute(
             repo_path,
             caller_session_id,
             caller_token,
+            external_caller_id,
             child_session_id,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
-            authorize_caller(
+            let caller = authorize_caller(
                 &state.orchestration,
-                &caller_session_id,
-                &caller_token,
+                caller_session_id.as_deref(),
+                caller_token.as_deref(),
+                external_caller_id.as_deref(),
                 &canonical_repo,
             )?;
 
-            let already_ended = {
-                let inner = state.orchestration.lock();
-                let rec = authorize_child(
-                    &inner,
-                    &caller_session_id,
-                    &child_session_id,
-                    &canonical_repo,
-                )?;
-                let tel_ended = rec
-                    .telemetry
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .ended;
-                rec.ended || tel_ended
-            };
-
-            if !already_ended {
-                crate::terminal::kill_session(state, &child_session_id)?;
-                state.orchestration.mark_ended(&child_session_id, None);
-            }
-
-            ui.child_closed(TerminalChildClosedPayload {
-                id: child_session_id.clone(),
-                parent_session_id: caller_session_id,
-                repo_path: canonical_repo,
-            });
+            let already_ended = close_child_internal(
+                state,
+                ui,
+                caller.parent_key(),
+                &child_session_id,
+                &canonical_repo,
+            )?;
 
             Ok(json!({
                 "ok": true,
@@ -1983,8 +2994,10 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::List {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: bad_tok,
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(bad_tok),
+                external_caller_id: None,
+                include_repo_shells: None,
             },
         )
         .unwrap_err();
@@ -1996,8 +3009,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: token_a.clone(),
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2017,8 +3031,10 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::List {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: token_a.clone(),
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a.clone()),
+                external_caller_id: None,
+                include_repo_shells: None,
             },
         )
         .expect("list_a");
@@ -2032,10 +3048,14 @@ pub(crate) mod tests {
                 &ui,
                 OrchestrateCall::Read {
                     repo_path: repo.clone(),
-                    caller_session_id: parent_a.into(),
-                    caller_token: token_a.clone(),
+                    caller_session_id: Some(parent_a.into()),
+                    caller_token: Some(token_a.clone()),
+                    external_caller_id: None,
                     child_session_id: forbidden.into(),
                     max_lines: None,
+                    offset_lines: None,
+                    grep: None,
+                    last_command_only: None,
                 },
             )
             .unwrap_err();
@@ -2046,8 +3066,9 @@ pub(crate) mod tests {
                 &ui,
                 OrchestrateCall::Send {
                     repo_path: repo.clone(),
-                    caller_session_id: parent_a.into(),
-                    caller_token: token_a.clone(),
+                    caller_session_id: Some(parent_a.into()),
+                    caller_token: Some(token_a.clone()),
+                    external_caller_id: None,
                     child_session_id: forbidden.into(),
                     input: "echo nope".into(),
                     append_newline: Some(true),
@@ -2063,10 +3084,14 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Read {
                 repo_path: repo.clone(),
-                caller_session_id: parent_b.into(),
-                caller_token: token_b,
+                caller_session_id: Some(parent_b.into()),
+                caller_token: Some(token_b),
+                external_caller_id: None,
                 child_session_id: child_a.clone(),
                 max_lines: None,
+                offset_lines: None,
+                grep: None,
+                last_command_only: None,
             },
         )
         .unwrap_err();
@@ -2079,8 +3104,10 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::List {
                 repo_path: repo,
-                caller_session_id: parent_a.into(),
-                caller_token: token_a,
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a),
+                external_caller_id: None,
+                include_repo_shells: None,
             },
         )
         .unwrap_err();
@@ -2106,8 +3133,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: Some(unsafe_signal.clone()),
@@ -2128,8 +3156,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2151,8 +3180,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Send {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 input: unsafe_signal,
                 append_newline: Some(true),
@@ -2167,8 +3197,9 @@ pub(crate) mod tests {
                 &ui,
                 OrchestrateCall::Send {
                     repo_path: repo.clone(),
-                    caller_session_id: parent.into(),
-                    caller_token: token.clone(),
+                    caller_session_id: Some(parent.into()),
+                    caller_token: Some(token.clone()),
+                    external_caller_id: None,
                     child_session_id: child.clone(),
                     input: raw.into(),
                     append_newline: Some(true),
@@ -2183,8 +3214,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::OpenFile {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 path: "src/main.rs".into(),
                 line: Some(1),
                 column: Some(4),
@@ -2199,8 +3231,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::OpenFile {
                 repo_path: repo,
-                caller_session_id: parent.into(),
-                caller_token: token,
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token),
+                external_caller_id: None,
                 path: "../outside.txt".into(),
                 line: None,
                 column: None,
@@ -2227,8 +3260,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2241,6 +3275,7 @@ pub(crate) mod tests {
         )
         .expect("spawn child");
         let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        assert_eq!(spawned["baseline_seq"], 0);
         assert_eq!(ui.spawned.lock().unwrap().len(), 1);
 
         // Print an ANSI carriage-return overwrite + a real secret + the child's
@@ -2250,8 +3285,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Send {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 input: "printf 'DRAFT\\rFINAL_GRID_OK\\nKEY=sk-ant-api03-1234567890abcdefghijklmnopqrstuvwxyz\\nTOK=%s\\nREADY_MARKER_42\\n' \"$GITPULSE_SESSION_TOKEN\"".into(),
                 append_newline: Some(true),
@@ -2264,8 +3300,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Wait {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 timeout_ms: Some(8_000),
                 pattern: Some("READY_MARKER_42".into()),
@@ -2282,10 +3319,14 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Read {
                 repo_path: repo,
-                caller_session_id: parent.into(),
-                caller_token: token,
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 max_lines: Some(40),
+                offset_lines: None,
+                grep: None,
+                last_command_only: None,
             },
         )
         .expect("read child screen");
@@ -2377,8 +3418,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2399,8 +3441,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Send {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 input: r#"printf '\033]7501;status;idle;Ready\007http://%s:4321/\n' localhost"#
                     .into(),
@@ -2414,8 +3457,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Wait {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 timeout_ms: Some(5_000),
                 pattern: None,
@@ -2433,8 +3477,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Send {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 input: r#"sleep 0.5; printf '\033]7501;status;done;Finished\007'"#.into(),
                 append_newline: Some(true),
@@ -2447,8 +3492,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Wait {
                 repo_path: repo.clone(),
-                caller_session_id: parent.into(),
-                caller_token: token.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
                 child_session_id: child.clone(),
                 timeout_ms: Some(80),
                 pattern: None,
@@ -2513,8 +3559,10 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::List {
                 repo_path: repo,
-                caller_session_id: parent_id.into(),
-                caller_token: parent_token,
+                caller_session_id: Some(parent_id.into()),
+                caller_token: Some(parent_token),
+                external_caller_id: None,
+                include_repo_shells: None,
             },
         )
         .expect("list adopted children");
@@ -2564,8 +3612,9 @@ pub(crate) mod tests {
                 &ui,
                 OrchestrateCall::Spawn {
                     repo_path: repo.clone(),
-                    caller_session_id: parent_a.into(),
-                    caller_token: token_a.clone(),
+                    caller_session_id: Some(parent_a.into()),
+                    caller_token: Some(token_a.clone()),
+                    external_caller_id: None,
                     launcher: Some("shell".into()),
                     cwd: None,
                     command: None,
@@ -2586,8 +3635,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: token_a.clone(),
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a.clone()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2616,8 +3666,9 @@ pub(crate) mod tests {
                 &ui,
                 OrchestrateCall::Close {
                     repo_path: repo.clone(),
-                    caller_session_id: caller_id.into(),
-                    caller_token: caller_tok.clone(),
+                    caller_session_id: Some(caller_id.into()),
+                    caller_token: Some(caller_tok.clone()),
+                    external_caller_id: None,
                     child_session_id: target.into(),
                 },
             )
@@ -2631,8 +3682,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Close {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: token_a.clone(),
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a.clone()),
+                external_caller_id: None,
                 child_session_id: children_a[0].clone(),
             },
         )
@@ -2648,8 +3700,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Close {
                 repo_path: repo.clone(),
-                caller_session_id: parent_a.into(),
-                caller_token: token_a.clone(),
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a.clone()),
+                external_caller_id: None,
                 child_session_id: children_a[0].clone(),
             },
         )
@@ -2662,8 +3715,9 @@ pub(crate) mod tests {
             &ui,
             OrchestrateCall::Spawn {
                 repo_path: repo,
-                caller_session_id: parent_a.into(),
-                caller_token: token_a,
+                caller_session_id: Some(parent_a.into()),
+                caller_token: Some(token_a),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: None,
                 command: None,
@@ -2685,5 +3739,421 @@ pub(crate) mod tests {
         for cid in children_a.iter().skip(1) {
             let _ = crate::terminal::kill_session(&state, cid);
         }
+    }
+
+    #[test]
+    fn read_supports_offset_lines_grep_and_last_command_only_without_secret_oracle() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90007-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let child = "term-90007-2";
+        let child_tok = mint_session_token().unwrap();
+        state
+            .orchestration
+            .register_session(
+                child,
+                &child_tok,
+                Path::new(&repo),
+                Path::new(&repo),
+                "shell",
+                24,
+                120,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: parent.into(),
+                    launcher: "shell".into(),
+                    title: None,
+                }),
+            )
+            .unwrap();
+
+        let stream = concat!(
+            "\x1b]133;B\x07old cmd\r\n\x1b]133;C\x07FIRST_BLOCK_LINE\r\n\x1b]133;D;0\x07",
+            "\x1b]133;B\x07cargo test\r\n\x1b]133;C\x07",
+            "LINE_01 alpha\r\n",
+            "LINE_02 match me\r\n",
+            "LINE_03 secret sk-ant-api03-1234567890abcdefghijklmnopqrstuvwxyz\r\n",
+            "LINE_04 match two\r\n",
+            "LINE_05 match three\r\n",
+            "\x1b]133;D;0\x07",
+        );
+        state.orchestration.observe_output(child, stream.as_bytes());
+
+        // 1. last_command_only isolates ONLY the most recent completed block (no FIRST_BLOCK_LINE).
+        let last_only = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Read {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.into(),
+                max_lines: None,
+                offset_lines: None,
+                grep: None,
+                last_command_only: Some(true),
+            },
+        )
+        .expect("last_command_only");
+        assert_eq!(last_only["last_command_found"], true);
+        assert_eq!(last_only["last_command"], "cargo test");
+        let last_text = last_only["text"].as_str().unwrap();
+        assert!(last_text.contains("LINE_01"), "{last_text}");
+        assert!(!last_text.contains("FIRST_BLOCK_LINE"), "{last_text}");
+        assert!(!last_text.contains("sk-ant-api03"), "{last_text}");
+
+        // 2. grep + offset_lines paginate deterministically.
+        let paged = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Read {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.into(),
+                max_lines: Some(1),
+                offset_lines: Some(1),
+                grep: Some("match".into()),
+                last_command_only: Some(true),
+            },
+        )
+        .expect("grep+offset");
+        assert_eq!(paged["total_lines"], 3);
+        assert_eq!(paged["lines_returned"], 1);
+        assert_eq!(paged["text"], "LINE_04 match two");
+
+        // 3. Redaction runs BEFORE grep so secrets cannot be probed via grep.
+        let probe = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Read {
+                repo_path: repo,
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token),
+                external_caller_id: None,
+                child_session_id: child.into(),
+                max_lines: None,
+                offset_lines: None,
+                grep: Some("sk-ant-api03".into()),
+                last_command_only: Some(true),
+            },
+        )
+        .expect("grep redacted secret");
+        assert_eq!(probe["total_lines"], 0);
+        assert_eq!(probe["text"], "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_caller_spawns_parallel_shells_and_exec_supports_ephemeral_and_persistent_runs() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+
+        // Partial credentials fail closed; missing external id fails closed.
+        assert!(OrchestrateCall::List {
+            repo_path: repo.clone(),
+            caller_session_id: Some("term-1-1".into()),
+            caller_token: None,
+            external_caller_id: None,
+            include_repo_shells: None,
+        }
+        .validate()
+        .is_err());
+        assert!(OrchestrateCall::List {
+            repo_path: repo.clone(),
+            caller_session_id: None,
+            caller_token: None,
+            external_caller_id: Some("badcaller".into()),
+            include_repo_shells: None,
+        }
+        .validate()
+        .is_err());
+
+        let ext = Some("mcp-4242".to_string());
+
+        // 1. Ephemeral Exec runs in a new shell, captures exact non-zero exit code & stdout, and closes.
+        let eph = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Exec {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                child_session_id: None,
+                cwd: None,
+                command: "printf 'EPHEMERAL_OUT_91\\n'; (exit 7)".into(),
+                timeout_ms: Some(10_000),
+                pattern: None,
+                keep_open: Some(false),
+                split: Some(false),
+                title: Some("ephemeral-run".into()),
+                max_lines: Some(40),
+            },
+        )
+        .expect("ephemeral exec");
+        assert_eq!(eph["spawned"], true, "{eph}");
+        assert_eq!(eph["kept_open"], false, "{eph}");
+        assert_eq!(eph["timed_out"], false, "{eph}");
+        assert_eq!(eph["exit_code"], 7, "{eph}");
+        assert!(
+            eph["text"].as_str().unwrap().contains("EPHEMERAL_OUT_91"),
+            "{eph}"
+        );
+
+        // 2. Two persistent shells spawned by external caller preserve independent shell state in parallel.
+        let s1 = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Exec {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                child_session_id: None,
+                cwd: None,
+                command: "export GP_TAG=ALPHA && cd src && pwd".into(),
+                timeout_ms: Some(10_000),
+                pattern: None,
+                keep_open: Some(true),
+                split: Some(false),
+                title: Some("worker-1".into()),
+                max_lines: None,
+            },
+        )
+        .expect("exec shell 1 start");
+        let id1 = s1["child_session_id"].as_str().unwrap().to_string();
+        assert_eq!(s1["kept_open"], true, "{s1}");
+
+        let s2 = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Exec {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                child_session_id: None,
+                cwd: None,
+                command: "export GP_TAG=BETA && echo SECOND_SHELL".into(),
+                timeout_ms: Some(10_000),
+                pattern: None,
+                keep_open: Some(true),
+                split: Some(false),
+                title: Some("worker-2".into()),
+                max_lines: None,
+            },
+        )
+        .expect("exec shell 2 start");
+        let id2 = s2["child_session_id"].as_str().unwrap().to_string();
+        assert_ne!(id1, id2);
+
+        // Re-running on shell 1 observes `GP_TAG=ALPHA` and subdir `src`!
+        let s1_follow = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Exec {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                child_session_id: Some(id1.clone()),
+                cwd: None,
+                command: "printf '%s|%s\\n' \"$GP_TAG\" \"$(basename \"$PWD\")\"".into(),
+                timeout_ms: Some(10_000),
+                pattern: None,
+                keep_open: Some(true),
+                split: None,
+                title: None,
+                max_lines: None,
+            },
+        )
+        .expect("exec shell 1 follow-up");
+        assert!(
+            s1_follow["text"].as_str().unwrap().contains("ALPHA|src"),
+            "{s1_follow}"
+        );
+
+        let listed = execute(
+            &state,
+            &ui,
+            OrchestrateCall::List {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                include_repo_shells: None,
+            },
+        )
+        .expect("list external shells");
+        assert!(listed["total"].as_u64().unwrap() >= 2, "{listed}");
+
+        for cid in [&id1, &id2] {
+            execute(
+                &state,
+                &ui,
+                OrchestrateCall::Close {
+                    repo_path: repo.clone(),
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: ext.clone(),
+                    child_session_id: cid.clone(),
+                },
+            )
+            .expect("close external shell");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allow_agent_shell_reads_grants_readonly_user_shell_access_while_blocking_send_and_close() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+
+        let user_shell = spawn_at(
+            &state,
+            Place::Repo {
+                repo_path: repo.clone(),
+                start_dir: None,
+            },
+            24,
+            80,
+            None,
+            None,
+            None,
+            discard_sink(),
+            Arc::new(RecordingEvents),
+            None,
+            None,
+        )
+        .expect("user shell");
+
+        state
+            .orchestration
+            .observe_output(&user_shell.id, b"USER_SHELL_OUTPUT_55\r\n");
+
+        let ext = Some("mcp-9999".to_string());
+
+        // When allow_agent_shell_reads == false (default), user shells are omitted & blocked.
+        let list_off = execute_with_shell_reads(
+            &state,
+            &ui,
+            OrchestrateCall::List {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                include_repo_shells: Some(true),
+            },
+            false,
+        )
+        .expect("list off");
+        assert_eq!(list_off["shell_reads_enabled"], false);
+        assert_eq!(list_off["total"], 0);
+        assert_eq!(
+            execute_with_shell_reads(
+                &state,
+                &ui,
+                OrchestrateCall::Read {
+                    repo_path: repo.clone(),
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: ext.clone(),
+                    child_session_id: user_shell.id.clone(),
+                    max_lines: None,
+                    offset_lines: None,
+                    grep: None,
+                    last_command_only: None,
+                },
+                false,
+            )
+            .unwrap_err(),
+            LINEAGE_REFUSAL
+        );
+
+        // When enabled, List(include_repo_shells: true) and Read see the user shell with owned=false...
+        let list_on = execute_with_shell_reads(
+            &state,
+            &ui,
+            OrchestrateCall::List {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                include_repo_shells: Some(true),
+            },
+            true,
+        )
+        .expect("list on");
+        assert_eq!(list_on["shell_reads_enabled"], true);
+        assert_eq!(list_on["total"], 1);
+        assert_eq!(list_on["children"][0]["child_session_id"], user_shell.id);
+        assert_eq!(list_on["children"][0]["owned"], false);
+
+        let read_on = execute_with_shell_reads(
+            &state,
+            &ui,
+            OrchestrateCall::Read {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: ext.clone(),
+                child_session_id: user_shell.id.clone(),
+                max_lines: Some(40),
+                offset_lines: None,
+                grep: None,
+                last_command_only: None,
+            },
+            true,
+        )
+        .expect("read user shell when opted in");
+        assert_eq!(read_on["owned"], false);
+        assert!(read_on["text"].as_str().unwrap().contains("USER_SHELL_OUTPUT_55"));
+
+        // ...while Send and Close on the user shell STILL fail closed with LINEAGE_REFUSAL!
+        assert_eq!(
+            execute_with_shell_reads(
+                &state,
+                &ui,
+                OrchestrateCall::Send {
+                    repo_path: repo.clone(),
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: ext.clone(),
+                    child_session_id: user_shell.id.clone(),
+                    input: "echo nope".into(),
+                    append_newline: Some(true),
+                },
+                true,
+            )
+            .unwrap_err(),
+            LINEAGE_REFUSAL
+        );
+        assert_eq!(
+            execute_with_shell_reads(
+                &state,
+                &ui,
+                OrchestrateCall::Close {
+                    repo_path: repo,
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: ext,
+                    child_session_id: user_shell.id.clone(),
+                },
+                true,
+            )
+            .unwrap_err(),
+            LINEAGE_REFUSAL
+        );
+
+        let _ = crate::terminal::kill_session(&state, &user_shell.id);
     }
 }

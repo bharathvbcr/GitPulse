@@ -1,11 +1,185 @@
 //! Host-wide readings from the operating system, and the clocks and thread
 //! controls the sampler needs.
 //!
-//! macOS reads sysctls, `host_statistics64`, `getloadavg`, `statfs`,
-//! `NSProcessInfo.thermalState` and the IOKit power-source estimate. Linux
-//! reads PSI and `/proc` (observe-and-advise; the PSI level mapping has not
-//! been checked on a real Linux host). Everything else reports every reading
-//! as unsupported.
+//! macOS reads sysctls, `host_statistics64`, `host_statistics` (`HOST_CPU_LOAD_INFO`),
+//! `getloadavg`, `statfs`, `IOAccelerator` `PerformanceStatistics`,
+//! `NSProcessInfo.thermalState`, `IOHIDEventSystemClient` SoC die temperatures,
+//! and the IOKit power-source estimate. Linux reads PSI and `/proc`
+//! (observe-and-advise; the PSI level mapping has not been checked on a real
+//! Linux host). Everything else reports every reading as unsupported.
+
+use super::sensor::{CpuUsage, Reading, Why};
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn cpu_usage_from_deltas(user_plus_nice: u64, system: u64, idle: u64) -> Reading<CpuUsage> {
+    let total = user_plus_nice.saturating_add(system).saturating_add(idle);
+    if total == 0 {
+        return Reading::Unavailable(Why::NotYet);
+    }
+    let total_f = total as f64;
+    let busy = user_plus_nice.saturating_add(system) as f64;
+    Reading::Value(CpuUsage {
+        total_pct: round1((busy / total_f * 100.0).clamp(0.0, 100.0)),
+        user_pct: round1((user_plus_nice as f64 / total_f * 100.0).clamp(0.0, 100.0)),
+        system_pct: round1((system as f64 / total_f * 100.0).clamp(0.0, 100.0)),
+    })
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_soc_die_temp_sensor(product: &str, temp_c: f64) -> bool {
+    if !temp_c.is_finite() || !(1.0..=150.0).contains(&temp_c) {
+        return false;
+    }
+    product.starts_with("PMU tdie")
+        || product.starts_with("eACC")
+        || product.starts_with("pACC")
+        || product.starts_with("gACC")
+        || product.contains("MTR Temp Sensor")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct GpuEntryReading {
+    utilization_pct: Option<f64>,
+    renderer_pct: Option<f64>,
+    tiler_pct: Option<f64>,
+    memory_in_use: Option<u64>,
+    memory_allocated: Option<u64>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn select_gpu_sample(entries: &[GpuEntryReading]) -> Reading<super::sensor::GpuSample> {
+    if entries.is_empty() {
+        return Reading::Unavailable(Why::Unsupported);
+    }
+    let mut best_util: Option<f64> = None;
+    let mut best_renderer: Option<f64> = None;
+    let mut best_tiler: Option<f64> = None;
+    let mut sum_in_use: Option<u64> = None;
+    let mut sum_alloc: Option<u64> = None;
+
+    for entry in entries {
+        let Some(util) = entry.utilization_pct else {
+            continue;
+        };
+        if best_util.is_none_or(|prev| util > prev) {
+            best_util = Some(util);
+            best_renderer = entry.renderer_pct;
+            best_tiler = entry.tiler_pct;
+        }
+        if let Some(mem) = entry.memory_in_use {
+            sum_in_use = Some(sum_in_use.unwrap_or(0).saturating_add(mem));
+        }
+        if let Some(alloc) = entry.memory_allocated {
+            sum_alloc = Some(sum_alloc.unwrap_or(0).saturating_add(alloc));
+        }
+    }
+
+    match best_util {
+        Some(utilization_pct) => Reading::Value(super::sensor::GpuSample {
+            utilization_pct,
+            renderer_pct: best_renderer,
+            tiler_pct: best_tiler,
+            memory_in_use: sum_in_use,
+            memory_allocated: sum_alloc,
+        }),
+        None => Reading::Unavailable(Why::Unreadable),
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_linux_thermal_temp_c(text: &str) -> Option<f64> {
+    let milli: i64 = text.trim().parse().ok()?;
+    let temp_c = milli as f64 / 1000.0;
+    if !temp_c.is_finite() || !(1.0..=150.0).contains(&temp_c) {
+        return None;
+    }
+    Some(round1(temp_c))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_thermal_temp_in(dir: &std::path::Path) -> Reading<f64> {
+    use std::io::Read;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => return Reading::Unavailable(Why::of_errno(e.raw_os_error())),
+    };
+    let mut max_temp: Option<f64> = None;
+    let mut saw_unreadable = false;
+    let mut saw_failed = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("thermal_zone") {
+            continue;
+        }
+        let temp_path = entry.path().join("temp");
+        let mut text = String::new();
+        match std::fs::File::open(&temp_path).and_then(|f| f.take(128).read_to_string(&mut text)) {
+            Ok(_) => {
+                if let Some(t) = parse_linux_thermal_temp_c(&text) {
+                    max_temp = Some(max_temp.map_or(t, |prev| prev.max(t)));
+                }
+            }
+            Err(e) => match Why::of_errno(e.raw_os_error()) {
+                Why::Unreadable => saw_unreadable = true,
+                Why::Unsupported => {}
+                Why::Failed | Why::NotYet | Why::Disabled | Why::Older => saw_failed = true,
+            },
+        }
+    }
+    max_temp.map_or_else(
+        || {
+            Reading::Unavailable(if saw_unreadable {
+                Why::Unreadable
+            } else if saw_failed {
+                Why::Failed
+            } else {
+                Why::Unsupported
+            })
+        },
+        Reading::Value,
+    )
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_linux_loadavg(text: &str) -> Option<[f64; 3]> {
+    let mut it = text
+        .split_whitespace()
+        .map(|v| v.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0));
+    match (it.next(), it.next(), it.next()) {
+        (Some(Some(a)), Some(Some(b)), Some(Some(c))) => Some([a, b, c]),
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_stat_cpu(text: &str) -> Option<(u64, u64, u64)> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let mut nums = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse::<u64>().ok());
+    let user = nums.next()?;
+    let nice = nums.next()?;
+    let system = nums.next()?;
+    let idle = nums.next()?;
+    let iowait = nums.next().unwrap_or(0);
+    let irq = nums.next().unwrap_or(0);
+    let softirq = nums.next().unwrap_or(0);
+    let steal = nums.next().unwrap_or(0);
+    Some((
+        user.saturating_add(nice),
+        system
+            .saturating_add(irq)
+            .saturating_add(softirq)
+            .saturating_add(steal),
+        idle.saturating_add(iowait),
+    ))
+}
 
 /// A hash of a boot identity string, never 0 (0 means unknown).
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -31,9 +205,14 @@ pub(super) fn set_user_initiated_qos() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::super::sensor::{
-        Compressor, CompressorSegments, Cores, HostSample, Level, Power, Reading, Thermal, Why,
+        Compressor, CompressorSegments, Cores, CpuUsage, GpuSample, HostSample, Level,
+        MemorySample, Power, Reading, Thermal, Why,
+    };
+    use super::{
+        cpu_usage_from_deltas, is_soc_die_temp_sensor, round1, select_gpu_sample, GpuEntryReading,
     };
     use std::ffi::{CStr, CString};
+    use std::sync::OnceLock;
 
     fn last_errno() -> Option<i32> {
         std::io::Error::last_os_error().raw_os_error()
@@ -216,6 +395,351 @@ mod imp {
         /// `kIOPSTimeRemainingUnlimited` (-2.0) on external power,
         /// `kIOPSTimeRemainingUnknown` (-1.0) or seconds left on battery.
         fn IOPSGetTimeRemainingEstimate() -> f64;
+        fn IOServiceMatching(name: *const libc::c_char) -> *mut libc::c_void;
+        fn IOServiceGetMatchingServices(
+            main_port: libc::mach_port_t,
+            matching: *const libc::c_void,
+            existing: *mut u32,
+        ) -> libc::kern_return_t;
+        fn IOIteratorNext(iterator: u32) -> u32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: *const libc::c_void,
+            allocator: *const libc::c_void,
+            options: u32,
+        ) -> *const libc::c_void;
+        fn IOObjectRelease(object: u32) -> libc::kern_return_t;
+    }
+
+    type CFTypeRef = *const libc::c_void;
+    type CFIndex = libc::c_long;
+    type CFTypeID = libc::c_ulong;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
+    const K_CF_NUMBER_SINT64_TYPE: CFIndex = 4;
+    const K_CF_NUMBER_FLOAT64_TYPE: CFIndex = 6;
+    const K_IOHID_EVENT_TYPE_TEMPERATURE: i64 = 15;
+    const K_IOHID_EVENT_FIELD_TEMP_LEVEL: i32 = 15 << 16;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
+        fn CFDictionaryGetTypeID() -> CFTypeID;
+        fn CFDictionaryGetValue(the_dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFDictionaryCreate(
+            allocator: CFTypeRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const libc::c_void,
+            value_callbacks: *const libc::c_void,
+        ) -> CFTypeRef;
+        fn CFStringCreateWithBytes(
+            alloc: CFTypeRef,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFTypeRef;
+        fn CFStringGetTypeID() -> CFTypeID;
+        fn CFStringGetLength(the_string: CFTypeRef) -> CFIndex;
+        fn CFStringGetCString(
+            the_string: CFTypeRef,
+            buffer: *mut libc::c_char,
+            buffer_size: CFIndex,
+            encoding: u32,
+        ) -> u8;
+        fn CFNumberGetTypeID() -> CFTypeID;
+        fn CFNumberGetValue(
+            number: CFTypeRef,
+            the_type: CFIndex,
+            value_ptr: *mut libc::c_void,
+        ) -> u8;
+        fn CFNumberCreate(
+            allocator: CFTypeRef,
+            the_type: CFIndex,
+            value_ptr: *const libc::c_void,
+        ) -> CFTypeRef;
+        fn CFArrayGetTypeID() -> CFTypeID;
+        fn CFArrayGetCount(the_array: CFTypeRef) -> CFIndex;
+        fn CFArrayGetValueAtIndex(the_array: CFTypeRef, idx: CFIndex) -> CFTypeRef;
+    }
+
+    struct OwnedCf(CFTypeRef);
+
+    impl Drop for OwnedCf {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is an owned CoreFoundation object with +1 retain.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    struct OwnedIo(u32);
+
+    impl Drop for OwnedIo {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                // SAFETY: `self.0` is a live `io_object_t` handle.
+                unsafe { IOObjectRelease(self.0) };
+            }
+        }
+    }
+
+    fn cf_str(s: &str) -> OwnedCf {
+        // SAFETY: `s.as_ptr()` is valid for `s.len()` UTF-8 bytes.
+        let ptr = unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        };
+        OwnedCf(ptr)
+    }
+
+    fn cf_dict_f64(dict: CFTypeRef, key: &str) -> Option<f64> {
+        let cf_key = cf_str(key);
+        if cf_key.0.is_null() {
+            return None;
+        }
+        // SAFETY: `dict` is a verified CFDictionaryRef and `cf_key.0` is a CFStringRef.
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.0) };
+        if val.is_null() || unsafe { CFGetTypeID(val) != CFNumberGetTypeID() } {
+            return None;
+        }
+        let mut out = 0.0f64;
+        // SAFETY: `val` is a verified CFNumberRef and `out` is a valid f64 slot.
+        if unsafe { CFNumberGetValue(val, K_CF_NUMBER_FLOAT64_TYPE, (&raw mut out).cast()) } == 0 {
+            return None;
+        }
+        out.is_finite().then_some(out)
+    }
+
+    fn cf_dict_u64(dict: CFTypeRef, key: &str) -> Option<u64> {
+        let cf_key = cf_str(key);
+        if cf_key.0.is_null() {
+            return None;
+        }
+        // SAFETY: `dict` is a verified CFDictionaryRef and `cf_key.0` is a CFStringRef.
+        let val = unsafe { CFDictionaryGetValue(dict, cf_key.0) };
+        if val.is_null() || unsafe { CFGetTypeID(val) != CFNumberGetTypeID() } {
+            return None;
+        }
+        let mut out = 0i64;
+        // SAFETY: `val` is a verified CFNumberRef and `out` is a valid i64 slot.
+        if unsafe { CFNumberGetValue(val, K_CF_NUMBER_SINT64_TYPE, (&raw mut out).cast()) } == 0 {
+            return None;
+        }
+        u64::try_from(out).ok()
+    }
+
+    fn cf_string_to_rust(s: CFTypeRef) -> Option<String> {
+        if s.is_null() || unsafe { CFGetTypeID(s) != CFStringGetTypeID() } {
+            return None;
+        }
+        let len = unsafe { CFStringGetLength(s) };
+        if !(0..=1024).contains(&len) {
+            return None;
+        }
+        let mut buf = vec![0u8; (len as usize) * 4 + 1];
+        // SAFETY: `s` is a CFStringRef and `buf` is sized for UTF-8 + NUL.
+        let ok = unsafe {
+            CFStringGetCString(
+                s,
+                buf.as_mut_ptr().cast(),
+                buf.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let text = CStr::from_bytes_until_nul(&buf).ok()?;
+        Some(text.to_string_lossy().into_owned())
+    }
+
+    fn gpu() -> Reading<GpuSample> {
+        // SAFETY: returns a CFMutableDictionaryRef (+1) consumed by IOServiceGetMatchingServices.
+        let matching = unsafe { IOServiceMatching(c"IOAccelerator".as_ptr()) };
+        if matching.is_null() {
+            return Reading::Unavailable(Why::Unsupported);
+        }
+        let mut raw_iter: u32 = 0;
+        // SAFETY: `IOServiceGetMatchingServices` always consumes one retain on `matching`.
+        let kr = unsafe { IOServiceGetMatchingServices(0, matching.cast(), &mut raw_iter) };
+        if kr != libc::KERN_SUCCESS {
+            return Reading::Unavailable(Why::Unsupported);
+        }
+        let iter = OwnedIo(raw_iter);
+        let perf_key = cf_str("PerformanceStatistics");
+        if perf_key.0.is_null() {
+            return Reading::Unavailable(Why::Failed);
+        }
+
+        let mut entries = Vec::new();
+        loop {
+            // SAFETY: `iter.0` is a live `io_iterator_t`.
+            let raw_entry = unsafe { IOIteratorNext(iter.0) };
+            if raw_entry == 0 {
+                break;
+            }
+            let entry = OwnedIo(raw_entry);
+            // SAFETY: returns a CFTypeRef (+1) owned by `prop`.
+            let prop = OwnedCf(unsafe {
+                IORegistryEntryCreateCFProperty(entry.0, perf_key.0, std::ptr::null(), 0)
+            });
+            if prop.0.is_null() || unsafe { CFGetTypeID(prop.0) != CFDictionaryGetTypeID() } {
+                entries.push(GpuEntryReading {
+                    utilization_pct: None,
+                    renderer_pct: None,
+                    tiler_pct: None,
+                    memory_in_use: None,
+                    memory_allocated: None,
+                });
+                continue;
+            }
+            let dict = prop.0;
+            let utilization_pct = cf_dict_f64(dict, "Device Utilization %")
+                .or_else(|| cf_dict_f64(dict, "GPU Activity(%)"))
+                .or_else(|| {
+                    cf_dict_f64(dict, "GPU Core Utilization").map(|raw| {
+                        if raw > 100.0 {
+                            raw / 10_000_000.0
+                        } else {
+                            raw
+                        }
+                    })
+                })
+                .map(|v| round1(v.clamp(0.0, 100.0)));
+            let renderer_pct =
+                cf_dict_f64(dict, "Renderer Utilization %").map(|v| round1(v.clamp(0.0, 100.0)));
+            let tiler_pct =
+                cf_dict_f64(dict, "Tiler Utilization %").map(|v| round1(v.clamp(0.0, 100.0)));
+            let memory_in_use = cf_dict_u64(dict, "In use system memory")
+                .or_else(|| cf_dict_u64(dict, "vramUsedBytes"));
+            let memory_allocated = cf_dict_u64(dict, "Alloc system memory");
+            entries.push(GpuEntryReading {
+                utilization_pct,
+                renderer_pct,
+                tiler_pct,
+                memory_in_use,
+                memory_allocated,
+            });
+        }
+
+        select_gpu_sample(&entries)
+    }
+
+    type IoHidCreateFn = unsafe extern "C" fn(CFTypeRef) -> CFTypeRef;
+    type IoHidSetMatchingFn = unsafe extern "C" fn(CFTypeRef, CFTypeRef);
+    type IoHidCopyServicesFn = unsafe extern "C" fn(CFTypeRef) -> CFTypeRef;
+    type IoHidCopyPropertyFn = unsafe extern "C" fn(CFTypeRef, CFTypeRef) -> CFTypeRef;
+    type IoHidCopyEventFn = unsafe extern "C" fn(CFTypeRef, i64, CFTypeRef, u32) -> CFTypeRef;
+    type IoHidGetFloatFn = unsafe extern "C" fn(CFTypeRef, i32) -> f64;
+
+    struct IoHidSyms {
+        create: IoHidCreateFn,
+        set_matching: IoHidSetMatchingFn,
+        copy_services: IoHidCopyServicesFn,
+        copy_property: IoHidCopyPropertyFn,
+        copy_event: IoHidCopyEventFn,
+        get_float: IoHidGetFloatFn,
+    }
+
+    fn iohid_syms() -> Option<&'static IoHidSyms> {
+        static SYMS: OnceLock<Option<IoHidSyms>> = OnceLock::new();
+        SYMS.get_or_init(|| {
+            let resolve = |name: &CStr| -> Option<*mut libc::c_void> {
+                // SAFETY: `name` is a static C string and `RTLD_DEFAULT` searches linked frameworks.
+                let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+                (!ptr.is_null()).then_some(ptr)
+            };
+            // SAFETY: symbol signatures match CoreFoundation/IOKit `IOHIDEventSystemClient` APIs.
+            unsafe {
+                Some(IoHidSyms {
+                    create: std::mem::transmute::<*mut libc::c_void, IoHidCreateFn>(resolve(
+                        c"IOHIDEventSystemClientCreate",
+                    )?),
+                    set_matching: std::mem::transmute::<*mut libc::c_void, IoHidSetMatchingFn>(
+                        resolve(c"IOHIDEventSystemClientSetMatching")?,
+                    ),
+                    copy_services: std::mem::transmute::<*mut libc::c_void, IoHidCopyServicesFn>(
+                        resolve(c"IOHIDEventSystemClientCopyServices")?,
+                    ),
+                    copy_property: std::mem::transmute::<*mut libc::c_void, IoHidCopyPropertyFn>(
+                        resolve(c"IOHIDServiceClientCopyProperty")?,
+                    ),
+                    copy_event: std::mem::transmute::<*mut libc::c_void, IoHidCopyEventFn>(
+                        resolve(c"IOHIDServiceClientCopyEvent")?,
+                    ),
+                    get_float: std::mem::transmute::<*mut libc::c_void, IoHidGetFloatFn>(resolve(
+                        c"IOHIDEventGetFloatValue",
+                    )?),
+                })
+            }
+        })
+        .as_ref()
+    }
+
+    struct HidClient(OwnedCf);
+
+    // SAFETY: Created synchronously without scheduling on a run loop, owned
+    // exclusively by `HostProbe`, and accessed only through `&mut self`.
+    unsafe impl Send for HidClient {}
+
+    fn create_hid_client(syms: &IoHidSyms) -> Result<HidClient, Why> {
+        // SAFETY: `IOHIDEventSystemClientCreate(NULL)` returns a +1 CFTypeRef.
+        let client = OwnedCf(unsafe { (syms.create)(std::ptr::null()) });
+        if client.0.is_null() {
+            return Err(Why::Unsupported);
+        }
+        let k_page = cf_str("PrimaryUsagePage");
+        let k_usage = cf_str("PrimaryUsage");
+        let page_val: i32 = 0xff00;
+        let usage_val: i32 = 5;
+        let v_page = OwnedCf(unsafe {
+            CFNumberCreate(
+                std::ptr::null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                (&raw const page_val).cast(),
+            )
+        });
+        let v_usage = OwnedCf(unsafe {
+            CFNumberCreate(
+                std::ptr::null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                (&raw const usage_val).cast(),
+            )
+        });
+        if k_page.0.is_null() || k_usage.0.is_null() || v_page.0.is_null() || v_usage.0.is_null() {
+            return Err(Why::Failed);
+        }
+        let keys = [k_page.0, k_usage.0];
+        let vals = [v_page.0, v_usage.0];
+        let match_dict = OwnedCf(unsafe {
+            CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                vals.as_ptr(),
+                2,
+                (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                (&raw const kCFTypeDictionaryValueCallBacks).cast(),
+            )
+        });
+        if match_dict.0.is_null() {
+            return Err(Why::Failed);
+        }
+        // SAFETY: `client.0` and `match_dict.0` are valid CF objects.
+        unsafe { (syms.set_matching)(client.0, match_dict.0) };
+        Ok(HidClient(client))
     }
 
     fn power() -> Reading<Power> {
@@ -231,13 +755,34 @@ mod imp {
     }
 
     pub(crate) struct HostProbe {
-        /// The host port, asked for once: every `mach_host_self` call hands
-        /// out another send right.
+        /// The host port, asked for once and deallocated in `Drop`: every
+        /// `mach_host_self` call hands out another send right.
         host: libc::mach_port_t,
         page_size: u64,
         cores: Reading<Cores>,
         memsize: Reading<u64>,
         disk_path: Option<CString>,
+        prev_cpu_ticks: Option<[u32; 4]>,
+        hid_client: Option<HidClient>,
+        hid_had_services: bool,
+    }
+
+    impl Drop for HostProbe {
+        fn drop(&mut self) {
+            if self.host != 0 {
+                extern "C" {
+                    fn mach_port_deallocate(
+                        task: libc::mach_port_t,
+                        name: libc::mach_port_t,
+                    ) -> libc::kern_return_t;
+                }
+                // SAFETY: `self.host` is the send right owned by this `HostProbe`.
+                #[allow(deprecated)]
+                unsafe {
+                    mach_port_deallocate(libc::mach_task_self(), self.host);
+                }
+            }
+        }
     }
 
     impl HostProbe {
@@ -255,10 +800,30 @@ mod imp {
                 cores: read_cores(),
                 memsize: sysctl_uint(c"hw.memsize"),
                 disk_path: CString::new(disk_path.as_os_str().as_bytes()).ok(),
+                prev_cpu_ticks: None,
+                hid_client: None,
+                hid_had_services: false,
             }
         }
 
+        pub(crate) fn reset(&mut self) {
+            self.prev_cpu_ticks = None;
+            self.hid_client = None;
+            self.hid_had_services = false;
+        }
+
+        #[cfg(test)]
+        pub(super) fn hid_client_state(&self) -> (Option<usize>, bool) {
+            (
+                self.hid_client.as_ref().map(|c| c.0 .0 as usize),
+                self.hid_had_services,
+            )
+        }
+
         pub(crate) fn sample(&mut self) -> HostSample {
+            let (compressed_bytes, memory) = self.vm_memory();
+            let (free_disk, total_disk) = self.disk();
+            let swap = self.swap();
             HostSample {
                 pressure: match sysctl_uint(c"kern.memorystatus_vm_pressure_level") {
                     Reading::Value(raw) => u32::try_from(raw)
@@ -267,20 +832,116 @@ mod imp {
                         .map_or(Reading::Unavailable(Why::Failed), Reading::Value),
                     Reading::Unavailable(why) => Reading::Unavailable(why),
                 },
-                swap_used: self.swap().map(|s| s.0),
-                swap_total: self.swap().map(|s| s.1),
+                swap_used: swap.map(|s| s.0),
+                swap_total: swap.map(|s| s.1),
                 compressor: compressor(),
-                compressed_bytes: self.compressed_bytes(),
+                compressed_bytes,
                 compressor_segments: compressor_segments(),
                 load: load(),
                 cores: self.cores,
                 memsize: self.memsize,
                 open_files: sysctl_uint(c"kern.num_files"),
                 max_files: sysctl_uint(c"kern.maxfiles"),
-                free_disk: self.free_disk(),
+                free_disk,
                 thermal: thermal(),
                 power: power(),
+                cpu_usage: self.cpu_usage(),
+                gpu: gpu(),
+                memory,
+                total_disk,
+                thermal_temp_c: self.thermal_temp_c(),
             }
+        }
+
+        fn thermal_temp_c(&mut self) -> Reading<f64> {
+            let Some(syms) = iohid_syms() else {
+                return Reading::Unavailable(Why::Unsupported);
+            };
+            let client_ref = match self.hid_client.as_ref() {
+                Some(client) => client.0 .0,
+                None => match create_hid_client(syms) {
+                    Ok(client) => self.hid_client.insert(client).0 .0,
+                    Err(why) => return Reading::Unavailable(why),
+                },
+            };
+            // SAFETY: returns a +1 CFArrayRef of HID service clients, or NULL.
+            let services = OwnedCf(unsafe { (syms.copy_services)(client_ref) });
+            if services.0.is_null() || unsafe { CFGetTypeID(services.0) != CFArrayGetTypeID() } {
+                self.hid_client = None;
+                self.hid_had_services = false;
+                return Reading::Unavailable(Why::Unsupported);
+            }
+            let product_key = cf_str("Product");
+            if product_key.0.is_null() {
+                return Reading::Unavailable(Why::Failed);
+            }
+            let count = unsafe { CFArrayGetCount(services.0) };
+            if count > 0 {
+                self.hid_had_services = true;
+            } else if self.hid_had_services {
+                // If the HID daemon restarted after previously publishing services,
+                // drop the cached client so the next tick creates a fresh one.
+                self.hid_client = None;
+                self.hid_had_services = false;
+            }
+            let mut max_temp: Option<f64> = None;
+            for i in 0..count {
+                let service = unsafe { CFArrayGetValueAtIndex(services.0, i) };
+                if service.is_null() {
+                    continue;
+                }
+                let prop = OwnedCf(unsafe { (syms.copy_property)(service, product_key.0) });
+                let Some(name) = cf_string_to_rust(prop.0) else {
+                    continue;
+                };
+                let event = OwnedCf(unsafe {
+                    (syms.copy_event)(service, K_IOHID_EVENT_TYPE_TEMPERATURE, std::ptr::null(), 0)
+                });
+                if event.0.is_null() {
+                    continue;
+                }
+                let temp = unsafe { (syms.get_float)(event.0, K_IOHID_EVENT_FIELD_TEMP_LEVEL) };
+                if is_soc_die_temp_sensor(&name, temp) {
+                    max_temp = Some(max_temp.map_or(temp, |prev| prev.max(temp)));
+                }
+            }
+            max_temp.map_or(Reading::Unavailable(Why::Unsupported), |t| {
+                Reading::Value(round1(t))
+            })
+        }
+
+        fn cpu_usage(&mut self) -> Reading<CpuUsage> {
+            if self.host == 0 {
+                return Reading::Unavailable(Why::Failed);
+            }
+            let mut ticks = [0u32; 4];
+            let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+            // SAFETY: `ticks` holds 4 `u32`s (`cpu_ticks`), matching `HOST_CPU_LOAD_INFO_COUNT`.
+            let kr = unsafe {
+                libc::host_statistics(
+                    self.host,
+                    libc::HOST_CPU_LOAD_INFO,
+                    ticks.as_mut_ptr().cast(),
+                    &mut count,
+                )
+            };
+            if kr != libc::KERN_SUCCESS || count != libc::HOST_CPU_LOAD_INFO_COUNT {
+                return Reading::Unavailable(Why::Failed);
+            }
+            let Some(prev) = self.prev_cpu_ticks else {
+                self.prev_cpu_ticks = Some(ticks);
+                return Reading::Unavailable(Why::NotYet);
+            };
+            let delta = |idx: usize| u64::from(ticks[idx].wrapping_sub(prev[idx]));
+            let d_user = delta(libc::CPU_STATE_USER as usize)
+                .saturating_add(delta(libc::CPU_STATE_NICE as usize));
+            let d_sys = delta(libc::CPU_STATE_SYSTEM as usize);
+            let d_idle = delta(libc::CPU_STATE_IDLE as usize);
+            let reading = cpu_usage_from_deltas(d_user, d_sys, d_idle);
+            if matches!(reading, Reading::Value(_)) {
+                self.prev_cpu_ticks = Some(ticks);
+            }
+            reading
         }
 
         fn swap(&self) -> Reading<(u64, u64)> {
@@ -307,9 +968,12 @@ mod imp {
             Reading::Value((usage.xsu_used, usage.xsu_total))
         }
 
-        fn compressed_bytes(&self) -> Reading<u64> {
+        fn vm_memory(&self) -> (Reading<u64>, Reading<MemorySample>) {
             if self.host == 0 {
-                return Reading::Unavailable(Why::Failed);
+                return (
+                    Reading::Unavailable(Why::Failed),
+                    Reading::Unavailable(Why::Failed),
+                );
             }
             let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
             let mut count = libc::HOST_VM_INFO64_COUNT;
@@ -324,25 +988,48 @@ mod imp {
                 )
             };
             if kr != libc::KERN_SUCCESS {
-                return Reading::Unavailable(Why::Failed);
+                return (
+                    Reading::Unavailable(Why::Failed),
+                    Reading::Unavailable(Why::Failed),
+                );
             }
             // SAFETY: zero-initialised, then filled by the kernel.
             let stats = unsafe { stats.assume_init() };
-            Reading::Value(u64::from(stats.compressor_page_count).saturating_mul(self.page_size))
+            let compressed = u64::from(stats.compressor_page_count).saturating_mul(self.page_size);
+            let app = u64::from(
+                stats
+                    .internal_page_count
+                    .saturating_sub(stats.purgeable_count),
+            )
+            .saturating_mul(self.page_size);
+            let wired = u64::from(stats.wire_count).saturating_mul(self.page_size);
+            let cached = u64::from(
+                stats
+                    .external_page_count
+                    .saturating_add(stats.purgeable_count),
+            )
+            .saturating_mul(self.page_size);
+            let used = app.saturating_add(wired).saturating_add(compressed);
+            (
+                Reading::Value(compressed),
+                Reading::Value(MemorySample {
+                    used_bytes: used,
+                    app_bytes: Some(app),
+                    wired_bytes: Some(wired),
+                    compressed_bytes: Some(compressed),
+                    cached_bytes: Some(cached),
+                }),
+            )
         }
 
-        fn free_disk(&self) -> Reading<u64> {
+        fn disk(&self) -> (Reading<u64>, Reading<u64>) {
             let Some(path) = &self.disk_path else {
-                return Reading::Unavailable(Why::Failed);
+                return (
+                    Reading::Unavailable(Why::Failed),
+                    Reading::Unavailable(Why::Failed),
+                );
             };
-            let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-            // SAFETY: a NUL-terminated path and one statfs buffer.
-            if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-                return Reading::Unavailable(Why::of_errno(last_errno()));
-            }
-            // SAFETY: filled by the kernel.
-            let fs = unsafe { fs.assume_init() };
-            Reading::Value(fs.f_bavail.saturating_mul(u64::from(fs.f_bsize)))
+            super::super::disk::volume_bytes_c(path)
         }
     }
 
@@ -437,7 +1124,8 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::super::sensor::{Cores, HostSample, Level, Reading, Why};
+    use super::super::sensor::{Cores, CpuUsage, HostSample, Level, MemorySample, Reading, Why};
+    use super::{cpu_usage_from_deltas, parse_proc_stat_cpu};
     use std::ffi::CString;
 
     /// PSI `avg10` percentages at which the level steps up. Provisional: no
@@ -530,6 +1218,7 @@ mod imp {
     pub(crate) struct HostProbe {
         disk_path: Option<CString>,
         cores: Reading<Cores>,
+        prev_cpu: Option<(u64, u64, u64)>,
     }
 
     impl HostProbe {
@@ -548,7 +1237,12 @@ mod imp {
             Self {
                 disk_path: CString::new(disk_path.as_os_str().as_bytes()).ok(),
                 cores: logical,
+                prev_cpu: None,
             }
+        }
+
+        pub(crate) fn reset(&mut self) {
+            self.prev_cpu = None;
         }
 
         pub(crate) fn sample(&mut self) -> HostSample {
@@ -566,6 +1260,19 @@ mod imp {
                     Reading::Unavailable(why)
                 }
             };
+            let memsize = kib("MemTotal");
+            let memory = match (memsize, kib("MemAvailable")) {
+                (Reading::Value(total), Reading::Value(avail)) => Reading::Value(MemorySample {
+                    used_bytes: total.saturating_sub(avail),
+                    app_bytes: None,
+                    wired_bytes: None,
+                    compressed_bytes: None,
+                    cached_bytes: kib("Cached").value(),
+                }),
+                (Reading::Unavailable(why), _) | (_, Reading::Unavailable(why)) => {
+                    Reading::Unavailable(why)
+                }
+            };
             let file_nr = read_small("/proc/sys/fs/file-nr");
             let file_field = |i: usize| match &file_nr {
                 Ok(text) => text
@@ -575,6 +1282,7 @@ mod imp {
                     .map_or(Reading::Unavailable(Why::Failed), Reading::Value),
                 Err(why) => Reading::Unavailable(*why),
             };
+            let (free_disk, total_disk) = self.disk();
             HostSample {
                 pressure: match read_small("/proc/pressure/memory") {
                     Ok(text) => {
@@ -588,43 +1296,57 @@ mod imp {
                 compressed_bytes: Reading::Unavailable(Why::Unsupported),
                 compressor_segments: Reading::Unavailable(Why::Unsupported),
                 load: match read_small("/proc/loadavg") {
-                    Ok(text) => {
-                        let mut it = text.split_whitespace().map(|v| v.parse::<f64>().ok());
-                        match (it.next(), it.next(), it.next()) {
-                            (Some(Some(a)), Some(Some(b)), Some(Some(c))) => {
-                                Reading::Value([a, b, c])
-                            }
-                            _ => Reading::Unavailable(Why::Failed),
-                        }
-                    }
+                    Ok(text) => parse_linux_loadavg(&text)
+                        .map_or(Reading::Unavailable(Why::Failed), Reading::Value),
                     Err(why) => Reading::Unavailable(why),
                 },
                 cores: self.cores,
-                memsize: kib("MemTotal"),
+                memsize,
                 open_files: file_field(0),
                 max_files: file_field(2),
-                free_disk: self.free_disk(),
+                free_disk,
                 thermal: Reading::Unavailable(Why::Unsupported),
                 power: Reading::Unavailable(Why::Unsupported),
+                cpu_usage: self.cpu_usage(),
+                gpu: Reading::Unavailable(Why::Unsupported),
+                memory,
+                total_disk,
+                thermal_temp_c: super::linux_thermal_temp_in(std::path::Path::new(
+                    "/sys/class/thermal",
+                )),
             }
         }
 
-        fn free_disk(&self) -> Reading<u64> {
-            let Some(path) = &self.disk_path else {
-                return Reading::Unavailable(Why::Failed);
+        fn cpu_usage(&mut self) -> Reading<CpuUsage> {
+            let now = match read_small("/proc/stat") {
+                Ok(text) => match parse_proc_stat_cpu(&text) {
+                    Some(v) => v,
+                    None => return Reading::Unavailable(Why::Failed),
+                },
+                Err(why) => return Reading::Unavailable(why),
             };
-            let mut fs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
-            // SAFETY: a NUL-terminated path and one statvfs buffer.
-            if unsafe { libc::statvfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-                return Reading::Unavailable(Why::of_errno(
-                    std::io::Error::last_os_error().raw_os_error(),
-                ));
+            let Some(prev) = self.prev_cpu else {
+                self.prev_cpu = Some(now);
+                return Reading::Unavailable(Why::NotYet);
+            };
+            let d_user = now.0.wrapping_sub(prev.0);
+            let d_sys = now.1.wrapping_sub(prev.1);
+            let d_idle = now.2.wrapping_sub(prev.2);
+            let reading = cpu_usage_from_deltas(d_user, d_sys, d_idle);
+            if matches!(reading, Reading::Value(_)) {
+                self.prev_cpu = Some(now);
             }
-            // SAFETY: filled by the kernel.
-            let fs = unsafe { fs.assume_init() };
-            #[allow(clippy::useless_conversion)]
-            let bytes = u64::from(fs.f_bavail).saturating_mul(u64::from(fs.f_frsize));
-            Reading::Value(bytes)
+            reading
+        }
+
+        fn disk(&self) -> (Reading<u64>, Reading<u64>) {
+            let Some(path) = &self.disk_path else {
+                return (
+                    Reading::Unavailable(Why::Failed),
+                    Reading::Unavailable(Why::Failed),
+                );
+            };
+            super::super::disk::volume_bytes_c(path)
         }
     }
 
@@ -684,6 +1406,8 @@ mod imp {
             Self
         }
 
+        pub(crate) fn reset(&mut self) {}
+
         /// Every reading unsupported: the default sample.
         pub(crate) fn sample(&mut self) -> HostSample {
             HostSample::default()
@@ -694,15 +1418,197 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sysload::sensor::Reading;
-    #[cfg(not(target_os = "macos"))]
-    use crate::sysload::sensor::Why;
+    use crate::sysload::sensor::{Reading, Why};
 
     #[test]
     fn boot_ids_hash_stably_and_never_to_the_unknown_value() {
         assert_eq!(hash_boot_id("abc"), hash_boot_id(" abc\n"));
         assert_ne!(hash_boot_id("abc"), hash_boot_id("abd"));
         assert_ne!(hash_boot_id(""), 0);
+    }
+
+    #[test]
+    fn cpu_usage_from_deltas_handles_zero_wraparound_and_normal() {
+        assert_eq!(
+            cpu_usage_from_deltas(0, 0, 0),
+            Reading::Unavailable(Why::NotYet)
+        );
+        // 30 user + 10 sys + 60 idle = 100 ticks -> 40.0% total, 30.0% user, 10.0% system.
+        assert_eq!(
+            cpu_usage_from_deltas(30, 10, 60),
+            Reading::Value(CpuUsage {
+                total_pct: 40.0,
+                user_pct: 30.0,
+                system_pct: 10.0,
+            })
+        );
+        // 32-bit u32 wraparound: prev = u32::MAX - 9, now = 10 -> wrapping_sub = 20.
+        let prev = u32::MAX - 9;
+        let now = 10u32;
+        assert_eq!(u64::from(now.wrapping_sub(prev)), 20);
+        // Linux /proc/stat parser extracts (user+nice, system+irq+softirq+steal, idle+iowait).
+        assert_eq!(
+            parse_proc_stat_cpu("cpu  100 20 30 400 50 5 15 10\ncpu0 50 10 15 200 25 2 8 5\n"),
+            Some((120, 60, 450))
+        );
+    }
+
+    #[test]
+    fn soc_die_sensor_filter_accepts_die_and_rejects_noise() {
+        assert!(is_soc_die_temp_sensor("PMU tdie1", 97.3));
+        assert!(is_soc_die_temp_sensor("eACC MTR Temp Sensor0", 54.2));
+        assert!(is_soc_die_temp_sensor("pACC MTR Temp Sensor3", 61.0));
+        assert!(is_soc_die_temp_sensor("gACC MTR Temp Sensor0", 58.0));
+        assert!(is_soc_die_temp_sensor("gACC0", 55.5));
+        assert!(!is_soc_die_temp_sensor("PMU tdev3", -9201.1));
+        assert!(!is_soc_die_temp_sensor("PMU tdev3", 45.0));
+        assert!(!is_soc_die_temp_sensor("gas gauge battery", 30.5));
+        assert!(!is_soc_die_temp_sensor("NAND CH0 temp", 43.0));
+        assert!(!is_soc_die_temp_sensor("PMU tcal", 51.8));
+        assert!(!is_soc_die_temp_sensor("PMU tdie1", f64::NAN));
+        assert!(!is_soc_die_temp_sensor("PMU tdie1", 0.0));
+        assert!(!is_soc_die_temp_sensor("PMU tdie1", 200.0));
+    }
+
+    #[test]
+    fn gpu_selection_never_splices_counters_across_gpus_and_reports_unreadable() {
+        assert_eq!(
+            select_gpu_sample(&[]),
+            Reading::Unavailable(Why::Unsupported)
+        );
+        assert_eq!(
+            select_gpu_sample(&[GpuEntryReading {
+                utilization_pct: None,
+                renderer_pct: Some(12.0),
+                tiler_pct: None,
+                memory_in_use: Some(1024),
+                memory_allocated: None,
+            }]),
+            Reading::Unavailable(Why::Unreadable)
+        );
+        // Discrete GPU (util 75%, no tiler) beats integrated GPU (util 10%, tiler 8%):
+        // tiler must come strictly from the winning entry (None), never spliced from GPU 0.
+        let picked = select_gpu_sample(&[
+            GpuEntryReading {
+                utilization_pct: Some(10.0),
+                renderer_pct: Some(9.0),
+                tiler_pct: Some(8.0),
+                memory_in_use: Some(100),
+                memory_allocated: Some(200),
+            },
+            GpuEntryReading {
+                utilization_pct: Some(75.0),
+                renderer_pct: Some(70.0),
+                tiler_pct: None,
+                memory_in_use: Some(400),
+                memory_allocated: Some(800),
+            },
+        ]);
+        assert_eq!(
+            picked,
+            Reading::Value(crate::sysload::sensor::GpuSample {
+                utilization_pct: 75.0,
+                renderer_pct: Some(70.0),
+                tiler_pct: None,
+                memory_in_use: Some(500),
+                memory_allocated: Some(1000),
+            })
+        );
+    }
+
+    #[test]
+    fn linux_thermal_parser_and_directory_walk_handle_millidegrees_and_noise() {
+        assert_eq!(parse_linux_thermal_temp_c("45230\n"), Some(45.2));
+        assert_eq!(parse_linux_thermal_temp_c("0\n"), None);
+        assert_eq!(parse_linux_thermal_temp_c("-1000\n"), None);
+        assert_eq!(parse_linux_thermal_temp_c("200000\n"), None);
+        assert_eq!(parse_linux_thermal_temp_c("not-a-number"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            linux_thermal_temp_in(&dir.path().join("missing")),
+            Reading::Unavailable(Why::Unsupported)
+        );
+        std::fs::create_dir(dir.path().join("thermal_zone0")).unwrap();
+        std::fs::write(dir.path().join("thermal_zone0/temp"), "42340\n").unwrap();
+        std::fs::create_dir(dir.path().join("thermal_zone1")).unwrap();
+        std::fs::write(dir.path().join("thermal_zone1/temp"), "68760\n").unwrap();
+        std::fs::create_dir(dir.path().join("thermal_zone2")).unwrap();
+        std::fs::write(dir.path().join("thermal_zone2/temp"), "-1000\n").unwrap();
+        std::fs::create_dir(dir.path().join("cooling_device0")).unwrap();
+        std::fs::write(dir.path().join("cooling_device0/temp"), "99000\n").unwrap();
+        assert_eq!(linux_thermal_temp_in(dir.path()), Reading::Value(68.8));
+
+        let err_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(err_dir.path().join("thermal_zone0/temp")).unwrap();
+        assert_eq!(
+            linux_thermal_temp_in(err_dir.path()),
+            Reading::Unavailable(Why::Failed)
+        );
+
+        assert_eq!(
+            parse_linux_loadavg("1.25 0.50 0.12 2/400 12345\n"),
+            Some([1.25, 0.50, 0.12])
+        );
+        assert_eq!(parse_linux_loadavg("NaN 0.50 0.12"), None);
+        assert_eq!(parse_linux_loadavg("inf 0.50 0.12"), None);
+        assert_eq!(parse_linux_loadavg("-0.1 0.50 0.12"), None);
+    }
+
+    #[test]
+    fn host_probe_is_send_and_reset_clears_cpu_baseline() {
+        fn assert_send<T: Send>() {}
+        assert_send::<HostProbe>();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = HostProbe::new(dir.path());
+        let first = probe.sample();
+        assert_eq!(first.cpu_usage, Reading::Unavailable(Why::NotYet));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let _second = probe.sample();
+        probe.reset();
+        let after_reset = probe.sample();
+        assert_eq!(after_reset.cpu_usage, Reading::Unavailable(Why::NotYet));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_probe_reuses_hid_client_across_repeated_samples() {
+        use crate::procguard::LockedSpawn;
+        let virtualised = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output_locked()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = HostProbe::new(dir.path());
+        let a = probe.sample();
+        let (ptr_a, _) = probe.hid_client_state();
+        let b = probe.sample();
+        let (ptr_b, _) = probe.hid_client_state();
+        let c = probe.sample();
+        let (ptr_c, _) = probe.hid_client_state();
+        if !virtualised {
+            assert!(
+                matches!(a.thermal_temp_c, Reading::Value(t) if (10.0..=130.0).contains(&t)),
+                "bare-metal macOS must read die temp: {a:?}"
+            );
+            assert!(ptr_a.is_some(), "bare-metal macOS must cache HID client");
+        }
+        assert_eq!(ptr_a, ptr_b);
+        assert_eq!(ptr_b, ptr_c);
+        assert_eq!(
+            matches!(a.thermal_temp_c, Reading::Value(_)),
+            matches!(b.thermal_temp_c, Reading::Value(_))
+        );
+        assert_eq!(
+            matches!(b.thermal_temp_c, Reading::Value(_)),
+            matches!(c.thermal_temp_c, Reading::Value(_))
+        );
+        probe.reset();
+        let (after_ptr, after_had) = probe.hid_client_state();
+        assert!(after_ptr.is_none());
+        assert!(!after_had);
     }
 
     /// Real: this host's own readings, whatever they are. Each must be a
@@ -725,6 +1631,18 @@ mod tests {
                 .output_locked()
                 .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1");
             assert!(matches!(sample.pressure, Reading::Value(_)), "{sample:?}");
+            assert_eq!(sample.cpu_usage, Reading::Unavailable(Why::NotYet));
+            assert!(
+                matches!(sample.memory, Reading::Value(m) if m.used_bytes > 0),
+                "{sample:?}"
+            );
+            assert!(
+                matches!(
+                    (sample.free_disk, sample.total_disk),
+                    (Reading::Value(f), Reading::Value(t)) if t >= f && t > 0
+                ),
+                "{sample:?}"
+            );
             if !virtualised {
                 assert!(matches!(sample.compressor, Reading::Value(_)), "{sample:?}");
                 // The segment sysctls read as plain integers in-process.
@@ -734,6 +1652,10 @@ mod tests {
                 );
                 assert!(matches!(sample.thermal, Reading::Value(_)), "{sample:?}");
                 assert!(matches!(sample.power, Reading::Value(_)), "{sample:?}");
+                assert!(
+                    matches!(sample.gpu, Reading::Value(g) if (0.0..=100.0).contains(&g.utilization_pct)),
+                    "{sample:?}"
+                );
             }
             // Part 0: host_statistics64 is reachable through the existing
             // libc and reports the compressor's page count.
@@ -749,6 +1671,17 @@ mod tests {
             assert_ne!(boot_id(), 0);
             assert!(shared_monotonic_ns() > 0);
             assert!(thread_cpu_ns().is_some());
+
+            // Second sample after a short interval produces a valid CPU delta.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let second = probe.sample();
+            assert!(
+                matches!(
+                    second.cpu_usage,
+                    Reading::Value(c) if (0.0..=100.0).contains(&c.total_pct)
+                ) || second.cpu_usage == Reading::Unavailable(Why::NotYet),
+                "{second:?}"
+            );
         }
         #[cfg(target_os = "linux")]
         {
@@ -759,8 +1692,20 @@ mod tests {
                 matches!(sample.memsize, Reading::Value(v) if v > 0),
                 "{sample:?}"
             );
+            assert!(
+                matches!(sample.memory, Reading::Value(m) if m.used_bytes > 0),
+                "{sample:?}"
+            );
+            assert!(
+                matches!(
+                    (sample.free_disk, sample.total_disk),
+                    (Reading::Value(f), Reading::Value(t)) if t >= f && t > 0
+                ),
+                "{sample:?}"
+            );
             assert!(matches!(sample.open_files, Reading::Value(_)), "{sample:?}");
             assert_eq!(sample.compressor, Reading::Unavailable(Why::Unsupported));
+            assert_eq!(sample.cpu_usage, Reading::Unavailable(Why::NotYet));
             assert_ne!(boot_id(), 0);
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]

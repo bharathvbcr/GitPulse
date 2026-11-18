@@ -21,7 +21,6 @@
     Plus,
     X,
     Folder,
-    FolderGit2,
     FolderOpen,
     Layers,
     Bot,
@@ -87,6 +86,9 @@
   import { shortcutTextLabel } from "../ui/platformCopy";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import RepoLogo from "./RepoLogo.svelte";
+  import RepoLogoBrowser from "./RepoLogoBrowser.svelte";
+  import RepoLogoChoices from "./RepoLogoChoices.svelte";
   import { taskChrome } from "../workbench/taskTabs";
 
   let {
@@ -109,6 +111,11 @@
   const terminalCounts = $derived(sessionsByRepo($terminalSessions));
 
   let menu = $state<{ x: number; y: number; id: string } | null>(null);
+  /** The tab whose logo is being chosen in the browser; the dialog outlives the menu that opened it. */
+  let logoBrowseId = $state<string | null>(null);
+  /** The tab that opened the menu, for focus to go back to when the browser closes. */
+  let logoBrowseReturn = $state.raw<HTMLElement | null>(null);
+  const logoBrowseTab = $derived(logoBrowseId ? ($repoStore.openTabs.find((item) => item.id === logoBrowseId) ?? null) : null);
   // Measured menu box feeds the shared clamp so the tab menu can never open
   // off-screen (the old innerWidth-200 guess overflowed on short windows).
   let menuEl: HTMLDivElement | undefined = $state();
@@ -1071,6 +1078,9 @@
   interface OverflowUnit {
     key: string;
     id: string;
+    /** The tab whose logo the row shows: the stack's current checkout, or the tab. */
+    tab: OpenRepoTab;
+    stacked: boolean;
     label: string;
     branch: string | null;
     dirty: boolean;
@@ -1087,6 +1097,8 @@
         units.push({
           key: `stack:${item.key}`,
           id: item.current.id,
+          tab: item.current,
+          stacked: true,
           label: item.label,
           branch: item.current.currentBranch,
           dirty: item.isDirty,
@@ -1099,6 +1111,8 @@
         units.push({
           key: `tab:${item.tab.id}`,
           id: item.tab.id,
+          tab: item.tab,
+          stacked: false,
           label: item.tab.label,
           branch: item.tab.currentBranch,
           dirty: item.tab.isDirty,
@@ -1444,13 +1458,22 @@
         }
       }}
       ondblclick={() => repoStore.pinTab(tab.id, !tab.pinned)}
-      class="h-full pl-3 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+      class="h-full pl-2 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
     >
-      {#if tab.pinned}
-        <Pin size={11} class="text-accent shrink-0" />
-      {:else}
-        <FolderGit2 size={12} class="shrink-0 {tab.error ? 'text-danger' : 'text-accent'}" />
-      {/if}
+      <!-- The repository's own logo, else its initials on its tab color: the
+           fastest way to find one repository among many. Pinned and
+           unreadable ride on the mark (a corner pin, a danger ring) rather
+           than replacing it. -->
+      <RepoLogo
+        path={tab.path}
+        {tab}
+        color={colorInfo.color}
+        size={16}
+        priority={tab.isActive}
+        pinned={tab.pinned}
+        error={!!tab.error}
+        muted={tab.watch === "parked"}
+      />
       <span class="whitespace-nowrap font-medium {tab.watch === 'parked' ? 'opacity-60' : ''}">{tab.label}</span>
       {#if tab.watch === "parked"}
         <span class="sr-only">, live updates paused</span>
@@ -1573,7 +1596,7 @@
         onkeydown={(e) => onStackKeydown(e, info)}
       >
         <ChevronDown size={12} class="shrink-0 text-textMuted group-hover:text-textPrimary" />
-        <Layers size={12} class="shrink-0 {info.hasActiveTab ? 'text-accent' : 'text-textMuted'}" />
+        <RepoLogo path={current.path} tab={current} color={colorInfo.color} size={14} stacked muted={!info.hasActiveTab} />
         <span class="whitespace-nowrap">{info.label}</span>
         <span class="text-micro tabular-nums font-mono opacity-70">({info.tabCount})</span>
       </button>
@@ -1597,9 +1620,19 @@
         data-active-repo={info.hasActiveTab ? "true" : "false"}
         onclick={() => selectRepoTab(current.id)}
         onkeydown={(e) => onStackKeydown(e, info)}
-        class="h-7 pl-2.5 pr-1 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
+        class="h-7 pl-2 pr-1 flex items-center gap-1.5 text-left rounded-l-full focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/70"
       >
-        <Layers size={12} class="shrink-0 {current.error ? 'text-danger' : 'text-accent'}" />
+        <!-- The second tile behind the logo says "several checkouts", as the
+             layers glyph did. -->
+        <RepoLogo
+          path={current.path}
+          tab={current}
+          color={colorInfo.color}
+          size={15}
+          priority={info.hasActiveTab}
+          stacked
+          error={!!current.error}
+        />
         <span class="whitespace-nowrap font-medium">{info.label}</span>
         {#if member.primary}
           {#if current.currentBranch}
@@ -1873,10 +1906,13 @@
                       recentsOpen = false;
                       void repoStore.openRepo(path);
                     }}
-                    class="flex-1 min-w-0 px-2 py-1.5 text-left hover:bg-surfaceHover rounded-lg transition-colors"
+                    class="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-2 text-left hover:bg-surfaceHover rounded-lg transition-colors"
                   >
-                    <div class="truncate text-textPrimary">{displayName(path)}</div>
-                    <div class="truncate text-micro text-textMuted font-mono">{path}</div>
+                    <RepoLogo {path} name={displayName(path)} size={22} />
+                    <span class="min-w-0 flex-1">
+                      <span class="block truncate text-textPrimary">{displayName(path)}</span>
+                      <span class="block truncate text-micro text-textMuted font-mono">{path}</span>
+                    </span>
                   </button>
                   <button
                     type="button"
@@ -1964,7 +2000,10 @@
     class="fixed w-72 max-w-[calc(100vw-1rem)] gp-menu p-2.5 text-meta text-textPrimary"
     style="z-index: {LAYERS.MENU}"
   >
-    <p class="truncate text-xs font-medium">{cardTab.label}</p>
+    <p class="flex min-w-0 items-center gap-2 text-xs font-medium">
+      <RepoLogo path={cardTab.path} tab={cardTab} color={tabColorInfo(cardTab).color} size={20} />
+      <span class="truncate">{cardTab.label}</span>
+    </p>
     <dl class="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
       {#each cardRows as row (row.label)}
         <dt class="text-textMuted">{row.label}</dt>
@@ -2008,6 +2047,7 @@
             selectRepoTab(unit.id);
           }}
         >
+          <RepoLogo path={unit.tab.path} tab={unit.tab} color={tabColorInfo(unit.tab).color} size={14} stacked={unit.stacked} />
           <span class="min-w-0 flex-1 truncate">{unit.label}</span>
           {#if unit.branch}
             <span class="shrink-0 truncate max-w-24 font-mono text-micro text-textMuted">{unit.branch}</span>
@@ -2065,6 +2105,17 @@
           : null,
         (color) => repoStore.setTabColor(tab.id, color),
       )}
+      <RepoLogoChoices
+        {tab}
+        color={tabColorInfo(tab).color}
+        onbrowse={() => {
+          // The menu item that opened the browser is gone by the time it
+          // closes, so focus is handed back to the tab behind the menu.
+          logoBrowseReturn = currentOpener();
+          logoBrowseId = tab.id;
+          closeMenu();
+        }}
+      />
       <span class="gp-menu-sep" aria-hidden="true"></span>
       <!-- One step left or right is Ctrl+Shift+←/→, the palette, or a drag;
            only the jumps to either end live here. -->
@@ -2549,4 +2600,17 @@
       </button>
     {/if}
   </div>
+{/if}
+
+{#if logoBrowseTab}
+  {#key logoBrowseTab.id}
+    <RepoLogoBrowser
+      tab={logoBrowseTab}
+      returnFocus={logoBrowseReturn}
+      onclose={() => {
+        logoBrowseId = null;
+        logoBrowseReturn = null;
+      }}
+    />
+  {/key}
 {/if}

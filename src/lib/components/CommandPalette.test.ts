@@ -83,5 +83,14 @@ describe("CommandPalette", () => {
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf("page = 0"));
     expect(effect).toContain("highlighted = 0");
     expect(effect).toContain("actionError = null");
+    expect(effect).toContain("actionNotice = null");
+  });
+
+  it("keeps the path visible with an Active badge and surfaces inline feedback for disabled commands", () => {
+    expect(source).toContain("cmd.badge ? (cmd.description ?? cmd.disabledReason ?? cmd.category)");
+    expect(source).toContain('badge: tab.isActive ? "Active" : undefined');
+    expect(source).toContain("actionNotice = command.disabledReason");
+    expect(source).toContain("data-palette-notice");
+    expect(source).toContain("data-palette-badge");
   });
 });

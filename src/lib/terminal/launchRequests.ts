@@ -83,6 +83,8 @@ interface LaunchRequest {
   url?: string;
   /** A file pane's repository-relative path and optional reveal coordinates (`requestFile`). */
   filePath?: string;
+  fileOpenMode?: "tab" | "split";
+  fileFocus?: boolean;
   line?: number | null;
   column?: number | null;
   /** Pre-arms quiescent peer auto-wake on unattended kickoff launches. */
@@ -200,8 +202,9 @@ export function createTerminalLaunchRequests() {
       return enqueue({ repoPath, launcher: "browser", url: url.trim() }, signal);
     },
     /**
-     * Opens or reuses a `TerminalFilePane` split on `filePath` in `repoPath`'s
-     * terminal dock, optionally scrolling to 1-based `line` / `column`.
+     * Opens or reuses a `TerminalFilePane` on `filePath` in `repoPath`'s
+     * terminal dock (either in a side-by-side split or a standalone `Files` tab),
+     * optionally scrolling to 1-based `line` / `column`.
      */
     async requestFile(
       repoPath: string,
@@ -209,12 +212,24 @@ export function createTerminalLaunchRequests() {
       line?: number | null,
       column?: number | null,
       signal?: AbortSignal,
+      options?: { mode?: "tab" | "split"; focus?: boolean },
     ): Promise<void> {
       const cleanPath = normalizePaneFilePath(filePath);
       if (!cleanPath) {
         throw new Error("A terminal file pane requires a valid repository-relative path");
       }
-      return enqueue({ repoPath, launcher: "file", filePath: cleanPath, line: line ?? null, column: column ?? null }, signal);
+      return enqueue(
+        {
+          repoPath,
+          launcher: "file",
+          filePath: cleanPath,
+          line: line ?? null,
+          column: column ?? null,
+          ...(options?.mode ? { fileOpenMode: options.mode } : {}),
+          ...(options?.focus !== undefined ? { fileFocus: options.focus } : {}),
+        },
+        signal,
+      );
     },
     /** Whether a launch is waiting to be claimed; a caller with its own queue waits for this. */
     get busy(): boolean {

@@ -127,4 +127,10 @@ describe("RepoPanel submodules", () => {
     const flows = source.slice(source.indexOf("function activateStash"), source.indexOf("function submitAddRemote"));
     expect(flows).not.toContain("askConfirm");
   });
+
+  it("defers CodeViewer via module-scoped LazyView for stash previews so the initial main bundle stays lean", () => {
+    expect(source).toContain('const loadCodeViewer: ViewLoader = () => import("./files/CodeViewer.svelte");');
+    expect(source).toContain('<LazyView load={loadCodeViewer} name="Stash preview"');
+    expect(source).not.toContain('import CodeViewer from "./files/CodeViewer.svelte"');
+  });
 });

@@ -271,6 +271,106 @@ ${row(["tokio", "1.40.0", "1.41.1", "maintained", "none", "", "cancelling_the_to
       check("and a request for another file does not switch this one", () => modeButton("Rendered").getAttribute("aria-pressed") === "true");
       clearReveal();
 
+      // --- adaptive split and scroll in narrow / short panes -----------------
+      const findOutlineToggle = () => [...viewer().querySelectorAll("button")].find(b => b.textContent.includes("Outline"));
+      if (findOutlineToggle()?.getAttribute("aria-pressed") === "true") {
+        findOutlineToggle().click();
+        await settle();
+      }
+      modeButton("Split").click();
+      await until(() => viewer().querySelector('[data-markdev-split="horizontal"]'), 2000);
+      await settle();
+      {
+        const rawPane = viewer().querySelector("[data-markdev-split-raw]");
+        const previewPane = viewer().querySelector("[data-markdev-split-preview]");
+        const rawRect = rawPane.getBoundingClientRect();
+        const previewRect = previewPane.getBoundingClientRect();
+        check("wide split lays raw and preview side by side without horizontal overflow", () =>
+          rawRect.right <= previewRect.left + 12 &&
+          viewer().scrollWidth <= viewer().clientWidth + 1);
+      }
+
+      host.update({ width: 340, height: 640 });
+      await until(() => viewer().querySelector('[data-markdev-split="vertical"]'), 2000);
+      await settle();
+      {
+        const rawPane = viewer().querySelector("[data-markdev-split-raw]");
+        const previewPane = viewer().querySelector("[data-markdev-split-preview]");
+        const rawRect = rawPane.getBoundingClientRect();
+        const previewRect = previewPane.getBoundingClientRect();
+        check("narrow split stacks raw above preview at full column width without overflowing", () =>
+          rawRect.bottom <= previewRect.top + 12 &&
+          rawRect.width >= 320 &&
+          previewRect.width >= 320 &&
+          page().clientWidth >= 250 &&
+          viewer().scrollWidth <= viewer().clientWidth + 1);
+
+        findOutlineToggle().click();
+        await until(() => viewer().querySelector("[data-markdev-outline-card]"), 2000);
+        await settle();
+        const outlineRect = viewer().querySelector("[data-markdev-outline-card]").getBoundingClientRect();
+        const splitRect = viewer().querySelector("[data-markdev-split]").getBoundingClientRect();
+        check("narrow outline stacks above split instead of stealing split width", () =>
+          outlineRect.bottom <= splitRect.top + 12 &&
+          splitRect.width >= 320);
+        findOutlineToggle().click();
+        await settle();
+      }
+
+      // A short terminal split: both panes must be on screen. One outer
+      // scroller around two minimum-height panes put the preview below the
+      // fold, and the wheel never reached that scroller, because every pane
+      // scroller contains its overscroll.
+      host.update({ width: 340, height: 240 });
+      await until(() => viewer().getBoundingClientRect().height <= 245 && viewer().querySelector('[data-markdev-split="vertical"]'), 2000);
+      await settle();
+      {
+        const splitEl = viewer().querySelector('[data-markdev-split="vertical"]');
+        const splitRect = splitEl.getBoundingClientRect();
+        const rawRect = viewer().querySelector("[data-markdev-split-raw]").getBoundingClientRect();
+        const previewRect = viewer().querySelector("[data-markdev-split-preview]").getBoundingClientRect();
+        check(`short narrow split shows both panes without an outer scroller (raw ${Math.round(rawRect.height)}px, preview ${Math.round(previewRect.height)}px, split ${splitEl.scrollHeight}/${splitEl.clientHeight})`, () =>
+          rawRect.height >= 40 &&
+          previewRect.height >= 40 &&
+          rawRect.top >= splitRect.top - 0.5 &&
+          previewRect.bottom <= splitRect.bottom + 0.5 &&
+          splitEl.scrollHeight <= splitEl.clientHeight + 1 &&
+          css(splitEl, "overflow-y") === "hidden");
+      }
+
+      // --- the toolbar fits its pane, and the mode switcher is always in view ---
+      // 170px is a terminal split in a sidebar with its file explorer open.
+      // Each width sits on or just past a label breakpoint, where a reveal that
+      // does not fit would first push the row past its pane.
+      {
+        const misfits = [];
+        for (const w of [170, 220, 256, 300, 400, 511, 512, 576, 672, 768, 1024, 1100]) {
+          host.update({ width: w, height: 640 });
+          await until(() => {
+            const modes = viewer().querySelector("[data-markdev-modes]");
+            return modes && modes.dataset.markdevModes === (w >= 512 ? "inline" : "stacked");
+          }, 2000);
+          await settle();
+          const box = viewer().getBoundingClientRect();
+          const bar = viewer().querySelector(".gp-header-scroll");
+          const buttons = [...viewer().querySelectorAll("[data-markdev-modes] button")];
+          const inView = buttons.length === 3 && buttons.every(b => {
+            const r = b.getBoundingClientRect();
+            return r.width >= 24 && r.left >= box.left - 0.5 && r.right <= box.right + 0.5;
+          });
+          if (!inView || bar.scrollWidth > bar.clientWidth + 1) misfits.push(`${w}px: bar ${bar.scrollWidth}/${bar.clientWidth}, switcher ${inView ? "in view" : "clipped"}`);
+        }
+        check(`the toolbar fits and every mode button is in view from 170px to 1100px${misfits.length ? ` (${misfits.join("; ")})` : ""}`, () => misfits.length === 0);
+        host.update({ width: 220, height: 640 });
+        await settle();
+        check("a narrow pane names each icon-only mode button", () =>
+          [...viewer().querySelectorAll("[data-markdev-modes] button")].map(b => b.getAttribute("aria-label")).join() === "Rendered,Split,Raw");
+      }
+
+      host.update({ width: 900, height: 640 });
+      modeButton("Rendered").click();
+      await settle();
+
       check("no unexpected native commands", () => unexpected.size === 0);
       check("no runtime errors", () => errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

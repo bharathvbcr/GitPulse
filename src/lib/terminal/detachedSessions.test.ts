@@ -263,4 +263,72 @@ describe("a tab's process kept after its view went away", () => {
     expect(await adopt()).toBe(0);
     expect(get(registry)).toHaveLength(1);
   });
+
+  it("preserves live slot and host listing titles across keepDetached, adoptDetachedSessions, and reveal()", async () => {
+    for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
+    const registry = createSessionRegistry();
+    const { bus } = fakeBus();
+    const tabSlot = registry.reserve({
+      key: "tab-live",
+      repoPath: "/repos/app",
+      label: "Claude",
+      title: "Auditing splitTree.ts",
+      status: "running",
+      sessionId: "term-live-1",
+      close: async () => {},
+    });
+    keepDetached(row({ id: "term-live-1" }), tabSlot, {
+      bus,
+      invoke: async <T,>() => null as T,
+      confirm: async () => true,
+    });
+    const detachedRecord = get(registry).find((r) => r.sessionId === "term-live-1");
+    expect(detachedRecord?.title).toBe("Auditing splitTree.ts");
+    detachedRecord?.reveal?.();
+    expect(get(taskTerminalRequests)).toContainEqual(
+      expect.objectContaining({
+        runId: "detached:term-live-1",
+        title: "Auditing splitTree.ts",
+        attach: { sessionId: "term-live-1" },
+      }),
+    );
+
+    // Cold-boot adoption from host listing with `title`
+    for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
+    const { registry: coldRegistry, adopt } = setup([
+      row({ id: "term-cold-2", title: "Refactoring headerPlane" }),
+    ]);
+    expect(parseListing(row({ id: "term-cold-2", title: "  Refactoring headerPlane  " }))?.title).toBe(
+      "Refactoring headerPlane",
+    );
+    expect(await adopt()).toBe(1);
+    const coldRecord = get(coldRegistry)[0];
+    expect(coldRecord?.title).toBe("Refactoring headerPlane");
+    coldRecord?.reveal?.();
+    expect(get(taskTerminalRequests)).toContainEqual(
+      expect.objectContaining({
+        runId: "detached:term-cold-2",
+        title: "Refactoring headerPlane",
+      }),
+    );
+
+    // Live slot rename/OSC title beats a stale host listing title on keepDetached
+    for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
+    const liveBeatsStaleRegistry = createSessionRegistry();
+    const renamedSlot = liveBeatsStaleRegistry.reserve({
+      key: "tab-renamed",
+      repoPath: "/repos/app",
+      label: "Claude",
+      title: "User Pinned Name",
+      status: "running",
+      sessionId: "term-stale-3",
+      close: async () => {},
+    });
+    keepDetached(row({ id: "term-stale-3", title: "Stale OSC Title" }), renamedSlot, {
+      bus,
+      invoke: async <T,>() => null as T,
+      confirm: async () => true,
+    });
+    expect(get(liveBeatsStaleRegistry)[0]?.title).toBe("User Pinned Name");
+  });
 });

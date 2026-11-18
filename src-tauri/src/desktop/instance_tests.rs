@@ -2346,8 +2346,10 @@ fn terminal_orchestrate_roundtrips_over_the_mailbox_and_refuses_when_unattached(
     let token = crate::terminal::orchestrate::mint_session_token().expect("token");
     let call = crate::terminal::orchestrate::OrchestrateCall::List {
         repo_path: "/repo".into(),
-        caller_session_id: "term-100-1".into(),
-        caller_token: token.clone(),
+        caller_session_id: Some("term-100-1".into()),
+        caller_token: Some(token.clone()),
+        external_caller_id: None,
+        include_repo_shells: None,
     };
 
     // Before `attach_terminal_orchestrate`, the owner fails closed with an explicit reason.
@@ -2364,10 +2366,11 @@ fn terminal_orchestrate_roundtrips_over_the_mailbox_and_refuses_when_unattached(
             repo_path,
             caller_session_id,
             caller_token,
+            ..
         } => {
             assert_eq!(repo_path, "/repo");
-            assert_eq!(caller_session_id, "term-100-1");
-            assert_eq!(caller_token, token);
+            assert_eq!(caller_session_id.as_deref(), Some("term-100-1"));
+            assert_eq!(caller_token.as_deref(), Some(token.as_str()));
             Ok(serde_json::json!({
                 "parent_session_id": caller_session_id,
                 "children": [],

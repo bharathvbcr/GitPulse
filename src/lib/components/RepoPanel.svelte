@@ -1,3 +1,9 @@
+<script module lang="ts">
+  import type { ViewLoader } from "./LazyView.svelte";
+
+  const loadCodeViewer: ViewLoader = () => import("./files/CodeViewer.svelte");
+</script>
+
 <script lang="ts">
   /**
    * Remotes, submodules and the stash stack in one place.
@@ -12,7 +18,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import type { DiffPayload } from "../stores/repoStore";
-  import CodeViewer from "./files/CodeViewer.svelte";
+  import LazyView from "./LazyView.svelte";
 
   let { embedded = false }: { embedded?: boolean } = $props();
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -866,7 +872,7 @@
                   {#if previewError}<p role="alert" class="text-meta text-danger">{previewError}</p>
                   {:else if preview}
                     {#if preview.truncated}<p class="mb-2 text-meta text-warn">Preview is incomplete. {preview.truncation_reason ?? "The diff exceeds the display limit."}</p>{/if}
-                    <div class="h-80 overflow-hidden rounded-lg border border-edgeSoft"><CodeViewer filePath={`stash-${entry.index}.diff`} content={preview.text} readOnly /></div>
+                    <div class="h-80 overflow-hidden rounded-lg border border-edgeSoft"><LazyView load={loadCodeViewer} name="Stash preview" props={{ filePath: `stash-${entry.index}.diff`, content: preview.text, readOnly: true }} /></div>
                   {:else}<Skeleton variant="rect" height="20rem" />{/if}
                 </div>
               {/if}

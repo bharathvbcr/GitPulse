@@ -312,4 +312,43 @@ describe("sessionLedger store dismissal and reopen lifecycle (S2-03 & S2-05)", (
     expect(watchSource).not.toContain("setSessionLedgerView");
     expect(incidentSource).not.toContain("dismissSessionLedgerRow");
   });
+
+  it("forwards persisted session ledger titles when reopening interrupted agent conversations", async () => {
+    const titledOffer = makeOffer({
+      row_id: "row-titled-1",
+      launcher: "claude",
+      native_id: UUID_1,
+      title: "Fixing zoomed split unread state",
+    });
+    setSessionLedgerViewForTest({ offers: [titledOffer], reopenable_count: 1, unreadable_count: 0 });
+    const enqueued: TaskTerminalRequest[] = [];
+    const outcome = await reopenSessionLedgerOffer(titledOffer, {
+      check: async () => ({ offer: titledOffer }),
+      repo: {
+        showRepositorySurface: () => {},
+        snapshot: () => ({ openTabs: [{ id: "tab-1", path: "/work/repo" }], activeTabId: "tab-1" }),
+        activateTab: async () => {},
+        openRepo: async () => true,
+        setTerminalOpen: () => true,
+        identity: { caseInsensitive: false },
+      },
+      enqueue: (req) => enqueued.push(req),
+    });
+    expect(outcome.reopened).toBe(true);
+    expect(enqueued[0]?.title).toBe("Fixing zoomed split unread state");
+  });
+
+  it("normalizes malformed or non-object session ledger IPC payloads safely at the boundary", async () => {
+    const { normalizeSessionLedgerView } = await import("./sessionLedger");
+    expect(normalizeSessionLedgerView([])).toEqual({
+      offers: [],
+      reopenable_count: 0,
+      unreadable_count: 0,
+    });
+    expect(normalizeSessionLedgerView(null)).toEqual({
+      offers: [],
+      reopenable_count: 0,
+      unreadable_count: 0,
+    });
+  });
 });

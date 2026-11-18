@@ -161,4 +161,21 @@ describe("terminal pill", () => {
     expect(source).toContain('event.key === "Escape"');
     expect(source).toContain('event.key !== "Escape"');
   });
+
+  it("renders structured session cards for 1 or more sessions with repo logo, repo name, agent icon, and session title", () => {
+    const menu = source.slice(
+      source.indexOf('data-testid="terminal-pill-menu"'),
+      source.length,
+    );
+    expect(menu).toContain("terminalPill.sessions.length > 0");
+    expect(menu).not.toContain("terminalPill.sessions.length > 1");
+    expect(menu).toContain('data-testid="terminal-pill-session-title"');
+    expect(menu).toContain('data-testid="terminal-pill-session-repo"');
+    expect(menu).toContain('data-testid="terminal-pill-session-agent"');
+    expect(menu).toContain("<RepoLogo");
+    expect(menu).toContain("<LauncherIcon kind={session.launcherKind}");
+    expect(menu).toContain("max-w-[9rem] truncate");
+    expect(source).toContain("terminalPill.highlightedLauncher");
+    expect(source).toContain("liveAct?.title");
+  });
 });

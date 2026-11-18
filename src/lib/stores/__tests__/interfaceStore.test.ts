@@ -941,6 +941,30 @@ it("treats smooth mouse-wheel scrolling as on by default, switchable, and falls 
   }
 });
 
+it("treats select to copy as on by default, switchable, and falls back to on for a corrupt value", async () => {
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalCopyOnSelect).toBe(true);
+  interfaceStore.setTerminalCopyOnSelect(false);
+  expect(get(interfaceStore).terminalCopyOnSelect).toBe(false);
+  interfaceStore.reset();
+  expect(get(interfaceStore).terminalCopyOnSelect).toBe(true);
+
+  const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const storage = memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ terminalCopyOnSelect: false }) });
+  try {
+    Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalCopyOnSelect).toBe(false);
+    storage.setItem("gitpulse_interface_prefs", JSON.stringify({ terminalCopyOnSelect: "no" }));
+    vi.resetModules();
+    expect(get((await import("../interfaceStore")).interfaceStore).terminalCopyOnSelect).toBe(true);
+  } finally {
+    if (restore) Object.defineProperty(globalThis, "window", restore);
+    else Reflect.deleteProperty(globalThis, "window");
+    vi.resetModules();
+  }
+});
+
 it("treats Option as Meta as on by default, switchable, and falls back to on for a corrupt value", async () => {
   interfaceStore.reset();
   expect(get(interfaceStore).terminalOptionAsMeta).toBe(true);
@@ -1181,6 +1205,46 @@ describe("tasks board view preferences", () => {
       storage.setItem("gitpulse_interface_prefs", JSON.stringify({ taskHiddenRepositories: "repo-0" }));
       vi.resetModules();
       expect(get((await import("../interfaceStore")).interfaceStore).taskHiddenRepositories).toEqual([]);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
+  it("defaults repository sort to name-asc, persists choices, sanitizes invalid values, and resets on view reset", async () => {
+    expect(get(interfaceStore).taskRepositorySort).toBe("name-asc");
+    interfaceStore.setTaskRepositorySort("open");
+    expect(get(interfaceStore).taskRepositorySort).toBe("open");
+    interfaceStore.setTaskRepositorySort("recent");
+    expect(get(interfaceStore).taskRepositorySort).toBe("recent");
+    interfaceStore.setTaskRepositorySort("name-desc");
+    expect(get(interfaceStore).taskRepositorySort).toBe("name-desc");
+    interfaceStore.setTaskRepositorySort("invalid" as unknown as "name-asc");
+    expect(get(interfaceStore).taskRepositorySort).toBe("name-asc");
+
+    interfaceStore.setTaskRepositorySort("open");
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskRepositorySort).toBe("name-asc");
+
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const loadSort = async (stored: unknown) => {
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: memoryStorage({ gitpulse_interface_prefs: JSON.stringify({ taskRepositorySort: stored }) }) },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      return get((await import("../interfaceStore")).interfaceStore).taskRepositorySort;
+    };
+    try {
+      expect(await loadSort("name-asc")).toBe("name-asc");
+      expect(await loadSort("name-desc")).toBe("name-desc");
+      expect(await loadSort("open")).toBe("open");
+      expect(await loadSort("recent")).toBe("recent");
+      expect(await loadSort("invalid")).toBe("name-asc");
+      expect(await loadSort(123)).toBe("name-asc");
+      expect(await loadSort(null)).toBe("name-asc");
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else Reflect.deleteProperty(globalThis, "window");

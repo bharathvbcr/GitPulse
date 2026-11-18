@@ -18,6 +18,7 @@ import {
   tabId,
   panelId,
 } from "../../../src/lib/dom/tablist";
+import { stripMarkupComments } from "../../../src/lib/dom/markupText";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(here, "../../..");
@@ -382,7 +383,7 @@ describe("Part 2: Adversarial Stress-Testing of createRepoStore Tab Retention & 
     for (const relPath of filesToCheck) {
       const absPath = path.join(projectRoot, relPath);
       expect(existsSync(absPath)).toBe(true);
-      const content = readFileSync(absPath, "utf8").replace(/<!--[\s\S]*?-->/g, "");
+      const content = stripMarkupComments(readFileSync(absPath, "utf8"));
 
       // Invariant: no destructive keying on currentPath
       expect(content).not.toContain("{#key $repoStore.currentPath}");

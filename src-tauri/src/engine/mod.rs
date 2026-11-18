@@ -5,6 +5,7 @@ pub mod churn_store;
 pub mod commit_signature;
 pub mod content_search;
 pub mod cow_clone;
+pub mod dcgrep;
 pub mod deadbranch;
 pub mod git_cli;
 pub mod git_reader;

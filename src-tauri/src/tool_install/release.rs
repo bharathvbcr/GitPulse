@@ -496,17 +496,22 @@ pub fn verify_checksum(path: &Path, expected_hex: &str) -> Result<(), CommandErr
     Ok(())
 }
 
+/// App-owned bin directory path without creating it on disk.
+pub(crate) fn app_bin_dir_path() -> Result<PathBuf, String> {
+    let cfg = crate::tool_config::config_path()?;
+    let base = cfg
+        .parent()
+        .ok_or_else(|| format!("tools.json path {} has no parent directory", cfg.display()))?;
+    Ok(base.join("bin"))
+}
+
 /// App-owned bin directory for installed prebuilts.
 ///
 /// Follows `config_path()` so `GITPULSE_TOOL_CONFIG` tests (and anyone who
 /// relocates tools.json) keep binaries next to that file instead of writing
 /// into the real Application Support directory.
 pub fn app_bin_dir() -> Result<PathBuf, String> {
-    let cfg = crate::tool_config::config_path()?;
-    let base = cfg
-        .parent()
-        .ok_or_else(|| format!("tools.json path {} has no parent directory", cfg.display()))?;
-    let dir = base.join("bin");
+    let dir = app_bin_dir_path()?;
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     Ok(dir)
 }

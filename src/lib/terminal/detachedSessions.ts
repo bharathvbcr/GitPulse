@@ -126,12 +126,15 @@ export function parseListing(raw: unknown): TerminalListing | null {
   if (!text(row.id, 128) || !text(row.shell) || !text(row.cwd) || !text(row.repo)) return null;
   if (!optional(row.launcher) || !optional(row.run_id) || typeof row.detached !== "boolean") return null;
   if (row.parent_session_id !== undefined && row.parent_session_id !== null && !text(row.parent_session_id, 128)) return null;
+  if (row.title !== undefined && row.title !== null && !text(row.title, 512)) return null;
+  const parsedTitle = typeof row.title === "string" ? row.title.trim() : "";
   return {
     id: row.id as string, shell: row.shell as string, cwd: row.cwd as string, repo: row.repo as string,
     launcher: (row.launcher as string | null) ?? null, run_id: (row.run_id as string | null) ?? null,
     detached: row.detached,
     ...(row.ending === true ? { ending: true } : {}),
     ...(typeof row.parent_session_id === "string" ? { parent_session_id: row.parent_session_id } : {}),
+    ...(parsedTitle ? { title: parsedTitle } : {}),
   };
 }
 
@@ -169,13 +172,15 @@ function listDetached(
   const launcher = launcherOf(listing);
   const key = `${KEY_PREFIX}${listing.id}`;
   const label = launcherLabel(launcher);
+  const resolvedTitle = listing.title?.trim() || (listing.run_id ? "Task run" : undefined);
   let unsubscribe: (() => void) | null = null;
   let slot: Slot | null = take({
     key,
     repoPath: listing.repo,
     label,
     launcher,
-    ...(listing.run_id ? { title: "Task run", taskRunId: listing.run_id } : {}),
+    ...(resolvedTitle ? { title: resolvedTitle } : {}),
+    ...(listing.run_id ? { taskRunId: listing.run_id } : {}),
     ...(family ? { family } : {}),
     status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
     sessionId: listing.id,
@@ -193,11 +198,12 @@ function listDetached(
     // and its exit watch give way, before the tab that takes the session over
     // reserves its own slot: never listed twice, never counted twice against
     // the limit.
+    const revealTitle = slot?.current?.()?.title?.trim() || resolvedTitle || label;
     enqueueTaskTerminal({
       runId: listing.run_id ?? key,
       repoPath: listing.repo,
       provider: launcher,
-      title: listing.run_id ? "Task run" : label,
+      title: revealTitle,
       ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
       ...(family ? { family } : {}),
     });
@@ -230,7 +236,9 @@ export function keepDetached(
   slot: Slot,
   deps: { invoke?: Invoke; confirm?: Confirm; bus?: PtyBus; family?: string | null; conversations?: Conversations } = {},
 ): void {
-  listDetached(listing, deps.family ?? null, (record) => slot.handOver(record), {
+  const liveTitle = slot.current?.()?.title?.trim() || undefined;
+  const mergedListing = liveTitle ? { ...listing, title: liveTitle } : listing;
+  listDetached(mergedListing, deps.family ?? null, (record) => slot.handOver(record), {
     invoke: deps.invoke ?? (tauriInvoke as Invoke),
     confirm: deps.confirm ?? askConfirm,
     bus: deps.bus ?? tauriBus,

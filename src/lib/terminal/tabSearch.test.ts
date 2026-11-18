@@ -66,11 +66,22 @@ describe("filterTerminalTabs", () => {
     expect(found[0].id).toBe(tabs[17].id);
   });
 
-  it("matches launcher kind, status, and unread independently", () => {
-    const claude = createTab("claude");
+  it("matches launcher kind, status, launchName, live OSC title, agentDetail, and unread independently", () => {
+    const claude = {
+      ...createTab("claude"),
+      name: "Preserve E42",
+      launchName: "Preserve E42",
+      title: "✳ Running cargo test",
+    };
     const shell = createTab("shell");
-    const found = filterTerminalTabs([claude, shell], "claude");
-    expect(found.map((tab) => tab.id)).toEqual([claude.id]);
+    expect(filterTerminalTabs([claude, shell], "claude").map((tab) => tab.id)).toEqual([claude.id]);
+    expect(filterTerminalTabs([claude, shell], "Preserve").map((tab) => tab.id)).toEqual([claude.id]);
+    expect(filterTerminalTabs([claude, shell], "cargo").map((tab) => tab.id)).toEqual([claude.id]);
+    expect(
+      filterTerminalTabs([claude, shell], "Auditing splitTree", {
+        [shell.id]: { agentDetail: "Auditing splitTree.ts" },
+      }).map((tab) => tab.id),
+    ).toEqual([shell.id]);
     expect(
       filterTerminalTabs([claude, shell], "unread", { [shell.id]: { unread: true } }).map(
         (tab) => tab.id,
@@ -78,6 +89,11 @@ describe("filterTerminalTabs", () => {
     ).toEqual([shell.id]);
     expect(
       filterTerminalTabs([claude, shell], "error", { [claude.id]: { status: "error" } }).map(
+        (tab) => tab.id,
+      ),
+    ).toEqual([claude.id]);
+    expect(
+      filterTerminalTabs([claude, shell], "Pair 2", { [claude.id]: { groupLabel: "Pair 2" } }).map(
         (tab) => tab.id,
       ),
     ).toEqual([claude.id]);

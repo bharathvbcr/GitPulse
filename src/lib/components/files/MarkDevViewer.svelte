@@ -5,6 +5,7 @@
     Eye,
     Code,
     Columns,
+    Rows2,
     ExternalLink,
     Copy,
     Check,
@@ -14,6 +15,8 @@
     Sparkles,
     WrapText,
   } from "@lucide/svelte";
+  import { observeResize } from "../../dom/observeResize";
+  import { resolveMarkDevLayout } from "../../files/markdevLayout";
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import type { LineEnding } from "../../files/types";
@@ -167,6 +170,35 @@
 
   let previewContainerEl: HTMLDivElement | undefined = $state();
   let markdevBar: HTMLDivElement | undefined = $state();
+  let viewportEl: HTMLDivElement | undefined = $state();
+  let viewportWidth = $state(0);
+
+  $effect(() => {
+    const el = viewportEl;
+    if (!el) return;
+    const sync = (w: number) => {
+      viewportWidth = Number.isFinite(w) && w > 0 ? w : 0;
+    };
+    sync(el.clientWidth);
+    return observeResize(el, (entries) => {
+      const rect = entries.find((entry) => entry.target === el)?.contentRect ?? entries[0]?.contentRect;
+      if (rect) sync(rect.width);
+    });
+  });
+
+  let layout = $derived(
+    resolveMarkDevLayout({
+      width: viewportWidth,
+      outlineRequested: showOutline,
+      hasOutline: outline.length > 0,
+    }),
+  );
+  let modeButtonClass = $derived(
+    layout.toolbar === "stacked"
+      ? "gp-seg-btn flex flex-1 min-w-0 items-center justify-center gap-1 px-2!"
+      : "gp-seg-btn flex items-center gap-1 @md/markdev:gap-1.5 px-2! @md/markdev:px-2.5!",
+  );
+  let modeLabelClass = $derived(layout.toolbar === "stacked" ? "hidden @3xs/markdev:inline truncate" : "");
 
   async function handleCopySource() {
     if (!(await copyText(rawContent))) {
@@ -212,6 +244,61 @@
   }
 </script>
 
+<!--
+  Rendered / Split / Raw. One instance, placed by `layout.toolbar`: inline in
+  the toolbar row when the viewer is wide enough for it, otherwise on a row of
+  its own under the toolbar so it is never scrolled out of reach. Labels give
+  way to icons only in the narrowest panes; the aria-label keeps each name.
+-->
+{#snippet modeSwitch()}
+  <div class="gp-segmented" role="group" aria-label="Markdown view" data-markdev-modes={layout.toolbar}>
+    <button
+      type="button"
+      onclick={() => (viewMode = "rendered")}
+      aria-pressed={viewMode === "rendered"}
+      aria-label="Rendered"
+      class={modeButtonClass}
+      data-active={viewMode === "rendered"}
+      title="Rendered view: formatted Markdown with rich blocks"
+    >
+      <Eye size={12} />
+      <span class={modeLabelClass}>Rendered</span>
+    </button>
+
+    <button
+      type="button"
+      onclick={() => (viewMode = "split")}
+      aria-pressed={viewMode === "split"}
+      aria-label="Split"
+      class={modeButtonClass}
+      data-active={viewMode === "split"}
+      title={layout.splitDirection === "vertical"
+        ? "Split view: raw source above live preview"
+        : "Split view: raw source and live preview side by side"}
+    >
+      {#if layout.splitDirection === "vertical"}
+        <Rows2 size={12} />
+      {:else}
+        <Columns size={12} />
+      {/if}
+      <span class={modeLabelClass}>Split</span>
+    </button>
+
+    <button
+      type="button"
+      onclick={() => (viewMode = "raw")}
+      aria-pressed={viewMode === "raw"}
+      aria-label="Raw"
+      class={modeButtonClass}
+      data-active={viewMode === "raw"}
+      title="Raw view: source editor with line numbers and find"
+    >
+      <Code size={12} />
+      <span class={modeLabelClass}>Raw</span>
+    </button>
+  </div>
+{/snippet}
+
 {#snippet page()}
   {#if renderError}
     <div class="gp-md-notice" role="status">
@@ -227,7 +314,7 @@
     </div>
   {/if}
   {#if rendered.frontmatter.length > 0}
-    <dl class="gp-md-frontmatter" aria-label="Frontmatter">
+    <dl class="gp-md-frontmatter max-w-full overflow-x-auto" aria-label="Frontmatter">
       {#each keyedList(rendered.frontmatter, (field) => field.key) as { item: field, key: fieldKey } (fieldKey)}
         <dt>{field.key}</dt>
         <dd>{field.value}</dd>
@@ -237,17 +324,20 @@
   <MarkdownContent html={rendered.html} {note} />
 {/snippet}
 
-<div class="flex flex-col h-full bg-background font-sans text-xs min-h-0 select-text relative">
+<div
+  class="@container/markdev flex-1 flex flex-col h-full w-full bg-background font-sans text-xs min-h-0 min-w-0 overflow-hidden select-text relative"
+  data-markdev-layout={layout.mode}
+>
   <!-- MarkDev Integrated Header Toolbar -->
   <div class="relative shrink-0 select-none" data-tip-place="above">
     <div bind:this={markdevBar} class="gp-header-scroll">
-      <div class="flex items-center justify-between gap-2 px-3 py-1.5 min-w-max w-full">
+      <div class="flex items-center justify-between gap-1.5 @md/markdev:gap-2 px-2 @md/markdev:px-3 py-1.5 min-w-max w-full">
     <!-- Left: MarkDev Brand & Outline Toggle -->
-    <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-edge shadow-xs">
+    <div class="flex items-center gap-1.5 @md/markdev:gap-2 shrink-0">
+      <div class="hidden @3xs/markdev:flex items-center gap-1.5 py-0.5 px-2 rounded-full bg-surface border border-edge shadow-xs">
         <MarkDevLogo size={15} />
-        <span class="font-semibold text-textPrimary text-meta">MarkDev</span>
-        <span class="gp-chip font-mono" data-tone="accent" data-kind="count">.MD</span>
+        <span class="hidden @2xl/markdev:inline font-semibold text-textPrimary text-meta">MarkDev</span>
+        <span class="hidden @3xl/markdev:inline-flex gp-chip font-mono" data-tone="accent" data-kind="count">.MD</span>
       </div>
 
       {#if outline.length > 0}
@@ -255,60 +345,27 @@
           type="button"
           onclick={() => (showOutline = !showOutline)}
           aria-pressed={showOutline}
+          aria-label="{showOutline ? 'Hide' : 'Show'} table of contents"
           title="{showOutline ? 'Hide' : 'Show'} table of contents"
           class="gp-btn text-meta {showOutline ? 'border-accent/65 bg-accent/15 text-accent font-semibold' : ''}"
           data-size="sm"
         >
           <ListTree size={12} />
-          <span>Outline</span>
-          <span class="text-micro text-faint font-mono">({outline.length})</span>
+          <span class="hidden @xl/markdev:inline">Outline</span>
+          <span class="hidden @3xs/markdev:inline text-micro text-faint font-mono">({outline.length})</span>
         </button>
       {/if}
     </div>
 
-    <!-- Center: MarkDev Tri-Mode Switcher (Rendered / Split / Raw) -->
-    <div class="gp-segmented" role="group" aria-label="Markdown view">
-      <button
-        type="button"
-        onclick={() => (viewMode = "rendered")}
-        aria-pressed={viewMode === "rendered"}
-        class="gp-seg-btn flex items-center gap-1.5"
-        data-active={viewMode === "rendered"}
-        title="Rendered view: formatted Markdown with rich blocks"
-      >
-        <Eye size={12} />
-        <span>Rendered</span>
-      </button>
-
-      <button
-        type="button"
-        onclick={() => (viewMode = "split")}
-        aria-pressed={viewMode === "split"}
-        class="gp-seg-btn flex items-center gap-1.5"
-        data-active={viewMode === "split"}
-        title="Split view: raw source and live preview side by side"
-      >
-        <Columns size={12} />
-        <span>Split</span>
-      </button>
-
-      <button
-        type="button"
-        onclick={() => (viewMode = "raw")}
-        aria-pressed={viewMode === "raw"}
-        class="gp-seg-btn flex items-center gap-1.5"
-        data-active={viewMode === "raw"}
-        title="Raw view: source editor with line numbers and find"
-      >
-        <Code size={12} />
-        <span>Raw</span>
-      </button>
-    </div>
+    <!-- Center: the mode switcher, while the row has room for it -->
+    {#if layout.toolbar === "inline"}
+      {@render modeSwitch()}
+    {/if}
 
     <!-- Right: Stats Pill & Open in MarkDev / Actions -->
-    <div class="flex items-center gap-1.5 shrink-0">
+    <div class="flex items-center gap-1 @md/markdev:gap-1.5 shrink-0">
       <!-- Reading Stats Pill -->
-      <div class="hidden md:block select-none">
+      <div class="hidden @5xl/markdev:block select-none">
         <span class="gp-chip gap-2 font-mono" data-tone="neutral">
           <span class="flex items-center gap-1">
             <BookOpen size={10} class="text-accent" />
@@ -339,41 +396,55 @@
       <button
         type="button"
         onclick={handleCopySource}
+        aria-label="Copy raw Markdown text"
         class="gp-btn text-meta"
         data-size="sm"
         title="Copy raw Markdown text"
       >
         {#if copiedSource}
           <Check size={11} class="text-ok" />
-          <span class="text-ok font-semibold">Copied</span>
+          <span class="hidden @xl/markdev:inline text-ok font-semibold">Copied</span>
         {:else}
           <Copy size={11} />
-          <span>Copy</span>
+          <span class="hidden @xl/markdev:inline">Copy</span>
         {/if}
       </button>
 
       <button
         type="button"
         onclick={openInMarkDev}
+        aria-label="Open in MarkDev"
         class="gp-btn text-meta"
         data-variant="primary"
         data-size="sm"
         title="Open in MarkDev desktop application or default editor"
       >
         <ExternalLink size={11} />
-        <span>Open in MarkDev</span>
+        <span class="hidden @3xl/markdev:inline">Open in MarkDev</span>
       </button>
     </div>
       </div>
     </div>
     <ScrollCue target={markdevBar} axis="x" />
+    {#if layout.toolbar === "stacked"}
+      <div class="grid px-2 pb-1.5" data-markdev-mode-row>
+        {@render modeSwitch()}
+      </div>
+    {/if}
   </div>
 
   <!-- Main Viewport Surface -->
-  <div class="flex-1 flex min-h-0 overflow-hidden relative">
+  <div
+    bind:this={viewportEl}
+    class="flex-1 flex {layout.outlineVisible && layout.outlineLayout === 'sheet' ? 'flex-col' : 'flex-row'} min-h-0 min-w-0 overflow-hidden relative"
+    data-outline-layout={layout.outlineVisible ? layout.outlineLayout : undefined}
+  >
     <!-- Outline / TOC Drawer -->
     {#if showOutline && outline.length > 0}
-      <div class="gp-float-card w-56 shrink-0 flex flex-col select-none" data-markdev-outline-card>
+      <div
+        class="gp-float-card {layout.outlineLayout === 'sheet' ? 'max-h-40' : 'w-56'} shrink-0 flex flex-col select-none"
+        data-markdev-outline-card
+      >
       <div class="flex-1 min-h-0 p-3 overflow-y-auto gp-scroll">
         <div class="gp-label mb-2 flex items-center gap-1.5">
           <Sparkles size={11} class="text-accent" />
@@ -402,9 +473,9 @@
       <!-- Fully Rendered View -->
       <div
         bind:this={previewContainerEl}
-        class="flex-1 min-h-0 min-w-0 p-8 overflow-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
+        class="@container/md-preview flex-1 min-h-0 min-w-0 p-3 @md/md-preview:p-5 @2xl/md-preview:p-8 overflow-auto gp-scroll bg-background select-text {wordWrap ? 'wrap-break-word' : ''}"
       >
-        <div class="gp-card p-8 max-w-4xl mx-auto shadow-card">
+        <div class="gp-card min-w-0 p-3.5 @md/md-preview:p-6 @2xl/md-preview:p-8 max-w-4xl mx-auto shadow-card">
           {@render page()}
           {#if backlinks.length > 0}
             <div class="mt-10">
@@ -425,7 +496,7 @@
       </div>
     {:else if viewMode === "raw"}
       <!-- Full Raw Editor View -->
-      <div class="flex-1 min-h-0 h-full">
+      <div class="grid grid-rows-[minmax(0,1fr)] grid-cols-[minmax(0,1fr)] flex-1 min-h-0 min-w-0 overflow-hidden">
         <CodeViewer
           {filePath}
           content={sourceContent}
@@ -442,10 +513,23 @@
         />
       </div>
     {:else if viewMode === "split"}
-      <!-- Side-by-Side Split View -->
-      <div class="flex-1 flex min-h-0 h-full gap-2">
-        <!-- Left: Raw Editor Pane -->
-        <div class="flex-1 min-w-0 h-full">
+      <!-- Adaptive Split View: side by side when wide. Stacked when narrow, the
+           two panes share the height and each scrolls itself: an outer
+           scroller would trap the wheel (pane scrollers contain overscroll),
+           leaving the lower pane out of reach in a short terminal split. -->
+      <div
+        class="flex-1 flex {layout.splitDirection === 'vertical'
+          ? 'flex-col overflow-hidden'
+          : 'flex-row overflow-x-auto overflow-y-hidden'} min-h-0 min-w-0 gap-2 gp-scroll"
+        data-markdev-split={layout.splitDirection}
+      >
+        <!-- Raw Editor Pane -->
+        <div
+          class="grid grid-rows-[minmax(0,1fr)] grid-cols-[minmax(0,1fr)] flex-1 basis-0 overflow-hidden {layout.splitDirection === 'vertical'
+            ? 'w-full min-w-0 min-h-0'
+            : 'h-full min-h-0 min-w-[260px]'}"
+          data-markdev-split-raw
+        >
           <CodeViewer
             {filePath}
             content={sourceContent}
@@ -462,12 +546,15 @@
           />
         </div>
 
-        <!-- Right: Live Rendered Preview Pane -->
+        <!-- Live Rendered Preview Pane -->
         <div
           bind:this={previewContainerEl}
-          class="flex-1 min-w-0 h-full p-6 overflow-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
+          class="@container/md-preview flex-1 basis-0 {layout.splitDirection === 'vertical'
+            ? 'w-full min-w-0 min-h-0'
+            : 'h-full min-h-0 min-w-[260px]'} p-2.5 @md/md-preview:p-4 @xl/md-preview:p-6 overflow-auto gp-scroll bg-background/60 select-text {wordWrap ? 'wrap-break-word' : ''}"
+          data-markdev-split-preview
         >
-          <div class="gp-card p-6 max-w-2xl mx-auto shadow-card">
+          <div class="gp-card min-w-0 p-3 @md/md-preview:p-5 @xl/md-preview:p-6 max-w-2xl mx-auto shadow-card">
             {@render page()}
           </div>
         </div>

@@ -175,4 +175,17 @@ describe("terminal view controls", () => {
     expect(commandJumpChord(key("ArrowUp", { ctrlKey: true, shiftKey: true }), "linux", false)).toBe("prev");
     expect(commandJumpChord(key("ArrowDown", { ctrlKey: true, shiftKey: true }), "windows", false)).toBe("next");
   });
+
+  it("maps copy chords while leaving plain Ctrl+C (SIGINT) untouched", () => {
+    expect(terminalViewChord(key("c", { metaKey: true }), "macos")).toBe("copy-selection");
+    expect(terminalViewChord(key("C", { metaKey: true, shiftKey: true }), "macos")).toBe("copy-last-output");
+    expect(terminalViewChord(key("C", { ctrlKey: true, shiftKey: true }), "macos")).toBeNull();
+    expect(terminalViewChord(key("c", { ctrlKey: true }), "macos")).toBeNull();
+
+    for (const os of ["linux", "windows", undefined]) {
+      expect(terminalViewChord(key("C", { ctrlKey: true, shiftKey: true }), os)).toBe("copy-selection");
+      expect(terminalViewChord(key("c", { ctrlKey: true, altKey: true }), os)).toBe("copy-last-output");
+      expect(terminalViewChord(key("c", { ctrlKey: true }), os)).toBeNull();
+    }
+  });
 });

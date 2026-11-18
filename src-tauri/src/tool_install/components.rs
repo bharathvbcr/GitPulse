@@ -202,11 +202,11 @@ fn catalogue() -> Vec<Spec<'static>> {
             id: "dcgrep",
             label: "dcgrep",
             need: ComponentNeed::HostResolved,
-            purpose: "Manvi's repository search. GitPulse does not spawn it directly.",
+            purpose: "Accelerates File Explorer search and file listing when installed (falling back to git), and powers Manvi's repository search.",
             probe: Probe::VersionWithFallback(&["health"]),
             presets: &["analysis", "all"],
             managed: None,
-            host_env: None,
+            host_env: Some("MANVI_GREP_BINARY"),
             workbench_schema: None,
         },
         Spec {
@@ -248,6 +248,9 @@ fn run_probe(path: &str, id: &str, args: &[&str]) -> Result<(bool, String), Stri
 
 /// Resolve one component's path without running it.
 fn locate(spec: &Spec<'_>) -> Option<String> {
+    if spec.id == "dcgrep" {
+        return crate::engine::dcgrep::locate_binary_for_inventory();
+    }
     if let Some(tool) = spec.managed {
         // Managed tools honour the explicit override and the saved config, so
         // reporting a PATH copy while the app runs a configured one elsewhere
@@ -573,6 +576,7 @@ fn probe_located_with(
 /// Probe every DevCouncil component and measure the install presets against
 /// the result.
 pub fn suite_status() -> SuiteStatus {
+    crate::tool_capability::invalidate_all();
     let specs = catalogue();
     let components: Vec<ComponentStatus> = specs.iter().map(probe).collect();
 

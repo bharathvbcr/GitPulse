@@ -8,6 +8,8 @@ import {
   MANAGED_VARS,
   MATERIAL_FLOOR,
   SHIPPED_FIELD,
+  WALLPAPER_INTENSITY_RANGE,
+  backdropDim,
   appearanceNotes,
   installAppearance,
   nearestPreset,
@@ -70,6 +72,7 @@ describe("planAppearance: defaults", () => {
       "data-radius-scale": null,
       "data-float-blur": null,
       "data-backdrop": null,
+      "data-backdrop-dim": null,
     });
   });
 });
@@ -435,6 +438,36 @@ describe("the wallpaper", () => {
     expect(other.notes.map((note) => note.id)).toContain("backdrop-host");
   });
 
+  it("at full intensity writes no fade, so the still is drawn exactly as before", () => {
+    const plan = planAppearance(prefs({ backdrop: "neural" }), mac);
+    expect(plan.vars["--gp-backdrop-dim"]).toBeUndefined();
+    expect(plan.attributes["data-backdrop-dim"]).toBeNull();
+  });
+
+  it("below full intensity fades by the remainder, through one variable the still and the moving layer share", () => {
+    const plan = planAppearance(prefs({ backdrop: "neural", wallpaperIntensity: 0.6 }), mac);
+    expect(plan.vars["--gp-backdrop-dim"]).toBe("0.4");
+    expect(plan.attributes["data-backdrop-dim"]).toBe("");
+    expect(MANAGED_VARS).toContain("--gp-backdrop-dim");
+    expect(MANAGED_ATTRIBUTES).toContain("data-backdrop-dim");
+    // Nothing to fade without a wallpaper.
+    const none = planAppearance(prefs({ wallpaperIntensity: 0.6 }), mac);
+    expect(none.vars["--gp-backdrop-dim"]).toBeUndefined();
+  });
+
+  it("holds intensity to its range on read: it can only fade, never brighten or vanish", () => {
+    expect(backdropDim(1)).toBe(0);
+    expect(backdropDim(5)).toBe(0);
+    expect(backdropDim(0)).toBe(Number((1 - WALLPAPER_INTENSITY_RANGE.min).toFixed(3)));
+    expect(backdropDim(Number.NaN)).toBe(0);
+    expect(sanitizeAppearance({ wallpaperIntensity: 7 }).wallpaperIntensity).toBe(1);
+    expect(sanitizeAppearance({ wallpaperIntensity: -1 }).wallpaperIntensity).toBe(WALLPAPER_INTENSITY_RANGE.min);
+    expect(sanitizeAppearance({ wallpaperIntensity: "loud" }).wallpaperIntensity).toBe(1);
+    expect(sanitizeAppearance({}).wallpaperMotion).toBe(false);
+    expect(sanitizeAppearance({ wallpaperMotion: "yes" }).wallpaperMotion).toBe(false);
+    expect(sanitizeAppearance({ wallpaperMotion: true }).wallpaperMotion).toBe(true);
+  });
+
   it("clears both when the wallpaper goes back to none", () => {
     const root = new FakeRoot();
     writeAppearance(planAppearance(prefs({ backdrop: "hex" }), mac), root);
@@ -503,6 +536,27 @@ describe("the wallpaper", () => {
     expect(hide).toBeGreaterThan(media);
     // And the in-app choice, keyed on the attribute (more specific, so it wins anywhere).
     expect(css).toContain('html.macos[data-transparency="reduced"][data-backdrop] body {\n  background-image: none;');
+  });
+
+  it("removes the faded and the moving forms under the same preferences", () => {
+    // The fade's selector is more specific than the plain hide, so it needs its own.
+    const media = css.indexOf("@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {");
+    expect(css.indexOf("  html.macos[data-backdrop][data-backdrop-dim] body {\n    background-image: none;", media)).toBeGreaterThan(media);
+    expect(css.indexOf("  html.macos .gp-wallpaper-motion {\n    display: none;", media)).toBeGreaterThan(media);
+    expect(css).toContain('html.macos[data-transparency="reduced"][data-backdrop][data-backdrop-dim] body {\n  background-image: none;');
+    expect(css).toContain('html.macos[data-transparency="reduced"] .gp-wallpaper-motion {\n  display: none;');
+    // The moving layer sits under body, below every in-flow box, and moves only transform and opacity.
+    const layer = /\.gp-wallpaper-motion \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    expect(layer).toMatch(/position: fixed;/);
+    expect(layer).toMatch(/z-index: -1;/);
+    for (const [, name, body] of css.matchAll(/@keyframes (gp-wp-[a-z]+) \{([\s\S]*?)\n\}/g)) {
+      const properties = [...body.matchAll(/^\s*([a-z-]+):/gm)].map((match) => match[1]);
+      expect(properties.every((property) => property === "transform" || property === "opacity"), name).toBe(true);
+    }
+    // Movement is declared only where motion is welcome.
+    const motionBlock = css.indexOf("html:not([data-motion=\"reduced\"]) .gp-wallpaper-motion > .gp-wp-drift");
+    expect(css.lastIndexOf("@media (prefers-reduced-motion: no-preference) {", motionBlock)).toBeGreaterThan(-1);
+    expect(css).not.toMatch(/\.gp-wallpaper-motion[^{]*\{[^}]*\bfilter:/);
   });
 });
 

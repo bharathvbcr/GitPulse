@@ -136,6 +136,16 @@ export function createSessionLifecycle(options: {
    * or reconnecting this same process, must not.
    */
   let lossNotice: string | null = null;
+  let currentTitle: string | undefined = options.title;
+  let currentPlacement: {
+    isActive: boolean;
+    splitSlot: number | null;
+    attention: string | null;
+  } = {
+    isActive: false,
+    splitSlot: null,
+    attention: null,
+  };
 
   function state(status: "starting" | "running" | "exited" | "error", message?: string) {
     if (status === "starting" || status === "running") shownError = null;
@@ -246,6 +256,7 @@ export function createSessionLifecycle(options: {
         return;
       } catch { /* the slot was not taken; this lifecycle keeps it below */ }
     }
+    slot?.setPlacement({ isActive: false, splitSlot: null, attention: null });
     slot?.update("Still running — its tab was closed");
   }
   async function launch(reconnect: boolean) {
@@ -261,7 +272,10 @@ export function createSessionLifecycle(options: {
           ...(options.checkout ? { checkout: options.checkout } : {}),
           ...(options.launcher ? { launcher: options.launcher } : {}),
           reveal: options.reveal, confirmClose: options.confirmClose,
-          ...(options.title ? { title: options.title } : {}),
+          ...(currentTitle ? { title: currentTitle } : {}),
+          ...(currentPlacement.isActive ? { isActive: true } : {}),
+          ...(currentPlacement.splitSlot != null ? { splitSlot: currentPlacement.splitSlot } : {}),
+          ...(currentPlacement.attention ? { attention: currentPlacement.attention } : {}),
           ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
           ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
         };
@@ -439,6 +453,22 @@ export function createSessionLifecycle(options: {
       void resizeLatest();
     },
     fail,
+    retitle(nextTitle: string | undefined) {
+      currentTitle = nextTitle;
+      slot?.retitle(nextTitle);
+    },
+    setPlacement(placement: {
+      isActive?: boolean;
+      splitSlot?: number | null;
+      attention?: string | null;
+    }) {
+      currentPlacement = {
+        isActive: placement.isActive ?? false,
+        splitSlot: placement.splitSlot ?? null,
+        attention: placement.attention?.trim() || null,
+      };
+      slot?.setPlacement(currentPlacement);
+    },
     /** The user's Close: ends the process. A view going away uses `dispose`. */
     close,
     isCurrent: (sessionId: string) => !disposed && id === sessionId,

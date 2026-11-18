@@ -312,6 +312,7 @@
     "allow-cmd-terminal-session-ledger",
     "allow-cmd-terminal-session-ledger-dismiss",
     "allow-cmd-terminal-session-ledger-reopen-check",
+    "allow-cmd-terminal-set-title",
     "allow-cmd-terminal-spawn",
     "allow-cmd-terminal-transcript",
     "allow-cmd-terminal-write",

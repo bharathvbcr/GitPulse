@@ -151,7 +151,7 @@ describe("host-gated settings", () => {
   it("gates the glass material settings by capability, not by OS name", () => {
     expect(REQUIREMENTS).toContain("nativeMaterial");
     const unsupported = unsupportedSettingIds({ ...capabilities(true), nativeMaterial: false });
-    for (const id of ["material-intensity", "float-blur", "background-field", "transparency"]) {
+    for (const id of ["material-intensity", "float-blur", "background-field", "wallpaper", "transparency"]) {
       expect(unsupported.has(id)).toBe(true);
     }
     // Everything else in Appearance is portable CSS and stays.

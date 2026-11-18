@@ -180,6 +180,35 @@ pub enum Thermal {
     Critical,
 }
 
+/// Host CPU busy percentages over the last sampling interval (`0.0..=100.0`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct CpuUsage {
+    pub total_pct: f64,
+    pub user_pct: f64,
+    pub system_pct: f64,
+}
+
+/// Host GPU residency and memory from IOKit `IOAccelerator` (`PerformanceStatistics`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct GpuSample {
+    pub utilization_pct: f64,
+    pub renderer_pct: Option<f64>,
+    pub tiler_pct: Option<f64>,
+    pub memory_in_use: Option<u64>,
+    pub memory_allocated: Option<u64>,
+}
+
+/// Physical memory breakdown. On macOS `used_bytes` matches Activity Monitor:
+/// `(internal_page_count - purgeable_count + wire_count + compressor_page_count) * page_size`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemorySample {
+    pub used_bytes: u64,
+    pub app_bytes: Option<u64>,
+    pub wired_bytes: Option<u64>,
+    pub compressed_bytes: Option<u64>,
+    pub cached_bytes: Option<u64>,
+}
+
 impl Thermal {
     pub(super) fn code(self) -> u8 {
         match self {
@@ -233,12 +262,49 @@ pub struct HostSample {
     pub free_disk: Reading<u64>,
     pub thermal: Reading<Thermal>,
     pub power: Reading<Power>,
+    pub cpu_usage: Reading<CpuUsage>,
+    pub gpu: Reading<GpuSample>,
+    pub memory: Reading<MemorySample>,
+    /// Total capacity of the volume holding GitPulse's state.
+    pub total_disk: Reading<u64>,
+    /// SoC die temperature in degrees Celsius (`IOHIDEventSystemClient`), when readable.
+    pub thermal_temp_c: Reading<f64>,
+}
+
+impl HostSample {
+    /// A sample where every reading carries the same unavailability reason.
+    pub fn unavailable(why: Why) -> Self {
+        Self {
+            pressure: Reading::Unavailable(why),
+            swap_used: Reading::Unavailable(why),
+            swap_total: Reading::Unavailable(why),
+            compressor: Reading::Unavailable(why),
+            compressed_bytes: Reading::Unavailable(why),
+            compressor_segments: Reading::Unavailable(why),
+            load: Reading::Unavailable(why),
+            cores: Reading::Unavailable(why),
+            memsize: Reading::Unavailable(why),
+            open_files: Reading::Unavailable(why),
+            max_files: Reading::Unavailable(why),
+            free_disk: Reading::Unavailable(why),
+            thermal: Reading::Unavailable(why),
+            power: Reading::Unavailable(why),
+            cpu_usage: Reading::Unavailable(why),
+            gpu: Reading::Unavailable(why),
+            memory: Reading::Unavailable(why),
+            total_disk: Reading::Unavailable(why),
+            thermal_temp_c: Reading::Unavailable(why),
+        }
+    }
 }
 
 /// The seam every host reading comes through: the OS on a real run, a trace
 /// on a replay.
 pub trait Sensor {
     fn sample(&mut self) -> HostSample;
+    /// Clears any stateful sampling baselines (e.g. previous CPU tick counters)
+    /// when measurement pauses or turns off.
+    fn reset(&mut self) {}
 }
 
 /// Host readings from this operating system.
@@ -258,6 +324,10 @@ impl OsSensor {
 impl Sensor for OsSensor {
     fn sample(&mut self) -> HostSample {
         self.probe.sample()
+    }
+
+    fn reset(&mut self) {
+        self.probe.reset();
     }
 }
 

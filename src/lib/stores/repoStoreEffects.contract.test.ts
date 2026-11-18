@@ -7,6 +7,7 @@ import { filterPathsByFileQuery, parseFileQuery } from "../files/fileQuery";
 import { mergeListedAndStatusPaths } from "../files/fileStatus";
 import { memoryStorage } from "../repos/persist";
 import { createRepoStore, type InvokeFn } from "./repoStore";
+import { firstScriptBlock, scriptBlocks } from "../dom/markupText";
 import { codeOnly, svelteFiles } from "./sourceScan";
 
 /**
@@ -36,11 +37,8 @@ interface EffectRead {
 /** Every `$repoStore` read inside an `$effect` / `$effect.pre` body. */
 function effectStoreReads(source: string): EffectRead[] {
   const reads: EffectRead[] = [];
-  const scripts = /<script\b[^>]*>([\s\S]*?)<\/script>/g;
-  let block: RegExpExecArray | null;
-  while ((block = scripts.exec(source)) !== null) {
-    const offset = block.index + block[0].indexOf(">") + 1;
-    const code = codeOnly(block[1]);
+  for (const block of scriptBlocks(source)) {
+    const code = codeOnly(block.inner);
     const effects = /\$effect(?:\.pre)?\s*\(/g;
     let effect: RegExpExecArray | null;
     while ((effect = effects.exec(code)) !== null) {
@@ -51,7 +49,7 @@ function effectStoreReads(source: string): EffectRead[] {
       }
       const body = code.slice(effect.index, end);
       for (const read of body.matchAll(/\$repoStore\b[\w.?]*/g)) {
-        const at = offset + effect.index + (read.index ?? 0);
+        const at = block.innerStart + effect.index + (read.index ?? 0);
         reads.push({ line: source.slice(0, at).split("\n").length, read: read[0] });
       }
     }
@@ -117,7 +115,7 @@ describe("file tree array identity", () => {
 
   it("FileTreePanel feeds its derived chain from one identity-stable statuses read", () => {
     const panel = readFileSync(join(SRC, "lib", "components", "files", "FileTreePanel.svelte"), "utf8");
-    const script = codeOnly(/<script\b[^>]*>([\s\S]*?)<\/script>/.exec(panel)?.[1] ?? "");
+    const script = codeOnly(firstScriptBlock(panel)?.inner ?? "");
     expect(script).toMatch(/const statuses = \$derived\(\$repoStore\.statuses\)/);
     // A fresh array built straight from the whole store defeats it: a derived
     // that maps `$repoStore.statuses` is a new array on every publish.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 import PulseLineTrend from "./PulseLineTrend.svelte";
+import { visibleMarkupText } from "../../dom/markupText";
 import type { PulseCommitSummary } from "../../pulse/types";
 
 const source = readFileSync(new URL("./PulseLineTrend.svelte", import.meta.url), "utf8");
@@ -65,7 +66,7 @@ describe("PulseLineTrend totals", () => {
   /** Whitespace-normalised visible text. */
   function text(commits: PulseCommitSummary[], scoped = false): string {
     const { body } = render(PulseLineTrend, { props: { commits, now: NOW, scoped } });
-    return body.replace(/<!--.*?-->/g, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+    return visibleMarkupText(body);
   }
 
   // Two commits inside the 26-week window, one 30 weeks back that the chart cannot show.

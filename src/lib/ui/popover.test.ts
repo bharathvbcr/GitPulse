@@ -364,6 +364,45 @@ describe("popover placement", () => {
     handle.destroy();
   });
 
+  it("re-places an above-anchored panel via ResizeObserver when content grows after update", () => {
+    fakeWindow({ width: 1000, height: 900 });
+    const observers: Array<() => void> = [];
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: () => void) {
+          observers.push(cb);
+        }
+        observe() {}
+        disconnect = disconnect;
+      },
+    );
+
+    const node = fakeNode({ width: 320, height: 200 });
+    const handle = popover(node, {
+      anchor: {
+        kind: "element",
+        element: anchorElement({ left: 600, right: 920, top: 860, bottom: 888 }),
+        gap: 6,
+        place: "above",
+        align: "end",
+      },
+    });
+    // Initially 860 - 6 - 200 = 654 -> bottom edge 854.
+    expect(node.style.top).toBe("654px");
+    expect(observers).toHaveLength(1);
+
+    // Simulate Svelte mounting a taller conditional child after action mount/update.
+    node.offsetHeight = 310;
+    for (const cb of observers) cb();
+    expect(node.style.top).toBe("544px");
+    expect(544 + 310).toBeLessThanOrEqual(860 - 6);
+
+    handle.destroy();
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
+
   it("lines an end-aligned panel up with its trigger's right edge", () => {
     // A trigger at the right of a narrow pane: opening flush-left would push
     // the panel across the neighbouring pane instead of under its own button.

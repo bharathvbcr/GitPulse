@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 import PulsePeriodCompare from "./PulsePeriodCompare.svelte";
+import { visibleMarkupText } from "../../dom/markupText";
 import type { PulseCommitSummary } from "../../pulse/types";
 
 const source = readFileSync(new URL("./PulsePeriodCompare.svelte", import.meta.url), "utf8");
@@ -45,7 +46,7 @@ describe("PulsePeriodCompare without a prior period to compare with", () => {
   }
 
   const text = (props: { commits: PulseCommitSummary[]; truncated?: boolean }): string =>
-    render(PulsePeriodCompare, { props }).body.replace(/<!--.*?-->/g, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+    visibleMarkupText(render(PulsePeriodCompare, { props }).body);
 
   it("shows a neutral \"new\" rather than +100% when the prior period is empty", () => {
     const rendered = text({ commits: [commit(3)] });

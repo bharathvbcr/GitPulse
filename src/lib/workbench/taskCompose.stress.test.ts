@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyNotesToDraft, canAskManvi, consumeNotes, sanitizeNotes, titleFromNotes } from "./taskCompose";
+import { applyNotesToDraft, canAskManvi, composeFromNotes, sanitizeNotes, titleFromNotes } from "./taskCompose";
 
 const ABBREVIATIONS = ["Dr", "Mr", "Mrs", "Ms", "Prof", "vs", "etc", "e.g", "i.e", "U.S"] as const;
 
@@ -31,6 +31,15 @@ describe("notes extraction adversarial corpus", () => {
       "- [x] Preserve `src/main.go` and E42",
       "A.\nSecond line holds the real work for E42.",
       `${"Keep E42. ".repeat(80)}Do not truncate identifiers.`,
+      // The shapes text-to-task reads: a list, a hard-wrapped paragraph, a
+      // labelled section with an intro line, an item wrapped at the margin, an
+      // item with code under it, and nested detail.
+      "- Reproduce E42 on login\n- Fix pkg/auth/session.go\n- Ship #21",
+      "The upload to E42 fails when the\nnetwork drops and pkg/net/retry.go gives up.",
+      "## Description\nLogin loops for E7.\n\n## Tasks\nDo these in order:\n- Read pkg/auth/login.go\n- Fix E8",
+      "- [ ] Retry the upload for E9 when the\nnetwork drops\n- [ ] Close #30",
+      "Subtasks:\n- Run E10\n  ```sh\n  go test ./pkg/x/y.go\n  ```\n- Ship E11",
+      "- [ ] Parent E12\n  - detail for #13\nAfter E14.",
     ];
     for (const notes of samples) {
       const applied = applyNotesToDraft({ title: "", description: "" }, notes);
@@ -38,9 +47,13 @@ describe("notes extraction adversarial corpus", () => {
       expect(applied.title.length).toBeGreaterThan(2);
       expect(applied.title).not.toMatch(/^(?:\d+|[A-Za-z]{1,4}|[A-Za-z](?:\.[A-Za-z])+)\.$/);
       expect(applied.description).toBe(sanitizeNotes(notes));
-      const consumed = consumeNotes({ title: "", description: "" }, notes);
+      const consumed = composeFromNotes({ title: "", description: "" }, notes);
       expect(consumed.notes).toBe("");
       expect(consumed.extracted).toBe(true);
+      // A checklist line moves to the criteria; nothing the author wrote is lost
+      // between the three fields.
+      const kept = [consumed.title, consumed.description, ...consumed.acceptance_criteria].join("\n");
+      for (const id of notes.match(/E\d+|#\d+|[\w./]+\.go/g) ?? []) expect(kept, notes).toContain(id);
       expect(canAskManvi({ title: "", repository_ids: ["r"] }, notes)).toBeNull();
     }
     expect(canAskManvi({ title: "Keep", repository_ids: ["r"] }, "界".repeat(22_000))).toMatch(/64 KB/);
@@ -54,7 +67,7 @@ describe("notes extraction adversarial corpus", () => {
       description: "Keep E42",
       extracted: true,
     });
-    const once = consumeNotes({ title: "", description: "" }, "Preserve repository scope.");
-    expect(consumeNotes({ title: once.title, description: once.description }, once.notes).extracted).toBe(false);
+    const once = composeFromNotes({ title: "", description: "" }, "Preserve repository scope.");
+    expect(composeFromNotes({ title: once.title, description: once.description }, once.notes).extracted).toBe(false);
   });
 });

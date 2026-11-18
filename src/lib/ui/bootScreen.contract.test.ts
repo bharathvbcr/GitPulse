@@ -22,7 +22,7 @@ function tokenBg(selectorPattern: RegExp): string {
 
 /** The `rgb(r g b)` literal the boot rule paints, as a triplet. */
 function bootBg(selector: string): string {
-  const escaped = selector.replace(/[.#]/g, "\\$&");
+  const escaped = selector.replace(/[\\.#]/g, "\\$&");
   const hit = new RegExp(`${escaped}\\s*\\{[^}]*background:\\s*rgb\\((\\d+ \\d+ \\d+)\\)`).exec(html);
   if (!hit) throw new Error(`index.html has no background: rgb() for ${selector}`);
   return hit[1];

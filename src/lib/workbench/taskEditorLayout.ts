@@ -18,9 +18,10 @@ export const EDITOR_SECTION_IDS = [
   "repositories",
   "assist",
   "title",
+  "criteria",
   "logs",
   "schedule",
-  "owner",
+  "relations",
 ] as const;
 
 export type EditorSectionId = (typeof EDITOR_SECTION_IDS)[number];
@@ -45,13 +46,21 @@ export const ASSIST_HEADING_DRAFT = "Notes";
 /** Secondary heading on a saved task: improve wording, do not compose a second card. */
 export const ASSIST_HEADING_SAVED = "Improve with model";
 
+/**
+ * "Acceptance criteria" is its own section and says what it stores. It used to
+ * be "Subtasks and acceptance criteria" inside the title section, while the
+ * checklist and the real child subtasks sat under "Status and scheduling" —
+ * three things called subtasks in three places. Owner is one field, so it is
+ * a field under Details rather than a numbered section of its own.
+ */
 const HEADINGS: Readonly<Record<EditorSectionId, string>> = Object.freeze({
   repositories: "Repositories",
   assist: ASSIST_HEADING_DRAFT,
   title: "Title and description",
+  criteria: "Acceptance criteria",
   logs: "Raw logs",
-  schedule: "Status and scheduling",
-  owner: "Owner",
+  schedule: "Details",
+  relations: "Checklist, links and subtasks",
 });
 
 /**
@@ -65,18 +74,20 @@ const DRAFT_ORDER: readonly EditorSectionId[] = Object.freeze([
   "repositories",
   "assist",
   "title",
+  "criteria",
   "logs",
   "schedule",
-  "owner",
+  "relations",
 ]);
 
 const SAVED_ORDER: readonly EditorSectionId[] = Object.freeze([
   "repositories",
   "title",
+  "criteria",
   "assist",
   "logs",
   "schedule",
-  "owner",
+  "relations",
 ]);
 
 function headingFor(id: EditorSectionId, saved: boolean): string {

@@ -126,15 +126,31 @@ export function formatSubtaskProgress(metrics: SubtaskRollupMetrics): string {
   return `${metrics.completed} of ${metrics.total} subtasks done (${metrics.percentComplete}%)`;
 }
 
-const SUBTASK_PLACEHOLDER = /^(?:no\s+acceptance\s+criteria\s+recorded|none|n\/a)\.?$/i;
+/** A line that stands for "no criteria": a template's empty slot, never an item. */
+export const SUBTASK_PLACEHOLDER = /^(?:no\s+acceptance\s+criteria\s+recorded|none|n\/a)\.?$/i;
 const SUBTASK_TITLE_LIMIT = 300;
 const SUBTASK_COUNT_LIMIT = 32;
 
-function normalizeSubtaskTitle(rawLine: string): string {
+/** Bullets as Markdown writes them, and as Notes, Slack and word processors paste them. */
+export const LIST_BULLET = String.raw`(?:[-*+•–—▪◦]|\d+[.)])`;
+const LEADING_BULLET = new RegExp(String.raw`^${LIST_BULLET}(?:\s+|$)`);
+const LEADING_BOX = /^(?:\[[ xX]\]|[☐☑☒])\s*/;
+
+/**
+ * A list line's text without its marker: "- [ ] item", "1. item", "• item",
+ * "☐ item" and "[ ] 2) item" all give "item". The one stripper for the task
+ * sheet's criteria and the breakdown box's card titles.
+ */
+export function stripListMarker(rawLine: string): string {
   let text = rawLine.trim();
-  text = text.replace(/^(?:[-*+]|\d+[.)])(?:\s+|$)/, "").trim();
-  text = text.replace(/^\[[ xX]\]\s*/, "").trim();
-  text = text.replace(/^(?:[-*+]|\d+[.)])(?:\s+|$)/, "").trim();
+  // The bullet comes before the box in "- [ ] item", so it goes first.
+  text = text.replace(LEADING_BULLET, "").trim();
+  text = text.replace(LEADING_BOX, "").trim();
+  return text.replace(LEADING_BULLET, "").trim();
+}
+
+function normalizeSubtaskTitle(rawLine: string): string {
+  const text = stripListMarker(rawLine);
   if (!text || SUBTASK_PLACEHOLDER.test(text)) return "";
   const chars = [...text];
   return chars.length > SUBTASK_TITLE_LIMIT ? chars.slice(0, SUBTASK_TITLE_LIMIT).join("") : text;

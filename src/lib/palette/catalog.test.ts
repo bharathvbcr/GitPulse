@@ -390,6 +390,11 @@ describe("command catalog and context", () => {
     const commands = buildCommands(current, () => {});
     expect(commands.filter(command => command.id.startsWith("recent:"))).toHaveLength(1);
     expect(commands.find(command => command.id === "switch:a")?.description).toBe("/one/same");
+    expect(commands.find(command => command.id === "switch:a")?.badge).toBeUndefined();
+    const activeSwitch = commands.find(command => command.id === "switch:b");
+    expect(activeSwitch?.description).toBe("/two/same");
+    expect(activeSwitch?.badge).toBe("Active");
+    expect(activeSwitch?.disabledReason).toBe("Already on b/same. Choose another repository to switch.");
     await commands.find(command => command.id === "switch:a")?.action();
     expect(open).toHaveBeenLastCalledWith("/one/same");
     await commands.find(command => command.id === "recent:/four/same")?.action();

@@ -188,11 +188,16 @@ export function createViewNavigation(deps: ViewNavigationDeps) {
     selectFilePath: (filePath: string | null) => {
       const session = deps.activeSession();
       if (!session) return;
+      // A diff read in flight would apply its own file when it lands. This
+      // selection is newer, so it stops that read: otherwise a read slowed by
+      // an agent's load lands later and Code view opens its file unasked.
+      diffSelection.supersede();
       deps.applyToSession(session.id, session.generation, {
         selectedFilePath: filePath,
         selectedCommitId: null,
         selectedCompareBase: null,
         selectionKind: "file",
+        selectedDiffPending: false,
       });
     },
     setIgnoreWhitespace: (next: boolean) => {
@@ -291,7 +296,10 @@ export function createViewNavigation(deps: ViewNavigationDeps) {
       deps.bumpOpenEpoch();
       const session = deps.activeSession();
       if (!session || !commitId) return;
+      // As in selectFilePath: a newer selection stops the read in flight.
+      diffSelection.supersede();
       deps.applyToSession(session.id, session.generation, {
+        selectedDiffPending: false,
         selectedCommitId: commitId,
         selectedCompareBase: null,
         selectedFilePath: null,

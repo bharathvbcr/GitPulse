@@ -351,3 +351,42 @@ describe("runningAgents", () => {
     expect(runningAgents([])).toEqual([]);
   });
 });
+
+describe("live title updates via slot.retitle", () => {
+  it("updates title in place while preserving sessionId, status, and handlers, and skips redundant publishes", () => {
+    const registry = createSessionRegistry();
+    const reveal = () => {};
+    const confirmClose = async () => true;
+    const slot = registry.reserve(record({ label: "Claude", launcher: "claude", status: "running", reveal, confirmClose }));
+    slot.identify("term-live-1");
+
+    const publications: Array<string | undefined> = [];
+    const stop = registry.subscribe((rows) => publications.push(rows[0]?.title));
+    publications.length = 0;
+
+    slot.retitle("✳ Fixing auth\u0007bug");
+    expect(get(registry)[0]).toMatchObject({
+      title: "✳ Fixing auth bug",
+      sessionId: "term-live-1",
+      status: "running",
+      reveal,
+      confirmClose,
+    });
+    expect(publications).toEqual(["✳ Fixing auth bug"]);
+
+    // Identical sanitized value emits nothing.
+    slot.retitle("✳ Fixing auth bug");
+    expect(publications).toHaveLength(1);
+
+    // Blank / control-only resets title to undefined cleanly.
+    slot.retitle("   \u200b  ");
+    expect(get(registry)[0].title).toBeUndefined();
+    expect(publications).toEqual(["✳ Fixing auth bug", undefined]);
+
+    // Ignores retitle after release or handOver.
+    slot.release();
+    slot.retitle("Should not publish");
+    expect(get(registry)).toHaveLength(0);
+    stop();
+  });
+});

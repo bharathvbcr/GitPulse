@@ -290,17 +290,19 @@ fn emit_stderr(payload: String) {
 const TERM_USAGE: &str = "\
 Usage: gitpulse-hook term <command> [options]
 
-Option A scoped child terminal orchestration for coding agents running inside a
-GitPulse PTY (`GITPULSE_TERMINAL_SESSION` + `GITPULSE_SESSION_TOKEN`).
+Scoped child terminal orchestration for coding agents. Uses `GITPULSE_TERMINAL_SESSION`
++ `GITPULSE_SESSION_TOKEN` inside a GitPulse PTY, or a caller-scoped `ext-<ppid>`
+identity when run standalone (`exec`/`spawn`/`list`/`wait`/`read`/`send`/`close`).
 
 Commands:
   spawn       Spawn a scoped child PTY (`shell`, `claude`, `agy`, `codex`, `manvi`, `grok`)
+  exec        Run a gated shell command and wait for OSC 133 completion/exit output
   open-file   Open a repository file in a right-hand terminal split pane
-  list        List child sessions spawned by this caller session
+  list        List child sessions (add `--include-repo-shells` when enabled in Settings)
   wait        Wait on a child session (`OSC 133`, `OSC 7501`, pattern, or loopback port)
-  read        Read secret-scrubbed `vt100` screen lines from a child session
+  read        Read secret-scrubbed `vt100` screen lines or last OSC 133 block
   send        Send policy-gated plain-text input to a child session
-  close       Terminate and close a child session spawned by this caller session
+  close       Terminate and close a child session spawned by this caller
 
 Common options:
   --repo <abs-path>           Repository root (defaults to git root of current working directory)
@@ -317,10 +319,24 @@ Spawn options:
   --rows <1..500>             Initial PTY rows
   --cols <2..1000>            Initial PTY columns
 
+Exec options:
+  --command <cmd>             Shell command to execute (or pass as positional arg)
+  --child <session-id>        Reuse an existing owned 'shell' session (default: spawn fresh shell)
+  --cwd <dir>                 Subdirectory inside the repository when spawning a fresh shell
+  --timeout-ms <1..25000>     Wait ceiling in milliseconds (default: 10000)
+  --pattern <substring>       Wake early as soon as output contains substring
+  --keep-open | --ephemeral   Keep shell open after running (default: keep open)
+  --split | --no-split        Split pane when spawning a fresh shell
+  --title <title>             Tab / pane title when spawning a fresh shell
+  --max-lines <1..1000>       Maximum output lines returned (default: 80)
+
 Open-file options:
   --path <rel-path>           Repository-relative path (or pass as positional arg)
   --line <1-based>            Optional line number
   --column <1-based>          Optional column number
+
+List options:
+  --include-repo-shells       Include read-only repository user shells when opted in
 
 Wait options:
   --child <session-id>        Child session id (or pass as positional arg)
@@ -328,10 +344,14 @@ Wait options:
   --pattern <substring>       Wake as soon as screen contains substring
   --wait-for-idle             Wait until prompt/agent idle (default: true)
   --no-wait-for-idle          Return immediately if pattern/exit already satisfied
+  --since-seq <n>             Telemetry event sequence cursor
 
 Read options:
   --child <session-id>        Child session id (or pass as positional arg)
-  --max-lines <1..200>        Maximum trailing screen lines (default: 80)
+  --max-lines <1..1000>       Maximum trailing lines (default: 80, max: 1000)
+  --offset-lines <0..2000>    Skip N lines upward from the bottom for scrollback paging
+  --grep <substring>          Plain-text substring filter over secret-redacted lines
+  --last-command-only         Return output of the most recent completed OSC 133 block
 
 Send options:
   --child <session-id>        Child session id (or pass as positional arg)
@@ -341,6 +361,17 @@ Send options:
 Close options:
   --child <session-id>        Child session id (or pass as positional arg)
 ";
+
+fn external_hook_caller_id() -> String {
+    #[cfg(unix)]
+    {
+        format!("ext-{}", std::os::unix::process::parent_id())
+    }
+    #[cfg(not(unix))]
+    {
+        format!("ext-{}", std::process::id())
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum TermCliOutcome {
@@ -417,7 +448,7 @@ fn parse_term_cli(
     let resolve_common = |repo_opt: Option<String>,
                           sid_opt: Option<String>,
                           tok_opt: Option<String>|
-     -> Result<(String, String, String), String> {
+     -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
         let repo = repo_opt
             .or_else(|| default_repo.map(str::to_owned))
             .map(|s| s.trim().to_owned())
@@ -429,24 +460,23 @@ fn parse_term_cli(
         let sid = sid_opt
             .or_else(|| env_session_id.map(str::to_owned))
             .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "missing caller terminal session id: {} is not set (pass --caller-session inside tests)",
-                    gitpulse_lib::alerts::bridge::SESSION_ENV
-                )
-            })?;
+            .filter(|s| !s.is_empty());
         let tok = tok_opt
             .or_else(|| env_session_token.map(str::to_owned))
             .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "missing caller session capability token: {} is not set",
-                    gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV
-                )
-            })?;
-        Ok((repo, sid, tok))
+            .filter(|s| !s.is_empty());
+        match (sid, tok) {
+            (Some(s), Some(t)) => Ok((repo, Some(s), Some(t), None)),
+            (None, None) => Ok((repo, None, None, Some(external_hook_caller_id()))),
+            (Some(_), None) => Err(format!(
+                "missing caller session capability token: {} is not set",
+                gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV
+            )),
+            (None, Some(_)) => Err(format!(
+                "missing caller terminal session id: {} is not set (pass --caller-session inside tests)",
+                gitpulse_lib::alerts::bridge::SESSION_ENV
+            )),
+        }
     };
 
     let mut iter = args[1..].iter();
@@ -502,12 +532,13 @@ fn parse_term_cli(
                     }
                 }
             }
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Spawn {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 launcher,
                 cwd,
                 command,
@@ -516,6 +547,94 @@ fn parse_term_cli(
                 split,
                 rows,
                 cols,
+            }
+        }
+        "exec" => {
+            let mut child_session_id = None;
+            let mut cwd = None;
+            let mut command: Option<String> = None;
+            let mut timeout_ms = None;
+            let mut pattern = None;
+            let mut keep_open = None;
+            let mut split = None;
+            let mut title = None;
+            let mut max_lines = None;
+            while let Some(raw) = iter.next() {
+                let (flag, inline) = split_flag(raw);
+                match flag {
+                    "--repo" => repo_override = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--caller-session" => {
+                        sid_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--caller-token" => {
+                        tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
+                    }
+                    "--child" => child_session_id = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--cwd" => cwd = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--command" => command = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--timeout-ms" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        timeout_ms = Some(parse_u64_flag(flag, &v)?);
+                    }
+                    "--pattern" => pattern = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--keep-open" => {
+                        if inline.is_some() {
+                            return Err("--keep-open takes no value".into());
+                        }
+                        keep_open = Some(true);
+                    }
+                    "--ephemeral" => {
+                        if inline.is_some() {
+                            return Err("--ephemeral takes no value".into());
+                        }
+                        keep_open = Some(false);
+                    }
+                    "--split" => {
+                        if inline.is_some() {
+                            return Err("--split takes no value (use --split or --no-split)".into());
+                        }
+                        split = Some(true);
+                    }
+                    "--no-split" => {
+                        if inline.is_some() {
+                            return Err("--no-split takes no value".into());
+                        }
+                        split = Some(false);
+                    }
+                    "--title" => title = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--max-lines" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        max_lines = Some(parse_usize_flag(flag, &v)?);
+                    }
+                    _ if !raw.starts_with('-') && command.is_none() => {
+                        command = Some(raw.clone());
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown option {raw:?} for `gitpulse-hook term exec`"
+                        ))
+                    }
+                }
+            }
+            let command = command.ok_or_else(|| {
+                "`gitpulse-hook term exec` requires --command <shell-command>".to_string()
+            })?;
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
+                resolve_common(repo_override, sid_override, tok_override)?;
+            OrchestrateCall::Exec {
+                repo_path,
+                caller_session_id,
+                caller_token,
+                external_caller_id,
+                child_session_id,
+                cwd,
+                command,
+                timeout_ms,
+                pattern,
+                keep_open,
+                split,
+                title,
+                max_lines,
             }
         }
         "open-file" | "open_file" => {
@@ -554,18 +673,20 @@ fn parse_term_cli(
             let path = path.ok_or_else(|| {
                 "`gitpulse-hook term open-file` requires --path <repo-relative-path>".to_string()
             })?;
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::OpenFile {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 path,
                 line,
                 column,
             }
         }
         "list" => {
+            let mut include_repo_shells = None;
             while let Some(raw) = iter.next() {
                 let (flag, inline) = split_flag(raw);
                 match flag {
@@ -576,6 +697,12 @@ fn parse_term_cli(
                     "--caller-token" => {
                         tok_override = Some(next_flag_value(flag, inline, &mut iter)?)
                     }
+                    "--include-repo-shells" => {
+                        if inline.is_some() {
+                            return Err("--include-repo-shells takes no value".into());
+                        }
+                        include_repo_shells = Some(true);
+                    }
                     _ => {
                         return Err(format!(
                             "unknown option {raw:?} for `gitpulse-hook term list`"
@@ -583,12 +710,14 @@ fn parse_term_cli(
                     }
                 }
             }
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::List {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
+                include_repo_shells,
             }
         }
         "wait" => {
@@ -642,12 +771,13 @@ fn parse_term_cli(
             let child_session_id = child_session_id.ok_or_else(|| {
                 "`gitpulse-hook term wait` requires --child <session-id>".to_string()
             })?;
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Wait {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 timeout_ms,
                 pattern,
@@ -658,6 +788,9 @@ fn parse_term_cli(
         "read" => {
             let mut child_session_id: Option<String> = None;
             let mut max_lines = None;
+            let mut offset_lines = None;
+            let mut grep = None;
+            let mut last_command_only = None;
             while let Some(raw) = iter.next() {
                 let (flag, inline) = split_flag(raw);
                 match flag {
@@ -673,6 +806,17 @@ fn parse_term_cli(
                         let v = next_flag_value(flag, inline, &mut iter)?;
                         max_lines = Some(parse_usize_flag(flag, &v)?);
                     }
+                    "--offset-lines" => {
+                        let v = next_flag_value(flag, inline, &mut iter)?;
+                        offset_lines = Some(parse_usize_flag(flag, &v)?);
+                    }
+                    "--grep" => grep = Some(next_flag_value(flag, inline, &mut iter)?),
+                    "--last-command-only" => {
+                        if inline.is_some() {
+                            return Err("--last-command-only takes no value".into());
+                        }
+                        last_command_only = Some(true);
+                    }
                     _ if !raw.starts_with('-') && child_session_id.is_none() => {
                         child_session_id = Some(raw.clone());
                     }
@@ -686,14 +830,18 @@ fn parse_term_cli(
             let child_session_id = child_session_id.ok_or_else(|| {
                 "`gitpulse-hook term read` requires --child <session-id>".to_string()
             })?;
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Read {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 max_lines,
+                offset_lines,
+                grep,
+                last_command_only,
             }
         }
         "send" => {
@@ -739,12 +887,13 @@ fn parse_term_cli(
             })?;
             let input = input
                 .ok_or_else(|| "`gitpulse-hook term send` requires --input <text>".to_string())?;
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Send {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
                 input,
                 append_newline,
@@ -776,18 +925,19 @@ fn parse_term_cli(
             let child_session_id = child_session_id.ok_or_else(|| {
                 "`gitpulse-hook term close` requires --child <session-id>".to_string()
             })?;
-            let (repo_path, caller_session_id, caller_token) =
+            let (repo_path, caller_session_id, caller_token, external_caller_id) =
                 resolve_common(repo_override, sid_override, tok_override)?;
             OrchestrateCall::Close {
                 repo_path,
                 caller_session_id,
                 caller_token,
+                external_caller_id,
                 child_session_id,
             }
         }
         other => {
             return Err(format!(
-                "unknown `gitpulse-hook term` command {other:?}; expected spawn, open-file, list, wait, read, send, or close"
+                "unknown `gitpulse-hook term` command {other:?}; expected spawn, exec, open-file, list, wait, read, send, or close"
             ));
         }
     };
@@ -800,6 +950,7 @@ fn call_repo_path(call: &gitpulse_lib::terminal::orchestrate::OrchestrateCall) -
     use gitpulse_lib::terminal::orchestrate::OrchestrateCall;
     match call {
         OrchestrateCall::Spawn { repo_path, .. }
+        | OrchestrateCall::Exec { repo_path, .. }
         | OrchestrateCall::OpenFile { repo_path, .. }
         | OrchestrateCall::List { repo_path, .. }
         | OrchestrateCall::Wait { repo_path, .. }
@@ -944,8 +1095,9 @@ mod tests {
             spawn,
             TermCliOutcome::Call(OrchestrateCall::Spawn {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 launcher: Some("shell".into()),
                 cwd: Some("src".into()),
                 command: Some("cargo test".into()),
@@ -968,8 +1120,9 @@ mod tests {
             open_file,
             TermCliOutcome::Call(OrchestrateCall::OpenFile {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 path: "src/main.rs".into(),
                 line: Some(42),
                 column: Some(7),
@@ -982,6 +1135,7 @@ mod tests {
                 "--repo",
                 "/explicit/repo",
                 "--caller-session=term-200-9",
+                "--include-repo-shells",
             ]),
             Some("/ignored/default"),
             Some("ignored-sid"),
@@ -992,8 +1146,10 @@ mod tests {
             list,
             TermCliOutcome::Call(OrchestrateCall::List {
                 repo_path: "/explicit/repo".into(),
-                caller_session_id: "term-200-9".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-200-9".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
+                include_repo_shells: Some(true),
             })
         );
 
@@ -1016,8 +1172,9 @@ mod tests {
             wait,
             TermCliOutcome::Call(OrchestrateCall::Wait {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 child_session_id: "term-100-2".into(),
                 timeout_ms: Some(5000),
                 pattern: Some("Listening on".into()),
@@ -1027,7 +1184,15 @@ mod tests {
         );
 
         let read = parse_term_cli(
-            &vec_args(&["read", "--child", "term-100-2", "--max-lines=50"]),
+            &vec_args(&[
+                "read",
+                "--child",
+                "term-100-2",
+                "--max-lines=50",
+                "--offset-lines=12",
+                "--grep=FAIL",
+                "--last-command-only",
+            ]),
             Some("/repo/root"),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
@@ -1037,10 +1202,51 @@ mod tests {
             read,
             TermCliOutcome::Call(OrchestrateCall::Read {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 child_session_id: "term-100-2".into(),
                 max_lines: Some(50),
+                offset_lines: Some(12),
+                grep: Some("FAIL".into()),
+                last_command_only: Some(true),
+            })
+        );
+
+        let exec = parse_term_cli(
+            &vec_args(&[
+                "exec",
+                "--command",
+                "cargo check",
+                "--cwd=src",
+                "--timeout-ms=9000",
+                "--ephemeral",
+                "--no-split",
+                "--title",
+                "Check build",
+                "--max-lines=300",
+            ]),
+            Some("/repo/root"),
+            None,
+            None,
+        )
+        .expect("standalone exec parse");
+        assert_eq!(
+            exec,
+            TermCliOutcome::Call(OrchestrateCall::Exec {
+                repo_path: "/repo/root".into(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: Some(external_hook_caller_id()),
+                child_session_id: None,
+                cwd: Some("src".into()),
+                command: "cargo check".into(),
+                timeout_ms: Some(9000),
+                pattern: None,
+                keep_open: Some(false),
+                split: Some(false),
+                title: Some("Check build".into()),
+                max_lines: Some(300),
             })
         );
 
@@ -1055,8 +1261,9 @@ mod tests {
             send,
             TermCliOutcome::Call(OrchestrateCall::Send {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 child_session_id: "term-100-2".into(),
                 input: "echo ok".into(),
                 append_newline: Some(false),
@@ -1074,8 +1281,9 @@ mod tests {
             close,
             TermCliOutcome::Call(OrchestrateCall::Close {
                 repo_path: "/repo/root".into(),
-                caller_session_id: "term-100-1".into(),
-                caller_token: SAMPLE_TOKEN.into(),
+                caller_session_id: Some("term-100-1".into()),
+                caller_token: Some(SAMPLE_TOKEN.into()),
+                external_caller_id: None,
                 child_session_id: "term-100-2".into(),
             })
         );

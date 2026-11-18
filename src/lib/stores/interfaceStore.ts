@@ -35,6 +35,7 @@ import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
 import {
   APPEARANCE_DEFAULTS,
   FLOAT_BLUR_MAX,
+  WALLPAPER_INTENSITY_RANGE,
   installAppearance,
   sanitizeAppearance,
   type AppearancePrefs,
@@ -44,9 +45,11 @@ import type { Appearance } from "../ui/color/derive";
 import { densityFromLegacy, type Density } from "../ui/appearance/density";
 import type { GitPulseTheme } from "../ui/appearance/themeSchema";
 import type { BackdropId } from "../ui/appearance/backdrops";
-import { presetPatch, themeSelectionPatch, type ThemePreset } from "../ui/appearance/presets";
+import { clearThemePatch, presetPatch, themeSelectionPatch, type ThemePreset } from "../ui/appearance/presets";
 import { withSavedTheme, withoutSavedTheme, type SaveOutcome } from "../ui/appearance/savedThemes";
 import { customWallpaper } from "../ui/appearance/wallpaperStore";
+import { installWallpaperMotion } from "../ui/appearance/wallpaperMotion";
+import { hostLoadPulse, startHostLoad } from "./hostLoadStore";
 import { themeStore } from "./themeStore";
 import { hostPlatform } from "./platformStore";
 import { isAgentFilter, type AgentFilter } from "../agents/plane";
@@ -76,6 +79,11 @@ import {
 } from "../ui/taskView";
 import type { TaskStatus } from "../workbench/vocabulary";
 import { sanitizeHiddenRepositories, toggleHiddenRepository } from "../workbench/taskHiddenRepositories";
+import {
+  DEFAULT_TASK_REPOSITORY_SORT,
+  isTaskRepositorySort,
+  type TaskRepositorySort,
+} from "../workbench/taskRepositories";
 import {
   deleteView,
   isSwimlane,
@@ -300,6 +308,8 @@ export interface InterfacePrefs extends AppearancePrefs {
    * board its full width without removing the scopes.
    */
   taskNavigatorCollapsed: boolean;
+  /** How the Tasks scope navigator orders its Repositories list. */
+  taskRepositorySort: TaskRepositorySort;
   /**
    * What Return does in the board's quick-add line.
    *
@@ -384,6 +394,11 @@ export interface InterfacePrefs extends AppearancePrefs {
    * it wrong. Hidden sessions never hold a context either way.
    */
   terminalGpu: boolean;
+  /**
+   * Automatically copies non-whitespace terminal text selections to the
+   * clipboard on mouse/keyboard selection completion. On by default.
+   */
+  terminalCopyOnSelect: boolean;
   terminalLauncher: SessionKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -535,6 +550,7 @@ const DEFAULTS: InterfacePrefs = {
   taskBoards: {},
   taskShowArchivedWorkspaces: true,
   taskNavigatorCollapsed: false,
+  taskRepositorySort: DEFAULT_TASK_REPOSITORY_SORT,
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
@@ -546,6 +562,7 @@ const DEFAULTS: InterfacePrefs = {
   terminalOptionAsMeta: true,
   terminalSmoothWheel: true,
   terminalGpu: true,
+  terminalCopyOnSelect: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -716,6 +733,9 @@ function readPrefs(): InterfacePrefs {
         DEFAULTS.taskShowArchivedWorkspaces,
       ),
       taskNavigatorCollapsed: bool(parsed.taskNavigatorCollapsed, DEFAULTS.taskNavigatorCollapsed),
+      taskRepositorySort: isTaskRepositorySort(parsed.taskRepositorySort)
+        ? parsed.taskRepositorySort
+        : DEFAULTS.taskRepositorySort,
       // Anything unrecognizable falls back to manual. A stored value this
       // build cannot read must not be the one that spends a model call.
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
@@ -730,6 +750,7 @@ function readPrefs(): InterfacePrefs {
       terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
       terminalSmoothWheel: bool(parsed.terminalSmoothWheel, DEFAULTS.terminalSmoothWheel),
       terminalGpu: bool(parsed.terminalGpu, DEFAULTS.terminalGpu),
+      terminalCopyOnSelect: bool(parsed.terminalCopyOnSelect, DEFAULTS.terminalCopyOnSelect),
       terminalLauncher: SESSION_TYPES.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -861,7 +882,11 @@ function createInterfaceStore() {
     setFieldLevel: (level: FieldLevel) => patch({ fieldLevel: level }),
     setFieldHue: (degrees: number) => patch({ fieldHue: degrees }),
     setReduceTransparency: (reduce: boolean) => patch({ reduceTransparency: reduce }),
-    setCustomTheme: (theme: GitPulseTheme | null) => patch({ customTheme: theme }),
+    /**
+     * Takes the theme out of force, with whatever it stamped that is still as it
+     * left it: a preset's wallpaper and material, any theme's corner scale and fonts.
+     */
+    clearTheme: () => patch((prefs) => clearThemePatch(prefs)),
     /** Applies several appearance fields at once (an imported theme), as one save. */
     patchAppearance: (changes: Partial<AppearancePrefs>) => patch(changes),
     /**
@@ -877,6 +902,15 @@ function createInterfaceStore() {
         highRefresh: false,
       })),
     setBackdrop: (backdrop: BackdropId) => patch({ backdrop }),
+    /** 0.1..1; held to the range, so a stray value can only fade, never brighten. */
+    setWallpaperIntensity: (intensity: number) =>
+      patch({
+        wallpaperIntensity: Math.min(
+          WALLPAPER_INTENSITY_RANGE.max,
+          Math.max(WALLPAPER_INTENSITY_RANGE.min, Number.isFinite(intensity) ? intensity : 1),
+        ),
+      }),
+    setWallpaperMotion: (on: boolean) => patch({ wallpaperMotion: on }),
     /**
      * Applies a built-in preset: its theme, wallpaper and material, and switches
      * the window to the preset's appearance, because a theme only draws in its own.
@@ -1028,6 +1062,8 @@ function createInterfaceStore() {
       }),
     setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
     setTaskNavigatorCollapsed: (collapsed: boolean) => patch({ taskNavigatorCollapsed: collapsed }),
+    setTaskRepositorySort: (sort: TaskRepositorySort) =>
+      patch({ taskRepositorySort: isTaskRepositorySort(sort) ? sort : DEFAULTS.taskRepositorySort }),
     setTaskQuickAddAssist: (assist: boolean) => patch({ taskQuickAddAssist: assist }),
     /**
      * Remembers the last handoff a reader chose.
@@ -1053,6 +1089,7 @@ function createInterfaceStore() {
         taskOrder: DEFAULTS.taskOrder,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
         taskNavigatorCollapsed: DEFAULTS.taskNavigatorCollapsed,
+        taskRepositorySort: DEFAULTS.taskRepositorySort,
         taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),
       }),
@@ -1065,6 +1102,7 @@ function createInterfaceStore() {
     setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
     setTerminalSmoothWheel: (on: boolean) => patch({ terminalSmoothWheel: on }),
     setTerminalGpu: (on: boolean) => patch({ terminalGpu: on }),
+    setTerminalCopyOnSelect: (on: boolean) => patch({ terminalCopyOnSelect: on }),
     setTerminalLauncher: (launcher: SessionKind) => patch({ terminalLauncher: SESSION_TYPES.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),
@@ -1101,5 +1139,14 @@ installAppearance({
   theme: themeStore,
   platform: hostPlatform,
   customBackdrop: customWallpaper,
+});
+// The moving wallpaper, beside the still: it decides on its own inputs (the
+// host's power and load among them) and owns the one layer that moves.
+installWallpaperMotion({
+  prefs: interfaceStore,
+  platform: hostPlatform,
+  custom: customWallpaper,
+  pulse: hostLoadPulse,
+  startPulse: startHostLoad,
 });
 installHeaderLabels(interfaceStore);

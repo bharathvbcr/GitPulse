@@ -554,4 +554,20 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     expect(source).toContain("sessionId: !spawnResume || spawnResume.fork ? hostedId : null,");
     expect(source).toContain("if (resume?.fork && !forkedId) forkedId = hostedId;");
   });
+
+  it("wires Select-to-Copy, capture copy clipboard preservation, write-only OSC 52, per-block actions, viewport context menu, and one-shot initialCommand", () => {
+    expect(source).toContain("createSelectToCopyController(");
+    expect(source).toContain("created.onSelectionChange(");
+    expect(source).toContain("created.parser.registerOscHandler(52,");
+    expect(source).toContain("parseOsc52(payload)");
+    expect(source).toContain('host.addEventListener("copy", onCopyCapture, true)');
+    expect(source).toContain("normalizeSelectedText(term.getSelection())");
+    expect(source).toContain("mouseTrackingMode");
+    expect(source).toContain("terminal-osc133-copy-block");
+    expect(source).toContain("terminal-osc133-rerun-shell");
+    expect(source).toContain("terminal-viewport-context-menu");
+    expect(source).toContain("terminal-copied-flash");
+    expect(source).toContain("out:popoverExit");
+    expect(source).toContain("takeInitialCommand()");
+  });
 });

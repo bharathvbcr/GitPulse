@@ -22,12 +22,12 @@
 //! reported as unknown (`None`, with a note), never as absent or as zero.
 
 mod advice;
-mod index_file;
+pub(crate) mod index_file;
 pub use advice::*;
 
 use crate::engine::git_reader::{ConfigEntry, ConfigScope};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -289,19 +289,18 @@ enum IndexFile {
 /// width, which is the trailer's width.
 fn open_index(git_dir: &Path, hash_len: usize) -> IndexFile {
     let path = git_dir.join("index");
-    let meta = match fs::symlink_metadata(&path) {
-        Ok(meta) => meta,
+    let (mut file, meta) = match index_file::open_regular_file_no_follow(&path) {
+        Ok(pair) => pair,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return IndexFile::Missing,
-        Err(e) => return IndexFile::Unreadable(format!("the index could not be examined: {e}")),
+        Err(e) => {
+            return IndexFile::Unreadable(format!("the index could not be opened: {e}"));
+        }
     };
-    if !meta.is_file() {
-        return IndexFile::Unreadable("the index is not a regular file".to_string());
-    }
     let mut head = [0u8; INDEX_HEADER_LEN];
-    let read = File::open(&path).and_then(|mut file| file.read_exact(&mut head));
-    if let Err(e) = read {
+    if let Err(e) = file.read_exact(&mut head) {
         return IndexFile::Unreadable(format!("the index header could not be read: {e}"));
     }
+    drop(file);
     let header = match parse_index_header(&head) {
         Ok(header) => header,
         Err(why) => return IndexFile::Unreadable(why),

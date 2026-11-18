@@ -23,9 +23,10 @@ describe("editorSections", () => {
       "repositories",
       "assist",
       "title",
+      "criteria",
       "logs",
       "schedule",
-      "owner",
+      "relations",
     ]);
     const assist = editorSections(false).find((section) => section.id === "assist");
     const title = editorSections(false).find((section) => section.id === "title");
@@ -40,16 +41,17 @@ describe("editorSections", () => {
     expect(ids(true)).toEqual([
       "repositories",
       "title",
+      "criteria",
       "assist",
       "logs",
       "schedule",
-      "owner",
+      "relations",
     ]);
     const sections = editorSections(true);
     const title = sections.find((section) => section.id === "title");
     const assist = sections.find((section) => section.id === "assist");
     expect(title?.n).toBe(2);
-    expect(assist?.n).toBe(3);
+    expect(assist?.n).toBe(4);
     expect(title?.n).toBeLessThan(assist?.n ?? 0);
     expect(assist?.heading).toBe(ASSIST_HEADING_SAVED);
     expect(sections.map((section) => section.heading)).not.toContain("Quick add");
@@ -58,7 +60,7 @@ describe("editorSections", () => {
   it("numbers every section from 1 with no gaps and no duplicates", () => {
     for (const saved of [false, true]) {
       const sections = editorSections(saved);
-      expect(sections.map((section) => section.n)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(sections.map((section) => section.n)).toEqual([1, 2, 3, 4, 5, 6, 7]);
       expect(new Set(sections.map((section) => section.id)).size).toBe(EDITOR_SECTION_IDS.length);
       expect(sections.map((section) => section.id).sort()).toEqual([...EDITOR_SECTION_IDS].sort());
       for (const section of sections) {
@@ -72,7 +74,7 @@ describe("editorSections", () => {
     first.reverse();
     first[0]!.heading = "mutated";
     first.pop();
-    expect(ids(true)).toEqual(["repositories", "title", "assist", "logs", "schedule", "owner"]);
+    expect(ids(true)).toEqual(["repositories", "title", "criteria", "assist", "logs", "schedule", "relations"]);
     expect(editorSections(true)[0]?.heading).toBe("Repositories");
   });
 

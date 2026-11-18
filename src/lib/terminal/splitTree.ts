@@ -8,7 +8,7 @@
  * normalized `[0, 1]` pane boxes and interactive sash descriptors.
  */
 import { MAX_VISIBLE_SESSIONS } from "./attendance";
-import type { TabKind } from "./tabs";
+import { cleanTabName, type TabKind } from "./tabs";
 
 export type SplitDirection = "row" | "col";
 
@@ -279,6 +279,54 @@ export function equalizeSplits(root: SplitNode | null, branchId?: string): Split
   return walk(root);
 }
 
+/**
+ * Toggles `"row" <-> "col"` on the split branch immediately enclosing
+ * `targetPaneId` (or on `root` when `targetPaneId` is omitted/absent),
+ * preserving branch IDs, sash ratios, and leaf order.
+ */
+export function flipSplitOrientation(
+  root: SplitNode | null,
+  targetPaneId?: string | null,
+): SplitNode | null {
+  if (!root || root.kind !== "branch") return root;
+  const flipDir = (direction: SplitDirection): SplitDirection =>
+    direction === "row" ? "col" : "row";
+
+  if (targetPaneId && hasPane(root, targetPaneId)) {
+    const walk = (node: SplitNode): SplitNode => {
+      if (node.kind === "leaf") return node;
+      if (
+        (node.a.kind === "leaf" && node.a.paneId === targetPaneId) ||
+        (node.b.kind === "leaf" && node.b.paneId === targetPaneId)
+      ) {
+        return { ...node, direction: flipDir(node.direction) };
+      }
+      const nextA = walk(node.a);
+      if (nextA !== node.a) return { ...node, a: nextA };
+      const nextB = walk(node.b);
+      if (nextB !== node.b) return { ...node, b: nextB };
+      return node;
+    };
+    return walk(root);
+  }
+
+  return { ...root, direction: flipDir(root.direction) };
+}
+
+/**
+ * Swaps `paneId` with the next cyclic leaf in `root`, preserving all branch
+ * directions and sash ratios.
+ */
+export function swapWithAdjacentSplitPane(
+  root: SplitNode | null,
+  paneId: string | null,
+): SplitNode | null {
+  if (!root || root.kind !== "branch" || !paneId || !hasPane(root, paneId)) return root;
+  const partner = cycleVisibleSplitPane(root, paneId, 1);
+  if (!partner || partner === paneId) return root;
+  return swapPanes(root, paneId, partner);
+}
+
 export function visiblePaneIds(
   root: SplitNode | null,
   activeId: string | null,
@@ -357,10 +405,11 @@ export function computeSplitLayout(
 
 /**
  * The least height a pane is laid out at; a shorter dock scrolls its panes.
- * A pane's own chrome (status row, footer) takes about 48px and Find another
- * 36px in the active one, so this leaves a grid of about 96px with Find open.
+ * A pane's own chrome (split header h-7 = 28px, status row h-8 = 32px) takes
+ * ~60px and Find another 36px in the active one, leaving ~104px of xterm rows
+ * at minimum height with Find open.
  */
-export const MIN_PANE_HEIGHT_PX = 180;
+export const MIN_PANE_HEIGHT_PX = 200;
 
 /**
  * The height the pane area must be for every visible pane of
@@ -450,14 +499,1120 @@ export interface PersistedSplitLeafMeta {
   readonly filePath?: string;
   readonly revealLine?: number | null;
   readonly revealColumn?: number | null;
+  readonly snippet?: {
+    readonly title: string;
+    readonly content: string;
+  };
+  readonly pinned?: boolean;
   readonly url?: string;
   readonly checkout?: string;
+  readonly name?: string;
+  readonly launchName?: string;
+  readonly userNamed?: boolean;
+  readonly title?: string;
 }
 
-export interface PersistedSplitWorkspace {
-  readonly version: 2;
+export const MAX_PERSISTED_SNIPPET_CHARS = 16_384;
+
+export type TabDropZone =
+  | {
+      readonly paneId: string;
+      readonly mode: "split";
+      readonly direction: SplitDirection;
+      readonly position: "before" | "after";
+    }
+  | {
+      readonly paneId: string;
+      readonly mode: "swap";
+    };
+
+/**
+ * Classifies a pointer position inside `paneId` into one of 4 outer split zones
+ * (`< 0.25` from an edge) or the center `[0.25..0.75]` swap/replace zone.
+ */
+export function computeTabDropHint(
+  rect: { left: number; top: number; width: number; height: number },
+  clientX: number,
+  clientY: number,
+  paneId: string,
+): TabDropZone | null {
+  if (!paneId || rect.width <= 0 || rect.height <= 0) return null;
+  const rx = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  const ry = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+  if (rx >= 0.25 && rx <= 0.75 && ry >= 0.25 && ry <= 0.75) {
+    return { paneId, mode: "swap" };
+  }
+  const distLeft = rx;
+  const distRight = 1 - rx;
+  const distTop = ry;
+  const distBottom = 1 - ry;
+  const min = Math.min(distLeft, distRight, distTop, distBottom);
+  if (min === distLeft) return { paneId, mode: "split", direction: "row", position: "before" };
+  if (min === distRight) return { paneId, mode: "split", direction: "row", position: "after" };
+  if (min === distTop) return { paneId, mode: "split", direction: "col", position: "before" };
+  return { paneId, mode: "split", direction: "col", position: "after" };
+}
+
+export type SplitReplacementChoice =
+  | { readonly mode: "replace"; readonly targetPaneId: string }
+  | { readonly mode: "split"; readonly anchorPaneId: string }
+  | { readonly mode: "blocked" };
+
+/**
+ * Picks which split slot a background tab click should occupy without evicting
+ * any pinned split pane:
+ *  1. Replaces `preferredId` when it is an unpinned leaf in `root`.
+ *  2. Otherwise replaces the first unpinned leaf in `root`.
+ *  3. When all leaves in `root` are pinned, splits alongside `preferredId` if
+ *     under `MAX_SPLIT_PANES`, or returns `{ mode: "blocked" }` at capacity.
+ */
+export function chooseSplitReplacementSlot(
+  root: SplitNode | null,
+  preferredId: string | null,
+  pinnedIds: ReadonlySet<string>,
+): SplitReplacementChoice | null {
+  if (!root || root.kind !== "branch") return null;
+  const leaves = leafPaneIds(root);
+  if (leaves.length === 0) return null;
+  if (preferredId && leaves.includes(preferredId) && !pinnedIds.has(preferredId)) {
+    return { mode: "replace", targetPaneId: preferredId };
+  }
+  const firstUnpinned = leaves.find((id) => !pinnedIds.has(id));
+  if (firstUnpinned) {
+    return { mode: "replace", targetPaneId: firstUnpinned };
+  }
+  if (leaves.length < MAX_SPLIT_PANES) {
+    const anchorPaneId =
+      preferredId && leaves.includes(preferredId) ? preferredId : leaves[leaves.length - 1];
+    return { mode: "split", anchorPaneId };
+  }
+  return { mode: "blocked" };
+}
+
+export interface HiddenSplitSummary {
+  readonly hiddenIds: string[];
+  readonly hiddenCount: number;
+  readonly blockedCount: number;
+  readonly errorCount: number;
+  readonly doneCount: number;
+  readonly unreadCount: number;
+  readonly urgentPaneId: string | null;
+  readonly badgeLabel: string | null;
+  readonly tone: "warn" | "danger" | "accent" | "info" | null;
+}
+
+/**
+ * Summarizes unseen activity and OSC 7501 attention states across hidden split
+ * siblings while `zoomedPaneId` fills the workspace.
+ */
+export function summarizeHiddenSplitSiblings(
+  root: SplitNode | null,
+  zoomedPaneId: string | null,
+  unreadIds: ReadonlySet<string>,
+  agentStatuses: Readonly<
+    Record<string, { state?: string; detail?: string | null } | null | undefined>
+  >,
+): HiddenSplitSummary {
+  const empty: HiddenSplitSummary = {
+    hiddenIds: [],
+    hiddenCount: 0,
+    blockedCount: 0,
+    errorCount: 0,
+    doneCount: 0,
+    unreadCount: 0,
+    urgentPaneId: null,
+    badgeLabel: null,
+    tone: null,
+  };
+  if (!root || root.kind !== "branch" || !zoomedPaneId || !hasPane(root, zoomedPaneId)) {
+    return empty;
+  }
+  const hiddenIds = leafPaneIds(root).filter((id) => id !== zoomedPaneId);
+  return summarizePaneSetAttention(hiddenIds, unreadIds, agentStatuses);
+}
+
+/**
+ * Cycles focus across visible leaves of `root` without touching non-split tabs
+ * or evicting any pane.
+ */
+export function cycleVisibleSplitPane(
+  root: SplitNode | null,
+  currentId: string | null,
+  step: 1 | -1,
+): string | null {
+  if (!root || root.kind !== "branch") return null;
+  const leaves = leafPaneIds(root);
+  if (leaves.length < 2) return null;
+  const idx = currentId ? leaves.indexOf(currentId) : -1;
+  if (idx === -1) return step === 1 ? leaves[0] : leaves[leaves.length - 1];
+  return leaves[(idx + step + leaves.length) % leaves.length];
+}
+
+export interface SplitGroup {
+  readonly id: string;
+  readonly tree: SplitBranch;
+  readonly name?: string;
+  readonly activePaneId?: string;
+}
+
+export type TabStripSegment<T extends { id: string }> =
+  | {
+      readonly kind: "group";
+      readonly group: SplitGroup;
+      readonly groupIndex: number;
+      readonly tabs: T[];
+    }
+  | {
+      readonly kind: "single";
+      readonly tab: T;
+    };
+
+export interface PersistedSplitGroup {
+  readonly id: string;
   readonly tree: SplitNode;
-  readonly leaves: Record<string, PersistedSplitLeafMeta>;
+  readonly name?: string;
+  readonly activePaneId?: string;
+}
+
+export type PersistedSplitWorkspace =
+  | {
+      readonly version: 2;
+      readonly tree: SplitNode;
+      readonly leaves: Record<string, PersistedSplitLeafMeta>;
+    }
+  | {
+      readonly version: 3;
+      readonly activeGroupId: string | null;
+      readonly groups: readonly PersistedSplitGroup[];
+      readonly leaves: Record<string, PersistedSplitLeafMeta>;
+    };
+
+let nextGroupSeq = 1;
+export function mintSplitGroupId(): string {
+  const id = `pair-${nextGroupSeq}`;
+  nextGroupSeq += 1;
+  return id;
+}
+
+export function allGroupedPaneIds(groups: readonly SplitGroup[]): Set<string> {
+  const out = new Set<string>();
+  for (const group of groups) {
+    for (const id of leafPaneIds(group.tree)) {
+      out.add(id);
+    }
+  }
+  return out;
+}
+
+export function findGroupForPane(
+  groups: readonly SplitGroup[],
+  paneId: string | null | undefined,
+): SplitGroup | null {
+  if (!paneId) return null;
+  for (const group of groups) {
+    if (hasPane(group.tree, paneId)) return group;
+  }
+  return null;
+}
+
+export function normalizeSplitGroups(
+  groups: readonly SplitGroup[],
+  validPaneIds?: ReadonlySet<string>,
+): SplitGroup[] {
+  const out: SplitGroup[] = [];
+  const claimed = new Set<string>();
+  const seenGroupIds = new Set<string>();
+
+  for (const group of groups) {
+    if (!group || !group.tree) continue;
+    const candidateLeaves = leafPaneIds(group.tree);
+    const allowedMap = new Map<string, string>();
+    for (const id of candidateLeaves) {
+      if (claimed.has(id)) continue;
+      if (validPaneIds && !validPaneIds.has(id)) continue;
+      allowedMap.set(id, id);
+    }
+    const pruned = remapSplitTree(group.tree, allowedMap);
+    if (!pruned || pruned.kind !== "branch") continue;
+
+    const survivingLeaves = leafPaneIds(pruned);
+    for (const id of survivingLeaves) claimed.add(id);
+
+    const cleanedId = cleanTabName(group.id, 48);
+    const id = cleanedId && !seenGroupIds.has(cleanedId) ? cleanedId : mintSplitGroupId();
+    seenGroupIds.add(id);
+
+    const name = group.name ? cleanTabName(group.name, 48) || undefined : undefined;
+    const activePaneId =
+      group.activePaneId && hasPane(pruned, group.activePaneId)
+        ? group.activePaneId
+        : survivingLeaves[0];
+
+    out.push({
+      id,
+      tree: pruned,
+      ...(name ? { name } : {}),
+      activePaneId,
+    });
+  }
+
+  return out;
+}
+
+function stripPanesFromTree(root: SplitBranch, removeIds: ReadonlySet<string>): SplitBranch | null {
+  let current: SplitNode | null = root;
+  for (const id of removeIds) {
+    if (!current || current.kind !== "branch") return null;
+    if (hasPane(current, id)) {
+      current = removePane(current, id);
+    }
+  }
+  return current && current.kind === "branch" ? current : null;
+}
+
+export function upsertSplitGroup(
+  groups: readonly SplitGroup[],
+  nextTree: SplitNode | null,
+  options?: {
+    groupId?: string;
+    name?: string;
+    activePaneId?: string | null;
+  },
+): SplitGroup[] {
+  const targetId = options?.groupId;
+  if (!nextTree || nextTree.kind !== "branch") {
+    return targetId ? groups.filter((group) => group.id !== targetId) : [...groups];
+  }
+
+  const newLeaves = new Set(leafPaneIds(nextTree));
+  const resolvedId = targetId && groups.some((group) => group.id === targetId)
+    ? targetId
+    : (targetId || mintSplitGroupId());
+  const nextName =
+    options?.name !== undefined
+      ? cleanTabName(options.name, 48) || undefined
+      : groups.find((group) => group.id === resolvedId)?.name;
+
+  const updated: SplitGroup[] = [];
+  let replacedExisting = false;
+
+  for (const group of groups) {
+    if (group.id === resolvedId) {
+      replacedExisting = true;
+      const leaves = leafPaneIds(nextTree);
+      const activeCandidate =
+        options?.activePaneId && hasPane(nextTree, options.activePaneId)
+          ? options.activePaneId
+          : group.activePaneId && hasPane(nextTree, group.activePaneId)
+            ? group.activePaneId
+            : leaves[0];
+      updated.push({
+        id: resolvedId,
+        tree: nextTree,
+        ...(nextName ? { name: nextName } : {}),
+        activePaneId: activeCandidate,
+      });
+      continue;
+    }
+
+    const stripped = stripPanesFromTree(group.tree, newLeaves);
+    if (!stripped) continue;
+    const surviving = leafPaneIds(stripped);
+    updated.push({
+      ...group,
+      tree: stripped,
+      activePaneId:
+        group.activePaneId && hasPane(stripped, group.activePaneId)
+          ? group.activePaneId
+          : surviving[0],
+    });
+  }
+
+  if (!replacedExisting) {
+    const leaves = leafPaneIds(nextTree);
+    const activeCandidate =
+      options?.activePaneId && hasPane(nextTree, options.activePaneId)
+        ? options.activePaneId
+        : leaves[0];
+    updated.push({
+      id: resolvedId,
+      tree: nextTree,
+      ...(nextName ? { name: nextName } : {}),
+      activePaneId: activeCandidate,
+    });
+  }
+
+  return normalizeSplitGroups(updated);
+}
+
+export function removeSplitGroup(groups: readonly SplitGroup[], groupId: string): SplitGroup[] {
+  if (!groupId) return [...groups];
+  return groups.filter((group) => group.id !== groupId);
+}
+
+export function removePaneFromGroups(groups: readonly SplitGroup[], paneId: string): SplitGroup[] {
+  if (!paneId) return groups as SplitGroup[];
+  let changed = false;
+  const next: SplitGroup[] = [];
+  for (const group of groups) {
+    if (!hasPane(group.tree, paneId)) {
+      next.push(group);
+      continue;
+    }
+    changed = true;
+    const pruned = removePane(group.tree, paneId);
+    if (!pruned || pruned.kind !== "branch") continue;
+    const surviving = leafPaneIds(pruned);
+    next.push({
+      ...group,
+      tree: pruned,
+      activePaneId:
+        group.activePaneId && hasPane(pruned, group.activePaneId)
+          ? group.activePaneId
+          : surviving[0],
+    });
+  }
+  return changed ? next : (groups as SplitGroup[]);
+}
+
+export function renameSplitGroup(
+  groups: readonly SplitGroup[],
+  groupId: string,
+  rawName: string,
+): SplitGroup[] {
+  const cleaned = cleanTabName(rawName, 48) || undefined;
+  let changed = false;
+  const next = groups.map((group) => {
+    if (group.id !== groupId) return group;
+    if (group.name === cleaned) return group;
+    changed = true;
+    return cleaned
+      ? { ...group, name: cleaned }
+      : { id: group.id, tree: group.tree, ...(group.activePaneId ? { activePaneId: group.activePaneId } : {}) };
+  });
+  return changed ? next : (groups as SplitGroup[]);
+}
+
+export function recordGroupActivePane(
+  groups: readonly SplitGroup[],
+  activePaneId: string | null,
+): SplitGroup[] {
+  if (!activePaneId) return groups as SplitGroup[];
+  let changed = false;
+  const next = groups.map((group) => {
+    if (!hasPane(group.tree, activePaneId) || group.activePaneId === activePaneId) return group;
+    changed = true;
+    return { ...group, activePaneId };
+  });
+  return changed ? next : (groups as SplitGroup[]);
+}
+
+export function orderGroupsByTabOrder(
+  groups: readonly SplitGroup[],
+  tabs: readonly { id: string }[],
+): SplitGroup[] {
+  if (groups.length <= 1) return groups as SplitGroup[];
+  const indexById = new Map<string, number>();
+  tabs.forEach((tab, index) => indexById.set(tab.id, index));
+  const earliestFor = (group: SplitGroup): number => {
+    let min = Number.POSITIVE_INFINITY;
+    for (const id of leafPaneIds(group.tree)) {
+      const idx = indexById.get(id);
+      if (idx !== undefined && idx < min) min = idx;
+    }
+    return min;
+  };
+  const sorted = [...groups].sort((a, b) => earliestFor(a) - earliestFor(b));
+  const unchanged = sorted.every((group, index) => group === groups[index]);
+  return unchanged ? (groups as SplitGroup[]) : sorted;
+}
+
+export function coLocateTabsForGroups<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+): T[] {
+  if (tabs.length < 2 || groups.length === 0) return tabs as T[];
+  const tabById = new Map<string, T>();
+  for (const tab of tabs) tabById.set(tab.id, tab);
+
+  const ownerByTabId = new Map<string, SplitGroup>();
+  for (const group of groups) {
+    for (const id of leafPaneIds(group.tree)) {
+      if (tabById.has(id) && !ownerByTabId.has(id)) {
+        ownerByTabId.set(id, group);
+      }
+    }
+  }
+
+  const emittedGroups = new Set<string>();
+  const out: T[] = [];
+  for (const tab of tabs) {
+    const owner = ownerByTabId.get(tab.id);
+    if (!owner) {
+      out.push(tab);
+      continue;
+    }
+    if (emittedGroups.has(owner.id)) continue;
+    emittedGroups.add(owner.id);
+    for (const leafId of leafPaneIds(owner.tree)) {
+      const member = tabById.get(leafId);
+      if (member) out.push(member);
+    }
+  }
+
+  if (out.length === tabs.length && out.every((tab, idx) => tab === tabs[idx])) {
+    return tabs as T[];
+  }
+  return out;
+}
+
+export function buildTabStripSegments<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+): TabStripSegment<T>[] {
+  const orderedTabs = coLocateTabsForGroups(tabs, groups);
+  const orderedGroups = orderGroupsByTabOrder(groups, orderedTabs);
+  const ownerByTabId = new Map<string, SplitGroup>();
+  const groupIndexById = new Map<string, number>();
+
+  orderedGroups.forEach((group, idx) => {
+    groupIndexById.set(group.id, idx + 1);
+    for (const leafId of leafPaneIds(group.tree)) {
+      ownerByTabId.set(leafId, group);
+    }
+  });
+
+  const tabById = new Map<string, T>();
+  for (const tab of orderedTabs) tabById.set(tab.id, tab);
+
+  const emitted = new Set<string>();
+  const segments: TabStripSegment<T>[] = [];
+  for (const tab of orderedTabs) {
+    const group = ownerByTabId.get(tab.id);
+    if (!group) {
+      segments.push({ kind: "single", tab });
+      continue;
+    }
+    if (emitted.has(group.id)) continue;
+    emitted.add(group.id);
+    const groupTabs = leafPaneIds(group.tree)
+      .map((leafId) => tabById.get(leafId))
+      .filter((item): item is T => item !== undefined);
+    if (groupTabs.length >= 2) {
+      segments.push({
+        kind: "group",
+        group,
+        groupIndex: groupIndexById.get(group.id) ?? 1,
+        tabs: groupTabs,
+      });
+    } else {
+      for (const orphan of groupTabs) segments.push({ kind: "single", tab: orphan });
+    }
+  }
+  return segments;
+}
+
+export function splitGroupDisplayLabel(
+  group: SplitGroup,
+  indexZeroBased: number,
+  totalGroups: number,
+): string {
+  if (group.name) return group.name;
+  if (totalGroups > 1) return `Pair ${indexZeroBased + 1}`;
+  return leafPaneIds(group.tree).length > 2 ? "Split" : "Pair";
+}
+
+export function cycleSplitGroup(
+  groups: readonly SplitGroup[],
+  currentGroupId: string | null,
+  step: 1 | -1,
+): { group: SplitGroup; targetPaneId: string } | null {
+  if (groups.length === 0) return null;
+  const idx = currentGroupId ? groups.findIndex((group) => group.id === currentGroupId) : -1;
+  const group =
+    idx === -1
+      ? step === 1
+        ? groups[0]
+        : groups[groups.length - 1]
+      : groups[(idx + step + groups.length) % groups.length];
+  const leaves = leafPaneIds(group.tree);
+  if (leaves.length === 0) return null;
+  const targetPaneId =
+    group.activePaneId && hasPane(group.tree, group.activePaneId)
+      ? group.activePaneId
+      : leaves[0];
+  return { group, targetPaneId };
+}
+
+/**
+ * The loose tab a plain Split (toolbar button, ⌘D) re-pairs with the active
+ * tab, or null when it should open a new session of `kind` instead.
+ *
+ * Only a tab the user would have asked for qualifies: same kind as the
+ * chosen launcher, same checkout, and not held by any pair. Splitting a tab
+ * that is already paired always adds a new pane — growing a pair by pulling
+ * in whatever happened to be loose in the strip is the guess that put a File
+ * Explorer tab into a shell pair as a third pane. Any other tab still pairs
+ * explicitly: "Pair With Open Tab…", "Open in Split", or a drag.
+ */
+export function chooseSplitPartner<
+  T extends { id: string; launcher: string; checkout?: string | null },
+>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  activeId: string | null,
+  kind: string,
+  /** Tabs whose process has ended: a dead session is never the guess. */
+  endedIds: readonly string[] = [],
+): string | null {
+  if (!activeId) return null;
+  const active = tabs.find((tab) => tab.id === activeId);
+  if (!active) return null;
+  const grouped = allGroupedPaneIds(groups);
+  if (grouped.has(activeId)) return null;
+  const checkout = active.checkout || null;
+  const partner = tabs.find(
+    (tab) =>
+      tab.id !== activeId &&
+      !grouped.has(tab.id) &&
+      !endedIds.includes(tab.id) &&
+      tab.launcher === kind &&
+      (tab.checkout || null) === checkout,
+  );
+  return partner?.id ?? null;
+}
+
+export interface PairJoinTarget {
+  readonly groupId: string;
+  readonly label: string;
+  /** The pane the joining tab is split beside: the pair's remembered focus. */
+  readonly anchorPaneId: string;
+}
+
+/**
+ * The pairs `tabId` can be added to from a menu — the same move as dropping
+ * the tab on a pair's badge. Its own pair and pairs already at the pane limit
+ * are left out. Labels match the strip's badges.
+ */
+export function pairJoinTargets(
+  groups: readonly SplitGroup[],
+  tabId: string,
+): PairJoinTarget[] {
+  const targets: PairJoinTarget[] = [];
+  groups.forEach((group, index) => {
+    const leaves = leafPaneIds(group.tree);
+    if (leaves.length === 0 || leaves.includes(tabId)) return;
+    if (leaves.length >= MAX_SPLIT_PANES) return;
+    const anchorPaneId =
+      group.activePaneId && leaves.includes(group.activePaneId) ? group.activePaneId : leaves[0];
+    targets.push({
+      groupId: group.id,
+      label: splitGroupDisplayLabel(group, index, groups.length),
+      anchorPaneId,
+    });
+  });
+  return targets;
+}
+
+export function moveTabWithGroups<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  id: string,
+  step: -1 | 1,
+): { tabs: T[]; groups: SplitGroup[] } {
+  const coLocated = coLocateTabsForGroups(tabs, groups);
+  const orderedGroups = orderGroupsByTabOrder(groups, coLocated);
+  const segments = buildTabStripSegments(coLocated, orderedGroups);
+  const segIdx = segments.findIndex((seg) =>
+    seg.kind === "group" ? seg.tabs.some((tab) => tab.id === id) : seg.tab.id === id,
+  );
+  if (segIdx === -1) return { tabs: coLocated, groups: orderedGroups };
+
+  const seg = segments[segIdx];
+  if (seg.kind === "group") {
+    const leafIdx = seg.tabs.findIndex((tab) => tab.id === id);
+    const neighborIdx = leafIdx + step;
+    if (neighborIdx >= 0 && neighborIdx < seg.tabs.length) {
+      const partnerId = seg.tabs[neighborIdx].id;
+      const swappedTree = swapPanes(seg.group.tree, id, partnerId);
+      if (swappedTree && swappedTree.kind === "branch") {
+        const nextGroups = orderedGroups.map((candidate) =>
+          candidate.id === seg.group.id ? { ...candidate, tree: swappedTree } : candidate,
+        );
+        const nextTabs = coLocateTabsForGroups(coLocated, nextGroups);
+        return { tabs: nextTabs, groups: orderGroupsByTabOrder(nextGroups, nextTabs) };
+      }
+    }
+  }
+
+  const adjIdx = segIdx + step;
+  if (adjIdx < 0 || adjIdx >= segments.length) {
+    return { tabs: coLocated, groups: orderedGroups };
+  }
+  const reorderedSegments = [...segments];
+  [reorderedSegments[segIdx], reorderedSegments[adjIdx]] = [
+    reorderedSegments[adjIdx],
+    reorderedSegments[segIdx],
+  ];
+  const nextTabs = reorderedSegments.flatMap((entry) =>
+    entry.kind === "group" ? entry.tabs : [entry.tab],
+  );
+  return { tabs: nextTabs, groups: orderGroupsByTabOrder(orderedGroups, nextTabs) };
+}
+
+export type TabStripDropMode = "before" | "after" | "pair";
+
+/**
+ * Classifies a pointer offset `rx` (`[0, 1]`) across a tab in the strip.
+ * Plain drags reorder (`before` / `after`) so users never accidentally create
+ * a split when rearranging tabs; holding `Alt` explicitly pairs into a split.
+ */
+export function classifyTabStripDropZone(rx: number, altKey = false): TabStripDropMode {
+  if (altKey) return "pair";
+  return rx < 0.5 ? "before" : "after";
+}
+
+/**
+ * Executes a tab-strip drop deterministically:
+ * - `mode === "pair"`: pairs `movingTabId` with `targetTabId` (or swaps if already in the same group),
+ *   respecting `MAX_SPLIT_PANES` and `pinnedIds`.
+ * - `mode === "before" | "after"` within the same `SplitGroup`: reorders/swaps their split pane slots.
+ * - `mode === "before" | "after"` onto another group's tab: reorders `movingTabId` cleanly before or
+ *   after the entire target group capsule without forcing an unwanted 3rd split pane.
+ * - `mode === "before" | "after"` onto an ungrouped tab: detaches `movingTabId` (if grouped) and
+ *   inserts it at the requested side of `targetTabId`.
+ */
+export function applyTabStripDrop<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  drop: {
+    movingTabId: string;
+    targetTabId: string;
+    mode: TabStripDropMode;
+    pinnedIds?: ReadonlySet<string>;
+  },
+): {
+  tabs: T[];
+  groups: SplitGroup[];
+  activeTabId?: string;
+  refusedReason?: string;
+} {
+  const { movingTabId, targetTabId, mode, pinnedIds } = drop;
+  if (
+    !movingTabId ||
+    !targetTabId ||
+    movingTabId === targetTabId ||
+    !tabs.some((tab) => tab.id === movingTabId) ||
+    !tabs.some((tab) => tab.id === targetTabId)
+  ) {
+    return { tabs: [...tabs], groups: [...groups] };
+  }
+
+  if (mode === "pair") {
+    const existingTargetGroup = findGroupForPane(groups, targetTabId);
+    if (existingTargetGroup && hasPane(existingTargetGroup.tree, movingTabId)) {
+      const swapped = swapPanes(existingTargetGroup.tree, movingTabId, targetTabId);
+      const nextGroups = upsertSplitGroup(groups, swapped, {
+        groupId: existingTargetGroup.id,
+        name: existingTargetGroup.name,
+        activePaneId: movingTabId,
+      });
+      const coLocated = coLocateTabsForGroups(tabs, nextGroups);
+      return {
+        tabs: coLocated,
+        groups: orderGroupsByTabOrder(nextGroups, coLocated),
+        activeTabId: movingTabId,
+      };
+    }
+
+    const baseGroups = removePaneFromGroups(groups, movingTabId);
+    const refreshedTargetGroup = findGroupForPane(baseGroups, targetTabId);
+    if (refreshedTargetGroup) {
+      let nextTree: SplitNode | null = null;
+      if (leafPaneIds(refreshedTargetGroup.tree).length < MAX_SPLIT_PANES) {
+        nextTree = splitPane(refreshedTargetGroup.tree, targetTabId, movingTabId, "row", "after", 0.5);
+      } else {
+        const choice = chooseSplitReplacementSlot(
+          refreshedTargetGroup.tree,
+          targetTabId,
+          pinnedIds ?? new Set<string>(),
+        );
+        if (choice?.mode === "replace") {
+          nextTree = replacePane(refreshedTargetGroup.tree, choice.targetPaneId, movingTabId);
+        } else {
+          const coLocated = coLocateTabsForGroups(tabs, groups);
+          return {
+            tabs: coLocated,
+            groups: orderGroupsByTabOrder(groups, coLocated),
+            refusedReason:
+              "That split pane is pinned and all 8 split slots are full — unpin or remove a pane first.",
+          };
+        }
+      }
+      const nextGroups = upsertSplitGroup(baseGroups, nextTree, {
+        groupId: refreshedTargetGroup.id,
+        name: refreshedTargetGroup.name,
+        activePaneId: movingTabId,
+      });
+      const coLocated = coLocateTabsForGroups(tabs, nextGroups);
+      return {
+        tabs: coLocated,
+        groups: orderGroupsByTabOrder(nextGroups, coLocated),
+        activeTabId: movingTabId,
+      };
+    }
+
+    const newTree = splitPane(null, targetTabId, movingTabId, "row", "after", 0.5);
+    const nextGroups = upsertSplitGroup(baseGroups, newTree, { activePaneId: movingTabId });
+    const coLocated = coLocateTabsForGroups(tabs, nextGroups);
+    return {
+      tabs: coLocated,
+      groups: orderGroupsByTabOrder(nextGroups, coLocated),
+      activeTabId: movingTabId,
+    };
+  }
+
+  const sourceGroup = findGroupForPane(groups, movingTabId);
+  const targetGroup = findGroupForPane(groups, targetTabId);
+
+  // Reordering within the same split group updates its leaf order directly while
+  // preserving every branch direction ("row"/"col") and custom sash ratio.
+  if (sourceGroup && targetGroup && sourceGroup.id === targetGroup.id) {
+    const leaves = leafPaneIds(sourceGroup.tree);
+    const fromLeafIdx = leaves.indexOf(movingTabId);
+    const toLeafRaw = leaves.indexOf(targetTabId);
+    if (fromLeafIdx < 0 || toLeafRaw < 0 || fromLeafIdx === toLeafRaw) {
+      const coLocated = coLocateTabsForGroups(tabs, groups);
+      return {
+        tabs: coLocated,
+        groups: orderGroupsByTabOrder(groups, coLocated),
+      };
+    }
+    const nextLeaves = [...leaves];
+    nextLeaves.splice(fromLeafIdx, 1);
+    const adjustedLeafTo = fromLeafIdx < toLeafRaw ? toLeafRaw - 1 : toLeafRaw;
+    nextLeaves.splice(mode === "after" ? adjustedLeafTo + 1 : adjustedLeafTo, 0, movingTabId);
+    if (nextLeaves.every((id, idx) => id === leaves[idx])) {
+      const coLocated = coLocateTabsForGroups(tabs, groups);
+      return {
+        tabs: coLocated,
+        groups: orderGroupsByTabOrder(groups, coLocated),
+      };
+    }
+    let cursor = 0;
+    const permuteLeaves = (node: SplitNode): SplitNode => {
+      if (node.kind === "leaf") {
+        const assigned = nextLeaves[cursor] ?? node.paneId;
+        cursor += 1;
+        return assigned === node.paneId ? node : leaf(assigned);
+      }
+      const nextA = permuteLeaves(node.a);
+      const nextB = permuteLeaves(node.b);
+      return nextA === node.a && nextB === node.b ? node : { ...node, a: nextA, b: nextB };
+    };
+    const reorderedTree = permuteLeaves(sourceGroup.tree);
+    const nextGroups = orderedGroupsForSameGroupUpdate(groups, sourceGroup, reorderedTree);
+    const coLocated = coLocateTabsForGroups(tabs, nextGroups);
+    return {
+      tabs: coLocated,
+      groups: orderGroupsByTabOrder(nextGroups, coLocated),
+    };
+  }
+
+  // Detach from any previous group and place before/after target (or target's whole group capsule).
+  const baseGroups = removePaneFromGroups(groups, movingTabId);
+  const coLocatedBase = coLocateTabsForGroups(tabs, baseGroups);
+  const refreshedTargetGroup = findGroupForPane(baseGroups, targetTabId);
+  let anchorTabId = targetTabId;
+  if (refreshedTargetGroup) {
+    const groupLeaves = leafPaneIds(refreshedTargetGroup.tree);
+    if (groupLeaves.length > 0) {
+      anchorTabId = mode === "before" ? groupLeaves[0] : groupLeaves[groupLeaves.length - 1];
+    }
+  }
+
+  const fromIdx = coLocatedBase.findIndex((tab) => tab.id === movingTabId);
+  const toRaw = coLocatedBase.findIndex((tab) => tab.id === anchorTabId);
+  if (fromIdx < 0 || toRaw < 0 || fromIdx === toRaw) {
+    return {
+      tabs: coLocatedBase,
+      groups: orderGroupsByTabOrder(baseGroups, coLocatedBase),
+    };
+  }
+
+  const nextTabs = [...coLocatedBase];
+  const [picked] = nextTabs.splice(fromIdx, 1);
+  const adjustedTo = fromIdx < toRaw ? toRaw - 1 : toRaw;
+  nextTabs.splice(mode === "after" ? adjustedTo + 1 : adjustedTo, 0, picked);
+  const finalTabs = coLocateTabsForGroups(nextTabs, baseGroups);
+  return {
+    tabs: finalTabs,
+    groups: orderGroupsByTabOrder(baseGroups, finalTabs),
+  };
+}
+
+/**
+ * Detaches `tabId` from any split group and places it at the end of the strip,
+ * keeping its underlying session alive.
+ */
+export function detachTabToStripEnd<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  tabId: string,
+): { tabs: T[]; groups: SplitGroup[] } {
+  const idx = tabs.findIndex((tab) => tab.id === tabId);
+  if (idx < 0) return { tabs: [...tabs], groups: [...groups] };
+  const nextGroups = removePaneFromGroups(groups, tabId);
+  const coLocated = coLocateTabsForGroups(tabs, nextGroups);
+  const currentIdx = coLocated.findIndex((tab) => tab.id === tabId);
+  if (currentIdx < 0) {
+    return { tabs: coLocated, groups: orderGroupsByTabOrder(nextGroups, coLocated) };
+  }
+  const reordered = [...coLocated];
+  const [picked] = reordered.splice(currentIdx, 1);
+  reordered.push(picked);
+  const finalTabs = coLocateTabsForGroups(reordered, nextGroups);
+  return {
+    tabs: finalTabs,
+    groups: orderGroupsByTabOrder(nextGroups, finalTabs),
+  };
+}
+
+function orderedGroupsForSameGroupUpdate(
+  groups: readonly SplitGroup[],
+  sourceGroup: SplitGroup,
+  reorderedTree: SplitNode,
+): SplitGroup[] {
+  if (reorderedTree.kind !== "branch") return [...groups];
+  return groups.map((candidate) =>
+    candidate.id === sourceGroup.id ? { ...candidate, tree: reorderedTree } : candidate,
+  );
+}
+
+/**
+ * Reorders an entire `SplitGroup` capsule before or after another group or single
+ * tab in the strip without ungrouping either.
+ */
+export function reorderSplitGroupInStrip<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  movingGroupId: string,
+  targetId: string,
+  position: "before" | "after",
+): { tabs: T[]; groups: SplitGroup[] } {
+  const coLocated = coLocateTabsForGroups(tabs, groups);
+  const orderedGroups = orderGroupsByTabOrder(groups, coLocated);
+  const segments = buildTabStripSegments(coLocated, orderedGroups);
+  const fromSegIdx = segments.findIndex(
+    (seg) => seg.kind === "group" && seg.group.id === movingGroupId,
+  );
+  const toSegIdx = segments.findIndex((seg) =>
+    seg.kind === "group"
+      ? seg.group.id === targetId || seg.tabs.some((tab) => tab.id === targetId)
+      : seg.tab.id === targetId,
+  );
+  if (fromSegIdx < 0 || toSegIdx < 0 || fromSegIdx === toSegIdx) {
+    return { tabs: coLocated, groups: orderedGroups };
+  }
+  const nextSegments = [...segments];
+  const [picked] = nextSegments.splice(fromSegIdx, 1);
+  const adjustedTo = fromSegIdx < toSegIdx ? toSegIdx - 1 : toSegIdx;
+  nextSegments.splice(position === "after" ? adjustedTo + 1 : adjustedTo, 0, picked);
+  const nextTabs = nextSegments.flatMap((seg) => (seg.kind === "group" ? seg.tabs : [seg.tab]));
+  return {
+    tabs: nextTabs,
+    groups: orderGroupsByTabOrder(orderedGroups, nextTabs),
+  };
+}
+
+/**
+ * Moves an entire `SplitGroup` capsule to the end of the tab strip without
+ * ungrouping any of its panes.
+ */
+export function moveSplitGroupToStripEnd<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  movingGroupId: string,
+): { tabs: T[]; groups: SplitGroup[] } {
+  const coLocated = coLocateTabsForGroups(tabs, groups);
+  const orderedGroups = orderGroupsByTabOrder(groups, coLocated);
+  const segments = buildTabStripSegments(coLocated, orderedGroups);
+  const fromSegIdx = segments.findIndex(
+    (seg) => seg.kind === "group" && seg.group.id === movingGroupId,
+  );
+  if (fromSegIdx < 0 || fromSegIdx === segments.length - 1) {
+    return { tabs: coLocated, groups: orderedGroups };
+  }
+  const nextSegments = [...segments];
+  const [picked] = nextSegments.splice(fromSegIdx, 1);
+  nextSegments.push(picked);
+  const nextTabs = nextSegments.flatMap((seg) => (seg.kind === "group" ? seg.tabs : [seg.tab]));
+  return {
+    tabs: nextTabs,
+    groups: orderGroupsByTabOrder(orderedGroups, nextTabs),
+  };
+}
+
+/**
+ * Shifts an entire `SplitGroup` capsule one segment left (`step = -1`) or
+ * right (`step = 1`) across the tab strip without ungrouping or mutating any
+ * internal split tree.
+ */
+export function moveSplitGroupByStep<T extends { id: string }>(
+  tabs: readonly T[],
+  groups: readonly SplitGroup[],
+  groupId: string,
+  step: -1 | 1,
+): { tabs: T[]; groups: SplitGroup[] } {
+  const coLocated = coLocateTabsForGroups(tabs, groups);
+  const orderedGroups = orderGroupsByTabOrder(groups, coLocated);
+  const segments = buildTabStripSegments(coLocated, orderedGroups);
+  const segIdx = segments.findIndex(
+    (seg) => seg.kind === "group" && seg.group.id === groupId,
+  );
+  const targetIdx = segIdx + step;
+  if (segIdx < 0 || targetIdx < 0 || targetIdx >= segments.length) {
+    return { tabs: coLocated, groups: orderedGroups };
+  }
+  const neighbor = segments[targetIdx];
+  const targetId = neighbor.kind === "group" ? neighbor.group.id : neighbor.tab.id;
+  return reorderSplitGroupInStrip(
+    coLocated,
+    orderedGroups,
+    groupId,
+    targetId,
+    step === -1 ? "before" : "after",
+  );
+}
+
+function summarizePaneSetAttention(
+  paneIds: readonly string[],
+  unreadIds: ReadonlySet<string>,
+  agentStatuses: Readonly<
+    Record<string, { state?: string; detail?: string | null } | null | undefined>
+  >,
+): HiddenSplitSummary {
+  const empty: HiddenSplitSummary = {
+    hiddenIds: paneIds as string[],
+    hiddenCount: paneIds.length,
+    blockedCount: 0,
+    errorCount: 0,
+    doneCount: 0,
+    unreadCount: 0,
+    urgentPaneId: null,
+    badgeLabel: null,
+    tone: null,
+  };
+  if (paneIds.length === 0) return empty;
+
+  let blockedCount = 0;
+  let errorCount = 0;
+  let doneCount = 0;
+  let unreadCount = 0;
+  let firstBlocked: string | null = null;
+  let firstError: string | null = null;
+  let firstDone: string | null = null;
+  let firstUnread: string | null = null;
+
+  for (const id of paneIds) {
+    const st = agentStatuses[id]?.state;
+    if (st === "blocked") {
+      blockedCount += 1;
+      firstBlocked ??= id;
+    } else if (st === "error") {
+      errorCount += 1;
+      firstError ??= id;
+    } else if (st === "done") {
+      doneCount += 1;
+      firstDone ??= id;
+    }
+    if (unreadIds.has(id)) {
+      unreadCount += 1;
+      firstUnread ??= id;
+    }
+  }
+
+  if (blockedCount > 0) {
+    return {
+      hiddenIds: [...paneIds],
+      hiddenCount: paneIds.length,
+      blockedCount,
+      errorCount,
+      doneCount,
+      unreadCount,
+      urgentPaneId: firstBlocked,
+      badgeLabel: blockedCount > 1 ? `${blockedCount} need input` : "Needs input",
+      tone: "warn",
+    };
+  }
+  if (errorCount > 0) {
+    return {
+      hiddenIds: [...paneIds],
+      hiddenCount: paneIds.length,
+      blockedCount,
+      errorCount,
+      doneCount,
+      unreadCount,
+      urgentPaneId: firstError,
+      badgeLabel: errorCount > 1 ? `${errorCount} failed` : "Failed",
+      tone: "danger",
+    };
+  }
+  if (doneCount > 0) {
+    return {
+      hiddenIds: [...paneIds],
+      hiddenCount: paneIds.length,
+      blockedCount,
+      errorCount,
+      doneCount,
+      unreadCount,
+      urgentPaneId: firstDone,
+      badgeLabel: doneCount > 1 ? `${doneCount} done` : "Done",
+      tone: "accent",
+    };
+  }
+  if (unreadCount > 0) {
+    return {
+      hiddenIds: [...paneIds],
+      hiddenCount: paneIds.length,
+      blockedCount,
+      errorCount,
+      doneCount,
+      unreadCount,
+      urgentPaneId: firstUnread,
+      badgeLabel: `${unreadCount} unread`,
+      tone: "info",
+    };
+  }
+  return empty;
+}
+
+/**
+ * Summarizes unseen activity and OSC 7501 attention states across all panes
+ * of a background terminal pair when that pair is not currently active.
+ */
+export function summarizeSplitGroupAttention(
+  group: SplitGroup,
+  isGroupActive: boolean,
+  unreadIds: ReadonlySet<string>,
+  agentStatuses: Readonly<
+    Record<string, { state?: string; detail?: string | null } | null | undefined>
+  >,
+): HiddenSplitSummary {
+  if (isGroupActive) {
+    return {
+      hiddenIds: [],
+      hiddenCount: 0,
+      blockedCount: 0,
+      errorCount: 0,
+      doneCount: 0,
+      unreadCount: 0,
+      urgentPaneId: null,
+      badgeLabel: null,
+      tone: null,
+    };
+  }
+  return summarizePaneSetAttention(leafPaneIds(group.tree), unreadIds, agentStatuses);
 }
 
 export function serializeSplitTree(root: SplitNode | null): string | null {
@@ -466,16 +1621,44 @@ export function serializeSplitTree(root: SplitNode | null): string | null {
 }
 
 export function serializeSplitWorkspace(
-  root: SplitNode | null,
+  rootOrGroups: SplitNode | readonly SplitGroup[] | null,
   leaves: Record<string, PersistedSplitLeafMeta>,
+  activeGroupId?: string | null,
 ): string | null {
-  if (!root || root.kind !== "branch") return null;
-  const usedIds = leafPaneIds(root);
+  if (Array.isArray(rootOrGroups)) {
+    const normalized = normalizeSplitGroups(rootOrGroups);
+    if (normalized.length === 0) return null;
+    const usedIds = allGroupedPaneIds(normalized);
+    const filtered: Record<string, PersistedSplitLeafMeta> = {};
+    for (const id of usedIds) {
+      if (leaves[id]) filtered[id] = leaves[id];
+    }
+    const groupsPayload: PersistedSplitGroup[] = normalized.map((group) => ({
+      id: group.id,
+      ...(group.name ? { name: group.name } : {}),
+      ...(group.activePaneId ? { activePaneId: group.activePaneId } : {}),
+      tree: group.tree,
+    }));
+    const validActiveGroup =
+      activeGroupId && groupsPayload.some((group) => group.id === activeGroupId)
+        ? activeGroupId
+        : null;
+    const payload: PersistedSplitWorkspace = {
+      version: 3,
+      activeGroupId: validActiveGroup,
+      groups: groupsPayload,
+      leaves: filtered,
+    };
+    return JSON.stringify(payload);
+  }
+  const singleRoot = rootOrGroups as SplitNode | null;
+  if (!singleRoot || singleRoot.kind !== "branch") return null;
+  const usedIds = leafPaneIds(singleRoot);
   const filtered: Record<string, PersistedSplitLeafMeta> = {};
   for (const id of usedIds) {
     if (leaves[id]) filtered[id] = leaves[id];
   }
-  const payload: PersistedSplitWorkspace = { version: 2, tree: root, leaves: filtered };
+  const payload: PersistedSplitWorkspace = { version: 2, tree: singleRoot, leaves: filtered };
   return JSON.stringify(payload);
 }
 
@@ -504,9 +1687,59 @@ function parseRawSplitNode(value: unknown, depth: number): SplitNode | null {
   return null;
 }
 
+function parsePersistedLeaves(rawLeaves: unknown): Record<string, PersistedSplitLeafMeta> {
+  const leavesRaw =
+    rawLeaves && typeof rawLeaves === "object" && !Array.isArray(rawLeaves)
+      ? (rawLeaves as Record<string, unknown>)
+      : {};
+  const leaves: Record<string, PersistedSplitLeafMeta> = {};
+  for (const [id, item] of Object.entries(leavesRaw)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const meta = item as Record<string, unknown>;
+    if (typeof meta.launcher !== "string") continue;
+    const cleanName = typeof meta.name === "string" ? cleanTabName(meta.name, 120) : "";
+    const cleanLaunchName = typeof meta.launchName === "string" ? cleanTabName(meta.launchName, 120) : "";
+    const cleanTitle = typeof meta.title === "string" ? cleanTabName(meta.title, 256) : "";
+    const rawSnippet =
+      meta.snippet && typeof meta.snippet === "object" && !Array.isArray(meta.snippet)
+        ? (meta.snippet as Record<string, unknown>)
+        : null;
+    const snippet =
+      rawSnippet && typeof rawSnippet.content === "string"
+        ? {
+            title: cleanTabName(typeof rawSnippet.title === "string" ? rawSnippet.title : "", 64) || "Command output",
+            content: rawSnippet.content.slice(0, MAX_PERSISTED_SNIPPET_CHARS),
+          }
+        : undefined;
+    leaves[id] = {
+      launcher: meta.launcher as TabKind,
+      slotIndex: typeof meta.slotIndex === "number" && Number.isFinite(meta.slotIndex) ? meta.slotIndex : 0,
+      ...(typeof meta.backendSessionId === "string" && meta.backendSessionId ? { backendSessionId: meta.backendSessionId } : {}),
+      ...(typeof meta.parentSessionId === "string" && meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
+      ...(typeof meta.filePath === "string" && meta.filePath ? { filePath: meta.filePath } : {}),
+      ...(typeof meta.revealLine === "number" ? { revealLine: meta.revealLine } : {}),
+      ...(typeof meta.revealColumn === "number" ? { revealColumn: meta.revealColumn } : {}),
+      ...(snippet ? { snippet } : {}),
+      ...(meta.pinned === true ? { pinned: true } : {}),
+      ...(typeof meta.url === "string" && meta.url ? { url: meta.url } : {}),
+      ...(typeof meta.checkout === "string" && meta.checkout ? { checkout: meta.checkout } : {}),
+      ...(cleanName ? { name: cleanName } : {}),
+      ...(cleanLaunchName ? { launchName: cleanLaunchName } : {}),
+      ...(typeof meta.userNamed === "boolean" ? { userNamed: meta.userNamed } : {}),
+      ...(cleanTitle ? { title: cleanTitle } : {}),
+    };
+  }
+  return leaves;
+}
+
 export function parsePersistedSplitWorkspace(
   raw: string | null | undefined,
-): { tree: SplitNode; leaves: Record<string, PersistedSplitLeafMeta> } | null {
+): {
+  tree: SplitNode;
+  groups: SplitGroup[];
+  activeGroupId: string | null;
+  leaves: Record<string, PersistedSplitLeafMeta>;
+} | null {
   if (!raw) return null;
   let parsed: unknown;
   try {
@@ -516,35 +1749,76 @@ export function parsePersistedSplitWorkspace(
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const rec = parsed as Record<string, unknown>;
+  if (rec.version === 3 && Array.isArray(rec.groups)) {
+    const rawGroups: SplitGroup[] = [];
+    for (const item of rec.groups.slice(0, 32)) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const gRec = item as Record<string, unknown>;
+      const gTree = parseRawSplitNode(gRec.tree, 0);
+      if (!gTree || gTree.kind !== "branch") continue;
+      const id = typeof gRec.id === "string" ? cleanTabName(gRec.id, 48) || mintSplitGroupId() : mintSplitGroupId();
+      const name = typeof gRec.name === "string" ? cleanTabName(gRec.name, 48) || undefined : undefined;
+      const activePaneId = typeof gRec.activePaneId === "string" ? gRec.activePaneId : undefined;
+      rawGroups.push({
+        id,
+        tree: gTree,
+        ...(name ? { name } : {}),
+        ...(activePaneId ? { activePaneId } : {}),
+      });
+    }
+    const groups = normalizeSplitGroups(rawGroups);
+    if (groups.length === 0) return null;
+    const requestedActive =
+      typeof rec.activeGroupId === "string" && groups.some((group) => group.id === rec.activeGroupId)
+        ? rec.activeGroupId
+        : null;
+    const activeGroup = (requestedActive ? groups.find((g) => g.id === requestedActive) : null) ?? groups[0];
+    return {
+      tree: activeGroup.tree,
+      groups,
+      activeGroupId: requestedActive,
+      leaves: parsePersistedLeaves(rec.leaves),
+    };
+  }
   if (rec.version === 2 && rec.tree && typeof rec.tree === "object") {
     const tree = parseRawSplitNode(rec.tree, 0);
     if (!tree || tree.kind !== "branch") return null;
-    const leavesRaw =
-      rec.leaves && typeof rec.leaves === "object" && !Array.isArray(rec.leaves)
-        ? (rec.leaves as Record<string, unknown>)
-        : {};
-    const leaves: Record<string, PersistedSplitLeafMeta> = {};
-    for (const [id, item] of Object.entries(leavesRaw)) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-      const meta = item as Record<string, unknown>;
-      if (typeof meta.launcher !== "string") continue;
-      leaves[id] = {
-        launcher: meta.launcher as TabKind,
-        slotIndex: typeof meta.slotIndex === "number" && Number.isFinite(meta.slotIndex) ? meta.slotIndex : 0,
-        ...(typeof meta.backendSessionId === "string" && meta.backendSessionId ? { backendSessionId: meta.backendSessionId } : {}),
-        ...(typeof meta.parentSessionId === "string" && meta.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
-        ...(typeof meta.filePath === "string" && meta.filePath ? { filePath: meta.filePath } : {}),
-        ...(typeof meta.revealLine === "number" ? { revealLine: meta.revealLine } : {}),
-        ...(typeof meta.revealColumn === "number" ? { revealColumn: meta.revealColumn } : {}),
-        ...(typeof meta.url === "string" && meta.url ? { url: meta.url } : {}),
-        ...(typeof meta.checkout === "string" && meta.checkout ? { checkout: meta.checkout } : {}),
-      };
-    }
-    return { tree, leaves };
+    const group: SplitGroup = { id: mintSplitGroupId(), tree };
+    return {
+      tree,
+      groups: [group],
+      activeGroupId: group.id,
+      leaves: parsePersistedLeaves(rec.leaves),
+    };
   }
   const v1Tree = parseRawSplitNode(parsed, 0);
   if (!v1Tree || v1Tree.kind !== "branch") return null;
-  return { tree: v1Tree, leaves: {} };
+  const group: SplitGroup = { id: mintSplitGroupId(), tree: v1Tree };
+  return {
+    tree: v1Tree,
+    groups: [group],
+    activeGroupId: group.id,
+    leaves: {},
+  };
+}
+
+export function remapSplitGroups(
+  groups: readonly SplitGroup[],
+  paneIdMap: ReadonlyMap<string, string>,
+): SplitGroup[] {
+  const mapped: SplitGroup[] = [];
+  for (const group of groups) {
+    const remapped = remapSplitTree(group.tree, paneIdMap);
+    if (!remapped || remapped.kind !== "branch") continue;
+    const mappedActive = group.activePaneId ? paneIdMap.get(group.activePaneId) : undefined;
+    mapped.push({
+      id: group.id,
+      tree: remapped,
+      ...(group.name ? { name: group.name } : {}),
+      ...(mappedActive ? { activePaneId: mappedActive } : {}),
+    });
+  }
+  return normalizeSplitGroups(mapped);
 }
 
 export function remapSplitTree(
@@ -589,24 +1863,73 @@ export function hydrateSplitTree(
   return remapSplitTree(parsed.tree, identityMap);
 }
 
+export type SplitSlotChord =
+  | "focus-pane-1"
+  | "focus-pane-2"
+  | "focus-pane-3"
+  | "focus-pane-4"
+  | "focus-pane-5"
+  | "focus-pane-6"
+  | "focus-pane-7"
+  | "focus-pane-8";
+
 export type SplitChord =
   | "split-right"
   | "split-down"
   | "zoom-pane"
+  | "unsplit"
   | "focus-left"
   | "focus-right"
   | "focus-up"
   | "focus-down"
+  | "focus-next-pane"
+  | "focus-prev-pane"
+  | "focus-next-group"
+  | "focus-prev-group"
+  | SplitSlotChord
   | "ignore";
 
+function altSplitKey(event: { key: string; code?: string }): SplitChord | null {
+  if (event.key === "ArrowLeft") return "focus-left";
+  if (event.key === "ArrowRight") return "focus-right";
+  if (event.key === "ArrowUp") return "focus-up";
+  if (event.key === "ArrowDown") return "focus-down";
+  if (event.key === "]" || event.code === "BracketRight") return "focus-next-pane";
+  if (event.key === "[" || event.code === "BracketLeft") return "focus-prev-pane";
+  if (event.key === "0" || event.code === "Digit0") return "unsplit";
+  const digitMatch =
+    /^[1-8]$/.exec(event.key)?.[0] ??
+    /^Digit([1-8])$/.exec(event.code ?? "")?.[1];
+  if (digitMatch) {
+    return `focus-pane-${digitMatch}` as SplitSlotChord;
+  }
+  return null;
+}
+
+function altShiftSplitKey(event: { key: string; code?: string }): SplitChord | null {
+  if (event.code === "BracketRight" || event.key === "}" || event.key === "]") {
+    return "focus-next-group";
+  }
+  if (event.code === "BracketLeft" || event.key === "{" || event.key === "[") {
+    return "focus-prev-group";
+  }
+  return null;
+}
+
 /**
- * Spatial split and pane-zoom keyboard chords:
- * - macOS: `⌘D` (split right), `⌘⇧D` (split down), `⌘⇧Enter` (zoom pane), `⌘⌥←/→/↑/↓` (focus neighbor)
- * - Linux/Windows: `Ctrl+Shift+D`, `Ctrl+Shift+Alt+D`, `Ctrl+Shift+Enter`, `Ctrl+Alt+Arrow`
+ * Spatial split, pane-zoom, non-destructive split-pane focus cycling, pair switching, and slot jump chords:
+ * - macOS: `⌘D` (split right), `⌘⇧D` (split down), `⌘⇧Enter` (zoom pane),
+ *   `⌘⌥←/→/↑/↓` (focus neighbor), `⌘⌥]` / `⌘⌥[` (next/prev split pane),
+ *   `⌘⌥⇧]` / `⌘⌥⇧[` (next/prev terminal pair),
+ *   `⌘⌥1–8` (jump to split pane slot), `⌘⌥0` (close split view)
+ * - Linux/Windows: `Ctrl+Shift+D`, `Ctrl+Shift+Alt+D`, `Ctrl+Shift+Enter`,
+ *   `Ctrl+Alt+Arrow`, `Ctrl+Alt+]` / `Ctrl+Alt+[`, `Ctrl+Alt+Shift+]` / `[`,
+ *   `Ctrl+Alt+1–8`, `Ctrl+Alt+0`
  */
 export function terminalSplitChord(
   event: {
     key: string;
+    code?: string;
     ctrlKey: boolean;
     metaKey: boolean;
     altKey: boolean;
@@ -629,11 +1952,11 @@ export function terminalSplitChord(
         return event.repeat ? "ignore" : "zoom-pane";
       }
     }
-    if (event.metaKey && event.altKey && !event.ctrlKey && !event.shiftKey) {
-      if (event.key === "ArrowLeft") return "focus-left";
-      if (event.key === "ArrowRight") return "focus-right";
-      if (event.key === "ArrowUp") return "focus-up";
-      if (event.key === "ArrowDown") return "focus-down";
+    if (event.metaKey && event.altKey && !event.ctrlKey) {
+      if (event.shiftKey) return altShiftSplitKey(event);
+      const hit = altSplitKey(event);
+      if (hit === "unsplit" && event.repeat) return "ignore";
+      return hit;
     }
     return null;
   }
@@ -646,11 +1969,11 @@ export function terminalSplitChord(
     if (event.shiftKey && !event.altKey && event.key === "Enter") {
       return event.repeat ? "ignore" : "zoom-pane";
     }
-    if (event.altKey && !event.shiftKey) {
-      if (event.key === "ArrowLeft") return "focus-left";
-      if (event.key === "ArrowRight") return "focus-right";
-      if (event.key === "ArrowUp") return "focus-up";
-      if (event.key === "ArrowDown") return "focus-down";
+    if (event.altKey) {
+      if (event.shiftKey) return altShiftSplitKey(event);
+      const hit = altSplitKey(event);
+      if (hit === "unsplit" && event.repeat) return "ignore";
+      return hit;
     }
   }
   return null;

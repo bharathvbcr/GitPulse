@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import GitHubPanel from "./GitHubPanel.svelte";
+import { stripMarkupTags } from "../dom/markupText";
 import { VIEW_REGISTRY } from "../views/viewRegistry";
 
 // What the panel does with a live page — truncation and error states, the
@@ -36,7 +37,7 @@ describe("GitHubPanel", () => {
     const section = VIEW_REGISTRY.work.sections?.find((s) => s.id === "remote");
     expect(section?.label).toBe("Remote");
     const heading = /<h2[^>]*>([\s\S]*?)<\/h2>/.exec(render(GitHubPanel).body)?.[1] ?? "";
-    expect(heading.replace(/<[^>]+>/g, "").trim()).toBe(section?.label);
+    expect(stripMarkupTags(heading).trim()).toBe(section?.label);
   });
 });
 

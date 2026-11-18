@@ -7,7 +7,7 @@
     <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
     <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
     <script type="module">
-      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
+      import { mockIPCWithEvents, adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
       import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
@@ -104,6 +104,12 @@
           case "cmd_terminal_ack":
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
+          case "cmd_terminal_set_title":
+            return null;
+          case "cmd_terminal_session_ledger":
+            return { offers: [], reopenable_count: 0, unreadable_count: 0 };
+          case "cmd_terminal_listening_ports":
+            return [];
           case "cmd_save_export": return args.fileName;
           case "cmd_terminal_write":
             report.writes++;
@@ -151,6 +157,15 @@
             return { id: args.sessionId, cwd: "/fixture/GitPulse", shell: "/bin/zsh" };
           }
           case "cmd_terminal_context": {
+            if (args.sessionId === "fixture-claude-root") {
+              return {
+                process: "claude",
+                busy: false,
+                jobs: true,
+                cwd: "/fixture/GitPulse/.claude/worktrees/sidebar-ux",
+                repo_dir: "",
+              };
+            }
             const root = sessions.get(args.sessionId);
             if (!root) throw new Error(`Terminal session '${args.sessionId}' not found`);
             // A host that never answers: the page's own deadline is all that ends the wait.
@@ -164,7 +179,10 @@
               repo_dir: contextDir,
             };
           }
-          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+          case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": case "cmd_list_worktrees": case "cmd_worktree_routes": return [];
+          case "cmd_task_view": return { available: false, store_path: "", leases: [], error: "" };
+          case "cmd_repository_trust": return { path: args?.repoPath ?? "/fixture/GitPulse", git_dir: "/fixture/GitPulse/.git", common_dir: "/fixture/GitPulse/.git", identity: "fixture", scope: "repository", worktrees: 1 };
+          case "cmd_get_language_stats": return { stats: [], truncated: false };
           case "cmd_stash_list": return { entries: [], truncated: false };
           case "cmd_list_tags": return { tags: [], truncated: false };
           case "cmd_branch_stats": return {};
@@ -175,7 +193,10 @@
           // What a file pane beside the terminal reads: the same 400-line
           // fixture the code view shows, so both ways of following a file
           // reference land on the same named line.
-          case "cmd_get_file_blob": return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
+          // Repository logos: GitPulse ships an icon, Other has none, so the
+          // session list draws one logo and one set of initials.
+          case "cmd_list_repo_files": return args?.repoPath === "/fixture/GitPulse" ? ["src-tauri/icons/128x128.png", "src/main.ts"] : ["src/main.ts"];
+          case "cmd_get_file_blob": if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 }; return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
       });
@@ -393,7 +414,9 @@
               check("clicking a localhost URL opens a browser session on it, and the system browser is not asked",
                 () => browserCalls.some((c) => c.cmd === "cmd_browser_open" && c.args.url === "http://localhost:5173/app")
                   && opened.length === openerBefore && visible("[data-browser-session]").length === 1);
-              label("Close Browser")?.click();
+              check("a browser tab without a page title yet names its host:port",
+                () => Boolean(label("Close localhost:5173")));
+              label("Close localhost:5173")?.click();
               await wait(300);
               check("closing it closes its page", () => browserCalls.some((c) => c.cmd === "cmd_browser_close"));
             } finally {
@@ -1095,6 +1118,25 @@
           button("All terminal sessions").click(); await wait();
           check("session list sits above the grid instead of overlapping it", () => aboveGrid(label("Sessions across repositories")));
           check("session manager includes both repositories", () => label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
+          {
+            const list = () => label("Sessions across repositories");
+            const heads = () => [...list().querySelectorAll('[data-testid="session-group"]')];
+            for (let i = 0; i < 40 && !list().querySelector("[data-repo-logo][data-logo-state='image']"); i += 1) await wait(25);
+            check("every repository group in the session list carries its mark", () =>
+              heads().length >= 2 && heads().every((head) => head.querySelector("[data-repo-logo]")));
+            check("a repository with a logo shows it at its group; one without shows its initials", () => {
+              const mark = (name) => heads().find((head) => head.textContent.includes(name))?.querySelector("[data-repo-logo]");
+              return mark("GitPulse")?.dataset.logoState === "image" && mark("Other")?.dataset.logoState === "initials";
+            });
+            check("every session row says what it runs with a kind icon, beside its text", () => {
+              const rows = [...list().querySelectorAll('[data-testid="session-row"]')];
+              return rows.length > 0 && rows.every((row) => row.querySelector("[data-launcher-icon]")?.getAttribute("aria-hidden") === "true");
+            });
+            check("the session list keeps its repository names and rows", () =>
+              list().querySelectorAll('[data-testid="session-repository"]').length === heads().length);
+          }
+          check("every dock tab carries its kind icon", () =>
+            visible("[data-terminal-tab] [role=\"tab\"]").length > 0 && visible("[data-terminal-tab] [role=\"tab\"]").every((tab) => tab.querySelector("[data-launcher-icon]")));
           const searchSessions = label("Search terminal sessions");
           searchSessions.value = "Other"; searchSessions.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           check("global session search filters repositories", () => label("Sessions across repositories").textContent.includes("Other") && !label("Sessions across repositories").textContent.includes("GitPulse"));
@@ -1429,6 +1471,17 @@
             return true;
           });
           if (!lastWriteId) throw new Error("no session received the typed text");
+          // Acks are coalesced per session per frame, so credit still owed for
+          // earlier output would ride in the same ack as the oversize message
+          // and be counted as its repayment (65619 = 65537 + 82 owed, in a
+          // WebKit run). Let the session's earlier output be repaid first.
+          const ackedFor = (id) => acks.filter((row) => row.sessionId === id).reduce((sum, row) => sum + row.bytes, 0);
+          const settleDeadline = performance.now() + 2000;
+          while (performance.now() < settleDeadline && ackedFor(lastWriteId) < pushedBytes(lastWriteId)) await wait(20);
+          check("earlier output is repaid before the oversize message is sent", () => {
+            if (ackedFor(lastWriteId) === pushedBytes(lastWriteId)) return true;
+            throw new Error(JSON.stringify({ acked: ackedFor(lastWriteId), pushed: pushedBytes(lastWriteId) }));
+          });
           const ackMark = acks.length;
           const killedBeforeCorrupt = report.killed;
           // One message longer than a read can make. Rust reserved its length,
@@ -1438,8 +1491,16 @@
           const corruptDeadline = performance.now() + 2000;
           const repaid = () => acks.slice(ackMark).filter((row) => row.sessionId === lastWriteId).reduce((sum, row) => sum + row.bytes, 0);
           while (performance.now() < corruptDeadline && repaid() < OVERSIZE) await wait(20);
-          check("an oversize message is repaid in full and the process kept", () =>
-            repaid() === OVERSIZE && report.killed === killedBeforeCorrupt);
+          check("an oversize message is repaid in full and the process kept", () => {
+            if (repaid() === OVERSIZE && report.killed === killedBeforeCorrupt) return true;
+            // Say what was measured, so a failure names its own shape.
+            const rows = acks.slice(ackMark);
+            throw new Error(JSON.stringify({
+              repaid: repaid(), expected: OVERSIZE, killed: report.killed - killedBeforeCorrupt,
+              ackRows: rows.length, otherSessions: rows.filter((row) => row.sessionId !== lastWriteId).length,
+              lastBytes: rows.slice(-4).map((row) => row.bytes),
+            }));
+          });
           const liveDeadline = performance.now() + 2000;
           let liveStatus = "";
           while (performance.now() < liveDeadline) {
@@ -1884,6 +1945,975 @@
       }
 
       /**
+       * Wait until a DOM/store predicate turns truthy so Chromium and WebKit
+       * timing differences on layout, DragEvent, and OSC frames stay deterministic.
+       */
+      async function waitFor(predicate, timeoutMs = 2000, stepMs = 40) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const hit = predicate();
+          if (hit) return hit;
+          await wait(stepMs);
+        }
+        return predicate();
+      }
+
+      /** Read one entry from the terminalSessions Svelte store regardless of container type. */
+      function findSessionEntry(storeValue, tabId) {
+        if (!storeValue) return null;
+        if (Array.isArray(storeValue)) return storeValue.find((entry) => entry?.key === tabId) ?? null;
+        if (storeValue instanceof Map) {
+          return storeValue.get(tabId) ?? [...storeValue.values()].find((entry) => entry?.key === tabId) ?? null;
+        }
+        if (typeof storeValue === "object") {
+          return storeValue[tabId] ?? Object.values(storeValue).find((entry) => entry?.key === tabId) ?? null;
+        }
+        return null;
+      }
+
+      /** Switch the terminal launcher ("New session type") to a target runtime such as "Shell". */
+      async function setLauncherType(targetLabel) {
+        const control = visible('[aria-label="New session type"]')[0];
+        if (!control) throw new Error('Missing launcher control [aria-label="New session type"]');
+        if (control.textContent?.trim() === targetLabel) return;
+        control.click();
+        const menuOption = await waitFor(() =>
+          [...document.querySelectorAll('#terminal-launcher-menu [role="option"]')].find(
+            (el) => el.textContent?.trim() === targetLabel
+          )
+        );
+        if (!menuOption) throw new Error(`Missing launcher option ${targetLabel}`);
+        menuOption.click();
+        await wait(120);
+      }
+
+      /** Locate the visible button that spawns a new terminal session tab. */
+      function findNewSessionButton() {
+        const candidates = visible("button");
+        return (
+          visible("button[data-terminal-new]")[0] ??
+          candidates.find((el) => /new .*session/i.test(el.getAttribute("aria-label") ?? "")) ??
+          candidates.find((el) => /new (terminal|session|tab)/i.test(el.getAttribute("title") ?? "")) ??
+          null
+        );
+      }
+
+      /**
+       * Verify Round 2 split-pane UX invariants: open-in-split, pane header
+       * center-drop swap, zoomed hidden urgent/unread alert + reveal, pin
+       * eviction protection, inline rename focus handling, and Console pill jump.
+       */
+      async function runSplitUx() {
+        const { results, check, stopped } = createChecks();
+        const initialLimit = SESSION_LIMIT;
+        let pinnedTabId = null;
+        try {
+          const { get } = await import("svelte/store");
+          const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry.ts");
+
+          const shellRoot = document.querySelector(".h-screen");
+          if (shellRoot && shellRoot.getBoundingClientRect().width < 700) {
+            button("Toggle narrow layout").click();
+            await wait(250);
+          }
+
+          const consoleBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
+          const shellModeBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Shell");
+          if (
+            shellModeBtn &&
+            (visible('[data-testid="terminal-active-session-summary"]').length > 0 ||
+              consoleBtn?.getAttribute("aria-pressed") === "true")
+          ) {
+            shellModeBtn.click();
+            await wait(200);
+          }
+
+          const closeSplitBtn =
+            visible('button[aria-label="Close split view"], button[title="Close split view"]')[0] ??
+            visible("button").find((el) => el.textContent?.trim() === "Close split view");
+          if (closeSplitBtn) {
+            closeSplitBtn.click();
+            await wait(200);
+          }
+
+          setTerminalSessionLimit(Math.max(10, initialLimit));
+          await setLauncherType("Shell");
+
+          async function spawnTrackedShellTab() {
+            const existing = new Set(visible("[data-terminal-tab]").map((el) => el.getAttribute("data-terminal-tab")));
+            const addBtn = findNewSessionButton();
+            if (!addBtn) throw new Error("Missing new terminal tab button");
+            addBtn.click();
+            const spawnedEl = await waitFor(() =>
+              visible("[data-terminal-tab]").find((el) => !existing.has(el.getAttribute("data-terminal-tab")))
+            );
+            const tabId = spawnedEl?.getAttribute("data-terminal-tab");
+            if (!tabId) throw new Error("Timed out waiting for spawned terminal tab");
+            const entry = await waitFor(() => {
+              const hit = findSessionEntry(get(terminalSessions), tabId);
+              return hit?.sessionId ? hit : null;
+            });
+            if (!entry?.sessionId) throw new Error(`Missing pty sessionId for ${tabId}`);
+            return { tabId, ptyId: entry.sessionId };
+          }
+
+          let tabC = visible("[data-terminal-tab]")
+            .find((el) => !el.querySelector('[data-testid="terminal-tab-pinned-icon"]'))
+            ?.getAttribute("data-terminal-tab");
+          if (!tabC) tabC = (await spawnTrackedShellTab()).tabId;
+
+          const { tabId: tabA } = await spawnTrackedShellTab();
+          const { tabId: tabB, ptyId: ptyB } = await spawnTrackedShellTab();
+          await wait(300);
+
+          const tabABtn = document.getElementById(`terminal-tab-${tabA}`);
+          if (!tabABtn) throw new Error(`Missing tab button for ${tabA}`);
+          tabABtn.click();
+          await waitFor(() => document.getElementById(`terminal-tab-${tabA}`)?.getAttribute("aria-selected") === "true");
+
+          const openSplitBtn = await waitFor(() =>
+            document.querySelector(`[data-terminal-tab="${tabB}"] [data-testid="terminal-tab-open-in-split"]`)
+          );
+          if (!openSplitBtn) throw new Error(`Missing open-in-split button on ${tabB}`);
+          openSplitBtn.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 2);
+
+          check("A: open-in-split creates a 2-pane split with Pane 2 of 2 indicator", () => {
+            const panes = visible('[role="tabpanel"]');
+            const hasA = panes.some((p) => p.getAttribute("data-pane-id") === tabA);
+            const hasB = panes.some((p) => p.getAttribute("data-pane-id") === tabB);
+            const indicator = visible('[data-testid="terminal-header-split-indicator"]')[0]?.textContent ?? "";
+            return panes.length === 2 && hasA && hasB && indicator.includes("Pane 2 of 2");
+          });
+
+          const paneABefore = visible(`[role="tabpanel"][data-pane-id="${tabA}"]`)[0];
+          const paneBBefore = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0];
+          const rectA0 = paneABefore?.getBoundingClientRect();
+          const rectB0 = paneBBefore?.getBoundingClientRect();
+          const srcPane = rectA0 && rectB0 && rectA0.left <= rectB0.left ? paneABefore : paneBBefore;
+          const dstPane = srcPane === paneABefore ? paneBBefore : paneABefore;
+          const srcHeader = srcPane?.querySelector('[data-testid="terminal-split-pane-header"]');
+          if (!srcPane || !dstPane || !srcHeader) throw new Error("Missing split panes for drag-drop swap");
+          const srcRect = srcHeader.getBoundingClientRect();
+          const dstRect = dstPane.getBoundingClientRect();
+          const cx = dstRect.left + dstRect.width * 0.5;
+          const cy = dstRect.top + dstRect.height * 0.5;
+          let transfer = null;
+          try {
+            transfer = new DataTransfer();
+          } catch {}
+          srcHeader.dispatchEvent(
+            new DragEvent("dragstart", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transfer,
+              clientX: srcRect.left + 12,
+              clientY: srcRect.top + 10
+            })
+          );
+          dstPane.dispatchEvent(
+            new DragEvent("dragover", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transfer,
+              clientX: cx,
+              clientY: cy
+            })
+          );
+          await wait(30);
+          dstPane.dispatchEvent(
+            new DragEvent("drop", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transfer,
+              clientX: cx,
+              clientY: cy
+            })
+          );
+          srcHeader.dispatchEvent(
+            new DragEvent("dragend", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transfer,
+              clientX: cx,
+              clientY: cy
+            })
+          );
+          await waitFor(() => {
+            const pA = visible(`[role="tabpanel"][data-pane-id="${tabA}"]`)[0]?.getBoundingClientRect();
+            const pB = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0]?.getBoundingClientRect();
+            return pA && pB && rectA0 && rectB0 && Math.sign(pA.left - pB.left) === -Math.sign(rectA0.left - rectB0.left);
+          });
+
+          check("B: pane header drag onto sibling center swaps pane positions while keeping 2 panes", () => {
+            const panes = visible('[role="tabpanel"]');
+            const pA = visible(`[role="tabpanel"][data-pane-id="${tabA}"]`)[0]?.getBoundingClientRect();
+            const pB = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0]?.getBoundingClientRect();
+            return (
+              panes.length === 2 &&
+              Boolean(pA && pB && rectA0 && rectB0) &&
+              Math.sign(pA.left - pB.left) === -Math.sign(rectA0.left - rectB0.left)
+            );
+          });
+
+          const headerToZoom = visible(`[role="tabpanel"][data-pane-id="${tabA}"] [data-testid="terminal-split-pane-header"]`)[0];
+          if (!headerToZoom) throw new Error(`Missing split header for ${tabA}`);
+          headerToZoom.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+          await waitFor(() => visible('[role="tabpanel"]').length === 1);
+
+          pushOutput(ptyB, "\r\nhidden-sibling-line\r\n\u001b]7501;status;blocked;Approve migration\u0007");
+          const hiddenAlertEl = await waitFor(() => visible('[data-testid="terminal-hidden-split-alert"]')[0]);
+
+          check("C1: zoomed pane shows hidden unread badge and Needs input banners for off-screen sibling", () => {
+            const panes = visible('[role="tabpanel"]');
+            const indicator = visible('[data-testid="terminal-header-split-indicator"]')[0]?.textContent ?? "";
+            const unreadDot = visible(`[data-terminal-tab="${tabB}"] [aria-label="Unread output"]`)[0];
+            const headerAlert = visible('[data-testid="terminal-hidden-split-alert"]')[0]?.textContent ?? "";
+            const zoomedAlert = visible('[data-testid="terminal-zoomed-hidden-alert"]')[0]?.textContent ?? "";
+            return (
+              panes.length === 1 &&
+              panes[0].getAttribute("data-pane-id") === tabA &&
+              indicator.includes("Zoomed") &&
+              Boolean(unreadDot) &&
+              headerAlert.includes("Needs input") &&
+              zoomedAlert.includes("Needs input")
+            );
+          });
+
+          if (!hiddenAlertEl) throw new Error("Missing terminal-hidden-split-alert banner");
+          hiddenAlertEl.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 2);
+          await waitFor(() => document.getElementById(`terminal-tab-${tabB}`)?.getAttribute("aria-selected") === "true");
+
+          check("C2: clicking hidden alert unzooms, activates hidden sibling, and clears its unread badge", () => {
+            const panes = visible('[role="tabpanel"]');
+            const indicator = visible('[data-testid="terminal-header-split-indicator"]')[0]?.textContent ?? "";
+            const activeSelected = document.getElementById(`terminal-tab-${tabB}`)?.getAttribute("aria-selected") === "true";
+            const unreadRemaining = visible(`[data-terminal-tab="${tabB}"] [aria-label="Unread output"]`).length;
+            return panes.length === 2 && !indicator.includes("Zoomed") && activeSelected && unreadRemaining === 0;
+          });
+
+          pushOutput(ptyB, "\u001b]7501;clear\u0007");
+          await wait(120);
+
+          const pinBtn = visible(`[role="tabpanel"][data-pane-id="${tabB}"] [data-testid="terminal-split-pin-btn"]`)[0];
+          if (!pinBtn) throw new Error(`Missing split pin button on ${tabB}`);
+          pinBtn.click();
+          pinnedTabId = tabB;
+          await waitFor(() => pinBtn.getAttribute("aria-pressed") === "true");
+
+          const tabCBtn = document.getElementById(`terminal-tab-${tabC}`);
+          if (!tabCBtn) throw new Error(`Missing tabC button ${tabC}`);
+          tabCBtn.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 1 && visible('[role="tabpanel"]')[0]?.getAttribute("data-pane-id") === tabC);
+
+          check("D1: switching to standalone tab shows it alone while keeping Pair 1 grouped", () => {
+            const panes = visible('[role="tabpanel"]');
+            const groups = visible('[data-testid="terminal-tab-group"]');
+            const groupTabs = groups[0] ? [...groups[0].querySelectorAll("[data-terminal-tab]")].map((el) => el.getAttribute("data-terminal-tab")) : [];
+            const switcherBtns = visible('[data-testid="terminal-pair-switcher-btn"]');
+            return (
+              panes.length === 1 &&
+              panes[0].getAttribute("data-pane-id") === tabC &&
+              groups.length === 1 &&
+              groupTabs.includes(tabA) &&
+              groupTabs.includes(tabB) &&
+              switcherBtns.length === 1
+            );
+          });
+
+          const pair1Badge = visible('[data-testid="terminal-tab-group-badge"]')[0];
+          if (!pair1Badge) throw new Error("Missing Pair 1 badge to switch back");
+          pair1Badge.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 2);
+
+          const tabCDragEl = document.getElementById(`terminal-tab-${tabC}`);
+          const paneBDropTarget = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0];
+          if (!tabCDragEl || !paneBDropTarget) throw new Error("Missing elements for D2 center-drop test");
+          const cDragRect = tabCDragEl.getBoundingClientRect();
+          const bDropRect = paneBDropTarget.getBoundingClientRect();
+          let transferC = null;
+          try {
+            transferC = new DataTransfer();
+          } catch {}
+          tabCDragEl.dispatchEvent(
+            new DragEvent("dragstart", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transferC,
+              clientX: cDragRect.left + 8,
+              clientY: cDragRect.top + 8
+            })
+          );
+          paneBDropTarget.dispatchEvent(
+            new DragEvent("dragover", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transferC,
+              clientX: bDropRect.left + bDropRect.width * 0.5,
+              clientY: bDropRect.top + bDropRect.height * 0.5
+            })
+          );
+          await wait(30);
+          paneBDropTarget.dispatchEvent(
+            new DragEvent("drop", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transferC,
+              clientX: bDropRect.left + bDropRect.width * 0.5,
+              clientY: bDropRect.top + bDropRect.height * 0.5
+            })
+          );
+          tabCDragEl.dispatchEvent(
+            new DragEvent("dragend", {
+              bubbles: true,
+              cancelable: true,
+              dataTransfer: transferC,
+              clientX: bDropRect.left + bDropRect.width * 0.5,
+              clientY: bDropRect.top + bDropRect.height * 0.5
+            })
+          );
+          await waitFor(() => visible(`[role="tabpanel"][data-pane-id="${tabC}"]`).length === 1);
+
+          check("D2: center-dropping tabC onto pinned pane protects pinned tabB and replaces unpinned tabA", () => {
+            const panes = visible('[role="tabpanel"]');
+            const pinPressed =
+              visible(`[role="tabpanel"][data-pane-id="${tabB}"] [data-testid="terminal-split-pin-btn"]`)[0]?.getAttribute("aria-pressed") === "true";
+            const pinIcon = visible(`[data-terminal-tab="${tabB}"] [data-testid="terminal-tab-pinned-icon"]`).length > 0;
+            const keptB = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`).length === 1;
+            const addedC = visible(`[role="tabpanel"][data-pane-id="${tabC}"]`).length === 1;
+            const evictedA = visible(`[role="tabpanel"][data-pane-id="${tabA}"]`).length === 0;
+            return panes.length === 2 && pinPressed && pinIcon && keptB && addedC && evictedA;
+          });
+
+          const paneB = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0];
+          paneB?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true }));
+          paneB?.click();
+          await waitFor(() => document.getElementById(`terminal-tab-${tabB}`)?.getAttribute("aria-selected") === "true");
+
+          const paneBTitle = visible(`[role="tabpanel"][data-pane-id="${tabB}"] [data-testid="terminal-split-pane-title"]`)[0];
+          if (!paneBTitle) throw new Error(`Missing split pane title on ${tabB}`);
+          paneBTitle.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+          const renameInput = await waitFor(() => visible('input[data-testid="terminal-inline-rename-input"]')[0]);
+          if (!renameInput) throw new Error("Missing inline rename input from pane title");
+          renameInput.value = "Pinned Agent";
+          renameInput.dispatchEvent(new Event("input", { bubbles: true }));
+          renameInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('input[data-testid="terminal-inline-rename-input"]').length === 0);
+          await wait(100);
+
+          check("E1: pane-title inline rename + Enter updates title and focuses the pane terminal input", () => {
+            const titleText = visible(`[role="tabpanel"][data-pane-id="${tabB}"] [data-testid="terminal-split-pane-title"]`)[0]?.textContent ?? "";
+            const tabText = document.getElementById(`terminal-tab-${tabB}`)?.textContent ?? "";
+            const activeEl = document.activeElement;
+            const currentPaneB = visible(`[role="tabpanel"][data-pane-id="${tabB}"]`)[0];
+            return (
+              titleText.includes("Pinned Agent") &&
+              tabText.includes("Pinned Agent") &&
+              Boolean(activeEl?.classList.contains("xterm-helper-textarea") && currentPaneB?.contains(activeEl))
+            );
+          });
+
+          const tabBEl = document.getElementById(`terminal-tab-${tabB}`);
+          tabBEl?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+          const cancelInput = await waitFor(() => visible('input[data-testid="terminal-inline-rename-input"]')[0]);
+          if (!cancelInput) throw new Error("Missing inline rename input from tab strip");
+          cancelInput.value = "Discarded Draft";
+          cancelInput.dispatchEvent(new Event("input", { bubbles: true }));
+          cancelInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('input[data-testid="terminal-inline-rename-input"]').length === 0);
+          await wait(80);
+
+          check("E2: tab inline rename + Escape preserves Pinned Agent and focuses the tab button", () => {
+            const titleText = visible(`[role="tabpanel"][data-pane-id="${tabB}"] [data-testid="terminal-split-pane-title"]`)[0]?.textContent ?? "";
+            const tabText = document.getElementById(`terminal-tab-${tabB}`)?.textContent ?? "";
+            return (
+              titleText.includes("Pinned Agent") &&
+              !tabText.includes("Discarded Draft") &&
+              document.activeElement === document.getElementById(`terminal-tab-${tabB}`)
+            );
+          });
+
+          const consoleSwitcher = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
+          if (!consoleSwitcher) throw new Error("Missing Console mode toggle button");
+          consoleSwitcher.click();
+          const summaryBtn = await waitFor(() => visible('button[data-testid="terminal-active-session-summary"]')[0]);
+
+          check("E3: Console mode renders clickable active-session summary with Pinned Agent and -> Shell", () => {
+            const text = summaryBtn?.textContent ?? "";
+            return summaryBtn?.tagName === "BUTTON" && text.includes("Pinned Agent") && text.includes("→ Shell");
+          });
+
+          summaryBtn?.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 2);
+
+          check("E4: clicking Console active-session summary restores Shell mode with both split panes visible", () => {
+            const panes = visible('[role="tabpanel"]');
+            const hasB = panes.some((p) => p.getAttribute("data-pane-id") === tabB);
+            const hasC = panes.some((p) => p.getAttribute("data-pane-id") === tabC);
+            return panes.length === 2 && hasB && hasC;
+          });
+
+          const group1Id = visible('[data-testid="terminal-tab-group"]')[0]?.getAttribute("data-group-id");
+          if (!group1Id) throw new Error("Missing Pair 1 group id before F checks");
+          const killedBeforeF = report.killed;
+          const launcherBtn = visible('[aria-label="New session type"]')[0];
+          if (!launcherBtn) throw new Error("Missing New session type button for F1");
+          launcherBtn.click();
+          const shellPairPreset = await waitFor(() => document.querySelector('#terminal-launcher-menu [data-testid="terminal-preset-shell-pair"]'));
+          if (!shellPairPreset) throw new Error("Missing New Shell Pair preset button");
+          shellPairPreset.click();
+          await waitFor(() => visible('[data-testid="terminal-tab-group"]').length === 2);
+          const group2Id = visible('[data-testid="terminal-tab-group"]')
+            .map((el) => el.getAttribute("data-group-id"))
+            .find((id) => id && id !== group1Id);
+          await waitFor(() => visible('[role="tabpanel"]').every((el) => el.getAttribute("data-pane-id") !== tabB && el.getAttribute("data-pane-id") !== tabC));
+          await wait(250);
+
+          check("F1: New Shell Pair preset creates a second independent pair capsule and activates its 2 panes", () => {
+            const groups = visible('[data-testid="terminal-tab-group"]');
+            const switcherBtns = visible('[data-testid="terminal-pair-switcher-btn"]');
+            const panes = visible('[role="tabpanel"]');
+            const distinctFromPair1 = panes.every((el) => {
+              const pid = el.getAttribute("data-pane-id");
+              return pid && pid !== tabB && pid !== tabC;
+            });
+            return (
+              groups.length === 2 &&
+              Boolean(group2Id) &&
+              switcherBtns.length === 2 &&
+              panes.length === 2 &&
+              distinctFromPair1
+            );
+          });
+
+          const pair2Badge = visible(`[data-testid="terminal-tab-group"][data-group-id="${group2Id}"] [data-testid="terminal-tab-group-badge"]`)[0];
+          if (!pair2Badge) throw new Error("Missing Pair 2 badge for inline rename");
+          pair2Badge.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+          const groupRenameInput = await waitFor(() => visible('input[data-testid="terminal-group-rename-input"]')[0]);
+          if (!groupRenameInput) throw new Error("Missing Pair 2 inline rename input");
+          groupRenameInput.value = "Build Pair";
+          groupRenameInput.dispatchEvent(new Event("input", { bubbles: true }));
+          groupRenameInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('input[data-testid="terminal-group-rename-input"]').length === 0);
+          await wait(80);
+
+          check("F2: inline-renaming Pair 2 updates both its tab group badge and header switcher", () => {
+            const badgeText = visible(`[data-testid="terminal-tab-group"][data-group-id="${group2Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.textContent ?? "";
+            const switcherText = visible(`[data-testid="terminal-pair-switcher-btn"][data-group-id="${group2Id}"]`)[0]?.textContent ?? "";
+            return badgeText.includes("Build Pair") && switcherText.includes("Build Pair");
+          });
+
+          pushOutput(ptyB, "\u001b]7501;status;blocked;Approve pair 1\u0007");
+          await waitFor(() =>
+            visible(`[data-testid="terminal-pair-switcher-btn"][data-group-id="${group1Id}"]`)[0]?.getAttribute("data-group-attention") === "warn"
+          );
+
+          check("F3a: blocked agent in background Pair 1 surfaces attention state on Pair 1 switcher and badge", () => {
+            const switcherBtn = visible(`[data-testid="terminal-pair-switcher-btn"][data-group-id="${group1Id}"]`)[0];
+            const groupBadge = visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0];
+            const attDot = visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-attention"]`)[0];
+            return (
+              switcherBtn?.getAttribute("data-group-attention") === "warn" &&
+              groupBadge?.getAttribute("data-group-attention") === "warn" &&
+              Boolean(attDot)
+            );
+          });
+
+          visible(`[data-testid="terminal-pair-switcher-btn"][data-group-id="${group1Id}"]`)[0]?.click();
+          await waitFor(() => visible(`[role="tabpanel"][data-pane-id="${tabB}"]`).length === 1 && visible('[role="tabpanel"]').length === 2);
+
+          check("F3b: clicking Pair 1 switcher restores Pair 1 split layout and focuses the urgent blocked pane", () => {
+            const panes = visible('[role="tabpanel"]');
+            const hasB = panes.some((p) => p.getAttribute("data-pane-id") === tabB);
+            const hasC = panes.some((p) => p.getAttribute("data-pane-id") === tabC);
+            const activeB = document.getElementById(`terminal-tab-${tabB}`)?.getAttribute("aria-selected") === "true";
+            return panes.length === 2 && hasB && hasC && activeB;
+          });
+
+          pushOutput(ptyB, "\u001b]7501;clear\u0007");
+          await wait(120);
+
+          const isMacHost = button("Split terminal right").getAttribute("title")?.includes("⌘") ?? true;
+          const panelRegion = visible('[role="region"][aria-label="Terminal"]')[0];
+          panelRegion?.dispatchEvent(
+            new KeyboardEvent(
+              "keydown",
+              isMacHost
+                ? { key: "’", code: "BracketRight", metaKey: true, altKey: true, shiftKey: true, bubbles: true, cancelable: true }
+                : { key: "}", code: "BracketRight", ctrlKey: true, altKey: true, shiftKey: true, bubbles: true, cancelable: true }
+            )
+          );
+          await waitFor(() =>
+            visible(`[data-testid="terminal-tab-group"][data-group-id="${group2Id}"]`)[0]?.getAttribute("data-group-active") === "true"
+          );
+
+          check("F4: next-pair keyboard chord switches cleanly back to Build Pair", () => {
+            const panes = visible('[role="tabpanel"]');
+            const active2 = visible(`[data-testid="terminal-tab-group"][data-group-id="${group2Id}"]`)[0]?.getAttribute("data-group-active") === "true";
+            const indicator = visible('[data-testid="terminal-header-split-indicator"]')[0]?.textContent ?? "";
+            return panes.length === 2 && active2 && indicator.includes("Build Pair");
+          });
+
+          const ungroup2Btn = visible(`[data-testid="terminal-tab-group"][data-group-id="${group2Id}"] [data-testid="terminal-tab-group-unsplit"]`)[0];
+          if (!ungroup2Btn) throw new Error("Missing Build Pair ungroup button");
+          ungroup2Btn.click();
+          await waitFor(() => visible('[data-testid="terminal-tab-group"]').length === 1);
+
+          check("F5: ungrouping Pair 2 keeps Pair 1 intact and closes zero sessions", () => {
+            const panes = visible('[role="tabpanel"]');
+            const groups = visible('[data-testid="terminal-tab-group"]');
+            return (
+              panes.length === 1 &&
+              groups.length === 1 &&
+              groups[0].getAttribute("data-group-id") === group1Id &&
+              report.killed === killedBeforeF
+            );
+          });
+
+          // Activate Pair 1 so 2 split panes are visible, then verify the docked File Explorer sidebar
+          // never forces a 3rd split pane.
+          visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
+          await waitFor(() => visible('[role="tabpanel"]').length === 2);
+          const explorerToggle = visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0];
+          if (!explorerToggle) throw new Error("Missing terminal-explorer-sidebar-toggle");
+          explorerToggle.click();
+          const explorerAside = await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]')[0]);
+          check("G1: toggling File Explorer sidebar docks beside a 2-pane split without forcing a 3rd split pane", () => {
+            const panes = visible('[role="tabpanel"]');
+            const tabTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-tab"]');
+            const splitTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-split"]');
+            return (
+              Boolean(explorerAside) &&
+              panes.length === 2 &&
+              tabTarget?.getAttribute("aria-pressed") === "true" &&
+              Boolean(splitTarget)
+            );
+          });
+          explorerToggle.click();
+          await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
+
+          // Session Typer: brand icon on trigger + File Explorer option
+          const typerBtn = visible('[aria-label="New session type"]')[0];
+          if (!typerBtn) throw new Error("Missing New session type button for G2");
+          typerBtn.click();
+          await waitFor(() => visible('#terminal-launcher-menu [role="option"]').length > 0);
+          check("G2: Session Typer trigger renders launcher icon and menu offers File Explorer + sidebar quick toggle", () => {
+            const hasTriggerIcon = Boolean(typerBtn.querySelector("[data-launcher-icon]"));
+            const options = [...document.querySelectorAll('#terminal-launcher-menu [role="option"]')].map((el) => el.textContent?.trim());
+            const hasSidebarToggle = Boolean(document.querySelector('#terminal-launcher-menu [data-testid="terminal-launcher-toggle-explorer"]'));
+            return hasTriggerIcon && options.includes("File Explorer") && hasSidebarToggle;
+          });
+          await setLauncherType("Shell");
+
+          // Predictable tab-strip drag-and-drop: plain drag of an ungrouped tab onto Pair 1 reorders without creating a 3-pane split
+          const ungroupedTabEl = visible("[data-terminal-tab]").find((el) => !el.getAttribute("data-group-id"));
+          const ungroupedBtn = ungroupedTabEl?.querySelector('[role="tab"]');
+          const groupedTabCard = visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-terminal-tab]`)[0];
+          if (!ungroupedTabEl || !ungroupedBtn || !groupedTabCard) throw new Error("Missing tabs for G3 strip drag check");
+          const gRect = groupedTabCard.getBoundingClientRect();
+          let stripTransfer = null;
+          try { stripTransfer = new DataTransfer(); } catch {}
+          ungroupedBtn.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: stripTransfer, clientX: gRect.left, clientY: gRect.top + 8 }));
+          groupedTabCard.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: stripTransfer, clientX: gRect.left + 4, clientY: gRect.top + 8, altKey: false }));
+          await wait(30);
+          const sawBeforeBar = Boolean(groupedTabCard.querySelector('[data-testid="terminal-tab-drop-before"]'));
+          groupedTabCard.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: stripTransfer, clientX: gRect.left + 4, clientY: gRect.top + 8, altKey: false }));
+          ungroupedBtn.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: stripTransfer }));
+          await wait(60);
+          check("G3: plain tab-strip drag shows drop-before bar and reorders before Pair 1 without forcing a 3rd split pane", () => {
+            const panes = visible('[role="tabpanel"]');
+            const allStripIds = visible("[data-terminal-tab]").map((el) => el.getAttribute("data-terminal-tab"));
+            const movedId = ungroupedTabEl.getAttribute("data-terminal-tab");
+            const firstPairTabId = groupedTabCard.getAttribute("data-terminal-tab");
+            return sawBeforeBar && panes.length === 2 && allStripIds.indexOf(movedId) < allStripIds.indexOf(firstPairTabId);
+          });
+
+          // Right-click tab context menu + keyboard focus + Escape dismissal
+          groupedTabCard.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: gRect.left + 12, clientY: gRect.bottom + 2 }));
+          const ctxMenu = await waitFor(() => visible('[data-testid="terminal-tab-context-menu"]')[0]);
+          await waitFor(() => ctxMenu && ctxMenu.contains(document.activeElement));
+          const firstFocusedMenuItem = document.activeElement;
+          ctxMenu?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", bubbles: true, cancelable: true }));
+          await wait(30);
+          const secondFocusedMenuItem = document.activeElement;
+          check("G4: right-clicking a tab opens the portaled tab context menu with keyboard focus and ArrowDown navigation", () => {
+            const menuText = ctxMenu?.textContent ?? "";
+            return (
+              Boolean(ctxMenu) &&
+              menuText.includes("Remove from Split") &&
+              menuText.includes("Rename Tab") &&
+              Boolean(firstFocusedMenuItem && ctxMenu?.contains(firstFocusedMenuItem)) &&
+              Boolean(secondFocusedMenuItem && ctxMenu?.contains(secondFocusedMenuItem)) &&
+              secondFocusedMenuItem !== firstFocusedMenuItem
+            );
+          });
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('[data-testid="terminal-tab-context-menu"]').length === 0);
+
+          // Split toolbar right-click menu: session creation list, explicit placement, and live orientation flip/restore
+          const splitRightBtn = button("Split terminal right");
+          const splitBtnRect = splitRightBtn.getBoundingClientRect();
+          splitRightBtn.dispatchEvent(
+            new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: splitBtnRect.left + 8,
+              clientY: splitBtnRect.bottom + 2,
+            })
+          );
+          const splitCtxMenu = await waitFor(() => visible('[data-testid="terminal-split-context-menu"]')[0]);
+          await waitFor(() => splitCtxMenu && splitCtxMenu.contains(document.activeElement));
+          const splitCtxText = splitCtxMenu?.textContent ?? "";
+          splitCtxMenu?.querySelector('[data-testid="terminal-split-ctx-flip"]')?.click();
+          await waitFor(
+            () =>
+              visible('[data-testid="terminal-split-context-menu"]').length === 0 &&
+              visible('.terminal-split-sash[aria-orientation="horizontal"]').length === 1
+          );
+          const flippedHorizontal = visible('.terminal-split-sash[aria-orientation="horizontal"]').length === 1;
+          splitRightBtn.dispatchEvent(
+            new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: splitBtnRect.left + 8,
+              clientY: splitBtnRect.bottom + 2,
+            })
+          );
+          const splitCtxMenuAgain = await waitFor(() => visible('[data-testid="terminal-split-context-menu"]')[0]);
+          splitCtxMenuAgain?.querySelector('[data-testid="terminal-split-ctx-flip"]')?.click();
+          await waitFor(
+            () =>
+              visible('[data-testid="terminal-split-context-menu"]').length === 0 &&
+              visible('.terminal-split-sash[aria-orientation="vertical"]').length === 1
+          );
+          const restoredVertical = visible('.terminal-split-sash[aria-orientation="vertical"]').length === 1;
+          check("G4b: right-clicking Split terminal right opens split context menu with session kinds and flips orientation cleanly", () => {
+            return (
+              Boolean(splitCtxMenu) &&
+              splitCtxText.includes("New Split With…") &&
+              splitCtxText.includes("New Shell") &&
+              splitCtxText.includes("New File Explorer") &&
+              splitCtxText.includes("Flip Split Orientation") &&
+              splitCtxText.includes("Swap Split Panes") &&
+              splitCtxText.includes("Equalize Split Sizes") &&
+              flippedHorizontal &&
+              restoredVertical
+            );
+          });
+
+          // Pair badge & split pane header right-click menus
+          const g4Pair1Badge = visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0];
+          const g4Pair1BadgeRect = g4Pair1Badge?.getBoundingClientRect();
+          if (!g4Pair1Badge || !g4Pair1BadgeRect) throw new Error("Missing Pair 1 badge for G4c");
+          g4Pair1Badge.dispatchEvent(
+            new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: g4Pair1BadgeRect.left + 8,
+              clientY: g4Pair1BadgeRect.bottom + 2,
+            })
+          );
+          const groupCtxMenu = await waitFor(() => visible('[data-testid="terminal-group-context-menu"]')[0]);
+          await waitFor(() => groupCtxMenu && groupCtxMenu.contains(document.activeElement));
+          const groupCtxText = groupCtxMenu?.textContent ?? "";
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('[data-testid="terminal-group-context-menu"]').length === 0);
+
+          const splitPaneHeader = visible('[data-testid="terminal-split-pane-header"]')[0];
+          const splitHeaderRect = splitPaneHeader?.getBoundingClientRect();
+          if (!splitPaneHeader || !splitHeaderRect) throw new Error("Missing split pane header for G4c");
+          splitPaneHeader.dispatchEvent(
+            new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: splitHeaderRect.left + 12,
+              clientY: splitHeaderRect.bottom + 2,
+            })
+          );
+          const headerTabCtxMenu = await waitFor(() => visible('[data-testid="terminal-tab-context-menu"]')[0]);
+          const headerTabCtxText = headerTabCtxMenu?.textContent ?? "";
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+          await waitFor(() => visible('[data-testid="terminal-tab-context-menu"]').length === 0);
+
+          check("G4c: right-clicking a pair badge opens group context menu and right-clicking a split pane header opens tab context menu", () => {
+            return (
+              Boolean(groupCtxMenu) &&
+              groupCtxText.includes("Rename Pair…") &&
+              groupCtxText.includes("Flip Split Orientation") &&
+              groupCtxText.includes("Swap Panes in Pair") &&
+              groupCtxText.includes("Ungroup Pair (Keep Tabs)") &&
+              Boolean(headerTabCtxMenu) &&
+              headerTabCtxText.includes("Flip Split Orientation") &&
+              headerTabCtxText.includes("Swap Split Panes")
+            );
+          });
+
+          // Collapsing a 3rd File Explorer split pane into the docked File Explorer sidebar
+          {
+            const typerForSplitFile = visible('[aria-label="New session type"]')[0];
+            typerForSplitFile?.click();
+            const splitFileItem = await waitFor(() => document.querySelector('#terminal-launcher-menu [data-testid="terminal-launcher-split-file"]'));
+            if (!splitFileItem) throw new Error("Missing terminal-launcher-split-file");
+            splitFileItem.click();
+            await waitFor(() => visible('[role="tabpanel"]').length === 3);
+            const dockSidebarBtn = await waitFor(() => visible('[data-testid="terminal-file-dock-sidebar"]')[0]);
+            if (!dockSidebarBtn) throw new Error("Missing terminal-file-dock-sidebar button");
+            dockSidebarBtn.click();
+            await waitFor(() => visible('[role="tabpanel"]').length === 2 && visible('[data-testid="terminal-explorer-sidebar"]').length === 1);
+            check("G6: Move to Explorer sidebar collapses an empty 3rd File Explorer split pane into the docked sidebar", () => {
+              return visible('[role="tabpanel"]').length === 2 && visible('[data-testid="terminal-explorer-sidebar"]').length === 1;
+            });
+            visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
+            await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
+          }
+
+          // Joining a 3rd tab via Pair badge drop and detaching out of a 3-pane split (with a pinned pane) via Detach dropzone
+          {
+            const killedBeforeG7 = report.killed;
+            const joinTabId = ungroupedTabEl.getAttribute("data-terminal-tab");
+            const joinBtn = document.getElementById(`terminal-tab-${joinTabId}`);
+            const badgeDropTarget = visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0];
+            if (!joinBtn || !badgeDropTarget) throw new Error("Missing joinBtn or badgeDropTarget for G7");
+            let joinTransfer = null;
+            try { joinTransfer = new DataTransfer(); } catch {}
+            joinBtn.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: joinTransfer }));
+            badgeDropTarget.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: joinTransfer }));
+            await wait(20);
+            badgeDropTarget.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: joinTransfer }));
+            joinBtn.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: joinTransfer }));
+            await waitFor(() => visible('[role="tabpanel"]').length === 3);
+
+            const detachBtn = document.getElementById(`terminal-tab-${joinTabId}`);
+            let detachTransfer = null;
+            try { detachTransfer = new DataTransfer(); } catch {}
+            detachBtn?.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: detachTransfer }));
+            const detachZone = await waitFor(() => visible('[data-testid="terminal-tab-detach-dropzone"]')[0]);
+            if (!detachZone) throw new Error("Missing terminal-tab-detach-dropzone");
+            detachZone.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: detachTransfer }));
+            await wait(20);
+            detachZone.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: detachTransfer }));
+            detachBtn?.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: detachTransfer }));
+            await wait(60);
+
+            // Switch back to Pair 1 so its remaining 2 panes (including pinned tabB) are on screen
+            visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
+            await waitFor(() => visible('[role="tabpanel"]').length === 2);
+            check("G7: dragging onto Pair badge joins 3-pane split and Detach dropzone cleanly detaches without killing sessions or unpinning", () => {
+              const groupMemberIds = [...(visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"]`)[0]?.querySelectorAll("[data-terminal-tab]") ?? [])]
+                .map((el) => el.getAttribute("data-terminal-tab"));
+              const stillPinned = visible(`[data-terminal-tab="${pinnedTabId}"] [data-testid="terminal-tab-pinned-icon"]`).length > 0;
+              return (
+                visible('[role="tabpanel"]').length === 2 &&
+                groupMemberIds.length === 2 &&
+                !groupMemberIds.includes(joinTabId) &&
+                stillPinned &&
+                report.killed === killedBeforeG7
+              );
+            });
+          }
+
+          // TerminalPill hover dropdown: rich session cards with agent icon, repo logo, repo/worktree, title & truthful agent status
+          {
+            const { mount: mountComp, unmount: unmountComp } = await import("svelte");
+            const TerminalPill = (await import("../src/lib/components/TerminalPill.svelte")).default;
+            const pillHost = document.createElement("div");
+            pillHost.style.cssText = "position:fixed;top:12px;left:12px;z-index:9999;";
+            document.body.appendChild(pillHost);
+            const claudeHandle = terminalSessions.reserve({
+              key: "g5-pill-claude",
+              repoPath: "/fixture/GitPulse/.claude/worktrees/sidebar-ux",
+              label: "Claude",
+              launcher: "claude",
+              title: "Improve sidebar navigation",
+              sessionId: "fixture-claude-root",
+              status: "running",
+              close: async () => {},
+            });
+            const genericClaudeHandle = terminalSessions.reserve({
+              key: "g5-pill-claude-generic",
+              repoPath: "/fixture/GitPulse",
+              checkout: "/fixture/GitPulse/.claude/worktrees/generic-ux",
+              label: "Claude",
+              launcher: "claude",
+              title: "✳ Claude Code",
+              sessionId: "fixture-claude-root",
+              status: "running",
+              close: async () => {},
+            });
+            const mountedPill = mountComp(TerminalPill, { target: pillHost });
+            try {
+              const pillWrap = await waitFor(() => pillHost.querySelector("[data-terminal-pill]"));
+              pillWrap?.dispatchEvent(new PointerEvent("pointerenter", { bubbles: true }));
+              const pillMenu = await waitFor(() => visible('[data-testid="terminal-pill-menu"]')[0]);
+              await waitFor(() => pillMenu?.querySelector('[data-brand-mark="claude"]'));
+              await wait(80);
+              const cards = [...(pillMenu?.querySelectorAll('[data-testid="terminal-pill-session"]') ?? [])];
+              const claudeCard = cards.find((el) => el.textContent?.includes("Improve sidebar navigation"));
+              const genericCard = cards.find(
+                (el) => el.querySelector('[data-testid="terminal-pill-session-checkout"]')?.textContent?.trim() === "/generic-ux",
+              );
+              if (!claudeCard) throw new Error("G5: missing claudeCard");
+              if (!claudeCard.querySelector('[data-launcher-icon="claude"] [data-brand-mark="claude"]')) {
+                throw new Error(`G5: missing claude brand mark: ${claudeCard.innerHTML}`);
+              }
+              if (!claudeCard.querySelector("[data-repo-logo]")) throw new Error("G5: missing repo logo");
+              await waitFor(() => claudeCard.querySelector('[data-repo-logo][data-logo-state="image"] img.repo-logo-img'));
+              if (!claudeCard.querySelector('[data-repo-logo][data-logo-state="image"] img.repo-logo-img')) {
+                throw new Error(`G5: adopted worktree card did not resolve parent repo logo: ${claudeCard.querySelector("[data-repo-logo]")?.outerHTML}`);
+              }
+              if (claudeCard.querySelector('[data-testid="terminal-pill-session-repo"]')?.textContent?.trim() !== "GitPulse") {
+                throw new Error(`G5: unexpected repo: ${claudeCard.querySelector('[data-testid="terminal-pill-session-repo"]')?.textContent}`);
+              }
+              if (claudeCard.querySelector('[data-testid="terminal-pill-session-checkout"]')?.textContent?.trim() !== "/sidebar-ux") {
+                throw new Error(`G5: unexpected checkout: ${claudeCard.querySelector('[data-testid="terminal-pill-session-checkout"]')?.textContent}`);
+              }
+              if (!claudeCard.querySelector('[data-testid="terminal-pill-session-agent"]')?.textContent?.includes("Claude")) {
+                throw new Error("G5: missing agent label on custom-titled card");
+              }
+              if (claudeCard.textContent?.includes("Background job")) {
+                throw new Error(`G5: false Background job shown: ${claudeCard.textContent}`);
+              }
+              if (!genericCard) {
+                throw new Error(`G5: missing genericCard among checkouts: ${cards.map((c) => c.querySelector('[data-testid="terminal-pill-session-checkout"]')?.textContent).join(",")}`);
+              }
+              const genericTitleText = genericCard.querySelector('[data-testid="terminal-pill-session-title"]')?.textContent?.replace(/^Switch to\s*/, "").trim();
+              if (genericTitleText !== "Claude") {
+                throw new Error(`G5: unexpected generic title: ${JSON.stringify(genericTitleText)}`);
+              }
+              if (genericCard.textContent?.includes("✳ Claude Code")) {
+                throw new Error(`G5: generic startup title leaked: ${genericCard.textContent}`);
+              }
+              if (genericCard.querySelector('[data-testid="terminal-pill-session-agent"]')) {
+                throw new Error("G5: redundant secondary Claude label rendered on generic card");
+              }
+              if (genericCard.textContent?.includes("Background job")) {
+                throw new Error(`G5: false Background job shown on generic card: ${genericCard.textContent}`);
+              }
+              check("G5: TerminalPill hover dropdown renders agent icon, repo logo, repo/worktree, title, and omits false Background job / generic startup titles", () => true);
+              window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true }));
+              await waitFor(() => visible('[data-testid="terminal-pill-menu"]').length === 0);
+            } finally {
+              await unmountComp(mountedPill);
+              claudeHandle.release();
+              genericClaudeHandle.release();
+              pillHost.remove();
+            }
+          }
+
+          // Main left Sidebar Git | Explorer switcher, Tab open-target, terminal dock sync & duplicate-tree auto-collapse
+          {
+            const { mount: mountComp, unmount: unmountComp } = await import("svelte");
+            const { get: getStore } = await import("svelte/store");
+            const Sidebar = (await import("../src/lib/components/Sidebar.svelte")).default;
+            const { layoutStore, sidebarNavStore, sidebarExplorerDocked } = await import("../src/lib/sidebar/layoutStore.ts");
+            const { toastStore } = await import("../src/lib/stores/toastStore.ts");
+            const initialSidebarCollapsed = getStore(layoutStore).collapsed;
+            const initialNav = getStore(sidebarNavStore);
+            if (initialSidebarCollapsed) layoutStore.toggleCollapsed();
+            sidebarNavStore.setView("git");
+            const sidebarHost = document.createElement("div");
+            sidebarHost.style.cssText = "position:fixed;top:0;left:0;height:520px;z-index:9998;display:flex;";
+            document.body.appendChild(sidebarHost);
+            const mountedSidebar = mountComp(Sidebar, { target: sidebarHost });
+            try {
+              const gitViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]'));
+              const filesViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-files"]'));
+              filesViewBtn?.click();
+              const explorerPane = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-explorer-pane"]'));
+              await waitFor(() => getStore(sidebarExplorerDocked) === true);
+              const syncedOuterExplorerDocked = getStore(sidebarExplorerDocked) === true;
+              const errorToastsBefore = getStore(toastStore).filter((t) => t.type === "error").length;
+              const tabTargetBtn = explorerPane?.querySelector('[data-testid="sidebar-explorer-target-tab"]');
+              tabTargetBtn?.click();
+              const mainTsItem = await waitFor(() =>
+                [...(explorerPane?.querySelectorAll('[role="treeitem"]') ?? [])].find((el) => el.textContent?.includes("main.ts")),
+              );
+              mainTsItem?.click();
+              mainTsItem?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+              await waitFor(() => visible('[data-terminal-tab] [role="tab"]').some((el) => el.textContent?.includes("main.ts")));
+              const openedStandaloneTab = visible('[role="tabpanel"]').length === 1;
+              const noDoubleClickErrorToast = getStore(toastStore).filter((t) => t.type === "error").length === errorToastsBefore;
+
+              // Open TerminalFilePane's internal ExplorerRail on the non-empty main.ts tab, then dock outer sidebar via SidebarExplorerPane
+              const innerExplorerToggle = visible('[role="tabpanel"] [data-testid="terminal-file-pane-explorer-toggle"]')[0];
+              if (innerExplorerToggle && visible("[data-terminal-file-explorer-card]").length === 0) {
+                innerExplorerToggle.click();
+                await waitFor(() => visible("[data-terminal-file-explorer-card]").length === 1);
+              }
+              const sawInnerExplorerBeforeDock = visible("[data-terminal-file-explorer-card]").length === 1;
+              const dockTerminalBtn = explorerPane?.querySelector('[data-testid="sidebar-explorer-dock-terminal"]');
+              dockTerminalBtn?.click();
+              await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 1 && visible("[data-terminal-file-explorer-card]").length === 0);
+              const autoCollapsedDuplicateTree =
+                visible('[data-testid="terminal-explorer-sidebar"]').length === 1 &&
+                visible("[data-terminal-file-explorer-card]").length === 0 &&
+                dockTerminalBtn?.getAttribute("aria-pressed") === "true";
+
+              // Clicking sidebar-explorer-dock-terminal again toggles terminal Explorer sidebar closed
+              dockTerminalBtn?.click();
+              await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
+              const toggledDockClosed =
+                visible('[data-testid="terminal-explorer-sidebar"]').length === 0 &&
+                dockTerminalBtn?.getAttribute("aria-pressed") === "false";
+
+              // Collapse Sidebar to rail and verify rail view buttons expand back to Git
+              sidebarHost.querySelector('[aria-label="Collapse sidebar"]')?.click();
+              const railGitBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-rail-git"]'));
+              const railFilesBtn = sidebarHost.querySelector('[data-testid="sidebar-rail-files"]');
+              const sawRailButtons = Boolean(railGitBtn && railFilesBtn);
+              const clearedOuterExplorerDockedOnCollapse = getStore(sidebarExplorerDocked) === false;
+              railGitBtn?.click();
+              await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true");
+              const restoredGitView = sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true";
+
+              if (!syncedOuterExplorerDocked) throw new Error("G8: sidebarExplorerDocked was not true while Sidebar Explorer was open");
+              if (!openedStandaloneTab) throw new Error(`G8: expected 1 standalone tabpanel, got ${visible('[role="tabpanel"]').length}`);
+              if (!noDoubleClickErrorToast) throw new Error("G8: double-clicking a file in SidebarExplorerPane triggered an error toast");
+              if (!sawInnerExplorerBeforeDock) throw new Error("G8: inner file explorer card did not open before docking");
+              if (!autoCollapsedDuplicateTree) throw new Error("G8: duplicate inner file tree did not auto-collapse on dock");
+              if (!toggledDockClosed) throw new Error("G8: sidebar-explorer-dock-terminal did not toggle terminal Explorer sidebar closed");
+              if (!sawRailButtons) throw new Error("G8: missing collapsed rail Git/Explorer buttons");
+              if (!clearedOuterExplorerDockedOnCollapse) throw new Error("G8: sidebarExplorerDocked was not cleared when Sidebar collapsed");
+              if (!restoredGitView) throw new Error("G8: rail Git button did not restore Git view");
+
+              check("G8: Sidebar switches Git/Explorer, opens standalone file tab on Tab target, syncs terminal Explorer sidebar while auto-collapsing duplicate inner file tree, and expands from rail", () => true);
+
+              // Clean up opened main.ts tab and terminal explorer sidebar
+              if (visible('[data-testid="terminal-explorer-sidebar"]').length > 0) {
+                visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
+                await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
+              }
+              const mainTsTabWrap = visible("[data-terminal-tab]").find((el) => el.textContent?.includes("main.ts"));
+              mainTsTabWrap?.querySelector('button[aria-label^="Close "]')?.click();
+              await wait(40);
+              visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
+              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+            } finally {
+              await unmountComp(mountedSidebar);
+              sidebarHost.remove();
+              sidebarNavStore.setView(initialNav.view);
+              sidebarNavStore.setOpenTarget(initialNav.openTarget);
+              if (getStore(layoutStore).collapsed !== initialSidebarCollapsed) layoutStore.toggleCollapsed();
+            }
+          }
+
+          check("no runtime errors", () => report.errors.length === 0);
+        } catch (error) {
+          stopped(error);
+        } finally {
+          if (pinnedTabId) {
+            const cleanupPinBtn = visible(`[role="tabpanel"][data-pane-id="${pinnedTabId}"] [data-testid="terminal-split-pin-btn"]`)[0];
+            if (cleanupPinBtn?.getAttribute("aria-pressed") === "true") cleanupPinBtn.click();
+          }
+          setTerminalSessionLimit(initialLimit);
+        }
+        report.splitUx = results;
+        showReport();
+        return results;
+      }
+
+      /**
        * DEC 2026 synchronized output (xtermjs/xterm.js#6071). xterm drops the
        * paint of a frame when the next frame's `CSI ? 2026 h` has been parsed by
        * the time its animation frame fires, so a program that redraws
@@ -2152,7 +3182,8 @@
         const fit = stress.length && stress.every((row) => row.pass) ? await runFit() : [];
         const sync = fit.length && fit.every((row) => row.pass) ? await runSync() : { results: [], numbers: {} };
         const bypass = sync.results.length && sync.results.every((row) => row.pass) ? await runBypass() : [];
-        const results = [...checks, ...stress, ...fit, ...sync.results, ...bypass];
+        const splitUx = bypass.length && bypass.every((row) => row.pass) ? await runSplitUx() : [];
+        const results = [...checks, ...stress, ...fit, ...sync.results, ...bypass, ...splitUx];
         const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}; skipped in this engine ${JSON.stringify(report.skipped)}; dock churn ${JSON.stringify(report.churn ?? null)}; calm wait ms ${report.calmWaitMs ?? null}`;
         document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors, diagnostics }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });

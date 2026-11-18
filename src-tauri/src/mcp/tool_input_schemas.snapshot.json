@@ -1975,23 +1975,89 @@
     ],
     "type": "object"
   },
-  "gitpulse_terminal_list": {
+  "gitpulse_terminal_exec": {
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
-        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
         "maxLength": 64,
         "minLength": 1,
         "type": "string"
       },
       "caller_token": {
-        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
         "maxLength": 128,
         "minLength": 1,
         "type": "string"
       },
+      "child_session_id": {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "command": {
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "cwd": {
+        "maxLength": 1024,
+        "minLength": 1,
+        "type": "string"
+      },
+      "keep_open": {
+        "type": "boolean"
+      },
+      "max_lines": {
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "pattern": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      },
       "repo_path": {
-        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "split": {
+        "type": "boolean"
+      },
+      "timeout_ms": {
+        "maximum": 25000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "title": {
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "command"
+    ],
+    "type": "object"
+  },
+  "gitpulse_terminal_list": {
+    "additionalProperties": false,
+    "properties": {
+      "caller_session_id": {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "caller_token": {
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "include_repo_shells": {
+        "type": "boolean"
+      },
+      "repo_path": {
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
@@ -2052,31 +2118,39 @@
     "additionalProperties": false,
     "properties": {
       "caller_session_id": {
-        "description": "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
         "maxLength": 64,
         "minLength": 1,
         "type": "string"
       },
       "caller_token": {
-        "description": "Optional parent session capability token override; defaults to GITPULSE_SESSION_TOKEN from the environment",
         "maxLength": 128,
         "minLength": 1,
         "type": "string"
       },
       "child_session_id": {
-        "description": "Child terminal session id previously spawned by this parent session",
         "maxLength": 64,
         "minLength": 1,
         "type": "string"
       },
+      "grep": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      },
+      "last_command_only": {
+        "type": "boolean"
+      },
       "max_lines": {
-        "description": "Maximum rendered screen lines to return from the bottom of the vt100 grid (default 80, max 200)",
-        "maximum": 200,
+        "maximum": 1000,
         "minimum": 1,
         "type": "integer"
       },
+      "offset_lines": {
+        "maximum": 2000,
+        "minimum": 0,
+        "type": "integer"
+      },
       "repo_path": {
-        "description": "Absolute path to a git repository",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"

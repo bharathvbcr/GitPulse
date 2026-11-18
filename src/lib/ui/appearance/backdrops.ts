@@ -1,5 +1,5 @@
 /**
- * Window wallpapers (Settings -> Appearance -> Material -> Wallpaper).
+ * Window wallpapers (Settings -> Appearance -> Theme and wallpaper -> Wallpaper).
  *
  * A wallpaper is painted on `html.macos body`, BENEATH the shell veil, so it
  * takes the place of the desktop the translucent window would otherwise show.
@@ -13,6 +13,8 @@
  * seed, no animation, no script, no external reference. It is drawn once into a
  * `data:` URL and composited like any other background image, which is the
  * cost model app.css asks of the window field (no perpetual rendering loop).
+ * Movement, when the reader turns it on and the host has room, is a stack of
+ * equally static textures moved by the compositor (`BACKDROP_MOTION` below).
  *
  * A wallpaper is a separate preference from a theme file on purpose: the
  * `gitpulse-theme/1` format refuses `url()` by rule, and a theme stays a small
@@ -456,6 +458,183 @@ const DRAW: Readonly<Record<BuiltinBackdropId, () => string>> = {
   skyline,
   warp,
 };
+
+// --- motion ------------------------------------------------------------------
+//
+// How a built-in moves while the host has room (wallpaperMotion.ts). Never by
+// animating inside an SVG: an animated SVG used as an image repaints the whole
+// picture every frame. Instead each wallpaper is a short stack of static
+// textures, each rasterised once, that app.css moves with `transform` and
+// `opacity` alone, which the compositor does without repainting. The base
+// layer is the still itself; every accent is a transparent overlay drawn on
+// the same 1600x1000 canvas with the same cover crop, so it lines up with the
+// picture, and starts transparent, so the first moving frame is the still.
+
+/** The app.css animation a layer runs: `gp-wp-<kind>`. */
+export type MotionKind = "drift" | "fade" | "sweep" | "spin" | "rush";
+
+export interface MotionLayer {
+  readonly kind: MotionKind;
+  /** `base` is the still; anything else is an overlay texture from this module. */
+  readonly texture: "base" | MotionTextureId;
+  /** One cycle, in seconds. */
+  readonly seconds: number;
+  /** Seconds before the first cycle; never negative, so frame one is the still. */
+  readonly delay?: number;
+}
+
+function glintField(seed: number, colors: readonly string[], count: number, top = 0, bottom = H): string {
+  const random = rng(seed);
+  let dots = "";
+  for (let i = 0; i < count; i += 1) {
+    const x = random() * W;
+    const y = top + random() * (bottom - top);
+    const r = 2 + random() * 5;
+    const fill = colors[Math.floor(random() * colors.length)] ?? colors[0];
+    dots +=
+      `<circle cx="${n(x)}" cy="${n(y)}" r="${n(r * 4)}" fill="${fill}" fill-opacity=".14"/>` +
+      `<circle cx="${n(x)}" cy="${n(y)}" r="${n(r)}" fill="${fill}" fill-opacity=".9"/>`;
+  }
+  return svg("", dots);
+}
+
+function band(color: string): string {
+  return svg(
+    `<linearGradient id="band" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity="0"/><stop offset=".5" stop-color="${color}" stop-opacity=".22"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient>`,
+    `<rect width="${W}" height="180" fill="url(#band)"/>`,
+  );
+}
+
+function glow(cx: number, cy: number, r: number, color: string): string {
+  return svg(
+    `<radialGradient id="glow"><stop offset="0" stop-color="${color}" stop-opacity=".55"/><stop offset=".45" stop-color="${color}" stop-opacity=".2"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></radialGradient>`,
+    `<circle cx="${n(cx)}" cy="${n(cy)}" r="${n(r)}" fill="url(#glow)"/>`,
+  );
+}
+
+/** A tick-marked ring about the canvas centre, for `spin` (which turns the layer about its own centre). */
+function ring(r: number, color: string): string {
+  const cx = W / 2;
+  const cy = H / 2;
+  return svg(
+    "",
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color}" stroke-opacity=".55" stroke-width="3" stroke-dasharray="14 22"/>` +
+      ticks(cx, cy, r + 14, r + 30, 48, color, 2).replace("<path ", `<path stroke-opacity=".45" `),
+  );
+}
+
+const MOTION_TEXTURES = {
+  "neural-glints": () => glintField(0x1e71, ["#9be6ff", "#d8f6ff"], 36),
+  "neural-glints-b": () => glintField(0x1e72, ["#5fd4ff"], 28),
+  "neural-band": () => band("#5fd4ff"),
+  "neural-core": () => glow(1130, 470, 150, "#d8f6ff"),
+  "reactor-core": () => glow(W / 2, H / 2, 240, "#c9f6ff"),
+  "reactor-ring": () => ring(330, "#4fd8ff"),
+  "hex-glints": () => glintField(0x4e71, ["#ff5a4a", "#ffb08a"], 26),
+  "hex-glints-b": () => glintField(0x4e72, ["#ff3b30"], 22),
+  "circuit-glints": () => glintField(0xc171, ["#39ff7a", "#b8ffd0"], 34),
+  "circuit-band": () => band("#39ff7a"),
+  "horizon-sun": () => glow(W / 2, 570, 330, "#ff9be6"),
+  "horizon-stars": () => glintField(0x4071, ["#ffffff", "#ffd36b"], 30, 0, 560),
+  "crt-band": () => band("#ffb000"),
+  "crt-bloom": () => glow(W / 2, 450, 520, "#ffb000"),
+  "blueprint-band": () => band("#8fd0ff"),
+  "blueprint-glints": () => glintField(0xb171, ["#cfe8ff"], 20),
+  "nebula-stars": () => glintField(0x9e71, ["#ffffff", "#cfe0ff"], 40),
+  "nebula-stars-b": () => glintField(0x9e72, ["#ffffff", "#ff9fd0", "#8ff0f0"], 30),
+  "orbit-stars": () => glintField(0x0b71, ["#ffffff", "#ffe2bf"], 34),
+  "orbit-planet": () => glow(1060, 520, 300, "#ffb36b"),
+  "skyline-windows": () => glintField(0x5c71, ["#ff4fd8", "#36e3ff"], 34, 600, H - 30),
+  "skyline-windows-b": () => glintField(0x5c72, ["#ff4fd8", "#36e3ff"], 30, 600, H - 30),
+  "warp-stars": () => glintField(0x3a71, ["#ffffff", "#bcd8ff"], 70),
+  "warp-stars-b": () => glintField(0x3a72, ["#ffffff", "#bcd8ff"], 70),
+  "warp-core": () => glow(W / 2, H / 2, 260, "#e8f4ff"),
+} as const satisfies Record<string, () => string>;
+
+export type MotionTextureId = keyof typeof MOTION_TEXTURES;
+
+export const MOTION_TEXTURE_IDS = Object.keys(MOTION_TEXTURES) as readonly MotionTextureId[];
+
+/**
+ * How each built-in moves. Keyed by every id, so a new wallpaper cannot be
+ * added without saying how it moves (`backdrops.test.ts` derives its cases
+ * from the id list).
+ */
+export const BACKDROP_MOTION: Readonly<Record<BuiltinBackdropId, readonly MotionLayer[]>> = {
+  neural: [
+    { kind: "drift", texture: "base", seconds: 90 },
+    { kind: "fade", texture: "neural-glints", seconds: 5 },
+    { kind: "fade", texture: "neural-glints-b", seconds: 7, delay: 2.5 },
+    { kind: "fade", texture: "neural-core", seconds: 4 },
+    { kind: "sweep", texture: "neural-band", seconds: 12, delay: 1 },
+  ],
+  reactor: [
+    { kind: "drift", texture: "base", seconds: 90 },
+    { kind: "fade", texture: "reactor-core", seconds: 3.5 },
+    { kind: "spin", texture: "reactor-ring", seconds: 80 },
+  ],
+  hex: [
+    { kind: "drift", texture: "base", seconds: 100 },
+    { kind: "fade", texture: "hex-glints", seconds: 6 },
+    { kind: "fade", texture: "hex-glints-b", seconds: 9, delay: 3 },
+  ],
+  circuit: [
+    { kind: "drift", texture: "base", seconds: 100 },
+    { kind: "fade", texture: "circuit-glints", seconds: 5 },
+    { kind: "sweep", texture: "circuit-band", seconds: 14, delay: 2 },
+  ],
+  horizon: [
+    { kind: "drift", texture: "base", seconds: 110 },
+    { kind: "fade", texture: "horizon-sun", seconds: 7 },
+    { kind: "fade", texture: "horizon-stars", seconds: 5, delay: 1.5 },
+  ],
+  scanlines: [
+    { kind: "drift", texture: "base", seconds: 120 },
+    { kind: "sweep", texture: "crt-band", seconds: 7 },
+    { kind: "fade", texture: "crt-bloom", seconds: 3 },
+  ],
+  blueprint: [
+    { kind: "drift", texture: "base", seconds: 120 },
+    { kind: "sweep", texture: "blueprint-band", seconds: 15, delay: 1 },
+    { kind: "fade", texture: "blueprint-glints", seconds: 8 },
+  ],
+  nebula: [
+    { kind: "drift", texture: "base", seconds: 120 },
+    { kind: "fade", texture: "nebula-stars", seconds: 6 },
+    { kind: "fade", texture: "nebula-stars-b", seconds: 9, delay: 3 },
+  ],
+  orbit: [
+    { kind: "drift", texture: "base", seconds: 110 },
+    { kind: "fade", texture: "orbit-stars", seconds: 7 },
+    { kind: "fade", texture: "orbit-planet", seconds: 6, delay: 2 },
+  ],
+  skyline: [
+    { kind: "drift", texture: "base", seconds: 120 },
+    { kind: "fade", texture: "skyline-windows", seconds: 4 },
+    { kind: "fade", texture: "skyline-windows-b", seconds: 6, delay: 2 },
+  ],
+  warp: [
+    { kind: "rush", texture: "warp-stars", seconds: 4 },
+    { kind: "rush", texture: "warp-stars-b", seconds: 4, delay: 2 },
+    { kind: "fade", texture: "warp-core", seconds: 3 },
+  ],
+};
+
+/** The SVG markup of a motion texture. Deterministic, like the stills. */
+export function motionTextureSvg(id: MotionTextureId): string {
+  return MOTION_TEXTURES[id]();
+}
+
+const motionCache = new Map<MotionTextureId, string>();
+
+/** A `data:` URL for a motion texture, drawn once per session. */
+export function motionTextureUrl(id: MotionTextureId): string {
+  const known = motionCache.get(id);
+  if (known !== undefined) return known;
+  const url = `data:image/svg+xml,${encodeURIComponent(motionTextureSvg(id))}`;
+  motionCache.set(id, url);
+  return url;
+}
 
 const cache = new Map<BuiltinBackdropId, string>();
 

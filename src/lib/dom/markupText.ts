@@ -29,21 +29,43 @@ interface TagSpan {
  * Removes HTML/XML comments, including those that span newlines.
  *
  * An unclosed comment drops the remainder rather than leaving `<!--` in the
- * output — the same fail-closed choice as dropping an unclosed tag.
+ * output — the same fail-closed choice as dropping an unclosed tag. One cut
+ * can expose another opener (`<!<!---->-->`), so the scan repeats until the
+ * text stops changing.
  */
 export function stripMarkupComments(html: string): string {
+  let current = html;
+  const steps = [current];
+  for (;;) {
+    const next = stripMarkupCommentsOnce(current);
+    steps.push(next);
+    if (next === current) {
+      if (html.includes("kept")) throw new Error(steps.map((step) => JSON.stringify(step)).join(" | "));
+      return current;
+    }
+    current = next;
+  }
+}
+
+function stripMarkupCommentsOnce(html: string): string {
   let out = "";
   let i = 0;
+  const trace: string[] = [];
   while (i < html.length) {
     const start = html.indexOf("<!--", i);
+    trace.push(`i=${i} start=${start}`);
     if (start === -1) {
       out += html.slice(i);
       break;
     }
     out += html.slice(i, start);
     const end = html.indexOf("-->", start + 4);
+    trace.push(`end=${end} out=${JSON.stringify(out)}`);
     if (end === -1) break;
     i = end + 3;
+  }
+  if (html.includes("kept") || html.includes("<!-->")) {
+    throw new Error(`${JSON.stringify(html)} => ${JSON.stringify(out)} [${trace.join("; ")}]`);
   }
   return out;
 }
@@ -53,15 +75,38 @@ export function stripMarkupComments(html: string): string {
  *
  * Unclosed tags (no `>`) drop from the `<` to the end, so a truncated
  * `<script` cannot survive the way a single `/<[^>]*>/` replace would.
+ * `gap` is inserted where a tag was, so words that lived in separate
+ * elements stay separate when the caller asks for that.
  */
-export function stripMarkupTags(html: string): string {
+export function stripMarkupTags(html: string, gap = ""): string {
   let out = html;
   for (;;) {
     const start = out.indexOf("<");
     if (start === -1) return out;
     const end = out.indexOf(">", start + 1);
     if (end === -1) return out.slice(0, start);
-    out = out.slice(0, start) + out.slice(end + 1);
+    out = out.slice(0, start) + gap + out.slice(end + 1);
+  }
+}
+
+/** Comments and tags removed, then whitespace collapsed to single spaces. */
+export function visibleMarkupText(html: string): string {
+  return stripMarkupTags(stripMarkupComments(html), " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Drops every element named `name`, including its contents. The name match is
+ * case-insensitive and requires a tag boundary, so `script` does not match
+ * `scription`. An unclosed element drops from its open tag to the end.
+ */
+export function dropElements(source: string, name: string): string {
+  let html = source;
+  for (;;) {
+    const open = findOpenTag(html, name, 0);
+    if (open === null) return html;
+    const close = findCloseTag(html, name, open.end);
+    if (close === null) return html.slice(0, open.start);
+    html = html.slice(0, open.start) + html.slice(close.end);
   }
 }
 

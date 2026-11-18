@@ -15,7 +15,8 @@ import { DEFAULT_ACCENT } from "../accents";
 import { SHIPPED_CONTRAST, deriveTokens, type Appearance } from "../color/derive";
 import type { BackdropId } from "./backdrops";
 import { THEME_SCHEMA_ID, validateTheme, type GitPulseTheme } from "./themeSchema";
-import type { AppearancePrefs } from "./apply";
+import { APPEARANCE_DEFAULTS, type AppearancePrefs } from "./apply";
+import { themeToPatch } from "./themeFile";
 
 export interface ThemePreset {
   readonly id: string;
@@ -301,6 +302,44 @@ export function presetPatch(
     ...themeSelectionPatch(preset.theme),
     backdrop: preset.backdrop,
     materialIntensity: { ...current.materialIntensity, [appearance]: preset.material },
+  };
+}
+
+type ClearableFields = "customTheme" | "backdrop" | "materialIntensity" | "radiusScale" | "fontUi" | "fontMono";
+
+/**
+ * The inverse of putting a theme in force: clears the theme and puts back each
+ * value it stamped, but only where that value is still the stamped one, so a
+ * wallpaper, material, corner scale or font chosen afterwards is kept.
+ *
+ * Any theme may have stamped a corner scale and fonts (`themeToPatch` is the
+ * superset of what applying one writes). A built-in preset also stamped its
+ * wallpaper and its material; a saved or imported theme never touched the
+ * wallpaper, so removing one leaves it alone. With no theme in force this is
+ * an empty patch.
+ */
+export function clearThemePatch(current: Pick<AppearancePrefs, ClearableFields>): Partial<AppearancePrefs> {
+  const theme = current.customTheme;
+  if (theme === null) return {};
+  const stamped = themeToPatch(theme);
+  const keptUnless = <K extends "radiusScale" | "fontUi" | "fontMono">(key: K): Partial<AppearancePrefs> =>
+    stamped[key] !== undefined && current[key] === stamped[key] ? { [key]: APPEARANCE_DEFAULTS[key] } : {};
+  const preset = THEME_PRESETS.find((candidate) => sameTheme(candidate.theme, theme));
+  const appearance: Appearance | null = preset ? preset.theme.appearance : null;
+  return {
+    customTheme: null,
+    ...keptUnless("radiusScale"),
+    ...keptUnless("fontUi"),
+    ...keptUnless("fontMono"),
+    ...(preset && current.backdrop === preset.backdrop ? { backdrop: APPEARANCE_DEFAULTS.backdrop } : {}),
+    ...(preset && appearance && current.materialIntensity[appearance] === preset.material
+      ? {
+          materialIntensity: {
+            ...current.materialIntensity,
+            [appearance]: APPEARANCE_DEFAULTS.materialIntensity[appearance],
+          },
+        }
+      : {}),
   };
 }
 

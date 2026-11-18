@@ -1512,6 +1512,10 @@ impl GitReader {
     /// Lists every path the file explorer may show: tracked files plus
     /// untracked-but-not-ignored working-tree files.
     ///
+    /// Returns working-tree file paths using `dcgrep` + `.git/index` when a
+    /// compatible `dcgrep` binary is available, falling back to `git ls-files
+    /// -z --cached --others --exclude-standard`.
+    ///
     /// `--cached --others --exclude-standard` is deliberately the same
     /// enumeration [`GitReader::get_repo_language_stats`] uses: `--cached`
     /// covers the index; `--others --exclude-standard` adds untracked files
@@ -1523,6 +1527,10 @@ impl GitReader {
     /// quotes, glob characters, and non-ASCII names survive verbatim.
     pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
+        if let Some(files) = crate::engine::dcgrep::list_working_tree_files(&repo, MAX_REPO_FILES)?
+        {
+            return Ok(files);
+        }
         let stdout = git_text(
             &repo,
             &[
@@ -6363,16 +6371,21 @@ pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<
 /// byte-sorted so callers get deterministic order. No other normalization:
 /// git always emits forward slashes, and entries cannot contain `\0` once
 /// split on `\0`.
-fn parse_ls_files_entries(raw: &str) -> Vec<String> {
+pub(crate) fn sanitize_repo_file_entries<'a>(
+    entries: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let repo_sentinel = Path::new(".");
     let mut unique: HashSet<&str> = HashSet::new();
-    for entry in raw.split('\0') {
+    for entry in entries {
         let entry = entry.trim_suffix('/');
         if entry.is_empty()
-            || entry == "."
-            || entry == ".."
-            || entry.starts_with("../")
-            || entry.contains("/../")
-            || entry.starts_with('/')
+            || entry
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+            || !Path::new(entry)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            || super::git_cli::sandbox_join(repo_sentinel, entry).is_err()
         {
             continue;
         }
@@ -6381,6 +6394,10 @@ fn parse_ls_files_entries(raw: &str) -> Vec<String> {
     let mut files: Vec<String> = unique.into_iter().map(String::from).collect();
     files.sort();
     files
+}
+
+fn parse_ls_files_entries(raw: &str) -> Vec<String> {
+    sanitize_repo_file_entries(raw.split('\0'))
 }
 
 /// One `git status --porcelain=v1 -z` record decoded into typed fields.
@@ -13847,9 +13864,9 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     #[test]
     fn parse_ls_files_entries_skips_suspicious_entries_dedups_and_sorts_bytewise() {
         let parsed = parse_ls_files_entries(
-            ".\0..\0../escape.txt\0deep/../../out.txt\0/etc/passwd\0dup.txt\0dup.txt\0keep.txt\0",
+            ".\0..\0../escape.txt\0deep/../../out.txt\0a/..\0./a\0a/./b\0a/.\0/etc/passwd\0.GIT/config\0sub/.git/HEAD\0git~1/HEAD\0.g\u{200c}it/config\0.git\\config\0.devcouncil/config.yaml\0dup.txt\0dup.txt\0keep.txt\0",
         );
-        assert_eq!(parsed, ["dup.txt", "keep.txt"]);
+        assert_eq!(parsed, [".devcouncil/config.yaml", "dup.txt", "keep.txt"]);
         // Byte-wise order, not collator order: uppercase sorts first.
         let parsed = parse_ls_files_entries("b.txt\0A.txt\0a.txt\0");
         assert_eq!(parsed, ["A.txt", "a.txt", "b.txt"]);

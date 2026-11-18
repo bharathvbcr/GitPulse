@@ -325,7 +325,7 @@ Blame is a lens on the file open in Explorer, not a separate section: the **Blam
 
 Content search lives in Explorer's side column: the search button beside the Explorer toggle swaps the file tree for the search pane (the tree keeps its folds and filter), and a hit opens in the editor beside its results.
 
-- **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision via `git grep`.
+- **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision. When a compatible DevCouncil `dcgrep` is installed (`GITPULSE_DCGREP_BIN`, `MANVI_GREP_BINARY`, the app's bin directory, or `PATH`), working-tree searches use it. Revision searches always use `git grep`, as do repository layouts dcgrep does not emulate, and any answer dcgrep cannot give exactly. On this repository dcgrep is about 3× faster. The figures are in [PERFORMANCE.md](PERFORMANCE.md#2026-11-17-explorer-search-dcgrep-against-the-git-fallback).
 - **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
 - **Honest Outcome Reporting**: A search that is cancelled, timed out, capped, or truncated explicitly declares its partial status and reason, rather than presenting a partial match count as complete.
 - **Search Controls**: Regular expressions, match case, and an optional revision to search instead of the working tree. Cancel stops the search in flight and keeps its partial answer, labelled.

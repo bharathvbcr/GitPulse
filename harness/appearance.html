@@ -24,6 +24,7 @@
   import { interfaceStore } from "../src/lib/stores/interfaceStore";
   import { themeStore } from "../src/lib/stores/themeStore";
   import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
+  import { publishHostLoadPulseForTests } from "../src/lib/stores/hostLoadStore";
   import { publishNativeRenderingStatus, setNativeRenderingBoot } from "../src/lib/desktop/nativeRendering";
   import { applyTransparency, TRANSPARENCY_ATTRIBUTE } from "../src/lib/ui/transparencyPreference";
   import { validateTheme } from "../src/lib/ui/appearance/themeSchema";
@@ -81,9 +82,12 @@
   }
 
   // The export click makes a Blob URL and an anchor click; capture the first and cancel the second.
+  // Only the exported JSON is captured: every blob still gets a real URL, since the
+  // wallpaper's still and video are drawn and played from theirs (a stub URL for
+  // them read as "this window can't decode the video").
   let exported = null;
-  URL.createObjectURL = (blob) => { exported = blob; return "blob:gp-harness"; };
-  URL.revokeObjectURL = () => {};
+  const realCreateObjectURL = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = (blob) => { if (blob?.type === "application/json") exported = blob; return realCreateObjectURL(blob); };
   document.addEventListener("click", (event) => { if (event.target?.closest?.("a[download]")) event.preventDefault(); }, true);
 
   async function run() {
@@ -231,20 +235,31 @@
     check("a system Reduce Transparency removes it too", () => bodyImage() === "none");
     applyTransparency("standard"); await settle();
     $('[data-backdrop-option="hex"]').click(); await settle();
-    check("picking another wallpaper swaps it and keeps the theme", () => root.getAttribute("data-backdrop") === "hex" && $('[data-preset="neural-hud"]').getAttribute("aria-pressed") === "false" && root.style.getPropertyValue("--c-bg").trim() !== "");
+    // The theme is still in force, so its card stays picked; the wallpaper row marks the new wallpaper.
+    check("picking another wallpaper swaps it and keeps the theme picked", () => root.getAttribute("data-backdrop") === "hex" && $('[data-preset="neural-hud"]').getAttribute("aria-pressed") === "true" && $('[data-backdrop-option="hex"]').getAttribute("aria-pressed") === "true" && root.style.getPropertyValue("--c-bg").trim() !== "");
+    check("the current look names the theme and the wallpaper", () => $("[data-current-look]").textContent.includes("Neural HUD") && $("[data-current-look]").textContent.includes("Hex"));
     $('[data-backdrop-option="none"]').click(); await settle();
     check("None clears the wallpaper attribute and the body image", () => !root.hasAttribute("data-backdrop") && bodyImage() === "none");
+    await press($('[data-setting="theme-gallery"]'), "Neural HUD");
+    $('[data-preset="default"]').click(); await settle();
+    check("the Default tile after a wallpaper preset takes back its palette and its wallpaper", () =>
+      root.style.getPropertyValue("--c-bg") === "" && !root.hasAttribute("data-backdrop") && bodyImage() === "none" &&
+      $('[data-preset="default"]').getAttribute("aria-pressed") === "true" && !$("[data-theme-active]"));
     await press($('[data-setting="theme-gallery"]'), "Pure Black");
     check("Pure Black draws a black ground with an opaque material", () =>
       root.style.getPropertyValue("--c-bg").trim() === "0 0 0" && cs(root).getPropertyValue("--gp-material").trim() === "1");
+    await press($("[data-current-look]"), "Remove theme");
+    check("Remove theme after Pure Black returns the palette and the material to their defaults", () =>
+      root.style.getPropertyValue("--c-bg") === "" && get(interfaceStore).materialIntensity.dark === 0 &&
+      cs(root).getPropertyValue("--gp-material").trim() !== "1" && $('[data-preset="default"]').getAttribute("aria-pressed") === "true");
     await press($('[data-setting="theme-gallery"]'), "Paper");
     check("a light preset switches the window to light", () => root.classList.contains("light") && !root.classList.contains("dark"));
     await setValue($("[data-save-theme-name]"), "Harness look", ["input"]);
-    await press($('[data-setting="theme-gallery"]'), "Save current look");
+    await press($('[data-setting="theme-file"]'), "Save current look");
     check("Save current look puts the theme on the shelf", () => $('[data-saved-theme="Harness look"]') !== null);
     await press($('[data-saved-theme="Harness look"]'), "Remove “Harness look” from my themes");
-    check("and Remove takes it off again", () => $('[data-saved-theme="Harness look"]') === null);
-    interfaceStore.patchAppearance({ customTheme: null, backdrop: "none", materialIntensity: { light: 0, dark: 0 } });
+    check("and Remove takes it off the shelf without taking it out of force", () => $('[data-saved-theme="Harness look"]') === null && $("[data-theme-active]") !== null);
+    await press($("[data-current-look]"), "Remove theme");
     themeStore.setTheme("dark"); await settle();
     check("clearing the theme returns to the shipped palette", () => root.style.getPropertyValue("--c-bg") === "" && !root.hasAttribute("data-backdrop"));
 
@@ -277,7 +292,7 @@
     }
     await pickFile("{ not json");
     check("text that is not JSON is refused the same way", () => $("[data-theme-failure]")?.textContent.includes("isn't valid JSON"));
-    await press($("[data-theme-file]"), "Remove");
+    await press($("[data-current-look]"), "Remove theme");
     check("removing the theme returns the shipped palette", () => !root.style.getPropertyValue("--c-bg") && !$("[data-theme-active]"));
 
     // --- native rendering switches (Liquid Glass, 120 Hz) --------------------
@@ -331,6 +346,131 @@
     publishNativeRenderingStatus(null);
     check("the switch stays reachable by its accessible name", () => $('[aria-label="Use the Liquid Glass window material"]') && $('[aria-label="Render the interface above 60 Hz"]'));
 
+    // --- wallpaper intensity -------------------------------------------------
+    const wallBody = () => cs(document.body).backgroundImage;
+    $('[data-backdrop-option="neural"]').click(); await settle();
+    const intensity = $('[data-wallpaper-intensity] input[type="range"]');
+    check("full intensity draws the still exactly as before, with no fade written", () => !root.hasAttribute("data-backdrop-dim") && wallBody().startsWith('url("data:image/svg+xml,'));
+    await setValue(intensity, 0.6);
+    check("lower intensity fades the still toward the ground colour", () =>
+      root.hasAttribute("data-backdrop-dim") && root.style.getPropertyValue("--gp-backdrop-dim").trim() === "0.4" &&
+      wallBody().startsWith("linear-gradient(") && wallBody().includes('url("data:image/svg+xml,'));
+    check("the slider cannot go to nothing", () => Number(intensity.min) === 0.1 && Number(intensity.max) === 1);
+
+    // --- the moving wallpaper ------------------------------------------------
+    const layer = () => $("body > .gp-wallpaper-motion");
+    const motionStatus = () => $("[data-wallpaper-motion-status]")?.getAttribute("data-wallpaper-motion-status") ?? "none";
+    const pulseWith = (over = {}) => ({
+      state: "fresh", pressure: "normal", level: "normal", age_ms: 400, enabled: true, compressor_thrash: false, role: "writer",
+      governor: { admit: true, shed_background: false, shed_reactive: false, binding: null, refusing_for_s: null, notice: false, overridden: false, largest_foreign: null },
+      power: "ac", thermal: "nominal", load_per_core: 0.2, ...over,
+    });
+    const pulses = async (count, over = {}) => { for (let i = 0; i < count; i += 1) { publishHostLoadPulseForTests(pulseWith(over)); await settle(); } };
+    check("the switch is off by default and nothing moves", () => get(interfaceStore).wallpaperMotion === false && !layer() && !root.hasAttribute("data-backdrop-motion"));
+    await press($("[data-wallpaper-motion-setting]"), "Animate the wallpaper when plugged in and the system is quiet");
+    check("with no host reading it stays still and says why", () => motionStatus() === "unknown" && !layer() && wallBody().includes("svg+xml"));
+    await pulses(2);
+    check("two quiet pulses are not enough: it says it is about to start", () => motionStatus() === "settling" && !layer());
+    await pulses(1);
+    check("the third quiet pulse on mains power starts it", () => motionStatus() === "playing" && root.hasAttribute("data-backdrop-motion") && layer() !== null);
+    check("the layer is the first thing in body, outside the shell, fixed beneath every in-flow box", () =>
+      document.body.firstElementChild === layer() && !layer().closest(".gp-shell") && cs(layer()).position === "fixed" && cs(layer()).zIndex === "-1");
+    check("the still hands over to the layer: body draws no picture while it moves", () => wallBody() === "none");
+    check("the layer's base is the still itself, drifting; every accent starts transparent", () => {
+      const base = layer().querySelector(".gp-wp-drift");
+      const accents = [...layer().querySelectorAll(".gp-wp-accent")];
+      return base && base.style.backgroundImage.includes(encodeURIComponent("<svg").slice(0, 6)) && cs(base).animationName === "gp-wp-drift" && accents.length >= 1;
+    });
+    check("the same fade sits over the moving layer", () => {
+      const tint = getComputedStyle(layer(), "::after").backgroundColor;
+      const alpha = /rgba?\([^)]*[,/]\s*([\d.]+)\)/.exec(tint)?.[1];
+      return alpha !== undefined && Math.abs(Number(alpha) - 0.4) < 0.01;
+    });
+    await pulses(1, { power: "battery" });
+    check("on battery it stops at once and the still comes back", () => motionStatus() === "battery" && !layer() && !root.hasAttribute("data-backdrop-motion") && wallBody().includes("svg+xml"));
+    await pulses(3);
+    check("plugged in and quiet again, it moves again", () => motionStatus() === "playing" && layer() !== null);
+    await pulses(1, { load_per_core: 2.4 });
+    check("a busy host stops it and names the load", () => motionStatus() === "busy" && !layer() && $("[data-wallpaper-motion-status]").textContent.includes("2.40 per core"));
+    await pulses(1, { thermal: "serious" });
+    check("heat stops it", () => motionStatus() === "thermal" && !layer());
+    await pulses(1, { power: null });
+    check("a power reading that could not be taken holds it still, not moving", () => motionStatus() === "unknown" && !layer());
+    await pulses(3);
+    interfaceStore.setReduceMotion(true); await settle();
+    check("app Reduce Motion stops it whatever the host says", () => motionStatus() === "reduce-motion" && !layer());
+    interfaceStore.setReduceMotion(false); await settle();
+    check("and it moves again when Reduce Motion is off, with no new settling", () => motionStatus() === "playing" && layer() !== null);
+    await press($('[data-setting="transparency"]'), "Reduced");
+    check("Reduced transparency stops it and hides the wallpaper", () => motionStatus() === "reduce-transparency" && !layer() && wallBody() === "none");
+    await press($('[data-setting="transparency"]'), "Auto");
+    check("Auto brings it back", () => motionStatus() === "playing" && layer() !== null);
+
+    // --- a video wallpaper, end to end ---------------------------------------
+    // A real clip, recorded here from a canvas (red ground, a green bar moving),
+    // through the real file input, the real decoder and IndexedDB.
+    const wait = async (ok, ms = 8000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); await settle(); return ok(); };
+    const recordClip = async () => {
+      if (typeof MediaRecorder === "undefined") return null;
+      const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 200 });
+      const ctx = canvas.getContext("2d");
+      const stream = canvas.captureStream?.(30);
+      // Record a type this engine can also play back: WebKit records WebM it cannot decode.
+      const player = document.createElement("video");
+      const type = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported?.(t) && player.canPlayType(t) !== "");
+      if (!stream || !type) return null;
+      let frame = 0;
+      const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); };
+      paint();
+      const painter = setInterval(paint, 33);
+      const recorder = new MediaRecorder(stream, { mimeType: type });
+      const chunks = [];
+      recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+      const stopped = new Promise((resolve) => (recorder.onstop = resolve));
+      recorder.start(100);
+      await new Promise((r) => setTimeout(r, 1500));
+      recorder.stop(); await stopped; clearInterval(painter);
+      for (const track of stream.getTracks()) track.stop();
+      return new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
+    };
+    const clip = await recordClip();
+    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with`, () => clip !== null && clip.size > 0);
+    if (clip) {
+      const input = $("[data-wallpaper-input]");
+      const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      await wait(() => $("[data-custom-video-badge]") !== null || $("[data-wallpaper-failure]") !== null, 20000);
+      const refusal = $("[data-wallpaper-failure]")?.textContent.trim() ?? "";
+      check(`the clip is accepted as a video wallpaper and chosen${refusal ? ` (refused: ${refusal})` : ""}`, () =>
+        $("[data-custom-video-badge]") !== null && get(interfaceStore).backdrop === "custom" && !$("[data-wallpaper-failure]"));
+      check("its still is the clip's first frame, not a blank one", () => {
+        const img = $('[data-backdrop-option="custom"] img');
+        if (!img?.complete || img.naturalWidth === 0) return false;
+        const probe = Object.assign(document.createElement("canvas"), { width: img.naturalWidth, height: img.naturalHeight });
+        const g = probe.getContext("2d"); g.drawImage(img, 0, 0);
+        const [r, gr] = g.getImageData(Math.floor(img.naturalWidth * 0.8), Math.floor(img.naturalHeight * 0.8), 1, 1).data;
+        return r > 150 && gr < 100;
+      });
+      const video = () => layer()?.querySelector("video") ?? null;
+      check("plugged in and quiet, the layer plays it muted, looping, with the still as its poster", () =>
+        video() !== null && video().muted && video().loop && !video().controls && video().poster.startsWith("blob:"));
+      const plays = await wait(() => (video()?.currentTime ?? 0) > 0.05 && video()?.paused === false, 8000);
+      check("and it actually plays: time moves", () => plays);
+      await pulses(1, { power: "battery" });
+      check("on battery the video is stopped and gone, and the still is drawn", () =>
+        document.querySelectorAll("video").length === 0 && !layer() && wallBody().includes("blob:"));
+      await pulses(3);
+      const playsAgain = await wait(() => (video()?.currentTime ?? 0) > 0 && video()?.paused === false, 8000);
+      check("plugged in again, it plays again", () => playsAgain);
+      await press($("[data-wallpaper-settings]"), "Remove video");
+      await wait(() => get(interfaceStore).backdrop === "none");
+      check("Remove video forgets it and leaves no player behind", () => get(interfaceStore).backdrop === "none" && document.querySelectorAll("video").length === 0 && !$('[data-backdrop-option="custom"]'));
+    }
+    $('[data-backdrop-option="none"]').click(); await settle();
+    check("no wallpaper, no layer", () => !layer() && !root.hasAttribute("data-backdrop-motion"));
+    await press($("[data-wallpaper-motion-setting]"), "Animate the wallpaper when plugged in and the system is quiet");
+    publishHostLoadPulseForTests(null); await settle();
+
     // --- reset, gating -------------------------------------------------------
     await press(page, "Reset appearance");
     check("Reset appearance restores every default", () => { const p = get(interfaceStore); return p.density === "comfortable" && p.radiusScale === 1 && p.floatBlur === 34 && p.fieldLevel === "vivid" && p.customAccent === "" && !p.reduceTransparency && p.customTheme === null; });
@@ -340,6 +480,11 @@
     check("without the capability the Material group explains itself instead of showing dead sliders", () => $("[data-material-unavailable]") && !$("[data-group='material']").hidden);
     check("and writes no glass token even when a stored value exists", () => !root.hasAttribute("data-float-blur") && !root.style.getPropertyValue("--gp-material"));
     check("density and corner style still work off macOS", () => !$('[data-setting="density"]').hidden && !$('[data-setting="corner-style"]').hidden);
+    // The modal hides unsupported ids through `shown`; the host stands in for it here.
+    globalThis.__gpHide(["wallpaper"]); await settle();
+    check("without the capability the wallpaper row leaves the Theme card, and the rest of the card stays", () =>
+      $('[data-setting="wallpaper"]').hidden && $('[data-setting="wallpaper"]').closest('[data-group="theme"]') && !$("[data-group='theme']").hidden && !$('[data-setting="theme-gallery"]').hidden);
+    globalThis.__gpHide([]);
     interfaceStore.reset();
     check("no runtime errors", () => errors.length === 0);
     document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

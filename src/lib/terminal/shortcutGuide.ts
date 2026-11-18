@@ -27,11 +27,20 @@ export function terminalGuideShortcuts(os: HostOS): GuideShortcut[] {
   // the platform-vocabulary guard satisfied about where a glyph may be spelled.
   const cmd = shortcutKeyLabel("⌘", os);
   const opt = shortcutKeyLabel("⌥", os);
+  const shift = shortcutKeyLabel("⇧", os);
   const rows: GuideShortcut[] = [
     { keys: ["Ctrl", "Shift", "T"], description: "New shell in the directory of the shell beside it" },
     { keys: ["Ctrl", "Shift", "W"], description: "Close session — asks first when a job is running" },
     { keys: ["Ctrl", "Tab"], description: "Next terminal tab" },
     { keys: ["Ctrl", "Shift", "Tab"], description: "Previous terminal tab" },
+    { keys: mac ? [cmd, "D"] : ["Ctrl", "Shift", "D"], description: "Split terminal right" },
+    { keys: mac ? [cmd, shift, "D"] : ["Ctrl", "Shift", opt, "D"], description: "Split terminal down" },
+    { keys: mac ? [cmd, shift, "Enter"] : ["Ctrl", "Shift", "Enter"], description: "Zoom or restore split pane" },
+    { keys: mac ? [cmd, opt, "←/→/↑/↓"] : ["Ctrl", opt, "←/→/↑/↓"], description: "Focus adjacent split pane" },
+    { keys: mac ? [cmd, opt, "[ / ]"] : ["Ctrl", opt, "[ / ]"], description: "Previous / next visible split pane" },
+    { keys: mac ? [cmd, opt, shift, "[ / ]"] : ["Ctrl", opt, "Shift", "[ / ]"], description: "Previous / next terminal pair" },
+    { keys: mac ? [cmd, opt, "1–8"] : ["Ctrl", opt, "1–8"], description: "Jump directly to split pane 1–8" },
+    { keys: mac ? [cmd, opt, "0"] : ["Ctrl", opt, "0"], description: "Close split view and keep active session" },
     { keys: [cmd, "1–9"], description: "Jump to a repository tab, from the terminal too; 9 is the last" },
     { keys: mac ? [cmd, "F"] : ["Ctrl", "Shift", "F"], description: "Find in the terminal" },
     { keys: ["Enter"], description: "Next match" },

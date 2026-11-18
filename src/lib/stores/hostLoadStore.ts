@@ -88,6 +88,31 @@ export interface Cores {
   perf1: number;
 }
 
+/** `sysload::CpuUsage`: system-wide CPU utilization deltas (% across logical CPUs). */
+export interface CpuUsage {
+  total_pct: number;
+  user_pct: number;
+  system_pct: number;
+}
+
+/** `sysload::GpuSample`: IOKit `IOAccelerator` GPU utilization and unified memory. */
+export interface GpuSample {
+  utilization_pct: number;
+  renderer_pct: number | null;
+  tiler_pct: number | null;
+  memory_in_use: number | null;
+  memory_allocated: number | null;
+}
+
+/** `sysload::MemorySample`: physical memory used and Activity Monitor category breakdown. */
+export interface MemorySample {
+  used_bytes: number;
+  app_bytes: number | null;
+  wired_bytes: number | null;
+  compressed_bytes: number | null;
+  cached_bytes: number | null;
+}
+
 export interface HostSample {
   pressure: Reading<Level>;
   swap_used: Reading<number>;
@@ -103,6 +128,11 @@ export interface HostSample {
   free_disk: Reading<number>;
   thermal: Reading<Thermal>;
   power: Reading<Power>;
+  cpu_usage?: Reading<CpuUsage>;
+  gpu?: Reading<GpuSample>;
+  memory?: Reading<MemorySample>;
+  total_disk?: Reading<number>;
+  thermal_temp_c?: Reading<number>;
 }
 
 export interface SessionCount {
@@ -483,6 +513,98 @@ export interface HostLoadPulse {
   compressor_thrash: boolean;
   role: Role;
   governor: GovernorPulse;
+  /**
+   * Host room from the last snapshot (`sysload::HostLoadPulse`). Optional and
+   * nullable: an older backend or a fixture that leaves them out reads as
+   * unknown, never as mains power or a quiet machine.
+   */
+  power?: Power | null;
+  thermal?: Thermal | null;
+  /** One-minute load average over the logical core count. */
+  load_per_core?: number | null;
+  cpu_pct?: number | null;
+  gpu_pct?: number | null;
+  mem_used_bytes?: number | null;
+  mem_total_bytes?: number | null;
+  swap_used_bytes?: number | null;
+  thermal_temp_c?: number | null;
+  disk_free_bytes?: number | null;
+  disk_total_bytes?: number | null;
+  disk_write_rate?: number | null;
+  disk_fill_rate?: number | null;
+  snapshot_seq?: number;
+}
+
+/** Mirrors `sysload::room_of`: each reading only when it was read. */
+export function hostRoomOf(host: HostSample | undefined): Pick<HostLoadPulse, "power" | "thermal" | "load_per_core"> {
+  if (!host) return { power: null, thermal: null, load_per_core: null };
+  const load = host.load.status === "value" ? host.load.value[0] : null;
+  const logical = host.cores.status === "value" ? host.cores.value.logical : 0;
+  return {
+    power: host.power.status === "value" ? host.power.value : null,
+    thermal: host.thermal.status === "value" ? host.thermal.value : null,
+    load_per_core:
+      load !== null && Number.isFinite(load) && load >= 0 && logical > 0 ? Math.round((load / logical) * 100) / 100 : null,
+  };
+}
+
+export type HostPulseMetrics = Required<
+  Pick<
+    HostLoadPulse,
+    | "cpu_pct"
+    | "gpu_pct"
+    | "mem_used_bytes"
+    | "mem_total_bytes"
+    | "swap_used_bytes"
+    | "thermal_temp_c"
+    | "disk_free_bytes"
+    | "disk_total_bytes"
+    | "disk_write_rate"
+    | "disk_fill_rate"
+  >
+>;
+
+/** Extracts live CPU/GPU/Memory/Thermal/Disk pulse metrics from a snapshot. */
+export function hostMetricsOf(snapshot: Snapshot | null | undefined): HostPulseMetrics {
+  if (!snapshot || snapshot.enabled === false) {
+    return {
+      cpu_pct: null,
+      gpu_pct: null,
+      mem_used_bytes: null,
+      mem_total_bytes: null,
+      swap_used_bytes: null,
+      thermal_temp_c: null,
+      disk_free_bytes: null,
+      disk_total_bytes: null,
+      disk_write_rate: null,
+      disk_fill_rate: null,
+    };
+  }
+  const h = snapshot.host;
+  const cpuPct =
+    h.cpu_usage?.status === "value" && Number.isFinite(h.cpu_usage.value.total_pct) && h.cpu_usage.value.total_pct >= 0
+      ? h.cpu_usage.value.total_pct
+      : null;
+  const gpuPct =
+    h.gpu?.status === "value" && Number.isFinite(h.gpu.value.utilization_pct) && h.gpu.value.utilization_pct >= 0
+      ? h.gpu.value.utilization_pct
+      : null;
+  const tempC =
+    h.thermal_temp_c?.status === "value" && Number.isFinite(h.thermal_temp_c.value)
+      ? h.thermal_temp_c.value
+      : null;
+  return {
+    cpu_pct: cpuPct,
+    gpu_pct: gpuPct,
+    mem_used_bytes: h.memory?.status === "value" ? h.memory.value.used_bytes : null,
+    mem_total_bytes: h.memsize.status === "value" ? h.memsize.value : null,
+    swap_used_bytes: h.swap_used.status === "value" ? h.swap_used.value : null,
+    thermal_temp_c: tempC,
+    disk_free_bytes: h.free_disk.status === "value" ? h.free_disk.value : null,
+    disk_total_bytes: h.total_disk?.status === "value" ? h.total_disk.value : null,
+    disk_write_rate: snapshot.launched_write_rate.status === "value" ? snapshot.launched_write_rate.value : null,
+    disk_fill_rate: snapshot.disk_fill_rate?.status === "value" ? snapshot.disk_fill_rate.value : null,
+  };
 }
 
 /** `sysload::InputMode`: what one input may do to the governor's verdict. */
@@ -618,15 +740,48 @@ export function thresholdsAreDefault(thresholds: Thresholds): boolean {
 /** The event the app's sampler emits after every tick. */
 export const HOST_LOAD_PULSE_EVENT = "host-load-pulse";
 
+/** Whether a pulse represents an enabled, governing sensor reading (`fresh` or `stale_recent`). */
+export function isLiveHostLoadPulse(pulse: HostLoadPulse): boolean {
+  return pulse.enabled && (pulse.state === "fresh" || pulse.state === "stale_recent");
+}
+
+function sanitizePulse(pulse: HostLoadPulse): HostLoadPulse {
+  if (isLiveHostLoadPulse(pulse)) return pulse;
+  return {
+    ...pulse,
+    pressure: "unavailable",
+    compressor_thrash: false,
+    power: null,
+    thermal: null,
+    load_per_core: null,
+    cpu_pct: null,
+    gpu_pct: null,
+    mem_used_bytes: null,
+    mem_total_bytes: null,
+    swap_used_bytes: null,
+    thermal_temp_c: null,
+    disk_free_bytes: null,
+    disk_total_bytes: null,
+    disk_write_rate: null,
+    disk_fill_rate: null,
+  };
+}
+
 /** Mirrors `sysload::pulse_of`, so the first status read stands in for a pulse. */
 export function pulseOf(status: HostLoadStatus): HostLoadPulse {
+  const enabled = status.sensor.enabled ?? false;
+  const live =
+    enabled &&
+    (status.sensor.state === "fresh" || status.sensor.state === "stale_recent") &&
+    status.snapshot?.enabled !== false;
+  const liveSnapshot = live ? status.snapshot : null;
   return {
     state: status.sensor.state,
-    pressure: status.pressure,
+    pressure: live ? status.pressure : "unavailable",
     level: status.sensor.level,
     age_ms: status.sensor.age_ms,
-    enabled: status.sensor.enabled ?? false,
-    compressor_thrash: status.snapshot?.compressor_thrash ?? false,
+    enabled,
+    compressor_thrash: liveSnapshot?.compressor_thrash ?? false,
     role: status.role,
     governor: {
       admit: status.governor.verdict.admit,
@@ -638,11 +793,55 @@ export function pulseOf(status: HostLoadStatus): HostLoadPulse {
       overridden: status.governor.override_remaining_s !== null,
       largest_foreign: status.governor.largest_foreign,
     },
+    ...hostRoomOf(liveSnapshot?.host),
+    ...hostMetricsOf(liveSnapshot),
+    ...(status.snapshot && typeof status.snapshot.seq === "number"
+      ? { snapshot_seq: status.snapshot.seq }
+      : {}),
   };
 }
 
+export const MAX_HOST_LOAD_HISTORY = 60;
+
 const pulseStore = writable<HostLoadPulse | null>(null);
 const statusStore = writable<HostLoadStatus | null>(null);
+const historyStore = writable<readonly HostLoadPulse[]>([]);
+let lastReaderSeq: number | null = null;
+
+function appendHistory(rawPulse: HostLoadPulse, seedOnly = false): void {
+  const pulse = sanitizePulse(rawPulse);
+  const live = isLiveHostLoadPulse(pulse);
+  const seq =
+    pulse.role === "reader" && typeof pulse.snapshot_seq === "number"
+      ? pulse.snapshot_seq
+      : null;
+
+  historyStore.update((items) => {
+    // Polls only seed empty history when live, so live sampler events aren't duplicated;
+    // when the sensor transitions from live to non-live (e.g. dead sampler stopped emitting),
+    // still allow one null-metrics gap entry to break the chart series.
+    if (seedOnly && items.length > 0 && live) return items;
+
+    if (live) {
+      if (seq !== null && seq === lastReaderSeq) {
+        return items;
+      }
+      if (seq !== null) lastReaderSeq = seq;
+      const next = [...items, pulse];
+      return next.length > MAX_HOST_LOAD_HISTORY ? next.slice(next.length - MAX_HOST_LOAD_HISTORY) : next;
+    }
+
+    // Clear the tracked reader sequence on non-live gaps so a restarted writer
+    // whose new sequence happens to match an old seq is not deduplicated.
+    lastReaderSeq = null;
+    const prev = items[items.length - 1];
+    if (prev && !isLiveHostLoadPulse(prev)) {
+      return items;
+    }
+    const next = [...items, pulse];
+    return next.length > MAX_HOST_LOAD_HISTORY ? next.slice(next.length - MAX_HOST_LOAD_HISTORY) : next;
+  });
+}
 
 let listening: Promise<UnlistenFn | null> | null = null;
 let noticeShown = false;
@@ -686,8 +885,10 @@ function announceRefusal(pulse: HostLoadPulse): void {
 export function startHostLoad(): void {
   if (listening || !isTauri()) return;
   const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
-    pulseStore.set(event.payload);
-    announceRefusal(event.payload);
+    const pulse = sanitizePulse(event.payload);
+    pulseStore.set(pulse);
+    appendHistory(pulse);
+    announceRefusal(pulse);
     rereadProfileIfUnsettled();
   }).catch((error) => {
     if (listening === attempt) listening = null;
@@ -739,7 +940,9 @@ export function refreshHostLoad(): Promise<HostLoadStatus | null> {
   const flight: Promise<HostLoadStatus | null> = (async () => {
     const status = await invoke<HostLoadStatus>("cmd_host_load_status");
     statusStore.set(status);
-    pulseStore.set(pulseOf(status));
+    const pulse = pulseOf(status);
+    pulseStore.set(pulse);
+    appendHistory(pulse, true);
     return status;
   })().finally(() => {
     if (refreshing === flight) refreshing = null;
@@ -969,6 +1172,9 @@ export const hostLoadPulse: Readable<HostLoadPulse | null> = { subscribe: pulseS
 export const hostLoadStatus: Readable<HostLoadStatus | null> = {
   subscribe: statusStore.subscribe,
 };
+export const hostLoadHistory: Readable<readonly HostLoadPulse[]> = {
+  subscribe: historyStore.subscribe,
+};
 
 /**
  * The resource profile the backend derived, or null until the first status
@@ -989,14 +1195,26 @@ export const hostPressure: Readable<PressureInput> = derived(
   (pulse) => pulse?.pressure ?? "unavailable",
 );
 
+/**
+ * Test seam: publishes `pulse` as if the sampler had just ticked, for a page
+ * with no backend (the browser harness) to drive what reads the pulse.
+ */
+export function publishHostLoadPulseForTests(pulse: HostLoadPulse | null): void {
+  const sanitized = pulse === null ? null : sanitizePulse({ ...pulse });
+  pulseStore.set(sanitized);
+  if (sanitized !== null) appendHistory(sanitized);
+}
+
 /** Test seam: resets the module state between tests. */
 export function resetHostLoadForTests(): void {
   listening = null;
   refreshing = null;
   noticeShown = false;
+  lastReaderSeq = null;
   profileRetries = 0;
   profileRetryNotBefore = 0;
   pulseStore.set(null);
   statusStore.set(null);
+  historyStore.set([]);
   settingsStore.set(null);
 }

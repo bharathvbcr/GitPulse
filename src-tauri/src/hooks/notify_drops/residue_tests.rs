@@ -95,7 +95,7 @@ fn a_record_another_user_owns_is_not_appended_to_and_not_changed() {
 
     let refusal = append_owned_by(&record, b"{}\n", someone_else).unwrap_err();
 
-    assert!(refusal.contains("owned by uid"), "{refusal}");
+    assert!(refusal.contains("owned by another user"), "{refusal}");
     assert!(refusal.contains(&record.display().to_string()), "{refusal}");
     assert_eq!(std::fs::read(&record).unwrap(), b"theirs\n");
     assert_eq!(

@@ -169,6 +169,7 @@ pub struct HerdrStatus {
 /// same single-pass resumable byte scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryEvent {
+    OscTitle(String),
     Osc7Cwd(String),
     Osc133(ShellMark),
     Osc7501(HerdrStatus),
@@ -229,6 +230,7 @@ pub struct Scanner {
     line_buf: Vec<u8>,
     line_overflowed: bool,
     last_loopback_url: Option<String>,
+    last_osc_title: Option<String>,
 }
 
 impl Default for Scanner {
@@ -251,6 +253,7 @@ impl Scanner {
             line_buf: Vec::new(),
             line_overflowed: false,
             last_loopback_url: None,
+            last_osc_title: None,
         }
     }
 
@@ -269,6 +272,24 @@ impl Scanner {
         if self.telemetry.len() < MAX_TELEMETRY_BUFFER {
             self.telemetry.push(event);
         }
+    }
+
+    fn record_osc_title(&mut self, title: String) {
+        if self.last_osc_title.is_none() && title.is_empty() {
+            return;
+        }
+        if self.last_osc_title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        self.last_osc_title = Some(title.clone());
+        if let Some(existing) = self.telemetry.iter_mut().find_map(|ev| match ev {
+            TelemetryEvent::OscTitle(slot) => Some(slot),
+            _ => None,
+        }) {
+            *existing = title;
+            return;
+        }
+        self.record_telemetry(TelemetryEvent::OscTitle(title));
     }
 
     fn flush_line_token(&mut self, clear_line: bool) {
@@ -449,6 +470,13 @@ impl Scanner {
             return None;
         }
         match ident.as_slice() {
+            b"0" | b"2" => {
+                if let Ok(raw) = std::str::from_utf8(&payload) {
+                    let clean = sanitize_osc_title(raw);
+                    self.record_osc_title(clean);
+                }
+                None
+            }
             b"7" => {
                 if let Some(cwd) = osc7(&payload) {
                     self.record_telemetry(TelemetryEvent::Osc7Cwd(cwd));
@@ -641,6 +669,80 @@ fn text_of(bytes: &[u8]) -> Option<String> {
     }
     let text = sanitize(std::str::from_utf8(bytes).ok()?);
     (!text.is_empty()).then_some(text)
+}
+
+const MAX_OSC_TITLE_CHARS: usize = 120;
+
+fn is_transient_spinner_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2800}'
+            ..='\u{28ff}'
+                | '◐'
+                | '◓'
+                | '◑'
+                | '◒'
+                | '◴'
+                | '◷'
+                | '◶'
+                | '◵'
+                | '✢'
+                | '✶'
+                | '✻'
+                | '✽'
+                | '·'
+    )
+}
+
+/// Sanitizes an `OSC 0` / `OSC 2` terminal title and strips transient 8–12 Hz
+/// CLI spinner frames (Braille dots, quarter-circle/clock spinners, and starburst/dot
+/// glyphs) while keeping static status symbols such as `✳` and mid-title `·` intact.
+pub fn sanitize_osc_title(raw: &str) -> String {
+    let sanitized = sanitize(raw);
+    if sanitized.is_empty() {
+        return String::new();
+    }
+    let mut slice = sanitized.as_str();
+    loop {
+        let mut chars = slice.chars();
+        let Some(first) = chars.next() else {
+            return String::new();
+        };
+        if is_transient_spinner_char(first) {
+            let rest = chars.as_str();
+            if rest.is_empty() {
+                return String::new();
+            }
+            if rest.starts_with(char::is_whitespace) {
+                slice = rest.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    loop {
+        let mut chars = slice.chars();
+        let Some(last) = chars.next_back() else {
+            return String::new();
+        };
+        if is_transient_spinner_char(last) {
+            let head = chars.as_str();
+            if head.is_empty() {
+                return String::new();
+            }
+            if head.ends_with(char::is_whitespace) {
+                slice = head.trim_end();
+                continue;
+            }
+        }
+        break;
+    }
+    let trimmed = slice.trim();
+    if trimmed.chars().count() <= MAX_OSC_TITLE_CHARS {
+        trimmed.to_owned()
+    } else {
+        trimmed.chars().take(MAX_OSC_TITLE_CHARS).collect()
+    }
 }
 
 /// Decodes `OSC 7 ; file://<host>/<percent-encoded-path>`.
@@ -1218,6 +1320,58 @@ mod tests {
                 }),
                 TelemetryEvent::Osc7501Clear,
                 TelemetryEvent::Osc7501Probe,
+            ]
+        );
+    }
+
+    #[test]
+    fn osc_title_deduplicates_spinner_frames_preserves_static_icons_and_never_crowds_buffer() {
+        let mut scanner = Scanner::new();
+        // 8-12 Hz Braille spinner frames collapse to one title event.
+        scanner.feed("\x1b]0;⠋ Refactoring split panes\x07".as_bytes());
+        scanner.feed("\x1b]2;⠙ Refactoring split panes\x1b\\".as_bytes());
+        scanner.feed("\x1b]0;⠹ Refactoring split panes\x07".as_bytes());
+        assert_eq!(
+            scanner.drain_telemetry(),
+            vec![TelemetryEvent::OscTitle("Refactoring split panes".into())]
+        );
+
+        // Starburst and dot spinner frames produce zero extra title events once normalized.
+        for glyph in ['✢', '✶', '✻', '✽', '·'] {
+            scanner.feed(format!("\x1b]2;{glyph} Refactoring split panes\x07").as_bytes());
+        }
+        assert!(scanner.drain_telemetry().is_empty());
+
+        // Mid-title `·` separator and non-whitespace prefixes stay intact.
+        scanner.feed("\x1b]2;api · worker\x07".as_bytes());
+        assert_eq!(
+            scanner.drain_telemetry(),
+            vec![TelemetryEvent::OscTitle("api · worker".into())]
+        );
+
+        // Static status prefixes such as `✳` are preserved intact.
+        scanner.feed("\x1b]2;✳ Running cargo test\x07".as_bytes());
+        assert_eq!(
+            scanner.drain_telemetry(),
+            vec![TelemetryEvent::OscTitle("✳ Running cargo test".into())]
+        );
+
+        // Even 50 distinct OSC title updates in a single read chunk coalesce in-place
+        // and never crowd out a subsequent OSC 7501 blocked status.
+        let mut burst = String::new();
+        for idx in 0..50 {
+            burst.push_str(&format!("\x1b]2;Step {idx}\x07"));
+        }
+        burst.push_str("\x1b]7501;status;blocked;Approve schema\x07");
+        scanner.feed(burst.as_bytes());
+        assert_eq!(
+            scanner.drain_telemetry(),
+            vec![
+                TelemetryEvent::OscTitle("Step 49".into()),
+                TelemetryEvent::Osc7501(HerdrStatus {
+                    state: HerdrState::Blocked,
+                    detail: Some("Approve schema".into()),
+                }),
             ]
         );
     }

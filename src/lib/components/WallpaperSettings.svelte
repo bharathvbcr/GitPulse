@@ -1,23 +1,34 @@
 <script lang="ts">
   import { Check, ImagePlus, Trash2 } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { appearanceNotes } from "../ui/appearance/apply";
+  import { WALLPAPER_INTENSITY_RANGE, appearanceNotes } from "../ui/appearance/apply";
   import { BUILTIN_BACKDROPS, builtinBackdropUrl, type BackdropId } from "../ui/appearance/backdrops";
   import {
-    WALLPAPER_TYPES,
+    MAX_WALLPAPER_VIDEO_BYTES,
+    WALLPAPER_ACCEPT,
     clearWallpaper,
     customWallpaper,
     saveWallpaper,
   } from "../ui/appearance/wallpaperStore";
+  import { BUSY_LOAD, QUIET_LOAD, motionReasonText, wallpaperMotionState } from "../ui/appearance/wallpaperMotion";
+  import SettingToggle from "./SettingToggle.svelte";
+  import Slider from "./Slider.svelte";
 
   /**
-   * Settings -> Appearance -> Material -> Wallpaper.
+   * Settings -> Appearance -> Theme and wallpaper -> Wallpaper, right under the
+   * presets, since a preset sets one too.
    *
    * The picture is drawn under the window material, in place of the desktop, so
    * it is only offered where that material exists (the catalog entry requires
-   * `nativeMaterial`). The reader's own image is re-encoded and kept in
-   * IndexedDB by wallpaperStore.ts; nothing about it enters the preferences
-   * except the choice `custom`.
+   * `nativeMaterial`). "None" is the way to take any wallpaper away, a preset's
+   * included. The reader's own image or video is kept in IndexedDB by
+   * wallpaperStore.ts; nothing about it enters the preferences except the
+   * choice `custom`.
+   *
+   * Intensity fades the picture, still or moving, toward the ground colour.
+   * Animate asks for movement; whether it moves right now is
+   * wallpaperMotion.ts's decision, and the line under the switch says which
+   * of its reasons holds, so a wallpaper standing still never looks broken.
    */
   let picker = $state<HTMLInputElement>();
   let busy = $state(false);
@@ -26,6 +37,9 @@
   const prefs = $derived($interfaceStore);
   const custom = $derived($customWallpaper);
   const notes = $derived($appearanceNotes.filter((note) => note.id.startsWith("backdrop-")));
+  const motion = $derived($wallpaperMotionState);
+  const motionLine = $derived(prefs.wallpaperMotion && prefs.backdrop !== "none" ? motionReasonText(motion) : null);
+  const isVideo = $derived(custom.status === "ready" && custom.videoUrl !== null);
 
   function choose(id: BackdropId) {
     failure = "";
@@ -75,7 +89,10 @@
       <span class="flex aspect-[16/10] w-full items-center justify-center rounded-md border border-dashed border-edge text-micro text-textMuted">
         None
       </span>
-      <span class="px-0.5 text-micro text-textPrimary">Desktop</span>
+      <span class="flex items-center justify-between gap-1 px-0.5">
+        <span class="truncate text-micro text-textPrimary">Desktop</span>
+        {#if prefs.backdrop === "none"}<Check size={11} class="shrink-0 text-accent" />{/if}
+      </span>
     </button>
 
     {#each BUILTIN_BACKDROPS as backdrop (backdrop.id)}
@@ -116,7 +133,12 @@
         data-backdrop-option="custom"
         onclick={() => choose("custom")}
       >
-        <img src={custom.url} alt="" class="aspect-[16/10] w-full rounded-md object-cover" decoding="async" />
+        <span class="relative block">
+          <img src={custom.url} alt="" class="aspect-[16/10] w-full rounded-md object-cover" decoding="async" />
+          {#if isVideo}
+            <span class="absolute bottom-1 left-1 rounded-sm bg-black/60 px-1 text-micro text-white" data-custom-video-badge>Video</span>
+          {/if}
+        </span>
         <span class="flex items-center justify-between gap-1 px-0.5">
           <span class="truncate text-micro text-textPrimary">{custom.name}</span>
           {#if picked}<Check size={11} class="shrink-0 text-accent" />{/if}
@@ -129,9 +151,9 @@
     <input
       bind:this={picker}
       type="file"
-      accept={WALLPAPER_TYPES.join(",")}
+      accept={WALLPAPER_ACCEPT}
       hidden
-      aria-label="Wallpaper image"
+      aria-label="Wallpaper image or video"
       data-wallpaper-input
       onchange={onPick}
     />
@@ -144,12 +166,12 @@
       onclick={() => picker?.click()}
     >
       <ImagePlus size={12} />
-      {busy ? "Preparing image…" : custom.status === "ready" ? "Replace image…" : "Choose image…"}
+      {busy ? "Preparing…" : custom.status === "ready" ? "Replace image or video…" : "Choose image or video…"}
     </button>
     {#if custom.status === "ready"}
       <button type="button" class="gp-btn" data-variant="ghost" data-size="sm" onclick={removeImage}>
         <Trash2 size={12} />
-        Remove image
+        {isVideo ? "Remove video" : "Remove image"}
       </button>
     {/if}
   </div>
@@ -170,8 +192,43 @@
     </p>
   {/each}
 
+  <div class="flex flex-col gap-1.5" data-wallpaper-intensity>
+    <Slider
+      label="Wallpaper intensity"
+      value={prefs.wallpaperIntensity}
+      min={WALLPAPER_INTENSITY_RANGE.min}
+      max={WALLPAPER_INTENSITY_RANGE.max}
+      step={0.05}
+      disabled={prefs.backdrop === "none"}
+      format={(n) => `${Math.round(n * 100)}%`}
+      oninput={(next) => interfaceStore.setWallpaperIntensity(next)}
+    />
+    <p class="text-micro text-textMuted">Lower fades the wallpaper into the theme's background color.</p>
+  </div>
+
+  <div class="flex flex-col gap-1.5" data-wallpaper-motion-setting>
+    <SettingToggle
+      label="Animate"
+      description="Built-in wallpapers drift and glint, and a video plays, only while the Mac is plugged in and the system is quiet (load under {QUIET_LOAD} per core; it stops above {BUSY_LOAD}). Reduce Motion always keeps it still."
+      ariaLabel="Animate the wallpaper when plugged in and the system is quiet"
+      checked={prefs.wallpaperMotion}
+      onchange={(next) => interfaceStore.setWallpaperMotion(next)}
+    />
+    {#if motionLine}
+      <p
+        class="text-meta {motion.play ? 'text-textPrimary' : 'text-textMuted'}"
+        role="status"
+        data-wallpaper-motion-status={motion.reason}
+      >
+        {motionLine}
+      </p>
+    {/if}
+  </div>
+
   <p class="text-micro text-textMuted">
-    Drawn behind the window material in place of the desktop, under the same veil, so text stays as readable as it
-    is over any desktop. Your image is resized to at most 2560 pixels and kept on this computer only.
+    Drawn behind the window in place of the desktop, under the same veil, so text stays as readable as over any
+    desktop. An image is resized to at most 2560 pixels; a video (MP4, WebM or MOV, up to
+    {MAX_WALLPAPER_VIDEO_BYTES / (1024 * 1024)} MB) plays muted and shows its first frame whenever it is still. Both are
+    kept on this computer only.
   </p>
 </div>

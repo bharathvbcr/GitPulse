@@ -1229,7 +1229,7 @@
     >
       <div class="flex items-center justify-between gap-2">
         <span>{describeFailure({ verb: "refresh", object: "the file list" }, errorMsg).headline} Showing the last successful listing.</span>
-        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath, true); }}>Try again</button>
+        <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => { if (effectiveRepoPath) void loadFiles(effectiveRepoPath, true); }}>Try again</button>
       </div>
       <div class="text-textMuted truncate" title={errorMsg}>{errorMsg}</div>
     </div>
@@ -1257,7 +1257,7 @@
       <div class="h-full flex flex-col items-center justify-center gap-2 text-xs p-4 text-center">
         <span class="font-medium text-danger">{describeFailure({ verb: "list", object: "the files" }, errorMsg).headline}</span>
         <span class="text-textMuted">{errorMsg}</span>
-        <button type="button" class="gp-btn" data-size="sm" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath, true); }}>Try again</button>
+        <button type="button" class="gp-btn" data-size="sm" onclick={() => { if (effectiveRepoPath) void loadFiles(effectiveRepoPath, true); }}>Try again</button>
       </div>
     {:else if rows.length === 0}
       <EmptyState
@@ -1294,8 +1294,9 @@
                 aria-posinset={index + 1}
                 aria-expanded={r.kind === "dir" ? !isCollapsed(r.path) : undefined}
                 ondragstart={(e) => {
-                  const base = ($currentRepoPath ?? "").replace(/\/+$/, "");
-                  const fullPath = base ? `${base}/${r.path}` : r.path;
+                  const base = (effectiveRepoPath ?? "").replace(/[\\/]+$/, "");
+                  const sep = base.includes("\\") ? "\\" : "/";
+                  const fullPath = base ? `${base}${sep}${r.path}` : r.path;
                   e.dataTransfer?.setData("application/x-gitpulse-filepath", fullPath);
                   e.dataTransfer?.setData("text/plain", r.path);
                   if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
@@ -1524,8 +1525,8 @@
       <span>Copy relative path</span>
     </button>
 
-    {#if $repoStore.currentPath}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(`${$repoStore.currentPath}/${row.path}`)}>
+    {#if effectiveRepoPath}
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => void copyPath(`${effectiveRepoPath.replace(/[\\/]+$/, "")}/${row.path}`)}>
         <Copy size={13} class="text-textMuted" />
         <span>Copy full path</span>
       </button>

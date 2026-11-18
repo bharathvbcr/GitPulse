@@ -42,7 +42,13 @@ export const headerAgentPlane: Readable<HeaderPlane> = readable(EMPTY, (set) => 
 
   const refresh = () => {
     if (!started) return;
-    const terminals = planeTerminals(sessions, activity, directories);
+    // Header pills (`repoAgentPill` in RepoTabBar and ViewBar) read presence
+    // and attention reasons only — never `PlaneTerminal.title`. Normalizing
+    // `title` here prevents 8–12 Hz OSC title updates from invalidating the
+    // JSON signature and re-running `projectAgentPlane` across every open tab.
+    const terminals = planeTerminals(sessions, activity, directories).map((t) =>
+      t.title === t.label ? t : { ...t, title: t.label },
+    );
     // Probes compare by identity (a sweep replaces the array); terminals by
     // value, because an unrelated output tick republishes the same facts.
     const next = `${JSON.stringify(terminals)}|${probes.length}`;

@@ -21,6 +21,8 @@ export interface StatusBarSignals {
   watchDegraded: boolean;
   /** `git status` has stopped answering, so the file list may be stale. */
   statusUnavailable: boolean;
+  /** The host-load governor is actively refusing agent launches. */
+  hostLoadRefusing?: boolean;
 }
 
 export interface ResolvedStatusBar {
@@ -31,14 +33,14 @@ export interface ResolvedStatusBar {
 
 /**
  * The status bar is the only always-on surface that says a merge is parked,
- * conflicts are unresolved, live updates stopped arriving, or the file list
- * stopped being re-read. Decluttering must never turn one of those into
- * silence, so any of the four pulls a
+ * conflicts are unresolved, live updates stopped arriving, the file list
+ * stopped being re-read, or host load is refusing agent launches. Decluttering
+ * must never turn one of those into silence, so any of the five pulls a
  * hidden bar back to "minimal": the preference still holds for the quiet
  * case it was asked for, and the loud case still reaches the user.
  *
- * "minimal" needs no override — it keeps exactly those four signals and
- * drops only the ambient readouts.
+ * "minimal" needs no override — it keeps those alert signals and drops only
+ * the ambient readouts.
  */
 export function resolveStatusBarMode(
   preference: StatusBarMode,
@@ -49,6 +51,7 @@ export function resolveStatusBarMode(
     signals.operationParked ||
     signals.conflictedCount > 0 ||
     signals.watchDegraded ||
-    signals.statusUnavailable;
+    signals.statusUnavailable ||
+    Boolean(signals.hostLoadRefusing);
   return alarming ? { mode: "minimal", forced: true } : { mode: "hidden", forced: false };
 }

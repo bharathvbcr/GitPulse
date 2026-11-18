@@ -4,6 +4,7 @@
   import { hostPlatform } from "../stores/platformStore";
   import {
     anchorOwnsOpenPopup,
+    remigrateTitle,
     tipGuideOf,
     tipTextOf,
     TOOLTIP_ANCHOR_SELECTOR,
@@ -147,6 +148,30 @@
     // Any scroll anywhere (including nested lists) invalidates the anchor.
     if (visible || timer !== undefined) hide();
   }
+
+  // A renderer writes `title` back whenever the text it binds changes, onto
+  // anchors this component has already taken over. Take it straight back off:
+  // left there, the OS bubble returns after its own delay — over the styled
+  // one on the anchor under the pointer, and lingering as the pointer moves
+  // to the next row. The open bubble follows the new text in place.
+  $effect(() => {
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        const el = record.target;
+        if (!(el instanceof HTMLElement)) continue;
+        const next = remigrateTitle(el);
+        if (next === null || el !== activeEl || guide) continue;
+        if (!next.trim()) {
+          hide();
+          continue;
+        }
+        text = next;
+        if (visible) void tick().then(reveal);
+      }
+    });
+    observer.observe(document.documentElement, { subtree: true, attributes: true, attributeFilter: ["title"] });
+    return () => observer.disconnect();
+  });
 
   // Capture-phase scroll listener: scrolling inside any container moves the
   // anchor without firing pointer events.

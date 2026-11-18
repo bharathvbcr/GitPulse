@@ -368,7 +368,8 @@ pub async fn cmd_get_reflog(
     off_thread(move || GitReader::get_reflog(&repo_path, max_entries.unwrap_or(200))).await
 }
 
-/// Repository-wide content search (`git grep`) over the working tree or one
+/// Repository-wide content search (using `dcgrep` when installed for the
+/// working tree, falling back to `git grep`) over the working tree or one
 /// revision. Bounded, with the reason named when the answer is partial.
 /// `cancel_token` joins the shared query registry, so `cmd_codeintel_cancel`
 /// stops a running search the same way it stops a code-graph query.

@@ -490,8 +490,7 @@ done
         account
             .detail
             .starts_with("Managed agent runs end when GitPulse quits: the installed Manvi"),
-        "{}",
-        account.detail
+        "detail did not start with the managed-agent sentence"
     );
     assert!(!plan.paths.socket.exists(), "nothing was started to listen");
     assert!(connection.shutdown());

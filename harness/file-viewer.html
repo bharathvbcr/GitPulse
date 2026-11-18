@@ -373,6 +373,22 @@ const type = async value => { const area = textarea(); area.value = value; area.
   host.style.width = ""; await wait(120);
   lens.resetExplorerLens();
 
+  // --- Docked left Sidebar Explorer suppresses duplicate inner ExplorerRail ---
+  const { setSidebarExplorerDocked } = await import("../src/lib/sidebar/layoutStore.ts");
+  const showToggle = () => [...host.querySelectorAll("button")].find(el => el.getAttribute("aria-label") === "Show Explorer");
+  if (!rail()) { showToggle()?.click(); await until(() => Boolean(rail()), "Explorer column restored for docked-sidebar check"); }
+  setSidebarExplorerDocked(true); await tick();
+  await until(() => !rail(), "duplicate Explorer column auto-hides when docked Sidebar shows Explorer");
+  check("when docked left Sidebar shows Explorer, FileViewer auto-hides its duplicate Explorer column", () => !rail() && Boolean(showToggle()));
+  showToggle()?.click(); await tick();
+  await until(() => Boolean(rail()), "explicit Show Explorer overrides docked-sidebar suppression");
+  check("explicit Show Explorer still opens FileViewer's Explorer column when requested", () => Boolean(rail()));
+  hideToggle()?.click(); await tick();
+  await until(() => !rail(), "Hide Explorer closes forced column");
+  setSidebarExplorerDocked(false); await tick();
+  showToggle()?.click(); await tick();
+  await until(() => Boolean(rail()), "Explorer column restores cleanly when Sidebar returns to Git");
+
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);
 } catch (error) { stopped(error); }

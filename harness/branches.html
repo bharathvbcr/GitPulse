@@ -15,6 +15,7 @@ import WorktreesPanel from "../src/lib/components/WorktreesPanel.svelte";
 import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
 import { interfaceStore } from "../src/lib/stores/interfaceStore";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
+import Tooltip from "../src/lib/components/Tooltip.svelte";
 import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 const params = new URLSearchParams(location.search);
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
@@ -316,6 +317,99 @@ if(params.has("check")) {
     check("the hover actions stay level with line one, clear of line two",branchRows().every(row =>
       linePaintRight(lines(row)[0]) <= railThree(row).left + 0.5
       && lines(row)[1].getBoundingClientRect().top >= railThree(row).bottom - 0.5));
+    // Hover motion, as the engine computes it: the source test proves the
+    // classes are written, this proves Tailwind emitted them and the tokens
+    // resolve. Fill and text move, as on the gp-row primitive; the ring
+    // (box-shadow) is kept out of transitions by design-lint rule 9.
+    const motionRow = branchRows()[0];
+    const rowMotion = getComputedStyle(motionRow);
+    const rootStyle = getComputedStyle(document.documentElement);
+    const instantMs = parseFloat(rootStyle.getPropertyValue("--gp-dur-instant"));
+    const ms = value => value.split(",").map(v => parseFloat(v) * (v.trim().endsWith("ms") ? 1 : 1000));
+    check("a branch row moves its fill and text, and animates no paint-heavy property",
+      rowMotion.transitionProperty.split(", ").sort().join()==="background-color,color");
+    check("a branch row's hover runs on the instant duration token",
+      instantMs > 0 && ms(rowMotion.transitionDuration).every(d => Math.abs(d - instantMs) < 0.5));
+    check("a branch row's hover is not on Tailwind's slow-start default curve",
+      !rowMotion.transitionTimingFunction.includes("cubic-bezier(0.4, 0, 0.2, 1)"));
+    const reveals = [
+      motionRow.querySelector('[aria-label="Pin branch to top"],[aria-label="Unpin branch"]'),
+      motionRow.querySelector('[aria-label^="Copy branch name"]'),
+      motionRow.querySelector('[aria-label="Branch actions"]'),
+      motionRow.querySelector(".absolute.right-1\\.5"),
+    ];
+    check("the row's reveals and status dots fade on the same timing as the row",
+      reveals.every(el => el && getComputedStyle(el).transitionProperty.split(", ").includes("opacity")
+        && ms(getComputedStyle(el).transitionDuration).every(d => Math.abs(d - instantMs) < 0.5)));
+    document.documentElement.dataset.motion = "reduced";
+    check("reduced motion switches the row and its reveals off",
+      [motionRow, ...reveals].every(el => ms(getComputedStyle(el).transitionDuration).every(d => d === 0)));
+    delete document.documentElement.dataset.motion;
+    // Every row state answers the pointer. Synthetic events cannot raise
+    // :hover, so read the stylesheet instead: some emitted `:hover` rule must
+    // match the row and change both its fill and its ring. The checked-out and
+    // selected rows used to have none, so hovering them changed nothing.
+    const hoverRules = [];
+    const walk = rules => {for(const r of rules){if(r.cssRules&&!(r instanceof CSSStyleRule))walk(r.cssRules);else if(r instanceof CSSStyleRule&&r.selectorText.includes(":hover"))hoverRules.push(r);}};
+    for(const sheet of document.styleSheets){try{walk(sheet.cssRules);}catch{}}
+    const answersHover = row => {
+      const hits = hoverRules.filter(r => {try{return row.matches(r.selectorText.replaceAll(":hover",""));}catch{return false;}});
+      return hits.some(r => r.style.getPropertyValue("background-color")) && hits.some(r => r.style.getPropertyValue("--tw-ring-color"));
+    };
+    const currentRow = branchRows().find(r => r.className.includes("font-semibold"));
+    const restRow = branchRows().find(r => r!==currentRow);
+    const restName = restRow?.querySelector('[aria-label^="Copy branch name"]').getAttribute("aria-label").replace("Copy branch name ","");
+    check("a resting branch row answers hover with fill and ring",!!restRow && answersHover(restRow));
+    check("the checked-out branch row answers hover with fill and ring",!!currentRow && answersHover(currentRow));
+    filterStore.selectBranch(restName);await settle();
+    const pickedRow = branchRows().find(r => r.querySelector(`[aria-label="Copy branch name ${restName}"]`));
+    check("a selected branch row answers hover with fill and ring",
+      !!pickedRow && pickedRow.className.includes("bg-accent/10") && answersHover(pickedRow));
+    filterStore.selectBranch(null);await settle();
+    // The hover tooltip handing off from one branch to the next after the
+    // rows have re-rendered. The global tooltip turns a `title` into
+    // `data-tip-text` on first sight; the row's tooltip text carries a
+    // relative age and counts that change while the app is open, and Svelte
+    // writes the new text back into `title`. Mounted only here: once mounted
+    // it rewrites `title` on every focus, which later checks read.
+    const tipHost = document.createElement("div");document.body.append(tipHost);
+    const tip = mount(Tooltip,{target:tipHost});await settle();
+    const nameButton = name => branchRows().find(r => r.querySelector(`[aria-label="Copy branch name ${name}"]`))?.querySelectorAll(":scope > button")[1];
+    const tipShown = () => document.querySelector('[role="tooltip"]')?.textContent.trim() ?? "";
+    const pause = ms => new Promise(resolve => setTimeout(resolve,ms));
+    const pointerTo = async (from,to) => {
+      if(from)from.dispatchEvent(new MouseEvent("mouseout",{bubbles:true,relatedTarget:to.closest(".gp-cv-row")}));
+      to.closest(".gp-cv-row").dispatchEvent(new MouseEvent("mouseover",{bubbles:true,relatedTarget:from}));
+      to.dispatchEvent(new MouseEvent("mouseover",{bubbles:true,relatedTarget:to.closest(".gp-cv-row")}));
+      await pause(500);await settle();
+    };
+    const [nameA, nameB] = branchRows().slice(0,2).map(r => r.querySelector('[aria-label^="Copy branch name"]').getAttribute("aria-label").replace("Copy branch name ",""));
+    // A reader sweeps the list once, then rests on A while the data moves on.
+    await pointerTo(null,nameButton(nameB));
+    await pointerTo(nameButton(nameB),nameButton(nameA));
+    const firstTip = tipShown();
+    const savedBranches = branches;
+    branches = branches.map(b => ({...b,last_author:"Robin"}));await repoStore.refresh();await settle();
+    const restingTitleA = nameButton(nameA).getAttribute("title");
+    const restingTip = tipShown();
+    await pointerTo(nameButton(nameA),nameButton(nameB));
+    const secondTip = tipShown();
+    check(`hovering a branch shows its tooltip (${JSON.stringify(firstTip.slice(0,40))})`,firstTip.startsWith(nameA));
+    check(`moving to the next branch shows that branch's tooltip (${JSON.stringify(secondTip.slice(0,60))})`,secondTip.startsWith(nameB));
+    check(`the next branch's tooltip is current, not the text from before the rows changed (${JSON.stringify(secondTip)})`,secondTip.includes("Robin"));
+    check(`a re-rendered row under the pointer gets no native title back (${JSON.stringify(restingTitleA?.slice(0,30) ?? null)})`,restingTitleA===null);
+    check("the branch under the pointer carries no native title",nameButton(nameB).getAttribute("title")===null);
+    check(`the open tooltip follows its row's new text without the pointer moving (${JSON.stringify(restingTip.slice(0,60))})`,
+      restingTip.startsWith(nameA) && restingTip.includes("Robin"));
+    nameButton(nameB).dispatchEvent(new MouseEvent("mouseout",{bubbles:true,relatedTarget:document.body}));
+    unmount(tip);tipHost.remove();
+    branches = savedBranches;await repoStore.refresh();await settle();
+    // A refresh must not swap the row out from under a resting pointer: the
+    // engine only re-matches :hover on the next pointer move, so a replaced
+    // node would drop its hover until the mouse moved again.
+    const keptRow = branchRows()[0];
+    await repoStore.refresh();await settle();
+    check("a refresh keeps the row under the pointer as the same node",keptRow.isConnected && branchRows()[0]===keptRow);
     // The name at the sidebar's real default width, 360px, for a 30-character
     // name on a branch carrying the full set of numbers.
     const LONG30 = "a-thirty-character-branch-name";

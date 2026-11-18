@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { onDestroy, onMount, untrack } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { bounded } from "../workbench/taskActions";
   import { DEFAULT_PRIORITY, PRIORITY_LABELS } from "../workbench/taskPriority";
-  import { Clipboard, X } from "@lucide/svelte";
+  import { ChevronDown, ChevronUp, Clipboard, X } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
@@ -20,7 +20,7 @@
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { linkSummary, repositoryRows, shouldOfferFilter, triggerChips } from "../workbench/taskRepositories";
-  import { applyNotesToDraft, canAskManvi, consumeNotes, extractDraftSubtasks, formatDraftAgentCopy, wrapSavedBriefForAgent } from "../workbench/taskCompose";
+  import { appendCriteria, canAskManvi, composeFromNotes, describeChecklistMove, describeRefusedCriteria, criteriaFromPaste, extractDraftSubtasks, formatDraftAgentCopy, MAX_SUBTASKS, SUBTASK_CAP, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { sanitizeLogs } from "../workbench/taskLogs";
   import { assistEngineName, DEFAULT_ASSIST_ENGINE } from "../workbench/taskEnhance";
   import { editorTabBadge, editorTabHint, editorTabs, resolveEditorTab, type TaskEditorTab } from "../workbench/taskEditorTabs";
@@ -66,6 +66,14 @@
   let criteria = $state(untrack(() => draft.acceptance_criteria.join("\n")));
   let newSubtask = $state("");
   const criteriaList = $derived(criteria.split("\n").map((s) => s.trim()).filter(Boolean));
+  /**
+   * The same rows as `criteriaList`, untrimmed, for the inline editors: a row
+   * redrawn from the trimmed list would eat the space a reader just typed
+   * between two words. Both filter on the trimmed text, so indexes agree.
+   */
+  const criteriaRows = $derived(criteria.split("\n").filter((s) => s.trim()));
+  /** Off by default: one list to edit, with the raw lines a toggle away. */
+  let rawCriteria = $state(false);
   let labelChips = $state<string[]>(untrack(() => [...draft.labels]));
   let error = $state("");
   let note = $state("");
@@ -103,6 +111,8 @@
   let shortcutBlocked = $state("");
   let customKind = $state(false);
   let sheet: HTMLElement;
+  /** The checklist, links and subtasks section, which holds a typed-but-unadded checklist item. */
+  let relations: ReturnType<typeof TaskRelations> | undefined = $state();
   let tabStrip: HTMLDivElement | undefined = $state();
   /**
    * The pane on screen.
@@ -132,6 +142,10 @@
   const tabs = $derived(editorTabs(Boolean(current)));
   const tab = $derived(resolveEditorTab(requestedTab, Boolean(current)));
   const saved = $derived(Boolean(current));
+  /** Why Save is disabled, said beside it rather than left for the reader to guess. */
+  const saveBlocker = $derived(!draft.repository_ids.length ? "Link a repository to save."
+    : !draft.title.trim() && !notes.trim() ? "Add a title, or paste notes above."
+    : !draft.kind.trim() ? "Choose a type under Details." : "");
   const sections = $derived(editorSections(saved));
   let assistState = $state<string | null>(null);
   let assistUncertain = $state(false);
@@ -152,7 +166,10 @@
     });
   });
   const assistChrome = $derived(assistDisclosure({ saved, opened: assistOpened }));
-  const assistStatus = $derived(!assistChrome.open ? assistFoldStatus({ state: assistState, uncertain: assistUncertain }) : "");
+  // Folded notes are still written by Save, so the fold says so.
+  const assistStatus = $derived(!assistChrome.open
+    ? notes.trim() ? "Notes not applied yet: Save adds them" : assistFoldStatus({ state: assistState, uncertain: assistUncertain })
+    : "");
   const hasLogs = $derived(Boolean((draft.logs ?? "").trim()));
   let logsOpened = $state(false);
   const logsChrome = $derived(logsDisclosure({ saved, hasLogs, opened: logsOpened }));
@@ -168,7 +185,7 @@
     sheet.querySelector<HTMLInputElement>('input[name="task-title"]')?.focus();
     return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus(); };
   });
-  onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); });
+  onDestroy(() => { disposed = true; if (copiedTimer) clearTimeout(copiedTimer); if (flashTimer) clearTimeout(flashTimer); });
   const copyable = $derived(Boolean(current || draft.title.trim() || draft.description.trim() || notes.trim() || (draft.logs ?? "").trim()));
   const id = initial.value?.id ?? newID();
   const group = `task-sheet-${id}`;
@@ -244,7 +261,9 @@
     if (saving || adding || reloading || confirming) return false;
     if (enhancementWorking) { shortcutBlocked = `Wait for ${assistName} to finish before leaving this task.`; return false; }
     if (pending || pendingDelete) { error = "Try the pending action again before closing this task."; return false; }
-    const edited = dirty || Boolean(notes.trim());
+    // A criterion or checklist item typed but not added is work too: Save keeps
+    // it, so leaving must not drop it without asking.
+    const edited = dirty || Boolean(notes.trim()) || Boolean(newSubtask.trim()) || Boolean(relations?.hasPending());
     if (!edited && !suggestionEditing) return true;
     confirming = true;
     try {
@@ -262,8 +281,19 @@
     if (!draft.repository_ids.includes(draft.primary_repository_id)) draft.primary_repository_id = draft.repository_ids[0] ?? "";
     dirty = true;
   }
+  /**
+   * What the notes would write, drawn live under the notes box.
+   *
+   * The save calls the same `composeFromNotes`, so the preview cannot promise
+   * a title, a description or criteria the save does not then write.
+   */
+  const notesPreview = $derived(notes.trim()
+    ? composeFromNotes({ title: draft.title, description: draft.description, acceptance_criteria: criteriaList }, notes)
+    : null);
+  /** Whether the description holds a checklist; the Extract button is drawn only then. */
+  const checklistInText = $derived(extractDraftSubtasks({ description: draft.description, acceptance_criteria: criteriaList }));
   function applyExtractedNotes(): boolean {
-    const next = consumeNotes(draft, notes);
+    const next = composeFromNotes({ title: draft.title, description: draft.description, acceptance_criteria: criteriaList }, notes);
     if (!next.extracted) return true;
     if (new TextEncoder().encode(next.description).length > 65_536) {
       error = "Description is too long. Keep it below 64 KB.";
@@ -271,17 +301,71 @@
     }
     draft.title = next.title;
     draft.description = next.description;
+    if (next.addedCriteria.length) criteria = next.acceptance_criteria.join("\n");
     notes = next.notes;
     dirty = true;
     return true;
   }
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Flash fields once; cleared afterwards so the next fill can flash them again. */
+  function flashFields(fields: EnhancementField[]) {
+    flash = fields;
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { flash = []; }, 1600);
+  }
+  type MoveSnapshot = { title: string; description: string; criteria: string; notes: string };
+  const currentSnapshot = $derived<MoveSnapshot>({ title: draft.title, description: draft.description, criteria, notes });
+  /**
+   * The last text move (Fill from notes, or Extract), so one click puts it back.
+   *
+   * `after` is what the move left. Undo is offered only while the four fields
+   * still read exactly that: an edit made since, a save or a refresh would
+   * otherwise be overwritten by a snapshot from before it.
+   */
+  let lastMove = $state<{ what: string; before: MoveSnapshot; after: MoveSnapshot } | null>(null);
+  const canUndoMove = $derived(lastMove !== null
+    && currentSnapshot.title === lastMove.after.title && currentSnapshot.description === lastMove.after.description
+    && currentSnapshot.criteria === lastMove.after.criteria && currentSnapshot.notes === lastMove.after.notes);
+  function rememberMove(what: string, before: MoveSnapshot) {
+    lastMove = { what, before, after: { title: draft.title, description: draft.description, criteria, notes } };
+  }
+  /** Fill the fields from the notes now, so the reader edits the result before saving it. */
+  function applyNotesNow() {
+    const preview = notesPreview;
+    if (!preview || enhancementBusy) return;
+    const before = { ...currentSnapshot };
+    if (!applyExtractedNotes()) return;
+    rememberMove("the fill", before);
+    const touched: EnhancementField[] = [];
+    if (preview.titleFromNotes) touched.push("title");
+    if (preview.addedText) touched.push("description");
+    flashFields(touched);
+    const parts = [preview.titleFromNotes ? "title" : "", preview.addedText ? "description" : "", preview.addedCriteria.length ? `${preview.addedCriteria.length} criteri${preview.addedCriteria.length === 1 ? "on" : "a"}` : ""].filter(Boolean);
+    note = parts.length
+      ? `Filled ${parts.join(", ")} from your notes. Review them, then save.`
+      : "Nothing new in those notes: it was already in the task.";
+  }
+  function undoMove() {
+    if (!lastMove || !canUndoMove || enhancementBusy) return;
+    const { before, what } = lastMove;
+    draft.title = before.title; draft.description = before.description; criteria = before.criteria; notes = before.notes;
+    lastMove = null; dirty = true; note = `Undid ${what}.`;
+  }
+  /** Append criteria through the one owner, leaving existing rows as typed and saying what it refused. */
+  function addCriteria(lines: readonly string[]): number {
+    const result = appendCriteria(criteriaRows, lines);
+    if (!result.added.length && !result.duplicates && !result.overflow) return 0;
+    if (result.added.length) {
+      criteria = [...criteriaRows, ...result.added].join("\n");
+      dirty = true;
+    }
+    note = describeRefusedCriteria(result) || (result.added.length > 1 ? `Added ${result.added.length} criteria` : "");
+    return result.added.length;
+  }
   function addSubtaskItem() {
-    const text = newSubtask.trim();
-    if (!text) return;
-    const current = criteria.trim();
-    criteria = current ? `${current}\n${text}` : text;
+    if (!newSubtask.trim()) return;
+    addCriteria([newSubtask]);
     newSubtask = "";
-    dirty = true;
   }
   function onSubtaskKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -289,31 +373,173 @@
       addSubtaskItem();
     }
   }
+  /**
+   * A pasted block becomes one criterion per item. The paste lands where the
+   * cursor is, so text already typed in the box is kept; a block holding a
+   * checklist ("Subtasks:" then bullets) adds its items, not its heading.
+   */
+  function onSubtaskPaste(e: ClipboardEvent) {
+    const text = e.clipboardData?.getData("text") ?? "";
+    if (!/\r?\n/.test(text.trim())) return;
+    e.preventDefault();
+    const box = e.currentTarget as HTMLInputElement;
+    const start = box.selectionStart ?? box.value.length;
+    const end = box.selectionEnd ?? start;
+    const value = `${box.value.slice(0, start)}${text}${box.value.slice(end)}`;
+    addCriteria(criteriaFromPaste(value));
+    newSubtask = "";
+  }
   function removeSubtaskItem(index: number) {
-    const list = criteria.split("\n").map((s) => s.trim()).filter(Boolean);
+    const list = [...criteriaRows];
     if (index < 0 || index >= list.length) return;
     list.splice(index, 1);
     criteria = list.join("\n");
     dirty = true;
   }
-  function extractSubtasksAction() {
-    const extracted = extractDraftSubtasks(
-      { description: draft.description, acceptance_criteria: criteria.split("\n").map((s) => s.trim()).filter(Boolean) },
-      notes,
-    );
-    if (!extracted.extracted) {
-      note = "No checklist items found to extract.";
-      return;
+  function editCriterion(index: number, value: string) {
+    // An emptied row stays on screen until it loses focus, so clearing it to
+    // retype does not delete it under the cursor.
+    if (!value.trim()) return;
+    const list = [...criteriaRows];
+    if (index < 0 || index >= list.length) return;
+    list[index] = value.replace(/[\r\n]+/g, " ");
+    criteria = list.join("\n");
+    dirty = true;
+  }
+  async function focusCriterion(index: number) {
+    await tick();
+    const target = index < 0 || index >= criteriaRows.length
+      ? sheet?.querySelector<HTMLInputElement>('[data-testid="task-subtask-add-input"]')
+      : sheet?.querySelector<HTMLTextAreaElement>(`[data-testid="task-subtask-item-${index}"] .subtask-text`);
+    target?.focus();
+  }
+  /**
+   * Several lines pasted into a row become that row and new rows under it, in
+   * the order pasted, through the same `appendCriteria` the add box uses. A
+   * criterion is one line, so the paste is never folded into one long row.
+   */
+  function onCriterionPaste(e: ClipboardEvent, index: number) {
+    const text = e.clipboardData?.getData("text") ?? "";
+    if (!/\r?\n/.test(text.trim())) return;
+    e.preventDefault();
+    const box = e.currentTarget as HTMLTextAreaElement;
+    const start = box.selectionStart ?? box.value.length;
+    const end = box.selectionEnd ?? start;
+    const others = criteriaRows.filter((_, i) => i !== index);
+    const result = appendCriteria(others, criteriaFromPaste(`${box.value.slice(0, start)}${text}${box.value.slice(end)}`));
+    const list = [...others];
+    list.splice(index, 0, ...result.added);
+    criteria = list.join("\n");
+    dirty = true;
+    note = describeRefusedCriteria(result) || (result.added.length > 1 ? `Pasted as ${result.added.length} criteria` : "");
+  }
+  /**
+   * Fit a criterion's box to its text.
+   *
+   * Two things change the height a row needs, and each re-fits it. A new value
+   * — typed, or set by the sheet in a move, a fill or an undo, which reuse rows
+   * by index — reaches `update`, deferred until the DOM holds it; "Edit as
+   * text" is one of its inputs too, so the list coming back re-fits. A new
+   * width — the box first laid out, the sheet resized, the Task tab shown after
+   * Agents — reaches the observer, which waits a frame: resizing the box inside
+   * its own callback is the "ResizeObserver loop" error. The first fit runs at
+   * once so a long row is not drawn one line tall for that frame. A box with no
+   * layout is left at its one row rather than pinned to 0px.
+   */
+  function growToFit(node: HTMLTextAreaElement, _deps: unknown) {
+    const fit = () => {
+      node.style.height = "auto";
+      const height = node.scrollHeight;
+      node.style.height = height > 0 ? `${height}px` : "";
+    };
+    fit();
+    let width = -1;
+    let frame = 0;
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(([entry]) => {
+      const next = Math.round(entry?.contentRect.width ?? 0);
+      if (next === width) return;
+      width = next;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fit);
+    });
+    observer?.observe(node);
+    return {
+      update: () => { queueMicrotask(fit); },
+      destroy() { observer?.disconnect(); cancelAnimationFrame(frame); },
+    };
+  }
+  function moveCriterion(index: number, delta: number) {
+    const list = [...criteriaRows];
+    const to = index + delta;
+    if (to < 0 || to >= list.length) return;
+    [list[index], list[to]] = [list[to]!, list[index]!];
+    criteria = list.join("\n");
+    dirty = true;
+    void focusCriterion(to);
+  }
+  function onCriterionKeydown(e: KeyboardEvent, index: number) {
+    const input = e.currentTarget as HTMLTextAreaElement;
+    if (e.key === "Enter") {
+      // Enter in a form field would submit the sheet; here it moves on. On a
+      // row the reader cleared, it removes the row first and stays in place,
+      // where the next row now is — computing the target before the removal
+      // skipped a row.
+      e.preventDefault();
+      if (!input.value.trim()) { removeSubtaskItem(index); void focusCriterion(index); return; }
+      void focusCriterion(index + 1 < criteriaRows.length ? index + 1 : -1);
+    } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      moveCriterion(index, e.key === "ArrowUp" ? -1 : 1);
+    } else if (e.key === "Backspace" && !input.value) {
+      e.preventDefault();
+      removeSubtaskItem(index);
+      void focusCriterion(index > 0 ? index - 1 : 0);
     }
+  }
+  /**
+   * Move the description's checklist into the criteria. Notes are not read
+   * here: what they hold is shown, criteria included, in the preview under
+   * the notes box, and filled by its button or the save. Reading them here too
+   * gave two buttons that each moved the notes' checklist, counted differently.
+   */
+  function extractSubtasksAction() {
+    const extracted = extractDraftSubtasks({ description: draft.description, acceptance_criteria: criteriaRows });
+    note = describeChecklistMove(extracted);
+    if (!extracted.extracted) return;
+    const before = { ...currentSnapshot };
     draft.description = extracted.description;
     criteria = extracted.subtasks.join("\n");
     dirty = true;
-    note = `Extracted ${extracted.count} subtask${extracted.count === 1 ? "" : "s"}`;
+    rememberMove("the extract", before);
+  }
+  /** Typing into an "add" box or a search is not an edit to the task until it is added. */
+  function markDirty(event: Event) {
+    if (event.target instanceof Element && event.target.closest("[data-ephemeral]")) return;
+    dirty = true;
   }
   async function save(fromManvi = false): Promise<Task | null> {
     if (saving || adding || reloading || confirming || pendingDelete || (enhancementBusy && !fromManvi)) return null;
+    // A criterion or checklist item typed but not yet added is saved with the
+    // rest, not dropped.
+    if (!pending) {
+      // A row cleared and still focused has not lost focus yet, so its removal
+      // has not run: Cmd+S would otherwise save the text the reader deleted.
+      const active = document.activeElement;
+      if (active instanceof HTMLTextAreaElement && active.classList.contains("subtask-text") && sheet?.contains(active) && !active.value.trim()) active.blur();
+    }
+    if (!pending && newSubtask.trim()) addSubtaskItem();
+    if (!pending) {
+      const refused = relations?.flushPending() ?? "";
+      if (refused) { error = refused; return null; }
+    }
     if (!pending && !applyExtractedNotes()) return null;
     if (!pending && (!draft.title.trim() || !draft.kind.trim())) { error = "Add a title and task type before saving."; return null; }
+    if (!pending) {
+      // The store bounds each criterion in bytes; name the row rather than
+      // letting the write fail with a message about the whole task.
+      const long = criteriaList.findIndex((item) => new TextEncoder().encode(item).length > SUBTASK_CAP);
+      if (long >= 0) { error = `Criterion ${long + 1} is longer than 4 KB. Shorten or split it before saving.`; return null; }
+    }
     if (!pending && new TextEncoder().encode(draft.description).length > 65_536) { error = "Description is too long. Keep it below 64 KB."; return null; }
     if (!pending) {
       const logs = sanitizeLogs(draft.logs);
@@ -331,7 +557,7 @@
       if (saved.id !== id || saved.revision !== Number(pending.expected_revision) + 1) throw new WorkbenchError("protocol_error", "Task update confirmation does not match the request.");
       if (disposed) return null;
       current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [], logs: saved.logs ?? "" }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels]; dirty = false; pending = null;
-      note = "Saved"; onSaved(saved);
+      note = "Saved"; lastMove = null; onSaved(saved);
       return saved;
     } catch (cause) {
       error = explainError(cause);
@@ -398,7 +624,7 @@
         if (packet && await copyText(packet)) markCopied(`Copied revision ${revision}${dirty ? " (unsaved edits omitted)" : ""}`);
         else error = "Clipboard unavailable";
       } else {
-        const extracted = applyNotesToDraft(draft, notes);
+        const extracted = composeFromNotes({ title: draft.title, description: draft.description, acceptance_criteria: criteriaList }, notes);
         const packet = formatDraftAgentCopy({
           title: extracted.title,
           description: extracted.description,
@@ -407,7 +633,8 @@
           priority: draft.priority,
           owner: draft.owner,
           labels: [...labelChips],
-          acceptance_criteria: criteria.split("\n").map((item) => item.trim()).filter(Boolean),
+          // Typed but not yet added: Save keeps it, so the copy carries it too.
+          acceptance_criteria: appendCriteria(extracted.acceptance_criteria, [newSubtask]).list,
           repositoryNames: draft.repository_ids.map((repo) => known.find((item) => item.id === repo)?.name ?? repo),
           logs: draft.logs,
         });
@@ -426,7 +653,7 @@
       const latest = await bounded(getTask(id));
       if (disposed) return;
       if (latest.id !== id) throw new WorkbenchError("protocol_error", "Loaded task does not match this editor.");
-      current = latest; draft = { ...taskDraft(latest), locked_fields: latest.locked_fields ?? [], logs: latest.logs ?? "" }; criteria = latest.acceptance_criteria.join("\n"); labelChips = [...latest.labels]; notes = ""; logNotice = ""; pending = null; dirty = false; error = "";
+      lastMove = null; current = latest; draft = { ...taskDraft(latest), locked_fields: latest.locked_fields ?? [], logs: latest.logs ?? "" }; criteria = latest.acceptance_criteria.join("\n"); labelChips = [...latest.labels]; notes = ""; logNotice = ""; pending = null; dirty = false; error = "";
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) { confirming = false; reloading = false; } }
   }
@@ -453,6 +680,7 @@
     } finally { if (!disposed) saving = false; }
   }
   function applied(saved: Task) {
+    lastMove = null;
     current = saved; draft = { ...taskDraft(saved), locked_fields: saved.locked_fields ?? [], logs: saved.logs ?? "" }; criteria = saved.acceptance_criteria.join("\n"); labelChips = [...saved.labels];
     dirty = false; pending = null; note = `Saved revision ${saved.revision}`; onSaved(saved);
   }
@@ -563,8 +791,8 @@
   <div class="sheet-body" use:scrollEdgeFade>
   <form id="task-editor-form-{id}" novalidate
     onsubmit={(e) => { e.preventDefault(); void save(); }}
-    oninput={() => { dirty = true; }}
-    onchange={() => { dirty = true; }}
+    oninput={markDirty}
+    onchange={markDirty}
   >
     <fieldset disabled={saving || reloading || pending !== null || pendingDelete !== null}>
       <div class="pane" hidden={Boolean(current) && tab !== "task"} id={panelId(group, "task")} role={current ? "tabpanel" : undefined} aria-labelledby={current ? tabId(group, "task") : undefined}>
@@ -652,6 +880,7 @@
                     {dirty}
                     {active}
                     onNotes={(value) => { notes = value; dirty = true; }}
+                    onFillNotes={() => { if (!notesPreview) return false; applyNotesNow(); return true; }}
                     bind:title={draft.title}
                     bind:description={draft.description}
                     bind:lockedFields={draft.locked_fields!}
@@ -666,7 +895,37 @@
                     onEngine={(name) => { assistName = name; }}
                     onStatus={({ state, uncertain }) => { assistState = state; assistUncertain = uncertain; }}
                     disabled={saving || reloading || pending !== null || pendingDelete !== null}
-                  />
+                  >
+                  {#snippet notesExtra()}
+                  {#if notesPreview?.extracted}
+                    <!-- Drawn from the same `composeFromNotes` the save calls, so
+                         nothing here is a guess about what Save will write. -->
+                    <div class="notes-preview" data-testid="task-notes-preview" aria-live="polite">
+                      <p class="preview-head">{current ? "Saving adds your notes to this task" : "Your notes will become"}</p>
+                      <dl>
+                        {#if notesPreview.titleFromNotes}
+                          <div><dt class="gp-label">Title</dt><dd class="preview-title" data-testid="task-notes-preview-title">{notesPreview.title}</dd></div>
+                        {/if}
+                        {#if notesPreview.addedText}
+                          {@const lineCount = notesPreview.addedText.split("\n").filter((line) => line.trim()).length}
+                          <div><dt class="gp-label">Description</dt><dd>{draft.description.trim() ? "Adds" : "Gets"} {lineCount} line{lineCount === 1 ? "" : "s"}<span class="preview-excerpt">{notesPreview.addedText.slice(0, 140)}{notesPreview.addedText.length > 140 ? "…" : ""}</span></dd></div>
+                        {/if}
+                        {#if notesPreview.addedCriteria.length}
+                          <div><dt class="gp-label">Criteria</dt><dd data-testid="task-notes-preview-criteria">
+                            +{notesPreview.addedCriteria.length}
+                            {#each notesPreview.addedCriteria.slice(0, 3) as item (item)}<span class="gp-chip" data-kind="label">{item}</span>{/each}
+                            {#if notesPreview.addedCriteria.length > 3}<span class="meta">and {notesPreview.addedCriteria.length - 3} more</span>{/if}
+                          </dd></div>
+                        {/if}
+                        {#if !notesPreview.titleFromNotes && !notesPreview.addedText && !notesPreview.addedCriteria.length}
+                          <div><dt class="gp-label">Nothing new</dt><dd>Everything in these notes is already in the task.</dd></div>
+                        {/if}
+                      </dl>
+                      <button type="button" class="gp-btn" data-size="sm" data-testid="task-notes-apply" disabled={enhancementBusy} onclick={applyNotesNow}>Fill the fields now</button>
+                    </div>
+                  {/if}
+                  {/snippet}
+                  </TaskManviAssist>
                   {#if current}
                     <TaskRefine task={current} repositoryPath={$repoStore.currentPath ?? ""} disabled={dirty || saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy} onApplied={applied} />
                   {/if}
@@ -674,56 +933,115 @@
               {:else if section.id === "title"}
                 <fieldset disabled={enhancementBusy}>
                   <label class:flash={flash.includes("title")}>Title
-                    <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder="Or let {assistName} draft this from your notes" />
+                    <input class="gp-field" name="task-title" bind:value={draft.title} disabled={enhancementBusy} required maxlength="300" placeholder={current ? "What needs doing" : `A short name, or paste notes above and let them fill it`} />
                   </label>
                   <label class:flash={flash.includes("description")}>Description
-                    <textarea class="gp-field-multi" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Or let {assistName} draft this from your notes"></textarea>
+                    <textarea class="gp-field-multi" bind:value={draft.description} disabled={enhancementBusy} rows="6" maxlength="65536" placeholder="Context, reproduction steps, links. A “- [ ] item” checklist here can move into Acceptance criteria."></textarea>
                   </label>
-                  <div class="subtasks-section">
-                    <div class="subtasks-head">
-                      <label for="task-criteria-{id}">Subtasks and acceptance criteria{#if criteriaList.length > 0} <span class="criteria-count">({criteriaList.length})</span>{/if}</label>
+                </fieldset>
+              {:else if section.id === "criteria"}
+                <fieldset disabled={enhancementBusy} class="criteria" data-testid="task-criteria-section">
+                  <div class="criteria-tools">
+                    <p class="meta criteria-summary">{criteriaList.length
+                      ? `${criteriaList.length} criteri${criteriaList.length === 1 ? "on" : "a"} — what has to be true for this to be done`
+                      : "What has to be true for this task to be done."}</p>
+                    {#if checklistInText.extracted}
+                      {@const found = checklistInText.count + checklistInText.duplicates}
                       <button
                         type="button"
                         class="gp-btn shrink-0" data-size="sm"
                         data-testid="task-extract-subtasks"
-                        disabled={enhancementBusy || (!draft.description.trim() && !notes.trim())}
+                        disabled={enhancementBusy}
                         onclick={extractSubtasksAction}
-                        title="Extract checklist items from description and notes"
-                      >
-                        Extract subtasks
-                      </button>
-                    </div>
-                    {#if criteriaList.length > 0}
-                      <ul class="subtasks-list" data-testid="task-subtasks-list">
-                        {#each criteriaList as item, index}
+                        title="Move the checklist in the description into this list"
+                      >Extract {found} from text</button>
+                    {/if}
+                    <button
+                      type="button"
+                      class="gp-btn shrink-0" data-size="sm" data-variant="ghost"
+                      data-testid="task-criteria-raw-toggle"
+                      aria-pressed={rawCriteria}
+                      onclick={() => { rawCriteria = !rawCriteria; }}
+                    >{rawCriteria ? "Edit as list" : "Edit as text"}</button>
+                  </div>
+                  <div class="criteria-list-view" hidden={rawCriteria}>
+                    {#if criteriaRows.length > 0}
+                      <ol class="subtasks-list" data-testid="task-subtasks-list" aria-label="Acceptance criteria">
+                        {#each criteriaRows as item, index}
                           <li class="subtask-item" data-testid="task-subtask-item-{index}">
-                            <span class="subtask-bullet" aria-hidden="true">•</span>
-                            <span class="subtask-text">{item}</span>
+                            <span class="subtask-n tabular-nums" aria-hidden="true">{index + 1}</span>
+                            <!-- A text box one line tall that grows with its text, so a
+                                 long criterion is read whole rather than scrolled
+                                 sideways. Enter never adds a line: a criterion is one. -->
+                            <textarea
+                              class="subtask-text"
+                              rows="1"
+                              value={item}
+                              maxlength="4096"
+                              disabled={enhancementBusy}
+                              aria-label="Criterion {index + 1}"
+                              title="Edit in place. Alt+↑/↓ reorders; Backspace on an empty row removes it."
+                              use:growToFit={[item, rawCriteria]}
+                              oninput={(event) => editCriterion(index, event.currentTarget.value)}
+                              onblur={(event) => { if (!event.currentTarget.value.trim()) removeSubtaskItem(index); }}
+                              onkeydown={(event) => onCriterionKeydown(event, index)}
+                              onpaste={(event) => onCriterionPaste(event, index)}
+                            ></textarea>
+                            <!-- The reorder Alt+↑/↓ does, for a reader who uses the
+                                 pointer. mousedown is held so a click does not first
+                                 blur a cleared row, whose removal would shift the
+                                 index under the button. -->
+                            <span class="subtask-moves">
+                              <button
+                                type="button"
+                                class="subtask-move"
+                                data-testid="task-subtask-up-{index}"
+                                disabled={enhancementBusy || index === 0}
+                                onmousedown={(event) => event.preventDefault()}
+                                onclick={() => moveCriterion(index, -1)}
+                                aria-label="Move criterion {index + 1} up"
+                                title="Move up (Alt+↑)"
+                              ><ChevronUp size={12} /></button>
+                              <button
+                                type="button"
+                                class="subtask-move"
+                                data-testid="task-subtask-down-{index}"
+                                disabled={enhancementBusy || index === criteriaRows.length - 1}
+                                onmousedown={(event) => event.preventDefault()}
+                                onclick={() => moveCriterion(index, 1)}
+                                aria-label="Move criterion {index + 1} down"
+                                title="Move down (Alt+↓)"
+                              ><ChevronDown size={12} /></button>
+                            </span>
                             <button
                               type="button"
                               class="subtask-remove"
                               data-testid="task-subtask-remove-{index}"
                               disabled={enhancementBusy}
+                              onmousedown={(event) => event.preventDefault()}
                               onclick={() => removeSubtaskItem(index)}
-                              aria-label="Remove subtask: {item}"
-                              title="Remove subtask"
+                              aria-label="Remove criterion: {item}"
+                              title="Remove"
                             >
                               <X size={12} />
                             </button>
                           </li>
                         {/each}
-                      </ul>
+                      </ol>
                     {/if}
                     <div class="subtask-add-row" data-testid="task-subtask-add-row">
                       <input
                         class="gp-field subtask-add-input"
                         data-size="sm"
                         data-testid="task-subtask-add-input"
+                        data-ephemeral
                         bind:value={newSubtask}
-                        disabled={enhancementBusy}
+                        disabled={enhancementBusy || criteriaList.length >= MAX_SUBTASKS}
                         maxlength="4096"
-                        placeholder="Add a subtask…"
+                        aria-label="New acceptance criterion"
+                        placeholder={criteriaList.length >= MAX_SUBTASKS ? `The list is full (${MAX_SUBTASKS})` : "Add a criterion — paste several lines to add each"}
                         onkeydown={onSubtaskKeydown}
+                        onpaste={onSubtaskPaste}
                       />
                       <button
                         type="button"
@@ -735,19 +1053,19 @@
                         Add
                       </button>
                     </div>
-                    <label class="criteria-raw-label">
-                      <span class="sr-only">Acceptance criteria</span>
-                      <textarea
-                        id="task-criteria-{id}"
-                        class="gp-field-multi criteria-textarea"
-                        data-testid="task-criteria"
-                        bind:value={criteria}
-                        rows="3"
-                        maxlength="65536"
-                        placeholder="One verifiable criterion per line"
-                      ></textarea>
-                    </label>
                   </div>
+                  <label class="criteria-raw-label" hidden={!rawCriteria}>
+                    <span class="sr-only">Acceptance criteria</span>
+                    <textarea
+                      id="task-criteria-{id}"
+                      class="gp-field-multi criteria-textarea"
+                      data-testid="task-criteria"
+                      bind:value={criteria}
+                      rows="5"
+                      maxlength="65536"
+                      placeholder="One verifiable criterion per line"
+                    ></textarea>
+                  </label>
                 </fieldset>
               {:else if section.id === "logs"}
                 <div id="task-logs-body-{id}" data-testid="task-logs-body" hidden={!logsChrome.open}>
@@ -785,32 +1103,26 @@
                        An archived workspace is offered only while it is the
                        current choice, so saving never silently clears it. -->
                   <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces.filter((space) => !space.archived || space.id === draft.home_workspace_id) as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
-                  <div class="due-field">
-                    <span class="field-label">Due</span>
-                    <!-- `disabled` is passed rather than inherited: the popover is
-                         portaled to the body, so a disabled fieldset around this
-                         component would not reach the controls inside it. -->
-                    <TaskDuePicker
-                      value={draft.due_at}
-                      disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
-                      onChange={(next) => { draft.due_at = next; dirty = true; }}
-                    />
+                  <!-- Owner is one field, so it sits beside Due rather than taking
+                       a numbered section of its own. Written on one line: the
+                       label's first child has to be the name. -->
+                  <div class="pair">
+                    <label>Owner<input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" placeholder="Unassigned" /></label>
+                    <div class="due-field">
+                      <span class="field-label">Due</span>
+                      <!-- `disabled` is passed rather than inherited: the popover is
+                           portaled to the body, so a disabled fieldset around this
+                           component would not reach the controls inside it. -->
+                      <TaskDuePicker
+                        value={draft.due_at}
+                        disabled={saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy}
+                        onChange={(next) => { draft.due_at = next; dirty = true; }}
+                      />
+                    </div>
                   </div>
                   <label>Labels
                     <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
                   </label>
-                  <TaskRelations
-                    bind:checklist={draft.checklist}
-                    bind:links={draft.links}
-                    taskId={current?.id ?? null}
-                    task={current}
-                    acceptanceCriteria={criteriaList}
-                    repositories={known}
-                    {openTabs}
-                    repositoryPath={$repoStore.currentPath ?? ""}
-                    disabled={enhancementBusy}
-                    onchange={() => { dirty = true; }}
-                  />
                   {#if current}
                     <div class="notifications-row">
                       <p class="notifications-label">Notifications (profile-wide; mute this task)</p>
@@ -818,13 +1130,25 @@
                     </div>
                   {/if}
                 </fieldset>
-              {:else if section.id === "owner"}
+              {:else if section.id === "relations"}
+                <!-- The done-able checklist, links to other tasks, and real child
+                     subtasks. They used to hang off the bottom of "Status and
+                     scheduling", where nothing said they were there. -->
                 <fieldset disabled={enhancementBusy}>
-                  <!-- The section heading already says "Owner", so the label is
-                       there for a screen reader rather than repeated on screen.
-                       Written on one line deliberately: the label's first child has
-                       to be the name, not a whitespace text node. -->
-                  <label class="owner-field"><span class="sr-only">Owner</span><input class="gp-field" value={draft.owner ?? ""} oninput={(e) => { draft.owner = e.currentTarget.value || null; }} maxlength="300" placeholder="Unassigned" /></label>
+                  <TaskRelations
+                    bind:checklist={draft.checklist}
+                    bind:links={draft.links}
+                    taskId={current?.id ?? null}
+                    task={current}
+                    bind:this={relations}
+                    acceptanceCriteria={current?.acceptance_criteria ?? []}
+                    criteriaUnsaved={criteriaList.join("\n") !== (current?.acceptance_criteria ?? []).join("\n")}
+                    repositories={known}
+                    {openTabs}
+                    repositoryPath={$repoStore.currentPath ?? ""}
+                    disabled={enhancementBusy}
+                    onchange={() => { dirty = true; }}
+                  />
                 </fieldset>
               {/if}
             </section>
@@ -859,6 +1183,10 @@
       <button type="button" class="gp-btn" data-variant="danger" onclick={remove} disabled={saving || adding || enhancementBusy || pending !== null}>{pendingDelete ? "Try delete again" : "Delete"}</button>
     {/if}
     {#if note}<p role="status" class="footer-note">{note}</p>{/if}
+    {#if canUndoMove && lastMove}<button type="button" class="gp-btn" data-size="sm" data-variant="ghost" data-testid="task-notes-undo" disabled={enhancementBusy} onclick={undoMove} title="Put the fields back as they were before {lastMove.what}">Undo {lastMove.what.replace(/^the /, "")}</button>{/if}
+    <!-- The reason Save is off is its own line: a note left by an earlier action
+         ("Added 3 criteria") used to take its place and hide it. -->
+    {#if saveBlocker && !pending}<p class="footer-note" data-testid="task-save-blocker">{saveBlocker}</p>{/if}
   </footer>
 </aside>
 
@@ -905,28 +1233,44 @@
   /* The last field in a section carries the section's own bottom gap, not a
      second one of its own. */
   .step fieldset > :last-child{margin-bottom:0}
-  .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0}
+  .due-field{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;min-width:0;flex:1}
   .field-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}
-  .owner-field{margin-bottom:0;gap:0}
   header,footer,.pair,.header-actions{display:flex;gap:10px;align-items:center}header{padding:16px 18px;justify-content:space-between;flex-shrink:0;padding-bottom:10px;background:rgb(var(--c-surface) / 0.82)}h2{font-size:var(--text-base);font-weight:600;margin:0}small,.meta,.notifications-label{color:rgb(var(--c-text-muted));font-size:var(--text-meta)}form{font-size:var(--text-xs);min-width:0}fieldset{border:0;padding:0;min-width:0}label{display:flex;flex-direction:column;gap:6px;margin-bottom:13px;flex:1}.pair{align-items:flex-start}input,textarea,select{width:100%;min-width:0}textarea{resize:vertical}
   /* Only a control that carries no field primitive is drawn here. This rule used
      to restyle every input, so its scoped selector outranked gp-field and
-     gp-select and squared the editor's one-line pills into 8px rectangles. */
-  :where(input,textarea,select):not(.gp-field):not(.gp-field-multi):not(.gp-select){padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6);color:inherit}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
+     gp-select and squared the editor's one-line pills into 8px rectangles.
+     A criterion row's input is bare on purpose: the row is the field. */
+  :where(input,textarea,select):not(.gp-field):not(.gp-field-multi):not(.gp-select):not(.subtask-text){padding:8px;border:1px solid var(--gp-edge);border-radius:var(--gp-r-md);background:rgb(var(--c-bg) / 0.6);color:inherit}button:disabled{opacity:.5}footer{flex-shrink:0;flex-wrap:wrap;padding:10px 18px 16px}.footer-note{margin:0;flex:1;min-width:8rem;color:rgb(var(--c-text-muted))}
   .error{color:rgb(var(--c-danger))}p{font-size:var(--text-xs);margin:10px 0}.notifications-row{margin:12px 0 16px}.kind-preset{margin-top:6px;align-self:flex-start}
-  .subtasks-section{display:flex;flex-direction:column;gap:8px;margin-bottom:13px}
-  .subtasks-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-  .subtasks-head label{margin-bottom:0;font-weight:500}
-  .criteria-count{font-size:var(--text-meta);font-weight:400;color:rgb(var(--c-text-muted))}
-  
-  .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
-  .subtask-item{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
-  .subtask-bullet{color:rgb(var(--c-text-muted));font-size:var(--text-sm);line-height:1}
-  .subtask-text{flex:1;min-width:0;word-break:break-word}
-  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs)}
+  .criteria-tools{display:flex;align-items:center;gap:6px;margin:0 0 8px}
+  .criteria-summary{flex:1;min-width:0;margin:0}
+  .criteria-list-view{display:flex;flex-direction:column;gap:6px}
+  .subtasks-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:3px}
+  .subtask-item{display:flex;align-items:flex-start;gap:6px;padding:2px 4px 2px 6px;border-radius:var(--gp-r-sm);background:rgb(var(--c-bg) / 0.4);border:1px solid var(--gp-edge-soft);font-size:var(--text-meta)}
+  .subtask-item:focus-within{border-color:rgb(var(--c-accent) / 0.65)}
+  .subtask-n{flex-shrink:0;min-width:1.2em;padding-top:4px;text-align:right;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
+  /* The row is the field: no second border inside the bordered row. */
+  .subtask-item .subtask-text{flex:1;min-width:0;padding:3px 2px;border:0;border-radius:var(--gp-r-xs);background:transparent;color:inherit;font:inherit;font-size:var(--text-meta);line-height:1.4;resize:none;overflow:hidden;overflow-wrap:anywhere}
+  .subtask-item .subtask-text:focus{outline:none}
+  .subtask-moves{display:inline-flex;flex-shrink:0;opacity:.6}
+  .subtask-item:hover .subtask-moves,.subtask-item:focus-within .subtask-moves{opacity:1}
+  .subtask-move{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs)}
+  .subtask-move:hover:not(:disabled){color:rgb(var(--c-text))}
+  .subtask-move:disabled{opacity:.3;cursor:default}
+  .subtask-remove{background:transparent;border:0;cursor:pointer;padding:2px;display:inline-flex;align-items:center;justify-content:center;color:rgb(var(--c-text-muted));border-radius:var(--gp-r-xs);opacity:.6}
+  .subtask-item:hover .subtask-remove,.subtask-remove:focus-visible{opacity:1}
   .subtask-remove:hover{color:rgb(var(--c-text))}
   .subtask-add-row{display:flex;gap:6px;align-items:center}
   .subtask-add-input{flex:1;font-size:var(--text-meta)}
-  
   .criteria-raw-label{margin-bottom:0}
-</style>
+  .criteria-list-view[hidden],.criteria-raw-label[hidden]{display:none}
+
+  .notes-preview{margin:10px 0 4px;padding:9px 11px;border-radius:var(--gp-r-md);border:1px dashed rgb(var(--c-accent) / 0.35);background:rgb(var(--c-accent) / 0.06);display:flex;flex-direction:column;gap:6px}
+  .preview-head{margin:0;font-size:var(--text-meta);font-weight:600;color:rgb(var(--c-text))}
+  .notes-preview dl{margin:0;display:flex;flex-direction:column;gap:4px}
+  .notes-preview dl > div{display:grid;grid-template-columns:5.5rem 1fr;gap:8px;align-items:baseline}
+  .notes-preview dt{margin:0}
+  .notes-preview dd{margin:0;min-width:0;overflow-wrap:anywhere;font-size:var(--text-meta);display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+  .preview-title{font-weight:600}
+  .preview-excerpt{flex-basis:100%;color:rgb(var(--c-text-muted));white-space:pre-line;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .notes-preview > button{align-self:flex-start}</style>

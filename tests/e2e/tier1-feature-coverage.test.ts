@@ -28,6 +28,7 @@ import {
   priorityLabel,
 } from "../../src/lib/workbench/taskPriority";
 import { tabProps } from "../../src/lib/dom/tablist";
+import { stripMarkupComments } from "../../src/lib/dom/markupText";
 import {
   taskWrite,
   taskDraft,
@@ -1068,7 +1069,7 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
       // App.svelte hosts views without destructive keying blocks
       const appFile = path.join(PROJECT_ROOT, "src/App.svelte");
       const appContent = readFileSync(appFile, "utf8");
-      const appTemplate = appContent.replace(/<!--[\s\S]*?-->/g, "");
+      const appTemplate = stripMarkupComments(appContent);
       expect(appTemplate).not.toContain("{#key $repoStore.currentPath}");
       expect(appTemplate).not.toContain("{#key activeTab}");
       expect(appTemplate).not.toContain("{#key");

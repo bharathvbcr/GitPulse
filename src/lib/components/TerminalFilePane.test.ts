@@ -87,4 +87,22 @@ describe("TerminalFilePane contracts", () => {
     expect(source).toContain("symbolsForFile(");
     expect(source).toContain("getNeighbors(");
   });
+
+  it("respects defaultExplorerOpen when docked TerminalPanel sidebar is already showing ExplorerRail and exposes dock-to-sidebar action", () => {
+    const { body } = render(TerminalFilePane, {
+      props: {
+        tabId: "file-no-dup-tree",
+        repoPath: "/repo",
+        defaultExplorerOpen: false,
+        onscreen: true,
+        onDockToSidebar: () => {},
+      },
+    });
+    expect(body).not.toContain("data-terminal-file-explorer-card");
+    expect(body).toContain('aria-label="Show file explorer"');
+    expect(body).toContain('data-testid="terminal-file-dock-sidebar"');
+    expect(source).toContain("explorerTouchedByUser");
+    expect(source).toContain("prevDefaultExplorerOpen");
+    expect(source).toContain("if (desired === false && prev !== false)");
+  });
 });

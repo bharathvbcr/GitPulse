@@ -268,9 +268,8 @@ pub(crate) fn append_owned_by(path: &Path, line: &[u8], owner: u32) -> Result<()
     }
     if meta.uid() != owner {
         return Err(format!(
-            "{} is owned by uid {}, not this user (uid {owner})",
-            path.display(),
-            meta.uid()
+            "{} is owned by another user, not this user",
+            path.display()
         ));
     }
     if wide_mode(&meta).is_some() {

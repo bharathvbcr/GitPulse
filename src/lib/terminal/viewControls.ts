@@ -80,13 +80,20 @@ export function macOptionOptions(
   return { macOptionIsMeta: on, macOptionClickForcesSelection: on };
 }
 
-export type TerminalViewChord = "find" | "zoom-in" | "zoom-out" | "zoom-reset";
+export type TerminalViewChord =
+  | "find"
+  | "zoom-in"
+  | "zoom-out"
+  | "zoom-reset"
+  | "copy-selection"
+  | "copy-last-output";
 
 /**
- * Leave readline's Ctrl+F and Command+K intact. On macOS the view chords are
- * Command chords only: Ctrl+Shift+- is `^_`, readline's undo, and a Mac
- * keyboard reaches find and zoom with Command anyway. Elsewhere Control+Shift
- * is the terminal convention, because plain Control belongs to the shell.
+ * Leave readline's Ctrl+F, Command+K, and Ctrl+C (SIGINT) intact. On macOS
+ * the view chords are Command chords only: Ctrl+Shift+- is `^_`, readline's
+ * undo, and a Mac keyboard reaches find, copy, and zoom with Command anyway.
+ * Elsewhere Control+Shift (and Control+Alt+C for last output) is the terminal
+ * convention, because plain Control belongs to the shell.
  */
 export function terminalViewChord(event: {
   key: string;
@@ -97,12 +104,20 @@ export function terminalViewChord(event: {
   isComposing?: boolean;
   keyCode?: number;
 }, os?: string): TerminalViewChord | null {
-  if (isImeComposition(event) || event.altKey) return null;
+  if (isImeComposition(event)) return null;
+  const lower = event.key.toLowerCase();
+  if (os !== "macos" && event.ctrlKey && event.altKey && !event.metaKey && !event.shiftKey) {
+    return lower === "c" ? "copy-last-output" : null;
+  }
+  if (event.altKey) return null;
   const command = event.metaKey && !event.ctrlKey;
   const controlShift = os !== "macos" && event.ctrlKey && event.shiftKey && !event.metaKey;
   if (!command && !controlShift) return null;
-  switch (event.key.toLowerCase()) {
+  switch (lower) {
     case "f": return "find";
+    case "c":
+      if (os === "macos") return event.shiftKey ? "copy-last-output" : "copy-selection";
+      return "copy-selection";
     case "=":
     case "+": return "zoom-in";
     case "_":

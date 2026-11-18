@@ -44,6 +44,23 @@ describe("TaskManviAssist", () => {
     // holds a live attempt while the on-device engine is chosen.
     expect(source).toMatch(/const existing = await bounded\(latestEnhancement\(saved\.id, LIVE_ENHANCEMENT_STATES\)\)[\s\S]*?runAppleEnhancement/);
   });
+  it("sends the on-device model the notes as asked, read before the save consumes them", () => {
+    // Saving a draft turns the notes into fields and clears them, so reading
+    // `notes` after `prepareTask()` asked the model about an empty box.
+    expect(source).toMatch(/const asked = \{ kind: askKind, notes \};[\s\S]*?await prepareTask\(\)/);
+    expect(source).toMatch(/runAppleEnhancement\([\s\S]*?kind: asked\.kind,\s*notes: asked\.notes,/);
+  });
+  it("fills the fields from the notes on Cmd+Enter when no model can draft", () => {
+    // Rendered on a draft in harness/tasksChecks.js ("Cmd+Enter in the notes
+    // fills the fields when no model can draft"); this pins the order: the
+    // fill is tried only when no model is there, and asking is the default.
+    // A reader who unticked every field is refused, not filled for
+    // ("empty field selection cannot widen through the keyboard shortcut").
+    expect(source).toMatch(/event\.key === "Enter"\) \{\s*event\.preventDefault\(\);\s*if \(noModel && onFillNotes\?\.\(\)\) return;\s*void generate\(\);/);
+    // The on-device side reads the model's own state, never `appleAsk.ok`,
+    // which is also false for an empty field selection.
+    expect(source).toMatch(/const noModel = \$derived\(\s*!disabled && !acting && !liveAttempt\s*&& \(engine === "apple" \? apple !== null && apple\.state !== "available" : !configPending && !manviReady\),/);
+  });
   // Compose copy on a new task and improve copy on a saved one are rendered
   // in harness/tasksChecks.js ("a new task's assist asks what is needed...",
   // "a saved task's assist offers to improve it...").

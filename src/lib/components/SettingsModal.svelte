@@ -99,6 +99,7 @@
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
   import KeepTerminalsSetting from "./KeepTerminalsSetting.svelte";
+  import AgentShellReadsSetting from "./AgentShellReadsSetting.svelte";
   import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
   import AgentModelSettings from "./AgentModelSettings.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
@@ -1096,7 +1097,7 @@
                     <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
                   </div>
                 </section>
-                <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(["agent-live-runs", "terminal-sessions", "keep-terminals"])}>
+                <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(["agent-live-runs", "terminal-sessions", "keep-terminals", "agent-shell-reads"])}>
                   <h3 class="gp-label">Sessions and limits</h3>
                   <div data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
                     <AgentLimitSetting
@@ -1127,6 +1128,9 @@
                   </div>
                   <div data-setting="keep-terminals" hidden={!shown("keep-terminals")}>
                     <KeepTerminalsSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                  <div data-setting="agent-shell-reads" hidden={!shown("agent-shell-reads")}>
+                    <AgentShellReadsSetting active={isOpen && activeSection === "agents"} />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["session-alerts", "bell-asks"])}>

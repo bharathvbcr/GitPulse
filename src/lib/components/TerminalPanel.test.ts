@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import TerminalPanel from "./TerminalPanel.svelte";
+import { stripMarkupTags } from "../dom/markupText";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "TerminalPanel.svelte"),
@@ -146,7 +147,7 @@ describe("TerminalPanel rendering", () => {
     const { body } = render(TerminalPanel);
     const match = body.match(/data-testid="terminal-session-count"[^>]*>([\s\S]*?)<\/button>/);
     expect(match).not.toBeNull();
-    const text = (match?.[1] ?? "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+    const text = stripMarkupTags(match?.[1] ?? "").replace(/\s+/g, " ").trim();
     // The old control was an unlabeled `0/32` icon button.
     expect(text).toMatch(/^\d+ open \/ \d+ limit$/);
     expect(text).not.toBe("0/32");
@@ -306,6 +307,27 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain("onSendToAgent={sendReferenceToAgent}");
   });
 
+  it("lets Follow Agent drive only the one pane it owns, and end when the user closes or takes it", () => {
+    // The decision lives in terminal/followAgent.ts (behaviour-tested there);
+    // these pin that the panel routes every touched file through it. Follow
+    // used to retarget whichever file pane was visible — the user's own — and
+    // open a fresh split per edit once that pane was closed.
+    const handler = source.slice(
+      source.indexOf("function handleAgentTouchedFile("),
+      source.indexOf("function handleFileDropOnPane("),
+    );
+    expect(handler).toContain("decideFollow(followTarget, tabState.tabs, followPaneFile)");
+    expect(handler).toContain('decision.kind === "stop"');
+    expect(handler).not.toContain("existingVisibleFile");
+    expect(handler).toContain("reuseSameFileOnly: true");
+    expect(handler).toContain("if (!before.has(shown.id)) adoptFollowPaneById(shown.id);");
+    expect(source).toContain("followPaneOpen(target, tabs)");
+    // Every way follow turns on goes through startFollowing, which records the pane it owns.
+    expect(source.match(/followAgent = true;/g)).toHaveLength(1);
+    expect(source).toContain("startFollowing(fileId);");
+    expect(source).toContain("onclick={() => { if (followAgent) stopFollowing(); else startFollowing(); }}");
+  });
+
   it("wires parent-child supervision (↳ badge, Stop children, onChildClosed) and 1-click Claude <-> Antigravity pair handoff", () => {
     expect(source).toContain("onChildClosed: handleChildClosed");
     expect(source).toContain("function handleChildClosed(payload: TerminalChildClosedPayload)");
@@ -348,7 +370,187 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(emptyState).toContain("{#each sessionTypes as launcher (launcher.kind)}");
     expect(emptyState).toContain("data-testid={`terminal-empty-launch-${launcher.kind}`}");
     expect(emptyState).toContain("canCreateKind(launcher.kind)");
-    expect(emptyState).toContain("openBrowserFor(undefined)");
+    expect(emptyState).not.toContain("openBrowserFor(");
     expect(emptyState).toContain("newTab(launcher.kind)");
+  });
+
+  it("surfaces the active session summary, 3-tier split tab strip markers, constant-height split pane headers, and live session retitling", () => {
+    expect(source).toContain('data-testid="terminal-active-session-summary"');
+    expect(source).toContain('data-testid="terminal-header-split-indicator"');
+    expect(source).toContain('data-active={isActiveTab ? "true" : "false"}');
+    expect(source).toContain('data-in-split={inVisibleSplit ? "true" : "false"}');
+    expect(source).toContain('data-testid="terminal-tab-split-slot"');
+    expect(source).toContain('data-testid="terminal-split-pane-header"');
+    expect(source).toContain('data-testid="terminal-split-active-badge"');
+    expect(source).toContain("removePaneFromSplit(");
+    expect(source).toContain("zoomSplitPane(");
+    expect(source).toContain("effectiveSessionTitle(tab, effectiveAgentStatuses[tab.id])");
+    // Constant-height header inside split panes with tonal step only (never border-b hairline) and no destructive Close Browser aria-label collision.
+    expect(source).toContain("h-7 shrink-0");
+    expect(source).toContain("aria-label={`Remove ${tabLabel(tab)} from split`}");
+  });
+
+  it("wires zoomed hidden-sibling alerts, center swap drops, split-pane pinning, Open in split, container-query narrow headers, inline rename, and cross-surface slot markers", () => {
+    // P0.2: zoomed hidden sibling attention alert + visibleIds unread clearing
+    expect(source).toContain("summarizeHiddenSplitSiblings(");
+    expect(source).toContain('data-testid="terminal-hidden-split-alert"');
+    expect(source).toContain('data-testid="terminal-zoomed-hidden-alert"');
+    expect(source).toContain("revealHiddenSplitUrgent()");
+
+    // P0.3: durable ledger row title display
+    expect(source).toContain('data-testid="terminal-ledger-row-title"');
+
+    // P1.5: center swap drop zone + draggable split-pane header
+    expect(source).toContain("swapPanes(splitRoot,");
+    expect(source).toContain('data-testid="terminal-tab-drop-swap"');
+
+    // P1.6: split-pane pinning + 1-click Open in split
+    expect(source).toContain("chooseSplitReplacementSlot(");
+    expect(source).toContain('data-testid="terminal-split-pin-btn"');
+    expect(source).toContain('data-testid="terminal-tab-pin-toggle"');
+    expect(source).toContain('data-testid="terminal-tab-open-in-split"');
+
+    // P1.8: @container split-pane narrow header responsiveness + inline rename + Console active summary return
+    expect(source).toContain("@container split-pane");
+    expect(source).toContain('data-testid="terminal-inline-rename-input"');
+    expect(source).toContain("→ Shell");
+
+    // P2.9: multi-agent pair handoff targets + Sessions across repositories Active & Split #slot badges
+    expect(source).toContain("resolvePairHandoffTargets(");
+    expect(source).toContain('data-testid="session-split-slot"');
+    expect(source).toContain('data-testid="session-active-badge"');
+    expect(source).toContain('data-testid="session-attention-badge"');
+
+    // Native hook attention fallback (`$sessionActivity`), 8-pinned-pane activeId preservation,
+    // non-child reclaimed title hydration without launchName pollution, and inline rename focus restore
+    expect(source).toContain("activityToAgentStatus(");
+    expect(source).toContain("activityAttentionLabel($sessionActivity");
+    expect(source).toContain('choice?.mode === "blocked"');
+    expect(source).toContain("all 8 split panes are pinned");
+    expect(source).toContain("title: meta.parentSessionId ? (reclaimed.title ?? null) : null");
+    expect(source).toContain("restoreFocusAfterInlineRename(");
+  });
+
+  it("supports multiple grouped terminal pairs with pair capsules, header switcher, pair presets, and non-destructive switching", () => {
+    expect(source).toContain('data-testid="terminal-tab-group"');
+    expect(source).toContain('data-testid="terminal-tab-group-badge"');
+    expect(source).toContain('data-testid="terminal-tab-group-unsplit"');
+    expect(source).toContain('data-testid="terminal-pair-switcher"');
+    expect(source).toContain('data-testid="terminal-pair-switcher-btn"');
+    expect(source).toContain('data-testid="terminal-group-rename-input"');
+    expect(source).toContain('data-testid="terminal-preset-shell-pair"');
+    expect(source).toContain('data-testid="terminal-preset-agent-shell-pair"');
+    expect(source).toContain("upsertSplitGroup(");
+    expect(source).toContain("coLocateTabsForGroups(");
+    expect(source).toContain("summarizeSplitGroupAttention(");
+  });
+
+  it("docks a non-splitting File Explorer sidebar with user-controlled open targets, exposes File Explorer + icons in Session Typer, and supports predictable tab drag-and-drop + tab context menu", () => {
+    // 1. Docked File Explorer sidebar (never forces a 3rd split pane on toggle) + user-controlled Tab | Split | Code target
+    expect(source).toContain('data-testid="terminal-explorer-sidebar-toggle"');
+    expect(source).toContain('data-testid="terminal-explorer-sidebar"');
+    expect(source).toContain('data-testid="terminal-explorer-target-tab"');
+    expect(source).toContain('data-testid="terminal-explorer-target-split"');
+    expect(source).toContain('data-testid="terminal-explorer-target-code"');
+    expect(source).toContain("resolveExplorerFileAction(");
+    expect(source).not.toContain("function toggleFilePaneSplit()");
+
+    // 2. Session Typer includes File Explorer via dockTabTypesFor + renders LauncherIcon on trigger and presets
+    expect(source).toContain("dockTabTypesFor(");
+    expect(source).toContain("offeredDockTabKind(");
+    expect(source).toContain('data-testid="terminal-launcher-toggle-explorer"');
+    expect(source).toContain('data-testid="terminal-empty-launch-file"');
+    const launcherTrigger = source.slice(
+      source.indexOf("data-terminal-launcher"),
+      source.indexOf("data-terminal-new"),
+    );
+    expect(launcherTrigger).toContain("<LauncherIcon kind={nextLauncher}");
+
+    // 3. Predictable tab-strip drag-and-drop (before/after drop bars, detach dropzone, group reorder) + right-click context menu
+    expect(source).toContain("classifyTabStripDropZone(");
+    expect(source).toContain("applyTabStripDrop(");
+    expect(source).toContain("detachTabToStripEnd(");
+    expect(source).toContain("reorderSplitGroupInStrip(");
+    expect(source).toContain("moveSplitGroupToStripEnd(");
+    expect(source).toContain('data-testid="terminal-tab-drop-before"');
+    expect(source).toContain('data-testid="terminal-tab-drop-after"');
+    expect(source).toContain('data-testid="terminal-tab-detach-dropzone"');
+    expect(source).toContain('data-testid="terminal-tab-split-dropzone"');
+    expect(source).toContain('data-testid="terminal-tab-context-menu"');
+    expect(source).toContain("dockFileTabToSidebar(");
+    expect(source).toContain('"Switch to tab"');
+    expect(source).toContain('"Split left"');
+    expect(source).toContain('"Split right"');
+    expect(source).toContain('aria-hidden="true" data-testid="terminal-tab-split-slot"');
+    expect(source).not.toContain("if (!meta.filePath) continue;");
+
+    // 4. Clicking + (openBeside) opens a standalone Browser tab via newTab rather than forcing a 2-pane split
+    const openBesideBody = source.slice(
+      source.indexOf("async function openBeside("),
+      source.indexOf("async function closeListed("),
+    );
+    expect(openBesideBody).not.toContain("openBrowserFor(");
+    expect(openBesideBody).toContain("newTab(launcher)");
+
+    // 5. Cold-boot file split preserves an anchor shell, folder drops on file panes forward to session, and ledger rows suppress generic startup titles
+    const initialTabsBody = source.slice(
+      source.indexOf("function initialTabs(): TabState"),
+      source.indexOf("let tabState = $state<TabState>"),
+    );
+    expect(initialTabsBody).toContain('launch.launcher === "file"');
+    expect(initialTabsBody).toContain('launch.fileOpenMode !== "tab"');
+    const fileDropBody = source.slice(
+      source.indexOf("function handleFileDropOnPane("),
+      source.indexOf("function canEdgeSplitDrop("),
+    );
+    expect(fileDropBody).toContain("filesOnly");
+    const ledgerRowBlock = source.slice(
+      source.indexOf('data-testid="terminal-ledger-row"'),
+      source.indexOf('data-testid="terminal-ledger-reopen-btn"'),
+    );
+    expect(ledgerRowBlock).toContain("isGenericLauncherTitle(");
+  });
+
+  it("exposes right-click context menus for tabs, split panes, pair badges, and split toolbar controls", () => {
+    // 1. Portaled tab, split toolbar, and pair group menus exist with keyboard/accessibility triggers
+    expect(source).toContain('data-testid="terminal-tab-context-menu"');
+    expect(source).toContain('data-testid="terminal-split-context-menu"');
+    expect(source).toContain('data-testid="terminal-group-context-menu"');
+    expect(source).toContain("resolveContextMenuPoint(");
+    expect(source).toContain('event.key === "ContextMenu"');
+
+    // 2. Split toolbar context menu supports explicit placement (right/left/down/up), session creation, and pairing
+    expect(source).toContain('data-testid="terminal-split-ctx-place-right"');
+    expect(source).toContain('data-testid="terminal-split-ctx-place-left"');
+    expect(source).toContain('data-testid="terminal-split-ctx-place-down"');
+    expect(source).toContain('data-testid="terminal-split-ctx-place-up"');
+    expect(source).toContain("splitPaneWithNewKind(");
+    expect(source).toContain('data-testid="terminal-split-ctx-pair-tab"');
+
+    // 3. Layout & pair controls wire into flipSplitOrientation, swapWithAdjacentSplitPane, moveSplitGroupByStep, equalize, and ungroup
+    expect(source).toContain("flipSplitOrientation(");
+    expect(source).toContain("swapWithAdjacentSplitPane(");
+    expect(source).toContain("moveSplitGroupByStep(");
+    expect(source).toContain("equalizeGroupSplits(");
+    expect(source).toContain("ungroupAllPairs(");
+
+    // 4. Upgraded tab context menu exposes directional split controls, new-session splits, and bulk close actions
+    expect(source).toContain('data-testid="terminal-tab-ctx-split-left"');
+    expect(source).toContain('data-testid="terminal-tab-ctx-split-up"');
+    expect(source).toContain('data-testid="terminal-tab-ctx-split-new-right"');
+    expect(source).toContain("closeOtherTabs(");
+    expect(source).toContain("closeTabsToRight(");
+    expect(source).toContain("closeEndedTabs(");
+  });
+
+  it("wires rich output copy actions, Select-to-Copy toggle, initialCommand, and run-in-new-split-shell handoff", () => {
+    expect(source).toContain("setTabInitialCommand(");
+    expect(source).toContain("async function runCommandInNewSplitShell(");
+    expect(source).toContain('value="copy-md"');
+    expect(source).toContain('value="last-cmd"');
+    expect(source).toContain('value="run-last-new-shell"');
+    expect(source).toContain('data-testid="terminal-tab-opt-copy-on-select"');
+    expect(source).toContain("initialCommand={tab.initialCommand}");
+    expect(source).toContain("onRunInNewShell={(cmd, sub) => void runCommandInNewSplitShell(tab.id, cmd, sub)}");
   });
 });

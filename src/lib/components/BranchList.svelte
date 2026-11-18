@@ -120,6 +120,29 @@
   // Equal icon pills: one literal so Tailwind keeps every utility.
   const headerActionClass =
     "gp-chip h-6 min-w-0 flex-1 basis-0 justify-center bg-surface font-medium text-textMuted hover:bg-surfaceHover hover:text-textPrimary";
+  // Hover motion for every row in the list: what the `gp-row` primitive
+  // animates, on its tokens. The ring is box-shadow, which design-lint rule 9
+  // keeps out of transitions, so it changes on the instant. On Tailwind's
+  // 150ms slow-start default the fill trailed that ring by a visible beat;
+  // on the 80ms fast-out curve it lands with it. The `transition-[…]`
+  // spelling is the one the reduced-motion rules in app.css switch off.
+  const ROW_MOTION =
+    "transition-[color,background-color] duration-(--gp-dur-instant) ease-(--gp-ease-effect)";
+  // The hover-revealed controls and the status dots they replace crossfade in
+  // one spot, so they share one timing, and a revealed button's own hover
+  // fill moves with its fade instead of snapping.
+  const REVEAL_MOTION =
+    "transition-[opacity,color,background-color] duration-(--gp-dur-instant) ease-(--gp-ease-effect)";
+  // Fill and ring of a branch or tag row, at rest and under the pointer. Every
+  // state takes one step on hover: the checked-out, selected and keyboard rows
+  // used to change nothing, and they are the rows hovered most. Text colour
+  // stays with the caller (a selected tag reads in accent, a branch does not).
+  function rowSurface(current: boolean, selected: boolean, keyboard: boolean): string {
+    if (current) return "bg-accent/15 ring-accent/40 hover:bg-accent/20 hover:ring-accent/60";
+    if (selected) return "bg-accent/10 ring-accent/20 hover:bg-accent/15 hover:ring-accent/40";
+    if (keyboard) return "bg-surfaceHover ring-border hover:ring-accent/30";
+    return "ring-border/60 hover:bg-surfaceHover hover:ring-border";
+  }
   let gapChips = $derived($densityStore === "compact" ? "mb-1.5" : "mb-2");
   // The list's bottom padding clears the last row off the edge once the fade
   // is gone at the end of the list.
@@ -974,8 +997,8 @@
 {#snippet branchActions(branch: BranchInfo, reveal: boolean)}
   <button
     type="button"
-    class="rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0 {reveal
-      ? 'p-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity'
+    class="rounded-full text-textMuted hover:text-accent hover:bg-background focus-visible:outline-2 focus-visible:outline-accent shrink-0 {REVEAL_MOTION} {reveal
+      ? 'p-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
       : 'p-1'}"
     onclick={() => void copyText(branch.name)}
     title="Copy branch name"
@@ -983,7 +1006,7 @@
   ><Copy size={12} /></button>
   <button
     type="button"
-    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted transition-opacity shrink-0"
+    class="p-0.5 rounded-full opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-background text-textMuted {REVEAL_MOTION} shrink-0"
     onclick={(e) => {
       e.stopPropagation();
       openBranchMenu(e, branch);
@@ -1008,15 +1031,11 @@
     !branch.is_current &&
     !branch.is_default}
   <div
-    class="gp-cv-row relative w-full flex items-center gap-1.5 group transition-colors select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {multiLine
+    class="gp-cv-row relative w-full flex items-center gap-1.5 group {ROW_MOTION} select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {multiLine
       ? 'rounded-2xl'
       : 'rounded-full pr-1'} {branch.is_current
-      ? 'bg-accent/15 text-accent font-semibold ring-accent/40'
-      : selected
-        ? 'bg-accent/10 text-textPrimary ring-accent/20'
-        : isRowSelected
-          ? 'bg-surfaceHover text-textPrimary ring-border'
-          : 'text-textPrimary ring-border/60 hover:bg-surfaceHover hover:ring-border'}"
+      ? 'text-accent font-semibold'
+      : 'text-textPrimary'} {rowSurface(branch.is_current, selected, isRowSelected)}"
     style="height: {BRANCH_HEIGHT}px; contain-intrinsic-size: auto {BRANCH_HEIGHT}px; padding-left: {8 +
       depth * 12}px;"
   >
@@ -1025,7 +1044,7 @@
       onclick={(e) => togglePin(branch.name, e)}
       title={isPinned ? "Unpin branch" : "Pin branch to top"}
       aria-label={isPinned ? "Unpin branch" : "Pin branch to top"}
-      class="p-0.5 rounded-full text-textMuted hover:text-warn transition-opacity shrink-0 {isPinned ? 'text-warn opacity-100' : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60'}"
+      class="p-0.5 rounded-full text-textMuted hover:text-warn {REVEAL_MOTION} shrink-0 {isPinned ? 'text-warn opacity-100' : 'opacity-0 group-hover:opacity-60 group-focus-within:opacity-60'}"
     >
       <Star size={11} class={isPinned ? "fill-warn" : ""} />
     </button>
@@ -1118,7 +1137,7 @@
            keeps neighbouring outlines apart), so 4px here is y 5. -->
       <div class="absolute right-1 top-[4px] h-4 flex items-center">
         <span
-          class="absolute right-1.5 flex items-center gap-1 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0"
+          class="absolute right-1.5 flex items-center gap-1 {REVEAL_MOTION} group-hover:opacity-0 group-focus-within:opacity-0"
         >
           <BranchHealthDot {branch} />
           {#if branch.is_current}
@@ -1149,11 +1168,9 @@
     onclick={() => selectRef(row.tag.name)}
     oncontextmenu={(e) => openTagMenu(e, row.tag)}
     title={tagTooltip(row.tag)}
-    class="gp-cv-row w-full px-2 rounded-full flex items-center gap-1.5 text-left transition-colors select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {$filterStore.selectedBranch === row.tag.name
-      ? 'bg-accent/10 text-accent ring-accent/20'
-      : isRowSelected
-        ? 'bg-surfaceHover text-textPrimary ring-border'
-        : 'text-textPrimary ring-border/60 hover:bg-surfaceHover hover:ring-border'}"
+    class="gp-cv-row w-full px-2 rounded-full flex items-center gap-1.5 text-left {ROW_MOTION} select-none border-y border-transparent bg-clip-padding ring-1 ring-inset {$filterStore.selectedBranch === row.tag.name
+      ? 'text-accent'
+      : 'text-textPrimary'} {rowSurface(false, $filterStore.selectedBranch === row.tag.name, isRowSelected)}"
     style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px;"
   >
     <Tag size={12} class="text-textMuted shrink-0" />
@@ -1177,7 +1194,7 @@
     type="button"
     onclick={() => toggle(row.folderId, "local")}
     aria-expanded={!closed}
-    class="gp-cv-row gp-label w-full flex items-center gap-1.5 hover:text-textPrimary transition-colors select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
+    class="gp-cv-row gp-label w-full flex items-center gap-1.5 hover:text-textPrimary {ROW_MOTION} select-none {isRowSelected ? 'bg-surfaceHover text-textPrimary' : ''}"
     style="height: {HEADER_HEIGHT}px; contain-intrinsic-size: auto {HEADER_HEIGHT}px; padding-left: {8 + row.depth * 12}px"
   >
     {#if closed}

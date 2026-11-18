@@ -643,6 +643,7 @@ pub fn run() {
             cmd_terminal_session_ledger,
             cmd_terminal_session_ledger_dismiss,
             cmd_terminal_session_ledger_reopen_check,
+            cmd_terminal_set_title,
             cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_listening_ports,

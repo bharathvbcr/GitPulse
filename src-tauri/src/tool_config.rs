@@ -106,6 +106,11 @@ pub struct AgentDefaults {
     /// closes, and changing the default is gated on a security sign-off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_terminals_running: Option<bool>,
+    /// Whether MCP / `gitpulse-hook term` callers inside a trusted repository
+    /// may list and read secret-scrubbed screen output from user-opened shells
+    /// (`include_repo_shells: true`). Off by default (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_agent_shell_reads: Option<bool>,
     /// Which model each agent CLI starts with, keyed by launcher name — for a
     /// plain agent tab and a task terminal attempt alike. Absent means the
     /// CLI's own choice (its settings files, its environment, its default),
@@ -212,6 +217,12 @@ impl AgentDefaults {
     /// with the app. (On Unix, terminal sessions always live in `gitpulse-ptyd`.)
     pub fn keeps_terminals_running(&self) -> bool {
         self.keep_terminals_running.unwrap_or(true)
+    }
+
+    /// Whether authenticated agents may read secret-scrubbed output from
+    /// user-opened shell tabs inside the same trusted repository.
+    pub fn allows_agent_shell_reads(&self) -> bool {
+        self.allow_agent_shell_reads.unwrap_or(false)
     }
 
     /// The terminal session limit to apply: the stored one, or the default.
@@ -354,6 +365,8 @@ pub struct StoredAgentLaunch {
     pub max_terminal_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_terminals_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_agent_shell_reads: Option<bool>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub models: std::collections::BTreeMap<String, ModelChoice>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -440,6 +453,7 @@ impl<'de> Deserialize<'de> for StoredAgentLaunch {
             claude_setting_sources: field(&fields, "claude_setting_sources"),
             max_terminal_sessions: field(&fields, "max_terminal_sessions"),
             keep_terminals_running: field(&fields, "keep_terminals_running"),
+            allow_agent_shell_reads: field(&fields, "allow_agent_shell_reads"),
             models: lenient_models("models", fields.get("models")),
             commit_models: lenient_models("commit_models", fields.get("commit_models")),
         })
@@ -1898,6 +1912,7 @@ pub fn agent_defaults() -> AgentDefaults {
         claude_setting_sources: cfg.agent_launch.claude_setting_sources,
         max_terminal_sessions: cfg.agent_launch.max_terminal_sessions,
         keep_terminals_running: cfg.agent_launch.keep_terminals_running,
+        allow_agent_shell_reads: cfg.agent_launch.allow_agent_shell_reads,
         models: cfg.agent_launch.models,
         commit_models: cfg.agent_launch.commit_models,
     };
@@ -1968,6 +1983,7 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
             claude_setting_sources: sources,
             max_terminal_sessions: next.max_terminal_sessions,
             keep_terminals_running: next.keep_terminals_running,
+            allow_agent_shell_reads: next.allow_agent_shell_reads,
             models: next
                 .models
                 .into_iter()
@@ -3252,6 +3268,30 @@ mod tests {
             fs::write(path, text.to_string()).unwrap();
             assert!(agent_defaults().keeps_terminals_running());
             assert_eq!(agent_defaults().terminal_sessions(), 40);
+        });
+    }
+
+    #[test]
+    fn allow_agent_shell_reads_defaults_off_persists_and_degrades_safely() {
+        with_temp_config(|path| {
+            assert!(!agent_defaults().allows_agent_shell_reads());
+            let on = AgentDefaults {
+                allow_agent_shell_reads: Some(true),
+                ..AgentDefaults::default()
+            };
+            set_agent_defaults(on.clone()).unwrap();
+            assert_eq!(agent_defaults(), on);
+            assert!(agent_defaults().allows_agent_shell_reads());
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["agent_launch"]["allow_agent_shell_reads"], true);
+
+            let mut corrupt = written;
+            corrupt["agent_launch"]["allow_agent_shell_reads"] = serde_json::json!("yes");
+            corrupt["agent_launch"]["max_terminal_sessions"] = serde_json::json!(24);
+            fs::write(path, corrupt.to_string()).unwrap();
+            assert!(!agent_defaults().allows_agent_shell_reads());
+            assert_eq!(agent_defaults().terminal_sessions(), 24);
         });
     }
 

@@ -41,6 +41,7 @@ describe("resolveStatusBarMode", () => {
     ["unresolved conflicts", { ...quiet, conflictedCount: 1 }],
     ["a degraded watcher", { ...quiet, watchDegraded: true }],
     ["a status poll that stopped answering", { ...quiet, statusUnavailable: true }],
+    ["the host-load governor refusing agent launches", { ...quiet, hostLoadRefusing: true }],
   ])("forces a hidden bar back for %s", (_label, signals) => {
     // Hiding chrome is allowed to cost the ambient readouts. It is not
     // allowed to cost a warning: silence here is how a user finds out too
@@ -48,7 +49,7 @@ describe("resolveStatusBarMode", () => {
     expect(resolveStatusBarMode("hidden", signals)).toEqual({ mode: "minimal", forced: true });
   });
 
-  it("does not force on a negative or absent count", () => {
-    expect(resolveStatusBarMode("hidden", { ...quiet, conflictedCount: 0 }).forced).toBe(false);
+  it("does not force on a negative or absent count or non-refusing host load", () => {
+    expect(resolveStatusBarMode("hidden", { ...quiet, conflictedCount: 0, hostLoadRefusing: false }).forced).toBe(false);
   });
 });

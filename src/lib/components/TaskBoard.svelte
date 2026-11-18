@@ -5,7 +5,7 @@
   import { createResizeObservation } from "../dom/observeResize";
   import { onMount, tick, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, ArrowDownWideNarrow, Bot, CircleAlert, CircleQuestionMark, ListFilter, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, ArrowDownWideNarrow, ArrowUpDown, Bot, Check, CircleAlert, CircleQuestionMark, ListFilter, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Ellipsis, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, PanelLeft, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -31,7 +31,7 @@
   import { resolveGitRoot } from "../desktop/nativeShell";
   import { applyMove, moveWrites, navigatorOrder } from "../workbench/workspaceOrder";
   import { importSummary, importTabGroups, tabGroups } from "../workbench/workspaceImport";
-  import { workspaceMembershipLabel } from "../workbench/taskRepositories";
+  import { DEFAULT_TASK_REPOSITORY_SORT, TASK_REPOSITORY_SORTS, TASK_REPOSITORY_SORT_LABELS, sortNavigatorRepositories, type TaskRepositorySort, workspaceMembershipLabel } from "../workbench/taskRepositories";
   import { hiddenByRepository, hiddenRepositoryNote, hiddenRepositoryPhrase, hidesRepositories } from "../workbench/taskHiddenRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { checkoutCandidates, handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
@@ -406,12 +406,14 @@
   });
   $effect(() => { if (railDocked) railOpen = false; });
   function closeRail(options?: { restoreFocus?: boolean }) {
+    addMenu = false;
+    repoSortMenu = false;
     if (!railOpen) return;
     railOpen = false;
     if (options?.restoreFocus) restoreFocusTo(railToggleEl);
   }
   function toggleRail() {
-    if (railDocked) { interfaceStore.setTaskNavigatorCollapsed(true); return; }
+    if (railDocked) { addMenu = false; repoSortMenu = false; interfaceStore.setTaskNavigatorCollapsed(true); return; }
     if (railOpen) { closeRail({ restoreFocus: true }); return; }
     // Below the toolbar, so the toggle that opened it stays in reach to close it.
     const header = boardEl?.querySelector("header");
@@ -432,14 +434,14 @@
   }
   const railDismissal = $derived({
     dismiss: {
-      inside: "[data-task-rail], [data-nav-toggle], [data-add-repo-popup]",
+      inside: "[data-task-rail], [data-nav-toggle], [data-add-repo-popup], [data-repo-sort-popup]",
       pointer: "pointerdown" as const,
       escape: "bubble" as const,
     },
     onDismiss: (reason: string) => {
-      // Escape belongs to the add-repository menu while it is open; it closes
-      // itself, and the rail stays for the next one.
-      if (reason === "escape" && addMenu) return;
+      // Escape belongs to an open navigator popover; it closes itself, and the
+      // rail stays for the next choice.
+      if (reason === "escape" && (addMenu || repoSortMenu)) return;
       closeRail({ restoreFocus: reason === "escape" });
     },
   });
@@ -490,6 +492,62 @@
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
   /** The navigator's order; moves are computed against this same list. */
   const orderedWorkspaces = $derived(navigatorOrder(visibleWorkspaces));
+  /** The navigator's repository order; the sheet's own picker keeps raw catalog order. */
+  const repositorySort = $derived($interfaceStore.taskRepositorySort);
+  const orderedRepositories = $derived(sortNavigatorRepositories(repositories, repositorySort, openTabRefs, pathOpts));
+  let repoSortMenu = $state(false);
+  let repoSortTriggerEl: HTMLButtonElement | undefined = $state();
+  let repoSortMenuEl: HTMLDivElement | undefined = $state();
+  function closeRepoSortMenu(options?: { restoreFocus?: boolean }) {
+    const opener = repoSortTriggerEl;
+    repoSortMenu = false;
+    if (options?.restoreFocus) restoreFocusTo(opener);
+  }
+  function toggleRepoSortMenu() {
+    addMenu = false;
+    repoSortMenu = !repoSortMenu;
+  }
+  function chooseRepositorySort(next: TaskRepositorySort) {
+    interfaceStore.setTaskRepositorySort(next);
+    announce = `Repositories sorted by ${TASK_REPOSITORY_SORT_LABELS[next]}`;
+    closeRepoSortMenu({ restoreFocus: true });
+  }
+  const repoSortMenuDismissal = $derived({
+    anchor: { kind: "element" as const, element: repoSortTriggerEl, gap: 6 },
+    estimate: { width: 184, height: 156 },
+    revision: repositorySort,
+    inset: 8,
+    dismiss: {
+      inside: "[data-repo-sort-trigger], [data-repo-sort-popup]",
+      scroll: true,
+      resize: true,
+      escape: "bubble" as const,
+    },
+    onDismiss: (reason: string) => closeRepoSortMenu({ restoreFocus: reason === "escape" }),
+  });
+  $effect(() => {
+    if (!repoSortMenu || !repoSortMenuEl) return;
+    const id = window.setTimeout(() => {
+      (repoSortMenuEl?.querySelector<HTMLElement>('[role="menuitemradio"][aria-checked="true"]')
+        ?? repoSortMenuEl?.querySelector<HTMLElement>('[role="menuitemradio"]'))?.focus();
+    }, 0);
+    return () => clearTimeout(id);
+  });
+  function onRepoSortMenuKey(event: KeyboardEvent) {
+    event.stopPropagation();
+    if (event.key === "Tab" || event.key === "Escape") {
+      event.preventDefault();
+      closeRepoSortMenu({ restoreFocus: true });
+      return;
+    }
+    const items = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>("button:not([disabled])")];
+    if (items.length === 0) return;
+    const index = Math.max(0, items.indexOf(event.target as HTMLElement));
+    if (event.key === "ArrowDown") { event.preventDefault(); items[(index + 1) % items.length]?.focus(); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); items[(index - 1 + items.length) % items.length]?.focus(); }
+    else if (event.key === "Home") { event.preventDefault(); items[0]?.focus(); }
+    else if (event.key === "End") { event.preventDefault(); items[items.length - 1]?.focus(); }
+  }
   // ---- Navigator search -------------------------------------------------
   // Narrows the workspace and repository rows by name (and a repository's
   // identity, its path or remote). The selected scope stays listed, so the
@@ -1239,6 +1297,7 @@
   }
   function toggleAddMenu() {
     if (adding) return;
+    repoSortMenu = false;
     // With nothing to list, the menu would be one "Choose folder…" row; go
     // straight there. A workspace with registered repositories to join has
     // rows even when no tab is open, so it must not take that shortcut.
@@ -2692,7 +2751,61 @@
     <!-- In a workspace scope this control has a second effect: whatever it
          adds also joins the workspace. It says so rather than leaving the
          membership write to be discovered. -->
-    <div class="nav-heading gp-label" data-add-repo>Repositories<button bind:this={addRepoTriggerEl} type="button" class="gp-icon-btn" data-size="sm" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button></div>
+    <div class="nav-heading gp-label">
+      Repositories
+      <span class="heading-actions">
+        <button
+          bind:this={repoSortTriggerEl}
+          type="button"
+          class="gp-icon-btn"
+          class:sort-active={repositorySort !== DEFAULT_TASK_REPOSITORY_SORT}
+          data-size="sm"
+          data-repo-sort-trigger
+          data-testid="task-repo-sort-trigger"
+          aria-haspopup="menu"
+          aria-expanded={repoSortMenu}
+          aria-controls="task-repo-sort-menu"
+          title={`Sort repositories — ${TASK_REPOSITORY_SORT_LABELS[repositorySort]}`}
+          aria-label={`Sort repositories (${TASK_REPOSITORY_SORT_LABELS[repositorySort]})`}
+          onclick={toggleRepoSortMenu}
+        ><ArrowUpDown size={12} /></button>
+        <span class="inline-flex shrink-0" data-add-repo>
+          <button bind:this={addRepoTriggerEl} type="button" class="gp-icon-btn" data-size="sm" aria-haspopup="menu" aria-expanded={addMenu} aria-controls="task-add-repo-menu" aria-busy={adding} title={addRepoLabel} aria-label={addRepoLabel} disabled={adding} onclick={toggleAddMenu}><Plus size={12} /></button>
+        </span>
+      </span>
+    </div>
+    {#if repoSortMenu}
+      <div
+        bind:this={repoSortMenuEl}
+        use:portal={"body"}
+        use:popover={repoSortMenuDismissal} out:popoverExit
+        id="task-repo-sort-menu"
+        data-repo-sort-popup
+        data-testid="task-repo-sort-menu"
+        class="repo-sort-menu gp-menu gp-pop fixed"
+        role="menu"
+        aria-label="Sort repositories"
+        tabindex="-1"
+        style="z-index: {LAYERS.MENU}"
+        onkeydown={onRepoSortMenuKey}
+      >
+        <div class="add-menu-label">Sort repositories</div>
+        {#each TASK_REPOSITORY_SORTS as option (option)}
+          {@const checked = repositorySort === option}
+          <button
+            type="button"
+            class="gp-menu-item"
+            role="menuitemradio"
+            aria-checked={checked}
+            data-testid={`task-repo-sort-${option}`}
+            onclick={() => chooseRepositorySort(option)}
+          >
+            <span class="sort-mark" aria-hidden="true">{#if checked}<Check size={12} />{/if}</span>
+            <span>{TASK_REPOSITORY_SORT_LABELS[option]}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
     {#if addMenu}
       <div
         bind:this={addMenuEl}
@@ -2728,7 +2841,7 @@
         <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
       </div>
     {/if}
-    {#each repositories as repo (repo.id)}
+    {#each orderedRepositories as repo (repo.id)}
       {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
     {/each}
     <!-- Hidden repositories keep their rows: their own boards still open
@@ -2742,7 +2855,7 @@
       </div>
       {#if expanded}
         <div id="task-hidden-repository-rows">
-          {#each repositories as repo (repo.id)}
+          {#each orderedRepositories as repo (repo.id)}
             {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
           {/each}
           {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
@@ -2750,7 +2863,7 @@
       {/if}
     {/if}
     {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
-    {#if repositoryCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
+    {#if repositoryCursor}<button type="button" class="gp-btn nav-more" data-variant="ghost" data-size="sm" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search and sort cover loaded rows" : " — sort covers loaded rows"}</button>{/if}
   </nav>
 {/snippet}
 <svelte:window onkeydown={onBoardKeydown} onpointermove={onCardPointerMove} onpointerup={onCardPointerUp} onpointercancel={onCardPointerCancel} onlostpointercapture={onCardPointerCancel} onblur={cancelDrag} />
@@ -3398,6 +3511,9 @@
      panel off the window the way the old 260px-in-188px absolute menu did.
      `gp-menu`'s overflow:hidden is overridden so the list can scroll. */
   .add-menu{width:min(20rem,calc(100vw - 16px));max-width:calc(100vw - 16px);max-height:min(20rem,calc(100vh - 16px));overflow:hidden auto;box-sizing:border-box}
+  .repo-sort-menu{min-width:11rem;max-width:calc(100vw - 16px)}
+  .sort-mark{width:12px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;color:rgb(var(--c-accent))}
+  .navigator .gp-icon-btn.sort-active{color:rgb(var(--c-accent))}
   .add-menu-label{padding:4px 8px;font-size:var(--text-micro);color:rgb(var(--c-text-muted))}
   .add-menu button{width:100%;height:auto;min-width:0;padding:6px 8px;white-space:normal;overflow:visible;text-align:left}
   .add-item{display:flex;flex-direction:column;align-items:stretch;gap:1px;min-width:0}

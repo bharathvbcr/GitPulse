@@ -8,8 +8,10 @@
 
 import { currentSessionLimit, MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 import { isImeComposition } from "../keyboard/imeGuard";
-import { clean } from "./sessionActivity";
+import { clean, stripTitleSpinner } from "./sessionActivity";
 import type { PermissionMode } from "./agentDefaults";
+
+export { stripTitleSpinner };
 
 /** What a tab runs. `shell` is the user's own login shell; the rest are agent CLIs. */
 export type LauncherKind = "shell" | "claude" | "manvi" | "codex" | "grok" | "agy";
@@ -58,6 +60,22 @@ export function offeredSessionKind(kind: unknown, browserSessions: boolean): Ses
   return sessionTypesFor(browserSessions).find((type) => type.kind === kind)?.kind ?? "shell";
 }
 
+/**
+ * Every tab kind selectable in the terminal dock's Session Typer (`New session type`),
+ * including standalone File Explorer tabs alongside process launchers and Browser.
+ * Kept distinct from {@link SESSION_TYPES} so process/global settings contracts stay untouched.
+ */
+export function dockTabTypesFor(
+  browserSessions: boolean,
+): readonly { kind: TabKind; label: string }[] {
+  return [...sessionTypesFor(browserSessions), { kind: "file", label: "File Explorer" }];
+}
+
+/** Resolves a requested dock tab kind supported on this host, falling back to `shell`. */
+export function offeredDockTabKind(kind: unknown, browserSessions: boolean): TabKind {
+  return dockTabTypesFor(browserSessions).find((type) => type.kind === kind)?.kind ?? "shell";
+}
+
 export interface TerminalTab {
   id: string;
   launcher: TabKind;
@@ -68,8 +86,14 @@ export interface TerminalTab {
    */
   title: string | null;
   name?: string;
+  /** Initial label seeded by a task, worktree preset, resume, or child spawn (never a manual user rename). */
+  launchName?: string;
+  /** True only when `name` was explicitly set by the user via `renameTab`. */
+  userNamed?: boolean;
   /** Supplied as a literal agent CLI argument when this tab starts. */
   initialPrompt?: string;
+  /** One-shot shell command written once when a fresh shell PTY starts (never persisted). */
+  initialCommand?: string;
   /**
    * Repository-relative directory this tab's process starts in, copied from
    * the session it was opened beside. Absent means the repository root.
@@ -112,6 +136,8 @@ export interface TerminalTab {
   revealSeq?: number;
   /** Read-only virtual command-output snippet rendered in `TerminalFilePane.svelte` without dirtying Git. */
   snippet?: { title: string; content: string };
+  /** Protects this split pane from being evicted when clicking a background tab in the strip. */
+  pinned?: boolean;
   /** Pre-arms quiescent peer auto-wake on unattended kickoff sessions. */
   autoWake?: boolean;
   /** What the session was launched for; sent with every spawn of this tab so a restart keeps its model. */
@@ -221,21 +247,214 @@ export function launcherLabel(kind: TabKind): string {
   return SESSION_TYPES.find((l) => l.kind === kind)?.label ?? kind;
 }
 
+export type TabTitleSource = "custom" | "agent" | "launch" | "file" | "url" | "launcher";
+
+export interface BrowserPageState {
+  loading?: boolean;
+  error?: string | null;
+}
+
+export interface TabDisplayTitle {
+  primary: string;
+  secondary: string | null;
+  fullTitle: string;
+  source: TabTitleSource;
+}
+
+/** Extracts a concise `host` or `host:port` label from a browser tab URL before `<title>` loads. */
+export function browserHostLabel(url: string | null | undefined): string {
+  const raw = url?.trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw).host || "";
+  } catch {
+    try {
+      if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && /^[\w.[\]:-]+(?:\/|$)/.test(raw)) {
+        return new URL(`http://${raw}`).host || "";
+      }
+    } catch {
+      /* ignore malformed address */
+    }
+    return "";
+  }
+}
+
+function fileFallbackFor(tab: TerminalTab): string {
+  if (tab.launcher !== "file") return "";
+  return tab.filePath ? (tab.filePath.split(/[\\/]/).pop() ?? "") : (tab.snippet?.title ?? "");
+}
+
+function clipCodepoints(value: string, maxChars: number): string {
+  const glyphs = Array.from(value);
+  if (glyphs.length <= maxChars) return value;
+  return `${glyphs.slice(0, maxChars - 1).join("")}…`;
+}
+
+function distinctClean(candidate: string | null | undefined, primaryLower: string, maxChars: number): string | null {
+  if (!candidate) return null;
+  const cleaned = cleanTabName(candidate, maxChars);
+  if (!cleaned || cleaned.toLowerCase() === primaryLower) return null;
+  return cleaned;
+}
+
+const GENERIC_LAUNCHER_TITLES: Readonly<Record<TabKind, ReadonlySet<string>>> = {
+  shell: new Set(["shell"]),
+  claude: new Set(["claude", "claude code", "claude-code", "anthropic claude"]),
+  manvi: new Set(["manvi", "manvi cli"]),
+  codex: new Set(["codex", "codex cli", "openai codex"]),
+  grok: new Set(["grok", "grok cli", "xai grok"]),
+  agy: new Set(["agy", "antigravity", "antigravity cli", "google antigravity"]),
+  browser: new Set(["browser"]),
+  file: new Set(["files", "file explorer"]),
+};
+
 /**
- * The text on a tab: what the program calls itself, else what it was started
- * as. A shell-reported title is trimmed and clipped — a program may emit an
- * arbitrarily long one, and a tab strip is not the place to discover that.
+ * True when an OSC or launch title only repeats the launcher's generic brand
+ * name (such as startup `"✳ Claude Code"`, `"Claude Code"`, or `"OpenAI Codex"`),
+ * carrying no task or topic information.
+ */
+export function isGenericLauncherTitle(raw: string | null | undefined, launcher: TabKind): boolean {
+  if (!raw) return true;
+  const normalized = stripTitleSpinner(cleanTabName(raw, 256))
+    .replace(/^[✳✦★•·\-–—:\s]+/u, "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return true;
+  if (normalized === launcherLabel(launcher).toLowerCase()) return true;
+  return GENERIC_LAUNCHER_TITLES[launcher]?.has(normalized) ?? false;
+}
+
+function resolveTabPrimaryTitle(tab: TerminalTab): { raw: string; source: TabTitleSource } {
+  const customName = tab.userNamed ? cleanTabName(tab.name ?? "", 120) : "";
+  if (customName) return { raw: customName, source: "custom" };
+  const oscTitle = tab.title ? stripTitleSpinner(cleanTabName(tab.title, 256)) : "";
+  if (oscTitle && !isGenericLauncherTitle(oscTitle, tab.launcher)) {
+    return { raw: oscTitle, source: "agent" };
+  }
+  const seededName = cleanTabName(tab.launchName ?? tab.name ?? "", 120);
+  if (seededName && !isGenericLauncherTitle(seededName, tab.launcher)) {
+    return { raw: seededName, source: "launch" };
+  }
+  const fileFallback = cleanTabName(fileFallbackFor(tab), 120);
+  if (fileFallback) return { raw: fileFallback, source: "file" };
+  if (tab.launcher === "browser" && tab.url) {
+    const host = cleanTabName(browserHostLabel(tab.url), 120);
+    if (host) return { raw: host, source: "url" };
+  }
+  return { raw: launcherLabel(tab.launcher), source: "launcher" };
+}
+
+/**
+ * The text on a tab: custom rename when user-pinned, else live OSC title, else
+ * launch-seeded task/worktree name, clipped so a long title cannot stretch the strip.
  */
 export function tabLabel(tab: TerminalTab): string {
-  const fileFallback =
-    tab.launcher === "file"
-      ? tab.filePath
-        ? (tab.filePath.split(/[\\/]/).pop() ?? "")
-        : (tab.snippet?.title ?? "")
-      : "";
-  const reported = tab.name?.trim() || tab.title?.trim() || fileFallback;
-  if (!reported) return launcherLabel(tab.launcher);
-  return reported.length > 28 ? `${reported.slice(0, 27)}…` : reported;
+  const { raw } = resolveTabPrimaryTitle(tab);
+  if (!raw) return launcherLabel(tab.launcher);
+  return clipCodepoints(raw, 28);
+}
+
+/**
+ * Full header / pane title and secondary context for a session tab.
+ * Separates user renames, live OSC 0/2 agent/program titles, launch-seeded names,
+ * browser URL/loading/error state, file `:revealLine` context, and OSC 7501 status detail.
+ */
+export function tabDisplayTitle(
+  tab: TerminalTab,
+  agentStatus?: { state?: string; detail?: string | null } | null,
+  browserState?: BrowserPageState | null,
+): TabDisplayTitle {
+  const { raw, source } = resolveTabPrimaryTitle(tab);
+  const fileLine =
+    tab.launcher === "file" && tab.filePath && typeof tab.revealLine === "number" && tab.revealLine > 0
+      ? Math.floor(tab.revealLine)
+      : null;
+  const fileCol =
+    fileLine !== null && typeof tab.revealColumn === "number" && tab.revealColumn > 0
+      ? Math.floor(tab.revealColumn)
+      : null;
+
+  const baseFullTitle = cleanTabName(raw, 256) || launcherLabel(tab.launcher);
+  const fullTitle =
+    source === "file" && tab.filePath && fileLine !== null
+      ? `${cleanTabName(tab.filePath, 240)}:${fileLine}${fileCol !== null ? `:${fileCol}` : ""}`
+      : baseFullTitle;
+  const primary =
+    source === "file" && fileLine !== null
+      ? `${clipCodepoints(baseFullTitle, 110)}:${fileLine}`
+      : clipCodepoints(baseFullTitle, 120);
+  const primaryLower = primary.toLowerCase();
+  const oscDetail = cleanTabName(agentStatus?.detail ?? "", 96);
+  const rawLaunchLabel = cleanTabName(tab.launchName ?? (!tab.userNamed ? (tab.name ?? "") : ""), 96);
+  const launchLabel = isGenericLauncherTitle(rawLaunchLabel, tab.launcher) ? "" : rawLaunchLabel;
+  const rawLiveOsc = tab.title ? stripTitleSpinner(cleanTabName(tab.title, 96)) : "";
+  const liveOsc = isGenericLauncherTitle(rawLiveOsc, tab.launcher) ? "" : rawLiveOsc;
+  const browserSecondary = (): string | null => {
+    if (tab.launcher !== "browser") return null;
+    if (browserState?.error) {
+      return distinctClean(browserState.error, primaryLower, 96) ?? "Page load error";
+    }
+    if (browserState?.loading) {
+      return "Loading…";
+    }
+    return (
+      distinctClean(browserHostLabel(tab.url), primaryLower, 96) ??
+      distinctClean(tab.url, primaryLower, 96)
+    );
+  };
+
+  let secondary: string | null = null;
+  if (source === "custom") {
+    const customFileLoc =
+      tab.launcher === "file" && tab.filePath
+        ? `${tab.filePath}${fileLine !== null ? `:${fileLine}` : ""}`
+        : null;
+    secondary =
+      distinctClean(liveOsc, primaryLower, 96) ??
+      distinctClean(launchLabel, primaryLower, 96) ??
+      distinctClean(customFileLoc, primaryLower, 96) ??
+      browserSecondary() ??
+      distinctClean(oscDetail, primaryLower, 96);
+  } else if (source === "agent") {
+    secondary =
+      distinctClean(launchLabel, primaryLower, 96) ??
+      distinctClean(oscDetail, primaryLower, 96) ??
+      browserSecondary();
+  } else if (source === "file") {
+    if (tab.filePath) {
+      const lastSlash = tab.filePath.lastIndexOf("/");
+      const dir = lastSlash > 0 ? tab.filePath.slice(0, lastSlash) : null;
+      const dirWithLine =
+        dir && fileLine !== null
+          ? `${dir}:${fileLine}`
+          : dir ?? (fileLine !== null ? `L${fileLine}` : null);
+      secondary = distinctClean(dirWithLine, primaryLower, 96) ?? distinctClean(oscDetail, primaryLower, 96);
+    } else if (tab.snippet) {
+      secondary = distinctClean("Captured output", primaryLower, 96) ?? distinctClean(oscDetail, primaryLower, 96);
+    }
+  } else {
+    secondary = browserSecondary() ?? distinctClean(oscDetail, primaryLower, 96);
+  }
+  return { primary, secondary, fullTitle, source };
+}
+
+/**
+ * Best descriptive title for `TerminalSessionRecord.title` (status pill and
+ * cross-repository Sessions list), returning `undefined` when only generic
+ * launcher labeling is present.
+ */
+export function effectiveSessionTitle(
+  tab: TerminalTab,
+  agentStatus?: { state?: string; detail?: string | null } | null,
+): string | undefined {
+  const customName = tab.userNamed ? cleanTabName(tab.name ?? "", 120) : "";
+  if (customName) return customName;
+  const oscTitle = tab.title ? stripTitleSpinner(cleanTabName(tab.title, 256)) : "";
+  if (oscTitle && !isGenericLauncherTitle(oscTitle, tab.launcher)) return oscTitle;
+  const launchLabel = cleanTabName(tab.launchName ?? tab.name ?? "", 120);
+  if (launchLabel && !isGenericLauncherTitle(launchLabel, tab.launcher)) return launchLabel;
+  const detail = cleanTabName(agentStatus?.detail ?? "", 120);
+  return detail || undefined;
 }
 
 let sequence = 0;
@@ -325,21 +544,41 @@ export function openTab(state: TabState, launcher: TabKind, launch?: string | Ta
   const tab = createTab(launcher, typeof launch === "string" ? launch : undefined);
   if (task?.attach) {
     if (task.resume || !task.attach.sessionId) return state;
+    const launchLabel = cleanTabName(task.title, 120) || undefined;
     tab.attachSessionId = task.attach.sessionId;
-    tab.name = task.title;
+    if (launchLabel) {
+      tab.name = launchLabel;
+      tab.launchName = launchLabel;
+    }
   } else if (task?.resume) {
     // A plain agent tab, not the attempt's: the attempt ended and its
     // record is final, so this session is the reader's own continuation.
     if (task.resume.fork) {
       if (launcher !== "claude" || !isSessionId(task.resume.sessionId)) return state;
+      const launchLabel = cleanTabName(`${task.title} (forked)`, 120) || undefined;
       tab.resume = { ...task.resume, ...(task.runId ? { runId: task.runId } : {}) };
-      tab.name = `${task.title} (forked)`;
+      if (launchLabel) {
+        tab.name = launchLabel;
+        tab.launchName = launchLabel;
+      }
     } else {
       if ((launcher !== "claude" && launcher !== "agy") || !isResumableSessionRef(task.resume.sessionId, launcher)) return state;
+      const suffix = task.resume.ledgerRowId ? "(reopened)" : "(resumed)";
+      const launchLabel = cleanTabName(`${task.title} ${suffix}`, 120) || undefined;
       tab.resume = { ...task.resume, ...(task.runId ? { runId: task.runId } : {}) };
-      tab.name = task.resume.ledgerRowId ? `${task.title} (reopened)` : `${task.title} (resumed)`;
+      if (launchLabel) {
+        tab.name = launchLabel;
+        tab.launchName = launchLabel;
+      }
     }
-  } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
+  } else if (task) {
+    tab.taskRunId = task.runId;
+    const launchLabel = cleanTabName(task.title, 120) || undefined;
+    if (launchLabel) {
+      tab.name = launchLabel;
+      tab.launchName = launchLabel;
+    }
+  }
   // A taken-over session is already running wherever it runs.
   const startDir = task && !task.attach ? relativeStartDir(task.startDir) : null;
   if (startDir) tab.startDir = startDir;
@@ -393,8 +632,11 @@ export function openAttachedChildTab(
   tab.attachSessionId = sessionId;
   if (parentId) tab.parentSessionId = parentId;
   if (options.title) {
-    const cleaned = cleanTabName(options.title);
-    if (cleaned) tab.name = cleaned;
+    const cleaned = cleanTabName(options.title, 120);
+    if (cleaned) {
+      tab.name = cleaned;
+      tab.launchName = cleaned;
+    }
   }
   const relDir = relativeStartDir(options.startDir);
   if (relDir) tab.startDir = relDir;
@@ -427,20 +669,96 @@ const ANSI_CSI_OR_OSC =
   // eslint-disable-next-line no-control-regex
   /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
 
+export type AgentLauncherKind = Exclude<LauncherKind, "shell">;
+
+export function isHandoffCapableLauncher(kind: TabKind): kind is AgentLauncherKind {
+  return (
+    kind === "claude" ||
+    kind === "manvi" ||
+    kind === "codex" ||
+    kind === "grok" ||
+    kind === "agy"
+  );
+}
+
+export interface PairHandoffTarget {
+  readonly id: string;
+  readonly launcher: AgentLauncherKind;
+  readonly slot: number;
+  readonly fromSlot: number;
+  readonly label: string;
+  readonly buttonLabel: string;
+}
+
+/**
+ * Resolves live prompt-capable agent peers visible in the current split workspace
+ * relative to `activeId`, supporting any agent CLI combination (including same-agent
+ * splits like two Claude panes) with `#slot` disambiguation.
+ */
+export function resolvePairHandoffTargets(
+  tabs: readonly TerminalTab[],
+  visibleIds: readonly string[],
+  activeId: string | null,
+  statuses?: Readonly<Record<string, string | undefined>>,
+): PairHandoffTarget[] {
+  if (!activeId || visibleIds.length < 2) return [];
+  const fromIdx = visibleIds.indexOf(activeId);
+  if (fromIdx === -1) return [];
+  const activeTab = tabs.find((tab) => tab.id === activeId);
+  if (!activeTab || !isHandoffCapableLauncher(activeTab.launcher)) return [];
+  if (statuses?.[activeTab.id] === "exited") return [];
+
+  const rawTargets: Array<{ tab: TerminalTab; launcher: AgentLauncherKind; slot: number }> = [];
+  const launcherCounts = new Map<AgentLauncherKind, number>();
+  launcherCounts.set(activeTab.launcher, 1);
+
+  for (let i = 0; i < visibleIds.length; i += 1) {
+    const id = visibleIds[i];
+    if (id === activeId) continue;
+    const candidate = tabs.find((tab) => tab.id === id);
+    if (!candidate || !isHandoffCapableLauncher(candidate.launcher)) continue;
+    if (statuses?.[candidate.id] === "exited") continue;
+    rawTargets.push({ tab: candidate, launcher: candidate.launcher, slot: i + 1 });
+    launcherCounts.set(candidate.launcher, (launcherCounts.get(candidate.launcher) ?? 0) + 1);
+  }
+
+  return rawTargets.map(({ tab, launcher, slot }) => {
+    const base = launcherLabel(launcher);
+    const needsSlot =
+      (launcherCounts.get(launcher) ?? 0) > 1 || rawTargets.length > 1;
+    const targetName = needsSlot ? `${base} #${slot}` : base;
+    return {
+      id: tab.id,
+      launcher,
+      slot,
+      fromSlot: fromIdx + 1,
+      label: targetName,
+      buttonLabel: `Handoff -> ${targetName}`,
+    };
+  });
+}
+
 /**
  * Builds a bounded, ANSI-stripped handoff prompt for 1-click context transfer
- * between paired Claude Code and Antigravity split panes.
+ * between visible agent split panes.
  */
 export function buildPairHandoffPrompt(options: {
   fromLauncher: TabKind;
+  fromSlot?: number | null;
+  toLauncher?: TabKind | null;
+  toSlot?: number | null;
   checkoutBranch?: string | null;
   openFilePath?: string | null;
   openFileLine?: number | null;
   terminalTail?: string | null;
 }): string {
-  const sender = launcherLabel(options.fromLauncher);
+  const senderBase = launcherLabel(options.fromLauncher);
+  const senderSlot = typeof options.fromSlot === "number" && options.fromSlot > 0 ? ` #${options.fromSlot}` : "";
+  const receiverPart = options.toLauncher
+    ? ` -> ${launcherLabel(options.toLauncher)}${typeof options.toSlot === "number" && options.toSlot > 0 ? ` #${options.toSlot}` : ""}`
+    : "";
   const branchTag = options.checkoutBranch?.trim() ? ` (${options.checkoutBranch.trim()})` : "";
-  const parts: string[] = [`[Handoff from ${sender}${branchTag}]`];
+  const parts: string[] = [`[Handoff from ${senderBase}${senderSlot}${receiverPart}${branchTag}]`];
   const filePath = options.openFilePath?.trim();
   if (filePath) {
     const lineRef =
@@ -506,8 +824,11 @@ export function openCheckoutTab(
   const tab = createTab(launcher, options.initialPrompt);
   tab.checkout = checkout;
   if (options.name) {
-    const cleaned = cleanTabName(options.name);
-    if (cleaned) tab.name = cleaned;
+    const cleaned = cleanTabName(options.name, 120);
+    if (cleaned) {
+      tab.name = cleaned;
+      tab.launchName = cleaned;
+    }
   }
   const relDir = relativeStartDir(options.startDir);
   if (relDir) tab.startDir = relDir;
@@ -548,6 +869,13 @@ export function setTabStartDir(state: TabState, id: string, startDir: string | n
   return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, startDir } : tab)) };
 }
 
+/** Seeds a one-shot shell command consumed once when a fresh shell PTY starts. */
+export function setTabInitialCommand(state: TabState, id: string, initialCommand: string | null): TabState {
+  const trimmed = initialCommand?.trim() ?? "";
+  if (!trimmed || !state.tabs.some((tab) => tab.id === id)) return state;
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, initialCommand: trimmed } : tab)) };
+}
+
 /** Pre-arms quiescent peer auto-wake on an unattended kickoff tab. */
 export function setTabAutoWake(state: TabState, id: string, autoWake: boolean): TabState {
   if (!state.tabs.some((tab) => tab.id === id)) return state;
@@ -563,12 +891,21 @@ export function setTabPurpose(state: TabState, id: string, purpose: "commit"): T
 /** Sets typed resume metadata (and optional display name) on a newly opened tab. */
 export function setTabResume(state: TabState, id: string, resume: ResumeLaunch, name?: string): TabState {
   if (!state.tabs.some((tab) => tab.id === id)) return state;
-  const trimmedName = name?.trim();
+  const cleanedName = name ? cleanTabName(name, 120) : "";
   return {
     ...state,
     tabs: state.tabs.map((tab) =>
       tab.id === id
-        ? { ...tab, resume: { ...resume }, ...(trimmedName ? { name: trimmedName } : {}) }
+        ? {
+            ...tab,
+            resume: { ...resume },
+            ...(cleanedName
+              ? {
+                  launchName: cleanedName,
+                  ...(tab.userNamed ? {} : { name: cleanedName }),
+                }
+              : {}),
+          }
         : tab,
     ),
   };
@@ -636,7 +973,7 @@ export function normalizePaneFilePath(raw: string | null | undefined): string | 
   return trimmed;
 }
 
-/** Finds an existing `file` tab in the same checkout (matching `filePath` when supplied, or the first `file` tab in that checkout). */
+/** Finds an existing non-snippet `file` tab in the same checkout (matching `filePath` when supplied, or the first disk `file` tab in that checkout). */
 export function fileTabFor(
   state: TabState,
   filePath?: string,
@@ -647,11 +984,11 @@ export function fileTabFor(
   const sameCheckout = (tab: TerminalTab) => (tab.checkout || undefined) === normalizedCheckout;
   if (cleanPath) {
     const exact = state.tabs.find(
-      (tab) => tab.launcher === "file" && sameCheckout(tab) && tab.filePath === cleanPath,
+      (tab) => tab.launcher === "file" && !tab.snippet && sameCheckout(tab) && tab.filePath === cleanPath,
     );
     if (exact) return exact;
   }
-  return state.tabs.find((tab) => tab.launcher === "file" && sameCheckout(tab));
+  return state.tabs.find((tab) => tab.launcher === "file" && !tab.snippet && sameCheckout(tab));
 }
 
 /** Updates a `file` tab's selected path and optional 1-based reveal line/column. */
@@ -681,6 +1018,7 @@ export function setTabFile(
     ? (tab.revealColumn ?? null)
     : (column && column > 0 ? Math.floor(column) : null);
   const nextSeq = options?.preserveReveal ? (tab.revealSeq ?? 1) : (tab.revealSeq ?? 0) + 1;
+  const switchedFile = cleanPath !== undefined && cleanPath !== tab.filePath;
   return {
     ...state,
     tabs: state.tabs.map((candidate) =>
@@ -688,6 +1026,9 @@ export function setTabFile(
         ? {
             ...candidate,
             ...(cleanPath !== undefined ? { filePath: cleanPath, snippet: undefined } : {}),
+            ...(switchedFile && candidate.userNamed
+              ? { userNamed: false, name: candidate.launchName }
+              : {}),
             fallbackPath: effectiveFallback,
             ...(nextCheckout ? { checkout: nextCheckout } : { checkout: undefined }),
             revealLine: nextLine,
@@ -796,6 +1137,7 @@ export function openSnippetTab(
             ? {
                 ...tab,
                 filePath: undefined,
+                ...(tab.userNamed ? { userNamed: false, name: tab.launchName } : {}),
                 snippet: { title, content },
                 revealLine: 1,
                 revealColumn: null,
@@ -826,10 +1168,107 @@ export function openSnippetTab(
 }
 
 export function setTabTitle(state: TabState, id: string, title: string): TabState {
-  if (!state.tabs.some((tab) => tab.id === id)) return state;
+  const existing = state.tabs.find((tab) => tab.id === id);
+  if (!existing) return state;
+  const cleaned = stripTitleSpinner(cleanTabName(title, 256)) || null;
+  if (existing.title === cleaned) return state;
   return {
     ...state,
-    tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, title: cleanTabName(title, 256) } : tab)),
+    tabs: state.tabs.map((tab) => (tab.id === id ? { ...tab, title: cleaned } : tab)),
+  };
+}
+
+export function toggleTabPinned(state: TabState, id: string, pinned?: boolean): TabState {
+  const existing = state.tabs.find((tab) => tab.id === id);
+  if (!existing) return state;
+  const nextPinned = pinned ?? !existing.pinned;
+  if (Boolean(existing.pinned) === nextPinned) return state;
+  return {
+    ...state,
+    tabs: state.tabs.map((tab) =>
+      tab.id === id ? { ...tab, ...(nextPinned ? { pinned: true } : { pinned: undefined }) } : tab,
+    ),
+  };
+}
+
+/**
+ * Leading + trailing coalescer for high-frequency OSC 0/2 title updates (8–12 Hz
+ * CLI spinners). Delivers the first distinct normalized title immediately so
+ * real task transitions have zero latency, and coalesces rapid bursts within
+ * `intervalMs` into one trailing update.
+ */
+export function createTitleCoalescer(
+  onFlush: (title: string) => void,
+  intervalMs = 150,
+  timers: {
+    now?: () => number;
+    setTimeout?: typeof globalThis.setTimeout;
+    clearTimeout?: typeof globalThis.clearTimeout;
+  } = {},
+) {
+  const nowFn = timers.now ?? Date.now;
+  const setTimer = timers.setTimeout ?? globalThis.setTimeout;
+  const clearTimer = timers.clearTimeout ?? globalThis.clearTimeout;
+  let lastDelivered: string | null = null;
+  let lastDeliveredAt = -Infinity;
+  let pendingTitle: string | null = null;
+  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  let disposed = false;
+
+  const deliver = (normalized: string, timestamp: number) => {
+    lastDelivered = normalized;
+    lastDeliveredAt = timestamp;
+    onFlush(normalized);
+  };
+
+  return {
+    push(rawTitle: string): void {
+      if (disposed) return;
+      const normalized = stripTitleSpinner(cleanTabName(rawTitle, 256));
+      if (timer !== null) {
+        if (normalized === lastDelivered && pendingTitle === null) return;
+        pendingTitle = normalized;
+        return;
+      }
+      if (normalized === lastDelivered) return;
+      const now = nowFn();
+      const elapsed = now - lastDeliveredAt;
+      if (elapsed >= intervalMs) {
+        deliver(normalized, now);
+        return;
+      }
+      pendingTitle = normalized;
+      timer = setTimer(() => {
+        timer = null;
+        if (disposed || pendingTitle === null) return;
+        const next = pendingTitle;
+        pendingTitle = null;
+        if (next !== lastDelivered) {
+          deliver(next, nowFn());
+        }
+      }, Math.max(1, intervalMs - elapsed));
+    },
+    flush(): void {
+      if (timer !== null) {
+        clearTimer(timer);
+        timer = null;
+      }
+      if (!disposed && pendingTitle !== null) {
+        const next = pendingTitle;
+        pendingTitle = null;
+        if (next !== lastDelivered) {
+          deliver(next, nowFn());
+        }
+      }
+    },
+    dispose(): void {
+      disposed = true;
+      pendingTitle = null;
+      if (timer !== null) {
+        clearTimer(timer);
+        timer = null;
+      }
+    },
   };
 }
 
@@ -919,7 +1358,17 @@ export function cleanTabName(value: string, limit = 64): string {
 }
 
 export function renameTab(state: TabState, id: string, name: string): TabState {
-  return { ...state, tabs: state.tabs.map((tab) => tab.id === id ? { ...tab, name: cleanTabName(name) } : tab) };
+  const cleaned = cleanTabName(name);
+  return {
+    ...state,
+    tabs: state.tabs.map((tab) => {
+      if (tab.id !== id) return tab;
+      if (cleaned) {
+        return { ...tab, name: cleaned, userNamed: true };
+      }
+      return { ...tab, name: tab.launchName, userNamed: false };
+    }),
+  };
 }
 
 export function moveTab(state: TabState, id: string, step: -1 | 1): TabState {

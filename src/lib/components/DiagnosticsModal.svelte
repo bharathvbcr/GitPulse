@@ -1,6 +1,6 @@
 <script module lang="ts">
   import type { DaemonStatus, Degraded, PersistedLog as PersistedLogShape } from "../diagnostics/types";
-  import type { DiagnosticSeverity } from "../diagnostics/diagnostics";
+  import type { DiagnosticEntry, DiagnosticGroup, DiagnosticSeverity } from "../diagnostics/diagnostics";
 
   export type BackendDiagnosticStatus =
     | "idle"
@@ -54,6 +54,14 @@
   ): boolean {
     return open && generation === currentGeneration;
   }
+
+  /** Collects entries from groups whose keys are selected, in display order. */
+  export function selectedDiagnosticEntries(
+    groups: readonly DiagnosticGroup[],
+    selectedKeys: Readonly<Record<string, boolean>>,
+  ): DiagnosticEntry[] {
+    return groups.flatMap((group) => (selectedKeys[group.key] === true ? group.entries : []));
+  }
 </script>
 
 <script lang="ts">
@@ -68,7 +76,6 @@
     groupDiagnostics,
     redactDiagnosticText,
     staleBuildNote,
-    type DiagnosticEntry,
   } from "../diagnostics/diagnostics";
   import {
     backdropFade,
@@ -87,7 +94,8 @@
     withPersistedLogSection,
   } from "../diagnostics/report";
   import { unreadablePersistedLog, type PersistedLog } from "../diagnostics/types";
-  import { TriangleAlert, CircleAlert, ChevronDown, ClipboardCopy, Trash2, Activity, Check } from "@lucide/svelte";
+  import Checkbox from "./Checkbox.svelte";
+  import { TriangleAlert, CircleAlert, ChevronDown, ClipboardCopy, Copy, Trash2, Activity, Check } from "@lucide/svelte";
 
   let {
     isOpen = false,
@@ -103,12 +111,18 @@
     { value: "warning", label: "Warnings" },
   ];
 
+  type CopyTarget = "report" | "selected";
+
   let filter = $state<SeverityFilter>("all");
-  let copied = $state(false);
+  let copied = $state<CopyTarget | null>(null);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
-  let copyFailed = $state(false);
+  let copyFailed = $state<CopyTarget | null>(null);
   let copyFailedTimer: ReturnType<typeof setTimeout> | undefined;
-  let copying = $state(false);
+  let copying = $state<CopyTarget | null>(null);
+  let copiedGroupKey = $state<string | null>(null);
+  let groupCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+  let copyFailedGroupKey = $state<string | null>(null);
+  let groupCopyFailedTimer: ReturnType<typeof setTimeout> | undefined;
   let backendStatus = $state<BackendDiagnosticStatus>("loading");
   let backendLines = $state<string[]>([]);
   let persistedLog = $state<PersistedLog | null>(null);
@@ -123,6 +137,8 @@
     return () => {
       if (copiedTimer) clearTimeout(copiedTimer);
       if (copyFailedTimer) clearTimeout(copyFailedTimer);
+      if (groupCopiedTimer) clearTimeout(groupCopiedTimer);
+      if (groupCopyFailedTimer) clearTimeout(groupCopyFailedTimer);
     };
   });
 
@@ -135,6 +151,16 @@
   );
   /** Which groups have their occurrence list open, by group key. */
   let expanded = $state<Record<string, boolean>>({});
+  /** Which visible groups are checked for selective copying, by group key. */
+  let selected = $state<Record<string, boolean>>({});
+  let selectedGroups = $derived(visibleGroups.filter((group) => selected[group.key] === true));
+  let selectedEntries = $derived(selectedDiagnosticEntries(visibleGroups, selected));
+  let allVisibleSelected = $derived(
+    visibleGroups.length > 0 && selectedGroups.length === visibleGroups.length,
+  );
+  let someVisibleSelected = $derived(
+    selectedGroups.length > 0 && selectedGroups.length < visibleGroups.length,
+  );
   let hiddenNotice = $derived(hiddenByFilterNotice(filter, $diagnostics.length));
   let errorCount = $derived(
     ($diagnostics as readonly DiagnosticEntry[]).reduce(
@@ -244,6 +270,12 @@
       persistedLog = null;
       memoryReadError = null;
       backendLoad = null;
+      selected = {};
+      copied = null;
+      copyFailed = null;
+      copying = null;
+      copiedGroupKey = null;
+      copyFailedGroupKey = null;
       return;
     }
     void beginBackendLoad();
@@ -253,9 +285,84 @@
     };
   });
 
+  function toggleGroupSelection(key: string, next: boolean) {
+    if (next) {
+      selected = { ...selected, [key]: true };
+      return;
+    }
+    const { [key]: _, ...rest } = selected;
+    selected = rest;
+  }
+
+  function toggleSelectAllVisible(next: boolean) {
+    const nextSelected = { ...selected };
+    for (const group of visibleGroups) {
+      if (next) nextSelected[group.key] = true;
+      else delete nextSelected[group.key];
+    }
+    selected = nextSelected;
+  }
+
+  function clearSelection() {
+    selected = {};
+  }
+
+  function clearFrontend() {
+    diagnostics.clear();
+    selected = {};
+  }
+
+  function flashCopyOutcome(target: CopyTarget, ok: boolean) {
+    if (!ok) {
+      copyFailed = target;
+      if (copyFailedTimer) clearTimeout(copyFailedTimer);
+      copyFailedTimer = setTimeout(() => {
+        if (copyFailed === target) copyFailed = null;
+      }, 2000);
+      return;
+    }
+    copied = target;
+    if (copiedTimer) clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => {
+      if (copied === target) copied = null;
+    }, 1500);
+  }
+
+  async function copySelected() {
+    if (copying !== null || selectedEntries.length === 0) return;
+    const entriesToCopy = selectedEntries;
+    const generation = backendLoadGeneration;
+    copying = "selected";
+    const report = formatDiagnosticReport(entriesToCopy, new Date(), APP_VERSION);
+    const ok = await copyText(report);
+    copying = null;
+    if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;
+    flashCopyOutcome("selected", ok);
+  }
+
+  async function copyGroup(group: DiagnosticGroup) {
+    const generation = backendLoadGeneration;
+    const report = formatDiagnosticReport(group.entries, new Date(), APP_VERSION);
+    const ok = await copyText(report);
+    if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;
+    if (!ok) {
+      copyFailedGroupKey = group.key;
+      if (groupCopyFailedTimer) clearTimeout(groupCopyFailedTimer);
+      groupCopyFailedTimer = setTimeout(() => {
+        if (copyFailedGroupKey === group.key) copyFailedGroupKey = null;
+      }, 2000);
+      return;
+    }
+    copiedGroupKey = group.key;
+    if (groupCopiedTimer) clearTimeout(groupCopiedTimer);
+    groupCopiedTimer = setTimeout(() => {
+      if (copiedGroupKey === group.key) copiedGroupKey = null;
+    }, 1500);
+  }
+
   async function copyReport() {
-    if (copying) return;
-    copying = true;
+    if (copying !== null) return;
+    copying = "report";
     let generation = backendLoadGeneration;
     if (!backendLoad && (backendStatus === "idle" || backendStatus === "loading")) {
       const request = beginBackendLoad();
@@ -265,7 +372,7 @@
       await backendLoad;
     }
     if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) {
-      copying = false;
+      copying = null;
       return;
     }
 
@@ -283,17 +390,9 @@
       persistedLog ?? unreadablePersistedLog("backend diagnostics have not loaded"),
     );
     const ok = await copyText(report);
-    copying = false;
+    copying = null;
     if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;
-    if (!ok) {
-      copyFailed = true;
-      if (copyFailedTimer) clearTimeout(copyFailedTimer);
-      copyFailedTimer = setTimeout(() => (copyFailed = false), 2000);
-      return;
-    }
-    copied = true;
-    if (copiedTimer) clearTimeout(copiedTimer);
-    copiedTimer = setTimeout(() => (copied = false), 1500);
+    flashCopyOutcome("report", ok);
   }
 </script>
 
@@ -314,7 +413,7 @@
       use:trapFocus
       in:scale={cardScale()}
       out:scale={cardScaleOut()}
-      class="w-full max-w-xl max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
+      class="w-full max-w-4xl max-h-[calc(100vh-2rem)] min-h-0 gp-card shadow-float rounded-2xl overflow-hidden flex flex-col font-sans text-xs gp-gpu"
     >
       <div class="p-4 gp-section-edge flex items-center justify-between gap-3">
         <div class="flex items-center gap-2 text-sm font-semibold text-textPrimary shrink-0">
@@ -417,11 +516,33 @@
           {/if}
         </section>
 
-        <div class="px-1 pt-1 gp-label">
-          Frontend diagnostics
+        <div class="px-1 pt-1 flex items-center justify-between gap-2">
+          <div class="flex items-center gap-2">
+            {#if visibleGroups.length > 0}
+              <Checkbox
+                ariaLabel="Select all visible diagnostics"
+                checked={allVisibleSelected}
+                indeterminate={someVisibleSelected}
+                onchange={toggleSelectAllVisible}
+              />
+            {/if}
+            <span class="gp-label">Frontend diagnostics</span>
+          </div>
+          {#if selectedGroups.length > 0}
+            <div class="flex items-center gap-2">
+              <span class="text-micro text-textMuted">{selectedGroups.length} selected</span>
+              <button
+                type="button"
+                class="gp-btn"
+                data-size="sm"
+                onclick={clearSelection}
+              >Clear selection</button>
+            </div>
+          {/if}
         </div>
         {#each visibleGroups as group (group.key)}
           {@const open = expanded[group.key] === true}
+          {@const isSelected = selected[group.key] === true}
           {@const tone = group.severity === "error" ? "text-danger" : "text-warn"}
           <div
             class="rounded-xl border px-3 py-2 {group.severity === 'error'
@@ -459,24 +580,53 @@
                 >×{group.count}{group.varied ? " differing" : ""}</span>
               {/if}
             {/snippet}
-            {#if group.count > 1}
+            <div class="flex items-center gap-2 mb-1">
+              <Checkbox
+                ariaLabel="Select {group.severity} from {group.source}"
+                checked={isSelected}
+                onchange={(next) => toggleGroupSelection(group.key, next)}
+              />
+              {#if group.count > 1}
+                <button
+                  type="button"
+                  class="flex flex-1 min-w-0 items-center gap-2 text-left cursor-pointer"
+                  aria-expanded={open}
+                  aria-controls={`diagnostic-occurrences-${groupDomId(group.key)}`}
+                  title={open ? "Hide each occurrence" : "Show each occurrence"}
+                  onclick={() => (expanded = { ...expanded, [group.key]: !open })}
+                >
+                  {@render head()}
+                  <ChevronDown size={12} class="shrink-0 text-textMuted transition-transform {open ? 'rotate-180' : ''}" />
+                </button>
+              {:else}
+                <div class="flex flex-1 min-w-0 items-center gap-2">
+                  {@render head()}
+                </div>
+              {/if}
               <button
                 type="button"
-                class="flex w-full items-center gap-2 mb-1 text-left cursor-pointer"
-                aria-expanded={open}
-                aria-controls={`diagnostic-occurrences-${groupDomId(group.key)}`}
-                title={open ? "Hide each occurrence" : "Show each occurrence"}
-                onclick={() => (expanded = { ...expanded, [group.key]: !open })}
+                class="gp-icon-btn shrink-0"
+                data-size="sm"
+                aria-label={copiedGroupKey === group.key
+                  ? `Copied ${group.severity} from ${group.source}`
+                  : `Copy ${group.severity} from ${group.source}`}
+                title={copiedGroupKey === group.key
+                  ? "Copied"
+                  : copyFailedGroupKey === group.key
+                    ? "Copy failed"
+                    : "Copy only this diagnostic"}
+                onclick={() => void copyGroup(group)}
               >
-                {@render head()}
-                <ChevronDown size={12} class="shrink-0 text-textMuted transition-transform {open ? 'rotate-180' : ''}" />
+                {#if copiedGroupKey === group.key}
+                  <Check size={12} class="text-ok" />
+                {:else if copyFailedGroupKey === group.key}
+                  <TriangleAlert size={12} class="text-danger" />
+                {:else}
+                  <Copy size={12} />
+                {/if}
               </button>
-            {:else}
-              <div class="flex items-center gap-2 mb-1">
-                {@render head()}
-              </div>
-            {/if}
-            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0">{group.message}</pre>
+            </div>
+            <pre class="whitespace-pre-wrap wrap-break-word font-mono text-meta leading-relaxed text-textPrimary m-0 select-text">{group.message}</pre>
             {#if open}
               <ul
                 id={`diagnostic-occurrences-${groupDomId(group.key)}`}
@@ -513,32 +663,47 @@
         {/each}
       </div>
 
+      {#snippet copyButtonContent(target: CopyTarget, idleLabel: string)}
+        {#if copied === target}
+          <Check size={13} class="text-ok" />
+          <span>Copied</span>
+        {:else if copyFailed === target}
+          <TriangleAlert size={13} class="text-danger" />
+          <span class="text-danger">Copy failed</span>
+        {:else if copying === target}
+          <Activity size={13} class="animate-spin" />
+          <span>Preparing…</span>
+        {:else}
+          <ClipboardCopy size={13} />
+          <span>{idleLabel}</span>
+        {/if}
+      {/snippet}
+
       <div class="p-3 gp-section-edge bg-surfaceHover/30 shrink-0 space-y-2">
         <p class="text-micro leading-relaxed text-textMuted">
           Review local paths and command output before sharing. Copy only places the report on your
           clipboard; it does not upload or delete any logs.
         </p>
         <div class="flex justify-between gap-2">
-          <button type="button" class="gp-btn" onclick={copyReport} disabled={copying}>
-            {#if copied}
-              <Check size={13} class="text-ok" />
-              <span>Copied</span>
-            {:else if copyFailed}
-              <TriangleAlert size={13} class="text-danger" />
-              <span class="text-danger">Copy failed</span>
-            {:else if copying}
-              <Activity size={13} class="animate-spin" />
-              <span>Preparing…</span>
+          <div class="flex items-center gap-2">
+            {#if selectedGroups.length > 0}
+              <button type="button" class="gp-btn" data-variant="primary" onclick={copySelected} disabled={copying !== null}>
+                {@render copyButtonContent("selected", `Copy selected (${selectedGroups.length})`)}
+              </button>
+              <button type="button" class="gp-btn" onclick={copyReport} disabled={copying !== null}>
+                {@render copyButtonContent("report", "Copy full report")}
+              </button>
             {:else}
-              <ClipboardCopy size={13} />
-              <span>Copy report</span>
+              <button type="button" class="gp-btn" onclick={copyReport} disabled={copying !== null}>
+                {@render copyButtonContent("report", "Copy report")}
+              </button>
             {/if}
-          </button>
+          </div>
           <div class="flex gap-2">
             <button
               type="button"
               class="gp-btn"
-              onclick={() => diagnostics.clear()}
+              onclick={clearFrontend}
               disabled={$diagnostics.length === 0}
               title="Clear only the frontend diagnostics shown in this app; backend logs remain on disk"
             >

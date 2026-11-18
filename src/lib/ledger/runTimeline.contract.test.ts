@@ -27,7 +27,7 @@ function rustStates(): Map<string, string> {
   const body = SOURCE.match(/pub fn state_of\(event: &str\) -> Option<&'static str> \{(.*?)\n\}/s);
   if (!body) throw new Error("ledger/lifecycle.rs no longer declares `state_of`");
   const states = new Map<string, string>();
-  for (const arm of body[1].matchAll(/((?:"[a-z_]+"\s*\|?\s*)+)=>\s*"([a-z_]+)"/g)) {
+  for (const arm of body[1].matchAll(/("(?:[a-z_]+)"(?:\s*\|\s*"(?:[a-z_]+)")*)\s*=>\s*"([a-z_]+)"/g)) {
     for (const name of arm[1].matchAll(/"([a-z_]+)"/g)) states.set(name[1], arm[2]);
   }
   return states;

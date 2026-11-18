@@ -108,6 +108,39 @@ export interface SessionActivity {
   attention: SessionAttention | null;
 }
 
+/**
+ * Maps native notifier hook/bell attention onto the terminal tab/split status
+ * model when no explicit OSC 7501 status overrides it.
+ */
+export function activityToAgentStatus(
+  activity: SessionActivity | null | undefined,
+): { state: "blocked" | "error" | "done"; detail: string | null } | null {
+  const attention = activity?.attention;
+  if (!attention) return null;
+  const detail = attention.detail ?? (attention.label || null);
+  if (attention.kind === "needs-you") return { state: "blocked", detail };
+  if (attention.kind === "error") return { state: "error", detail };
+  if (attention.kind === "finished") return { state: "done", detail };
+  if (attention.kind === "signalled" && asksForReader("signalled")) {
+    return { state: "blocked", detail };
+  }
+  return null;
+}
+
+/**
+ * Concise cross-surface attention badge phrase ("Needs input" / "Failed") for
+ * native hook attention when no OSC 7501 label overrides it.
+ */
+export function activityAttentionLabel(
+  activity: SessionActivity | null | undefined,
+): string | null {
+  const mapped = activityToAgentStatus(activity);
+  if (!mapped) return null;
+  if (mapped.state === "blocked") return "Needs input";
+  if (mapped.state === "error") return "Failed";
+  return null;
+}
+
 /** Silence required on both input and output before quiescent auto-wake may fire. */
 export const PEER_QUIESCENCE_MS = 3_000;
 
@@ -175,6 +208,46 @@ export function clean(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
   const text = Array.from(value.replace(HIDDEN, "").replace(SEPARATORS, " ").trim()).slice(0, max).join("");
   return text || null;
+}
+
+const TRANSIENT_SPINNER_CHAR = /^[\u2800-\u28ff◐◓◑◒◴◷◶◵✢✶✻✽·]$/u;
+
+/**
+ * Strips transient 8–12 Hz CLI spinner frames (Braille dots, quarter-circle/clock
+ * spinners, and starburst/dot glyphs such as `✢`, `✶`, `✻`, `✽`, `·`) from the
+ * start or end of a terminal title when separated by whitespace (or when the title
+ * is a bare spinner glyph), while keeping static status icons such as `✳` and
+ * mid-title separators (`api · worker`) intact.
+ */
+export function stripTitleSpinner(value: string): string {
+  let slice = value.trim();
+  while (slice.length > 0) {
+    const glyphs = Array.from(slice);
+    const first = glyphs[0];
+    if (first && TRANSIENT_SPINNER_CHAR.test(first)) {
+      if (glyphs.length === 1) return "";
+      const rest = glyphs.slice(1).join("");
+      if (/^\s/u.test(rest)) {
+        slice = rest.trimStart();
+        continue;
+      }
+    }
+    break;
+  }
+  while (slice.length > 0) {
+    const glyphs = Array.from(slice);
+    const last = glyphs[glyphs.length - 1];
+    if (last && TRANSIENT_SPINNER_CHAR.test(last)) {
+      if (glyphs.length === 1) return "";
+      const head = glyphs.slice(0, -1).join("");
+      if (/\s$/u.test(head)) {
+        slice = head.trimEnd();
+        continue;
+      }
+    }
+    break;
+  }
+  return slice.trim();
 }
 
 /**
@@ -358,7 +431,12 @@ export function createSessionActivity(clock: () => number = Date.now) {
     /** The program renamed itself; a rename is also a sign of life. */
     title(session: string, value: string) {
       const now = clock();
-      const title = clean(value, MAX_TITLE);
+      const rawClean = clean(value, MAX_TITLE);
+      const title = rawClean ? (stripTitleSpinner(rawClean) || null) : null;
+      const existing = entries.get(session);
+      if (existing && existing.title === title && existing.lastOutputAt !== null && now - existing.lastOutputAt < ACTIVITY_PUBLISH_MS) {
+        return;
+      }
       if (update(session, (current) => ({ ...current, title, lastOutputAt: now }))) publishThrottled(session, now);
     },
     /**

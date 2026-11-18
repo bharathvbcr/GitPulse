@@ -45,8 +45,8 @@
 use super::governor::{Binding, GovernorVerdict, Tier};
 use super::procscan::SessionCount;
 use super::sensor::{
-    Compressor, CompressorDelta, CompressorSegments, Cores, HostSample, Level, Power, Reading,
-    Thermal, Why,
+    Compressor, CompressorDelta, CompressorSegments, Cores, CpuUsage, GpuSample, HostSample, Level,
+    MemorySample, Power, Reading, Thermal, Why,
 };
 use super::{age_ms, Clock, Platform, SensorReport, SensorState};
 use serde::{Deserialize, Serialize};
@@ -65,8 +65,11 @@ const MIN_READ_VERSION: u32 = 1;
 /// record shorter than this is refused; one this long is a version-1 record
 /// and reads with the extension's fields unsupported.
 pub const RECORD_LEN: usize = 664;
-/// Bytes in the record this build writes: version 1's, then the extension.
-pub const EXTENDED_LEN: usize = 712;
+/// Bytes through the version-2 `GPX3` block, kept fixed for installed readers.
+const EXT_V2_LEN: usize = 712;
+/// Bytes in the record this build writes: version 1's, the `GPX3` block, then
+/// the `GPXM` host-metrics trailer (`712..816`).
+pub const EXTENDED_LEN: usize = 816;
 /// Reads retried while a write is in progress before giving up as torn.
 const READ_ATTEMPTS: usize = 64;
 
@@ -160,6 +163,34 @@ const OFF_X_FILL_RATE: usize = 696;
 const OFF_X_FILL_SUSTAINED_RATE: usize = 700;
 const OFF_X_CHECKSUM: usize = 704;
 
+// The metrics extension (`GPXM`), appended after the 712-byte `GPX3` block
+// without changing any offset `gitpulse-hook` or `gitpulse-mcp` reads.
+const OFF_EXT_M: usize = EXT_V2_LEN;
+const EXT_M_MAGIC: [u8; 4] = *b"GPXM";
+const OFF_M_CPU_STATUS: usize = 716;
+const OFF_M_GPU_STATUS: usize = 717;
+const OFF_M_MEM_STATUS: usize = 718;
+const OFF_M_DISK_STATUS: usize = 719;
+const OFF_M_THERMAL_STATUS: usize = 720;
+const OFF_M_GPU_OPTS: usize = 721;
+const OFF_M_MEM_OPTS: usize = 722;
+const OFF_M_CPU_TOTAL: usize = 724;
+const OFF_M_CPU_USER: usize = 726;
+const OFF_M_CPU_SYS: usize = 728;
+const OFF_M_GPU_UTIL: usize = 730;
+const OFF_M_GPU_RENDERER: usize = 732;
+const OFF_M_GPU_TILER: usize = 734;
+const OFF_M_THERMAL_TEMP: usize = 736;
+const OFF_M_GPU_MEM_IN_USE: usize = 744;
+const OFF_M_GPU_MEM_ALLOC: usize = 752;
+const OFF_M_MEM_USED: usize = 760;
+const OFF_M_MEM_APP: usize = 768;
+const OFF_M_MEM_WIRED: usize = 776;
+const OFF_M_MEM_COMP: usize = 784;
+const OFF_M_MEM_CACHED: usize = 792;
+const OFF_M_TOTAL_DISK: usize = 800;
+const OFF_M_CHECKSUM: usize = 808;
+
 // One status byte per reading: 0 is a value, else a `Why` code.
 const S_PRESSURE: usize = 0;
 const S_SWAP_USED: usize = 1;
@@ -194,7 +225,11 @@ const _: () = assert!(S_MAX_TREE_WRATE < OFF_PRESSURE - OFF_STATUS);
 const _: () = assert!(OFF_SAMPLER_CPU + 8 == OFF_CHECKSUM);
 const _: () = assert!(OFF_X_SEG_LIMIT + 8 <= OFF_X_BINDING_EXACT);
 const _: () = assert!(OFF_X_FILL_SUSTAINED_RATE + 4 == OFF_X_CHECKSUM);
-const _: () = assert!(OFF_X_CHECKSUM + 8 == EXTENDED_LEN);
+const _: () = assert!(OFF_X_CHECKSUM + 8 == EXT_V2_LEN);
+const _: () = assert!(OFF_EXT_M == EXT_V2_LEN);
+const _: () = assert!(OFF_M_THERMAL_TEMP + 2 <= OFF_M_GPU_MEM_IN_USE);
+const _: () = assert!(OFF_M_TOTAL_DISK + 8 == OFF_M_CHECKSUM);
+const _: () = assert!(OFF_M_CHECKSUM + 8 == EXTENDED_LEN);
 
 const FLAG_ENABLED: u32 = 1;
 const FLAG_PLATFORM_SHIFT: u32 = 1;
@@ -304,8 +339,8 @@ pub struct Snapshot {
     /// single burst cannot fake and a pause cannot hide.
     pub disk_fill_sustained: Reading<u64>,
     /// The app's held governor verdict (see [`PublishedVerdict`]). Pending on
-    /// a writer's first tick, unsupported in a version-1 record or while the
-    /// sensor is switched off.
+    /// a writer's first tick, unsupported in a version-1 record, and disabled
+    /// while the sensor is switched off.
     pub verdict: Reading<PublishedVerdict>,
 }
 
@@ -313,6 +348,11 @@ impl Snapshot {
     /// A record carrying no readings: what a writer publishes while the kill
     /// switch is off, so readers can tell "switched off" from "no sampler".
     pub fn empty(written: Clock, writer: WriterIdentity, enabled: bool) -> Self {
+        let why = if enabled {
+            Why::Unsupported
+        } else {
+            Why::Disabled
+        };
         Self {
             version: VERSION,
             length: EXTENDED_LEN as u32,
@@ -322,26 +362,26 @@ impl Snapshot {
             platform: Platform::current(),
             cadence_ms: super::CADENCE_MS as u32,
             writer,
-            host: HostSample::default(),
-            compressor_delta: Reading::default(),
+            host: HostSample::unavailable(why),
+            compressor_delta: Reading::Unavailable(why),
             compressor_thrash: false,
-            processes: Reading::default(),
+            processes: Reading::Unavailable(why),
             unreadable_processes: 0,
-            claude: Reading::default(),
-            codex: Reading::default(),
-            launched_footprint: Reading::default(),
-            observed_footprint: Reading::default(),
-            largest_foreign: Reading::default(),
-            launched_write_rate: Reading::default(),
-            max_tree_write_rate: Reading::default(),
+            claude: Reading::Unavailable(why),
+            codex: Reading::Unavailable(why),
+            launched_footprint: Reading::Unavailable(why),
+            observed_footprint: Reading::Unavailable(why),
+            largest_foreign: Reading::Unavailable(why),
+            launched_write_rate: Reading::Unavailable(why),
+            max_tree_write_rate: Reading::Unavailable(why),
             memguard_present: false,
             memguard_warn: false,
             memguard_pid: 0,
             orphans: 0,
             tick: TickStats::default(),
-            disk_fill_rate: Reading::default(),
-            disk_fill_sustained: Reading::default(),
-            verdict: Reading::default(),
+            disk_fill_rate: Reading::Unavailable(why),
+            disk_fill_sustained: Reading::Unavailable(why),
+            verdict: Reading::Unavailable(why),
         }
     }
 }
@@ -395,6 +435,9 @@ impl std::fmt::Display for SnapshotError {
 fn put_u16(buf: &mut [u8], at: usize, v: u16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
+fn put_i16(buf: &mut [u8], at: usize, v: i16) {
+    buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
 fn put_u32(buf: &mut [u8], at: usize, v: u32) {
     buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
@@ -403,6 +446,16 @@ fn put_u64(buf: &mut [u8], at: usize, v: u64) {
 }
 fn get_u16(buf: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([buf[at], buf[at + 1]])
+}
+fn get_i16(buf: &[u8], at: usize) -> i16 {
+    i16::from_le_bytes([buf[at], buf[at + 1]])
+}
+fn put_pct(buf: &mut [u8], at: usize, pct: f64) {
+    let tenths = (pct.max(0.0) * 10.0).round().min(f64::from(u16::MAX)) as u16;
+    put_u16(buf, at, tenths);
+}
+fn get_pct(buf: &[u8], at: usize) -> f64 {
+    f64::from(get_u16(buf, at)) / 10.0
 }
 fn get_u32(buf: &[u8], at: usize) -> u32 {
     let mut b = [0u8; 4];
@@ -463,6 +516,7 @@ pub(super) fn encode(snap: &Snapshot, seq: u64) -> [u8; EXTENDED_LEN] {
     put_u32(&mut b, OFF_VERSION, VERSION);
     put_u32(&mut b, OFF_LENGTH, EXTENDED_LEN as u32);
     encode_extension(&mut b, snap, seq);
+    encode_metrics_extension(&mut b, snap, seq);
     let sum = checksum(&b);
     put_u64(&mut b, OFF_CHECKSUM, sum);
     b
@@ -561,14 +615,126 @@ fn get_fill(b: &[u8], status_at: usize, rate_at: usize) -> Reading<u64> {
     }
 }
 
-/// FNV-1a over the extension's bytes, with the sequence mixed in.
-fn ext_checksum(record: &[u8], seq: u64) -> u64 {
+fn put_m_reading<T>(
+    b: &mut [u8],
+    status_at: usize,
+    reading: Reading<T>,
+    write: impl FnOnce(&mut [u8], T),
+) {
+    match reading {
+        Reading::Value(v) => {
+            b[status_at] = 0;
+            write(b, v);
+        }
+        Reading::Unavailable(why) => b[status_at] = why.code(),
+    }
+}
+
+/// Appends the metrics extension (`GPXM`, bytes 712..816) without altering any
+/// version-1 or `GPX3` offset read by older hook/MCP binaries.
+fn encode_metrics_extension(b: &mut [u8], snap: &Snapshot, seq: u64) {
+    b[OFF_EXT_M..OFF_EXT_M + 4].copy_from_slice(&EXT_M_MAGIC);
+    let h = &snap.host;
+    let valid_pct = |v: f64| v.is_finite() && v >= 0.0;
+    let cpu_usage = match h.cpu_usage {
+        Reading::Value(c)
+            if !valid_pct(c.total_pct) || !valid_pct(c.user_pct) || !valid_pct(c.system_pct) =>
+        {
+            Reading::Unavailable(Why::Failed)
+        }
+        other => other,
+    };
+    put_m_reading(b, OFF_M_CPU_STATUS, cpu_usage, |b, c| {
+        put_pct(b, OFF_M_CPU_TOTAL, c.total_pct);
+        put_pct(b, OFF_M_CPU_USER, c.user_pct);
+        put_pct(b, OFF_M_CPU_SYS, c.system_pct);
+    });
+    let gpu = match h.gpu {
+        Reading::Value(g)
+            if !valid_pct(g.utilization_pct)
+                || g.renderer_pct.is_some_and(|v| !valid_pct(v))
+                || g.tiler_pct.is_some_and(|v| !valid_pct(v)) =>
+        {
+            Reading::Unavailable(Why::Failed)
+        }
+        other => other,
+    };
+    put_m_reading(b, OFF_M_GPU_STATUS, gpu, |b, g| {
+        put_pct(b, OFF_M_GPU_UTIL, g.utilization_pct);
+        let mut opts = 0u8;
+        if let Some(r) = g.renderer_pct {
+            opts |= 1 << 0;
+            put_pct(b, OFF_M_GPU_RENDERER, r);
+        }
+        if let Some(t) = g.tiler_pct {
+            opts |= 1 << 1;
+            put_pct(b, OFF_M_GPU_TILER, t);
+        }
+        if let Some(v) = g.memory_in_use {
+            opts |= 1 << 2;
+            put_u64(b, OFF_M_GPU_MEM_IN_USE, v);
+        }
+        if let Some(v) = g.memory_allocated {
+            opts |= 1 << 3;
+            put_u64(b, OFF_M_GPU_MEM_ALLOC, v);
+        }
+        b[OFF_M_GPU_OPTS] = opts;
+    });
+    put_m_reading(b, OFF_M_MEM_STATUS, h.memory, |b, m| {
+        put_u64(b, OFF_M_MEM_USED, m.used_bytes);
+        let mut opts = 0u8;
+        if let Some(v) = m.app_bytes {
+            opts |= 1 << 0;
+            put_u64(b, OFF_M_MEM_APP, v);
+        }
+        if let Some(v) = m.wired_bytes {
+            opts |= 1 << 1;
+            put_u64(b, OFF_M_MEM_WIRED, v);
+        }
+        if let Some(v) = m.compressed_bytes {
+            opts |= 1 << 2;
+            put_u64(b, OFF_M_MEM_COMP, v);
+        }
+        if let Some(v) = m.cached_bytes {
+            opts |= 1 << 3;
+            put_u64(b, OFF_M_MEM_CACHED, v);
+        }
+        b[OFF_M_MEM_OPTS] = opts;
+    });
+    put_m_reading(b, OFF_M_DISK_STATUS, h.total_disk, |b, v| {
+        put_u64(b, OFF_M_TOTAL_DISK, v)
+    });
+    let thermal_temp = match h.thermal_temp_c {
+        Reading::Value(t) if !t.is_finite() => Reading::Unavailable(Why::Failed),
+        other => other,
+    };
+    put_m_reading(b, OFF_M_THERMAL_STATUS, thermal_temp, |b, t| {
+        let tenths = (t * 10.0)
+            .round()
+            .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+        put_i16(b, OFF_M_THERMAL_TEMP, tenths);
+    });
+    let sum = metrics_checksum(b, seq);
+    put_u64(b, OFF_M_CHECKSUM, sum);
+}
+
+fn fnv1a_seq(slice: &[u8], seq: u64) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in &record[OFF_EXT..OFF_X_CHECKSUM] {
+    for byte in slice {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash ^ seq
+}
+
+/// FNV-1a over the extension's bytes, with the sequence mixed in.
+fn ext_checksum(record: &[u8], seq: u64) -> u64 {
+    fnv1a_seq(&record[OFF_EXT..OFF_X_CHECKSUM], seq)
+}
+
+/// FNV-1a over the `GPXM` metrics block, with the sequence mixed in.
+fn metrics_checksum(record: &[u8], seq: u64) -> u64 {
+    fnv1a_seq(&record[OFF_EXT_M..OFF_M_CHECKSUM], seq)
 }
 
 /// Everything version 1 held, written where version 1 wrote it. The caller
@@ -633,10 +799,16 @@ fn encode_v1_fields(b: &mut [u8], snap: &Snapshot, seq: u64) {
     put_reading(b, S_COMPRESSED, h.compressed_bytes, |b, v| {
         put_u64(b, OFF_COMPRESSED, v)
     });
-    put_reading(b, S_LOAD, h.load, |b, l| {
+    let load = match h.load {
+        Reading::Value(l) if l.iter().any(|v| !v.is_finite() || *v < 0.0) => {
+            Reading::Unavailable(Why::Failed)
+        }
+        other => other,
+    };
+    put_reading(b, S_LOAD, load, |b, l| {
         for (i, v) in l.iter().enumerate() {
             // Milli-load: a load of 4.2 B is far past anything real.
-            let milli = (v.max(0.0) * 1000.0).round().min(f64::from(u32::MAX)) as u32;
+            let milli = (v * 1000.0).round().min(f64::from(u32::MAX)) as u32;
             put_u32(b, OFF_LOAD + 4 * i, milli);
         }
     });
@@ -749,6 +921,8 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
     }
     let (segments, verdict, disk_fill_rate, disk_fill_sustained) =
         decode_extension(buf, version, length, seq)?;
+    let (cpu_usage, gpu, memory, total_disk, thermal_temp_c) =
+        decode_metrics_extension(buf, version, length, seq)?;
     let flags = get_u32(buf, OFF_FLAGS);
     let platform = Platform::from_code((flags & FLAG_PLATFORM_MASK) >> FLAG_PLATFORM_SHIFT)
         .unwrap_or(Platform::Unavailable);
@@ -790,6 +964,11 @@ fn decode_as(buf: &[u8], min_version: u32, known_len: usize) -> Result<Snapshot,
             1 => Some(Power::Battery),
             _ => None,
         }),
+        cpu_usage,
+        gpu,
+        memory,
+        total_disk,
+        thermal_temp_c,
     };
     let count = |b: &[u8], at: usize| {
         Some(SessionCount {
@@ -887,8 +1066,8 @@ fn decode_extension(
     seq: u64,
 ) -> Result<Extension, SnapshotError> {
     if version < 2
-        || length < EXTENDED_LEN
-        || buf.len() < EXTENDED_LEN
+        || length < EXT_V2_LEN
+        || buf.len() < EXT_V2_LEN
         || buf[OFF_EXT..OFF_EXT + 4] != EXT_MAGIC
     {
         let older = Reading::Unavailable(Why::Older);
@@ -920,6 +1099,75 @@ fn decode_extension(
     let fill = get_fill(buf, OFF_X_FILL_STATUS, OFF_X_FILL_RATE);
     let sustained = get_fill(buf, OFF_X_FILL_SUSTAINED_STATUS, OFF_X_FILL_SUSTAINED_RATE);
     Ok((segments, verdict, fill, sustained))
+}
+
+type MetricsExtension = (
+    Reading<CpuUsage>,
+    Reading<GpuSample>,
+    Reading<MemorySample>,
+    Reading<u64>,
+    Reading<f64>,
+);
+
+/// Decodes the `GPXM` metrics block (`712..816`). Older 712-byte `GPX3`
+/// records return [`Why::Older`] for these fields so readers know an older
+/// writer published the record.
+fn decode_metrics_extension(
+    buf: &[u8],
+    version: u32,
+    length: usize,
+    seq: u64,
+) -> Result<MetricsExtension, SnapshotError> {
+    if version < 2
+        || length < EXTENDED_LEN
+        || buf.len() < EXTENDED_LEN
+        || buf[OFF_EXT_M..OFF_EXT_M + 4] != EXT_M_MAGIC
+    {
+        return Ok((
+            Reading::Unavailable(Why::Older),
+            Reading::Unavailable(Why::Older),
+            Reading::Unavailable(Why::Older),
+            Reading::Unavailable(Why::Older),
+            Reading::Unavailable(Why::Older),
+        ));
+    }
+    if get_u64(buf, OFF_M_CHECKSUM) != metrics_checksum(buf, seq) {
+        return Err(SnapshotError::Torn);
+    }
+    let cpu_usage = ext_reading(buf[OFF_M_CPU_STATUS], || {
+        Some(CpuUsage {
+            total_pct: get_pct(buf, OFF_M_CPU_TOTAL),
+            user_pct: get_pct(buf, OFF_M_CPU_USER),
+            system_pct: get_pct(buf, OFF_M_CPU_SYS),
+        })
+    });
+    let gpu = ext_reading(buf[OFF_M_GPU_STATUS], || {
+        let opts = buf[OFF_M_GPU_OPTS];
+        Some(GpuSample {
+            utilization_pct: get_pct(buf, OFF_M_GPU_UTIL),
+            renderer_pct: (opts & (1 << 0) != 0).then(|| get_pct(buf, OFF_M_GPU_RENDERER)),
+            tiler_pct: (opts & (1 << 1) != 0).then(|| get_pct(buf, OFF_M_GPU_TILER)),
+            memory_in_use: (opts & (1 << 2) != 0).then(|| get_u64(buf, OFF_M_GPU_MEM_IN_USE)),
+            memory_allocated: (opts & (1 << 3) != 0).then(|| get_u64(buf, OFF_M_GPU_MEM_ALLOC)),
+        })
+    });
+    let memory = ext_reading(buf[OFF_M_MEM_STATUS], || {
+        let opts = buf[OFF_M_MEM_OPTS];
+        Some(MemorySample {
+            used_bytes: get_u64(buf, OFF_M_MEM_USED),
+            app_bytes: (opts & (1 << 0) != 0).then(|| get_u64(buf, OFF_M_MEM_APP)),
+            wired_bytes: (opts & (1 << 1) != 0).then(|| get_u64(buf, OFF_M_MEM_WIRED)),
+            compressed_bytes: (opts & (1 << 2) != 0).then(|| get_u64(buf, OFF_M_MEM_COMP)),
+            cached_bytes: (opts & (1 << 3) != 0).then(|| get_u64(buf, OFF_M_MEM_CACHED)),
+        })
+    });
+    let total_disk = ext_reading(buf[OFF_M_DISK_STATUS], || {
+        Some(get_u64(buf, OFF_M_TOTAL_DISK))
+    });
+    let thermal_temp_c = ext_reading(buf[OFF_M_THERMAL_STATUS], || {
+        Some(f64::from(get_i16(buf, OFF_M_THERMAL_TEMP)) / 10.0)
+    });
+    Ok((cpu_usage, gpu, memory, total_disk, thermal_temp_c))
 }
 
 #[cfg(unix)]
@@ -982,7 +1230,7 @@ fn read_as(path: &Path, min_version: u32, known_len: usize) -> Result<Snapshot, 
     };
     // A newer writer's record may be longer; read what this build knows plus
     // room to see that it is longer, never an unbounded file.
-    let cap = known_len.max(RECORD_LEN) * 2;
+    let cap = known_len.max(EXTENDED_LEN) * 2;
     let mut buf = Vec::with_capacity(cap);
     let mut head = [0u8; 8];
     for _ in 0..READ_ATTEMPTS {
@@ -1182,6 +1430,27 @@ mod tests {
             free_disk: Reading::Value(199 << 30),
             thermal: Reading::Value(Thermal::Fair),
             power: Reading::Value(Power::Ac),
+            cpu_usage: Reading::Value(CpuUsage {
+                total_pct: 42.5,
+                user_pct: 31.2,
+                system_pct: 11.3,
+            }),
+            gpu: Reading::Value(GpuSample {
+                utilization_pct: 28.0,
+                renderer_pct: Some(24.5),
+                tiler_pct: Some(12.0),
+                memory_in_use: Some(2 << 30),
+                memory_allocated: Some(6 << 30),
+            }),
+            memory: Reading::Value(MemorySample {
+                used_bytes: 34 << 30,
+                app_bytes: Some(18 << 30),
+                wired_bytes: Some(6 << 30),
+                compressed_bytes: Some(10 << 30),
+                cached_bytes: Some(14 << 30),
+            }),
+            total_disk: Reading::Value(926 << 30),
+            thermal_temp_c: Reading::Value(64.5),
         };
         s.compressor_delta = Reading::Value(CompressorDelta {
             thrashing_detected: 1,
@@ -1438,10 +1707,10 @@ mod tests {
     #[test]
     fn readers_accept_newer_additive_records_and_refuse_short_or_old_ones() {
         let snap = full(clock(5));
-        // A v2 writer: VERSION 2, 64 more bytes of fields after v1's.
+        // A v2 writer: VERSION 2, 64 more bytes of fields after this build's.
         let mut v2 = encode(&snap, 8).to_vec();
         put_u32(&mut v2, OFF_VERSION, 2);
-        put_u32(&mut v2, OFF_LENGTH, (RECORD_LEN + 64) as u32);
+        put_u32(&mut v2, OFF_LENGTH, (EXTENDED_LEN + 64) as u32);
         reseal(&mut v2);
         v2.extend_from_slice(&[0xAB; 64]);
         let read_by_v1 = decode_as(&v2, MIN_READ_VERSION, RECORD_LEN).unwrap();
@@ -1829,5 +2098,171 @@ mod tests {
             matches!(&err, SnapshotError::Unsafe(why) if why.contains("other users")),
             "{err}"
         );
+    }
+
+    #[test]
+    fn metrics_extension_preserves_gpx3_reads_older_and_rejects_tamper() {
+        let mut snap = full(clock(9));
+        let full_rec = encode(&snap, 14);
+        let decoded = decode_as(&full_rec, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(decoded.host.cpu_usage, snap.host.cpu_usage);
+        assert_eq!(decoded.host.gpu, snap.host.gpu);
+        assert_eq!(decoded.host.memory, snap.host.memory);
+        assert_eq!(decoded.host.total_disk, snap.host.total_disk);
+        assert_eq!(decoded.host.thermal_temp_c, snap.host.thermal_temp_c);
+
+        // Optional fields absent + negative/warm temperature + non-finite guard.
+        snap.host.gpu = Reading::Value(GpuSample {
+            utilization_pct: 15.4,
+            renderer_pct: None,
+            tiler_pct: None,
+            memory_in_use: None,
+            memory_allocated: None,
+        });
+        snap.host.memory = Reading::Value(MemorySample {
+            used_bytes: 12 << 30,
+            app_bytes: None,
+            wired_bytes: None,
+            compressed_bytes: None,
+            cached_bytes: None,
+        });
+        snap.host.thermal_temp_c = Reading::Unavailable(Why::Unsupported);
+        let partial = decode_as(&encode(&snap, 16), MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(partial.host.gpu, snap.host.gpu);
+        assert_eq!(partial.host.memory, snap.host.memory);
+        assert_eq!(
+            partial.host.thermal_temp_c,
+            Reading::Unavailable(Why::Unsupported)
+        );
+
+        // A 712-byte GPX3-only record keeps GPX3 fields valid and marks GPXM Older.
+        let mut gpx3_only = full_rec[..EXT_V2_LEN].to_vec();
+        put_u32(&mut gpx3_only, OFF_LENGTH, EXT_V2_LEN as u32);
+        reseal(&mut gpx3_only);
+        let from_gpx3 = decode_as(&gpx3_only, MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(from_gpx3.verdict, full(clock(9)).verdict);
+        assert_eq!(from_gpx3.host.cpu_usage, Reading::Unavailable(Why::Older));
+        assert_eq!(from_gpx3.host.gpu, Reading::Unavailable(Why::Older));
+        assert_eq!(from_gpx3.host.memory, Reading::Unavailable(Why::Older));
+        assert_eq!(from_gpx3.host.total_disk, Reading::Unavailable(Why::Older));
+        assert_eq!(
+            from_gpx3.host.thermal_temp_c,
+            Reading::Unavailable(Why::Older)
+        );
+
+        // A corrupted GPXM byte without updating GPXM checksum is Torn.
+        let mut torn = full_rec;
+        torn[OFF_M_CPU_TOTAL] ^= 0xFF;
+        assert_eq!(
+            decode_as(&torn, MIN_READ_VERSION, RECORD_LEN),
+            Err(SnapshotError::Torn)
+        );
+    }
+
+    #[test]
+    fn disabled_snapshot_populates_and_round_trips_why_disabled() {
+        let off = Snapshot::empty(clock(12), writer_id(), false);
+        assert!(!off.enabled);
+        let decoded = decode_as(&encode(&off, 4), MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert!(!decoded.enabled);
+        assert_eq!(decoded.host.pressure, Reading::Unavailable(Why::Disabled));
+        assert_eq!(decoded.host.cpu_usage, Reading::Unavailable(Why::Disabled));
+        assert_eq!(decoded.host.gpu, Reading::Unavailable(Why::Disabled));
+        assert_eq!(decoded.host.memory, Reading::Unavailable(Why::Disabled));
+        assert_eq!(decoded.host.total_disk, Reading::Unavailable(Why::Disabled));
+        assert_eq!(
+            decoded.host.thermal_temp_c,
+            Reading::Unavailable(Why::Disabled)
+        );
+        assert_eq!(decoded.processes, Reading::Unavailable(Why::Disabled));
+        assert_eq!(decoded.disk_fill_rate, Reading::Unavailable(Why::Disabled));
+        assert_eq!(
+            decoded.disk_fill_sustained,
+            Reading::Unavailable(Why::Disabled)
+        );
+        assert_eq!(decoded.verdict, Reading::Unavailable(Why::Disabled));
+    }
+
+    #[test]
+    fn non_finite_or_negative_floats_in_cpu_and_gpu_degrade_to_failed_not_zero() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            for cpu in [
+                CpuUsage {
+                    total_pct: bad,
+                    user_pct: 10.0,
+                    system_pct: 5.0,
+                },
+                CpuUsage {
+                    total_pct: 15.0,
+                    user_pct: bad,
+                    system_pct: 5.0,
+                },
+                CpuUsage {
+                    total_pct: 15.0,
+                    user_pct: 10.0,
+                    system_pct: bad,
+                },
+            ] {
+                let mut snap = full(clock(20));
+                snap.host.cpu_usage = Reading::Value(cpu);
+                let back = decode_as(&encode(&snap, 6), MIN_READ_VERSION, RECORD_LEN).unwrap();
+                assert_eq!(
+                    back.host.cpu_usage,
+                    Reading::Unavailable(Why::Failed),
+                    "cpu {cpu:?} must fail closed"
+                );
+            }
+
+            for gpu in [
+                GpuSample {
+                    utilization_pct: bad,
+                    renderer_pct: Some(5.0),
+                    tiler_pct: Some(2.0),
+                    memory_in_use: None,
+                    memory_allocated: None,
+                },
+                GpuSample {
+                    utilization_pct: 10.0,
+                    renderer_pct: Some(bad),
+                    tiler_pct: Some(2.0),
+                    memory_in_use: None,
+                    memory_allocated: None,
+                },
+                GpuSample {
+                    utilization_pct: 10.0,
+                    renderer_pct: Some(5.0),
+                    tiler_pct: Some(bad),
+                    memory_in_use: None,
+                    memory_allocated: None,
+                },
+            ] {
+                let mut snap = full(clock(20));
+                snap.host.gpu = Reading::Value(gpu);
+                let back = decode_as(&encode(&snap, 8), MIN_READ_VERSION, RECORD_LEN).unwrap();
+                assert_eq!(
+                    back.host.gpu,
+                    Reading::Unavailable(Why::Failed),
+                    "gpu {gpu:?} must fail closed"
+                );
+            }
+        }
+
+        let mut bad_temp = full(clock(20));
+        bad_temp.host.thermal_temp_c = Reading::Value(f64::NAN);
+        let back = decode_as(&encode(&bad_temp, 10), MIN_READ_VERSION, RECORD_LEN).unwrap();
+        assert_eq!(back.host.thermal_temp_c, Reading::Unavailable(Why::Failed));
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+            for load in [[bad, 1.0, 1.0], [1.0, bad, 1.0], [1.0, 1.0, bad]] {
+                let mut bad_load = full(clock(20));
+                bad_load.host.load = Reading::Value(load);
+                let back = decode_as(&encode(&bad_load, 12), MIN_READ_VERSION, RECORD_LEN).unwrap();
+                assert_eq!(
+                    back.host.load,
+                    Reading::Unavailable(Why::Failed),
+                    "load {load:?} must fail closed"
+                );
+            }
+        }
     }
 }

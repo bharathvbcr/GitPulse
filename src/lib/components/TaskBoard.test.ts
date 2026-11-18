@@ -70,4 +70,9 @@ describe("TaskBoard source contracts", () => {
   it("asks through the in-app dialog, never the native confirm", () => {
     expect(source).not.toContain("window.confirm");
   });
+
+  it("offers a repository sort trigger and menu in the scope navigator", () => {
+    expect(source).toContain('data-testid="task-repo-sort-trigger"');
+    expect(source).toContain('data-testid="task-repo-sort-menu"');
+  });
 });

@@ -218,6 +218,8 @@ export interface TerminalListing {
   ending?: boolean;
   /** Parent session id when spawned as an Option A child session. */
   parent_session_id?: string;
+  /** Live or user-named session title, when recorded by the host or durable ledger. */
+  title?: string;
   /**
    * Milliseconds since its terminal last printed, when the host that holds the
    * PTY can say. Absent is unknown, never quiet.

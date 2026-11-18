@@ -58,4 +58,25 @@ describe("channel bypass: tab titles are cleaned by the one owner", () => {
     expect(Array.from(cleanTabName("x".repeat(1_000_000), 256)).length).toBe(256);
     expect(cleanTabName("​‮\u{E0041}", 256)).toBe("");
   });
+
+  it("tabDisplayTitle and effectiveSessionTitle sanitize adversarial detail and launch names", async () => {
+    const mod = await import("./tabs");
+    const hostileDetail = `a\ud800${"​‮".repeat(10)}${"x".repeat(10_000)}`;
+    const base = {
+      id: "tab-adv",
+      launcher: "claude" as const,
+      title: null,
+      name: `Task\ud800‮${"\u200b".repeat(5)} One`,
+      launchName: `Task\ud800‮${"\u200b".repeat(5)} One`,
+    };
+    const display = mod.tabDisplayTitle(base, { state: "working", detail: hostileDetail });
+    expect(display.primary.isWellFormed()).toBe(true);
+    expect(display.fullTitle.isWellFormed()).toBe(true);
+    expect(display.secondary?.isWellFormed()).toBe(true);
+    expect(display.primary).toBe("Task One");
+    const reg = mod.effectiveSessionTitle({ ...base, name: undefined, launchName: undefined }, { state: "working", detail: hostileDetail });
+    expect(reg).toBeDefined();
+    expect(reg?.isWellFormed()).toBe(true);
+    expect(Array.from(reg ?? "").length).toBeLessThanOrEqual(120);
+  });
 });

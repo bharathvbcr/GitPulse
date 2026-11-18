@@ -329,4 +329,10 @@ describe("FileViewer", () => {
     expect(row).not.toContain("w-72");
     expect(source).toContain('import FileTreeColumn from "./files/FileTreeColumn.svelte"');
   });
+
+  it("auto-hides its duplicate ExplorerRail while the docked main Sidebar is already showing Explorer, unless explicitly opened", () => {
+    expect(source).toContain("sidebarExplorerDocked");
+    expect(source).toContain("explorerForcedWithOuterSidebar");
+    expect(source).toContain("explorerRequested: effectiveExplorerOpen");
+  });
 });

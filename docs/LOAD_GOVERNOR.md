@@ -107,8 +107,9 @@ otherwise it is `unavailable`, never a guessed `normal`.
 
 ## The snapshot, `host-load.v1`
 
-A fixed-size record of 712 bytes (version 2: the 664 bytes of version 1, then a
-48-byte extension; see Compatibility) in the per-user config directory
+A fixed-size record of 816 bytes (version 2: the 664 bytes of version 1, the
+48-byte `GPX3` governor/segment extension at `664..712`, and a 104-byte `GPXM`
+metrics extension at `712..816`; see Compatibility) in the per-user config directory
 (`~/Library/Application Support/GitPulse/host-load.v1`), beside
 `spawn-budget.v2`. It sits in the config directory rather than `TMPDIR` because
 agent hosts give their children a private `TMPDIR`. It opens through the same
@@ -137,9 +138,18 @@ a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
   without reading settings. **It is one tick behind the readings beside it**:
   the sampler publishes, then counts the sample, so a record carries the
   verdict the previous count produced (pending on a writer's first tick, and
-  unsupported while the sensor is switched off). The hook reads it (see The command
+  disabled while the sensor is switched off). The hook reads it (see The command
   gate). The extension opens with the magic `GPX3` (`GPX2` was the block before the two disk fill rates changed its layout; a branch build that reads `GPX2` ignores this one) and ends
   with a checksum of its own, which also covers the sequence.
+- **Metrics extension (version 2, bytes 712 to 816):** opens with magic `GPXM`
+  after the unchanged `GPX3` block (so older `gitpulse-hook` and `gitpulse-mcp`
+  binaries continue reading `GPX3` at `664..712` untouched) and ends with its
+  own FNV-1a checksum (`OFF_M_CHECKSUM` at 808). Carries `cpu_usage` (total/user/system
+  tenths of %), `gpu` (`IOAccelerator` utilization, renderer/tiler %, in-use and
+  allocated unified memory), `memory` (used bytes + App/Wired/Compressed/Cached
+  breakdown), `total_disk` (volume capacity), and `thermal_temp_c` (SoC die
+  temperature in tenths of °C). Older 712-byte records decode those five fields
+  as `Why::Older`, never zero.
 
 **Sequence lock.** The writer makes the head sequence odd, writes the body and
 a tail copy of the next even sequence, then makes the head even. A reader reads
@@ -288,8 +298,11 @@ procargs buffer) are allocated once and reused.
 | Load 1/5/15 | `getloadavg` | `/proc/loadavg` |
 | CPUs | `hw.logicalcpu`, `hw.perflevel0/1.logicalcpu`; no levels on Intel or Rosetta | logical count |
 | Open files | `kern.num_files` / `kern.maxfiles` | `/proc/sys/fs/file-nr` |
-| Free disk | `statfs` of the config directory's volume | `statvfs` |
-| Thermal state | `NSProcessInfo.thermalState` | unsupported |
+| Free / total disk | `statfs` of the config directory's volume (`f_bavail`, `f_blocks`) | `statvfs` (`f_bavail`, `f_blocks`) |
+| CPU usage | `host_statistics64(HOST_CPU_LOAD_INFO)` tick deltas (total/user/system %) | `/proc/stat` aggregate `cpu` line deltas |
+| GPU utilization & memory | IOKit `IOAccelerator` `PerformanceStatistics` (`Device/Renderer/Tiler Utilization %`, `In use/Alloc system memory`) | unsupported (`Why::Unsupported`) |
+| Memory used & breakdown | `host_statistics64(HOST_VM_INFO64)` Activity Monitor formula `(internal - purgeable + wire + compressor) * page_size`, plus App / Wired / Compressed / Cached | `/proc/meminfo` (`MemTotal - MemAvailable`) |
+| Thermal state & die °C | `NSProcessInfo.thermalState` + non-privileged `IOHIDEventSystemClient` (`0xff00`/`5`, `PMU tdie*` / `eACC*` / `pACC*` / `gACC*` / `MTR Temp Sensor`, rejecting disconnected channels) | `/sys/class/thermal/thermal_zone*/temp` (when readable; thermal state unsupported) |
 | Power source | `IOPSGetTimeRemainingEstimate` (−2 = external power) | unsupported |
 
 No `compressor_bytes_used` sysctl exists, and the counters above are the
@@ -906,9 +919,13 @@ It also says: *replay-verified; no real memory-pressure event has been
 observed by this sensor yet*. That stays until the first natural pressure event
 is recorded.
 
-The status bar is quiet while the machine is fine. It speaks when pressure is
-warn or critical, when the compressor is thrashing, or when the sampler has
-stopped ("Load sensor: no sampler"). While the governor acts it adds "· launches refused" or "· shedding". Clicking it opens Health.
+In `full` and `compact` status-bar modes, the right segment displays live CPU,
+GPU (when present), Memory, Thermal, and Storage indicators (`HostLoadSegment`);
+in `minimal` and `hidden` modes it stays quiet unless pressure is `warn` or
+`critical`, the compressor is thrashing, the governor is refusing/shedding, or
+the sampler has stopped ("Load sensor: no sampler"). Clicking the indicator strip
+opens a live popover with 60-sample (2-minute) sparkline charts, Activity
+Monitor memory breakdown, thermal steps, disk usage, and an **Open Health** jump.
 
 ## Settings
 

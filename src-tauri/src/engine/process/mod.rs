@@ -109,14 +109,14 @@ pub(crate) use runner::{
 };
 #[cfg(test)]
 pub(crate) use runner::{
-    forced_failure_active, run_observed_with, run_with_gate_options, spawn_labels_during,
-    with_forced_deferral, with_forced_spawn_failure, with_forced_spawn_failure_of,
-    with_forced_spawn_failure_then,
+    forced_failure_active, run_observed_with, run_with_gate, run_with_gate_options,
+    spawn_labels_during, with_forced_deferral, with_forced_spawn_failure,
+    with_forced_spawn_failure_of, with_forced_spawn_failure_then,
 };
 #[cfg(test)]
 pub(in crate::engine::process) use runner::{
-    is_cancellation, is_timeout_error, next_poll_backoff, run_with_gate, spawn_error,
-    DRAIN_JOIN_GRACE, POLL_BACKOFF_MAX, POLL_BACKOFF_START,
+    is_cancellation, is_timeout_error, next_poll_backoff, spawn_error, DRAIN_JOIN_GRACE,
+    POLL_BACKOFF_MAX, POLL_BACKOFF_START,
 };
 pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 

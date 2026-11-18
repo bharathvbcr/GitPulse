@@ -1,7 +1,7 @@
 import type { ContentMatch, ContentSearchReport, SearchTruncation } from "./types";
 import { plural, shortHash } from "../format";
 
-/** Matches grouped by file, in the order git reported the files. */
+/** Matches grouped by file, in the order the search engine reported the files. */
 export function groupByFile(matches: readonly ContentMatch[]): { path: string; matches: ContentMatch[] }[] {
   const groups = new Map<string, ContentMatch[]>();
   for (const match of matches) {

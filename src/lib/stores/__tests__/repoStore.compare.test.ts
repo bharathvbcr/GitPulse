@@ -103,6 +103,37 @@ describe("compare selection", () => {
     expect(state.selectionKind).toBe("commit");
   });
 
+  // A diff read applies its file to the shared selection when it lands. A
+  // selection made without a read (Code view opening, closing or switching
+  // a file; Inspect) must stop it, or a read that was slow — git under an
+  // agent's load — lands seconds later and Code view opens its file with no
+  // action from the user.
+  for (const [label, choose, expected] of [
+    ["a file opened in Code", (s: ReturnType<typeof makeStore>["store"]) => s.selectFilePath("src/opened.ts"), "src/opened.ts"],
+    ["the last Code tab closed", (s: ReturnType<typeof makeStore>["store"]) => s.selectFilePath(null), null],
+    ["Inspect on a commit", (s: ReturnType<typeof makeStore>["store"]) => s.inspectCommitInHistory("c9"), null],
+  ] as const) {
+    it(`drops a slower working-tree diff once ${label} replaced the selection`, async () => {
+      let releaseSlow!: (value: unknown) => void;
+      const { store } = makeStore((cmd, args) => {
+        if (cmd === "cmd_get_file_diff" && args.filePath === "src/agent-edited.ts") {
+          return new Promise((resolve) => (releaseSlow = resolve));
+        }
+        return patch(`answer for ${String(args.filePath ?? args.commitId)}`);
+      });
+      await store.openRepo(`/r/late-diff-${label.replace(/\W+/g, "-")}`);
+      const slow = store.selectFileDiff("src/agent-edited.ts");
+      choose(store);
+      releaseSlow(patch("late diff"));
+      await slow;
+      const state = get(store);
+      expect(state.selectedFilePath).toBe(expected);
+      expect(state.selectedDiff).not.toBe("late diff");
+      // Nothing is reading any more, so nothing may read as loading.
+      expect(state.selectedDiffPending).toBe(false);
+    });
+  }
+
   it("reads a failed comparison as a failure, not as no difference", async () => {
     const { store } = makeStore(() => {
       throw new Error("bad object base1");

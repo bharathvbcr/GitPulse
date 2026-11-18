@@ -779,7 +779,7 @@
           check("a reported issue is filed with its labels", () =>
             lastArgs("cmd_github_create_issue")?.title === "Search is slow" && lastArgs("cmd_github_create_issue")?.labels.join() === "bug");
           check("and says so with the policy verdict, then opens it", () =>
-            text().includes("Issue reported — ") && opened.includes("https://github.com/acme/app/issues/99"));
+            text().includes("Issue reported — ") && opened.some((url) => url === "https://github.com/acme/app/issues/99"));
           check("and Remote re-reads GitHub so the issue can appear", () => count("cmd_github_context") > contextsBeforeReport);
 
           const addButton = (n) => $$("button", issues()).filter((el) => words(el) === "Add to tasks")[n];

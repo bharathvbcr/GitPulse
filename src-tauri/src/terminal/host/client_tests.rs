@@ -187,6 +187,7 @@ fn serve(
                             detached: false,
                             ending: false,
                             parent_session_id: None,
+                            title: None,
                             quiet_ms: None,
                         })
                         .collect();

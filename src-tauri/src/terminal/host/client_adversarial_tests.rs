@@ -262,6 +262,7 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                             detached: false,
                             ending: false,
                             parent_session_id: None,
+                            title: None,
                             quiet_ms: None,
                         })
                         .collect();

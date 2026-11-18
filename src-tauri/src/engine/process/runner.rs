@@ -946,7 +946,7 @@ pub(crate) fn run_observed_with(
     )
 }
 
-pub(super) fn run_with_gate(
+pub(crate) fn run_with_gate(
     cmd: &mut Command,
     label: &str,
     timeout: Duration,

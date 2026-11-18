@@ -17,7 +17,13 @@ lines is the default now), which is geometry and so can only be measured where
 real layout exists: each row is exactly as tall as the window math believes,
 headers stay one line, neither line paints under the hover actions or past the
 row's edge, the name owns line one and is shown in full, and line two clips —
-author first, never a count. A stale branch shows its tinted age rather than a
+author first, never a count. The hover motion is read from computed style: the
+row transitions its fill and text and nothing paint-heavy (its ring is
+`box-shadow`, which design-lint rule 9 keeps out of transitions), the row and its
+revealed controls run on the `--gp-dur-instant` token rather than Tailwind's
+150ms default, reduced motion switches all of it off, and a refresh keeps the
+row under a resting pointer as the same node. Resting, checked-out and selected
+rows each match an emitted `:hover` rule that changes both fill and ring. A stale branch shows its tinted age rather than a
 chip. Fixture branches carry churn and divergence derived from their names, and
 `release/0.0.9` is deliberately 120 days old; without both, none of that chrome
 renders and the layout it used to break cannot be seen.

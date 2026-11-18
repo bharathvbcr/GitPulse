@@ -61,7 +61,8 @@ pub use thresholds::{
 pub use trace::{PreviousBoot, TracePeaks, TraceRecord};
 
 pub use disk::{
-    block_size, free_bytes, physical_memory, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR,
+    block_size, free_bytes, physical_memory, volume_bytes, FreeSpace, LowDisk, LowDiskCause,
+    LOW_DISK_FLOOR,
 };
 pub use governor::{
     admit, admit_anyway, admit_on, decide, disk_remedy_due, exec_latency, grant_override,
@@ -89,8 +90,8 @@ pub use sampler::{
     Role, SamplerOptions, StopHandle,
 };
 pub use sensor::{
-    Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, HostSample, Level,
-    OsSensor, Power, Reading, ReplaySensor, Sensor, Thermal, Why,
+    Compressor, CompressorDelta, CompressorSegments, CompressorTrend, Cores, CpuUsage, GpuSample,
+    HostSample, Level, MemorySample, OsSensor, Power, Reading, ReplaySensor, Sensor, Thermal, Why,
 };
 pub use snapshot::{
     read, report, PublishedVerdict, Snapshot, SnapshotError, TickStats, Writer as SnapshotWriter,

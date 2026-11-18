@@ -60,6 +60,7 @@
     repositoryPath = "",
     initialSubtasks,
     initialInboxThreads,
+    criteriaUnsaved = false,
     disabled = false,
     onchange,
   }: {
@@ -74,6 +75,8 @@
     repositoryPath?: string;
     initialSubtasks?: TaskCard[];
     initialInboxThreads?: AgentInboxThread[];
+    /** The sheet holds criteria edits that are not saved; Split reads only saved ones. */
+    criteriaUnsaved?: boolean;
     disabled?: boolean;
     onchange: () => void;
   } = $props();
@@ -338,6 +341,21 @@
     }
   }
 
+  /** Whether a checklist item is typed but not yet added; the sheet asks before dropping it. */
+  export function hasPending(): boolean {
+    return entry.trim().length > 0;
+  }
+  /** Add the typed checklist item, so Save keeps it. */
+  export function flushPending(): string {
+    const text = entry.trim();
+    if (!text) return "";
+    // Said, not skipped: a silent refusal let Save report "Saved" while the
+    // item stayed typed, and Close then asked to discard edits.
+    if (checklist.length >= MAX_CHECKLIST) return `The checklist holds ${MAX_CHECKLIST} items, so the one you typed was not added. Remove one first.`;
+    if (new TextEncoder().encode(text).length > MAX_CHECKLIST_TEXT) return `The checklist item you typed is longer than ${MAX_CHECKLIST_TEXT} bytes. Shorten it before saving.`;
+    addEntry();
+    return "";
+  }
   function addEntry() {
     const text = entry.trim();
     if (
@@ -409,6 +427,9 @@
         <span class="count" data-testid="task-checklist-count">{done} of {checklist.length} done</span>
       {/if}
     </div>
+    <!-- Three lists sit in this sheet; each says what it is for, so a step is
+         not filed as a criterion or a card. -->
+    <p class="hint" data-testid="task-checklist-hint">Your own steps for this task, ticked off as you go.</p>
     {#if checklist.length}
       <ul data-testid="task-checklist">
         {#each checklist as item, index (index)}
@@ -439,6 +460,7 @@
       <input
         class="gp-field"
         data-testid="task-checklist-add"
+        data-ephemeral
         bind:value={entry}
         {disabled}
         maxlength={MAX_CHECKLIST_TEXT}
@@ -491,7 +513,7 @@
       </ul>
     {/if}
     <div class="add">
-      <select class="gp-select" aria-label="Link kind" bind:value={kind} {disabled}>
+      <select class="gp-select" aria-label="Link kind" data-ephemeral bind:value={kind} {disabled}>
         {#each LINK_KINDS as option (option)}
           <option value={option} disabled={option === "parent" && hasParent}>
             {KIND_LABELS[option]}
@@ -502,6 +524,7 @@
         class="gp-field"
         type="search"
         data-testid="task-link-search"
+        data-ephemeral
         bind:value={query}
         {disabled}
         maxlength="512"
@@ -536,7 +559,10 @@
     {#if error}<div class="gp-notice" data-tone="danger" role="alert">{error}</div>{/if}
   </div>
 
-  <!-- Subtask Breakdown & Direct Multi-Agent Fan-Out (isolated from parent draft dirty tracking) -->
+  <!-- Subtask Breakdown & Direct Multi-Agent Fan-Out (isolated from parent draft dirty tracking).
+       A draft has nothing to split yet, so it draws nothing rather than a dead
+       block saying so. -->
+  {#if task}
   <div
     class="block collab-block"
     data-testid="task-breakdown-section"
@@ -551,10 +577,8 @@
         </span>
       {/if}
     </div>
+    <p class="hint" data-testid="task-breakdown-hint">Separate cards on the board, each one an agent can take on its own.</p>
 
-    {#if !task}
-      <p class="hint">Save this task first to split it into linked subtasks and fan out agents.</p>
-    {:else}
       {#if childSubtasks.length > 0}
         <div class="kickoff-mode-row">
           <span class="kind">Subtask run mode</span>
@@ -633,8 +657,11 @@
           <Layers size={12} /> Split acceptance criteria into subtasks{splitCandidates.length > 0 ? ` (${splitCandidates.length})` : ""}
         </button>
       </div>
-    {/if}
+      {#if criteriaUnsaved}
+        <p class="hint" data-testid="task-split-unsaved">Split uses the saved acceptance criteria. Save your edits first to split what is on screen.</p>
+      {/if}
   </div>
+  {/if}
 
   <!-- Linked Inbox Thread & Agent Collaboration -->
   {#if taskId}

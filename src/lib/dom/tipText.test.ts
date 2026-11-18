@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { anchorOwnsOpenPopup, tipGuideOf, tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
+import { anchorOwnsOpenPopup, remigrateTitle, tipGuideOf, tipTextOf, tooltipAnchorFromTarget, type TipHost } from "./tipText";
 
 class FakeTipHost implements TipHost {
   attributes = new Map<string, string>();
@@ -85,6 +85,43 @@ describe("tipTextOf", () => {
     expect(el.hasAttribute("title")).toBe(false);
   });
 
+  it("takes a title written back after migration as the newer text", () => {
+    // A branch row re-renders when its age or counts change, and Svelte
+    // writes the new text into `title` on a button already migrated. Reading
+    // the stored text first left that title on — the OS bubble came back over
+    // the styled one — and showed the text from before the change.
+    const el = new FakeTipHost({ title: "main\nAlex · just now" }, "main");
+    tipTextOf(el);
+    el.setAttribute("title", "main\nRobin · 1 min ago");
+    expect(tipTextOf(el)).toBe("main\nRobin · 1 min ago");
+    expect(el.getAttribute("data-tip-text")).toBe("main\nRobin · 1 min ago");
+    expect(el.hasAttribute("title")).toBe(false);
+  });
+
+  it("keeps a mirrored accessible name in step with the title it came from", () => {
+    const el = new FakeTipHost({ title: "Pin branch" }, "");
+    tipTextOf(el);
+    el.setAttribute("title", "Unpin branch");
+    tipTextOf(el);
+    expect(el.getAttribute("aria-label")).toBe("Unpin branch");
+  });
+
+  it("never rewrites an author's own label, even one that matched the old title", () => {
+    const el = new FakeTipHost({ title: "Close", "aria-label": "Close" }, "");
+    tipTextOf(el);
+    el.setAttribute("title", "Close (⌘W)");
+    tipTextOf(el);
+    expect(el.getAttribute("aria-label")).toBe("Close");
+  });
+
+  it("drops a mirrored name when the title it came from empties", () => {
+    const el = new FakeTipHost({ title: "Pin" }, "");
+    tipTextOf(el);
+    el.setAttribute("title", "");
+    expect(tipTextOf(el)).toBe("");
+    expect(el.hasAttribute("aria-label")).toBe(false);
+  });
+
   it("returns empty for elements without any tooltip source", () => {
     const el = new FakeTipHost();
     expect(tipTextOf(el)).toBe("");
@@ -162,5 +199,35 @@ describe("anchorOwnsOpenPopup", () => {
     expect(anchorOwnsOpenPopup(new FakeTipHost({ "aria-expanded": "true", title: "Toggle" }))).toBe(true);
     expect(anchorOwnsOpenPopup(new FakeTipHost({ "aria-expanded": "false", title: "Toggle" }))).toBe(false);
     expect(anchorOwnsOpenPopup(new FakeTipHost({ title: "Toggle" }))).toBe(false);
+  });
+});
+
+describe("remigrateTitle", () => {
+  it("takes a written-back title off an anchor already taken over", () => {
+    const el = new FakeTipHost({ title: "feature/a\nAlex" }, "feature/a");
+    tipTextOf(el);
+    el.setAttribute("title", "feature/a\nRobin");
+    expect(remigrateTitle(el)).toBe("feature/a\nRobin");
+    expect(el.hasAttribute("title")).toBe(false);
+  });
+
+  it("leaves an element it never took over for its first hover", () => {
+    const el = new FakeTipHost({ title: "Save" }, "Save");
+    expect(remigrateTitle(el)).toBeNull();
+    expect(el.getAttribute("title")).toBe("Save");
+    expect(el.hasAttribute("data-tip-text")).toBe(false);
+  });
+
+  it("strips a title from a destination-guide anchor without inventing text", () => {
+    const el = new FakeTipHost({ "data-tip-guide": "work", title: "Work" });
+    expect(remigrateTitle(el)).toBeNull();
+    expect(el.hasAttribute("title")).toBe(false);
+    expect(el.hasAttribute("data-tip-text")).toBe(false);
+  });
+
+  it("does nothing when no title came back", () => {
+    const el = new FakeTipHost({ "data-tip-text": "Pin" });
+    expect(remigrateTitle(el)).toBeNull();
+    expect(el.getAttribute("data-tip-text")).toBe("Pin");
   });
 });

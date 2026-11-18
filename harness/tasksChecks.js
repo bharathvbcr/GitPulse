@@ -1760,7 +1760,22 @@ if (params.has("check")) {
     // The assist speaks compose copy only when the sheet says this is a new task.
     check("a new task's assist asks what is needed and says notes become fields to accept",
       editor().querySelector(".assist-title")?.textContent.trim() === "What do you need?"
-      && editor().querySelector(".assist-hint")?.textContent.trim() === "Notes become a title and description you accept below.");
+      && /^Paste what you know\. Saving turns it into the fields below, or ask .+ to draft them\.$/.test(editor().querySelector(".assist-hint")?.textContent.trim() ?? ""));
+    check("a new task says why Save is disabled, and draws no split block it cannot use yet",
+      editor().querySelector('[data-testid="task-save-blocker"]')?.textContent.trim() === "Add a title, or paste notes above."
+      && !editor().querySelector('[data-testid="task-breakdown-section"]'));
+    {
+      // A note from an earlier action ("Added 3 criteria") used to take the
+      // reason's place, leaving Save off with nothing saying why.
+      const addBox = editor().querySelector('[data-testid="task-subtask-add-input"]');
+      const lines = new DataTransfer();
+      lines.setData("text/plain", "One\nTwo\nThree");
+      addBox.dispatchEvent(new ClipboardEvent("paste", { clipboardData: lines, bubbles: true, cancelable: true })); await settle();
+      check("the reason Save is off stays on screen beside another note",
+        /Added 3 criteria/.test(editor().querySelector("footer")?.textContent ?? "")
+        && editor().querySelector('[data-testid="task-save-blocker"]')?.textContent.trim() === "Add a title, or paste notes above.");
+      for (let n = 0; n < 3; n++) { editor().querySelector('[data-testid="task-subtask-remove-0"]')?.click(); await settle(); }
+    }
     check("a new task does not fold its notes",
       !assistToggle() && assistBody() && !assistBody().hidden
       && (idea.compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
@@ -1838,6 +1853,17 @@ if (params.has("check")) {
     check("inline configuration failure exposes a working retry", Boolean(button("Try again", editor().querySelector(".manvi-assist"))) && !button("Try again", editor().querySelector(".manvi-assist")).matches(":disabled"));
     failConfiguration=false; blankConfiguration=true; button("Try again", editor().querySelector(".manvi-assist")).click(); await settle();
     check("an unconfigured model exposes selection beside drafting", Boolean(editor().querySelector('.manvi-assist [data-testid="manvi-change-model"]')) && enhanceButton().matches(":disabled"));
+    {
+      // With no model to ask, the shortcut still does what the notes can do on
+      // their own: it used to only say the model was not ready.
+      const notesBox = editor().querySelector(".notes-label textarea");
+      await change(notesBox, "Book the venue\n- [ ] Confirm the date");
+      const shortcut = new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true, cancelable: true });
+      notesBox.dispatchEvent(shortcut); await settle();
+      check(`Cmd+Enter in the notes fills the fields when no model can draft (title: ${JSON.stringify(field("Title")?.value)})`,
+        shortcut.defaultPrevented && field("Title")?.value === "Book the venue"
+        && editor().querySelector('[data-testid="task-criteria"]')?.value === "Confirm the date" && notesBox.value === "");
+    }
     blankConfiguration=false;
     await harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "replacement-fixture" });
     await settle(150);
@@ -1846,7 +1872,10 @@ if (params.has("check")) {
     editor().querySelectorAll(".field-picks button").forEach(el=>el.click()); await settle();
     const emptySelectionWrites=enhancementWrites.length;
     editor().querySelector(".notes-label textarea").dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",ctrlKey:true,bubbles:true})); await settle();
-    check("empty field selection cannot widen through the keyboard shortcut", button("Draft with Manvi").matches(":disabled") && enhancementWrites.length===emptySelectionWrites);
+    // Unticking every field is a choice, not a missing model: the shortcut
+    // refuses it rather than filling the fields from the notes instead.
+    check("empty field selection cannot widen through the keyboard shortcut", button("Draft with Manvi").matches(":disabled") && enhancementWrites.length===emptySelectionWrites
+      && editor().querySelector(".notes-label textarea").value === "A recoverable task");
     blankConfiguration=false; await click("Close task details");
 
     // ---- One-line entry -------------------------------------------------
@@ -2617,6 +2646,20 @@ if (params.has("check")) {
       check("saving writes the checklist and links as stored fields",
         JSON.stringify(of("task-11").checklist) === JSON.stringify([{ text: "Write the regression test", done: true }])
         && JSON.stringify(of("task-11").links) === JSON.stringify([{ kind: "blocks", item_id: linkedId }]));
+      // A typed, unadded checklist item is the reader's: Save adds it, one the
+      // store would refuse is said out loud and stays typed, and Close asks.
+      const addBox = () => relations().querySelector('[data-testid="task-checklist-add"]');
+      await change(addBox(), "Second step");
+      await click("Save task"); await wait(() => of("task-11").checklist?.length === 2).catch(() => {}); // the check below names a miss
+      check("Save adds a checklist item that was typed but not yet added",
+        of("task-11").checklist[1]?.text === "Second step" && addBox().value === "");
+      await change(addBox(), "界".repeat(2000));
+      await click("Save task"); await settle();
+      check("Save refuses a checklist item longer than the store holds, says why, and keeps it typed",
+        /longer than 4096 bytes/.test(editor().textContent) && addBox().value.length === 2000 && of("task-11").checklist.length === 2);
+      await change(addBox(), "Not added yet");
+      confirmations = 0; confirmAnswer = false; await click("Close task details"); await settle();
+      check("closing with a checklist item typed but not added asks first", confirmations === 1 && Boolean(editor()));
       confirmAnswer = true; await click("Close task details"); await settle(100);
     } catch (error) { check(`the checklist and link checks ran to the end (${error.message})`, false); if (editor()) { confirmAnswer = true; await click("Close task details"); } }
 
@@ -3789,21 +3832,145 @@ if (params.has("check")) {
         card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
         const part = testid => editor().querySelector(`[data-testid="${testid}"]`);
         const typed = async text => { await change(part("task-subtask-add-input"), text); };
+        const row = index => part(`task-subtask-item-${index}`)?.querySelector(".subtask-text");
+        const unsaved = () => editor()?.querySelector("header small")?.textContent.trim() === "Unsaved";
+        // Typing into a box that only stages something — a criterion not yet
+        // added, a link search — is not an edit to the task. It used to mark the
+        // sheet Unsaved, which then asked to discard edits nobody had made and
+        // refused to accept a suggestion.
+        await change(editor().querySelector('[data-testid="task-link-search"]'), "Find something");
+        await typed("Write the tests");
+        check("typing in the link search or the add box does not mark the task Unsaved", !unsaved());
+        await change(editor().querySelector('[data-testid="task-link-search"]'), "");
+        check("the criteria are one list: the raw text is behind Edit as text, and Extract waits for a checklist to extract",
+          onScreen(part("task-subtask-add-input")) && !onScreen(part("task-criteria")) && !part("task-extract-subtasks"));
+        await typed("");
         check("Add stays disabled until a subtask is typed", part("task-subtask-add-button").disabled === true);
         await typed("Write the tests");
         check("and is enabled once one is", part("task-subtask-add-button").disabled === false);
         part("task-subtask-add-button").click(); await settle();
         check("Add lists the subtask, puts it in the criteria and clears the box",
-          part("task-subtask-item-0")?.textContent.includes("Write the tests") && part("task-criteria").value === "Write the tests" && part("task-subtask-add-input").value === "");
+          row(0)?.value === "Write the tests" && part("task-criteria").value === "Write the tests" && part("task-subtask-add-input").value === "" && unsaved());
         await typed("Ship it");
         part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
-        check("Enter in the box adds one too", part("task-subtask-item-1")?.textContent.includes("Ship it") && part("task-criteria").value === "Write the tests\nShip it");
-        part("task-subtask-remove-0").click(); await settle();
-        check("Remove drops that subtask and keeps the other", part("task-subtask-item-0")?.textContent.includes("Ship it") && !part("task-subtask-item-1") && part("task-criteria").value === "Ship it");
+        check("Enter in the box adds one too", row(1)?.value === "Ship it" && part("task-criteria").value === "Write the tests\nShip it");
+        await change(row(0), "Write the tests first ");
+        check("a row edits in place, keeping the space being typed", row(0)?.value === "Write the tests first " && part("task-criteria").value === "Write the tests first \nShip it");
+        row(0).dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true })); await settle();
+        check("Alt+Down moves a criterion down", part("task-criteria").value === "Ship it\nWrite the tests first ");
+        {
+          // The same reorder for the pointer, which held its press so a cleared
+          // row's blur cannot shift the index under it.
+          const press = new MouseEvent("mousedown", { bubbles: true, cancelable: true });
+          part("task-subtask-up-1").dispatchEvent(press);
+          part("task-subtask-up-1").click(); await settle();
+          const upped = part("task-criteria").value === "Write the tests first \nShip it";
+          part("task-subtask-down-0").click(); await settle();
+          check(`the up and down buttons reorder, and the ends cannot move past the list (criteria: ${JSON.stringify(part("task-criteria").value)})`,
+            press.defaultPrevented && upped && part("task-criteria").value === "Ship it\nWrite the tests first "
+            && part("task-subtask-up-0").disabled && part("task-subtask-down-1").disabled);
+          // A long criterion is read whole: its row grows rather than scrolling sideways.
+          const oneLine = row(1).offsetHeight;
+          await change(row(1), `Write the tests first ${"and cover every edge the parser meets ".repeat(8)}`);
+          check(`a long criterion's row grows to show all of it (${oneLine}px → ${row(1).offsetHeight}px)`,
+            row(1).offsetHeight > oneLine * 1.5 && row(1).scrollHeight <= row(1).clientHeight + 1);
+          // Rows are reused by position, so a move hands the long text to
+          // another box without an input event; and a list hidden behind "Edit
+          // as text" had no width to measure. Either left text cut off below a
+          // one-line box, with no scrollbar to show it was there.
+          const fits = index => row(index).scrollHeight <= row(index).clientHeight + 1;
+          part("task-subtask-up-1").click(); await settle();
+          check(`a moved criterion's rows refit: the long one grows where it lands, the short one shrinks (${row(0).offsetHeight}px, ${row(1).offsetHeight}px)`,
+            fits(0) && row(0).offsetHeight > oneLine * 1.5 && row(1).offsetHeight <= oneLine + 1);
+          part("task-criteria-raw-toggle").click(); await settle();
+          part("task-criteria-raw-toggle").click(); await settle(80);
+          check(`rows refit after the list comes back from Edit as text (${row(0).offsetHeight}px)`,
+            fits(0) && row(0).offsetHeight > oneLine * 1.5);
+          {
+            // A narrower sheet wraps the same text onto more lines; the row has
+            // to follow its width, not only its text.
+            // The sheet's own width is owned by its strip (an inline width on it
+            // is ignored), so the criteria section stands in for a narrower sheet.
+            const wide = row(0).offsetHeight;
+            const section = part("task-criteria-section");
+            section.style.width = "60%";
+            await settle(120);
+            const narrow = row(0).offsetHeight;
+            const fitsNarrow = fits(0);
+            section.style.width = ""; await settle(120);
+            check(`a row refits when the sheet's width changes (${wide}px → ${narrow}px → ${row(0).offsetHeight}px)`,
+              fitsNarrow && narrow > wide && fits(0) && row(0).offsetHeight <= wide + 1);
+          }
+          part("task-subtask-down-0").click(); await settle();
+          await change(row(1), "Write the tests first ");
+          check("and shrinks back when it is short again", row(1).offsetHeight <= oneLine + 1);
+        }
+        part("task-subtask-remove-1").click(); await settle();
+        check("Remove drops that subtask and keeps the other", row(0)?.value === "Ship it" && !part("task-subtask-item-1") && part("task-criteria").value === "Ship it");
+        check("Split says it reads the saved criteria while the list on screen differs from them",
+          Boolean(editor().querySelector('[data-testid="task-split-unsaved"]')));
+        {
+          // A cleared row removes itself when it loses focus. Pressing its own X
+          // used to blur it first (one removal) and then click the next row's
+          // reused button (a second), so the X's press keeps focus where it is.
+          for (const text of ["Gamma", "Delta"]) {
+            await typed(text);
+            part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+          }
+          await change(row(1), "");
+          const press = new MouseEvent("mousedown", { bubbles: true, cancelable: true });
+          part("task-subtask-remove-1").dispatchEvent(press);
+          part("task-subtask-remove-1").click(); await settle();
+          check(`removing a cleared row takes that row only (criteria: ${JSON.stringify(part("task-criteria").value)})`,
+            press.defaultPrevented && part("task-criteria").value === "Ship it\nDelta");
+          // With a row after it: moving on before removing used to send focus to
+          // a row the removal then deleted, leaving it on nothing.
+          await typed("Omega"); part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+          await change(row(1), "");
+          row(1).focus();
+          row(1).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+          check(`Enter on a cleared row removes that row only and stays on the row that took its place (criteria: ${JSON.stringify(part("task-criteria").value)})`,
+            part("task-criteria").value === "Ship it\nOmega" && document.activeElement === row(1) && row(1)?.value === "Omega");
+          part("task-subtask-remove-1")?.click(); await settle();
+        }
+        {
+          const data = new DataTransfer();
+          data.setData("text/plain", "- [ ] Gamma\n2. Delta\n\nship it");
+          part("task-subtask-add-input").dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true })); await settle();
+          check(`pasting lines adds one criterion each, markers stripped, a repeat refused and said so (criteria: ${JSON.stringify(part("task-criteria").value)}; note: ${JSON.stringify(editor().querySelector("footer [role=status]")?.textContent ?? "")})`,
+            part("task-criteria").value === "Ship it\nGamma\nDelta" && /1 not added: already listed/.test(editor().textContent));
+          part("task-subtask-remove-2")?.click(); await settle(); part("task-subtask-remove-1")?.click(); await settle();
+          const headed = new DataTransfer();
+          headed.setData("text/plain", "Subtasks:\n• Gamma\n• Delta");
+          part("task-subtask-add-input").dispatchEvent(new ClipboardEvent("paste", { clipboardData: headed, bubbles: true, cancelable: true })); await settle();
+          check(`a pasted list keeps its items and drops the heading over them (criteria: ${JSON.stringify(part("task-criteria").value)})`,
+            part("task-criteria").value === "Ship it\nGamma\nDelta");
+          part("task-subtask-remove-2")?.click(); await settle(); part("task-subtask-remove-1")?.click(); await settle();
+          // Lines pasted over a row become that row and rows under it, not one
+          // long criterion.
+          await typed("Omega"); part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+          const over = new DataTransfer();
+          over.setData("text/plain", "- Gamma\n- Delta");
+          row(0).focus(); row(0).setSelectionRange(0, row(0).value.length);
+          row(0).dispatchEvent(new ClipboardEvent("paste", { clipboardData: over, bubbles: true, cancelable: true })); await settle();
+          check(`lines pasted over a row replace it with one row each, in place (criteria: ${JSON.stringify(part("task-criteria").value)})`,
+            part("task-criteria").value === "Gamma\nDelta\nOmega");
+          await change(row(0), "Ship it"); part("task-subtask-remove-2")?.click(); await settle(); part("task-subtask-remove-1")?.click(); await settle();
+        }
+        {
+          // Extract reads the description only: a checklist in the notes is the
+          // notes preview's to fill, and two buttons moving it counted it twice.
+          const notesBox = () => editor().querySelector('[aria-label="Manvi task assist"] textarea');
+          if (assistToggle()?.getAttribute("aria-expanded") === "false") { assistToggle().click(); await settle(); }
+          await change(notesBox(), "- [ ] Noted step");
+          check("a checklist in the notes alone does not offer Extract", !part("task-extract-subtasks") && Boolean(part("task-notes-preview")));
+          await change(notesBox(), "");
+        }
         await change(field("Description"), "Plan:\n- [ ] Alpha step\n- [ ] Beta step");
+        check("Extract appears once the description holds a checklist, and counts it", part("task-extract-subtasks")?.textContent.trim() === "Extract 2 from text");
         part("task-extract-subtasks").click(); await settle();
         check("Extract subtasks moves the checklist out of the description into the criteria, keeping what was there",
-          part("task-criteria").value === "Ship it\nAlpha step\nBeta step" && !field("Description").value.includes("Alpha step") && /Extracted 2 subtasks/.test(editor().textContent));
+          part("task-criteria").value === "Ship it\nAlpha step\nBeta step" && !field("Description").value.includes("Alpha step") && /Moved 2 into acceptance criteria/.test(editor().textContent) && !part("task-extract-subtasks"));
         // Cmd+S from inside the repository popover, which is portaled out of the sheet.
         await openRepoPicker();
         const savesBefore = writes.length;
@@ -3812,6 +3979,65 @@ if (params.has("check")) {
         check("Command-S saves from inside the repository popover, with the criteria as stored lines",
           JSON.stringify(writes.at(-1).acceptance_criteria) === JSON.stringify(["Ship it", "Alpha step", "Beta step"]));
         await closeRepoPicker();
+        {
+          // A row cleared and still focused has not lost focus, so its removal
+          // has not run yet: Cmd+S used to save the text the reader deleted.
+          const cmdS = target => target.dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+          await change(row(2), ""); row(2).focus();
+          let before = writes.length;
+          cmdS(row(2)); await wait(() => writes.length > before).catch(() => {}); await settle(100);
+          check(`Command-S with a cleared row still focused saves without that row (saved: ${JSON.stringify(writes.at(-1)?.acceptance_criteria)})`,
+            writes.length > before && JSON.stringify(writes.at(-1).acceptance_criteria) === JSON.stringify(["Ship it", "Alpha step"]));
+          // A criterion typed and not yet added is saved with the rest, not dropped.
+          await typed("Beta step");
+          before = writes.length;
+          cmdS(part("task-subtask-add-input")); await wait(() => writes.length > before).catch(() => {}); await settle(100);
+          check(`Save adds a criterion that was typed but not yet added (saved: ${JSON.stringify(writes.at(-1)?.acceptance_criteria)})`,
+            JSON.stringify(writes.at(-1).acceptance_criteria) === JSON.stringify(["Ship it", "Alpha step", "Beta step"]) && part("task-subtask-add-input").value === "" && !unsaved());
+        }
+        // A criterion typed and not yet added is not an edit (the sheet stays
+        // clean), but it is work: Save keeps it, so Close must ask, not drop it.
+        {
+          await typed("Typed but not added");
+          const asked = confirmations;
+          confirmAnswer = false;
+          await click("Close task details");
+          confirmAnswer = true;
+          check("closing with a typed, unadded criterion asks first instead of dropping it", confirmations === asked + 1 && Boolean(editor()) && !unsaved());
+          await typed("");
+        }
+        // Notes say what they will write before anything is written, from the
+        // same function the save calls — and the checklist in them becomes
+        // criteria rather than a second copy inside the description.
+        {
+          const notesBox = () => editor().querySelector('[aria-label="Manvi task assist"] textarea');
+          if (assistToggle()?.getAttribute("aria-expanded") === "false") { assistToggle().click(); await settle(); }
+          const descriptionBefore = field("Description").value;
+          await change(notesBox(), "Seen on Safari only.\n\nSubtasks:\n- [ ] Reproduce on Safari\n- [ ] Ship it");
+          const preview = () => part("task-notes-preview");
+          // Folded notes are still written by Save, so the fold says so.
+          assistToggle().click(); await settle();
+          check("folding the assist with notes in it says Save will add them",
+            assistToggle().getAttribute("aria-expanded") === "false" && /Notes not applied yet/.test(part("task-assist-status")?.textContent ?? ""));
+          assistToggle().click(); await settle();
+          check("notes draw a live preview of what saving them adds",
+            onScreen(preview()) && /Saving adds your notes/.test(preview()?.textContent ?? "")
+            && part("task-notes-preview-criteria")?.textContent.includes("+1") && part("task-notes-preview-criteria")?.textContent.includes("Reproduce on Safari"));
+          part("task-notes-apply").click(); await settle();
+          check("Fill the fields now moves the checklist into the criteria and the prose into the description, once",
+            part("task-criteria").value === "Ship it\nAlpha step\nBeta step\nReproduce on Safari"
+            && field("Description").value === `${descriptionBefore}\n\nSeen on Safari only.` && notesBox().value === "" && !preview());
+          // Undo is offered only while the fields still read what the fill left;
+          // after another edit it would overwrite that edit.
+          const titleNow = field("Title").value;
+          await change(field("Title"), `${titleNow} (edited)`);
+          check("Undo disappears once the filled fields are edited again", !part("task-notes-undo"));
+          await change(field("Title"), titleNow);
+          part("task-notes-undo")?.click(); await settle();
+          check("Undo puts the notes back and the fields as they were",
+            part("task-criteria").value === "Ship it\nAlpha step\nBeta step" && field("Description").value === descriptionBefore
+            && notesBox().value.startsWith("Seen on Safari only.") && Boolean(preview()));
+        }
         await click("Close task details"); await wait(() => !editor());
       }
 
@@ -4074,6 +4300,95 @@ if (params.has("check")) {
         firstSpace.focus(); press(firstSpace, "ArrowUp", { altKey: true }); await settle(100);
         check("Alt+ArrowUp on the first workspace is the reorder shortcut, not row navigation: focus stays put", document.activeElement === firstSpace);
 
+        step = "repository sort";
+        {
+          const sortTrigger = () => scopesNav()?.querySelector('[data-testid="task-repo-sort-trigger"]');
+          const sortMenu = () => document.querySelector('[data-testid="task-repo-sort-menu"]');
+          const sortOption = key => document.querySelector(`[data-testid="task-repo-sort-${key}"]`);
+          const rowIds = () => [...(scopesNav()?.querySelectorAll("[data-repository-row]") ?? [])].map(el => el.dataset.repositoryRow);
+          const openSortMenu = async () => {
+            if (!sortMenu()) sortTrigger()?.click();
+            await wait(() => Boolean(sortMenu()) && Boolean(sortMenu()?.querySelector('[role="menuitemradio"]')));
+            await settle(50);
+          };
+          const savedRepos = repos.splice(0, repos.length,
+            { id: "repo-sort-zeta", name: "Zeta", revision: 1, updated_at: 20, identity_key: "local:/fixture/SortZeta/.git", remote_url: null },
+            { id: "repo-sort-two", name: "Manvi", revision: 1, updated_at: 10, identity_key: "local:/fixture/SortOpenTwo/.git", remote_url: null },
+            { id: "repo-sort-alpha", name: "Alpha", revision: 1, updated_at: 99, identity_key: "local:/fixture/SortAlpha/.git", remote_url: null },
+            { id: "repo-sort-one", name: "GitPulse", revision: 1, updated_at: 10, identity_key: "local:/fixture/SortOpenOne/.git", remote_url: null },
+          );
+          try {
+            await repoStore.openRepo("/fixture/SortOpenTwo", { activate: false });
+            await repoStore.openRepo("/fixture/SortOpenOne", { activate: false });
+            await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+            await click("Refresh");
+            await wait(() => rowIds().includes("repo-sort-alpha"));
+
+            check("repositories default to Name, A to Z in the scope navigator",
+              JSON.stringify(rowIds()) === JSON.stringify(["repo-sort-alpha", "repo-sort-one", "repo-sort-two", "repo-sort-zeta"]));
+
+            await openSortMenu();
+            check("the sort menu portals to body outside the navigator and marks the active sort",
+              Boolean(sortMenu()) && !scopesNav().contains(sortMenu()) && sortOption("name-asc")?.getAttribute("aria-checked") === "true");
+            await wait(() => document.activeElement === sortOption("name-asc"));
+            press(document.activeElement, "ArrowDown");
+            check("ArrowDown moves focus through repository sort options", document.activeElement === sortOption("name-desc"));
+            press(document.activeElement, "Escape");
+            await untilGone(sortMenu);
+            check("Escape closes the sort menu and returns focus to its trigger",
+              !sortMenu() && (await settled(() => document.activeElement === sortTrigger())));
+
+            await openSortMenu();
+            sortOption("name-desc").click();
+            await untilGone(sortMenu);
+            check("Name, Z to A reorders repositories descending and persists",
+              JSON.stringify(rowIds()) === JSON.stringify(["repo-sort-zeta", "repo-sort-two", "repo-sort-one", "repo-sort-alpha"])
+                && get(interfaceStore).taskRepositorySort === "name-desc");
+
+            await openSortMenu();
+            sortOption("open").click();
+            await untilGone(sortMenu);
+            check("Open first puts open tabs before closed repositories in Name, A to Z order",
+              JSON.stringify(rowIds()) === JSON.stringify(["repo-sort-two", "repo-sort-one", "repo-sort-alpha", "repo-sort-zeta"])
+                && get(interfaceStore).taskRepositorySort === "open");
+
+            await openSortMenu();
+            sortOption("recent").click();
+            await untilGone(sortMenu);
+            check("Recently added orders by newest updated_at first and ties A to Z",
+              JSON.stringify(rowIds()) === JSON.stringify(["repo-sort-alpha", "repo-sort-zeta", "repo-sort-one", "repo-sort-two"])
+                && get(interfaceStore).taskRepositorySort === "recent");
+
+            toggle().click(); await wait(() => !scopesNav());
+            toggle().click(); await wait(() => scopesNav());
+            await openSortMenu();
+            await wait(() => document.activeElement === sortOption("recent"));
+            press(document.activeElement, "Escape");
+            await untilGone(sortMenu);
+            check("Escape in the overlay sort menu closes only the menu and keeps the rail open",
+              !sortMenu() && Boolean(scopesNav()));
+
+            await openSortMenu();
+            sortOption("name-asc").click();
+            await untilGone(sortMenu);
+            check("choosing a sort inside the overlay updates order without dismissing the rail",
+              Boolean(scopesNav()) && JSON.stringify(rowIds()) === JSON.stringify(["repo-sort-alpha", "repo-sort-one", "repo-sort-two", "repo-sort-zeta"])
+                && get(interfaceStore).taskRepositorySort === "name-asc");
+            button("Dock the task scopes beside the board", scopesNav()).click();
+            await wait(() => scopesNav() && !scopesNav().classList.contains("is-overlay"));
+          } finally {
+            if (sortMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await untilGone(sortMenu); }
+            repos.splice(0, repos.length, ...savedRepos);
+            await repoStore.removeRepo("/fixture/SortOpenTwo");
+            await repoStore.removeRepo("/fixture/SortOpenOne");
+            interfaceStore.setTaskRepositorySort("name-asc");
+            interfaceStore.setTaskNavigatorCollapsed(false);
+            await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+            await click("Refresh");
+            await wait(() => Boolean(scopesNav()) && !rowIds().includes("repo-sort-alpha") && rowIds().includes("repo-0"));
+          }
+        }
+
         step = "navigator collapse";
         check("the toolbar offers to hide the navigator while it is docked", toggle()?.getAttribute("aria-label") === "Hide task scopes" && toggle().getAttribute("aria-expanded") === "true");
         toggle().click(); await wait(() => !scopesNav());
@@ -4116,7 +4431,8 @@ if (params.has("check")) {
         const severity = () => field("Severity");
         check("Severity offers None and the four levels, and a task without one shows None",
           same([...severity().options].map(option => option.textContent.trim()), ["None", "Low", "Medium", "High", "Critical"]) && severity().selectedOptions[0].textContent.trim() === "None");
-        const owner = editor().querySelector(".owner-field input");
+        // Owner is a labelled field under Details now, not a section of its own.
+        const owner = field("Owner");
         check("the text controls carry the store's length limits",
           field("Title").maxLength === 300 && field("Description").maxLength === 65536 && editor().querySelector('[data-testid="task-criteria"]').maxLength === 65536
           && editor().querySelector('[data-testid="task-subtask-add-input"]').maxLength === 4096 && owner.maxLength === 300 && field("Custom type")?.maxLength === 64);

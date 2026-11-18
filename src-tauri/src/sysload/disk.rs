@@ -31,29 +31,64 @@ pub const LOW_DISK_FLOOR: u64 = 10 << 30;
 /// `Copy`, and a test injects a fixed value.
 pub type FreeSpace = fn(&Path) -> Reading<u64>;
 
-/// The real reader. An unreadable volume is `Unavailable`, never a number.
 #[cfg(unix)]
-pub fn free_bytes(path: &Path) -> Reading<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return Reading::Unavailable(Why::Failed);
-    };
+fn statvfs_raw(c_path: &std::ffi::CStr) -> Result<libc::statvfs, Why> {
     let mut fs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
     // SAFETY: a NUL-terminated path and one statvfs buffer.
     if unsafe { libc::statvfs(c_path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-        return Reading::Unavailable(Why::of_errno(
+        return Err(Why::of_errno(
             std::io::Error::last_os_error().raw_os_error(),
         ));
     }
     // SAFETY: filled by the kernel.
-    let fs = unsafe { fs.assume_init() };
+    Ok(unsafe { fs.assume_init() })
+}
+
+/// Free bytes available to an unprivileged process and total capacity of the
+/// volume holding `c_path`.
+#[cfg(unix)]
+pub(crate) fn volume_bytes_c(c_path: &std::ffi::CStr) -> (Reading<u64>, Reading<u64>) {
+    let fs = match statvfs_raw(c_path) {
+        Ok(fs) => fs,
+        Err(why) => return (Reading::Unavailable(why), Reading::Unavailable(why)),
+    };
     #[allow(clippy::useless_conversion)]
-    let (avail, frsize, bsize) = (
+    let (avail, blocks, frsize, bsize) = (
         u64::from(fs.f_bavail),
+        u64::from(fs.f_blocks),
         u64::from(fs.f_frsize),
         u64::from(fs.f_bsize),
     );
-    Reading::Value(available_bytes(avail, frsize, bsize))
+    let free = available_bytes(avail, frsize, bsize);
+    let total = available_bytes(blocks, frsize, bsize);
+    (
+        Reading::Value(free),
+        if total > 0 {
+            Reading::Value(total)
+        } else {
+            Reading::Unavailable(Why::Failed)
+        },
+    )
+}
+
+/// Free bytes available to an unprivileged process and total capacity of the
+/// volume holding `path`.
+#[cfg(unix)]
+pub fn volume_bytes(path: &Path) -> (Reading<u64>, Reading<u64>) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return (
+            Reading::Unavailable(Why::Failed),
+            Reading::Unavailable(Why::Failed),
+        );
+    };
+    volume_bytes_c(&c_path)
+}
+
+/// The real reader. An unreadable volume is `Unavailable`, never a number.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> Reading<u64> {
+    volume_bytes(path).0
 }
 
 /// Blocks available times the fragment size, or the block size where the
@@ -72,13 +107,7 @@ fn available_bytes(avail_blocks: u64, frsize: u64, bsize: u64) -> u64 {
 pub fn block_size(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut fs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
-    // SAFETY: a NUL-terminated path and one statvfs buffer.
-    if unsafe { libc::statvfs(c_path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: filled by the kernel.
-    let fs = unsafe { fs.assume_init() };
+    let fs = statvfs_raw(&c_path).ok()?;
     // `f_frsize` is the allocation unit; `f_bsize` is the preferred transfer
     // size (1 MiB on APFS), which would charge a 100-byte file a megabyte.
     #[allow(clippy::useless_conversion)]
@@ -121,8 +150,17 @@ pub fn physical_memory() -> Option<u64> {
 
 /// Windows has no reader here: unknown, so nothing is skipped on a guess.
 #[cfg(not(unix))]
+pub fn volume_bytes(_path: &Path) -> (Reading<u64>, Reading<u64>) {
+    (
+        Reading::Unavailable(Why::Unsupported),
+        Reading::Unavailable(Why::Unsupported),
+    )
+}
+
+/// Windows has no reader here: unknown, so nothing is skipped on a guess.
+#[cfg(not(unix))]
 pub fn free_bytes(_path: &Path) -> Reading<u64> {
-    Reading::Unavailable(Why::Unsupported)
+    volume_bytes(_path).0
 }
 
 /// What bound the cache copy.
@@ -187,9 +225,16 @@ mod tests {
     fn a_real_volume_reads_a_value_and_a_missing_path_does_not() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(free_bytes(dir.path()), Reading::Value(v) if v > 0));
+        let (free, total) = volume_bytes(dir.path());
+        assert!(matches!((free, total), (Reading::Value(f), Reading::Value(t)) if f > 0 && t >= f));
         assert!(matches!(
             free_bytes(&dir.path().join("absent")),
             Reading::Unavailable(_)
+        ));
+        let (absent_free, absent_total) = volume_bytes(&dir.path().join("absent"));
+        assert!(matches!(
+            (absent_free, absent_total),
+            (Reading::Unavailable(_), Reading::Unavailable(_))
         ));
     }
 

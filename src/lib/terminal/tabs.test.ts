@@ -15,6 +15,7 @@ import {
   normalizePaneFilePath,
   tabFor,
   setTabPurpose,
+  setTabInitialCommand,
   setTabTitle,
   tabLabel,
   terminalTabChord,
@@ -529,13 +530,389 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
       name: "Claude · agent-1",
     });
     expect(wtOpened.id).toBeTruthy();
-    const created = wtOpened.state.tabs.find((t: { id: string }) => t.id === wtOpened.id)!;
-    expect(created).toMatchObject({
+    const wtTab = wtOpened.state.tabs.find((t: { id: string }) => t.id === wtOpened.id)!;
+    expect(wtTab).toMatchObject({
       launcher: "claude",
       checkout: "/Users/dev/repo.wt-agent-1",
       name: "Claude · agent-1",
     });
-    expect(created.taskRunId).toBeUndefined();
+    expect(wtTab.taskRunId).toBeUndefined();
+  });
+
+  it("lets live OSC titles override launch-seeded names while letting manual renames win and clear cleanly", async () => {
+    const mod = await import("./tabs");
+    // 1. Task-launched tab: starts with task title, then yields primary to live OSC title while keeping launch name as secondary.
+    let taskState = openTab(initialState("shell"), "claude", { runId: "run-42", title: "Preserve E42" });
+    const taskId = taskState.activeId!;
+    expect(tabLabel(taskState.tabs.find((t) => t.id === taskId)!)).toBe("Preserve E42");
+    taskState = setTabTitle(taskState, taskId, "✳ Running cargo test");
+    const taskUpdated = taskState.tabs.find((t) => t.id === taskId)!;
+    expect(tabLabel(taskUpdated)).toBe("✳ Running cargo test");
+    expect(mod.tabDisplayTitle(taskUpdated)).toEqual({
+      primary: "✳ Running cargo test",
+      secondary: "Preserve E42",
+      fullTitle: "✳ Running cargo test",
+      source: "agent",
+    });
+
+    // 2. Worktree checkout-launched tab & resumed tab & attached child tab: live OSC titles supersede launch names.
+    const wt = mod.openCheckoutTab(initialState("shell"), "claude", {
+      checkout: "/Users/dev/repo.wt-a",
+      name: "Claude · wt-a",
+    });
+    let wtState = setTabTitle(wt.state, wt.id!, "✳ Refactor auth");
+    const wtTab = wtState.tabs.find((t) => t.id === wt.id!)!;
+    expect(tabLabel(wtTab)).toBe("✳ Refactor auth");
+    expect(mod.tabDisplayTitle(wtTab).secondary).toBe("Claude · wt-a");
+
+    const resumed = openTab(initialState("shell"), "claude", {
+      runId: "run-9",
+      title: "Fix importer",
+      resume: { sessionId: "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11", mode: "edit" },
+    });
+    const resumedLive = setTabTitle(resumed, resumed.activeId!, "✳ Auditing importers");
+    const resumedTab = resumedLive.tabs.find((t) => t.id === resumed.activeId!)!;
+    expect(tabLabel(resumedTab)).toBe("✳ Auditing importers");
+    expect(mod.tabDisplayTitle(resumedTab).secondary).toBe("Fix importer (resumed)");
+
+    const child = openAttachedChildTab(initialState("claude"), {
+      sessionId: "term-child-88",
+      launcher: "agy",
+      title: "Review Worker",
+    });
+    const childLive = setTabTitle(child.state, child.id!, "Patching split header");
+    const childTab = childLive.tabs.find((t) => t.id === child.id!)!;
+    expect(tabLabel(childTab)).toBe("Patching split header");
+    expect(mod.tabDisplayTitle(childTab).secondary).toBe("Review Worker");
+
+    // 3. Explicit user rename sets userNamed: true, overrides live OSC title, and clearing restores automatic title.
+    wtState = mod.renameTab(wtState, wt.id!, "Pinned Name");
+    expect(wtState.tabs.find((t) => t.id === wt.id!)?.userNamed).toBe(true);
+    wtState = setTabTitle(wtState, wt.id!, "✳ New background title");
+    const pinnedTab = wtState.tabs.find((t) => t.id === wt.id!)!;
+    expect(tabLabel(pinnedTab)).toBe("Pinned Name");
+    expect(mod.tabDisplayTitle(pinnedTab)).toEqual({
+      primary: "Pinned Name",
+      secondary: "✳ New background title",
+      fullTitle: "Pinned Name",
+      source: "custom",
+    });
+
+    wtState = mod.renameTab(wtState, wt.id!, "   ");
+    const unpinnedTab = wtState.tabs.find((t) => t.id === wt.id!)!;
+    expect(unpinnedTab.userNamed).toBe(false);
+    expect(tabLabel(unpinnedTab)).toBe("✳ New background title");
+    expect(mod.tabDisplayTitle(unpinnedTab).secondary).toBe("Claude · wt-a");
+
+    // Clearing a user rename when title is null reverts to launchName cleanly.
+    const revertedNoOsc = mod.renameTab(
+      mod.renameTab(wt.state, wt.id!, "Temp Name"),
+      wt.id!,
+      "",
+    ).tabs.find((t) => t.id === wt.id!)!;
+    expect(revertedNoOsc.userNamed).toBe(false);
+    expect(tabLabel(revertedNoOsc)).toBe("Claude · wt-a");
+  });
+
+  it("surfaces OSC 7501 status detail in tabDisplayTitle and effectiveSessionTitle without replacing default tabLabel", async () => {
+    const mod = await import("./tabs");
+    const tab = createTab("claude");
+    const agentStatus = { state: "working", detail: "Auditing splitTree.ts" };
+    expect(tabLabel(tab)).toBe("Claude");
+    expect(mod.tabDisplayTitle(tab, agentStatus)).toEqual({
+      primary: "Claude",
+      secondary: "Auditing splitTree.ts",
+      fullTitle: "Claude",
+      source: "launcher",
+    });
+    expect(mod.effectiveSessionTitle(tab, agentStatus)).toBe("Auditing splitTree.ts");
+
+    const liveTab = { ...tab, title: "✳ Editing TerminalPanel.svelte" };
+    expect(mod.effectiveSessionTitle(liveTab, agentStatus)).toBe("✳ Editing TerminalPanel.svelte");
+  });
+
+  it("deduplicates high-frequency spinner frames in setTabTitle and coalesces rapid OSC title bursts", async () => {
+    const mod = await import("./tabs");
+    const base = initialState("claude");
+    const id = base.activeId!;
+    const first = setTabTitle(base, id, "⠋ Auditing splitTree.ts");
+    expect(first.tabs[0].title).toBe("Auditing splitTree.ts");
+
+    // Subsequent Braille and quarter-circle spinner frames normalize identically -> exact reference equality!
+    for (const frame of [
+      "⠙ Auditing splitTree.ts",
+      "⠹ Auditing splitTree.ts",
+      "◐ Auditing splitTree.ts",
+      "Auditing splitTree.ts ◒",
+      "  Auditing splitTree.ts  ",
+    ]) {
+      expect(setTabTitle(first, id, frame)).toBe(first);
+    }
+
+    // Static status icons (✳) are NOT stripped; bare spinner normalizes to null.
+    const star = setTabTitle(first, id, "✳ Ready for review");
+    expect(star.tabs[0].title).toBe("✳ Ready for review");
+    const bare = setTabTitle(star, id, "⠋");
+    expect(bare.tabs[0].title).toBeNull();
+    expect(setTabTitle(bare, id, "⠙")).toBe(bare);
+
+    // Leading + trailing coalescer: immediate first delivery, coalesced 10 Hz burst, clean dispose.
+    let now = 1_000;
+    const timers = new Map<number, { fn: () => void; due: number }>();
+    let nextTimerId = 1;
+    const delivered: string[] = [];
+    const coalescer = mod.createTitleCoalescer(
+      (title) => delivered.push(title),
+      150,
+      {
+        now: () => now,
+        setTimeout: ((fn: () => void, ms?: number) => {
+          const tid = nextTimerId++;
+          timers.set(tid, { fn, due: now + (ms ?? 0) });
+          return tid as unknown as ReturnType<typeof setTimeout>;
+        }) as typeof setTimeout,
+        clearTimeout: ((tid: unknown) => {
+          timers.delete(tid as number);
+        }) as typeof clearTimeout,
+      },
+    );
+
+    coalescer.push("⠋ Phase 1");
+    expect(delivered).toEqual(["Phase 1"]);
+    now += 80;
+    coalescer.push("⠙ Phase 1"); // identical normalized -> no timer needed
+    expect(timers.size).toBe(0);
+
+    coalescer.push("⠹ Phase 2");
+    now += 30;
+    coalescer.push("⠸ Phase 3");
+    expect(delivered).toEqual(["Phase 1"]);
+    expect(timers.size).toBe(1);
+
+    // Advance past 150ms window -> delivers trailing "Phase 3" once
+    now += 150;
+    const pending = [...timers.values()][0];
+    timers.clear();
+    pending.fn();
+    expect(delivered).toEqual(["Phase 1", "Phase 3"]);
+
+    // Flush & dispose safety
+    now += 20;
+    coalescer.push("Phase 4");
+    coalescer.flush();
+    expect(delivered).toEqual(["Phase 1", "Phase 3", "Phase 4"]);
+    now += 20;
+    coalescer.push("Phase 5");
+    coalescer.dispose();
+    expect(timers.size).toBe(0);
+    coalescer.push("Phase 6");
+    expect(delivered).toEqual(["Phase 1", "Phase 3", "Phase 4"]);
+  });
+
+  it("handles browser URL/loading/error titles, file :revealLine context, snippet isolation, and stale userNamed resets", async () => {
+    const mod = await import("./tabs");
+    expect(mod.browserHostLabel("http://localhost:5173/dashboard?tab=1")).toBe("localhost:5173");
+    expect(mod.browserHostLabel("127.0.0.1:8080/api")).toBe("127.0.0.1:8080");
+    expect(mod.browserHostLabel("javascript:alert(1)")).toBe("");
+    expect(mod.browserHostLabel("   ")).toBe("");
+
+    // Browser tab: host:port fallback before <title>, loading/error states, and live <title> promotion
+    const browserOpened = mod.openBrowserTab(initialState("shell"), "http://localhost:5173/login");
+    const bTab = browserOpened.state.tabs.find((t) => t.id === browserOpened.id)!;
+    expect(tabLabel(bTab)).toBe("localhost:5173");
+    expect(mod.tabDisplayTitle(bTab, null, { loading: true })).toEqual({
+      primary: "localhost:5173",
+      secondary: "Loading…",
+      fullTitle: "localhost:5173",
+      source: "url",
+    });
+    expect(mod.tabDisplayTitle(bTab, null, { error: "Connection refused" }).secondary).toBe("Connection refused");
+    const bTitled = setTabTitle(browserOpened.state, bTab.id, "GitPulse Preview").tabs.find((t) => t.id === bTab.id)!;
+    expect(mod.tabDisplayTitle(bTitled)).toEqual({
+      primary: "GitPulse Preview",
+      secondary: "localhost:5173",
+      fullTitle: "GitPulse Preview",
+      source: "agent",
+    });
+
+    // Snippet tab: never clobbered by openFileTab / fileTabFor, carries Captured output secondary
+    const withSnippet = mod.openSnippetTab(initialState("shell"), {
+      title: "cargo test --lib",
+      content: "test result: ok. 42 passed",
+    });
+    const snipTab = withSnippet.state.tabs.find((t) => t.id === withSnippet.id)!;
+    expect(mod.tabDisplayTitle(snipTab)).toEqual({
+      primary: "cargo test --lib",
+      secondary: "Captured output",
+      fullTitle: "cargo test --lib",
+      source: "file",
+    });
+    expect(mod.fileTabFor(withSnippet.state)).toBeUndefined();
+
+    const fileAlongside = openFileTab(withSnippet.state, {
+      filePath: "src/App.svelte",
+      line: 42,
+      column: 7,
+    });
+    expect(fileAlongside.opened).toBe(true);
+    expect(fileAlongside.id).not.toBe(withSnippet.id);
+    const fTab = fileAlongside.state.tabs.find((t) => t.id === fileAlongside.id)!;
+    expect(tabLabel(fTab)).toBe("App.svelte");
+    expect(mod.tabDisplayTitle(fTab)).toEqual({
+      primary: "App.svelte:42",
+      secondary: "src:42",
+      fullTitle: "src/App.svelte:42:7",
+      source: "file",
+    });
+
+    const rootFile = mod.setTabFile(fileAlongside.state, fTab.id, "README.md", 12).tabs.find((t) => t.id === fTab.id)!;
+    expect(mod.tabDisplayTitle(rootFile)).toEqual({
+      primary: "README.md:12",
+      secondary: "L12",
+      fullTitle: "README.md:12",
+      source: "file",
+    });
+
+    // User rename preserved on same-file line jump, reset when switching to a different file or snippet
+    const renamedFileState = mod.renameTab(fileAlongside.state, fTab.id, "App Entry");
+    const sameFileLine = mod.setTabFile(renamedFileState, fTab.id, "src/App.svelte", 99).tabs.find((t) => t.id === fTab.id)!;
+    expect(sameFileLine.userNamed).toBe(true);
+    expect(tabLabel(sameFileLine)).toBe("App Entry");
+
+    const switchedFile = mod.setTabFile(renamedFileState, fTab.id, "src/main.ts", 5).tabs.find((t) => t.id === fTab.id)!;
+    expect(switchedFile.userNamed).toBe(false);
+    expect(tabLabel(switchedFile)).toBe("main.ts");
+
+    const renamedSnipState = mod.renameTab(withSnippet.state, snipTab.id, "Saved Logs");
+    const reusedSnip = mod.openSnippetTab(renamedSnipState, {
+      title: "vitest run",
+      content: "100 passed",
+    });
+    expect(reusedSnip.opened).toBe(false);
+    const updatedSnip = reusedSnip.state.tabs.find((t) => t.id === snipTab.id)!;
+    expect(updatedSnip.userNamed).toBe(false);
+    expect(tabLabel(updatedSnip)).toBe("vitest run");
+  });
+
+  it("toggles split-pane pinning idempotently and resolves multi-agent pair handoff targets with #slot disambiguation", async () => {
+    const mod = await import("./tabs");
+    let state = initialState("claude");
+    const c1 = state.activeId!;
+    expect(mod.toggleTabPinned(state, "missing-id")).toBe(state);
+    expect(mod.toggleTabPinned(state, c1, false)).toBe(state);
+    const pinned = mod.toggleTabPinned(state, c1);
+    expect(pinned.tabs[0].pinned).toBe(true);
+    expect(mod.toggleTabPinned(pinned, c1, true)).toBe(pinned);
+    const unpinned = mod.toggleTabPinned(pinned, c1);
+    expect(unpinned.tabs[0].pinned).toBeUndefined();
+
+    // Multi-agent & same-agent pair handoff
+    state = openTab(state, "codex");
+    const codexId = state.activeId!;
+    state = openTab(state, "claude");
+    const c2 = state.activeId!;
+    state = openTab(state, "shell");
+    const shellId = state.activeId!;
+
+    // 2-pane Codex <-> Claude: distinct launchers need no #slot suffix
+    expect(mod.resolvePairHandoffTargets(state.tabs, [c1, codexId], c1)).toEqual([
+      {
+        id: codexId,
+        launcher: "codex",
+        slot: 2,
+        fromSlot: 1,
+        label: "Codex",
+        buttonLabel: "Handoff -> Codex",
+      },
+    ]);
+
+    // 2-pane Claude #1 <-> Claude #2: same launcher adds #slot disambiguation
+    expect(mod.resolvePairHandoffTargets(state.tabs, [c1, c2], c1)).toEqual([
+      {
+        id: c2,
+        launcher: "claude",
+        slot: 2,
+        fromSlot: 1,
+        label: "Claude #2",
+        buttonLabel: "Handoff -> Claude #2",
+      },
+    ]);
+
+    // 4-pane split with exited peer and non-agent shell: filters shell + exited, numbers visible slots accurately
+    const threeWay = mod.resolvePairHandoffTargets(
+      state.tabs,
+      [c1, shellId, codexId, c2],
+      c1,
+      { [c1]: "running", [codexId]: "running", [c2]: "exited" },
+    );
+    expect(threeWay).toEqual([
+      {
+        id: codexId,
+        launcher: "codex",
+        slot: 3,
+        fromSlot: 1,
+        label: "Codex",
+        buttonLabel: "Handoff -> Codex",
+      },
+    ]);
+
+    // Active shell or exited active agent offers no handoff
+    expect(mod.resolvePairHandoffTargets(state.tabs, [shellId, codexId], shellId)).toEqual([]);
+    expect(mod.resolvePairHandoffTargets(state.tabs, [c1, codexId], c1, { [c1]: "exited" })).toEqual([]);
+
+    const prompt = mod.buildPairHandoffPrompt({
+      fromLauncher: "claude",
+      fromSlot: 1,
+      toLauncher: "claude",
+      toSlot: 2,
+      checkoutBranch: "feat/split-ux",
+    });
+    expect(prompt).toBe("[Handoff from Claude #1 -> Claude #2 (feat/split-ux)]\n");
+  });
+
+  it("exposes File Explorer in dockTabTypesFor and offeredDockTabKind without polluting process LAUNCHERS or SESSION_TYPES", async () => {
+    const mod = await import("./tabs");
+    expect(mod.dockTabTypesFor(true).map((t: { kind: string }) => t.kind)).toEqual([
+      ...mod.LAUNCHERS.map((l) => l.kind),
+      "browser",
+      "file",
+    ]);
+    expect(mod.dockTabTypesFor(false).map((t: { kind: string }) => t.kind)).toEqual([
+      ...mod.LAUNCHERS.map((l) => l.kind),
+      "file",
+    ]);
+    expect(mod.dockTabTypesFor(true).find((t: { kind: string }) => t.kind === "file")?.label).toBe(
+      "File Explorer",
+    );
+    expect(mod.offeredDockTabKind("file", false)).toBe("file");
+    expect(mod.offeredDockTabKind("browser", false)).toBe("shell");
+    expect(mod.offeredDockTabKind("browser", true)).toBe("browser");
+    expect(mod.offeredDockTabKind("bogus", true)).toBe("shell");
+
+    // Generic startup OSC titles never clobber task/worktree launchName or duplicate brand labels
+    expect(mod.isGenericLauncherTitle("✳ Claude Code", "claude")).toBe(true);
+    expect(mod.isGenericLauncherTitle("Claude Code", "claude")).toBe(true);
+    expect(mod.isGenericLauncherTitle("OpenAI Codex", "codex")).toBe(true);
+    expect(mod.isGenericLauncherTitle("✳ Running cargo test", "claude")).toBe(false);
+
+    let seeded = openTab(initialState("shell"), "claude", { runId: "run-77", title: "Fix sidebar nav" });
+    const seededId = seeded.activeId!;
+    seeded = setTabTitle(seeded, seededId, "✳ Claude Code");
+    const seededTab = seeded.tabs.find((t) => t.id === seededId)!;
+    expect(tabLabel(seededTab)).toBe("Fix sidebar nav");
+    expect(mod.effectiveSessionTitle(seededTab)).toBe("Fix sidebar nav");
+
+    // Astral-plane emoji straddling codepoint 27 in tabLabel never splits surrogate pairs
+    const emojiState = setTabTitle(initialState("claude"), "tab-1", `${"a".repeat(26)}🚀!!`);
+    const emojiTab = emojiState.tabs[0];
+    if (emojiTab) {
+      const exactFit = tabLabel({ ...emojiTab, title: `${"a".repeat(26)}🚀!` });
+      expect(exactFit.isWellFormed()).toBe(true);
+      expect(exactFit).toBe(`${"a".repeat(26)}🚀!`);
+      const clipped = tabLabel({ ...emojiTab, title: `${"a".repeat(26)}🚀!!` });
+      expect(clipped.isWellFormed()).toBe(true);
+      expect(clipped).toBe(`${"a".repeat(26)}🚀…`);
+    }
   });
 });
 
@@ -546,5 +923,19 @@ describe("setTabPurpose", () => {
     expect(setTabPurpose(opened, id, "commit").tabs.find((t) => t.id === id)?.purpose).toBe("commit");
     expect(setTabPurpose(opened, "missing", "commit")).toBe(opened);
     expect(opened.tabs.find((t) => t.id === id)?.purpose).toBeUndefined();
+  });
+});
+
+describe("setTabInitialCommand", () => {
+  it("seeds a trimmed one-shot command on a shell tab and ignores blank or unknown ids", () => {
+    const opened = openTab(initialState(), "shell");
+    const id = opened.activeId!;
+    expect(setTabInitialCommand(opened, id, "  cargo test --lib  ").tabs.find((t) => t.id === id)?.initialCommand).toBe(
+      "cargo test --lib",
+    );
+    expect(setTabInitialCommand(opened, id, "   ")).toBe(opened);
+    expect(setTabInitialCommand(opened, id, null)).toBe(opened);
+    expect(setTabInitialCommand(opened, "missing", "ls")).toBe(opened);
+    expect(opened.tabs.find((t) => t.id === id)?.initialCommand).toBeUndefined();
   });
 });

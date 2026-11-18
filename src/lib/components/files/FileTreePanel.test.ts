@@ -142,4 +142,14 @@ describe("FileTreePanel source contracts", () => {
     expect(body).toContain("onContentSubmit");
     expect(body).toContain("fieldEscape(");
   });
+
+  it("uses effectiveRepoPath for drag payloads, retry buttons, and copy full path so docked worktree explorers never leak currentRepoPath", () => {
+    const dragAt = source.indexOf("ondragstart={(e) => {");
+    expect(dragAt).toBeGreaterThan(-1);
+    const dragBlock = source.slice(dragAt, source.indexOf("ondragend=", dragAt));
+    expect(dragBlock).toContain("effectiveRepoPath");
+    expect(dragBlock).not.toContain("$currentRepoPath");
+    expect(source).not.toContain("if ($currentRepoPath) void loadFiles($currentRepoPath, true)");
+    expect(source).not.toContain("copyPath(`${$repoStore.currentPath}/${row.path}`)");
+  });
 });

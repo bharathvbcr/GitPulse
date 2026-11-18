@@ -64,8 +64,14 @@ describe("TaskRefine renders", () => {
     // its form, and passes `dirty` as `disabled`. A part checkbox whose change
     // reached the form disabled Apply the moment it was ticked, so a split could
     // never be applied from the sheet.
-    const editorForm = /<form id="task-editor-form-[\s\S]*?\n\s*>/.exec(readFileSync(join(here, "TaskEditor.svelte"), "utf8"))?.[0] ?? "";
-    expect(editorForm).toMatch(/onchange=\{\(\) => \{ dirty = true; \}\}/);
+    const editor = readFileSync(join(here, "TaskEditor.svelte"), "utf8");
+    const editorForm = /<form id="task-editor-form-[\s\S]*?\n\s*>/.exec(editor)?.[0] ?? "";
+    expect(editorForm).toMatch(/onchange=\{markDirty\}/);
+    // The handler's one exemption is a staging box marked data-ephemeral; every
+    // other change, a refine checkbox included, would still mark the sheet.
+    const markDirty = /function markDirty\(event: Event\) \{[\s\S]*?\n  \}/.exec(editor)?.[0] ?? "";
+    expect(markDirty).toMatch(/closest\("\[data-ephemeral\]"\)\) return;\s*dirty = true;/);
+    expect(readFileSync(join(here, "TaskRefine.svelte"), "utf8")).not.toMatch(/data-ephemeral/);
     const root = /^<section class="refine".*$/m.exec(readFileSync(join(here, "TaskRefine.svelte"), "utf8"))?.[0] ?? "";
     expect(root).toMatch(/oninput=\{\(event\) => event\.stopPropagation\(\)\}/);
     expect(root).toMatch(/onchange=\{\(event\) => event\.stopPropagation\(\)\}/);

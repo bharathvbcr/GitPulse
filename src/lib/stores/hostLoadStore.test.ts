@@ -18,11 +18,16 @@ import {
   PROFILE_RETRY_BASE_MS,
   PROFILE_RETRY_CAP_MS,
   hostLoadPulse,
+  hostLoadHistory,
   hostPressure,
   loadIdleReport,
   loadLeaseStatus,
   parkSession,
   pulseOf,
+  hostRoomOf,
+  hostMetricsOf,
+  MAX_HOST_LOAD_HISTORY,
+  publishHostLoadPulseForTests,
   refreshHostLoad,
   resetHostLoadForTests,
   resourceProfile,
@@ -173,8 +178,38 @@ describe("hostLoadStore", () => {
       compressor_thrash: false,
       role: "writer",
       governor: calmPulse,
+      // No snapshot: the host-room readings are unknown, not assumed.
+      power: null,
+      thermal: null,
+      load_per_core: null,
+      cpu_pct: null,
+      gpu_pct: null,
+      mem_used_bytes: null,
+      mem_total_bytes: null,
+      swap_used_bytes: null,
+      thermal_temp_c: null,
+      disk_free_bytes: null,
+      disk_total_bytes: null,
+      disk_write_rate: null,
+      disk_fill_rate: null,
     });
     expect(pulseOf(status({ sensor: { ...stale.sensor, enabled: null } })).enabled).toBe(false);
+  });
+
+  it("reads host room only from readings that exist, as sysload::room_of does", () => {
+    const unread = { status: "unavailable" as const, value: "not_yet" as const };
+    const host = {
+      load: { status: "value" as const, value: [6, 4, 2] as [number, number, number] },
+      cores: { status: "value" as const, value: { logical: 8, levels: 1, perf0: 8, perf1: 0 } },
+      power: { status: "value" as const, value: "ac" as const },
+      thermal: { status: "value" as const, value: "fair" as const },
+    };
+    const sample = (over: object) =>
+      ({ pressure: unread, swap_used: unread, swap_total: unread, compressor: unread, compressed_bytes: unread, memsize: unread, open_files: unread, max_files: unread, free_disk: unread, ...host, ...over }) as never;
+    expect(hostRoomOf(undefined)).toEqual({ power: null, thermal: null, load_per_core: null });
+    expect(hostRoomOf(sample({}))).toEqual({ power: "ac", thermal: "fair", load_per_core: 0.75 });
+    expect(hostRoomOf(sample({ cores: { status: "value", value: { logical: 0, levels: 0, perf0: 0, perf1: 0 } } })).load_per_core).toBeNull();
+    expect(hostRoomOf(sample({ load: unread, power: unread, thermal: unread }))).toEqual({ power: null, thermal: null, load_per_core: null });
   });
 
   it("sends the orphan's identity under the names the command takes, then rereads", async () => {
@@ -462,6 +497,275 @@ describe("hostLoadStore", () => {
     expect(thresholdsAreDefault({ ...DEFAULT_THRESHOLDS, disk_auto: false })).toBe(false);
     const guard = { ...DEFAULT_THRESHOLDS.disk_guard, coverage: { mode: "refuse" as const, headroom_gib: 80 } };
     expect(thresholdsAreDefault({ ...shown, disk_guard: guard })).toBe(false);
+  });
+
+  it("extracts host metrics only when readings exist and leaves missing fields null", () => {
+    const unread = { status: "unavailable" as const, value: "not_yet" as const };
+    const value = <T>(v: T) => ({ status: "value" as const, value: v });
+    const fullSnap = {
+      ...status(),
+      snapshot: {
+        host: {
+          pressure: value("normal"),
+          swap_used: value(2 << 30),
+          swap_total: value(8 << 30),
+          compressor: unread,
+          compressed_bytes: value(4 << 30),
+          compressor_segments: unread,
+          load: value([3.2, 2.8, 2.4]),
+          cores: value({ logical: 16, levels: 2, perf0: 6, perf1: 10 }),
+          memsize: value(64 * 2 ** 30),
+          open_files: unread,
+          max_files: unread,
+          free_disk: value(200 * 2 ** 30),
+          thermal: value("fair"),
+          power: value("ac"),
+          cpu_usage: value({ total_pct: 41.2, user_pct: 30.1, system_pct: 11.1 }),
+          gpu: value({ utilization_pct: 19.5, renderer_pct: 16.0, tiler_pct: 4.0, memory_in_use: 1024, memory_allocated: 2048 }),
+          memory: value({ used_bytes: 32 * 2 ** 30, app_bytes: 18 * 2 ** 30, wired_bytes: 6 * 2 ** 30, compressed_bytes: 4 * 2 ** 30, cached_bytes: 10 * 2 ** 30 }),
+          total_disk: value(926 * 2 ** 30),
+          thermal_temp_c: value(67.8),
+        },
+        launched_write_rate: value(2_500_000),
+        disk_fill_rate: value(64 * 2 ** 20),
+        compressor_thrash: false,
+      },
+    } as never;
+
+    expect(hostMetricsOf(null)).toEqual({
+      cpu_pct: null,
+      gpu_pct: null,
+      mem_used_bytes: null,
+      mem_total_bytes: null,
+      swap_used_bytes: null,
+      thermal_temp_c: null,
+      disk_free_bytes: null,
+      disk_total_bytes: null,
+      disk_write_rate: null,
+      disk_fill_rate: null,
+    });
+    expect(pulseOf(fullSnap)).toMatchObject({
+      cpu_pct: 41.2,
+      gpu_pct: 19.5,
+      mem_used_bytes: 32 * 2 ** 30,
+      mem_total_bytes: 64 * 2 ** 30,
+      swap_used_bytes: 2 << 30,
+      thermal_temp_c: 67.8,
+      disk_free_bytes: 200 * 2 ** 30,
+      disk_total_bytes: 926 * 2 ** 30,
+      disk_write_rate: 2_500_000,
+      disk_fill_rate: 64 * 2 ** 20,
+    });
+  });
+
+  it("caps hostLoadHistory at MAX_HOST_LOAD_HISTORY and resets cleanly", async () => {
+    let listener: ((event: { payload: HostLoadPulse }) => void) | undefined;
+    vi.mocked(listen).mockImplementationOnce(async (_event, cb) => {
+      listener = cb as typeof listener;
+      return () => {};
+    });
+    vi.mocked(invoke).mockResolvedValueOnce(status({ pressure: "normal" }));
+
+    startHostLoad();
+    await vi.waitFor(() => expect(get(hostLoadHistory)).toHaveLength(1));
+
+    // A refresh after history has started does not duplicate the existing ring.
+    vi.mocked(invoke).mockResolvedValueOnce(status({ pressure: "normal" }));
+    await refreshHostLoad();
+    expect(get(hostLoadHistory)).toHaveLength(1);
+
+    const basePulse = pulseOf(status({ pressure: "normal" }));
+    for (let i = 0; i < MAX_HOST_LOAD_HISTORY + 10; i++) {
+      listener?.({ payload: { ...basePulse, cpu_pct: i } });
+    }
+    const hist = get(hostLoadHistory);
+    expect(hist).toHaveLength(MAX_HOST_LOAD_HISTORY);
+    expect(hist[0].cpu_pct).toBe(10);
+    expect(hist[MAX_HOST_LOAD_HISTORY - 1].cpu_pct).toBe(MAX_HOST_LOAD_HISTORY + 9);
+
+    publishHostLoadPulseForTests({ ...basePulse, cpu_pct: 99 });
+    expect(get(hostLoadHistory).at(-1)?.cpu_pct).toBe(99);
+
+    resetHostLoadForTests();
+    expect(get(hostLoadHistory)).toHaveLength(0);
+  });
+
+  it("gates live scalars on enabled && governing state, pushes null gaps, and deduplicates reader ticks", async () => {
+    let listener: ((event: { payload: HostLoadPulse }) => void) | undefined;
+    vi.mocked(listen).mockImplementationOnce(async (_event, cb) => {
+      listener = cb as typeof listener;
+      return () => {};
+    });
+
+    const liveStatus = status({
+      role: "reader",
+      writer_is_self: false,
+      sensor: { state: "fresh", age_ms: 400, level: "normal", enabled: true, reason: null },
+      snapshot: {
+        version: 2,
+        seq: 100,
+        written: { wall_ms: 1, mono_ns: 1, boot_id: 1 },
+        enabled: true,
+        platform: "governed",
+        cadence_ms: 2000,
+        writer: { pid: 1, start_us: 2, version: "1.99.0", path: "/a" },
+        compressor_delta: { status: "unavailable", value: "unsupported" },
+        compressor_thrash: true,
+        processes: { status: "value", value: 1 },
+        unreadable_processes: 0,
+        claude: { status: "unavailable", value: "unsupported" },
+        codex: { status: "unavailable", value: "unsupported" },
+        launched_footprint: { status: "unavailable", value: "unsupported" },
+        observed_footprint: { status: "unavailable", value: "unsupported" },
+        largest_foreign: { status: "unavailable", value: "unsupported" },
+        launched_write_rate: { status: "value", value: 512 },
+        max_tree_write_rate: { status: "unavailable", value: "unsupported" },
+        memguard_present: false,
+        memguard_warn: false,
+        memguard_pid: 0,
+        orphans: 0,
+        tick: { ticks: 1, overruns: 0, missed: 0, last_us: 1, max_us: 1, cpu_ns: 1 },
+        disk_fill_rate: { status: "value", value: 1024 },
+        disk_fill_sustained: { status: "unavailable", value: "not_yet" },
+        verdict: { status: "unavailable", value: "not_yet" },
+        host: {
+          pressure: { status: "value", value: "normal" },
+          swap_used: { status: "value", value: 1024 },
+          swap_total: { status: "value", value: 4096 },
+          compressor: { status: "unavailable", value: "unsupported" },
+          compressed_bytes: { status: "unavailable", value: "unsupported" },
+          compressor_segments: { status: "unavailable", value: "unsupported" },
+          load: { status: "value", value: [1.6, 1.2, 0.8] },
+          cores: { status: "value", value: { logical: 8, levels: 1, perf0: 8, perf1: 0 } },
+          memsize: { status: "value", value: 16 << 30 },
+          open_files: { status: "unavailable", value: "unsupported" },
+          max_files: { status: "unavailable", value: "unsupported" },
+          free_disk: { status: "value", value: 100 << 30 },
+          thermal: { status: "value", value: "nominal" },
+          power: { status: "value", value: "ac" },
+          cpu_usage: { status: "value", value: { total_pct: 33.3, user_pct: 20.0, system_pct: 13.3 } },
+          gpu: { status: "value", value: { utilization_pct: 15.0, renderer_pct: null, tiler_pct: null, memory_in_use: null, memory_allocated: null } },
+          memory: { status: "value", value: { used_bytes: 8 << 30, app_bytes: 4 << 30, wired_bytes: 2 << 30, compressed_bytes: 2 << 30, cached_bytes: 1 << 30 } },
+          total_disk: { status: "value", value: 500 << 30 },
+          thermal_temp_c: { status: "value", value: 58.0 },
+        },
+      } as never,
+    });
+
+    // `pulseOf` exposes metrics only when enabled and state governs (`fresh` | `stale_recent`).
+    expect(pulseOf(liveStatus)).toMatchObject({
+      cpu_pct: 33.3,
+      power: "ac",
+      compressor_thrash: true,
+      snapshot_seq: 100,
+    });
+    expect(
+      pulseOf({
+        ...liveStatus,
+        sensor: { ...liveStatus.sensor, state: "stale_recent" },
+      }).cpu_pct,
+    ).toBe(33.3);
+
+    for (const nonLive of [
+      { ...liveStatus, pressure: "critical" as const, sensor: { ...liveStatus.sensor, state: "stale_old" as const } },
+      { ...liveStatus, pressure: "warn" as const, sensor: { ...liveStatus.sensor, state: "dead" as const } },
+      { ...liveStatus, pressure: "critical" as const, sensor: { ...liveStatus.sensor, enabled: false } },
+    ]) {
+      expect(pulseOf(nonLive)).toMatchObject({
+        pressure: "unavailable",
+        compressor_thrash: false,
+        power: null,
+        thermal: null,
+        load_per_core: null,
+        cpu_pct: null,
+        gpu_pct: null,
+        mem_used_bytes: null,
+        mem_total_bytes: null,
+        thermal_temp_c: null,
+        disk_free_bytes: null,
+        disk_total_bytes: null,
+        snapshot_seq: 100,
+      });
+    }
+
+    // `hostMetricsOf` also returns nulls when snapshot.enabled === false.
+    expect(
+      hostMetricsOf({ ...liveStatus.snapshot!, enabled: false }).cpu_pct,
+    ).toBeNull();
+
+    // Seed live seq=100 into history.
+    vi.mocked(invoke).mockResolvedValueOnce(liveStatus);
+    startHostLoad();
+    await vi.waitFor(() => expect(get(hostLoadHistory)).toHaveLength(1));
+
+    // Duplicate reader tick (seq unchanged) must not flat-line history.
+    const readerPulse100 = pulseOf(liveStatus);
+    listener?.({ payload: { ...readerPulse100, state: "stale_recent", age_ms: 4200 } });
+    expect(get(hostLoadHistory)).toHaveLength(1);
+
+    // Advancing seq=101 appends cleanly.
+    listener?.({ payload: { ...readerPulse100, snapshot_seq: 101, cpu_pct: 49.5 } });
+    expect(get(hostLoadHistory)).toHaveLength(2);
+    expect(get(hostLoadHistory)[1].cpu_pct).toBe(49.5);
+
+    // Transition to stale_old (even carrying old numbers & same seq=101) pushes ONE null-metrics gap entry.
+    listener?.({
+      payload: { ...readerPulse100, snapshot_seq: 101, state: "stale_old", cpu_pct: 49.5 },
+    });
+    expect(get(hostLoadHistory)).toHaveLength(3);
+    expect(get(hostLoadHistory)[2]).toMatchObject({
+      state: "stale_old",
+      cpu_pct: null,
+      gpu_pct: null,
+      mem_used_bytes: null,
+      thermal_temp_c: null,
+      disk_free_bytes: null,
+      compressor_thrash: false,
+    });
+    expect(get(hostLoadPulse)?.cpu_pct).toBeNull();
+
+    // Repeated non-live ticks do not overwrite history with empty gap entries.
+    listener?.({ payload: { ...readerPulse100, snapshot_seq: 101, state: "dead", cpu_pct: 49.5 } });
+    expect(get(hostLoadHistory)).toHaveLength(3);
+
+    // If a restarted writer reuses seq=101 after the outage, it is NOT dropped.
+    listener?.({ payload: { ...readerPulse100, snapshot_seq: 101, cpu_pct: 22.0 } });
+    expect(get(hostLoadHistory)).toHaveLength(4);
+    expect(get(hostLoadHistory)[3].cpu_pct).toBe(22.0);
+
+    // Non-live event payloads carrying stale pressure must sanitize `pressure` to "unavailable"
+    // so `hostPressure` (card 1c) never defers work on dead/disabled data.
+    listener?.({
+      payload: {
+        ...readerPulse100,
+        snapshot_seq: 102,
+        state: "dead",
+        pressure: "critical",
+        cpu_pct: 88.0,
+      },
+    });
+    expect(get(hostPressure)).toBe("unavailable");
+    expect(get(hostLoadHistory)).toHaveLength(5);
+
+    // Returning live again then transitioning to dead via `refreshHostLoad` (poll seam)
+    // must still record one null-metrics gap entry even though polls use `seedOnly = true`.
+    listener?.({
+      payload: { ...readerPulse100, snapshot_seq: 103, pressure: "normal", cpu_pct: 19.0 },
+    });
+    expect(get(hostLoadHistory)).toHaveLength(6);
+    vi.mocked(invoke).mockResolvedValueOnce({
+      ...liveStatus,
+      pressure: "critical",
+      sensor: { ...liveStatus.sensor, state: "dead", age_ms: 90_000 },
+    });
+    await refreshHostLoad();
+    expect(get(hostLoadHistory)).toHaveLength(7);
+    expect(get(hostLoadHistory)[6]).toMatchObject({
+      state: "dead",
+      pressure: "unavailable",
+      cpu_pct: null,
+    });
+    expect(get(hostPressure)).toBe("unavailable");
   });
 
   it("carries the memory profile on a save, defaults it to automatic, and rereads the status after", async () => {

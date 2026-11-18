@@ -6,6 +6,15 @@ import {
 
 export const STORAGE_KEY = "gitpulse_sidebar_layout";
 export const SECTION_STORAGE_KEY = "gitpulse_sidebar_sections";
+export const SIDEBAR_NAV_STORAGE_KEY = "gitpulse_sidebar_nav";
+
+export type SidebarView = "git" | "files";
+export type SidebarFileOpenTarget = "code" | "tab" | "split";
+
+export interface SidebarNavPrefs {
+  view: SidebarView;
+  openTarget: SidebarFileOpenTarget;
+}
 
 export interface SidebarLayout {
   width: number;
@@ -157,3 +166,119 @@ export function createLayoutStore(): LayoutStore {
 }
 
 export const layoutStore = createLayoutStore();
+
+const DEFAULT_SIDEBAR_NAV: SidebarNavPrefs = {
+  view: "git",
+  openTarget: "code",
+};
+
+export function normalizeSidebarView(raw: unknown): SidebarView {
+  return raw === "files" ? "files" : "git";
+}
+
+export function normalizeSidebarOpenTarget(raw: unknown): SidebarFileOpenTarget {
+  if (raw === "tab" || raw === "split" || raw === "code") return raw;
+  return "code";
+}
+
+/**
+ * Resolves where clicking a file in the main left sidebar's File Explorer
+ * opens it: modifier keys take priority (`Alt+Click` -> terminal split,
+ * `⌘/Ctrl+Click` -> Code view, or terminal tab when already on Code),
+ * otherwise the user's explicit target preference (`code` | `tab` | `split`).
+ */
+export function resolveSidebarFileAction(options: {
+  defaultTarget: SidebarFileOpenTarget;
+  altKey?: boolean;
+  metaOrCtrlKey?: boolean;
+}): SidebarFileOpenTarget {
+  if (options.altKey) return "split";
+  if (options.metaOrCtrlKey) {
+    return options.defaultTarget === "code" ? "tab" : "code";
+  }
+  return normalizeSidebarOpenTarget(options.defaultTarget);
+}
+
+export function loadSidebarNav(raw: string | null): SidebarNavPrefs {
+  if (!raw) return { ...DEFAULT_SIDEBAR_NAV };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { ...DEFAULT_SIDEBAR_NAV };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ...DEFAULT_SIDEBAR_NAV };
+  }
+  const record = parsed as Record<string, unknown>;
+  return {
+    view: normalizeSidebarView(record.view),
+    openTarget: normalizeSidebarOpenTarget(record.openTarget),
+  };
+}
+
+export function saveSidebarNav(
+  prefs: SidebarNavPrefs,
+  storage: Pick<Storage, "setItem"> | null = readStorage(),
+): void {
+  if (!storage) return;
+  try {
+    const sanitized: SidebarNavPrefs = {
+      view: normalizeSidebarView(prefs.view),
+      openTarget: normalizeSidebarOpenTarget(prefs.openTarget),
+    };
+    storage.setItem(SIDEBAR_NAV_STORAGE_KEY, JSON.stringify(sanitized));
+  } catch {
+    /* quota / private mode — fail closed, keep in-memory state */
+  }
+}
+
+export interface SidebarNavStore extends Readable<SidebarNavPrefs> {
+  setView(view: SidebarView): void;
+  setOpenTarget(target: SidebarFileOpenTarget): void;
+  reset(): void;
+}
+
+export function createSidebarNavStore(): SidebarNavStore {
+  const initial = loadSidebarNav(readStorage()?.getItem(SIDEBAR_NAV_STORAGE_KEY) ?? null);
+  const { subscribe, update } = writable<SidebarNavPrefs>(initial);
+
+  function commit(next: SidebarNavPrefs): SidebarNavPrefs {
+    saveSidebarNav(next);
+    return next;
+  }
+
+  return {
+    subscribe,
+    setView: (view) =>
+      update((current) => {
+        const nextView = normalizeSidebarView(view);
+        return current.view === nextView ? current : commit({ ...current, view: nextView });
+      }),
+    setOpenTarget: (openTarget) =>
+      update((current) => {
+        const nextTarget = normalizeSidebarOpenTarget(openTarget);
+        return current.openTarget === nextTarget
+          ? current
+          : commit({ ...current, openTarget: nextTarget });
+      }),
+    reset: () => update(() => commit({ ...DEFAULT_SIDEBAR_NAV })),
+  };
+}
+
+export const sidebarNavStore = createSidebarNavStore();
+
+let currentSidebarExplorerDocked = false;
+const sidebarExplorerDockedStore = writable(false);
+
+/** True while a mounted, expanded, docked main Sidebar is already displaying ExplorerRail. */
+export const sidebarExplorerDocked: Readable<boolean> = {
+  subscribe: sidebarExplorerDockedStore.subscribe,
+};
+
+export function setSidebarExplorerDocked(active: boolean): void {
+  const next = Boolean(active);
+  if (currentSidebarExplorerDocked === next) return;
+  currentSidebarExplorerDocked = next;
+  sidebarExplorerDockedStore.set(next);
+}

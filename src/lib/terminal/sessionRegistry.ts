@@ -1,7 +1,7 @@
 import { writable } from "svelte/store";
 import { currentSessionLimit } from "./sessionLimit";
 import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
-import type { LauncherKind } from "./tabs";
+import { cleanTabName, type LauncherKind } from "./tabs";
 
 export interface TerminalSessionRecord {
   key: string;
@@ -41,6 +41,12 @@ export interface TerminalSessionRecord {
    * say which of three Claude sessions is the one waiting on you.
    */
   title?: string;
+  /** True when this session is currently focused in its repository's terminal dock. */
+  isActive?: boolean;
+  /** 1-based visible split slot index when shown in a multi-pane split layout, or null. */
+  splitSlot?: number | null;
+  /** Urgent agent attention phrase (e.g. "Needs input", "Error") when waiting on the user. */
+  attention?: string | null;
   /** Set when the process is a task attempt's, which a close ends for good. */
   taskRunId?: string;
   /**
@@ -227,10 +233,48 @@ export function createSessionRegistry() {
     publish();
     let released = false;
     return {
+      current(): TerminalSessionRecord | undefined {
+        return released ? undefined : (records.get(record.key) ?? record);
+      },
       update(status: string) {
         if (released) return;
         const current = records.get(record.key) ?? record;
+        if (current.status === status) return;
         records.set(record.key, { ...current, status });
+        publish();
+      },
+      retitle(title: string | undefined) {
+        if (released) return;
+        const cleaned = typeof title === "string" ? cleanTabName(title, 256) : "";
+        const normalized = cleaned || undefined;
+        const current = records.get(record.key) ?? record;
+        if (current.title === normalized) return;
+        records.set(record.key, { ...current, title: normalized });
+        publish();
+      },
+      setPlacement(placement: {
+        isActive?: boolean;
+        splitSlot?: number | null;
+        attention?: string | null;
+      }) {
+        if (released) return;
+        const current = records.get(record.key) ?? record;
+        const nextActive = placement.isActive ?? false;
+        const nextSplitSlot = placement.splitSlot ?? null;
+        const nextAttention = placement.attention?.trim() || null;
+        if (
+          Boolean(current.isActive) === nextActive &&
+          (current.splitSlot ?? null) === nextSplitSlot &&
+          (current.attention ?? null) === nextAttention
+        ) {
+          return;
+        }
+        records.set(record.key, {
+          ...current,
+          isActive: nextActive,
+          splitSlot: nextSplitSlot,
+          attention: nextAttention,
+        });
         publish();
       },
       /**

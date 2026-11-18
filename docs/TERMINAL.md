@@ -213,8 +213,18 @@ prompt.
 | Command+F or Ctrl+Shift+F | Find in active terminal |
 | Enter / Shift+Enter in Find | Next / previous result |
 | Escape in Find | Close Find and focus the terminal |
+| Command+C / Ctrl+Shift+C (with selection) | Copy normalized terminal selection |
+| Command+Shift+C / Ctrl+Alt+C | Copy last completed OSC 133 command output |
 | Command + / − / 0 (Ctrl+Shift on Windows/Linux) | Increase / decrease / reset text size |
 | Up / Down on the dock separator | Resize the dock |
+
+## Copy, Select-to-Copy, and multi-shell execution
+
+- **Select-to-Copy (`terminalCopyOnSelect`):** Enabled by default (`true`), copying non-whitespace selections on pointer release (or double/triple-click / Select All) without spamming the clipboard mid-drag. Toggleable in Settings -> Appearance -> Terminal, tab options, and the viewport context menu.
+- **Normalized copy & empty-selection guard:** Trailing padding before newlines and at selection end is stripped; `Copy` with no selection preserves the existing clipboard instead of overwriting it with empty text.
+- **OSC 52 (write-only):** Programs running inside the PTY can write UTF-8 text to the clipboard via `OSC 52` (capped at ~1 MiB UTF-8); clipboard read queries (`?`) are ignored.
+- **Command blocks & viewport context menu:** Right-click on the terminal canvas (or hold `Shift`/`Alt` in mouse-tracking TUI apps) opens Copy, Copy as Markdown, Paste, Last Command / Output, Run in New Split Shell, and Send to Agent actions. Completed `OSC 133` command blocks also show inline `Copy` (`Shift+Click` includes `$ command`) and `↻ Shell` buttons in the gutter badge, and successful copies flash briefly in the fixed-height status row.
+- **Agent shell execution & opt-in shell reads:** Both MCP callers (`gitpulse_terminal_exec`, `gitpulse_terminal_spawn`, `gitpulse_terminal_list`, `gitpulse_terminal_wait`, `gitpulse_terminal_read`, `gitpulse_terminal_send`, `gitpulse_terminal_close`, `gitpulse_terminal_open_file`) and `gitpulse-hook term` support caller-scoped standalone multi-shell orchestration as well as in-PTY `GITPULSE_TERMINAL_SESSION` + `GITPULSE_SESSION_TOKEN` callers. `gitpulse_terminal_read` supports up to `1000` lines (`64 KiB`), `offset_lines` paging over `2000`-row scrollback, `grep`, and `last_command_only`. Enabling `allow_agent_shell_reads` in Settings -> Agents grants read-only `list(include_repo_shells=true)` / `wait` / `read` access (`owned: false`) to user `"shell"` tabs while keeping `send`, `close`, and targeted `exec` strictly scoped to caller-spawned shells.
 
 Holding the new/close shortcut does not repeatedly create or terminate shells.
 IME composition and the shell's ordinary Ctrl+F binding are preserved.

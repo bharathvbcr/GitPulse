@@ -290,7 +290,8 @@ describe("tauri config helpers", () => {
    * Rendered repository Markdown shows remote pictures (README badges), so
    * images may come from any https origin — and only images, and never over
    * plain http: a page could otherwise be watched or rewritten in transit.
-   * Scripts, styles, connections and media stay same-origin.
+   * Scripts, styles and connections stay same-origin; media plays only from
+   * this origin or an object URL the page minted (a video wallpaper).
    */
   it("admits remote https pictures and nothing else remote", () => {
     const conf = JSON.parse(
@@ -300,6 +301,9 @@ describe("tauri config helpers", () => {
     for (const csp of policies) {
       const sources = (directive: string) => (csp[directive] ?? "").split(/\s+/).filter(Boolean);
       expect(sources("img-src")).toEqual(["'self'", "data:", "blob:", "https:"]);
+      // A video wallpaper plays from an object URL this page minted; media
+      // never comes from the network or a file path.
+      expect(sources("media-src")).toEqual(["'self'", "blob:"]);
       for (const [directive, value] of Object.entries(csp)) {
         if (directive === "img-src") continue;
         const tokens = value.split(/\s+/);

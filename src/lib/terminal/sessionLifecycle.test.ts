@@ -725,4 +725,19 @@ describe("a view that goes away without Close", () => {
     expect(get(registry).every((r) => r.key.startsWith("detached:"))).toBe(true);
     racer.owner.dispose(); await flush();
   });
+
+  it("propagates live retitle updates before start, during a live session, and across reconnects", async () => {
+    const f = fixture({}, createSessionRegistry(), "task-live", true, { launcher: "claude" });
+    f.owner.retitle("Initial Task Title");
+    await f.owner.start();
+    expect(get(f.registry)[0].title).toBe("Initial Task Title");
+    f.owner.retitle("✳ Updating split pane chrome");
+    expect(get(f.registry)[0].title).toBe("✳ Updating split pane chrome");
+    f.owner.fail("Transport disconnected");
+    await f.owner.restart();
+    expect(get(f.registry)[0].title).toBe("✳ Updating split pane chrome");
+    await f.owner.close();
+    f.owner.dispose();
+    await flush();
+  });
 });

@@ -86,6 +86,12 @@ describe("intake task decomposition", () => {
       "Launch real Antigravity session",
     ]);
 
+    // The breakdown box reads the same bullets and boxes as the task sheet's
+    // criteria: one stripper, so a pasted "• item" is never a card titled "• item".
+    expect(parseSubtaskLines("• Reproduce\n☐ Add test\n– Ship it\n☑ Done one\n1. [ ] Numbered")).toEqual([
+      "Reproduce", "Add test", "Ship it", "Done one", "Numbered",
+    ]);
+
     const longLine = "a".repeat(350);
     const capped = parseSubtaskLines(longLine, 2);
     expect(capped).toHaveLength(1);

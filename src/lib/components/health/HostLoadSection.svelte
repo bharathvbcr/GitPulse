@@ -43,6 +43,8 @@
   } from "../../health/hostLoad";
   import { describeFailure, type FailureAction, type FailureCopy } from "../../ui/copy/describeFailure";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
+  import { hostPlatform } from "../../stores/platformStore";
+  import { fileManagerName } from "../../ui/platformCopy";
 
   const REFRESH_MS = 4_000;
   const SESSION_COLUMNS = Object.freeze([
@@ -240,14 +242,17 @@
 
     {#if host && snap}
       <dl class="grid grid-cols-2 @2xl:grid-cols-4 gap-2" data-testid="host-load-readings">
+        <div><dt class="text-textMuted">CPU usage</dt><dd class="text-textPrimary">{describeReading(host.cpu_usage, (c) => `${c.total_pct.toFixed(1)}% (user ${c.user_pct.toFixed(1)}% · sys ${c.system_pct.toFixed(1)}%)`)}</dd></div>
+        <div><dt class="text-textMuted">GPU</dt><dd class="text-textPrimary">{describeReading(host.gpu, (g) => `${g.utilization_pct.toFixed(1)}%${g.memory_in_use !== null ? ` · ${bytes(g.memory_in_use)} in use` : ""}`)}</dd></div>
+        <div><dt class="text-textMuted">Memory used</dt><dd class="text-textPrimary">{describeReading(host.memory, (m) => `${bytes(m.used_bytes)} of ${describeReading(host.memsize, bytes)}`)}</dd></div>
         <div><dt class="text-textMuted">Swap used</dt><dd class="text-textPrimary">{describeReading(host.swap_used, bytes)} of {describeReading(host.swap_total, bytes)}</dd></div>
         <div><dt class="text-textMuted">Compressor</dt><dd class="text-textPrimary">{describeReading(host.compressed_bytes, bytes)}{snap.compressor_thrash ? " · thrashing" : ""}</dd></div>
         <div><dt class="text-textMuted">Compressor segments</dt><dd class="text-textPrimary" data-testid="host-load-segments">{describeReading(host.compressor_segments, (s) => `${s.total.toLocaleString()} of ${s.limit.toLocaleString()}`)}</dd></div>
         <div><dt class="text-textMuted">Load (1 / 5 / 15 min)</dt><dd class="text-textPrimary font-mono">{describeReading(host.load, (l) => l.map((v) => v.toFixed(2)).join(" / "))}</dd></div>
         <div><dt class="text-textMuted">CPUs</dt><dd class="text-textPrimary">{describeReading(host.cores, (c) => c.levels > 0 ? `${c.logical} (${c.perf0} + ${c.perf1} by level)` : `${c.logical}`)}</dd></div>
         <div><dt class="text-textMuted">Open files</dt><dd class="text-textPrimary">{describeReading(host.open_files, String)} of {describeReading(host.max_files, String)}</dd></div>
-        <div><dt class="text-textMuted">Free disk</dt><dd class="text-textPrimary">{describeReading(host.free_disk, bytes)}</dd></div>
-        <div><dt class="text-textMuted">Thermal · power</dt><dd class="text-textPrimary">{describeReading(host.thermal, String)} · {describeReading(host.power, (p) => p === "ac" ? "on power" : "on battery")}</dd></div>
+        <div title={`Measures immediate unallocated space available to GitPulse; ${fileManagerName($hostPlatform.os)} may report more by counting purgeable caches.`}><dt class="text-textMuted">Free disk</dt><dd class="text-textPrimary" data-testid="host-load-free-disk">{host.free_disk.status === "value" && host.total_disk?.status === "value" ? `${bytes(host.free_disk.value)} of ${bytes(host.total_disk.value)}` : describeReading(host.free_disk, bytes)}</dd></div>
+        <div><dt class="text-textMuted">Thermal · power</dt><dd class="text-textPrimary">{describeReading(host.thermal, String)}{host.thermal_temp_c?.status === "value" ? ` (${host.thermal_temp_c.value.toFixed(1)} °C)` : ""} · {describeReading(host.power, (p) => p === "ac" ? "on power" : "on battery")}</dd></div>
         <div><dt class="text-textMuted">Processes</dt><dd class="text-textPrimary">{describeReading(snap.processes, String)}{snap.unreadable_processes > 0 ? ` (${snap.unreadable_processes} unreadable)` : ""}</dd></div>
         <div><dt class="text-textMuted">Started by GitPulse</dt><dd class="text-textPrimary">{describeReading(snap.launched_footprint, bytes)} · writing {describeReading(snap.launched_write_rate, bytesPerSecond)}</dd></div>
         <div><dt class="text-textMuted">Other agent sessions</dt><dd class="text-textPrimary">{describeReading(snap.observed_footprint, bytes)}</dd></div>

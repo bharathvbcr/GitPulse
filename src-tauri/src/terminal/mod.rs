@@ -388,6 +388,8 @@ pub struct AgentArtifactRead {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTelemetry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub cwd: Option<String>,
     pub last_exit_code: Option<i32>,
     pub command_running: bool,
@@ -778,6 +780,9 @@ impl TerminalSessions {
     pub fn mark_app_quit_sessions(&self) -> usize {
         if self.leaves_sessions_running() {
             return 0;
+        }
+        if self.host.host_pid().is_some() {
+            let _ = list_sessions(self);
         }
         self.session_ledger.mark_app_quit()
     }
@@ -1727,6 +1732,13 @@ pub(crate) fn apply_telemetry_events(
     let mut saw_probe = false;
     for ev in events {
         match ev {
+            crate::alerts::scan::TelemetryEvent::OscTitle(title) => {
+                let next = (!title.is_empty()).then_some(title);
+                if state.title != next {
+                    state.title = next;
+                    notify = true;
+                }
+            }
             crate::alerts::scan::TelemetryEvent::Osc7Cwd(cwd) => {
                 if state.cwd.as_deref() != Some(cwd.as_str()) {
                     state.cwd = Some(cwd);
@@ -2596,6 +2608,9 @@ pub struct TerminalListing {
     /// Parent terminal session id when spawned via Option A child orchestration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Live or user-named session title observed via OSC 0/2 or the session ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Milliseconds since the session's child last wrote output (or since it
     /// started, if it never has). `None` when the engine holding the session
     /// cannot say (an older terminal host), which a reader must never treat as
@@ -2608,14 +2623,22 @@ pub struct TerminalListing {
 /// ending. Bounded by `MAX_PTY_SESSIONS`. `Err` when the host could not be
 /// asked, which is not the same as holding nothing.
 pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, String> {
-    #[cfg(unix)]
-    {
-        state.host.list()
+    let mut listed = {
+        #[cfg(unix)]
+        {
+            state.host.list()?
+        }
+        #[cfg(not(unix))]
+        {
+            engine_list_sessions(&state.engine)?
+        }
+    };
+    for item in &mut listed {
+        item.title = state
+            .session_ledger()
+            .resolved_title_for_terminal(&item.id, item.title.as_deref());
     }
-    #[cfg(not(unix))]
-    {
-        engine_list_sessions(&state.engine)
-    }
+    Ok(listed)
 }
 
 pub(in crate::terminal) fn engine_list_sessions(
@@ -2624,19 +2647,29 @@ pub(in crate::terminal) fn engine_list_sessions(
     let guard = engine.lock_sessions();
     let mut listed: Vec<TerminalListing> = guard
         .values()
-        .map(|s| TerminalListing {
-            id: s.spawned.id.clone(),
-            shell: s.spawned.shell.clone(),
-            cwd: s.spawned.cwd.clone(),
-            repo: s.repo.to_string_lossy().into_owned(),
-            launcher: launcher_kind(&s.spawned.shell).map(str::to_owned),
-            run_id: s.tracked_run.clone(),
-            ending: s.dead.load(Ordering::Acquire),
-            // An ending session has no view to show it in: it is only ever
-            // listed, so it reads as detached.
-            detached: s.flow.is_detached() || s.dead.load(Ordering::Acquire),
-            parent_session_id: s.parent_session_id.clone(),
-            quiet_ms: Some(clock_ms().saturating_sub(s.last_output_ms.load(Ordering::Relaxed))),
+        .map(|s| {
+            let osc_title = s
+                .telemetry
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .title
+                .clone();
+            TerminalListing {
+                id: s.spawned.id.clone(),
+                shell: s.spawned.shell.clone(),
+                cwd: s.spawned.cwd.clone(),
+                repo: s.repo.to_string_lossy().into_owned(),
+                launcher: launcher_kind(&s.spawned.shell).map(str::to_owned),
+                run_id: s.tracked_run.clone(),
+                ending: s.dead.load(Ordering::Acquire),
+                // An ending session has no view to show it in: it is only ever
+                // listed, so it reads as detached.
+                detached: s.flow.is_detached() || s.dead.load(Ordering::Acquire),
+                parent_session_id: s.parent_session_id.clone(),
+                title: s.child_title.clone().or(osc_title),
+                quiet_ms: Some(clock_ms().saturating_sub(s.last_output_ms.load(Ordering::Relaxed))),
+            }
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3270,10 +3303,9 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     if !is_session_id(&session_id) {
         return Err("Invalid terminal session id".into());
     }
-    if parent_session_id
-        .as_deref()
-        .is_some_and(|pid| !is_session_id(pid))
-    {
+    if parent_session_id.as_deref().is_some_and(|pid| {
+        !is_session_id(pid) && !crate::terminal::orchestrate::is_valid_external_caller_id(pid)
+    }) {
         return Err("Invalid parent terminal session id".into());
     }
     if token_hash_hex.as_deref().is_some_and(|hex| {

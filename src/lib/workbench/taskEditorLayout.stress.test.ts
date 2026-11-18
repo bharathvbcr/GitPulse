@@ -22,18 +22,18 @@ function assertValidSections(saved: unknown): void {
   const sections = editorSections(saved);
   const isSaved = saved === true;
   expect(sections).toHaveLength(EDITOR_SECTION_IDS.length);
-  expect(sections.map((section) => section.n)).toEqual([1, 2, 3, 4, 5, 6]);
+  expect(sections.map((section) => section.n)).toEqual([1, 2, 3, 4, 5, 6, 7]);
   expect(new Set(sections.map((section) => section.id)).size).toBe(EDITOR_SECTION_IDS.length);
   const ids = sections.map((section) => section.id);
   expect(ids).toEqual(isSaved
-    ? ["repositories", "title", "assist", "logs", "schedule", "owner"]
-    : ["repositories", "assist", "title", "logs", "schedule", "owner"]);
+    ? ["repositories", "title", "criteria", "assist", "logs", "schedule", "relations"]
+    : ["repositories", "assist", "title", "criteria", "logs", "schedule", "relations"]);
   const title = sections.find((section) => section.id === "title")!;
   const assist = sections.find((section) => section.id === "assist")!;
   if (isSaved) {
     expect(title.n).toBeLessThan(assist.n);
     expect(assist.heading).toBe(ASSIST_HEADING_SAVED);
-    expect(assist.n).toBe(3);
+    expect(assist.n).toBe(4);
   } else {
     expect(assist.n).toBeLessThan(title.n);
     expect(assist.heading).toBe(ASSIST_HEADING_DRAFT);
@@ -140,9 +140,9 @@ describe("task editor layout under hostile input", () => {
 });
 
 describe("section id table", () => {
-  it("is a closed vocabulary the sheet can switch on without a default branch inventing a seventh section", () => {
+  it("is a closed vocabulary the sheet can switch on without a default branch inventing an eighth section", () => {
     const seen = new Set<string>(EDITOR_SECTION_IDS);
-    expect(seen.size).toBe(6);
+    expect(seen.size).toBe(7);
     expect(seen.has("quick-add")).toBe(false);
     expect(seen.has("quickadd")).toBe(false);
     for (const id of EDITOR_SECTION_IDS) {

@@ -52,7 +52,7 @@ export function matchesTerminalSearch(
 export function filterTerminalTabs(
   tabs: readonly TerminalTab[],
   query: unknown,
-  extras?: Readonly<Record<string, { status?: string; unread?: boolean }>>,
+  extras?: Readonly<Record<string, { status?: string; unread?: boolean; agentDetail?: string; groupLabel?: string }>>,
 ): TerminalTab[] {
   if (!Array.isArray(tabs)) return [];
   return tabs.filter((tab) => {
@@ -63,7 +63,13 @@ export function filterTerminalTabs(
       launcherLabel(tab.launcher),
       tab.launcher,
       tab.name,
+      tab.launchName,
       tab.title,
+      tab.checkout,
+      tab.filePath,
+      tab.url,
+      extra?.agentDetail,
+      extra?.groupLabel,
       extra?.status,
       extra?.unread ? "unread" : "",
     );

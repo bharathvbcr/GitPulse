@@ -33,9 +33,10 @@
         spawns.push(id); adoptOutput(id, args); show();
         return { id, cwd: args.repoPath, shell: "/bin/zsh" };
       }
-      case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_write": case "cmd_terminal_kill": return null;
+      case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_write": case "cmd_terminal_kill": case "cmd_terminal_set_title": return null;
       case "cmd_terminal_detach": return true;
-      case "cmd_terminal_sessions": return [];
+      case "cmd_terminal_sessions": case "cmd_terminal_listening_ports": return [];
+      case "cmd_terminal_session_ledger": return { offers: [], reopenable_count: 0, unreadable_count: 0 };
       case "cmd_terminal_context": return { process: "zsh", busy: false, jobs: false, cwd: "/fixture/GitPulse", repo_dir: "" };
       case "cmd_agent_defaults": throw new Error("Unimplemented fixture: cmd_agent_defaults");
       default: throw new Error(`Unimplemented fixture: ${cmd}`);

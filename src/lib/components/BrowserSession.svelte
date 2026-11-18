@@ -58,6 +58,7 @@
     onTitle,
     initialUrl,
     onUrl,
+    onPageState,
     onSendToAgent,
   }: {
     tabId: string;
@@ -69,6 +70,8 @@
     initialUrl?: string;
     /** The address the page last loaded, for the tab (`setTabUrl`). */
     onUrl?: (url: string) => void;
+    /** Emits page loading and error transitions for tab/pane header status. */
+    onPageState?: (state: { loading: boolean; error: string | null }) => void;
     /** Attaches a captured viewport PNG (`@path`) to the active coding agent. */
     onSendToAgent?: (reference: string) => void;
   } = $props();
@@ -103,7 +106,10 @@
     queue = queue
       .then(() => (disposed ? undefined : op()))
       .catch((cause: unknown) => {
-        if (!disposed) error = describeError(cause, "browser");
+        if (!disposed) {
+          loading = false;
+          error = describeError(cause, "browser");
+        }
       });
     return queue;
   }
@@ -201,12 +207,17 @@
     void send(() => browserIpc.setVisible(tabId, visible));
   });
 
+  $effect(() => {
+    onPageState?.({ loading, error });
+  });
+
   function onPage(event: PageEvent) {
     switch (event.kind) {
       case "loading":
         loading = true;
         error = null;
         if (!editing) address = event.url;
+        if (event.url !== "about:blank") onUrl?.(event.url);
         break;
       case "loaded":
         loading = false;
@@ -245,7 +256,10 @@
     cancelPickElement();
     addressInput?.blur();
     if (opened) {
-      await send(() => browserIpc.navigate(tabId, url));
+      await send(async () => {
+        await browserIpc.navigate(tabId, url);
+        if (url !== "about:blank") onUrl?.(url);
+      });
       return;
     }
     if (opening) return;
@@ -260,6 +274,7 @@
         sentBounds = at;
         sentVisible = true;
         rememberAddress(url);
+        if (url !== "about:blank") onUrl?.(url);
       });
     } finally {
       opening = false;
