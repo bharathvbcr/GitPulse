@@ -688,9 +688,21 @@
             // -- The hold ends: the context is freed on purpose, not left for the collector.
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
-            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(900);
+            const reshown = shown()[0] === other;
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
+            const hiddenAt = performance.now();
+            const backOnTarget = shown()[0] === target;
+            await wait(900);
+            // Fails on the Ubuntu Chrome runner only (two commits), never locally:
+            // the state below says which premise did not hold there.
             check("a session that stays hidden past the hold gives its context up",
-              () => other.dataset.renderer === "dom" && !other.querySelector("canvas"));
+              () => (other.dataset.renderer === "dom" && !other.querySelector("canvas")) || (() => {
+                throw new Error(JSON.stringify({
+                  renderer: other.dataset.renderer, canvases: other.querySelectorAll("canvas").length,
+                  hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
+                  msSinceHidden: Math.round(performance.now() - hiddenAt),
+                }));
+              })());
             button("Hide the terminal dock").click(); await wait(900);
             check("hiding the dock past the hold releases the on-screen session's context too",
               () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
