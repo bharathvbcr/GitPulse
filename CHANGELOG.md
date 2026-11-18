@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **Explorer's search field is one row at every width.** Its Names | Contents
+  switch could not sit beside the text below 288px, so in the 264px sidebar,
+  the Explorer page column and the terminal's docked explorer it dropped to a
+  second row and turned the field into a tall box. The field now filters by
+  file name by default, and a single contents toggle at its right end
+  switches it to searching inside files.
+
+### Fixed
+
+- **Hiding Live pulse did not stick.** Its visibility was kept per repository
+  and in memory, defaulting to shown, so it came back on every repository
+  switch and every launch. It is now one app-wide setting, remembered across
+  launches, and the Live pulse column has its own Hide button.
+
 ## [1.99.0] - 2026-11-17
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It

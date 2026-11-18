@@ -210,13 +210,27 @@ describe("FileViewer", () => {
     expect(source).not.toContain('"w"');
   });
 
+  it("ignores its pane shortcuts while covered (inert) or already handled", () => {
+    const body = source.slice(source.indexOf("function handleWindowKeydown"), source.indexOf("$effect(", source.indexOf("function handleWindowKeydown")));
+    const guard = body.indexOf('closest("[inert]")');
+    expect(guard).toBeGreaterThan(-1);
+    expect(body).toContain("e.defaultPrevented");
+    // The guard runs before either toggle.
+    expect(guard).toBeLessThan(body.indexOf('toggleSidePane("explorer")'));
+    expect(guard).toBeLessThan(body.indexOf('toggleSidePane("dashboard")'));
+  });
+
   it("keeps Live pulse's visibility in one remembered preference, not per repository", () => {
     expect(source).toContain("const dashboardOpen = $derived($livePulsePref.visible)");
     expect(source).not.toMatch(/dashboardOpen\s*=\s*(true|false|cached)/);
     const cacheType = source.slice(source.indexOf("createRepoPanelCache<{"), source.indexOf("}>(", source.indexOf("createRepoPanelCache<{")));
     expect(cacheType).not.toContain("dashboardOpen");
-    // The card hides itself through the same toggle as the toolbar and ⌘⇧D.
-    expect(source).toContain('onHide={() => toggleSidePane("dashboard")}');
+    // The card's Hide is an explicit choice: remembered even on a compact
+    // layout, where the toolbar toggle only ends a transient peek.
+    expect(source).toContain("onHide={hideLivePulse}");
+    const hide = source.slice(source.indexOf("function hideLivePulse"), source.indexOf("}", source.indexOf("function hideLivePulse")));
+    expect(hide).toContain("livePulsePref.setVisible(false)");
+    expect(hide).toContain("livePulseToggle?.focus()");
   });
 
   it("arbitrates fixed side panes from the measured File view width", () => {

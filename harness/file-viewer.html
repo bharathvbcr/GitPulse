@@ -318,12 +318,27 @@ const type = async value => { const area = textarea(); area.value = value; area.
     host.textContent.includes("Ln 2, Col 1") && Boolean(host.querySelector("[data-search-match]")));
   searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
   check("Escape clears the query first and stays in Contents", () => searchBox()?.value === "" && rail().dataset.explorerRail === "search");
+  {
+    // The tree is hidden in Contents mode; arrow keys in the field must not
+    // move its selection or swallow the field's own caret movement.
+    const tree = host.querySelector('[role="tree"]');
+    const before = tree.getAttribute("aria-activedescendant");
+    const down = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+    searchBox().dispatchEvent(down); await tick();
+    check("arrow keys in the contents field leave the hidden tree's selection alone", () =>
+      !down.defaultPrevented && tree.getAttribute("aria-activedescendant") === before);
+  }
   searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
   check("a second Escape on the empty field returns to names", () => rail().dataset.explorerRail === "files" && contentsToggle().getAttribute("aria-pressed") === "false");
   check("names mode brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
+  // Park focus somewhere that is not the field first: the Escape above left it
+  // in the field, and `searchBox()` is null in names mode, so the old form of
+  // this check could not fail.
+  const focusHome = host.querySelector('[role="tree"]');
+  focusHome.focus();
   lens.showExplorerRail("search"); lens.showExplorerRail("files"); await tick(); await wait();
-  check("a search request that was never shown leaves the editor's focus alone", () => document.activeElement !== searchBox());
-  lens.consumeSearchFocus();
+  check("a search request that was never shown leaves focus where it was", () => document.activeElement === focusHome);
+  check("and switching back to names cancels the pending search focus", () => get(lens.explorerLens).searchFocusPending === false);
 
   // --- Blame as the editor's lens -------------------------------------------
   const blameToggle = () => host.querySelector("[data-blame-lens]");
@@ -421,6 +436,40 @@ const type = async value => { const area = textarea(); area.value = value; area.
     await until(() => Boolean(card()), "Live pulse shown again");
     check("the toolbar toggle brings it back and remembers that too", () =>
       Boolean(card()) && JSON.parse(localStorage.getItem("gitpulse.explorer.livePulse") ?? "{}").visible === true);
+
+    // A maximized terminal leaves Code mounted but inert. A chord it does not
+    // consume reaches this window listener; it must not flip a column nobody
+    // can see, because the flip is remembered.
+    const chord = () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "D", metaKey: true, ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    host.inert = true;
+    chord(); await tick(); await wait(120);
+    check("⌘⇧D does nothing while the page is covered (inert)", () =>
+      Boolean(card()) && JSON.parse(localStorage.getItem("gitpulse.explorer.livePulse") ?? "{}").visible === true);
+    host.inert = false;
+    chord(); await tick();
+    await until(() => !card(), "⌘⇧D hides Live pulse on a visible page");
+    check("and still toggles Live pulse when the page is on screen", () => !card());
+    chord(); await tick();
+    await until(() => Boolean(card()), "⌘⇧D shows Live pulse again");
+
+    // On a compact layout the toolbar opens Live pulse as a transient peek.
+    // The card's own Hide is still an explicit choice: widening the window
+    // afterwards must not bring it back.
+    host.style.width = "600px"; await wait(160);
+    check("(setup) a 600px pane is the compact layout with no side card", () =>
+      host.querySelector("[data-pane-layout]")?.dataset.paneLayout === "compact" && !card());
+    pulseToggle().click(); await tick();
+    await until(() => Boolean(card()), "Live pulse peeks on a compact layout");
+    card().querySelector("[data-live-pulse-hide]").click(); await tick();
+    await until(() => !card(), "the compact Live pulse leaves");
+    await wait(60);
+    const focusAfterHide = document.activeElement;
+    host.style.width = ""; await wait(160);
+    check("a Live pulse hidden from its card on a compact layout stays hidden once there is room", () =>
+      !card() && JSON.parse(localStorage.getItem("gitpulse.explorer.livePulse") ?? "{}").visible === false);
+    check("Hide hands focus to the toolbar toggle that brings it back", () => focusAfterHide === pulseToggle());
+    pulseToggle().click(); await tick();
+    await until(() => Boolean(card()), "Live pulse restored after the compact checks");
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

@@ -118,7 +118,7 @@ Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent co
 - File tree with git status, a virtualized viewer, and editing with compare-and-save.
 - Markdown through MarkDev, plus media and hex viewers.
 - **Blame** toggle with a code-age timeline.
-- **Repository-wide content search** (Code → Explorer, Contents mode) that reports capped or cancelled results.
+- **Repository-wide content search** (Code → Explorer, the contents toggle in the search field) that reports capped or cancelled results.
   There is no separate chord for it: `⌘F` searches the open file in Code, and searches commits elsewhere.
 
 ## 9. Insights

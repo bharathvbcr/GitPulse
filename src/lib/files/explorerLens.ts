@@ -39,13 +39,13 @@ const state = writable<ExplorerLensState>(INITIAL);
 
 export const explorerLens = { subscribe: state.subscribe };
 
-/** Shows `rail` in the side column. Asking for Search also asks for focus. */
+/**
+ * Shows `rail` in the side column. Asking for Search also asks for focus;
+ * going back to the tree withdraws that ask, so a search request that was
+ * never shown cannot pull focus into the name filter.
+ */
 export function showExplorerRail(rail: ExplorerRail): void {
-  state.update((s) => ({
-    ...s,
-    rail,
-    searchFocusPending: rail === "search" ? true : s.searchFocusPending,
-  }));
+  state.update((s) => ({ ...s, rail, searchFocusPending: rail === "search" }));
 }
 
 /** Search when the tree is up, the tree when Search is. */

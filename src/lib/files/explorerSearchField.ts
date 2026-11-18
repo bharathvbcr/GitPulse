@@ -17,8 +17,12 @@ export function toggledSearchMode(mode: ExplorerRail): ExplorerRail {
   return mode === "search" ? "files" : "search";
 }
 
-/** The toggle's accessible name. Constant: `aria-pressed` carries the state. */
-export const CONTENTS_TOGGLE_LABEL = "Include file contents";
+/**
+ * The toggle's accessible name. Constant: `aria-pressed` carries the state.
+ * "Search inside files", not "Include file contents": pressed, it replaces the
+ * name filter with content search rather than adding contents to it.
+ */
+export const CONTENTS_TOGGLE_LABEL = "Search inside files";
 
 /** The toggle's tooltip, which says what clicking it will do. */
 export function contentsToggleTitle(mode: ExplorerRail): string {

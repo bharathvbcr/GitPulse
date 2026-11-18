@@ -14,7 +14,10 @@ describe("explorer search field modes", () => {
   });
 
   it("names the toggle once and lets its tooltip say what a click does", () => {
-    expect(CONTENTS_TOGGLE_LABEL).toBe("Include file contents");
+    expect(CONTENTS_TOGGLE_LABEL).toBe("Search inside files");
+    // Distinct from the field's own name in contents mode, so a screen reader
+    // never hears two controls with one name.
+    expect(CONTENTS_TOGGLE_LABEL).not.toBe(searchFieldLabel("search"));
     expect(contentsToggleTitle("files")).toMatch(/inside files/);
     expect(contentsToggleTitle("search")).toMatch(/file name/);
   });

@@ -36,7 +36,7 @@
 </script>
 
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
@@ -104,6 +104,7 @@
   /** Id of the editor region the open-file tabs control. */
   const EDITOR_PANE_ID = "gitpulse-editor-pane";
   let tabStrip: HTMLDivElement | undefined = $state();
+  let livePulseToggle: HTMLButtonElement | undefined = $state();
   let pathStrip: HTMLElement | undefined = $state();
 
 
@@ -610,6 +611,20 @@
   }
 
   /**
+   * The Live pulse card's own Hide button. Unlike the toolbar toggle, which
+   * treats a compact-layout pane as a transient peek, this is an explicit
+   * choice, so it is remembered in every layout. Focus goes to the toolbar
+   * toggle, the control that brings the column back, instead of falling to the
+   * page when the card leaves.
+   */
+  function hideLivePulse() {
+    livePulsePref.setVisible(false);
+    if (compactPane === "dashboard") compactPane = null;
+    persistTabs(hydratedRepo);
+    void tick().then(() => livePulseToggle?.focus());
+  }
+
+  /**
    * Arrow keys walk the tab strip, as `role="tab"` implies. Focus follows the
    * key rather than activating on arrival: moving across tabs should not load
    * six files on the way to the seventh.
@@ -628,6 +643,12 @@
   }
 
   function handleWindowKeydown(e: KeyboardEvent) {
+    // A key another surface already handled is not ours, and neither is one
+    // pressed while this page is covered: a maximized terminal leaves Code
+    // mounted but `inert`, and a chord it does not consume (⌘⇧D outside shell
+    // mode) would otherwise flip a column nobody can see — and Live pulse's
+    // visibility is remembered, so the flip would outlive the session.
+    if (e.defaultPrevented || !fileViewRoot || fileViewRoot.closest("[inert]")) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b" && !e.shiftKey) {
       e.preventDefault();
       toggleSidePane("explorer");
@@ -893,6 +914,7 @@
 
       <button
         type="button"
+        bind:this={livePulseToggle}
         onclick={() => toggleSidePane("dashboard")}
         aria-pressed={paneLayout.dashboardVisible}
         aria-label="{paneLayout.dashboardVisible ? 'Hide' : 'Show'} Live pulse dashboard"
@@ -1085,7 +1107,7 @@
         <LivePulseDashboard
           selectedFile={activeTabPath}
           onSelectFile={(path) => previewFile(path)}
-          onHide={() => toggleSidePane("dashboard")}
+          onHide={hideLivePulse}
         />
       </div>
     {/if}

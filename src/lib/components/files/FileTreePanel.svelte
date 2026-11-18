@@ -216,6 +216,9 @@
         else selectMode("files");
         return;
       }
+      // The tree is hidden in Contents mode: its arrow keys would move a
+      // selection nobody can see, and the field's own caret keys stay put.
+      return;
     }
     handleKeydown(e);
   }
