@@ -3421,6 +3421,12 @@ fn scratch_build_line(checkout: &str) -> String {
     )
 }
 
+/// Where GitPulse's tools answer when the session's MCP connection does not:
+/// the same binary, one request per command. Only a brief can say this — a
+/// server that never loaded produces no failure for any later hook to see.
+/// Under the header with the scratch line, so the cap never cuts it.
+pub const SHELL_FALLBACK_LINE: &str = "MCP tools missing or failing: gitpulse-mcp call <tool> key=value answers from the shell (gitpulse-mcp tools lists them; a write needs --write)";
+
 /// [`session_brief`] with two more lines right under the header, so they are
 /// never the part [`BRIEF_LIMIT`] cuts: what the published host-load snapshot
 /// says (`load_gate::brief_line_live`), and the running app's fact source and
@@ -3450,6 +3456,8 @@ fn session_brief_with(
         out.push_str(&format!("served by: app (age {age_ms} ms)\n"));
     }
     out.push_str(&scratch_build_line(here));
+    out.push('\n');
+    out.push_str(SHELL_FALLBACK_LINE);
     out.push('\n');
     // Printed first because it qualifies everything under it: past the
     // snapshot deadline the expensive stages stop, and the facets they would
@@ -9356,6 +9364,31 @@ done
         let cut = session_brief(&snapshot, "/repo", "startup");
         assert!(cut.ends_with("… truncated"));
         assert!(cut.contains(".gitpulse/scratch/target-"), "{cut}");
+    }
+
+    /// An agent whose MCP connection never loaded learns the shell path from
+    /// the brief and nowhere else, so the line survives the cap, once.
+    #[test]
+    fn the_brief_names_the_shell_fallback_once_even_when_the_cap_cuts() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.worktrees.items = (0..400)
+            .map(|i| WorktreeSummary {
+                path: format!("/repo/wt/{i}"),
+                name: format!("worktree-with-a-long-name-{i}"),
+                branch: Some(format!("branch/{i}")),
+                dirty_files: Some(9),
+                ..Default::default()
+            })
+            .collect();
+        let cut = session_brief(&snapshot, "/repo", "startup");
+        assert!(cut.ends_with("… truncated"));
+        assert_eq!(
+            cut.lines().filter(|l| *l == SHELL_FALLBACK_LINE).count(),
+            1,
+            "{cut}"
+        );
+        assert!(SHELL_FALLBACK_LINE.contains("gitpulse-mcp call <tool>"));
+        assert!(SHELL_FALLBACK_LINE.len() < 160);
     }
 
     #[test]

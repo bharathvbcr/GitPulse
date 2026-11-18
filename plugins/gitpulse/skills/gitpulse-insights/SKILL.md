@@ -49,6 +49,33 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 
 The SessionStart brief that `gitpulse_insights` accompanies carries a `host load:` line read from the host-load snapshot (tier, what is binding, Claude and Codex sessions launched and observed). It is not a `gitpulse_insights` facet. Before a heavy build or test, and whenever a command is refused for load, follow the `gitpulse-load` skill.
 
+## When the MCP tools are not available
+
+The MCP connection can be missing (the server is not loaded in this session, the plugin is not visible to the host) or dead (the host dropped it mid-session). The same tools then answer from the shell, through the same `gitpulse-mcp` binary, one request per command:
+
+```sh
+gitpulse-mcp tools                      # the catalog, one line each, read or write
+gitpulse-mcp describe gitpulse_insights # one tool's description and input schema
+gitpulse-mcp call gitpulse_insights repo_path=/abs/repo
+gitpulse-mcp call gitpulse_collision_risk repo_path=/abs/repo path=src/lib.rs --compact
+gitpulse-mcp read gitpulse://server/manifest # lists the resources and their URI templates
+gitpulse-mcp read gitpulse://status/abs/repo  # a facet: its name, then the absolute repo path
+```
+
+`call` runs the server's own request path in-process: the same schema check, result budget, repository trust and policy gates. `key=value` is typed by the tool's schema (a string property takes the text as it is; integers, booleans, arrays and objects take JSON), and `--json '<object>'`, `--json -` (stdin) or `--json @file` passes the whole argument object. A tool that is not `readOnlyHint: true` runs only with `--write`. Pass `repo_path` explicitly and absolute: a shell's working directory is not necessarily the worktree you mean. Terminal tools (`gitpulse_terminal_*`) act for the GitPulse terminal the shell runs in; see the gitpulse-terminal skill for what works outside one.
+
+Stdout carries only the JSON answer; warnings go to stderr. A `call` or `read` waits at most `--timeout-ms` (by default 60000 for a read, the server's own per-request budget, and 600000 for a write, since a write stopped midway is left half done), then stops the tool, takes its git children down and exits 4. The exit status keeps the honesty rules below:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The tool answered and no part of the answer carries an incompleteness flag (still read each facet) |
+| `1` | The tool reported an error, including an argument its schema refused, or it panicked |
+| `2` | The command line was wrong: unknown command, tool, option, key or resource, or a write without `--write` |
+| `3` | The answer says it is incomplete: `ok: false`, `<facet>_ok: false`, `deferred: true` or `truncated: true` on any object in it (`worktrees.ok`, `agents.live.ok`), or the result budget cut it. The partial answer is still printed and stderr names where; read its `error` fields |
+| `4` | No answer within `--timeout-ms`. Nothing is printed; a write's outcome is unknown, so read the state back before retrying |
+
+This replaces a missing transport, not a loaded host: a read deferred under load is deferred from the shell too, and `gitpulse-mcp` on `PATH` is whatever `bun run mcp:install` last installed.
+
 ## Honesty rules this server already enforces
 
 - Unscanned worktrees are counted, never implied clean.

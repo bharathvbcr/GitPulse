@@ -28,3 +28,14 @@ The overlap list needs two dirty worktrees, so from a clean worktree it is empty
 If `sessions_ok` is false, some agent kind could not be observed (the process table could not be read, a session's directory was unreadable, or — on a platform with no process scan — Codex, which keeps no registry of running sessions) or the hook claims that attribute a session to its worktree could not be read in full (`sessions_error` names which, under `attribution:`), so an empty `shared_worktrees` is not proof you are alone in your checkout. Each kind in `agents.live.kinds` says whether it was observed; one with `ok: false` is unknown, not zero.
 
 A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, or `operation` on change context) is blocked on a person. Do not push more edits into that worktree until it is continued or aborted in GitPulse (Work → Overview leads with the conflict editor while one is parked).
+
+## When the MCP tools are not available
+
+The procedure above runs from the shell through the same binary when the MCP connection is not loaded or has dropped (the gitpulse-insights skill covers argument typing, `--json` and the exit statuses). Exit 3 is the incomplete answer this skill warns about: a worktree that was not read, so an empty list is not a clear path.
+
+```sh
+gitpulse-mcp call gitpulse_collision_risk repo_path=/abs/repo path=src/lib.rs
+gitpulse-mcp call gitpulse_worktree_radar repo_path=/abs/repo
+gitpulse-mcp call gitpulse_active_changes repo_path=/abs/repo limit=50
+gitpulse-mcp call gitpulse_worktree_claim --write --json @claim.json
+```

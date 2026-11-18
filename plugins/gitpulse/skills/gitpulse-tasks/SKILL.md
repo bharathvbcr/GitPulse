@@ -31,6 +31,14 @@ repository is refused with `untrusted_repository`; ask the person to open it in
 GitPulse and trust it. No write can start an agent run, and only
 `gitpulse_delete_task` and `gitpulse_merge_tasks` remove a card.
 
+Without a loaded MCP connection the same tools run from the shell (see the gitpulse-insights skill for the exit statuses). Writes need `--write`, and a brief is easiest passed as one JSON object on stdin:
+
+```sh
+gitpulse-mcp call gitpulse_list_tasks repo_path=/abs/repo limit=50
+gitpulse-mcp call gitpulse_add_task --write --json - < task.json
+gitpulse-mcp call gitpulse_complete_task --write repo_path=/abs/repo task_id=ft-... status=done summary='...'
+```
+
 ## Before you file a task
 
 A person reads every card on the board. Thirty narrow cards from one review are
