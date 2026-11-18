@@ -5985,5 +5985,9 @@ done
 }
 
 #[cfg(all(test, unix))]
+#[path = "sidecar_attack_tests.rs"]
+mod sidecar_attack_tests;
+
+#[cfg(all(test, unix))]
 #[path = "hosted_flow_tests.rs"]
 mod hosted_flow_tests;
