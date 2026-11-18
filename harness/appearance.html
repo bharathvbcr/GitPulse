@@ -101,7 +101,9 @@
     check("renders the seven groups of the design language", () =>
       ["theme", "colors", "type", "shape", "material", "motion", "density"].every((group) => $(`[data-group="${group}"]`)));
     check("keeps walkthrough replay and coach marks", () => $('[data-setting="walkthrough-replay"] button') && $('[data-setting="coach-marks"] button'));
-    check("the class macos survived the theme store, so the glass rules apply", () => root.classList.contains("macos") && root.classList.contains("dark"));
+    check("the class macos survived the theme store, so the glass rules apply", () =>
+      (root.classList.contains("macos") && root.classList.contains("dark"))
+      || (() => { throw new Error(`root classes "${root.className}"`); })());
     check("defaults: comfortable density is stamped", () => root.getAttribute("data-density") === "comfortable");
     check("defaults: the surface fill is the shipped half-transparent one", () => Math.abs(alphaOf(cs($("#probe-surface")).backgroundColor) - 0.5) < 0.03);
     check("defaults: the float computes the shipped blur(34px)", () => filterOf($("#probe-float")).includes("blur(34px)"));

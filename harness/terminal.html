@@ -689,18 +689,26 @@
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
+            const heldCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
             await wait(900);
-            // Fails on the Ubuntu Chrome runner only (two commits), never locally:
-            // the state below says which premise did not hold there.
+            // Fails on the Ubuntu Chrome runner only, never locally (nor under
+            // SwiftShader here): there the renderer was back on the DOM yet one
+            // canvas stayed. Each survivor says whether it is the WebGL canvas
+            // the session held, or another one.
             check("a session that stays hidden past the hold gives its context up",
               () => (other.dataset.renderer === "dom" && !other.querySelector("canvas")) || (() => {
                 throw new Error(JSON.stringify({
                   renderer: other.dataset.renderer, canvases: other.querySelectorAll("canvas").length,
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
                   msSinceHidden: Math.round(performance.now() - hiddenAt),
+                  survivors: [...other.querySelectorAll("canvas")].map((node) => ({
+                    held: node === heldCanvas, className: node.className, parent: node.parentElement?.className ?? null,
+                    size: `${node.width}x${node.height}`,
+                  })),
+                  heldCanvasConnected: heldCanvas?.isConnected ?? null,
                 }));
               })());
             button("Hide the terminal dock").click(); await wait(900);
