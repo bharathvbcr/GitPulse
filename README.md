@@ -10,6 +10,8 @@
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
 
+<p align="center"><sub>Tested on macOS; Windows and Linux builds are available but not yet tested.</sub></p>
+
 **A workspace, not a chat window. GitPulse is the local-first command centre for agentic coding.**
 
 GitPulse is built for the agentic era. It gives the same information and the same tools to the
