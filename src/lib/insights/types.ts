@@ -251,6 +251,27 @@ export interface CollisionRisk {
   claims_truncated?: boolean;
 }
 
+/**
+ * Milliseconds spent in each stage of one snapshot (Rust `StageTimings`). A
+ * stage that did not run in this process is absent, never 0.
+ */
+export interface StageTimings {
+  /** Asking the running app before scanning here (MCP only). */
+  app_ask?: number;
+  /** The process-table and session-registry observation of live agents. */
+  observe?: number;
+  /** `git worktree list`. */
+  listing?: number;
+  /** The main checkout's status, for `changes`. */
+  main_status?: number;
+  /** Every worktree's status, under the snapshot clock. */
+  worktree_status?: number;
+  /** Rows, operation probes, HEAD divergence, the collision scan and claims. */
+  derive?: number;
+  ledger?: number;
+  codeintel?: number;
+}
+
 export interface InsightsSnapshot {
   repo_path: string;
   branch: string | null;
@@ -261,19 +282,7 @@ export interface InsightsSnapshot {
   /** From before the live-session observation to the end of the snapshot. */
   duration_ms: number;
   /** Milliseconds per stage; a stage that did not run in this process is absent. */
-  stages_ms?: Partial<
-    Record<
-      | 'app_ask'
-      | 'observe'
-      | 'listing'
-      | 'main_status'
-      | 'worktree_status'
-      | 'derive'
-      | 'ledger'
-      | 'codeintel',
-      number
-    >
-  >;
+  stages_ms?: StageTimings;
   worktrees: WorktreeFacet;
   agents: AgentSummary;
   changes: ChangesFacet;
