@@ -347,6 +347,10 @@
         while (performance.now() < end) { if (predicate()) return true; await wait(20); }
         return predicate();
       };
+      // True once nothing under `root` is still animating (bounded, so an animation
+      // that never ends is reported by the caller, not waited on forever).
+      const animationsEnded = (root, ms = 5000) =>
+        sleepUntil(() => root.getAnimations({ subtree: true }).every((animation) => animation.playState === "finished"), ms);
 
       // ---- where things are -----------------------------------------------------
       const sidebar = () => $("aside.gp-sidebar");
@@ -822,6 +826,10 @@
             body.scrollTop = 0; await settle();
             const fadeAtTop = body.dataset.gpFade ?? "";
             body.scrollTop = body.scrollHeight; await settle(); await wait(120);
+            // The edge mask follows the scroll through ScrollCue, a frame or more
+            // after it; at the end it must be gone. Wait for that (bounded) and then
+            // read it, so a mask that stays is still a failure.
+            await sleepUntil(() => body.scrollHeight <= body.clientHeight + 1 || !(body.dataset.gpFade ?? "").includes("end"), 3000);
             const box = body.getBoundingClientRect();
             const rows = [...body.querySelectorAll("*")].filter((el) => el.getClientRects().length && el.children.length === 0 && !el.closest("[hidden]"));
             const last = rows.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
@@ -1110,7 +1118,7 @@
                   // that is leaving is still in the switcher beside the one that
                   // arrived, so its width is the sum of two views', not a view's.
                   // Measure the settled switcher, bounded, and say if it never was.
-                  const quiet = await sleepUntil(() => switcherScroller.getAnimations({ subtree: true }).every((animation) => animation.playState === "finished"), 5000);
+                  const quiet = await animationsEnded(switcherScroller);
                   const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}${quiet ? "" : ", still animating"}`;
                   measured.push(row);
                   if (switcherScroller.scrollWidth > switcherScroller.clientWidth + 1) squeezed.push(row);
@@ -1351,10 +1359,13 @@
                   for (const view of ["work", "code", "history"]) {
                     repoStore.setActiveTab(view);
                     await settle();
+                    // As in the search sweep above: measure once the view change's
+                    // crossfades have ended, not while two views' strips are in the row.
+                    const quiet = await animationsEnded(glanceScroller);
                     const pill = !!$('[data-testid="viewbar-agents"]', row2);
                     const { shown, torn } = glanceShown();
                     const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
-                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
+                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}${quiet ? "" : ", still animating"}`;
                     glanceMeasured.push(row);
                     // With no pill, Code and History leave room for every chip at 1400px.
                     const roomy = agentsOk && width === 1400 && view !== "work";
