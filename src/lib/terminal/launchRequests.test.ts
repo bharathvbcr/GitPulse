@@ -169,6 +169,16 @@ it("enqueues repository-contained file split requests and rejects traversal path
   const pending = requests.requestFile("/repo", "./src/lib/tabs.ts", 25, 3);
   const claimed = requests.take("/repo");
   expect(claimed).toMatchObject({ launcher: "file", filePath: "src/lib/tabs.ts", line: 25, column: 3 });
+  expect(claimed?.fileKeep).toBeUndefined();
+  claimed?.complete();
+  await expect(pending).resolves.toBeUndefined();
+});
+
+it("carries a double-click's keep on a file request", async () => {
+  const requests = createTerminalLaunchRequests();
+  const pending = requests.requestFile("/repo", "src/a.ts", null, null, undefined, { mode: "tab", keep: true });
+  const claimed = requests.take("/repo");
+  expect(claimed).toMatchObject({ launcher: "file", filePath: "src/a.ts", fileOpenMode: "tab", fileKeep: true });
   claimed?.complete();
   await expect(pending).resolves.toBeUndefined();
 });

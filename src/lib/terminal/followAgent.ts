@@ -19,6 +19,8 @@ export interface FollowPaneCandidate {
   readonly launcher: string;
   readonly filePath?: string;
   readonly snippet?: unknown;
+  /** The user double-clicked to keep this pane's file (`TerminalTab.kept`). */
+  readonly kept?: boolean;
 }
 
 /** What follow owns: a pane id and the file follow last showed in it. */
@@ -60,6 +62,8 @@ export function decideFollow(
   if (!pane) return { kind: "stop", reason: "closed" };
   if (!isFilePane(pane)) return { kind: "stop", reason: "taken" };
   if (paneFile(pane) !== target.filePath) return { kind: "stop", reason: "taken" };
+  // Keeping the file follow showed is taking the pane: follow never moves it.
+  if (pane.kept) return { kind: "stop", reason: "taken" };
   return { kind: "retarget", paneId: pane.id };
 }
 

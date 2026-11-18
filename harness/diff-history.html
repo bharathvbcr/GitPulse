@@ -241,6 +241,19 @@ const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbl
  check("the empty diff's action opens History and then steps aside",()=>tab("History").getAttribute("aria-selected")==="true"&&!emptyAction());
  emptyDiffPath=null;
 
+ // --- landing from Code → Explorer's History menu ------------------------------
+ // The open file's History menu calls selectCommitFileDiff from a working-tree
+ // file selection. The page must show that commit's change to that file, and
+ // stop calling it uncommitted work.
+ await repoStore.selectFileDiff("worktree-only.ts",false);
+ await until(()=>!get(repoStore).selectedDiffPending,"working-tree file diff");
+ tab("Files")?.click();await tick();
+ await repoStore.selectCommitFileDiff(hex(2),"worktree-only.ts");
+ await until(()=>text().includes(`commit file ${hex(2).slice(0,4)}`),"the commit's file diff renders");
+ check("a file's past change opened from Explorer renders that commit's patch of that file",()=>
+  callsOf("cmd_get_commit_file_diff").at(-1)?.args.commitId===hex(2)&&callsOf("cmd_get_commit_file_diff").at(-1)?.args.filePath==="worktree-only.ts"&&text().includes(`commit file ${hex(2).slice(0,4)}`));
+ check("and the page names the commit, not uncommitted work",()=>{const line=rail()?.querySelector("[data-change-line]")?.textContent??"";return !line.includes("Uncommitted changes")&&(line.includes(hex(2).slice(0,7))||line.includes("commit number 2"));});
+
  // --- a narrow pane -------------------------------------------------------------
  preview.style.width="420px";await wait(150);
  const controls=historyButton().parentElement;

@@ -362,7 +362,13 @@ describe("Sidebar change lists", () => {
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-tab"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-split"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-dock-terminal"');
-    expect(explorerPaneSource).toContain("resolveSidebarFileAction(");
+    // Routing goes through the shared resolver: `resolveSidebarOpen` (which
+    // lets a double-click follow its own clicks) delegates every fresh
+    // decision to `resolveSidebarFileAction`, unit-tested in layoutStore.test.
+    expect(explorerPaneSource).toContain("resolveSidebarOpen(");
+    expect(explorerPaneSource).not.toMatch(/altKey \? "split"|metaOrCtrlKey \? /);
+    // A double-click (onPinFile) asks to keep the file's tab.
+    expect(explorerPaneSource).toContain("onPinFile={(path) => void handleOpenFile(path, null, null, true)}");
     expect(explorerPaneSource).toContain("terminalExplorerSidebar.setOpen(true)");
     expect(explorerPaneSource).toContain("terminalExplorerSidebar.setOpen(false)");
     expect(explorerPaneSource).toContain("new AbortController()");

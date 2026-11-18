@@ -30,6 +30,14 @@ describe("decideFollow", () => {
     expect(decideFollow(target, [agent, filePane("f1")])).toEqual({ kind: "retarget", paneId: "f1" });
   });
 
+  it("stops once the user keeps follow's pane on its file (a double-click)", () => {
+    const target: FollowTarget = { paneId: "f1", filePath: "src/a.ts" };
+    expect(decideFollow(target, [agent, { ...filePane("f1", "src/a.ts"), kept: true }])).toEqual({
+      kind: "stop",
+      reason: "taken",
+    });
+  });
+
   it("stops, and opens nothing, once the user closed follow's pane", () => {
     const target: FollowTarget = { paneId: "f1", filePath: "src/a.ts" };
     expect(decideFollow(target, [agent])).toEqual({ kind: "stop", reason: "closed" });

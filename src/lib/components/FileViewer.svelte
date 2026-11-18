@@ -5,6 +5,7 @@
   import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
   import type { FileSidePane } from "../files/filePaneLayout";
   import { livePulsePref } from "../files/livePulsePref";
+  import { consumePin, pinRequest } from "../files/pinRequests";
   import type { FileBlob } from "../files/types";
   import { overwriteNote } from "../files/overwriteNote";
   import { recordEditorDrafts } from "../files/editorDraftRegistry";
@@ -71,6 +72,7 @@
   import { sidebarExplorerDocked } from "../sidebar/layoutStore";
   import MediaViewer from "./files/MediaViewer.svelte";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
+  import FileHistoryMenu from "./files/FileHistoryMenu.svelte";
   import EmptyState from "./EmptyState.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import ScrollCue from "./ScrollCue.svelte";
@@ -726,6 +728,23 @@
     });
   });
 
+  // A pin asked for by an explorer that does not own these tabs (the main
+  // sidebar's double-click). Declared after the hydration and selection
+  // effects so it runs after them in the same flush: a request made before
+  // this page mounted lands on the hydrated tabs instead of being overwritten
+  // by them. Tracking the store also catches a pin of the file already
+  // selected, which no selection change would announce.
+  const pinAsk = $derived($pinRequest);
+  $effect(() => {
+    const ask = pinAsk;
+    const repo = $currentRepoPath;
+    if (!ask || !repo) return;
+    untrack(() => {
+      if (hydratedRepo !== repo || !consumePin(repo, ask.path)) return;
+      pinFile(ask.path);
+    });
+  });
+
   const activeStatusCode = $derived(
     tabState.active ? ($repoStore.statuses.find((s) => s.path === tabState.active)?.status_code ?? "") : "",
   );
@@ -1005,6 +1024,10 @@
           <Layers size={11} />
           <span>Diff</span>
         </button>
+
+        <!-- Diff is this file's uncommitted change; History is the way back
+             through the commits before it, each opening on the Diff page. -->
+        <FileHistoryMenu repoPath={$currentRepoPath} path={activeTabPath} />
 
         <!-- A toggle, not a destination: the open file reads as its blame
              in place, and the tabs, tree and selection stay where they are. -->

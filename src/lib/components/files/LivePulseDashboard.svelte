@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { LanguageInfo } from "../../files/types";
-  import type { CommitGraphPayload } from "../../stores/graphStore";
+  import { loadFileHistory, type FileHistoryCommit } from "../../files/fileHistory";
   import { onMount, untrack } from "svelte";
   import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
@@ -35,13 +35,6 @@
   import LanguageLogo from "../LanguageLogo.svelte";
   import Skeleton from "../Skeleton.svelte";
 
-  interface FileCommit {
-    id: string;
-    author: string;
-    date: number;
-    message: string;
-  }
-
   let {
     selectedFile = null,
     onSelectFile,
@@ -55,7 +48,9 @@
 
   let isRefreshing = $state(false);
   let lastRefreshed = $state<number>(Date.now());
-  let recentCommits = $state<FileCommit[]>([]);
+  let recentCommits = $state<FileHistoryCommit[]>([]);
+  /** Why the history list is empty when it is not "no commits": a failed or unsupported read. */
+  let historyNote = $state<string | null>(null);
   let isLoadingCommits = $state(false);
   let commitGuard: AsyncGuard | null = null;
 
@@ -148,6 +143,7 @@
     // presented under the new identity while either command is pending.
     detectedLang = null;
     recentCommits = [];
+    historyNote = null;
 
     try {
       // 1. Language detection
@@ -161,27 +157,18 @@
         if (guard.isLive()) detectedLang = null;
       }
 
-      // 2. Commit history touching this file
-      const graph = await invoke<CommitGraphPayload>(
-        "cmd_get_commit_graph",
-        {
-          repoPath: repo,
-          maxCommits: 8,
-          query: `path:${path}`,
-          revision: null,
-          skip: 0,
-        }
-      );
-
+      // 2. Commit history touching this file. A read that failed, or a path
+      // the history query cannot express, says so instead of reading as
+      // "no prior commits".
+      const history = await loadFileHistory(invoke, repo, path, 6);
       if (!guard.isLive()) return;
-      recentCommits = (graph.rows || []).slice(0, 6).map((row) => ({
-        id: row.id,
-        author: row.author_name,
-        date: row.timestamp * 1000,
-        message: row.summary,
-      }));
-    } catch {
-      if (guard.isLive()) recentCommits = [];
+      recentCommits = history.status === "loaded" ? history.commits : [];
+      historyNote =
+        history.status === "error"
+          ? `Couldn't read this file's history: ${history.message}`
+          : history.status === "unsupported"
+            ? history.reason
+            : null;
     } finally {
       if (guard.isLive()) isLoadingCommits = false;
     }
@@ -210,6 +197,7 @@
         commitGuard = null;
         isLoadingCommits = false;
         recentCommits = [];
+        historyNote = null;
         detectedLang = null;
       }
     });
@@ -485,6 +473,10 @@
             <div class="p-1">
               <Skeleton variant="text" count={3} />
               <span class="sr-only">Loading file history…</span>
+            </div>
+          {:else if historyNote}
+            <div class="p-3 rounded-xl border border-edgeSoft bg-surface/30 text-center text-warn text-meta" data-file-history-note>
+              {historyNote}
             </div>
           {:else if recentCommits.length === 0}
             <div class="p-3 rounded-xl border border-edgeSoft bg-surface/30 text-center text-textMuted text-meta">

@@ -11,6 +11,13 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **The open file's previous changes, one click away.** A History menu in the
+  Explorer page's path bar, beside Diff and Blame, lists the commits that
+  changed the open file, newest first. Choosing one opens that commit's
+  change to the file on History → Diff.
+
 ### Changed
 
 - **Explorer's search field is one row at every width.** Its Names | Contents
@@ -26,6 +33,19 @@ before that tag is pushed.
   and in memory, defaulting to shown, so it came back on every repository
   switch and every launch. It is now one app-wide setting, remembered across
   launches, and the Live pulse column has its own Hide button.
+- **Double-clicking a file in the sidebar's File Explorer did not keep its
+  tab.** It did the same as a single click, so the file opened in a preview
+  tab that the next click replaced. It now keeps the tab, as a double-click
+  in the Explorer page's own tree already did. The same holds in the
+  terminal, at the sidebar's Tab and Split targets and in the terminal's
+  docked explorer: a kept file pane is no longer pointed at the next file you
+  click, even from its own explorer, which opens in a tab beside it instead.
+  Follow Agent stops driving a pane you keep, and a kept pane in a split
+  stays kept when the split is restored. An Alt-double-click (a split) keeps the file in that split rather
+  than switching to Code.
+- **Live pulse called an unreadable file history empty.** A failed read
+  showed "No prior commits recorded for this path"; it now says the history
+  could not be read.
 
 ## [1.99.0] - 2026-11-17
 

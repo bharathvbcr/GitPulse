@@ -31,7 +31,9 @@ describe("LivePulseDashboard", () => {
     expect(source).toContain("invoke<LanguageInfo>");
     expect(source).toContain('import type { LanguageInfo } from "../../files/types"');
     expect(source).toContain('"cmd_detect_language"');
-    expect(source).toContain('"cmd_get_commit_graph"');
+    // File history goes through the one owner (`files/fileHistory.ts`), which
+    // reads `cmd_get_commit_graph` and keeps a failed read distinct from none.
+    expect(source).toContain("loadFileHistory(invoke, repo, path, 6)");
   });
 
   it("invalidates prior file details synchronously when the async selection identity changes", () => {

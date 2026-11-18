@@ -199,6 +199,58 @@ export function resolveSidebarFileAction(options: {
   return normalizeSidebarOpenTarget(options.defaultTarget);
 }
 
+/** How long after a click its double-click is taken to belong to it. */
+export const SIDEBAR_DOUBLE_CLICK_WINDOW_MS = 1500;
+
+/** Where the sidebar explorer's last click on a file sent it. */
+export interface SidebarLastOpen {
+  path: string;
+  action: SidebarFileOpenTarget;
+  at: number;
+}
+
+/**
+ * Whether a double-click on `path` at `now` belongs to the last click, so it
+ * follows where that click sent the file. One rule for every explorer that
+ * remembers its last open: the main sidebar's and the terminal's docked one.
+ */
+export function doubleClickFollows(
+  lastOpen: { path: string; at: number } | null,
+  path: string,
+  now: number,
+): boolean {
+  return (
+    lastOpen !== null &&
+    lastOpen.path === path &&
+    now >= lastOpen.at &&
+    now - lastOpen.at <= SIDEBAR_DOUBLE_CLICK_WINDOW_MS
+  );
+}
+
+/**
+ * Where a click or double-click in the sidebar's File Explorer opens a file.
+ *
+ * A double-click (`pin`) arrives after its two clicks have already resolved
+ * (and consumed) the modifier keys, so it follows the target its own clicks
+ * chose instead of resolving again with none held. Otherwise an
+ * Alt-double-click, a split, would pin the file in Code and switch views.
+ */
+export function resolveSidebarOpen(options: {
+  path: string;
+  pin: boolean;
+  lastOpen: SidebarLastOpen | null;
+  now: number;
+  defaultTarget: SidebarFileOpenTarget;
+  altKey?: boolean;
+  metaOrCtrlKey?: boolean;
+}): SidebarFileOpenTarget {
+  const { lastOpen } = options;
+  if (options.pin && lastOpen && doubleClickFollows(lastOpen, options.path, options.now)) {
+    return lastOpen.action;
+  }
+  return resolveSidebarFileAction(options);
+}
+
 export function loadSidebarNav(raw: string | null): SidebarNavPrefs {
   if (!raw) return { ...DEFAULT_SIDEBAR_NAV };
   let parsed: unknown;

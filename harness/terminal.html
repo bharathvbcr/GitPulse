@@ -195,7 +195,7 @@
           // reference land on the same named line.
           // Repository logos: GitPulse ships an icon, Other has none, so the
           // session list draws one logo and one set of initials.
-          case "cmd_list_repo_files": return args?.repoPath === "/fixture/GitPulse" ? ["src-tauri/icons/128x128.png", "src/main.ts"] : ["src/main.ts"];
+          case "cmd_list_repo_files": return args?.repoPath === "/fixture/GitPulse" ? ["src-tauri/icons/128x128.png", "src/lib.ts", "src/main.ts"] : ["src/main.ts"];
           case "cmd_get_file_blob": if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 }; return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
@@ -2889,6 +2889,77 @@
               await wait(40);
               visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
               await waitFor(() => visible('[role="tabpanel"]').length === 2);
+
+              // G8b: a double-click keeps a file's terminal tab. The next single
+              // click on another file opens beside it, and the one after reuses
+              // that preview — from the main sidebar (Tab target) and from the
+              // terminal's docked explorer.
+              const tabNames = () => visible('[data-terminal-tab] [role="tab"]').map((el) => el.textContent ?? "");
+              const hasTab = (name) => tabNames().some((text) => text.includes(name));
+              const treeItem = (root, name) =>
+                [...(root?.querySelectorAll('[role="treeitem"]') ?? [])].find((el) => el.textContent?.includes(name));
+              const closeFileTab = async (name) => {
+                const wrap = visible("[data-terminal-tab]").find((el) => el.textContent?.includes(name));
+                wrap?.querySelector('button[aria-label^="Close "]')?.click();
+                await waitFor(() => !hasTab(name));
+              };
+              sidebarHost.querySelector('[data-testid="sidebar-view-files"]')?.click();
+              const keepPane = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-explorer-pane"]'));
+              keepPane?.querySelector('[data-testid="sidebar-explorer-target-tab"]')?.click();
+              const sideMain = await waitFor(() => treeItem(keepPane, "main.ts"));
+              sideMain?.click();
+              sideMain?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+              await waitFor(() => hasTab("main.ts"));
+              treeItem(keepPane, "lib.ts")?.click();
+              await waitFor(() => hasTab("lib.ts"));
+              const sidebarKeptBeside = hasTab("main.ts") && hasTab("lib.ts");
+              treeItem(keepPane, "128x128.png")?.click();
+              await waitFor(() => hasTab("128x128.png"));
+              await wait(80);
+              const sidebarPreviewReused = hasTab("main.ts") && !hasTab("lib.ts") && hasTab("128x128.png");
+              const sidebarTabsSeen = tabNames().join(" | ");
+              await closeFileTab("128x128.png");
+              await closeFileTab("main.ts");
+              sidebarNavStore.setView("git");
+
+              visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
+              const dockAside = await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]')[0]);
+              dockAside?.querySelector('[data-testid="terminal-explorer-target-tab"]')?.click();
+              const dockLib = await waitFor(() => treeItem(dockAside, "lib.ts"));
+              dockLib?.click();
+              await waitFor(() => hasTab("lib.ts"));
+              dockLib?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+              await wait(80);
+              treeItem(dockAside, "main.ts")?.click();
+              await waitFor(() => hasTab("main.ts"));
+              await wait(80);
+              const dockKeptBeside = hasTab("lib.ts") && hasTab("main.ts");
+              const dockTabsSeen = tabNames().join(" | ");
+
+              // The explorer inside the kept lib.ts pane: its single click opens
+              // beside the pane rather than replacing the kept file.
+              visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
+              await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
+              visible("[data-terminal-tab] [role=\"tab\"]").find((el) => el.textContent?.includes("lib.ts"))?.click();
+              await waitFor(() => visible('[role="tabpanel"]').length === 1);
+              const innerToggle = await waitFor(() => visible('[role="tabpanel"] [data-testid="terminal-file-pane-explorer-toggle"]')[0]);
+              if (visible("[data-terminal-file-explorer-card]").length === 0) innerToggle?.click();
+              const innerCard = await waitFor(() => visible("[data-terminal-file-explorer-card]")[0]);
+              const innerPng = await waitFor(() => treeItem(innerCard, "128x128.png"));
+              innerPng?.click();
+              await waitFor(() => hasTab("128x128.png"));
+              await wait(80);
+              const innerKeptBeside = hasTab("lib.ts") && hasTab("128x128.png");
+              const innerTabsSeen = tabNames().join(" | ");
+              for (const name of ["main.ts", "lib.ts", "128x128.png"]) if (hasTab(name)) await closeFileTab(name);
+              visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
+              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+              check(`G8b: double-click keeps a terminal file tab; the next click opens beside it, the one after reuses that preview (sidebar: ${sidebarTabsSeen}; docked: ${dockTabsSeen})`, () =>
+                sidebarKeptBeside && sidebarPreviewReused && dockKeptBeside,
+              );
+              check(`G8c: a click in a kept pane's own explorer opens beside it instead of replacing the kept file (${innerTabsSeen})`, () =>
+                innerKeptBeside,
+              );
             } finally {
               await unmountComp(mountedSidebar);
               sidebarHost.remove();

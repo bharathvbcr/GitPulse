@@ -9,6 +9,8 @@
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import { requestPin } from "../files/pinRequests";
+  import { doubleClickFollows } from "../sidebar/layoutStore";
   import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
@@ -207,6 +209,8 @@
     browserTabFor,
     openBrowserTab,
     fileTabFor,
+    canRepointFileTab,
+    keepFileTabFor,
     normalizePaneFilePath,
     openFileTab,
     openSnippetTab,
@@ -223,6 +227,7 @@
     type LauncherKind,
     type TabKind,
     type TabState,
+    type TerminalTab,
   } from "../terminal/tabs";
   import {
     crowdedTabStrip,
@@ -476,6 +481,12 @@
   let explorerResizing = $state(false);
   let selectedExplorerFile = $state<string | null>(null);
   let lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
+  /** Where the docked explorer's last click sent a file, for its double-click. */
+  let lastExplorerOpen: {
+    path: string;
+    action: ReturnType<typeof resolveExplorerFileAction>;
+    at: number;
+  } | null = null;
   let inlineRenameTabId = $state<string | null>(null);
   let inlineRenameSurface = $state<"tab" | "pane" | null>(null);
   let inlineRenameDraft = $state("");
@@ -704,6 +715,13 @@
     if (meta.pinned) {
       next = toggleTabPinned(next, tabId, true);
     }
+    if (meta.kept) {
+      // By id: the restored pane is this tab, whatever its path is spelled as.
+      next = {
+        ...next,
+        tabs: next.tabs.map((tab) => (tab.id === tabId && tab.launcher === "file" ? { ...tab, kept: true } : tab)),
+      };
+    }
     return next;
   }
 
@@ -909,6 +927,7 @@
         ...(tab.launchName ? { launchName: tab.launchName } : {}),
         ...(tab.userNamed ? { userNamed: true } : {}),
         ...(tab.pinned ? { pinned: true } : {}),
+        ...(tab.kept ? { kept: true } : {}),
         ...(backendId ? { backendSessionId: backendId } : {}),
         ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
         ...(tab.filePath ? { filePath: tab.filePath } : {}),
@@ -2086,19 +2105,18 @@
         return;
       }
       if (claimed.launcher === "file") {
-        if (claimed.fileOpenMode === "tab") {
-          claimed.complete(
-            openFileTabFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-              focus: claimed.fileFocus ?? true,
-            }),
-          );
-          return;
+        const err =
+          claimed.fileOpenMode === "tab"
+            ? openFileTabFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
+                focus: claimed.fileFocus ?? true,
+              })
+            : openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
+                focus: claimed.fileFocus ?? false,
+              });
+        if (!err && claimed.fileKeep && claimed.filePath) {
+          keepFileShown(claimed.filePath, activeTab?.checkout);
         }
-        claimed.complete(
-          openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-            focus: claimed.fileFocus ?? false,
-          }),
-        );
+        claimed.complete(err);
         return;
       }
       const createdId = newTab(
@@ -2750,11 +2768,13 @@
     if (!repoPath) return "Open a repository first";
     const shouldFocus = options?.focus ?? true;
     const checkout = activeTab?.checkout;
+    // A kept pane keeps its file: the new one opens in a tab of its own.
     const visibleFile =
       tabState.tabs.find(
         (tab) =>
           tab.launcher === "file" &&
           !tab.snippet &&
+          canRepointFileTab(tab, filePath) &&
           (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId) &&
           (tab.checkout || undefined) === (checkout?.trim() || undefined),
       ) ??
@@ -2762,6 +2782,7 @@
         (tab) =>
           tab.launcher === "file" &&
           !tab.snippet &&
+          canRepointFileTab(tab, filePath) &&
           (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
       );
     if (visibleFile && filePath) {
@@ -2820,24 +2841,70 @@
     });
   }
 
+  /** Keeps the file tab now showing `filePath` (a double-click). */
+  function keepFileShown(filePath: string, checkout?: string, preferId?: string | null) {
+    tabState = keepFileTabFor(tabState, filePath, checkout, preferId).state;
+  }
+
+  /**
+   * A file chosen inside a file pane (its explorer, a diff row, a caller).
+   * A preview pane moves to it; a kept pane keeps its file, and the chosen
+   * one opens in a tab beside it, as a click in any other explorer does.
+   */
+  function selectInFilePane(tab: TerminalTab, filePath: string, line: number | null, column: number | null) {
+    const current = tabState.tabs.find((candidate) => candidate.id === tab.id) ?? tab;
+    if (canRepointFileTab(current, filePath)) {
+      tabState = setTabFile(tabState, current.id, filePath, line, column);
+      return;
+    }
+    if (!canCreateKind("file") && !fileTabFor(tabState, filePath, current.checkout)) {
+      sessionError = capacityTitleFor("file");
+      return;
+    }
+    const opened = openFileTab(tabState, {
+      filePath,
+      checkout: current.checkout,
+      line,
+      column,
+      reuseExisting: true,
+      focus: true,
+    });
+    if (!opened.id) {
+      sessionError = capacityTitleFor("file");
+      return;
+    }
+    if (zoomedPaneId && zoomedPaneId !== opened.id) zoomedPaneId = null;
+    tabState = opened.state;
+  }
+
   function openFromExplorerSidebar(
     filePath: string,
     line: number | null = null,
     column: number | null = null,
+    keep = false,
   ) {
     if (!filePath || !repoPath) return;
     const mods = lastExplorerMod;
     lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
     selectedExplorerFile = filePath;
     const checkout = activeTab?.checkout;
-    const action = resolveExplorerFileAction({
-      defaultTarget: explorerOpenTarget,
-      altKey: mods.altKey,
-      metaOrCtrlKey: mods.metaOrCtrlKey,
-      hasVisibleFilePane,
-    });
+    // A double-click (`keep`) follows where its own clicks sent the file: they
+    // already used and cleared the modifier keys (`doubleClickFollows`).
+    const now = Date.now();
+    const action =
+      keep && lastExplorerOpen && doubleClickFollows(lastExplorerOpen, filePath, now)
+        ? lastExplorerOpen.action
+        : resolveExplorerFileAction({
+            defaultTarget: explorerOpenTarget,
+            altKey: mods.altKey,
+            metaOrCtrlKey: mods.metaOrCtrlKey,
+            hasVisibleFilePane,
+          });
+    lastExplorerOpen = { path: filePath, action, at: now };
 
     if (action === "open-code" && onOpenInCodeView) {
+      // Code owns its tabs: ask it to keep this one rather than preview it.
+      if (keep) requestPin(repoPath, filePath);
       onOpenInCodeView(filePath, line);
       return;
     }
@@ -2847,14 +2914,18 @@
         checkout,
       });
       if (err) sessionError = err;
+      else if (keep) keepFileShown(filePath, checkout);
       return;
     }
     if (action === "update-visible-pane") {
+      // A kept pane is never repointed at another file; the file then opens
+      // in a tab of its own below.
       const visibleFile =
         tabState.tabs.find(
           (tab) =>
             tab.launcher === "file" &&
             !tab.snippet &&
+            canRepointFileTab(tab, filePath) &&
             (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId) &&
             (tab.checkout || undefined) === (checkout?.trim() || undefined),
         ) ??
@@ -2862,10 +2933,12 @@
           (tab) =>
             tab.launcher === "file" &&
             !tab.snippet &&
+            canRepointFileTab(tab, filePath) &&
             (splitRoot ? visibleIds.includes(tab.id) : tab.id === activeId),
         );
       if (visibleFile) {
         tabState = setTabFile(tabState, visibleFile.id, filePath, line, column, { checkout });
+        if (keep) keepFileShown(filePath, checkout, visibleFile.id);
         return;
       }
     }
@@ -2888,6 +2961,7 @@
     }
     if (zoomedPaneId && zoomedPaneId !== opened.id) zoomedPaneId = null;
     tabState = opened.state;
+    if (keep) keepFileShown(filePath, checkout, opened.id);
   }
 
   function startExplorerResize(event: PointerEvent) {
@@ -6330,7 +6404,7 @@
               repoPath={activeTab?.checkout ?? repoPath}
               selectedFile={activeExplorerFile}
               onSelectFile={(p) => openFromExplorerSidebar(p, null, null)}
-              onPinFile={(p) => openFromExplorerSidebar(p, null, null)}
+              onPinFile={(p) => openFromExplorerSidebar(p, null, null, true)}
               onSelectMatch={(p, line, col) => openFromExplorerSidebar(p, line, col)}
             />
           </div>
@@ -6766,7 +6840,8 @@
               revealSeq={tab.revealSeq ?? 0}
               defaultExplorerOpen={explorerSidebarOpen ? false : undefined}
               onscreen={paneOnScreen({ visible, mode, splitIds, activeId: tabState.activeId, tabId: tab.id })}
-              onSelectFile={(fp, line, col) => (tabState = setTabFile(tabState, tab.id, fp, line ?? null, col ?? null))}
+              onSelectFile={(fp, line, col) => selectInFilePane(tab, fp, line ?? null, col ?? null)}
+              onKeepFile={(fp) => keepFileShown(fp, tab.checkout, tab.id)}
               onResolvedPath={(fp) => (tabState = setTabFile(tabState, tab.id, fp, null, null, { preserveReveal: true }))}
               onOpenInCodeView={onOpenInCodeView}
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}

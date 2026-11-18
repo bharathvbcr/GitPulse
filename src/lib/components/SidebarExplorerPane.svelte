@@ -2,11 +2,13 @@
   import { onDestroy } from "svelte";
   import { Columns2, FileCode, FileText, SquareTerminal } from "@lucide/svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
+  import { requestPin } from "../files/pinRequests";
   import { requestReveal } from "../files/revealRequests";
   import {
-    resolveSidebarFileAction,
+    resolveSidebarOpen,
     sidebarNavStore,
     type SidebarFileOpenTarget,
+    type SidebarLastOpen,
   } from "../sidebar/layoutStore";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
@@ -24,6 +26,8 @@
   const openTarget = $derived($sidebarNavStore.openTarget);
   const dockedInTerminal = $derived($terminalExplorerSidebar.open && $repoStore.terminalOpen);
   let lastClickMods = { altKey: false, metaOrCtrlKey: false };
+  /** Where the last click on a file sent it; a double-click follows it (`resolveSidebarOpen`). */
+  let lastOpen: SidebarLastOpen | null = null;
   let inflightOpen: { key: string; controller: AbortController } | null = null;
 
   onDestroy(() => {
@@ -49,25 +53,36 @@
     path: string,
     line: number | null = null,
     column: number | null = null,
+    pin = false,
   ) {
     const targetRepo = effectiveRepoPath;
     if (!path || !targetRepo) return;
     const mods = lastClickMods;
     lastClickMods = { altKey: false, metaOrCtrlKey: false };
-    const action = resolveSidebarFileAction({
+    const now = Date.now();
+    const action = resolveSidebarOpen({
+      path,
+      pin,
+      lastOpen,
+      now,
       defaultTarget: openTarget,
       altKey: mods.altKey,
       metaOrCtrlKey: mods.metaOrCtrlKey,
     });
+    lastOpen = { path, action, at: now };
 
     if (action === "code") {
+      // Double-click keeps the file's tab: the Explorer page owns the tabs, so
+      // ask it to pin rather than leave a preview the next click replaces.
+      if (pin) requestPin(targetRepo, path);
       requestReveal(path, line, column);
       repoStore.selectFilePath(path);
       repoStore.setActiveTab("code", "explorer");
       return;
     }
 
-    const requestKey = `${targetRepo}\0${action}\0${path}\0${line ?? ""}\0${column ?? ""}`;
+    // A double-click's keep is its own request, never deduped into its click's.
+    const requestKey = `${targetRepo}\0${action}\0${path}\0${line ?? ""}\0${column ?? ""}\0${pin ? "keep" : ""}`;
     if (inflightOpen?.key === requestKey) return;
     inflightOpen?.controller.abort();
     const controller = new AbortController();
@@ -80,7 +95,7 @@
         line,
         column,
         controller.signal,
-        { mode: action, focus: true },
+        { mode: action, focus: true, keep: pin },
       );
       repoStore.setTerminalOpen(true);
       await requested;
@@ -93,6 +108,9 @@
   }
 </script>
 
+<!-- Justified: the capture-phase pointerdown only records which modifier keys
+     a click on a file row carried (Alt, ⌘/Ctrl); it handles nothing itself,
+     and every row and button inside keeps its own keyboard handling. -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="flex-1 min-h-0 flex flex-col overflow-hidden"
@@ -170,7 +188,7 @@
       repoPath={effectiveRepoPath}
       selectedFile={$repoStore.selectedFilePath}
       onSelectFile={(path) => void handleOpenFile(path, null, null)}
-      onPinFile={(path) => void handleOpenFile(path, null, null)}
+      onPinFile={(path) => void handleOpenFile(path, null, null, true)}
       onSelectMatch={(path, line, col) => void handleOpenFile(path, line, col)}
     />
   </div>

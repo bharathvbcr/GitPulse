@@ -504,6 +504,8 @@ export interface PersistedSplitLeafMeta {
     readonly content: string;
   };
   readonly pinned?: boolean;
+  /** A `file` pane a double-click kept (`TerminalTab.kept`). */
+  readonly kept?: boolean;
   readonly url?: string;
   readonly checkout?: string;
   readonly name?: string;
@@ -1721,6 +1723,7 @@ function parsePersistedLeaves(rawLeaves: unknown): Record<string, PersistedSplit
       ...(typeof meta.revealColumn === "number" ? { revealColumn: meta.revealColumn } : {}),
       ...(snippet ? { snippet } : {}),
       ...(meta.pinned === true ? { pinned: true } : {}),
+      ...(meta.kept === true && meta.launcher === "file" ? { kept: true } : {}),
       ...(typeof meta.url === "string" && meta.url ? { url: meta.url } : {}),
       ...(typeof meta.checkout === "string" && meta.checkout ? { checkout: meta.checkout } : {}),
       ...(cleanName ? { name: cleanName } : {}),

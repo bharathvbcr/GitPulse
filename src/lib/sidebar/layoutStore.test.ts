@@ -7,10 +7,13 @@ import {
   STORAGE_KEY,
   createLayoutStore,
   createSidebarNavStore,
+  doubleClickFollows,
   loadLayout,
   loadSections,
   loadSidebarNav,
   resolveSidebarFileAction,
+  resolveSidebarOpen,
+  SIDEBAR_DOUBLE_CLICK_WINDOW_MS,
   saveSections,
   saveSidebarNav,
 } from "./layoutStore";
@@ -359,5 +362,44 @@ describe("loadLayout fuzz/stress", () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe("resolveSidebarOpen: a double-click follows its own clicks", () => {
+  const base = { path: "a.ts", now: 10_000, defaultTarget: "code" as const };
+
+  it("resolves a plain click from the target and modifier keys", () => {
+    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: null })).toBe("code");
+    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: null, altKey: true })).toBe("split");
+  });
+
+  it("keeps an Alt-double-click a split instead of pinning in Code", () => {
+    const lastOpen = { path: "a.ts", action: "split" as const, at: 9_800 };
+    // The double-click itself carries no modifiers: its clicks consumed them.
+    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen })).toBe("split");
+  });
+
+  it("re-resolves when the last click was another file, too old, or in the future", () => {
+    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "b.ts", action: "split", at: 9_900 } })).toBe("code");
+    expect(
+      resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now - SIDEBAR_DOUBLE_CLICK_WINDOW_MS - 1 } }),
+    ).toBe("code");
+    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now + 1 } })).toBe("code");
+  });
+
+  it("never lets a single click reuse the last action", () => {
+    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: { path: "a.ts", action: "split", at: 9_900 } })).toBe("code");
+  });
+});
+
+describe("doubleClickFollows", () => {
+  it("joins a double-click to its own click within the window only", () => {
+    const last = { path: "a.ts", at: 1_000 };
+    expect(doubleClickFollows(last, "a.ts", 1_000)).toBe(true);
+    expect(doubleClickFollows(last, "a.ts", 1_000 + SIDEBAR_DOUBLE_CLICK_WINDOW_MS)).toBe(true);
+    expect(doubleClickFollows(last, "a.ts", 1_001 + SIDEBAR_DOUBLE_CLICK_WINDOW_MS)).toBe(false);
+    expect(doubleClickFollows(last, "a.ts", 999)).toBe(false);
+    expect(doubleClickFollows(last, "b.ts", 1_100)).toBe(false);
+    expect(doubleClickFollows(null, "a.ts", 1_100)).toBe(false);
   });
 });

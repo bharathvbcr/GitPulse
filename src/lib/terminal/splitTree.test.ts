@@ -568,12 +568,15 @@ describe("splitTree", () => {
       {
         t1: { launcher: "claude", slotIndex: 0, pinned: true },
         t2: { launcher: "shell", slotIndex: 1 },
-        t3: { launcher: "shell", slotIndex: 2 },
-        t4: { launcher: "file", slotIndex: 3, filePath: "README.md" },
+        t3: { launcher: "shell", slotIndex: 2, kept: true },
+        t4: { launcher: "file", slotIndex: 3, filePath: "README.md", kept: true },
       },
       "pair-1",
     );
     const parsedV3 = mod.parsePersistedSplitWorkspace(serializedV3);
+    // A kept file pane stays kept across a restart; `kept` means nothing on a shell.
+    expect(parsedV3?.leaves.t4?.kept).toBe(true);
+    expect(parsedV3?.leaves.t3?.kept).toBeUndefined();
     expect(parsedV3?.groups).toHaveLength(2);
     expect(parsedV3?.activeGroupId).toBe("pair-1");
     expect(parsedV3?.groups[0].name).toBe("Review Pair");

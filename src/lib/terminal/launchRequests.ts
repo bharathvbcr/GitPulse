@@ -85,6 +85,8 @@ interface LaunchRequest {
   filePath?: string;
   fileOpenMode?: "tab" | "split";
   fileFocus?: boolean;
+  /** Keep the pane on this file (a double-click) rather than open a preview. */
+  fileKeep?: boolean;
   line?: number | null;
   column?: number | null;
   /** Pre-arms quiescent peer auto-wake on unattended kickoff launches. */
@@ -212,7 +214,7 @@ export function createTerminalLaunchRequests() {
       line?: number | null,
       column?: number | null,
       signal?: AbortSignal,
-      options?: { mode?: "tab" | "split"; focus?: boolean },
+      options?: { mode?: "tab" | "split"; focus?: boolean; keep?: boolean },
     ): Promise<void> {
       const cleanPath = normalizePaneFilePath(filePath);
       if (!cleanPath) {
@@ -227,6 +229,7 @@ export function createTerminalLaunchRequests() {
           column: column ?? null,
           ...(options?.mode ? { fileOpenMode: options.mode } : {}),
           ...(options?.focus !== undefined ? { fileFocus: options.focus } : {}),
+          ...(options?.keep ? { fileKeep: true } : {}),
         },
         signal,
       );

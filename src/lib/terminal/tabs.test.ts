@@ -12,6 +12,9 @@ import {
   openTab,
   openAttachedChildTab,
   openFileTab,
+  fileTabFor,
+  canRepointFileTab,
+  keepFileTabFor,
   normalizePaneFilePath,
   tabFor,
   setTabPurpose,
@@ -937,5 +940,60 @@ describe("setTabInitialCommand", () => {
     expect(setTabInitialCommand(opened, id, null)).toBe(opened);
     expect(setTabInitialCommand(opened, "missing", "ls")).toBe(opened);
     expect(opened.tabs.find((t) => t.id === id)?.initialCommand).toBeUndefined();
+  });
+});
+
+describe("kept file tabs (a double-click keeps the file)", () => {
+  const twoFiles = () => {
+    const a = openFileTab(initialState("shell"), { filePath: "src/a.ts" });
+    const b = openFileTab(a.state, { filePath: "src/b.ts", reuseExisting: false });
+    return { state: b.state, aId: a.id!, bId: b.id! };
+  };
+
+  it("keeps the tab showing the file, preferring the named one", () => {
+    const { state, aId } = twoFiles();
+    const kept = keepFileTabFor(state, "./src/a.ts", undefined, aId);
+    expect(kept.id).toBe(aId);
+    expect(kept.state.tabs.find((t) => t.id === aId)?.kept).toBe(true);
+    // Keeping again changes nothing.
+    expect(keepFileTabFor(kept.state, "src/a.ts").state).toBe(kept.state);
+  });
+
+  it("keeps nothing when no tab shows the file, or the path is unusable", () => {
+    const { state } = twoFiles();
+    expect(keepFileTabFor(state, "src/c.ts")).toEqual({ state, id: null });
+    expect(keepFileTabFor(state, "../escape.ts")).toEqual({ state, id: null });
+  });
+
+  it("never hands a kept tab out to be repointed at another file", () => {
+    const a = openFileTab(initialState("shell"), { filePath: "src/a.ts" });
+    const kept = keepFileTabFor(a.state, "src/a.ts").state;
+    expect(fileTabFor(kept, "src/b.ts")).toBeUndefined();
+    // The file it shows still finds it.
+    expect(fileTabFor(kept, "src/a.ts")?.id).toBe(a.id);
+    // So a single click elsewhere opens a tab of its own beside it.
+    const next = openFileTab(kept, { filePath: "src/b.ts" });
+    expect(next.opened).toBe(true);
+    expect(next.id).not.toBe(a.id);
+    expect(next.state.tabs.find((t) => t.id === a.id)?.filePath).toBe("src/a.ts");
+  });
+
+  it("lets a preview tab be repointed, and a kept one only to its own file", () => {
+    const a = openFileTab(initialState("shell"), { filePath: "src/a.ts" });
+    const tab = a.state.tabs.find((t) => t.id === a.id)!;
+    expect(canRepointFileTab(tab, "src/b.ts")).toBe(true);
+    const keptTab = { ...tab, kept: true };
+    expect(canRepointFileTab(keptTab, "src/b.ts")).toBe(false);
+    expect(canRepointFileTab(keptTab, "./src/a.ts")).toBe(true);
+    expect(canRepointFileTab(keptTab, undefined)).toBe(false);
+  });
+
+  it("reuses the preview tab beside a kept one on the next single click", () => {
+    const { state, aId, bId } = twoFiles();
+    const kept = keepFileTabFor(state, "src/a.ts", undefined, aId).state;
+    const next = openFileTab(kept, { filePath: "src/c.ts" });
+    expect(next.id).toBe(bId);
+    expect(next.opened).toBe(false);
+    expect(next.state.tabs.find((t) => t.id === aId)?.filePath).toBe("src/a.ts");
   });
 });

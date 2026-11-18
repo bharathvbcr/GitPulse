@@ -138,6 +138,14 @@ export interface TerminalTab {
   snippet?: { title: string; content: string };
   /** Protects this split pane from being evicted when clicking a background tab in the strip. */
   pinned?: boolean;
+  /**
+   * A `file` tab a double-click kept open. A single click elsewhere (an
+   * explorer, a terminal link) never repoints it to another file; that file
+   * opens beside it instead. Without it a file tab is a preview, which the
+   * next click reuses, the way Code's editor tabs behave. Distinct from
+   * `pinned`, which is about a split slot, not which file a pane shows.
+   */
+  kept?: boolean;
   /** Pre-arms quiescent peer auto-wake on unattended kickoff sessions. */
   autoWake?: boolean;
   /** What the session was launched for; sent with every spawn of this tab so a restart keeps its model. */
@@ -973,7 +981,12 @@ export function normalizePaneFilePath(raw: string | null | undefined): string | 
   return trimmed;
 }
 
-/** Finds an existing non-snippet `file` tab in the same checkout (matching `filePath` when supplied, or the first disk `file` tab in that checkout). */
+/**
+ * Finds an existing non-snippet `file` tab in the same checkout: the one
+ * already showing `filePath` when supplied, or else the first disk `file` tab
+ * in that checkout that is not `kept` (a kept tab is never handed out to be
+ * repointed at another file).
+ */
 export function fileTabFor(
   state: TabState,
   filePath?: string,
@@ -988,7 +1001,45 @@ export function fileTabFor(
     );
     if (exact) return exact;
   }
-  return state.tabs.find((tab) => tab.launcher === "file" && !tab.snippet && sameCheckout(tab));
+  return state.tabs.find((tab) => tab.launcher === "file" && !tab.snippet && sameCheckout(tab) && !tab.kept);
+}
+
+/**
+ * Whether an open on `filePath` may reuse `tab` by pointing it there: always
+ * when it already shows that file, otherwise only when it is not `kept`.
+ */
+export function canRepointFileTab(tab: TerminalTab, filePath?: string): boolean {
+  if (!tab.kept) return true;
+  const cleanPath = normalizePaneFilePath(filePath);
+  return cleanPath !== undefined && tab.filePath === cleanPath;
+}
+
+/**
+ * Keeps the `file` tab showing `filePath` (a double-click): the one in
+ * `checkout`, preferring `preferId` when it shows the file, else any tab
+ * showing it. Returns the state unchanged, and a null id, when no tab shows
+ * the file.
+ */
+export function keepFileTabFor(
+  state: TabState,
+  filePath: string,
+  checkout?: string,
+  preferId?: string | null,
+): { state: TabState; id: string | null } {
+  const cleanPath = normalizePaneFilePath(filePath);
+  if (!cleanPath) return { state, id: null };
+  const shows = (tab: TerminalTab) => tab.launcher === "file" && !tab.snippet && tab.filePath === cleanPath;
+  const normalizedCheckout = checkout?.trim() || undefined;
+  const target =
+    state.tabs.find((tab) => tab.id === preferId && shows(tab)) ??
+    state.tabs.find((tab) => shows(tab) && (tab.checkout || undefined) === normalizedCheckout) ??
+    state.tabs.find(shows);
+  if (!target) return { state, id: null };
+  if (target.kept) return { state, id: target.id };
+  return {
+    state: { ...state, tabs: state.tabs.map((tab) => (tab.id === target.id ? { ...tab, kept: true } : tab)) },
+    id: target.id,
+  };
 }
 
 /** Updates a `file` tab's selected path and optional 1-based reveal line/column. */

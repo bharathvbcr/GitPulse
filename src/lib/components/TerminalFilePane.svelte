@@ -58,6 +58,7 @@
     defaultExplorerOpen = undefined,
     onscreen = false,
     onSelectFile,
+    onKeepFile,
     onResolvedPath,
     onOpenInCodeView,
     onDockToSidebar,
@@ -75,6 +76,8 @@
     defaultExplorerOpen?: boolean;
     onscreen?: boolean;
     onSelectFile?: (path: string, line?: number | null, column?: number | null) => void;
+    /** A double-click in this pane's explorer: keep the pane on `path`. */
+    onKeepFile?: (path: string) => void;
     onResolvedPath?: (resolvedPath: string) => void;
     onOpenInCodeView?: (path: string, line: number | null) => void;
     onDockToSidebar?: () => void;
@@ -724,7 +727,10 @@
           {repoPath}
           selectedFile={filePath ?? null}
           onSelectFile={(p) => chooseFile(p)}
-          onPinFile={(p) => chooseFile(p)}
+          onPinFile={(p) => {
+            chooseFile(p);
+            onKeepFile?.(p);
+          }}
           onSelectMatch={(p, line, col) => chooseFile(p, line, col)}
         />
       </div>

@@ -30,11 +30,21 @@ let disk = { text: "one\ntwo\n", base: "8:aaaa" };
 let nextBase = "0:saved";
 const status = (path, code) => ({ path, is_staged: false, status_code: code, is_conflicted: false, additions: 1, deletions: 0 });
 let statuses = [status(file, "M")];
+// The repository listing. One file for most checks; the sidebar pin checks
+// widen it so a later click has another file to replace a preview with.
+let listing = [file];
+// The open file's history, newest first, and what was asked of it.
+const fileCommits = [
+  { id: "e".repeat(40), author_name: "Ada", timestamp: Math.floor(Date.now() / 1000) - 3600, summary: "second change to app" },
+  { id: "d".repeat(40), author_name: "Bob", timestamp: Math.floor(Date.now() / 1000) - 86400, summary: "first change to app" },
+];
+const graphReads = [], fileDiffReads = [];
+let historyFails = false;
 const blob = () => ({ path: file, is_binary: false, is_image: false, mime: "application/octet-stream", text: disk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: disk.base });
 mockIPCWithEvents((cmd, args) => {
   switch (cmd) {
     case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
-    case "cmd_list_repo_files": return [file];
+    case "cmd_list_repo_files": return listing;
     case "cmd_get_status": return statuses;
     case "cmd_detect_language": return { name: "TypeScript", color_hex: "#3178c6", category: "Programming" };
     case "cmd_syntax_highlight": return [];
@@ -52,7 +62,15 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_watch_repo": case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_last_fetch_at": case "cmd_set_recent_menu": return null;
     case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
     case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
-    case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+    // A file's history is the graph limited by `path:`; the rows are the shape
+    // `CommitGraphPayload` really has, and `has_more` says older ones exist.
+    case "cmd_get_commit_graph":
+      graphReads.push(args);
+      if (historyFails) throw new Error("git log failed (fixture)");
+      return { rows: String(args.query ?? "").startsWith("path:") ? fileCommits : [], head_id: null, refs: [], has_more: String(args.query ?? "").startsWith("path:") };
+    case "cmd_get_commit_file_diff":
+      fileDiffReads.push(args);
+      return { text: `diff --git a/${args.filePath} b/${args.filePath}\n--- a/${args.filePath}\n+++ b/${args.filePath}\n@@ -1 +1 @@\n-one\n+two\n`, truncated: false, truncation_reason: null };
     // Explorer's other two readings: content search in its rail, blame as the editor's lens.
     case "cmd_search_content": searches.push(args); return { matches: [{ path: file, line: 2, column: 1, text: "two", text_clipped: false }], files: 1, truncated: false, truncated_reason: null, revision: null };
     case "cmd_codeintel_cancel": return true;
@@ -63,6 +81,8 @@ mockIPCWithEvents((cmd, args) => {
 });
 // Live pulse visibility is remembered; start each run from the default (shown).
 localStorage.removeItem("gitpulse.explorer.livePulse");
+// The sidebar explorer's open target is remembered too; its default is Code.
+localStorage.removeItem("gitpulse_sidebar_nav");
 const { mount, tick, unmount } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
@@ -470,6 +490,96 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("Hide hands focus to the toolbar toggle that brings it back", () => focusAfterHide === pulseToggle());
     pulseToggle().click(); await tick();
     await until(() => Boolean(card()), "Live pulse restored after the compact checks");
+  }
+
+  // --- Double-click in the sidebar's File Explorer keeps the file's tab -------
+  // The sidebar opens a file in Code by selecting it, which makes a preview
+  // tab. Its double-click used to do the same as its click, so the next click
+  // replaced the file the user had double-clicked.
+  {
+    const other = "src/other.ts", third = "src/third.ts";
+    listing = [file, other, third];
+    // Listings are cached per repository; drop the one-file listing so the
+    // sidebar's tree reads the widened fixture.
+    (await import("../src/lib/files/repoListing.ts")).invalidateRepoListing(root);
+    const side = document.createElement("div");
+    side.style.cssText = "position:fixed;left:0;top:0;width:264px;height:420px;display:flex;flex-direction:column";
+    document.body.append(side);
+    const SidebarPane = (await import("../src/lib/components/SidebarExplorerPane.svelte")).default;
+    const sidebar = mount(SidebarPane, { target: side });
+    // A row's text starts with its language logo's label, so match the name anywhere in it.
+    const row = name => [...side.querySelectorAll('[role="treeitem"]')].find(el => el.textContent.includes(name));
+    const tabFor = path => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(path));
+    const isPreview = path => (tabFor(path)?.getAttribute("title") ?? "").includes("(preview");
+    await until(() => Boolean(row("third.ts")), "the sidebar tree lists the widened fixture");
+    const doubleClick = async el => {
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 })); await tick();
+      el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 2 })); await tick();
+      el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 })); await tick(); await wait(80);
+    };
+    await doubleClick(row("other.ts"));
+    await until(() => Boolean(tabFor(other)), "the double-clicked file has a tab");
+    check("a double-click in the sidebar opens the file in a kept (not preview) tab", () => Boolean(tabFor(other)) && !isPreview(other));
+    row("third.ts").click(); await tick(); await wait(80);
+    await until(() => Boolean(tabFor(third)), "the next file opens");
+    check("and the next single click opens beside it instead of replacing it", () => Boolean(tabFor(other)) && Boolean(tabFor(third)) && isPreview(third));
+
+    // A double-click while the Explorer page is not mounted (the user is on
+    // another view) is collected when it mounts, after its tabs hydrate.
+    await unmount(app); await tick();
+    await doubleClick(row("third.ts"));
+    app = mount(Viewer, { target: host });
+    await until(() => Boolean(tabFor(third)), "the remounted Explorer shows the tab");
+    await wait(80);
+    check("a pin asked for before the Explorer page mounted lands once it does", () => !isPreview(third) && Boolean(tabFor(other)));
+
+    await unmount(sidebar); side.remove();
+    listing = [file];
+  }
+
+  // --- The open file's History: previous changes, one click to the Diff page ---
+  {
+    repoStore.selectFilePath(file); await tick(); await wait(80);
+    const toggle = () => host.querySelector("[data-file-history-toggle]");
+    const menu = () => document.querySelector('[data-testid="file-history-menu"]');
+    const items = () => [...(menu()?.querySelectorAll("[data-file-history-commit]") ?? [])];
+    await until(() => Boolean(toggle()), "the open file's path bar offers History");
+    graphReads.length = 0;
+    toggle().click(); await tick();
+    await until(() => items().length > 0, "the history menu lists commits");
+    check("History asks for the open file's own commits from HEAD, bounded", () =>
+      graphReads.at(-1)?.query === `path:${file}` && graphReads.at(-1)?.revision === "HEAD" && graphReads.at(-1)?.maxCommits === 20);
+    check("and lists them newest first, with subject and author", () =>
+      items().length === 2 && items()[0].textContent.includes("second change to app") && items()[0].textContent.includes("Ada"));
+    check("and says the list is only the newest when older ones exist", () => menu().textContent.includes("most recent changes"));
+    items()[1].click(); await tick();
+    await until(() => get(repoStore).selectedCommitId === fileCommits[1].id, "the chosen change is selected");
+    await until(() => fileDiffReads.length > 0, "the change's diff is read");
+    check("choosing one reads that commit's diff of this file only", () =>
+      fileDiffReads.at(-1)?.commitId === fileCommits[1].id && fileDiffReads.at(-1)?.filePath === file);
+    await until(() => get(repoStore).activeTab === "history", "History → Diff comes forward");
+    check("and brings History → Diff forward on it", () => {
+      const s = get(repoStore);
+      return s.activeTab === "history" && s.viewSections?.history === "diff";
+    });
+    check("on this file's change", () => get(repoStore).selectedFilePath === file && get(repoStore).selectionKind === "commit");
+    // The menu leaves through its exit transition, which ends on a later frame.
+    await until(() => !menu(), "the history menu closes");
+    check("and the menu closes", () => !menu());
+
+    // A failed read says so and offers a retry, never "no commits".
+    repoStore.setActiveTab("code"); await tick(); await wait(80);
+    historyFails = true;
+    toggle().click(); await tick();
+    await until(() => menu()?.querySelector('[role="alert"]'), "the failed read is reported");
+    check("a history that could not be read says so, not that there are no commits", () =>
+      menu().textContent.includes("Couldn't read this file's history") && !menu().textContent.includes("No commits have changed"));
+    historyFails = false;
+    [...menu().querySelectorAll("button")].find(b => b.textContent.trim() === "Try again").click(); await tick();
+    await until(() => items().length > 0, "Try again reads it");
+    check("and Try again reads it again", () => items().length === 2);
+    menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick(); await wait(120);
+    check("Escape closes the menu", () => !menu());
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

@@ -210,6 +210,21 @@ describe("FileViewer", () => {
     expect(source).not.toContain('"w"');
   });
 
+  it("reads a file's history through one owner that keeps a failed read distinct from none", () => {
+    const pulse = readFileSync(join(here, "LivePulseDashboard.svelte"), "utf8");
+    const menu = readFileSync(join(here, "FileHistoryMenu.svelte"), "utf8");
+    for (const surface of [pulse, menu]) {
+      expect(surface).toContain("loadFileHistory(invoke,");
+      expect(surface).not.toContain("query: `path:");
+    }
+    // Live pulse states a failed or unsupported read before it can say "no commits".
+    expect(pulse.indexOf("{:else if historyNote}")).toBeGreaterThan(-1);
+    expect(pulse.indexOf("{:else if historyNote}")).toBeLessThan(pulse.indexOf("No prior commits recorded"));
+    // The open file's path bar carries the History menu beside Diff.
+    expect(source).toContain("<FileHistoryMenu repoPath={$currentRepoPath} path={activeTabPath} />");
+    expect(menu).toContain("repoStore.selectCommitFileDiff(commitId, path)");
+  });
+
   it("ignores its pane shortcuts while covered (inert) or already handled", () => {
     const body = source.slice(source.indexOf("function handleWindowKeydown"), source.indexOf("$effect(", source.indexOf("function handleWindowKeydown")));
     const guard = body.indexOf('closest("[inert]")');
