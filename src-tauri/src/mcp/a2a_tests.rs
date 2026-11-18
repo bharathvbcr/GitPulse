@@ -621,7 +621,7 @@ fn an_mcp_caller_cannot_send_as_a_person_by_choosing_a_reserved_sender_name() {
 fn a_reused_msg_id_sent_to_a_second_recipient_is_refused_and_deposits_nothing() {
     let (_dir, repo) = trusted_git_repo();
     let sid_b = "88888888-8888-4888-8888-888888888888";
-    let sid_c = "99999999-9999-4999-8999-999999999999";
+    let sid_c = "5e1f0a7c-2b3d-4e5f-8a6b-7c8d9e0f1a2b";
     register_forgery_target(&repo, sid_b, "reuse-b");
     register_forgery_target(&repo, sid_c, "reuse-c");
     let send = |to: &str| {
@@ -761,6 +761,12 @@ fn a_kickoff_refused_for_a_reserved_sender_leaves_no_claim_task_update_or_bus_ro
             .expect("lanes")
             .len(),
         1
+    );
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert_eq!(
+        bus.messages.len(),
+        1,
+        "the control kickoff posts one bus row"
     );
     drop(dir);
 }

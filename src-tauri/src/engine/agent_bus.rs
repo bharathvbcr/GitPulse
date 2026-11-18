@@ -981,7 +981,7 @@ pub fn post_peer_message(
                     return Ok(existing.clone());
                 }
                 return Err(CommandError::from(format!(
-                    "msg_id '{want_id}' already exists with a different payload ({} differ)",
+                    "msg_id '{want_id}' already exists with a different payload (mismatched: {})",
                     differs.join(", ")
                 )));
             }
