@@ -112,8 +112,10 @@ while read -r local_ref local_sha _remote_ref remote_sha; do
 
   tag=${local_ref#refs/tags/}
 
-  if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-    fail "tag '$tag' matches the release workflow's 'v*' trigger but is not vMAJOR.MINOR.PATCH.
+  # Same shape scripts/check-release-version.mjs accepts: a stable vX.Y.Z or a
+  # beta vX.Y.Z-beta.N; that script still owns the exact limits.
+  if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?$'; then
+    fail "tag '$tag' matches the release workflow's 'v*' trigger but is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-beta.N.
         It would start a release run and fail at the version gate. Rename or delete it."
     continue
   fi

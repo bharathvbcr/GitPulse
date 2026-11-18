@@ -61,6 +61,18 @@ describe("pre-push release hook", () => {
     expect(hook).toContain("refs/tags/v*)");
   });
 
+  it("lets a stable or beta tag through its shape check and nothing else", () => {
+    // The version gate accepts vX.Y.Z and vX.Y.Z-beta.N; a hook that only knew
+    // the first refused every beta before the gate could see it.
+    const pattern = hook.match(/grep -Eq '(\^v[^']+)'/)?.[1];
+    expect(pattern, "the hook's tag-shape pattern moved").toBeDefined();
+    const shape = new RegExp(pattern ?? "$^");
+    for (const ok of ["v0.2.0", "v0.2.0-beta.1", "v1.0.0-beta.12"]) expect(shape.test(ok), ok).toBe(true);
+    for (const bad of ["v0.03", "v0.2.0-rc.1", "v0.2.0-beta.0", "v0.2.0-beta", "v0.2.0-beta.1x"]) {
+      expect(shape.test(bad), bad).toBe(false);
+    }
+  });
+
   it("reuses the gates rather than reimplementing them", () => {
     // Named explicitly so renaming a script breaks the test, not the release.
     for (const gate of [
