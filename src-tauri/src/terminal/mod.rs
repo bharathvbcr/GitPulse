@@ -2726,6 +2726,17 @@ pub(in crate::terminal) fn engine_detach_all(engine: &Engine) -> usize {
 /// taken it over in between.
 fn let_go(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
     flow.detach();
+    unseen(flow, ring);
+}
+
+/// [`let_go`] for a view that still holds the session and is being replaced:
+/// its credit is kept as stale, because it can still repay it.
+fn take_from(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
+    flow.abandon();
+    unseen(flow, ring);
+}
+
+fn unseen(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
     let mut ring = ring
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2769,7 +2780,7 @@ impl Takeover {
         stall: Duration,
     ) -> Result<TerminalSpawned, String> {
         if forced {
-            let_go(&self.flow, &self.ring);
+            take_from(&self.flow, &self.ring);
         } else if !self.flow.is_detached() {
             // Refused before the ring's lock, which a reader waiting on the
             // holding view's credit keeps for as long as it waits.
