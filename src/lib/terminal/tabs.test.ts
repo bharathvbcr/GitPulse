@@ -882,7 +882,7 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
       "file",
     ]);
     expect(mod.dockTabTypesFor(true).find((t: { kind: string }) => t.kind === "file")?.label).toBe(
-      "File Explorer",
+      "Explorer",
     );
     expect(mod.offeredDockTabKind("file", false)).toBe("file");
     expect(mod.offeredDockTabKind("browser", false)).toBe("shell");

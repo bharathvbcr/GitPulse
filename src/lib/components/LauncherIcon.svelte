@@ -21,6 +21,7 @@
 </script>
 
 <script lang="ts">
+  import { untrack } from "svelte";
   import { launcherIcon } from "../terminal/launcherIcons";
   import type { TabKind } from "../terminal/tabs";
 
@@ -41,8 +42,10 @@
   const spec = $derived(launcherIcon(kind));
   let BrandMark = $state<typeof BrandMarkComponent | null>(cachedBrandMark);
 
+  // Depends on the kind alone: the load writes BrandMark, so reading it
+  // tracked would make the effect depend on its own result.
   $effect(() => {
-    if (spec.mark && !BrandMark) {
+    if (spec.mark && !untrack(() => BrandMark)) {
       void loadBrandMark().then((component) => {
         if (component) BrandMark = component;
       });

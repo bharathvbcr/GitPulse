@@ -992,8 +992,8 @@
         <button
           type="button"
           onclick={() => selectRailView("files")}
-          title="Show File Explorer in sidebar"
-          aria-label="Show File Explorer in sidebar"
+          title="Show Explorer in sidebar"
+          aria-label="Show Explorer in sidebar"
           aria-pressed={sidebarView === "files"}
           data-testid="sidebar-rail-files"
           class="gp-icon-btn {sidebarView === 'files' ? 'text-accent bg-accent/15' : 'hover:text-accent'}"

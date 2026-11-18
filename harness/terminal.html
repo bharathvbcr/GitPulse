@@ -2502,7 +2502,7 @@
             const hasTriggerIcon = Boolean(typerBtn.querySelector("[data-launcher-icon]"));
             const options = [...document.querySelectorAll('#terminal-launcher-menu [role="option"]')].map((el) => el.textContent?.trim());
             const hasSidebarToggle = Boolean(document.querySelector('#terminal-launcher-menu [data-testid="terminal-launcher-toggle-explorer"]'));
-            return hasTriggerIcon && options.includes("File Explorer") && hasSidebarToggle;
+            return hasTriggerIcon && options.includes("Explorer") && hasSidebarToggle;
           });
           await setLauncherType("Shell");
 
@@ -2593,7 +2593,7 @@
               Boolean(splitCtxMenu) &&
               splitCtxText.includes("New Split With…") &&
               splitCtxText.includes("New Shell") &&
-              splitCtxText.includes("New File Explorer") &&
+              splitCtxText.includes("New Explorer") &&
               splitCtxText.includes("Flip Split Orientation") &&
               splitCtxText.includes("Swap Split Panes") &&
               splitCtxText.includes("Equalize Split Sizes") &&

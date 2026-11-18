@@ -68,7 +68,7 @@ export function offeredSessionKind(kind: unknown, browserSessions: boolean): Ses
 export function dockTabTypesFor(
   browserSessions: boolean,
 ): readonly { kind: TabKind; label: string }[] {
-  return [...sessionTypesFor(browserSessions), { kind: "file", label: "File Explorer" }];
+  return [...sessionTypesFor(browserSessions), { kind: "file", label: "Explorer" }];
 }
 
 /** Resolves a requested dock tab kind supported on this host, falling back to `shell`. */
