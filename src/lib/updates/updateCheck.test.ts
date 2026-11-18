@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { interfaceStore } from "../stores/interfaceStore";
 import {
   AUTO_CHECK_INTERVAL_MS,
   checkForAppUpdate,
@@ -114,7 +115,20 @@ describe("checkForAppUpdate", () => {
   it("passes the registered command name through the IPC seam", async () => {
     const invokeFn = vi.fn().mockResolvedValue(result());
     await checkForAppUpdate(invokeFn);
-    expect(invokeFn).toHaveBeenCalledWith("cmd_check_app_update");
+    expect(invokeFn).toHaveBeenCalledWith("cmd_check_app_update", { includeBetas: false });
+  });
+
+  it("asks for betas only while the user has opted into them", async () => {
+    const invokeFn = vi.fn().mockResolvedValue(result());
+    interfaceStore.setIncludeBetaUpdates(true);
+    try {
+      await checkForAppUpdate(invokeFn);
+      expect(invokeFn).toHaveBeenLastCalledWith("cmd_check_app_update", { includeBetas: true });
+    } finally {
+      interfaceStore.setIncludeBetaUpdates(false);
+    }
+    await checkForAppUpdate(invokeFn);
+    expect(invokeFn).toHaveBeenLastCalledWith("cmd_check_app_update", { includeBetas: false });
   });
 
   it("turns a rejected invoke into an unchecked result, not a throw", async () => {

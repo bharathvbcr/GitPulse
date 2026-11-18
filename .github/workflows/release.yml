@@ -269,7 +269,9 @@ jobs:
           # is off, so the tag is not needed for latest.json URLs.
           releaseId: ${{ needs.prepare.outputs.release_id }}
           releaseDraft: true
-          prerelease: false
+          # release-state.mjs drafts a vX.Y.Z-beta.N tag as a pre-release;
+          # say the same here so the upload can never flip it to stable.
+          prerelease: ${{ contains(env.RELEASE_TAG, '-beta.') }}
           # No updater plugin is configured in tauri.conf.json, so there is no
           # latest.json to publish. v1 renamed the v0 updater-json input; the
           # old key is ignored and the default (true) would upload an updater

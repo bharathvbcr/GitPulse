@@ -1410,7 +1410,7 @@
               {:else if entry.id === "updates"}
                 <section
                   class="gp-card p-4 flex flex-col gap-2"
-                  hidden={!any(["update-check", "update-now"])}
+                  hidden={!any(["update-check", "update-betas", "update-now"])}
                 >
                   <h3 class="gp-label">Releases</h3>
                   <div data-setting="update-check" hidden={!shown("update-check")}>
@@ -1420,6 +1420,16 @@
                       ariaLabel="Automatically check for new GitPulse releases"
                       checked={$interfaceStore.checkForUpdates}
                       onchange={(next) => interfaceStore.setCheckForUpdates(next)}
+                    />
+                  </div>
+
+                  <div data-setting="update-betas" hidden={!shown("update-betas")}>
+                    <SettingToggle
+                      label="Include beta releases"
+                      description="Off by default. When on, a check also tells you about betas, which come before each stable release and get less testing. Applies to automatic checks and Check now."
+                      ariaLabel="Include beta releases in update checks"
+                      checked={$interfaceStore.includeBetaUpdates}
+                      onchange={(next) => interfaceStore.setIncludeBetaUpdates(next)}
                     />
                   </div>
 

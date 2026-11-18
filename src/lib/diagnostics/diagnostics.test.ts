@@ -1190,7 +1190,8 @@ describe("build stamping", () => {
     // If the build-time define is ever dropped, this catches it before the
     // stamp silently degrades to a constant that says nothing.
     expect(APP_VERSION).not.toBe("unknown");
-    expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    // Release versions are X.Y.Z or X.Y.Z-beta.N (scripts/check-release-version.mjs).
+    expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+(?:-beta\.[1-9]\d*)?$/);
   });
 
   it("omits the version mismatch note when versions match and identifies missing bundle provenance", () => {

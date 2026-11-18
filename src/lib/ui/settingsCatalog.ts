@@ -495,6 +495,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "update updates version release github network automatic",
   },
   {
+    id: "update-betas",
+    section: "updates",
+    label: "Include beta releases",
+    keywords: "update beta prerelease pre-release channel preview early release version",
+  },
+  {
     id: "update-now",
     section: "updates",
     label: "Check now",

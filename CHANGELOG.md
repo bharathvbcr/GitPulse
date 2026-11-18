@@ -6,59 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The release workflow reads the section matching the tag it is building, so every
-released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` here
-before that tag is pushed.
+released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
+`## [x.y.z-beta.n] - YYYY-MM-DD` for a beta) here before that tag is pushed.
 
 ## [Unreleased]
 
-### Added
+## [0.2.0-beta.1] - 2026-11-18
 
-- **The open file's previous changes, one click away.** A History menu in the
-  Explorer page's path bar, beside Diff and Blame, lists the commits that
-  changed the open file, newest first. Choosing one opens that commit's
-  change to the file on History → Diff.
+The first beta of GitPulse 0.2.0 (see [GitPulse 0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md)),
+published as a GitHub pre-release for macOS only. Windows and Linux installers come
+with a later release.
 
-### Changed
+**Versions restart at 0.x, on two channels.** Only macOS is tested so far, so
+GitPulse is not 1.0 yet; 1.0.0 is kept for the first release tested on macOS,
+Windows and Linux. Betas are tagged `vX.Y.Z-beta.N` and published as GitHub
+pre-releases; stable releases are tagged `vX.Y.Z`. A beta comes before the
+stable of the same number. Every earlier release, `v0.0.2` to `v1.3.1`, and its
+tag has been withdrawn; the sections below this one keep their history under
+the old numbers.
 
-- **Explorer's search field is one row at every width.** Its Names | Contents
-  switch could not sit beside the text below 288px, so in the 264px sidebar,
-  the Explorer page column and the terminal's docked explorer it dropped to a
-  second row and turned the field into a tall box. The field now filters by
-  file name by default, and a single contents toggle at its right end
-  switches it to searching inside files.
-
-### Fixed
-
-- **Hiding Live pulse did not stick.** Its visibility was kept per repository
-  and in memory, defaulting to shown, so it came back on every repository
-  switch and every launch. It is now one app-wide setting, remembered across
-  launches, and the Live pulse column has its own Hide button.
-- **Double-clicking a file in the sidebar's File Explorer did not keep its
-  tab.** It did the same as a single click, so the file opened in a preview
-  tab that the next click replaced. It now keeps the tab, as a double-click
-  in the Explorer page's own tree already did. The same holds in the
-  terminal, at the sidebar's Tab and Split targets and in the terminal's
-  docked explorer: a kept file pane is no longer pointed at the next file you
-  click, even from its own explorer, which opens in a tab beside it instead.
-  Follow Agent stops driving a pane you keep, and a kept pane in a split
-  stays kept when the split is restored. An Alt-double-click (a split) keeps the file in that split rather
-  than switching to Code.
-- **Live pulse called an unreadable file history empty.** A failed read
-  showed "No prior commits recorded for this path"; it now says the history
-  could not be read.
-
-## [1.99.0] - 2026-11-17
-
-The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
-ships as 1.99.0 because release and macOS bundle versions are plain numbers, so
-2.0.0 sorts after it. 1.99.0 (GitPulse 2.0) is the first release since 1.3.1:
-1.3.5 was withdrawn and 1.4.0 and 1.5.0 were never published, so their changes
-are merged here and upgrading from 1.3.1 also brings everything in the 1.4.0
-section of `CHANGELOG.md`. Read **Upgrade** below first: the task profile moves
-one way (dc-store store schema 11, workbench schema 17), the DevMap store moves
-one way to schema 29, the ledger bumps to writer generation 2, the Unix terminal
-host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
-`gitpulse-hook` need reinstalling.
+This release follows 1.3.1, the last published under the old numbering. 1.3.5
+was withdrawn, and 1.4.0, 1.5.0 and 1.99.0 (the former "2.0 beta") were never
+published, so their changes are merged here, and upgrading from 1.3.1 also
+brings everything in the 1.4.0 section. A 1.x build's release check compares
+version numbers and will never offer 0.2.0-beta.1, which sorts below 1.x:
+install it from the release page. Read **Upgrade** below first: the task
+profile moves one way (dc-store store schema 11, workbench schema 17), the
+DevMap store moves one way to schema 29, the ledger bumps to writer generation
+2, the Unix terminal host (`gitpulse-ptyd`, protocol 3) is unconditional, and
+`gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 
 ### Upgrade
 
@@ -91,6 +67,19 @@ host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
   default passes `depth` explicitly.
 
 ### Added
+
+- **Beta releases in the release check.** Settings → Updates → **Include
+  beta releases** (off by default) lets a check announce a beta
+  (`vX.Y.Z-beta.N`) as well as a stable release. With it off, a beta build is
+  still told about the stable release that follows it. The choice filters the
+  tag list on this machine and is never sent. The release workflow drafts a
+  beta tag as a GitHub pre-release, and the release version gate accepts
+  `X.Y.Z-beta.N` and requires the Windows MSI version `X.Y.Z.N` that Tauri's
+  MSI bundler needs for it.
+- **The open file's previous changes, one click away.** A History menu in the
+  Explorer page's path bar, beside Diff and Blame, lists the commits that
+  changed the open file, newest first. Choosing one opens that commit's
+  change to the file on History → Diff.
 
 - **Workbench schema 17 (`dc-store` at `b5215026`):** Cross-repo queue (`workbench/queue_driver.rs`), two-way GitHub issue sync outbox (`workbench/github_sync.rs`), and DAG launch readiness (`workbench/terminal_launch.rs`).
 - **Pre-operation Git snapshot log & guarded undo:** Allowed agent Git writes record snapshots under `refs/gitpulse/ops/<n>` via the desktop single-instance mailbox (`src-tauri/src/engine/git_writer.rs`), with CAS-checked restore in `cmd_undo_op_snapshot`, dirty-worktree confirmation in `ReflogViewer.svelte`, deadline-bounded capture (`CaptureOutcome`), and resilient ref pruning (`f61212e4`, `8276c79a`, `1c241608`, `02be199f`).
@@ -459,6 +448,15 @@ host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
   typed `low_disk` / `cache_error` advisories for worktree caches.
 
 ### Changed
+
+- **Versions restart at 0.x, with stable and beta channels.** See the
+  section introduction.
+- **Explorer's search field is one row at every width.** Its Names | Contents
+  switch could not sit beside the text below 288px, so in the 264px sidebar,
+  the Explorer page column and the terminal's docked explorer it dropped to a
+  second row and turned the field into a tall box. The field now filters by
+  file name by default, and a single contents toggle at its right end
+  switches it to searching inside files.
 
 - **The Secrets scan no longer needs Kingfisher.** Health's working-tree
   secrets scan is now GitPulse's own in-process scanner (`leak_scan`, the
@@ -932,6 +930,24 @@ host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
   with it (derived from the handler list at build), and the registry is 284 handlers.
 
 ### Fixed
+
+- **Hiding Live pulse did not stick.** Its visibility was kept per repository
+  and in memory, defaulting to shown, so it came back on every repository
+  switch and every launch. It is now one app-wide setting, remembered across
+  launches, and the Live pulse column has its own Hide button.
+- **Double-clicking a file in the sidebar's File Explorer did not keep its
+  tab.** It did the same as a single click, so the file opened in a preview
+  tab that the next click replaced. It now keeps the tab, as a double-click
+  in the Explorer page's own tree already did. The same holds in the
+  terminal, at the sidebar's Tab and Split targets and in the terminal's
+  docked explorer: a kept file pane is no longer pointed at the next file you
+  click, even from its own explorer, which opens in a tab beside it instead.
+  Follow Agent stops driving a pane you keep, and a kept pane in a split
+  stays kept when the split is restored. An Alt-double-click (a split) keeps the file in that split rather
+  than switching to Code.
+- **Live pulse called an unreadable file history empty.** A failed read
+  showed "No prior commits recorded for this path"; it now says the history
+  could not be read.
 
 - **A conflicted file was scanned and counted up to three times.**
   `git ls-files -t` lists an unmerged path once per stage and `--deduplicate`
@@ -5351,17 +5367,5 @@ Withdrawn before publish (Map pane-crash). See [0.0.8].
 Initial tagged release: the Rust/Tauri 2 backend, the Svelte 5 frontend, the commit
 graph renderer, and the cross-language contract checks that guard the IPC boundary.
 
-[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...HEAD
-[1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
-[1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.3.0
-[1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
-[1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
-[0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
-[0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
-[0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
-[0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6
-[0.0.5]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...v0.0.5
-[0.0.4]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...v0.0.4
-[0.0.3]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.2...v0.0.3
-[0.0.2]: https://github.com/bharathvbcr/GitPulse/releases/tag/v0.0.2
+[Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v0.2.0-beta.1...HEAD
+[0.2.0-beta.1]: https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1

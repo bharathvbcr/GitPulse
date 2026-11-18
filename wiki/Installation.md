@@ -5,8 +5,9 @@ The maintained installation guide lives in
 It covers platform packages, signing and quarantine, optional tools, updates,
 and building from source.
 
-[Download the GitPulse 2.0 beta (`v1.99.0`)](https://github.com/bharathvbcr/GitPulse/releases). It is a pre-release, so GitHub's
-[Latest release](https://github.com/bharathvbcr/GitPulse/releases/latest) stays on `v1.3.1` until the stable 2.0 release ships.
+[Download the GitPulse 0.2.0 beta (`v0.2.0-beta.1`)](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1). It is a
+GitHub pre-release with macOS installers only. Betas are tagged `vX.Y.Z-beta.N` and stable releases `vX.Y.Z`; see
+[versions and channels](https://github.com/bharathvbcr/GitPulse/blob/main/docs/INSTALLATION.md#versions-and-channels).
 Use the selected release's assets and notes for availability and signing status.
 A version in a repository checkout is not proof of a published release.
 

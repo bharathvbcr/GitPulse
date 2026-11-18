@@ -16,9 +16,14 @@ use crate::ipc_error::CommandError;
 /// `async fn` + [`off_thread`]: a sync body under `(async)` still runs on an
 /// async runtime worker, and this one is a network `git ls-remote` that may
 /// take its full timeout — holding a worker every other command needs.
+///
+/// `include_betas` is the user's "include beta releases" preference. Absent
+/// means stable only, so a caller that predates the preference never offers
+/// a beta. It filters the tag list locally and is never sent anywhere.
 #[tauri::command(async)]
-pub async fn cmd_check_app_update() -> crate::updates::UpdateCheck {
-    off_thread(|| Ok(crate::updates::check_for_update()))
+pub async fn cmd_check_app_update(include_betas: Option<bool>) -> crate::updates::UpdateCheck {
+    let channel = crate::updates::Channel::from_include_betas(include_betas.unwrap_or(false));
+    off_thread(move || Ok(crate::updates::check_for_update(channel)))
         .await
         .map_err(|e| e.message)
         .unwrap_or_else(crate::updates::UpdateCheck::failed)

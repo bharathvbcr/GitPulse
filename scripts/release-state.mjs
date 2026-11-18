@@ -106,6 +106,9 @@ export function runReleaseStage(options, run = runCommand) {
   const parsed = parseTag(tag);
   if (!parsed.ok) throw new Error(parsed.reason);
   const releaseVersion = parsed.version;
+  // A beta tag (vX.Y.Z-beta.N) is drafted as a GitHub pre-release from the
+  // start, so publishing the draft can never make it the "Latest" release.
+  const prerelease = parsed.prerelease;
   if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error("Expected the full preflight commit SHA");
   if (stage !== "prepare" && stage !== "ready" && !/^[1-9]\d*$/.test(releaseId ?? "")) throw new Error("Expected the prepared release ID");
   if (stage === "finalize" && (!notes || Buffer.byteLength(notes) > 125_000)) throw new Error("Missing or oversized release notes");
@@ -203,7 +206,7 @@ export function runReleaseStage(options, run = runCommand) {
   const tagIdentity = checkTag();
   /** @param {Record<string, unknown> | null} release */
   function assertMutableDraft(release) {
-    if (!release || release.draft !== true || release.prerelease !== false || release.immutable === true || release.published_at !== null) throw new Error("Release is not a mutable unpublished draft");
+    if (!release || release.draft !== true || release.prerelease !== prerelease || release.immutable === true || release.published_at !== null) throw new Error("Release is not a mutable unpublished draft");
     if (typeof release.id !== "number" || !Number.isSafeInteger(release.id) || release.id <= 0 || (releaseId && String(release.id) !== releaseId)) throw new Error("Draft release ID changed or is invalid");
     return release;
   }
@@ -358,7 +361,7 @@ export function runReleaseStage(options, run = runCommand) {
     if (!release) {
       // Do not automatically retry a POST whose outcome is unknown. A rerun
       // reads the existing draft before deciding whether creation is necessary.
-      release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease: false, body: "Draft — platform builds and verification are pending." }));
+      release = record(api("releases", "POST", { tag_name: tag, target_commitish: commit, name: `GitPulse ${tag}`, draft: true, prerelease, body: "Draft — platform builds and verification are pending." }));
     } else {
       // Identity first. `/releases/tags/{tag}` can still return a published
       // release; wiping its installers would delete the last successful set.

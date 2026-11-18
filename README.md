@@ -20,14 +20,14 @@ across all your repositories. Each agent gets its own worktree, a policy guard a
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
 native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 
-[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases) ·
+[Download the 0.2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1) ·
 [Getting started](docs/GETTING_STARTED.md) ·
 [Why GitPulse](docs/WHY_GITPULSE.md) ·
 [Agents guide](docs/AGENTS_GUIDE.md) ·
 [Documentation](docs/README.md) ·
 [Website](https://gitpulse.vbcr.dev/) ·
 [Release notes](CHANGELOG.md) ·
-[v2.0 Beta notes](docs/RELEASE_NOTES_v2.0.0.md)
+[0.2.0 notes](docs/RELEASE_NOTES_v0.2.0.md)
 
 ![GitPulse on macOS: a Claude Code agent fixing two wiki pages in its own worktree, with Follow agent showing each file it edits beside its terminal](docs/assets/hero-agents.webp)
 
@@ -58,11 +58,13 @@ they are stronger. The [agents guide](docs/AGENTS_GUIDE.md) covers running agent
 **Platforms.** GitPulse is tested on macOS. Windows and Linux builds are produced by release CI but have
 not been tested.
 
-## GitPulse 2.0 (beta)
+## GitPulse 0.2.0 (beta)
 
-GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases),
-published as a pre-release; the stable 2.0 release is coming soon. The beta is the first release since
-`v1.3.1` and includes all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
+GitPulse 0.2.0 is out in beta as [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1),
+a GitHub pre-release for macOS; the stable 0.2.0 release follows. Versions restart at 0.x because
+only macOS is tested so far, and 1.0.0 is kept for the first release tested on all three systems.
+Releases come on two channels: betas are tagged `vX.Y.Z-beta.N`, stable releases `vX.Y.Z`. See the
+[0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md) and [versioning](docs/INSTALLATION.md#versions-and-channels).
 The [feature reference](docs/FEATURES.md) lists every area.
 
 - **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.

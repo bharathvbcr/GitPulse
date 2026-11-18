@@ -2,8 +2,8 @@
 
 [Documentation index](README.md) · [Getting started](GETTING_STARTED.md)
 
-Download the GitPulse 2.0 beta, [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases). It is published as a pre-release, so
-GitHub's [Latest release](https://github.com/bharathvbcr/GitPulse/releases/latest) stays on `v1.3.1` until the stable 2.0 release ships.
+Download the GitPulse 0.2.0 beta, [`v0.2.0-beta.1`](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1).
+It is a GitHub pre-release with macOS installers only; Windows and Linux installers come with a later release.
 Choose an asset from the selected release; repository manifests describe the
 checkout and do not establish which release is publicly available.
 
@@ -193,16 +193,37 @@ A missing tool is reported as unavailable. A missing policy check is **unchecked
 not a successful policy verdict. See [Module integration](MODULE_INTEGRATION.md)
 and [Security](SECURITY.md).
 
+## Versions and channels
+
+GitPulse releases come on two channels:
+
+- **Stable**, tagged `vX.Y.Z` and published as an ordinary GitHub release.
+- **Beta**, tagged `vX.Y.Z-beta.N` and published as a GitHub pre-release. A beta
+  comes before the stable release of the same number: `0.2.0-beta.1`, then
+  `0.2.0-beta.2`, then `0.2.0`.
+
+Versions are below 1.0 while only macOS is tested. Windows and Linux builds are
+produced but not yet tested, and 1.0.0 is kept for the first release tested on
+all three. Releases numbered `v0.0.2` to `v1.3.1` under the earlier numbering
+have been withdrawn; [CHANGELOG.md](../CHANGELOG.md) keeps their history.
+
+On Windows, a beta's `.msi` carries the version `X.Y.Z.N`, because the MSI
+format allows only numbers.
+
 ## Updates
 
 Updates are manual downloads. **Settings → Updates** provides:
 
 - An opt-in periodic release check, off by default.
+- **Include beta releases**, off by default: whether a check may also announce
+  a beta. A beta build with it off is still told about the stable release that
+  follows it.
 - **Check now**, which makes one check on demand.
 - A link to the release page when an update is found.
 
 The check reads public tags using `git ls-remote`, at most once a day for the
-periodic path. It does not download or install a binary. A failed check reports
+periodic path. The channel only filters the tags after they arrive; it is not
+sent anywhere. It does not download or install a binary. A failed check reports
 that it could not check, rather than claiming the app is up to date.
 
 **Upgrading a profile that has opened a newer task store.** The DevCouncil task

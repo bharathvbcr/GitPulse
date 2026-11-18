@@ -588,7 +588,8 @@ flowchart TD
 - Automatic application release checks are off by default; GitPulse does not
   automatically install application updates.
 - When explicitly enabled under **Settings → Updates**, GitPulse compares public release tags once a day via `git ls-remote` against the upstream repository.
-- No user tokens, repository paths, or hardware telemetry are ever sent.
+- No user tokens, repository paths, or hardware telemetry are ever sent. The
+  **Include beta releases** choice filters the tag list locally and is not sent either.
 - Release checks only notify with a link to GitHub releases. Optional-tool setup
   is a separate, explicitly requested install/update workflow.
 

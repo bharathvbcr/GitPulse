@@ -8,8 +8,9 @@
  * Nothing here fires on its own. `shouldAutoCheck` is the single gate, and it
  * returns false unless the user has explicitly enabled the preference.
  */
-import { writable } from "svelte/store";
+import { get, writable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
+import { interfaceStore } from "../stores/interfaceStore";
 import { describeError } from "../ui/copy/describeFailure";
 
 /** Mirrors `crate::updates::UpdateCheck` (serde `camelCase`). */
@@ -96,10 +97,17 @@ export function describeUpdateCheck(result: UpdateCheck): UpdateStatus {
  */
 const APP_UPDATE_COMMAND = "cmd_check_app_update";
 
-/** Injectable IPC seam, so tests never touch the real bridge. */
-export type UpdateInvoker = (command: string) => Promise<UpdateCheck>;
+/** The command's arguments: which releases the check may announce. */
+export interface UpdateCheckArgs {
+  /** Mirrors the "Include beta releases" preference; false means stable only. */
+  includeBetas: boolean;
+}
 
-const defaultInvoker: UpdateInvoker = () => invoke<UpdateCheck>(APP_UPDATE_COMMAND);
+/** Injectable IPC seam, so tests never touch the real bridge. */
+export type UpdateInvoker = (command: string, args: UpdateCheckArgs) => Promise<UpdateCheck>;
+
+const defaultInvoker: UpdateInvoker = (_command, args) =>
+  invoke<UpdateCheck>(APP_UPDATE_COMMAND, { includeBetas: args.includeBetas });
 
 /**
  * Runs one check.
@@ -130,7 +138,10 @@ async function performUpdateCheck(
   invokeFn: UpdateInvoker = defaultInvoker,
 ): Promise<UpdateCheck> {
   try {
-    return await invokeFn(APP_UPDATE_COMMAND);
+    // Read at call time, so every surface (Settings, the menu, the automatic
+    // check) asks for the channel the user has chosen right now.
+    const args: UpdateCheckArgs = { includeBetas: get(interfaceStore).includeBetaUpdates === true };
+    return await invokeFn(APP_UPDATE_COMMAND, args);
   } catch (error) {
     return {
       currentVersion: "",

@@ -127,6 +127,24 @@ describe("remote release lifecycle", () => {
     expect(calls.filter(call => call.includes("POST"))).toHaveLength(1);
     expect(calls.filter(call => call.some(arg => arg.includes("actions/workflows/")))).toHaveLength(2);
   });
+  it("drafts a beta tag as a GitHub pre-release and refuses a stable draft left for it", () => {
+    // Publishing the draft must never make a beta the repository's Latest release.
+    const betaTag = "v0.2.0-beta.1";
+    const betaRemote = `${commit}\trefs/tags/${betaTag}\n`;
+    const {run} = fixture({release: null, remote: betaRemote});
+    const bodies: string[] = [];
+    const spy: Runner = (program, args, input) => {
+      if (args[3] === "POST" && !String(args[4] ?? "").startsWith("https://uploads.github.com/")) bodies.push(input ?? "");
+      return run(program, args, input);
+    };
+    expect(runReleaseStage({...options, tag: betaTag}, spy).release_id).toBe("42");
+    expect(bodies).toHaveLength(1);
+    expect(JSON.parse(bodies[0])).toMatchObject({tag_name: betaTag, draft: true, prerelease: true});
+
+    const stable = fixture({release: {...draft(), tag_name: betaTag, name: `GitPulse ${betaTag}`, prerelease: false}, remote: betaRemote});
+    expect(() => runReleaseStage({...options, tag: betaTag}, stable.run)).toThrow(/mutable unpublished draft/);
+    expect(stable.calls.some(call => call.includes("POST") || call.includes("PATCH") || call.includes("DELETE"))).toBe(false);
+  });
   it("resumes an existing matching draft without duplicate creation", () => {
     const {run, calls} = fixture();
     expect(runReleaseStage(options, run).release_id).toBe("42");

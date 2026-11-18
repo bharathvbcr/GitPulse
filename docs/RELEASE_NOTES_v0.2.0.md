@@ -1,8 +1,8 @@
-# GitPulse 2.0 (1.99.0 Beta)
+# GitPulse 0.2.0 (beta 1)
 
-GitPulse 2.0 is a major release of the desktop workspace, agentic control plane, and terminal host. It ships in the repository and bundle manifests as `1.99.0` (the 2.0 beta) so plain numeric release and macOS bundle versions sort before `2.0.0`. It is the first release published since `v1.3.1`, incorporating all changes from the unpublished `v1.3.5`, `v1.4.0`, and `v1.5.0` cycles alongside the 2.0 overhaul.
+GitPulse 0.2.0 is a major release of the desktop workspace, agentic control plane, and terminal host. Its first beta is `v0.2.0-beta.1`, a GitHub pre-release for macOS; Windows and Linux installers come with a later release. It is also the first release under a new version scheme: versions restart at 0.x because only macOS is tested so far, 1.0.0 is kept for the first release tested on all three systems, and releases come on two channels, betas tagged `vX.Y.Z-beta.N` and stable releases tagged `vX.Y.Z` (see [Versions and channels](INSTALLATION.md#versions-and-channels)). Every earlier release, `v0.0.2` to `v1.3.1`, has been withdrawn. This one follows `v1.3.1`, the last published under the old numbering, and incorporates all changes from the unpublished `v1.3.5`, `v1.4.0`, `v1.5.0` and `1.99.0` cycles.
 
-To upgrade from `v1.3.1`, install this build and read **Breaking changes & upgrade** below: the task profile moves one way (workbench schema 17, with Inbox merged into Backlog), the DevMap store moves one way to schema 29, the ledger bumps to writer generation 2, the terminal host (`gitpulse-ptyd`, protocol 3) is unconditional on Unix, and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
+A 1.x build's own release check compares version numbers and will never offer `0.2.0-beta.1`, which sorts below 1.x, so install it from the [release page](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1). To upgrade from `v1.3.1`, install this build and read **Breaking changes & upgrade** below: the task profile moves one way (workbench schema 17, with Inbox merged into Backlog), the DevMap store moves one way to schema 29, the ledger bumps to writer generation 2, the terminal host (`gitpulse-ptyd`, protocol 3) is unconditional on Unix, and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 
 ## Highlights
 

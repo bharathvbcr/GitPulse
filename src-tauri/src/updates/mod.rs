@@ -65,10 +65,11 @@ const MAX_TAG_LINES: usize = 5_000;
 pub struct UpdateCheck {
     /// Version of the running build.
     pub current_version: String,
-    /// Newest stable published version, empty when the check did not run.
+    /// Newest published version on the checked channel, empty when the check
+    /// did not run.
     pub latest_version: String,
-    /// True only when a strictly newer stable release exists. Meaningless
-    /// unless `checked` is true.
+    /// True only when a strictly newer release exists on the checked channel.
+    /// Meaningless unless `checked` is true.
     pub update_available: bool,
     /// Where to send the user. Always populated, so "could not check" can
     /// still offer the releases page.
@@ -107,26 +108,98 @@ pub fn release_tag_url(tag: &str) -> String {
     )
 }
 
-/// A parsed `MAJOR.MINOR.PATCH` release version.
+/// A parsed release version: a stable `MAJOR.MINOR.PATCH`, or the beta of
+/// one, `MAJOR.MINOR.PATCH-beta.N`.
 ///
-/// Pre-release and build-metadata suffixes are not modelled, because tags
-/// carrying them are never offered as updates (see [`parse_release_tag`]).
-/// Ordering is the derived field order, which is exactly numeric precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// These are the only two shapes `scripts/check-release-version.mjs` lets a
+/// release carry. Other pre-release spellings (`-rc.1`, `-beta`, `-0`) and
+/// build metadata (`+build`) are not modelled and never parse.
+///
+/// Ordering is SemVer precedence for those two shapes: the numeric fields
+/// first, then a beta below the stable release of the same numbers, then
+/// betas by number. So `0.2.0-beta.1 < 0.2.0-beta.2 < 0.2.0 < 0.2.1-beta.1`,
+/// which is what carries a beta user onto the stable that follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    /// `N` of a `-beta.N` version; `None` for a stable release.
+    pub beta: Option<u64>,
 }
 
-/// Parses a bare `MAJOR.MINOR.PATCH` version string.
+impl Version {
+    /// Whether this is a beta (`-beta.N`) rather than a stable release.
+    pub fn is_beta(&self) -> bool {
+        self.beta.is_some()
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (self.beta, other.beta) {
+                (None, None) => Ordering::Equal,
+                // A stable release outranks every beta of the same numbers.
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(a), Some(b)) => a.cmp(&b),
+            })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The canonical spelling, `1.2.3` or `1.2.3-beta.4`: the one the release
+/// workflow names tags and assets with. Every place that prints a version
+/// goes through this, so a beta's suffix cannot be dropped in one of them.
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(beta) = self.beta {
+            write!(f, "-beta.{beta}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The largest beta number: it becomes the MSI installer's fourth version
+/// field, which holds at most 65535 (see `msiVersion` in
+/// `scripts/check-release-version.mjs`).
+const MAX_BETA: u64 = 65_535;
+
+/// Parses a bare `MAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH-beta.N` version.
 ///
-/// Strict on purpose: exactly three numeric components, no suffix, no leading
-/// `v`. Anything else returns `None` rather than a partially-guessed version,
-/// because a misparse here silently changes which build a user is told to
-/// install.
+/// Strict on purpose: exactly three numeric components, optionally followed by
+/// exactly `-beta.N` with `N` from 1 to 65535 and no leading zero, and no
+/// leading `v`. Anything else returns `None` rather than a partially-guessed
+/// version, because a misparse here silently changes which build a user is
+/// told to install.
 pub fn parse_version(text: &str) -> Option<Version> {
-    let mut parts = text.split('.');
+    let (core, beta) = match text.split_once('-') {
+        None => (text, None),
+        Some((core, pre)) => {
+            let number = pre.strip_prefix("beta.")?;
+            if number.is_empty()
+                || number.starts_with('0')
+                || !number.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let number = number.parse::<u64>().ok()?;
+            if number > MAX_BETA {
+                return None;
+            }
+            (core, Some(number))
+        }
+    };
+    let mut parts = core.split('.');
     let major = parts.next()?;
     let minor = parts.next()?;
     let patch = parts.next()?;
@@ -145,34 +218,83 @@ pub fn parse_version(text: &str) -> Option<Version> {
         major: component(major)?,
         minor: component(minor)?,
         patch: component(patch)?,
+        beta,
     })
 }
 
-/// Parses one release tag (`v1.2.3` or `1.2.3`) into a version.
+/// Parses one release tag (`v1.2.3`, `v1.2.3-beta.4`, or either without the
+/// `v`) into a version.
 ///
-/// Pre-release tags (`v1.2.3-rc.1`, `v1.2.3+build`) return `None` and are
-/// therefore never proposed as an update. Offering a release candidate to
-/// someone running a stable build is a decision the user has not made, and
-/// this check has no way to ask.
+/// A beta parses, but whether it is a candidate is the [`Channel`]'s call:
+/// offering a beta to someone who has not asked for betas is a decision they
+/// have not made. Any other pre-release (`v1.2.3-rc.1`) or build suffix
+/// (`v1.2.3+build`) returns `None` and is never proposed.
 pub fn parse_release_tag(tag: &str) -> Option<Version> {
     let trimmed = tag.trim();
     let bare = trimmed.trim_prefix('v');
-    if bare.contains('-') || bare.contains('+') {
-        return None;
-    }
     parse_version(bare)
 }
 
+/// Which releases a check may announce.
+///
+/// The choice only filters the tag list after it arrives; it never travels
+/// with the request (scripts/update-privacy-contract.test.ts reads that
+/// request), so the upstream learns nothing about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Channel {
+    /// Stable releases only. The default: nobody is offered a beta unasked.
+    #[default]
+    Stable,
+    /// Stable releases and betas, whichever is newest.
+    Beta,
+}
+
+impl Channel {
+    /// The channel for the frontend's "include betas" preference.
+    pub fn from_include_betas(include_betas: bool) -> Self {
+        if include_betas {
+            Self::Beta
+        } else {
+            Self::Stable
+        }
+    }
+
+    /// Whether a release of `version` belongs on this channel.
+    pub fn admits(self, version: Version) -> bool {
+        match self {
+            Self::Stable => !version.is_beta(),
+            Self::Beta => true,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
 /// Extracts every stable version from `git ls-remote --tags --refs` output,
-/// highest first.
+/// highest first. See [`release_tags`].
+pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, String> {
+    release_tags(ls_remote_output, Channel::Stable)
+}
+
+/// Extracts every version on `channel` from `git ls-remote --tags --refs`
+/// output, highest first.
 ///
 /// Each line is `<sha>\trefs/tags/<name>`. Lines that do not match that shape,
-/// and tags that are not stable `MAJOR.MINOR.PATCH` releases, are skipped:
-/// a repository is free to carry tags this scheme does not describe.
+/// tags that are not release versions, and releases `channel` does not admit
+/// are skipped: a repository is free to carry tags this scheme does not
+/// describe.
 ///
 /// Returns the tag text alongside the version, so the caller links to the tag
 /// the remote actually published rather than a reconstructed guess.
-pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, String> {
+pub fn release_tags(
+    ls_remote_output: &str,
+    channel: Channel,
+) -> Result<Vec<(String, Version)>, String> {
     let mut found: Vec<(String, Version)> = Vec::new();
     let mut seen = 0usize;
     for line in ls_remote_output.lines() {
@@ -198,6 +320,9 @@ pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, Str
         let Some(version) = parse_release_tag(tag) else {
             continue;
         };
+        if !channel.admits(version) {
+            continue;
+        }
         match found.iter_mut().find(|(_, known)| *known == version) {
             None => found.push((tag.to_string(), version)),
             // Several spellings of one version (`1.5.0`, `v01.5.0`, `v1.5.0`):
@@ -226,13 +351,10 @@ pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Versi
 const RELEASE_TAG_PREFIX: char = 'v';
 
 /// How likely the release workflow published `tag`: the canonical
-/// `v<major>.<minor>.<patch>` spelling (2), any other `v` spelling such as
-/// `v01.5.0` (1), a bare spelling (0).
+/// `v<version>` spelling (2), any other `v` spelling such as `v01.5.0` (1), a
+/// bare spelling (0).
 fn spelling_rank(tag: &str, version: Version) -> u8 {
-    let canonical = format!(
-        "{RELEASE_TAG_PREFIX}{}.{}.{}",
-        version.major, version.minor, version.patch
-    );
+    let canonical = format!("{RELEASE_TAG_PREFIX}{version}");
     if tag == canonical {
         2
     } else if tag.starts_with(RELEASE_TAG_PREFIX) {
@@ -259,10 +381,7 @@ const MAX_RELEASE_PROBES: usize = 5;
 /// draft is published, so it is public exactly when users can install the
 /// release. A test pins this format to that script.
 pub fn release_marker_asset(version: Version) -> String {
-    format!(
-        "GitPulse_{}.{}.{}_SHA256SUMS.txt",
-        version.major, version.minor, version.patch
-    )
+    format!("GitPulse_{version}_SHA256SUMS.txt")
 }
 
 /// Whether the release for `tag` is published: its checksum asset answers an
@@ -299,14 +418,29 @@ pub fn evaluate(
     ls_remote_output: &str,
     published: &dyn Fn(&str, Version) -> Result<bool, CommandError>,
 ) -> UpdateCheck {
-    evaluate_detailed(current_version, ls_remote_output, published).check
+    evaluate_on(
+        Channel::Stable,
+        current_version,
+        ls_remote_output,
+        published,
+    )
+}
+
+/// [`evaluate`] for one [`Channel`].
+pub fn evaluate_on(
+    channel: Channel,
+    current_version: &str,
+    ls_remote_output: &str,
+    published: &dyn Fn(&str, Version) -> Result<bool, CommandError>,
+) -> UpdateCheck {
+    evaluate_detailed(channel, current_version, ls_remote_output, published).check
 }
 
 /// The answer for a tag whose release is confirmed published.
 fn announce(current_version: &str, tag: &str, version: Version) -> UpdateCheck {
     UpdateCheck {
         current_version: current_version.to_string(),
-        latest_version: format!("{}.{}.{}", version.major, version.minor, version.patch),
+        latest_version: version.to_string(),
         update_available: true,
         release_url: release_tag_url(tag),
         checked: true,
@@ -325,6 +459,7 @@ struct Evaluation {
 }
 
 fn evaluate_detailed(
+    channel: Channel,
     current_version: &str,
     ls_remote_output: &str,
     published: &dyn Fn(&str, Version) -> Result<bool, CommandError>,
@@ -337,25 +472,34 @@ fn evaluate_detailed(
         // Unreachable via CURRENT_VERSION (Cargo would reject a non-semver
         // package version), but this function is also the tested entry point.
         return plain(UpdateCheck::failed(format!(
-            "the running version '{current_version}' is not a MAJOR.MINOR.PATCH version"
+            "the running version '{current_version}' is not a MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-beta.N version"
         )));
     };
-    let tags = match stable_tags(ls_remote_output) {
+    let tags = match release_tags(ls_remote_output, channel) {
         Ok(found) => found,
         Err(error) => return plain(UpdateCheck::failed(error)),
     };
-    let Some((_, newest)) = tags.first() else {
-        return plain(UpdateCheck::failed(
-            "the repository published no stable release tag to compare against".into(),
-        ));
-    };
     let up_to_date = |latest: Version| UpdateCheck {
         current_version: current_version.to_string(),
-        latest_version: format!("{}.{}.{}", latest.major, latest.minor, latest.patch),
+        latest_version: latest.to_string(),
         update_available: false,
         release_url: releases_url(),
         checked: true,
         error: None,
+    };
+    let Some((_, newest)) = tags.first() else {
+        // Only betas published so far is an answer for the stable channel,
+        // not a failure: the check ran, and there is no stable release to
+        // offer. A listing with no release tag at all still fails, since it is
+        // as likely to be a wrong or empty answer as a real one.
+        if channel == Channel::Stable
+            && release_tags(ls_remote_output, Channel::Beta).is_ok_and(|betas| !betas.is_empty())
+        {
+            return plain(up_to_date(current));
+        }
+        return plain(UpdateCheck::failed(
+            "the repository published no release tag to compare against".into(),
+        ));
     };
     if *newest <= current {
         return plain(up_to_date(*newest));
@@ -415,14 +559,16 @@ struct FailClosedRecord {
 }
 
 /// Fingerprint of everything in the listing that could change the verdict:
-/// every stable tag newer than `current_version`, with the commit it points
-/// at. A new tag, a moved tag or a removed tag all change it; tags at or
-/// below the running version cannot, so they do not.
+/// the channel, and every tag on it newer than `current_version`, with the
+/// commit it points at. A new tag, a moved tag or a removed tag all change
+/// it; tags at or below the running version cannot, so they do not. The
+/// channel is part of it because one listing answers the two channels
+/// differently.
 ///
 /// FNV-1a over the sorted `sha\ttag` lines: dependency-free and stable across
 /// Rust versions, which `DefaultHasher` does not promise for a value written
 /// to disk.
-fn tip_fingerprint(ls_remote_output: &str, current_version: &str) -> String {
+fn tip_fingerprint(ls_remote_output: &str, current_version: &str, channel: Channel) -> String {
     let current = parse_version(current_version);
     let mut lines: Vec<&str> = ls_remote_output
         .lines()
@@ -436,6 +582,7 @@ fn tip_fingerprint(ls_remote_output: &str, current_version: &str) -> String {
             };
             let tag = tag.trim_suffix("^{}");
             match (parse_release_tag(tag), current) {
+                (Some(version), _) if !channel.admits(version) => false,
                 (Some(version), Some(current)) => version > current,
                 (Some(_), None) => true,
                 _ => false,
@@ -444,7 +591,8 @@ fn tip_fingerprint(ls_remote_output: &str, current_version: &str) -> String {
         .collect();
     lines.sort_unstable();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for line in lines {
+    let seed = format!("channel={}", channel.label());
+    for line in std::iter::once(seed.as_str()).chain(lines) {
         for byte in line.bytes().chain(std::iter::once(b'\n')) {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -508,7 +656,28 @@ pub fn evaluate_with_backoff(
     record_path: Option<&std::path::Path>,
     now: u64,
 ) -> UpdateCheck {
-    let tip = tip_fingerprint(ls_remote_output, current_version);
+    evaluate_with_backoff_on(
+        Channel::Stable,
+        current_version,
+        ls_remote_output,
+        published,
+        record_path,
+        now,
+    )
+}
+
+/// [`evaluate_with_backoff`] for one [`Channel`]. The remembered answer is
+/// keyed on the channel (through [`tip_fingerprint`]), so switching betas on
+/// or off never replays the other channel's answer.
+pub fn evaluate_with_backoff_on(
+    channel: Channel,
+    current_version: &str,
+    ls_remote_output: &str,
+    published: &dyn Fn(&str, Version) -> Result<bool, CommandError>,
+    record_path: Option<&std::path::Path>,
+    now: u64,
+) -> UpdateCheck {
+    let tip = tip_fingerprint(ls_remote_output, current_version, channel);
     if let Some(record) = record_path.and_then(read_record) {
         // `recorded_at > now` is a clock that moved backwards: not evidence of
         // recency, so it probes.
@@ -521,7 +690,7 @@ pub fn evaluate_with_backoff(
             // fails the check without touching the record, and unpublished
             // replays the recorded failure.
             let newest = parse_version(current_version).and_then(|current| {
-                stable_tags(ls_remote_output)
+                release_tags(ls_remote_output, channel)
                     .ok()?
                     .into_iter()
                     .find(|(_, version)| *version > current)
@@ -545,7 +714,7 @@ pub fn evaluate_with_backoff(
             }
         }
     }
-    let evaluation = evaluate_detailed(current_version, ls_remote_output, published);
+    let evaluation = evaluate_detailed(channel, current_version, ls_remote_output, published);
     if let Some(path) = record_path {
         if evaluation.budget_exhausted {
             let record = FailClosedRecord {
@@ -590,6 +759,7 @@ type PublishedProbe = dyn Fn(&str, Version) -> Result<bool, CommandError>;
 /// between the real `ls-remote`, clock and record path and
 /// [`evaluate_with_backoff`] is exercised rather than assumed.
 struct CheckEnv {
+    channel: Channel,
     current_version: String,
     ls_remote: Box<LsRemote>,
     published: Box<PublishedProbe>,
@@ -601,8 +771,9 @@ impl CheckEnv {
     /// The real version, probe, record path and clock around `ls_remote`.
     /// The network request itself is spelled out in [`check_for_update`], where
     /// scripts/update-privacy-contract.test.ts reads it.
-    fn production(ls_remote: Box<LsRemote>) -> Self {
+    fn production(channel: Channel, ls_remote: Box<LsRemote>) -> Self {
         Self {
+            channel,
             current_version: CURRENT_VERSION.to_string(),
             ls_remote,
             published: Box::new(release_is_published),
@@ -615,7 +786,8 @@ impl CheckEnv {
 /// One launch's check: a single `ls-remote`, then the back-off evaluation.
 fn run_check(env: &CheckEnv) -> UpdateCheck {
     match (env.ls_remote)() {
-        Ok(listing) => evaluate_with_backoff(
+        Ok(listing) => evaluate_with_backoff_on(
+            env.channel,
             &env.current_version,
             &listing,
             &*env.published,
@@ -634,15 +806,19 @@ fn run_check(env: &CheckEnv) -> UpdateCheck {
 ///
 /// Exactly one `git ls-remote` per call; the HTTP probes behind it are
 /// subject to the fail-closed back-off of [`evaluate_with_backoff`].
-pub fn check_for_update() -> UpdateCheck {
-    run_check(&CheckEnv::production(Box::new(|| {
-        git_global_with_timeout(
-            &["ls-remote", "--tags", "--refs", REPOSITORY_URL],
-            CHECK_TIMEOUT,
-        )
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .map_err(|error| error.into_message())
-    })))
+/// `channel` decides which of the listed releases may be announced.
+pub fn check_for_update(channel: Channel) -> UpdateCheck {
+    run_check(&CheckEnv::production(
+        channel,
+        Box::new(|| {
+            git_global_with_timeout(
+                &["ls-remote", "--tags", "--refs", REPOSITORY_URL],
+                CHECK_TIMEOUT,
+            )
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .map_err(|error| error.into_message())
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -660,7 +836,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                beta: None,
             })
         );
         assert_eq!(
@@ -668,7 +845,8 @@ mod tests {
             Some(Version {
                 major: 0,
                 minor: 0,
-                patch: 0
+                patch: 0,
+                beta: None,
             })
         );
     }
@@ -702,7 +880,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                beta: None,
             })
         );
     }
@@ -715,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn prerelease_tags_are_never_candidates() {
+    fn prerelease_tags_other_than_beta_n_are_never_candidates() {
         for tag in [
             "v1.2.3-rc.1",
             "v1.2.3-beta",
@@ -742,7 +921,8 @@ mod tests {
             Version {
                 major: 1,
                 minor: 3,
-                patch: 0
+                patch: 0,
+                beta: None,
             }
         );
     }
@@ -1004,7 +1184,8 @@ mod tests {
             release_marker_asset(Version {
                 major: 1,
                 minor: 4,
-                patch: 0
+                patch: 0,
+                beta: None,
             }),
             "GitPulse_1.4.0_SHA256SUMS.txt"
         );
@@ -1040,7 +1221,7 @@ mod tests {
     #[test]
     #[ignore = "requires network access to the upstream repository"]
     fn live_check_reaches_the_upstream_repository() {
-        let result = check_for_update();
+        let result = check_for_update(Channel::Beta);
         assert!(result.checked, "live check failed: {:?}", result.error);
         assert!(
             parse_version(&result.latest_version).is_some(),
@@ -1348,6 +1529,7 @@ mod tests {
         let listing = listing.to_string();
         let calls = ls_calls.clone();
         CheckEnv {
+            channel: Channel::Stable,
             current_version: "1.4.0".to_string(),
             ls_remote: Box::new(move || {
                 calls.set(calls.get() + 1);
@@ -1399,7 +1581,7 @@ mod tests {
     #[test]
     fn the_production_env_uses_the_real_version_record_path_clock_and_one_ls_remote() {
         let before = now_unix();
-        let env = CheckEnv::production(Box::new(|| Ok("listing".to_string())));
+        let env = CheckEnv::production(Channel::Stable, Box::new(|| Ok("listing".to_string())));
         let after = now_unix();
         assert_eq!(env.current_version, CURRENT_VERSION);
         assert_eq!(env.record_path, record_path());
@@ -1422,10 +1604,182 @@ mod tests {
     fn tags_not_newer_than_the_build_do_not_change_the_tip() {
         let a = format!("{}{}", exhausted_listing("1"), line("v1.0.0"));
         let b = format!("{}{}", exhausted_listing("1"), line("v1.1.0"));
-        assert_eq!(tip_fingerprint(&a, "1.4.0"), tip_fingerprint(&b, "1.4.0"));
-        assert_ne!(
-            tip_fingerprint(&exhausted_listing("1"), "1.4.0"),
-            tip_fingerprint(&exhausted_listing("2"), "1.4.0")
+        assert_eq!(
+            tip_fingerprint(&a, "1.4.0", Channel::Stable),
+            tip_fingerprint(&b, "1.4.0", Channel::Stable)
         );
+        assert_ne!(
+            tip_fingerprint(&exhausted_listing("1"), "1.4.0", Channel::Stable),
+            tip_fingerprint(&exhausted_listing("2"), "1.4.0", Channel::Stable)
+        );
+    }
+
+    fn beta(major: u64, minor: u64, patch: u64, n: u64) -> Version {
+        Version {
+            major,
+            minor,
+            patch,
+            beta: Some(n),
+        }
+    }
+
+    #[test]
+    fn a_beta_sorts_below_its_stable_and_betas_sort_by_number() {
+        let order = [
+            "0.1.9",
+            "0.2.0-beta.1",
+            "0.2.0-beta.2",
+            "0.2.0-beta.10",
+            "0.2.0",
+            "0.2.1-beta.1",
+            "0.2.1",
+            "1.0.0-beta.1",
+            "1.0.0",
+        ];
+        let parsed: Vec<Version> = order.iter().map(|v| parse_version(v).unwrap()).collect();
+        for pair in parsed.windows(2) {
+            assert!(pair[0] < pair[1], "{} must sort below {}", pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn only_the_beta_spelling_the_release_gate_allows_parses() {
+        assert_eq!(parse_version("0.2.0-beta.1"), Some(beta(0, 2, 0, 1)));
+        assert_eq!(
+            parse_version("0.2.0-beta.65535"),
+            Some(beta(0, 2, 0, 65_535))
+        );
+        for bad in [
+            "0.2.0-beta.0",
+            "0.2.0-beta.01",
+            "0.2.0-beta.65536",
+            "0.2.0-beta.",
+            "0.2.0-beta",
+            "0.2.0-beta.1.2",
+            "0.2.0-beta.1+build",
+            "0.2.0-rc.1",
+            "0.2.0-1",
+            "0.2.0-",
+            "0.2-beta.1",
+        ] {
+            assert_eq!(parse_version(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_version_prints_the_spelling_it_was_tagged_with() {
+        for text in ["1.2.3", "0.2.0-beta.1", "10.0.65535-beta.65535"] {
+            assert_eq!(parse_version(text).unwrap().to_string(), text);
+        }
+        // The marker asset must carry the suffix, or a published beta would
+        // never be confirmed.
+        assert_eq!(
+            release_marker_asset(beta(0, 2, 0, 1)),
+            "GitPulse_0.2.0-beta.1_SHA256SUMS.txt"
+        );
+    }
+
+    #[test]
+    fn the_stable_channel_never_lists_a_beta_and_the_beta_channel_lists_both() {
+        let output = format!(
+            "{}{}{}",
+            line("v0.2.0-beta.1"),
+            line("v0.1.0"),
+            line("v0.2.0-beta.2")
+        );
+        let stable: Vec<String> = release_tags(&output, Channel::Stable)
+            .unwrap()
+            .into_iter()
+            .map(|(tag, _)| tag)
+            .collect();
+        assert_eq!(stable, ["v0.1.0"]);
+        let all: Vec<String> = release_tags(&output, Channel::Beta)
+            .unwrap()
+            .into_iter()
+            .map(|(tag, _)| tag)
+            .collect();
+        assert_eq!(all, ["v0.2.0-beta.2", "v0.2.0-beta.1", "v0.1.0"]);
+    }
+
+    #[test]
+    fn a_stable_user_is_not_offered_a_newer_beta_and_a_beta_user_is() {
+        let output = format!("{}{}", line("v0.2.0"), line("v0.3.0-beta.1"));
+        let stable = evaluate_on(Channel::Stable, "0.2.0", &output, &|_, _| Ok(true));
+        assert!(stable.checked && !stable.update_available, "{stable:?}");
+        assert_eq!(stable.latest_version, "0.2.0");
+        let betas = evaluate_on(Channel::Beta, "0.2.0", &output, &|_, _| Ok(true));
+        assert!(betas.update_available, "{betas:?}");
+        assert_eq!(betas.latest_version, "0.3.0-beta.1");
+        assert!(
+            betas.release_url.ends_with("/releases/tag/v0.3.0-beta.1"),
+            "{betas:?}"
+        );
+    }
+
+    #[test]
+    fn a_beta_build_with_betas_off_is_still_offered_the_stable_that_follows() {
+        let output = format!("{}{}", line("v0.2.0-beta.1"), line("v0.2.0"));
+        let result = evaluate_on(Channel::Stable, "0.2.0-beta.1", &output, &|_, _| Ok(true));
+        assert!(result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "0.2.0");
+        assert_eq!(result.current_version, "0.2.0-beta.1");
+    }
+
+    #[test]
+    fn a_beta_build_on_the_beta_channel_moves_to_the_next_beta() {
+        let output = format!("{}{}", line("v0.2.0-beta.1"), line("v0.2.0-beta.2"));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = evaluate_on(Channel::Beta, "0.2.0-beta.1", &output, &|tag, version| {
+            asked.borrow_mut().push(release_marker_asset(version));
+            Ok(tag == "v0.2.0-beta.2")
+        });
+        assert!(result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "0.2.0-beta.2");
+        assert_eq!(*asked.borrow(), ["GitPulse_0.2.0-beta.2_SHA256SUMS.txt"]);
+    }
+
+    #[test]
+    fn only_betas_published_is_an_answer_on_the_stable_channel_not_a_failure() {
+        // The state right after the first beta ships: no stable tag exists.
+        let output = line("v0.2.0-beta.1");
+        let result = evaluate_on(Channel::Stable, "0.2.0-beta.1", &output, &|_, _| {
+            panic!("nothing on the stable channel is newer, so nothing is probed")
+        });
+        assert!(result.checked && !result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "0.2.0-beta.1");
+        // A listing with no release tag at all is still a failure.
+        let empty = evaluate_on(
+            Channel::Stable,
+            "0.2.0-beta.1",
+            &line("nightly"),
+            &|_, _| Ok(true),
+        );
+        assert!(!empty.checked, "{empty:?}");
+    }
+
+    #[test]
+    fn the_remembered_answer_is_kept_apart_per_channel() {
+        let listing = exhausted_listing("1");
+        assert_ne!(
+            tip_fingerprint(&listing, "1.4.0", Channel::Stable),
+            tip_fingerprint(&listing, "1.4.0", Channel::Beta)
+        );
+        // A beta newer than the build moves only the beta channel's tip.
+        let with_beta = format!("{listing}{}", line("v1.9.0-beta.1"));
+        assert_eq!(
+            tip_fingerprint(&listing, "1.4.0", Channel::Stable),
+            tip_fingerprint(&with_beta, "1.4.0", Channel::Stable)
+        );
+        assert_ne!(
+            tip_fingerprint(&listing, "1.4.0", Channel::Beta),
+            tip_fingerprint(&with_beta, "1.4.0", Channel::Beta)
+        );
+    }
+
+    #[test]
+    fn the_include_betas_preference_maps_to_a_channel() {
+        assert_eq!(Channel::from_include_betas(false), Channel::Stable);
+        assert_eq!(Channel::from_include_betas(true), Channel::Beta);
+        assert_eq!(Channel::default(), Channel::Stable);
     }
 }

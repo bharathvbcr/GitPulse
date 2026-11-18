@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   CRATE_NAME,
   discoverPluginPackages,
+  msiVersion,
   parseCargoLockVersion,
   parseCargoTomlVersion,
   parseTag,
@@ -51,6 +52,8 @@ async function scratchTree(
     plugin: string;
     pluginClaude: string;
     pluginCodex: string;
+    /** `bundle.windows.wix.version`; omitted when undefined. */
+    wix: string;
   }> = {},
 ) {
   const base = "0.4.2";
@@ -76,7 +79,15 @@ async function scratchTree(
   );
   await writeFile(
     path.join(dir, "src-tauri", "tauri.conf.json"),
-    JSON.stringify({ productName: "GitPulse", version: v.tauri }, null, 2),
+    JSON.stringify(
+      {
+        productName: "GitPulse",
+        version: v.tauri,
+        ...(v.wix === undefined ? {} : { bundle: { windows: { wix: { version: v.wix } } } }),
+      },
+      null,
+      2,
+    ),
   );
   await writeFile(
     path.join(dir, "src-tauri", "Cargo.toml"),
@@ -277,7 +288,47 @@ describe("release version gate", () => {
 
     const suffixed = await runScript(["--root", dir, "--tag", "v0.4.2-rc.1"]);
     expect(suffixed.code).toBe(1);
-    expect(suffixed.stdout).toMatch(/must be v<major>\.<minor>\.<patch> with no suffix/);
+    expect(suffixed.stdout).toMatch(/must be v<major>\.<minor>\.<patch> or v<major>\.<minor>\.<patch>-beta\.<n>/);
+  });
+
+  it("passes a beta tree whose MSI version is derived from the beta number", async () => {
+    const beta = "0.2.0-beta.3";
+    const dir = await scratchTree("beta", {
+      pkg: beta, tauri: beta, cargoToml: beta, cargoLock: beta, plugin: beta, pluginClaude: beta, pluginCodex: beta, wix: "0.2.0.3",
+    });
+    const { code, stdout } = await runScript(["--root", dir, "--tag", "v0.2.0-beta.3"]);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/agree on 0\.2\.0-beta\.3 and match tag v0\.2\.0-beta\.3/);
+  });
+
+  it("fails a beta whose MSI version is missing or names another beta", async () => {
+    // Tauri's MSI bundler refuses a -beta.N app version, so a missing or stale
+    // override would only surface as a failed Windows leg mid-release.
+    const beta = "0.2.0-beta.3";
+    const all = { pkg: beta, tauri: beta, cargoToml: beta, cargoLock: beta, plugin: beta, pluginClaude: beta, pluginCodex: beta };
+    const missing = await runScript(["--root", await scratchTree("beta-no-wix", all)]);
+    expect(missing.code).toBe(1);
+    expect(missing.stdout).toMatch(/beta 0\.2\.0-beta\.3 needs bundle\.windows\.wix\.version = "0\.2\.0\.3".*found null/);
+    const stale = await runScript(["--root", await scratchTree("beta-stale-wix", { ...all, wix: "0.2.0.2" })]);
+    expect(stale.code).toBe(1);
+    expect(stale.stdout).toMatch(/found "0\.2\.0\.2"/);
+  });
+
+  it("fails a stable release that still carries a beta's MSI version", async () => {
+    const dir = await scratchTree("stable-wix", { wix: "0.4.2.1" });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/stable 0\.4\.2 must not set bundle\.windows\.wix\.version/);
+  });
+
+  it("fails a manifest version that is neither release shape, even with no tag", async () => {
+    const odd = "0.4.2-rc.1";
+    const dir = await scratchTree("odd-suffix", {
+      pkg: odd, tauri: odd, cargoToml: odd, cargoLock: odd, plugin: odd, pluginClaude: odd, pluginCodex: odd,
+    });
+    const { code, stdout } = await runScript(["--root", dir]);
+    expect(code).toBe(1);
+    expect(stdout).toMatch(/version "0\.4\.2-rc\.1" is neither/);
   });
 
   it("rejects an explicitly empty tag; branch CI omits the flag", async () => {
@@ -396,13 +447,28 @@ describe("manifest parsers", () => {
   });
 
   it("parses well-formed tags and refuses the rest", () => {
-    expect(parseTag("v1.2.3")).toEqual({ ok: true, version: "1.2.3" });
+    expect(parseTag("v1.2.3")).toEqual({ ok: true, version: "1.2.3", prerelease: false });
+    expect(parseTag("v0.2.0-beta.1")).toEqual({ ok: true, version: "0.2.0-beta.1", prerelease: true });
+    expect(parseTag("v0.2.0-beta.65535").ok).toBe(true);
+    expect(parseTag("v0.2.0-beta.65536").ok).toBe(false);
+    expect(parseTag("v0.2.0-beta.0").ok).toBe(false);
+    expect(parseTag("v0.2.0-beta.01").ok).toBe(false);
+    expect(parseTag("v0.2.0-beta").ok).toBe(false);
+    expect(parseTag("v0.2.0-rc.1").ok).toBe(false);
+    expect(parseTag("v0.2.0-1").ok).toBe(false);
     expect(parseTag("v1.2").ok).toBe(false);
     expect(parseTag("release-1.2.3").ok).toBe(false);
     expect(parseTag("v1.2.3+build").ok).toBe(false);
   });
 });
 
+
+it("maps a beta to its MSI version and a stable to none", () => {
+  expect(msiVersion("0.2.0-beta.1")).toBe("0.2.0.1");
+  expect(msiVersion("1.4.12-beta.65535")).toBe("1.4.12.65535");
+  expect(msiVersion("0.2.0")).toBeNull();
+  expect(msiVersion("0.2.0-rc.1")).toBeNull();
+});
 
 it.each(["v01.2.3", "v1.02.3", "v1.2.03", "v9007199254740992.0.0"])("rejects noncanonical or unsafe release tag %s", tag => {
   expect(parseTag(tag).ok).toBe(false);

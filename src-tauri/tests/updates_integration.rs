@@ -34,16 +34,17 @@ fn parses_only_three_component_versions() {
 }
 
 #[test]
-fn release_tags_accept_either_prefix_but_never_a_pre_release() {
+fn release_tags_accept_either_prefix_and_only_the_beta_n_pre_release() {
     // The `v` is optional: a repository may tag either way.
     assert!(parse_release_tag("v1.2.3").is_some());
     assert!(parse_release_tag("1.2.3").is_some());
-    // Offering a release candidate to someone on a stable build is a choice
-    // the user never made, and this check has no way to ask.
+    // A beta parses; whether it is offered is the channel's decision.
+    assert!(parse_release_tag("v1.2.3-beta.1").is_some_and(|v| v.is_beta()));
+    // Any other pre-release or build suffix is never a release.
     for pre in ["v1.2.3-rc.1", "1.2.3-beta", "v1.2.3+build.5", "v1.2.3-0"] {
         assert!(
             parse_release_tag(pre).is_none(),
-            "{pre} must not count as stable"
+            "{pre} must not count as a release"
         );
     }
 }

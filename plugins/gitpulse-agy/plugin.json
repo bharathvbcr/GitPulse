@@ -1,6 +1,6 @@
 {
   "name": "gitpulse-agy",
-  "version": "1.99.0",
+  "version": "0.2.0-beta.1",
   "description": "GitPulse control plane and bidirectional A2A bridge for Antigravity: worktrees, edit tracking and collision checks, code intelligence, and peer messaging.",
   "author": {
     "name": "GitPulse Team",

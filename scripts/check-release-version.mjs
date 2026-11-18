@@ -74,26 +74,119 @@ export function defaultSources(root) {
 }
 
 /**
+ * The two release channels' version shapes: stable `X.Y.Z`, and the beta of a
+ * coming stable, `X.Y.Z-beta.N`. SemVer orders `X.Y.Z-beta.N` below `X.Y.Z`,
+ * which is what carries a beta user onto the stable that follows it.
+ *
+ * Exactly one pre-release spelling is accepted. Cargo, npm and every plugin
+ * host read `-beta.N` the same way, while `rc`, `alpha` or bare `-N` suffixes
+ * would each need their own MSI mapping (see {@link msiVersion}). N is 1 to
+ * 65535, the range of the MSI version field it becomes.
+ */
+const RELEASE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-beta\.([1-9]\d{0,4}))?$/;
+
+/** The largest MSI major and minor (one byte each) and build field. */
+const MSI_MAJOR_MINOR_MAX = 255;
+const MSI_FIELD_MAX = 65535;
+
+/**
+ * Parses a release version into its parts, or null when it is neither shape.
+ *
+ * @param {string} version
+ * @returns {{ major: number, minor: number, patch: number, beta: number | null } | null}
+ */
+export function parseReleaseVersion(version) {
+  const match = RELEASE_VERSION.exec(version);
+  if (!match) return null;
+  const [major, minor, patch] = [match[1], match[2], match[3]].map(Number);
+  const beta = match[4] === undefined ? null : Number(match[4]);
+  if (![major, minor, patch].every(Number.isSafeInteger)) return null;
+  if (beta !== null && beta > MSI_FIELD_MAX) return null;
+  return { major, minor, patch, beta };
+}
+
+/** @param {string} version */
+export function isPrerelease(version) {
+  return parseReleaseVersion(version)?.beta != null;
+}
+
+/**
+ * The MSI installer version a beta must carry in tauri.conf.json's
+ * `bundle.windows.wix.version`, or null for a stable release, which needs none.
+ *
+ * WiX takes only numeric `major.minor.build.revision`, and Tauri's MSI bundler
+ * fails a Windows build outright on a `-beta.N` app version. So
+ * `X.Y.Z-beta.N` installs as `X.Y.Z.N`. Windows Installer ignores the fourth
+ * field when it compares versions, and Tauri gives every MSI a major upgrade
+ * that allows downgrades, so a later beta and the final `X.Y.Z` both replace
+ * an installed beta.
+ *
+ * @param {string} version
+ * @returns {string | null}
+ */
+export function msiVersion(version) {
+  const parsed = parseReleaseVersion(version);
+  if (!parsed || parsed.beta === null) return null;
+  return `${parsed.major}.${parsed.minor}.${parsed.patch}.${parsed.beta}`;
+}
+
+/**
  * A tag this repo's release workflow can trigger on (`tags: ['v*']`), carrying
- * a plain three-part version. Pre-release/build suffixes are rejected rather
- * than guessed at: Cargo and npm disagree on how to spell them, so a suffix
- * that round-trips here would still break one of the manifests.
+ * a stable `X.Y.Z` or beta `X.Y.Z-beta.N` version. Any other suffix is
+ * rejected rather than guessed at.
  *
  * @param {string} tag
- * @returns {{ ok: true, version: string } | { ok: false, reason: string }}
+ * @returns {{ ok: true, version: string, prerelease: boolean } | { ok: false, reason: string }}
  */
 export function parseTag(tag) {
   if (!tag.startsWith("v")) {
     return { ok: false, reason: `tag ${JSON.stringify(tag)} must start with "v" (workflow triggers on tags: ['v*'])` };
   }
   const version = tag.slice(1);
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || !version.split(".").every(part => Number.isSafeInteger(Number(part)))) {
+  const parsed = parseReleaseVersion(version);
+  if (!parsed) {
     return {
       ok: false,
-      reason: `tag ${JSON.stringify(tag)} must be v<major>.<minor>.<patch> with no suffix, got version part ${JSON.stringify(version)}`,
+      reason: `tag ${JSON.stringify(tag)} must be v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-beta.<n>, got version part ${JSON.stringify(version)}`,
     };
   }
-  return { ok: true, version };
+  return { ok: true, version, prerelease: parsed.beta !== null };
+}
+
+/**
+ * The MSI rules the app version and `bundle.windows.wix.version` must meet
+ * together. Checked on every run, not only for tags: a stale override would
+ * otherwise surface as a failed Windows leg ninety minutes into a release.
+ *
+ * @param {string} version the agreed app version
+ * @param {string} tauriConfPath
+ * @returns {string[]} violations
+ */
+export function checkMsiVersion(version, tauriConfPath) {
+  const parsed = parseReleaseVersion(version);
+  if (!parsed) {
+    return [`version ${JSON.stringify(version)} is neither <major>.<minor>.<patch> nor <major>.<minor>.<patch>-beta.<n>`];
+  }
+  /** @type {string[]} */
+  const violations = [];
+  if (parsed.major > MSI_MAJOR_MINOR_MAX || parsed.minor > MSI_MAJOR_MINOR_MAX || parsed.patch > MSI_FIELD_MAX) {
+    violations.push(`version ${version} cannot be an MSI version (major and minor at most ${MSI_MAJOR_MINOR_MAX}, patch at most ${MSI_FIELD_MAX})`);
+  }
+  let wix;
+  try {
+    const conf = /** @type {{ bundle?: { windows?: { wix?: { version?: unknown } | null } | null } }} */ (readJson(tauriConfPath));
+    wix = conf.bundle?.windows?.wix?.version ?? null;
+  } catch {
+    // The version collection above already reports an unreadable tauri.conf.json.
+    return violations;
+  }
+  const expected = msiVersion(version);
+  if (expected === null && wix !== null) {
+    violations.push(`stable ${version} must not set bundle.windows.wix.version (found ${JSON.stringify(wix)}); the MSI takes the app version`);
+  } else if (expected !== null && wix !== expected) {
+    violations.push(`beta ${version} needs bundle.windows.wix.version = ${JSON.stringify(expected)} in src-tauri/tauri.conf.json (found ${JSON.stringify(wix)}): the MSI bundler refuses a -beta.N version`);
+  }
+  return violations;
 }
 
 /**
@@ -324,6 +417,10 @@ export function runVersionCheck({ sources, tag }) {
     for (const entry of readable) {
       violations.push(`  ${entry.label} = ${JSON.stringify(entry.version)}`);
     }
+  }
+
+  if (distinct.length === 1 && typeof distinct[0] === "string") {
+    violations.push(...checkMsiVersion(distinct[0], sources.tauriConfPath));
   }
 
   /** @type {string | null} */

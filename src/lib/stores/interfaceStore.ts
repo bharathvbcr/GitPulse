@@ -412,6 +412,11 @@ export interface InterfacePrefs extends AppearancePrefs {
   /** Version whose update notice the user dismissed ("" means none). */
   dismissedUpdateVersion: string;
   /**
+   * Whether a release check may announce a beta (`X.Y.Z-beta.N`) as well as
+   * a stable release. Off by default: nobody is offered a beta unasked.
+   */
+  includeBetaUpdates: boolean;
+  /**
    * Opt-in automatic coverage generation. Off by default: generating coverage
    * runs the repository's own test suites, which costs minutes of CPU and
    * writes artifacts (coverage.out, .coverage, lcov.info) into the working
@@ -568,6 +573,7 @@ const DEFAULTS: InterfacePrefs = {
   checkForUpdates: false,
   lastUpdateCheckAt: 0,
   dismissedUpdateVersion: "",
+  includeBetaUpdates: false,
   autoRunCoverage: false,
   autoScanGithubAlerts: true,
   bellAsksForReader: false,
@@ -771,6 +777,8 @@ function readPrefs(): InterfacePrefs {
       // Anything other than an explicit `true` leaves the check off. A
       // corrupt or partially-written value must never opt a user in.
       checkForUpdates: parsed.checkForUpdates === true,
+      // Same rule: only an explicit `true` puts a user on the beta channel.
+      includeBetaUpdates: parsed.includeBetaUpdates === true,
       // Same rule, and it matters more here: this one runs the repository's
       // test suites and writes files into the working tree.
       autoRunCoverage: parsed.autoRunCoverage === true,
@@ -1116,6 +1124,13 @@ function createInterfaceStore() {
         checkForUpdates: enabled,
         dismissedUpdateVersion: enabled ? prefs.dismissedUpdateVersion : "",
       })),
+    /**
+     * Switches the release check between stable releases only and stable
+     * plus betas. The dismissal is cleared, since it was made about the other
+     * channel's answer.
+     */
+    setIncludeBetaUpdates: (enabled: boolean) =>
+      patch({ includeBetaUpdates: enabled, dismissedUpdateVersion: "" }),
     /** Records that an automatic check completed, restarting the throttle. */
     markUpdateChecked: (at: number) => patch({ lastUpdateCheckAt: at }),
     /** Silences the notice for one specific version only. */
