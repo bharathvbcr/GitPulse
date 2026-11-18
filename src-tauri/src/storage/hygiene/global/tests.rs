@@ -1942,7 +1942,7 @@ fn every_reclaim_scope_is_off_by_default_and_absent_from_saved_state() {
 #[cfg(unix)]
 fn set_old(path: &std::path::Path) {
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
-    crate::test_support::set_modified(&path, old).unwrap();
+    crate::test_support::set_modified(path, old).unwrap();
 }
 
 /// A Cargo repository on `main` with one linked worktree under
@@ -3737,7 +3737,7 @@ fn a_target_shaped_like_a_real_cargo_target_with_hard_links_is_completed() {
     let shape = |target: &std::path::Path| {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
         let set = |p: &std::path::Path| {
-            crate::test_support::set_modified(&p, old).unwrap();
+            crate::test_support::set_modified(p, old).unwrap();
         };
         for dir in ["debug/deps", "debug/incremental/crate-1", "debug/build/out"] {
             fs::create_dir_all(target.join(dir)).unwrap();
