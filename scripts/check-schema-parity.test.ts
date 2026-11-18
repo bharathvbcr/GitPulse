@@ -224,7 +224,8 @@ describe("stack-lease format", () => {
     expect(summarize([row]).ok).toBe(false);
   });
 
-  it("asks an installed devmap through its --version line", () => {
+  // The fake devmap is a `#!/bin/sh` script, which Windows cannot execute.
+  it.skipIf(process.platform === "win32")("asks an installed devmap through its --version line", () => {
     const bin = fakeDevmap("devmap 0.2.5 (store schema 27, code graph schema 2, extract schema 94, stack lease format 1, build abc)");
     expect(readCliSchema(bin).lease).toBe(1);
     expect(readCliSchema(fakeDevmap("devmap 0.2.5 (store schema 27, extract schema 94, build abc)")).lease).toBeNull();

@@ -10,20 +10,28 @@ mod common;
 
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::path::Path;
 
 use gitpulse_lib::insights::claims::{
-    append_claim, append_claims, append_claims_repairing, read_store, ClaimSource, FileClaim,
-    DEFAULT_CAP, DEFAULT_TTL_MS,
+    append_claim, read_store, ClaimSource, FileClaim, DEFAULT_CAP, DEFAULT_TTL_MS,
 };
+#[cfg(unix)]
+use gitpulse_lib::insights::claims::{append_claims, append_claims_repairing};
+#[cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
 
 const T0: u64 = 1_794_110_184_306;
+#[cfg(unix)]
 const COMPACT_BYTES_PER_ROW: u64 = 512;
 const WORKTREE: &str = "/Users/bharath/Code/devtools/GitPulse/.gitpulse/worktrees/b1106w9-claims";
+#[cfg(unix)]
 const CHILDREN: usize = 6;
+#[cfg(unix)]
 const APPENDS: usize = 120;
+#[cfg(unix)]
 const BATCH_AT: usize = 60;
+#[cfg(unix)]
 const BATCH_ROWS: usize = 64;
 const TORN_FRAGMENT: &[u8] = b"{\"source\":\"observed\",\"sess";
 
@@ -39,6 +47,7 @@ fn observed(tag: &str, i: usize, ts: u64) -> FileClaim {
     }
 }
 
+#[cfg(unix)]
 fn declared(id: usize, k: usize, j: usize, pad: usize, ts: u64) -> FileClaim {
     FileClaim {
         source: ClaimSource::Declared,
@@ -51,6 +60,7 @@ fn declared(id: usize, k: usize, j: usize, pad: usize, ts: u64) -> FileClaim {
     }
 }
 
+#[cfg(unix)]
 fn fill_to_threshold(store: &Path) -> usize {
     let threshold = DEFAULT_CAP as u64 * COMPACT_BYTES_PER_ROW;
     let mut rows = 0usize;
@@ -62,6 +72,7 @@ fn fill_to_threshold(store: &Path) -> usize {
     rows
 }
 
+#[cfg(unix)]
 fn child_main(store: &Path) {
     let id: usize = std::env::var("W9R4_CHILD_ID").unwrap().parse().unwrap();
     let pad: usize = std::env::var("W9R4_PAD").unwrap().parse().unwrap();
@@ -104,6 +115,7 @@ fn child_main(store: &Path) {
 /// skipped. With them, a fragment may swallow at most the one row appended
 /// straight after it, so at most one claim per fragment is missing, and the
 /// reader counts what it skipped.
+#[cfg(unix)]
 fn scenario(name: &str, pad: usize, torn: bool) {
     if let Ok(store) = std::env::var("W9R4_CHILD_STORE") {
         child_main(Path::new(&store));

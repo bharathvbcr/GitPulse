@@ -89,7 +89,11 @@
  *      an allow-listed utility (gp-menu-sep, gp-separator, gp-card, gp-field,
  *      gp-field-multi, gp-btn, gp-chip, gp-floor, gp-select). `gp-section-edge`
  *      is NOT an exemption: it is the shim whose call sites are being removed.
- *      Misses `border-top:` written in `<style>`.
+ *      A side border in a class source that also wears `border-transparent`
+ *      and no other border colour is spacing, not a separator (a pill row's
+ *      `border-y border-transparent bg-clip-padding` gap), so it passes; any
+ *      other border colour anywhere in that source, ternary branches included,
+ *      keeps it a hairline. Misses `border-top:` written in `<style>`.
  *   8  border opacity: tokens `border*-<color>/N` and `divide-<color>/N` whose
  *      N is not 35, 65, 90 (or `[0.35]`, `[0.65]`, `[0.9]`); and `<style>`
  *      border/outline declarations using `/ 0.N` outside those stops.
@@ -1135,6 +1139,17 @@ const NON_COLOR_REST = {
   accent: /^(?:auto|\[.*)$/,
 };
 
+/**
+ * Rule 7: true when every border colour this class source can wear, under any
+ * variant or ternary branch, is `border-transparent`, and it wears at least
+ * that one. Such a border never paints, so a side width on it is spacing.
+ * @param {ClassSource} cs
+ */
+function invisibleBorder(cs) {
+  const colours = cs.tokens.filter((x) => /^border(?:-[xytblrse])?-/.test(x.util) && isColorUtil(x.util));
+  return colours.length > 0 && colours.every((x) => x.util === "border-transparent");
+}
+
 /** @param {string} util */
 function isColorUtil(util) {
   const m = COLOR_PREFIX.exec(util);
@@ -1544,6 +1559,7 @@ export const RULES = [
       eachToken(m, (t, cs) => {
         if (cs.exempt) return;
         const side = /^border-([tblrxyse])(?:-(\d+|\[\d+(?:px)?\]))?$/.exec(t.util);
+        if (side && invisibleBorder(cs)) return;
         const divide = /^divide-[xy](?:-(\d+))?$/.exec(t.util);
         const width = side ? side[2] : divide ? divide[1] : undefined;
         if ((side || divide) && !/^(?:0|\[0(?:px)?\])$/.test(width ?? "")) report(t.start, `${t.util}: separate regions with spacing, a tonal step or [data-gp-fade], not a hairline`);

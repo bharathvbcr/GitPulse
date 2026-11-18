@@ -321,6 +321,17 @@ describe("design-lint precision: the tricky negatives, one by one", () => {
     expect(svelte('<div class="md:border-t"></div>', 7)).toHaveLength(1);
   });
 
+  it("a side border that can only ever be transparent is spacing, not a rule 7 hairline", () => {
+    expect(svelte('<div class="border-y border-transparent bg-clip-padding"></div>', 7)).toEqual([]);
+    expect(svelte('<div class="row {m ? \'a\' : \'b\'} border-y border-transparent"></div>', 7)).toEqual([]);
+    // Any colour that can paint keeps it a hairline: a plain one, a variant, a ternary branch.
+    expect(svelte('<div class="border-y border-transparent border-accent"></div>', 7)).toHaveLength(1);
+    expect(svelte('<div class="border-y border-transparent hover:border-border"></div>', 7)).toHaveLength(1);
+    expect(svelte('<div class="border-y border-transparent {on ? \'border-accent\' : \'\'}"></div>', 7)).toHaveLength(1);
+    // No colour at all is the default border colour, which paints.
+    expect(svelte('<div class="border-y"></div>', 7)).toHaveLength(1);
+  });
+
   it("transition-colors is allowed while transition-all is not", () => {
     expect(svelte('<a class="transition-colors"></a>', 9)).toEqual([]);
     expect(svelte('<a class="transition-all"></a>', 9)).toHaveLength(1);

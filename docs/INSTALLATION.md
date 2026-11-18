@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Getting started](GETTING_STARTED.md)
 
-Download the GitPulse 2.0 beta, [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0). It is published as a pre-release, so
+Download the GitPulse 2.0 beta, [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases). It is published as a pre-release, so
 GitHub's [Latest release](https://github.com/bharathvbcr/GitPulse/releases/latest) stays on `v1.3.1` until the stable 2.0 release ships.
 Choose an asset from the selected release; repository manifests describe the
 checkout and do not establish which release is publicly available.

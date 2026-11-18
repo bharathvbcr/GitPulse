@@ -1057,7 +1057,9 @@ describe("bundle contents: adversarial bundles", () => {
   });
 });
 
-describe("app bundle on disk", () => {
+// POSIX-only: a .app bundle is a macOS artifact whose executables are told apart by mode bits
+// (and its symlinks need no privilege); NTFS reports 0o666 for every file, so nothing there is executable.
+describe.skipIf(process.platform === "win32")("app bundle on disk", () => {
   function thinMachO(cpu = ARM64): Buffer {
     const out = Buffer.alloc(32);
     out.writeUInt32LE(0xfeedfacf, 0);

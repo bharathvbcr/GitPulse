@@ -8348,9 +8348,9 @@ mod tests {
             "{hold}"
         );
         // The same directory through a symlink is the same worktree.
-        let link = dir.path().join("alias");
         #[cfg(unix)]
         {
+            let link = dir.path().join("alias");
             std::os::unix::fs::symlink(&wt, &link).unwrap();
             assert!(claim_hold(&by_path, &link, None).is_some());
         }

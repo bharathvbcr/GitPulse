@@ -1,6 +1,7 @@
 //! Adversarial tests for `RunError` and slot-wait/timeout refusal diagnostics.
 
 use super::*;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::Duration;
 

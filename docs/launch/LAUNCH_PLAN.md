@@ -70,11 +70,12 @@ work. The pitch is about what happens when you run five agents across three repo
 6. **You still need git.** You still need the graph, the branch stack tree, diffs, conflicts, reflog,
    PRs and Actions. They are in the same window, not a second app.
 
-### The "free" claim, worded so it holds
+### The claim, worded so it holds
 
-T3 Code is also free and MIT-licensed, so we must **not** say "the only free ADE". Use this instead:
+Compare capabilities, never prices: every agent needs its own plan or API key whichever workspace runs
+it, so "free next to paid" is not a fair comparison. Use this instead:
 
-> **No other free agentic workspace puts a full git client, a code graph, agent guards, a load
+> **No other agentic workspace we found puts a full git client, a code graph, agent guards, a load
 > scheduler, a task board agents write to, and agent-to-agent messaging in one app.**
 >
 > Lead with the four capabilities none of the ten researched products showed: cross-agent file
@@ -98,7 +99,6 @@ This table needs verification before publishing. Legend: ✅ stated by the offic
 
 | Capability | **GitPulse** | Claude Code | T3 Code | VS Code (Copilot) | Cursor | Conductor | Codex app |
 |---|---|---|---|---|---|---|---|
-| Price | **Free, MIT** | Paid plan ($20/mo and up) | Free, MIT | ? | Free tier, paid $8–200 | Free (joining Meta) | ? |
 | App runtime | **Rust core on the system webview (Tauri 2)** | ? (CLI; desktop app runtime not checked) | **Electron** ([T3 Code desktop guide](https://www.mintlify.com/pingdotgg/t3code/guides/desktop-app), [DeepWiki](https://deepwiki.com/pingdotgg/t3code/4-desktop-application)) | ? | ? | ? | ? |
 | Platforms | macOS tested; Windows and Linux built, testing pending | macOS, Windows, Linux | macOS, Win, Linux, mobile, web | ? | ? | macOS | macOS, Windows (Linux unclear) |
 | Many repos in one window | ✅ tabs, worktree stacks, Fleet | ◐ agent view lists sessions | ? | ✅ | ◐ multi-root | ? | ◐ |
@@ -127,7 +127,6 @@ These pages were read through a summarizing fetcher. Re-verify every ✅ before 
 |---|---|---|---|---|---|
 | Category | Agentic workspace + git client | Editor with agent panel | Agentic terminal | Git GUI + agent sessions | Git GUI |
 | App runtime | **Rust core on the system webview (Tauri 2), no bundled Chromium** | ? | ? | **Electron** ([GitKraken blog](https://gitkraken.com/blog/5-electron-apps)) | ? |
-| Price | **Free, MIT** | Free personal; Pro $10/mo; Business $30/seat | Free; Build $20/mo; Max $200; Business $50/user | Free Community; paid prices not shown on the page | No free plan; $69–149/yr |
 | Platforms | macOS tested; Windows, Linux built, untested | macOS, Windows, Linux | macOS, Windows, Linux | Windows, macOS, Linux | macOS, Windows |
 | Many repos in one window | ✅ | ✅ | ? | ◐ | ◐ |
 | Parallel agents in worktrees | ✅ | ✅ opt-in per thread | ? | ✅ one per session | ? |
@@ -142,8 +141,8 @@ These pages were read through a summarizing fetcher. Re-verify every ✅ before 
 | Load-aware scheduling | ✅ | ? | ? | ? | ? |
 | Full git GUI | ✅ | ◐ panel, blame, conflict buttons | ? | ✅ graph and blame | ✅ graph, blame, conflicts, reflog |
 | GitHub PRs / Actions | ✅ both | ◐ links | ◐ cloud PR review | ✅ PRs; Actions ? | ✅ PRs (4 hosts); Actions ? |
-| MCP server for agents | ✅ 65 tools, free | ? | ? | ✅ 22 tools, Pro and up | ? (`gittower` CLI + Agent Skill) |
-| Cloud / remote execution | Labs (own machines free) | ? | ✅ Oz cloud agents | ◐ remote environments (Pro+) | ? |
+| MCP server for agents | ✅ 65 tools | ? | ? | ✅ 22 tools | ? (`gittower` CLI + Agent Skill) |
+| Cloud / remote execution | Labs | ? | ✅ Oz cloud agents | ◐ remote environments | ? |
 
 **What this changes in the pitch:**
 - GitPulse is **not** the only app with agent guards (Zed, GitKraken), with worktree agents (Zed,
@@ -151,17 +150,16 @@ These pages were read through a summarizing fetcher. Re-verify every ✅ before 
 - The rows where **no researched product showed the capability** are cross-agent file collision
   warnings, agents filing follow-up tasks on a board, code-graph impact and affected tests, and
   load-aware scheduling.
-- Lead with those four, plus "all of it, in one free app, alongside a full git client."
+- Lead with those four, plus "all of it, in one app, alongside a full git client."
 
 **Sources:**
-- **Zed:** [pricing](https://zed.dev/pricing), [external agents](https://zed.dev/docs/ai/external-agents), [parallel agents](https://zed.dev/docs/ai/parallel-agents), [tool permissions](https://zed.dev/docs/ai/tool-permissions), [git](https://zed.dev/docs/git)
-- **Warp:** [pricing](https://www.warp.dev/pricing), [download](https://www.warp.dev/download), [agents](https://docs.warp.dev/agents/), [harnesses](https://docs.warp.dev/platform/harnesses/)
-- **GitKraken:** [pricing](https://www.gitkraken.com/pricing), [agents](https://help.gitkraken.com/gitkraken-desktop/agents/), [worktrees](https://help.gitkraken.com/gitkraken-desktop/worktrees/), [MCP tools](https://help.gitkraken.com/mcp/mcp-tools-reference/)
-- **Tower:** [pricing](https://www.git-tower.com/pricing), [features](https://www.git-tower.com/features/all-features), [release notes](https://www.git-tower.com/release-notes)
+- **Zed:** [external agents](https://zed.dev/docs/ai/external-agents), [parallel agents](https://zed.dev/docs/ai/parallel-agents), [tool permissions](https://zed.dev/docs/ai/tool-permissions), [git](https://zed.dev/docs/git)
+- **Warp:** [download](https://www.warp.dev/download), [agents](https://docs.warp.dev/agents/), [harnesses](https://docs.warp.dev/platform/harnesses/)
+- **GitKraken:** [agents](https://help.gitkraken.com/gitkraken-desktop/agents/), [worktrees](https://help.gitkraken.com/gitkraken-desktop/worktrees/), [MCP tools](https://help.gitkraken.com/mcp/mcp-tools-reference/)
+- **Tower:** [features](https://www.git-tower.com/features/all-features), [release notes](https://www.git-tower.com/release-notes)
 
 **Caveats:**
-- GitKraken's paid prices are not shown on its page, so don't quote any.
-- Tower's prices are read as annual (an inference).
+- No prices of other products are quoted: compare capabilities only.
 - Kepler is a separate GitKraken product; don't credit its features to Desktop.
 
 ### Trade-offs: each product's drawbacks for multi-agent work
@@ -171,16 +169,16 @@ names a limit the product's own docs state, not an opinion.
 
 | Product | Drawback for running many agents across many repos | Source |
 |---|---|---|
-| Claude Code | Claude only; no free plan includes it; agent view is a research preview that shows only background sessions | claude.com/pricing; code.claude.com/docs/en/agent-view |
+| Claude Code | Claude only; agent view is a research preview that shows only background sessions | code.claude.com/docs/en/agent-view |
 | T3 Code | Electron app, early (alpha) desktop build; threads, not a task board; git limited to diff, commit and PR | t3code README and desktop guide |
 | VS Code | Codex-extension sessions don't appear in the Agents window; its docs say a worktree "isn't a security boundary"; sessions don't isolate files on their own | code.visualstudio.com docs |
-| Cursor | Cloud agents need the Premium plan or higher; an editor first, not a cross-repo control plane | cursor.com/docs, cursor.com/pricing |
+| Cursor | An editor first, not a cross-repo control plane | cursor.com/docs |
 | Conductor | macOS only; joining Meta, with its cloud product shutting down; PostHog analytics; warns that agents in one workspace can edit the same files | conductor.build announcement, docs |
 | Codex app | OpenAI agents only; Linux availability unclear | learn.chatgpt.com/docs/app |
 | Zed | An editor; no commit graph found in its git docs; hosted AI and collaboration need server-side data | zed.dev/docs/git, zed.dev/docs/telemetry |
-| Warp | A terminal, with no git GUI found; cloud agents and higher limits on paid tiers; telemetry opt-out | warp.dev/pricing, docs.warp.dev privacy |
-| GitKraken | Electron; its MCP server needs Pro or higher; remote environments need Pro or higher; collision checks cover branch and worktree names only, not files; paid prices not shown | gitkraken.com/pricing, help.gitkraken.com |
-| Tower | No free plan ($69–149/yr); no agent launching, task board or guards found | git-tower.com/pricing, features |
+| Warp | A terminal, with no git GUI found; telemetry opt-out | docs.warp.dev agents, privacy |
+| GitKraken | Electron; collision checks cover branch and worktree names only, not files | help.gitkraken.com |
+| Tower | No agent launching, task board or guards found | git-tower.com features |
 
 GitPulse's own limits go on the same slide. It is tested on macOS only, there are no cloud agents
 outside Labs, it is not an editor, and Antigravity sessions get no command guard.
@@ -203,8 +201,7 @@ outside Labs, it is not an editor, and Antigravity sessions get no command guard
 
 1. For each product, run a targeted search on the three rows where GitPulse claims to be unique:
    collision warning, code-graph impact and load-aware scheduling. Fill every ? or leave it as ?.
-2. Re-check prices on the live pages on the day you publish. Cursor's tier names had changed.
-3. Before naming Conductor, re-check its status (Meta acquisition, cloud shutdown).
+2. Before naming Conductor, re-check its status (Meta acquisition, cloud shutdown).
 4. Run the four "only GitPulse" rows (collision warnings, agents filing tasks, code-graph impact,
    load-aware scheduling) as targeted searches against all ten products. Until then, the slide says
    "not found in any of the products we checked".

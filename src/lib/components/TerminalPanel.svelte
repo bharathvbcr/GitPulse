@@ -444,6 +444,7 @@
   let panesContainerEl = $state<HTMLDivElement | null>(null);
   /** The session types this host can open; browser sessions are macOS-only. */
   const sessionTypes = $derived(sessionTypesFor($hostPlatform.browser_sessions));
+  const codeViewClick = $derived(platformChord("⌘/Ctrl+Click", "Ctrl+Click", $hostPlatform.os));
   /** All dock tab kinds selectable in Session Typer, including File Explorer. */
   const dockTabTypes = $derived(dockTabTypesFor($hostPlatform.browser_sessions));
   /** What the reader chose last; shown as `nextLauncher` once this host is known to offer it. */
@@ -1018,7 +1019,7 @@
   const splitWithLabel = $derived(
     splitPartnerTab
       ? tabLabel(splitPartnerTab)
-      : `new ${nextLauncher === "file" ? "File Explorer" : launcherLabel(nextLauncher)}`,
+      : `new ${nextLauncher === "file" ? "Explorer" : launcherLabel(nextLauncher)}`,
   );
   const canPlainSplit = $derived(
     Boolean(activeId) && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES && (Boolean(splitPartner) || canCreateKind(nextLauncher)),
@@ -4292,10 +4293,10 @@
            two repositories that share a name stay separate groups. -->
       {#each sessionGroups as group (group.key)}
         {#each group.sessions as session, indexInGroup (session.key)}
-            {@const row = sessionRow(session, repoPath, checkouts, pathOpts)}
+            {@const sessionInfo = sessionRow(session, repoPath, checkouts, pathOpts)}
             {@const where = session.checkout ?? session.repoPath}
             {@const index = sessionListFlat.findIndex((candidate) => candidate.key === session.key)}
-            {@const focused = session.key === activeId && row.here}
+            {@const focused = session.key === activeId && sessionInfo.here}
             {@const rowLiveAct = session.sessionId ? $sessionActivity.get(session.sessionId) : undefined}
             {@const rowAttention = session.attention ?? (session.sessionId ? activityAttentionLabel($sessionActivity.get(session.sessionId)) : null)}
             {@const rowLauncher = session.launcher ?? "shell"}
@@ -4337,10 +4338,10 @@
                 {#if session.splitSlot}<span class="gp-chip shrink-0 tabular-nums" data-tone="neutral" data-testid="session-split-slot" title={`Visible in split pane #${session.splitSlot}`}>#{session.splitSlot}</span>{/if}
                 {#if session.isActive}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-active-badge">Active</span>{/if}
                 {#if rowAttention}<span class="gp-chip shrink-0" data-tone={rowAttention === "Failed" ? "danger" : "warn"} data-testid="session-attention-badge">{rowAttention}</span>{/if}
-                {#if row.agent && rawRowTitle && rawRowTitle.toLowerCase() !== row.agent.toLowerCase()}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
+                {#if sessionInfo.agent && rawRowTitle && rawRowTitle.toLowerCase() !== sessionInfo.agent.toLowerCase()}<span class="gp-chip shrink-0" data-tone="accent" data-testid="session-agent" title={`Agent: ${sessionInfo.agent}`}><span class="sr-only">Agent: </span>{sessionInfo.agent}</span>{/if}
                 <span class="min-w-0 truncate">
                   <span class="font-medium text-textPrimary">{rowMainTitle}</span>
-                  {#if row.checkout}<span class="text-textMuted" aria-hidden="true"> · </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
+                  {#if sessionInfo.checkout}<span class="text-textMuted" aria-hidden="true"> · </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{sessionInfo.checkout}</span>{/if}
                   <span class="text-textMuted"> · <span data-testid="session-status">{sessionStatusLabel(session.status)}</span></span>
                   <span class="sr-only">{session.status}</span>
                   {#if session.taskRunId}<span class="text-textMuted"> · task run</span>{:else if session.continuesRunId}<span class="text-textMuted"> · resumed conversation</span>{/if}
@@ -4353,14 +4354,14 @@
                   class="gp-btn" data-size="sm"
                   disabled={!session.reveal}
                   title={session.reveal
-                    ? (row.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
+                    ? (sessionInfo.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
                     : "This session's panel is not mounted, so it cannot be shown"}
                   onclick={(event) => {
                     event.stopPropagation();
                     void goToSession(session);
                   }}
                 >Go to</button>
-                {#if row.taskRunId}
+                {#if sessionInfo.taskRunId}
                   <button
                     type="button"
                     class="gp-btn" data-size="sm"
@@ -4369,7 +4370,7 @@
                     title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
                     onclick={(event) => {
                       event.stopPropagation();
-                      void openListedTask(row.taskRunId);
+                      void openListedTask(sessionInfo.taskRunId);
                     }}
                   >Task</button>
                 {/if}
@@ -4516,7 +4517,7 @@
           aria-label={explorerSidebarOpen ? "Hide file explorer sidebar" : "Show file explorer sidebar"}
           aria-pressed={explorerSidebarOpen}
           disabled={!repoPath}
-          title={explorerSidebarOpen ? "Hide docked File Explorer sidebar" : "Dock File Explorer sidebar beside terminal (never forces a 3rd split pane)"}
+          title={explorerSidebarOpen ? "Hide docked Explorer sidebar" : "Dock Explorer sidebar beside terminal (never forces a 3rd split pane)"}
           onclick={toggleExplorerSidebar}
         >
           {#if explorerSidebarOpen}
@@ -4540,6 +4541,9 @@
         {@const isRenamingThisTab = inlineRenameTabId === tab.id && inlineRenameSurface === "tab"}
         {@const canOpenInSplit = tabState.tabs.length >= 2 && (splitRoot ? !inActiveSplitGroup : !isActiveTab) && leafPaneIds(splitRoot).length < MAX_SPLIT_PANES}
         {@const stripHint = tabStripDropHint?.tabId === tab.id ? tabStripDropHint.mode : null}
+        <!-- Justified: this wrapper only receives pointer gestures (context menu,
+             drag-and-drop reorder); the focusable controls are the buttons inside
+             it, so the wrapper itself must not take focus or a role. -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           data-terminal-tab={tab.id}
@@ -4581,11 +4585,12 @@
             if (draggedGroupId) {
               const movingGroup = draggedGroupId;
               const hint = tabStripDropHint?.tabId === tab.id && tabStripDropHint.mode === "after" ? "after" : "before";
+              const targetGroupId = groupMeta?.group.id;
               draggedGroupId = null;
               draggedTabId = null;
               tabDropHint = null;
               tabStripDropHint = null;
-              if (!movingGroup || groupMeta?.group.id === movingGroup) return;
+              if (!movingGroup || targetGroupId === movingGroup) return;
               event.preventDefault();
               event.stopPropagation();
               const reordered = reorderSplitGroupInStrip(tabState.tabs, splitGroups, movingGroup, tab.id, hint);
@@ -4740,6 +4745,9 @@
           </button>
         </div>
       {/snippet}
+      <!-- Justified: role=tablist is a container here, not a widget that takes focus;
+           the focusable items are the tab buttons inside it. Its drag handlers only
+           accept a drop on the empty strip (event.target === currentTarget). -->
       <!-- svelte-ignore a11y_interactive_supports_focus -->
       <div
         bind:this={tabScroller}
@@ -4964,6 +4972,9 @@
         {/if}
       {/each}
       {#if stripPairDropTargetId}
+        <!-- Justified: a transient drop target that exists only while a tab is being
+             dragged. It has no pointer-free use; the same pairing is available from
+             the tab context menu (Open in Split). -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           data-testid="terminal-tab-split-dropzone"
@@ -5011,6 +5022,8 @@
         </div>
       {/if}
       {#if draggedTabId && groupedTabIds.has(draggedTabId)}
+        <!-- Justified: a transient drop target that exists only while a grouped tab is
+             being dragged. It has no pointer-free use and takes no focus. -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           data-testid="terminal-tab-detach-dropzone"
@@ -5187,7 +5200,7 @@
             onclick={() => launcherMenuOpen ? closeChrome() : openLauncherMenu()}
           >
             <LauncherIcon kind={nextLauncher} size={12} class="shrink-0" />
-            <span class="terminal-launcher-label truncate">{nextLauncher === "file" ? "File Explorer" : launcherLabel(nextLauncher)}</span>
+            <span class="terminal-launcher-label truncate">{nextLauncher === "file" ? "Explorer" : launcherLabel(nextLauncher)}</span>
             <ChevronDown size={11} class="shrink-0" />
           </button>
         </div>
@@ -5201,7 +5214,7 @@
             if (!repoPath || !activeId) return;
             openSplitContextMenu("row", event, event.currentTarget as HTMLElement);
           }}
-          aria-label={nextLauncher === "file" ? "New File Explorer tab" : `New ${launcherLabel(nextLauncher)} session`}
+          aria-label={nextLauncher === "file" ? "New Explorer tab" : `New ${launcherLabel(nextLauncher)} session`}
           title={capacityTitleFor(nextLauncher)}
         ><Plus size={14} /></button>
       </div>
@@ -5288,27 +5301,27 @@
         </div>
         <div class="gp-menu-sep my-1"></div>
         <div class="flex flex-col gap-0.5" role="group" aria-label="Sidebar and file explorer">
-          <span class="gp-label px-2.5 py-0.5">Sidebar &amp; File Explorer</span>
+          <span class="gp-label px-2.5 py-0.5">Sidebar &amp; Explorer</span>
           <button
             type="button"
             class="gp-menu-item text-textMuted"
             data-testid="terminal-launcher-toggle-explorer"
             disabled={!repoPath}
-            title="Dock or hide the dedicated File Explorer sidebar beside terminal panes (never forces a 3rd split pane)"
+            title="Dock or hide the dedicated Explorer sidebar beside terminal panes (never forces a 3rd split pane)"
             onclick={() => {
               launcherMenuOpen = false;
               toggleExplorerSidebar();
             }}
           >
             <FolderTree size={13} class="text-accent shrink-0" />
-            <span class="truncate">{explorerSidebarOpen ? "Hide File Explorer Sidebar" : "Show File Explorer Sidebar"}</span>
+            <span class="truncate">{explorerSidebarOpen ? "Hide Explorer Sidebar" : "Show Explorer Sidebar"}</span>
           </button>
           <button
             type="button"
             class="gp-menu-item text-textMuted"
             data-testid="terminal-launcher-split-file"
             disabled={!repoPath || (!hasVisibleFilePane && !canCreateKind("file"))}
-            title="Open a File Explorer & Markdown pane in a side-by-side split"
+            title="Open a Explorer & Markdown pane in a side-by-side split"
             onclick={() => {
               launcherMenuOpen = false;
               const err = openFileSplitFor(undefined, null, null, { focus: true });
@@ -5316,7 +5329,7 @@
             }}
           >
             <Columns2 size={13} class="text-textMuted shrink-0" />
-            <span class="truncate">Open File Explorer in Split</span>
+            <span class="truncate">Open Explorer in Split</span>
           </button>
         </div>
         <div class="gp-menu-sep my-1"></div>
@@ -5402,7 +5415,7 @@
         {@const ctxCanReplaceActive = Boolean(splitRoot && !ctxInActiveSplitGroup)}
         {@const ctxJoinTargets = pairJoinTargets(splitGroups, ctxTab.id).filter((target) => !(ctxCanPairWithActive && target.groupId === activeGroup?.id))}
         {@const canSplitPaneWithNew = Boolean(repoPath && leafPaneIds(ctxGroup?.tree ?? null).length < MAX_SPLIT_PANES && canCreateKind(ctxTab.launcher))}
-        {@const ctxKindLabel = ctxTab.launcher === "file" ? "File Explorer" : launcherLabel(ctxTab.launcher)}
+        {@const ctxKindLabel = ctxTab.launcher === "file" ? "Explorer" : launcherLabel(ctxTab.launcher)}
         {@const ctxStripIdx = orderedStripTabs.findIndex((candidate) => candidate.id === ctxTab.id)}
         {@const closableOtherIds = orderedStripTabs.filter((candidate) => candidate.id !== ctxTab.id && !candidate.pinned).map((candidate) => candidate.id)}
         {@const closableRightIds = ctxStripIdx >= 0 ? orderedStripTabs.slice(ctxStripIdx + 1).filter((candidate) => !candidate.pinned).map((candidate) => candidate.id) : []}
@@ -6343,7 +6356,7 @@
                   data-testid="terminal-explorer-target-tab"
                   aria-pressed={explorerOpenTarget === "tab"}
                   class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'tab' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
-                  title="Open clicked files in a Files tab (or update an already-visible file pane) without adding a 3rd split pane · Alt+Click splits · ⌘/Ctrl+Click opens in Code view"
+                  title={`Open clicked files in a Files tab (or update an already-visible file pane) without adding a 3rd split pane · Alt+Click splits · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("tab")}
                 >
                   <FileText size={10} class="shrink-0" />
@@ -6354,7 +6367,7 @@
                   data-testid="terminal-explorer-target-split"
                   aria-pressed={explorerOpenTarget === "split"}
                   class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'split' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
-                  title="Open clicked files side-by-side in split view · ⌘/Ctrl+Click opens in Code view"
+                  title={`Open clicked files side-by-side in split view · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("split")}
                 >
                   <Columns2 size={10} class="shrink-0" />
@@ -6366,7 +6379,7 @@
                     data-testid="terminal-explorer-target-code"
                     aria-pressed={explorerOpenTarget === "code"}
                     class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'code' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
-                    title="Open clicked files in the full Code view · ⌘/Ctrl+Click opens a Files tab · Alt+Click splits"
+                    title={`Open clicked files in the full Code view · ${codeViewClick} opens a Files tab · Alt+Click splits`}
                     onclick={() => setExplorerOpenTarget("code")}
                   >
                     <ExternalLink size={10} class="shrink-0" />
@@ -6392,7 +6405,7 @@
                 class="gp-icon-btn"
                 data-size="sm"
                 aria-label="Close file explorer sidebar"
-                title="Hide docked File Explorer sidebar"
+                title="Hide docked Explorer sidebar"
                 onclick={toggleExplorerSidebar}
               >
                 <PanelLeftClose size={12} />
@@ -6467,7 +6480,7 @@
               title={capacityTitleFor("file")}
               onclick={() => void openBeside("file")}
             >
-              <LauncherIcon kind="file" size={12} /> File Explorer
+              <LauncherIcon kind="file" size={12} /> Explorer
             </button>
           </div>
         </div>
@@ -6631,6 +6644,9 @@
             aria-label={tabLabel(tab)}
           >
             {#if splitRoot}
+              <!-- Justified: a drag handle and context-menu surface for the pane. The
+                   focusable controls (rename input, buttons) sit inside it, and dragstart
+                   declines when the event comes from one of them. -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="h-7 shrink-0 px-2 flex items-center gap-1.5 min-w-0 select-none text-micro transition-colors {isRenamingThisPane ? '' : 'cursor-grab active:cursor-grabbing'} {isFocusedPane ? 'bg-accent/10 text-textPrimary' : 'bg-surface/80 text-textMuted'}"

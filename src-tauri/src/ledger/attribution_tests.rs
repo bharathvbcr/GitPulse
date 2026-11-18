@@ -4,10 +4,12 @@
 //! real catch-up writes.
 
 use super::attribution::{
-    basis, command_target, is_whole_command, link_commits, read_command, read_command_from,
-    runs_git_mutation, CommitLink, Target, COMMAND_META_VERSION, HIDDEN_PROBE_ROWS,
-    LINK_MAX_COMMITS, LINK_SCAN_ROWS, LINK_WINDOW_MS,
+    basis, is_whole_command, link_commits, read_command_from, runs_git_mutation, CommitLink,
+    Target, COMMAND_META_VERSION, HIDDEN_PROBE_ROWS, LINK_MAX_COMMITS, LINK_SCAN_ROWS,
+    LINK_WINDOW_MS,
 };
+#[cfg(unix)]
+use super::attribution::{command_target, read_command};
 use super::*;
 use std::path::Path;
 

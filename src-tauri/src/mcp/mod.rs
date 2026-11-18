@@ -3843,11 +3843,15 @@ fn read_target(
     .map_err(|error| error.to_string())
 }
 
+/// Repository root, the caller session id, the caller token, and the standalone
+/// `mcp-<pid>` caller name (set only when there is no terminal session).
+type OrchestrateContext = (String, Option<String>, Option<String>, Option<String>);
+
 fn resolve_orchestrate_context(
     repo_path: &str,
     caller_session_id: Option<String>,
     caller_token: Option<String>,
-) -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
+) -> Result<OrchestrateContext, String> {
     crate::repository_trust::require(std::path::Path::new(repo_path))
         .map_err(CommandError::into_message)?;
     let root = crate::engine::git_cli::find_git_root(std::path::Path::new(repo_path))
@@ -7813,7 +7817,10 @@ mod tests {
             .expect("gitpulse_terminal_exec succeeds");
             assert_eq!(exec_out["exit_code"], 0, "{exec_out}");
             assert!(
-                exec_out["text"].as_str().unwrap().contains("MCP_EXEC_READY_88"),
+                exec_out["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("MCP_EXEC_READY_88"),
                 "{exec_out}"
             );
             call_writer(
@@ -8774,6 +8781,9 @@ mod tests {
         // 3. Mark the database file as read-only.
         struct ReadonlyGuard(std::path::PathBuf);
         impl Drop for ReadonlyGuard {
+            // On Windows `set_readonly(false)` clears the read-only attribute; the lint
+            // is about Unix permission bits.
+            #[allow(clippy::permissions_set_readonly_false)]
             fn drop(&mut self) {
                 #[cfg(unix)]
                 {

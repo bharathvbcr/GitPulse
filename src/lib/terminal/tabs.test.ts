@@ -885,7 +885,7 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
       "file",
     ]);
     expect(mod.dockTabTypesFor(true).find((t: { kind: string }) => t.kind === "file")?.label).toBe(
-      "File Explorer",
+      "Explorer",
     );
     expect(mod.offeredDockTabKind("file", false)).toBe("file");
     expect(mod.offeredDockTabKind("browser", false)).toBe("shell");
@@ -904,6 +904,15 @@ describe("orchestrated child tabs (openAttachedChildTab)", () => {
     const seededTab = seeded.tabs.find((t) => t.id === seededId)!;
     expect(tabLabel(seededTab)).toBe("Fix sidebar nav");
     expect(mod.effectiveSessionTitle(seededTab)).toBe("Fix sidebar nav");
+
+    // A task attempt keeps naming its task once the agent sets a title of its own.
+    let attempt = openTab(initialState("shell"), "claude", { runId: "run-78", title: "Preserve E42 when reconnecting" });
+    const attemptId = attempt.activeId!;
+    attempt = setTabTitle(attempt, attemptId, "Fixing E42");
+    const attemptTab = attempt.tabs.find((t) => t.id === attemptId)!;
+    expect(attemptTab.taskRunId).toBe("run-78");
+    expect(mod.effectiveSessionTitle(attemptTab)).toBe("Preserve E42 when reconnecting");
+    expect(mod.effectiveSessionTitle({ ...attemptTab, taskRunId: undefined })).toBe("Fixing E42");
 
     // Astral-plane emoji straddling codepoint 27 in tabLabel never splits surrogate pairs
     const emojiState = setTabTitle(initialState("claude"), "tab-1", `${"a".repeat(26)}🚀!!`);

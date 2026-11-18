@@ -420,7 +420,7 @@
         title="Open in MarkDev desktop application or default editor"
       >
         <ExternalLink size={11} />
-        <span class="hidden @3xl/markdev:inline">Open in MarkDev</span>
+        <span class="hidden @4xl/markdev:inline">Open in MarkDev</span>
       </button>
     </div>
       </div>

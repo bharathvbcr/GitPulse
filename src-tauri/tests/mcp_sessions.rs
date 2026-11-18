@@ -8,18 +8,29 @@
 
 mod common;
 
+#[cfg(unix)]
 use gitpulse_lib::alerts::{
     default_state_snapshot_path, read_state_snapshot, start as start_alerts, try_offer, Host,
     HubStateRead, Notice, Origin,
 };
 use gitpulse_lib::procguard::LockedSpawn;
+#[cfg(unix)]
 use gitpulse_lib::repository_trust;
+#[cfg(unix)]
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(unix)]
+use std::process::{Child, ChildStdin};
+use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROLE_ENV: &str = "GITPULSE_FAKE_AGENT_ROLE";
@@ -68,10 +79,12 @@ fn fake_agent_process_entry() {
     }
 }
 
+#[cfg(unix)]
 struct SnapshotHost {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Host for SnapshotHost {
     fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
         Ok(true)
@@ -86,17 +99,20 @@ impl Host for SnapshotHost {
     }
 }
 
+#[cfg(unix)]
 struct ChildGuard {
     child: Child,
     stdin: Option<ChildStdin>,
 }
 
+#[cfg(unix)]
 impl ChildGuard {
     fn pid(&self) -> u32 {
         self.child.id()
     }
 }
 
+#[cfg(unix)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         drop(self.stdin.take());
@@ -105,11 +121,13 @@ impl Drop for ChildGuard {
     }
 }
 
+#[cfg(unix)]
 struct CallerMcpSession {
     guard: ChildGuard,
     lines: Receiver<Value>,
 }
 
+#[cfg(unix)]
 impl CallerMcpSession {
     fn send_and_wait(&mut self, id: u64, method: &str, params: Value) -> Value {
         let mut payload = params;
@@ -172,6 +190,7 @@ impl CallerMcpSession {
     }
 }
 
+#[cfg(unix)]
 fn spawn_sleep_agent(bin: &Path, cwd: &Path, extra_env: &[(&str, &str)]) -> ChildGuard {
     let mut cmd = Command::new(bin);
     cmd.args(["--exact", "fake_agent_process_entry", "--nocapture"])
@@ -210,6 +229,7 @@ fn spawn_sleep_agent(bin: &Path, cwd: &Path, extra_env: &[(&str, &str)]) -> Chil
     ChildGuard { child, stdin }
 }
 
+#[cfg(unix)]
 fn spawn_caller_mcp_agent(
     bin: &Path,
     cwd: &Path,
@@ -272,10 +292,12 @@ fn spawn_caller_mcp_agent(
     }
 }
 
+#[cfg(unix)]
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+#[cfg(unix)]
 fn copy_fake_agent_binary(dir: &Path, name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let dst = dir.join(name);
@@ -290,6 +312,7 @@ fn copy_fake_agent_binary(dir: &Path, name: &str) -> PathBuf {
     dst
 }
 
+#[cfg(unix)]
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -298,6 +321,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(unix)]
 fn row_by_pid(rows: &[Value], pid: u32) -> &Value {
     rows.iter()
         .find(|row| row["pid"].as_u64() == Some(u64::from(pid)))

@@ -682,7 +682,7 @@
           type="button"
           class="gp-icon-btn p-1!"
           aria-label="Move to Explorer sidebar"
-          title="Dock File Explorer into the terminal's left sidebar"
+          title="Dock Explorer into the terminal's left sidebar"
           data-testid="terminal-file-dock-sidebar"
           onclick={() => {
             explorerOpen = false;

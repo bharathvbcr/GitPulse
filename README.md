@@ -20,7 +20,7 @@ across all your repositories. Each agent gets its own worktree, a policy guard a
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
 native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 
-[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0) ·
+[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases) ·
 [Getting started](docs/GETTING_STARTED.md) ·
 [Why GitPulse](docs/WHY_GITPULSE.md) ·
 [Agents guide](docs/AGENTS_GUIDE.md) ·
@@ -60,13 +60,13 @@ not been tested.
 
 ## GitPulse 2.0 (beta)
 
-GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0),
+GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases),
 published as a pre-release; the stable 2.0 release is coming soon. The beta is the first release since
 `v1.3.1` and includes all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
 The [feature reference](docs/FEATURES.md) lists every area.
 
-- **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab, live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.
-- **A task board agents write to:** five columns (Backlog, Ready, In progress, Review, Done), cross-repository and saved-workspace boards, up to 2,000 cards per fill, launch an agent from a card, and `gitpulse_add_task` with duplicate gating. `gitpulse_complete_task` marks a task done only after a passed verification; otherwise the card moves to Review.
+- **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab (macOS), live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.
+- **A task board agents write to:** five columns (Backlog, Ready, In progress, Review, Done), cross-repository and saved-workspace boards, up to 2,000 cards shared across a board's columns per fill, launch an agent from a card, and `gitpulse_add_task` with duplicate gating. `gitpulse_complete_task` marks a task done only after a passed verification; otherwise the card moves to Review.
 - **Guards:** Manvi's command gate classifies each decision into one of eight statuses (see [Security](docs/SECURITY.md)), repository trust is per repository and only the desktop can grant it, and allowed agent Git mutations take pre-operation snapshots (`refs/gitpulse/ops/`) with a checked undo.
 - **Code intelligence:** DevMap map, blast radius, affected tests, regression suspects, dead symbols, clones and symbol search through the palette.
 - **Load scheduler:** a memory-pressure governor for agent launches, build leases with a queue for heavy builds, parking of idle agent sessions, and a host-load strip with CPU, GPU, memory, thermal and storage indicators.
@@ -155,7 +155,7 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
 Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected
-file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (up to 1,000 open repository tabs, with at most 32 repositories watched at once and 24 recent repositories remembered),
+file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (up to 1,000 open repository tabs, with at most 24 repositories watched at once and 24 recent repositories remembered),
 **Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
 
 ## From a change to the next step
@@ -166,13 +166,13 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   phrasing with on-device Apple Intelligence fallback.
 - **Manage worktrees and branches.** Zero-round-trip branch churn carry-forward on branch mutations,
   DevMap-guided `--cone` sparse worktrees, `<512 B` zero-copy DevMap base pointers with Blake3/CAS delta overlays,
-  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`) plus lock-free `gitpulse-rustc` (`RUSTC_WRAPPER`)
-  shared CoW crate caching, parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
+  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`), an opt-in `gitpulse-rustc` (`RUSTC_WRAPPER`)
+  shared crate cache in the separately installed `gitpulse-worktree` CLI (the app itself does not use it), parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
   dead-branch cleanup with durable WAL tip backups and authorized delete actions, macOS pre-exec background QoS band isolation,
   named localhost routes via portless, and trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
   due date, and notes. Board views with swimlanes (grouped by owner or label),
-  saved views, column WIP limits, column "Load all" paging up to 2,000 cards with
+  saved views, column WIP limits, column "Load all" paging until the board holds 2,000 cards, with
   persistent reload depth, named hidden repository notices, task checklists with done states, cross-task links
   (parent, blocks, related, duplicate), the Archive dock with Deleted recovery,
   review drafting suggestions, and agent terminal handoff with per-launch model selection.

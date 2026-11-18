@@ -93,8 +93,8 @@ describe("TerminalPanel session ownership", () => {
   });
 
   it("links a resumed conversation's session back to its task, as it does an attempt's", () => {
-    expect(source).toContain("{#if row.taskRunId}");
-    expect(source).toContain("openListedTask(row.taskRunId)");
+    expect(source).toContain("{#if sessionInfo.taskRunId}");
+    expect(source).toContain("openListedTask(sessionInfo.taskRunId)");
   });
 
   it("refits the visible session when its host is shown again", () => {

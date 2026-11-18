@@ -405,6 +405,7 @@ fn git_seeded_repo() -> (tempfile::TempDir, String) {
     (dir, repo)
 }
 
+#[cfg(unix)]
 fn good_session(root: &std::path::Path, repo: &str) {
     write_at(
         &root.join("slug"),

@@ -89,7 +89,7 @@ beforeAll(() => {
   const loaded = original
     .replace(DRAFT_LINE, "let draft = $state<SessionAlertSettings | null>({ ...DEFAULT_SESSION_ALERT_SETTINGS });")
     .replace("  hookReplyMisses,\n", "  hookReplyMisses,\n    DEFAULT_SESSION_ALERT_SETTINGS,\n")
-    .replace(/from "(\.\.?\/[^"]+)"/g, (_match, specifier: string) => `from "${join(here, specifier)}"`);
+    .replace(/from "(\.\.?\/[^"]+)"/g, (_match, specifier: string) => `from "${join(here, specifier).replaceAll("\\", "/")}"`);
   expect(loaded).toContain("DEFAULT_SESSION_ALERT_SETTINGS,");
   expect(loaded).not.toMatch(/from "\.\.?\//);
   writeFileSync(generatedPath, loaded);

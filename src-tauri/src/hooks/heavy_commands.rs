@@ -418,6 +418,7 @@ pub(super) fn classify(command: &str) -> Classified {
 /// Reads one program and its arguments, already split, against the table: what
 /// the lease wrapper has when it is the program being run. No shell line is
 /// parsed, so nothing here can be a quoted word or a chained command.
+#[cfg(any(unix, test))]
 pub(super) fn classify_argv(program: &str, args: &[String]) -> Classified {
     let mut out = Classified::default();
     let mut words = Vec::with_capacity(args.len() + 1);
@@ -431,6 +432,7 @@ pub(super) fn classify_argv(program: &str, args: &[String]) -> Classified {
 /// program. `run` can start a server that never exits and would hold its slot
 /// for good; the rest build nothing. A verb added to a row above that belongs
 /// here too is still refused a slot: this list is read first.
+#[cfg(any(unix, test))]
 const NEVER_LEASED: &[(&str, &[&str])] = &[
     (
         "cargo",
@@ -441,6 +443,7 @@ const NEVER_LEASED: &[(&str, &[&str])] = &[
 
 /// Whether `program args` is a build that takes a slot: heavy by the table, on
 /// a row that leases, and not a verb that never does.
+#[cfg(any(unix, test))]
 pub(super) fn leased(program: &str, args: &[String]) -> bool {
     let name = base_name(program);
     // A call that only prints help builds nothing. After `--` the words belong

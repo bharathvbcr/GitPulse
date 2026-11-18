@@ -9,6 +9,7 @@
 
 <script lang="ts">
   import { ChevronRight, Folder, ImageOff, Search } from "@lucide/svelte";
+  import { untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import Dialog from "./Dialog.svelte";
   import { logoDirOf, logoFolderView, logoParentDir, MAX_BROWSE_SHOWN, type LogoImageList } from "../repos/repoLogo";
@@ -30,8 +31,8 @@
   }
   let { tab, returnFocus = null, onclose }: Props = $props();
 
-  // The subject is fixed for the dialog's life: a tab that re-resolves its
-  // family while the dialog is open must not move the choice to another key.
+  // Justified: the subject is fixed for the dialog's life: a tab that re-resolves
+  // its family while the dialog is open must not move the choice to another key.
   // svelte-ignore state_referenced_locally
   const subject = logoSubject(tab.path, tab, pathOptions);
   const chosen = repoLogos.choiceFor(subject.target.key);
@@ -56,7 +57,9 @@
         if (!live) return;
         list = found;
         // A start folder that holds no images any more opens at the root.
-        if (dir !== "" && !found.paths.some((path) => path.startsWith(`${dir}/`))) dir = "";
+        // Read untracked: this load runs once per subject, not on every folder change.
+        const start = untrack(() => dir);
+        if (start !== "" && !found.paths.some((path) => path.startsWith(`${start}/`))) dir = "";
       },
       () => {
         if (live) failed = true;
@@ -120,6 +123,8 @@
   function close() {
     open = false;
     // svelte-ignore state_referenced_locally
+    // Justified: the element to refocus is read once, at close, on purpose;
+    // the timeout below must not follow a prop that changes after onclose().
     const back = returnFocus;
     onclose();
     // After the focus trap has handed focus back to what it recorded, which
@@ -249,8 +254,8 @@
     </div>
 
     {#if view && view.total > 0}
-      <!-- The grid only moves focus between its own tile buttons with the
-           arrow keys; each tile is a button that does its own work. -->
+      <!-- Justified: the grid only moves focus between its own tile buttons with
+           the arrow keys; each tile is a button that does its own work. -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <div
         bind:this={gridEl}

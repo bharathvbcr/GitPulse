@@ -55,6 +55,7 @@ pub mod lease_wrapper;
 /// Whether `program args` is a build that takes a build slot: the one reading
 /// of the heavy table (`heavy_commands::leased`) the lease wrapper acts on and
 /// Health counts unleased builds by.
+#[cfg(unix)]
 pub(crate) fn build_is_leased(program: &str, args: &[String]) -> bool {
     heavy_commands::leased(program, args)
 }
@@ -3754,6 +3755,7 @@ fn report_agent_session_meta(_repo_root: &str, _input: &HookInput) {}
 ///
 /// Only `report_agent_touched_file` (macOS) sends it, and the tests read it on
 /// every host, so it exists on macOS and under `cfg(test)`.
+#[cfg(unix)]
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TouchedFileReport {
@@ -3762,6 +3764,7 @@ pub(crate) struct TouchedFileReport {
     pub artifact: bool,
 }
 
+#[cfg(unix)]
 #[cfg(any(target_os = "macos", test))]
 fn normalize_normal_relative(rel: &Path) -> Option<String> {
     let mut parts = Vec::new();
@@ -3784,6 +3787,7 @@ fn normalize_normal_relative(rel: &Path) -> Option<String> {
     }
 }
 
+#[cfg(unix)]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn extract_touched_file_report(input: &HookInput) -> Option<TouchedFileReport> {
     if input.incoming.is_none()
@@ -6107,6 +6111,7 @@ mod tests {
         parts.join("\n")
     }
 
+    #[cfg(unix)]
     fn live_here(pid: u32) -> crate::insights::LiveSession {
         crate::insights::LiveSession {
             kind: "claude".into(),

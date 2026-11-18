@@ -1430,6 +1430,7 @@ impl Shape {
     };
 
     /// Whether the command is a run of several commits.
+    #[cfg(unix)]
     #[cfg(test)]
     pub(crate) fn is_run(self) -> bool {
         self.run

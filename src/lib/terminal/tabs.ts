@@ -68,7 +68,7 @@ export function offeredSessionKind(kind: unknown, browserSessions: boolean): Ses
 export function dockTabTypesFor(
   browserSessions: boolean,
 ): readonly { kind: TabKind; label: string }[] {
-  return [...sessionTypesFor(browserSessions), { kind: "file", label: "File Explorer" }];
+  return [...sessionTypesFor(browserSessions), { kind: "file", label: "Explorer" }];
 }
 
 /** Resolves a requested dock tab kind supported on this host, falling back to `shell`. */
@@ -457,9 +457,13 @@ export function effectiveSessionTitle(
 ): string | undefined {
   const customName = tab.userNamed ? cleanTabName(tab.name ?? "", 120) : "";
   if (customName) return customName;
+  const launchLabel = cleanTabName(tab.launchName ?? tab.name ?? "", 120);
+  // An attempt's terminal is about its task. The agent's own title says what it
+  // is doing this minute, and would replace the task in the Sessions list and
+  // in the "Open the task ..." label on its Task button.
+  if (tab.taskRunId && launchLabel && !isGenericLauncherTitle(launchLabel, tab.launcher)) return launchLabel;
   const oscTitle = tab.title ? stripTitleSpinner(cleanTabName(tab.title, 256)) : "";
   if (oscTitle && !isGenericLauncherTitle(oscTitle, tab.launcher)) return oscTitle;
-  const launchLabel = cleanTabName(tab.launchName ?? tab.name ?? "", 120);
   if (launchLabel && !isGenericLauncherTitle(launchLabel, tab.launcher)) return launchLabel;
   const detail = cleanTabName(agentStatus?.detail ?? "", 120);
   return detail || undefined;

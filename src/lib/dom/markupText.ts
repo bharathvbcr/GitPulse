@@ -35,14 +35,9 @@ interface TagSpan {
  */
 export function stripMarkupComments(html: string): string {
   let current = html;
-  const steps = [current];
   for (;;) {
     const next = stripMarkupCommentsOnce(current);
-    steps.push(next);
-    if (next === current) {
-      if (html.includes("kept")) throw new Error(steps.map((step) => JSON.stringify(step)).join(" | "));
-      return current;
-    }
+    if (next === current) return current;
     current = next;
   }
 }
@@ -50,22 +45,18 @@ export function stripMarkupComments(html: string): string {
 function stripMarkupCommentsOnce(html: string): string {
   let out = "";
   let i = 0;
-  const trace: string[] = [];
   while (i < html.length) {
     const start = html.indexOf("<!--", i);
-    trace.push(`i=${i} start=${start}`);
     if (start === -1) {
       out += html.slice(i);
       break;
     }
     out += html.slice(i, start);
-    const end = html.indexOf("-->", start + 4);
-    trace.push(`end=${end} out=${JSON.stringify(out)}`);
+    // The close may share the opener's dashes: `<!-->` and `<!--->` are
+    // complete (empty) comments, as the HTML parser reads them.
+    const end = html.indexOf("-->", start + 2);
     if (end === -1) break;
     i = end + 3;
-  }
-  if (html.includes("kept") || html.includes("<!-->")) {
-    throw new Error(`${JSON.stringify(html)} => ${JSON.stringify(out)} [${trace.join("; ")}]`);
   }
   return out;
 }

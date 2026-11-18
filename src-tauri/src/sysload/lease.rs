@@ -475,10 +475,12 @@ pub fn bin_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("lease-bin")
 }
 
+#[cfg(unix)]
 fn slot_name(slot: usize) -> String {
     format!("slot-{slot}")
 }
 
+#[cfg(unix)]
 fn parse_record(bytes: &[u8]) -> Option<LeaseRecord> {
     if bytes.len() > RECORD_MAX_BYTES {
         return None;
@@ -860,6 +862,9 @@ mod unix {
 
     /// Takes the write lock on byte 0. `Ok(false)` when another process holds it.
     fn try_lock(file: &File) -> io::Result<bool> {
+        // F_WRLCK is a c_short on macOS and a c_int on Linux, so the cast is
+        // needed on one and a no-op on the other.
+        #[allow(clippy::unnecessary_cast)]
         let mut lock = flock(libc::F_WRLCK as i32);
         // SAFETY: the descriptor is open for the life of `file`, and `lock`
         // is a valid `flock` the kernel only reads.
@@ -878,6 +883,8 @@ mod unix {
     /// descriptor may be read-only and a holder holds the write lock, which
     /// conflicts with it. The calling process's own locks never conflict.
     fn probe(file: &File) -> io::Result<Probe> {
+        // As in `try_lock`: c_short on macOS, c_int on Linux.
+        #[allow(clippy::unnecessary_cast)]
         let mut lock = flock(libc::F_RDLCK as i32);
         // SAFETY: as in `try_lock`; the kernel writes the answer into `lock`.
         let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };

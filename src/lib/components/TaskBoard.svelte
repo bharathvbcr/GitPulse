@@ -3545,8 +3545,9 @@
   :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn{padding:2px 10px}
   /* The shared liquid rule clears the active fill because a gliding
      `.gp-liquid-selection` draws it; this switch has none, so on macOS the
-     chosen layout was marked by text colour alone. Draw the bubble here. */
-  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn[data-active="true"]{background:rgb(var(--c-surface-hover));box-shadow:inset 0 0 0 1px var(--mac-glass-edge),var(--shadow-bubble)}
+     chosen layout was marked by text colour alone. Draw the same glass bubble
+     `.gp-liquid-selection` paints (app.css), sheen over the hover tint. */
+  :global(html.macos) .layout-switch.gp-liquid-tabs .gp-seg-btn[data-active="true"]{background:linear-gradient(160deg,var(--mac-glass-sheen),transparent),rgb(var(--c-surface-hover));box-shadow:inset 0 0 0 1px var(--mac-glass-edge),inset 0 1px 0 var(--mac-glass-sheen),var(--shadow-bubble-lift)}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
   .match-hint{display:block;margin-top:4px;font-size:var(--text-micro);line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}

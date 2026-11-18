@@ -5,10 +5,8 @@ use super::process::simplified_windows_path;
 use super::process::XCRUN_GIT_SHIM;
 #[cfg(test)]
 use super::process::{
-    build_capture_command_in, frozen_gate as frozen, hold_credit_open, is_deferred_under_load,
-    is_injected_git_env, last_process_failure, process_failures, rev_parse_launches_from,
-    spawn_labels_during, spawn_log, take_post_action_credit, PathSource, SpawnGate,
-    POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
+    build_capture_command_in, is_deferred_under_load, is_injected_git_env, last_process_failure,
+    process_failures, rev_parse_launches_from, PathSource, SLOT_WAIT_SUFFIX,
 };
 #[cfg(target_os = "macos")]
 use super::process::{developer_dirs, past_xcrun_git_shim, REAL_GIT_DIRS};
@@ -17,6 +15,11 @@ use super::process::{
     pin_git_environment, run_bounded, run_bounded_capped, run_observed, run_read_shared,
     text_from_bytes, with_spawn_source, BoundedRun, Incomplete, KeepDeadlinePrefix,
     ProcessObserver, DEFAULT_TIMEOUT, MAX_OUTPUT_BYTES, NETWORK_TIMEOUT, TIMEOUT_MARKER,
+};
+#[cfg(all(test, unix))]
+use super::process::{
+    frozen_gate as frozen, hold_credit_open, spawn_labels_during, spawn_log,
+    take_post_action_credit, SpawnGate, POST_ACTION_CREDIT_SPAWNS,
 };
 use crate::diff::{Expect, WriteFailure};
 use crate::ipc_error::CommandError;
@@ -2010,8 +2013,11 @@ mod tests {
     use crate::procguard::LockedSpawn;
     #[cfg(unix)]
     use crate::test_support::wait_gone;
+    #[cfg(unix)]
     use crate::test_support::wait_until;
+    #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::thread;
 
     #[cfg(unix)]

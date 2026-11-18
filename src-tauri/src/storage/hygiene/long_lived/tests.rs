@@ -21,9 +21,10 @@ fn spend() -> Spend {
 
 /// Restores a directory's mode when dropped, so a failing assertion cannot
 /// leave a fixture the temp directory cannot remove.
+#[cfg(unix)]
 struct Denied(PathBuf);
+#[cfg(unix)]
 impl Denied {
-    #[cfg(unix)]
     fn new(path: &Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();

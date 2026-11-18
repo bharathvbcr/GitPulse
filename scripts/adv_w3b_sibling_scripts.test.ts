@@ -122,7 +122,9 @@ describe("a bad bound is refused identically by both siblings, before any other 
   });
 });
 
-describe("a git that hangs inside findSibling", () => {
+// POSIX-only: the fake `git` is an extensionless `#!/bin/sh` script that ends in `sleep`, which
+// Windows cannot spawn as `git`, so the scripts never reach it (no marker is written).
+describe.skipIf(process.platform === "win32")("a git that hangs inside findSibling", () => {
   // The scripts are copied under a scratch root that has no sibling checkout
   // on any ancestor, so `findSibling` falls back to `git rev-parse`, which the
   // fake hangs. The bound of 300 ms must cut it, and report it as a FAIL.

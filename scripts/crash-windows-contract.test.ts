@@ -42,7 +42,7 @@ const table = JSON.parse(readFileSync(TABLE_PATH, "utf8")) as Table;
 /** Every `.rs` file the table's scope names, directories walked recursively. */
 function scopeFiles(scope: Table["scope"]): string[] {
   const walked = scope.dirs.flatMap((dir) =>
-    filesUnder(path.join(ROOT, dir), (name) => name.endsWith(".rs")).map((file) => path.relative(ROOT, file)),
+    filesUnder(path.join(ROOT, dir), (name) => name.endsWith(".rs")).map((file) => path.relative(ROOT, file).replaceAll("\\", "/")),
   );
   return [...new Set([...walked, ...scope.files])].sort();
 }

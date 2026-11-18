@@ -327,8 +327,10 @@ pub(crate) trait SessionObserver: Send + Sync {
 /// release LTO folded those calls into the app's one implementor
 /// (`workbench::terminal_run::RunObserver<Wry>`), whose window-stack code the
 /// host's own LTO had already dropped: `gitpulse-ptyd` stopped linking.
+#[cfg(unix)]
 pub(crate) enum NoObserver {}
 
+#[cfg(unix)]
 impl SessionObserver for NoObserver {
     fn run_id(&self) -> &str {
         match *self {}
@@ -478,8 +480,10 @@ struct SessionEntry {
     rows: Arc<AtomicU16>,
     cols: Arc<AtomicU16>,
     parent_session_id: Option<String>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     child_launcher: Option<String>,
     child_title: Option<String>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     token_hash_hex: Option<String>,
     /// [`clock_ms`] when the reader last got output from the child: the
     /// session's own clock for "this terminal has been quiet for".
@@ -759,17 +763,9 @@ impl Default for TerminalSessions {
     }
 }
 
-#[cfg(unix)]
+/// The durable session ledger is the same on every platform: Unix keeps it
+/// beside the terminal host, Windows beside the in-process engine.
 impl TerminalSessions {
-    /// Creates an isolated registry backed by `ledger` (used by persistence tests).
-    #[cfg(test)]
-    pub fn with_ledger(ledger: Arc<session_ledger::SessionLedger>) -> Self {
-        Self {
-            session_ledger: ledger,
-            ..Self::default()
-        }
-    }
-
     /// Durable per-tab recovery ledger for hosted agent & shell tabs.
     pub fn session_ledger(&self) -> &Arc<session_ledger::SessionLedger> {
         &self.session_ledger
@@ -781,7 +777,7 @@ impl TerminalSessions {
         if self.leaves_sessions_running() {
             return 0;
         }
-        if self.host.host_pid().is_some() {
+        if self.host_pid().is_some() {
             let _ = list_sessions(self);
         }
         self.session_ledger.mark_app_quit()
@@ -802,6 +798,18 @@ impl TerminalSessions {
                 );
                 0
             }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl TerminalSessions {
+    /// Creates an isolated registry backed by `ledger` (used by persistence tests).
+    #[cfg(test)]
+    pub fn with_ledger(ledger: Arc<session_ledger::SessionLedger>) -> Self {
+        Self {
+            session_ledger: ledger,
+            ..Self::default()
         }
     }
 
@@ -1110,6 +1118,7 @@ impl TerminalSessions {
     }
 }
 
+#[cfg(unix)]
 pub(in crate::terminal) fn engine_session_telemetry(
     engine: &Engine,
     session_id: &str,
@@ -4115,6 +4124,7 @@ pub const PEER_WAKE_PROMPT: &str = "Process pending GitPulse peer inbox message.
 /// Whether `process_name` names the Antigravity CLI (`agy`) in a terminal's
 /// foreground. Shells (`zsh`, `bash`, `sh`) and editors (`vim`) return `false`
 /// so a post-exit shell can never execute the wake prompt as a command.
+#[cfg(unix)]
 pub(crate) fn is_agy_foreground_process(process_name: Option<&str>) -> bool {
     matches!(process_name, Some("agy"))
 }
@@ -4151,7 +4161,7 @@ pub(crate) fn deliver_peer_wake_with_mailbox(
     }
     #[cfg(not(unix))]
     {
-        let _ = state;
+        let _ = (state, session_id);
         Err("Peer terminal wakeup requires Unix foreground process verification.".into())
     }
 }
@@ -4717,7 +4727,6 @@ pub(in crate::terminal) mod engine {
         engine_pty_size as pty_size, engine_reader_wakeups as reader_wakeups,
         engine_resize_session as resize_session, engine_session_context as session_context,
         engine_session_listening_ports as session_listening_ports,
-        engine_session_telemetry as session_telemetry,
         engine_set_background_sessions as set_background_sessions,
         engine_shutdown_sessions as shutdown_sessions, engine_write_pty_bytes as write_pty_bytes,
         MasterHold,
@@ -4725,7 +4734,7 @@ pub(in crate::terminal) mod engine {
     #[cfg(unix)]
     pub(in crate::terminal) use super::{
         engine_hosted_session_snapshot as hosted_session_snapshot,
-        engine_start_unobserved as start_unobserved,
+        engine_session_telemetry as session_telemetry, engine_start_unobserved as start_unobserved,
     };
 }
 

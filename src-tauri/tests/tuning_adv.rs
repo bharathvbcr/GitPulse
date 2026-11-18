@@ -128,6 +128,7 @@ fn adv_crafted_confirmed_argv_variants_run_nothing() {
     assert_eq!(local_value(&main, "core.hooksPath"), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_symlink_to_an_untrusted_repository_is_refused() {
     let _g = serial();
@@ -142,10 +143,7 @@ fn adv_symlink_to_an_untrusted_repository_is_refused() {
         .unwrap();
     assert!(init.status.success());
     let link = parent.path().join("link");
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    #[cfg(not(unix))]
-    return;
     let refused = tuning_apply(
         str_of(&link),
         &[TuningChange::UntrackedCache],

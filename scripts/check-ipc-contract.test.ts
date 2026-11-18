@@ -344,8 +344,11 @@ describe("annotated but unregistered commands", () => {
     // storage branch took main. 335 with cmd_manvi_use (the Manvi pane's
     // local/cloud switch, from the Manvi-route AI branch) and
     // cmd_host_load_leases, cmd_host_load_idle and cmd_host_load_park (build
-    // slots and idle sessions, from the load-leases branch).
-    expect(found.size).toBe(335);
+    // slots and idle sessions, from the load-leases branch). 336 with
+    // cmd_terminal_set_title (a renamed terminal keeps its title across
+    // reloads and restarts), from the terminal landing in e8f7bad9c.
+    expect(found.size).toBe(336);
+    expect(found.has("cmd_terminal_set_title")).toBe(true);
     expect(found.has("cmd_manvi_use")).toBe(true);
     expect(found.has("cmd_host_load_leases")).toBe(true);
     expect(found.has("cmd_host_load_idle")).toBe(true);

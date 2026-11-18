@@ -71,6 +71,7 @@ struct Obs {
     cpu_us: u64,
 }
 
+#[cfg(unix)]
 fn children_cpu_us() -> u64 {
     // SAFETY: `rusage` is plain data; getrusage writes it and reads nothing.
     let usage = unsafe {
@@ -80,6 +81,14 @@ fn children_cpu_us() -> u64 {
     };
     let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
     micros(usage.ru_utime) + micros(usage.ru_stime)
+}
+
+/// Windows has no `RUSAGE_CHILDREN`, and a bench row without its CPU column is not
+/// this bench, so it stops here rather than report a made-up one.
+#[cfg(not(unix))]
+fn children_cpu_us() -> u64 {
+    eprintln!("graph_hit_path measures getrusage(RUSAGE_CHILDREN), which this platform lacks; run it on Unix");
+    std::process::exit(2)
 }
 
 /// One call of the command plus its JSON, checked to be the answer the arm

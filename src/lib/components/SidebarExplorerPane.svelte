@@ -15,6 +15,8 @@
   import { terminalExplorerSidebar } from "../terminal/explorerSidebar";
   import { TERMINAL_SESSION_CANCELED, terminalLaunchRequests } from "../terminal/launchRequests";
   import { describeError } from "../ui/copy/describeFailure";
+  import { platformChord } from "../ui/platformCopy";
+  import { hostPlatform } from "../stores/platformStore";
 
   let {
     repoPath = null,
@@ -23,6 +25,7 @@
   } = $props();
 
   const effectiveRepoPath = $derived(repoPath ?? $currentRepoPath);
+  const codeViewClick = $derived(platformChord("⌘/Ctrl+Click", "Ctrl+Click", $hostPlatform.os));
   const openTarget = $derived($sidebarNavStore.openTarget);
   const dockedInTerminal = $derived($terminalExplorerSidebar.open && $repoStore.terminalOpen);
   let lastClickMods = { altKey: false, metaOrCtrlKey: false };
@@ -148,7 +151,7 @@
         class="inline-flex flex-1 justify-center items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {openTarget === 'tab'
           ? 'bg-accent/15 text-accent font-medium'
           : 'text-textMuted hover:text-textPrimary'}"
-        title="Open clicked files in a standalone terminal Files tab · ⌘/Ctrl+Click opens in Code view"
+        title={`Open clicked files in a standalone terminal Files tab · ${codeViewClick} opens in Code view`}
         onclick={() => setTarget("tab")}
       >
         <FileText size={11} class="shrink-0" />
@@ -161,7 +164,7 @@
         class="inline-flex flex-1 justify-center items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {openTarget === 'split'
           ? 'bg-accent/15 text-accent font-medium'
           : 'text-textMuted hover:text-textPrimary'}"
-        title="Open clicked files side-by-side in terminal split · ⌘/Ctrl+Click opens in Code view"
+        title={`Open clicked files side-by-side in terminal split · ${codeViewClick} opens in Code view`}
         onclick={() => setTarget("split")}
       >
         <Columns2 size={11} class="shrink-0" />
@@ -173,10 +176,10 @@
       class="gp-icon-btn shrink-0 {dockedInTerminal ? 'text-accent bg-accent/15' : 'hover:text-accent'}"
       data-size="sm"
       data-testid="sidebar-explorer-dock-terminal"
-      aria-label={dockedInTerminal ? "Hide File Explorer in terminal sidebar" : "Show File Explorer in terminal sidebar"}
+      aria-label={dockedInTerminal ? "Hide Explorer in terminal sidebar" : "Show Explorer in terminal sidebar"}
       aria-pressed={dockedInTerminal}
       disabled={!effectiveRepoPath}
-      title={dockedInTerminal ? "Hide docked File Explorer sidebar inside the terminal" : "Show docked File Explorer sidebar inside the terminal"}
+      title={dockedInTerminal ? "Hide docked Explorer sidebar inside the terminal" : "Show docked Explorer sidebar inside the terminal"}
       onclick={dockExplorerInTerminal}
     >
       <SquareTerminal size={13} />

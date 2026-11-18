@@ -395,6 +395,7 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
 /// names the worktree in its arguments (a build run from elsewhere with
 /// `--target-dir` inside it) has nothing "working in" it by cwd, and still
 /// keeps it from being removed. Before, only the working directory was read.
+#[cfg(unix)]
 #[test]
 fn a_process_naming_the_worktree_in_an_argument_refuses_teardown() {
     let dir = tempfile::tempdir().unwrap();

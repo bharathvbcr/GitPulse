@@ -456,7 +456,7 @@ describe("BranchList two-line branch rows", () => {
     // so the rail ends above line two). Line two runs under nothing.
     expect(source).toContain('<span class="w-full flex items-center gap-1.5 min-w-0 leading-none pr-11">');
     expect(source).toContain('"flex-1 min-w-0 flex items-center gap-1.5 text-left pr-1"');
-    expect(source).toContain('class="absolute right-1 top-[5px] h-4 flex items-center"');
+    expect(source).toContain('class="absolute right-1 top-[4px] h-4 flex items-center"');
     // At rest the status dots hold the row's right edge; they yield to the
     // actions on hover and focus rather than sitting beside them.
     expect(source).toContain("group-hover:opacity-0 group-focus-within:opacity-0");

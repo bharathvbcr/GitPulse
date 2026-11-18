@@ -373,11 +373,17 @@ fn external_hook_caller_id() -> String {
     }
 }
 
+/// `Call` carries the whole wire request, as it is sent; the enum is built once
+/// per CLI run, so boxing it would only add an allocation.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum TermCliOutcome {
     Help(String),
     Call(gitpulse_lib::terminal::orchestrate::OrchestrateCall),
 }
+
+/// Repository root, caller session id, caller token, and the standalone caller name.
+type CallerContext = (String, Option<String>, Option<String>, Option<String>);
 
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
@@ -448,7 +454,7 @@ fn parse_term_cli(
     let resolve_common = |repo_opt: Option<String>,
                           sid_opt: Option<String>,
                           tok_opt: Option<String>|
-     -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
+     -> Result<CallerContext, String> {
         let repo = repo_opt
             .or_else(|| default_repo.map(str::to_owned))
             .map(|s| s.trim().to_owned())

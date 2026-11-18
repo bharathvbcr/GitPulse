@@ -69,7 +69,7 @@ describe("every popover the action places leaves with the shared exit", () => {
   };
 
   const found = svelteFiles(SRC).flatMap((file) => {
-    const rel = relative(SRC, file);
+    const rel = relative(SRC, file).replaceAll("\\", "/");
     return popoverTags(readFileSync(file, "utf8")).map((tag) => ({ rel, tag }));
   });
 

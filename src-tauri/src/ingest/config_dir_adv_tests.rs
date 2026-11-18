@@ -8,8 +8,11 @@
 
 use super::*;
 
+#[cfg(unix)]
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 const ROOT_VARS: [&str; 5] = [
     "GITPULSE_TRANSCRIPT_ROOT",
