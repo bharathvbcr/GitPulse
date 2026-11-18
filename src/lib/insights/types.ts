@@ -258,7 +258,22 @@ export interface InsightsSnapshot {
   branch_ok: boolean;
   /** True when the snapshot hit its deadline, so facets below may be partial. */
   deadline_expired: boolean;
+  /** From before the live-session observation to the end of the snapshot. */
   duration_ms: number;
+  /** Milliseconds per stage; a stage that did not run in this process is absent. */
+  stages_ms?: Partial<
+    Record<
+      | 'app_ask'
+      | 'observe'
+      | 'listing'
+      | 'main_status'
+      | 'worktree_status'
+      | 'derive'
+      | 'ledger'
+      | 'codeintel',
+      number
+    >
+  >;
   worktrees: WorktreeFacet;
   agents: AgentSummary;
   changes: ChangesFacet;

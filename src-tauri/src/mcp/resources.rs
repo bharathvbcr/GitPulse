@@ -436,14 +436,44 @@ pub fn ledger_query_page(
 /// age_ms}`; whatever keeps the app from answering (absent, slow, too old,
 /// busy, an older build, a facet it could not read) leaves this process to scan
 /// for itself, which is the document the tool has always returned.
+///
+/// When the app did not serve it, the document says why in `app_unserved` and
+/// how long the ask took in `stages_ms.app_ask`. Both used to be visible only
+/// at Debug, which release builds do not log, so a reader could not tell "not
+/// asked" from "refused" from "too slow", and the ask's cost was invisible
+/// beside `duration_ms`.
 pub fn insights_document(repo: &str) -> Value {
+    let asking = std::time::Instant::now();
     match crate::hooks::insights_from_app(repo) {
         Ok((snapshot, age_ms)) => served_document(&snapshot, age_ms),
         Err(why) => {
+            let asked_ms = asking.elapsed().as_millis() as u64;
             log::debug!(target: "mcp", "insights: scanning here, the app did not: {why}");
-            json!(crate::insights::snapshot(repo))
+            let mut snapshot = crate::insights::snapshot(repo);
+            snapshot.stages_ms.app_ask = Some(asked_ms);
+            // The whole call, as on the served path, whose clock starts at the ask.
+            snapshot.duration_ms = snapshot.duration_ms.saturating_add(asked_ms);
+            unserved_document(&snapshot, &why)
         }
     }
+}
+
+/// The most of the app's refusal the document carries: enough for the reason,
+/// not a payload of its own.
+const APP_UNSERVED_MAX_CHARS: usize = 300;
+
+/// The insights document of a snapshot this process made because the app did
+/// not serve one, with the reason as `app_unserved`.
+pub(crate) fn unserved_document(snapshot: &crate::insights::InsightsSnapshot, why: &str) -> Value {
+    let mut document = json!(snapshot);
+    if let Some(object) = document.as_object_mut() {
+        let mut reason: String = why.chars().take(APP_UNSERVED_MAX_CHARS).collect();
+        if why.chars().nth(APP_UNSERVED_MAX_CHARS).is_some() {
+            reason.push('…');
+        }
+        object.insert("app_unserved".to_string(), json!(reason));
+    }
+    document
 }
 
 /// The insights document of a snapshot the app supplied: the snapshot, plus

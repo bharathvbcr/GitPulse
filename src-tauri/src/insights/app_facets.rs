@@ -311,17 +311,25 @@ fn serve_with(
             // when the re-read did not complete, `changes` is not scanned,
             // never the kept read.
             if parties.iter().any(|party| super::same_path(party, repo)) {
-                let reread_ok = list.iter().any(|info| {
-                    super::same_path(&info.path, repo)
-                        && matches!(info.status_read, StatusRead::Read { .. })
-                });
-                read.changes = if reread_ok {
-                    match GitReader::get_status_since(repo, reread.begun) {
-                        Ok(files) => changes_from_status(&files, false),
-                        Err(error) => empty_changes(error.into_message()),
+                let main_read = list
+                    .iter()
+                    .find(|info| super::same_path(&info.path, repo))
+                    .map(|info| &info.status_read);
+                read.changes = match main_read {
+                    Some(StatusRead::Read { .. }) => {
+                        match GitReader::get_status_since(repo, reread.begun) {
+                            Ok(files) => changes_from_status(&files, false),
+                            Err(error) => empty_changes(error.into_message()),
+                        }
                     }
-                } else {
-                    empty_changes("the re-read of this checkout did not finish in time")
+                    // Refused (shed under load) or failed: say which. Calling
+                    // a 0 ms refusal "did not finish in time" sent the
+                    // diagnosis looking at budgets instead of the spawn gate.
+                    Some(StatusRead::Failed(error)) => empty_changes(format!(
+                        "the re-read of this checkout failed: {}",
+                        error.message()
+                    )),
+                    _ => empty_changes("the re-read of this checkout did not finish in time"),
                 };
                 stamps.changes = reread.begun;
             }
@@ -648,6 +656,12 @@ pub fn snapshot_from_app(
                     .collect();
                 crate::engine::worktree::remember_verified_member_paths(repo_path, &member_paths);
             }
+            // The git stages ran in the app, inside the ask; only the ask's own
+            // length is known here, and the local stages are timed after it.
+            let stages = super::StageTimings {
+                app_ask: Some(super::elapsed_ms(started)),
+                ..Default::default()
+            };
             Ok(complete_snapshot(
                 repo_path,
                 started,
@@ -657,6 +671,7 @@ pub fn snapshot_from_app(
                     changes,
                     collisions,
                     deadline_expired,
+                    stages,
                 },
             ))
         }

@@ -248,6 +248,36 @@ fn a_clean_shared_checkout_is_not_read_again() {
 
 /// A positive that cannot be read again within the bound comes back not
 /// scanned: never served from the read it was found in, and never read late.
+///
+/// A re-read that ran and failed (refused by the spawn gate, or git erroring)
+/// says it failed and why. Calling it "did not finish in time" made a 0 ms
+/// refusal read as a budget problem (2026-11-17).
+#[test]
+fn a_shared_checkout_whose_reread_fails_says_why_not_that_it_ran_late() {
+    let farm = farm(1, false);
+    let observation = busy_main(&farm, true);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let kept = ask_observed(&farm, &observation, &memo);
+    assert!(kept.changes.is_some(), "{:?}", kept.not_scanned);
+
+    // The kept read stays in the cell; the re-read of the positive fails.
+    std::fs::write(Path::new(&farm.repo).join(".git/index"), b"not an index")
+        .expect("corrupt the index");
+    let failed = ask_observed(&farm, &observation, &memo);
+    assert!(failed.changes.is_none(), "a failed re-read was served");
+    let gap = failed
+        .not_scanned
+        .iter()
+        .find(|gap| gap.facet == "changes")
+        .expect("changes is named as not scanned");
+    assert!(
+        gap.reason.contains("re-read of this checkout failed"),
+        "{}",
+        gap.reason
+    );
+    assert!(!gap.reason.contains("in time"), "{}", gap.reason);
+}
+
 #[test]
 fn a_dirty_shared_checkout_whose_reread_misses_the_bound_is_not_scanned() {
     let farm = farm(2, false);
