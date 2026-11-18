@@ -11306,15 +11306,31 @@ done
             );
         }
 
-        /// A case-variant spelling of a file in a sibling that holds it dirty
-        /// (APFS is case-insensitive).
+        /// A case-variant spelling of a file in a sibling that holds it dirty.
+        /// On a volume that folds case (APFS by default) `SEED.TXT` is that
+        /// file and must be judged as it. On one that does not (ext4, as on
+        /// ubuntu-latest) it names another file that no worktree holds, and is
+        /// judged exactly as a fresh name in that sibling is.
         #[test]
         fn case_variant_spelling_of_a_sibling_file_is_still_judged() {
             let farm = farm_bound(true, false, 2);
             let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
             let upper = format!("{}/SEED.TXT", b.display());
             let output = guard_here(&edit_call(a.to_str().unwrap(), &upper));
-            assert!(asks(&output), "{}", rendered(&output));
+            let folds_case = std::fs::metadata(&upper).is_ok();
+            if folds_case {
+                assert!(asks(&output), "{}", rendered(&output));
+            } else {
+                let fresh = format!("{}/never-touched.txt", b.display());
+                let control = guard_here(&edit_call(a.to_str().unwrap(), &fresh));
+                assert_eq!(
+                    asks(&output),
+                    asks(&control),
+                    "on a case-sensitive volume SEED.TXT is a file of its own: {} vs {}",
+                    rendered(&output),
+                    rendered(&control)
+                );
+            }
         }
     }
 
