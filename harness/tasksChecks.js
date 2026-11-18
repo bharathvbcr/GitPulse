@@ -3730,7 +3730,7 @@ if (params.has("check")) {
       // the fixture's own column order (position, id), never the DOM. Board
       // order is on (pickOrder above), which is what makes a card movable.
       const LONG = 60, STEP = 100, BASE = 100000;
-      const longTasks = Array.from({ length: LONG }, (_, i) => ({ ...makeTask(`task-${5000 + i}`, `Windowed review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"), position: BASE + i * STEP }));
+      const longTasks = Array.from({ length: LONG }, (_, i) => ({ ...makeTask(`task-${5000 + i}`, `Windowed review ${String(i + 1).padStart(2, "0")}${i % 3 === 1 ? " with a long title that wraps across several lines of its card, so the card is taller than a fixed row slot would allow" : ""}`, "repo-0", "review"), position: BASE + i * STEP }));
       const movers = [0, 1].map(i => makeTask(`task-${5100 + i}`, `Windowed mover ${i + 1}`, "repo-0", "backlog"));
       const longId = i => longTasks[i].id;
       const refreshLong = async () => { root.querySelector('button[aria-label="Refresh"]').click(); await settle(300); };
@@ -3749,6 +3749,13 @@ if (params.has("check")) {
         const order = fixtureOrder();
         check(`a column past 35 cards draws every one of them (${reviewIds().length} drawn of ${order.length})`, order.length > 35 && reviewIds().length === order.length);
         check("and draws them in the column's order", reviewIds().join() === order.join());
+        // Cards of different heights (the wrapping titles above) must each own a
+        // slot: a fixed-height window painted a tall card over the next one.
+        const boxes = reviewIds().map(id => card(id).getBoundingClientRect());
+        const heights = new Set(boxes.map(box => Math.round(box.height)));
+        const overlapped = boxes.map((box, i) => i > 0 && box.top < boxes[i - 1].bottom - 1 ? reviewIds()[i] : null).filter(Boolean);
+        check(`cards of varied height (${heights.size} distinct heights) each get their own slot, none painted over the one before (overlaps: ${overlapped.slice(0, 5).join(", ") || "none"})`,
+          heights.size > 1 && overlapped.length === 0 && boxes.every(box => box.height > 0));
         check("every drawn card is its own task (title and id agree)", reviewIds().every(id => card(id)?.textContent.includes(tasks.find(task => task.id === id)?.title)) && reviewIds().length > 0);
 
         guardStep = "long column: Home and End";
@@ -3762,11 +3769,14 @@ if (params.has("check")) {
 
         guardStep = "long column: re-render keeps each card's element";
         const elements = new Map(order.map(id => [id, card(id)]));
+        card(longId(30))?.focus();
         tasks = tasks.map(task => task.id === longId(0) ? { ...task, position: BASE + (LONG + 5) * STEP, revision: task.revision + 1 } : task);
         await refreshLong();
         const reordered = await settled(() => reviewIds().join() === fixtureOrder().join() && reviewIds().indexOf(longId(0)) > reviewIds().indexOf(longId(59))); await settle(200);
         const swapped = order.filter(id => card(id) === null || card(id) !== elements.get(id));
         check(`a reordered column keeps the same element on the same card id${swapped.length ? ` (changed: ${swapped.slice(0, 5).join(", ")} of ${swapped.length})` : ""}`, reordered && swapped.length === 0);
+        check("a focused card keeps its focus, and its own element, when the column reorders around it",
+          document.activeElement === elements.get(longId(30)) && document.activeElement?.dataset?.cardId === longId(30));
         check("and each card still shows its own task after the reorder", reviewIds().length === order.length && reviewIds().every(id => card(id).textContent.includes(tasks.find(task => task.id === id).title)));
         tasks = tasks.filter(task => task.id !== longId(10));
         await refreshLong();
