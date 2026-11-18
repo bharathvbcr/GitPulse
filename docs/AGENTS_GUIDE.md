@@ -61,6 +61,8 @@ created for the attempt. An attempt holds its checkout until its process is know
 You can also start sessions directly from the dock, without a task: the launchers are Shell, Claude,
 Manvi, Codex, Grok and Antigravity, plus a Browser tab for local dev servers.
 
+![The Agents view: every agent session with its checkout, presence and what needs your attention](assets/agents-tree.webp)
+
 ## Guards and trust
 
 **Per-repository trust.** Opening a checkout asks for **Trust and Open**. Trust is per repository (bound to
@@ -68,6 +70,8 @@ its common Git directory), is stored outside the repository, and can be revoked 
 desktop can grant it: the MCP server refuses writes in an untrusted repository (`untrusted_repository`)
 and cannot grant trust itself. Trust permits the repository's hooks and project tools to run under your
 account. It is an execution decision, not an OS sandbox.
+
+![The Trust this repository? prompt, shown when a new checkout is opened](assets/trust-prompt.webp)
 
 **The Manvi command gate.** Where the plugin's hooks are registered, each agent shell command passes
 `gitpulse-hook command-gate` before it runs, and each file write passes `collision-guard`. The gate is
@@ -97,6 +101,8 @@ catch an agent's own `git commit`. Allowed agent Git mutations record pre-operat
 under `refs/gitpulse/turns/` capture the working tree at a turn's start and end. A signal guard stops
 agents from killing GitPulse.
 
+![A commit from GitPulse's composer blocked by the secret scan: nothing was committed, and the finding names the file and line](assets/guard-secret-blocked.webp)
+
 ## Agent-to-agent messaging
 
 Agents on different worktrees can talk to each other instead of overwriting each other's work. The peer
@@ -115,6 +121,8 @@ hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff me
 (`gitpulse_worktree_send_message`, `gitpulse_worktree_inbox`), for example an interface-change notice to
 every sibling lane. You can send an agent a message yourself with **Send to agent** on a live session;
 GitPulse shows a preview and waits for your confirmation before delivering it.
+
+![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 
 ## The collision workflow
 

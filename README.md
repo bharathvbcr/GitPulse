@@ -18,7 +18,7 @@ across all your repositories. Each agent gets its own worktree, a policy guard a
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
 native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 
-[Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
+[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0) ·
 [Getting started](docs/GETTING_STARTED.md) ·
 [Why GitPulse](docs/WHY_GITPULSE.md) ·
 [Agents guide](docs/AGENTS_GUIDE.md) ·
@@ -27,7 +27,7 @@ native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 [Release notes](CHANGELOG.md) ·
 [v2.0 Beta notes](docs/RELEASE_NOTES_v2.0.0.md)
 
-![GitPulse on macOS: commit graph and selected commit diff](docs/assets/screenshot-graph.png)
+![GitPulse on macOS: a Claude Code agent fixing two wiki pages in its own worktree, with Follow agent showing each file it edits beside its terminal](docs/assets/hero-agents.webp)
 
 ## Why GitPulse
 
@@ -58,8 +58,9 @@ not been tested.
 
 ## GitPulse 2.0 (beta)
 
-GitPulse 2.0 is in beta on `main` as `1.99.0`. It is the first release since `v1.3.1` and includes all
-unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
+GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0),
+published as a pre-release; the stable 2.0 release is coming soon. The beta is the first release since
+`v1.3.1` and includes all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
 The [feature reference](docs/FEATURES.md) lists every area.
 
 - **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab, live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.
@@ -193,15 +194,20 @@ The [feature reference](docs/FEATURES.md) describes each surface and its limits.
 The [changelog](CHANGELOG.md) records release changes; [open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md)
 tracks remaining platform, provider, and performance checks.
 
-![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)
+![DevMap dependency map as a globe, with main.rs selected and its connections traced](docs/assets/devmap-globe.webp)
 
-| File explorer | Diff review |
+| Task board | Agents |
 | --- | --- |
-| ![File explorer with working tree status](docs/assets/screenshot-files.png) | ![Commit diff with highlighted changes](docs/assets/screenshot-diff.png) |
-| Coverage | Dependency health |
-| ![Per-file and line coverage](docs/assets/screenshot-coverage.png) | ![Dependency audit findings](docs/assets/screenshot-health.png) |
+| ![Task board with backlog, ready, in-progress, review and done columns](docs/assets/tasks-board.webp) | ![Agents view listing every agent session and its checkout](docs/assets/agents-tree.webp) |
+| Agent inbox | Secrets check on commit |
+| ![Peer inbox with an overlap notice between two agent sessions](docs/assets/agent-inbox.webp) | ![A commit blocked by the secret scan before anything was committed](docs/assets/guard-secret-blocked.webp) |
+| Blast radius | Local CI on affected tests |
+| ![Diff view with the blast radius of a change](docs/assets/blast-radius.webp) | ![CI:local report running only the one affected test file](docs/assets/ci-local-affected.webp) |
+| Conflict editor | Terminal splits |
+| ![Three-way conflict editor resolving a README merge conflict](docs/assets/conflicts.webp) | ![Terminal dock split into three shells](docs/assets/terminal-splits.webp) |
 
-Screenshots are captures from the macOS app; appearance varies by release and platform.
+Screenshots are captures from the macOS app; appearance varies by release and platform. Names of
+private repositories are blurred.
 
 ## Local state and explicit permissions
 

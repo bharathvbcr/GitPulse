@@ -8,7 +8,7 @@ GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/
 
 [Website](https://gitpulse.vbcr.dev/) · [Releases](https://github.com/bharathvbcr/GitPulse/releases) · [Repository](https://github.com/bharathvbcr/GitPulse)
 
-![GitPulse graph view: canvas commit graph with lanes, ref decorations, and the commit diff pane](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-graph.png)
+![GitPulse: a Claude Code agent working in its own worktree, with Follow agent showing each file it edits](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/hero-agents.webp)
 
 [Complete documentation index](https://github.com/bharathvbcr/GitPulse/blob/main/docs/README.md)
 

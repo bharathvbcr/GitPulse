@@ -5,7 +5,8 @@ The maintained installation guide lives in
 It covers platform packages, signing and quarantine, optional tools, updates,
 and building from source.
 
-[Download from GitHub Releases](https://github.com/bharathvbcr/GitPulse/releases/latest).
+[Download the GitPulse 2.0 beta (`v1.99.0`)](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0). It is a pre-release, so GitHub's
+[Latest release](https://github.com/bharathvbcr/GitPulse/releases/latest) stays on `v1.3.1` until the stable 2.0 release ships.
 Use the selected release's assets and notes for availability and signing status.
 A version in a repository checkout is not proof of a published release.
 
