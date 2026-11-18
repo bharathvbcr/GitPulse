@@ -146,6 +146,10 @@ jobs:
 
       - name: Native Renderer Regressions (WKWebView)
         if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        # Unattended: the runner may make its window key, which WebKit needs
+        # before it matches `:focus` (scripts/webkit-regressions.swift).
+        env:
+          GITPULSE_WEBKIT_TAKE_FOCUS: "1"
         run: bun run test:webkit:all
 
       - name: Frontend Vite Build
