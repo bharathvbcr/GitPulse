@@ -1681,8 +1681,10 @@ fn r2_cap_boundary_inclusive() {
 
 #[test]
 fn r2_cap_hidden_row_with_empty_ts_but_in_window_event() {
-    // The hidden row was appended with a bad append stamp but its event time
-    // is inside the window: session B ran a commit, then A's is credited alone.
+    // The hidden row's append stamp is empty, not a time, or earlier than its
+    // own in-window event time allows, so the append clock cannot vouch for
+    // the unread region (read_hidden). Session B may have committed inside the
+    // window, so the answer is SCAN_CAPPED and nobody, never A alone.
     for ts in ["", "not-a-time", "2026-01-01T00:00:00.000Z"] {
         let (_d, repo, _) = r2_capped_world(|repo, at| {
             r2_raw(
@@ -1698,12 +1700,8 @@ fn r2_cap_hidden_row_with_empty_ts_but_in_window_event() {
             );
         });
         let got = link(&repo, &sha(1));
-        assert_eq!(
-            got.session_id.as_deref(),
-            Some("A"),
-            "hidden ts={ts:?} basis={:?}",
-            got.basis
-        );
+        assert_eq!(got.basis, basis::SCAN_CAPPED, "hidden ts={ts:?}");
+        assert_eq!(got.session_id, None, "hidden ts={ts:?}: {got:?}");
     }
 }
 
