@@ -17,6 +17,7 @@
     Clock,
     CheckCircle2,
     Flame,
+    PanelRightClose,
   } from "@lucide/svelte";
   import { formatAge } from "../../storage/format";
   import { askConfirm } from "../../stores/modalStore";
@@ -44,9 +45,12 @@
   let {
     selectedFile = null,
     onSelectFile,
+    onHide,
   }: {
     selectedFile?: string | null;
     onSelectFile?: (path: string) => void;
+    /** Hides this column; the host remembers the choice. */
+    onHide?: () => void;
   } = $props();
 
   let isRefreshing = $state(false);
@@ -239,6 +243,19 @@
       >
         <RefreshCw size={12} class={isRefreshing || $repoStore.isLoading ? "animate-spin" : ""} />
       </button>
+      {#if onHide}
+        <button
+          type="button"
+          onclick={onHide}
+          title="Hide Live pulse"
+          aria-label="Hide Live pulse"
+          class="gp-icon-btn"
+          data-size="sm"
+          data-live-pulse-hide
+        >
+          <PanelRightClose size={12} />
+        </button>
+      {/if}
     </div>
   </div>
 

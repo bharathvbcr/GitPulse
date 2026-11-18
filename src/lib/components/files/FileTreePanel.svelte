@@ -26,6 +26,7 @@
     X,
     PencilLine,
     Trash2,
+    TextSearch,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -42,8 +43,13 @@
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
   import { consumeSearchFocus, explorerLens, showExplorerRail, type ExplorerRail } from "../../files/explorerLens";
-  import { EXPLORER_SEARCH_MODES, fieldEscape, searchFieldLabel } from "../../files/explorerSearchField";
-  import SettingSegment from "../SettingSegment.svelte";
+  import {
+    CONTENTS_TOGGLE_LABEL,
+    contentsToggleTitle,
+    fieldEscape,
+    searchFieldLabel,
+    toggledSearchMode,
+  } from "../../files/explorerSearchField";
   import {
     classifyFileChange,
     hasUnstagedChanges,
@@ -159,8 +165,9 @@
   let containerEl: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
 
-  // One field, two modes: Names narrows the tree (the rail is "files"),
-  // Contents searches inside files (the rail is "search").
+  // One field, two modes: by default it narrows the tree by name (the rail is
+  // "files"); the contents toggle inside it searches inside files (the rail is
+  // "search").
   const mode = $derived($explorerLens.rail);
   const contentMode = $derived(mode === "search");
   const fieldLabel = $derived(searchFieldLabel(mode));
@@ -1077,15 +1084,13 @@
     <ScrollCue target={explorerChrome} axis="x" />
   </div>
 
-  <div class="@container px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain space-y-1.5">
+  <div class="px-2 pt-2 pb-1.5 shrink-0 max-h-[min(16rem,45%)] overflow-y-auto overscroll-contain space-y-1.5">
     <!-- The pill is the field: its edge carries focus, the input inside it
-         draws none. The clear button sits over the pill's right end so the
-         pill keeps one height whether or not there is a query. Where the rail
-         is too narrow for the text and the Names/Contents switch side by side
-         (the rail's own width, a container query), the switch drops to a
-         full-width second row inside the pill, so it never covers the text or
-         runs past the rail's edge. -->
-    <div class="file-tree-filter-pill relative flex flex-wrap items-center gap-x-1.5 gap-y-1 bg-background border border-edge rounded-full pl-2.5 pr-1.5 py-1 @max-[18rem]:rounded-2xl @max-[18rem]:pr-1 @max-[18rem]:pb-1 focus-within:border-(--field-focus-edge) transition-colors">
+         draws none. The clear button sits over the text's right end so the
+         pill keeps one height whether or not there is a query. The contents
+         toggle is one icon at the pill's right end, so the pill is one row at
+         every rail width, the 264px sidebar included. -->
+    <div class="file-tree-filter-pill relative flex items-center gap-1.5 bg-background border border-edge rounded-full pl-2.5 pr-1 py-0.5 focus-within:border-(--field-focus-edge) transition-colors">
       <Search size={12} class="pointer-events-none text-textMuted shrink-0" />
       <div class="relative flex-1 min-w-0">
         <input
@@ -1115,15 +1120,18 @@
           </button>
         {/if}
       </div>
-      <div class="shrink-0 @max-[18rem]:basis-full @max-[18rem]:[&>.gp-segmented]:flex @max-[18rem]:[&_.gp-seg-btn]:flex-1" data-explorer-search-modes>
-        <SettingSegment
-          ariaLabel="Search in"
-          options={EXPLORER_SEARCH_MODES}
-          value={mode}
-          onselect={selectMode}
-          size="sm"
-        />
-      </div>
+      <button
+        type="button"
+        onclick={() => selectMode(toggledSearchMode(mode))}
+        aria-pressed={contentMode}
+        aria-label={CONTENTS_TOGGLE_LABEL}
+        title={contentsToggleTitle(mode)}
+        class="gp-icon-btn shrink-0 rounded-full {contentMode ? 'text-accent bg-accent/15' : 'text-textMuted hover:text-textPrimary'}"
+        data-size="sm"
+        data-explorer-contents-toggle
+      >
+        <TextSearch size={12} />
+      </button>
     </div>
 
     <!--

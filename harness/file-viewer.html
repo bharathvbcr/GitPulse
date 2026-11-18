@@ -61,6 +61,8 @@ mockIPCWithEvents((cmd, args) => {
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
 });
+// Live pulse visibility is remembered; start each run from the default (shown).
+localStorage.removeItem("gitpulse.explorer.livePulse");
 const { mount, tick, unmount } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
@@ -271,20 +273,27 @@ const type = async value => { const area = textarea(); area.value = value; area.
   // --- Explorer's Search rail ----------------------------------------------
   // Search used to be a section of Code that replaced the editor; it is the
   // Explorer column's other pane now, so a hit opens beside its results.
-  // One field in Explorer: its Names | Contents segment is the mode switch,
-  // and its aria-label follows the mode.
-  const modeButton = label => [...host.querySelectorAll('[aria-label="Search in"] button')].find(el => el.textContent.trim() === label);
+  // One field in Explorer: it filters by name by default, and one icon toggle
+  // inside it switches to searching file contents. Its aria-label follows the mode.
+  const contentsToggle = () => host.querySelector("[data-explorer-contents-toggle]");
   const rail = () => host.querySelector("[data-explorer-rail]");
   const searchBox = () => host.querySelector('input[aria-label="Search file contents"]');
-  const searchRailIsUp = () => modeButton("Contents")?.getAttribute("aria-pressed") === "true";
+  const searchRailIsUp = () => contentsToggle()?.getAttribute("aria-pressed") === "true";
   check("Explorer has no separate content-search toggle", () => !host.querySelector("[data-search-toggle]"));
-  check("its one search field offers Names and Contents, on Names", () =>
-    modeButton("Names")?.getAttribute("aria-pressed") === "true" && modeButton("Contents")?.getAttribute("aria-pressed") === "false" &&
+  check("its one search field filters names by default, with the contents toggle off", () =>
+    contentsToggle()?.getAttribute("aria-pressed") === "false" && !host.querySelector('[aria-label="Search in"]') &&
     host.querySelectorAll('input[aria-label="Filter files"]').length === 1);
+  {
+    const pill = host.querySelector(".file-tree-filter-pill");
+    const input = pill.querySelector("input");
+    const box = pill.getBoundingClientRect(), tog = contentsToggle().getBoundingClientRect(), field = input.getBoundingClientRect();
+    check("the toggle sits on the field's own row, so the pill is one row", () =>
+      Math.abs((tog.top + tog.bottom) / 2 - (field.top + field.bottom) / 2) <= 2 && box.height <= 32);
+  }
   check("and opens on the file tree", () => rail()?.dataset.explorerRail === "files" && !!host.querySelector('[role="tree"]'));
-  modeButton("Contents").click(); await tick();
+  contentsToggle().click(); await tick();
   await until(() => searchBox() && document.activeElement === searchBox(), "the search box takes focus");
-  check("Contents swaps the tree for content search and focuses the same field", () =>
+  check("the toggle swaps the tree for content search and focuses the same field", () =>
     rail().dataset.explorerRail === "search" && searchRailIsUp() && document.activeElement === searchBox() &&
     !host.querySelector('input[aria-label="Filter files"]'));
   // The save checks above leave the file open in edit mode with a draft.
@@ -296,7 +305,7 @@ const type = async value => { const area = textarea(); area.value = value; area.
     Boolean(treeWhileSearching) && treeWhileSearching.closest(".hidden") !== null);
   const searchPane = host.querySelector("[data-content-search]");
   check("the search form fits the rail without widening it", () => searchPane.scrollWidth <= searchPane.clientWidth + 1);
-  check("the field and its segment fit the rail", () => { const r = rail(); return r.scrollWidth <= r.clientWidth + 1; });
+  check("the field and its toggle fit the rail", () => { const r = rail(); return r.scrollWidth <= r.clientWidth + 1; });
   searchBox().value = "two"; searchBox().dispatchEvent(new Event("input", { bubbles: true })); await tick();
   searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await tick();
   await until(() => host.querySelector("[data-search-match]"), "a search hit is listed");
@@ -310,8 +319,8 @@ const type = async value => { const area = textarea(); area.value = value; area.
   searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
   check("Escape clears the query first and stays in Contents", () => searchBox()?.value === "" && rail().dataset.explorerRail === "search");
   searchBox().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick();
-  check("a second Escape on the empty field returns to Names", () => rail().dataset.explorerRail === "files" && modeButton("Names").getAttribute("aria-pressed") === "true");
-  check("Names brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
+  check("a second Escape on the empty field returns to names", () => rail().dataset.explorerRail === "files" && contentsToggle().getAttribute("aria-pressed") === "false");
+  check("names mode brings the tree back", () => rail().dataset.explorerRail === "files" && host.querySelector('[role="tree"]').closest(".hidden") === null);
   lens.showExplorerRail("search"); lens.showExplorerRail("files"); await tick(); await wait();
   check("a search request that was never shown leaves the editor's focus alone", () => document.activeElement !== searchBox());
   lens.consumeSearchFocus();
@@ -388,6 +397,31 @@ const type = async value => { const area = textarea(); area.value = value; area.
   setSidebarExplorerDocked(false); await tick();
   showToggle()?.click(); await tick();
   await until(() => Boolean(rail()), "Explorer column restores cleanly when Sidebar returns to Git");
+
+  // --- Live pulse hides from its own card, and stays hidden -------------------
+  // Its visibility used to be per repository and in memory, defaulting to
+  // shown, so a hidden Live pulse came back on the next mount.
+  {
+    const card = () => host.querySelector("[data-live-pulse-card]");
+    const pulseToggle = () => [...host.querySelectorAll("button")].find(el => /Live pulse dashboard$/.test(el.getAttribute("aria-label") ?? ""));
+    await until(() => Boolean(card()), "the Live pulse card on a wide layout");
+    const hide = card().querySelector("[data-live-pulse-hide]");
+    check("the Live pulse card offers its own Hide button", () => hide?.getAttribute("aria-label") === "Hide Live pulse");
+    hide.click(); await tick();
+    await until(() => !card(), "the Live pulse card leaves");
+    check("Hide removes the card and the toolbar toggle reads Show", () =>
+      !card() && pulseToggle()?.getAttribute("aria-pressed") === "false" && pulseToggle().getAttribute("aria-label").startsWith("Show"));
+    await unmount(app); await tick();
+    app = mount(Viewer, { target: host });
+    await until(() => Boolean(pulseToggle()), "the remounted toolbar");
+    await wait(200);
+    check("a remounted Explorer page remembers Live pulse is hidden", () =>
+      !card() && JSON.parse(localStorage.getItem("gitpulse.explorer.livePulse") ?? "{}").visible === false);
+    pulseToggle().click(); await tick();
+    await until(() => Boolean(card()), "Live pulse shown again");
+    check("the toolbar toggle brings it back and remembers that too", () =>
+      Boolean(card()) && JSON.parse(localStorage.getItem("gitpulse.explorer.livePulse") ?? "{}").visible === true);
+  }
 
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);

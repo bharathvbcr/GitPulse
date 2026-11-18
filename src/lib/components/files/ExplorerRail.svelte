@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
    * Explorer's side column: the file tree, or repository-wide content search,
-   * both under ONE search field (Names | Contents) that FileTreePanel owns.
+   * both under ONE search field that FileTreePanel owns: it filters names by
+   * default, and its contents toggle switches it to content search.
    *
    * Search used to be its own section of Code, so opening a hit swapped the
    * results out for the editor and coming back meant switching sections again.

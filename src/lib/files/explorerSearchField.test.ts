@@ -1,12 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { EXPLORER_SEARCH_MODES, fieldEscape, searchFieldLabel } from "./explorerSearchField";
+import {
+  CONTENTS_TOGGLE_LABEL,
+  contentsToggleTitle,
+  fieldEscape,
+  searchFieldLabel,
+  toggledSearchMode,
+} from "./explorerSearchField";
 
 describe("explorer search field modes", () => {
-  it("offers Names then Contents, mapped onto the files and search rails", () => {
-    expect(EXPLORER_SEARCH_MODES.map((m) => [m.value, m.label])).toEqual([
-      ["files", "Names"],
-      ["search", "Contents"],
-    ]);
+  it("has one contents toggle that swaps the names and contents rails", () => {
+    expect(toggledSearchMode("files")).toBe("search");
+    expect(toggledSearchMode("search")).toBe("files");
+  });
+
+  it("names the toggle once and lets its tooltip say what a click does", () => {
+    expect(CONTENTS_TOGGLE_LABEL).toBe("Include file contents");
+    expect(contentsToggleTitle("files")).toMatch(/inside files/);
+    expect(contentsToggleTitle("search")).toMatch(/file name/);
   });
 
   it("labels the field by what it does in each mode", () => {

@@ -4,6 +4,7 @@
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
   import type { FileSidePane } from "../files/filePaneLayout";
+  import { livePulsePref } from "../files/livePulsePref";
   import type { FileBlob } from "../files/types";
   import { overwriteNote } from "../files/overwriteNote";
   import { recordEditorDrafts } from "../files/editorDraftRegistry";
@@ -18,7 +19,6 @@
   const tabCache = createRepoPanelCache<{
     tabs: EditorTabState;
     explorerOpen: boolean;
-    dashboardOpen: boolean;
     preferredSidePane: FileSidePane;
   }>({
     // A cache bound may discard clean navigation history, never unsaved work.
@@ -108,7 +108,9 @@
 
 
   let explorerOpen = $state(true);
-  let dashboardOpen = $state(true);
+  // App-wide and remembered across launches (`livePulsePref`), so hiding Live
+  // pulse sticks across repository switches and restarts.
+  const dashboardOpen = $derived($livePulsePref.visible);
   let tabState = $state<Tabs>(emptyEditorTabs());
   let fileViewRoot: HTMLDivElement | undefined = $state();
   let fileViewWidth = $state(0);
@@ -204,7 +206,6 @@
         drafts: tabState.drafts,
       },
       explorerOpen,
-      dashboardOpen,
       preferredSidePane,
     });
     recordEditorDrafts(repo, Object.keys(tabState.drafts));
@@ -586,7 +587,7 @@
           explorerOpen = false;
         }
       } else {
-        dashboardOpen = false;
+        livePulsePref.setVisible(false);
       }
       persistTabs(hydratedRepo);
       return;
@@ -597,7 +598,7 @@
         explorerOpen = true;
         if (outerExplorerDocked) explorerForcedWithOuterSidebar = true;
       } else {
-        dashboardOpen = true;
+        livePulsePref.setVisible(true);
       }
     } else if (pane === "explorer" && outerExplorerDocked) {
       explorerForcedWithOuterSidebar = true;
@@ -665,7 +666,6 @@
         cached = {
           tabs: disk,
           explorerOpen: true,
-          dashboardOpen: true,
           preferredSidePane: "explorer",
         };
         tabCache.set(repo, cached);
@@ -676,12 +676,10 @@
       if (cached) {
         tabState = cached.tabs;
         explorerOpen = cached.explorerOpen;
-        dashboardOpen = cached.dashboardOpen;
         preferredSidePane = cached.preferredSidePane ?? "explorer";
       } else {
         tabState = emptyEditorTabs();
         explorerOpen = true;
-        dashboardOpen = true;
         preferredSidePane = "explorer";
       }
     });
@@ -1084,7 +1082,11 @@
     {#if paneLayout.dashboardVisible}
       <!-- A floating card beside the editor, like the sidebar beside the workspace. -->
       <div class="gp-float-card {paneLayout.editorVisible ? 'w-80 shrink-0' : 'flex-1 min-w-0'}" data-live-pulse-card>
-        <LivePulseDashboard selectedFile={activeTabPath} onSelectFile={(path) => previewFile(path)} />
+        <LivePulseDashboard
+          selectedFile={activeTabPath}
+          onSelectFile={(path) => previewFile(path)}
+          onHide={() => toggleSidePane("dashboard")}
+        />
       </div>
     {/if}
   </div>

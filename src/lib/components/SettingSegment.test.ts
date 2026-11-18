@@ -29,10 +29,13 @@ describe("SettingSegment size", () => {
     expect(segButton).toMatch(/\[data-size='sm'\] > & \{\s*@apply px-2 text-meta;/);
   });
 
-  it("is the compact size in Explorer's search field", () => {
-    const panel = readFileSync(new URL("./files/FileTreePanel.svelte", import.meta.url), "utf8");
-    const segment = panel.slice(panel.indexOf("<SettingSegment"), panel.indexOf("/>", panel.indexOf("<SettingSegment")));
-    expect(segment).toContain('ariaLabel="Search in"');
+  // Explorer's search field used this size for its Names | Contents segment
+  // until that became a single contents toggle; Reflog's source switch is the
+  // compact size's caller now.
+  it("is the compact size in Reflog's source switch", () => {
+    const reflog = readFileSync(new URL("./ReflogViewer.svelte", import.meta.url), "utf8");
+    const segment = reflog.slice(reflog.indexOf("<SettingSegment"), reflog.indexOf("/>", reflog.indexOf("<SettingSegment")));
+    expect(segment).toContain('ariaLabel="Reflog source"');
     expect(segment).toContain('size="sm"');
   });
 });

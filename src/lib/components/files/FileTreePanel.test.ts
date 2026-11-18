@@ -114,17 +114,25 @@ describe("FileTreePanel source contracts", () => {
   });
 
   /**
-   * One search field, not two: Explorer's toolbar no longer carries a content
-   * search toggle, and the field's Names | Contents segment is the only way
-   * into Contents besides the palette.
+   * One search field, not two: Explorer's toolbar carries no separate content
+   * search, and the field's own contents toggle is the only way into Contents
+   * besides the palette. Names is the default; the toggle is one icon, not a
+   * Names | Contents segment, because the segment could not sit beside the
+   * text in the 264px sidebar and wrapped the pill onto a second row.
    */
-  it("is the single search field, with a Names | Contents segment inside it", () => {
+  it("is the single search field, with one contents toggle inside it", () => {
     expect(source.match(/<input\b/g)?.length).toBe(1);
     const pillAt = source.indexOf("file-tree-filter-pill");
-    const segmentAt = source.indexOf("<SettingSegment", pillAt);
-    expect(segmentAt).toBeGreaterThan(pillAt);
-    expect(source.indexOf("</div>", segmentAt)).toBeGreaterThan(segmentAt);
-    expect(source).toContain("options={EXPLORER_SEARCH_MODES}");
+    const toggleAt = source.indexOf("data-explorer-contents-toggle", pillAt);
+    expect(toggleAt).toBeGreaterThan(pillAt);
+    const toggle = source.slice(source.lastIndexOf("<button", toggleAt), source.indexOf("</button>", toggleAt));
+    expect(toggle).toContain("aria-pressed={contentMode}");
+    expect(toggle).toContain("toggledSearchMode(mode)");
+    expect(source).not.toContain("<SettingSegment");
+    // The pill never wraps: no flex-wrap and no narrow-width second row.
+    const pill = source.slice(source.lastIndexOf("<div", pillAt), source.indexOf(">", pillAt));
+    expect(pill).not.toContain("flex-wrap");
+    expect(pill).not.toContain("@max-");
 
     const viewer = readFileSync(new URL("../FileViewer.svelte", import.meta.url), "utf8");
     expect(viewer).not.toContain("data-search-toggle");
