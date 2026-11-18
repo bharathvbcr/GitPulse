@@ -1103,7 +1103,13 @@
                 for (const view of ["work", "code", "history"]) {
                   repoStore.setActiveTab(view);
                   await settle();
-                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}`;
+                  // A view change plays the selection pill's crossfade (280 ms,
+                  // ViewTabBar) and the section strip's: until they end, the strip
+                  // that is leaving is still in the switcher beside the one that
+                  // arrived, so its width is the sum of two views', not a view's.
+                  // Measure the settled switcher, bounded, and say if it never was.
+                  const quiet = await sleepUntil(() => switcherScroller.getAnimations({ subtree: true }).every((animation) => animation.playState === "finished"), 5000);
+                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}${quiet ? "" : ", still animating"}`;
                   measured.push(row);
                   if (switcherScroller.scrollWidth > switcherScroller.clientWidth + 1) squeezed.push(row);
                 }
