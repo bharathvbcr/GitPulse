@@ -1222,15 +1222,30 @@ mod tests {
 
     // -- recorder -----------------------------------------------------------------
 
+    /// The window for tests whose ends come from one thread, back to back.
+    /// Those ends are microseconds apart on an idle host, but a loaded one can
+    /// stop the thread between two of them for longer than a few milliseconds;
+    /// the group then closes short of [`THRESHOLD`] and no incident comes,
+    /// which is the window working, not the recorder failing. A 5 ms window
+    /// did exactly that on ubuntu-latest's 8-thread run, beside
+    /// `fifty_threads_ending_at_once_make_exactly_one_incident_every_time`'s
+    /// 400 threads ("timed out waiting for the round's incident").
+    ///
+    /// Not passed through `coverage_relaxed`: an incident is published when its
+    /// window closes, so the window is every round's latency, and that helper's
+    /// 5 s floor under instrumentation would make `stored_incidents_are_bounded`
+    /// take minutes and its rounds outlast `wait_until`'s deadline.
+    const BACK_TO_BACK_WINDOW: Duration = Duration::from_millis(100);
+
     fn recorder(
-        window_ms: u64,
+        window: Duration,
     ) -> (
         Arc<Recorder>,
         Arc<Mutex<Vec<TerminalIncidentPayload>>>,
         Sink,
     ) {
         let rec = Arc::new(Recorder::new(
-            Duration::from_millis(window_ms),
+            window,
             THRESHOLD,
             Arc::new(|_| Attribution::none("test")),
         ));
@@ -1263,7 +1278,7 @@ mod tests {
             for lane in 0..8 {
                 lanes.spawn(move || {
                     for round in 0..25 {
-                        let (rec, seen, sink) = recorder(400);
+                        let (rec, seen, sink) = recorder(Duration::from_millis(400));
                         let start = Arc::new(std::sync::Barrier::new(50));
                         let threads: Vec<_> = (0..50)
                             .map(|i| {
@@ -1299,7 +1314,7 @@ mod tests {
 
     #[test]
     fn the_worker_stops_when_nothing_is_pending_and_restarts_for_the_next_group() {
-        let (rec, seen, sink) = recorder(20);
+        let (rec, seen, sink) = recorder(BACK_TO_BACK_WINDOW);
         report(&rec, &sink, "lonely");
         wait_until("the worker to stop", || !rec.worker_running());
         assert!(
@@ -1319,7 +1334,7 @@ mod tests {
 
     #[test]
     fn stored_incidents_are_bounded() {
-        let (rec, _seen, sink) = recorder(5);
+        let (rec, _seen, sink) = recorder(BACK_TO_BACK_WINDOW);
         for round in 0..(MAX_STORED + 5) {
             for i in 0..3 {
                 report(&rec, &sink, &format!("r{round}-{i}"));
@@ -1341,7 +1356,7 @@ mod tests {
     #[test]
     fn an_attributor_that_panics_still_delivers_the_incident_and_frees_its_place() {
         let rec = Arc::new(Recorder::new(
-            Duration::from_millis(20),
+            BACK_TO_BACK_WINDOW,
             THRESHOLD,
             Arc::new(|_| panic!("the log query blew up")),
         ));
