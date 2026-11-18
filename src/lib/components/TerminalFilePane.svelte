@@ -11,8 +11,10 @@
     Send,
     FileText,
     AlertCircle,
+    Maximize2,
   } from "@lucide/svelte";
   import { invoke } from "../ipc/invoke";
+  import { opensExplorerPage } from "../files/explorerPageGesture";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
@@ -61,6 +63,7 @@
     onKeepFile,
     onResolvedPath,
     onOpenInCodeView,
+    onOpenExplorerPage,
     onDockToSidebar,
     onSendToAgent,
   }: {
@@ -80,6 +83,8 @@
     onKeepFile?: (path: string) => void;
     onResolvedPath?: (resolvedPath: string) => void;
     onOpenInCodeView?: (path: string, line: number | null) => void;
+    /** Shows the full Explorer page; the toolbar button and a double-click on the Explorer card's empty space call it. */
+    onOpenExplorerPage?: () => void;
     onDockToSidebar?: () => void;
     onSendToAgent?: (reference: string) => void;
   } = $props();
@@ -677,6 +682,18 @@
           </button>
         {/if}
       {/if}
+      {#if onOpenExplorerPage}
+        <button
+          type="button"
+          class="gp-icon-btn p-1!"
+          aria-label="Open the Explorer page"
+          title="Open the Explorer page · or double-click empty space in this pane's Explorer"
+          data-testid="terminal-file-open-explorer-page"
+          onclick={onOpenExplorerPage}
+        >
+          <Maximize2 size={12} />
+        </button>
+      {/if}
       {#if onDockToSidebar}
         <button
           type="button"
@@ -722,7 +739,17 @@
 
   <div class="flex-1 min-h-0 flex overflow-hidden">
     {#if explorerOpen && onscreen}
-      <div class="gp-float-card w-56 max-w-[45%] shrink-0" data-terminal-file-explorer-card>
+      <!-- Justified: the double-click is a mouse shortcut for the toolbar's
+           "Open the Explorer page" button; opensExplorerPage leaves the
+           rail's rows, fields and controls their own double-click. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="gp-float-card w-56 max-w-[45%] shrink-0"
+        data-terminal-file-explorer-card
+        ondblclick={(event) => {
+          if (onOpenExplorerPage && opensExplorerPage(event)) onOpenExplorerPage();
+        }}
+      >
         <ExplorerRail
           {repoPath}
           selectedFile={filePath ?? null}

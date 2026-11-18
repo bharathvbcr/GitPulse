@@ -6884,6 +6884,7 @@
               onKeepFile={(fp) => keepFileShown(fp, tab.checkout, tab.id)}
               onResolvedPath={(fp) => (tabState = setTabFile(tabState, tab.id, fp, null, null, { preserveReveal: true }))}
               onOpenInCodeView={onOpenInCodeView}
+              onOpenExplorerPage={onOpenExplorerPage}
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
             />
