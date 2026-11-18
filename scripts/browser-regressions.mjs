@@ -24,12 +24,19 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * and the synchronized-output phase (two seconds of frames in each of four
  * arms plus the real session) ~59 s cold. `coverage` took 48-53 s of its 60 on
  * the Linux runner (cold dependency optimisation, 163 checks) and timed out once
- * in three; it passed six of six with the cap lifted. A page that is long by design gets
+ * in three; it passed six of six with the cap lifted. `health` spends about 30
+ * of its seconds in the auto-scan lifecycle checks, which wait out the product's
+ * real 1.5 s settle a dozen times on purpose: 53 s on the development Mac, 57 s
+ * and 61-69 s on the macOS CI runner with window focus on and off (probe runs
+ * 44370388488: verdicts at 56.8, 56.7, 69.2 and 60.5 s), which a minute cannot
+ * hold. `tasks` is 688 sequential checks, each behind real settled waits: 141 s
+ * on the development Mac and 168 s (focus on) and 194 s (focus off) on the CI
+ * runner, with every section within the same ratio of its local time. A page that is long by design gets
  * its own number here; the rest keep the minute, so a hang anywhere else is
  * still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120, terminal: 210, coverage: 120 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 300, health: 120, "tab-switch": 120, terminal: 210, coverage: 120 }));
 
 /** @param {string} harness */
 export function harnessDeadlineSeconds(harness) {
