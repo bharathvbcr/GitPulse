@@ -115,6 +115,9 @@ site | src/devmap/live.rs | xproc_writer_lock_holder | 0 | bounded-poll
 # src/docs/rename_tests.rs
 site | src/docs/rename_tests.rs | counting_gate_rename | 0 | fixture-delay
 
+# src/engine/dcgrep.rs
+site | src/engine/dcgrep.rs | cancellation_while_queued_at_saturated_spawn_gate_during_health_probe | 0 | fixture-delay
+
 # src/engine/git_cli.rs
 site | src/engine/git_cli.rs | a_hook_running_command_is_never_shared_so_it_stays_cancellable | 0 | bounded-poll
 site | src/engine/git_cli.rs | create_refuses_existing_tracked_untracked_ignored_lf_crlf_empty | 0 | mtime-gap
@@ -264,6 +267,10 @@ site | src/storage/hygiene/global/tests.rs | wait | 0 | bounded-poll
 # src/supervisor.rs
 site | src/supervisor.rs | wait | 0 | bounded-poll
 
+# src/sysload/probe.rs
+site | src/sysload/probe.rs | host_probe_is_send_and_reset_clears_cpu_baseline | 0 | spacing
+site | src/sysload/probe.rs | real_host_readings_are_values_or_named_reasons | 0 | mtime-gap
+
 # src/sysload/procscan.rs
 site | src/sysload/procscan.rs | fixture_pid | 0 | bounded-poll
 site | src/sysload/procscan.rs | fixture_process | 0 | hold
@@ -275,6 +282,9 @@ site | src/sysload/sampler.rs | real_sampler_holds_its_activity_only_while_enabl
 site | src/sysload/sampler.rs | real_sampler_keeps_publishing_after_a_tick_panics | 0 | bounded-poll
 site | src/sysload/sampler.rs | real_sampler_publishes_and_a_second_one_reads | 0 | bounded-poll
 site | src/sysload/sampler.rs | real_sampler_publishes_and_a_second_one_reads | 1 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_resets_sensor_baseline_when_switched_off_and_re_enabled | 0 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_resets_sensor_baseline_when_switched_off_and_re_enabled | 1 | bounded-poll
+site | src/sysload/sampler.rs | real_sampler_resets_sensor_baseline_when_switched_off_and_re_enabled | 2 | bounded-poll
 site | src/sysload/sampler.rs | real_sampler_switched_off_publishes_a_heartbeat_without_readings | 0 | bounded-poll
 
 # src/sysload/snapshot.rs
