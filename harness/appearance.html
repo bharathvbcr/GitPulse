@@ -413,15 +413,19 @@
     // A real clip, recorded here from a canvas (red ground, a green bar moving),
     // through the real file input, the real decoder and IndexedDB.
     const wait = async (ok, ms = 8000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); await settle(); return ok(); };
+    let clipWhy = "";
     const recordClip = async () => {
-      if (typeof MediaRecorder === "undefined") return null;
+      if (typeof MediaRecorder === "undefined") { clipWhy = "MediaRecorder is undefined"; return null; }
       const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 200 });
       const ctx = canvas.getContext("2d");
       const stream = canvas.captureStream?.(30);
       // Record a type this engine can also play back: WebKit records WebM it cannot decode.
       const player = document.createElement("video");
       const type = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported?.(t) && player.canPlayType(t) !== "");
-      if (!stream || !type) return null;
+      if (!stream || !type) {
+        clipWhy = `MediaRecorder ${typeof MediaRecorder}, captureStream ${typeof canvas.captureStream}, stream ${!!stream}; ${["video/mp4", "video/webm"].map((t) => `${t}: record ${MediaRecorder.isTypeSupported?.(t)}, play "${player.canPlayType(t)}"`).join("; ")}`;
+        return null;
+      }
       let frame = 0;
       const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); };
       paint();
@@ -437,7 +441,7 @@
       return new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
     };
     const clip = await recordClip();
-    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with`, () => clip !== null && clip.size > 0);
+    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clip ? "" : ` (${clipWhy})`}`, () => clip !== null && clip.size > 0);
     if (clip) {
       const input = $("[data-wallpaper-input]");
       const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;
