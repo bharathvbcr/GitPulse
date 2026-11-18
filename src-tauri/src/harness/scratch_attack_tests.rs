@@ -63,8 +63,6 @@ fn near_miss_names_never_name_an_owner() {
 /// The sweep claims to remove only "the exact shape this code writes", and this
 /// code writes `{pid}` with `{}` and the hash with `{:016x}`: a canonical decimal
 /// pid and lowercase hex. A name that is not that was written by someone else.
-// BREAK (not fixed here): owner_pid accepts "+42", "0042" and uppercase hex.
-#[ignore = "BREAK: owner_pid is looser than the shape scratch_dir writes (scratch.rs owner_pid)"]
 #[test]
 fn a_name_this_code_could_not_have_written_is_not_ours() {
     let accepted: Vec<&str> = [

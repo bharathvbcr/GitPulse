@@ -12,6 +12,20 @@
 //! has the exact shape this code writes, the entry is a real directory (never a
 //! symlink), this user owns it, and the pid in its name is gone. Anything it
 //! cannot establish is kept.
+//!
+//! Two limits of the sweep, both deliberate:
+//!
+//! - It is unix-only. Off unix there is no owner id to read and no liveness
+//!   probe, so nothing is proved and nothing is removed; what covers Windows is
+//!   self-removal: [`ScratchDir::remove`] after the child is reaped, and the
+//!   hook binary's shutdown of its sidecars before it exits.
+//! - A pid is only meaningful inside its own pid namespace, and a temp root can
+//!   be shared across namespaces (a container bind-mounting the host's `/tmp`).
+//!   A directory whose owner lives in another namespace may name a pid that is
+//!   free here, and is then swept as stale. The user-ownership check bounds the
+//!   damage to the same user's own scratch state, which is recreated on the
+//!   next spawn, but the sweep is not safe to point at a root shared with
+//!   another namespace's live sidecars.
 
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -84,10 +98,13 @@ pub(super) fn remove_tree(dir: &Path) -> Result<(), String> {
 /// Strict on purpose: it is the only evidence that a directory is ours.
 pub(super) fn owner_pid(name: &str) -> Option<u32> {
     let (pid, hash) = name.strip_prefix(SCRATCH_PREFIX)?.split_once('-')?;
-    if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Exactly what `scratch_dir` writes: the pid with `{}` (so no sign, no
+    // leading zeros) and the hash with `{:016x}` (sixteen lowercase digits).
+    if hash.len() != 16 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
     }
-    pid.parse::<u32>().ok().filter(|pid| *pid > 0)
+    let parsed = pid.parse::<u32>().ok().filter(|pid| *pid > 0)?;
+    (parsed.to_string() == pid).then_some(parsed)
 }
 
 /// Whether `meta` says `uid` owns the entry. Where there is no owner id to
@@ -242,6 +259,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_dead_owners_directory_is_removed_and_everything_else_is_kept() {
         let root = root("sweep");
@@ -294,6 +312,7 @@ mod tests {
         assert_eq!((swept.removed, swept.kept), (0, 1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_sweep_is_bounded_and_says_so() {
         let root = root("cap");
