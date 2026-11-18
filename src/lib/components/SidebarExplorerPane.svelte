@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { Columns2, FileCode, FileText, SquareTerminal } from "@lucide/svelte";
+  import { Columns2, FileCode, FileText, Maximize2, SquareTerminal } from "@lucide/svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
+  import { opensExplorerPage } from "../files/explorerPageGesture";
   import { requestPin } from "../files/pinRequests";
   import { requestReveal } from "../files/revealRequests";
   import {
@@ -40,6 +41,11 @@
 
   function setTarget(target: SidebarFileOpenTarget) {
     sidebarNavStore.setOpenTarget(target);
+  }
+
+  /** The full Explorer page, through the page owner every Explorer entry uses. */
+  function openExplorerPage() {
+    repoStore.setActiveTab("code", "explorer");
   }
 
   function dockExplorerInTerminal() {
@@ -111,6 +117,9 @@
   }
 </script>
 
+<!-- The double-click is a mouse shortcut for the "Open the Explorer page"
+     button in the strip below, which is the keyboard's way to the same place;
+     `opensExplorerPage` leaves rows, fields and controls their own. -->
 <!-- Justified: the capture-phase pointerdown only records which modifier keys
      a click on a file row carried (Alt, ⌘/Ctrl); it handles nothing itself,
      and every row and button inside keeps its own keyboard handling. -->
@@ -118,6 +127,9 @@
 <div
   class="flex-1 min-h-0 flex flex-col overflow-hidden"
   data-testid="sidebar-explorer-pane"
+  ondblclick={(event) => {
+    if (opensExplorerPage(event)) openExplorerPage();
+  }}
   onpointerdowncapture={(event) => {
     lastClickMods = {
       altKey: event.altKey,
@@ -171,6 +183,17 @@
         <span>Split</span>
       </button>
     </div>
+    <button
+      type="button"
+      class="gp-icon-btn shrink-0 hover:text-accent"
+      data-size="sm"
+      data-testid="sidebar-explorer-open-page"
+      aria-label="Open the Explorer page"
+      title="Open the Explorer page · or double-click empty space in this pane"
+      onclick={openExplorerPage}
+    >
+      <Maximize2 size={13} />
+    </button>
     <button
       type="button"
       class="gp-icon-btn shrink-0 {dockedInTerminal ? 'text-accent bg-accent/15' : 'hover:text-accent'}"

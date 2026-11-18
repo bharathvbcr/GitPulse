@@ -1,4 +1,5 @@
 import { writable, type Readable } from "svelte/store";
+import { handleTablistKeydown } from "../dom/tablist";
 import {
   SIDEBAR_DEFAULT_WIDTH,
   clampSidebarWidth,
@@ -174,6 +175,20 @@ const DEFAULT_SIDEBAR_NAV: SidebarNavPrefs = {
 
 export function normalizeSidebarView(raw: unknown): SidebarView {
   return raw === "files" ? "files" : "git";
+}
+
+/** The sidebar's views, in the order its switcher draws them. */
+export const SIDEBAR_VIEWS: readonly SidebarView[] = ["git", "files"];
+
+/**
+ * The view an arrow, Home or End press in the Git | Explorer tablist moves to,
+ * or null for a key the tablist does not own. The movement is the shared
+ * tablist's (`dom/tablist.ts`), so it wraps and jumps like every other tab
+ * strip here.
+ */
+export function sidebarViewForKey(current: SidebarView, key: string): SidebarView | null {
+  const move = handleTablistKeydown(key, SIDEBAR_VIEWS.indexOf(current), SIDEBAR_VIEWS.length);
+  return move ? (SIDEBAR_VIEWS[move.index] ?? null) : null;
 }
 
 export function normalizeSidebarOpenTarget(raw: unknown): SidebarFileOpenTarget {
