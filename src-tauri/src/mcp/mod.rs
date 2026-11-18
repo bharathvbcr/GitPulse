@@ -4756,11 +4756,14 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_browser_open" => {
             let a: BrowserOpenArgs = parse(name, arguments)?;
+            // Trust first, as every repository-scoped tool does: an untrusted
+            // repository is refused as untrusted on every platform, never
+            // answered with what this platform lacks.
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
             if !crate::browser::SUPPORTED {
                 return Err(crate::browser::UNSUPPORTED.to_string());
             }
-            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
-                .map_err(CommandError::into_message)?;
             let root = crate::engine::git_cli::find_git_root(std::path::Path::new(&a.repo_path))
                 .ok_or_else(|| format!("{} is not inside a git repository", a.repo_path))?;
             let repo = root.to_string_lossy().into_owned();
@@ -7215,6 +7218,57 @@ mod tests {
         ("devmap_preview", "one preview verdict, no list"),
     ];
 
+    /// Tools whose payload exists only where the desktop mailbox carries
+    /// terminal orchestration (macOS): elsewhere they answer "available on
+    /// macOS only for now", so there is no list to probe. On macOS they are
+    /// probed like any other, and off it the test checks that they do refuse.
+    const PROBED_ON_MACOS_ONLY: &[(&str, &str)] = &[(
+        "gitpulse_terminal_list",
+        "terminal orchestration is macOS only for now, so off macOS there is no children list",
+    )];
+
+    /// Tools whose every answer is the desktop app's, reached over its mailbox,
+    /// which carries browser sessions and terminal orchestration on macOS only
+    /// (`crate::browser::SUPPORTED`, `ask_app_to_orchestrate`). Elsewhere each
+    /// refuses with "available on macOS only for now", so there is no result to
+    /// validate. On macOS they are validated like any other; off it the test
+    /// calls each with arguments that parse and a trusted repository, and checks
+    /// it refuses for want of the platform and for nothing else.
+    fn answered_on_macos_only(repo: &str) -> [(&'static str, Value); 9] {
+        [
+            (
+                "gitpulse_browser_open",
+                json!({ "repo_path": repo, "url": "http://localhost:5173/" }),
+            ),
+            ("gitpulse_terminal_spawn", json!({ "repo_path": repo })),
+            (
+                "gitpulse_terminal_exec",
+                json!({ "repo_path": repo, "command": "true" }),
+            ),
+            (
+                "gitpulse_terminal_open_file",
+                json!({ "repo_path": repo, "path": "README.md" }),
+            ),
+            ("gitpulse_terminal_list", json!({ "repo_path": repo })),
+            (
+                "gitpulse_terminal_wait",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+            (
+                "gitpulse_terminal_read",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+            (
+                "gitpulse_terminal_send",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1", "input": "x" }),
+            ),
+            (
+                "gitpulse_terminal_close",
+                json!({ "repo_path": repo, "child_session_id": "term-1-1" }),
+            ),
+        ]
+    }
+
     /// Tools whose `outputSchema` declares an array that is empty in every
     /// payload the fixtures reach (no ledger events, no tasks on the board that
     /// the call lists, no dead symbols, no collisions): the probe needs a
@@ -8064,12 +8118,15 @@ mod tests {
                 let in_list =
                     |list: &[(&str, &str)]| list.iter().any(|(exempt, _)| *exempt == name);
                 let has_array = schema_declares_array(&tool["outputSchema"]);
-                let listed = in_list(NO_ARRAY_IN_SCHEMA) || in_list(EMPTY_ON_FIXTURES);
+                let listed = in_list(NO_ARRAY_IN_SCHEMA)
+                    || in_list(EMPTY_ON_FIXTURES)
+                    || (!cfg!(target_os = "macos") && in_list(PROBED_ON_MACOS_ONLY));
                 // The reasons are checked, not just stated: a tool listed as
                 // having no array must declare none, and one listed as empty
-                // on the fixtures must declare one.
+                // on the fixtures (or probed on macOS only) must declare one.
                 let reason_holds = (!in_list(NO_ARRAY_IN_SCHEMA) || !has_array)
-                    && (!in_list(EMPTY_ON_FIXTURES) || has_array);
+                    && (!in_list(EMPTY_ON_FIXTURES) || has_array)
+                    && (!in_list(PROBED_ON_MACOS_ONLY) || has_array);
                 (probed.contains(name) == listed || !reason_holds).then(|| {
                     format!(
                         "{name} (probed={}, listed={listed}, schema declares an array={has_array})",
@@ -8084,6 +8141,26 @@ mod tests {
              EMPTY_ON_FIXTURES with a reason, and not both:\n{}",
             misfiled.join("\n")
         );
+        // Off macOS the exemptions are checked, not just stated: each tool
+        // must refuse for want of the platform, not for anything else.
+        let macos_only = answered_on_macos_only(&wt_repo);
+        assert!(
+            PROBED_ON_MACOS_ONLY
+                .iter()
+                .all(|(name, _)| macos_only.iter().any(|(only, _)| only == name)),
+            "a tool probed on macOS only must be one answered on macOS only"
+        );
+        if !cfg!(target_os = "macos") {
+            for (name, arguments) in &macos_only {
+                let answer = handle_tool_call(name, arguments);
+                assert!(
+                    answer
+                        .as_ref()
+                        .is_err_and(|error| error.contains("macOS only")),
+                    "{name} is exempt off macOS as unavailable here, but answered {answer:?}"
+                );
+            }
+        }
         // Every advertised tool whose result holds a string was run with a
         // long one at the mirror threshold.
         for tool in tools() {
@@ -8103,6 +8180,9 @@ mod tests {
         for tool in tools() {
             let name = tool["name"].as_str().expect("name");
             if is_object_only_exempt(name) {
+                continue;
+            }
+            if !cfg!(target_os = "macos") && macos_only.iter().any(|(only, _)| *only == name) {
                 continue;
             }
             assert!(
