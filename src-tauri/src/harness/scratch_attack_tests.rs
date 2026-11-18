@@ -2,6 +2,7 @@
 //! unwritable trees, racing sweepers and the two caps.
 
 use super::scratch::*;
+use crate::procguard::LockedSpawn;
 use std::path::Path;
 
 const DEAD: u32 = 4_000_001;
@@ -258,7 +259,7 @@ fn this_processs_own_dir_and_a_live_strangers_are_kept_by_the_real_liveness_chec
     // An unrelated live process whose pid a recycled directory name could carry.
     let mut stranger = std::process::Command::new("sleep")
         .arg("60")
-        .spawn()
+        .spawn_locked()
         .expect("sleep");
     let theirs = root.path().join(name(stranger.id()));
     std::fs::create_dir(&theirs).unwrap();

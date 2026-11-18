@@ -278,23 +278,27 @@ fn the_longest_managed_deadline_follows_what_the_child_advertised() {
         lane: "managed".into(),
         deadline_ms: ms,
     };
-    let mut small = HelloResult::default();
-    small.op_limits = Some(
-        MANAGED_OPS
-            .iter()
-            .map(|op| ((*op).to_owned(), limit(1)))
-            .collect(),
-    );
+    let small = HelloResult {
+        op_limits: Some(
+            MANAGED_OPS
+                .iter()
+                .map(|op| ((*op).to_owned(), limit(1)))
+                .collect(),
+        ),
+        ..HelloResult::default()
+    };
     assert!(
         bound(&small) < table,
         "all four advertised small shrinks the bound"
     );
-    let mut big = HelloResult::default();
-    big.op_limits = Some(
-        [(MANAGED_OPS[0].to_owned(), limit(10 * 60_000))]
-            .into_iter()
-            .collect(),
-    );
+    let big = HelloResult {
+        op_limits: Some(
+            [(MANAGED_OPS[0].to_owned(), limit(10 * 60_000))]
+                .into_iter()
+                .collect(),
+        ),
+        ..HelloResult::default()
+    };
     assert!(bound(&big) >= table);
     assert!(bound(&big) <= MAX_ADVERTISED_TIMEOUT);
 }
