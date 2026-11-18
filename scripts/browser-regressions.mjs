@@ -225,12 +225,33 @@ async function runHarness(harness, webkit) {
   let deadline;
   let requests = 0;
   let lastRequest = "none";
+  const started = Date.now();
+  const since = () => ((Date.now() - started) / 1000).toFixed(1);
+  /** The page's own account of how far it got (harness/progress.ts), with when. */
+  const progress = { first: "", last: "" };
+  /** When the server finished starting, for the timing line. */
+  let listening = "";
   /** @type {import('vite').Plugin} */
   const receiver = { name: "gitpulse-browser-verdict" };
   const completed = new Promise((resolve, reject) => {
-    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest})`)), seconds * 1000);
+    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest}; ${progress.last ? `page progress: ${progress.last}` : "the page reported no check"}${listening ? `; server listening at ${listening}s` : "; server not yet listening"})`)), seconds * 1000);
     receiver.configureServer = (server) => {
       server.middlewares.use((request, _response, next) => { requests++; lastRequest = request.url ?? "unknown"; next(); });
+      server.middlewares.use(reportPath.replace("/__gp_result/", "/__gp_progress/"), (request, response) => {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", chunk => { if (body.length < 4096) body += chunk; });
+        request.on("end", () => {
+          response.end("ok");
+          try {
+            const beat = JSON.parse(body);
+            const text = `${beat.count} checks at ${since()}s, last: ${String(beat.name).slice(0, 160)}`;
+            if (process.env.GITPULSE_HARNESS_BEATS) console.log("beat:", text);
+            progress.first ||= text;
+            progress.last = text;
+          } catch { /* advisory */ }
+        });
+      });
       server.middlewares.use(reportPath, (request, response) => {
       if (request.method !== "POST") { response.statusCode = 405; response.end(); return; }
       let html = "";
@@ -261,6 +282,7 @@ async function runHarness(harness, webkit) {
       server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
     });
     await server.listen();
+    listening = since();
     const address = server.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");
     const chrome = chromeBinary();
@@ -287,7 +309,9 @@ async function runHarness(harness, webkit) {
       browser?.once("close", report);
       browser?.once("exit", code => setTimeout(() => report(code), 1000).unref());
     });
-    console.log(await Promise.race([completed, exited]));
+    const verdict = await Promise.race([completed, exited]);
+    // Where each page's time goes, so a deadline is set from a measurement.
+    console.log(`${verdict} [timing: server listening ${listening}s; first beat ${progress.first || "none"}; verdict ${since()}s of ${seconds}s]`);
   } finally {
     clearTimeout(deadline);
     // A browser ended by a signal has no exit code; waiting for its `close`

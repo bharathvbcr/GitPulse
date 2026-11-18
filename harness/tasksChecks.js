@@ -7,6 +7,7 @@ import { mockIPCWithEvents } from "./tauriMocks";
 import { applyPlatformClass } from "../src/lib/platform";
 import { shortcutTextLabel } from "../src/lib/ui/platformCopy";
 import { hostPlatform } from "../src/lib/stores/platformStore";
+import { reportProgress } from "./progress";
 import TasksHost from "./TasksHost.svelte";
 import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen";
 import { themeStore } from "../src/lib/stores/themeStore";
@@ -595,7 +596,7 @@ const repoRow = name => [...(repoPopup()?.querySelectorAll(".repo-row") ?? [])].
 // without opening anything, so both count as the summary.
 const repoSummaryText = () => editor()?.querySelector("[data-task-repo-picker]")?.textContent ?? "";
 const editor = () => root.querySelector(".task-editor");
-const check = (name, pass) => results.push({name, pass:Boolean(pass)});
+const check = (name, pass) => { results.push({name, pass:Boolean(pass)}); reportProgress(results.length, name); };
 check("a fresh Tasks board opens most urgent first", openedInPriorityOrder);
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
 const click = async text => {
