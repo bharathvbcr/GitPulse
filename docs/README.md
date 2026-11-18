@@ -14,7 +14,10 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 | Install the app or update it | [Installation](INSTALLATION.md) |
 | Open a repository and review my first change | [Getting started](GETTING_STARTED.md) |
 | Understand the walkthrough or OS permissions | [Onboarding and permissions](ONBOARDING.md) |
-| Find a view, section, or capability | [Feature reference](FEATURES.md) |
+| See what GitPulse does, by area | [Features](FEATURES.md) |
+| Look up a view or section in detail | [View reference](VIEW_REFERENCE.md) |
+| Run agents on a task board, with guards and collision warnings | [Agents guide](AGENTS_GUIDE.md) |
+| Compare GitPulse with other tools | [Why GitPulse](WHY_GITPULSE.md) |
 | Find a command or keyboard shortcut | [Command palette](COMMAND_PALETTE.md) · [Keyboard shortcuts](../wiki/Keyboard%20Shortcuts.md) |
 | Explore topics, tags and SEO | [Topics and SEO](../README.md#topics-tags--discoverability) |
 

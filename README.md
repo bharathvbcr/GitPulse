@@ -6,19 +6,22 @@
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg" alt="Coverage"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/releases"><img src="https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms">
+  <img src="https://img.shields.io/badge/tested%20on-macOS-lightgrey" alt="Tested on macOS; Windows and Linux builds are not yet tested">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
 
-**Fast, local-first Git desktop client, code intelligence suite, and task workspace.**
+**A workspace, not a chat window. GitPulse is the local-first command centre for agentic coding.**
 
-Review changes with GPU acceleration, resolve 3-way conflicts, follow branch and commit
-history, search across repositories, organize tasks with board swimlanes, and inspect repository
-health from a native Rust / Tauri 2 app with a Svelte 5 frontend. 100% on-device, private-by-design,
-zero telemetry.
+GitPulse is built for the agentic era. It gives the same information and the same tools to the
+people and to the agents doing the work. It runs Claude Code, Codex and other agents side by side
+across all your repositories. Each agent gets its own worktree, a policy guard and a code map, and
+a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
+native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 
 [Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
 [Getting started](docs/GETTING_STARTED.md) ·
+[Why GitPulse](docs/WHY_GITPULSE.md) ·
+[Agents guide](docs/AGENTS_GUIDE.md) ·
 [Documentation](docs/README.md) ·
 [Website](https://gitpulse.vbcr.dev/) ·
 [Release notes](CHANGELOG.md) ·
@@ -26,22 +29,48 @@ zero telemetry.
 
 ![GitPulse on macOS: commit graph and selected commit diff](docs/assets/screenshot-graph.png)
 
-## GitPulse 2.0 — Coming Soon
+## Why GitPulse
 
-GitPulse 2.0 (currently in beta on `main` as `1.99.0` — the first release since `v1.3.1`, rolling in all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)) brings a redesigned desktop shell, out-of-process terminal and agent hosting, pre-operation Git recovery snapshots, and full multi-agent worktree orchestration:
+Most agent apps are organised around a chat transcript: one agent, one conversation, and you scroll
+to find out what happened. GitPulse is organised around the work itself: repositories, worktrees,
+tasks, sessions, code and machine load. It shows that state to you in the UI, and to your agents
+through the same facts over MCP (66 tools).
 
-- **Streamlined 4 views & 11 sections with floating glass cards:**
-  - **Work (`Overview · Remote · Tasks`)**: Inline 3-way conflict editor leading Overview whenever a merge or rebase is parked, plus folded stale-branch cleanup with tip backups, policy activity, outgoing-commit checks, and release tag publishing.
-  - **Code (`Explorer · Map`)**: Inline Search (`git grep`) and Blame toggles inside Explorer, and a Map overview of repository size, caps, and critical files with `[n/5]` live build progress and hover tooltips across files, symbols, and subsystems.
-  - **History (`Graph · Diff`)**: Unified `Commits | HEAD moves | Suspects` switcher on Graph, a **History (`⌥H`)** commit-graph rail tab right inside Diff, rich commit hover cards (full message body, `git notes`, recorded verification), and `Shift+click` `older..newer` commit-to-commit comparisons.
-  - **Insights (`Pulse · Coverage · Health · Storage`)**: in-process Secrets scan (Kingfisher as the opt-in deep scan) folded into Health under one health verdict, five-row previewed report lists (`Show all N`), and Storage on-demand `git commit-graph write`.
-- **Theme preset gallery, saved themes shelf & macOS window wallpapers:** Seventeen built-in `gitpulse-theme/1` presets across Standard (*Neural HUD*, *Reactor*, *Pure Black*, *Crimson*, *Phosphor*, *Synthwave*, *Paper*), Developer (*Amber CRT*, *Blueprint*, *Midnight IDE*, *Arctic*, *Solar Dark*, *Daylight*), and Sci-Fi (*Nebula*, *Orbital*, *Neon City*, *Hyperspace*); a **My themes** shelf for up to 24 saved or imported themes; and eleven seeded static SVG backdrops or custom raster wallpapers (`<= 2560px` JPEG in IndexedDB, macOS only).
-- **Stacked worktree tabs & collapsible repository groups:** Every checkout of a repository shares one tab with a checkout switcher, and inactive repository groups (and inactive tabs within groups) can collapse from the tab bar, Settings, or Command Palette.
-- **Always-on Unix terminal host (`gitpulse-ptyd`), WebGL rendering & hosted Manvi runs:** PTY terminal sessions on Unix unconditionally live in `gitpulse-ptyd` ([Terminal host](docs/TERMINAL_HOST.md)) with transcript recovery (`512 KiB`), a durable 64-row session ledger (`terminal-sessions.v1.jsonl`, `TerminalResume --fork`), default-on detached `manvi serve --listen` hosting for managed Codex and Claude runs, GPU WebGL rendering (`@xterm/addon-webgl` with 5-minute context hold and 3-strike DOM fallback), DEC 2026 synchronized output, `@xterm/addon-unicode11`, kernel-event exit waiting, and **Send to agent** live-session wakeups (`gitpulse-hook deliver`).
-- **Pre-operation Git snapshots (`refs/gitpulse/ops/<n>`) & agent turn checkpoints (`refs/gitpulse/turns/`):** Allowed agent Git mutations record pre-operation snapshots with CAS-checked undo (`cmd_undo_op_snapshot`) in Reflog, while opt-in turn checkpoints capture working-tree state at agent turn start and end (inspectable over MCP via `gitpulse_turn_checkpoints`).
-- **Zero-copy agentic worktrees, Claude Code hooks, Codex ledger & live MCP control plane:** Eleven `gitpulse_worktree_*` MCP tools, `gitpulse-worktree` CLI, `gitpulse-rustc` build cache, `.worktreeinclude`, and `WorktreeCreate`/`WorktreeRemove` plugin hooks provision `claude --worktree` and isolated subagents with CoW-seeded DevMap stores (`~1.2 s` query-ready vs `~7.6 s` cold). `gitpulse_sessions` and `agents.live` report live Claude Code, Codex, Antigravity, DevCouncil, and Manvi sessions (`0` `git` spawns on `gitpulse_sessions`), alongside Codex rollout ledger ingestion, per-run activity timelines, agent thread trees, `gitpulse_merge_conflicts`, `gitpulse_landed`, `gitpulse_provenance`, and inode-bound ledger adoption.
-- **Workbench schema 17 & faster Tasks board:** Merges the Inbox column into Backlog (five columns: *Backlog*, *Ready*, *In progress*, *Review*, *Done*), adds cross-repo queues, a two-way GitHub issue sync outbox, and DAG launch readiness, automatically fills board columns up to 2,000 cards (`fillBoard`), refreshes live while the window is on screen even when unfocused (`liveOnScreen`), and adds a two-row header, subtask progress, due-date/status filters, attention inbox dismiss/restore, card merge/delete, `expected_revision` CAS protection on `gitpulse_add_task`, and CI watching on agent branches.
-- **Manvi Anthropic account registry, host-load governor, Firebase diagnostics & PR review:** Launches `manvi serve` via `~/.anthropic-accounts` (`anthropic-account exec --no-fallback`) with `Cloud · <model>` pill display, governs agent launches under severe host memory pressure (`sysload::governor`) with class-tiered Git spawn budgets (`spawn-budget.v2`), adds GitHub PR review/approve/merge actions, classifies Firebase App Hosting CLI failures with redacted *Copy diagnostics*, renders GitHub commit author avatars in Graph, and expands `dc-redact` secret detection (`ya29.`, `1//`, `GOCSPX-`, GitLab `gldt-`/`glft-`/`glrt-`/`glwt-`, Slack `xoxe-`, AWS `ABIA`/`ACCA`/`A3T`, HuggingFace `api_org_`).
+When you run several agents across several repositories, these are the problems GitPulse is built for:
+
+- **You lose the map.** Live session detection finds agent sessions across your repositories, including ones GitPulse did not launch, and the agent tree nests them.
+- **Agents collide.** The collision radar and file claims warn before two agents' edits meet, and agents can message each other through a peer inbox.
+- **Agents do damage.** Manvi's command gate, per-repository trust, the secret gate on commits GitPulse makes, and pre-operation undo snapshots limit what an agent can do.
+- **Agents do not know the code.** DevMap gives you, and them, the blast radius and the affected tests for a change.
+- **The laptop melts.** The load scheduler admits, queues or sheds heavy work by host pressure.
+- **You still need Git.** The commit graph, branch stack tree, diffs, conflicts, reflog, pull requests and Actions are in the same window.
+
+The task board is part of this. An agent that finds out-of-scope work files it with `gitpulse_add_task`,
+and it lands on your board instead of scrolling away in a transcript. You can launch an agent from any
+card.
+
+GitPulse does not replace Claude Code, Codex or your editor. It launches, watches, guards and lands their
+work. [Why GitPulse](docs/WHY_GITPULSE.md) has the dated comparison with other tools, including where
+they are stronger. The [agents guide](docs/AGENTS_GUIDE.md) covers running agents.
+
+**Platforms.** GitPulse is tested on macOS. Windows and Linux builds are produced by release CI but have
+not been tested.
+
+## GitPulse 2.0 (beta)
+
+GitPulse 2.0 is in beta on `main` as `1.99.0`. It is the first release since `v1.3.1` and includes all
+unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
+The [feature reference](docs/FEATURES.md) lists every area.
+
+- **Agents:** six launchers (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab, live session detection, an agent tree, a worktree per agent with copy-on-write dependency caches, a peer inbox for agent-to-agent messages, collision radar, file claims, and turn checkpoints. The `gitpulse-mcp` server exposes 66 tools (55 `gitpulse_*`, 11 `devmap_*`) and 4 prompts.
+- **A task board agents write to:** five columns (Backlog, Ready, In progress, Review, Done), cross-repository and saved-workspace boards, up to 2,000 cards per fill, launch an agent from a card, and `gitpulse_add_task` with duplicate gating. `gitpulse_complete_task` marks a task done only after a passed verification; otherwise the card moves to Review.
+- **Guards:** Manvi's command gate classifies each decision into one of eight statuses (see [Security](docs/SECURITY.md)), repository trust is per repository and only the desktop can grant it, and allowed agent Git mutations take pre-operation snapshots (`refs/gitpulse/ops/`) with a checked undo.
+- **Code intelligence:** DevMap map, blast radius, affected tests, regression suspects, dead symbols, clones and symbol search through the palette.
+- **Load scheduler:** a memory-pressure governor for agent launches, build leases with a queue for heavy builds, parking of idle agent sessions, and a host-load strip with CPU, GPU, memory, thermal and storage indicators.
+- **Terminal:** nested splits (up to 8 panes), split groups, command blocks, a Browser pane for local dev servers, and sessions that survive quitting the app on Unix (`gitpulse-ptyd`).
+- **Four views, 11 sections:** Work (`Overview · Remote · Tasks`), Code (`Explorer · Map`), History (`Graph · Diff`) and Insights (`Pulse · Coverage · Health · Storage`), plus Fleet and an Agents plane.
+- **Git client:** lane-solved commit graph with avatars, branch stack tree with restack, hunk and line staging, a 3-way conflict editor, HEAD moves (reflog) with undo, and GitHub pull requests, issues, Actions and releases.
+- **Customization:** 17 theme presets, a My themes shelf (24), 11 macOS wallpapers plus your own image, a command palette with 8 modes, and repository logos.
 
 ## Get started
 
@@ -123,12 +152,12 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
 Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected
-file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (scaling to 1,000 repositories with 24 active watches),
+file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (up to 1,000 open repository tabs, with at most 32 repositories watched at once and 24 recent repositories remembered),
 **Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
 
 ## From a change to the next step
 
-- **Review and commit.** Canvas commit graph (100K+ commits at 60/120 FPS), unified and side-by-side diffs,
+- **Review and commit.** Canvas commit graph (the lane solver handles a synthetic 100,000-row history in about 41 ms, and assembling the window takes about 58 ms; see [performance notes](docs/PERFORMANCE.md)), unified and side-by-side diffs,
   word highlighting, symbol-grouped diff hunks, image comparisons, selective staging,
   stash previews, a three-way conflict resolver, and structured patch-brief commit
   phrasing with on-device Apple Intelligence fallback.
@@ -214,7 +243,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]
-        Bridge["invoke('cmd_*') — 335 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+        Bridge["invoke('cmd_*') — 330+ Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -229,7 +258,7 @@ flowchart TB
     subgraph Integrations["Modular Integrations & Local Tools"]
         direction TB
         subgraph ManviWrap["Manvi (Wraps DevCouncil Modules)"]
-            ManviSidecar["manvi serve --posture host<br/>(5-verdict policy gate & workbench DB)"]
+            ManviSidecar["manvi serve --posture host<br/>(policy gate: 8 decision statuses & workbench DB)"]
         end
         subgraph DevCouncilMods["DevCouncil & DevMap"]
             Vendored["Vendored Readers<br/>(devmap-store, devmap-query, dc-store)"]
@@ -349,7 +378,7 @@ types.
 | --- | --- |
 | **GitHub Topics** | `git`, `git-client`, `git-gui`, `tauri`, `tauri-v2`, `rust`, `svelte5`, `svelte`, `local-first`, `code-intelligence`, `developer-tools`, `devtools`, `desktop-app`, `mcp`, `commit-graph`, `merge-conflict-resolver`, `reflog`, `test-coverage`, `terminal`, `privacy-first`, `zero-telemetry` |
 | **Tech Stack** | Rust (Tauri 2, Rayon), Svelte 5 (Runes), TypeScript, Tailwind CSS, portable-pty, DevMap, Manvi |
-| **Target Platforms** | macOS (Apple Silicon & Intel Universal dmg), Linux (.AppImage, .deb), Windows (.msi, .exe) |
+| **Target Platforms** | Tested on macOS (universal build). Release CI also builds Linux x64 and arm64 (`.AppImage`, `.deb`) and Windows x64 and arm64 (`.msi`, `.exe`); those builds are not yet tested. |
 | **License & Privacy** | MIT License · 100% on-device · Zero telemetry |
 
 ---

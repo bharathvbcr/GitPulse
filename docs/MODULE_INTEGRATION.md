@@ -49,7 +49,7 @@ flowchart TD
         direction TB
         ManviWrap["Go Embedding & Harness Wrap"]
         ManviSidecar["<code>manvi serve --posture host</code> (NDJSON stdio)"]
-        ManviPolicy["Policy Evaluation Engine (5-verdict ladder)"]
+        ManviPolicy["Policy Evaluation Engine (8 decision statuses)"]
         ManviWorkbench["Workbench API wrap of <code>dc-store</code>"]
         ManviAgents["Managed Agent Hosting (Claude Code · Codex)"]
         ManviWrap --> ManviSidecar
@@ -61,7 +61,7 @@ flowchart TD
     subgraph GitPulseHost["GitPulse Desktop Host"]
         direction TB
         UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
-        RustIPC["Rust Core (335 Handlers, Tauri 2 IPC)"]
+        RustIPC["Rust Core (336 Handlers, Tauri 2 IPC)"]
         InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
         CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
         HarnessClient["Harness Client & Grants<br/>(<code>src-tauri/src/harness/</code>)"]

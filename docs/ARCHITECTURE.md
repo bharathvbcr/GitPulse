@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["335 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["330+ Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (335 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (330+ Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -205,7 +205,7 @@ On the backend, a DevMap live refresh never holds its IPC command on the `devmap
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +335 Registered Handlers
+        330+ Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -472,7 +472,7 @@ sequenceDiagram
 - **Async runtime**: `rayon` and `tokio` are the direct concurrency dependencies in `src-tauri/Cargo.toml`. `tokio` is pinned with an exact `=` requirement to the version `Cargo.lock` already resolves for Tauri, so declaring it adds no package, and it is used for two things only: `pools.rs` builds the runtime Tauri runs on (2 to 4 async workers, at most 64 blocking threads) and hands it over with `tauri::async_runtime::set` as the first call in `run()`, and `commands/mod.rs` bounds background commands with a two-permit `tokio::sync::Semaphore`. Rayon's global pool is sized to half the logical cores, rounded up. Blocking work leaves the IPC thread through `tauri::async_runtime::spawn_blocking` (see `off_thread` in `commands/mod.rs`).
 - **Nogap Lookback Bounds**: Prevents disconnected lane lines across virtualized scrolling regions.
 - **Author Avatars**: Fast on-canvas rendering with caching for author initials, identicons, and GitHub avatars.
-- **Frame Scheduling**: Renders at 60/120 FPS using requestAnimationFrame batches, avoiding UI thrashing during rapid kinetic scrolling.
+- **Frame Scheduling**: Draws in requestAnimationFrame batches, avoiding UI thrashing during rapid kinetic scrolling. No frame-rate figure is claimed; the measured lane-solve and window-assembly timings are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ---
 
@@ -482,7 +482,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 335 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 330+ Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
 | **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 2415 data fields, over 344 structs, in 129 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` (a source-checkout command) recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |

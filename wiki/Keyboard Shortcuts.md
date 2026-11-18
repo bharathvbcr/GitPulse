@@ -26,7 +26,10 @@ macOS listed first; Windows / Linux in the second column.
 | History | `⌥⌘2` | `Ctrl+Shift+2` |
 | Insights | `⌥⌘3` | `Ctrl+Shift+3` |
 | Fleet | `⌘⇧F` | `Ctrl+Shift+F` |
+| Agents plane | `⌘⇧A` | `Ctrl+Shift+A` |
 | Terminal dock | `⌃\`` | `Ctrl+\`` |
+
+The terminal dock has its own shortcuts, listed in its shortcut guide (splits, pane focus, Find, text size); for example `⌘D` splits right and `⌘⇧D` splits down on macOS.
 
 Sections (Work: Overview/Remote/Tasks; Code: Explorer/Map; History: Graph/Diff; Insights: Pulse/Coverage/Health/Storage) are switched with `⌥` + the section's digit while that view is active, or by name in the command palette.
 
@@ -52,7 +55,7 @@ Sections (Work: Overview/Remote/Tasks; Code: Explorer/Map; History: Graph/Diff; 
 | Zoom In / Out / Reset | `⌘+` / `⌘-` / `⌘0` | `Ctrl++` / `Ctrl+-` / `Ctrl+0` |
 | Toggle Dark / Light | `⌘⇧T` | `Ctrl+Shift+T` |
 
-In **Code**, `⌘F` searches the open file (Explorer, including when the Blame toggle is active). From other views it focuses History's commit filter.
+`⌘⇧F` is **Fleet**, not search. `⌘F` is the only search chord: in **Code** it searches the open file (Explorer, including when the Blame toggle is active), in History → Diff it searches the diff, and from other views it focuses History's commit filter. Repository-wide content search has no chord of its own; open it in Code → Explorer with the field's Contents mode, or find files by name with the palette's `/` mode.
 
 ## Git operations
 

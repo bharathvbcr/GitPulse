@@ -9,6 +9,8 @@
 * [[Troubleshooting]]
 
 **Agents & policy**
+* [Agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md)
+* [Why GitPulse](https://github.com/bharathvbcr/GitPulse/blob/main/docs/WHY_GITPULSE.md)
 * [[MCP and Agents]]
 * [[Policy and AI]]
 * [[Security]]

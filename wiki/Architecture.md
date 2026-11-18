@@ -37,7 +37,7 @@ flowchart TB
     subgraph Integrations["Modular Sidecars & Local Tools"]
         direction TB
         subgraph ManviBox["Manvi Harness"]
-            Manvi["manvi serve --posture host<br/>(5-verdict policy ladder & dc-store workbench)"]
+            Manvi["manvi serve --posture host<br/>(policy gate: 8 decision statuses & dc-store workbench)"]
         end
         subgraph DevCouncilBox["DevCouncil & DevMap"]
             Vendored["Vendored Readers (devmap-store, devmap-query)"]

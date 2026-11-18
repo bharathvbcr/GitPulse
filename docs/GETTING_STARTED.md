@@ -65,7 +65,41 @@ Drafting suggestions require review and acceptance. Read
 [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the complete token syntax,
 loaded-page filtering, multi-selection, archive, and run boundaries.
 
-## 5. Add optional capabilities when you need them
+## 5. Run your first two agents
+
+This path starts two agents on two tasks in one repository, each in its own
+worktree, and shows you what GitPulse reports while they work. It needs a
+repository you have trusted and at least one agent CLI installed (Claude Code,
+Codex, Antigravity or Manvi). Agents run under their own permissions, so read the
+[agents guide](AGENTS_GUIDE.md) first if you are unsure what GitPulse does and does
+not guard.
+
+1. **Connect the agent.** Open **Settings → Agents → Connect your agent** and apply
+   the plan (see step 6 for what it does). Without it, agents still launch, but they
+   cannot call GitPulse's MCP tools or the hooks that guard them.
+2. **Write two tasks.** In **Work → Tasks**, use Quick add to create two small,
+   independent tasks. Give each an acceptance criterion; the agent's brief includes it.
+3. **Launch the first.** Choose **Send to agent** on the first card. Pick the agent,
+   the working checkout and the permission mode, and tick **Run in a new worktree**.
+   Optionally set the model, effort and advisor for this launch. GitPulse creates
+   `.gitpulse/worktrees/<task>-<id>` on a new `gitpulse/<task>-<id>` branch and opens
+   a terminal for the attempt in the dock.
+4. **Launch the second** the same way, with a different agent if you have one. The
+   form tells you when a checkout already holds an agent and selects a new worktree
+   for you.
+5. **Watch them.** The Agents plane (`⌘⇧A`) shows the checkouts, terminals and task attempts
+   in one tree. **Work → Overview** shows one row per
+   worktree and sorts blocked ones first.
+6. **Check for overlap.** If both tasks touch the same file, the collision radar and
+   the edit hook warn the agent that edits it second. The agents can also send each
+   other messages. [Collisions and messaging](AGENTS_GUIDE.md#agent-to-agent-messaging)
+   explains both.
+7. **Finish.** An agent calls `gitpulse_complete_task` when its work is done and
+   verified. The card moves to Done only when Manvi has recorded a passed verification
+   for the head the worktree is still on; otherwise it moves to Review, and you decide. Merge or remove the worktree from
+   **Worktrees** when you have reviewed the result.
+
+## 6. Add optional capabilities when you need them
 
 GitPulse works without any of these. The code-map views (Health, Suspects, diff
 impact and palette symbol search) stay open without DevMap and say what is

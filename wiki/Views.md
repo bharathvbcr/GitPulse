@@ -1,12 +1,12 @@
 # Views
 
-GitPulse has **four views**. Each holds sections (lenses) on one subject. Tasks, Fleet and the terminal dock are workspace surfaces outside those four views.
+GitPulse has **four views**. Each holds sections (lenses) on one subject. Tasks, Fleet, the Agents plane and the terminal dock are workspace surfaces outside those four views.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. Work → Overview's cleanup and policy activity, Remote's issue import and release publishing, and Tasks go through Manvi; Code → Map uses DevCouncil's `devmap` module.
 
 ![Files view: explorer, syntax-highlighted viewer, and uncommitted status](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-files.png)
 
-The complete catalog lives in [docs/FEATURES.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md). This page is the map.
+The area-by-area list is [docs/FEATURES.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/FEATURES.md) and the per-view detail is [docs/VIEW_REFERENCE.md](https://github.com/bharathvbcr/GitPulse/blob/main/docs/VIEW_REFERENCE.md). This page is the map.
 
 ## Work (`F10`)
 
@@ -54,8 +54,8 @@ Four on-demand scans of **this repository**. Each must say when it was capped ra
 | Section | Purpose |
 | --- | --- |
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
-| **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
-| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, pinned advisory table columns, Dependabot and code scanning via `gh` when a repository opens, and the **Kingfisher Secrets Scanner** (showing Git location and shared-value rows while dropping secret values and context, never reporting partial/incomplete scans as clean). Critical and high findings warn. |
+| **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, SimpleCov, JaCoCo, Clover (7 formats parsed; a coverage.py `.coverage` database is detected but must be exported). Toolchain hints and failure recovery. |
+| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, pinned advisory table columns, Dependabot and code scanning via `gh` when a repository opens, and the **Secrets scan** (in-process; Kingfisher is an optional second opinion on an explicit Rescan; showing Git location and shared-value rows while dropping secret values and context, never reporting partial/incomplete scans as clean). Critical and high findings warn. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
 ![Coverage scanner](https://raw.githubusercontent.com/bharathvbcr/GitPulse/main/docs/assets/screenshot-coverage.png)
@@ -69,6 +69,10 @@ Resizable PTY under whichever view is on screen. When expanded, inerts and hides
 ### Tasks
 
 The Tasks button beside Fleet opens global and saved-workspace scopes over the same records as Work → Tasks. Saved workspace membership survives closing repository tabs. Board/list layouts, filters over loaded cards, context actions, Quick Enhance and agent copying are described in [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md).
+
+### Agents plane (`Command/Ctrl+Shift+A`)
+
+The agent checkouts, terminals and task attempts your open repositories are holding, drawn as one tree: a terminal that continues an attempt, and a child session, nest under their parent. It also holds the agent inbox. Live sessions that GitPulse did not launch are detected from the process table and reported by `gitpulse_sessions` and `gitpulse_insights`, and Work → Overview shows them against their worktree. See the [agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md).
 
 ### Fleet (`Command/Ctrl+Shift+F`)
 

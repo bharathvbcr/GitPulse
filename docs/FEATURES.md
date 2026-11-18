@@ -1,840 +1,190 @@
-# GitPulse Features & View Catalog
-
-[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Installation](INSTALLATION.md)
-
-This is the detailed feature reference. Start with the guides above for a first
-session; use the sections below for controls, prerequisites, and limits.
-[Open qualification](https://github.com/bharathvbcr/GitPulse/blob/90362c2eaee356294574da6427a637c048fbcf18/docs/QUALIFICATION.md) tracks verification that remains outstanding.
-
-## Find a workflow
-
-- [Work: Overview, Remote, and Tasks](#1-work-work)
-- [Tasks and saved workspaces](TASKS_AND_WORKSPACES.md)
-- [Code](#2-code-code), [History](#3-history-history), and [Insights](#4-insights-insights)
-- [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
-- [Trust and permissions](SECURITY.md)
-
-## Four views, one workspace
-
-GitPulse has 4 application views with 11 specialized sections. Each view keeps related sections together.
-
-| View | What you do here | Sections |
-| --- | --- | --- |
-| **[Work](#1-work-work)** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Tasks |
-| **[Code](#2-code-code)** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
-| **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
-| **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
-
-Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
-
-GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
-
-**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for the Code → Map code graph. See [Module integration](MODULE_INTEGRATION.md).
-
-On macOS, GitPulse automatically uses [glass surfaces, theme presets, saved themes, window wallpapers, and liquid transitions](MACOS_APPEARANCE.md) over a transparent, desktop-blurring window, with opaque code/diff/graph content and accessibility fallbacks.
-
-The native menu bar contains **GitPulse, File, Edit, View, Go, Repository, Window
-and Help**. **Go** opens all 11 sections directly. **View** includes Zoom In,
-Zoom Out and Actual Size. **Help** provides documentation, keyboard shortcuts,
-diagnostics, optional-tool setup, release notes and issue reporting. Commands
-reflect repository availability and running work; checkmarks follow selection
-and appearance. Repository menus include staging, branches, parked-operation
-actions and copy/reveal/remote utilities. Enable the compact pulse icon in
-**Settings → Layout → Menu bar status icon** for a compact popover with repository switching,
-changed/staged/conflict/stash cards, last-fetch sync counts, parked-operation and
-busy-work chips, History/Pulse/Fleet/Terminal shortcuts, copy/reveal/remote/appearance
-utilities, expandable details and contextual review/recovery actions. Refresh and
-appearance stay in the panel; Open GitPulse restores the main window. See the
-[menu inventory](MACOS_MENUS.md).
-
-```mermaid
-flowchart TD
-    subgraph ViewGroup["The four views"]
-        Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Tasks"]
-        Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
-        History["<b>History</b> (<code>history</code>)<br/>Graph (commits, HEAD moves or suspects) · Diff — lenses on commit history"]
-        Insights["<b>Insights</b> (<code>insights</code>)<br/>Pulse · Coverage · Health · Storage — four scans of the repository; Health includes secrets"]
-    end
-
-    subgraph NotViews["Not views — available under every view"]
-        Terminal["<b>Terminal dock</b> (<code>⌃`</code>)<br/>Embedded PTY beneath the active view"]
-        Tasks["<b>Tasks</b><br/>Global and saved-workspace boards"]
-        Fleet["<b>Fleet</b> (<code>⌘⇧F</code>)<br/>Every open and recent repository at once"]
-    end
-```
-
----
-
-## 1. Work (`work`)
-
-Everything in flight, and the actions that unblock it. Three sections cover
-worktree activity (with the conflict editor, branch chains, cleanup and the
-policy journal folded into Overview), GitHub and the outgoing commits
-(Remote), and the repository's shared task board. Resolve and Policy were
-sections once; their content now lives with the subject it acts on — see
-[1.3](#13-policy-manvi-across-work-and-settings).
-
-### 1.1 Overview
-
-- **One Row Per Place Work Is Happening**: Joins linked worktrees, open pull requests, workflow runs, policy verdicts and grants into one row each. Everything else in GitPulse shows one of these; this shows how they relate.
-- **Keyed On What Exists Here**: With a DevCouncil store, the unit is the task. Without one — the ordinary case for a repository driven by Claude Code or by hand — the unit is the **worktree**, because that is where a branch, its uncommitted changes, its parked operation and its pull request actually live. Keying on task regardless collapsed the whole repository into a single row labelled "Not bound to a task".
-- **Agent Worktrees Are Named As Such**: A worktree under `/.<agent>/worktrees/` (Claude Code, Cursor, Codex, and any other tool using that layout) is marked, because a stale agent session and a stale hand-made checkout want opposite remedies — resume or merge, versus prune. Detection reads the directory layout, never the branch name, so a human naming a branch `claude/…` is not mislabelled. Git's own `.git/worktrees/` metadata is never labelled an agent session.
-- **Blocked Worktrees Sort First**: A worktree parked mid-merge, rebase, cherry-pick or revert is the one thing on the screen that cannot progress without a person, so it outranks rows with more pull requests, and clicking it opens that worktree in Policy, which leads with the conflict editor.
-- **Uncommitted Is Counted, Unscanned Is Not Claimed**: A worktree past the scan cap shows nothing rather than `0`, which would report it as verified clean.
-- **Remotes, Submodules And Stash**: Folded in as a collapsed section rather than a separate view — the same repository, reference material rather than work in flight. Remotes can be added, renamed, re-pointed, pruned, or removed; submodules can be initialized, URL-synced, or deinitialized (never force-discarded). A remote, tag, or submodule listing cut by a cap says so, instead of looking complete.
-- **Recorded Joins Only**: A worktree is placed on the task the ledger *bound* it to, never on a branch-name coincidence — two worktrees can hold the same branch. Pull requests and runs join through a worktree's branch, because that is the only link GitHub knows about; one matching no worktree stays in the unbound bucket rather than being guessed at. Verdicts and grants carry their own `task_id`, recorded when the gate judged.
-- **A Branch on Two Tasks Appears on Both**: Assigning it to one would hide the work from the other with nothing on screen to say so.
-- **Where You Are Standing**: A strip above the rows for the checked-out branch itself — tracking state against its upstream, how far behind the default branch it is, and the working tree split into staged, unstaged and conflicted. A branch the progressive branch-stats pass has not reached yet reads *"sync not measured yet"* rather than as `0↑ 0↓`, which is what a pushed, current branch looks like. A parked operation here gets its own line into Resolve, and a probe that could not run says so instead of leaving the same empty space as an idle worktree.
-- **The Counts Are Doors**: Each tile in the strip selects exactly the rows it counted, and a filter box matches on branch, path, task and pull request. Strip and list share one predicate, so a tile saying three can never sit above a list showing none of them. A filter matching nothing says so — and offers to clear itself — rather than borrowing the wording of a repository with nothing in flight. Narrowing is dropped on a repository switch.
-- **How Long It Has Been Sitting**: Each row carries the age of the most recent commit on its branches. A worktree nobody has touched in three weeks and one from ten minutes ago read identically without it and want opposite things done; a branch the branch list has not measured shows nothing rather than the epoch.
-- **Verdict Tally**: Per-row counts of every policy status, with `allowed` folded into the total rather than shown as a chip, so the exceptions are what you see.
-- **Unreadable Is Its Own State**: A verdict this build cannot parse is counted as `unreadable`, never as `allowed` — a check that could not be read must never render as one that ran and passed.
-- **Incomplete Screens Say So**: Each of the five sources can be present, empty, or unreadable, and a row assembled from an unreadable source looks exactly like one assembled from an empty source. A banner above the rows names what could not be read, and distinguishes "this repository has no DevCouncil store" (ordinary) from "its store could not be opened" (a problem). The absence itself is never the headline: a reader who does not run one is told what *is* here, not what is missing.
-- **Worktree Copy-on-Write Cache Sync & `gitpulse-rustc` Build Cache**: Ignored dependency caches (`node_modules`, `target`, `.venv`) clone from the anchor checkout via APFS `clonefile`, Linux `FICLONE`, or bounded copy fallback (selectable from the **Worktrees** panel's **Copy-on-Write dependency caches** toggle). When an active anchor build holds `.cargo-lock` and `target/` must be skipped, the standalone `gitpulse-rustc` (`RUSTC_WRAPPER`) binary and `gitpulse-worktree build` / `cache-stats` CLI share compiled Rust crate artifacts (`.rlib`, `.rmeta`, `proc-macro` dylibs) across sibling worktrees from `<git-common-dir>/gitpulse/build-cache` using two-stage Blake3 direct + `.d` dep-info / `# env-dep:` verification and CoW reflink materialization.
-- **Zero-Copy DevMap Pointers, Sparse `--cone` Checkouts & Delta Overlays**: Creating a worktree from the desktop **Worktrees** panel (**Zero-copy DevMap base pointer** toggle and **Sparse cone paths** input), `gitpulse-mcp`, or `gitpulse-worktree` can materialize only DevMap-expanded `--cone` dependency directories (`expand_sparse_cone_with_devmap`, `add_sparse_worktree_zero_copy`) and share the anchor's `devmap.sqlite`, mmap `.csr` graph, and `cas/ast/` store via a `<512 B` `base_store_ref.json` pointer (or CoW-clone and rebind `repo_root` when local isolation is requested). Uncommitted edits compile into `overlay.json` plus a `RoaringBitmap` of dirty CSR node IDs (`sync_worktree_overlay`). Hand-made paths inside `.gitpulse/worktrees/` are refused (`refuse_gitpulse_lane_target`) so managed task lanes stay isolated.
-- **Zero-Round-Trip Branch Churn Carry-Forward**: Branch create, rename, and delete actions refresh only the `"branches"` facet rather than re-reading the full repository snapshot. Tip-matched local and unshadowed remote donors transfer verified `ahead`, `behind`, `additions`, and `deletions` in memory (`withCarriedChurn`), and `fetchBranchStats` skips `cmd_branch_stats` altogether when every eligible branch is already verified against an unchanged comparison base (`sessionBook.statsDrained`). See [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md).
-- **Worktree Routes**: When portless is running, a worktree is matched to its named localhost URL. Otherwise the worktree receives a stable, deterministic port derived from its name.
-- **Worktree Lifecycle Hooks**: Trusted repositories can declare `post_create`, `pre_merge`, and `post_merge` hooks in `.gitpulse/hooks` / `.gitpulse/hooks.toml`, with exact file-content preview and explicit approval in the **Worktrees** panel (`cmd_preview_worktree_hooks`, `cmd_approve_worktree_hooks`). Untrusted checkouts refuse to run lifecycle hooks.
-- **`.worktreeinclude`**: Every worktree GitPulse creates (the **Worktrees** panel, whether or not **Copy-on-Write dependency caches** is on, task lanes, `gitpulse_worktree_create`/`switch`, and Claude Code's own worktrees below) also gets the files the anchor checkout's `.worktreeinclude` names: `.gitignore` syntax, the convention Claude Code and Worktrunk use. A file is copied only when it is untracked, listed, ignored by the anchor **and** ignored by the new worktree, a regular file (links are skipped, never followed), not under a directory the cache copy owns (`node_modules`, `.turbo`, `target`, `.venv`, `venv`), and not already present. Each file is reflinked where the filesystem allows and byte-copied otherwise, whole or not at all; more than 2,000 matches copies nothing and says why (`engine/cow_clone/worktree_include.rs`). It can copy `.env` and other secrets-bearing files; see [Security](SECURITY.md#claude-code-worktree-hooks-and-worktreeinclude).
-- **Claude Code's own worktrees, made by GitPulse**: The plugin registers `WorktreeCreate` and `WorktreeRemove` (`gitpulse-hook worktree-create` / `worktree-remove`, run through `plugins/gitpulse/hooks/gitpulse-worktree.sh`). `claude --worktree`, the `EnterWorktree` tool, a subagent with `isolation: "worktree"`, workflow agents and background sessions then get a worktree made by the app's own owner path (`add_worktree_with_devmap`): at `<root>/.claude/worktrees/<name>` on branch `worktree-<name>`, exactly where Claude Code would have put it, with the approved `post_create` hooks, copy-on-write caches, `.worktreeinclude` and a copy-on-write clone of the anchor's DevMap store (not the zero-copy pointer, which the `devmap` binary an agent runs does not read). It branches from the repository's default branch **as it is locally** (`main`, not `origin/main`), or `HEAD` when that branch is not local. Stdout carries only the path. A repository GitPulse does not trust, or a GitPulse failure before any git write (trust store unreadable, command gate unable to run, binary missing or older than the plugin), falls back to the plain `git worktree add` Claude Code would have run; a policy refusal or a git failure fails the creation. A `post_create` hook that fails leaves the worktree in place, as the Worktrees panel does. Claude Code shows nothing a successful `WorktreeCreate` hook writes to stderr (2.1.319 logs only its exit status), so the failure is recorded in the worktree's own git directory (`gitpulse-post-create-failed`) and the plugin's `SessionStart` brief opens with it, which is what tells the agent. Registering the hook twice (the plugin and the Settings copy) is safe: creations of one name are serialized by a lock in the repository's git directory, and the second run hands over the worktree the first made instead of failing on "already exists". `WorktreeRemove` removes through the app's removal path (rename aside under the repository lock). Claude Code asks before it removes a worktree with uncommitted or untracked files or with commits no other branch or remote holds (and never sends the hook a `discard_changes` field), so such a removal is a confirmed one: the hook forces it, deletes the `worktree-<name>` branch with `-D`, and names what was discarded on stderr. A clean worktree's branch is deleted with `-d`, so git keeps it unless it is merged. A check that cannot run keeps the worktree. A session started inside a linked worktree (a GitPulse task lane included) gets its worktree under the repository's main checkout, never nested in the linked one: that is where Claude Code 2.1.319 puts it with no hook (checked live), and the hook anchors there whatever `cwd` the payload carries. **What the hooks cannot cover**: `claude --worktree --tmux` creates its worktree before plugins load, so a plugin's `WorktreeCreate` never runs for it (define the hook in a settings file — the copy **Settings → Agents** offers does this — to cover it); a worktree added with `git worktree add` from Bash fires no hook at all; and subagent and workflow worktrees are never removed by the hook, because Claude Code keeps them and does not run `WorktreeRemove` for them — remove them from the **Worktrees** panel or with `gitpulse_worktree_prune`. The launcher needs a POSIX `sh`: Claude Code runs shell-form hooks in Git Bash on Windows, and in PowerShell when Git for Windows is not installed, where the plugin's `WorktreeCreate` fails and so do `--worktree` sessions; install Git for Windows (or set `CLAUDE_CODE_GIT_BASH_PATH`) before enabling the plugin there. Until the launcher is qualified on Windows, the **Settings → Agents** copy for Windows leaves `WorktreeCreate` and `WorktreeRemove` out, so Claude Code makes those worktrees itself there.
-- **Worktrunk-Style Worktree Lifecycle, Agent Bus & 3-Layer Radar (MCP + CLI)**: Exposes 11 `gitpulse_worktree_*` MCP tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_prune`, `gitpulse_worktree_merge`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_inbox`, and `gitpulse_worktree_radar`) alongside the standalone `gitpulse-worktree` CLI. Parallel lanes coordinate through `<git-common-dir>/gitpulse/lanes/` (`flock`-serialized `claims.json` + bounded `messages.json` ring) and a strictly read-only 3-layer collision radar combining pre-edit file/symbol claims, 1-hop CSR call-graph neighbor hazards, and ODB-quarantined `git merge-tree` checks, paired with 6-point branch integration verification (`verify_branch_integration`), orphan daemon reaping (`reap_processes_in_dir`), and quarantined merge pipelines (`merge_worktree_pipeline`).
-- **Tri-State Line-Level Entity Collision Detection**: Extends file-level collision checks with hunk-range and entity-range overlap detection (`insights/entity_collision.rs`: `ContendedLine`, `CollisionRisk` = *None* | *SameFileClean* | *OverlappingEntity*).
-- **Shortcut**: `F10`.
-
-### 1.2 Remote & Local CI
-
-- **Two Columns, Not One Ragged Grid**: Pull requests and issues take the wide column because they are what a reader acts on; workflows, the runs they produce, and releases sit together in a CI rail. The five listings used to share one grid whose rows are as tall as their tallest cell, so twenty pull requests left a screen of white space beside a three-line releases card — and Workflows sat a row away from its own runs.
-- **PR Management**: List repository PRs with one-click checkout, and a **New pull request** action that opens GitHub's compare form for the current branch onto the default branch.
-- **The Queue's Counts Are The Way Into It**: `All / Awaiting review / Failing / Drafts` chips carry their own counts and filter the list, plus a search across number, title and both refs. Chip and list share one predicate. "Failing" means a red verdict only — a run still going and a repository whose checks never start are neither passing nor failing, and neither is folded into the other.
-- **Issue List**: Open issues the context already fetched, with `issues_error` shown as a failure rather than an empty list, each carrying when it was last updated, and searchable by number, title, author or label.
-- **Actions Dispatch**: View workflow runs and manually trigger `workflow_dispatch` events. Runs carry their age and can be narrowed to the checked-out branch; a run whose timestamp `gh` did not supply carries no age label rather than one dated to the epoch.
-- **Runs Update While You Watch Them**: While any run is queued or executing,
-  the run list refreshes itself; once everything has settled it stops, so a
-  repository nobody is deploying runs no run poll at all. (Separately, the
-  whole context is re-read quietly once a minute while Remote is on screen —
-  the issue monitor Policy used to run — reusing a read a neighbour just made,
-  and never while the window, or a global surface, hides it.) The poll asks only for
-  the run listing — one `gh` call, not the four the full context costs — skips
-  a tick while the previous call is still out, backs off on failure, and is
-  bounded by both a wall-clock ceiling and a poll count so a run waiting on a
-  runner that never arrives cannot keep a subprocess loop alive. It pauses
-  while the window is hidden. **A poll that gives up says so on screen**, with
-  the reason: live updates having silently stopped while stale rows keep
-  rendering as current is the one outcome worse than not being live at all.
-  Refresh revives a paused session; nothing else does.
-- **A Run That Goes Red Is Announced**: A run observed executing and then
-  observed failed raises a dismissible notice. Only that transition — a run
-  already finished when the panel opened is history, not news, so opening the
-  panel never replays the window's failures as though they had just happened,
-  and a run dropping off the display cap is never reported as an outcome.
-- **Run Duration And Outcome, Drawn**: A timeline of every run the branch
-  filter admitted, whether or not the collapsed list below draws its card, and
-  nothing at all when the filter admitted none — so a filter matching no run
-  gets the filter's own empty state, never a timeline reporting that the
-  repository has recorded none. One bar per run, scaled to the slowest in the
-  sample, coloured by verdict, with
-  the pass rate stated as a fraction (`60% (3/5)`), the median duration with
-  its sample size, and the count of rows that carry no verdict. Measured from
-  when a run *started*, never from when it was created, so queue time is not
-  reported as execution time. An unknown duration is a dash and no bar, never
-  `0s`; an end before its start is clock skew and measures nothing rather than
-  zero; a completed run whose conclusion `gh` did not report is "no conclusion
-  reported", never a pass. The same component draws App Hosting rollouts, so a
-  deploy and the run that produced it are read the same way.
-- **Deploys Refresh Too, But Only Once You Have Asked**: A rollout listing can
-  enable the App Hosting API on a project where it is off, which is why it is
-  click-only. The enabling happens when the API is *off*, though — so a
-  listing that has already answered is proof it is on, and refreshing that
-  exact target enables nothing. The first listing for a project and backend is
-  therefore still a click, and only an already-answered target refreshes
-  itself while a rollout is still rolling out. The authorisation is keyed to
-  project *and* backend together, because a backend id is not unique across
-  projects; it is withdrawn when either changes, and a listing that could not
-  run never grants it. Same bounded budget, backoff and visible pause as the
-  run poll.
-- **Fetched, Not Merely Present**: The header stamps how long ago the context on screen was fetched, and a listing hydrated from cache on a repository switch loses the stamp rather than inheriting a fetch that never happened.
-- **Firebase Deploys, Joined To Commits**: For a repository carrying `.firebaserc`
-  or `firebase.json`, the CI rail lists the project's App Hosting backends and,
-  where the CLI supports it, the rollouts of one — matching each rollout to the
-  commit it shipped, since App Hosting reports the full SHA and "this commit is
-  live" is therefore a lookup rather than a guess. Detection is a local file read;
-  both listings run only when asked, because the Firebase CLI enables the App
-  Hosting API when it is off and that is a change to a Cloud project, not a read.
-  The project is always picked by hand: `.firebaserc`'s `default` alias is
-  frequently production, so nothing is aimed there by a default nobody saw, and
-  changing project clears the backend with it because backend ids are not unique
-  across projects. **Rollout listing depends on the installed CLI**: upstream
-  ships `apphosting:rollouts:list` only behind an experiment that is off by
-  default, so GitPulse asks the CLI what it has and, when the subcommand is
-  absent, says so and names the trade-off instead of offering a button that
-  cannot work. A rollout whose commit is absent from this checkout — a
-  force-push, a fork, a shallow clone — is shown and marked rather than dropped,
-  a state Firebase has not published yet is rendered as unknown instead of
-  inheriting a green badge, and a listing that could not run says so rather than
-  reading as a backend that never deployed.
-- **Deploying A Commit, Behind Two Steps**: A rollout can be created against one
-  full commit SHA. It is the only Firebase action that changes what production
-  serves and the only one GitPulse cannot undo — App Hosting has no rollback
-  command, so reverting means deploying an earlier commit — and it is not
-  idempotent, so a repeat click would deploy twice. The panel therefore refuses
-  an abbreviated SHA *with the reason*, spells out the exact project, backend
-  and commit before the deploying button exists, disarms that confirmation the
-  moment any part of the target changes, and disarms again after a deploy. A
-  rollout that started is never reported as failed: when the CLI exits cleanly
-  without confirming, the panel says so and warns against a blind retry.
-- **CI:Local Runner**: Runs the repository CI pipeline locally before pushing commits. When a fresh
-  DevMap index can answer, test steps may be scoped to **affected test files** for the change set;
-  a stale map, incomplete walk, or unmatched seed **fails closed** to the full suite and says why —
-  the run badge never reads "affected tests passed" for a fail-closed full suite:
-  ```mermaid
-  flowchart LR
-      Manifests["Detect Manifests<br/>(package.json, Cargo.toml)"] --> Scope["Affected tests or full suite"]
-      Scope --> Plan["Plan Step Matrix"]
-      Plan --> Exec["Sequential Execution<br/>(Svelte Check → Tests → Clippy → Cargo Test)"]
-      Exec --> Report["Honest Accounting<br/>(Passed / Failed / Skipped · scope named)"]
-  ```
-
-#### Branch Stack Hierarchy (in Overview)
-
-- **The Chain, As A Chain**: The hierarchy renders as a tree — parents above, children indented under them — rather than a flat list with "based on X" on every row, which made the reader rebuild the shape in their head. Embedded directly in Overview as a collapsible card.
-- **Each Branch, Joined To What Is Known About It**: How far it is ahead of its parent and behind the default branch, its tracking state (`↑`/`↓`, `upstream gone`, or `untracked` — never `0↑ 0↓` for a branch with no upstream), and when it last moved and by whom.
-- **Updating A Stack Cascades**: Rebasing one branch moves every branch above it off the commit it was cut from, so a single restack silently strands the rest of the stack. The action plans the whole subtree from the tree on screen *before* the first rewrite — the last moment those fork points exist — names every branch it will touch in the confirmation, and runs the steps in parent-before-child order. Each step is an independently gated, independently rolled-back rebase; a cascade that stops part-way reports which branches were rebased and which are still on their old base, then reloads so a second attempt cannot plan from a stale tree.
-- **Fork Points Are Recorded, Not Recomputed**: Once a parent has been rebased, `merge-base` collapses back to the trunk and would replay the parent's own commits onto the parent. `cmd_restack` accepts the parent tip the stack was read at, refuses one that is not an ancestor of the branch (rather than silently widening the rewrite), and so does not depend on the reflog — which a fresh clone, a bare repository, or `gc.reflogExpire` will not have.
-- **What The Hierarchy Cannot See, It Says**: A branch appears as a child only while it sits on its parent's *current* tip. Git records no "cut from" link, so a branch left behind by a rebase of its parent reappears as its own root, not as a stale child — stated on the page, with the local branches the walk placed on no stack listed by name. Otherwise a stack that fell apart reads as a repository that never had one.
-
-### 1.3 Policy (Manvi), across Work and Settings
-
-Resolve and Policy were Work sections. Resolve was an empty state nearly every
-visit — agents finish most parked merges — and Policy was a page named after
-the engine underneath rather than a subject, showing GitHub issues and
-releases beside Remote's lists of the same objects. Each piece now lives with
-the subject it acts on, and a saved `resolve` or `policy` selection, a native
-menu build or an old deep link lands on Overview.
-
-**On Overview**
-- **Conflicts Lead While a Merge Is Stopped**: While files are conflicted, a merge, rebase, cherry-pick or revert is parked, or the operation could not be read, the conflict editor leads Overview at full height and the joined rows follow in one scroller; nothing about it shows otherwise. The rows are one instance outside the editor's branch, so a merge an agent parks or finishes while you read does not rebuild them under you. Drafts kept from an earlier operation get a one-line row with **Review drafts** instead of the whole page. Every way that used to open Resolve (the conflicts chip, status bar, tray and its `3` key, merge dialog, blocked rows, the palette's **Resolve conflicts**) lands here and scrolls to the editor.
-  - **3-Way Conflict Editor**: Clear visual distinction between *ours*, *theirs*, and *base* revisions.
-  - **One-Click Resolution**: Quick actions to accept current, incoming, or combined changes.
-  - **Marker Navigation**: Jump directly between unresolved conflict markers across changed files.
-- **Branch and Tag Cleanup** (collapsed): Manvi's conservative cleanup plan for merged local branches and redundant tags, scanned on request. It is always listed, never hidden when empty, because the scan is manual and a hidden card would read as clean without having checked; a count appears only after a scan has run. **Stale branches…** opens the dead-branch cleanup: it scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`), writes a restorable tip backup first and records it in the ledger, authorizes each `git branch -d/-D` and `git push --delete` before execution (a refusal aborts the batch before any branch is removed), and its Restore action puts backed-up tips back.
-- **Policy Activity** (collapsed): Grants and the agent journal — the verdicts Manvi's command and file write gates recorded, with ledger adoption when the history reports an error. Shown unless Manvi is positively not installed with nothing recorded; a check that could not run keeps it visible. Grants refresh only while it is open. Each row's verdict chips show the same verdicts per piece of work.
-
-**On Remote**
-- **Outgoing Commits**: Conventional format, duplicate subjects, issue links and length, checked before you push. A local check, so it works without `gh`; shown while the branch is ahead, and when the ahead count is unknown (no upstream) it says so rather than hiding.
-- **Issues to Tasks**: Remote's one issue list gains **Report issue…**, **Add to tasks** per issue, **Add all to tasks** (only the missing ones), and a pause for the import. Its once-a-minute refresh is one quiet read beside the panel's own.
-- **Release Publisher**: **Push release tag…** on Releases, with preflight (clean worktree, synchronized branch) and a confirmation before the SemVer tag is pushed.
-
-**In Settings → Agents**
-- **Manvi Policy** and **Capability Boundary**: connection status, posture and what the gate can and cannot see, beside the external CLI installer.
-- **Local Model Servers & Anthropic Account Registry**: scan and pick local model servers, and configure the Claude model Manvi uses. When `~/.anthropic-accounts` exists, GitPulse launches `manvi serve` via `anthropic-account exec --no-fallback --repo $HOME -- manvi` without reading or storing an Anthropic API key, and the status-bar pill displays `Cloud · <model>` (`HarnessBadge.svelte`).
-- **Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`, on by default): keeps managed Codex and Claude runs alive in a detached `manvi serve --listen` process across app restarts (while Unix PTY terminal sessions always live in `gitpulse-ptyd`).
-- **Branch naming** for the work in progress moved beside the new-branch field of the **Worktrees** panel.
-
-**Underneath**
-- **macOS Background Band Pre-Exec Hook**: Background Git and CLI processes enter Darwin's background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`), ensuring background tasks and their child trees inherit background priority permanently without race conditions.
-
-The header's Manvi chip opens **Settings → Agents → Manvi policy**, its verdict chip opens **Overview → Policy activity**, and Storage's merged-branch count opens **Overview → Branch and tag cleanup** — each names its destination in its tooltip. Quick pull and Quick push were dropped: they called the same pull and push the sidebar, palette and branch menu offer.
-
----
-
-### 1.4 Tasks
-
-Work → Tasks shows tasks linked to the active repository. The **Tasks** button
-beside Fleet opens global and saved-workspace scopes over the same records.
-
-- **Organize**: Two-row board header (a title row for search, syntax help, **Inbox** / **Archive** / **Refresh**, and **New task**, and a toolbar row for `Board | List`, **Filters**, **Views**, **View**, **Suggest next**, **Organize**, and **Auto (Manvi)**), board/list layouts with swimlanes (grouped by owner or first label),
-  saved views, column WIP limits, full-text search with structured query filters
-  (`is:bug`, `priority:high`, `status:open`, `repo:name`, `owner:`, `label:`, `severity:`, `due:` with `-` negation),
-  quick filter chips, multi-selection, context menus, and drag or keyboard moves.
-- **Attention Inbox**: Each notice in the **Inbox** drawer (`AttentionInbox.svelte`, `attentionDismiss.ts`) can be opened or dismissed out of **Active** / **Unread** and restored from **All**.
-- **Checklists & Task Links**: Task checklists with individual completion states, and
-  relational links between tasks (parent, blocks, related, duplicate of) edited in the task sheet
-  and surfaced in agent handoff briefs.
-- **Know the scope**: Facets and Select all operate on loaded cards; after the initial 30-card read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards across columns in 200-card chunks up to `MAX_CANDIDATES` (2,000 cards) while the column cursor matches, and each column also provides manual **Load all** / **Stop**. Live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused) so external agent writes appear immediately. Loaded column counts are preserved across board refreshes (`reloadSize`),
-  and card verdict queries are automatically chunked in batches of 256 IDs (`getBoardVerdicts`)
-  so large boards never trigger host refusals or cleared verdicts. When tasks from hidden
-  repositories are omitted from the board, the notification banner explicitly names the
-  hidden repository. Background verification sweeps batch all claimed card status reads into a
-  single `latest_many` pass (`LIMIT 1`), slashing idle CPU consumption. Due soon means the next seven days. Missing checkouts are flagged before action.
-- **Edit and review**: Notes can seed a draft. Manvi proposes title/description
-  changes against a saved revision; field locks and explicit acceptance apply.
-  Quick Enhance exposes details that compact cards omit. **Merge…** on the board's selection
-  bar combines duplicate tasks safely.
-- **Hand off**: Copy a saved task brief or an explicitly labeled unsaved draft for
-  an agent. Terminal handoffs feature per-launch model selection (model, effort, advisor).
-- **Archive & Deleted Recovery**: Independent archived flag (dc-store schema 11) files work
-  away while preserving completion dates. The Archive dock lists most recently completed first,
-  with search and **Restore**. The dedicated **Deleted** view allows restoring deleted tasks
-  by ID, checked against the deletion revision.
-- **Delete**: Confirmed removal from every board. Partial results retain failures
-  and skipped items.
-
-See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the workflow, shortcuts,
-copy limits and the distinction between terminal handoffs and managed runs.
-
----
-
-## 2. Code (`code`)
-
-Two sections under one view. Explorer is the **file**: its side column toggles
-between the tree and content search, and the open file toggles between the
-editor and its blame — Search and Blame were sections of their own once, and
-each sent the reader back to Explorer for the file it had just named. Map is
-the structural navigator over the DevMap repo map, the code/doc graph, and
-repository markdown — not another reading of the same open file. Sections
-switch from the segmented control (`⌥1` / `⌥2` while Code is active) or by
-name in the command palette, which also keeps `Open Search — …` and
-`Open Blame — …` commands that open Explorer with the toggle on.
-
-### 2.1 Explorer
-
-- **IDE File Explorer**: Recursive directory tree navigation with real-time Git status markers (staged, unstaged, untracked, ignored).
-- **Virtualized Code Viewer**: High-performance line-virtualized code viewer. Syntax highlighting has one owner and two backends: MarkDev tree-sitter for Rust / JavaScript / TypeScript / Python / JSON / shell, and the existing regex tokenizer for the rest of the supported set. Virtualized row heights scale proportionally with editor zoom stops (70%–160%) via `scaledRowHeight`, preventing line overlaps and row clipping at compact zoom.
-- **In-File Search & Filter**: Search with case-sensitivity toggle (`Aa`), regular expression support (`.*`), match count badges, and keyboard navigation (`Enter` / `Shift+Enter`).
-- **Go To Line**: Fast modal overlay to jump directly to any line number (1–N).
-- **Line Selection & Range Inspection**: Single-click line selection, shift-click line range highlighting, indentation style detection, and file status bar.
-- **Inline Editor**: Instant toggle between read-only syntax viewing and direct in-memory text editing with save feedback.
-- **Copy & Formatting Tools**: One-click whole-file or line-range copying with persistent feedback, whitespace character rendering toggle (`·` / `→`), and zoom font scaling (`⌘+` / `⌘-` / `⌘0`).
-- **Responsive Header Controls & Scroll Cues**: File viewer headers across `CodeViewer`, `FileTreePanel`, `MarkDevViewer`, and `MediaViewer` scroll horizontally when horizontal space is constrained, paired with `ScrollCue` visual indicators to ensure all buttons and controls remain reachable on narrower viewports.
-- **Boundary-Aware Tooltip Placement**: Tooltip bubbles position dynamically relative to viewport boundaries via `placeTooltipBubble`, keeping labels on-screen across arbitrary window sizes while respecting directional hints (`above` vs `below`).
-- **Specialized Media & Binary Previews**:
-  - **Markdown / MarkDev**: Rendered by MarkDev's own HTML renderer (`markdev-html`, the pipeline MarkDev exports with), so nested lists, tables, callouts, footnotes, highlights and task lists read as they do in MarkDev. The outline and frontmatter come from the same pass that wrote the page's heading ids. Math is shown as its LaTeX source, not typeset. Pictures inside the repository are embedded (8 MiB per render), remote https pictures load with no referrer, and anything else shows its alt text with the reasons it may not have loaded. Links never navigate the app: http(s) and mailto open in the OS, relative paths open repository files, and everything else is refused with a reason. Notes over 128 KiB render their first 128 KiB and say so. Backlinks come from the repo docs vault. Preview panes feature bidirectional scrolling and flex-bound layouts to prevent text clipping on oversized formatted blocks. Commit message bodies and MANVI verdict detail use the same renderer.
-  - **Images & Media**: Visual viewer with dimensions, aspect ratios, and format inspection.
-  - **Binary Hex Viewer**: Formatted byte-offset hex dump with ASCII decoded gutters for compiled and binary artifacts.
-- **Live Pulse Dashboard & Commit Composer**: Uncommitted churn overview, active branch status, and instant staging accelerators. The commit composer drafts structured commit briefs classified from the patch (type, scope, subject), falling back to on-device Apple Intelligence for subject phrasing on supported Macs, or pure patch-based phrasing when no model is active. Pre-commit impact shows a **what this commit breaks** summary from `devmap preview` over staged paths (shared with the Diff file rail).
-- **Language Logo Vector Icons**: High-fidelity vector SVG logos for 34+ programming languages, configuration formats, and markup types rendered across the file tree, tab bar, diff toolbar, and dashboard.
-- **Path Hierarchy Formatting**: Dimmed directory hierarchy prefixes with prominent filenames in the sidebar and commit details for scannable navigation.
-- **Language mix (status bar)**: Compact segment and popover of repository language shares, ordered by percentage, with programming languages kept on the bar when data files would otherwise crowd them off. Toggles between lines-of-code (`loc`) and percentage (`percentage`) mode. The label is the highest-percentage language among what is drawn, not the first programming language. Click a language to filter Code → Explorer.
-
-### 2.2 Blame (an Explorer toggle)
-
-Blame is a lens on the file open in Explorer, not a separate section: the **Blame** toggle in the open file's path bar swaps the editor for that file's blame, beside Explorer's own tree, and follows the active tab until it is toggled off. The command palette's `Open Blame — line authorship and code age` opens Explorer with it on.
-
-- **Line Authorship Viewer**: Interactive gutter displaying commit author, commit age and commit SHA for every line. Hardened with an SWR (stale-while-revalidate) architecture and deep equality guards to eliminate unnecessary re-renders. The age follows the shared timestamp preference (relative or `YYYY-MM-DD`), with the other form on hover.
-- **Commit Blocks**: Consecutive lines from one commit state their hash and author once, at the head of the block; a continuation line keeps its hash reachable on hover or focus, and hovering any line marks the whole commit down the left edge.
-- **Code Age Timeline**: A chronological axis above the gutter showing what percentage of *this file* was last changed in each period. The resolution adapts to the file's history (daily through yearly) and is bounded — a history too long for even a yearly axis folds its oldest lines into the leading column and says so. Every column is a share of the whole file, and clicking one filters the gutter to exactly the lines that column counted. Quiet periods are drawn as empty columns rather than omitted, so a gap reads as a gap.
-- **Off-axis lines are named, not dropped**: Worktree-only, clock-skewed (author date after now) and undated lines cannot sit on a commit-date axis, so they ride beside it as labelled, selectable chips carrying their own share. The columns plus the chips account for 100% of the file — a bar summing to 100% of *some* of the file would overstate every period it drew.
-- **Code Age Rail**: A heat strip down the right edge showing where in the file each age lives, with a band marking what is on screen; click or drag it to navigate. It maps the list actually drawn, so under a filter it maps the filtered lines. The freshest tone wins each bucket — one fresh line among sixty old ones is what a reader opens the map to find — and the mark's intensity says how much of the bucket that tone really is. A worktree edit outranks every commit.
-- **Age Filter (the legend)**: Each band states its share of the file and filters the gutter to it, so "what in here has not been touched in three months" is a glance and a click. Period columns, off-axis chips and age bands are one selection model with one matching rule, so each surface selects exactly what it counted.
-- **Commit Age Heatmaps**: Visual recency coloration highlighting fresh additions versus mature, historical lines. The row tint, the timeline column fill, the legend and the rail all come from one age scale and one per-line classifier, so a swatch cannot name a band the rows no longer use. A line with no knowable age — worktree-only, undated or clock-skewed — carries no tint rather than reading as fresh or as ancient.
-- **Coverage Gutter**: Per-line hit counts beside the authorship gutter, and an explicit *Coverage unavailable* marker when the lookup fails — a file with no coverage data and a coverage read that failed must not look the same.
-- **Commit Navigation**: One-click navigation from any blamed line directly to its full commit diff and history details.
-- **Uncommitted Lines Named**: Worktree-only lines carry an all-zero OID and render as `uncommitted` rather than as a link to a commit that does not exist.
-
-### 2.3 Search (an Explorer toggle)
-
-Content search lives in Explorer's side column: the search button beside the Explorer toggle swaps the file tree for the search pane (the tree keeps its folds and filter), and a hit opens in the editor beside its results.
-
-- **Repository-Wide Text Search**: Searches file contents across the working tree or an explicit Git revision. When a compatible DevCouncil `dcgrep` is installed (`GITPULSE_DCGREP_BIN`, `MANVI_GREP_BINARY`, the app's bin directory, or `PATH`), working-tree searches use it. Revision searches always use `git grep`, as do repository layouts dcgrep does not emulate, and any answer dcgrep cannot give exactly. On this repository dcgrep is about 3× faster. The figures are in [PERFORMANCE.md](PERFORMANCE.md#2026-11-17-explorer-search-dcgrep-against-the-git-fallback).
-- **Honest Inclusion Boundaries**: Searches tracked and untracked files while strictly respecting `.gitignore` exclusions.
-- **Honest Outcome Reporting**: A search that is cancelled, timed out, capped, or truncated explicitly declares its partial status and reason, rather than presenting a partial match count as complete.
-- **Search Controls**: Regular expressions, match case, and an optional revision to search instead of the working tree. Cancel stops the search in flight and keeps its partial answer, labelled.
-- **Navigation**: Reached with the search button in Explorer's tab strip or the command palette (`Open Search — find text across the repository`). Selecting a match opens the file in the editor beside the results, at the matched line (a search run at a revision opens the working-tree file without a line), and turns Blame off so the line is visible.
-
-### 2.4 Map
-
-DevCouncil's `devmap` module. GitPulse takes this component without requiring the rest of the DevCouncil suite, and updates it independently of the Manvi wrap.
-
-```mermaid
-flowchart TD
-    subgraph DevMapEngine["DevMap Architecture (Code → Map)"]
-        direction TB
-        Paths["Resolve State Paths<br/>(devmap paths --json)"] --> Status["Read Index Status<br/>(generation, freshness, schema)"]
-        Status --> Gate{"Artifacts or Schema Outdated?"}
-        Gate -->|Yes| BuildCLI["devmap build --manifest<br/>(Writes .devmap/store.db & repo_map.json)"]
-        Gate -->|No| Ready["Index Ready"]
-        BuildCLI --> Ready
-
-        Ready --> Projections["Graph & Metadata Projections"]
-        Projections --> Subsystems["Subsystems & Critical Files<br/>(repo_map.json)"]
-        Projections --> CanvasGraph["Interactive Code & Doc Graph<br/>(Canvas stack)"]
-        Projections --> Vault["Repo Docs Vault<br/>(Markdown search & backlink graph)"]
-        Projections --> CrossRepo["Cross-Repo Search & Links<br/>(workspace.json open tabs registry)"]
-    end
-```
-
-- **Repo map navigator**: Reads the `repo_map` path resolved by `devmap paths --json` (`.devmap/repo_map.json` by default, with legacy `.devcouncil` support) — subsystems, entry points, critical files, role-file samples with real `role_file_counts`, neighbors / handoff paths, and liveness candidates, with hover tooltips across files, symbols, and subsystems (`RepoMapPanel.svelte`). Prefer unwired / dead-symbol candidates over `unreachable_files`; ignore unreachable entirely when `liveness_unreachable_unreliable` is set. Every capped list says shown / total / truncated.
-- **Code & doc graph canvas**: Renderer-agnostic payloads from DevMap viz / map-preview and the MarkDev doc graph, drawn on the shared canvas stack (not the commit-lane graph). The legend names node caps and truncation rather than implying the picture is the whole graph.
-- **Repo docs vault**: Built from `git ls-files` of markdown (git is the authority — no ignored / vendor walk). Full-text search, broken-link report, and backlinks in the markdown viewer. Caps and skips are reported on the status strip.
-- **Freshness & build**: Status strip from `devmap status --json` (generation, freshness, `schema_outdated`, coverage gaps). Build / Refresh shell out to the installed `devmap` CLI. Watcher-driven incremental refresh runs when the index is stale, one build per repo at a time.
-- **Opening a repository is the setup**: a trusted repository is indexed on open, without a Build click. The first build uses `--manifest` because a plain `devmap build` writes the database and nothing else, so an index with no `repo_map.json` is a state the tool produces on its own — and store freshness says nothing about the artifacts beside it, so a deleted map heals on the next activation rather than staying empty forever. A schema-behind store is migrated by a full rebuild only when the CLI'"'"'s `rebuild_required` says a rebuild fixes it; a `newer` store is refused with the remedy the CLI names. While a build runs, the pane shows the kernel'"'"'s own `[n/5]` stage rather than an empty panel. See [Module integration](MODULE_INTEGRATION.md).
-- **Nothing lands in `git status`**: the resolved DevMap state directory is added to `$GIT_COMMON_DIR/info/exclude` — per-clone, never committed, effective in linked worktrees — before any state is written. An existing project `.gitignore` rule is honoured rather than duplicated, and a pattern that does not take effect is reported as a refusal, not a success. `.gitignore` itself is never touched.
-- **Cross-repository search has a registry**: the open-tab set is synchronized into the active repository'"'"'s `workspace.json`, which is what workspace search and import-link candidates read.
-- **Cross-repo link candidates**: Import-graph candidates across repos registered in DevMap's workspace from open tabs.
-- **Index all, from Fleet**: builds every open repository in one sequential, abortable pass, for the case the automatic path is wrong about — devmap installed against a workspace that is already full of tabs. Repositories that were already current say so rather than counting as rebuilt, and a sweep that was stopped or that had nothing to build with reports both numbers instead of claiming the fleet.
-- **A running `devmap serve` is not raced**: where the kernel's own daemon has this repository's changes queued, the live gate answers `skip_daemon` instead of launching a build that would queue behind the same writer lock. Gated on queued work, not on the daemon being alive — a daemon that reports nothing pending against a store the CLI calls stale has missed the change, and standing down there would strand the index. Schema migration and the consumer artifacts stay with the CLI either way, because the daemon's status reply does not carry `schema_outdated` and the daemon never writes `repo_map.json`.
-- **Heals survive a busy launch**: the live heal runs as background work, which the spawn gate sheds while its budget is low. When that happens the gate answers `skip_deferred`, not `skip_unavailable`, because nothing was examined. The tab is re-queued with the shared deferral backoff (3 s, doubling, at most five retries) instead of being recorded as settled. If the load outlasts the retries, the tab says so, and focusing it or the next change on disk asks again. The background queue runs the focused repository first, so at launch the map you are looking at does not wait behind every restored tab.
-- **Zero-copy worktree graph sharing & delta overlays**: Linked worktrees provisioned with `base_store_ref.json` (`<512 B`) resolve in-process `codeintel` queries (`search`, `impact`, `dependencies`, `trace`, `neighbors`, `explore`, `affected_tests`, `clones`, `dead_symbols`) directly against the verified anchor repository's read-only `devmap.sqlite` and mmap `.csr` sidecar (`OpenedRepoStore::ZeroCopy`), evaluating worktree-specific freshness (`evaluate_zero_copy_status`) and merging per-lane `overlay.json` tombstones, Blake3 `CasAstStore` symbol ASTs, and `RoaringBitmap` dirty CSR node masks without duplicating SQLite files across agent lanes. See [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md).
-- **Honesty**: `walk_incomplete`, schema mismatch, and missing CLI are named. An empty panel with `available: false` is not an all-clear.
-
----
-
-## 3. History (`history`)
-
-Lenses on one subject — what happened to this repository — switched by
-the segmented control in the view's own header (Graph, Diff); the context bar below carries the commit
-filter, or the suspects question while Graph shows Suspects. Graph, Diff and Reflog were three top-level
-tabs, then sections; Reflog then folded into Graph as its *HEAD moves* list and Suspects as its third
-list. They share selected commit context, so switching list or lens keeps the commit you were looking at.
-The split was expensive in a way the code admitted: the Diff tab had to grow
-its own commit picker purely so you would not have to walk back to Graph for
-the commit you had just selected.
-
-### 3.1 Graph
-
-- **GPU Canvas Rendering**: High-performance commit graph capable of rendering repositories with 100,000+ commits smoothly.
-- **Topological Lane Solver**: Rust-powered stable-column lane solving with nogap lookback guarantees to avoid visual discontinuities. The default branch (`main`, or the repository's own default; `origin/main` when it is ahead) is pinned to the leftmost column in one colour for the whole loaded window, so merged feature branches peel off and close back into a straight mainline instead of displacing it. Hovering the rail names the branch it belongs to.
-- **Author Avatars & Badges**: Automatic display of GitHub author avatars (`src-tauri/src/github/avatars.rs`, `AuthorAvatar.svelte`) or initials fallback with one-click filter isolation.
-- **Branch & Tag Ref Badges**: Visual indicators for local heads, tracking remotes, and release tags. The sidebar tag list names a failed or capped read rather than presenting a partial set as the whole history.
-- **Commit Search**: ⌘F (and native Search Commits) focuses the commit filter in History's section bar, which filters all three sections from one walk. From any other view it switches to History first; in Code, ⌘F still searches the open file — whether the Blame gutter toggle is active or not, because Blame annotates that same file's lines.
-- **Filters That Keep The Graph Connected**: Every filter term — `author:`, `sha:`, `type:` or a `fix:`-style prefix, free text, and `path:` — is applied by the backend before lanes are solved. A commit the filter drops hands its lineage to its children, the way `git log --parents -- path` rewrites parents, so the survivors stay connected to their nearest kept ancestors, a survivor with no kept ancestors becomes a root of the filtered view, and the straight main-branch rail stays straight, anchored on the first surviving commit of the default branch's chain. A fading stub therefore always means one thing: the parent is past the loaded window, and the tooltip says so.
-- **Cherry-pick & Revert**: Context-menu actions on a commit row replay or invert that commit onto the current branch, parking in Work → Overview, with the conflict editor first, if a conflict results.
-
-### 3.2 Diff
-
-- **Identity Read From The Diff**: The header names what the body actually holds — one file by path, or `N files` with the combined `+X −Y` — taken from the patch's own `diff --git` sections rather than from whichever path was last clicked. A commit-wide or worktree-wide diff no longer wears one file's name, icon and line count.
-- **True Side-By-Side Split**: Replacement blocks align `del[k]` against `add[k]`, so a three-line rewrite reads across, not down; the longer side spills into rows whose other column is empty, and file/hunk chrome spans both columns instead of leaving one blank. Unified and Split derive from one row model and one intra-line pairing, so the two views cannot disagree about what a change replaced or which words changed.
-- **One Horizontal Scroll, Pinned Gutter**: The surface scrolls sideways as a whole with the line-number gutter stuck to the left over an opaque background. Rows used to scroll independently — a scrollbar per line, and the numbers rode away with the code.
-- **Both Line Numbers**: Old and new columns, sized to the file's widest number, instead of one column that meant `oldNo` on deletions and `newNo` on additions.
-- **Syntax Colouring**: The same dual-backend highlighter the code viewer uses (tree-sitter where MarkDev has a grammar; regex otherwise), composed under the intra-line word diff and the search highlight so all three read at once. Bounded by line length and by diff size, and toggleable.
-- **Blast radius & rung filter**: Change-set layered impact by hop (sample size *and* omitted counts). Flat per-file impact offers a min-rung filter and a rung histogram; layered impact and min-rung are never offered together. `walk_incomplete` is shown when the walk stopped early.
-- **Pre-commit preview markers**: The file rail shares the commit composer's `devmap preview` batch — per-file markers for broken callers / unreliable preview, not a second query path.
-- **Find In Diff**: ⌘F, case and regex toggles, match count, F3 / ⇧F3 stepping, and highlighting that follows the rendered text rather than the raw `+`/`-` column. A pattern whose nesting can backtrack exponentially (`(a+)+`) is refused with a message rather than run — a JavaScript regex cannot be interrupted once it starts.
-- **Change Stepping & Sticky Context**: Alt+PgUp/PgDn walk block to block, and a strip above the rows names the file and hunk you are inside once its header has scrolled away.
-- **Embedded File Rail**: Browse changed files without leaving the section. Rows carry the shortest path suffix that tells them apart (`analyzer/mod.rs` beside `codeintel/mod.rs`), filter as you type, group into a directory tree on request, virtualize past sixty entries, and the rail resizes. A change line under the tabs always names what is on screen.
-- **History Tab (⌥H)**: The rail's second tab is the commit graph itself — the Graph view's solved lanes, refs and rows, painted by the same renderer at rail size — so another commit is one click away. It owns the rail's full height (never a second scroller stacked over the file list), windows its rows, and pages older history in as you near the end. Uncommitted changes stay a first-class entry at the top. Hovering a commit shows the Graph view's card plus its message body, its plain git note and its recorded GitPulse verification, read once on a resting pointer. Shift+click one commit and click another to compare them: the diff is the direct `older..newer` change, its own file list replaces the commit's, and the image view and hunk labels read the base as the old side. ↑/↓, Page Up/Down, Home/End, Enter and Shift+Enter drive it from the keyboard; Esc cancels a half-made comparison. Lanes past the rail's share of width are cut on the far side, and the tab says so.
-- **A Frame That Survives Empty**: The rail, the toolbars and the file stepper stay put through an empty diff, an image diff and a pending fetch. Each of those used to replace the entire pane, so a clean merge or a `.png` left no way to reach the next file.
-- **Precision Word Wrap & Normal-Flow Reflow**: Toggleable word-wrapping that gracefully disables row virtualization (`virtualize={false}`) up to `WRAP_MAX_LINES`, allowing long lines to reflow naturally without clipping or row overlap.
-- **Intra-Line Word Highlighting**: Pinpoints exact character and token changes within modified lines.
-- **Selective Patch Staging**: Stage or unstage individual hunks or selected line ranges, from either layout. Only the action that applies to this side of the index is offered, and a selection is cleared when the diff text changes underneath it — indices into a replaced patch would stage lines nobody picked.
-- **Honest Map**: The minimap projects the list actually on screen (unified lines or split rows), marks each file boundary, shows the viewport band, and centres what you click instead of scrolling past it.
-- **Diff Symbol Groups**: Unified-diff hunks can be grouped under the declared symbols in that file, providing semantic organization for changes across complex files.
-- **Symbol-Level Collision Notes**: Overlapping file paths in collision scans leverage DevMap symbol spans to identify whether active worktrees touch the exact same symbol or merely share a file. Missing or stale indexes degrade safely to file-level notices.
-- **Image Diffs**: Side-by-side, 2-up, and swipe comparison modes for image assets, inside the same frame.
-
-### 3.3 Reflog (Graph › HEAD moves)
-
-- **Reference Log Browser**: The *Commits | HEAD moves* toggle on Graph swaps the commit graph for HEAD's reflog: every movement of HEAD, checkouts, commits, rebases and resets, newest first (the 200 most recent, with the cap named). The commit filter narrows the loaded entries by selector, sha, action or message.
-- **Selected In Place**: Clicking an entry shows its commit in the details pane below the list, including a commit a reset or amend left reachable only from the reflog (marked *Not in the graph*). A pruned object shows the details error and Retry, not an empty commit.
-- **Recovery Points**: Select an entry and use *Branch* or *Reset* in the details pane below to create a branch at its commit, or reset the current branch to it with `reset --keep` after a preview that names every commit the branch would drop. The same two actions act on any commit the pane describes, whichever list selected it, and sit in the graph's row menu (`branches/commitActions.ts` owns both). The list reloads when HEAD moves.
-- **Restored Sessions**: A session saved on the old Reflog section or view reopens on Graph's HEAD-moves list.
-
-### 3.4 Suspects (Graph's third list)
-
-```mermaid
-flowchart LR
-    subgraph Input["Symptom Input"]
-        Symptom["Failing Symbol / Path<br/>+ Known-Good Base Ref"]
-    end
-
-    subgraph Analysis["DevMap + Git Analysis"]
-        Blame["Git Blame Window<br/>(Commits modifying symbol or path)"]
-        GraphSearch["DevMap Call Graph Traversal<br/>(Reachable callers & dependencies)"]
-        Ranker["dc-regress Ranking Engine<br/>(Score by graph proximity & churn)"]
-        Blame --> Ranker
-        GraphSearch --> Ranker
-    end
-
-    subgraph Output["History → Graph → Suspects"]
-        Results["Ranked Suspects List<br/>(Commit OID, Author, Evidence Chip)"]
-        Details["Click Suspect → Commit Details Below<br/>(verdict, files, diff preview)"]
-        Chips["Commits / HEAD moves<br/>chip ranked commits"]
-        Ranker --> Results --> Details
-        Results --> Chips
-    end
-
-    Input --> Analysis
-```
-
-- **Regression Suspects Finder**: Pinpoints which commit between a known-good ref and a failing commit could have caused a regression or affected a given symbol.
-- **Graph-Ranked Candidates**: Joins blame history with the DevMap code graph (`dc-regress` and `dc-regress-store`), ranking suspects by what the call graph actually reaches from the symptom rather than simple chronological recency.
-- **Indexed Search Window**: Analyzes the historical commit window up to the currently indexed commit, reporting exact commit reachability and blame attribution.
-- **Ways In**: Blame's toolbar (*Suspects* — the blamed file is the symptom), a diff hunk's symbol (*suspects*), a code-graph node's connections panel (*Find suspects for …*, by its DevMap id), the palette (*Find regression suspects*, and *Find suspects for the open file*), and *Suspects since* on any commit's details. All go through `openSuspectsFor`, which lands on Graph's Suspects list and asks at once when a symptom was named.
-- **One of Graph's Lists**: The question (symptom, last known good, cone depth) sits in History's context bar in place of the commit filter. A click selects the suspect in place, above the same details pane as the commit graph and HEAD moves, and stays selected when a graph reload stops drawing it. The details pane shows the suspect's verdict whichever list selected the commit, the other lists chip ranked commits (the tooltip names the symptom and window), and *Suspects since* on any commit's details asks again from that commit.
-- **Restored Sessions**: A session saved on the old Suspects section reopens on Graph's Suspects list; the palette's *Find regression suspects* keeps its id and opens it with the symptom focused.
-
----
-
-## 4. Insights (`insights`)
-
-Five scans of one subject — this repository — behind one segmented control.
-They were four separate header entries, and every one of them is empty until
-someone runs it: over half the Inspect menu costing attention every session
-and paying occasionally. They also share a shape, which is the real reason to
-gather them: each is an on-demand measurement that must say when it was capped
-rather than presenting a floor as a total.
-
-### 4.1 Pulse
-
-- **Contribution heatmap**: 53-week calendar of local-day activity, toggling commit count vs churn. Includes unpushed and all-branch commits. Click a day to filter Graph with `date:YYYY-MM-DD`.
-- **Rhythm**: current streak, longest run and longest gap in the last 90 days, plus active-day rate. A bounded history is labelled as such; a gap is never an artifact of where the scan stopped.
-- **Punch card**: hour-of-week grid with after-hours share. Defaults to every author on every local and remote branch; an author filter is required before reading it as personal.
-- **Line changes and LOC**: weekly additions vs deletions, reconstructed LOC trend from today's language-scan total walking numstat backwards, and churn-by-extension from the same walk. A partial or failed language scan is not shown as `0` LOC.
-- **Commit hygiene**: conventional-commit rate (same type set the backend parser accepts), median non-merge churn, signed-commit rate, merge rate, co-author rate from `Co-authored-by:` trailers in the commit body.
-- **Hotspot risk**: files ranked by churn × coverage. Unscanned coverage is "unknown", not "untested".
-- **Knowledge and age**: blame-bounded bus factor, orphaned files, line-age distribution. Truncation is visible.
-- **Local DORA**: deploy frequency and lead time from tags and `git describe --contains`. Change-failure rate and restore time are labelled approximations; a missing estimate is "—" not a invented number. Both come from one commit scan bounded at 25,000, and each names the sample it was measured over — a rate with no commits behind it reads as "no sample", never a confident 0%, and a scan the bound cut short says so on both cards with the window total behind it, rather than letting the newest slice stand in for the whole window the release count beside it covers.
-- **Export card**: a standalone SVG summary of the same window, sized for a README. Every tile carries its own definition rather than a bare label, each caveat sits on the tile it applies to (`CAPPED` commit scan, `PARTIAL` language or blame scan), and a metric whose scan did not run renders as an em dash with the reason — [an unscanned card](assets/screenshot-pulse-card-unscanned.png) and [a single-commit repository](assets/screenshot-pulse-card-solo.png) show both. The commit count and its active days always come from one population, so an author filter cannot leave the card mixing two.
-- **Honesty**: payload-budget truncation is data, not an error. Scan Deeper raises the commit cap only when the byte budget was not the limiter. No `.mailmap` is announced, because per-author tiles are otherwise split across emails.
-
-### 4.2 Coverage
-
-- **Universal Format Scanner**: Discovers coverage reports across all major formats:
-  - **LCOV** (`lcov.info`, `coverage.lcov`)
-  - **Cobertura XML** (`cobertura.xml`, `coverage.xml`)
-  - **Go Cover** (`cover.out`, `profile.out`)
-  - **Istanbul / NYC JSON** (`coverage-final.json`, `coverage-summary.json`)
-  - **JaCoCo XML** (`jacoco.xml`)
-  - **Clover XML** (`clover.xml`)
-- **Per-File Line Coverage**: Displays hit counts, uncovered branches, and line gutter markers.
-- **Toolchain Installation & Detection**: Automatically detects missing coverage generators (`cargo-llvm-cov`, `pytest-cov`, `vitest`, `nyc`, etc.) and provides 1-click install suggestions. Separately, Settings → Agents (and Code → Map / MANVI when missing) can install or update the `devmap` and `manvi` CLIs from a sibling checkout.
-- **DevCouncil component inventory**: Settings → Agents probes every component the setup wizard can install — `devmap`, `manvi`, `dcstore`, `dcverify`, `dcgrep`, and the Go host — by running each one rather than stat-ing a path. `dcstore` is not optional in practice: `manvi serve --workbench-db` resolves it from `PATH`, so the profile workbench and managed runs fail without it. Three components expose no version flag, so presence and version are reported as separate facts. `devmap doctor`'"'"'s installation warnings (binary skew, duplicate MCP registrations, stale `devmap mcp` processes, a mismatched plugin bundle) are shown beside the inventory; without a trusted repository to probe in, the panel says health was not checked instead of showing an empty list.
-- **Agent-host integration, previewed**: Settings → Agents runs `devmap integrate <host> --dry-run` for Claude Code, Cursor and Codex, and renders exactly which guides, editor rules, MCP entries, skills and hook files would change. Applying is a separate click. Repository writes and home-directory writes are counted separately — the command cannot do one without the other, and agreeing to add guides to a project is not agreeing to edit `~/.claude.json`. A guide the kernel reports as `not_ours` is yours: it is surfaced as protected and left alone.
-- **Failure Recovery Hints**: Surfaces actionable diagnostic explanations when test coverage generation fails.
-- **Report & Diagnostics Copying**: Persistent copy action to export sanitized coverage metrics directly to your clipboard.
-- **MANVI AI Test Generator**: Analyzes coverage gaps and suggests runnable test scripts for Rust, TypeScript/JavaScript, Python, Go, Swift, Dart, Java, etc.
-
-### 4.3 Health
-
-- **Multi-Ecosystem Audits**: Automatically detects and scans project manifests:
-  - `npm audit` / `npm outdated` (Node.js)
-  - `cargo-audit` (Rust)
-  - `pip-audit` (Python requirements.txt)
-  - `govulncheck` (Go)
-  - `composer audit` (PHP)
-  - `bundler-audit` (Ruby)
-  - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
-- **Supply-Chain Security Parsers**: Integrates `cargo deny` (SARIF) and `cargo crev` (JSONL) report parsers alongside `cargo audit` in dependency health for thorough Rust crate vetting.
-- **Code map status & dead symbols**: When a DevMap store is present (the vendored reader is schema 29), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
-- **Pinned Advisory Columns**: Table columns for security advisories and vulnerability details are pinned to fixed widths to prevent layout jitter across scans.
-- **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
-- **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, the working-tree secrets scan, and repository health signals into a single explicit verdict with one canonical owner per repeated decision. Secrets reads as unknown until a complete scan has been shown, and any finding is critical.
-- **Coding-agent tasks**: The agent bar above the page sends *Fix dependencies*, *Improve coverage*, *Fix secrets* or *Optimize storage* to Claude Code, Codex or another configured CLI in GitPulse's terminal, or copies the prompt. *Fix dependencies* attaches the report on screen and *Fix secrets* attaches the secrets scan on screen (rule, path, line and location — never a value); the Secrets section's **Fix with agent** selects that task and opens its prompt for review before anything launches.
-- **Previewed lists**: Every list on the page — vulnerabilities, Dependabot and code scanning alerts, secret findings, issues, outdated packages, manifests and dead-code candidates — opens on its first five rows with a **Show all N** control beneath it. Section headings still state the scan's own count and any cap; the control speaks only for rows it can reveal.
-
-### 4.4 Secrets (a section of Health)
-
-Secrets was its own Insights section until it folded into Health, which gave it the shared verdict and agent bar. A session that had Secrets open restores onto Health.
-
-- **In-Process Secrets Scan**: Discovers exposed API keys and private tokens in every tracked file and every untracked file git does not ignore, with GitPulse's own scanner (no external program, so it works with Kingfisher absent). The panel names the engine that produced the result. Rescan also asks Kingfisher, when it is installed, for a **second opinion**: it recognises many more credential shapes and also reads ignored files, its findings are merged (one row per path and line), and the panel says whether it ran or why it was unavailable. The green "No secrets reported" headline needs both engines to have read everything and found nothing; the in-process scan alone reads "No known secret shapes matched".
-- **Strict Privacy Redaction**: Findings carry rule, repo-relative path, line, confidence, Git location (tracked, untracked, ignored, `.git` metadata, nested repository), and a per-scan ordinal for rows sharing a value. Secret values, matches, context lines, fingerprints and redaction hashes are dropped in the backend and never persisted.
-- **Located Findings**: Rows are sorted with the actionable ones first, so a token in committed source does not sit among build output. Location chips (tracked, untracked, ignored, `.git` metadata, nested repository) filter the list, rows that hold the same value are marked, and each row can be revealed in the file manager.
-- **Stated Scope and Age**: The panel says what a scan covers — the working tree only, the file-size limit, symlinks, and inline ignores — and the header shows the scan's age. A result older than five minutes refreshes when the section is reopened.
-- **One Scan at a Time**: Opening Health runs one secrets scan beside the dependency scan, and a newer scan cancels an older one, so switching repositories never queues scanners. The section is drawn whether the dependency scan is loading, failed or done; moving between those states joins the scan already running instead of starting another. Every location of a repeated value is listed rather than deduplicated away.
-- **Unlogged Diagnostics**: Scanner standard output and diagnostic logging exclude secret payloads to prevent incidental leaks in debug logs.
-- **Fail-Closed Verification**: A scan that was cancelled, timed out, truncated, failed due to missing scanner binaries, or that left any file unread (over the size cap, past the byte or time budget, unreadable, a nested repository left unread, or one Kingfisher itself marked partial) reports explicitly as unverified / not clean, never as an all-clear.
-
-### 4.5 Storage
-
-- **Git Internals Audit**: Analyzes disk usage across packfiles, loose objects, reflogs, LFS assets, and submodules.
-- **Build & Cache Auditor**: Detects build directories (`target/`, `node_modules/`, `dist/`, `.venv/`, `.build/`) and unignored cache artifacts.
-- **Historical Snapshots**: Records repo size history to plot trend sparklines ("+180 MB this week").
-- **Repository Hygiene**: Reviews stale generated output across Rust, Go, Python, JavaScript, JVM, CMake and .NET projects, with retention, activity checks, expiring previews and cancellation. Shared Go/npm/uv/pnpm caches use their owning tools. Weekly cache review is opt in; deletion always requires a reviewed action. See [Repository hygiene](REPOSITORY_HYGIENE.md) for adapters and limits.
-- **Global build cleaner**: Fleet and Settings share explicit project roots, exclusions, retention, byte/target limits, opt-in schedules, cancellation and durable history. Closed repositories are discovered beneath selected roots. macOS bundles can opt into a per-user headless background job. Incompleteness is refused at the narrowest scope the evidence supports: a directory not read to the end is never a candidate, a repository whose inventory could not be enumerated has its candidates dropped, and the run refuses only when nothing is eligible and something could not be read — so a partial scan reports reduced coverage instead of vetoing the trees it did read. Unavailable checks still refuse. DevCouncil supplies the portable Rust policy and agent guidance.
-
----
-
-## 5. Beside the views
-
-Three surfaces that are deliberately **not** views: two live under every
-view, and one is scoped to the workspace rather than to a repository.
-
-### 5.1 Terminal — a dock, not a view (`⌃\``)
-
-The terminal is **not** one of the 4 views. It renders as a resizable dock
-*beneath* whichever view is on screen, reached with `⌃\``, the status bar's
-Terminal chip, the command palette, or **View → Terminal**.
-
-It was a view until the shape gave itself away: a PTY has to survive a view
-switch, so the pane was already mounted once and hidden thereafter — a page you
-could never leave without closing it. As a dock it is what it always behaved
-like, and command output can be read *against* the thing that prompted it: a
-Health remediation plan, a failing test, the diff you are about to commit.
-
-- **Embedded PTY**: Native terminal emulator powered by `portable-pty` and `@xterm/xterm` (6.1 beta pair).
-- **Expanded dock viewport isolation**: When expanded, the dock hides and marks `inert` the underlying workspace view, preventing focus leaks and background mouse or keyboard interactions.
-- **WebGL context hold & recovery**: Holds hidden WebGL contexts for up to 5 minutes (`GPU_HIDE_GRACE_MS`, counting toward the 8-context `MAX_VISIBLE_SESSIONS` limit) to eliminate tab switching lag, with a 3-strike recovery budget within 10 minutes (`GPU_LOSS_BUDGET` / `GPU_LOSS_WINDOW_MS`) for GPU context loss and automatic fallback to DOM rendering.
-- **DEC 2026 synchronized output**: Delimits all terminal write streams to ensure output concludes outside open DEC 2026 frames, preventing buffer freezes (xterm.js #6071).
-- **Unicode 11 double-cell glyphs**: Incorporates `@xterm/addon-unicode11` to accurately size emojis and wide characters across two cells.
-- **Deferred fitting schedule**: Defers `fit()` calls until terminal tabs and panes are visible and dimensioned, coalescing resizes with device pixel ratio changes and clearing texture atlases on display density shifts.
-- **Configurable terminal bell prompts**: "Count a terminal bell as waiting for you" in Settings → Agents (default off, `asksForReader`) controls whether terminal bells from Codex, Cursor, or shell CLIs count as waiting prompts.
-- **Stall-bounded input writes**: Input write timeouts measure idle stalls rather than cumulative write durations, preventing premature timeouts during high-throughput writes.
-- **Sanitized tab titles**: `cleanTabName` routes through `sessionActivity.clean()` to drop control characters and split surrogate pairs without corrupting Unicode text.
-- **Browser sessions (macOS)**: a **Browser** session type shows a local dev server's page (loopback only) in a native webview with no route to GitPulse's commands and its own non-persistent storage, placed over the tab and hidden whenever the tab is off screen or something of GitPulse's is drawn over it ([Terminal](TERMINAL.md#browser-sessions)).
-- **Explicit agent sessions**: Local AI suggestions and the policy sidecar do not read or write ordinary shell sessions. Choosing Claude, Manvi or Codex, or launching a saved task, starts a separate user-controlled agent session in the existing dock; that process receives input in its own PTY.
-- **Diagnostic Preservation**: Preserves command output, exit status, and failure context across builds.
-- **Lifecycle Supervision & Unix Terminal Host**: Switching views or repositories and hiding the dock preserve sessions. On Unix (`#[cfg(unix)]`), PTY sessions run in `gitpulse-ptyd` ([Terminal host](TERMINAL_HOST.md)) and survive app restarts or crashes. Closing a terminal tab or repository tab terminates the sessions it owns; failed cleanup remains visible.
-- **Resizable**: Drag the separator or nudge it with `↑`/`↓`, or double-click a page header or empty background to minimize an expanded dock (`panelDismiss.ts`); the height is remembered, and clamped so the dock can never grow to swallow the view above it.
-
-### 5.2 Agents (MCP 2.0 / Codex / Agent Plugins 1.0)
-
-- **Protocol**: `gitpulse-mcp` implements [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — `server/discover`, per-request `_meta`, `resultType` on results, cacheable tool lists. Dual-era: legacy `initialize` (2024-11-05 / 2025-11-25) still works.
-- **Package**: one canonical package at `plugins/gitpulse/` — native Codex `.codex-plugin/plugin.json` + `.mcp.json`, Claude Code compatibility files, closed Agent Plugins 1.0 manifests, and one shared `skills/` tree, plus the Antigravity bundle at `plugins/gitpulse-agy/`. The Tauri app copies this package into `Contents/Resources/plugin`.
-- **Tools**: Read-only inspection tools (`readOnlyHint: true`) — `gitpulse_insights`, `gitpulse_sessions` (zero-git live session attribution, `is_caller`, `run_id`, and `state`), `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, `gitpulse_worktree_inbox`, `gitpulse_worktree_radar` (3-layer claims + 1-hop CSR call-graph + ODB merge-tree radar), plus ledger, tasks, in-process `gitpulse_codeintel_*` / `devmap_*`, `gitpulse_provenance`, and `gitpulse_landed`. Repository-trust-gated write tools cover the task board (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and parallel agent worktree lifecycle & coordination (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), with Git mutations gated through the Manvi policy harness. `gitpulse_browser_open` (macOS) asks the running app to open a Browser session on a loopback URL in a trusted repository's terminal dock; it opens a page and nothing more.
-- **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
-- **Linux Signal Guard on Linux**: Models Linux process inspection tools (`procps pkill`/`pgrep`, `psmisc killall`, `pidof`) natively on Linux, checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect GitPulse and agent sessions.
-- **Durable Hook Notify Drop Record**: When notifications miss their timeout budget, timed records are appended to `<socket>.drops` beside the socket, rotated at 32 KiB, tightened to `0600` best-effort, and surfaced in Settings after 7-day expiration.
-- **Client-Side Vouched Snapshots**: `Host::knows` evaluates session membership directly from client-side vouched snapshots without IPC round-trips to `gitpulse-ptyd`.
-- **Settings**: copies `.codex-plugin/plugin.json` / `.mcp.json` and names the binary path, or why it could not be found.
-
-### 5.3 Fleet — the whole workspace at once (`⌘⇧F`)
-
-Fleet is not a view. Every view in the catalog above answers a question about
-*one* repository, is persisted on that repository's session, and lives inside
-the pane keyed on the active repository. Fleet answers a question about the
-**workspace**, so it sits above the repository tab strip and is reached from
-the strip's leftmost chip, the command palette, or **View → Fleet**. Toggling
-it hides the repository pane rather than unmounting it, so live terminal
-sessions survive and nothing re-hydrates on the way back.
-
-- **One row per repository, open and recent.** Open repositories show live
-  state; a repository that is only in your recents list is dimmed, marked *not
-  open*, and shows only what its own ledger already recorded — never a live
-  number it cannot have.
-- **Three tiers, priced honestly.** Changes, sync, conflicts, stash and parked
-  operations are already in memory and cost nothing. Worktrees, agent sessions,
-  commit rhythm and last activity cost two `git` calls per repository — three
-  for one that has been quiet all quarter — and refresh whenever the set of
-  open repositories changes. Lines of code, language mix, disk usage,
-  dependency audits and coverage cost minutes and **never run on their own** —
-  the same opt-in posture as automatic coverage generation and the release
-  check.
-- **Fleet Pulse.** A collapsible panel above the grid showing the workspace's
-  commit rhythm: every open repository's 90-day commit series summed bucket for
-  bucket into one chart, the 7-day trend against the 7 days before it, which
-  repositories are moving and which have gone silent for the whole window, and
-  the fleet's language mix drawn from the cached language scans. Everything in
-  it carries what it could not count: a repository whose history failed to read
-  is named in the coverage clause rather than flattening the chart, and a
-  percentage is never stated against an empty prior period — "5 in 7d, after
-  none in the 7 before", never "+100%".
-- **Commit statistics per repository.** A sparkline of the last 90 days, the
-  window total, and how many of those commits landed in the last 7. Author
-  counts and active days ride in the tooltip. A repository nobody has touched
-  this quarter renders a measured zero — a real finding — never "not scanned".
-- **Language statistics.** The Lines column carries the repository's language
-  mix as a proportional bar under its total, and the Pulse panel merges every
-  cached breakdown into one fleet mix. Shares are recomputed from summed lines
-  rather than averaged: a 200-line all-Rust repository and a 200,000-line
-  all-TypeScript one do not make a workspace that is half Rust.
-- **Sort, search, and scan one repository.** Any column sorts, and repositories
-  with no measurement stay at the bottom in *both* directions — "not scanned"
-  is not a low score. The filter box matches name, path, branch and any
-  language in the mix, as plain text rather than a pattern. And every "not
-  scanned" or "could not read" cell is itself the button that scans just that
-  repository for just that column, so filling one gap does not mean re-running
-  a sweep across the whole workspace.
-- **Every cell has three states, never two.** A measured value, *not scanned*,
-  or *could not read* with its reason. A repository nobody has audited shows
-  "not scanned", never a reassuring zero; an audit that ran but could not
-  finish is marked as a floor, so partial coverage cannot read as a clean bill
-  of health.
-- **Totals say what they could not count.** "1.50 GB — counted across 14 of
-  21, 1 failed, 6 not scanned" rather than a bare number that implies the
-  whole workspace. A total covering everything says nothing extra.
-- **A verdict is never made over a check that could not run.** A repository
-  whose sweep failed is reported *unknown*, never *clean* — but a repository
-  with real conflicts stays at conflicts, because unreadability must not
-  downgrade a worse problem.
-- **Sweeps report what actually happened.** "Scan all" for a family runs at a
-  bounded width (two at a time for storage and audits, which walk the tree and
-  spawn your package manager) and reports successes, failures and skips
-  separately, attributing each failure to the repository and column it
-  happened in.
-- **Change since the last measurement.** Where the ledger holds an earlier
-  reading, a cell carries a small chip saying how far it moved and names the day
-  it is measuring from — families are scanned independently, so "since
-  yesterday" is often months wrong on the same row. Direction is coloured by the
-  column's own goal, not by the sign: fewer vulnerabilities is an improvement,
-  less coverage is not, and more lines of code is neither. A first scan shows no
-  chip at all, because "unchanged" the first time something is measured is a
-  claim about a past nobody observed. The baseline is the previous distinct day
-  that family was actually measured; a day nobody scanned has no row, and none
-  is interpolated.
-- **A rescan never blanks what it is replacing.** A cell being rescanned keeps
-  showing its last measurement with a running marker beside it; only the two
-  absent states, which have nothing to preserve, are replaced by *scanning*. And
-  a *queued* repository is not a scanning one — the marker follows the handful
-  actually in flight, so a sweep of twenty-four never claims to be scanning all
-  twenty-four at once.
-- **Severity bands instead of a filter.** The grid groups itself by severity —
-  *Blocked by conflicts*, *Parked mid-operation*, *Uncommitted work* — worst
-  first, so "what needs attention" is how the list reads rather than a mode to
-  switch into and back out of. The bands only insert boundaries into the
-  existing order; the grouped and flat views can never disagree about which
-  repository comes first.
-- **Columns you can hide, and a notice when hiding costs you something.**
-  Every measurable column can be hidden and the grid can be made compact, both
-  remembered across restarts. Repository and severity are not on the menu — a
-  grid of measurements with nothing to attribute them to is not a smaller grid.
-  If a hidden column is concealing a *could not read*, the grid says so by
-  column and by count, because letting a failure vanish with its column is the
-  same lie as a blank cell, one level up.
-- **Bulk and single fetch.** Fetch or pull every open repository at a bounded
-  width, or fetch one row from its own control; the single-row path goes through
-  the identical skip rules, so a repository with no remote is skipped and said
-  to be skipped either way.
-- **A commit window you choose.** 30, 90 or 180 days, applied to the whole
-  sweep at once. Every repository in a sweep shares one anchor instant, which is
-  what makes the per-repository series summable bucket for bucket; a series
-  recorded against a different window is counted as mismatched rather than
-  silently mis-added.
-- **Keyboard.** With focus anywhere in Fleet: `/` jumps to the filter, `s`
-  cycles the sort through the columns actually on screen, `p` toggles Pulse, `r`
-  refreshes, and `1`–`9` jump to a row. Text fields keep every key — the
-  shortcuts never intercept typing — and each one is an accelerator for an
-  action that also has a real control.
-- **Remove from Fleet (`Delete` / `Backspace` or remove icon).** Any open or
-  recent repository can be removed directly from the Fleet grid. Removing an
-  open repository closes its tab and drops it from the workspace; removing a
-  recent repository purges it from workspace history so stale or moved project
-  paths stay clean without lingering.
-- **Repository Tab Groups.** Open repository tabs can be organized into named,
-  color-coded tab groups with collapse/expand and bulk close/reload controls,
-  simplifying navigation across multi-repository workspaces. Users can also
-  collapse inactive repository groups and collapse inactive tabs inside groups
-  (with an option to keep tabs running an active shell expanded), controllable
-  via **Settings → Layout** (`collapseInactiveGroupTabs`, `collapseInactiveIncludeShells`),
-  the tab strip (which also collapses inactive groups), or palette commands.
-- **Stacked Worktree Tabs.** Every checkout of one repository — the primary
-  checkout and its linked worktrees, including agent worktrees under
-  `.<agent>/worktrees/` — shares one tab instead of taking a tab each. The tab
-  names the repository and the checkout it is showing, counts the checkouts,
-  and carries their combined uncommitted, conflict and terminal badges, so work
-  in a checkout that is not on screen still shows. Its switcher (click the
-  count, press `↓`, or right-click) lists every checkout by session name with
-  its branch and the agent that made it, and can close one or all of them; the
-  worktrees stay on disk. **Show each checkout as a tab** (or `+`) unfolds the
-  stack in place; clicking its header folds it again. Membership comes from
-  Git's common directory as the backend reads it, never from a path guess, so a
-  checkout whose metadata cannot be read stands alone. Your own groups win: a
-  repository split across two groups stacks once in each. A worktree opened
-  while its repository is open lands next to it, and **Group all by parent
-  folder** groups a worktree with the folder its repository lives in. Turn it
-  off under **Settings → Layout → Stack worktree tabs**, or from the strip's
-  right-click menu.
-- **Coloured Tabs.** A tab can carry its own colour, and a group can carry one
-  that its tabs inherit when they have none. Colours persist with the workspace,
-  survive restore, and are named in the tab bar's accessible labels, including
-  when a colour is inherited. Quitting the app keeps open tabs, their groups,
-  and their collapsed state; an untrusted repository stays in the list without
-  a prompt or a Git command. Unsaved editor text is still discarded on quit.
-- **Stacked Notices.** Two or more toasts, or attention-inbox notices, collapse
-  into one card with at most two edges showing behind it. The pile expands to
-  every loaded card, and its toggle says how many unread notices it holds.
-
----
-
-## 6. Keyboard Shortcuts Reference
-
-GitPulse provides comprehensive keyboard navigation accelerators across the entire application:
-
-### 6.1 Workspace & Repository Tabs
-
-| Action | macOS | Windows / Linux |
-| --- | --- | --- |
-| **Open Repository…** | `⌘ O` / `⌘ T` | `Ctrl+O` / `Ctrl+T` |
-| **Clone Repository…** | `⌘ ⇧ O` | `Ctrl+Shift+O` |
-| **Close Repository Tab** | `⌘ ⇧ W` | `Ctrl+Shift+W` |
-| **Reopen Closed Tab** | `⌘ ⇧ Y` | `Ctrl+Shift+Y` |
-| **Next Repository Tab** | `Ctrl Tab` | `Ctrl+Tab` |
-| **Previous Repository Tab** | `Ctrl ⇧ Tab` | `Ctrl+Shift+Tab` |
-| **Jump to Tab 1–9** (9 is the last) | `⌘ 1–9` | `Ctrl+1–9` |
-| **Open a stack's checkout switcher** (focused stack) | `↓` | `↓` |
-| **Unfold / fold a worktree stack** (focused stack) | `+` / `-` | `+` / `-` |
-| **Preferences / Settings…** | `⌘ ,` | `Ctrl+,` |
-
-Next/previous tab and the number keys count what the strip draws: a folded
-worktree stack is one stop (the checkout it shows), and an unfolded one is a
-stop per checkout.
-
-### 6.2 View Switching
-
-| View | macOS | Windows / Linux |
-| --- | --- | --- |
-| **Work** | `F10` | `F10` |
-| **Code** | `⌥ ⌘ 1` | `Ctrl+Shift+1` |
-| **History** | `⌥ ⌘ 2` | `Ctrl+Shift+2` |
-| **Insights** | `⌥ ⌘ 3` | `Ctrl+Shift+3` |
-| **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
-| **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
-
-Sections within a view — Work's Overview / Remote / Tasks, Code's Explorer / Map, History's Graph /
-Diff, Insights' Pulse / Coverage / Health / Storage — are switched by that
-view's segmented control (`⌥` + section digit while the view is active),
-or by name from the command palette. **Go → view → section** also opens every
-section directly, including all three Work sections.
-
-### 6.3 Inside Fleet
-
-These fire while focus is anywhere in the Fleet grid, and never while typing:
-a text field keeps every key, and modified or IME-composing keys are left
-alone. Each is an accelerator for something that also has a visible control.
-
-| Action | macOS | Windows / Linux |
-| --- | --- | --- |
-| **Filter repositories** | `/` | `/` |
-| **Clear filter, return to grid** | `Esc` | `Esc` |
-| **Cycle sort through visible columns** | `s` | `s` |
-| **Toggle Fleet Pulse** | `p` | `p` |
-| **Refresh the sweep** | `r` | `r` |
-| **Jump to row 1–9** | `1`–`9` | `1`–`9` |
-| **Remove repository from Fleet** | `Delete` / `⌫` | `Delete` / `Backspace` |
-
-### 6.4 Navigation & Search
-
-| Action | macOS | Windows / Linux |
-| --- | --- | --- |
-| **Command Palette** | `⌘ K` | `Ctrl+K` |
-| **Search / Filter Commits** | `⌘ F` | `Ctrl+F` |
-| **Shortcuts Cheat Sheet** | `?` or `⌘ /` | `?` or `Ctrl+/` |
-| **Zoom In** | `⌘ +` or `⌘ =` | `Ctrl++` or `Ctrl+=` |
-| **Zoom Out** | `⌘ -` | `Ctrl+-` |
-| **Reset Zoom** | `⌘ 0` | `Ctrl+0` |
-| **Toggle Dark / Light Theme** | `⌘ ⇧ T` | `Ctrl+Shift+T` |
-
-### 6.5 Git Operations & Workflow
-
-| Action | macOS | Windows / Linux |
-| --- | --- | --- |
-| **Refresh Repository** | `⌘ R` | `Ctrl+R` |
-| **Fetch from Remote** | `⌘ ⇧ K` | `Ctrl+Shift+K` |
-| **Pull from Remote** | `⌘ ⇧ P` | `Ctrl+Shift+P` |
-| **Push to Remote** | `⌘ ⇧ U` | `Ctrl+Shift+U` |
-| **Quick Commit (Composer)** | `⌘ Enter` | `Ctrl+Enter` |
-| **Dismiss Modal / Overlay** | `Esc` | `Esc` |
-| **Navigate List Items** | `↑` / `↓` | `↑` / `↓` |
-| **Select / Execute Item** | `Enter` | `Enter` |
-
-### 6.6 Command Palette Modes
-
-| Prefix | Mode | Description |
-| --- | --- | --- |
-| `>` | **Commands** (default) | Search Git actions, every view and section, workspace controls, appearance and setup. Clone and Rebase open the existing dialogs. |
-| `/` | **Files** | Fuzzy-search tracked and untracked, non-ignored file paths and open them in Explorer. |
-| `%` | **Repositories** | Switch open tabs, reopen a closed tab, or open a recent repository. Full paths disambiguate names. |
-| `#` | **Jump to Commit** | Search loaded history by SHA, message or author, then open the selected commit's diff. The palette names the history limit and links to History for older commits. |
-| `@` | **Jump to Branch** | Search local and remote branches and checkout with a single keystroke. |
-| `:` | **Symbols (this repo)** | Search the DevMap symbol index for the active repository. |
-| `::` | **Symbols (workspace)** | Cross-repo symbol search over tabs registered in DevMap's workspace. Append `~` for TF-IDF name ranking. Unavailable repos and truncation are named on the result strip. |
-| `?` | **Help & Shortcuts** | View available keyboard shortcuts and documentation (including Map / docs tips). |
-
-Mode buttons expose every prefix without memorization. Local searches match multiple
-tokens across names and descriptions and rank exact/early label matches ahead of
-fuzzy matches. Successful commands gain a bounded frequency/recency score; cancelled
-or refused actions do not. Empty-query suggestions put available actions first.
-
-Unavailable actions remain searchable with a reason (no repository, loading, a bare
-repository, a parked operation, conflicts, empty stash or clean working tree).
-Async actions show progress and cannot be triggered twice while pending. Failed
-actions remain open with their error; prompts receive focus after the palette closes.
-
-Results use 50-item pages with exact visible/returned counts. `↑` / `↓`, `Home` /
-`End`, `PageUp` / `PageDown`, `Enter`, `Tab` and `Escape` support keyboard operation.
-Symbol searches debounce, expire after 12 seconds, and ignore responses after a
-query, mode, repository or visibility change. Errors and partial coverage remain
-visible alongside results, with Retry and Map/setup recovery. Workspace hits resolve
-through exact registered repository names and verify activation before selecting a file.
-
-See [Command palette architecture and verification](COMMAND_PALETTE.md) for the
-extension contract, regression cases, and limits.
+# GitPulse features
+
+[Documentation index](README.md) · [Getting started](GETTING_STARTED.md) · [Installation](INSTALLATION.md) · [Why GitPulse](WHY_GITPULSE.md) · [Agents guide](AGENTS_GUIDE.md) · [View reference](VIEW_REFERENCE.md)
+
+This page lists what GitPulse does, by area. Everything outside the [Coming](#coming) section is in the
+code on `main` today. For controls, prerequisites and limits of each view, see the
+[view reference](VIEW_REFERENCE.md). GitPulse is tested on macOS. Windows and Linux builds are produced by
+release CI but have not been tested, so some features below may behave differently or be missing there.
+
+GitPulse has 4 views and 11 sections: **Work** (Overview, Remote, Tasks), **Code** (Explorer, Map),
+**History** (Graph, Diff) and **Insights** (Pulse, Coverage, Health, Storage). Fleet, the Agents plane and
+the terminal dock sit beside them. The native layer exposes 330+ commands to the frontend.
+
+Contents: [1. One workspace](#1-one-workspace-for-every-project) · [2. Agent control plane](#2-agent-control-plane) ·
+[3. Agent guards](#3-agent-guards-with-manvi) · [4. Code intelligence](#4-devcouncil-and-devmap-code-intelligence) ·
+[5. Task board](#5-task-board) · [6. Remote and GitHub](#6-remote-and-github) · [7. Git client](#7-git-client) ·
+[8. Files and code](#8-files-and-code) · [9. Insights](#9-insights) · [10. Load scheduler](#10-load-scheduler) ·
+[11. Terminal](#11-terminal) · [12. Customization](#12-customization) · [13. Platform](#13-platform) ·
+[Coming](#coming)
+
+## 1. One workspace for every project
+
+- **Repository tabs**, up to 1,000 open, with collapsible groups that survive a restart. At most 32
+  repositories are watched at once (a pool of 24 active watches; the rest are parked), and 24 recent
+  repositories are remembered. Source: `MAX_OPEN_TABS`, `MAX_WATCHES` and `MAX_RECENT_REPOS` in the code.
+- **Worktree tab stacks**: every checkout of a repository shares one tab, with a switcher.
+- **Fleet** (`⌘⇧F`): a grid that compares repositories on churn, sync and health. Every cell is a value,
+  *not scanned* or *could not read*; totals name what they could not count.
+- **Work rows**: Work → Overview shows one row per place work is happening, blocked worktrees first.
+- **Boards across repositories**: the global and saved-workspace task boards, from the **Tasks** button
+  beside Fleet.
+- **Repository logos** on tabs, with a picker, and a file explorer that can dock in the sidebar.
+
+## 2. Agent control plane
+
+- **Launchers**: six (Shell, Claude, Codex, Manvi, Grok, Antigravity) plus a Browser tab, from the dock.
+  Each launcher has a default model, effort, advisor and commit model in **Settings → Agents**.
+- **Live session detection**, including sessions GitPulse did not launch (Claude, Codex, Antigravity,
+  DevCouncil and Manvi), over MCP as `gitpulse_sessions`. The Agents plane (`⌘⇧A`) draws the checkouts,
+  terminals and task attempts your repositories hold.
+- **Agent tree**: parent and child sessions nested, collapsible and filterable.
+- **A worktree per agent**, with copy-on-write `node_modules` and `target` caches, `.worktreeinclude`, and the
+  DevMap store seeded from the main checkout. The `claude --worktree` flow goes through GitPulse's hooks.
+- **Agent-to-agent communication**: the peer inbox (`gitpulse_agent_register`, `_peers`, `_send`, `_inbox`,
+  `_wait`), worktree lane messages, and **Send to agent** from the UI.
+- **Collision radar, file claims and the collision guard hook**: warnings before two agents' edits meet.
+- **Follow agent**: a split pane that follows an agent's file edits live.
+- **Turn checkpoints** (`refs/gitpulse/turns/`, opt-in), the **ledger** and **provenance** (which session
+  changed what, and how a commit landed), and **merge-conflict prediction** between worktrees in a quarantine.
+- **Notifications**, an attention inbox and a menu-bar status glyph.
+- **Managed runs that survive quitting** (hosted `manvi serve`), on Unix.
+- **MCP server for agents**: 66 tools (55 `gitpulse_*` and 11 `devmap_*`), 4 prompts and `gitpulse://`
+  resources, with plugins for Claude Code, Codex, Cursor and Antigravity. See the [agents guide](AGENTS_GUIDE.md).
+- **Agent reads of shells you opened** (opt-in, off by default): `allow_agent_shell_reads` lets MCP callers
+  read secret-scrubbed output from your shell sessions in the same trusted repository.
+
+## 3. Agent guards with Manvi
+
+- **Command gate** on every agent shell command where the hooks are registered. Each decision is one of eight
+  statuses: Allowed, Demoted, Granted, Widened, Degraded, Warned, Blocked or Unchecked
+  (`contracts/verdict.schema.json` defines them and the order they are evaluated in).
+- **Scope fences**: with a task scope bound, writes into another checkout (`sed -i`, `tee`, `rm`, `mv` and
+  similar) are refused.
+- **Per-repository trust**: only the desktop can grant it; MCP cannot.
+- **Secret gate** on commits and pushes GitPulse makes (`dc-redact`). It does not catch an agent's own `git commit`.
+- **Pre-operation undo snapshots** (`refs/gitpulse/ops/`) with a compare-and-swap-checked restore, from HEAD moves.
+- **Signal guard**: agents cannot kill GitPulse.
+- **Limits**: Antigravity has no `PreToolUse` guards from GitPulse, and a worktree is not an OS sandbox.
+
+## 4. DevCouncil and DevMap code intelligence
+
+- **Map**: navigator, files, symbols, subsystems, docs, doc graph and links (Code → Map).
+- **Blast radius** with a rung filter (History → Diff).
+- **Affected tests**, and **CI:local** scoped to them, falling back to the full suite and saying so.
+- **Regression suspects** (History → Graph → Suspects).
+- **Dead symbols, clones, trace** and workspace-wide symbol search through the palette (`:` and `::`).
+- **DevCouncil suite panel and installer** in Settings.
+- **Explorer search** through `dcgrep` when a compatible one is installed.
+
+## 5. Task board
+
+- Five columns (Backlog, Ready, In progress, Review, Done), swimlanes, WIP limits and filters. A column fills
+  up to 2,000 cards.
+- Cross-repository and saved-workspace boards.
+- Quick add, compose from notes, due dates, relations (blocks, depends, related, duplicate) and merging duplicates.
+- **Manvi assist**: refine, suggest and field locks.
+- **Launch an agent from a card**: model, effort and advisor per launch, one tracked attempt per run, in its own worktree.
+- **Verification chips.** `gitpulse_complete_task(done)` needs a passed Manvi verification for the worktree's
+  current head; otherwise the card goes to Review.
+- **GitHub issue to task**, and an archive dock with a Deleted view.
+- **Agents file tasks over MCP**, with duplicate gating, `expected_revision` protection and
+  `gitpulse_import_tasks` for `tasks/*.md` briefs.
+
+## 6. Remote and GitHub
+
+- **Pull requests**: view, review, approve, merge, check out, open as a worktree, create.
+- **Issues**, and issue to task.
+- **Actions**: workflows, runs, dispatch, rerun, cancel and timelines.
+- **Releases** and tag publishing with a preflight.
+- **Firebase App Hosting** rollouts.
+- **GitHub avatars** on the graph.
+- **Dependabot and code-scanning alerts**, in Health.
+
+## 7. Git client
+
+- **Commit graph** with a lane solver, avatars and hover cards. A synthetic 100,000-row history takes about
+  41 ms to lane-solve and about 58 ms to assemble (minimum timings; [performance notes](PERFORMANCE.md)).
+- **Branch stack tree**: stacked branches as a tree, with restack parent-before-child and rollback.
+- **Diff**: split or unified, word diff, image diff, a History rail, and Shift-click range compare.
+- **Hunk and line staging**, a commit composer, and Apple Intelligence commit drafting on macOS.
+- **3-way conflict editor**, which leads Overview while a merge is parked.
+- **HEAD moves (reflog)** with undo.
+- **Cherry-pick, revert, reset, interactive rebase, stash, remotes and submodules.**
+- **Branch and tag cleanup** with tip backups and one-click restore.
+
+## 8. Files and code
+
+- File tree with git status, a virtualized viewer, and editing with compare-and-save.
+- Markdown through MarkDev, plus media and hex viewers.
+- **Blame** toggle with a code-age timeline.
+- **Repository-wide content search** (Code → Explorer, Contents mode) that reports capped or cancelled results.
+  There is no separate chord for it: `⌘F` searches the open file in Code, and searches commits elsewhere.
+
+## 9. Insights
+
+- **Pulse**: heatmap, rhythm, punch card, code age, DORA, hotspots, knowledge map and period compare.
+- **Coverage**: 7 formats parsed (LCOV, Cobertura, Go cover, Istanbul, SimpleCov, JaCoCo, Clover). A
+  coverage.py `.coverage` database is detected but not parsed; the panel asks you to export `coverage.xml` or `lcov.info`.
+- **Health**: 13 sections (summary, plan, vulnerabilities, Dependabot, code scanning, secrets, issues,
+  outdated packages, packages, code graph, dead code, terminal incidents and host load).
+- **Secrets scan** runs in-process; Kingfisher is an optional second opinion on an explicit Rescan.
+- **Storage and hygiene**: commit-graph write, a cache inventory and a build cleaner.
+
+## 10. Load scheduler
+
+- **Memory-pressure governor**: admits, queues or sheds agent launches under host memory pressure, with a
+  human **Admit anyway**. It acts on memory pressure only.
+- **Heavy-command gate** in the hook, and a shared spawn budget for git.
+- **Build leases**: slots and a queue for heavy builds, a wrapper on the agent's `PATH`, and the queue
+  position on the terminal pill.
+- **Idle agent sessions** are classified and can be parked with one click.
+- **Resource profile** that sizes GPU contexts and caches to the machine.
+- **Host-load section** in Health, a pressure dot in the status bar, and a strip with CPU, GPU, memory,
+  thermal and storage indicators and a live-graph popover.
+
+## 11. Terminal
+
+- A dock beneath every view (`` Ctrl+` ``), per repository and expandable.
+- Tabs, **nested splits** (rows and columns, up to 8 panes) and split groups, tab and session search, Find
+  and text size.
+- Sessions grouped by repository in the session list.
+- **Sessions that survive reload and app quit** (`gitpulse-ptyd`), with transcript recovery and resume, on Unix.
+- WebGL rendering, synchronized output and Unicode 11. Command blocks (OSC 133).
+- **Browser pane** for localhost dev servers, which agents can open (macOS).
+- Select-to-copy, OSC 52, "Copy last command output", "Run in new split shell", launcher icons and per-tab counts.
+- Status-bar terminal pill and a shortcut guide.
+
+## 12. Customization
+
+- 17 theme presets (Standard, Developer, Sci-Fi), a My themes shelf (24), and import and export.
+- 11 macOS wallpapers plus your own image, glass appearance, and opt-in wallpaper motion.
+- **Command palette** with 8 modes (`>` `/` `%` `#` `@` `:` `::` `?`) opened with `⌘K`.
+- 9 settings sections with search, and a status bar that is full, minimal or hidden.
+- A product tour and a setup wizard.
+
+## 13. Platform
+
+- **Tested on macOS only.** Release CI builds five targets: macOS universal, Linux x64 and arm64, and
+  Windows x64 and arm64. The Linux and Windows builds have not been tested. macOS builds are ad-hoc signed,
+  not notarized, and Windows builds are unsigned.
+- On Windows, without a process scan, some live agent sessions show as unknown rather than zero.
+- Five binaries: `gitpulse`, `gitpulse-mcp`, `gitpulse-hook`, `gitpulse-ptyd` and `gitpulsed`.
+- Local-first: repository and task state stay on your machine. Git remotes, GitHub, release checks you opt
+  into and configured agent providers use the network; see [Security](SECURITY.md).
+
+## Coming
+
+These are not in the app today.
+
+- Load governor stages 3 and 4: a pressure verdict in the command gate and a load line in the session brief.
+- A cross-repository execution queue, two-way GitHub issue sync and DAG task planning.
+- Notifications on Windows and Linux, and CI and due-date reminders.
+- Browser pane element-to-source mapping, then a Chromium driver.
+- User-defined keyboard shortcuts and internationalization groundwork.
+- "Ask Manvi to organise the board".
+- Posting `devcouncil verify` results to GitHub.
+- Windows and Linux test passes, so each can move from "built" to "tested". Notarized macOS builds.
+- **Labs preview (not in this release):** remote runners over ssh, an encrypted secrets vault, snapshot
+  import, device and settings sync, and a team kill switch exist on a development branch behind a build
+  flag. No release build enables them. Issue-tracker integrations beyond GitHub are not built.

@@ -19,13 +19,20 @@ flowchart TD
 
 ## Verdict ladder
 
-| Verdict | Meaning |
+The harness decides one of three actions (`allow`, `warn`, `deny`). GitPulse then renders every decision as one of **eight statuses**, evaluated in a fixed order (`contracts/verdict.schema.json`, `$defs/classification`). An `allow` alone does not mean the rules passed.
+
+| Status | Meaning |
 | --- | --- |
-| **Allowed** | Conforms to policy and repo bounds |
-| **Demoted** | Transformed to a safer variant, then executed |
+| **Blocked** | The action was `deny`. Rejected; the UI explains why. (`denied` in the contract) |
+| **Granted** | An override cleared a soft block. Never shown as a clean allow |
+| **Demoted** | A gate mode or host posture downgraded a denial to an allow |
+| **Widened** | The write was allowed by scope an executor appended to its own task |
+| **Degraded** | A check could not run, so the decision is not the one a full check would reach |
 | **Warned** | Proceeds; advisory recorded |
-| **Blocked** | Rejected; the UI explains why |
-| **Unchecked** | Harness missing or that rung could not run. Recorded as unchecked — **never reported as allowed** |
+| **Allowed** | The rules passed with nothing overriding them. (`clean` in the contract) |
+| **Unchecked** | No decision exists (harness missing or that rung could not run). Recorded as unchecked, **never reported as allowed** |
+
+Each rule also has a severity: `hard` rules can never be cleared by a grant; `soft` rules can be demoted by posture or cleared by a grant.
 
 Asymmetric degradation: a wedged sidecar fails closed in the sense that the UI does not pretend the gate passed. Settings → Agents → Manvi policy shows posture; Work → Overview → Policy activity shows recent verdicts and grants.
 

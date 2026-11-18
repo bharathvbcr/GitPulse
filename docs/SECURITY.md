@@ -23,7 +23,7 @@ flowchart TD
 
     subgraph SidecarIsolation["Local Sidecar & Module Boundaries"]
         direction TB
-        ManviSidecar["Manvi Sidecar (manvi serve)<br/>(Stdio NDJSON, 5-verdict safety ladder)"]
+        ManviSidecar["Manvi Sidecar (manvi serve)<br/>(Stdio NDJSON, 8 decision statuses)"]
         DevMapGate["DevMap Engine<br/>(Local .devmap/ in $GIT_COMMON_DIR/info/exclude)"]
     end
 
