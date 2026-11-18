@@ -178,8 +178,9 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   repository-wide text search (`git grep` over working tree or revisions with honest
   cancellation and truncation reporting). Add DevMap for structural navigation,
   symbol search, symbol-level collision detection, dependencies, impact, and candidate tests.
-- **Inspect the repository.** Universal coverage reports across 6 formats (LCOV, Cobertura,
-  Go cover, Istanbul, JaCoCo, Clover), multi-ecosystem dependency audits (`cargo-audit`,
+- **Inspect the repository.** Universal coverage reports across 7 formats (LCOV, Cobertura,
+  Go cover, Istanbul, JaCoCo, Clover, SimpleCov; a coverage.py `.coverage` database is
+  detected and asks for an export), multi-ecosystem dependency audits (`cargo-audit`,
   `npm audit`, `pip-audit`, `govulncheck`) with `cargo deny` and `cargo crev` parsers,
   redacted secrets scanning (in-process by default, Kingfisher as the deep scan) that locates each finding against Git, storage
   cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
