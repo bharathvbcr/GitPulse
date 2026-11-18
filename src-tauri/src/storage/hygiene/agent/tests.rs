@@ -316,6 +316,7 @@ fn a_folder_that_became_live_between_preview_and_delete_is_not_removed() {
     assert!(target.is_dir());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_never_leads_the_removal_outside_the_scope() {
     let (_temp, root) = temp_root();
@@ -403,6 +404,7 @@ fn a_young_unreadable_or_oversized_target_is_kept() {
 
     cargo_target(&pad.join("sealed"), 30);
     let sealed = pad.join("sealed/debug");
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o0)).unwrap();
@@ -1221,6 +1223,7 @@ fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
 /// A folder holding anything Cargo, rustdoc and the coverage tools did not
 /// write at its top level is not offered, however well it carries the markers:
 /// someone put their own files in a build folder.
+#[cfg(unix)]
 #[test]
 fn a_marked_target_holding_foreign_files_at_its_top_level_is_kept() {
     let (_temp, root) = temp_root();
@@ -1470,6 +1473,7 @@ impl Drop for Mode {
     }
 }
 
+#[cfg(unix)]
 fn marked_targets(parent: &Path, count: usize) {
     for n in 0..count {
         cargo_target(&parent.join(format!("t{n:02}")), 30);
@@ -2111,6 +2115,7 @@ fn an_unreadable_marker_is_kept_not_no_markers() {
 
 /// A scan that was refused permission to read something and nothing else: no
 /// folder counted as unexamined, the scan complete, and a kept row for it.
+#[cfg(unix)]
 fn denied_and_complete(scan: &Scan) -> bool {
     scan.unexamined == 0
         && scan.complete

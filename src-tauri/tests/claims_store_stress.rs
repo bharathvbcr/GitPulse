@@ -13,6 +13,7 @@ use gitpulse_lib::insights::claims::{
     append_claim, append_claims_repairing, read_store, ClaimSource, FileClaim, DEFAULT_CAP,
     DEFAULT_TTL_MS,
 };
+#[cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
 
 const T0: u64 = 1_794_110_184_306;

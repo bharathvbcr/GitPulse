@@ -4,6 +4,7 @@
 //! the root set it uses, as a pass does once, so nothing here outlives a pass.
 
 use super::transcript::{deepest_root, RootSet};
+#[cfg(unix)]
 use crate::procguard::LockedSpawn;
 use crate::test_support::coverage_relaxed;
 use std::path::{Path, PathBuf};
@@ -477,6 +478,7 @@ fn adv2_unreadable_directory_key_errors_instead_of_colliding() {
     assert!(k1.is_err() && k2.is_err(), "{k1:?} {k2:?}");
 }
 
+#[cfg(unix)]
 fn git_repo(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     let status = std::process::Command::new("git")
@@ -531,6 +533,7 @@ mod reattack_7f7ed85c {
     use super::*;
     use crate::ingest::transcript::{attribution_root, departed_root, ToolCall};
 
+    #[cfg(unix)]
     fn same_dir(a: &Path, b: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         match (std::fs::metadata(a), std::fs::metadata(b)) {
@@ -541,6 +544,7 @@ mod reattack_7f7ed85c {
 
     /// The filesystem is the oracle: if `<tmp>/b` is the directory `<tmp>/a`
     /// made, a path under `b` is under root `a`, and if it is not, it is not.
+    #[cfg(unix)]
     fn fs_agrees(a: &str, b: &str) {
         let tmp = canon_tmp();
         let base = real(&tmp);
@@ -555,18 +559,21 @@ mod reattack_7f7ed85c {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "owner decision: Unicode normalisation dependency (ss/eszett)"]
     fn r01_eszett_vs_ss() {
         fs_agrees("stra\u{df}e", "STRASSE");
         fs_agrees("STRASSE", "stra\u{df}e");
     }
+    #[cfg(unix)]
     #[test]
     #[ignore = "owner decision: Unicode normalisation dependency (dotted capital I)"]
     fn r02_dotted_capital_i() {
         fs_agrees("\u{130}stanbul", "i\u{307}stanbul");
         fs_agrees("\u{130}stanbul", "istanbul");
     }
+    #[cfg(unix)]
     #[test]
     #[ignore = "owner decision: Unicode normalisation dependency (NFC vs NFD)"]
     fn r03_nfc_vs_nfd() {
@@ -574,6 +581,7 @@ mod reattack_7f7ed85c {
         fs_agrees("cafe\u{301}", "caf\u{e9}");
         fs_agrees("CAF\u{c9}", "cafe\u{301}");
     }
+    #[cfg(unix)]
     #[test]
     #[ignore = "owner decision: Unicode normalisation dependency (final sigma)"]
     fn r04_greek_sigma_forms() {
@@ -587,6 +595,7 @@ mod reattack_7f7ed85c {
         );
         fs_agrees("\u{3c2}", "\u{3c3}");
     }
+    #[cfg(unix)]
     #[test]
     fn r05_kelvin_and_ohm_signs() {
         fs_agrees("\u{212a}it", "kit");
@@ -596,6 +605,7 @@ mod reattack_7f7ed85c {
 
     /// A root whose last component has no letters (a numbered worktree) takes
     /// the volume from its deepest component that has one.
+    #[cfg(unix)]
     #[test]
     fn r06_digit_named_root_on_insensitive_volume() {
         let tmp = canon_tmp();
@@ -617,6 +627,7 @@ mod reattack_7f7ed85c {
     /// Ranking is by the depth of the spelling that matched, not the length of
     /// the text: a long link to a shallow directory does not outrank a deeper
     /// real root.
+    #[cfg(unix)]
     #[test]
     fn r07_long_link_to_shallow_dir_outranks_deeper_root() {
         let tmp = canon_tmp();
@@ -661,6 +672,7 @@ mod reattack_7f7ed85c {
     /// that pass (a root absent at prepare time keeps no real spelling) and is
     /// by the next one. Two links to one directory answer the same whatever
     /// the listing order, the first listed winning.
+    #[cfg(unix)]
     #[test]
     fn r09_root_appearing_mid_pass_and_same_real_dir_twice() {
         let tmp = canon_tmp();

@@ -9,6 +9,7 @@
 
 mod common;
 use common::{run_git, trust_repo};
+#[cfg(unix)]
 use gitpulse_lib::engine::git_writer::MergeMode;
 use gitpulse_lib::engine::{GitReader, GitWriter};
 use gitpulse_lib::graph::RefScope;
@@ -343,10 +344,12 @@ fn repo_with_identity() -> tempfile::TempDir {
     dir
 }
 
+#[cfg(unix)]
 const BREW_GIT_DIR: &str = "/opt/homebrew/bin";
 
 /// The PATH that puts a gettext-enabled git with a German catalog first, or
 /// `None` when this machine has none (English is then inferred, not verified).
+#[cfg(unix)]
 fn translating_git_path() -> Option<String> {
     let git = Path::new(BREW_GIT_DIR).join("git");
     if !git.exists() {

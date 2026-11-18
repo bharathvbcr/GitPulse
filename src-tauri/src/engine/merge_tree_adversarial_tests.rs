@@ -5,11 +5,12 @@
 //! hooks and `prepare-commit-msg`).
 
 use crate::engine::git_cli::git_text;
-use crate::engine::merge_tree::{active_commit_hooks_with, classify_hook_list, HeldReason};
-use crate::engine::worktree::{
-    add_worktree_extended, merge_and_teardown_requiring, merge_and_teardown_worktree,
-    MergeTeardownError,
-};
+#[cfg(unix)]
+use crate::engine::merge_tree::HeldReason;
+use crate::engine::merge_tree::{active_commit_hooks_with, classify_hook_list};
+use crate::engine::worktree::{add_worktree_extended, merge_and_teardown_worktree};
+#[cfg(unix)]
+use crate::engine::worktree::{merge_and_teardown_requiring, MergeTeardownError};
 use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -382,6 +383,7 @@ fn diverged_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
     (dir, lane)
 }
 
+#[cfg(unix)]
 fn wave(dir: &Path, lane: &Path) -> Result<(), MergeTeardownError> {
     merge_and_teardown_requiring(
         dir.to_str().unwrap(),
@@ -395,6 +397,7 @@ fn wave(dir: &Path, lane: &Path) -> Result<(), MergeTeardownError> {
     .map(drop)
 }
 
+#[cfg(unix)]
 fn expect_hooks_held(label: &str, outcome: Result<(), MergeTeardownError>) {
     match outcome {
         Err(MergeTeardownError::Held {

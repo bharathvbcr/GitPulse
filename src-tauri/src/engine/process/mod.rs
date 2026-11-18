@@ -51,6 +51,7 @@ pub(crate) use env::{
     build_capture_command_in, is_injected_git_env, lc_ctype_from_inherited, strip_injected_git_env,
 };
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use env::{
     default_child_path_with_env, gui_launch_fallback_dirs, restrict_env_to_allowlist,
     restrict_env_to_allowlist_plus, spawn_candidate_names, MAX_INHERITED_PATH_BYTES,
@@ -62,6 +63,8 @@ pub(crate) use env::{developer_dirs, past_xcrun_git_shim, REAL_GIT_DIRS};
 pub use gate::run_process_with_shared_spawn_budget;
 #[cfg(test)]
 pub(crate) use gate::with_disk_only_answer;
+#[cfg(any(not(unix), test))]
+pub(in crate::engine::process) use gate::SpawnPermit;
 pub(crate) use gate::{
     background_deferral_cause, current_admission, grant_post_action_credit_now,
     is_deferred_under_load, is_slot_wait_timeout, mark_user_action, production_spawn_rate,
@@ -69,11 +72,12 @@ pub(crate) use gate::{
     with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
 };
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use gate::{
     configured_spawn_gate, current_spawn_source, format_gate_report, grant_post_action_credit,
     mark_interactive, marked_repo_is_none, post_action_credits, refusal_message_at, report_label,
     spawn_gate, spawn_limit, AdmissionCounters, BucketLevel, LabelCounts, RefusingBucket,
-    SpawnPermit, CANCELLED_BEFORE_SPAWN, POST_ACTION_CREDIT_REPOS, POST_ACTION_CREDIT_WINDOW,
+    CANCELLED_BEFORE_SPAWN, POST_ACTION_CREDIT_REPOS, POST_ACTION_CREDIT_WINDOW,
     UNATTRIBUTED_SOURCE,
 };
 pub use gate::{
@@ -81,11 +85,15 @@ pub use gate::{
     run_process_with_unlimited_spawn_rate,
 };
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use gate::{
-    frozen_gate, hold_credit_open, leak_gate, refusal_message, rev_parse_launches_from, spawn_log,
+    frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log,
     take_post_action_credit, with_background_budget_wait, Refusal, SpawnGate,
     POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
 };
+
+#[cfg(all(test, unix))]
+pub(crate) use gate::hold_credit_open;
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use qos::band_outcomes;
@@ -93,6 +101,7 @@ pub(crate) use qos::with_background_band;
 pub use qos::QosTier;
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use read_cancel::CANCELLED_MESSAGE;
 
 pub use runner::{
@@ -108,12 +117,14 @@ pub(crate) use runner::{
     ExitFacts, KeepDeadlinePrefix, OutputStream, ProcessObserver, RunError, ToolProbe,
 };
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use runner::{
     forced_failure_active, run_observed_with, run_with_gate, run_with_gate_options,
     spawn_labels_during, with_forced_deferral, with_forced_spawn_failure,
     with_forced_spawn_failure_of, with_forced_spawn_failure_then,
 };
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use runner::{
     is_cancellation, is_timeout_error, next_poll_backoff, spawn_error, DRAIN_JOIN_GRACE,
     POLL_BACKOFF_MAX, POLL_BACKOFF_START,
@@ -122,4 +133,5 @@ pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 
 pub(crate) use shared_read::run_read_shared;
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use shared_read::{run_read_shared_with, shared_reads};

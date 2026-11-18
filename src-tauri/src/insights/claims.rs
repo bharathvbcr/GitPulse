@@ -1073,6 +1073,7 @@ enum Acquired {
     /// The lock, or `None` where the platform has no file lock to hold.
     Held(Option<HeldLock>),
     /// Not free within the wait.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Busy,
 }
 

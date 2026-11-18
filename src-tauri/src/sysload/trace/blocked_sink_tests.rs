@@ -98,6 +98,7 @@ pub(in crate::sysload) fn failing_writes(gate: Arc<Gate>, failures: usize) -> Tr
 }
 
 /// Blocks the open itself at `gate`, then opens the real ring.
+#[cfg(unix)]
 pub(in crate::sysload) fn blocked_open(gate: Arc<Gate>) -> TraceOpener {
     Arc::new(move |dir, boot_id| {
         gate.pass();

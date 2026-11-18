@@ -996,10 +996,12 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn real_gate(repo: &str, argv: &[&str]) -> Result<(), String> {
         crate::harness::guard_command(repo, argv).map(|_| ())
     }
 
+    #[cfg(unix)]
     fn open_at(
         repo: &str,
         number: u64,

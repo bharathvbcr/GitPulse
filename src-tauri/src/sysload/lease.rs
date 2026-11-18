@@ -475,10 +475,12 @@ pub fn bin_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("lease-bin")
 }
 
+#[cfg(unix)]
 fn slot_name(slot: usize) -> String {
     format!("slot-{slot}")
 }
 
+#[cfg(unix)]
 fn parse_record(bytes: &[u8]) -> Option<LeaseRecord> {
     if bytes.len() > RECORD_MAX_BYTES {
         return None;

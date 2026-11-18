@@ -336,6 +336,8 @@ fn is_waiter_name(name: &str) -> bool {
 
 /// Cross-process exclusive advisory lock on a `0600` `O_NOFOLLOW` lock file.
 struct AdvisoryLock {
+    /// Held open for its lock; only the Unix `flock` release in `drop` reads it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     file: File,
 }
 

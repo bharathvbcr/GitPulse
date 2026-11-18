@@ -1858,6 +1858,7 @@ pub(crate) fn frozen_gate(gate: SpawnGate) -> &'static SpawnGate {
 }
 
 /// Keeps `repo`'s post-action credit open for the test across slow spawns.
+#[cfg(unix)]
 #[cfg(test)]
 pub(crate) fn hold_credit_open(repo: &Path) {
     let mut credits = post_action_credits().lock().unwrap();

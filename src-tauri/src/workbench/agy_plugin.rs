@@ -31,24 +31,36 @@
 //!    own approval settings, so Antigravity runs ungated; GitPulse still records
 //!    its edits through `PostToolUse`.
 
+#[cfg(unix)]
 use serde_json::{json, Value};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 const PLUGIN_JSON: &str = include_str!("../../../plugins/gitpulse/plugin.json");
+#[cfg(unix)]
 const HOOKS_JSON: &str = include_str!("../../../plugins/gitpulse/hooks.json");
+#[cfg(unix)]
 const SKILL_COLLISIONS: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-collisions/SKILL.md");
+#[cfg(unix)]
 const SKILL_INSIGHTS: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-insights/SKILL.md");
+#[cfg(unix)]
 const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-load/SKILL.md");
+#[cfg(unix)]
 const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md");
+#[cfg(unix)]
 const SKILL_TERMINAL: &str =
     include_str!("../../../plugins/gitpulse/skills/gitpulse-terminal/SKILL.md");
 
 /// Producer marker proving GitPulse created `~/.gemini/config/plugins/gitpulse`.
+#[cfg(unix)]
 pub(crate) const PRODUCER_MARKER: &str = ".gitpulse-managed";
+#[cfg(unix)]
 const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.0.0\n";
 
+#[cfg(unix)]
 const SKILLS: [(&str, &str); 5] = [
     ("gitpulse-collisions", SKILL_COLLISIONS),
     ("gitpulse-insights", SKILL_INSIGHTS),
@@ -57,10 +69,12 @@ const SKILLS: [(&str, &str); 5] = [
     ("gitpulse-terminal", SKILL_TERMINAL),
 ];
 
+#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', r"'\''"))
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -76,6 +90,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn resolve_helper_binary(env_var: &str, name: &str, exe: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(explicit) = std::env::var_os(env_var).filter(|v| !v.is_empty()) {
         let candidate = PathBuf::from(explicit);
@@ -103,6 +118,7 @@ fn resolve_helper_binary(env_var: &str, name: &str, exe: Option<&Path>) -> Resul
     }
 }
 
+#[cfg(unix)]
 fn ensure_non_symlink_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
@@ -127,6 +143,7 @@ fn ensure_non_symlink_dir(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn write_regular_file(path: &Path, contents: &[u8], executable: bool) -> Result<(), String> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if meta.file_type().is_symlink() || meta.is_dir() {
@@ -150,6 +167,7 @@ fn write_regular_file(path: &Path, contents: &[u8], executable: bool) -> Result<
     Ok(())
 }
 
+#[cfg(unix)]
 fn rewrite_agy_hooks(raw_hooks_json: &str, wrapper_hook_path: &Path) -> Result<String, String> {
     let mut parsed: Value = serde_json::from_str(raw_hooks_json)
         .map_err(|e| format!("plugins/gitpulse/hooks.json is invalid JSON: {e}"))?;
@@ -190,6 +208,7 @@ fn rewrite_agy_hooks(raw_hooks_json: &str, wrapper_hook_path: &Path) -> Result<S
     Ok(out)
 }
 
+#[cfg(unix)]
 fn build_mcp_wrapper(mcp_bin: &Path) -> String {
     let quoted = shell_single_quote(&mcp_bin.to_string_lossy());
     format!(
@@ -197,6 +216,7 @@ fn build_mcp_wrapper(mcp_bin: &Path) -> String {
     )
 }
 
+#[cfg(unix)]
 fn build_hook_wrapper(hook_bin: &Path) -> String {
     let quoted = shell_single_quote(&hook_bin.to_string_lossy());
     format!(
@@ -204,6 +224,7 @@ fn build_hook_wrapper(hook_bin: &Path) -> String {
     )
 }
 
+#[cfg(unix)]
 fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(plugin_dir) {
         Ok(meta) => {
@@ -234,6 +255,7 @@ fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
     }
 }
 
+#[cfg(unix)]
 fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
     let exists = verify_owned_or_absent(plugin_dir)?;
     if !exists {
@@ -263,6 +285,7 @@ fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
 }
 
 /// Synchronizes `<home_root>/.gemini/config/plugins/gitpulse` deterministically.
+#[cfg(unix)]
 pub(crate) fn sync_under_home(
     home_root: &Path,
     enabled: bool,
@@ -367,48 +390,45 @@ pub(crate) fn sync_under_home(
 
 /// Applies the user's current `session_alerts` preference (`enabled && configure_agents`)
 /// to `~/.gemini/config/plugins/gitpulse` on Unix hosts.
+#[cfg(unix)]
 pub(crate) fn apply_from_settings() {
-    #[cfg(not(unix))]
-    {
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let settings = crate::tool_config::session_alerts();
+    let enabled = settings.enabled && settings.configure_agents;
+    if !enabled {
+        if let Err(error) = sync_under_home(&home, false, None, None) {
+            log::debug!(target: "workbench", "Antigravity plugin cleanup skipped: {error}");
+        }
         return;
     }
-    #[cfg(unix)]
-    {
-        let Some(home) = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
-        else {
-            return;
-        };
-        let settings = crate::tool_config::session_alerts();
-        let enabled = settings.enabled && settings.configure_agents;
-        if !enabled {
-            if let Err(error) = sync_under_home(&home, false, None, None) {
-                log::debug!(target: "workbench", "Antigravity plugin cleanup skipped: {error}");
-            }
+    let exe = std::env::current_exe().ok();
+    let mcp = match resolve_helper_binary("GITPULSE_MCP_PATH", "gitpulse-mcp", exe.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => {
+            log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
             return;
         }
-        let exe = std::env::current_exe().ok();
-        let mcp = match resolve_helper_binary("GITPULSE_MCP_PATH", "gitpulse-mcp", exe.as_deref()) {
-            Ok(p) => p,
-            Err(reason) => {
-                log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
-                return;
-            }
-        };
-        let hook =
-            match resolve_helper_binary("GITPULSE_HOOK_PATH", "gitpulse-hook", exe.as_deref()) {
-                Ok(p) => p,
-                Err(reason) => {
-                    log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
-                    return;
-                }
-            };
-        if let Err(error) = sync_under_home(&home, true, Some(&mcp), Some(&hook)) {
-            log::warn!(target: "workbench", "Antigravity plugin sync did not complete: {error}");
+    };
+    let hook = match resolve_helper_binary("GITPULSE_HOOK_PATH", "gitpulse-hook", exe.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => {
+            log::debug!(target: "workbench", "Antigravity plugin sync skipped ({reason})");
+            return;
         }
+    };
+    if let Err(error) = sync_under_home(&home, true, Some(&mcp), Some(&hook)) {
+        log::warn!(target: "workbench", "Antigravity plugin sync did not complete: {error}");
     }
 }
+
+/// Antigravity plugin sync is Unix-only; elsewhere there is nothing to apply.
+#[cfg(not(unix))]
+pub(crate) fn apply_from_settings() {}
 
 #[cfg(all(test, unix))]
 mod tests {

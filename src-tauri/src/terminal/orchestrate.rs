@@ -223,6 +223,7 @@ pub(crate) fn token_hash_hex(token: &str) -> Result<String, String> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn decode_token_hash_hex(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -525,11 +526,13 @@ struct OrchestratedRecord {
     observed_bytes: u64,
     baseline_event_seq: u64,
     parser: Option<vt100::Parser>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     host_scanner: Option<crate::alerts::scan::Scanner>,
     blocks: Option<CommandBlockRecorder>,
     telemetry: SharedSessionTelemetry,
 }
 
+#[cfg(unix)]
 fn apply_scanner_telemetry(
     scanner: &mut crate::alerts::scan::Scanner,
     telemetry: &SharedSessionTelemetry,
@@ -596,11 +599,7 @@ impl OrchestrationRegistry {
         };
         let track_screen = parent_session_id.is_some() || effective_launcher == "shell";
         let parser = track_screen.then(|| {
-            vt100::Parser::new(
-                nz_u16(size.rows),
-                nz_u16(size.cols),
-                PARSER_SCROLLBACK_ROWS,
-            )
+            vt100::Parser::new(nz_u16(size.rows), nz_u16(size.cols), PARSER_SCROLLBACK_ROWS)
         });
         let host_scanner = track_screen.then(crate::alerts::scan::Scanner::new);
         let blocks = track_screen.then(CommandBlockRecorder::default);
@@ -637,6 +636,7 @@ impl OrchestrationRegistry {
     /// Resets an orchestrated child's `vt100` screen right before `gitpulse-ptyd`
     /// streams its ring replay on `Attach`, `AttachTracked`, or reconnect so
     /// replayed bytes never duplicate onto an already-populated grid.
+    #[cfg(unix)]
     pub(crate) fn reset_parser_for_attach_replay(&self, session_id: &str, rows: u16, cols: u16) {
         let size = bounded_pty_size(rows, cols);
         let mut inner = self.lock();
@@ -660,6 +660,7 @@ impl OrchestrationRegistry {
     /// Restores parent/child lineage, RAM-only caller capability token digests,
     /// and OSC telemetry from `gitpulse-ptyd` across app restarts or socket
     /// reconnects.
+    #[cfg(unix)]
     pub(crate) fn adopt_hosted_sessions(&self, snapshots: &[crate::terminal::HostedSessionMeta]) {
         if snapshots.is_empty() {
             return;
@@ -774,6 +775,7 @@ impl OrchestrationRegistry {
     /// into both the child's `vt100` parser and its OSC telemetry scanner so
     /// `gitpulse-ptyd` and in-process sessions expose identical `Wait`/`Read`
     /// telemetry.
+    #[cfg(unix)]
     #[cfg(unix)]
     pub(crate) fn observe_output_from_host(&self, session_id: &str, bytes: &[u8]) {
         if bytes.is_empty() {
@@ -1461,8 +1463,7 @@ fn authorize_child<'a>(
     let Some(record) = inner.sessions.get(child_session_id) else {
         return Err(LINEAGE_REFUSAL.to_string());
     };
-    if record.parent_session_id.as_deref() != Some(caller_key)
-        || record.repo_path != canonical_repo
+    if record.parent_session_id.as_deref() != Some(caller_key) || record.repo_path != canonical_repo
     {
         return Err(LINEAGE_REFUSAL.to_string());
     }
@@ -2090,12 +2091,13 @@ fn wait_child_internal(
         } else if ended {
             Some("ended")
         } else if tel.last_herdr_event_seq > effective_since
-            && matches!(herdr.as_deref(), Some("done" | "idle" | "blocked" | "error"))
+            && matches!(
+                herdr.as_deref(),
+                Some("done" | "idle" | "blocked" | "error")
+            )
         {
             Some("herdr_status")
-        } else if wait_idle
-            && tel.last_command_event_seq > effective_since
-            && !tel.command_running
+        } else if wait_idle && tel.last_command_event_seq > effective_since && !tel.command_running
         {
             Some("command_finished")
         } else if wait_idle
@@ -2289,8 +2291,7 @@ pub(crate) fn execute_with_shell_reads(
                 #[cfg(unix)]
                 refresh_detached_host_screen(state, &cid);
                 let inner = state.orchestration.lock();
-                let rec =
-                    authorize_child(&inner, caller.parent_key(), &cid, &canonical_repo)?;
+                let rec = authorize_child(&inner, caller.parent_key(), &cid, &canonical_repo)?;
                 if rec.ended {
                     return Err("child terminal session has already ended".into());
                 }
@@ -2382,7 +2383,8 @@ pub(crate) fn execute_with_shell_reads(
             let eff_max = max_lines.unwrap_or(DEFAULT_READ_LINES);
             let (text, lines_returned, total_lines, truncated, cmd_exit_code, active_cwd, ended) = {
                 let inner = state.orchestration.lock();
-                let rec = authorize_child(&inner, caller.parent_key(), &target_id, &canonical_repo)?;
+                let rec =
+                    authorize_child(&inner, caller.parent_key(), &target_id, &canonical_repo)?;
                 let tel = rec
                     .telemetry
                     .0
@@ -2686,12 +2688,8 @@ pub(crate) fn execute_with_shell_reads(
                             select_scrubbed_lines(lines, eff_max, offset, grep.as_deref());
                         (t, lr, tl, tr, blk.command.clone(), true)
                     } else {
-                        let (t, lr, tl, tr) = render_redacted_screen_filtered(
-                            rec,
-                            eff_max,
-                            offset,
-                            grep.as_deref(),
-                        );
+                        let (t, lr, tl, tr) =
+                            render_redacted_screen_filtered(rec, eff_max, offset, grep.as_deref());
                         (t, lr, tl, tr, None, false)
                     }
                 } else {
@@ -3511,6 +3509,7 @@ pub(crate) mod tests {
         let _ = crate::terminal::kill_session(&state, &child);
     }
 
+    #[cfg(unix)]
     #[test]
     fn adopt_hosted_sessions_restores_lineage_and_caller_token_without_raw_secret() {
         let (_dir, repo) = init_trusted_repo();
@@ -4116,7 +4115,10 @@ pub(crate) mod tests {
         )
         .expect("read user shell when opted in");
         assert_eq!(read_on["owned"], false);
-        assert!(read_on["text"].as_str().unwrap().contains("USER_SHELL_OUTPUT_55"));
+        assert!(read_on["text"]
+            .as_str()
+            .unwrap()
+            .contains("USER_SHELL_OUTPUT_55"));
 
         // ...while Send and Close on the user shell STILL fail closed with LINEAGE_REFUSAL!
         assert_eq!(

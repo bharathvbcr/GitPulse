@@ -18,6 +18,8 @@
 //! work and not the production gate's 8-spawns-per-second refill.
 
 mod common;
+// The paired numstat bench reads `getrusage(RUSAGE_CHILDREN)`, which Windows lacks.
+#[cfg(unix)]
 #[path = "repo_read/numstat_paired.rs"]
 mod numstat_paired;
 
@@ -25,6 +27,7 @@ use common::fixture::{build_repo, count_git_processes, dirty_files, git, trust_r
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::engine::git_cli::sandbox_write_edited_text;
 use gitpulse_lib::engine::git_reader::GitReader;
+#[cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
 
 struct Shape {
@@ -122,12 +125,15 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| report.opts.samples(15));
+    #[cfg(unix)]
     if only
         .as_deref()
         .is_none_or(|only| only.contains("50k files"))
     {
         numstat_paired::run(&mut report, &temp.path().join("numstat"), rounds);
     }
+    #[cfg(not(unix))]
+    report.note("numstat paired arms skipped: they read getrusage(RUSAGE_CHILDREN), which this platform lacks");
 
     // Blame (F-4): the old read was `git blame --line-porcelain`, which repeats a
     // commit's metadata for every line; the shipped one is `--porcelain` plus
@@ -468,8 +474,10 @@ fn main() {
 /// as a delta from [`ChildCpu::start`]. `RUSAGE_CHILDREN` accumulates every
 /// waited-for child, so the delta around a call is what the git children that
 /// call started and waited for used; the cases run one at a time.
+#[cfg(unix)]
 struct ChildCpu(f64);
 
+#[cfg(unix)]
 impl ChildCpu {
     fn now_ms() -> f64 {
         // SAFETY: `usage` is a valid, writable `rusage` for the call to fill.
@@ -490,6 +498,7 @@ impl ChildCpu {
 }
 
 /// Stdout of `git <args>` in `dir`; a failed git aborts the bench.
+#[cfg(unix)]
 fn git_bytes(dir: &std::path::Path, args: &[&str]) -> Vec<u8> {
     let output = std::process::Command::new("git")
         .args(args)

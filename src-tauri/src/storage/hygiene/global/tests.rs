@@ -1,6 +1,7 @@
 use super::{
     eligible_candidates, Cleaner, CleanerCandidate, CleanerConfig, CleanerRun, Saved, VERSION,
 };
+#[cfg(unix)]
 use crate::procguard::LockedSpawn;
 use crate::storage::hygiene::discovery;
 use std::fs;
@@ -1772,6 +1773,7 @@ fn a_run_of_many_refusals_keeps_its_history_readable_and_counts_what_it_did_not_
 }
 
 /// A check the host-load governor refused, typed as the spawn gate types it.
+#[cfg(unix)]
 fn shed() -> crate::ipc_error::CommandError {
     crate::ipc_error::CommandError::typed(
         crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
@@ -1824,6 +1826,7 @@ fn a_check_the_host_shed_is_reported_unexamined_not_skipped() {
     assert!(!calm.join("__pycache__").exists(), "{run:?}");
 }
 
+#[cfg(unix)]
 static SHED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// A host that sheds a check briefly is asked again within the same run
@@ -1954,6 +1957,7 @@ fn every_reclaim_scope_is_off_by_default_and_absent_from_saved_state() {
     );
 }
 
+#[cfg(unix)]
 fn set_old(path: &std::path::Path) {
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
     fs::File::open(path)
@@ -2045,6 +2049,7 @@ fn worktree_with_cargo_target(root: &std::path::Path) -> (std::path::PathBuf, st
     (r, wt)
 }
 
+#[cfg(unix)]
 fn scoped(
     cleaner: &Arc<Cleaner>,
     root: &std::path::Path,
@@ -3363,6 +3368,7 @@ fn quiet_session_folder(scratchpad: &std::path::Path) {
 
 /// A cleaner whose home, Claude configuration directories, process table and
 /// `/tmp` are the test's, with one removable scratch build in a worktree.
+#[cfg(unix)]
 fn long_lived_fixture() -> (
     tempfile::TempDir,
     Arc<Cleaner>,
@@ -3401,6 +3407,7 @@ fn long_lived_fixture() -> (
     (temp, cleaner, root, repo, scratch)
 }
 
+#[cfg(unix)]
 fn candidate_paths(inventory: &super::CleanerInventory) -> Vec<String> {
     let mut paths: Vec<String> = inventory
         .candidates
@@ -3415,6 +3422,7 @@ fn candidate_paths(inventory: &super::CleanerInventory) -> Vec<String> {
 /// root and the very folder a scope offers, it is only reported: the candidates
 /// are the ones the scopes alone would offer, a reported directory that is not a
 /// candidate survives a run, and nothing the run records names it.
+#[cfg(unix)]
 #[test]
 fn long_lived_data_is_reported_and_never_a_candidate_or_removed() {
     let _serial = crate::storage::hygiene::tests::serial();
@@ -4125,6 +4133,7 @@ fn the_scheduler_loop_holds_a_due_run_back_only_when_the_remedy_is_not_due() {
 }
 
 /// Only a preview that measures reports; a run, which does not, carries none.
+#[cfg(unix)]
 #[test]
 fn a_run_inspection_does_not_build_the_long_lived_list() {
     let _serial = crate::storage::hygiene::tests::serial();

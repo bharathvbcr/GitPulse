@@ -399,9 +399,11 @@ fn caches_and_the_include_are_copied_as_for_an_app_created_worktree() {
     assert_eq!(fs::read_to_string(path.join(".env")).unwrap(), "SECRET=1");
 }
 
+#[cfg(unix)]
 const HOOKS: &str =
     r#"{"worktree":{"post_create":["printf '%s' \"$GITPULSE_WORKTREE_PATH\" > hooked.txt"]}}"#;
 
+#[cfg(unix)]
 fn with_hooks(hooks: &'static str) -> Fixture {
     let fixture = fixture_with(|root| {
         fs::create_dir_all(root.join(".gitpulse")).unwrap();

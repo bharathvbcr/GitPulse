@@ -168,6 +168,8 @@ fn parse_which(stdout: &[u8]) -> Result<Account, String> {
 /// keeps it: the account and its workspace, or GitPulse's own key. No secret,
 /// but enough that a server started on one credential is not reused once the
 /// machine names another.
+#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub(crate) fn credential_label(detection: &Detection) -> String {
     match detection {
         Detection::Absent => "key".into(),

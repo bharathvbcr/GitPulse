@@ -190,7 +190,7 @@ const START_SLACK_US: u64 = 50_000;
 /// Linux derives a start time from the boot time, which `/proc/stat` gives in
 /// whole seconds, so every start time carries a constant offset of up to a
 /// second from the wall clock. 2 s covers that and the clock granularity.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const START_SLACK_US: u64 = 2_000_000;
 
 /// Wall-clock microseconds since the Unix epoch: the clock the OS start times
@@ -1017,6 +1017,7 @@ enum Attempt {
 }
 
 /// The start time of `pid` as the OS reports it, in microseconds.
+#[cfg(unix)]
 fn identity_of(pid: i32) -> Option<u64> {
     crate::sysload::procscan::probe_one(pid).map(|facts| facts.start_us)
 }

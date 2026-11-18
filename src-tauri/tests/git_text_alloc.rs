@@ -11,12 +11,15 @@
 //! helper itself by `decoding_valid_captured_output_does_not_copy_the_buffer`
 //! in the library's tests.
 
+#[cfg(unix)]
 use gitpulse_lib::engine::git_cli::{
     git_bytes_capped, git_text, git_text_capped, git_text_partial, git_text_with_timeout,
 };
+#[cfg(unix)]
 use gitpulse_lib::engine::process::MAX_OUTPUT_BYTES;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+#[cfg(unix)]
 use std::time::Duration;
 
 mod common;
@@ -63,6 +66,7 @@ unsafe impl GlobalAlloc for Counting {
 static COUNTING: Counting = Counting;
 
 /// What `body` returns and the bytes the calling thread allocated meanwhile.
+#[cfg(unix)]
 fn allocated_by<T>(body: impl FnOnce() -> T) -> (T, usize) {
     BYTES.with(|total| total.set(0));
     ON.with(|on| on.set(true));

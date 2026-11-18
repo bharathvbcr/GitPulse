@@ -6003,8 +6003,11 @@ const UNTRACKED_TOO_LARGE: &str =
     "untracked file not line-counted: larger than the 64 MiB scan limit";
 const UNTRACKED_UNREADABLE: &str = "untracked file not line-counted: it could not be read";
 const UNTRACKED_SYMLINK: &str = "untracked file not line-counted: symbolic link";
+#[cfg(unix)]
 const UNTRACKED_FIFO: &str = "untracked file not line-counted: FIFO / named pipe";
+#[cfg(unix)]
 const UNTRACKED_SOCKET: &str = "untracked file not line-counted: socket";
+#[cfg(unix)]
 const UNTRACKED_DEVICE: &str = "untracked file not line-counted: device node";
 const UNTRACKED_DIRECTORY: &str = "untracked file not line-counted: directory";
 const UNTRACKED_NOT_REGULAR: &str = "untracked file not line-counted: not a regular file";
@@ -11718,6 +11721,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
 
     /// The `--line-porcelain` parser this module shipped before blame moved to
     /// `--porcelain`, kept only as the oracle the parity tests compare against.
+    #[cfg(unix)]
     fn oracle_line_porcelain(stdout: &str) -> Vec<BlameLine> {
         let mut blame_lines = Vec::new();
         let mut current_sha = String::new();
@@ -11779,6 +11783,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
 
     /// `git blame <args>` read both ways: the oracle over `--line-porcelain`
     /// and the shipped parser over `--porcelain`.
+    #[cfg(unix)]
     fn blame_both_ways(repo: &Path, args: &[&str]) -> (Vec<BlameLine>, Vec<BlameLine>) {
         let run = |format: &str| {
             let mut argv = vec!["blame", format];

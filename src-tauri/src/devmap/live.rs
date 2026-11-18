@@ -3873,6 +3873,7 @@ exit 2
     const XPROC_HOLD_DB: &str = "GITPULSE_XPROC_HOLD_DB";
     const XPROC_HOLD_READY: &str = "GITPULSE_XPROC_HOLD_READY";
     const XPROC_HOLD_RELEASE: &str = "GITPULSE_XPROC_HOLD_RELEASE";
+    #[cfg(unix)]
     const XPROC_HOLDER_FILTER: &str = "devmap::live::tests::xproc_writer_lock_holder";
 
     /// The helper a separate process runs: the store's writer lock, held the

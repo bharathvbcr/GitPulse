@@ -1125,7 +1125,7 @@ mod imp {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::super::sensor::{Cores, CpuUsage, HostSample, Level, MemorySample, Reading, Why};
-    use super::{cpu_usage_from_deltas, parse_proc_stat_cpu};
+    use super::{cpu_usage_from_deltas, parse_linux_loadavg, parse_proc_stat_cpu};
     use std::ffi::CString;
 
     /// PSI `avg10` percentages at which the level steps up. Provisional: no

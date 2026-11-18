@@ -1,10 +1,13 @@
 use super::*;
 use crate::ipc_error::CommandError;
+#[cfg(unix)]
 use crate::procguard::LockedSpawn;
 use crate::sysload::Binding;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -5549,6 +5552,7 @@ fn run_options_custom_kill_grace_reaps_sigterm_ignoring_child_promptly() {
 }
 
 /// Records what the runner says about how a child's wait ended.
+#[cfg(unix)]
 #[derive(Default)]
 struct RecordsExit {
     facts: Option<ExitFacts>,
@@ -5558,6 +5562,7 @@ struct RecordsExit {
     heard: bool,
 }
 
+#[cfg(unix)]
 impl ProcessObserver for RecordsExit {
     fn cancelled(&self) -> bool {
         self.cancel_after_output && self.heard
