@@ -28,7 +28,8 @@
   import { hostLoadPulse, startHostLoad } from "../stores/hostLoadStore";
   import { diagnostics } from "../diagnostics/diagnostics";
   import { onMount } from "svelte";
-  import HostLoadSegment from "./HostLoadSegment.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  import { loadHostLoadSegment } from "./lazyLoaders";
 
   let {
     onOpenShortcuts,
@@ -331,7 +332,15 @@
          stays mounted at zero height, and a pill left in it would be a second,
          invisible but focusable Manvi chip beside the title bar's. -->
     {#if $interfaceStore.globalSurface === "repository"}
-      <HostLoadSegment detail={detail === "full" ? "full" : "minimal"} />
+      <!-- Loaded, not imported: the strip and its metrics are about 19 KB, and
+           as a static import they pushed the entry chunk past its 640 KB budget.
+           Until the chunk lands the bar draws nothing here, as it does before
+           the first host-load status. -->
+      <LazyMount
+        load={loadHostLoadSegment}
+        name="The host load strip"
+        props={{ detail: detail === "full" ? "full" : "minimal" }}
+      />
       <HarnessBadge variant="full" />
     {/if}
   </div>

@@ -6,6 +6,7 @@ import {
   WARMED_LOADERS,
   loadMergeBranchDialog,
   loadProductTour,
+  loadRepoLogoBrowser,
   loadViewGuideArt,
   warmLazyChunks,
 } from "./lazyLoaders";
@@ -15,7 +16,7 @@ const read = (name: string) => readFileSync(join(here, name), "utf8");
 
 describe("warmLazyChunks", () => {
   it("warms exactly the loaders LazyMount keys its cache on, once the schedule fires", async () => {
-    expect(WARMED_LOADERS).toEqual([loadViewGuideArt, loadMergeBranchDialog]);
+    expect(WARMED_LOADERS).toEqual([loadViewGuideArt, loadMergeBranchDialog, loadRepoLogoBrowser]);
     const calls: string[] = [];
     const a = () => (calls.push("a"), Promise.resolve({ default: {} as never }));
     const b = () => (calls.push("b"), Promise.reject(new Error("offline")));

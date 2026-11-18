@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import StatusBar from "./StatusBar.svelte";
+import { preloadMountForTests } from "./LazyMount.svelte";
+import { loadHostLoadSegment } from "./lazyLoaders";
 import { interfaceStore } from "../stores/interfaceStore";
 import { hostLoadStatusFixture } from "../../../harness/hostLoadFixture";
 import {
@@ -24,7 +26,17 @@ const badgeSource = readFileSync(
 
 const bar = () => render(StatusBar).body;
 
+// The host-load strip is loaded, not imported (it is kept out of the entry
+// chunk), and a server render never runs the effect that loads it. Preloading
+// puts the bar in the state the app reaches once the chunk lands.
+beforeAll(() => preloadMountForTests(loadHostLoadSegment));
+
 describe("StatusBar", () => {
+  it("loads the host-load strip through LazyMount, only on the repository surface", () => {
+    expect(source).not.toMatch(/import HostLoadSegment from/);
+    const repoOnly = source.slice(source.indexOf('{#if $interfaceStore.globalSurface === "repository"}'));
+    expect(repoOnly).toContain("load={loadHostLoadSegment}");
+  });
   it("opens uncommitted files rather than retaining a previous commit diff", () => {
     const changes = source.slice(source.indexOf("<!-- Working Tree Changes"), source.indexOf("<!-- Conflicts Indicator"));
     expect(changes).toContain("repoStore.previewUncommitted()");

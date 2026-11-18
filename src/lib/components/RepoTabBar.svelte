@@ -87,8 +87,9 @@
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import RepoLogo from "./RepoLogo.svelte";
-  import RepoLogoBrowser from "./RepoLogoBrowser.svelte";
   import RepoLogoChoices from "./RepoLogoChoices.svelte";
+  import LazyMount from "./LazyMount.svelte";
+  import { loadRepoLogoBrowser } from "./lazyLoaders";
   import { taskChrome } from "../workbench/taskTabs";
 
   let {
@@ -2604,12 +2605,18 @@
 
 {#if logoBrowseTab}
   {#key logoBrowseTab.id}
-    <RepoLogoBrowser
-      tab={logoBrowseTab}
-      returnFocus={logoBrowseReturn}
-      onclose={() => {
-        logoBrowseId = null;
-        logoBrowseReturn = null;
+    <!-- Loaded, not imported, to keep it out of the entry chunk; warmed after
+         first paint (lazyLoaders.ts), so opening it from the menu does not lag. -->
+    <LazyMount
+      load={loadRepoLogoBrowser}
+      name="The logo browser"
+      props={{
+        tab: logoBrowseTab,
+        returnFocus: logoBrowseReturn,
+        onclose: () => {
+          logoBrowseId = null;
+          logoBrowseReturn = null;
+        },
       }}
     />
   {/key}

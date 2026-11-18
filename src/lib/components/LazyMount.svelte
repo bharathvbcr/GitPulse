@@ -25,6 +25,16 @@
   export function mountedComponentCount(): number {
     return resolved.size;
   }
+
+  /**
+   * Test seam: fetch a deferred component into the cache now, so a server
+   * render (`svelte/server`, where `$effect` never runs and so the load below
+   * never starts) draws it in place, as the app does once the chunk has landed.
+   * Takes the same loader the call site uses: the cache is keyed by identity.
+   */
+  export async function preloadMountForTests(loader: MountLoader): Promise<void> {
+    if (!resolved.has(loader)) resolved.set(loader, (await loader()).default);
+  }
 </script>
 
 <script lang="ts">

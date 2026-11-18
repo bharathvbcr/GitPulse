@@ -12,14 +12,21 @@ export const loadProductTour: MountLoader = () => import("./onboarding/ProductTo
 export const loadMergeBranchDialog: MountLoader = () => import("./MergeBranchDialog.svelte");
 export const loadNativeNotificationBridge: MountLoader = () => import("./NativeNotificationBridgeView.svelte");
 export const loadViewGuideArt: MountLoader = () => import("./ViewGuideArt.svelte");
+export const loadHostLoadSegment: MountLoader = () => import("./HostLoadSegment.svelte");
+export const loadRepoLogoBrowser: MountLoader = () => import("./RepoLogoBrowser.svelte");
 
 /**
- * Chunks worth having before the first interaction asks for them. Both are
+ * Chunks worth having before the first interaction asks for them. Each is
  * opened by a hover or a click, where an import round trip is visible: the guide
- * tooltip would show an empty schematic band, and the merge dialog would lag its
- * button. The walkthrough is not here; App mounts it at startup.
+ * tooltip would show an empty schematic band, and the merge dialog and the logo
+ * browser would lag the button that opened them. The walkthrough is not here;
+ * App mounts it at startup, and the host-load strip loads as the status bar mounts.
  */
-export const WARMED_LOADERS: readonly MountLoader[] = [loadViewGuideArt, loadMergeBranchDialog];
+export const WARMED_LOADERS: readonly MountLoader[] = [
+  loadViewGuideArt,
+  loadMergeBranchDialog,
+  loadRepoLogoBrowser,
+];
 
 type Schedule = (task: () => void) => void;
 

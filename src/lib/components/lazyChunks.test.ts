@@ -28,7 +28,15 @@ function sourceFiles(dir: string): string[] {
 // under budget. The dialogs after them were already deferred by App.svelte's
 // own loaders and are pinned here so that stays true: none is on screen at
 // first paint, and Settings alone is 134 kB of the app.
+//
+// The host-load strip and the repository logo browser joined the list when
+// they first landed (e8f7bad9c): with both imported statically the entry chunk
+// was 656 KB against the 640 KB budget, and `bun run build` failed. The strip is
+// on screen at startup, so LazyMount fetches it as the status bar mounts; the
+// browser opens from a tab's menu and is warmed after first paint.
 const DEFERRED = [
+  "HostLoadSegment",
+  "RepoLogoBrowser",
   "onboarding/ProductTour",
   "MergeBranchDialog",
   "ViewGuideArt",
