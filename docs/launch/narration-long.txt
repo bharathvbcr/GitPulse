@@ -1,81 +1,77 @@
-GitPulse — long video narration (about 8 min, 14 scenes)
-For Google or Grok TTS. One block per scene; the time is the slot the narration must fit.
-Pace target: about 150 words per minute, using about 70% of each slot so the picture can breathe.
-Every claim here matches a Shipped row in docs/launch/LAUNCH_PLAN.md §3. Scenes 8 and 9 assume the
-in-flight host-load strip and split groups have landed (the recording gate). If they have not,
-drop the sentences marked [IF LANDED].
+GitPulse — long video narration (about 4 min, 14 scenes)
+For Google or Grok TTS. One block per scene; the time is where the scene sat in the last recording.
+Pace target: about 150 words per minute.
+Every sentence here has footage in the recorded takes. Scenes 4, 6, 9 and 10 were rewritten on
+2026-11-17 to match what was filmed: no Codex launch, no quit-and-relaunch, no browser pane.
 
-[Scene 1 · 0:00–0:20 · Cold open]
+[Scene 1 · 0:00–0:12 · Cold open]
 This is what coding looks like now. Agents running in parallel, across every repository you own,
 and one person keeping it all on track. GitPulse is where you run all of it.
 
-[Scene 2 · 0:20–0:45 · The problem]
+[Scene 2 · 0:12–0:28 · The problem]
 Most agent tools give you a chat window per agent. But agents collide. They wander outside their
 checkout. They melt your laptop. And a transcript won't show you any of that.
 GitPulse shows the work itself, to you and to your agents.
 
-[Scene 3 · 0:45–1:30 · One workspace]
+[Scene 3 · 0:28–0:49 · One workspace]
 Every repository gets a tab. Every checkout of a repository stacks into that tab, so worktrees
 never get lost. Fleet compares all of your repositories at a glance: what's changed, what's out of
 sync, and what's unhealthy. And the Overview puts what's blocked first, like a merge waiting on you,
 so you always know where you're needed.
 
-[Scene 4 · 1:30–2:10 · Task to agent]
+[Scene 4 · 0:49–1:10 · Task to agent]
 Work starts on the task board. Write a task, and let Manvi tighten the wording. Then launch.
-Pick the agent, the model and the effort. GitPulse creates a fresh worktree, clones the build caches,
-and seeds the code map, so the agent starts with context instead of a cold checkout.
-Here's a second task, launched with Codex.
+Pick the agent, the model and the effort. GitPulse creates a fresh worktree on a branch of its own,
+so the agent's work stays apart from your checkout until you choose to merge it.
 
-[Scene 4b · 2:10–2:30 · Agents fill the board]
+[Scene 4b · 1:10–1:25 · Agents fill the board]
 When an agent finds something outside its task, it doesn't bury it in a transcript. It files it on
 your board, and GitPulse checks it isn't a duplicate first. Nothing gets lost.
 
-[Scene 5 · 2:30–3:30 · Control plane]
+[Scene 5 · 1:25–1:55 · Control plane]
 The Agents view shows every session as a tree, parents and the children they started. GitPulse sees
 Claude Code, Codex and Antigravity sessions, even the ones it didn't launch.
 Now two agents are about to edit the same file. GitPulse warns before they collide, and the agents
 can message each other through the peer inbox instead of overwriting each other's work.
 And Follow agent opens each file the agent edits, live, right beside its terminal.
 
-[Scene 6 · 3:30–4:15 · Guards]
-Claude Code and Codex shell commands pass through Manvi's policy gate before they run. Here, an agent
-tries to write into another checkout, and the gate stops it.
-Repositories are trusted one at a time, and only by you. GitPulse checks its own commits and pushes
-for secrets. And the git operations it allows an agent to run are snapshotted first, so you can
-undo them.
+[Scene 6 · 1:55–2:17 · Guards]
+Claude Code and Codex shell commands pass through Manvi's policy gate before they run. Here, an
+agent's shell command tries to write outside its repository, and the gate stops it.
+Repositories are trusted one at a time, and only by you. GitPulse scans its own commits for secrets,
+and stops the commit before it happens. And when an agent runs git, GitPulse snapshots first, so you
+can review the change and undo it.
 
-[Scene 7 · 4:15–5:00 · DevMap]
+[Scene 7 · 2:17–2:43 · DevMap]
 DevMap is a code graph of your repository. Explore it by subsystem, file or symbol. Open a diff and
 see its blast radius: everything the change can reach. Then run local CI on just the tests it
 affects, with the full suite as the fallback whenever the graph isn't sure. Your agents get the same
 answers, through the same tools.
 
-[Scene 8 · 5:00–5:30 · Load scheduler]
+[Scene 8 · 2:43–2:59 · Load scheduler]
 Parallel builds don't have to mean a frozen machine. The load scheduler gives heavy builds slots and
 queues the rest, and you can park an idle agent with one click.
-[IF LANDED] The live load strip shows CPU, GPU, memory and thermal pressure as it happens.
+The live load strip shows CPU, GPU, memory and thermal pressure as it happens.
 
-[Scene 9 · 5:30–6:15 · Terminal]
-The terminal is built for power users. Split it into rows and columns.
-[IF LANDED] Group your splits.
-Sessions live outside the app, so quitting GitPulse doesn't stop them. Reopen, and they're still
-running. Open your dev server in the built-in browser pane, and see every command as its own block.
-[IF LANDED] Copy the last command's output in one click.
+[Scene 9 · 2:59–3:21 · Terminal]
+The terminal is built for power users. Split it into rows and columns, and group your splits.
+Every command is its own block, with its exit status and how long it took,
+and you can copy a command and its output in one click.
 
-[Scene 10 · 6:15–7:00 · Git, fully]
+[Scene 10 · 3:21–3:35 · Git, fully]
 And it's a complete git client. A commit graph with avatars. Stacked branches as a tree, restacked
-in order. Word-level diffs and line staging. A three-way conflict editor. Pull requests reviewed and
-merged, and Actions rerun, without leaving the window.
+when their base moves. A three-way conflict editor. Pull requests reviewed and merged, and your
+workflows, without leaving the window.
 
-[Scene 11 · 7:00–7:20 · Insights]
+[Scene 11 · 3:35–3:40 · Insights]
 Pulse, coverage, health and storage, all computed on your machine.
 
-[Scene 12 · 7:20–7:40 · Make it yours]
+[Scene 12 · 3:40–3:43 · Make it yours]
 Seventeen themes, your own wallpapers, and a command palette for everything.
 
-[Scene 13 · 7:40–8:05 · Free, Labs, next]
+[Scene 13 · 3:43–3:56 · Free, Labs, next]
 GitPulse is free and open source, and it runs on your machine. In Labs: remote runners on your own
 machines, a secrets vault, device sync, team controls, and integrations with Jira, Trello and more.
 
-[Scene 14 · 8:05–8:15 · Call to action]
+[Scene 14 · 3:56–4:02 · Call to action]
 GitPulse. Built for the agentic era. Download it at gitpulse dot v-b-c-r dot dev.
