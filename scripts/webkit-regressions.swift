@@ -21,6 +21,16 @@ guard let deadline = requestedDeadline, deadline.isFinite, deadline >= 1, deadli
     exit(2)
 }
 
+// With Reduce Motion on, WKWebView matches `prefers-reduced-motion: reduce`
+// and the app draws no transitions, so every check that measures one fails
+// with "0 animate calls" and the run says nothing about the product. The
+// macos-26 GitHub runner image ships with it on (ci.yml turns it off first).
+// Refuse such a host with the reason rather than report those as failures.
+if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+    fputs("This Mac has Reduce Motion on, so WebKit reports prefers-reduced-motion: reduce and the pages animate nothing to measure. Turn it off (System Settings > Accessibility > Display, or `defaults write com.apple.universalaccess reduceMotion -bool false`) to run the WebKit regressions.\n", stderr)
+    exit(3)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let config = WKWebViewConfiguration()
