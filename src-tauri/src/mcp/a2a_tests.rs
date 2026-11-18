@@ -660,6 +660,37 @@ fn a_reused_msg_id_sent_to_a_second_recipient_is_refused_and_deposits_nothing() 
 }
 
 #[test]
+fn a_retry_naming_the_same_peer_by_another_selector_is_idempotent_and_deposits_once() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa";
+    register_forgery_target(&repo, sid, "selector-b");
+    let send = |to: &str| {
+        handle_tool_call(
+            "gitpulse_agent_send",
+            &json!({
+                "repo_path": repo,
+                "from_peer": "claude:orchestrator",
+                "to_peer": to,
+                "msg_id": "msg_selector_1",
+                "body": "same text",
+            }),
+        )
+    };
+    let by_role = send("selector-b").expect("first send by role");
+    let by_peer_id = send(&format!("claude:{sid}")).expect("retry by canonical peer id");
+    assert_eq!(by_peer_id["message"]["seq"], by_role["message"]["seq"]);
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert_eq!(bus.messages.len(), 1);
+    let mb = Mailbox::at_default().expect("mailbox");
+    let pending = mb.peek_pending(sid, 16, SystemTime::now()).expect("peek");
+    assert_eq!(
+        pending.len(),
+        1,
+        "a retry must not double-deposit: {pending:?}"
+    );
+}
+
+#[test]
 fn a_kickoff_refused_for_a_reserved_sender_leaves_no_claim_task_update_or_bus_row() {
     let (dir, repo) = trusted_git_repo();
     let profile = tempfile::tempdir().expect("profile dir");
