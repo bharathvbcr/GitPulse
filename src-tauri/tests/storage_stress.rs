@@ -737,6 +737,20 @@ fn ignore(repo: &TempRepo, body: &str) {
     fs::write(repo.root.join(".gitignore"), body).unwrap();
 }
 
+/// How sure the audit is of a build directory's size on this platform. On
+/// Linux GitPulse makes FICLONE reflinks and nothing reads how much of a tree
+/// one shares, so the size is its logical length, an upper bound, and
+/// `Estimated` (`ReclaimSizing::MayShare`, since 0efa72fd0); it is then counted
+/// in `estimated_bytes`, never in the headline. macOS reads the clone-private
+/// bytes and other platforms make no clones, so there it is `Measured`.
+fn build_dir_confidence() -> ReclaimConfidence {
+    if cfg!(target_os = "linux") {
+        ReclaimConfidence::Estimated
+    } else {
+        ReclaimConfidence::Measured
+    }
+}
+
 /// A build directory with nothing committed in it is measured, safe, and
 /// counted toward the headline.
 #[test]
@@ -753,15 +767,22 @@ fn reclaim_counts_a_clean_build_directory_as_recoverable() {
         .iter()
         .find(|i| i.label.starts_with("target"))
         .expect("the build directory must appear in the audit");
-    assert_eq!(item.confidence, ReclaimConfidence::Measured);
+    assert_eq!(item.confidence, build_dir_confidence());
     assert_eq!(item.safety, ReclaimSafety::Safe);
     assert!(item.bytes >= 200_000, "bytes = {}", item.bytes);
     assert!(item.blocked_reason.is_none());
-    assert!(
-        report.reclaim_summary.reclaimable_bytes >= 200_000,
-        "a measured, safe item must reach the headline: {:?}",
-        report.reclaim_summary
-    );
+    let summary = &report.reclaim_summary;
+    if item.confidence == ReclaimConfidence::Measured {
+        assert!(
+            summary.reclaimable_bytes >= 200_000,
+            "a measured, safe item must reach the headline: {summary:?}"
+        );
+    } else {
+        assert!(
+            summary.estimated_bytes >= 200_000 && summary.reclaimable_bytes == 0,
+            "an estimated item is counted apart from the headline: {summary:?}"
+        );
+    }
 }
 
 /// THE ACCOUNTING RULE: the headline counts measured *and* safe bytes only.
@@ -790,7 +811,13 @@ fn committed_build_output_is_not_counted_as_reclaimable() {
         report.reclaim_summary.reclaimable_bytes, 0,
         "tracked content must never be promised as free space"
     );
-    assert!(report.reclaim_summary.needs_review_bytes >= 150_000);
+    assert_eq!(item.confidence, build_dir_confidence());
+    let summary = &report.reclaim_summary;
+    let held_back = match item.confidence {
+        ReclaimConfidence::Measured => summary.needs_review_bytes,
+        ReclaimConfidence::Estimated => summary.estimated_bytes,
+    };
+    assert!(held_back >= 150_000, "{summary:?}");
 }
 
 /// Every item lands in exactly one bucket of the summary.
