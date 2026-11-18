@@ -23,6 +23,9 @@ env:
   # re-vendor moves this with it; `bun run check:vendor-schema` below fails the
   # job when they disagree.
   DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+  # The Manvi commit the MANVI gate tests run against (see the manvi steps).
+  # Its own scripts/module-pins.txt pins the DevCouncil and gusset it builds with.
+  MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab
 
 jobs:
   # One job per OS used to run everything in a row: the contract checks, the
@@ -368,6 +371,56 @@ jobs:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
+      # Two tests drive a real `manvi` under its default gate, which no runner
+      # has: mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
+      # and hooks::tests::adv_held::a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout
+      # failed with "No MANVI harness is installed". It is built from Manvi at
+      # MANVI_REV with the module pins that commit names (its
+      # scripts/fetch-modules.sh), with cgo off: the Gusset engine is not linked,
+      # as in Manvi's own Windows release, and its policy decisions use Go's
+      # fnmatch either way. Go's version is the one Manvi's go.mod names. Cached
+      # on the SHA and saved as soon as it runs, as devmap is.
+      - name: Check out Manvi at MANVI_REV
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/manvi-src/Manvi"
+          git clone --quiet --filter=blob:none https://github.com/bharathvbcr/Manvi.git "$src"
+          git -C "$src" checkout --quiet "$MANVI_REV"
+
+      - name: Setup Go for Manvi
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ runner.temp }}/manvi-src/Manvi/manvi/go.mod
+          cache: false
+
+      - name: Cache manvi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      - name: Install manvi
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/manvi"
+          exe=manvi
+          if [ "$RUNNER_OS" = Windows ]; then exe=manvi.exe; fi
+          if [ ! -x "$root/bin/$exe" ]; then
+            src="$RUNNER_TEMP/manvi-src/Manvi"
+            bash "$src/scripts/fetch-modules.sh"
+            CGO_ENABLED=0 go -C "$src/manvi" build -trimpath -o "$root/bin/$exe" ./cmd/manvi
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/$exe" --version
+
+      - name: Keep the manvi build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
       - name: Rust Unit & Integration Tests
         if: ${{ !cancelled() }}
         # --no-fail-fast: without it cargo stops at the first failing test
@@ -496,6 +549,56 @@ jobs:
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      # Two tests drive a real `manvi` under its default gate, which no runner
+      # has: mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
+      # and hooks::tests::adv_held::a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout
+      # failed with "No MANVI harness is installed". It is built from Manvi at
+      # MANVI_REV with the module pins that commit names (its
+      # scripts/fetch-modules.sh), with cgo off: the Gusset engine is not linked,
+      # as in Manvi's own Windows release, and its policy decisions use Go's
+      # fnmatch either way. Go's version is the one Manvi's go.mod names. Cached
+      # on the SHA and saved as soon as it runs, as devmap is.
+      - name: Check out Manvi at MANVI_REV
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/manvi-src/Manvi"
+          git clone --quiet --filter=blob:none https://github.com/bharathvbcr/Manvi.git "$src"
+          git -C "$src" checkout --quiet "$MANVI_REV"
+
+      - name: Setup Go for Manvi
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ runner.temp }}/manvi-src/Manvi/manvi/go.mod
+          cache: false
+
+      - name: Cache manvi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      - name: Install manvi
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/manvi"
+          exe=manvi
+          if [ "$RUNNER_OS" = Windows ]; then exe=manvi.exe; fi
+          if [ ! -x "$root/bin/$exe" ]; then
+            src="$RUNNER_TEMP/manvi-src/Manvi"
+            bash "$src/scripts/fetch-modules.sh"
+            CGO_ENABLED=0 go -C "$src/manvi" build -trimpath -o "$root/bin/$exe" ./cmd/manvi
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/$exe" --version
+
+      - name: Keep the manvi build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
 
       # This shard's bucket of the suite. `--profile ci` is one test at a time
       # and writes target/nextest/ci/junit.xml, which the completeness job reads.
