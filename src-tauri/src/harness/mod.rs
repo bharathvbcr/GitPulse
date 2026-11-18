@@ -15,8 +15,8 @@ pub mod hosted;
 pub mod manvi_use;
 pub mod policy;
 pub mod protocol;
-mod scratch;
 pub(crate) mod review;
+mod scratch;
 pub mod sidecar;
 
 #[cfg(all(test, unix))]
