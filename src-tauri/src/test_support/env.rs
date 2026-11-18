@@ -376,6 +376,24 @@ pub(crate) mod hermetic {
         }
     }
 
+    /// `canonicalize` on Windows answers in the Win32 verbatim spelling
+    /// (`\\?\C:\…`, `\\?\UNC\server\share\…`). Every path below the root
+    /// reaches git as `GIT_CONFIG_GLOBAL`, `HOME` and `USERPROFILE`, and Git
+    /// for Windows cannot read a config file named that way: every `git`
+    /// a test ran failed with "unknown error occurred while reading the
+    /// configuration files". The prefix is a spelling of the same directory,
+    /// so dropping it changes nothing else; on other platforms it never occurs.
+    pub(crate) fn plain_spelling(path: &Path) -> PathBuf {
+        let text = path.to_string_lossy();
+        let Some(rest) = text.strip_prefix(r"\\?\") else {
+            return path.to_path_buf();
+        };
+        match rest.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(rest),
+        }
+    }
+
     pub(super) extern "C" fn install() {
         // Not `static`: a second include of this file in the same crate has its
         // own copy of every static, and the environment is the one thing both
@@ -395,7 +413,8 @@ pub(crate) mod hermetic {
         // `/var/folders/..`, and `/var` is a link to `/private/var`, which the
         // storage cleaner refuses as a root ("Symlink paths are not eligible").
         let temp = std::env::temp_dir();
-        let temp = std::fs::canonicalize(&temp).unwrap_or(temp);
+        let temp =
+            std::fs::canonicalize(&temp).map_or(temp, |canonical| plain_spelling(&canonical));
         let root = temp.join(format!(
             "gitpulse-hermetic-{}-{}",
             std::process::id(),
@@ -863,6 +882,62 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PROBE: &str = "GITPULSE_TEST_ENV_BINDING_PROBE";
+
+    /// The verbatim prefix is dropped in both of its forms and nothing else
+    /// is touched.
+    #[test]
+    fn the_hermetic_root_spelling_drops_only_the_win32_verbatim_prefix() {
+        use std::path::Path;
+        let plain = hermetic::plain_spelling;
+        assert_eq!(
+            plain(Path::new(r"\\?\C:\Users\r\Temp")),
+            Path::new(r"C:\Users\r\Temp")
+        );
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\srv\share\t")),
+            Path::new(r"\\srv\share\t")
+        );
+        assert_eq!(
+            plain(Path::new(r"C:\Users\r\Temp")),
+            Path::new(r"C:\Users\r\Temp")
+        );
+        assert_eq!(
+            plain(Path::new("/private/var/folders/x")),
+            Path::new("/private/var/folders/x")
+        );
+    }
+
+    /// Regression (Windows, every git fixture failed): the constructor built
+    /// the root from `canonicalize(temp_dir())`, which on Windows is
+    /// `\\?\C:\…`, and handed paths under it to git as `GIT_CONFIG_GLOBAL`
+    /// and `HOME`. Git for Windows refuses that spelling, so `git init` in
+    /// every fixture died with "unknown error occurred while reading the
+    /// configuration files". Every path the constructor hands git must carry a
+    /// spelling git can open.
+    #[test]
+    fn the_paths_the_hermetic_environment_gives_git_are_not_verbatim() {
+        let mut keys = vec![super::ROOT_MARKER];
+        keys.extend([
+            "GIT_CONFIG_GLOBAL",
+            "HOME",
+            "USERPROFILE",
+            "XDG_CONFIG_HOME",
+        ]);
+        for key in keys {
+            let value = std::env::var_os(key).unwrap_or_else(|| panic!("{key} is not set"));
+            assert!(
+                !value.to_string_lossy().starts_with(r"\\?\"),
+                "{key} is {value:?}: Git for Windows cannot read a config named in the verbatim spelling"
+            );
+        }
+        for path in [hermetic::pinned_git_config(), hermetic::home()] {
+            assert!(
+                !path.to_string_lossy().starts_with(r"\\?\"),
+                "{} is verbatim",
+                path.display()
+            );
+        }
+    }
 
     /// Regression (a panic leaks a process-global override): the whole point of
     /// the type. A test that fails while holding an override must leave the
