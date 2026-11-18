@@ -610,11 +610,19 @@
           // null" outside any check, so the run died with no row naming the step.
           // `need` waits (bounded) for the element and records the wait as a check,
           // so a control that never comes is a named failure, not a crash.
-          const need = async (label, find, ms = 15000) => {
+          const need = async (label, find, ms = 15000, why = () => "") => {
             await sleepUntil(() => !!find(), ms);
             let found = null;
-            hardCheck(`${label} is on screen`, () => (found = find()));
+            hardCheck(`${label} is on screen${find() ? "" : ` (${why()})`}`, () => (found = find()));
             return found;
+          };
+          // What the Create menu looked like when its item never appeared: a menu
+          // that never opened and one that opened and closed again read the same
+          // without this.
+          const createMenuState = () => {
+            const trigger = $("button[data-branch-create-trigger]");
+            const menu = $("#branch-create-menu");
+            return `trigger expanded=${trigger?.getAttribute("aria-expanded")}, menu ${menu ? "present: " + menu.outerHTML.slice(0, 160) : "absent"}, active ${document.activeElement?.tagName}, hasFocus ${document.hasFocus()}`;
           };
           // The scroller must also be tall enough to scroll: its rows arrive with
           // the repository's data.
@@ -629,7 +637,7 @@
           chip("Local")?.click();
           (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
           await settle();
-          (await need("the Create menu's Branch item", () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]'))).click();
+          (await need("the Create menu's Branch item", () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]'), 15000, createMenuState)).click();
           await settle();
           type(await need("the new-branch name input", createInput), "feat/half-typed");
           (await need("the create-worktree button", worktreeAdd)).click();
