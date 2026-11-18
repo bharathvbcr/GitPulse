@@ -32,6 +32,8 @@ use super::process_birth::{self, Liveness};
 use super::{query, WorkbenchError, WorkbenchState};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The states the store counts as holding a checkout, apart from `prepared`
@@ -225,6 +227,32 @@ fn abandonment(run: &Value) -> String {
     }
 }
 
+/// The profile worker if one is live. Never builds one: telling a worker that
+/// a run ended is no reason to start a Manvi.
+fn live_worker(state: &WorkbenchState) -> Option<Arc<crate::harness::sidecar::ProfileConnection>> {
+    crate::supervisor::lock_or_recover(&state.0.worker)
+        .as_ref()
+        .map(|(_, worker)| Arc::clone(worker))
+}
+
+/// A managed run the store no longer counts as live (ended, or released here)
+/// stops counting as hosted by the worker's Manvi. Only a `managed.stop` the
+/// child answered used to say so, which a run that ends on its own never gets,
+/// and a child that "hosts" a run that is over is never replaced when it wedges.
+fn note_ended(state: &WorkbenchState, run: &Value) {
+    let Some(id) = run["id"].as_str().filter(|_| run["kind"] == "managed") else {
+        return;
+    };
+    let live = run["state"]
+        .as_str()
+        .is_some_and(|s| s == "prepared" || HELD.contains(&s));
+    if !live {
+        if let Some(worker) = live_worker(state) {
+            worker.runs_ended(&[id.to_owned()]);
+        }
+    }
+}
+
 /// One identity per reconciling write, never equal to any launch owner.
 fn reconciler() -> String {
     let nanos = SystemTime::now()
@@ -408,6 +436,9 @@ fn settle(
         let run = state
             .with_store(|store| query(store, "runs.get", &json!({"id":id}).to_string()))?["item"]
             .clone();
+        // A run the store already records as over: the hosting Manvi's job for
+        // it is over too, whatever it did or did not answer.
+        note_ended(state, &run);
         let verdict = observe(state, &run, views);
         let Verdict::Release(reason) = &verdict else {
             return Ok((verdict, run));
@@ -421,7 +452,10 @@ fn settle(
             "reason": reason,
         });
         match state.with_store(|store| query(store, "runs.reconcile", &input.to_string())) {
-            Ok(saved) => return Ok((verdict, saved["item"].clone())),
+            Ok(saved) => {
+                note_ended(state, &saved["item"]);
+                return Ok((verdict, saved["item"].clone()));
+            }
             Err(error) if error.code == "revision_conflict" => continue,
             Err(error) => return Err(error),
         }
@@ -667,15 +701,41 @@ fn sweep_pages(state: &WorkbenchState, max_pages: usize) -> Result<Swept, Workbe
     // Receipts that storage refused when their runs ended are stored first,
     // so a recorded exit code is never overwritten by `outcome_uncertain`.
     super::receipts::replay(state, None);
+    // Read before any run is, so a run prepared while this pass walks the store
+    // cannot be in it and be mistaken for one the store no longer holds.
+    let worker = live_worker(state);
+    let hosted_before = worker.as_ref().map(|w| w.hosted_runs()).unwrap_or_default();
     let mut ids = Vec::new();
+    let mut live: HashSet<String> = HashSet::new();
     let mut complete = true;
     for held in HELD {
         complete &= walk_pages(state, held, false, max_pages, |run| {
             if let Some(id) = run["id"].as_str() {
                 ids.push(id.to_owned());
+                live.insert(id.to_owned());
             }
             true
         })?;
+    }
+    // What the worker's Manvi hosts that the store no longer holds live was
+    // over without any `managed.stop`: it ended by itself. Only a complete
+    // walk can say a run is absent.
+    if let Some(worker) = &worker {
+        if !hosted_before.is_empty() {
+            let prepared = walk_pages(state, "prepared", false, max_pages, |run| {
+                if let Some(id) = run["id"].as_str() {
+                    live.insert(id.to_owned());
+                }
+                true
+            });
+            if matches!(prepared, Ok(true)) && complete {
+                let ended: Vec<String> = hosted_before
+                    .into_iter()
+                    .filter(|id| !live.contains(id))
+                    .collect();
+                worker.runs_ended(&ended);
+            }
+        }
     }
     if !complete {
         log::warn!(target: "workbench", "run reconciliation stopped at its page cap; some held runs were not examined");

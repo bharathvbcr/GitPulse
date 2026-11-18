@@ -1193,3 +1193,169 @@ mod hosted {
         assert_eq!(asked.get(), 1, "each held run redialled the server");
     }
 }
+
+/// A fake `manvi serve` for the worker tests below: every request is answered
+/// in the background, and a `prepare` of the run named `wedge` takes thirty
+/// seconds, so a call on it outlasts any test budget.
+#[cfg(unix)]
+const FAKE_WORKER_SH: &str = r#"#!/bin/sh
+reply() { printf '{"id":"%s","ok":true,"result":%s}\n' "$1" "$2"; }
+handle() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  case "$1" in
+    *'"op":"hello"'*) reply "$id" '{"protocol":1,"ops":["hello","work.runs.managed.prepare","work.runs.managed.stop"],"posture":"host"}' ;;
+    *'"id":"wedge"'*) sleep 30; reply "$id" '{}' ;;
+    *) reply "$id" '{}' ;;
+  esac
+}
+while IFS= read -r line; do handle "$line" & done
+"#;
+
+#[cfg(unix)]
+fn fake_worker(
+    serial: &crate::harness::sidecar::SidecarTestGuard,
+    dir: &Path,
+) -> (
+    crate::harness::sidecar::TestBinaryBinding,
+    Arc<crate::harness::sidecar::ProfileConnection>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = dir.join("fake-worker");
+    std::fs::write(&binary, FAKE_WORKER_SH).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bound = crate::harness::sidecar::bind_test_binary(serial, binary.to_str().unwrap());
+    let worker =
+        crate::harness::sidecar::ProfileConnection::new(dir.join("profile.sqlite"), None).unwrap();
+    (bound, Arc::new(worker))
+}
+
+/// The defect: a run that ends by itself never gets a `managed.stop`, so the
+/// worker's Manvi counted it as hosted for the sidecar's life. A sweep now
+/// tells the worker which runs the store has over: one it releases, and one
+/// the store does not hold at all; a run the store still holds stays.
+#[cfg(unix)]
+#[test]
+fn a_sweep_stops_counting_runs_the_store_has_over_as_hosted() {
+    let serial = crate::harness::sidecar::test_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let state = host(&dir.path().join("profile.sqlite"));
+    seed(&state, &root);
+    let other = dir.path().join("other");
+    git_text(
+        &root,
+        &["worktree", "add", "--detach", other.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&other);
+    let (_bound, worker) = fake_worker(&serial, dir.path());
+    *state.0.worker.lock().unwrap() = Some((None, worker.clone()));
+    let store = |method: &str, input: Value| {
+        state
+            .with_store(|store| query(store, method, &input.to_string()))
+            .unwrap()
+    };
+    for (id, request, checkout) in [
+        ("over", "prepare-over", &root),
+        ("held", "prepare-held", &other),
+    ] {
+        state
+            .request(
+                "runs.prepare_managed",
+                &json!({"id":id,"request_id":request,"task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"ask","repo_path":checkout}).to_string(),
+            )
+            .unwrap();
+    }
+    // "over" was claimed by a Manvi that is gone: the sweep releases it.
+    let (dead, _) = reaped();
+    store(
+        "runs.claim",
+        json!({"id":"over","request_id":"claim-over","expected_revision":1,"kind":"managed","owner_id":format!("manvi-{dead}-1-ab12"),"session_id":"s-over"}),
+    );
+    // "held" was claimed by this live process: the sweep keeps it.
+    store(
+        "runs.claim",
+        json!({"id":"held","request_id":"claim-held","expected_revision":1,"kind":"managed","owner_id":format!("manvi-{}-{}-cd34", std::process::id(), now()),"session_id":"s-held"}),
+    );
+    for id in ["over", "held", "ghost"] {
+        worker
+            .call("work.runs.managed.prepare", json!({"id": id}))
+            .unwrap();
+    }
+    assert_eq!(worker.hosted_runs(), ["ghost", "held", "over"]);
+
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 1);
+
+    assert_eq!(
+        worker.hosted_runs(),
+        ["held"],
+        "only the run the store still holds is hosted"
+    );
+    worker.shutdown();
+}
+
+/// A child that stops answering while it hosts a run is replaced after a
+/// bounded number of timeouts, and the run it hosted is then recorded as
+/// released by the existing reconcile path: its Manvi is gone.
+#[cfg(unix)]
+#[test]
+fn a_run_hosted_by_a_child_that_went_silent_is_recorded_released_once_it_is_replaced() {
+    let serial = crate::harness::sidecar::test_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let state = host(&dir.path().join("profile.sqlite"));
+    seed(&state, &root);
+    let (_bound, worker) = fake_worker(&serial, dir.path());
+    *state.0.worker.lock().unwrap() = Some((None, worker.clone()));
+    state
+        .request(
+            "runs.prepare_managed",
+            &json!({"id":"managed","request_id":"prepare-managed","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"ask","repo_path":root}).to_string(),
+        )
+        .unwrap();
+    worker
+        .call("work.runs.managed.prepare", json!({"id":"managed"}))
+        .unwrap();
+    let child = worker.child_pid().expect("the worker's Manvi is running");
+    let owner = format!("manvi-{child}-{}-ab12", now());
+    state
+        .with_store(|store| {
+            query(
+                store,
+                "runs.claim",
+                &json!({"id":"managed","request_id":"claim","expected_revision":1,"kind":"managed","owner_id":owner,"session_id":"session"}).to_string(),
+            )
+        })
+        .unwrap();
+    // Its Manvi is alive and answering: the run is kept.
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
+    assert_eq!(worker.hosted_runs(), ["managed"]);
+
+    // The Manvi stops answering. The run it hosts keeps it for a while, then
+    // no longer.
+    let mut replaced_after = 0;
+    for attempt in 1..=10 {
+        let _ = worker.call_fixed(
+            "work.runs.managed.prepare",
+            json!({"id":"wedge"}),
+            std::time::Duration::from_millis(300),
+        );
+        if worker.child_pid() != Some(child) {
+            replaced_after = attempt;
+            break;
+        }
+    }
+    assert_ne!(
+        replaced_after, 0,
+        "a silent child hosting a run was never replaced"
+    );
+    assert!(replaced_after > 1, "the keep was not applied at all");
+
+    assert_eq!(state.reconcile_stale_runs().unwrap(), 1);
+    let item = state.request("runs.get", r#"{"id":"managed"}"#).unwrap()["item"].clone();
+    assert_eq!(item["state"], "exited", "{item}");
+    assert!(item["reason"].as_str().unwrap().contains("Manvi process"));
+    worker.shutdown();
+}

@@ -81,6 +81,18 @@ pub(crate) fn op_deadline(op: &str) -> Duration {
         _ => DEFAULT_CALL_TIMEOUT,
     }
 }
+/// The ops that start, drive or end a managed run, whose deadlines are the
+/// longest a child that hosts runs can be busy for.
+const MANAGED_OPS: [&str; 4] = [
+    "work.runs.managed.prepare",
+    "work.runs.managed.activate",
+    "work.runs.managed.stop",
+    "work.runs.managed.continue",
+];
+/// How long a read of the live connection's bookkeeping waits for the slot. The
+/// slot is held across no round trip, so a longer wait means a spawn is under
+/// way, and the reader has nothing to ask yet.
+const SLOT_PEEK: Duration = Duration::from_millis(200);
 /// Wire slack added to an advertised deadline: Manvi's own deadline ends the
 /// request, and the host's timeout must land after it so the refusal Manvi
 /// writes is read instead of the child being declared wedged first.
@@ -298,12 +310,55 @@ struct Sidecar {
     /// The state directory this child was started in, which only a stdio child
     /// has. Removed by [`Sidecar::terminate`] once the child is reaped.
     scratch: Option<ScratchDir>,
+    /// Consecutive calls that timed out with nothing answered in between; what
+    /// bounds how long a child that may host runs is kept (see [`record_fault`]).
+    stall: Mutex<Stall>,
+}
+
+/// How many timeouts in a row, each from a call issued after the one before it
+/// had already timed out, a child that may host runs is kept for. Past this the
+/// child is not slow, it is gone quiet: it is replaced and its runs are left to
+/// reconciliation, which records a run whose Manvi is gone as released.
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
+/// What a child that stopped answering has done so far.
+#[derive(Default)]
+struct Stall {
+    /// Timeouts counted since the child last answered anything.
+    count: u32,
+    /// When the first of them was counted.
+    first: Option<Instant>,
+    /// When the latest was counted. A call issued before this timed out beside
+    /// the one that was counted, so a burst of concurrent calls is one timeout.
+    last: Option<Instant>,
 }
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
         self.terminate();
     }
+}
+
+impl Stall {
+    /// Counts a timeout of a call issued at `issued`, seen at `now`; returns
+    /// how many have been counted since the child last answered and for how
+    /// long. A call issued before the last counted timeout was in flight beside
+    /// it, so a burst of concurrent calls is one timeout, not several.
+    fn count_timeout(&mut self, issued: Instant, now: Instant) -> (u32, Duration) {
+        if self.last.is_none_or(|last| issued > last) {
+            self.count += 1;
+            self.last = Some(now);
+        }
+        let first = *self.first.get_or_insert(now);
+        (self.count, now.saturating_duration_since(first))
+    }
+}
+
+/// Whether a child that may host runs has been kept long enough: it has timed
+/// out [`MAX_CONSECUTIVE_TIMEOUTS`] times in a row, or has been quiet for
+/// `bound` (its longest managed deadline).
+fn keep_is_exhausted(timeouts: u32, quiet: Duration, bound: Duration) -> bool {
+    timeouts >= MAX_CONSECUTIVE_TIMEOUTS || quiet >= bound
 }
 
 /// Where responses are routed to the call that is waiting for them.
@@ -639,6 +694,46 @@ impl Sidecar {
         !relock(&self.hosted).is_empty()
     }
 
+    /// The runs this child may host.
+    fn hosted_runs(&self) -> Vec<String> {
+        let mut runs: Vec<String> = relock(&self.hosted).iter().cloned().collect();
+        runs.sort();
+        runs
+    }
+
+    /// Forgets runs that have ended without a `managed.stop` the child answered
+    /// (they ended by themselves, or the app recorded their end), so a child
+    /// holding only those is not kept alive for them.
+    fn forget_runs(&self, ended: &[String]) {
+        let mut hosted = relock(&self.hosted);
+        for run in ended {
+            hosted.remove(run);
+        }
+    }
+
+    /// The child answered something: whatever stall it was in is over.
+    fn note_answered(&self) {
+        *relock(&self.stall) = Stall::default();
+    }
+
+    /// Counts a timeout of a call issued at `issued`, and returns how many
+    /// have been counted since the child last answered, and for how long.
+    fn note_timeout(&self, issued: Instant, now: Instant) -> (u32, Duration) {
+        relock(&self.stall).count_timeout(issued, now)
+    }
+
+    /// The longest a managed op may legitimately take on this child: its own
+    /// advertised deadline or, without one, the table's. A child that has been
+    /// quiet for longer than this has outlasted every call it could be busy
+    /// with.
+    fn longest_managed_deadline(&self) -> Duration {
+        MANAGED_OPS
+            .iter()
+            .map(|op| advertised_timeout(&self.hello, op).unwrap_or_else(|| op_deadline(op)))
+            .max()
+            .unwrap_or(DEFAULT_CALL_TIMEOUT)
+    }
+
     /// Keeps `hosted` true to the wire: a prepare that went out may have
     /// started a session whatever happens to its answer, and only an answered
     /// stop (or a refused prepare) says there is none.
@@ -749,6 +844,9 @@ impl Sidecar {
             .write_request_line(&line, op)
             .and_then(|()| self.await_answer(op, &id, timeout));
         self.note_managed(op, params.as_ref(), Some(&outcome));
+        if matches!(&outcome, Ok(_) | Err(HarnessError::Refused(_))) {
+            self.note_answered();
+        }
         outcome
     }
 
@@ -1824,6 +1922,7 @@ fn spawn_with_profile(
         },
         shutting_down,
         scratch: Some(scratch),
+        stall: Mutex::new(Stall::default()),
     };
     handshake_sidecar(sidecar, claude.is_some())
 }
@@ -1985,6 +2084,7 @@ fn socket_sidecar(
         shutdown_grace: Duration::ZERO,
         shutting_down,
         scratch: None,
+        stall: Mutex::new(Stall::default()),
     })
 }
 
@@ -2766,10 +2866,11 @@ fn call_in_slot(
             }
         },
     };
+    let issued = Instant::now();
     let outcome = sidecar.call(op, params, timeout);
     if let Err(e) = &outcome {
         if retriable_transport_fault(e) {
-            record_fault(owner, &sidecar, e);
+            record_fault(owner, &sidecar, e, issued);
         }
     }
     outcome
@@ -2796,17 +2897,38 @@ fn note_deadline_fallback(hello: &HelloResult, op: &str) {
 /// A *timeout* is not proof the child is wedged: it says one call outlasted
 /// its deadline. While other calls are being answered, or the child may host a
 /// managed session, the child is kept and the caller simply sees a retryable
-/// error. Anything else (exit, a stalled stdin, a broken protocol) leaves the
-/// connection unusable, so it is replaced and the sessions it hosted are left
-/// to reconciliation, which records a run whose Manvi is gone as released.
+/// error. That keep is bounded: once [`MAX_CONSECUTIVE_TIMEOUTS`] calls have
+/// timed out one after another with nothing answered in between, or the child
+/// has been quiet for longer than its longest managed deadline, it is gone
+/// quiet, and it is replaced like any other fault. Anything else (exit, a
+/// stalled stdin, a broken protocol) leaves the connection unusable, so it is
+/// replaced and the sessions it hosted are left to reconciliation, which
+/// records a run whose Manvi is gone as released.
+///
+/// `issued` is when the faulting call was sent.
 ///
 /// The slot is changed only if it still holds this very child: a fault
 /// reported by a call that outlived its connection must not drop its successor.
-fn record_fault(owner: &Mutex<Slot>, sidecar: &Arc<Sidecar>, fault: &HarnessError) {
-    let keep = matches!(fault, HarnessError::Timeout(_))
-        && (sidecar.hosts_sessions() || sidecar.in_flight.load(Ordering::Acquire) > 0);
-    if keep {
-        return;
+fn record_fault(
+    owner: &Mutex<Slot>,
+    sidecar: &Arc<Sidecar>,
+    fault: &HarnessError,
+    issued: Instant,
+) {
+    if matches!(fault, HarnessError::Timeout(_)) {
+        let (timeouts, quiet) = sidecar.note_timeout(issued, Instant::now());
+        let busy = sidecar.hosts_sessions() || sidecar.in_flight.load(Ordering::Acquire) > 0;
+        let bound = sidecar.longest_managed_deadline();
+        if busy && !keep_is_exhausted(timeouts, quiet, bound) {
+            return;
+        }
+        if busy {
+            log::warn!(
+                target: "harness",
+                "the sidecar answered nothing for {timeouts} timed-out call(s) over {quiet:?} (bounds: {MAX_CONSECUTIVE_TIMEOUTS} calls, {bound:?}); replacing it although it may host runs: {:?}",
+                sidecar.hosted_runs()
+            );
+        }
     }
     let Some(mut guard) = acquire_slot_for(owner, Instant::now() + DEFAULT_CALL_TIMEOUT) else {
         return;
@@ -2868,6 +2990,53 @@ impl ProfileConnection {
 
     pub(crate) fn call(&self, op: &str, params: Value) -> Result<Value, HarnessError> {
         self.call_within(op, params, Budget::PerOp)
+    }
+
+    /// [`Self::call`] with the caller's own timeout, so a test can wedge a call
+    /// inside its budget.
+    #[cfg(test)]
+    pub(crate) fn call_fixed(
+        &self,
+        op: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, HarnessError> {
+        self.call_within(op, params, Budget::Fixed(timeout))
+    }
+
+    /// The live stdio child's pid, if one is running.
+    #[cfg(test)]
+    pub(crate) fn child_pid(&self) -> Option<u32> {
+        let slot = self.slot.lock().unwrap();
+        slot.sidecar
+            .as_ref()
+            .map(|live| live.child().lock().unwrap().id())
+    }
+
+    /// The runs the live connection may host, read without starting one. Empty
+    /// when there is no connection or the slot is busy: a read that could not
+    /// be had is never a claim that nothing is hosted.
+    pub(crate) fn hosted_runs(&self) -> Vec<String> {
+        acquire_slot_for(&self.slot, Instant::now() + SLOT_PEEK)
+            .and_then(|guard| guard.sidecar.as_ref().map(|live| live.hosted_runs()))
+            .unwrap_or_default()
+    }
+
+    /// The app recorded these runs as over (they ended on their own, or were
+    /// released): the live connection no longer counts them as hosted. Never
+    /// starts a connection; a busy slot leaves them for the bounded keep rule
+    /// ([`MAX_CONSECUTIVE_TIMEOUTS`]) rather than waiting here.
+    pub(crate) fn runs_ended(&self, ended: &[String]) {
+        if ended.is_empty() {
+            return;
+        }
+        let Some(guard) = acquire_slot_for(&self.slot, Instant::now() + SLOT_PEEK) else {
+            log::info!(target: "harness", "the profile worker was busy; {} ended run(s) stay counted as hosted for now", ended.len());
+            return;
+        };
+        if let Some(live) = guard.sidecar.as_ref() {
+            live.forget_runs(ended);
+        }
     }
 
     fn call_within(&self, op: &str, params: Value, budget: Budget) -> Result<Value, HarnessError> {
@@ -3581,6 +3750,7 @@ mod tests {
             shutdown_grace: SHUTDOWN_GRACE,
             shutting_down,
             scratch: None,
+            stall: Mutex::new(Stall::default()),
         }
     }
 
@@ -4618,6 +4788,113 @@ while IFS= read -r line; do handle "$line" & done
             .expect("the prepare that timed out still owns a stoppable session");
         assert_eq!(sidecar_pid(&connection), Some(pid));
         connection.shutdown();
+    }
+
+    /// The defect: a run that ends by itself never gets a `managed.stop`, so it
+    /// stayed in `hosted` for the sidecar's life.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_the_app_records_as_ended_stops_counting_as_hosted() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        connection
+            .call("work.runs.managed.prepare", serde_json::json!({"id": "x"}))
+            .unwrap();
+        let hosts = |c: &ProfileConnection| {
+            c.slot
+                .lock()
+                .unwrap()
+                .sidecar
+                .as_ref()
+                .is_some_and(|s| s.hosts_sessions())
+        };
+        assert!(hosts(&connection));
+        assert_eq!(connection.hosted_runs(), vec!["x".to_string()]);
+        connection.runs_ended(&["x".to_string()]);
+        assert!(
+            !hosts(&connection),
+            "an ended run is still counted as hosted"
+        );
+        connection.shutdown();
+    }
+
+    /// A child that has stopped answering is replaced after at most
+    /// [`MAX_CONSECUTIVE_TIMEOUTS`] timeouts in a row even though it hosts a
+    /// run, and not before; an answer in between starts the count again.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_child_that_hosts_runs_is_replaced_after_a_bounded_number_of_timeouts() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("slow-wedge"), "30").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "live"}),
+            )
+            .unwrap();
+        let pid = connection.child_pid().expect("sidecar running");
+        let wedge = |c: &ProfileConnection| {
+            c.call_fixed(
+                "work.runs.managed.prepare",
+                serde_json::json!({"id": "wedge"}),
+                Duration::from_millis(300),
+            )
+        };
+        for round in 1..MAX_CONSECUTIVE_TIMEOUTS {
+            assert!(matches!(wedge(&connection), Err(HarnessError::Timeout(_))));
+            assert_eq!(connection.child_pid(), Some(pid), "kept at timeout {round}");
+        }
+        // An answer from the child ends the stall: the count starts again.
+        connection
+            .call("work.runs.managed.stop", serde_json::json!({"id": "live"}))
+            .unwrap();
+        for round in 1..MAX_CONSECUTIVE_TIMEOUTS {
+            assert!(matches!(wedge(&connection), Err(HarnessError::Timeout(_))));
+            assert_eq!(
+                connection.child_pid(),
+                Some(pid),
+                "an answer did not reset the count; replaced at timeout {round}"
+            );
+        }
+        assert!(matches!(wedge(&connection), Err(HarnessError::Timeout(_))));
+        assert_ne!(
+            connection.child_pid(),
+            Some(pid),
+            "a child that answered nothing for {MAX_CONSECUTIVE_TIMEOUTS} calls was kept"
+        );
+        connection.shutdown();
+    }
+
+    #[test]
+    fn a_burst_of_concurrent_timeouts_counts_once_and_the_quiet_clock_starts_at_the_first() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut stall = Stall::default();
+        // Three calls issued together time out together: one timeout.
+        assert_eq!(stall.count_timeout(at(0), at(100)).0, 1);
+        assert_eq!(stall.count_timeout(at(0), at(101)).0, 1);
+        assert_eq!(stall.count_timeout(at(10), at(102)).0, 1);
+        // A call issued after that one timed out is a second.
+        let (count, quiet) = stall.count_timeout(at(200), at(300));
+        assert_eq!(count, 2);
+        assert_eq!(quiet, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn the_keep_ends_on_the_count_or_on_the_longest_managed_deadline_whichever_is_first() {
+        let bound = op_deadline("work.runs.managed.prepare");
+        assert!(!keep_is_exhausted(1, Duration::from_secs(1), bound));
+        assert!(keep_is_exhausted(
+            MAX_CONSECUTIVE_TIMEOUTS,
+            Duration::from_secs(1),
+            bound
+        ));
+        assert!(keep_is_exhausted(1, bound, bound));
+        assert!(bound >= op_deadline("work.runs.managed.stop"));
+        assert!(bound >= op_deadline("work.runs.managed.continue"));
     }
 
     fn limits(entries: &[(&str, u64)]) -> HelloResult {
