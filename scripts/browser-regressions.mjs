@@ -181,6 +181,19 @@ export function startChrome(chrome, profile, url) {
   return child;
 }
 
+/** How much of a browser runner's stderr an early exit reports. */
+const STDERR_KEPT = 2000;
+
+/** The error for a browser that ended before writing a verdict. It carries
+ * what the runner printed: the WebKit runner refuses a host it cannot measure
+ * (Reduce Motion on) with a reason, and a bare exit code hid it.
+ * @param {string} engine @param {number | null} code @param {string} stderr
+ */
+export function browserExitMessage(engine, code, stderr) {
+  const said = stderr.trim();
+  return `${engine} exited before the verdict (${code})${said ? `: ${said}` : ""}`;
+}
+
 /** What a signal or an uncaught error must still undo: the live browser and
  * its profile. `finally` does it for every other exit.
  * @type {Set<() => void>}
@@ -254,16 +267,25 @@ async function runHarness(harness, webkit) {
     const version = await run(webkit ? "xcrun" : chrome, webkit ? ["swift", "--version"] : ["--version"], { timeout: 10_000 });
     console.log(version.stdout.trim());
     const url = `http://127.0.0.1:${address.port}/harness/${harness}.html?check=1&report=${reportPath}`;
+    /** The runner's own words, kept so an early exit can say why. */
+    let stderr = "";
     if (webkit) {
       // The Swift runner ends itself five seconds after this page's deadline.
       browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
         { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
+      browser.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-STDERR_KEPT); });
     } else {
       browser = startChrome(chrome, profile, url);
     }
+    const engine = webkit ? "WebKit" : "Chrome";
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);
-      browser?.once("exit", code => reject(new Error(`${webkit ? "WebKit" : "Chrome"} exited before the verdict (${code})`)));
+      // `close` fires after the stderr pipe has drained, so the reason the
+      // runner printed is in hand; a grandchild still holding the pipe must
+      // not hold the report back, so `exit` reports anyway a moment later.
+      const report = (/** @type {number | null} */ code) => reject(new Error(browserExitMessage(engine, code, stderr)));
+      browser?.once("close", report);
+      browser?.once("exit", code => setTimeout(() => report(code), 1000).unref());
     });
     console.log(await Promise.race([completed, exited]));
   } finally {

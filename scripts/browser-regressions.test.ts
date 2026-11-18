@@ -51,6 +51,29 @@ describe("failure reporting a CI reader can see", () => {
     ]);
   });
 
+  it("says why a browser runner exited before its verdict, not just its exit code", async () => {
+    const { browserExitMessage } = await import("./browser-regressions.mjs");
+    expect(browserExitMessage("WebKit", 3, "This Mac has Reduce Motion on, so ...\n"))
+      .toBe("WebKit exited before the verdict (3): This Mac has Reduce Motion on, so ...");
+    expect(browserExitMessage("Chrome", 1, "  \n")).toBe("Chrome exited before the verdict (1)");
+  });
+
+  // The macos-26 runner image has Reduce Motion on: WKWebView then matches
+  // prefers-reduced-motion and every animation check failed with "0 animate
+  // calls" (Frontend macos-latest, f9610b895). The runner refuses such a host
+  // with the reason, and CI turns the setting off before the WebKit step.
+  it("never measures motion on a host that asked for reduced motion", () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const runner = readFileSync(path.join(here, "webkit-regressions.swift"), "utf8");
+    const refusal = runner.indexOf("accessibilityDisplayShouldReduceMotion");
+    expect(refusal).toBeGreaterThan(-1);
+    expect(refusal).toBeLessThan(runner.indexOf("webview.load("));
+    const ci = readFileSync(path.join(here, "..", ".github", "workflows", "ci.yml"), "utf8");
+    const off = ci.indexOf("defaults write com.apple.universalaccess reduceMotion -bool false");
+    expect(off).toBeGreaterThan(-1);
+    expect(off).toBeLessThan(ci.indexOf("run: bun run test:webkit:all"));
+  });
+
   it("escapes an annotation so its text cannot end the command early", async () => {
     const { annotation } = await import("./browser-regressions.mjs");
     expect(annotation("Chrome a:b,c", "one\ntwo 50%")).toBe("::error title=Chrome a%3Ab%2Cc::one%0Atwo 50%25");
