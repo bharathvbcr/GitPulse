@@ -137,7 +137,10 @@ fn adv2_unreadable_recheck_continues_silently() {
     // second is copied after the unreadable reading. Three dense 70 MiB files
     // wrote 420 MiB here, which on Linux all counts against the suite's
     // disk-write budget.
-    let sizes = [crate::engine::cow_clone::RECHECK_EVERY_BYTES + (1 << 20), 1 << 20];
+    let sizes = [
+        crate::engine::cow_clone::RECHECK_EVERY_BYTES + (1 << 20),
+        1 << 20,
+    ];
     for (i, size) in sizes.iter().enumerate() {
         fs::File::create(anchor.join(format!("node_modules/f{i}")))
             .unwrap()
