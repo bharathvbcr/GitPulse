@@ -11,36 +11,7 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Changed
-
-- **The Secrets scan no longer needs Kingfisher.** Health's working-tree
-  secrets scan is now GitPulse's own in-process scanner (`leak_scan`, the
-  vendored `dc-redact` credential table): it reads every tracked file and every
-  untracked file git does not ignore, with a per-file cap, a byte budget and a
-  time limit, and lists every file it could not read. A scan with any skip is
-  partial, never clean. The report names its engine. A scan that left
-  nested repositories unread is partial. The in-process scan recognises far
-  fewer credential shapes than Kingfisher (recall tables in
-  `docs/PERFORMANCE.md`), so Kingfisher is its second opinion: a Rescan click
-  (`cmd_scan_secrets` takes an optional `second_opinion` argument) also runs
-  it when installed and merges its findings, one row per path and line. The
-  report says whether it was not installed, not run, unavailable (with the
-  reason) or ran, and a failed Kingfisher never changes the in-process result.
-  The green "No secrets reported" headline now needs both engines; the
-  in-process scan alone reads "No known secret shapes matched". Kingfisher
-  has no option to honour `.gitignore`, so its scope still includes ignored
-  files.
-
-- `gitpulse_provenance`: `verified` is now true only when the commit's verification note records a pass of the whole suite, and `confidence` is null whenever `verified` is false. A note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict used to come back as `verified: true` with confidence 1.0 at the tip; it now reads `verified: false`, with the note still in `verification` so the verdict can be read. An MCP client that read `verified` as "a note is attached" should check `verification` instead. The Rust pass set is held equal to the freshness badge's by `provenance-verdict-contract`.
-
-### Fixed
-
-- **A conflicted file was scanned and counted up to three times.**
-  `git ls-files -t` lists an unmerged path once per stage and `--deduplicate`
-  does not apply with `-t`, so the working-tree scan now keeps one entry per
-  path (tracked wins).
-
-## [1.99.0] - 2026-11-15
+## [1.99.0] - 2026-11-17
 
 The 2.0 beta (see [GitPulse 2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md)). It
 ships as 1.99.0 because release and macOS bundle versions are plain numbers, so
@@ -452,6 +423,26 @@ host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
   typed `low_disk` / `cache_error` advisories for worktree caches.
 
 ### Changed
+
+- **The Secrets scan no longer needs Kingfisher.** Health's working-tree
+  secrets scan is now GitPulse's own in-process scanner (`leak_scan`, the
+  vendored `dc-redact` credential table): it reads every tracked file and every
+  untracked file git does not ignore, with a per-file cap, a byte budget and a
+  time limit, and lists every file it could not read. A scan with any skip is
+  partial, never clean. The report names its engine. A scan that left
+  nested repositories unread is partial. The in-process scan recognises far
+  fewer credential shapes than Kingfisher (recall tables in
+  `docs/PERFORMANCE.md`), so Kingfisher is its second opinion: a Rescan click
+  (`cmd_scan_secrets` takes an optional `second_opinion` argument) also runs
+  it when installed and merges its findings, one row per path and line. The
+  report says whether it was not installed, not run, unavailable (with the
+  reason) or ran, and a failed Kingfisher never changes the in-process result.
+  The green "No secrets reported" headline now needs both engines; the
+  in-process scan alone reads "No known secret shapes matched". Kingfisher
+  has no option to honour `.gitignore`, so its scope still includes ignored
+  files.
+
+- `gitpulse_provenance`: `verified` is now true only when the commit's verification note records a pass of the whole suite, and `confidence` is null whenever `verified` is false. A note recording a failure, a pass of the affected tests only (`passed-affected`) or an unrecognised verdict used to come back as `verified: true` with confidence 1.0 at the tip; it now reads `verified: false`, with the note still in `verification` so the verdict can be read. An MCP client that read `verified` as "a note is attached" should check `verification` instead. The Rust pass set is held equal to the freshness badge's by `provenance-verdict-contract`.
 
 - **Unix terminal host (`gitpulse-ptyd`) is now unconditional, and hosted Manvi defaults to on:** On Unix (`#[cfg(unix)]`), PTY terminal sessions always live in `gitpulse-ptyd` so interactive shells and TUI agents survive app restarts or crashes (`docs/TERMINAL_HOST.md`, `b7b698ef`). **Settings → Agents → Keep managed agent runs running when GitPulse quits** (`keep_terminals_running`) now defaults to on and governs the detached `manvi serve --listen` process for managed Codex and Claude runs.
 - **Tasks board automatic column fill, live on-screen refresh, two-row header, & verdict memo:** After every board read, `fillBoard` (`boardPaging.ts`) automatically pages remaining cards in 200-card chunks up to 2,000 cards while the column cursor matches; live task surfaces (`liveOnScreen`) stay active whenever the window is visible on screen (even unfocused, `bac79cf7`); the Tasks header splits into a title row and a toolbar row (`PageHeader.svelte`, `TaskBoard.svelte`, `5606e1d9`); and task verification verdicts are cached in `verdict_memo` with an exact SQLite change signal and shared byte budget (`2bdd2511`, `e7c4491a`, `86ca8530`).
@@ -905,6 +896,11 @@ host (`gitpulse-ptyd`, protocol 3) is unconditional, and `gitpulse-mcp` and
   with it (derived from the handler list at build), and the registry is 284 handlers.
 
 ### Fixed
+
+- **A conflicted file was scanned and counted up to three times.**
+  `git ls-files -t` lists an unmerged path once per stage and `--deduplicate`
+  does not apply with `-t`, so the working-tree scan now keeps one entry per
+  path (tracked wins).
 
 - **Read-only hook ledger binding lookup:** `read_active_task_binding` only refuses unimported sibling rows that would be kept as a `bind` or `unbind` under `SourceAuthority`, preventing unrelated sibling ledger traffic from failing read-only hook lookups (`95a17657`).
 - **Health automatic scans & secrets signal crash reporting:** Automatic dependency and secrets scans wait for the pane to settle, skip fresh results, and hold off after a failure (stating why, `5f2a1e0b`, `4c81201d`), and a secrets scanner killed by a signal is reported as a crash naming the signal (`b0382546`).
