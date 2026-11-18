@@ -637,9 +637,22 @@
           type(await need("the file filter", fileFilter), "src/alpha");
           type(await need("the branch filter", branchFilter), "feat");
           chip("Local")?.click();
-          (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
-          await settle();
-          (await need("the Create menu's Branch item", () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]'), 15000, createMenuState)).click();
+          // The Local chip's filter lands a render or more later, and a click that
+          // arrives while the branch section is being rebuilt can open a menu on a
+          // trigger that is replaced under it (on the runner with window focus, the
+          // menu was absent and the trigger not expanded in 2 of 7 pages). A closed
+          // menu after a click is therefore clicked again, at most three times, and
+          // the attempt that opened it is named in the check; a menu that never opens
+          // fails as before, with its state.
+          const branchItem = () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]');
+          let createAttempts = 0;
+          while (createAttempts < 3 && !branchItem()) {
+            createAttempts++;
+            (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
+            await settle();
+            await sleepUntil(branchItem, createAttempts < 3 ? 3000 : 15000);
+          }
+          (await need(`the Create menu's Branch item (attempt ${createAttempts})`, branchItem, 1000, createMenuState)).click();
           await settle();
           type(await need("the new-branch name input", createInput), "feat/half-typed");
           (await need("the create-worktree button", worktreeAdd)).click();
