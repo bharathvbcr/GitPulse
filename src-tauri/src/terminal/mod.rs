@@ -10387,6 +10387,17 @@ mod tests {
         std::fs::create_dir_all(&versions).unwrap();
         let binary = versions.join("2.1.0");
         let (exe, args) = crate::sysload::procscan::tests::fixture_command();
+        // The scan classifies the path the kernel reports for the process.
+        // macOS reports ONE name for an inode (proc_pidpath), whichever of its
+        // hard links it cached first, which is the test image's own name here
+        // and not `versions/2.1.0`: a version-named process whose reported path
+        // is not an agent is never read further, and the session vanished 9
+        // runs in 10. A copy is a distinct inode with exactly this name (APFS
+        // clones it, so it writes nothing). Linux reads the exec'd path from
+        // /proc, so a link is enough there and a copy would write the image.
+        #[cfg(target_os = "macos")]
+        std::fs::copy(&exe, &binary).unwrap();
+        #[cfg(not(target_os = "macos"))]
         if std::fs::hard_link(&exe, &binary).is_err() {
             std::fs::copy(&exe, &binary).unwrap();
         }
