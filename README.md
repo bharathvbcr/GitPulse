@@ -18,7 +18,7 @@ across all your repositories. Each agent gets its own worktree, a policy guard a
 a load scheduler keeps the machine responsive. A full Git client sits in the same window. It is a
 native Rust and Tauri 2 app with a Svelte 5 frontend, free and MIT-licensed.
 
-[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0) ·
+[Download the 2.0 beta](https://github.com/bharathvbcr/GitPulse/releases) ·
 [Getting started](docs/GETTING_STARTED.md) ·
 [Why GitPulse](docs/WHY_GITPULSE.md) ·
 [Agents guide](docs/AGENTS_GUIDE.md) ·
@@ -58,7 +58,7 @@ not been tested.
 
 ## GitPulse 2.0 (beta)
 
-GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases/tag/v1.99.0),
+GitPulse 2.0 is out in beta as [`v1.99.0`](https://github.com/bharathvbcr/GitPulse/releases),
 published as a pre-release; the stable 2.0 release is coming soon. The beta is the first release since
 `v1.3.1` and includes all unpublished `v1.4.0` and `v1.5.0` changes; see the [v2.0 release notes](docs/RELEASE_NOTES_v2.0.0.md).
 The [feature reference](docs/FEATURES.md) lists every area.
