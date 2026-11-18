@@ -11,6 +11,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -392,6 +393,21 @@ const plant = (dir: string, files: Record<string, string> = { "debug/deps/x.rlib
     mkdirSync(join(dir, name, ".."), { recursive: true });
     writeFileSync(join(dir, name), body);
   }
+};
+/**
+ * Makes a planted tree look like it was built an hour ago. A directory that
+ * predates a run really is older than the run, and the run's own write must be
+ * able to move a timestamp: on NTFS a timestamp comes from a clock that ticks
+ * about every 15 ms, so a write made within the same tick as the planting
+ * leaves the directory's mtime equal and the change goes unseen.
+ */
+const backdate = (dir: string) => {
+  const then = new Date(Date.now() - 3_600_000);
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) backdate(join(dir, entry.name));
+    else utimesSync(join(dir, entry.name), then, then);
+  }
+  utimesSync(dir, then, then);
 };
 const defaultDir = () => join(root, "src-tauri", "target", "llvm-cov-target");
 
@@ -975,6 +991,7 @@ describe("only a build this run wrote is deleted", () => {
 
   it("deletes a directory that predates the run when the run changed it", () => {
     plant(defaultDir());
+    backdate(defaultDir());
     run([OWNER], { onRun: (id) => id === "owner" && writeFileSync(join(defaultDir(), "debug", "new.profraw"), "n") });
     expect(existsSync(defaultDir())).toBe(false);
   });
