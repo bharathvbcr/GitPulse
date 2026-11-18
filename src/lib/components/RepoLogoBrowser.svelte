@@ -65,7 +65,7 @@
     return () => {
       live = false;
       abort.abort();
-      // Thumbnails are data URLs of up to 512 KiB each: none outlive the dialog.
+      // Thumbnails are held as data URLs: none outlive the dialog.
       repoLogos.releasePreviews(subject.target);
     };
   });
@@ -285,7 +285,7 @@
               ? 'border-accent ring-2 ring-accent'
               : 'border-border hover:bg-surfaceHover'} {unusable ? 'opacity-60' : ''}"
             title={thumb?.state === "unusable"
-              ? `${path}: over 512 KB, or not the image its name says`
+              ? `${path}: not the image its name says`
               : thumb?.state === "failed"
                 ? `${path}: couldn't be read`
                 : path}

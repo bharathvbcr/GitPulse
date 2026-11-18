@@ -7,14 +7,10 @@
  *
  * A repository's own files are untrusted input. They are only ever drawn as
  * an `<img>` from a `data:` URL built here, never as inline SVG or HTML: an
- * SVG inside an image element runs no script and loads nothing, and the
- * bytes are capped so one huge PNG cannot become a megabyte string per tab.
+ * SVG inside an image element runs no script and loads nothing.
  */
 
 import { TAB_COLORS, type TabColor } from "./tabColors";
-
-/** Largest logo file drawn, in bytes. A tab is 16px; anything bigger is waste. */
-export const MAX_LOGO_BYTES = 512 * 1024;
 
 /** How many ranked candidates are read before a repository is called logo-less. */
 export const MAX_LOGO_ATTEMPTS = 4;
@@ -429,7 +425,7 @@ function utf8Base64(text: string): string {
 
 /**
  * A `data:` URL for a logo file, or null when the bytes are not a drawable
- * image of the format the name claims, or are over {@link MAX_LOGO_BYTES}.
+ * image of the format the name claims.
  */
 export function logoDataUrl(path: string, blob: LogoBlob): string | null {
   const ext = logoExtension(path);
@@ -438,12 +434,12 @@ export function logoDataUrl(path: string, blob: LogoBlob): string | null {
   if (ext === "svg") {
     // The backend reads SVG as text; a binary read of one is not an SVG.
     const text = typeof blob.text === "string" ? blob.text : null;
-    if (text === null || text.length > MAX_LOGO_BYTES) return null;
+    if (text === null) return null;
     if (!/<svg[\s>]/i.test(text.slice(0, 4096))) return null;
     return `data:${mime};base64,${utf8Base64(text)}`;
   }
   const base64 = typeof blob.base64 === "string" ? blob.base64 : null;
-  if (!base64 || base64.length > Math.ceil(MAX_LOGO_BYTES / 3) * 4) return null;
+  if (!base64) return null;
   if (!BASE64.test(base64)) return null;
   const head = leadingBytes(base64, 12);
   if (!head || !signatureMatches(ext, head)) return null;

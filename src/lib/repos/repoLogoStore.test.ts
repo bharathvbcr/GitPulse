@@ -351,7 +351,7 @@ describe("browsing a repository's images", () => {
 
   it("bounds the thumbnails it holds by size and lets a closed browser release them", async () => {
     const big = (n: number) => btoa(String.fromCharCode(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a) + "x".repeat(n));
-    // 300 KiB of base64 each: well under the per-file cap, so all draw.
+    // ~300 KiB of base64 each, so 60 of them exceed MAX_PREVIEW_CHARS.
     const blobs: Record<string, LogoBlob> = {};
     for (let i = 0; i < 60; i++) blobs[`shot${i}.png`] = { base64: big(225 * 1024) };
     const h = harness({ blobs });
@@ -380,6 +380,25 @@ describe("browsing a repository's images", () => {
     o.store.releasePreviews(target);
     o.store.releasePreviews(other);
     expect(o.store.previewFootprint()).toEqual({ count: 0, chars: 0 });
+  });
+
+  it("accepts logos larger than 512 KiB for tab marks, picker candidates, and previews", async () => {
+    const largePng = PNG + "A".repeat(700_000);
+    const largeSvg = `<svg xmlns="http://www.w3.org/2000/svg"><!-- ${"x".repeat(600 * 1024)} --></svg>`;
+    const h = harness({
+      files: { "/r": ["logo.png", "art/brand.svg"] },
+      blobs: { "logo.png": { base64: largePng }, "art/brand.svg": { text: largeSvg } },
+    });
+    h.store.request(target);
+    await flush();
+    expect(get(h.store)[target.key]).toMatchObject({
+      status: "ready",
+      path: "logo.png",
+      url: `data:image/png;base64,${largePng}`,
+    });
+    const offered = await h.store.candidates(target);
+    expect(offered.map((c) => c.path)).toEqual(["logo.png", "art/brand.svg"]);
+    expect(await h.store.preview(target, "art/brand.svg")).toMatch(/^data:image\/svg\+xml;base64,/);
   });
 
   it("shows a file chosen from the browser and keeps it", async () => {

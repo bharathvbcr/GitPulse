@@ -6,7 +6,6 @@ import {
   logoImagePaths,
   logoInitials,
   logoParentDir,
-  MAX_LOGO_BYTES,
   monogramColor,
   rankLogoCandidates,
   scoreLogoPath,
@@ -202,19 +201,25 @@ describe("logoDataUrl", () => {
     expect(logoDataUrl("notes.txt", { base64: b64(PNG_HEAD) })).toBeNull();
   });
 
-  it("refuses an image over the byte cap", () => {
-    const huge = "A".repeat(Math.ceil(MAX_LOGO_BYTES / 3) * 4 + 4);
-    expect(logoDataUrl("icon.png", { base64: huge })).toBeNull();
+  it("allows a raster image larger than 512 KiB", () => {
+    const large = b64(PNG_HEAD) + "A".repeat(700_000);
+    expect(logoDataUrl("icon.png", { base64: large })).toBe(`data:image/png;base64,${large}`);
   });
 
-  it("encodes an SVG read as text, and refuses text that is not an SVG", () => {
+  it("encodes an SVG read as text, including ones over 512 KiB, and refuses text that is not an SVG", () => {
     const svg = '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><title>é</title></svg>';
     const url = logoDataUrl("logo.svg", { text: svg });
     expect(url?.startsWith("data:image/svg+xml;base64,")).toBe(true);
     const decoded = new TextDecoder().decode(Uint8Array.from(atob(url!.split(",")[1]), (c) => c.charCodeAt(0)));
     expect(decoded).toBe(svg);
     expect(logoDataUrl("logo.svg", { text: "<html><script>alert(1)</script></html>" })).toBeNull();
-    expect(logoDataUrl("logo.svg", { text: `<svg>${"x".repeat(MAX_LOGO_BYTES)}</svg>` })).toBeNull();
+    const largeSvg = `<svg xmlns="http://www.w3.org/2000/svg"><!-- ${"x".repeat(600 * 1024)} --></svg>`;
+    const largeUrl = logoDataUrl("logo.svg", { text: largeSvg });
+    expect(largeUrl?.startsWith("data:image/svg+xml;base64,")).toBe(true);
+    const decodedLarge = new TextDecoder().decode(
+      Uint8Array.from(atob(largeUrl!.split(",")[1]), (c) => c.charCodeAt(0)),
+    );
+    expect(decodedLarge).toBe(largeSvg);
   });
 
   it("knows the other image signatures", () => {

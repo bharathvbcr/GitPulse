@@ -469,7 +469,7 @@ export function createRepoLogoStore(deps: RepoLogoDeps) {
 
     /**
      * One image's thumbnail: a URL, or null when the file is not a logo this
-     * app can draw (over the size cap, or not the image its name claims).
+     * app can draw (not the image its name claims).
      * Rejects when the read is refused, or when `signal` aborts before the
      * read starts; neither outcome is kept.
      */
