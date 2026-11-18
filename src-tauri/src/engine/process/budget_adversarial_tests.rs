@@ -33,6 +33,25 @@ fn open_in(dir: &tempfile::TempDir, name: &str) -> SharedBudget {
     SharedBudget::open(&dir.path().join(name)).expect("open")
 }
 
+/// Makes the record's bytes exactly `blob`, on the same file, without first
+/// truncating it to nothing as `fs::write` does. On Linux a truncation to zero
+/// drops the record's dirty page, so the next write dirties a fresh one and is
+/// charged 4 KiB again; the model below did that hundreds of thousands of
+/// times, 1.3 GiB of page-dirtying in one test that the disk-write watchdog
+/// counted (ubuntu-latest), though next to none of it reached the disk. The
+/// handles under test see the same bytes either way.
+fn put_record_bytes(path: &std::path::Path, blob: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    file.write_all(blob).unwrap();
+    file.set_len(blob.len() as u64).unwrap();
+}
+
 /// The pre-change decision: read, refill, take, and ALWAYS write. The oracle
 /// the skipped-write path must never beat.
 fn take_always_writing(
@@ -117,8 +136,8 @@ fn model(seed: u64, burst: u32, per_sec: u32, steps: u64) -> ModelResult {
                     }
                     _ => vec![0xFF; RECORD_LEN],
                 };
-                std::fs::write(dir.path().join("lane"), &blob).unwrap();
-                std::fs::write(dir.path().join("oracle"), &blob).unwrap();
+                put_record_bytes(&dir.path().join("lane"), &blob);
+                put_record_bytes(&dir.path().join("oracle"), &blob);
             }
         }
     }
