@@ -689,7 +689,7 @@
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
-            const heldCanvas = glCanvas(other);
+            const otherCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
@@ -705,10 +705,10 @@
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
                   msSinceHidden: Math.round(performance.now() - hiddenAt),
                   survivors: [...other.querySelectorAll("canvas")].map((node) => ({
-                    held: node === heldCanvas, className: node.className, parent: node.parentElement?.className ?? null,
+                    held: node === otherCanvas, className: node.className, parent: node.parentElement?.className ?? null,
                     size: `${node.width}x${node.height}`,
                   })),
-                  heldCanvasConnected: heldCanvas?.isConnected ?? null,
+                  heldCanvasConnected: otherCanvas?.isConnected ?? null,
                 }));
               })());
             button("Hide the terminal dock").click(); await wait(900);
