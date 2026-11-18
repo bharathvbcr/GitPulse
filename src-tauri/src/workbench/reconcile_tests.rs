@@ -1456,3 +1456,38 @@ fn a_hosted_run_that_cannot_be_read_stays_hosted() {
     );
     worker.shutdown();
 }
+
+/// A pass that panics must not stop later losses from being reconciled.
+#[cfg(unix)]
+#[test]
+fn a_panicking_lost_runs_pass_does_not_stop_the_next_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let serial = crate::harness::sidecar::test_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let state = host(&dir.path().join("profile.sqlite"));
+    let (_bound, worker) = fake_worker(&serial, dir.path());
+    let passes = Arc::new(AtomicUsize::new(0));
+    let counted = passes.clone();
+    super::watch_lost_runs_with(
+        &state,
+        &worker,
+        Arc::new(move |_| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the first pass fails");
+            }
+            Ok(())
+        }),
+    );
+    let limit = std::time::Duration::from_secs(20);
+    for (run, wanted) in [("x", 1), ("y", 2)] {
+        worker
+            .call("work.runs.managed.prepare", json!({"id": run}))
+            .unwrap();
+        assert!(worker.retire());
+        assert!(
+            crate::test_support::env::wait_until(limit, || passes.load(Ordering::SeqCst) >= wanted),
+            "loss {run}: no pass ran after the one that panicked"
+        );
+    }
+    worker.shutdown();
+}

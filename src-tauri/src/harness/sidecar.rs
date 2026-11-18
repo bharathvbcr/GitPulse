@@ -6332,8 +6332,14 @@ done
         .expect("judgement");
         assert!(verdict.is_object());
         assert_eq!(harness_dirs(fixture.root.path()).len(), 1);
+        let started = Instant::now();
         shutdown_for_hook_exit();
+        let took = started.elapsed();
         assert_eq!(harness_dirs(fixture.root.path()), Vec::<String>::new());
+        // The zero-grace kill and reap of a live child is bounded too: the
+        // host's budget for the hook leaves no room for a grace.
+        let limit = crate::test_support::coverage_relaxed(Duration::from_millis(500));
+        assert!(took < limit, "ending a live child took {took:?}");
     }
 
     /// A call that holds the slot when the hook exits must not hold the exit:

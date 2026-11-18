@@ -304,6 +304,18 @@ pub(super) fn watch_lost_runs(
     state: &WorkbenchState,
     worker: &crate::harness::sidecar::ProfileConnection,
 ) {
+    watch_lost_runs_with(state, worker, Arc::new(|state| sweep(state).map(|_| ())));
+}
+
+/// One reconcile pass over the store, as the lost-runs watcher runs it.
+type LostRunsPass = Arc<dyn Fn(&WorkbenchState) -> Result<(), WorkbenchError> + Send + Sync>;
+
+/// [`watch_lost_runs`] with the pass given, so a test can make one panic.
+fn watch_lost_runs_with(
+    state: &WorkbenchState,
+    worker: &crate::harness::sidecar::ProfileConnection,
+    pass: LostRunsPass,
+) {
     let inner = Arc::downgrade(&state.0);
     // `running`: a pass is in flight. `again`: a loss came in while it was, so
     // it runs once more when it ends. At most one pass at a time.
@@ -315,15 +327,25 @@ pub(super) fn watch_lost_runs(
         if running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (inner, running_flag, again_flag) = (inner.clone(), running.clone(), again.clone());
+        let (inner, running_flag, again_flag, pass) =
+            (inner.clone(), running.clone(), again.clone(), pass.clone());
         let started = crate::supervisor::spawn_one_of_many(
             "workbench-lost-runs",
             "lost run reconciliation",
             move || loop {
                 again_flag.store(false, Ordering::Release);
                 if let Some(inner) = inner.upgrade() {
-                    if let Err(error) = sweep(&WorkbenchState(inner)) {
-                        log::warn!(target: "workbench", "reconciling runs lost with their Manvi failed: {}: {}", error.code, error.message);
+                    // A panic in a pass must not leave `running` set: every
+                    // later loss would then see a pass in flight and return.
+                    let state = WorkbenchState(inner);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass(&state))) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            log::warn!(target: "workbench", "reconciling runs lost with their Manvi failed: {}: {}", error.code, error.message);
+                        }
+                        Err(_) => {
+                            log::error!(target: "workbench", "reconciling runs lost with their Manvi panicked");
+                        }
                     }
                 }
                 running_flag.store(false, Ordering::Release);
