@@ -74,7 +74,7 @@ GitPulse/
     ├── codeintel/        in-process DevMap reader & zero-copy worktree overlays
     ├── graph/            lanes, mainline pin, filter simplification
     ├── analyzer/         languages, LOC, coverage, deps, supply chain
-    ├── secrets/          Kingfisher secrets scanner
+    ├── secrets/          in-process secrets scan; Kingfisher as optional second opinion
     ├── ai/               commit briefs & on-device phrasing
     ├── harness/          MANVI policy gate
     ├── mcp/              MCP surface (reads, plus trust-gated task-board & worktree tools)
