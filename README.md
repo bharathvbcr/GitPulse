@@ -164,8 +164,8 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   phrasing with on-device Apple Intelligence fallback.
 - **Manage worktrees and branches.** Zero-round-trip branch churn carry-forward on branch mutations,
   DevMap-guided `--cone` sparse worktrees, `<512 B` zero-copy DevMap base pointers with Blake3/CAS delta overlays,
-  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`) plus lock-free `gitpulse-rustc` (`RUSTC_WRAPPER`)
-  shared CoW crate caching, parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
+  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`), an opt-in `gitpulse-rustc` (`RUSTC_WRAPPER`)
+  shared crate cache in the separately installed `gitpulse-worktree` CLI (the app itself does not use it), parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
   dead-branch cleanup with durable WAL tip backups and authorized delete actions, macOS pre-exec background QoS band isolation,
   named localhost routes via portless, and trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
