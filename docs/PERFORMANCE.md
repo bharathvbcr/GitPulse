@@ -936,7 +936,23 @@ attribute from the capped worktree rows. `resources::insights_document`
 `hooks::insights_from_app` (`COLLISION_APP_DEADLINE` 2 s) and reads the ledger
 and code graph itself. An answer from the app adds `served_by: {source: "app",
 age_ms}` to the document, declared in the tool's output schema and described in
-its description; a fallback adds nothing.
+its description. A fallback adds `app_unserved`, the reason the app's answer
+was not used (2026-11-17: before it the reason was logged only at Debug, which
+release builds do not write). Every document carries `stages_ms`, the
+milliseconds of each stage this process ran (`app_ask`, `observe`, `listing`,
+`main_status`, `worktree_status`, `derive`, `ledger`, `codeintel`; a stage that
+did not run here is absent, never 0), and over MCP `duration_ms` covers the
+whole call, the ask included.
+
+**`deadline_expired` means a cut, not a spent clock** (2026-11-17). It is set
+when the snapshot clock left a worktree unread, a status read failed or was
+killed under a spent clock, or a HEAD unmeasured, not merely when the clock had
+run out by the time the facets were derived. The parked-operation probe
+(control files, no process, about 0.3 ms a worktree in a debug build) runs
+whatever the clock says. Before, a pass whose every status read had finished
+but used the clock came back with `operation_ok: false` on every row and
+`deadline_expired: true`, and the asker refused it as partial: 4 of 7 complete
+answers from the running app were refused that way in one sample.
 
 **Where the answer comes from.** The same status cell and listing memo as the
 collision scan, with a shorter promise. The app reads with a clock that began

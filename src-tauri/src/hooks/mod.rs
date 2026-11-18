@@ -5454,6 +5454,7 @@ mod tests {
             },
             deadline_expired: false,
             duration_ms: 12,
+            stages_ms: Default::default(),
         }
     }
 
@@ -8167,10 +8168,19 @@ done
         let farm = farm(false);
         let canned = serve_insights(&farm.repo).expect("the app reads");
 
-        // No app registered for this repository: the MCP scans for itself.
+        // No app registered for this repository: the MCP scans for itself,
+        // and says why the app did not serve it and what asking cost.
         let alone = insights_document(&farm.repo);
         assert!(alone.get("served_by").is_none(), "{alone}");
         assert_eq!(alone["worktrees"]["ok"], json!(true));
+        assert!(
+            alone["app_unserved"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty()),
+            "{alone}"
+        );
+        assert!(alone["stages_ms"]["app_ask"].is_u64(), "{alone}");
+        assert!(alone["stages_ms"]["worktree_status"].is_u64(), "{alone}");
 
         // An app that answers.
         let app = app_for(&farm.repo, false);
@@ -8182,6 +8192,13 @@ done
         let cost = spawn_cost(&farm.dirs, &marks);
         assert_eq!(served["served_by"]["source"], json!("app"), "{served}");
         assert!(served["served_by"]["age_ms"].is_u64());
+        assert!(served.get("app_unserved").is_none(), "{served}");
+        assert!(served["stages_ms"]["app_ask"].is_u64(), "{served}");
+        // The git stages ran in the app: absent here, never a 0.
+        assert!(
+            served["stages_ms"].get("worktree_status").is_none(),
+            "{served}"
+        );
         assert_eq!((cost.status, cost.other), (0, 0), "{cost:?}");
         assert!(cost.worktree_list <= 1, "{cost:?}");
         assert_eq!(served["worktrees"]["count"], alone["worktrees"]["count"]);
@@ -8192,6 +8209,7 @@ done
             .attach_insights(std::sync::Arc::new(|_| Err("no read".into())));
         let refused = insights_document(&farm.repo);
         assert!(refused.get("served_by").is_none(), "{refused}");
+        assert_eq!(refused["app_unserved"], json!("no read"), "{refused}");
         assert_eq!(refused["worktrees"]["ok"], json!(true));
         assert_eq!(refused["worktrees"]["count"], alone["worktrees"]["count"]);
     }
@@ -8222,6 +8240,12 @@ done
                 .attach_insights(std::sync::Arc::new(move |_| Ok(reply.clone())));
             let document = insights_document(&farm.repo);
             assert!(document.get("served_by").is_none(), "{document}");
+            assert!(
+                document["app_unserved"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("partial")),
+                "{document}"
+            );
             assert_eq!(document["worktrees"]["ok"], json!(true));
         }
     }

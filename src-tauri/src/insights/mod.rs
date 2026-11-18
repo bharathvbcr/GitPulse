@@ -412,12 +412,54 @@ pub struct InsightsSnapshot {
     pub collisions: CollisionRisk,
     pub ledger: LedgerStatus,
     pub codeintel: CodeintelStatus,
-    /// True when [`SNAPSHOT_DEADLINE`] stopped the expensive stages early.
-    /// The facets they would have filled say so themselves — unprobed
-    /// worktrees carry `operation_ok: false`, and a collision scan that never
-    /// started is `ok: false` — so a partial snapshot is visibly partial.
+    /// True when [`SNAPSHOT_DEADLINE`] stopped a stage that starts git
+    /// children before it had read everything. The facets it would have filled
+    /// say so themselves — unread worktrees carry `dirty_files: null`, an
+    /// unmeasured HEAD a `divergence_note`, and a collision scan that never
+    /// started is `ok: false` — so a partial snapshot is visibly partial. A
+    /// clock that ran out after every read finished cut nothing and leaves it
+    /// false.
     pub deadline_expired: bool,
+    /// From before the live-session observation to the end of the snapshot;
+    /// over MCP, from the start of the ask of the app, whoever then read.
     pub duration_ms: u64,
+    /// Where `duration_ms` went, stage by stage. A stage this process did not
+    /// run (the app read the git facets, or a listing was supplied) is absent,
+    /// never 0.
+    #[serde(default)]
+    pub stages_ms: StageTimings,
+}
+
+/// Milliseconds spent in each stage of one snapshot. Each is `None` when the
+/// stage did not run in this process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageTimings {
+    /// Asking the running app before scanning here (MCP only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_ask: Option<u64>,
+    /// The process-table and session-registry observation of live agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe: Option<u64>,
+    /// `git worktree list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing: Option<u64>,
+    /// The main checkout's status, for `changes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_status: Option<u64>,
+    /// Every worktree's status, under the snapshot clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_status: Option<u64>,
+    /// Rows, operation probes, HEAD divergence, the collision scan and claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codeintel: Option<u64>,
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    since.elapsed().as_millis() as u64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -808,18 +850,21 @@ fn summarise_worktree(
 /// commit, detached or not, against the repository's default base. The one
 /// place those are set: [`summarise_worktree`] leaves them unmeasured so the
 /// fleet and context rows, which never pay for the read, cannot read as zero.
+/// Returns whether the clock left a HEAD unmeasured: a measurement already
+/// cached is served whatever the clock says, so a spent clock alone is not a
+/// cut.
 fn fill_head_divergence(
     repo_path: &str,
     items: &mut [WorktreeSummary],
     clock: &worktree::ScanDeadline,
-) {
+) -> bool {
     let heads: Vec<String> = items
         .iter()
         .filter(|item| !item.is_bare)
         .filter_map(|item| item.head.clone())
         .collect();
     if heads.is_empty() {
-        return;
+        return false;
     }
     let asked: Vec<&str> = heads.iter().map(String::as_str).collect();
     let measured = match validate_repo(repo_path) {
@@ -853,6 +898,7 @@ fn fill_head_divergence(
             }
         }
     }
+    measured.unread.is_some() && clock.expired()
 }
 
 /// Rolls per-worktree agent labels into counts.
@@ -1076,26 +1122,55 @@ pub(crate) fn snapshot_bounded(repo_path: &str, deadline: Duration) -> InsightsS
 /// repository. Sixty-five real worktrees to prove one boolean would be a slow,
 /// load-sensitive test of git rather than of this function.
 fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) -> InsightsSnapshot {
-    snapshot_observed(
+    // The observation walks the process table and every session registry; on a
+    // host with dozens of sessions it is not free, so it is inside the clock and
+    // inside `duration_ms` rather than before both.
+    let started = Instant::now();
+    let observation = live_sessions::observe();
+    let observed_ms = elapsed_ms(started);
+    snapshot_observed_from(
         repo_path,
+        started,
         deadline,
         max_worktrees,
-        &live_sessions::observe(),
+        &observation,
+        Some(observed_ms),
     )
 }
 
 /// [`snapshot_within`] over a live-session observation the caller made, so a
 /// test can place sessions without running agents.
+#[cfg(test)]
 fn snapshot_observed(
     repo_path: &str,
     deadline: Duration,
     max_worktrees: usize,
     observation: &live_sessions::Observation,
 ) -> InsightsSnapshot {
-    let started = Instant::now();
+    snapshot_observed_from(
+        repo_path,
+        Instant::now(),
+        deadline,
+        max_worktrees,
+        observation,
+        None,
+    )
+}
+
+/// The snapshot of a pass that began at `started`, with `observation` already
+/// made (`observed_ms` after `started`, when this process made it).
+fn snapshot_observed_from(
+    repo_path: &str,
+    started: Instant,
+    deadline: Duration,
+    max_worktrees: usize,
+    observation: &live_sessions::Observation,
+    observed_ms: Option<u64>,
+) -> InsightsSnapshot {
     // One clock for the whole pass, handed to every stage that can run long.
     let clock = worktree::ScanDeadline::after(started, deadline);
-    let read = read_git_facets(repo_path, &clock, max_worktrees, observation);
+    let mut read = read_git_facets(repo_path, &clock, max_worktrees, observation);
+    read.stages.observe = observed_ms;
     complete_snapshot(repo_path, started, read)
 }
 
@@ -1108,6 +1183,7 @@ struct GitFacets {
     changes: ChangesFacet,
     collisions: CollisionRisk,
     deadline_expired: bool,
+    stages: StageTimings,
 }
 
 /// Reads [`GitFacets`] against `clock`. A status any stage reads is accepted
@@ -1121,6 +1197,7 @@ fn read_git_facets(
     observation: &live_sessions::Observation,
 ) -> GitFacets {
     let read = read_listing(repo_path, clock, None);
+    let deriving = Instant::now();
     let derived = derive_facets(
         repo_path,
         clock,
@@ -1129,12 +1206,15 @@ fn read_git_facets(
         &read.listed,
         read.deadline_expired,
     );
+    let mut stages = read.stages;
+    stages.derive = Some(elapsed_ms(deriving));
     GitFacets {
         worktrees: derived.worktrees,
         agents: derived.agents,
         changes: read.changes,
         collisions: derived.collisions,
         deadline_expired: derived.deadline_expired,
+        stages,
     }
 }
 
@@ -1144,6 +1224,9 @@ struct ListingRead {
     listed: Result<Vec<WorktreeInfo>, CommandError>,
     changes: ChangesFacet,
     deadline_expired: bool,
+    /// `listing`, `main_status` and `worktree_status`; `listing` is absent
+    /// when the caller supplied the listing.
+    stages: StageTimings,
 }
 
 fn read_listing(
@@ -1153,11 +1236,21 @@ fn read_listing(
 ) -> ListingRead {
     // The listing alone: one process. The per-worktree status read is made
     // below, once, for the worktree rows and the collision scan together.
-    let mut listed = listing.unwrap_or_else(|| worktree::list_worktrees_lite(repo_path));
+    let mut stages = StageTimings::default();
+    let mut listed = match listing {
+        Some(listing) => listing,
+        None => {
+            let listing_began = Instant::now();
+            let listed = worktree::list_worktrees_lite(repo_path);
+            stages.listing = Some(elapsed_ms(listing_began));
+            listed
+        }
+    };
     let mut deadline_expired = false;
 
     // The main checkout is read here, for the changes facet, and its row below
     // takes this same read: a pass reads each worktree once.
+    let main_began = Instant::now();
     let changes = match GitReader::get_status_since(repo_path, clock.started()) {
         // The facet carries counts, not rows, and the whole status is already
         // in memory: count every file. Counting only the first
@@ -1165,6 +1258,7 @@ fn read_listing(
         Ok(files) => changes_from_status(&files, false),
         Err(error) => empty_changes(error.into_message()),
     };
+    stages.main_status = Some(elapsed_ms(main_began));
 
     // The only `git status` of each worktree this snapshot makes, and the last
     // git read it makes: the rows' dirty counts and the collision scan's paths
@@ -1173,14 +1267,17 @@ fn read_listing(
     // the same clock as everything else; a worktree it did not reach stays
     // unknown in both facets rather than reading as clean in either.
     if let Ok(list) = &mut listed {
+        let statuses_began = Instant::now();
         if worktree::read_dirty(list, clock) > 0 {
             deadline_expired = true;
         }
+        stages.worktree_status = Some(elapsed_ms(statuses_began));
     }
     ListingRead {
         listed,
         changes,
         deadline_expired,
+        stages,
     }
 }
 
@@ -1215,20 +1312,21 @@ fn derive_facets(
                 .iter()
                 .take(max_worktrees)
                 .map(|info| {
-                    // `detect_operation` reads control files and starts no
-                    // process, so this stage's cost is bounded by the number of
-                    // worktrees; the clock still ends it early on a host too
-                    // slow to read even those.
-                    if clock.expired() {
-                        deadline_expired = true;
-                        return summarise_worktree(info, String::new(), false);
-                    }
+                    // `detect_operation` reads a few control files and starts
+                    // no process (about 0.3 ms a worktree in a debug build), so
+                    // it runs whatever the clock says. Skipping it cost every
+                    // row its operation: a pass whose status reads had used up
+                    // the clock came back with `operation_ok: false` on every
+                    // worktree and was refused as partial by every asker,
+                    // although every git read in it had finished.
                     let (kind, probed) = detect_operation(&info.path);
                     summarise_worktree(info, kind, probed)
                 })
                 .collect();
             let mut facet = worktree_facet(list.len() as u32, truncated, items);
-            fill_head_divergence(repo_path, &mut facet.items, clock);
+            if fill_head_divergence(repo_path, &mut facet.items, clock) {
+                deadline_expired = true;
+            }
             // The same `truncated` the facet carries: these counts are rolled
             // from `facet.items`, which is the capped list, so a repository
             // past the cap must not report its floor as an exact count.
@@ -1243,13 +1341,21 @@ fn derive_facets(
 
     let mut collisions = match listed {
         Ok(list) => {
-            if clock.expired() {
-                deadline_expired = true;
-            }
             // Past the clock the scan spawns nothing: it uses the statuses
             // already read and counts every worktree it has none for as
             // unscanned, with `ok: false` and the reason — never
-            // `overlapping_files: 0` for a scan that did not look.
+            // `overlapping_files: 0` for a scan that did not look. A spent
+            // clock over statuses that were all read cut nothing; one over a
+            // worktree that is unread, or whose read failed (a read the clock
+            // killed mid-flight is recorded as failed, not cut), may have, so
+            // it keeps the flag.
+            if clock.expired()
+                && list.iter().any(|info| {
+                    !info.is_bare && !matches!(info.status_read, StatusRead::Read { .. })
+                })
+            {
+                deadline_expired = true;
+            }
             collision_from_list(list, &live, Some(clock))
         }
         Err(error) => empty_collisions(error.message().to_string()),
@@ -1276,6 +1382,7 @@ fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> Insi
         changes,
         collisions,
         deadline_expired,
+        mut stages,
     } = read;
     let main_worktree = worktrees.items.iter().find(|w| w.is_main);
     let branch = main_worktree.and_then(|w| w.branch.clone());
@@ -1290,6 +1397,7 @@ fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> Insi
     // when the first event is *recorded*, which is the honest moment for it to;
     // until then `not_initialised` is the true answer rather than one arranged
     // by writing to the user's repository so that "recording" could be said.
+    let ledger_began = Instant::now();
     let ledger = match crate::ledger::bindings::repository_status_readonly(repo_path) {
         Ok(status) => status,
         Err(error) => crate::ledger::LedgerStatus {
@@ -1306,6 +1414,10 @@ fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> Insi
             freshness: crate::ledger::Freshness::unavailable(error.to_string()),
         },
     };
+    stages.ledger = Some(elapsed_ms(ledger_began));
+    let codeintel_began = Instant::now();
+    let codeintel = codeintel::status(repo_path);
+    stages.codeintel = Some(elapsed_ms(codeintel_began));
 
     InsightsSnapshot {
         repo_path: repo_path.to_string(),
@@ -1316,9 +1428,10 @@ fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> Insi
         changes,
         collisions,
         ledger,
-        codeintel: codeintel::status(repo_path),
+        codeintel,
         deadline_expired,
-        duration_ms: started.elapsed().as_millis() as u64,
+        duration_ms: elapsed_ms(started),
+        stages_ms: stages,
     }
 }
 
@@ -5047,19 +5160,21 @@ mod tests {
         assert!(whole.worktrees.items.iter().all(|w| w.operation_ok));
         assert_eq!(whole.worktrees.blocked_unknown, 0);
 
-        // Zero budget: the fixed-cost stages still run, and every stage whose
-        // cost grows with the worktree count is skipped and says so.
+        // Zero budget: the fixed-cost stages still run, and every stage that
+        // starts a git child per worktree is skipped and says so. The parked-
+        // operation probe starts none (it reads control files), so it still
+        // runs: skipping it cost every row its operation for no time saved.
         let rushed = snapshot_within(repo, Duration::ZERO, MAX_SNAPSHOT_WORKTREES);
         assert!(rushed.deadline_expired, "{rushed:?}");
         assert!(rushed.worktrees.ok, "{:?}", rushed.worktrees);
         assert_eq!(rushed.worktrees.count, 3);
         assert!(rushed.changes.ok, "{:?}", rushed.changes);
         assert!(
-            rushed.worktrees.items.iter().all(|w| !w.operation_ok),
+            rushed.worktrees.items.iter().all(|w| w.operation_ok),
             "{:?}",
             rushed.worktrees.items
         );
-        assert_eq!(rushed.worktrees.blocked_unknown, 3);
+        assert_eq!(rushed.worktrees.blocked_unknown, 0);
         // A collision scan that never started must not arrive as "no overlaps".
         assert!(!rushed.collisions.ok, "{:?}", rushed.collisions);
         assert!(
@@ -5070,6 +5185,100 @@ mod tests {
         assert_eq!(rushed.collisions.scanned_worktrees, 0);
         assert!(whole.collisions.overlapping_files > 0);
         assert_eq!(rushed.collisions.overlapping_files, 0);
+    }
+
+    /// A clock that ran out after every status read had finished cut nothing,
+    /// so the pass is not partial: every row keeps its parked-operation probe
+    /// (control files, no process) and `deadline_expired` stays false. The
+    /// app's answers were refused whole by every asker for exactly this
+    /// (2026-11-17: all seven worktrees read, `operation_ok: false` on each).
+    #[test]
+    fn a_clock_spent_after_every_read_finished_is_not_a_partial_pass() {
+        let (main, _doomed) = repo_with_a_worktree_to_break();
+        let repo = main.path().to_str().unwrap();
+        let generous = worktree::ScanDeadline::after(Instant::now(), SNAPSHOT_DEADLINE);
+        let read = read_listing(repo, &generous, None);
+        assert!(
+            !read.deadline_expired,
+            "the reads themselves ran out of time"
+        );
+        // Divergence is measured once with time to spare, so the spent pass
+        // below finds it cached, as a repeated ask does.
+        let warm = derive_facets(
+            repo,
+            &generous,
+            MAX_SNAPSHOT_WORKTREES,
+            &Vec::new(),
+            &read.listed,
+            false,
+        );
+        assert!(!warm.deadline_expired, "{:?}", warm.worktrees);
+
+        let spent = worktree::ScanDeadline::after(Instant::now(), Duration::ZERO);
+        let derived = derive_facets(
+            repo,
+            &spent,
+            MAX_SNAPSHOT_WORKTREES,
+            &Vec::new(),
+            &read.listed,
+            read.deadline_expired,
+        );
+        assert!(
+            derived.worktrees.items.iter().all(|w| w.operation_ok),
+            "{:?}",
+            derived.worktrees.items
+        );
+        assert_eq!(derived.worktrees.blocked_unknown, 0);
+        assert!(derived.collisions.ok, "{:?}", derived.collisions);
+        assert_eq!(derived.collisions.unscanned_worktrees, 0);
+        assert!(
+            !derived.deadline_expired,
+            "a pass that cut nothing was marked partial"
+        );
+
+        // The same spent clock over a listing whose statuses were never read
+        // did cut the collision scan, and says so.
+        let mut unread = read.listed.clone().expect("listed");
+        for info in &mut unread {
+            info.status_read = StatusRead::NotRead;
+        }
+        let cut = derive_facets(
+            repo,
+            &spent,
+            MAX_SNAPSHOT_WORKTREES,
+            &Vec::new(),
+            &Ok(unread),
+            false,
+        );
+        assert!(cut.deadline_expired, "{:?}", cut.collisions);
+        assert!(!cut.collisions.ok, "{:?}", cut.collisions);
+
+        // A read the clock killed mid-flight is recorded as failed, not cut:
+        // under a spent clock it still marks the pass partial.
+        let mut killed = read.listed.clone().expect("listed");
+        killed[1].status_read = StatusRead::Failed(CommandError::from(
+            "git status timed out after 3.37s".to_string(),
+        ));
+        let timed_out = derive_facets(
+            repo,
+            &spent,
+            MAX_SNAPSHOT_WORKTREES,
+            &Vec::new(),
+            &Ok(killed),
+            false,
+        );
+        assert!(timed_out.deadline_expired, "{:?}", timed_out.collisions);
+    }
+
+    /// A snapshot written before `stages_ms` existed (an older app or MCP)
+    /// still reads, with every stage absent.
+    #[test]
+    fn a_snapshot_without_stage_timings_still_deserializes() {
+        let main = init_repo();
+        let mut old = serde_json::to_value(snapshot(main.path().to_str().unwrap())).unwrap();
+        old.as_object_mut().unwrap().remove("stages_ms");
+        let read: InsightsSnapshot = serde_json::from_value(old).expect("old shape");
+        assert_eq!(read.stages_ms, StageTimings::default());
     }
 
     #[test]
