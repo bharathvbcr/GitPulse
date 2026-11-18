@@ -243,14 +243,20 @@ fn note_ended(state: &WorkbenchState, run: &Value) {
     let Some(id) = run["id"].as_str().filter(|_| run["kind"] == "managed") else {
         return;
     };
-    let live = run["state"]
-        .as_str()
-        .is_some_and(|s| s == "prepared" || HELD.contains(&s));
-    if !live {
+    if run["state"].as_str().is_some_and(is_terminal) {
         if let Some(worker) = live_worker(state) {
             worker.runs_ended(&[id.to_owned()]);
         }
     }
+}
+
+/// The states no lifecycle method leaves (`vendored/dc-store/src/workbench/runs.rs`
+/// `TERMINAL`). Named, not inferred from "not held": a state this build does
+/// not know is not proof a run is over.
+const TERMINAL: [&str; 3] = ["exited", "failed", "cancelled"];
+
+fn is_terminal(state: &str) -> bool {
+    TERMINAL.contains(&state)
 }
 
 /// How many hosted runs one pass reads. A child hosts a handful; past this the
@@ -272,10 +278,11 @@ fn forget_ended_hosted(
     for id in hosted.iter().take(MAX_HOSTED_READS) {
         match read(id) {
             Ok(saved) => match saved["item"]["state"].as_str() {
-                Some(state) if state != "prepared" && !HELD.contains(&state) => {
-                    ended.push(id.clone());
+                Some(state) if is_terminal(state) => ended.push(id.clone()),
+                Some(state) if state == "prepared" || HELD.contains(&state) => {}
+                Some(state) => {
+                    log::warn!(target: "workbench", "run {id} is in state {state:?}, which this build does not know; it stays counted as hosted");
                 }
-                Some(_) => {}
                 None => {
                     log::warn!(target: "workbench", "run {id} has no readable state; it stays counted as hosted");
                 }
@@ -298,27 +305,38 @@ pub(super) fn watch_lost_runs(
     worker: &crate::harness::sidecar::ProfileConnection,
 ) {
     let inner = Arc::downgrade(&state.0);
-    let pending = Arc::new(AtomicBool::new(false));
+    // `running`: a pass is in flight. `again`: a loss came in while it was, so
+    // it runs once more when it ends. At most one pass at a time.
+    let running = Arc::new(AtomicBool::new(false));
+    let again = Arc::new(AtomicBool::new(false));
     worker.on_runs_lost(Arc::new(move |runs| {
         log::warn!(target: "workbench", "the agent runtime was replaced after it stopped answering; run(s) it may have hosted: {}", runs.join(", "));
-        if pending.swap(true, Ordering::AcqRel) {
+        again.store(true, Ordering::Release);
+        if running.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (inner, flag) = (inner.clone(), pending.clone());
-        let started = crate::supervisor::spawn_once(
+        let (inner, running_flag, again_flag) = (inner.clone(), running.clone(), again.clone());
+        let started = crate::supervisor::spawn_one_of_many(
             "workbench-lost-runs",
             "lost run reconciliation",
-            move || {
-                flag.store(false, Ordering::Release);
+            move || loop {
+                again_flag.store(false, Ordering::Release);
                 if let Some(inner) = inner.upgrade() {
                     if let Err(error) = sweep(&WorkbenchState(inner)) {
                         log::warn!(target: "workbench", "reconciling runs lost with their Manvi failed: {}: {}", error.code, error.message);
                     }
                 }
+                running_flag.store(false, Ordering::Release);
+                // A loss that arrived after the pass read the store asks for
+                // another; take the right to run it unless a new thread has.
+                if !again_flag.load(Ordering::Acquire) || running_flag.swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
             },
         );
         if let Err(error) = started {
-            pending.store(false, Ordering::Release);
+            running.store(false, Ordering::Release);
             log::warn!(target: "workbench", "could not start reconciling runs lost with their Manvi: {error}");
         }
     }));

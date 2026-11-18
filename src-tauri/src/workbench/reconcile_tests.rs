@@ -1367,9 +1367,11 @@ fn a_run_hosted_by_a_child_that_went_silent_is_recorded_released_once_it_is_repl
     worker.shutdown();
 }
 
-/// The race the walk-based decision lost: a run moves from prepared to
-/// starting after the hosted runs were read and before they are judged. It is
-/// live, and stays hosted.
+/// Guards the per-run decision: a run that moves from prepared to starting
+/// after the hosted runs were read and before they are judged is judged on its
+/// state now, live, and stays hosted. The seam sits before the decision, so
+/// this does not reproduce the old walk-based race (a run missed between two
+/// walks); it pins that nothing decides from the earlier read.
 #[cfg(unix)]
 #[test]
 fn a_run_that_starts_while_the_sweep_decides_stays_hosted() {
@@ -1423,15 +1425,22 @@ fn a_hosted_run_that_cannot_be_read_stays_hosted() {
     let serial = crate::harness::sidecar::test_serial();
     let dir = tempfile::tempdir().unwrap();
     let (_bound, worker) = fake_worker(&serial, dir.path());
-    for id in ["busy", "blank", "gone", "done"] {
+    for id in ["busy", "blank", "gone", "done", "odd"] {
         worker
             .call("work.runs.managed.prepare", json!({"id": id}))
             .unwrap();
     }
     super::forget_ended_hosted(
         &worker,
-        vec!["busy".into(), "blank".into(), "gone".into(), "done".into()],
+        vec![
+            "busy".into(),
+            "blank".into(),
+            "gone".into(),
+            "done".into(),
+            "odd".into(),
+        ],
         |id| match id {
+            "odd" => Ok(json!({"item": {"state": "mystery"}})),
             "busy" => Err(crate::workbench::WorkbenchError::new(
                 "store_busy",
                 "locked",
@@ -1443,7 +1452,7 @@ fn a_hosted_run_that_cannot_be_read_stays_hosted() {
     );
     assert_eq!(
         worker.hosted_runs(),
-        Some(vec!["blank".into(), "busy".into()])
+        Some(vec!["blank".into(), "busy".into(), "odd".into()])
     );
     worker.shutdown();
 }

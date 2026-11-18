@@ -266,12 +266,11 @@ fn the_longest_managed_deadline_follows_what_the_child_advertised() {
     let table = MANAGED_OPS.iter().map(|op| op_deadline(op)).max().unwrap();
     // The bound with nothing advertised is the table's longest.
     let none = HelloResult::default();
+    // The method itself, on a sidecar whose handshake said `hello`.
     let bound = |hello: &HelloResult| {
-        MANAGED_OPS
-            .iter()
-            .map(|op| advertised_timeout(hello, op).unwrap_or_else(|| op_deadline(op)))
-            .max()
-            .unwrap()
+        let mut sidecar = super::tests::scripted_sidecar("exit 0", WRITE_DEADLINE);
+        sidecar.hello = hello.clone();
+        sidecar.longest_managed_deadline()
     };
     assert_eq!(bound(&none), table);
     let limit = |ms: u64| OpLimit {
