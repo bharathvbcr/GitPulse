@@ -23,6 +23,19 @@ fn path_of(dir: &TempDir) -> String {
     dir.path().to_str().expect("utf-8 temp path").to_string()
 }
 
+/// Held by every test that starts Kingfisher. Starting a scan claims the
+/// process-wide newest-request ticket and cancels whichever scan claimed it
+/// before (`run::ScanTicket::claim`), and one scan runs at a time, so two of
+/// these tests in parallel cancel each other: the queued one is superseded
+/// before its stub starts ("stub never ran", "superseded by a newer secrets
+/// scan"). That is the product contract, not a test fault, so the tests take
+/// turns. Poison-tolerant: one failing test must not fail the rest.
+fn kingfisher_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A stub `kingfisher` that records that it ran and reports a clean tree.
 fn stub(dir: &Path) -> PathBuf {
     stub_with(dir, "", "exit 0")
@@ -144,6 +157,7 @@ fn a_listing_failure_is_a_failed_scan_not_a_clean_one() {
 
 #[test]
 fn an_explicit_scan_runs_kingfisher_after_the_in_process_scan_and_keeps_both() {
+    let _turn = kingfisher_turn();
     let dir = repo_with_plants();
     let bin = TempDir::new().unwrap();
     let kingfisher = stub(bin.path());
@@ -172,6 +186,7 @@ fn an_explicit_scan_runs_kingfisher_after_the_in_process_scan_and_keeps_both() {
 
 #[test]
 fn kingfisher_rows_are_the_union_and_a_shared_path_and_line_is_one_row() {
+    let _turn = kingfisher_turn();
     let dir = repo_with_plants();
     write(dir.path(), ".gitignore", "local.env\n");
     write(dir.path(), "local.env", "x\n");
@@ -220,6 +235,7 @@ fn kingfisher_rows_are_the_union_and_a_shared_path_and_line_is_one_row() {
 
 #[test]
 fn a_failed_kingfisher_never_changes_the_primary_result() {
+    let _turn = kingfisher_turn();
     let dir = repo_with_plants();
     let clean = scan_working_tree_with(&path_of(&dir), false, || None).expect("scan runs");
     // Exit 1 is not a success exit; a signal death and a missing envelope are
@@ -414,6 +430,7 @@ fn a_union_that_fits_the_display_cap_is_not_marked_cut() {
 
 #[test]
 fn the_unavailable_reason_is_fixed_wording_never_kingfisher_output() {
+    let _turn = kingfisher_turn();
     let dir = repo_with_plants();
     let secret = token();
     // Each stub writes the planted token to stdout and stderr, then ends the
