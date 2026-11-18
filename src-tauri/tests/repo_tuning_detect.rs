@@ -140,7 +140,7 @@ fn registration_and_tuning_keys_come_from_git_s_own_config() {
     let canonical = std::fs::canonicalize(dir.path()).unwrap();
     let block = format!(
         "\n[maintenance]\n\trepo = {}\n\tstrategy = incremental\n[core]\n\tuntrackedCache = true\n",
-        canonical.display()
+        common::env::git_config_value(&canonical.to_string_lossy())
     );
     let files = [global, home_config];
     let originals: Vec<Option<String>> = files
@@ -190,7 +190,10 @@ fn detection_spawns_no_git_process() {
     let _g = serial();
     let dir = repo_with_files(3);
     let log = dir.path().join("trace2.jsonl");
-    let arm = format!("\n[trace2]\n\teventTarget = {}\n", log.display());
+    let arm = format!(
+        "\n[trace2]\n\teventTarget = {}\n",
+        common::env::git_config_value(&log.to_string_lossy())
+    );
     let files = [
         PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").expect("hermetic config")),
         PathBuf::from(std::env::var_os("HOME").expect("hermetic HOME")).join(".gitconfig"),

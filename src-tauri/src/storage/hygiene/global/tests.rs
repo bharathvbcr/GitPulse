@@ -554,10 +554,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
         fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let mut c = config(&cleaner, &root);
@@ -747,10 +744,7 @@ fn policy_edits_inside_the_execution_gate_preserve_real_artifacts() {
     fs::write(cache.join("a.pyc"), "bytecode").unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
     for path in [cache.clone(), cache.join("a.pyc")] {
-        fs::File::open(path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        crate::test_support::set_modified(&path, old).unwrap();
     }
     let saved = cleaner.save(config(&cleaner, &root)).unwrap();
     cleaner
@@ -1080,10 +1074,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
         fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let blocked = root.join("unread/.unreadable");
@@ -1269,10 +1260,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         // non-bytecode content before it reads a stamp.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
         for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     let blocked = root.join("unread/__pycache__/blocked");
@@ -1412,10 +1400,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 4096]).unwrap();
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
     for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
-        fs::File::open(p)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        crate::test_support::set_modified(&p, old).unwrap();
     }
 
     // Enough artifact directories to push the report past its reporting cap,
@@ -1634,10 +1619,7 @@ fn aged_bytecode_repo(
         let file = cache.join("module.pyc");
         fs::write(&file, vec![b'x'; bytes]).unwrap();
         for p in [file, cache] {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         }
     }
     r
@@ -1960,10 +1942,7 @@ fn every_reclaim_scope_is_off_by_default_and_absent_from_saved_state() {
 #[cfg(unix)]
 fn set_old(path: &std::path::Path) {
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
-    fs::File::open(path)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(old))
-        .unwrap();
+    crate::test_support::set_modified(&path, old).unwrap();
 }
 
 /// A Cargo repository on `main` with one linked worktree under
@@ -3206,10 +3185,7 @@ fn old_cargo_target(dir: &std::path::Path) {
         dir.join("debug"),
         dir.to_path_buf(),
     ] {
-        fs::File::open(path)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(when))
-            .unwrap();
+        crate::test_support::set_modified(&path, when).unwrap();
     }
 }
 
@@ -3353,9 +3329,7 @@ fn agent_scratch_builds_are_previewed_then_removed_end_to_end() {
 fn quiet_session_folder(scratchpad: &std::path::Path) {
     let when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
     let set = |p: &std::path::Path| {
-        if let Ok(file) = fs::File::open(p) {
-            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
-        }
+        let _ = crate::test_support::set_modified(p, when);
     };
     for entry in fs::read_dir(scratchpad).into_iter().flatten().flatten() {
         set(&entry.path());
@@ -3763,10 +3737,7 @@ fn a_target_shaped_like_a_real_cargo_target_with_hard_links_is_completed() {
     let shape = |target: &std::path::Path| {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
         let set = |p: &std::path::Path| {
-            fs::File::open(p)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(old))
-                .unwrap();
+            crate::test_support::set_modified(&p, old).unwrap();
         };
         for dir in ["debug/deps", "debug/incremental/crate-1", "debug/build/out"] {
             fs::create_dir_all(target.join(dir)).unwrap();

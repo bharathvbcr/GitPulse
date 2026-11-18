@@ -271,6 +271,29 @@ pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::
     std::fs::write(path, format!("{GIT_MAINTENANCE_PIN}{extra}"))
 }
 
+/// `text` as one git config value: double-quoted, with `\` and `"` escaped.
+///
+/// A config value is not a raw string. Git reads a backslash as an escape and
+/// accepts only `\\`, `\"`, `\n`, `\t` and `\b`, so `file = C:\Users\x` is
+/// `fatal: bad config line N` on Windows, and a path containing `#` or `;`
+/// would be cut at the comment. Every fixture that writes a path (or any text
+/// it did not author) into config text goes through here.
+pub(crate) fn git_config_value(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\t' => quoted.push_str("\\t"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Names the per-process root. Its presence means this process is already
 /// hermetic: either a second `include!` of this file in the same crate ran the
 /// constructor first, or this process was spawned by a hermetic test process

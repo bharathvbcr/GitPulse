@@ -19,12 +19,7 @@ fn temp_root() -> (tempfile::TempDir, PathBuf) {
 /// Sets every entry under `path` (and `path`) modified `days` days ago.
 fn age(path: &Path, days: u64) {
     let when = SystemTime::now() - Duration::from_secs(days * 86_400);
-    let set = |p: &Path| {
-        fs::File::open(p)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(when))
-            .unwrap();
-    };
+    let set = |p: &Path| crate::test_support::set_modified(p, when).unwrap();
     let mut stack = vec![path.to_path_buf()];
     let mut all = Vec::new();
     while let Some(next) = stack.pop() {
@@ -58,9 +53,7 @@ fn cargo_target(dir: &Path, days_old: u64) {
 fn quiet_sessions(root: &Path, days: u64) {
     let when = SystemTime::now() - Duration::from_secs(days * 86_400);
     let set = |p: &Path| {
-        if let Ok(file) = fs::File::open(p) {
-            let _ = file.set_times(fs::FileTimes::new().set_modified(when));
-        }
+        let _ = crate::test_support::set_modified(p, when);
     };
     let Ok(users) = fs::read_dir(root) else {
         return;
@@ -1768,10 +1761,7 @@ fn a_session_folder_whose_age_cannot_be_read_or_trusted_is_not_quiet() {
     fs::remove_dir_all(&tasks).unwrap();
     // A modification time in the future keeps it.
     let future = SystemTime::now() + Duration::from_secs(10 * 86_400);
-    fs::File::open(pad.join("..").join("scratchpad"))
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(future))
-        .unwrap();
+    crate::test_support::set_modified(&pad.join("..").join("scratchpad"), future).unwrap();
     let refusal = session_quiet(&session, &ctx).unwrap_err();
     assert!(
         matches!(&refusal, Refusal::Kept(why) if why.contains("future")),
@@ -2075,9 +2065,7 @@ fn each_parent_has_its_own_first_removal_instant() {
     removals.note_removal(&session, &pad, t - 600);
     removals.note_removal(&session, &wrapper, t - 300);
     // A change to the wrapper dated between the two instants.
-    fs::File::open(&wrapper)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(450)))
+    crate::test_support::set_modified(&wrapper, SystemTime::now() - Duration::from_secs(450))
         .unwrap();
     let cancel = AtomicBool::new(false);
     let live = nobody();
@@ -2087,9 +2075,7 @@ fn each_parent_has_its_own_first_removal_instant() {
         "dated before the wrapper's own first removal, so it is a session's doing"
     );
     // At or after its own instant it is the run's.
-    fs::File::open(&wrapper)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(200)))
+    crate::test_support::set_modified(&wrapper, SystemTime::now() - Duration::from_secs(200))
         .unwrap();
     assert!(session_quiet(&session, &ctx).is_ok());
 }

@@ -242,6 +242,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         );
     }
     let dir = plain_git_path(dir);
+    let plain_args: Vec<String> = args.iter().map(|arg| plain_git_arg(arg)).collect();
     let mut command = Command::new("git");
     command
         .args([
@@ -252,7 +253,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
             "-c",
             "commit.gpgsign=false",
         ])
-        .args(args)
+        .args(&plain_args)
         .current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -267,12 +268,57 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
-        "git {args:?} failed with {}",
-        output.status
+        "git {args:?} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
     if args.first() == Some(&"init") {
         trust_repo(&dir);
     }
+}
+
+/// Sets the modification time of a file or directory.
+///
+/// `File::open(dir).set_times(..)` is `Access is denied` on Windows twice over:
+/// opening a directory needs `FILE_FLAG_BACKUP_SEMANTICS`, and `set_times`
+/// needs write-attribute access, which a read-only open does not carry. This
+/// asks for exactly those two things, and is the plain open elsewhere.
+#[cfg(test)]
+pub(crate) fn set_modified(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true);
+        if path.is_dir() {
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+    }
+    #[cfg(not(windows))]
+    options.read(true);
+    options
+        .open(path)?
+        .set_times(fs::FileTimes::new().set_modified(when))
+}
+
+/// `arg` in the spelling git takes on its command line.
+///
+/// Fixtures spell directories with `canonicalize()`, which on Windows answers
+/// `\\?\C:\...`, and hand them to git as a worktree target, a clone source or a
+/// remote URL (bare or as `file://`). Git refuses that form -- `could not
+/// create leading directories ... Invalid argument`, `fatal: Cannot resolve` --
+/// so the prefix is dropped here, once, for every fixture command. Any other
+/// argument, and a path with no ordinary spelling, is returned unchanged.
+/// Compiled on every host so the rewrite is tested where the suite is run.
+#[cfg(test)]
+pub(crate) fn plain_git_arg(arg: &str) -> String {
+    use crate::engine::process::simplified_windows_path;
+    if let Some(path) = arg.strip_prefix("file://") {
+        return simplified_windows_path(path)
+            .map_or_else(|| arg.to_string(), |p| format!("file://{p}"));
+    }
+    simplified_windows_path(arg).unwrap_or_else(|| arg.to_string())
 }
 
 /// What git reads from the environment besides [`STRIPPED_GIT_ENV`], that a
@@ -399,6 +445,44 @@ pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod pin_adversary_tests;
+
+#[cfg(test)]
+mod config_value_tests;
+
+#[cfg(test)]
+mod fs_time_tests;
+
+#[cfg(test)]
+mod plain_git_arg_tests {
+    use super::plain_git_arg;
+
+    #[test]
+    fn a_verbatim_path_is_plain_for_git_as_a_bare_argument_and_as_a_file_url() {
+        assert_eq!(
+            plain_git_arg(r"\\?\C:\Users\runneradmin\Temp\wt"),
+            r"C:\Users\runneradmin\Temp\wt"
+        );
+        assert_eq!(
+            plain_git_arg(r"file://\\?\C:\Users\runneradmin\Temp\src"),
+            r"file://C:\Users\runneradmin\Temp\src"
+        );
+        assert_eq!(plain_git_arg(r"\\?\UNC\srv\share\r"), r"\\srv\share\r");
+    }
+
+    #[test]
+    fn anything_else_is_left_alone() {
+        for arg in [
+            "HEAD:refs/heads/x",
+            "-b",
+            "/tmp/repo",
+            r"C:\plain\path",
+            r"\\?\Volume{1234}\x",
+            "file:///tmp/x",
+        ] {
+            assert_eq!(plain_git_arg(arg), arg);
+        }
+    }
+}
 
 #[cfg(test)]
 mod plain_path_tests {
