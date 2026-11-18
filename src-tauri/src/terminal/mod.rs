@@ -30,6 +30,7 @@ pub mod port_probe;
 mod readiness;
 mod ring;
 pub mod scratch_media;
+mod screen_feed;
 pub mod session_ledger;
 pub mod shell_integration;
 mod sink;
