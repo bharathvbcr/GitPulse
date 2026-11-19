@@ -588,6 +588,9 @@ describe("SettingsModal Manvi cards in Agents", () => {
     expect(agents).toContain('data-setting="local-model-servers"');
     expect(agents).toContain('id="manvi-section-harness"');
     expect(agents).toContain('id="manvi-section-model"');
+    const plateIds = [...agents.matchAll(/id="([^"]*-manvi-plate)"/g)].map((m) => m[1]);
+    expect(plateIds.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(plateIds).size).toBe(plateIds.length);
   });
 
   it("renders the External CLIs panel once, never again inside a Manvi card", () => {

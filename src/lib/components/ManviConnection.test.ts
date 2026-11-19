@@ -14,6 +14,7 @@ const source = readFileSync(
 describe("ManviConnection capability truth", () => {
   it("distinguishes the user PTY from scoped model-authored execution", () => {
     const { body } = render(ManviConnection);
+    expect(body).toContain('data-brand-mark="manvi"');
     expect(body).toContain("Manvi policy");
     expect(body).toContain("Capability boundary");
     expect(body).toContain("Interactive shell");

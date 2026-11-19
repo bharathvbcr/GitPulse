@@ -14,6 +14,7 @@ const source = readFileSync(
 describe("LocalModelServers", () => {
   it("renders the card heading and the Claude model control it sits with", () => {
     const { body } = render(LocalModelServers);
+    expect(body).toContain('data-brand-mark="manvi"');
     expect(body).toContain("Local model servers");
     expect(body).toContain("Manvi's model");
     expect(body).not.toContain("Harness &amp; AI");

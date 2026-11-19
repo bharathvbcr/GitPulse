@@ -12,6 +12,7 @@
   import { CLAUDE_MODELS } from "../workbench/taskModel";
   import { claudeKey, claudeKeyProblem, type ClaudeCredentialStatus } from "../workbench/claudeKey";
   import { formatDisplayFailure } from "../diagnostics/report";
+  import BrandMark from "./BrandMark.svelte";
 
   /** What Manvi itself is set to run on (`manvi use`); the controls below write it back. */
   let manvi = $derived($harnessStore.ai?.manvi ?? null);
@@ -91,7 +92,10 @@
 </script>
 
 <section class="gp-card p-4 space-y-2">
-  <h3 class="gp-label">Manvi's model</h3>
+  <div class="flex items-center gap-2">
+    <BrandMark mark="manvi" size={15} class="shrink-0" />
+    <h3 class="gp-label">Manvi's model</h3>
+  </div>
   <div class="flex flex-wrap gap-3 text-meta">
     <label class="inline-flex items-center gap-1">
       <input
