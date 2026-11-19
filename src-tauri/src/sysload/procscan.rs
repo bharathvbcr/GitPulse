@@ -3181,6 +3181,22 @@ mod os {
     }
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+fn parse_proc_cwd_link(path: PathBuf) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.exists() {
+        return Some(path);
+    }
+    let clean = path
+        .to_str()
+        .and_then(|raw| raw.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .unwrap_or(path);
+    clean.is_absolute().then_some(clean)
+}
+
 #[cfg(target_os = "linux")]
 mod os {
     use super::{Identity, LaunchKey, ProcFacts, ProcSource, MAX_SCANNED_PROCESSES};
@@ -3224,8 +3240,9 @@ mod os {
 
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
         let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-        // A deleted directory reads back as "/old/path (deleted)".
-        path.is_absolute().then_some(path).filter(|p| p.is_dir())
+        // A deleted directory reads back as "/old/path (deleted)", which is still
+        // proof of this process's working directory rather than an unreadable process.
+        super::parse_proc_cwd_link(path)
     }
 
     pub(crate) fn fd_path(pid: i32, fd: i32) -> Reading<String> {
@@ -6691,5 +6708,53 @@ pub(crate) mod tests {
         ] {
             assert!(!is_dynamic_loader(other), "{other}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linux_proc_cwd_with_a_deleted_suffix_keeps_its_path_unless_literally_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("gone-worktree");
+        let marked = PathBuf::from(format!("{} (deleted)", gone.display()));
+        assert_eq!(super::parse_proc_cwd_link(marked), Some(gone));
+
+        let literal_deleted = dir.path().join("real (deleted)");
+        std::fs::create_dir(&literal_deleted).expect("create dir with deleted suffix");
+        assert_eq!(
+            super::parse_proc_cwd_link(literal_deleted.clone()),
+            Some(literal_deleted)
+        );
+
+        assert_eq!(
+            super::parse_proc_cwd_link(PathBuf::from("relative (deleted)")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cwd_returns_the_path_even_after_the_directory_is_deleted() {
+        use crate::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("vanished");
+        std::fs::create_dir(&work).expect("create vanished dir");
+        let pidfile = dir.path().join("child.pid");
+        let (exe, args) = fixture_command();
+        let mut child = std::process::Command::new(&exe)
+            .args(&args)
+            .env(
+                FIXTURE_ENV,
+                format!("sleep=30,pidfile={}", pidfile.display()),
+            )
+            .current_dir(&work)
+            .stdout(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("spawn child in vanished dir");
+        let pid = fixture_pid(&pidfile);
+        std::fs::remove_dir(&work).expect("remove child cwd while alive");
+        let resolved = super::os::cwd(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(resolved, Some(work));
     }
 }

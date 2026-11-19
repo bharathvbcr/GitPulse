@@ -436,6 +436,35 @@ mod macos {
     }
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+fn collect_socket_inodes_from_dir(
+    fd_dir: &std::path::Path,
+    inodes: &mut std::collections::HashSet<u64>,
+) {
+    const MAX_FD_DIR_ENTRIES: usize = 65_536;
+    let Ok(entries) = std::fs::read_dir(fd_dir) else {
+        return;
+    };
+    let mut inspected_sockets = 0usize;
+    for entry in entries.flatten().take(MAX_FD_DIR_ENTRIES) {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let s = target.to_string_lossy();
+        if let Some(ino_str) = s.strip_prefix("socket:[").and_then(|r| r.strip_suffix(']')) {
+            inspected_sockets += 1;
+            if inspected_sockets > MAX_FDS_PER_PID {
+                break;
+            }
+            if let Ok(ino) = ino_str.parse::<u64>() {
+                if ino > 0 {
+                    inodes.insert(ino);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{MAX_CANDIDATE_PIDS, MAX_FDS_PER_PID};
@@ -495,26 +524,10 @@ mod linux {
     fn collect_socket_inodes(pids: &[u32]) -> HashSet<u64> {
         let mut inodes = HashSet::new();
         for &pid in pids {
-            let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
-                continue;
-            };
-            for (idx, entry) in entries.flatten().enumerate() {
-                if idx >= MAX_FDS_PER_PID {
-                    break;
-                }
-                let Ok(target) = fs::read_link(entry.path()) else {
-                    continue;
-                };
-                let s = target.to_string_lossy();
-                if let Some(ino_str) = s.strip_prefix("socket:[").and_then(|r| r.strip_suffix(']'))
-                {
-                    if let Ok(ino) = ino_str.parse::<u64>() {
-                        if ino > 0 {
-                            inodes.insert(ino);
-                        }
-                    }
-                }
-            }
+            super::collect_socket_inodes_from_dir(
+                std::path::Path::new(&format!("/proc/{pid}/fd")),
+                &mut inodes,
+            );
         }
         inodes
     }
@@ -705,5 +718,23 @@ mod tests {
         );
         drop(listener);
         drop(filler);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_socket_inodes_counts_sockets_not_non_socket_fds() {
+        let dir = tempfile::tempdir().expect("temp fd dir");
+        for idx in 0..(super::MAX_FDS_PER_PID + 32) {
+            std::os::unix::fs::symlink("/dev/null", dir.path().join(format!("{idx:05}")))
+                .expect("non-socket fd symlink");
+        }
+        std::os::unix::fs::symlink("socket:[424242]", dir.path().join("99999"))
+            .expect("socket fd symlink");
+        let mut inodes = std::collections::HashSet::new();
+        super::collect_socket_inodes_from_dir(dir.path(), &mut inodes);
+        assert!(
+            inodes.contains(&424242),
+            "socket beyond MAX_FDS_PER_PID non-socket FDs must still be found: {inodes:?}"
+        );
     }
 }
