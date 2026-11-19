@@ -674,7 +674,7 @@
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           const { runHostLoadChecks } = await import("./healthChecks.js");
-          await runHostLoadChecks({ check, root, section, has, flat, wait, until, tick, knobs });
+          await runHostLoadChecks({ check, root, section, has, flat, wait, until, tick, knobs, remount });
           check("no unhandled runtime errors", () => errors.length === 0);
           checksButton.textContent = `${results.length}/${results.length} health checks passed`;
         } catch (error) {

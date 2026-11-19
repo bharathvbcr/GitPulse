@@ -554,7 +554,7 @@ export async function runHealthChecks(ctx) {
  * card's own timer makes, called here so a scenario does not wait four seconds.
  */
 export async function runHostLoadChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, tick, knobs } = ctx;
+  const { check, root, section, has, flat, wait, until, tick, knobs, remount } = ctx;
   const DROP_TEXT = "dropped while the trace write was blocked or failing, so this history has gaps";
   const previous = () => root.querySelector('[data-testid="host-load-previous-boot"]');
   const card = () => section("host-load");
@@ -670,6 +670,57 @@ export async function runHostLoadChecks(ctx) {
       !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
     await show(withProcs([rate(0), rate(4096), rate(0)]));
     check("when nobody writes above the threshold no session is named", () => !fastest());
+
+    // A slow read must not stack: the mounted card's own adaptive timer keeps
+    // ticking while one status read is pending, and none of those ticks may
+    // issue a second cmd_host_load_status or blank the card. The card's
+    // 4 s cadence is shortened to 100 ms for this remount only (the shim
+    // counts and rewrites exactly the timer's 4000 ms arms), so several ticks
+    // fit in well under a second. Cost: about 1.5 s.
+    const calm = { ...hostLoadStatusFixture(), previous_boot: null, problems: [] };
+    await show(calm);
+    let started = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const pending = [];
+    knobs.hostLoad = () => {
+      started += 1;
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      return new Promise(resolve => pending.push(() => { inFlight -= 1; resolve(calm); }));
+    };
+    const realSetTimeout = window.setTimeout;
+    let timerArms = 0;
+    window.setTimeout = (handler, ms, ...rest) => {
+      if (ms === 4000) { timerArms += 1; return realSetTimeout(handler, 100, ...rest); }
+      return realSetTimeout(handler, ms, ...rest);
+    };
+    // The timer pauses while the document is not focused, and headless WebKit
+    // never reports focus; record it as focused for this scenario only.
+    const { noteForegroundFocus, resetForegroundFocus } = await import("../src/lib/runtime/foreground.ts");
+    noteForegroundFocus(true);
+    try {
+      await remount();
+      await until(() => !!card() && started >= 1 && has(card(), "Memory pressure"));
+      // Taken after the remount, which starts clean on the store's snapshot. The
+      // lease and idle blocks arrive later, so the card may only grow from here.
+      const shown = flat(card());
+      await until(() => timerArms >= 4);
+      await wait(150);
+      check(`while a read is pending the card's timer ticked (${timerArms} arms) and still only one read is in flight (started ${started}, peak ${peak})`, () =>
+        timerArms >= 4 && started === 1 && peak === 1);
+      check("and the card keeps showing the previous snapshot, with no blank, no read error and no alert", () =>
+        !!card() && has(card(), "Memory pressure") && flat(card()).length >= shown.length && !has(card(), "Couldn't read")
+        && !card().querySelector('[role="alert"]'));
+      pending.splice(0).forEach(release => release());
+      await until(() => started >= 2);
+      check("once the slow read settles the next tick reads again", () => started === 2 && peak === 1);
+    } finally {
+      window.setTimeout = realSetTimeout;
+      resetForegroundFocus();
+      knobs.hostLoad = () => calm;
+      pending.splice(0).forEach(release => release());
+    }
   } finally {
     knobs.hostLoad = null;
     knobs.hostLoadLeases = null;
