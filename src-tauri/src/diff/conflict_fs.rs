@@ -407,87 +407,115 @@ mod unix {
                 }
             } else {
                 handle.write_all(bytes).map_err(|e| e.to_string())?;
-                // Preserve the permission bits when the selected Git mode did
-                // not change, otherwise apply the chosen executable mode.
-                let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-                // SAFETY: metadata is initialized only when the call succeeds;
-                // this never follows a symlink to borrow its target's mode.
-                let exists = unsafe {
-                    libc::fstatat(
-                        directory.as_raw_fd(),
-                        target.as_ptr(),
-                        metadata.as_mut_ptr(),
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                } == 0;
-                let original = if exists {
-                    Some(unsafe { metadata.assume_init() })
-                } else {
-                    None
-                };
-                // mode_t is u16 on macOS and u32 on Linux. Keep the lossless
-                // conversion required by PermissionsExt without platform forks.
-                #[allow(clippy::useless_conversion)]
-                let mut mode = original
-                    .as_ref()
-                    .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
-                    .map_or(0o600, |stat| u32::from(stat.st_mode) & 0o777);
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                if original
-                    .as_ref()
-                    .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
-                {
-                    // SAFETY: an O_NOFOLLOW source descriptor and our exclusive
-                    // destination. Metadata copying preserves ACLs, ownership
-                    // and extended attributes without copying source bytes.
-                    let source_file = opened(unsafe {
-                        libc::openat(
+                if source.mode != "missing" {
+                    // Preserve the permission bits when the selected Git mode did
+                    // not change, otherwise apply the chosen executable mode.
+                    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    // SAFETY: metadata is initialized only when the call succeeds;
+                    // this never follows a symlink to borrow its target's mode.
+                    let exists = unsafe {
+                        libc::fstatat(
                             directory.as_raw_fd(),
                             target.as_ptr(),
-                            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                            metadata.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
                         )
-                    })?;
-                    #[cfg(target_os = "macos")]
-                    if unsafe {
-                        libc::fcopyfile(
-                            source_file.as_raw_fd(),
-                            handle.as_raw_fd(),
-                            std::ptr::null_mut(),
-                            libc::COPYFILE_METADATA,
-                        )
-                    } != 0
-                    {
-                        return Err(format!("Cannot preserve file metadata: {}", error()));
-                    }
-                    #[cfg(target_os = "linux")]
-                    crate::fs_entry::preserve_metadata(&source_file, &handle)
-                        .map_err(|e| format!("Cannot preserve file metadata: {e}"))?;
-                }
-                if source.mode != next.mode {
-                    mode = if next.mode == "100755" {
-                        mode | ((mode & 0o444) >> 2) | 0o100
+                    } == 0;
+                    let original = if exists {
+                        Some(unsafe { metadata.assume_init() })
                     } else {
-                        mode & !0o111
+                        None
                     };
+                    // mode_t is u16 on macOS and u32 on Linux. Keep the lossless
+                    // conversion required by PermissionsExt without platform forks.
+                    #[allow(clippy::useless_conversion)]
+                    let mut mode = original
+                        .as_ref()
+                        .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
+                        .map_or(0o600, |stat| u32::from(stat.st_mode) & 0o777);
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    if original
+                        .as_ref()
+                        .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
+                    {
+                        // SAFETY: an O_NOFOLLOW source descriptor and our exclusive
+                        // destination. Metadata copying preserves ACLs, ownership
+                        // and extended attributes without copying source bytes.
+                        let source_file = opened(unsafe {
+                            libc::openat(
+                                directory.as_raw_fd(),
+                                target.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC
+                                    | libc::O_NONBLOCK,
+                            )
+                        })?;
+                        #[cfg(target_os = "macos")]
+                        if unsafe {
+                            libc::fcopyfile(
+                                source_file.as_raw_fd(),
+                                handle.as_raw_fd(),
+                                std::ptr::null_mut(),
+                                libc::COPYFILE_METADATA,
+                            )
+                        } != 0
+                        {
+                            return Err(format!("Cannot preserve file metadata: {}", error()));
+                        }
+                        #[cfg(target_os = "linux")]
+                        crate::fs_entry::preserve_metadata(&source_file, &handle)
+                            .map_err(|e| format!("Cannot preserve file metadata: {e}"))?;
+                    }
+                    if source.mode != next.mode {
+                        mode = if next.mode == "100755" {
+                            mode | ((mode & 0o444) >> 2) | 0o100
+                        } else {
+                            mode & !0o111
+                        };
+                    }
+                    // Unconditional, and `mode` is masked to 0o777, so this is
+                    // also what clears set-user-ID, set-group-ID and the sticky
+                    // bit. Those are dropped by an ordinary content write and by
+                    // the Linux arm above, which strips them along with
+                    // `security.capability`; `fcopyfile` copies the whole mode, so
+                    // without this a saved resolution would leave a set-id file
+                    // set-id on macOS alone. For every other bit this repeats what
+                    // the metadata copy already applied.
+                    handle
+                        .set_permissions(std::fs::Permissions::from_mode(mode))
+                        .map_err(|e| e.to_string())?;
                 }
-                // Unconditional, and `mode` is masked to 0o777, so this is
-                // also what clears set-user-ID, set-group-ID and the sticky
-                // bit. Those are dropped by an ordinary content write and by
-                // the Linux arm above, which strips them along with
-                // `security.capability`; `fcopyfile` copies the whole mode, so
-                // without this a saved resolution would leave a set-id file
-                // set-id on macOS alone. For every other bit this repeats what
-                // the metadata copy already applied.
-                handle
-                    .set_permissions(std::fs::Permissions::from_mode(mode))
-                    .map_err(|e| e.to_string())?;
                 handle.sync_all().map_err(|e| e.to_string())?;
             }
         }
         let still_here = parent(path)?.metadata().map_err(|e| e.to_string())?;
         let anchored = directory.metadata().map_err(|e| e.to_string())?;
+        let target_still_missing = if source.mode == "missing" {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: initialized descriptor and name; fstatat initializes stat only on success.
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    target.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                false
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err.to_string());
+                }
+                true
+            }
+        } else {
+            read_at_with_limit(&directory, &target, cap)? == *source
+        };
         if (still_here.dev(), still_here.ino()) != (anchored.dev(), anchored.ino())
-            || read_at_with_limit(&directory, &target, cap)? != *source
+            || !target_still_missing
         {
             return Err(CHANGED_BEFORE_PUBLISH.into());
         }
@@ -507,6 +535,7 @@ mod unix {
                 handle
                     .set_permissions(std::fs::Permissions::from_mode(mode))
                     .map_err(|e| e.to_string())?;
+                handle.sync_all().map_err(|e| e.to_string())?;
             }
             // SAFETY: linkat without AT_SYMLINK_FOLLOW links the entry itself;
             // it fails if another writer created the destination meanwhile.
@@ -909,6 +938,7 @@ fn write_regular_recording(
 #[cfg(all(test, unix))]
 mod write_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn dir() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::TempDir::new().unwrap();
@@ -929,6 +959,26 @@ mod write_tests {
         );
         assert_eq!(result, Err(WriteFailure::AlreadyExists));
         assert_eq!(std::fs::read(&target).unwrap(), b"someone else's work");
+    }
+
+    #[test]
+    fn create_does_not_open_or_copy_metadata_from_an_entry_created_after_check() {
+        let (_root, root) = dir();
+        let target = root.join("unreadable.txt");
+        let planted = target.clone();
+        let result = write_regular_after_check(
+            &target,
+            Expect::Absent,
+            |_| Ok(b"mine\n".to_vec()),
+            || {
+                std::fs::write(&planted, b"winner").unwrap();
+                std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o000)).unwrap();
+            },
+        );
+        // Restore permissions so TempDir cleanup can inspect/remove cleanly if needed.
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
+        assert_eq!(result, Err(WriteFailure::AlreadyExists));
+        assert_eq!(std::fs::read(&target).unwrap(), b"winner");
     }
 
     #[test]
