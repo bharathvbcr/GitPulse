@@ -57,6 +57,26 @@ fn item_ids_are_stable_distinct_and_valid_store_ids() {
 }
 
 #[test]
+fn already_exists_names_the_card_and_both_ways_forward() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let first = add_task(&store, repo_path, task("gp-dup", "Alpha card"), false, &[]).unwrap();
+    let item_id = first["item_id"].as_str().unwrap().to_string();
+
+    let error = add_task(&store, repo_path, task("gp-dup", "Alpha card"), false, &[]).unwrap_err();
+    assert_eq!(error.code, "already_exists", "{}", error.message);
+    let m = &error.message;
+    assert!(m.contains("Alpha card"), "title: {m}");
+    assert!(m.contains(&item_id), "item id: {m}");
+    assert!(m.contains(first["status"].as_str().unwrap()), "status: {m}");
+    assert!(m.contains("overwrite: true"), "{m}");
+    assert!(m.contains("different task_id"), "{m}");
+    assert_eq!(items(&store, &registered(&store, &repo)).len(), 1);
+}
+
+#[test]
 fn due_dates_are_calendar_checked() {
     let noon = |days: i64| Some(days * 86_400 + 43_200);
     assert_eq!(parse_due(Some("1970-01-01")).unwrap(), noon(0));
