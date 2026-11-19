@@ -596,6 +596,70 @@ fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
     }
 }
 
+/// Status children started anywhere in the farm, on any thread: the spawn log is
+/// process-wide and keyed by directory, unlike a per-thread spawn counter.
+fn statuses_started(farm: &Farm) -> Vec<(std::path::PathBuf, Vec<String>)> {
+    farm.dirs
+        .iter()
+        .flat_map(|dir| {
+            spawns_in(dir)
+                .into_iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "status"))
+                .map(|argv| (dir.clone(), argv))
+        })
+        .collect()
+}
+
+/// Runs `ask` as a request whose asker leaves the moment the first status read
+/// of the farm is about to start: the flag is set there, so any worker that
+/// does not run under it spawns, and one that does is refused before it can.
+fn ask_whose_asker_leaves_at_the_first_status<T>(farm: &Farm, ask: impl FnOnce() -> T) -> T {
+    use crate::engine::process::read_cancel::{enter, ReadCancel};
+    let cancel = ReadCancel::new();
+    let leaves = cancel.clone();
+    crate::engine::worktree::status_probes::with_probe(
+        &farm.dirs,
+        move |_| leaves.cancel(),
+        || {
+            let _scope = enter(Some(&cancel));
+            ask()
+        },
+    )
+}
+
+/// The asker of a collision scan that leaves mid-scan stops the scan on the
+/// pool's threads too: the scope is thread-local, and the scan fans out over
+/// rayon.
+#[test]
+fn a_collision_scan_whose_asker_left_starts_no_status_on_any_thread() {
+    let farm = farm(10, true);
+    assert!(statuses_started(&farm).is_empty(), "a fresh farm");
+    ask_whose_asker_leaves_at_the_first_status(&farm, || {
+        crate::insights::collision_for_path_memoized(&farm.repo, "seed.txt")
+    });
+    let started = statuses_started(&farm);
+    assert!(
+        started.is_empty(),
+        "{} status children started after the asker left: {started:?}",
+        started.len()
+    );
+}
+
+/// The same for an insights read, which runs on a thread of its own and then
+/// scans the worktrees on scoped threads and rayon's pool.
+#[test]
+fn an_insights_read_whose_asker_left_starts_no_status_on_any_thread() {
+    let farm = farm(10, true);
+    assert!(statuses_started(&farm).is_empty(), "a fresh farm");
+    let _ = ask_whose_asker_leaves_at_the_first_status(&farm, || serve(&farm.repo));
+    let started = statuses_started(&farm);
+    assert!(
+        started.is_empty(),
+        "{} status children started after the asker left: {started:?}",
+        started.len()
+    );
+}
+
 /// An answer that is partial is not one the asker may build a snapshot on.
 #[test]
 fn a_partial_answer_is_not_a_snapshot() {
