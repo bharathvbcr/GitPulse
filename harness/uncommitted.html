@@ -232,6 +232,64 @@ async function agentCommitMenuChecks(){
  finally{layoutStore.toggleCollapsed();}
  files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];await repoStore.refresh();
 }
+/*
+ * AC6 of ft-7d89e82b: 5,000 changed files must scroll without a long task and
+ * without growing the DOM. Every file is partially staged, so both lists hold
+ * all 5,000. A check that could not observe long tasks says so and falls back
+ * to timing each scroll step; it never passes silently.
+ */
+async function sidebarWindowChecks(){
+ const total=5000,name=i=>"src/gen/f"+String(i).padStart(4,"0")+".ts",failures=[];
+ const soft=(label,pass)=>{results.push({name:label,pass});if(!pass)failures.push(label);};
+ const longTaskSupported="PerformanceObserver" in window&&(PerformanceObserver.supportedEntryTypes||[]).includes("longtask");
+ const seen=[];let observer=null;
+ if(longTaskSupported){observer=new PerformanceObserver(list=>seen.push(...list.getEntries()));observer.observe({type:"longtask"});}
+ const idle=async()=>{await frames(3);await new Promise(r=>setTimeout(r,120));};
+ const saved=files;
+ try{
+  files=Array.from({length:total},(_,i)=>({...status(name(i),true,"MM"),additions:2,deletions:1,staged_additions:1,staged_deletions:0,unstaged_additions:1,unstaged_deletions:1}));
+  await repoStore.refresh();await show("Sidebar");await idle();
+  if(longTaskSupported){
+   const t=performance.now();while(performance.now()-t<90);
+   await idle();
+   soft("sidebar windows: the long-task observer fires on a deliberate 90 ms stall",seen.length>=1);
+   seen.length=0;
+  }
+  console.info("sidebar windows: longtask observer "+(longTaskSupported?"supported":"NOT supported; timing each scroll step instead"));
+  const rowOf=(path,k)=>surface.querySelectorAll('button[title="'+path+'"]')[k];
+  const rowCount=()=>surface.querySelectorAll('button[title^="src/gen/"]').length;
+  const scrollerOf=node=>{for(let el=node?.parentElement;el;el=el.parentElement){const o=getComputedStyle(el).overflowY;if((o==="auto"||o==="scroll")&&el.scrollHeight>el.clientHeight)return el;}return null;};
+  const bound=96;
+  soft("sidebar windows: 5,000 changed files mount a bounded number of rows (<= "+bound+", got "+rowCount()+")",rowCount()<=bound);
+  const steps=[];
+  for(const [k,label] of [[0,"staged"],[1,"unstaged"]]){
+   const first=rowOf(name(0),k),scroller=scrollerOf(first);
+   soft("sidebar windows: the "+label+" list has its own scroller",!!scroller&&(k===0||scroller!==scrollerOf(rowOf(name(0),0))));
+   if(!scroller)continue;
+   let max=0,moved=0,peak=0;
+   const stepBy=Math.max(1,scroller.clientHeight*3);
+   for(let y=0;y<scroller.scrollHeight;y+=stepBy){
+    const t0=performance.now();scroller.scrollTop=y;await step();await tick();
+    max=Math.max(max,performance.now()-t0);peak=Math.max(peak,rowCount());if(scroller.scrollTop>0)moved++;
+   }
+   scroller.scrollTop=scroller.scrollHeight;await frames(3);
+   steps.push(label+" max step "+max.toFixed(1)+" ms, peak rows "+peak);
+   const last=scroller.querySelector('button[title="'+name(total-1)+'"]');
+   const edge=last?.getBoundingClientRect(),box=scroller.getBoundingClientRect();
+   soft("sidebar windows: the "+label+" list scrolls end to end and its last row lands inside the viewport",!!last&&edge.bottom<=box.bottom+1&&edge.top>=box.top-1&&moved>3);
+   soft("sidebar windows: the "+label+" list never mounts more than "+bound+" rows while scrolling (peak "+peak+")",peak<=bound);
+   soft("sidebar windows: the "+label+" scroll steps stay under 50 ms each (max "+max.toFixed(1)+" ms; includes one frame)",max<50+34);
+   scroller.scrollTop=0;await frames(2);
+  }
+  console.info("sidebar windows: "+steps.join("; "));
+  if(longTaskSupported){await idle();soft("sidebar windows: no long task over 50 ms while scrolling 5,000 files ("+seen.length+" seen)",seen.length===0);}
+  else soft("sidebar windows: this engine has no longtask entries; per-step timing above is the only long-task evidence",true);
+ }finally{
+  observer?.disconnect();
+  files=saved;await repoStore.refresh();await show("Sidebar");
+ }
+ if(failures.length)throw Error("Sidebar windows: "+failures.join(" | "));
+}
 async function run(){
  document.getElementById("run").disabled=true;
  try{
@@ -353,7 +411,8 @@ async function run(){
    await until(()=>get(repoStore).error?.includes("Fixture revocation denied"),"visible revocation failure");
    check("failed revocation preserves the repository tab",get(repoStore).openTabs.some(tab=>tab.path===root));
   }finally{cancelPrompt();await unmount(prompt);promptTarget.remove();}
-  await agentCommitMenuChecks();
+  await sidebarWindowChecks();
+ await agentCommitMenuChecks();
   check("No unexpected commands",unexpected.length===0);
   check("No runtime errors",crashes.length===0);
  }catch(error){results.push({name:String(error),pass:false});}
