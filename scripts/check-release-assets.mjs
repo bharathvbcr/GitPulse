@@ -16,7 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { SOURCE_MAP_SCANNED_EXTENSIONS, hasSourceMapComment, isSourceMapDocument, isSourceMapPath } from "./build-evidence.mjs";
-import { parseTag } from "./check-release-version.mjs";
+import { isPrerelease, parseTag } from "./check-release-version.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,10 +41,14 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 export const PLATFORM_INSTALLERS = Object.freeze({
   "macos-latest": (version) => [`GitPulse_${version}_universal.dmg`, `GitPulse_${version}_universal.app.tar.gz`],
   "ubuntu-22.04": (version) => [
-    `GitPulse-${version}-1.x86_64.rpm`, `GitPulse_${version}_amd64.AppImage`, `GitPulse_${version}_amd64.deb`,
+    ...(isPrerelease(version) ? [] : [`GitPulse-${version}-1.x86_64.rpm`]),
+    `GitPulse_${version}_amd64.AppImage`,
+    `GitPulse_${version}_amd64.deb`,
   ],
   "ubuntu-22.04-arm": (version) => [
-    `GitPulse-${version}-1.aarch64.rpm`, `GitPulse_${version}_aarch64.AppImage`, `GitPulse_${version}_arm64.deb`,
+    ...(isPrerelease(version) ? [] : [`GitPulse-${version}-1.aarch64.rpm`]),
+    `GitPulse_${version}_aarch64.AppImage`,
+    `GitPulse_${version}_arm64.deb`,
   ],
   "windows-latest": (version) => [`GitPulse_${version}_x64-setup.exe`, `GitPulse_${version}_x64_en-US.msi`],
   "windows-11-arm": (version) => [`GitPulse_${version}_arm64-setup.exe`, `GitPulse_${version}_arm64_en-US.msi`],

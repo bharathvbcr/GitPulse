@@ -208,7 +208,9 @@ all three. Releases numbered `v0.0.2` to `v1.3.1` under the earlier numbering
 have been withdrawn; [CHANGELOG.md](../CHANGELOG.md) keeps their history.
 
 On Windows, a beta's `.msi` carries the version `X.Y.Z.N`, because the MSI
-format allows only numbers.
+format allows only numbers. On Linux, a beta ships `.deb` and `.AppImage`
+installers only, because the RPM format forbids hyphens in package versions;
+`.rpm` installers ship on stable `X.Y.Z` releases.
 
 ## Updates
 

@@ -227,6 +227,25 @@ describe("local bundle names", () => {
     ]);
   });
 
+  it("accepts a beta Linux ARM build with .deb and .AppImage only, and rejects .rpm", () => {
+    const beta = "0.2.0-beta.1";
+    expect(expectedInstallerNames(beta)).toHaveLength(10);
+    expect(expectedInstallerNames(beta).some((name) => name.endsWith(".rpm"))).toBe(false);
+    expect(expectedInstallerNames("0.2.0")).toHaveLength(12);
+    const betaLinuxArm = [
+      `/w/bundle/deb/GitPulse_${beta}_arm64.deb`,
+      `/w/bundle/appimage/GitPulse_${beta}_aarch64.AppImage`,
+    ];
+    expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: betaLinuxArm }).ok).toBe(true);
+    const withRpm = [
+      ...betaLinuxArm,
+      `/w/bundle/rpm/GitPulse-${beta}-1.aarch64.rpm`,
+    ];
+    const unexpectedRpm = inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: withRpm });
+    expect(unexpectedRpm.ok).toBe(false);
+    expect(unexpectedRpm.violations).toContain(`unexpected: GitPulse-${beta}-1.aarch64.rpm`);
+  });
+
   it("refuses what it cannot judge rather than passing it", () => {
     expect(() => inspectBundles({ platform: "macos-latest", version: "1.5.0", paths: ["/x/GitPulse.app.tar.gz"] })).toThrow(/rewritten at upload/);
     expect(() => inspectBundles({ platform: "solaris", version: "1.5.0", paths: linuxArm })).toThrow(/unknown release platform/);
