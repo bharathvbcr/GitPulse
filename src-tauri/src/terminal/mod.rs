@@ -10376,8 +10376,16 @@ mod tests {
         std::fs::create_dir_all(&versions).unwrap();
         let binary = versions.join("2.1.0");
         let (exe, args) = crate::sysload::procscan::tests::fixture_command();
-        if std::fs::hard_link(&exe, &binary).is_err() {
+        // A clone (`clonefile` / `FICLONE`) or copy gives `versions/2.1.0` its
+        // own inode so macOS `proc_pidpath` resolves this path rather than the
+        // test harness's primary vnode name.
+        if crate::engine::cow_clone::reflink_copy_file(&exe, &binary).is_err() {
             std::fs::copy(&exe, &binary).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
         }
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();

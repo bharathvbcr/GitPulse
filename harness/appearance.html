@@ -443,6 +443,10 @@
       const refusal = $("[data-wallpaper-failure]")?.textContent.trim() ?? "";
       check(`the clip is accepted as a video wallpaper and chosen${refusal ? ` (refused: ${refusal})` : ""}`, () =>
         $("[data-custom-video-badge]") !== null && get(interfaceStore).backdrop === "custom" && !$("[data-wallpaper-failure]"));
+      await wait(() => {
+        const img = $('[data-backdrop-option="custom"] img');
+        return !!img?.complete && img.naturalWidth > 0;
+      }, 5000);
       check("its still is the clip's first frame, not a blank one", () => {
         const img = $('[data-backdrop-option="custom"] img');
         if (!img?.complete || img.naturalWidth === 0) return false;

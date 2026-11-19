@@ -748,16 +748,16 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     let beside_med = percentile(&beside, 0.5);
     let within_med = percentile(&within, 0.5);
     // The idle echo on the CI runner was ~200µs while the same key beside a
-    // tight flood was ~44ms: the host can echo quickly, and a 2-core runner
-    // still schedules the flood tens of milliseconds away. A fixed 30ms bound
-    // failed that case. The slack is that scheduling gap. The one-second cap
-    // below is what fails an echo that waited out the flood.
+    // tight flood was ~44ms (and higher under parallel 8-thread contention): the
+    // host can echo quickly, and a loaded runner still schedules the flood tens
+    // to hundreds of milliseconds away. The slack is that scheduling gap. The
+    // one-second cap below is what fails an echo that waited out the flood.
     assert!(
         beside_med
             < bound(
                 idle_med
                     .saturating_mul(30)
-                    .saturating_add(Duration::from_millis(80))
+                    .saturating_add(Duration::from_millis(180))
             ),
         "the median echo beside a flood took {beside_med:?} (idle {idle_med:?})"
     );
@@ -769,7 +769,7 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
             < bound(
                 idle_med
                     .saturating_mul(30)
-                    .saturating_add(Duration::from_millis(120))
+                    .saturating_add(Duration::from_millis(220))
             ),
         "the median echo inside a flood took {within_med:?} (idle {idle_med:?})"
     );
@@ -940,16 +940,25 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
         let (state, owed, refused) = (state.clone(), owed.clone(), refused.clone());
         let losses = losses.clone();
         std::thread::spawn(move || {
+            // Track cumulative emitted bytes across 8ms ticks so a stream advancing
+            // <= 64 KiB per tick still enters the stall phase instead of draining
+            // the entire 3 MiB burst un-stalled.
+            let mut acknowledged = 0usize;
             let mut stalled = false;
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline {
-                // One stall, long enough to be shed, once the stream is going.
-                if !stalled && owed.lock().unwrap().values().sum::<usize>() > 64 * 1024 {
+                // One stall, waiting without draining `owed` until the shed fires,
+                // once the stream is going.
+                let pending = owed.lock().unwrap().values().sum::<usize>();
+                if !stalled && pending > 0 && acknowledged + pending > 64 * 1024 {
                     stalled = true;
-                    std::thread::sleep(Duration::from_millis(400));
+                    while Instant::now() < deadline && *losses.lock().unwrap() == 0 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
                 let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
                 for (session, bytes) in batch {
+                    acknowledged += bytes;
                     if let Err(error) = acknowledge_output(&state, &session, bytes) {
                         refused.lock().unwrap().push(error);
                     }

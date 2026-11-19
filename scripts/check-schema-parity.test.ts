@@ -250,7 +250,8 @@ describe("summarize", () => {
   });
 });
 
-describe("pins", () => {
+// devcouncilFixture spawns 10 synchronous git subprocesses per test, exceeding Vitest's 5s default on Windows.
+describe("pins", { timeout: 30_000 }, () => {
   const sha = "a".repeat(40);
 
   it("reads Manvi's DevCouncil pin from its tab-separated pins file", () => {

@@ -448,16 +448,27 @@ fn four_waiters_each_get_tokens_under_the_nap_schedule() {
 #[test]
 fn reactive_waiters_are_served_in_arrival_order() {
     let (_dir, gate) = drained_gate(8, 4);
-    let began = Instant::now();
     let served = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         let mut waiters = Vec::new();
-        for (id, arrives_ms) in [(0_usize, 60_u64), (1, 155), (2, 165)] {
+        for id in 0..3_usize {
             let served = &served;
-            waiters.push(scope.spawn(move || {
-                let arrives = began + Duration::from_millis(arrives_ms);
-                std::thread::sleep(arrives.saturating_duration_since(Instant::now()));
-                let deadline = Instant::now() + Duration::from_millis(3_000);
+            let waiter = scope.spawn(move || {
+                // Sequence waiter arrival deterministically without timed
+                // sleeps: wait until prior waiters are queued in `reactive_line`
+                // (or already recorded in `served` on an overloaded host).
+                if id > 0 {
+                    assert!(
+                        crate::test_support::wait_until(Duration::from_secs(5), || {
+                            gate.state.lock().unwrap().reactive_line.len()
+                                + served.lock().unwrap().len()
+                                >= id
+                        }),
+                        "prior waiter {id} never reached reactive_line"
+                    );
+                }
+                let deadline = Instant::now()
+                    + crate::test_support::coverage_relaxed(Duration::from_millis(5_000));
                 let got = with_admission(Admission::Reactive, || {
                     gate.acquire_judged(deadline, &|| false)
                 });
@@ -465,7 +476,8 @@ fn reactive_waiters_are_served_in_arrival_order() {
                 // The grants are a refill interval apart, far more than the
                 // time between a grant and this push.
                 served.lock().unwrap().push(id);
-            }));
+            });
+            waiters.push(waiter);
         }
         for waiter in waiters {
             waiter.join().unwrap();

@@ -23,6 +23,15 @@ use tauri::Listener;
 
 mod common;
 
+// Floods write 4 MiB+ through the shared ptyd host; serialize tests within this
+// integration binary so `--test-threads=8` does not contend on one PTY daemon.
+static SERIAL: Mutex<()> = Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
@@ -220,6 +229,7 @@ fn settled_count(counter: &AtomicUsize, hold: Duration, within: Duration) -> Opt
 /// "renderer did not acknowledge output" and this exit arrived.
 #[test]
 fn a_view_that_stops_acknowledging_does_not_end_the_session() {
+    let _serial = serial();
     let view = View::new(Duration::from_millis(200));
     let _cleanup = TerminalCleanup(view.state.clone());
     let dir = repo();
@@ -269,6 +279,7 @@ fn a_view_that_stops_acknowledging_does_not_end_the_session() {
 /// listed as detached; a new view takes it over and is delivered to again.
 #[test]
 fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
+    let _serial = serial();
     let view = View::new(Duration::from_millis(200));
     let _cleanup = TerminalCleanup(view.state.clone());
     let dir = repo();
@@ -331,6 +342,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
 /// was not closed, and closing everything frees every slot.
 #[test]
 fn stalls_detaches_and_attaches_under_load_never_end_a_session() {
+    let _serial = serial();
     const SESSIONS: usize = 12;
     let view = View::new(Duration::from_millis(50));
     let _cleanup = TerminalCleanup(view.state.clone());
@@ -390,6 +402,7 @@ fn transcript_ends_with(state: &TerminalSessions, id: &str, suffix: &[u8]) -> bo
 /// notice.
 #[test]
 fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() {
+    let _serial = serial();
     const PAYLOAD_FILL: usize = 16 * 1024;
     let view = View::new(Duration::from_secs(2));
     let _cleanup = TerminalCleanup(view.state.clone());
@@ -482,6 +495,7 @@ fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() 
 /// `"Output while detached was not kept"` `terminal-loss` event.
 #[test]
 fn detached_non_repainting_output_past_ring_replays_tail_and_emits_loss() {
+    let _serial = serial();
     let blocks = (RING_BYTES / 65_536) + 2;
     let view = View::new(Duration::from_secs(2));
     let _cleanup = TerminalCleanup(view.state.clone());

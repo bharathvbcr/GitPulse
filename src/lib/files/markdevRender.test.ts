@@ -105,11 +105,24 @@ describe("markdevRender — document stats stay linear", () => {
     // not be seen; this is a synchronous pure function. Rounds alternate the
     // sizes so a drift in clock speed lands on both, and the minimum of each is
     // what the ratio is taken of.
+    // Batch multiple passes per CPU sample so Windows GetProcessTimes
+    // 15.625ms (1/64s) tick quantization does not inflate the 4x ratio.
+    const REPS_PER_SAMPLE = 5;
     let cpuSmall = Number.POSITIVE_INFINITY;
     let cpuLarge = Number.POSITIVE_INFINITY;
     for (let round = 0; round < 7; round += 1) {
-      cpuSmall = Math.min(cpuSmall, fastestCpuOf(1, () => void calculateDocumentStats(small)));
-      cpuLarge = Math.min(cpuLarge, fastestCpuOf(1, () => void calculateDocumentStats(large)));
+      cpuSmall = Math.min(
+        cpuSmall,
+        fastestCpuOf(1, () => {
+          for (let i = 0; i < REPS_PER_SAMPLE; i += 1) calculateDocumentStats(small);
+        }),
+      );
+      cpuLarge = Math.min(
+        cpuLarge,
+        fastestCpuOf(1, () => {
+          for (let i = 0; i < REPS_PER_SAMPLE; i += 1) calculateDocumentStats(large);
+        }),
+      );
     }
     expect(cpuLarge / cpuSmall).toBeLessThan(LINEAR_RATIO_LIMIT);
   }, STRESS_TIMEOUT_MS);

@@ -128,7 +128,6 @@ site | src/engine/git_cli/run_errors_adversarial_tests.rs | hold_lock | 0 | cloc
 
 # src/engine/process/budget_adversarial_tests.rs
 site | src/engine/process/budget_adversarial_tests.rs | a_local_bucket_waiter_does_not_spin_on_a_stale_shared_ask_time | 0 | race-widen
-site | src/engine/process/budget_adversarial_tests.rs | reactive_waiters_are_served_in_arrival_order | 0 | clock-seam-needed
 
 # src/engine/process/grace_adversarial_tests.rs
 site | src/engine/process/grace_adversarial_tests.rs | reap_leak | 0 | bounded-poll

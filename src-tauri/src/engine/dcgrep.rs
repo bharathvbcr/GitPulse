@@ -1850,13 +1850,25 @@ mod tests {
             ),
         );
 
+        struct ReleaseHolder(std::path::PathBuf);
+        impl Drop for ReleaseHolder {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"go");
+            }
+        }
+        let release_path = stub_dir.path().join("release-holder");
+        let release_guard = ReleaseHolder(release_path.clone());
+        let holder_script = format!(
+            "echo READY; while [ ! -f '{}' ]; do sleep 0.02; done",
+            release_path.display()
+        );
         let slot_held = Arc::new(AtomicBool::new(false));
         let slot_held_bg = Arc::clone(&slot_held);
         let holder_dir = stub_dir.path().to_path_buf();
         let holder = std::thread::spawn(move || {
             let mut cmd = process::build_capture_command(
                 "sh",
-                &["-c", "echo READY; sleep 0.4"],
+                &["-c", &holder_script],
                 Some(&holder_dir),
                 &[],
                 None,
@@ -1904,6 +1916,7 @@ mod tests {
         );
         let waited = wait_before.elapsed();
         canceller.join().unwrap();
+        drop(release_guard);
         holder.join().unwrap();
 
         let report = result

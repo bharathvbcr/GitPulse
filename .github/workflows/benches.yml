@@ -90,6 +90,12 @@ jobs:
       - name: Frontend Vite Build
         run: bun run build
 
+      # terminal_pty and idle_wakeups spawn the real PTY daemon next to the
+      # bench binary's release target directory; `cargo bench` does not
+      # build crate `[[bin]]` targets on its own.
+      - name: Build PTY helper binary
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml --locked --bin gitpulse-ptyd
+
       # Every bench runs even if one fails (the loop collects the failures), so
       # a bench that never ran cannot read like one that passed: the compare
       # step below refuses a baselined bench with no report.
