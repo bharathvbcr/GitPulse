@@ -1,12 +1,62 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "svelte/server";
+import type { RepoState } from "../stores/repoStore";
 import WorkView from "./WorkView.svelte";
 import { stripMarkupComments } from "../dom/markupText";
 import { ALL_STATUSES } from "../work/projection";
 import { functionBody } from "../stores/sourceScan";
+
+const mockRepo = vi.hoisted(() => ({
+  currentPath: null as string | null,
+  isBare: false,
+  probeFailed: false,
+  conflicted: false,
+}));
+
+vi.mock("../stores/repoStore", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../stores/repoStore")>();
+  const fieldStore = <T,>(read: () => T) => ({
+    subscribe: (run: (value: T) => void) => {
+      run(read());
+      return () => {};
+    },
+  });
+  const statuses = () =>
+    mockRepo.conflicted
+      ? [{ ...({} as RepoState["statuses"][number]), path: "a.txt", is_conflicted: true }]
+      : [];
+  return {
+    ...real,
+    currentRepoPath: fieldStore(() => mockRepo.currentPath),
+    repoStore: {
+      ...real.repoStore,
+      currentPath: fieldStore(() => mockRepo.currentPath),
+      statuses: fieldStore(statuses),
+      conflictedCount: fieldStore(() => (mockRepo.conflicted ? 1 : 0)),
+      subscribe: (run: (value: RepoState) => void) =>
+        real.repoStore.subscribe((value) =>
+          run({
+            ...value,
+            currentPath: mockRepo.currentPath,
+            isBare: mockRepo.isBare,
+            statuses: statuses(),
+            conflictedCount: mockRepo.conflicted ? 1 : 0,
+            operation: {
+              probeFailed: mockRepo.probeFailed,
+              operation: null,
+            },
+          } as RepoState),
+        ),
+    },
+  };
+});
+
+afterEach(() => {
+  Object.assign(mockRepo, { currentPath: null, isBare: false, probeFailed: false, conflicted: false });
+});
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "WorkView.svelte"),
@@ -185,7 +235,53 @@ describe("WorkView", () => {
     // The one door navigates and leaves a request the Overview pane takes,
     // which scrolls to the editor whether or not the switch remounted it.
     expect(body).toContain("openConflicts();");
-    expect(source.match(/onclick=\{showConflicts\}/g)).toHaveLength(3);
+    expect(source.match(/onclick=\{showConflicts\}/g)).toHaveLength(7);
+  });
+
+  it("renders a disabled Conflicts action in the header when no repository is open", () => {
+    const { body } = render(WorkView);
+    const match = body.match(/<button[^>]*data-testid="overview-conflicts-btn"[^>]*>/);
+    expect(match).not.toBeNull();
+    expect(match?.[0]).toContain("disabled");
+    expect(body).not.toContain('data-testid="overview-repo-conflicts-btn"');
+  });
+
+  it("keeps header Conflicts disabled without chips and avoids interactive Resolve buttons when bare and probeFailed", () => {
+    Object.assign(mockRepo, { currentPath: "/bare/repo.git", isBare: true, probeFailed: true });
+    const { body } = render(WorkView);
+    const btnStart = body.indexOf('data-testid="overview-conflicts-btn"');
+    const openTagStart = body.lastIndexOf("<button", btnStart);
+    const closeTagEnd = body.indexOf("</button>", btnStart);
+    const headerBtnHtml = body.slice(openTagStart, closeTagEnd);
+    expect(headerBtnHtml).toContain("disabled");
+    expect(headerBtnHtml).toContain('aria-label="Conflicts"');
+    expect(headerBtnHtml).toContain('title="Bare repositories have no working tree to resolve"');
+    expect(headerBtnHtml).toContain(">Conflicts</span>");
+    expect(headerBtnHtml).not.toContain("Resolve conflicts");
+    expect(headerBtnHtml).not.toContain("Unchecked");
+    expect(headerBtnHtml).not.toContain("gp-chip");
+    expect(body).not.toContain('data-testid="overview-repo-conflicts-btn"');
+    expect(body).not.toContain('data-testid="overview-probe-failed-conflicts-btn"');
+    expect(body).toContain("Bare repository");
+    expect(body).toContain("Couldn't check for a parked merge or rebase here");
+  });
+
+  it("keeps Conflicts and Resolve accessible across clean, draft-only, probe-failed, and conflicted states", () => {
+    const headerActionStart = source.indexOf('data-testid="overview-conflicts-btn"');
+    expect(headerActionStart).toBeGreaterThan(-1);
+    expect(source.indexOf("{#if $repoStore.currentPath}")).toBeGreaterThan(headerActionStart);
+    const headerButtonTag = source.slice(source.lastIndexOf("<button", headerActionStart), source.indexOf(">", headerActionStart) + 1);
+    expect(headerButtonTag).toContain("aria-expanded=");
+    expect(headerButtonTag).toContain("aria-controls=");
+    expect(headerButtonTag).toContain("aria-label=");
+    expect(headerButtonTag).toContain("disabled={!$repoStore.currentPath || $repoStore.isBare}");
+
+    const repoButtons = source.match(/data-testid="overview-repo-conflicts-btn"/g);
+    expect(repoButtons).toHaveLength(2);
+    expect(source).toContain("data-testid=\"overview-probe-failed-conflicts-btn\"");
+    expect(source).toContain("data-testid=\"work-row-resolve-current\"");
+    expect(source).toContain("const { conflictedCount, statuses } = repoStore;");
+    expect(source).toContain("conflictsPanelOpen");
   });
 
   it("refreshes when repository status generation changes", () => {
