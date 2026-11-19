@@ -488,6 +488,52 @@ pub(crate) mod hermetic {
         }
     }
 
+    /// Where the per-process root lives. The root also becomes `temp_dir()`
+    /// (`TMPDIR`), and a Unix socket path must fit in `sun_path` (104 bytes on
+    /// macOS), which macOS's per-user temp dir (`/private/var/folders/xx/..`,
+    /// ~50 bytes before the root's own name) does not leave room for: every
+    /// socket fixture under `temp_dir()` failed. So Unix uses the short, fixed
+    /// `/tmp` (`/private/tmp` on macOS), kept canonical so no path under it
+    /// crosses a symlink (the storage cleaner refuses a symlinked root:
+    /// "Symlink paths are not eligible"). Elsewhere, and where `/tmp` is not a
+    /// directory, it is the canonical `temp_dir()`.
+    fn root_base() -> PathBuf {
+        let mut base = std::env::temp_dir();
+        if cfg!(unix) && Path::new("/tmp").is_dir() {
+            base = PathBuf::from("/tmp");
+        }
+        std::fs::canonicalize(&base).map_or(base, |canonical| plain_spelling(&canonical))
+    }
+
+    /// Creates the root itself, failing if it already exists. `/tmp` is shared
+    /// and world-writable, so a pre-existing path is another party's, and on
+    /// Unix the root is made `0700` and checked to be ours before anything
+    /// (git config, `HOME`) is placed under it.
+    fn create_private_root(root: &Path) {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(root)
+            .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            let meta = std::fs::symlink_metadata(root)
+                .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            let euid = unsafe { geteuid() };
+            assert!(
+                meta.is_dir() && meta.uid() == euid && meta.mode() & 0o077 == 0,
+                "hermetic test root {} is not a private directory owned by this user",
+                root.display()
+            );
+        }
+    }
+
     pub(super) extern "C" fn install() {
         // Not `static`: a second include of this file in the same crate has its
         // own copy of every static, and the environment is the one thing both
@@ -503,19 +549,16 @@ pub(crate) mod hermetic {
         if std::env::var_os(super::ROOT_MARKER).is_some() {
             return;
         }
-        // Canonical, so no path under it crosses a symlink: macOS's temp dir is
-        // `/var/folders/..`, and `/var` is a link to `/private/var`, which the
-        // storage cleaner refuses as a root ("Symlink paths are not eligible").
-        let temp = std::env::temp_dir();
-        let temp =
-            std::fs::canonicalize(&temp).map_or(temp, |canonical| plain_spelling(&canonical));
-        let root = temp.join(format!(
-            "gitpulse-hermetic-{}-{}",
+        let root = root_base().join(format!(
+            "gph-{}-{:08x}",
             std::process::id(),
+            // The low 32 bits of the clock: the pid already separates live
+            // processes, this separates a reused pid.
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
+                .map_or(0, |elapsed| elapsed.as_nanos() as u32)
         ));
+        create_private_root(&root);
         let home = root.join("home");
         let dirs = [
             home.clone(),
@@ -1049,6 +1092,30 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Regression (70 socket fixtures failed): `TMPDIR` points inside the
+    /// hermetic root, and a Unix socket path must fit in `sun_path` (104 bytes
+    /// on macOS, 108 on Linux). The deepest socket fixture under `temp_dir()`
+    /// is a `tempfile` directory (prefix plus 6 random bytes, allowed 24) holding
+    /// a nested profile directory (allowed 24) holding `instance.sock`; the
+    /// temp dir must leave room for all of it.
+    #[cfg(unix)]
+    #[test]
+    fn the_hermetic_temp_dir_leaves_room_for_the_deepest_socket_fixture() {
+        const SUN_PATH_MIN: usize = 104;
+        let temp = std::env::temp_dir();
+        assert!(
+            temp.starts_with(hermetic::root()),
+            "{} is not under the hermetic root",
+            temp.display()
+        );
+        let worst = temp.as_os_str().len() + 1 + 24 + 1 + 24 + 1 + "instance.sock".len();
+        assert!(
+            worst < SUN_PATH_MIN,
+            "a socket fixture under {} can reach {worst} bytes; sun_path holds {SUN_PATH_MIN} including the NUL",
+            temp.display()
+        );
     }
 
     /// Regression (a panic leaks a process-global override): the whole point of
