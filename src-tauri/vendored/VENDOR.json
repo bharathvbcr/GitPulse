@@ -81,7 +81,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-redact",
-        "commit": "44288a2b6c5c8bf4b6f0dc60c23d3ce52d92d675",
+        "commit": "b9b2314d4063a9ab13ff17b6af72f53dee47d4a5",
         "commit_is_not_the_source": true
       },
       "omitted": [
