@@ -618,6 +618,160 @@ fn an_mcp_caller_cannot_send_as_a_person_by_choosing_a_reserved_sender_name() {
 }
 
 #[test]
+fn a_reused_msg_id_sent_to_a_second_recipient_is_refused_and_deposits_nothing() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid_b = "88888888-8888-4888-8888-888888888888";
+    let sid_c = "5e1f0a7c-2b3d-4e5f-8a6b-7c8d9e0f1a2b";
+    register_forgery_target(&repo, sid_b, "reuse-b");
+    register_forgery_target(&repo, sid_c, "reuse-c");
+    let send = |to: &str| {
+        handle_tool_call(
+            "gitpulse_agent_send",
+            &json!({
+                "repo_path": repo,
+                "from_peer": "claude:orchestrator",
+                "to_peer": to,
+                "msg_id": "msg_reuse_1",
+                "body": "same text",
+            }),
+        )
+    };
+    let first = send("reuse-b").expect("first send");
+    assert_eq!(first["to_peer"], format!("claude:{sid_b}"));
+
+    let refused = send("reuse-c").expect_err("a reused id for another recipient is refused");
+    assert!(refused.contains("to_agent"), "got: {refused}");
+
+    let mb = Mailbox::at_default().expect("mailbox");
+    let c_pending = mb
+        .peek_pending(sid_c, 16, SystemTime::now())
+        .expect("peek C");
+    assert!(
+        c_pending.is_empty(),
+        "a refused send must not deposit into C's mailbox: {c_pending:?}"
+    );
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert_eq!(bus.messages.len(), 1, "only B's message is on the bus");
+
+    // The exact retry to B stays idempotent.
+    let retry = send("reuse-b").expect("exact retry");
+    assert_eq!(retry["msg_id"], "msg_reuse_1");
+    assert_eq!(retry["message"]["seq"], first["message"]["seq"]);
+}
+
+#[test]
+fn a_retry_naming_the_same_peer_by_another_selector_is_idempotent_and_deposits_once() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-1111-4222-8333-aaaaaaaaaaaa";
+    register_forgery_target(&repo, sid, "selector-b");
+    let send = |to: &str| {
+        handle_tool_call(
+            "gitpulse_agent_send",
+            &json!({
+                "repo_path": repo,
+                "from_peer": "claude:orchestrator",
+                "to_peer": to,
+                "msg_id": "msg_selector_1",
+                "body": "same text",
+            }),
+        )
+    };
+    let by_role = send("selector-b").expect("first send by role");
+    let by_peer_id = send(&format!("claude:{sid}")).expect("retry by canonical peer id");
+    assert_eq!(by_peer_id["message"]["seq"], by_role["message"]["seq"]);
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert_eq!(bus.messages.len(), 1);
+    let mb = Mailbox::at_default().expect("mailbox");
+    let pending = mb.peek_pending(sid, 16, SystemTime::now()).expect("peek");
+    assert_eq!(
+        pending.len(),
+        1,
+        "a retry must not double-deposit: {pending:?}"
+    );
+}
+
+#[test]
+fn a_kickoff_refused_for_a_reserved_sender_leaves_no_claim_task_update_or_bus_row() {
+    let (dir, repo) = trusted_git_repo();
+    let profile = tempfile::tempdir().expect("profile dir");
+    super::PROFILE_OVERRIDE
+        .with(|cell| *cell.borrow_mut() = Some(profile.path().join("workbench.sqlite")));
+    let added = handle_tool_call(
+        "gitpulse_add_task",
+        &json!({"repo_path": repo, "task_id": "kickoff-order-1", "title": "Kickoff ordering"}),
+    )
+    .expect("add task");
+    let task_before = handle_tool_call(
+        "gitpulse_get_task",
+        &json!({"repo_path": repo, "task_id": "kickoff-order-1"}),
+    )
+    .expect("read task before");
+    let kickoff = |from: &str| {
+        handle_tool_call(
+            "gitpulse_kickoff_agent",
+            &json!({
+                "repo_path": repo,
+                "from_agent": from,
+                "to_agent": "claude:worker",
+                "task_id": "kickoff-order-1",
+                "branch": "feat/kickoff-order",
+                "claimed_files": ["src/a.rs"],
+            }),
+        )
+    };
+
+    for name in [
+        "developer",
+        "human",
+        "human-dev",
+        "user",
+        " User ",
+        "DEVELOPER",
+    ] {
+        let refused = kickoff(name).expect_err(name);
+        assert!(
+            refused.contains("reserved for the person"),
+            "{name:?}: {refused}"
+        );
+    }
+    let task_after = handle_tool_call(
+        "gitpulse_get_task",
+        &json!({"repo_path": repo, "task_id": "kickoff-order-1"}),
+    )
+    .expect("read task after");
+    assert_eq!(
+        task_after, task_before,
+        "a refused kickoff must not touch the task ({added})"
+    );
+    assert!(
+        crate::engine::agent_bus::list_lanes(&repo)
+            .expect("lanes")
+            .is_empty(),
+        "a refused kickoff must leave no lane claim"
+    );
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert!(bus.messages.is_empty(), "no bus row: {:?}", bus.messages);
+
+    // Control: the same call from a real agent does claim, update and post, so the
+    // assertions above can fail.
+    let ok = kickoff("claude:coordinator").expect("agent kickoff");
+    assert_eq!(ok["task_updated"], true);
+    assert_eq!(
+        crate::engine::agent_bus::list_lanes(&repo)
+            .expect("lanes")
+            .len(),
+        1
+    );
+    let bus = crate::engine::agent_bus::read_messages(&repo, None, 0).expect("bus");
+    assert_eq!(
+        bus.messages.len(),
+        1,
+        "the control kickoff posts one bus row"
+    );
+    drop(dir);
+}
+
+#[test]
 fn no_mcp_message_tool_accepts_a_name_reserved_for_a_person() {
     let (_dir, repo) = trusted_git_repo();
     let calls = [

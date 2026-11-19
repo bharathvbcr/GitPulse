@@ -958,11 +958,31 @@ pub fn post_peer_message(
                 .iter()
                 .find(|m| m.msg_id.as_deref() == Some(want_id.as_str()))
             {
-                if existing.body == trimmed_body && existing.from_agent == from {
+                // A retry is the same message only when every field that routes or threads it
+                // matches. A reused id aimed at another recipient, kind or thread would otherwise
+                // be reported as the first message while the caller believes it went elsewhere.
+                let mut differs: Vec<&str> = Vec::new();
+                if existing.body != trimmed_body {
+                    differs.push("body");
+                }
+                if existing.from_agent != from {
+                    differs.push("from_agent");
+                }
+                if existing.to_agent != to {
+                    differs.push("to_agent");
+                }
+                if existing.kind != msg_kind {
+                    differs.push("kind");
+                }
+                if existing.thread_key != t_key {
+                    differs.push("thread_key");
+                }
+                if differs.is_empty() {
                     return Ok(existing.clone());
                 }
                 return Err(CommandError::from(format!(
-                    "msg_id '{want_id}' already exists with a different payload"
+                    "msg_id '{want_id}' already exists with a different payload (mismatched: {})",
+                    differs.join(", ")
                 )));
             }
         }
@@ -3289,6 +3309,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agent.hop, Some(1));
+    }
+
+    #[test]
+    fn a_reused_msg_id_is_refused_when_recipient_kind_or_thread_differs_and_exact_retry_is_idempotent(
+    ) {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+
+        let send = |to: &str, thread: Option<&str>, kind: &str| {
+            post_peer_message(
+                anchor,
+                MessageOrigin::Agent,
+                "agy:lead",
+                Some(to),
+                thread,
+                kind,
+                "same text",
+                None,
+                Some("req_reuse_001"),
+                1,
+                6,
+            )
+        };
+        let first = send("claude:peer-b", Some("t-1"), "note").unwrap();
+
+        // The same id and body aimed at another recipient is refused, not reported as B's row.
+        let other_recipient = send("claude:peer-c", Some("t-1"), "note")
+            .expect_err("recipient")
+            .into_message();
+        assert!(
+            other_recipient.contains("to_agent"),
+            "refusal must name the recipient: {other_recipient}"
+        );
+        assert!(send("claude:peer-b", Some("t-1"), "ask")
+            .expect_err("kind")
+            .into_message()
+            .contains("kind"));
+        assert!(send("claude:peer-b", Some("t-2"), "note")
+            .expect_err("thread")
+            .into_message()
+            .contains("thread_key"));
+        assert!(send("claude:peer-b", None, "note")
+            .expect_err("dropped thread")
+            .into_message()
+            .contains("thread_key"));
+
+        // An exact retry still returns the original row, and nothing extra was stored.
+        let retry = send("claude:peer-b", Some("t-1"), "note").unwrap();
+        assert_eq!(retry.seq, first.seq);
+        assert_eq!(read_messages(anchor, None, 0).unwrap().messages.len(), 1);
     }
 
     #[test]
