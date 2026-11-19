@@ -243,10 +243,24 @@ fn run_one_shot(args: &[&str]) -> (Option<i32>, String, String) {
 
 /// [`run_one_shot`] with `input` written to stdin and then closed.
 fn run_one_shot_with_input(args: &[&str], input: Option<&str>) -> (Option<i32>, String, String) {
+    run_one_shot_with(args, input, false, &[])
+}
+
+/// [`run_one_shot_with_input`] with extra environment, and with stdin kept
+/// open (never closed, as a pipe whose writer is still alive) until the
+/// command has exited when `hold_stdin_open` is set.
+fn run_one_shot_with(
+    args: &[&str],
+    input: Option<&str>,
+    hold_stdin_open: bool,
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> (Option<i32>, String, String) {
     let log_dir = tempfile::tempdir().expect("log dir");
-    let mut child = Command::new(mcp_bin())
+    let mut command = Command::new(mcp_bin());
+    command.envs(envs.iter().copied());
+    let mut child = command
         .args(args)
-        .stdin(if input.is_some() {
+        .stdin(if input.is_some() || hold_stdin_open {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -268,9 +282,12 @@ fn run_one_shot_with_input(args: &[&str], input: Option<&str>) -> (Option<i32>, 
             text
         })
     };
+    let mut held_stdin = None;
     if let Some(input) = input {
         let mut stdin = child.stdin.take().expect("stdin");
         stdin.write_all(input.as_bytes()).expect("write stdin");
+    } else if hold_stdin_open {
+        held_stdin = child.stdin.take();
     }
     let stdout = drain(Box::new(child.stdout.take().expect("stdout")));
     let stderr = drain(Box::new(child.stderr.take().expect("stderr")));
@@ -286,11 +303,98 @@ fn run_one_shot_with_input(args: &[&str], input: Option<&str>) -> (Option<i32>, 
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    drop(held_stdin);
     (
         status.code(),
         stdout.join().expect("stdout reader"),
         stderr.join().expect("stderr reader"),
     )
+}
+
+/// A `--json -` whose writer never closes the pipe is a stall, bounded by
+/// `--timeout-ms` like a tool that never answers: exit 4 and nothing run, not
+/// a hang until the harness gives up (feat/mcp-cli review, finding 4).
+#[test]
+fn a_stdin_that_never_closes_exits_four_at_the_timeout() {
+    let (code, stdout, stderr) = run_one_shot_with(
+        &[
+            "call",
+            "gitpulse_status",
+            "--json",
+            "-",
+            "--timeout-ms",
+            "800",
+        ],
+        None,
+        true,
+        &[],
+    );
+    assert_eq!(code, Some(4), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("--json -"), "{stderr}");
+}
+
+/// A timed-out call takes the git it started down with it: a `git` that
+/// hangs is recorded by pid, the call times out (exit 4), and that pid is
+/// gone afterwards. By pid, never by name.
+#[test]
+#[cfg(unix)]
+fn a_timed_out_call_leaves_no_git_child_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempfile::tempdir().expect("repo");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status_locked()
+        .expect("git init")
+        .success());
+    // Persist the grant so the out-of-process `gitpulse-mcp` shares the
+    // hermetic trust decision.
+    let repo_str = repo.path().to_str().expect("utf-8 path");
+    let preview = gitpulse_lib::repository_trust::inspect(repo_str).expect("inspect repo");
+    gitpulse_lib::repository_trust::grant(repo_str, &preview.identity, true).expect("trust");
+    let stub = tempfile::tempdir().expect("stub dir");
+    let pids = stub.path().join("pids");
+    let script = stub.path().join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec sleep 300\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(stub.path());
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    let repo_arg = format!("repo_path={}", repo.path().to_str().expect("utf-8 path"));
+    let (code, stdout, stderr) = run_one_shot_with(
+        &["call", "gitpulse_status", &repo_arg, "--timeout-ms", "2500"],
+        None,
+        false,
+        &[("PATH", path.as_os_str())],
+    );
+    assert_eq!(code, Some(4), "stdout: {stdout}\nstderr: {stderr}");
+    let started: Vec<String> = std::fs::read_to_string(&pids)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !started.is_empty(),
+        "the call never started the stub git, so this proves nothing: {stderr}"
+    );
+    for pid in started {
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status_locked()
+            .expect("kill -0")
+            .success();
+        assert!(!alive, "git child {pid} outlived the timed-out call");
+    }
 }
 
 /// An agent whose MCP connection is not loaded still has a shell: the same

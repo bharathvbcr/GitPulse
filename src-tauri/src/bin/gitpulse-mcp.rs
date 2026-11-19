@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use gitpulse_lib::mcp::resources;
 use gitpulse_lib::mcp::{self, Accepted, Era, JsonRpcRequest, JsonRpcResponse, Ready};
 use gitpulse_lib::ndjson;
 use serde_json::{json, Value};
@@ -816,7 +817,7 @@ JSON result on stdout, and `read` prints one gitpulse:// resource
 (gitpulse://server/manifest lists the rest). They do not get past load: a read
 deferred under load is deferred here too.
 
-    gitpulse-mcp call gitpulse_insights repo_path=\"$PWD\"
+    gitpulse-mcp call gitpulse_insights repo_path=/abs/repo
     gitpulse-mcp call gitpulse_list_tasks repo_path=/abs/repo limit=20
     echo '{\"repo_path\":\"/abs/repo\",\"title\":\"...\"}' | gitpulse-mcp call gitpulse_add_task --json - --write
     gitpulse-mcp read gitpulse://server/manifest
@@ -835,12 +836,16 @@ EXIT STATUS (call, read):
     2  the command line was wrong: unknown command, tool, option, key or
        resource, or a write without --write
     3  the answer says it is incomplete: ok: false, <facet>_ok: false,
-       deferred: true or truncated: true on any object in it, or the result
-       budget cut it. The partial result is still printed; stderr names
-       where (worktrees.ok, agents.live.ok, ...)
-    4  no answer within --timeout-ms (default: GITPULSE_MCP_CALL_TIMEOUT_MS,
-       60000, for a read; 600000 for a write, which stopping midway would
-       leave half done). The tool is stopped and its git children taken
+       deferred: true, truncated: true, deadline_expired: true or a
+       walk_incomplete reason on any object in it (including objects inside
+       lists, where a row's own ok: false is data and is not read), the
+       result budget cut it, or a resource was cut at its size
+       cap. The partial result is still printed; stderr names where
+       (worktrees.ok, agents.live.ok, items[2].truncated, ...)
+    4  no answer within --timeout-ms, which also bounds reading --json from
+       stdin or a file (default: GITPULSE_MCP_CALL_TIMEOUT_MS, 60000, for a
+       read; 600000 for a write, which stopping midway would leave half
+       done). The tool is stopped and its git children taken
        down; nothing is printed on stdout, and a write's outcome is unknown:
        read the state back before retrying
 
@@ -971,6 +976,11 @@ fn main() {
     }
 
     if let Some(args) = command {
+        // This process exits when its one command returns, which ends any
+        // background thread and, through `exit_reaping`, any child: a build a
+        // tool would start in the background (a worktree's seeded index
+        // refresh) must run here instead.
+        gitpulse_lib::devmap::live::run_process_short_lived();
         exit_reaping(run_command(&args));
     }
 
@@ -1014,12 +1024,13 @@ fn exit_reaping(code: i32) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot commands: `tools`, `describe`, `call`.
+// One-shot commands: `tools`, `describe`, `call`, `read` ([`CLI_COMMANDS`]).
 //
 // An agent whose MCP connection is not loaded, was dropped by its host, or is
 // wedged still has a shell. These answer one request from it and exit. They
-// add no tool and no rule of their own: `call` is a `tools/call` request
-// handed to [`mcp::process_request`], so argument validation, the result
+// add no tool and no rule of their own: `call` and `read` hand a
+// `tools/call` or `resources/read` request to [`mcp::accept`] and
+// [`mcp::run`], the pair the server uses, so argument validation, the result
 // budget, unknown-tool handling, repository trust and policy gates are the
 // server's own, in this process.
 // ---------------------------------------------------------------------------
@@ -1037,7 +1048,8 @@ mod exit_status {
     /// The command line was wrong: unknown command, tool, option or key.
     pub const USAGE: i32 = 2;
     /// The tool answered and said the answer is incomplete, on any object in
-    /// it (`incomplete_parts`). The partial answer is printed.
+    /// it, lists included (`incomplete_parts`), or a resource was cut at its
+    /// size cap. The partial answer is printed.
     pub const INCOMPLETE: i32 = 3;
     /// No answer within the deadline. The tool was stopped, so a write's
     /// outcome is unknown.
@@ -1086,8 +1098,24 @@ impl CliOutput {
 fn run_command(args: &[String]) -> i32 {
     use std::io::Write;
     let catalog = mcp::tools();
-    let output = match parse_command(args, &catalog, &read_argument_source) {
+    // A stdin that never closes is a stall, not a usage error: it exits 4 as
+    // a tool that never answers does.
+    let stalled = std::cell::Cell::new(false);
+    let read = |source: &str, within: Duration| match read_argument_source_within(source, within) {
+        Ok(text) => Ok(text),
+        Err(ReadFailure::Failed(message)) => Err(message),
+        Err(ReadFailure::Stalled(message)) => {
+            stalled.set(true);
+            Err(message)
+        }
+    };
+    let output = match parse_command(args, &catalog, &read) {
         Ok(command) => execute(command, &catalog),
+        Err(message) if stalled.get() => CliOutput {
+            code: exit_status::TIMED_OUT,
+            stdout: String::new(),
+            stderr: format!("gitpulse-mcp: {message}\n"),
+        },
         Err(message) => CliOutput::usage(message),
     };
     // Stdout first: it is the answer. A reader that closed it early (`| head`)
@@ -1131,10 +1159,52 @@ fn read_argument_source(source: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("--json {source} is not UTF-8"))
 }
 
+/// Reads `--json -` or `--json @path` for [`parse_command`]; the second
+/// argument is how long it may wait.
+type ArgumentReader<'a> = dyn Fn(&str, Duration) -> Result<String, String> + 'a;
+
+/// Why a `--json` source did not come back.
+#[derive(Debug)]
+enum ReadFailure {
+    /// It could not be read, was too large or not UTF-8.
+    Failed(String),
+    /// It did not finish within the deadline: a stdin nobody closes, a FIFO
+    /// nobody writes.
+    Stalled(String),
+}
+
+/// [`read_argument_source`] under a deadline, so a source that never ends
+/// exits 4 like a tool that never answers. The read runs on its own thread
+/// (opening a FIFO blocks too); a thread still blocked when the deadline
+/// passes is left to the process exit that follows.
+fn read_argument_source_within(source: &str, within: Duration) -> Result<String, ReadFailure> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let owned = source.to_owned();
+    let spawned = gitpulse_lib::supervisor::spawn_once(
+        "gitpulse-mcp-argument",
+        "mcp one-shot argument read",
+        move || {
+            let _ = sender.send(read_argument_source(&owned));
+        },
+    );
+    if let Err(error) = spawned {
+        return Err(ReadFailure::Failed(format!(
+            "--json {source}: could not start a reader thread: {error}"
+        )));
+    }
+    match receiver.recv_timeout(within) {
+        Ok(result) => result.map_err(ReadFailure::Failed),
+        Err(_) => Err(ReadFailure::Stalled(format!(
+            "--json {source} did not end within {} ms (--timeout-ms); nothing was run",
+            within.as_millis()
+        ))),
+    }
+}
+
 fn parse_command(
     args: &[String],
     catalog: &[Value],
-    read: &dyn Fn(&str) -> Result<String, String>,
+    read: &ArgumentReader<'_>,
 ) -> Result<CliCommand, String> {
     let Some((command, rest)) = args.split_first() else {
         return Err("no command given".into());
@@ -1174,7 +1244,7 @@ fn is_read_only(tool: &Value) -> bool {
 fn parse_call(
     rest: &[String],
     catalog: &[Value],
-    read: &dyn Fn(&str) -> Result<String, String>,
+    read: &ArgumentReader<'_>,
 ) -> Result<CliCommand, String> {
     let Some((name, rest)) = rest.split_first() else {
         return Err("`call` needs a tool name: gitpulse-mcp call <tool> [key=value ...]".into());
@@ -1188,7 +1258,7 @@ fn parse_call(
     let mut arguments = serde_json::Map::new();
     let mut write = false;
     let mut compact = false;
-    let mut json_given = false;
+    let mut json_source: Option<&String> = None;
     let mut timeout = None;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
@@ -1196,27 +1266,15 @@ fn parse_call(
             "--write" => write = true,
             "--compact" => compact = true,
             "--timeout-ms" => set_timeout(&mut timeout, rest.next())?,
+            // Read after the loop: the source is read under the deadline, and
+            // `--timeout-ms` may come after it.
             "--json" => {
-                if json_given {
+                if json_source.is_some() {
                     return Err("--json given twice".into());
                 }
-                json_given = true;
-                let source = rest.next().ok_or(
+                json_source = Some(rest.next().ok_or(
                     "--json needs a value: a JSON object, - for stdin, or @path for a file",
-                )?;
-                let text = if source == "-" || source.starts_with('@') {
-                    read(source)?
-                } else {
-                    source.clone()
-                };
-                let parsed: Value =
-                    serde_json::from_str(&text).map_err(|e| format!("--json is not JSON: {e}"))?;
-                let Value::Object(object) = parsed else {
-                    return Err("--json must be a JSON object".into());
-                };
-                for (key, value) in object {
-                    insert_once(&mut arguments, key, value)?;
-                }
+                )?);
             }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option {flag:?} for `call`"));
@@ -1235,11 +1293,27 @@ fn parse_call(
             "{name} changes state (it is not marked readOnlyHint); pass --write to run it"
         ));
     }
+    let timeout = timeout.unwrap_or_else(|| default_timeout(tool));
+    if let Some(source) = json_source {
+        let text = if source == "-" || source.starts_with('@') {
+            read(source, timeout)?
+        } else {
+            source.clone()
+        };
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| format!("--json is not JSON: {e}"))?;
+        let Value::Object(object) = parsed else {
+            return Err("--json must be a JSON object".into());
+        };
+        for (key, value) in object {
+            insert_once(&mut arguments, key, value)?;
+        }
+    }
     Ok(CliCommand::Call {
         tool: name.clone(),
         arguments: Value::Object(arguments),
         compact,
-        timeout: timeout.unwrap_or_else(|| default_timeout(tool)),
+        timeout,
     })
 }
 
@@ -1469,9 +1543,8 @@ where
     let unstarted = ready.unstarted();
     let (sender, receiver) = mpsc::sync_channel(1);
     let worker_panicked = panicked.clone();
-    let spawned = std::thread::Builder::new()
-        .name("gitpulse-mcp-call".into())
-        .spawn(move || {
+    let spawned =
+        gitpulse_lib::supervisor::spawn_once("gitpulse-mcp-call", "mcp one-shot call", move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(ready)));
             // The receiver is gone only when the budget already ran out.
             let _ = sender.send(outcome.unwrap_or(worker_panicked));
@@ -1495,7 +1568,7 @@ fn timed_out_outcome(target: &str, budget: Duration) -> CliOutput {
         code: exit_status::TIMED_OUT,
         stdout: String::new(),
         stderr: format!(
-            "gitpulse-mcp: {target} did not answer within {} ms (--timeout-ms, default {CALL_BUDGET_ENV}); it was stopped and its git children taken down. A write's outcome is unknown: read the state back before retrying\n",
+            "gitpulse-mcp: {target} did not answer within {} ms (--timeout-ms; unset, a read waits {CALL_BUDGET_ENV}, 60000 ms by default, and a write waits 600000 ms); it was stopped and its git children taken down. A write's outcome is unknown: read the state back before retrying\n",
             budget.as_millis()
         ),
     }
@@ -1543,7 +1616,17 @@ fn read_outcome(response: &JsonRpcResponse, compact: bool) -> CliOutput {
     let contents = &response.result.as_ref().unwrap_or(&Value::Null)["contents"];
     match contents.as_array().map(Vec::as_slice) {
         Some([only]) if only["text"].is_string() => {
-            payload_outcome(only["text"].as_str().unwrap_or(""), compact, "read")
+            let text = only["text"].as_str().unwrap_or("");
+            // A document over the cap is cut and relabelled (not JSON any
+            // more), so it would pass as plain text: it is incomplete.
+            if only["mimeType"] == resources::CUT_DOCUMENT_MIME_TYPE {
+                return CliOutput {
+                    code: exit_status::INCOMPLETE,
+                    stdout: format!("{text}\n"),
+                    stderr: "gitpulse-mcp read: the answer is incomplete (the document was cut at its size cap); read the equivalent tool with a narrower argument\n".into(),
+                };
+            }
+            payload_outcome(text, compact, "read")
         }
         _ => payload_outcome(&contents.to_string(), compact, "read"),
     }
@@ -1582,48 +1665,86 @@ fn payload_outcome(text: &str, compact: bool, command: &str) -> CliOutput {
     }
 }
 
-/// Where a result says it is not whole, as dotted paths: `ok: false` or a
-/// `<facet>_ok: false` (`sessions_ok`), `deferred: true` or
-/// `truncated: true`, on the result or on any object inside it, and the
-/// result budget's own cut marker. Facets nest (`gitpulse_insights` reports
-/// `agents.live.ok` inside a result that otherwise succeeded), so every
-/// object is read. Arrays hold rows, which are data rather than facets, and
-/// are not read.
+/// Where a result says it is not whole, as paths (`agents.live.ok`,
+/// `items[2].truncated`): `ok: false` or a `<facet>_ok: false`
+/// (`sessions_ok`), `deferred: true`, `truncated: true` or
+/// `deadline_expired: true`, a `walk_incomplete` that is `true` or a
+/// non-empty reason (DevMap's is a string), and the result budget's own cut
+/// marker ([`resources::RESULT_TRUNCATION_KEY`]), on the result or on any
+/// object inside it, objects in lists included. The one thing a list changes:
+/// a row's own `ok: false` (or `<x>_ok: false`) is that row's verdict, data
+/// rather than a facet, and is not read, as before. At most [`MAX_INCOMPLETE_PARTS`] are
+/// named, then a count of the rest, so a hostile payload cannot make stderr
+/// as large as the answer.
 fn incomplete_parts(payload: &Value) -> Vec<String> {
     /// Deeper than any result nests; bounds the walk on a hostile payload.
     const MAX_DEPTH: usize = 16;
-    /// What `mcp::budget` adds when it had to cut a result to fit.
-    const BUDGET_CUT: &str = "result_truncation";
 
-    fn walk(value: &Value, path: &str, depth: usize, parts: &mut Vec<String>) {
-        let Some(object) = value.as_object() else {
+    /// `in_row`: the object is inside a list. A row's own `ok: false` is its
+    /// verdict (a failed event, a refused item), which is data; only the words
+    /// that say the *answer* is cut are read there.
+    fn says_partial(key: &str, field: &Value, in_row: bool) -> bool {
+        match key {
+            "deferred" | "truncated" | "deadline_expired" => *field == true,
+            resources::RESULT_TRUNCATION_KEY => !field.is_null(),
+            "walk_incomplete" => *field == true || field.as_str().is_some_and(|s| !s.is_empty()),
+            "ok" => !in_row && *field == false,
+            other => !in_row && other.ends_with("_ok") && *field == false,
+        }
+    }
+
+    fn walk(value: &Value, path: &str, in_row: bool, depth: usize, found: &mut Found) {
+        if depth > MAX_DEPTH {
             return;
-        };
-        for (key, field) in object {
-            let at = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
-            let says_partial = match key.as_str() {
-                "deferred" | "truncated" => *field == true,
-                BUDGET_CUT => !field.is_null(),
-                "ok" => *field == false,
-                other => other.ends_with("_ok") && *field == false,
-            };
-            if says_partial {
-                parts.push(at.clone());
+        }
+        match value {
+            Value::Object(object) => {
+                for (key, field) in object {
+                    let at = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if says_partial(key, field, in_row) {
+                        found.add(&at);
+                    }
+                    walk(field, &at, in_row, depth + 1, found);
+                }
             }
-            if depth < MAX_DEPTH {
-                walk(field, &at, depth + 1, parts);
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{index}]"), true, depth + 1, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[derive(Default)]
+    struct Found {
+        named: Vec<String>,
+        unnamed: usize,
+    }
+    impl Found {
+        fn add(&mut self, at: &str) {
+            if self.named.len() < MAX_INCOMPLETE_PARTS {
+                self.named.push(at.to_owned());
+            } else {
+                self.unnamed += 1;
             }
         }
     }
 
-    let mut parts = Vec::new();
-    walk(payload, "", 0, &mut parts);
-    parts
+    let mut found = Found::default();
+    walk(payload, "", false, 0, &mut found);
+    if found.unnamed > 0 {
+        found.named.push(format!("and {} more", found.unnamed));
+    }
+    found.named
 }
+
+/// How many incomplete markers [`incomplete_parts`] names before counting.
+const MAX_INCOMPLETE_PARTS: usize = 32;
 
 /// The library's environment-override guard, compiled into this crate too: the
 /// library's own is `#[cfg(test)]` and `pub(crate)`, so it does not exist from
@@ -2003,7 +2124,7 @@ mod cli_tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    fn no_reader(source: &str) -> Result<String, String> {
+    fn no_reader(source: &str, _within: Duration) -> Result<String, String> {
         panic!("nothing should be read, asked for {source}")
     }
 
@@ -2162,7 +2283,7 @@ mod cli_tests {
     #[test]
     fn json_arguments_come_inline_from_stdin_or_a_file_and_never_twice() {
         let tools = mcp::tools();
-        let reader = |source: &str| -> Result<String, String> {
+        let reader = |source: &str, _within: Duration| -> Result<String, String> {
             assert!(source == "-" || source == "@brief.json", "{source}");
             Ok(r#"{"repo_path":"/r","limit":3}"#.to_owned())
         };
@@ -2259,6 +2380,135 @@ mod cli_tests {
         assert!(refused.contains("larger than"), "{refused}");
     }
 
+    /// A `--json` source that never ends is a stall (exit 4), not a hang: a
+    /// FIFO nobody opens blocks the open itself, and the read gives up at the
+    /// deadline. A source that ends in time is read as before.
+    #[test]
+    #[cfg(unix)]
+    fn a_json_source_that_never_ends_stalls_at_the_deadline() {
+        use gitpulse_lib::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("brief.fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status_locked()
+            .expect("mkfifo")
+            .success());
+        let started = Instant::now();
+        let stalled = read_argument_source_within(
+            &format!("@{}", fifo.display()),
+            Duration::from_millis(200),
+        );
+        assert!(
+            matches!(stalled, Err(ReadFailure::Stalled(ref why)) if why.contains("200 ms")),
+            "{stalled:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let file = dir.path().join("brief.json");
+        std::fs::write(&file, r#"{"a":1}"#).unwrap();
+        let read =
+            read_argument_source_within(&format!("@{}", file.display()), Duration::from_secs(30));
+        assert!(
+            matches!(read, Ok(ref text) if text == r#"{"a":1}"#),
+            "{read:?}"
+        );
+        let missing = read_argument_source_within(
+            "@/no/such/gitpulse-cli-brief.json",
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(missing, Err(ReadFailure::Failed(_))),
+            "{missing:?}"
+        );
+    }
+
+    /// Every shape a result can say "not whole" in exits 3 and is named: a
+    /// facet inside a list, a deadline, DevMap's string-valued
+    /// `walk_incomplete`, the budget's own marker, a resource cut at its cap.
+    #[test]
+    fn every_incomplete_shape_is_named_and_exits_three() {
+        for (payload, named) in [
+            (
+                json!({ "items": [{ "ok": true }, { "truncated": true }] }),
+                "items[1].truncated",
+            ),
+            (
+                json!({ "rows": [[{ "deferred": true }]] }),
+                "rows[0][0].deferred",
+            ),
+            (
+                json!({ "ok": true, "deadline_expired": true }),
+                "deadline_expired",
+            ),
+            (
+                json!({ "ok": true, "walk_incomplete": "file walk stopped at 5000 files" }),
+                "walk_incomplete",
+            ),
+            (
+                json!({ "a": { "walk_incomplete": true } }),
+                "a.walk_incomplete",
+            ),
+            (
+                json!({ resources::RESULT_TRUNCATION_KEY: { "arrays": [] } }),
+                resources::RESULT_TRUNCATION_KEY,
+            ),
+        ] {
+            let outcome = call_outcome(&text_result(&payload), true);
+            assert_eq!(
+                outcome.code,
+                exit_status::INCOMPLETE,
+                "{payload}: {outcome:?}"
+            );
+            assert!(
+                outcome.stderr.contains(named),
+                "{payload}: {}",
+                outcome.stderr
+            );
+            assert!(!outcome.stdout.is_empty());
+        }
+        // What is not a marker stays complete: an empty or false reason, a
+        // false flag, a row's own verdict, and plain rows.
+        for payload in [
+            json!({ "ok": true, "walk_incomplete": "", "deadline_expired": false }),
+            json!({ "walk_incomplete": false, "items": [{ "ok": true, "truncated": false }] }),
+            json!({ "items": [1, "ok", null, { "ok": false, "sessions_ok": false }] }),
+        ] {
+            let outcome = call_outcome(&text_result(&payload), true);
+            assert_eq!(outcome.code, exit_status::OK, "{payload}: {outcome:?}");
+        }
+        // Stderr stays small however many markers a payload carries.
+        let many =
+            json!({ "items": (0..500).map(|_| json!({ "truncated": true })).collect::<Vec<_>>() });
+        let outcome = call_outcome(&text_result(&many), true);
+        assert_eq!(outcome.code, exit_status::INCOMPLETE);
+        assert!(
+            outcome.stderr.contains("and 468 more"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(outcome.stderr.len() < 2048, "{}", outcome.stderr.len());
+
+        // A resource cut at its document cap is relabelled text/plain with a
+        // notice: still incomplete. The same text under application/json is
+        // not judged by its wording.
+        let cut = response(json!({ "contents": [{
+            "uri": "gitpulse://status/x",
+            "mimeType": resources::CUT_DOCUMENT_MIME_TYPE,
+            "text": "{ \"a\": 1\n\n… truncated: document is 9 bytes, capped at 4 bytes as carried on the wire."
+        }] }));
+        let outcome = read_outcome(&cut, true);
+        assert_eq!(outcome.code, exit_status::INCOMPLETE, "{outcome:?}");
+        assert!(outcome.stdout.contains("… truncated"), "{}", outcome.stdout);
+        assert!(outcome.stderr.contains("size cap"), "{}", outcome.stderr);
+        let whole = response(json!({ "contents": [{
+            "uri": "gitpulse://status/x",
+            "mimeType": "application/json",
+            "text": "{\"a\":1}"
+        }] }));
+        assert_eq!(read_outcome(&whole, true).code, exit_status::OK);
+    }
+
     #[test]
     fn exit_status_tells_a_complete_answer_from_a_partial_one_and_from_an_error() {
         let complete = call_outcome(&text_result(&json!({ "ok": true })), true);
@@ -2352,7 +2602,7 @@ mod cli_tests {
     #[test]
     fn every_documented_example_parses_with_its_required_arguments() {
         let catalog = mcp::tools();
-        let brief = |source: &str| -> Result<String, String> {
+        let brief = |source: &str, _within: Duration| -> Result<String, String> {
             match source {
                 "-" => Ok(r#"{"repo_path":"/abs/repo","title":"..."}"#.to_owned()),
                 "@claim.json" => Ok(
