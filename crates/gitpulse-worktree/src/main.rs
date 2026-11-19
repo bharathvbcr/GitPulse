@@ -77,8 +77,10 @@ SUBCOMMANDS:
       carries devmap_refresh {kind: built|fresh|deferred|cooled_down|busy|failed,
       reason}; devmap_seeded is true only for built or fresh. Any other kind
       (index possibly stale) makes the answer ok:false, names it on stderr and
-      exits 1; the worktree still exists and its path is in the answer. Exit
-      codes: 0 success, 1 failure or stale index, 2 usage error.
+      exits 3 (done but incomplete, the status gitpulse-mcp uses for an
+      incomplete answer); the worktree still exists and its path is in the
+      answer. Exit codes: 0 success, 1 failure (nothing was created), 2 usage
+      error, 3 created but the index is not current.
       On a large repository the inline build can run up to 900 s (devmap's
       build deadline), longer than gitpulse-mcp's default 600 s write timeout:
       called through `gitpulse-mcp call --write`, the create can then end with
@@ -1944,7 +1946,7 @@ fn refresh_seeded_inline(path: &str) -> SeededRefreshReport {
 }
 
 /// A refresh that left the index possibly stale makes the answer `ok: false`
-/// (exit 1, see `main`), while the created worktree's fields stay in it: the
+/// (exit 3, see `main`), while the created worktree's fields stay in it: the
 /// worktree exists, so a caller can still find it and retry the refresh.
 fn with_refresh_verdict(mut answer: Value) -> Value {
     let stale = answer["devmap_refresh"]["index_current"] == json!(false);
@@ -1990,6 +1992,10 @@ fn emit_error(json_mode: bool, error: &str) {
         let _ = err.flush();
     }
 }
+
+/// Exit status of a create that made the worktree but left its DevMap index not
+/// current; the same number gitpulse-mcp gives an answer that says it is incomplete.
+const EXIT_INCOMPLETE: i32 = 3;
 
 fn main() {
     gitpulse_lib::engine::process::run_process_as_background();
@@ -2039,9 +2045,12 @@ fn main() {
     let exit_code = match execute_subcommand(cmd) {
         Ok(val) => {
             let emitted = emit_value(json_mode, &val).is_ok();
-            // An answer that carries `ok: false` (a refresh that left the
-            // index stale) is a failure: name it on stderr and exit 1.
+            // An answer that carries `ok: false` is not a success: name it on
+            // stderr. A worktree that was made but whose index is not current
+            // is "done but incomplete" (exit 3, as in gitpulse-mcp); any other
+            // `ok: false` is a failure (exit 1).
             let succeeded = val["ok"] != json!(false);
+            let incomplete = !succeeded && val["devmap_refresh"]["index_current"] == json!(false);
             if !succeeded {
                 if let Some(error) = val["error"].as_str() {
                     let mut err = io::stderr().lock();
@@ -2049,8 +2058,12 @@ fn main() {
                     let _ = err.flush();
                 }
             }
-            if emitted && succeeded {
+            if !emitted {
+                1
+            } else if succeeded {
                 0
+            } else if incomplete {
+                EXIT_INCOMPLETE
             } else {
                 1
             }
