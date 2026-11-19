@@ -598,12 +598,48 @@ fn a_hook_that_cannot_be_asked_makes_and_takes_away_no_link() {
     // A hook that never answers --version, as a spawn deferred under load or
     // a wedged binary looks to the probe: unknown, which is not a verdict.
     let silent = temp.path().join("gitpulse-hook");
-    std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    // It writes its pid first (an `exec` keeps it), so the test can see that
+    // the probe does not leave the silent hook running behind it.
+    let silent_pid = temp.path().join("silent.pid");
+    std::fs::write(
+        &silent,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+            silent_pid.display()
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         hook_serves_lease(&silent).is_err(),
         "unknown is never a pass"
     );
+    let pid: i32 = std::fs::read_to_string(&silent_pid)
+        .expect("the silent hook ran far enough to write its pid")
+        .trim()
+        .parse()
+        .unwrap();
+    let still_running = |pid: i32| {
+        use crate::procguard::LockedSpawn;
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output_locked()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while still_running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let left = still_running(pid);
+    if left {
+        // SAFETY: a pid this test recorded from the process it started.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(!left, "the probe left the silent hook ({pid}) running");
     let first = ensure_links(&config, &silent).unwrap_err();
     assert_eq!(
         std::fs::read_link(&cargo).unwrap(),
