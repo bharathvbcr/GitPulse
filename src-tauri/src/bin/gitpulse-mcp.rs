@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use gitpulse_lib::mcp::resources;
 use gitpulse_lib::mcp::{self, Accepted, Era, JsonRpcRequest, JsonRpcResponse, Ready};
 use gitpulse_lib::ndjson;
 use serde_json::{json, Value};
@@ -799,9 +800,60 @@ gitpulse-mcp — GitPulse MCP server
 
 USAGE:
     gitpulse-mcp
+    gitpulse-mcp tools [--json]
+    gitpulse-mcp describe <tool>
+    gitpulse-mcp call <tool> [key=value ...] [--json <object|-|@file>] [--write]
+                      [--compact] [--timeout-ms N]
+    gitpulse-mcp read <uri> [--compact] [--timeout-ms N]
 
-Speaks JSON-RPC (MCP) over stdin and stdout until stdin closes. An MCP host
-starts it with no arguments; see `npm run mcp:install`.
+With no arguments it speaks JSON-RPC (MCP) over stdin and stdout until stdin
+closes. An MCP host starts it that way; see `npm run mcp:install`.
+
+The other forms answer one request and exit, for an agent whose MCP connection
+is not loaded or has dropped. They run the same tools, argument checks, trust
+gates and policy as the server, in this process: `tools` lists the catalog,
+`describe` prints one tool's schema, `call` runs one tool and prints its
+JSON result on stdout, and `read` prints one gitpulse:// resource
+(gitpulse://server/manifest lists the rest). They do not get past load: a read
+deferred under load is deferred here too.
+
+    gitpulse-mcp call gitpulse_insights repo_path=/abs/repo
+    gitpulse-mcp call gitpulse_list_tasks repo_path=/abs/repo limit=20
+    echo '{\"repo_path\":\"/abs/repo\",\"title\":\"...\"}' | gitpulse-mcp call gitpulse_add_task --json - --write
+    gitpulse-mcp read gitpulse://server/manifest
+
+A key=value is typed by the tool's schema: a string property takes the text as
+it is, any other type takes JSON (limit=20, include=true, paths='[\"a\"]').
+--json takes a whole argument object inline, from stdin (-) or a file (@path);
+a key given twice, in either form, is refused. A tool that changes state (its
+readOnlyHint is false) runs only with --write.
+
+EXIT STATUS (call, read):
+    0  the tool answered and no part of the answer says it is incomplete
+       (still read each facet: this checks the flags below, nothing more)
+    1  the tool reported an error, including an argument it refused, or it
+       panicked
+    2  the command line was wrong: unknown command, tool, option, key or
+       resource, or a write without --write
+    3  the answer says it is incomplete: ok: false, <facet>_ok: false,
+       deferred: true, truncated: true, deadline_expired: true or a
+       walk_incomplete reason on any object in it (including objects inside
+       lists, where a row's own ok: false is data and is not read), the
+       result budget cut it, or a resource was cut at its size
+       cap. The partial result is still printed; stderr names where
+       (worktrees.ok, agents.live.ok, items[2].truncated, ...)
+    4  no answer within --timeout-ms, which also bounds reading --json from
+       stdin or a file (default: GITPULSE_MCP_CALL_TIMEOUT_MS, 60000, for a
+       read; 600000 for a write, which stopping midway would leave half
+       done). The tool is stopped and its git children taken
+       down; nothing is printed on stdout, and a write's outcome is unknown:
+       read the state back before retrying
+
+Stdout carries only the answer; warnings go to stderr. A terminal tool
+(gitpulse_terminal_*) acts for the GitPulse terminal it runs in
+(GITPULSE_TERMINAL_SESSION). Outside one, each call is a new caller
+(mcp-<pid>) that cannot reach a child an earlier call left open, so only a
+self-contained call (exec with keep_open=false, open_file) is useful there.
 
 OPTIONS:
     -h, --help       Print this message
@@ -809,7 +861,8 @@ OPTIONS:
 
 ENVIRONMENT:
     GITPULSE_MCP_CALL_TIMEOUT_MS      Per-request deadline in ms (default 60000,
-                                      at most 600000; zero or junk = default)
+                                      at most 600000; zero or junk = default),
+                                      and the default --timeout-ms of call/read
     GITPULSE_MCP_WRITE_TIMEOUT_MS     How long a response may take to leave the
                                       process before the client is judged stalled
                                       and the session ends (default 10000). The
@@ -828,6 +881,8 @@ enum Invocation {
     Serve,
     Help,
     Version,
+    /// A one-shot command ([`CLI_COMMANDS`]), with its whole argument list.
+    Command(Vec<String>),
     Unknown(String),
 }
 
@@ -836,18 +891,37 @@ fn invocation(args: &[String]) -> Invocation {
         [] => Invocation::Serve,
         [only] if only == "--help" || only == "-h" => Invocation::Help,
         [only] if only == "--version" || only == "-V" => Invocation::Version,
+        [first, ..] if CLI_COMMANDS.contains(&first.as_str()) => Invocation::Command(args.to_vec()),
         _ => Invocation::Unknown(args.join(" ")),
     }
 }
 
-/// Answers a command line that is not a host's, or returns to serve.
-fn answer_command_line() {
+/// `--version`: the version line, unchanged for whatever reads it, then the
+/// one-shot commands this build answers. `mcp:doctor` reads the second line:
+/// the version does not move between releases, so it is the only way to tell
+/// an installed binary that predates a command the skills tell agents to run.
+fn version_text() -> String {
+    format!(
+        "{} {}\ncommands: {}\n",
+        mcp::SERVER_NAME,
+        mcp::server_version(),
+        CLI_COMMANDS.join(", ")
+    )
+}
+
+/// Answers a command line that is not a host's. Returns `None` to serve, or
+/// the arguments of a one-shot command for [`run_command`], which runs only
+/// after the process is set up as the server would be: logging, descriptor
+/// headroom and the signal handlers that take a tool's `git` children down
+/// with it when the caller's own timeout kills this process.
+fn answer_command_line() -> Option<Vec<String>> {
     use std::io::Write;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let text = match invocation(&args) {
-        Invocation::Serve => return,
+        Invocation::Serve => return None,
+        Invocation::Command(args) => return Some(args),
         Invocation::Help => USAGE.to_string(),
-        Invocation::Version => format!("{} {}\n", mcp::SERVER_NAME, mcp::server_version()),
+        Invocation::Version => version_text(),
         Invocation::Unknown(given) => {
             eprintln!(
                 "gitpulse-mcp: unexpected argument {given:?}; a host passes none (see --help)"
@@ -875,8 +949,14 @@ fn main() {
     gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     // Both switches above only set a flag. Everything below logs, spawns or
     // arms a handler, and none of it applies to printing a usage line.
-    answer_command_line();
+    let command = answer_command_line();
     gitpulse_lib::logging::init();
+    if command.is_some() {
+        // A one-shot caller reads stderr beside the answer, and the setup
+        // narration below is for a long-lived server's log. Warnings and
+        // errors still reach both the log file and stderr.
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     gitpulse_lib::logging::install_panic_hook();
     // Same descriptor headroom the GUI takes: this server answers agent
     // traffic through the same git engine, and a launchd-inherited limit
@@ -893,6 +973,10 @@ fn main() {
         log::info!(target: "setup", "{}", signals.describe());
     } else {
         log::warn!(target: "setup", "{}", signals.describe());
+    }
+
+    if let Some(args) = command {
+        exit_reaping(run_one_shot(&args));
     }
 
     let wire = Arc::new(Wire::new());
@@ -913,13 +997,18 @@ fn main() {
     // Exit without waiting on abandoned workers. They hold no lock the client
     // can observe, and blocking here would let one wedged git subprocess turn
     // the documented "close stdin and wait" shutdown into a forced kill.
-    //
-    // Not waiting on a worker is not the same as leaving its subprocess
-    // running, though, and `process::exit` runs no destructor that would tell
-    // the difference. So the children themselves are taken down first: this
-    // returns immediately when none are registered, and otherwise costs one
-    // `procguard::CHILD_GRACE` — the window in which `git` removes its own
-    // `.git/index.lock` instead of leaving it for the user to find.
+    exit_reaping(code);
+}
+
+/// Ends the process with `code` after taking down any child still registered.
+///
+/// Not waiting on a worker is not the same as leaving its subprocess
+/// running, and `process::exit` runs no destructor that would tell the
+/// difference. So the children themselves are taken down first: this returns
+/// immediately when none are registered, and otherwise costs one
+/// `procguard::CHILD_GRACE` — the window in which `git` removes its own
+/// `.git/index.lock` instead of leaving it for the user to find.
+fn exit_reaping(code: i32) -> ! {
     let sweep = gitpulse_lib::procguard::reap_all(gitpulse_lib::procguard::CHILD_GRACE);
     if sweep.is_complete() {
         log::info!(target: "shutdown", "{}", sweep.describe());
@@ -928,6 +1017,740 @@ fn main() {
     }
     gitpulse_lib::procguard::exit(code);
 }
+
+// ---------------------------------------------------------------------------
+// One-shot commands: `tools`, `describe`, `call`, `read` ([`CLI_COMMANDS`]).
+//
+// An agent whose MCP connection is not loaded, was dropped by its host, or is
+// wedged still has a shell. These answer one request from it and exit. They
+// add no tool and no rule of their own: `call` and `read` hand a
+// `tools/call` or `resources/read` request to [`mcp::accept`] and
+// [`mcp::run`], the pair the server uses, so argument validation, the result
+// budget, unknown-tool handling, repository trust and policy gates are the
+// server's own, in this process.
+// ---------------------------------------------------------------------------
+
+/// The first arguments that select a one-shot command instead of serving.
+const CLI_COMMANDS: [&str; 4] = ["tools", "describe", "call", "read"];
+
+/// Exit statuses of the one-shot commands. Distinct, so a caller chaining
+/// `&&` never reads "could not look" as "looked and found nothing".
+mod exit_status {
+    /// The tool answered completely.
+    pub const OK: i32 = 0;
+    /// The tool reported an error, including an argument it refused.
+    pub const TOOL_ERROR: i32 = 1;
+    /// The command line was wrong: unknown command, tool, option or key.
+    pub const USAGE: i32 = 2;
+    /// The tool answered and said the answer is incomplete, on any object in
+    /// it, lists included (`incomplete_parts`), or a resource was cut at its
+    /// size cap. The partial answer is printed.
+    pub const INCOMPLETE: i32 = 3;
+    /// No answer within the deadline. The tool was stopped, so a write's
+    /// outcome is unknown.
+    pub const TIMED_OUT: i32 = 4;
+}
+
+#[derive(Debug, PartialEq)]
+enum CliCommand {
+    Tools {
+        json: bool,
+    },
+    Describe {
+        tool: String,
+    },
+    Call {
+        tool: String,
+        arguments: Value,
+        compact: bool,
+        timeout: Duration,
+    },
+    Read {
+        uri: String,
+        compact: bool,
+        timeout: Duration,
+    },
+}
+
+/// What a one-shot command prints and how it exits.
+#[derive(Debug, PartialEq)]
+struct CliOutput {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl CliOutput {
+    fn usage(message: impl std::fmt::Display) -> Self {
+        CliOutput {
+            code: exit_status::USAGE,
+            stdout: String::new(),
+            stderr: format!("gitpulse-mcp: {message} (see --help)\n"),
+        }
+    }
+}
+
+/// Runs one command and returns its exit status.
+///
+/// This process exits when the command returns, which ends any background
+/// thread and, through `exit_reaping`, any child: a build a tool would start
+/// in the background (a worktree's seeded index refresh) must run here
+/// instead, so the process declares itself short-lived first.
+fn run_one_shot(args: &[String]) -> i32 {
+    gitpulse_lib::devmap::live::run_process_short_lived();
+    run_command(args)
+}
+
+fn run_command(args: &[String]) -> i32 {
+    use std::io::Write;
+    let catalog = mcp::tools();
+    // A stdin that never closes is a stall, not a usage error: it exits 4 as
+    // a tool that never answers does.
+    let stalled = std::cell::Cell::new(false);
+    let read = |source: &str, within: Duration| match read_argument_source_within(source, within) {
+        Ok(text) => Ok(text),
+        Err(ReadFailure::Failed(message)) => Err(message),
+        Err(ReadFailure::Stalled(message)) => {
+            stalled.set(true);
+            Err(message)
+        }
+    };
+    let output = match parse_command(args, &catalog, &read) {
+        Ok(command) => execute(command, &catalog),
+        Err(message) if stalled.get() => CliOutput {
+            code: exit_status::TIMED_OUT,
+            stdout: String::new(),
+            stderr: format!("gitpulse-mcp: {message}\n"),
+        },
+        Err(message) => CliOutput::usage(message),
+    };
+    // Stdout first: it is the answer. A reader that closed it early (`| head`)
+    // gets a failing status rather than a silent success.
+    let mut stdout = io::stdout().lock();
+    let wrote = stdout
+        .write_all(output.stdout.as_bytes())
+        .and_then(|()| stdout.flush());
+    drop(stdout);
+    if !output.stderr.is_empty() {
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(output.stderr.as_bytes());
+    }
+    match wrote {
+        Ok(()) => output.code,
+        Err(error) => {
+            eprintln!("gitpulse-mcp: could not write the result to stdout: {error}");
+            exit_status::TOOL_ERROR.max(output.code)
+        }
+    }
+}
+
+/// Reads `--json -` (stdin) or `--json @path`, bounded by the frame a server
+/// would accept, so a runaway pipe is refused rather than buffered.
+fn read_argument_source(source: &str) -> Result<String, String> {
+    let limit = mcp::MAX_FRAME_BYTES;
+    let reader: Box<dyn Read> = if source == "-" {
+        Box::new(io::stdin())
+    } else {
+        let path = source.strip_prefix('@').unwrap_or(source);
+        Box::new(std::fs::File::open(path).map_err(|e| format!("--json {source}: {e}"))?)
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("--json {source}: {e}"))?;
+    if bytes.len() > limit {
+        return Err(format!("--json {source} is larger than {limit} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("--json {source} is not UTF-8"))
+}
+
+/// Reads `--json -` or `--json @path` for [`parse_command`]; the second
+/// argument is how long it may wait.
+type ArgumentReader<'a> = dyn Fn(&str, Duration) -> Result<String, String> + 'a;
+
+/// Why a `--json` source did not come back.
+#[derive(Debug)]
+enum ReadFailure {
+    /// It could not be read, was too large or not UTF-8.
+    Failed(String),
+    /// It did not finish within the deadline: a stdin nobody closes, a FIFO
+    /// nobody writes.
+    Stalled(String),
+}
+
+/// [`read_argument_source`] under a deadline, so a source that never ends
+/// exits 4 like a tool that never answers. The read runs on its own thread
+/// (opening a FIFO blocks too); a thread still blocked when the deadline
+/// passes is left to the process exit that follows.
+fn read_argument_source_within(source: &str, within: Duration) -> Result<String, ReadFailure> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let owned = source.to_owned();
+    let spawned = gitpulse_lib::supervisor::spawn_once(
+        "gitpulse-mcp-argument",
+        "mcp one-shot argument read",
+        move || {
+            let _ = sender.send(read_argument_source(&owned));
+        },
+    );
+    if let Err(error) = spawned {
+        return Err(ReadFailure::Failed(format!(
+            "--json {source}: could not start a reader thread: {error}"
+        )));
+    }
+    match receiver.recv_timeout(within) {
+        Ok(result) => result.map_err(ReadFailure::Failed),
+        Err(_) => Err(ReadFailure::Stalled(format!(
+            "--json {source} did not end within {} ms (--timeout-ms); nothing was run",
+            within.as_millis()
+        ))),
+    }
+}
+
+fn parse_command(
+    args: &[String],
+    catalog: &[Value],
+    read: &ArgumentReader<'_>,
+) -> Result<CliCommand, String> {
+    let Some((command, rest)) = args.split_first() else {
+        return Err("no command given".into());
+    };
+    match command.as_str() {
+        "tools" => match rest {
+            [] => Ok(CliCommand::Tools { json: false }),
+            [flag] if flag == "--json" => Ok(CliCommand::Tools { json: true }),
+            _ => Err(format!(
+                "`tools` takes only --json, got {:?}",
+                rest.join(" ")
+            )),
+        },
+        "describe" => match rest {
+            [tool] => find_tool(catalog, tool).map(|_| CliCommand::Describe { tool: tool.clone() }),
+            _ => Err("`describe` takes exactly one tool name".into()),
+        },
+        "call" => parse_call(rest, catalog, read),
+        "read" => parse_read(rest),
+        other => Err(format!("unknown command {other:?}")),
+    }
+}
+
+fn find_tool<'a>(catalog: &'a [Value], name: &str) -> Result<&'a Value, String> {
+    catalog
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or_else(|| format!("unknown tool {name:?}; `gitpulse-mcp tools` lists them"))
+}
+
+/// A tool runs without `--write` only when it declares itself read-only.
+/// Anything else (`false`, or no annotation at all) is treated as a write.
+fn is_read_only(tool: &Value) -> bool {
+    tool["annotations"]["readOnlyHint"] == true
+}
+
+fn parse_call(
+    rest: &[String],
+    catalog: &[Value],
+    read: &ArgumentReader<'_>,
+) -> Result<CliCommand, String> {
+    let Some((name, rest)) = rest.split_first() else {
+        return Err("`call` needs a tool name: gitpulse-mcp call <tool> [key=value ...]".into());
+    };
+    if name.starts_with('-') {
+        return Err(format!(
+            "`call` needs a tool name before options, got {name:?}"
+        ));
+    }
+    let tool = find_tool(catalog, name)?;
+    let mut arguments = serde_json::Map::new();
+    let mut write = false;
+    let mut compact = false;
+    let mut json_source: Option<&String> = None;
+    let mut timeout = None;
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--write" => write = true,
+            "--compact" => compact = true,
+            "--timeout-ms" => set_timeout(&mut timeout, rest.next())?,
+            // Read after the loop: the source is read under the deadline, and
+            // `--timeout-ms` may come after it.
+            "--json" => {
+                if json_source.is_some() {
+                    return Err("--json given twice".into());
+                }
+                json_source = Some(rest.next().ok_or(
+                    "--json needs a value: a JSON object, - for stdin, or @path for a file",
+                )?);
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option {flag:?} for `call`"));
+            }
+            pair => {
+                let Some((key, raw)) = pair.split_once('=') else {
+                    return Err(format!("expected key=value, got {pair:?}"));
+                };
+                let value = typed_value(tool, key, raw)?;
+                insert_once(&mut arguments, key.to_owned(), value)?;
+            }
+        }
+    }
+    if !is_read_only(tool) && !write {
+        return Err(format!(
+            "{name} changes state (it is not marked readOnlyHint); pass --write to run it"
+        ));
+    }
+    let timeout = timeout.unwrap_or_else(|| default_timeout(tool));
+    if let Some(source) = json_source {
+        let text = if source == "-" || source.starts_with('@') {
+            read(source, timeout)?
+        } else {
+            source.clone()
+        };
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| format!("--json is not JSON: {e}"))?;
+        let Value::Object(object) = parsed else {
+            return Err("--json must be a JSON object".into());
+        };
+        for (key, value) in object {
+            insert_once(&mut arguments, key, value)?;
+        }
+    }
+    Ok(CliCommand::Call {
+        tool: name.clone(),
+        arguments: Value::Object(arguments),
+        compact,
+        timeout,
+    })
+}
+
+/// A read waits the server's own per-request budget. A write waits the
+/// longest window there is: stopping one midway (a worktree half created, a
+/// merge half done) is worse than waiting for it, and the server, which
+/// answers at its budget, still lets the work finish.
+fn default_timeout(tool: &Value) -> Duration {
+    if is_read_only(tool) {
+        call_budget()
+    } else {
+        MAX_ENV_WINDOW
+    }
+}
+
+/// `read <uri> [--compact] [--timeout-ms N]`. The URI is the server's to
+/// judge: one it does not address comes back as the caller's error.
+fn parse_read(rest: &[String]) -> Result<CliCommand, String> {
+    let mut uri = None;
+    let mut compact = false;
+    let mut timeout = None;
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--compact" => compact = true,
+            "--timeout-ms" => set_timeout(&mut timeout, rest.next())?,
+            flag if flag.starts_with('-') => {
+                return Err(format!("unknown option {flag:?} for `read`"));
+            }
+            given if uri.is_none() => uri = Some(given.to_owned()),
+            extra => return Err(format!("`read` takes one URI, got another: {extra:?}")),
+        }
+    }
+    Ok(CliCommand::Read {
+        uri: uri.ok_or("`read` needs a URI: gitpulse-mcp read gitpulse://server/manifest")?,
+        compact,
+        timeout: timeout.unwrap_or_else(call_budget),
+    })
+}
+
+/// `--timeout-ms N`: a positive whole number of milliseconds, at most
+/// [`MAX_ENV_WINDOW`], given once. Refused rather than clamped, so the
+/// deadline a caller asked for is the one that runs.
+fn set_timeout(slot: &mut Option<Duration>, raw: Option<&String>) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("--timeout-ms given twice".into());
+    }
+    let max = MAX_ENV_WINDOW.as_millis();
+    let raw = raw.ok_or("--timeout-ms needs a number of milliseconds")?;
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 && u128::from(ms) <= max => {
+            *slot = Some(Duration::from_millis(ms));
+            Ok(())
+        }
+        _ => Err(format!(
+            "--timeout-ms takes a whole number of milliseconds from 1 to {max}, got {raw:?}"
+        )),
+    }
+}
+
+fn insert_once(
+    arguments: &mut serde_json::Map<String, Value>,
+    key: String,
+    value: Value,
+) -> Result<(), String> {
+    if arguments.contains_key(&key) {
+        return Err(format!("argument {key:?} given twice"));
+    }
+    arguments.insert(key, value);
+    Ok(())
+}
+
+/// Types a `key=value` by the property's declared schema type: a string
+/// property takes the text as it is (so `title=42` is the string "42"), and
+/// every other type takes JSON. A key the tool does not declare is refused
+/// here, with the keys it does take, rather than left for validation.
+fn typed_value(tool: &Value, key: &str, raw: &str) -> Result<Value, String> {
+    let properties = &tool["inputSchema"]["properties"];
+    let Some(schema) = properties.get(key) else {
+        let mut accepted: Vec<&str> = properties
+            .as_object()
+            .map(|p| p.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        accepted.sort_unstable();
+        return Err(format!(
+            "{} takes no argument {key:?}; it takes: {}",
+            tool["name"].as_str().unwrap_or("the tool"),
+            accepted.join(", ")
+        ));
+    };
+    match schema["type"].as_str() {
+        Some("string") => Ok(Value::String(raw.to_owned())),
+        declared => serde_json::from_str(raw).map_err(|_| {
+            format!(
+                "{key} takes {}; {raw:?} is not JSON (quote strings inside arrays and objects, or use --json)",
+                declared.unwrap_or("a JSON value")
+            )
+        }),
+    }
+}
+
+fn execute(command: CliCommand, catalog: &[Value]) -> CliOutput {
+    match command {
+        CliCommand::Tools { json } => CliOutput {
+            code: exit_status::OK,
+            stdout: if json {
+                pretty(&Value::Array(catalog.to_vec()))
+            } else {
+                tool_lines(catalog)
+            },
+            stderr: String::new(),
+        },
+        CliCommand::Describe { tool } => match find_tool(catalog, &tool) {
+            Ok(entry) => CliOutput {
+                code: exit_status::OK,
+                stdout: pretty(entry),
+                stderr: String::new(),
+            },
+            Err(message) => CliOutput::usage(message),
+        },
+        CliCommand::Call {
+            tool,
+            arguments,
+            compact,
+            timeout,
+        } => {
+            let request = cli_request(
+                "tools/call",
+                json!({ "name": tool, "arguments": arguments }),
+            );
+            match run_bounded(request, timeout, mcp::run) {
+                Bounded::Answered(response) => call_outcome(&response, compact),
+                Bounded::TimedOut => timed_out_outcome(&tool, timeout),
+            }
+        }
+        CliCommand::Read {
+            uri,
+            compact,
+            timeout,
+        } => {
+            let request = cli_request("resources/read", json!({ "uri": uri }));
+            match run_bounded(request, timeout, mcp::run) {
+                Bounded::Answered(response) => read_outcome(&response, compact),
+                Bounded::TimedOut => timed_out_outcome(&uri, timeout),
+            }
+        }
+    }
+}
+
+/// One line per tool: name, `read` or `write`, and the first line of its
+/// description.
+fn tool_lines(catalog: &[Value]) -> String {
+    let width = catalog
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for tool in catalog {
+        let name = tool["name"].as_str().unwrap_or("");
+        let access = if is_read_only(tool) { "read " } else { "write" };
+        let summary = tool["description"]
+            .as_str()
+            .and_then(|d| d.lines().next())
+            .unwrap_or("");
+        out.push_str(&format!("{name:<width$}  {access}  {summary}\n"));
+    }
+    out
+}
+
+fn pretty(value: &Value) -> String {
+    let mut text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    text.push('\n');
+    text
+}
+
+/// One request for the server's own request path.
+///
+/// A one-shot command has no session to negotiate. The legacy era serves a
+/// request without per-request `_meta`, as it serves a client that sent
+/// `initialize`, and answers a tool call with its result as compact JSON text.
+fn cli_request(method: &str, params: Value) -> JsonRpcRequest {
+    JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(1)),
+        method: method.into(),
+        params,
+    }
+}
+
+/// What [`run_bounded`] got back.
+#[derive(Debug)]
+enum Bounded {
+    /// The server's answer, or the answer for a request that panicked or
+    /// could not start.
+    Answered(JsonRpcResponse),
+    /// Nothing within the budget. The caller exits, which stops the work.
+    TimedOut,
+}
+
+/// Runs one request as the server does — header checks with [`mcp::accept`],
+/// the body on a worker thread under a panic guard — and waits at most
+/// `budget` for it. `run` is [`mcp::run`] outside tests.
+///
+/// Unlike the server, nothing is left running past the budget for long: the
+/// command returns, and its process exits through [`exit_reaping`], which takes
+/// the tool's `git` children down with it.
+fn run_bounded<F>(request: JsonRpcRequest, budget: Duration, run: F) -> Bounded
+where
+    F: FnOnce(Ready) -> JsonRpcResponse + Send + 'static,
+{
+    let mut era = Era::Legacy;
+    let ready = match mcp::accept(request, &mut era) {
+        Accepted::Ready(ready) => ready,
+        Accepted::Answered(response) => return Bounded::Answered(response),
+        Accepted::Silent => {
+            return Bounded::Answered(JsonRpcResponse {
+                jsonrpc: "2.0",
+                id: json!(1),
+                result: None,
+                error: Some(json!({ "code": -32603, "message": "the request was not answered" })),
+            })
+        }
+    };
+    let panicked = ready.panicked();
+    let unstarted = ready.unstarted();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker_panicked = panicked.clone();
+    let spawned =
+        gitpulse_lib::supervisor::spawn_once("gitpulse-mcp-call", "mcp one-shot call", move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(ready)));
+            // The receiver is gone only when the budget already ran out.
+            let _ = sender.send(outcome.unwrap_or(worker_panicked));
+        });
+    if let Err(error) = spawned {
+        log::error!(target: "mcp", "could not spawn a worker thread: {error}");
+        return Bounded::Answered(unstarted);
+    }
+    match receiver.recv_timeout(budget) {
+        Ok(response) => Bounded::Answered(response),
+        Err(mpsc::RecvTimeoutError::Timeout) => Bounded::TimedOut,
+        // The worker sends on every path it returns by, so a dropped sender
+        // means it died some other way: report it as the panic it was.
+        Err(mpsc::RecvTimeoutError::Disconnected) => Bounded::Answered(panicked),
+    }
+}
+
+/// Exit 4, with what the caller must do about a write that may have happened.
+fn timed_out_outcome(target: &str, budget: Duration) -> CliOutput {
+    CliOutput {
+        code: exit_status::TIMED_OUT,
+        stdout: String::new(),
+        stderr: format!(
+            "gitpulse-mcp: {target} did not answer within {} ms (--timeout-ms; unset, a read waits {CALL_BUDGET_ENV}, 60000 ms by default, and a write waits 600000 ms); it was stopped and its git children taken down. A write's outcome is unknown: read the state back before retrying\n",
+            budget.as_millis()
+        ),
+    }
+}
+
+/// A JSON-RPC error. -32600..-32602 are the request's fault (an unknown
+/// tool or resource, arguments that are not an object); anything else is the
+/// server's, a panic included.
+fn protocol_error_outcome(error: &Value, command: &str) -> CliOutput {
+    let message = error["message"].as_str().unwrap_or("protocol error");
+    let caller_fault = matches!(error["code"].as_i64(), Some(-32602..=-32600));
+    CliOutput {
+        code: if caller_fault {
+            exit_status::USAGE
+        } else {
+            exit_status::TOOL_ERROR
+        },
+        stdout: String::new(),
+        stderr: format!("gitpulse-mcp {command}: {message}\n"),
+    }
+}
+
+fn call_outcome(response: &JsonRpcResponse, compact: bool) -> CliOutput {
+    if let Some(error) = &response.error {
+        return protocol_error_outcome(error, "call");
+    }
+    let result = response.result.as_ref().unwrap_or(&Value::Null);
+    let text = result["content"][0]["text"].as_str().unwrap_or("");
+    if result["isError"] == true {
+        return CliOutput {
+            code: exit_status::TOOL_ERROR,
+            stdout: String::new(),
+            stderr: format!("gitpulse-mcp call: {text}\n"),
+        };
+    }
+    payload_outcome(text, compact, "call")
+}
+
+/// A `resources/read` answer: the one document's text, judged as a tool's
+/// result is. Several contents are printed as the array they came as.
+fn read_outcome(response: &JsonRpcResponse, compact: bool) -> CliOutput {
+    if let Some(error) = &response.error {
+        return protocol_error_outcome(error, "read");
+    }
+    let contents = &response.result.as_ref().unwrap_or(&Value::Null)["contents"];
+    match contents.as_array().map(Vec::as_slice) {
+        Some([only]) if only["text"].is_string() => {
+            let text = only["text"].as_str().unwrap_or("");
+            // A document over the cap is cut and relabelled (not JSON any
+            // more), so it would pass as plain text: it is incomplete.
+            if only["mimeType"] == resources::CUT_DOCUMENT_MIME_TYPE {
+                return CliOutput {
+                    code: exit_status::INCOMPLETE,
+                    stdout: format!("{text}\n"),
+                    stderr: "gitpulse-mcp read: the answer is incomplete (the document was cut at its size cap); read the equivalent tool with a narrower argument\n".into(),
+                };
+            }
+            payload_outcome(text, compact, "read")
+        }
+        _ => payload_outcome(&contents.to_string(), compact, "read"),
+    }
+}
+
+/// Prints a result's text: JSON pretty (or compact) with its incompleteness
+/// judged, anything else as it came.
+fn payload_outcome(text: &str, compact: bool, command: &str) -> CliOutput {
+    let Ok(payload) = serde_json::from_str::<Value>(text) else {
+        return CliOutput {
+            code: exit_status::OK,
+            stdout: format!("{text}\n"),
+            stderr: String::new(),
+        };
+    };
+    let incomplete = incomplete_parts(&payload);
+    CliOutput {
+        code: if incomplete.is_empty() {
+            exit_status::OK
+        } else {
+            exit_status::INCOMPLETE
+        },
+        stdout: if compact {
+            format!("{payload}\n")
+        } else {
+            pretty(&payload)
+        },
+        stderr: if incomplete.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "gitpulse-mcp {command}: the answer is incomplete ({}); read its error fields before relying on it\n",
+                incomplete.join(", ")
+            )
+        },
+    }
+}
+
+/// Where a result says it is not whole, as paths (`agents.live.ok`,
+/// `items[2].truncated`): `ok: false` or a `<facet>_ok: false`
+/// (`sessions_ok`), `deferred: true`, `truncated: true` or
+/// `deadline_expired: true`, a `walk_incomplete` that is `true` or a
+/// non-empty reason (DevMap's is a string), and the result budget's own cut
+/// marker ([`resources::RESULT_TRUNCATION_KEY`]), on the result or on any
+/// object inside it, objects in lists included. The one thing a list changes:
+/// a row's own `ok: false` (or `<x>_ok: false`) is that row's verdict, data
+/// rather than a facet, and is not read, as before. At most [`MAX_INCOMPLETE_PARTS`] are
+/// named, then a count of the rest, so a hostile payload cannot make stderr
+/// as large as the answer.
+fn incomplete_parts(payload: &Value) -> Vec<String> {
+    /// Deeper than any result nests; bounds the walk on a hostile payload.
+    const MAX_DEPTH: usize = 16;
+
+    /// `in_row`: the object is inside a list. A row's own `ok: false` is its
+    /// verdict (a failed event, a refused item), which is data; only the words
+    /// that say the *answer* is cut are read there.
+    fn says_partial(key: &str, field: &Value, in_row: bool) -> bool {
+        match key {
+            "deferred" | "truncated" | "deadline_expired" => *field == true,
+            resources::RESULT_TRUNCATION_KEY => !field.is_null(),
+            "walk_incomplete" => *field == true || field.as_str().is_some_and(|s| !s.is_empty()),
+            "ok" => !in_row && *field == false,
+            other => !in_row && other.ends_with("_ok") && *field == false,
+        }
+    }
+
+    fn walk(value: &Value, path: &str, in_row: bool, depth: usize, found: &mut Found) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        match value {
+            Value::Object(object) => {
+                for (key, field) in object {
+                    let at = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    if says_partial(key, field, in_row) {
+                        found.add(&at);
+                    }
+                    walk(field, &at, in_row, depth + 1, found);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{index}]"), true, depth + 1, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[derive(Default)]
+    struct Found {
+        named: Vec<String>,
+        unnamed: usize,
+    }
+    impl Found {
+        fn add(&mut self, at: &str) {
+            if self.named.len() < MAX_INCOMPLETE_PARTS {
+                self.named.push(at.to_owned());
+            } else {
+                self.unnamed += 1;
+            }
+        }
+    }
+
+    let mut found = Found::default();
+    walk(payload, "", false, 0, &mut found);
+    if found.unnamed > 0 {
+        found.named.push(format!("and {} more", found.unnamed));
+    }
+    found.named
+}
+
+/// How many incomplete markers [`incomplete_parts`] names before counting.
+const MAX_INCOMPLETE_PARTS: usize = 32;
 
 /// The library's environment-override guard, compiled into this crate too: the
 /// library's own is `#[cfg(test)]` and `pub(crate)`, so it does not exist from
@@ -939,6 +1762,21 @@ mod test_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-shot entry declares the process short-lived before it runs a
+    /// command, so a shared handler's background seeded refresh runs inline
+    /// instead of dying with the process (feat/mcp-cli re-review). Nothing
+    /// else observed the declaration.
+    #[test]
+    fn the_one_shot_entry_declares_the_process_short_lived() {
+        // A refused command: it runs nothing and prints nothing to stdout.
+        let code = run_one_shot(&["call".to_owned(), "gitpulse_no_such_tool".to_owned()]);
+        assert_eq!(code, exit_status::USAGE);
+        assert!(
+            gitpulse_lib::devmap::live::process_is_short_lived(),
+            "run_one_shot must call run_process_short_lived before the command"
+        );
+    }
 
     /// A deferred and retried insights read, with its wait for budget at every
     /// spawn, still ends inside the per-call budget the watchdog enforces.
@@ -1296,5 +2134,763 @@ mod tests {
                 .all(|entry| entry.answered.load(Ordering::Acquire)),
             "the watchdog must not answer it a second time"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn no_reader(source: &str, _within: Duration) -> Result<String, String> {
+        panic!("nothing should be read, asked for {source}")
+    }
+
+    fn parse(list: &[&str]) -> Result<CliCommand, String> {
+        parse_command(&args(list), &mcp::tools(), &no_reader)
+    }
+
+    fn response(result: Value) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: json!(1),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    /// A tool call through the real server path, with room to finish.
+    fn call_tool(tool: &str, arguments: Value) -> JsonRpcResponse {
+        let request = cli_request(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+        );
+        match run_bounded(request, Duration::from_secs(120), mcp::run) {
+            Bounded::Answered(response) => response,
+            Bounded::TimedOut => panic!("{tool} did not answer in 120 s"),
+        }
+    }
+
+    fn text_result(payload: &Value) -> JsonRpcResponse {
+        response(json!({
+            "content": [{ "type": "text", "text": payload.to_string() }],
+            "isError": false
+        }))
+    }
+
+    #[test]
+    fn one_shot_commands_are_routed_and_other_arguments_still_refused() {
+        assert_eq!(
+            invocation(&args(&["call", "gitpulse_status"])),
+            Invocation::Command(args(&["call", "gitpulse_status"]))
+        );
+        assert_eq!(
+            invocation(&args(&["tools"])),
+            Invocation::Command(args(&["tools"]))
+        );
+        assert_eq!(
+            invocation(&args(&["describe", "x"])),
+            Invocation::Command(args(&["describe", "x"]))
+        );
+        assert_eq!(
+            invocation(&args(&["read", "gitpulse://server/manifest"])),
+            Invocation::Command(args(&["read", "gitpulse://server/manifest"]))
+        );
+        // Only the first argument selects a command.
+        assert_eq!(
+            invocation(&args(&["--json", "call"])),
+            Invocation::Unknown("--json call".into())
+        );
+        assert_eq!(
+            invocation(&args(&["serve"])),
+            Invocation::Unknown("serve".into())
+        );
+        assert_eq!(invocation(&[]), Invocation::Serve);
+    }
+
+    #[test]
+    fn a_read_tool_runs_without_write_and_a_write_tool_does_not() {
+        let catalog = mcp::tools();
+        let status = find_tool(&catalog, "gitpulse_status").unwrap();
+        assert!(is_read_only(status), "{status}");
+        let add = find_tool(&catalog, "gitpulse_add_task").unwrap();
+        assert!(!is_read_only(add), "{add}");
+
+        assert_eq!(
+            parse(&["call", "gitpulse_status", "repo_path=/r"]),
+            Ok(CliCommand::Call {
+                tool: "gitpulse_status".into(),
+                arguments: json!({ "repo_path": "/r" }),
+                compact: false,
+                timeout: call_budget()
+            })
+        );
+        let refused = parse(&["call", "gitpulse_add_task", "repo_path=/r", "title=t"]).unwrap_err();
+        assert!(refused.contains("--write"), "{refused}");
+        assert!(parse(&[
+            "call",
+            "gitpulse_add_task",
+            "repo_path=/r",
+            "title=t",
+            "--write"
+        ])
+        .is_ok());
+    }
+
+    /// Every tool without `readOnlyHint: true` needs --write, including one
+    /// that carries no annotation at all: the default is the cautious one.
+    #[test]
+    fn a_tool_without_a_read_only_claim_is_a_write() {
+        assert!(!is_read_only(&json!({ "name": "x" })));
+        assert!(!is_read_only(
+            &json!({ "name": "x", "annotations": { "readOnlyHint": "true" } })
+        ));
+        for tool in mcp::tools() {
+            let name = tool["name"].as_str().unwrap();
+            let without = parse_command(
+                &args(&["call", name]),
+                std::slice::from_ref(&tool),
+                &no_reader,
+            );
+            if is_read_only(&tool) {
+                assert!(without.is_ok(), "{name}: {without:?}");
+            } else {
+                assert!(without.unwrap_err().contains("--write"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn key_value_arguments_are_typed_by_the_schema() {
+        let catalog = mcp::tools();
+        // A string property keeps digits and JSON-looking text as text.
+        let Ok(CliCommand::Call { arguments, .. }) =
+            parse(&["call", "gitpulse_status", "repo_path=42"])
+        else {
+            panic!("parse failed")
+        };
+        assert_eq!(arguments, json!({ "repo_path": "42" }));
+
+        // An integer property takes JSON, and text that is not JSON is refused
+        // with the type it wanted rather than sent as a string.
+        let sessions = find_tool(&catalog, "gitpulse_sessions").unwrap();
+        assert_eq!(
+            sessions["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(typed_value(sessions, "limit", "5"), Ok(json!(5)));
+        let refused = typed_value(sessions, "limit", "five").unwrap_err();
+        assert!(refused.contains("integer"), "{refused}");
+
+        // A key the tool does not take names the keys it does.
+        let refused = typed_value(sessions, "lmit", "5").unwrap_err();
+        assert!(
+            refused.contains("limit") && refused.contains("repo_path"),
+            "{refused}"
+        );
+
+        // A value may itself contain '='.
+        let Ok(CliCommand::Call { arguments, .. }) =
+            parse(&["call", "gitpulse_status", "repo_path=/a=b"])
+        else {
+            panic!("parse failed")
+        };
+        assert_eq!(arguments, json!({ "repo_path": "/a=b" }));
+    }
+
+    #[test]
+    fn json_arguments_come_inline_from_stdin_or_a_file_and_never_twice() {
+        let tools = mcp::tools();
+        let reader = |source: &str, _within: Duration| -> Result<String, String> {
+            assert!(source == "-" || source == "@brief.json", "{source}");
+            Ok(r#"{"repo_path":"/r","limit":3}"#.to_owned())
+        };
+        for source in ["-", "@brief.json"] {
+            let parsed = parse_command(
+                &args(&["call", "gitpulse_sessions", "--json", source]),
+                &tools,
+                &reader,
+            );
+            assert_eq!(
+                parsed,
+                Ok(CliCommand::Call {
+                    tool: "gitpulse_sessions".into(),
+                    arguments: json!({ "repo_path": "/r", "limit": 3 }),
+                    compact: false,
+                    timeout: call_budget()
+                })
+            );
+        }
+        let inline = parse(&[
+            "call",
+            "gitpulse_status",
+            "--json",
+            r#"{"repo_path":"/r"}"#,
+            "--compact",
+        ]);
+        assert_eq!(
+            inline,
+            Ok(CliCommand::Call {
+                tool: "gitpulse_status".into(),
+                arguments: json!({ "repo_path": "/r" }),
+                compact: true,
+                timeout: call_budget()
+            })
+        );
+
+        // The same key from both forms, or twice in one, is refused: neither
+        // copy silently wins.
+        for list in [
+            &[
+                "call",
+                "gitpulse_status",
+                "--json",
+                r#"{"repo_path":"/a"}"#,
+                "repo_path=/b",
+            ][..],
+            &["call", "gitpulse_status", "repo_path=/a", "repo_path=/a"],
+        ] {
+            let refused = parse(list).unwrap_err();
+            assert!(refused.contains("twice"), "{list:?}: {refused}");
+        }
+        for (list, wanted) in [
+            (&["call", "gitpulse_status", "--json", "[1]"][..], "object"),
+            (&["call", "gitpulse_status", "--json", "{"], "not JSON"),
+            (&["call", "gitpulse_status", "--json"], "needs a value"),
+            (
+                &["call", "gitpulse_status", "--json", "{}", "--json", "{}"],
+                "twice",
+            ),
+        ] {
+            let refused = parse(list).unwrap_err();
+            assert!(refused.contains(wanted), "{list:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_command_line_is_refused_before_anything_runs() {
+        for (list, wanted) in [
+            (&["call"][..], "needs a tool name"),
+            (&["call", "--write"], "needs a tool name"),
+            (&["call", "gitpulse_nope"], "unknown tool"),
+            (&["call", "gitpulse_status", "--yes"], "unknown option"),
+            (&["call", "gitpulse_status", "repo_path"], "key=value"),
+            (&["describe"], "exactly one"),
+            (&["describe", "gitpulse_nope"], "unknown tool"),
+            (&["tools", "--all"], "only --json"),
+        ] {
+            let refused = parse(list).unwrap_err();
+            assert!(refused.contains(wanted), "{list:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn the_read_source_is_bounded_and_named_in_its_errors() {
+        let missing = read_argument_source("@/no/such/gitpulse-cli-brief.json").unwrap_err();
+        assert!(
+            missing.contains("/no/such/gitpulse-cli-brief.json"),
+            "{missing}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.json");
+        std::fs::write(&path, vec![b' '; mcp::MAX_FRAME_BYTES + 1]).unwrap();
+        let refused = read_argument_source(&format!("@{}", path.display())).unwrap_err();
+        assert!(refused.contains("larger than"), "{refused}");
+    }
+
+    /// A `--json` source that never ends is a stall (exit 4), not a hang: a
+    /// FIFO nobody opens blocks the open itself, and the read gives up at the
+    /// deadline. A source that ends in time is read as before.
+    #[test]
+    #[cfg(unix)]
+    fn a_json_source_that_never_ends_stalls_at_the_deadline() {
+        use gitpulse_lib::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("brief.fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status_locked()
+            .expect("mkfifo")
+            .success());
+        let started = Instant::now();
+        let stalled = read_argument_source_within(
+            &format!("@{}", fifo.display()),
+            Duration::from_millis(200),
+        );
+        assert!(
+            matches!(stalled, Err(ReadFailure::Stalled(ref why)) if why.contains("200 ms")),
+            "{stalled:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let file = dir.path().join("brief.json");
+        std::fs::write(&file, r#"{"a":1}"#).unwrap();
+        let read =
+            read_argument_source_within(&format!("@{}", file.display()), Duration::from_secs(30));
+        assert!(
+            matches!(read, Ok(ref text) if text == r#"{"a":1}"#),
+            "{read:?}"
+        );
+        let missing = read_argument_source_within(
+            "@/no/such/gitpulse-cli-brief.json",
+            Duration::from_secs(30),
+        );
+        assert!(
+            matches!(missing, Err(ReadFailure::Failed(_))),
+            "{missing:?}"
+        );
+    }
+
+    /// Every shape a result can say "not whole" in exits 3 and is named: a
+    /// facet inside a list, a deadline, DevMap's string-valued
+    /// `walk_incomplete`, the budget's own marker, a resource cut at its cap.
+    #[test]
+    fn every_incomplete_shape_is_named_and_exits_three() {
+        for (payload, named) in [
+            (
+                json!({ "items": [{ "ok": true }, { "truncated": true }] }),
+                "items[1].truncated",
+            ),
+            (
+                json!({ "rows": [[{ "deferred": true }]] }),
+                "rows[0][0].deferred",
+            ),
+            (
+                json!({ "ok": true, "deadline_expired": true }),
+                "deadline_expired",
+            ),
+            (
+                json!({ "ok": true, "walk_incomplete": "file walk stopped at 5000 files" }),
+                "walk_incomplete",
+            ),
+            (
+                json!({ "a": { "walk_incomplete": true } }),
+                "a.walk_incomplete",
+            ),
+            (
+                json!({ resources::RESULT_TRUNCATION_KEY: { "arrays": [] } }),
+                resources::RESULT_TRUNCATION_KEY,
+            ),
+        ] {
+            let outcome = call_outcome(&text_result(&payload), true);
+            assert_eq!(
+                outcome.code,
+                exit_status::INCOMPLETE,
+                "{payload}: {outcome:?}"
+            );
+            assert!(
+                outcome.stderr.contains(named),
+                "{payload}: {}",
+                outcome.stderr
+            );
+            assert!(!outcome.stdout.is_empty());
+        }
+        // What is not a marker stays complete: an empty or false reason, a
+        // false flag, a row's own verdict, and plain rows.
+        for payload in [
+            json!({ "ok": true, "walk_incomplete": "", "deadline_expired": false }),
+            json!({ "walk_incomplete": false, "items": [{ "ok": true, "truncated": false }] }),
+            json!({ "items": [1, "ok", null, { "ok": false, "sessions_ok": false }] }),
+        ] {
+            let outcome = call_outcome(&text_result(&payload), true);
+            assert_eq!(outcome.code, exit_status::OK, "{payload}: {outcome:?}");
+        }
+        // Stderr stays small however many markers a payload carries.
+        let many =
+            json!({ "items": (0..500).map(|_| json!({ "truncated": true })).collect::<Vec<_>>() });
+        let outcome = call_outcome(&text_result(&many), true);
+        assert_eq!(outcome.code, exit_status::INCOMPLETE);
+        assert!(
+            outcome.stderr.contains("and 468 more"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(outcome.stderr.len() < 2048, "{}", outcome.stderr.len());
+
+        // A resource cut at its document cap is relabelled text/plain with a
+        // notice: still incomplete. The same text under application/json is
+        // not judged by its wording.
+        let cut = response(json!({ "contents": [{
+            "uri": "gitpulse://status/x",
+            "mimeType": resources::CUT_DOCUMENT_MIME_TYPE,
+            "text": "{ \"a\": 1\n\n… truncated: document is 9 bytes, capped at 4 bytes as carried on the wire."
+        }] }));
+        let outcome = read_outcome(&cut, true);
+        assert_eq!(outcome.code, exit_status::INCOMPLETE, "{outcome:?}");
+        assert!(outcome.stdout.contains("… truncated"), "{}", outcome.stdout);
+        assert!(outcome.stderr.contains("size cap"), "{}", outcome.stderr);
+        let whole = response(json!({ "contents": [{
+            "uri": "gitpulse://status/x",
+            "mimeType": "application/json",
+            "text": "{\"a\":1}"
+        }] }));
+        assert_eq!(read_outcome(&whole, true).code, exit_status::OK);
+    }
+
+    #[test]
+    fn exit_status_tells_a_complete_answer_from_a_partial_one_and_from_an_error() {
+        let complete = call_outcome(&text_result(&json!({ "ok": true })), true);
+        assert_eq!(complete.code, exit_status::OK);
+        assert_eq!(complete.stdout, "{\"ok\":true}\n");
+        assert!(complete.stderr.is_empty());
+
+        // A top-level refusal, a deferral, a capped scan, a budget cut, and a
+        // facet that could not scan anywhere inside a result that otherwise
+        // succeeded are all partial, and each is named by its path.
+        for (payload, named) in [
+            (json!({ "ok": false, "error": "e" }), "ok"),
+            (
+                json!({ "deferred": true, "retry_after_ms": 125 }),
+                "deferred",
+            ),
+            (json!({ "items": [], "truncated": true }), "truncated"),
+            (
+                json!({ "items": [], "result_truncation": { "budget_bytes": 1 } }),
+                "result_truncation",
+            ),
+            (json!({ "items": [], "sessions_ok": false }), "sessions_ok"),
+            (
+                json!({ "worktrees": { "ok": false, "error": "e" }, "ledger": { "ok": true } }),
+                "worktrees.ok",
+            ),
+            (
+                json!({ "ok": true, "agents": { "ok": true, "live": { "ok": false } } }),
+                "agents.live.ok",
+            ),
+        ] {
+            let partial = call_outcome(&text_result(&payload), false);
+            assert_eq!(partial.code, exit_status::INCOMPLETE, "{payload}");
+            assert!(
+                !partial.stdout.is_empty(),
+                "the partial answer is still printed"
+            );
+            assert!(
+                partial.stderr.contains(named),
+                "{payload}: {}",
+                partial.stderr
+            );
+        }
+        // Rows in a list are data, not facets; and flags that say "whole"
+        // are not flags.
+        let rows = call_outcome(
+            &text_result(
+                &json!({ "items": [{ "ok": false }], "ok": true, "truncated": false, "sessions_ok": true }),
+            ),
+            false,
+        );
+        assert_eq!(rows.code, exit_status::OK, "{rows:?}");
+
+        let refused = call_outcome(
+            &response(
+                json!({ "content": [{ "type": "text", "text": "bad limit" }], "isError": true }),
+            ),
+            false,
+        );
+        assert_eq!(refused.code, exit_status::TOOL_ERROR);
+        assert!(refused.stdout.is_empty());
+        assert!(refused.stderr.contains("bad limit"));
+
+        let unknown = JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: json!(1),
+            result: None,
+            error: Some(json!({ "code": -32602, "message": "Unknown tool: x" })),
+        };
+        assert_eq!(call_outcome(&unknown, false).code, exit_status::USAGE);
+        let internal = JsonRpcResponse {
+            error: Some(json!({ "code": -32603, "message": "boom" })),
+            ..unknown
+        };
+        assert_eq!(call_outcome(&internal, false).code, exit_status::TOOL_ERROR);
+    }
+
+    /// The call goes through the server's own request path: the schema refusal
+    /// a host would get is the refusal the command line gets.
+    #[test]
+    fn a_call_is_validated_by_the_server_path() {
+        let refused = call_outcome(&call_tool("gitpulse_status", json!({})), false);
+        assert_eq!(refused.code, exit_status::TOOL_ERROR, "{refused:?}");
+        assert!(refused.stderr.contains("repo_path"), "{}", refused.stderr);
+        let unknown = call_outcome(&call_tool("gitpulse_nope", json!({})), false);
+        assert_eq!(unknown.code, exit_status::USAGE, "{unknown:?}");
+    }
+
+    /// Every example the help text and the skills show parses, names only keys
+    /// the tool takes, and carries every key its schema requires. Nothing runs.
+    #[test]
+    fn every_documented_example_parses_with_its_required_arguments() {
+        let catalog = mcp::tools();
+        let brief = |source: &str, _within: Duration| -> Result<String, String> {
+            match source {
+                "-" => Ok(r#"{"repo_path":"/abs/repo","title":"..."}"#.to_owned()),
+                "@claim.json" => Ok(
+                    r#"{"repo_path":"/abs/repo","agent_id":"a","branch":"b","claimed_files":["src/lib.rs"]}"#
+                        .to_owned(),
+                ),
+                other => panic!("no example reads {other}"),
+            }
+        };
+        let examples: [&[&str]; 13] = [
+            &["call", "gitpulse_insights", "repo_path=/abs/repo"],
+            &[
+                "call",
+                "gitpulse_list_tasks",
+                "repo_path=/abs/repo",
+                "limit=20",
+            ],
+            &[
+                "call",
+                "gitpulse_list_tasks",
+                "repo_path=/abs/repo",
+                "limit=50",
+            ],
+            &["call", "gitpulse_add_task", "--json", "-", "--write"],
+            &["call", "gitpulse_add_task", "--write", "--json", "-"],
+            &[
+                "call",
+                "gitpulse_collision_risk",
+                "repo_path=/abs/repo",
+                "path=src/lib.rs",
+                "--compact",
+            ],
+            &[
+                "call",
+                "gitpulse_complete_task",
+                "--write",
+                "repo_path=/abs/repo",
+                "task_id=ft-0",
+                "status=done",
+                "summary=...",
+            ],
+            &["describe", "gitpulse_insights"],
+            &["read", "gitpulse://server/manifest"],
+            &[
+                "call",
+                "gitpulse_collision_risk",
+                "repo_path=/abs/repo",
+                "path=src/lib.rs",
+            ],
+            &["call", "gitpulse_worktree_radar", "repo_path=/abs/repo"],
+            &[
+                "call",
+                "gitpulse_active_changes",
+                "repo_path=/abs/repo",
+                "limit=50",
+            ],
+            &[
+                "call",
+                "gitpulse_worktree_claim",
+                "--write",
+                "--json",
+                "@claim.json",
+            ],
+        ];
+        for example in examples {
+            let parsed = parse_command(&args(example), &catalog, &brief)
+                .unwrap_or_else(|e| panic!("{example:?}: {e}"));
+            let CliCommand::Call {
+                tool, arguments, ..
+            } = parsed
+            else {
+                continue;
+            };
+            let schema = &find_tool(&catalog, &tool).unwrap()["inputSchema"];
+            for required in schema["required"].as_array().into_iter().flatten() {
+                let key = required.as_str().unwrap();
+                assert!(arguments.get(key).is_some(), "{example:?} lacks {key}");
+            }
+            if let Some(status) = arguments.get("status") {
+                let allowed = &schema["properties"]["status"]["enum"];
+                assert!(
+                    allowed.as_array().is_some_and(|a| a.contains(status)),
+                    "{example:?}: {status} not in {allowed}"
+                );
+            }
+        }
+        assert!(parse(&["tools"]).is_ok());
+    }
+
+    /// A call that outlives its budget is reported as timed out, not waited
+    /// on; one that panics is a tool error, and the process is still there to
+    /// say so.
+    #[test]
+    fn a_call_past_its_deadline_times_out_and_a_panic_is_a_tool_error() {
+        let request = || {
+            cli_request(
+                "tools/call",
+                json!({ "name": "gitpulse_status", "arguments": {} }),
+            )
+        };
+        let started = Instant::now();
+        let slow = run_bounded(request(), Duration::from_millis(20), |ready| {
+            std::thread::sleep(Duration::from_secs(5));
+            ready.panicked()
+        });
+        assert!(matches!(slow, Bounded::TimedOut), "{slow:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "it waited for the worker"
+        );
+
+        let timed_out = timed_out_outcome("gitpulse_status", Duration::from_millis(20));
+        assert_eq!(timed_out.code, exit_status::TIMED_OUT);
+        assert!(timed_out.stdout.is_empty());
+        assert!(timed_out.stderr.contains("20 ms"), "{}", timed_out.stderr);
+        assert!(
+            timed_out.stderr.contains("outcome is unknown"),
+            "{}",
+            timed_out.stderr
+        );
+
+        let Bounded::Answered(panicked) =
+            run_bounded(request(), Duration::from_secs(5), |_| panic!("injected"))
+        else {
+            panic!("a panic was reported as a timeout")
+        };
+        let outcome = call_outcome(&panicked, false);
+        assert_eq!(outcome.code, exit_status::TOOL_ERROR, "{outcome:?}");
+        assert!(outcome.stderr.contains("panicked"), "{}", outcome.stderr);
+    }
+
+    #[test]
+    fn timeout_ms_is_a_positive_bounded_number_given_once() {
+        let Ok(CliCommand::Call { timeout, .. }) = parse(&[
+            "call",
+            "gitpulse_status",
+            "repo_path=/r",
+            "--timeout-ms",
+            "1500",
+        ]) else {
+            panic!("parse failed")
+        };
+        assert_eq!(timeout, Duration::from_millis(1500));
+        let Ok(CliCommand::Read { timeout, .. }) = parse(&[
+            "read",
+            "gitpulse://server/manifest",
+            "--timeout-ms",
+            "600000",
+        ]) else {
+            panic!("parse failed")
+        };
+        assert_eq!(timeout, MAX_ENV_WINDOW);
+        // A read waits the server's budget by default; a write the longest
+        // window, since stopping it midway would leave it half done.
+        let Ok(CliCommand::Call { timeout, .. }) =
+            parse(&["call", "gitpulse_status", "repo_path=/r"])
+        else {
+            panic!("parse failed")
+        };
+        assert_eq!(timeout, call_budget());
+        let Ok(CliCommand::Call { timeout, .. }) = parse(&[
+            "call",
+            "gitpulse_add_task",
+            "repo_path=/r",
+            "title=t",
+            "--write",
+        ]) else {
+            panic!("parse failed")
+        };
+        assert_eq!(timeout, MAX_ENV_WINDOW);
+        for bad in [
+            &["call", "gitpulse_status", "--timeout-ms", "0"][..],
+            &["call", "gitpulse_status", "--timeout-ms", "abc"],
+            &["call", "gitpulse_status", "--timeout-ms", "-5"],
+            &["call", "gitpulse_status", "--timeout-ms", "600001"],
+            &["call", "gitpulse_status", "--timeout-ms"],
+            &[
+                "call",
+                "gitpulse_status",
+                "--timeout-ms",
+                "5",
+                "--timeout-ms",
+                "6",
+            ],
+            &["read", "gitpulse://server/manifest", "--timeout-ms", "0"],
+        ] {
+            let refused = parse(bad).unwrap_err();
+            assert!(refused.contains("--timeout-ms"), "{bad:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn read_takes_one_uri_and_its_own_options() {
+        assert_eq!(
+            parse(&["read", "gitpulse://server/manifest", "--compact"]),
+            Ok(CliCommand::Read {
+                uri: "gitpulse://server/manifest".into(),
+                compact: true,
+                timeout: call_budget()
+            })
+        );
+        for bad in [
+            &["read"][..],
+            &["read", "--compact"],
+            &["read", "gitpulse://a", "gitpulse://b"],
+            &["read", "gitpulse://a", "--write"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `read` goes through the server's resource path: the manifest is there,
+    /// and a URI the server does not address is the caller's error.
+    #[test]
+    fn read_answers_from_the_server_resource_path() {
+        let catalog = mcp::tools();
+        let read = |uri: &str| {
+            execute(
+                CliCommand::Read {
+                    uri: uri.into(),
+                    compact: true,
+                    timeout: Duration::from_secs(120),
+                },
+                &catalog,
+            )
+        };
+        let manifest = read("gitpulse://server/manifest");
+        assert_eq!(manifest.code, exit_status::OK, "{manifest:?}");
+        let parsed: Value = serde_json::from_str(&manifest.stdout).expect("JSON on stdout");
+        assert!(parsed.is_object(), "{parsed}");
+        let unknown = read("gitpulse://no-such-resource");
+        assert_eq!(unknown.code, exit_status::USAGE, "{unknown:?}");
+        assert!(unknown.stdout.is_empty());
+        assert!(
+            unknown.stderr.starts_with("gitpulse-mcp read:"),
+            "{}",
+            unknown.stderr
+        );
+    }
+
+    /// The doctor reads the second line; the first stays what it was.
+    #[test]
+    fn the_version_names_every_one_shot_command() {
+        let text = version_text();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("{} {}", mcp::SERVER_NAME, mcp::server_version()).as_str())
+        );
+        assert_eq!(lines.next(), Some("commands: tools, describe, call, read"));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn tools_lists_every_tool_with_its_access() {
+        let catalog = mcp::tools();
+        let lines = tool_lines(&catalog);
+        assert_eq!(lines.lines().count(), catalog.len());
+        let status = lines
+            .lines()
+            .find(|l| l.starts_with("gitpulse_status "))
+            .unwrap();
+        assert!(status.contains(" read "), "{status}");
+        let add = lines
+            .lines()
+            .find(|l| l.starts_with("gitpulse_add_task "))
+            .unwrap();
+        assert!(add.contains(" write "), "{add}");
     }
 }

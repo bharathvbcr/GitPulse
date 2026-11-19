@@ -21,6 +21,8 @@ import {
   PLUGIN_ID,
   probeHook,
   probeServer,
+  probeServerCommands,
+  SERVER_COMMANDS,
   readInstalledPluginHooks,
   readRepoHooks,
   resolveOnPath,
@@ -152,8 +154,32 @@ describe("classify", () => {
     expect(classify(observed).status).not.toBe("ok");
   });
 
-  it("reports ok when both version and schema match", () => {
-    expect(classify({ binPath: "/x/gitpulse-mcp", version: "0.0.5", error: null, expected, ...identity }).status).toBe("ok");
+  it("reports ok when version, schema and the one-shot commands match", () => {
+    const commands = [...SERVER_COMMANDS];
+    expect(classify({ binPath: "/x/gitpulse-mcp", version: "0.0.5", error: null, expected, ...identity, commands }).status).toBe("ok");
+  });
+
+  it("marks a server that lists no one-shot commands stale, not ok", () => {
+    // An install from before the commands prints the same version and schema.
+    for (const commands of [null, undefined]) {
+      const old = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands });
+      expect(old.status).toBe("stale");
+      expect(old.violations.join(" ")).toContain("`gitpulse-mcp call`");
+      expect(old.violations.join(" ")).toContain("bun run mcp:install");
+    }
+  });
+
+  it("names the one-shot command an installed server lacks", () => {
+    const partial = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands: ["call", "describe", "tools"] });
+    expect(partial.status).toBe("stale");
+    expect(partial.violations.join(" ")).toContain("`gitpulse-mcp read`");
+    expect(partial.violations.join(" ")).not.toContain("`gitpulse-mcp call`");
+  });
+
+  it("does not call a --version that never answered stale", () => {
+    const silent = classify({ binPath: "/x/gitpulse-mcp", version: expected, error: null, expected, ...identity, commands: null, commandsError: "no identity response within 10ms" });
+    expect(silent.status).toBe("unresponsive");
+    expect(silent.violations.join(" ")).toContain("within 10ms");
   });
 
   it("separates absent from ok — the collapse this check exists to prevent", () => {
@@ -434,6 +460,38 @@ describe("probeHook", () => {
     const result = await probeHook(file, 400);
     expect(result.error).toContain("within 400ms");
     expect(Date.now() - started).toBeLessThan(wallClockBudget(5000));
+  });
+});
+
+describe("probeServerCommands", () => {
+  itPosix("reads the commands line, sorted", async () => {
+    const bin = await fakeHook("cmds", "gitpulse-mcp 1.2.3\ncommands: tools, describe, call, read\n");
+    await expect(probeServerCommands(bin, 5000)).resolves.toEqual({
+      commands: ["call", "describe", "read", "tools"],
+      error: null,
+    });
+  });
+
+  itPosix("reports an older build's version-only answer as no commands, not an error", async () => {
+    const bin = await fakeHook("old", "gitpulse-mcp 1.2.3\n");
+    await expect(probeServerCommands(bin, 5000)).resolves.toEqual({ commands: null, error: null });
+  });
+
+  it("reports a missing executable as an error", async () => {
+    const dir = await scratchDir("missing-server");
+    const result = await probeServerCommands(path.join(dir, "not-here"), 5000);
+    expect(result.commands).toBeNull();
+    expect(result.error).toBeTruthy();
+  });
+});
+
+describe("SERVER_COMMANDS", () => {
+  it("is the CLI_COMMANDS gitpulse-mcp declares", async () => {
+    const source = await readFile(new URL("../src-tauri/src/bin/gitpulse-mcp.rs", import.meta.url), "utf8");
+    const declared = /const CLI_COMMANDS: \[&str; \d+\] = \[([^\]]*)\];/.exec(source);
+    expect(declared, "CLI_COMMANDS not found in gitpulse-mcp.rs").not.toBeNull();
+    const names = [...(declared?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+    expect(names).toEqual([...SERVER_COMMANDS].sort());
   });
 });
 

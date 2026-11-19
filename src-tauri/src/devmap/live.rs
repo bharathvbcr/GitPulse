@@ -73,7 +73,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1092,13 +1092,46 @@ pub fn start_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
 /// own build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeededRefresh {
-    /// A long-lived process (the app, `gitpulse-mcp`): the build runs on a
-    /// supervised background thread and this returns at once.
+    /// A long-lived process (the app, `gitpulse-mcp` serving): the build runs
+    /// on a supervised background thread and this returns at once.
+    ///
+    /// In a process that declared itself short-lived
+    /// ([`run_process_short_lived`]) this runs as [`SeededRefresh::Inline`]:
+    /// the one-shot `gitpulse-mcp call` reaches the same handlers as the
+    /// server, which ask for `Background`, and exits through `reap_all`,
+    /// which would kill the detached build or never let it start.
     Background,
-    /// A short-lived process (the `gitpulse-worktree` CLI), whose background
-    /// thread would die with it: the build runs here, within the build
-    /// deadline.
+    /// A short-lived process (the `gitpulse-worktree` CLI, a one-shot
+    /// `gitpulse-mcp` command), whose background thread would die with it:
+    /// the build runs here, within the build deadline.
     Inline,
+}
+
+/// Set once by a process that exits when its command returns.
+static SHORT_LIVED_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Declares this process short-lived: it exits when its one command returns,
+/// taking any background thread and child with it. From then on
+/// [`refresh_seeded_worktree`] builds inline whatever its caller asked for, so
+/// a shared handler (an MCP tool) need not know which kind of process runs it.
+/// The server keeps `Background`; only the one-shot path calls this.
+pub fn run_process_short_lived() {
+    SHORT_LIVED_PROCESS.store(true, Ordering::Release);
+}
+
+/// Whether [`run_process_short_lived`] has been called in this process.
+pub fn process_is_short_lived() -> bool {
+    SHORT_LIVED_PROCESS.load(Ordering::Acquire)
+}
+
+/// What a seeding caller's request becomes in a process that is (or is not)
+/// short-lived: a background build would not outlive such a process.
+fn effective_seeded_run(run: SeededRefresh, short_lived: bool) -> SeededRefresh {
+    if short_lived {
+        SeededRefresh::Inline
+    } else {
+        run
+    }
 }
 
 /// Bring a worktree whose DevMap store was just seeded (cloned from its main
@@ -1116,7 +1149,13 @@ pub enum SeededRefresh {
 /// against ~7.6 s for the cold build a missing store costs). Every seeding
 /// path calls this rather than its own build.
 pub fn refresh_seeded_worktree(path: &str, run: SeededRefresh) -> LiveRefreshOutcome {
-    let outcome = match run {
+    refresh_seeded(path, run, SHORT_LIVED_PROCESS.load(Ordering::Acquire))
+}
+
+/// [`refresh_seeded_worktree`] with the process's lifetime given, so a test
+/// states it without flipping a flag every other test in the process reads.
+fn refresh_seeded(path: &str, run: SeededRefresh, short_lived: bool) -> LiveRefreshOutcome {
+    let outcome = match effective_seeded_run(run, short_lived) {
         SeededRefresh::Background => start_refresh(path, false),
         SeededRefresh::Inline => maybe_refresh(path, false),
     };
@@ -4162,6 +4201,41 @@ exit 2
                 .expect("git worktree list");
             String::from_utf8_lossy(&out.stdout).contains("/lane")
         }
+    }
+
+    /// A one-shot process exits when its command returns, so a seeded refresh
+    /// asked for in the background must run to completion before the call
+    /// returns (feat/mcp-cli review, finding 1). A long-lived process keeps
+    /// the background build.
+    #[test]
+    #[cfg(unix)]
+    fn a_short_lived_process_builds_a_seeded_refresh_inline() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        let fixture = removal_fixture(600);
+        // The stub finishes at once: the build is observable as done on return.
+        std::fs::write(fixture.stub_dir.path().join("release"), "").unwrap();
+        let outcome = refresh_seeded(
+            fixture.wt.to_str().unwrap(),
+            SeededRefresh::Background,
+            true,
+        );
+        assert_ne!(
+            outcome.decision,
+            LiveRefreshDecision::Started,
+            "a short-lived process must not detach the build: {outcome:?}"
+        );
+        assert!(
+            outcome.build.is_some(),
+            "the outcome must carry the finished build: {outcome:?}"
+        );
+        fixture.assert_idle();
+        assert_eq!(
+            effective_seeded_run(SeededRefresh::Background, false),
+            SeededRefresh::Background,
+            "a long-lived process keeps the background build"
+        );
+        fixture.finish();
     }
 
     /// Removing a worktree moments after it was created used to race the

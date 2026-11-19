@@ -321,10 +321,14 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, error: string | null, expected: string, expectedSchema: number }} observed
+ * `commands` is what `--version` listed (`probeServerCommands`); null or absent
+ * is not a pass: a server whose one-shot commands were never seen is not
+ * known to have them.
+ *
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, error: string | null, expected: string, expectedSchema: number, commands?: string[] | null, commandsError?: string | null }} observed
  * @returns {{ status: "ok" | "stale" | "unresponsive" | "absent", violations: string[] }}
  */
-export function classify({ binPath, version, storeSchema, error, expected, expectedSchema }) {
+export function classify({ binPath, version, storeSchema, error, expected, expectedSchema, commands = null, commandsError = null }) {
   if (binPath === null) {
     return {
       status: "absent",
@@ -359,6 +363,22 @@ export function classify({ binPath, version, storeSchema, error, expected, expec
     return {
       status: "stale",
       violations: [`${binPath} reads store schema ${storeSchema} but this tree reads ${expectedSchema}`, "refresh it with: bun run mcp:install"],
+    };
+  }
+  if (commands === null && commandsError !== null) {
+    return {
+      status: "unresponsive",
+      violations: [`${binPath} --version did not answer (${commandsError})`],
+    };
+  }
+  const missing = SERVER_COMMANDS.filter((command) => !(commands ?? []).includes(command));
+  if (missing.length > 0) {
+    return {
+      status: "stale",
+      violations: [
+        `${binPath} does not answer ${missing.map((c) => `\`${SERVER_BIN} ${c}\``).join(", ")} — the shell path the skills and the session brief give agents whose MCP connection is down`,
+        "refresh it with: bun run mcp:install",
+      ],
     };
   }
   return { status: "ok", violations: [] };
@@ -451,6 +471,38 @@ export function bareHookCommand(command) {
 }
 
 /**
+ * Read a `<bin> --version` identity: the `<bin> <version>` line, and the
+ * comma-separated list on the `<listKey>:` line. Either is null when absent.
+ *
+ * @param {string} stdout
+ * @param {string} bin
+ * @param {string} listKey
+ * @returns {{ version: string | null, list: string[] | null }}
+ */
+export function parseIdentity(stdout, bin, listKey) {
+  /** @type {string | null} */
+  let version = null;
+  /** @type {string[] | null} */
+  let list = null;
+  const versionLine = new RegExp(`^${bin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(\\S+)$`);
+  const listLine = new RegExp(`^${listKey}:\\s*(.+)$`);
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const versioned = versionLine.exec(trimmed);
+    if (versioned && version === null) version = versioned[1];
+    const listed = listLine.exec(trimmed);
+    if (listed && list === null) {
+      list = listed[1]
+        .split(",")
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0)
+        .sort();
+    }
+  }
+  return { version, list };
+}
+
+/**
  * Read `gitpulse-hook --version`: its version, and the subcommands it serves.
  *
  * Both halves must be present. A binary that printed one and not the other has
@@ -461,55 +513,38 @@ export function bareHookCommand(command) {
  * @returns {{ version: string | null, subcommands: string[] | null }}
  */
 export function parseHookIdentity(stdout) {
-  /** @type {string | null} */
-  let version = null;
-  /** @type {string[] | null} */
-  let subcommands = null;
-  for (const line of stdout.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    const versioned = /^gitpulse-hook\s+(\S+)$/.exec(trimmed);
-    if (versioned && version === null) version = versioned[1];
-    const listed = /^subcommands:\s*(.+)$/.exec(trimmed);
-    if (listed && subcommands === null) {
-      subcommands = listed[1]
-        .split(",")
-        .map((name) => name.trim())
-        .filter((name) => name.length > 0)
-        .sort();
-    }
-  }
-  return { version, subcommands };
+  const { version, list } = parseIdentity(stdout, HOOK_BIN, "subcommands");
+  return { version, subcommands: list };
 }
 
 /**
- * Ask the hook binary who it is.
+ * Run `<binPath> --version` and return what it printed, bounded in time and
+ * size. `error` is set only when it could not be asked (spawn failure, no exit
+ * within the deadline, a flood); what the text says is the caller's to judge.
  *
- * `--version` is the only argument that makes this binary answer at all: every
- * other invocation is a hook, and silence is a legitimate reply to all of them,
- * so no hook call can distinguish a working binary from a broken one. stdin is
- * closed rather than piped — the identity path reads none, and leaving a pipe
- * open would make this probe hang on a build that does.
+ * `--version` is the one argument both binaries answer without serving: the
+ * hook would otherwise wait for a hook payload and the server for a client.
+ * stdin is closed rather than piped — the identity path reads none, and
+ * leaving a pipe open would make this probe hang on a build that does.
  *
  * @param {string} binPath
  * @param {number} timeoutMs
- * @returns {Promise<{ version: string | null, subcommands: string[] | null, error: string | null }>}
+ * @returns {Promise<{ stdout: string, error: string | null }>}
  */
-export function probeHook(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
+function readVersionText(binPath, timeoutMs) {
   return new Promise((resolve) => {
-    // stdin is `null` here by construction: the identity path reads none, and
-    // handing it an open pipe would hang this probe against a build that does.
     /** @type {import("node:child_process").ChildProcessByStdio<null, import("node:stream").Readable, import("node:stream").Readable>} */
     let child;
     try {
       child = spawn(binPath, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ version: null, subcommands: null, error: /** @type {Error} */ (err).message });
+      resolve({ stdout: "", error: /** @type {Error} */ (err).message });
       return;
     }
     let stdout = "";
     let receivedBytes = 0;
     let settled = false;
-    const finish = (/** @type {{ version: string | null, subcommands: string[] | null, error: string | null }} */ outcome) => {
+    const finish = (/** @type {{ stdout: string, error: string | null }} */ outcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -517,34 +552,73 @@ export function probeHook(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       resolve(outcome);
     };
     const timer = setTimeout(
-      () => finish({ version: null, subcommands: null, error: `no identity response within ${timeoutMs}ms` }),
+      () => finish({ stdout: "", error: `no identity response within ${timeoutMs}ms` }),
       timeoutMs,
     );
-    child.on("error", (err) => finish({ version: null, subcommands: null, error: err.message }));
+    child.on("error", (err) => finish({ stdout: "", error: err.message }));
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       if (settled) return;
       receivedBytes += Buffer.byteLength(chunk, "utf8");
       if (receivedBytes > MAX_RESPONSE_BYTES) {
-        finish({ version: null, subcommands: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
+        finish({ stdout: "", error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
         return;
       }
       stdout += chunk;
     });
-    // Read to EOF rather than settling on the first chunk: the two identity
+    // Read to EOF rather than settling on the first chunk: the identity
     // lines are not guaranteed to arrive in one write.
-    child.on("close", () => {
-      const { version, subcommands } = parseHookIdentity(stdout);
-      finish({
-        version,
-        subcommands,
-        error: version !== null && subcommands !== null
-          ? null
-          : "binary exited without a complete identity line",
-      });
-    });
+    child.on("close", () => finish({ stdout, error: null }));
   });
+}
+
+/**
+ * Ask the hook binary who it is.
+ *
+ * `--version` is the only argument that makes this binary answer at all: every
+ * other invocation is a hook, and silence is a legitimate reply to all of them,
+ * so no hook call can distinguish a working binary from a broken one.
+ *
+ * @param {string} binPath
+ * @param {number} timeoutMs
+ * @returns {Promise<{ version: string | null, subcommands: string[] | null, error: string | null }>}
+ */
+export async function probeHook(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const { stdout, error } = await readVersionText(binPath, timeoutMs);
+  if (error !== null) return { version: null, subcommands: null, error };
+  const { version, subcommands } = parseHookIdentity(stdout);
+  return {
+    version,
+    subcommands,
+    error: version !== null && subcommands !== null
+      ? null
+      : "binary exited without a complete identity line",
+  };
+}
+
+/**
+ * The one-shot commands the installed server must answer: the shell path the
+ * skills, AGENTS.md and the session brief send an agent down when its MCP
+ * connection is missing. Pinned to `CLI_COMMANDS` in
+ * `src-tauri/src/bin/gitpulse-mcp.rs` by a contract test.
+ */
+export const SERVER_COMMANDS = ["call", "describe", "read", "tools"];
+
+/**
+ * Ask the server which one-shot commands it answers, from the `commands:` line
+ * of its `--version`. `commands` is null both when it could not be asked
+ * (`error` says why) and when it printed no such line — a build that predates
+ * them, which is the staleness this exists to see.
+ *
+ * @param {string} binPath
+ * @param {number} timeoutMs
+ * @returns {Promise<{ commands: string[] | null, error: string | null }>}
+ */
+export async function probeServerCommands(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const { stdout, error } = await readVersionText(binPath, timeoutMs);
+  if (error !== null) return { commands: null, error };
+  return { commands: parseIdentity(stdout, SERVER_BIN, "commands").list, error: null };
 }
 
 /**
@@ -915,7 +989,7 @@ export function probeLease(binDir, { shell = process.env.SHELL || "/bin/zsh", ti
 }
 
 /**
- * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] }, lease?: { status: string, detail: string, resolved: string | null, ok: boolean } }} result
+ * @param {{ binPath: string | null, version: string | null, storeSchema: number | null, expected: string, expectedSchema: number, commands?: string[] | null, status: string, violations: string[], hook?: { binPath: string | null, version: string | null, subcommands: string[] | null, declared: string[], status: string, violations: string[] }, provenance?: { status: string, violations: string[], treeDigest: string, treeFileCount: number, installedAt: string | null }, pluginCache?: { status: string, violations: string[], installPaths: string[] }, lease?: { status: string, detail: string, resolved: string | null, ok: boolean } }} result
  */
 export function formatReport(result) {
   const lines = ["MCP install doctor", ""];
@@ -924,6 +998,9 @@ export function formatReport(result) {
   lines.push(`  ${"version this tree carries".padEnd(26)} : ${result.expected}`);
   lines.push(`  ${"store schema it reports".padEnd(26)} : ${result.storeSchema ?? "<unavailable>"}`);
   lines.push(`  ${"store schema this tree reads".padEnd(26)} : ${result.expectedSchema}`);
+  if (result.commands !== undefined) {
+    lines.push(`  ${"one-shot commands".padEnd(26)} : ${result.commands?.join(", ") ?? "<none listed>"}`);
+  }
   if (result.violations.length > 0) {
     lines.push("", "  violations:");
     for (const violation of result.violations) lines.push(`    - ${violation}`);
@@ -971,7 +1048,7 @@ export function formatReport(result) {
   lines.push(
     "",
     result.status === "ok"
-      ? `OK: the ${SERVER_BIN} on PATH matches version ${result.expected} and store schema ${result.expectedSchema}.`
+      ? `OK: the ${SERVER_BIN} on PATH matches version ${result.expected} and store schema ${result.expectedSchema}, and answers ${SERVER_COMMANDS.join(", ")} from the shell.`
       : `FAIL (${result.status}): the server an agent would connect to is not this tree's build.`,
   );
   if (hook) {
@@ -1088,7 +1165,13 @@ export async function main(argv = process.argv.slice(2)) {
     const expectedSchema = readVendoredSchema();
     const binPath = opts.bin ?? resolveOnPath(SERVER_BIN);
     const probe = binPath === null ? { version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, extractSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
-    const { status, violations } = classify({ binPath, ...probe, expected, expectedSchema });
+    const commandProbe = binPath === null
+      ? { commands: null, error: null }
+      : await probeServerCommands(binPath, opts.timeoutMs);
+    const { status, violations } = classify({
+      binPath, ...probe, expected, expectedSchema,
+      commands: commandProbe.commands, commandsError: commandProbe.error,
+    });
 
     // Derived from the shipped manifest, so a hook added there is checked
     // against the installed binary without this file being touched.
@@ -1146,6 +1229,7 @@ export async function main(argv = process.argv.slice(2)) {
 
     const result = {
       binPath, version: probe.version, storeSchema: probe.storeSchema, expected, expectedSchema,
+      commands: commandProbe.commands,
       status, violations,
       // Kept as the server's own verdict so an existing reader of this field
       // is not silently told something new; `ok` below is the whole package.

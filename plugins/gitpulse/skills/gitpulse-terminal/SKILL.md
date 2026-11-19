@@ -50,6 +50,8 @@ gitpulse-hook term list
 gitpulse-hook term open-file src/main.rs --line 42
 ```
 
+`gitpulse-mcp call gitpulse_terminal_* --write ...` (the one-shot form the gitpulse-insights skill describes) acts for `GITPULSE_TERMINAL_SESSION` inside a GitPulse terminal, as the MCP tools do. Outside one, each call is a new `mcp-<pid>` caller that cannot reach a child an earlier call left open, so only a self-contained call is useful there: `gitpulse_terminal_exec` with `keep_open: false`, or `gitpulse_terminal_open_file`. `gitpulse-hook term` outside a GitPulse terminal acts for its parent shell (`ext-<ppid>`), so spawn, wait, read and close from one shell script reach the same child; separate agent shell commands are separate parents.
+
 ## Workflow guidelines
 
 0. **Shell execution, paging, and opt-in shell reads:** Use `gitpulse_terminal_exec` to execute commands across fresh or persistent parallel shells without polling. Pass `max_lines` (up to `1000`, `64 KiB`), `offset_lines`, `grep`, or `last_command_only: true` on `gitpulse_terminal_read`. User-opened repository `"shell"` tabs can be inspected read-only (`owned: false`) with `gitpulse_terminal_list` (`include_repo_shells: true`), `gitpulse_terminal_wait`, and `gitpulse_terminal_read` only when `allow_agent_shell_reads` is enabled in Settings -> Agents; `gitpulse_terminal_send`, `gitpulse_terminal_close`, and targeted `gitpulse_terminal_exec` remain strictly restricted to sessions owned by this caller.

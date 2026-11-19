@@ -214,9 +214,14 @@ fn command_line_arguments_are_answered_without_serving() {
     for flag in ["--version", "-V"] {
         let (code, stdout, stderr) = run_with_args(&[flag]);
         assert_eq!(code, Some(0), "{flag}: {stderr}");
+        // The first line is the version alone, as it always was; the second
+        // names the one-shot commands, for mcp:doctor.
         assert_eq!(
             stdout,
-            format!("gitpulse-mcp {}\n", env!("CARGO_PKG_VERSION")),
+            format!(
+                "gitpulse-mcp {}\ncommands: tools, describe, call, read\n",
+                env!("CARGO_PKG_VERSION")
+            ),
             "{flag}"
         );
     }
@@ -226,6 +231,287 @@ fn command_line_arguments_are_answered_without_serving() {
         assert!(stdout.is_empty(), "{args:?} wrote to the wire: {stdout}");
         assert!(stderr.contains("unexpected argument"), "{args:?}: {stderr}");
     }
+}
+
+/// Runs a one-shot command the way an agent's shell does (no stdin) and
+/// returns its exit code, stdout and stderr. Both pipes are drained while it
+/// runs: `tools --json` prints far more than a pipe buffer holds, and a
+/// reader that waited for exit first would deadlock against it.
+fn run_one_shot(args: &[&str]) -> (Option<i32>, String, String) {
+    run_one_shot_with_input(args, None)
+}
+
+/// [`run_one_shot`] with `input` written to stdin and then closed.
+fn run_one_shot_with_input(args: &[&str], input: Option<&str>) -> (Option<i32>, String, String) {
+    run_one_shot_with(args, input, false, &[])
+}
+
+/// [`run_one_shot_with_input`] with extra environment, and with stdin kept
+/// open (never closed, as a pipe whose writer is still alive) until the
+/// command has exited when `hold_stdin_open` is set.
+fn run_one_shot_with(
+    args: &[&str],
+    input: Option<&str>,
+    hold_stdin_open: bool,
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> (Option<i32>, String, String) {
+    let log_dir = tempfile::tempdir().expect("log dir");
+    let mut command = Command::new(mcp_bin());
+    command.envs(envs.iter().copied());
+    let mut child = command
+        .args(args)
+        .stdin(if input.is_some() || hold_stdin_open {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GITPULSE_LOG_DIR", log_dir.path())
+        // Not the terminal this test runs in: a terminal tool acts for the
+        // GitPulse terminal named here, and the tests must not depend on one.
+        .env_remove(gitpulse_lib::terminal::TERMINAL_SESSION_ENV)
+        .env_remove(gitpulse_lib::alerts::bridge::SESSION_ENV)
+        .env_remove(gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV)
+        .spawn_locked()
+        .unwrap_or_else(|e| panic!("spawn {}: {e}", mcp_bin()));
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut pipe, &mut text).expect("read pipe");
+            text
+        })
+    };
+    let mut held_stdin = None;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(input.as_bytes()).expect("write stdin");
+    } else if hold_stdin_open {
+        held_stdin = child.stdin.take();
+    }
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr")));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().expect("kill");
+            child.wait().expect("reap");
+            panic!("gitpulse-mcp {args:?} did not exit within 60 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(held_stdin);
+    (
+        status.code(),
+        stdout.join().expect("stdout reader"),
+        stderr.join().expect("stderr reader"),
+    )
+}
+
+/// A `--json -` whose writer never closes the pipe is a stall, bounded by
+/// `--timeout-ms` like a tool that never answers: exit 4 and nothing run, not
+/// a hang until the harness gives up (feat/mcp-cli review, finding 4).
+#[test]
+fn a_stdin_that_never_closes_exits_four_at_the_timeout() {
+    let (code, stdout, stderr) = run_one_shot_with(
+        &[
+            "call",
+            "gitpulse_status",
+            "--json",
+            "-",
+            "--timeout-ms",
+            "800",
+        ],
+        None,
+        true,
+        &[],
+    );
+    assert_eq!(code, Some(4), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("--json -"), "{stderr}");
+}
+
+/// A timed-out call takes the git it started down with it: a `git` that
+/// hangs is recorded by pid, the call times out (exit 4), and that pid is
+/// gone afterwards. By pid, never by name.
+#[test]
+#[cfg(unix)]
+fn a_timed_out_call_leaves_no_git_child_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempfile::tempdir().expect("repo");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status_locked()
+        .expect("git init")
+        .success());
+    // Persist the grant so the out-of-process `gitpulse-mcp` shares the
+    // hermetic trust decision.
+    let repo_str = repo.path().to_str().expect("utf-8 path");
+    let preview = gitpulse_lib::repository_trust::inspect(repo_str).expect("inspect repo");
+    gitpulse_lib::repository_trust::grant(repo_str, &preview.identity, true).expect("trust");
+    let stub = tempfile::tempdir().expect("stub dir");
+    let pids = stub.path().join("pids");
+    let script = stub.path().join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec sleep 300\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::ffi::OsString::from(stub.path());
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+
+    // The timeout stays under the gate's 2 s wait for a spawn token: past
+    // that, a loaded host defers a second git and the call ends with exit 3
+    // (incomplete) before the watchdog's exit 4, which this test must see.
+    let repo_arg = format!("repo_path={}", repo.path().to_str().expect("utf-8 path"));
+    let (code, stdout, stderr) = run_one_shot_with(
+        &["call", "gitpulse_status", &repo_arg, "--timeout-ms", "1200"],
+        None,
+        false,
+        &[("PATH", path.as_os_str())],
+    );
+    assert_eq!(code, Some(4), "stdout: {stdout}\nstderr: {stderr}");
+    let started: Vec<String> = std::fs::read_to_string(&pids)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !started.is_empty(),
+        "the call never started the stub git, so this proves nothing: {stderr}"
+    );
+    for pid in started {
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status_locked()
+            .expect("kill -0")
+            .success();
+        assert!(!alive, "git child {pid} outlived the timed-out call");
+    }
+}
+
+/// An agent whose MCP connection is not loaded still has a shell: the same
+/// binary answers one request from the command line and exits, with nothing
+/// but the answer on stdout and an exit status that tells a partial answer
+/// from a complete one.
+#[test]
+fn one_shot_commands_answer_without_a_session() {
+    let (code, stdout, stderr) = run_one_shot(&["tools"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.lines().any(|l| l.starts_with("gitpulse_insights ")),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run_one_shot(&["tools", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let catalog: Value = serde_json::from_str(&stdout).expect("tools --json is JSON");
+    assert!(
+        catalog
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|t| t["name"] == "gitpulse_status")),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run_one_shot(&["describe", "gitpulse_status"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let tool: Value = serde_json::from_str(&stdout).expect("describe prints JSON");
+    assert!(
+        tool["inputSchema"]["properties"]["repo_path"].is_object(),
+        "{tool}"
+    );
+
+    // A facet that could not scan is not a clean answer: exit 3, and the
+    // partial answer is still the only thing on stdout.
+    let (code, stdout, stderr) = run_one_shot(&[
+        "call",
+        "gitpulse_insights",
+        "repo_path=/no/such/gitpulse-cli-repo",
+        "--compact",
+    ]);
+    assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    let payload: Value = serde_json::from_str(&stdout).expect("call prints JSON");
+    assert_eq!(payload["worktrees"]["ok"], false, "{payload}");
+    assert!(stderr.contains("worktrees"), "{stderr}");
+
+    // A write needs --write, and is refused before anything runs.
+    let (code, stdout, stderr) = run_one_shot(&[
+        "call",
+        "gitpulse_add_task",
+        "repo_path=/no/such/gitpulse-cli-repo",
+        "title=t",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("--write"), "{stderr}");
+
+    // The server's own schema check refuses a missing argument: exit 1.
+    let (code, stdout, stderr) = run_one_shot(&["call", "gitpulse_status"]);
+    assert_eq!(code, Some(1), "{stdout} {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("repo_path"), "{stderr}");
+
+    // A resource answers from the same binary.
+    let (code, stdout, stderr) = run_one_shot(&["read", "gitpulse://server/manifest", "--compact"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let manifest: Value = serde_json::from_str(&stdout).expect("read prints JSON");
+    assert!(manifest.is_object(), "{manifest}");
+
+    // An unknown tool, key, resource or deadline is the command line's
+    // fault: exit 2.
+    for args in [
+        &["call", "gitpulse_nope"][..],
+        &["call", "gitpulse_status", "repo_pth=/x"],
+        &["describe", "gitpulse_nope"],
+        &["read", "gitpulse://no-such-resource"],
+        &[
+            "call",
+            "gitpulse_status",
+            "repo_path=/x",
+            "--timeout-ms",
+            "0",
+        ],
+    ] {
+        let (code, stdout, stderr) = run_one_shot(args);
+        assert_eq!(code, Some(2), "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+    }
+}
+
+/// The command line is not a way around repository trust: a write the server
+/// would refuse for an untrusted repository is refused here too, with the
+/// same code, and the argument object arrives whole through stdin.
+#[test]
+fn a_one_shot_write_is_held_to_repository_trust() {
+    let repo = tempfile::tempdir().expect("repo");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status_locked()
+        .expect("git init")
+        .success());
+    let brief = json!({
+        "repo_path": repo.path().to_str().expect("utf-8 path"),
+        "title": "one-shot trust probe"
+    })
+    .to_string();
+    let (code, stdout, stderr) = run_one_shot_with_input(
+        &["call", "gitpulse_add_task", "--write", "--json", "-"],
+        Some(&brief),
+    );
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("untrusted_repository"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------

@@ -451,6 +451,7 @@ site | tests/logging_process.rs | wait_for_probe | 0 | bounded-poll
 
 # tests/mcp_stdio.rs
 site | tests/mcp_stdio.rs | run_with_args | 0 | bounded-poll
+site | tests/mcp_stdio.rs | run_one_shot_with | 0 | bounded-poll
 
 # tests/mcp_transport_stress.rs
 site | tests/mcp_transport_stress.rs | a_client_that_never_reads_ends_the_session_after_the_write_window | 0 | bounded-poll
