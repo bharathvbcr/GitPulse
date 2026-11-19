@@ -782,6 +782,7 @@
                 items={filteredStaged}
                 rowHeight={CHANGE_ROW_HEIGHT}
                 bind:scrollTop={stagedScroll}
+                key={(f) => f.path}
                 class="h-full"
               >
                 {#snippet row(f)}
@@ -869,6 +870,7 @@
                 items={filteredUnstaged}
                 rowHeight={CHANGE_ROW_HEIGHT}
                 bind:scrollTop={unstagedScroll}
+                key={(f) => f.path}
                 class="h-full"
               >
                 {#snippet row(f)}
