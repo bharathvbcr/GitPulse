@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GitPulse E2E · Notifications & Logo</title>
+    <style>
+      body { margin: 0; min-height: 100vh; }
+      #stage { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+      #verdict { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <div id="inbox-host"></div>
+      <div id="native-host"></div>
+      <div id="session-host"></div>
+      <div id="toast-host"></div>
+    </div>
+    <pre id="verdict">Loading…</pre>
+    <script type="module" src="/tests/e2e-r1-r4/browser/notifications-logo.ts"></script>
+  </body>
+</html>
