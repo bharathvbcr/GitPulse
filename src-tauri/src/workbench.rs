@@ -989,7 +989,9 @@ impl WorkbenchState {
                     hosting,
                 )
                 .map_err(|error| worker_error(&path, error))?;
-                *guard = Some((fingerprint, Arc::new(connection)));
+                let connection = Arc::new(connection);
+                reconcile::watch_lost_runs(self, &connection);
+                *guard = Some((fingerprint, connection));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
         };

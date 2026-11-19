@@ -56,6 +56,13 @@ fn main() {
     // can block, so every later wait is cut to what the host's timeout leaves.
     hooks::start_deadline();
     let code = run_guarded(decide);
+    // `process::exit` below runs no destructor, so a harness sidecar this hook
+    // started (and the state directory it holds) is ended here, before the
+    // sweep takes down what is left. It waits for nothing: the host enforces a
+    // budget on the whole process, and a hook killed after its decision was
+    // printed loses the decision. A slot a call still holds is left to the
+    // sweep and the next process.
+    gitpulse_lib::harness::sidecar::shutdown_for_hook_exit();
     // The decision is already on stdout. Anything a check abandoned at its
     // deadline is still running: a `git status` or the harness sidecar, in its
     // own process group, able to hold `.git/index.lock` after the hook is gone.

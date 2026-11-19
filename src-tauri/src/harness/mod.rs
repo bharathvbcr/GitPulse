@@ -16,6 +16,9 @@ pub mod manvi_use;
 pub mod policy;
 pub mod protocol;
 pub(crate) mod review;
+mod scratch;
+#[cfg(all(test, unix))]
+mod scratch_attack_tests;
 pub mod sidecar;
 
 #[cfg(all(test, unix))]
