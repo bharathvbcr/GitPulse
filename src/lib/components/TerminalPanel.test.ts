@@ -51,6 +51,33 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
   });
 });
 
+describe("TerminalPanel docked Explorer: double-click opens the Explorer page", () => {
+  const dockSource = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "TerminalDock.svelte"),
+    "utf8",
+  );
+  const asideStart = source.indexOf('data-testid="terminal-explorer-sidebar"');
+  const asideTag = source.slice(source.lastIndexOf("<aside", asideStart), source.indexOf(">\n", asideStart));
+
+  it("routes a double-click on the aside's empty space or title strip through the shared decision", () => {
+    expect(source).toContain('import { opensExplorerPage } from "../files/explorerPageGesture"');
+    expect(asideTag).toMatch(/ondblclick=\{\(event\) => \{\s*if \(onOpenExplorerPage && opensExplorerPage\(event\)\) onOpenExplorerPage\(\);\s*\}\}/);
+    expect(source).toContain("onOpenExplorerPage?: () => void;");
+  });
+
+  it("offers the same move as a labelled button, only where a host can open the page", () => {
+    const button = source.indexOf('data-testid="terminal-explorer-open-page"');
+    expect(button).toBeGreaterThan(-1);
+    expect(source.slice(source.lastIndexOf("{#if onOpenExplorerPage}", button), button)).not.toContain("{/if}");
+    expect(source.slice(button, source.indexOf("</button>", button))).toContain('aria-label="Open the Explorer page"');
+  });
+
+  it("is given the page owner by the dock, the same call every other Explorer entry point makes", () => {
+    expect(dockSource).toMatch(/function openExplorerPage\(\) \{\s*repoStore\.setActiveTab\("code", "explorer"\);\s*\}/);
+    expect(dockSource).toContain("onOpenExplorerPage: openExplorerPage,");
+  });
+});
+
 describe("TerminalPanel session ownership", () => {
   it("binds to the path it was given, not to the live currentPath", () => {
     // A hidden panel that still read $repoStore.currentPath would display

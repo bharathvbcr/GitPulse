@@ -2851,6 +2851,9 @@
             sidebarHost.style.cssText = "position:fixed;top:0;left:0;height:520px;z-index:9998;display:flex;";
             document.body.appendChild(sidebarHost);
             const mountedSidebar = mountComp(Sidebar, { target: sidebarHost });
+            // The sidebar's Git | Explorer switch is a tablist with panels of
+            // its own; these checks count the terminal's panes.
+            const terminalPanels = () => visible('[role="tabpanel"]').filter((el) => !sidebarHost.contains(el));
             try {
               const gitViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]'));
               const filesViewBtn = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-files"]'));
@@ -2867,7 +2870,7 @@
               mainTsItem?.click();
               mainTsItem?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
               await waitFor(() => visible('[data-terminal-tab] [role="tab"]').some((el) => el.textContent?.includes("main.ts")));
-              const openedStandaloneTab = visible('[role="tabpanel"]').length === 1;
+              const openedStandaloneTab = terminalPanels().length === 1;
               const noDoubleClickErrorToast = getStore(toastStore).filter((t) => t.type === "error").length === errorToastsBefore;
 
               // Open TerminalFilePane's internal ExplorerRail on the non-empty main.ts tab, then dock outer sidebar via SidebarExplorerPane
@@ -2899,11 +2902,11 @@
               const sawRailButtons = Boolean(railGitBtn && railFilesBtn);
               const clearedOuterExplorerDockedOnCollapse = getStore(sidebarExplorerDocked) === false;
               railGitBtn?.click();
-              await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true");
-              const restoredGitView = sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-pressed") === "true";
+              await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-selected") === "true");
+              const restoredGitView = sidebarHost.querySelector('[data-testid="sidebar-view-git"]')?.getAttribute("aria-selected") === "true";
 
               if (!syncedOuterExplorerDocked) throw new Error("G8: sidebarExplorerDocked was not true while Sidebar Explorer was open");
-              if (!openedStandaloneTab) throw new Error(`G8: expected 1 standalone tabpanel, got ${visible('[role="tabpanel"]').length}`);
+              if (!openedStandaloneTab) throw new Error(`G8: expected 1 standalone tabpanel, got ${terminalPanels().length}`);
               if (!noDoubleClickErrorToast) throw new Error("G8: double-clicking a file in SidebarExplorerPane triggered an error toast");
               if (!sawInnerExplorerBeforeDock) throw new Error("G8: inner file explorer card did not open before docking");
               if (!autoCollapsedDuplicateTree) throw new Error("G8: duplicate inner file tree did not auto-collapse on dock");
@@ -2923,7 +2926,7 @@
               mainTsTabWrap?.querySelector('button[aria-label^="Close "]')?.click();
               await wait(40);
               visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+              await waitFor(() => terminalPanels().length === 2);
 
               // G8b: a double-click keeps a file's terminal tab. The next single
               // click on another file opens beside it, and the one after reuses
@@ -2976,7 +2979,7 @@
               visible('[data-testid="terminal-explorer-sidebar-toggle"]')[0]?.click();
               await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]').length === 0);
               visible("[data-terminal-tab] [role=\"tab\"]").find((el) => el.textContent?.includes("lib.ts"))?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 1);
+              await waitFor(() => terminalPanels().length === 1);
               const innerToggle = await waitFor(() => visible('[role="tabpanel"] [data-testid="terminal-file-pane-explorer-toggle"]')[0]);
               if (visible("[data-terminal-file-explorer-card]").length === 0) innerToggle?.click();
               const innerCard = await waitFor(() => visible("[data-terminal-file-explorer-card]")[0]);
@@ -2988,7 +2991,7 @@
               const innerTabsSeen = tabNames().join(" | ");
               for (const name of ["main.ts", "lib.ts", "128x128.png"]) if (hasTab(name)) await closeFileTab(name);
               visible(`[data-testid="terminal-tab-group"][data-group-id="${group1Id}"] [data-testid="terminal-tab-group-badge"]`)[0]?.click();
-              await waitFor(() => visible('[role="tabpanel"]').length === 2);
+              await waitFor(() => terminalPanels().length === 2);
               check(`G8b: double-click keeps a terminal file tab; the next click opens beside it, the one after reuses that preview (sidebar: ${sidebarTabsSeen}; docked: ${dockTabsSeen})`, () =>
                 sidebarKeptBeside && sidebarPreviewReused && dockKeptBeside,
               );

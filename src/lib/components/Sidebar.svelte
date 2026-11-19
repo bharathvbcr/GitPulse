@@ -59,6 +59,8 @@
   import TrustExtensionBanner from "./TrustExtensionBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
   import LazyView from "./LazyView.svelte";
+  import SidebarViewSwitch from "./SidebarViewSwitch.svelte";
+  import { panelId, tabId } from "../dom/tablist";
   import { formatPathParts } from "../files/formatPath";
   import { hasUnstagedChanges, statusForSide, summarizeStatuses } from "../files/fileStatus";
   import {
@@ -559,43 +561,18 @@
 
     {#if $repoStore.currentPath}
       <div class="px-3 pb-1 shrink-0">
-        <div
-          class="gp-segmented flex w-full"
-          role="group"
-          aria-label="Sidebar view"
-          data-testid="sidebar-view-switcher"
-        >
-          <button
-            type="button"
-            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
-            data-testid="sidebar-view-git"
-            data-active={sidebarView === "git" ? "true" : "false"}
-            aria-pressed={sidebarView === "git"}
-            title="Show Git branches, worktrees, and changes"
-            onclick={() => selectSidebarView("git")}
-          >
-            <GitBranch size={12} class="shrink-0" />
-            <span>Git</span>
-          </button>
-          <button
-            type="button"
-            class="gp-seg-btn flex-1 justify-center gap-1.5 text-meta!"
-            data-testid="sidebar-view-files"
-            data-active={sidebarView === "files" ? "true" : "false"}
-            aria-pressed={sidebarView === "files"}
-            title="Browse and search repository files"
-            onclick={() => selectSidebarView("files")}
-          >
-            <FolderTree size={12} class="shrink-0" />
-            <span>Explorer</span>
-          </button>
-        </div>
+        <SidebarViewSwitch view={sidebarView} onSelect={selectSidebarView} />
       </div>
     {/if}
 
+    <!-- With no repository there is no switch, so the Git column is plain
+         content rather than a tab's panel. -->
     <div
       class="flex-1 min-h-0 flex flex-col"
       class:hidden={$repoStore.currentPath !== null && sidebarView !== "git"}
+      role={$repoStore.currentPath ? "tabpanel" : undefined}
+      id={panelId("sidebar-view", "git")}
+      aria-labelledby={$repoStore.currentPath ? tabId("sidebar-view", "git") : undefined}
     >
     {#if $repoStore.currentPath}
       <!-- At-a-glance repo pulse strip -->
@@ -949,17 +926,25 @@
     <CommitComposer />
     </div>
 
-    {#if $repoStore.currentPath && explorerMounted}
+    {#if $repoStore.currentPath}
+      <!-- The panel exists as soon as its tab does, so the tab's
+           aria-controls always resolves; only the Explorer itself waits until
+           it is first shown. -->
       <div
         class="flex-1 min-h-0 flex flex-col"
         class:hidden={sidebarView !== "files"}
+        role="tabpanel"
+        id={panelId("sidebar-view", "files")}
+        aria-labelledby={tabId("sidebar-view", "files")}
         data-testid="sidebar-explorer-container"
       >
-        <LazyView
-          load={loadSidebarExplorer}
-          name="the file explorer"
-          props={{ repoPath: $repoStore.currentPath }}
-        />
+        {#if explorerMounted}
+          <LazyView
+            load={loadSidebarExplorer}
+            name="the file explorer"
+            props={{ repoPath: $repoStore.currentPath }}
+          />
+        {/if}
       </div>
     {/if}
 {/snippet}

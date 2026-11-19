@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
+import { SIDEBAR_VIEWS, sidebarViewForKey } from "./layoutStore";
 import { STRESS_TIMEOUT_MS, expectWithinBudget } from "../__tests__/perfBudget";
 import { get } from "svelte/store";
 import {
@@ -401,5 +402,26 @@ describe("doubleClickFollows", () => {
     expect(doubleClickFollows(last, "a.ts", 999)).toBe(false);
     expect(doubleClickFollows(last, "b.ts", 1_100)).toBe(false);
     expect(doubleClickFollows(null, "a.ts", 1_100)).toBe(false);
+  });
+});
+
+describe("sidebarViewForKey: arrow keys move the Git | Explorer tabs", () => {
+  it("lists the views in the order the switcher draws them", () => {
+    expect(SIDEBAR_VIEWS).toEqual(["git", "files"]);
+  });
+
+  it("moves with the arrows, wrapping, and jumps with Home and End", () => {
+    expect(sidebarViewForKey("git", "ArrowRight")).toBe("files");
+    expect(sidebarViewForKey("files", "ArrowRight")).toBe("git");
+    expect(sidebarViewForKey("git", "ArrowLeft")).toBe("files");
+    expect(sidebarViewForKey("files", "ArrowLeft")).toBe("git");
+    expect(sidebarViewForKey("files", "Home")).toBe("git");
+    expect(sidebarViewForKey("git", "End")).toBe("files");
+  });
+
+  it("leaves every other key to the caller", () => {
+    for (const key of ["Enter", " ", "Tab", "ArrowDown", "ArrowUp", "a"]) {
+      expect(sidebarViewForKey("git", key)).toBeNull();
+    }
   });
 });

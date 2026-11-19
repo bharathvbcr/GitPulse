@@ -105,4 +105,18 @@ describe("TerminalFilePane contracts", () => {
     expect(source).toContain("prevDefaultExplorerOpen");
     expect(source).toContain("if (desired === false && prev !== false)");
   });
+
+  it("opens the Explorer page from a double-click on its Explorer card's empty space, and from a toolbar button", () => {
+    const panelSource = readFileSync(join(here, "TerminalPanel.svelte"), "utf8");
+    const card = source.slice(source.lastIndexOf("<div", source.indexOf("data-terminal-file-explorer-card")), source.indexOf("<ExplorerRail"));
+    expect(source).toContain('import { opensExplorerPage } from "../files/explorerPageGesture"');
+    expect(source).toContain("onOpenExplorerPage?: () => void;");
+    expect(card).toMatch(/ondblclick=\{\(event\) => \{\s*if \(onOpenExplorerPage && opensExplorerPage\(event\)\) onOpenExplorerPage\(\);\s*\}\}/);
+    const button = source.indexOf('data-testid="terminal-file-open-explorer-page"');
+    expect(button).toBeGreaterThan(-1);
+    expect(source.slice(source.lastIndexOf("{#if onOpenExplorerPage}", button), button)).not.toContain("{/if}");
+    expect(source.slice(button, source.indexOf("</button>", button))).toContain("onclick={onOpenExplorerPage}");
+    // The terminal hands its host's page owner straight through.
+    expect(panelSource).toContain("onOpenExplorerPage={onOpenExplorerPage}");
+  });
 });

@@ -10,6 +10,7 @@
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { requestPin } from "../files/pinRequests";
+  import { opensExplorerPage } from "../files/explorerPageGesture";
   import { doubleClickFollows } from "../sidebar/layoutStore";
   import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
@@ -255,6 +256,7 @@
     onToggleDockMode,
     onGoToSession,
     onOpenInCodeView,
+    onOpenExplorerPage,
     onCreateAgentWorktree,
     checkouts = [],
   }: {
@@ -278,6 +280,12 @@
      */
     onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
     onOpenInCodeView?: (path: string, line: number | null) => void;
+    /**
+     * Shows the full Explorer page in the main window. The docked Explorer's
+     * header button and a double-click on its empty space call it; without
+     * it (a host with no main page) neither is offered.
+     */
+    onOpenExplorerPage?: () => void;
     /**
      * Provisions a sibling Git worktree on behalf of this panel's repository
      * tab via the dock's `MutationTarget`, keeping this panel decoupled from
@@ -6336,6 +6344,9 @@
           aria-label="Terminal file explorer sidebar"
           style:width={`${explorerSidebarWidth}px`}
           class="gp-float-card shrink-0 flex flex-col min-h-0 max-w-[45%] overflow-hidden"
+          ondblclick={(event) => {
+            if (onOpenExplorerPage && opensExplorerPage(event)) onOpenExplorerPage();
+          }}
           onpointerdowncapture={(event) => {
             lastExplorerMod = { altKey: event.altKey, metaOrCtrlKey: event.metaKey || event.ctrlKey };
           }}
@@ -6398,6 +6409,19 @@
                   onclick={() => activeExplorerFile && sendReferenceToAgent(`@${activeExplorerFile} `)}
                 >
                   <Send size={11} />
+                </button>
+              {/if}
+              {#if onOpenExplorerPage}
+                <button
+                  type="button"
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  data-testid="terminal-explorer-open-page"
+                  aria-label="Open the Explorer page"
+                  title="Open the Explorer page · or double-click empty space in this sidebar"
+                  onclick={onOpenExplorerPage}
+                >
+                  <Maximize2 size={11} />
                 </button>
               {/if}
               <button
@@ -6860,6 +6884,7 @@
               onKeepFile={(fp) => keepFileShown(fp, tab.checkout, tab.id)}
               onResolvedPath={(fp) => (tabState = setTabFile(tabState, tab.id, fp, null, null, { preserveReveal: true }))}
               onOpenInCodeView={onOpenInCodeView}
+              onOpenExplorerPage={onOpenExplorerPage}
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
             />
