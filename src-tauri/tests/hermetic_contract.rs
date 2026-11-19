@@ -324,9 +324,11 @@ struct EnvReads {
     not_names: usize,
 }
 
-fn scan_env_reads() -> EnvReads {
+fn scan_env_reads(roots: &[PathBuf]) -> EnvReads {
     let mut files = Vec::new();
-    rust_files(&manifest("src"), &mut files);
+    for root in roots {
+        rust_files(root, &mut files);
+    }
     let mut sources = Vec::new();
     let mut consts = BTreeMap::new();
     for path in files {
@@ -408,7 +410,7 @@ fn scan_env_reads() -> EnvReads {
 /// counted as clean.
 #[test]
 fn every_environment_name_read_under_src_is_scrubbed_or_allowed() {
-    let reads = scan_env_reads();
+    let reads = scan_env_reads(&[manifest("src")]);
     assert!(
         reads.names.len() > 40,
         "the scan found only {} names; it has stopped reading the source",
@@ -449,6 +451,190 @@ fn every_environment_name_read_under_src_is_scrubbed_or_allowed() {
         stale.is_empty(),
         "ALLOWED_ENV_NAMES entries nothing reads, or that the constructor now removes: {stale:?}"
     );
+}
+
+/// Scoped names the suites set for a child process they spawn. The child is the
+/// same test binary and inherits `GITPULSE_TEST_HERMETIC_ROOT`, so its
+/// constructor returns before it scrubs anything: the value the parent set
+/// arrives intact. Nothing a developer exports reaches these, so they are not
+/// kept; each is listed with the test that sets it.
+const SET_FOR_A_CHILD: &[(&str, &str)] = &[
+    (
+        "GITPULSE_E2E_GRANT_REPO",
+        "cli_e2e and build_cache_integration pass the fixture repository to their grant helper",
+    ),
+    (
+        "GITPULSE_E2E_MAIN",
+        "repository_trust passes the main checkout to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_E2E_WORKTREE",
+        "repository_trust passes the linked worktree to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_E2E_READY",
+        "repository_trust passes the readiness file to its isolated subprocess",
+    ),
+    (
+        "GITPULSE_PROBE_FULL_STDERR",
+        "logging_process selects the stderr-pipe mode of its child",
+    ),
+    (
+        "GITPULSE_PROBE_STATUS_FILE",
+        "logging_process names the status file of each child",
+    ),
+    (
+        "GITPULSE_LOGGING_PROBE",
+        "logging_process selects the mode of its child",
+    ),
+    (
+        "GITPULSE_FAKE_AGENT_ROLE",
+        "mcp_sessions selects the role of the fake agent it spawns",
+    ),
+    (
+        "GITPULSE_LOG_DIR",
+        "mcp_sessions and logging_process give each child the log directory it writes to",
+    ),
+    (
+        "GITPULSE_SIGNAL_TEARDOWN_DIR",
+        "signal_teardown passes the scratch directory to the child it signals",
+    ),
+    (
+        "GITPULSE_FSEVENT_FAULT",
+        "native_watcher_faults selects the injected fault of its child",
+    ),
+];
+
+/// The integration crates, benches and the workspace crates' own tests read
+/// scoped names too, and the source scan above does not see them. A name read
+/// there that the constructor removes is a switch a developer can export and the
+/// test never sees: it must be kept on purpose (`KEPT_PREFIXES`) or be a value the
+/// suite sets for a child (`SET_FOR_A_CHILD`).
+#[test]
+fn every_scoped_name_a_test_reads_survives_the_constructor_or_is_set_for_a_child() {
+    let mut roots = vec![manifest("tests"), manifest("benches")];
+    for krate in std::fs::read_dir(manifest("../crates")).unwrap() {
+        let krate = krate.unwrap().path();
+        roots.extend(
+            ["tests", "benches"]
+                .map(|dir| krate.join(dir))
+                .into_iter()
+                .filter(|dir| dir.is_dir()),
+        );
+    }
+    let reads = scan_env_reads(&roots);
+    let scoped: BTreeMap<&String, &BTreeSet<String>> = reads
+        .names
+        .iter()
+        .filter(|(name, _)| common::env::hermetic::is_scrubbed(name))
+        .collect();
+    assert!(
+        reads.names.len() > 20,
+        "the scan found only {} names under tests, benches and crates; it has stopped reading them",
+        reads.names.len()
+    );
+    let child: BTreeMap<&str, &str> = SET_FOR_A_CHILD.iter().copied().collect();
+    assert_eq!(
+        child.len(),
+        SET_FOR_A_CHILD.len(),
+        "SET_FOR_A_CHILD lists a name twice"
+    );
+    let swallowed: Vec<String> = scoped
+        .iter()
+        .filter(|(name, _)| !child.contains_key(name.as_str()))
+        .map(|(name, files)| format!("{name} (read in {files:?})"))
+        .collect();
+    assert!(
+        swallowed.is_empty(),
+        "tests read these names, but the hermetic constructor removes them from the test \
+         process, so a value a developer exports never arrives. If a developer sets it, \
+         add it to `KEPT_PREFIXES` in src/test_support/env.rs with the reason; if the \
+         suite sets it for a child process, add it to SET_FOR_A_CHILD here:\n{}\n(blind \
+         spot: {} reads take a runtime value and cannot be named: {:?})",
+        swallowed.join("\n"),
+        reads.dynamic.len(),
+        reads.dynamic
+    );
+    let stale: Vec<&str> = child
+        .keys()
+        .copied()
+        .filter(|name| !scoped.contains_key(&name.to_string()))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "SET_FOR_A_CHILD entries no test reads, or the constructor no longer removes: {stale:?}"
+    );
+}
+
+/// A name being on the kept list is a claim about a process the constructor ran
+/// in. Run it: a fresh copy of this binary, with the hermetic markers removed so
+/// its constructor really runs, is started with the opt-in drivers and a
+/// terminal's session variables exported, and reports what is left. The drivers
+/// survive and the session variables do not.
+#[test]
+fn an_exported_opt_in_driver_reaches_the_test_process_and_a_session_variable_does_not() {
+    use gitpulse_lib::procguard::LockedSpawn;
+    let kept = [
+        "GITPULSE_MANVI_BIN",
+        "GITPULSE_DEVMAP_BIN",
+        "GITPULSE_HOST_LOAD_ONCE",
+    ];
+    let gone = [
+        "GITPULSE_SESSION_ID",
+        "GITPULSE_RUSTC_BIN",
+        "MANVI_STATE_DIR",
+        "LAPPI_SOCKET",
+    ];
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "scrub_probe_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_remove("GITPULSE_TEST_HERMETIC_ROOT")
+        .env_remove("GITPULSE_TEST_HERMETIC_OWNER")
+        .env("GITPULSE_TEST_SCRUB_PROBE_KEPT", kept.join(","))
+        .env("GITPULSE_TEST_SCRUB_PROBE_GONE", gone.join(","));
+    for name in kept.into_iter().chain(gone) {
+        command.env(name, "/exported/by/a/developer");
+    }
+    let output = command.output_locked().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("scrub probe: ok"),
+        "the child did not see the drivers kept and the session variables removed:\n{text}"
+    );
+}
+
+/// The child half of the test above. Ignored so it only runs when spawned.
+#[test]
+#[ignore = "child of an_exported_opt_in_driver_reaches_the_test_process_and_a_session_variable_does_not"]
+fn scrub_probe_child() {
+    let names = |key: &str| {
+        std::env::var(key)
+            .expect("probe list")
+            .split(',')
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    for name in names("GITPULSE_TEST_SCRUB_PROBE_KEPT") {
+        assert_eq!(
+            std::env::var(&name).as_deref(),
+            Ok("/exported/by/a/developer"),
+            "{name} was exported and did not survive the constructor"
+        );
+    }
+    for name in names("GITPULSE_TEST_SCRUB_PROBE_GONE") {
+        assert!(
+            std::env::var_os(&name).is_none(),
+            "{name} survived the constructor"
+        );
+    }
+    println!("scrub probe: ok");
 }
 
 /// Lines (1-based, with their text) where an elapsed time is compared against a

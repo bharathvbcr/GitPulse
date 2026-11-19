@@ -416,7 +416,21 @@ pub(crate) mod hermetic {
             "GITPULSE_REQUIRE_",
             "CI strictness switches that fail instead of skip",
         ),
-        ("GITPULSE_HOST_LOAD_SOAK_", "soak-run parameters"),
+        (
+            "GITPULSE_HOST_LOAD_",
+            "host-load bench and soak inputs: `_ONCE` picks the single sample a \
+             sampler asks one bench process for, `_REPO` and `_SOAK_*` size the run",
+        ),
+        (
+            "GITPULSE_MANVI_BIN",
+            "the manvi a developer points `hook_scope_fence` and the real-Manvi \
+             tests at; read by the test itself, not state",
+        ),
+        (
+            "GITPULSE_DEVMAP_BIN",
+            "the devmap build under test (`devmap_embedding`, the `cli_e2e` \
+             zero-copy tests, `worktree_create`); read by the test itself",
+        ),
         ("GITPULSE_COW_MEASURE_", "measurement-run inputs"),
         ("GITPULSE_WALK_MEASURE_", "measurement-run inputs"),
         ("GITPULSE_DRIVER_MEASURE_", "measurement-run inputs"),
