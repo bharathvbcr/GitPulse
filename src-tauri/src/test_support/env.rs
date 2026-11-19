@@ -387,6 +387,77 @@ pub(crate) mod hermetic {
         "GITPULSE_BACKUPS_DIR",
     ];
 
+    /// Name prefixes whose inherited values are removed: every variable a
+    /// GitPulse, Manvi, lappi or portless process could export to override
+    /// where this code reads state or whom it talks to. GitPulse itself injects
+    /// several into every hosted terminal (`GITPULSE_SESSION_ID`,
+    /// `GITPULSE_NOTIFY_SOCKET`, `GITPULSE_AGENT_KIND`, `LAPPI_SOCKET`), so a
+    /// `cargo test` launched from one would otherwise read the host's values.
+    /// A prefix rather than a list so a name added to production tomorrow is
+    /// covered today; the `env_names_read_by_production` contract test in
+    /// `tests/hermetic_contract.rs` pins the names that are *not* covered.
+    const SCRUBBED_PREFIXES: &[&str] = &["GITPULSE_", "MANVI_", "LAPPI_", "PORTLESS_"];
+
+    /// Opt-in test drivers a developer exports on purpose (`GITPULSE_TEST_NPM=1`,
+    /// `GITPULSE_LIVE_AI=1`, a benchmark's repository): they only ever switch a
+    /// test on or point it at an input, and nothing in production reads them.
+    /// Removing them would silently turn those suites off. The four hermetic
+    /// markers are `GITPULSE_TEST_*` and are kept by the first entry. Each entry
+    /// is a prefix and says why it is kept.
+    const KEPT_PREFIXES: &[(&str, &str)] = &[
+        (
+            "GITPULSE_TEST_",
+            "opt-in suite switches and the hermetic markers",
+        ),
+        ("GITPULSE_BENCH_", "benchmark drivers"),
+        ("GITPULSE_LIVE_", "live-service suites, opt-in"),
+        ("GITPULSE_SMOKE_", "smoke-run inputs"),
+        (
+            "GITPULSE_REQUIRE_",
+            "CI strictness switches that fail instead of skip",
+        ),
+        ("GITPULSE_HOST_LOAD_SOAK_", "soak-run parameters"),
+        ("GITPULSE_COW_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_WALK_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_DRIVER_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_FSEVENTSD_", "measurement-run inputs"),
+        ("GITPULSE_WATCH_TIMING_", "measurement-run inputs"),
+        ("GITPULSE_LEDGER_RELIABILITY_", "reliability-run inputs"),
+        ("GITPULSE_LEDGER_FRESHNESS_", "reliability-run inputs"),
+        ("GITPULSE_LEAK_", "leak-corpus run inputs"),
+        ("GITPULSE_AVATAR_LIVE_", "live-repository suite inputs"),
+        ("GITPULSE_ADV_SHAPE_", "adversarial-shape run output"),
+        (
+            "GITPULSE_BLESS_FIXTURES",
+            "regenerates committed fixtures on request",
+        ),
+        ("GITPULSE_VERDICT_BENCH_STORE", "benchmark input"),
+        ("GITPULSE_SCAN_REPO", "scan-benchmark input"),
+        ("GITPULSE_CODEINTEL_TEST_REPO", "code-intel suite input"),
+        ("GITPULSE_PULSE_REPO", "pulse suite input"),
+        ("GITPULSE_HOOK_STRESS_GRANT_REPO", "hook stress suite input"),
+        ("GITPULSE_MCP_BIN", "path of the binary an MCP suite drives"),
+    ];
+
+    /// Whether the constructor removes `name` from the test process. The
+    /// canary and the env-name contract test ask the same question, so there is
+    /// one answer.
+    pub(crate) fn is_scrubbed(name: &str) -> bool {
+        SCRUBBED.contains(&name)
+            || (SCRUBBED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                && !is_kept_test_knob(name))
+    }
+
+    /// Whether `name` is a scoped-prefix name kept on purpose (a hermetic
+    /// marker or an opt-in test driver).
+    pub(crate) fn is_kept_test_knob(name: &str) -> bool {
+        KEPT_PREFIXES
+            .iter()
+            .any(|(prefix, _)| name.starts_with(prefix))
+    }
+
     /// Toolchain homes that default to a directory under `HOME`. The tests
     /// spawn `cargo`, `rustc` and `go` through rustup shims that find their
     /// toolchain there, so moving `HOME` must not move them.
@@ -489,6 +560,7 @@ pub(crate) mod hermetic {
         set("XDG_CONFIG_HOME", &home.join(".config"));
         set("XDG_CACHE_HOME", &home.join(".cache"));
         set("XDG_DATA_HOME", &home.join(".local").join("share"));
+        set("XDG_STATE_HOME", &home.join(".local").join("state"));
         set("CLAUDE_CONFIG_DIR", &home.join(".claude"));
         set("GIT_CONFIG_GLOBAL", &gitconfig);
         // SAFETY: as above.
@@ -496,6 +568,23 @@ pub(crate) mod hermetic {
             std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
             for key in SCRUBBED {
                 std::env::remove_var(key);
+            }
+            let inherited: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| is_scrubbed(name))
+                .collect();
+            for name in inherited {
+                std::env::remove_var(name);
+            }
+            // Point the temp directory inside the root too: `temp_dir()`
+            // callers (hook markers, viz scratch, fixtures) must not write to
+            // the developer's real one, and the root's own removal then
+            // cleans what they leave.
+            let tmp = root.join("tmp");
+            std::fs::create_dir_all(&tmp)
+                .unwrap_or_else(|error| panic!("hermetic tmp {}: {error}", tmp.display()));
+            for key in ["TMPDIR", "TEMP", "TMP"] {
+                std::env::set_var(key, &tmp);
             }
             std::env::set_var(super::OWNER_MARKER, std::process::id().to_string());
             std::env::set_var(super::ROOT_MARKER, &root);
