@@ -974,6 +974,299 @@ fn a_read_only_ask_whose_asker_hung_up_before_its_verdict_is_not_computed() {
     assert!(line.contains("no answer was worked out"), "{line}");
 }
 
+/// What a gate sink that works through several git stages saw, for the tests of
+/// an asker that leaves while its verdict is being computed.
+struct Stages {
+    /// Git children started while the asker was still connected.
+    before: Vec<String>,
+    /// Git children started after the asker hung up.
+    after: Vec<String>,
+    /// Stages that came back as a cancellation rather than an answer.
+    cancelled: usize,
+    /// How the first stage, run while the asker was connected, ended.
+    first: Result<String, String>,
+}
+
+impl Default for Stages {
+    fn default() -> Self {
+        Self {
+            before: Vec::new(),
+            after: Vec::new(),
+            cancelled: 0,
+            first: Ok(String::new()),
+        }
+    }
+}
+
+/// One git stage of a verdict, recorded in `into` with the children it spawned.
+fn git_stage(repo: &std::path::Path, into: &mut Vec<String>) -> Result<String, String> {
+    let (outcome, spawned) = crate::engine::process::spawn_labels_during(|| {
+        crate::engine::git_cli::git_text(repo, &["status", "--porcelain"])
+    });
+    into.extend(spawned);
+    outcome.map_err(|error| error.message().to_string())
+}
+
+/// A gate sink that spawns one git stage, holds the computation open on
+/// `started` until its asker has hung up and the owner has noticed, then goes
+/// on with `later` more stages. The owner's notice is the cancel flag the
+/// computation runs under; a computation that runs under none does not wait.
+fn gate_in_stages(
+    repo: std::path::PathBuf,
+    started: Mutex<mpsc::Sender<()>>,
+    gone: UnixStream,
+    later: usize,
+    seen: Arc<Mutex<Stages>>,
+) -> GateSink {
+    Arc::new(move |_: &str, _: &str| {
+        let mut stages = Stages::default();
+        stages.first = git_stage(&repo, &mut stages.before);
+        // Whatever the first stage did, the test is waiting to hang up.
+        started.lock().unwrap().send(()).unwrap();
+        wait_for_hang_up(&gone);
+        let until = Instant::now() + coverage_relaxed(Duration::from_secs(30));
+        while crate::engine::process::read_cancel::current()
+            .is_some_and(|flag| !flag.is_cancelled())
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for _ in 0..later {
+            if git_stage(&repo, &mut stages.after).is_err() {
+                stages.cancelled += 1;
+            }
+        }
+        *seen.lock().unwrap() = stages;
+        Ok(serde_json::json!({ "decision": "allow" }))
+    })
+}
+
+/// Asks a gate on a fresh connection and has the asker leave mid-computation:
+/// it hangs up once the sink has started, then reports what the sink saw.
+fn gate_asker_leaves_midway(later: usize) -> (Result<(), String>, Stages) {
+    let repo = crate::test_support::git_repo();
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let (started, running) = mpsc::channel();
+    let seen = Arc::new(Mutex::new(Stages::default()));
+    *shared.gate.lock().unwrap() = Some(gate_in_stages(
+        repo.path().to_path_buf(),
+        Mutex::new(started),
+        server.try_clone().unwrap(),
+        later,
+        Arc::clone(&seen),
+    ));
+    let answered = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer_gate(&mut server, &shared, "g-mid", "/", "ls"));
+        running
+            .recv_timeout(coverage_relaxed(Duration::from_secs(60)))
+            .expect("the verdict never started");
+        drop(client);
+        served.join().unwrap()
+    });
+    let stages = std::mem::take(&mut *seen.lock().unwrap());
+    (answered, stages)
+}
+
+#[test]
+fn an_asker_that_leaves_while_its_verdict_is_computed_costs_no_further_git_spawn() {
+    // The card's remainder: an asker gone before the verdict is skipped, but one
+    // that left a few seconds in still paid for the whole computation.
+    let (answered, stages) = gate_asker_leaves_midway(4);
+    assert_eq!(
+        stages.before.len(),
+        1,
+        "a connected asker's verdict spawns ({:?}): {:?}",
+        stages.first,
+        stages.before
+    );
+    assert!(
+        stages.after.is_empty(),
+        "git children started for an asker that had hung up: {:?}",
+        stages.after
+    );
+    assert!(stages.first.is_ok(), "{:?}", stages.first);
+    assert_eq!(stages.cancelled, 4, "every later stage came back cancelled");
+    assert!(answered.is_err(), "nothing was answered: {answered:?}");
+}
+
+#[test]
+fn an_asker_that_left_midway_is_logged_as_leaving_not_as_a_refusal() {
+    let (answered, _) = gate_asker_leaves_midway(1);
+    let reason = answered.expect_err("nothing was answered");
+    let (server, client) = UnixStream::pair().unwrap();
+    drop(client);
+    wait_for_hang_up(&server.try_clone().unwrap());
+    let ended = Ended::after_ask(&server, "the gate", true, Instant::now(), reason);
+    assert!(matches!(ended, Ended::Unheard(_)), "{ended:?}");
+}
+
+#[test]
+fn a_cancelled_computation_does_not_leave_its_flag_on_the_handler_thread() {
+    let (_, _) = gate_asker_leaves_midway(1);
+    assert!(
+        crate::engine::process::read_cancel::current().is_none(),
+        "this thread served no ask, and the scope of one must not outlive it"
+    );
+    // The handler thread of a pool is reused: a gate that follows an abandoned
+    // one on the same thread starts with a live flag.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let live = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&live);
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+        let flag =
+            crate::engine::process::read_cancel::current().expect("an abandonable ask has a flag");
+        if !flag.is_cancelled() {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(serde_json::json!({ "decision": "allow" }))
+    }));
+    answer_gate(&mut server, &shared, "g-next", "/", "ls").expect("answered");
+    drop(client);
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_verdict_whose_asker_stays_is_computed_in_full_and_delivered() {
+    let repo = crate::test_support::git_repo();
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let path = repo.path().to_path_buf();
+    let spawned = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&spawned);
+    *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+        let mut into = Vec::new();
+        for _ in 0..3 {
+            git_stage(&path, &mut into)?;
+            // Long enough for the owner's watch to have looked a few times.
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        record.lock().unwrap().extend(into);
+        Ok(serde_json::json!({ "decision": "allow" }))
+    }));
+    answer_gate(&mut server, &shared, "g-stay", "/", "ls").expect("answered");
+    let mut reader = BufReader::new(client);
+    let ack: Ack = serde_json::from_str(&read_frame(&mut reader).unwrap().expect("ack")).unwrap();
+    assert!(ack.accepted, "{:?}", ack.reason);
+    assert_eq!(ack.reply.unwrap()["decision"], "allow");
+    assert_eq!(spawned.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn an_asker_that_hangs_up_as_the_verdict_completes_ends_cleanly_either_way() {
+    // The hang-up and the completion race. Whichever wins, the handler returns,
+    // its watch ends with it, and nothing is delivered to a closed socket as if
+    // it had been heard: a verdict is either written or the ask ends as left.
+    for round in 0..20 {
+        let (mut server, client) = UnixStream::pair().unwrap();
+        // SAFETY: `getuid` has no preconditions.
+        let shared = Shared::new(unsafe { libc::getuid() });
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let at = Arc::clone(&go);
+        *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+            at.wait();
+            Ok(serde_json::json!({ "decision": "allow" }))
+        }));
+        let answered = std::thread::scope(|scope| {
+            let served = scope.spawn(|| answer_gate(&mut server, &shared, "g-edge", "/", "ls"));
+            go.wait();
+            if round % 2 == 0 {
+                std::thread::yield_now();
+            }
+            drop(client);
+            served.join().unwrap()
+        });
+        if let Err(reason) = answered {
+            let ended = Ended::after_ask(&server, "the gate", true, Instant::now(), reason);
+            assert!(
+                matches!(ended, Ended::Unheard(_) | Ended::Refused(_)),
+                "{ended:?}"
+            );
+        }
+        assert!(crate::engine::process::read_cancel::current().is_none());
+    }
+}
+
+#[test]
+fn an_ask_that_acts_runs_under_no_cancel_flag_even_when_its_asker_leaves() {
+    // An op record's work is for the world, not the asker: nothing may stop its
+    // git children because the asker gave up.
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let flagged = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&flagged);
+    let control = server.try_clone().unwrap();
+    *shared.op_record.lock().unwrap() = Some(Arc::new(move |_, _| {
+        wait_for_hang_up(&control);
+        std::thread::sleep(Duration::from_millis(100));
+        if crate::engine::process::read_cancel::current().is_some() {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(serde_json::json!({ "snapshotted": true }))
+    }));
+    std::thread::scope(|scope| {
+        let served = scope.spawn(|| {
+            answer_op_record(
+                &mut server,
+                &shared,
+                "op-flag",
+                &op_request("op-flag"),
+                Instant::now(),
+            )
+        });
+        drop(client);
+        let _ = served.join().unwrap();
+    });
+    assert_eq!(flagged.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn many_askers_leaving_midway_each_stop_and_the_ones_that_stay_are_answered() {
+    let results: Vec<(bool, Result<(), String>, Stages)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                scope.spawn(move || {
+                    if n % 2 == 0 {
+                        let (answered, stages) = gate_asker_leaves_midway(3);
+                        (true, answered, stages)
+                    } else {
+                        let repo = crate::test_support::git_repo();
+                        let (mut server, client) = UnixStream::pair().unwrap();
+                        // SAFETY: `getuid` has no preconditions.
+                        let shared = Shared::new(unsafe { libc::getuid() });
+                        let path = repo.path().to_path_buf();
+                        *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
+                            git_stage(&path, &mut Vec::new())?;
+                            Ok(serde_json::json!({ "decision": "allow" }))
+                        }));
+                        let answered = answer_gate(&mut server, &shared, "g-many", "/", "ls");
+                        drop(client);
+                        (false, answered, Stages::default())
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (left, answered, stages) in results {
+        if left {
+            assert!(
+                stages.after.is_empty(),
+                "spawned after hang-up: {:?}",
+                stages.after
+            );
+            assert!(answered.is_err());
+        } else {
+            answered.expect("an asker that stayed is answered");
+        }
+    }
+}
+
 #[test]
 fn an_ask_that_acts_is_still_carried_out_when_its_asker_hung_up() {
     // A delivery or an op record does its work for the world, not for the

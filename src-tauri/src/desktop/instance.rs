@@ -1960,6 +1960,77 @@ fn attached<T: Clone>(slot: &Mutex<Option<T>>, name: &str) -> Result<T, String> 
 const ASKER_GONE: &str =
     "the asker hung up before its answer was started, so no answer was worked out";
 
+/// What a read-only ask reports when its asker hung up while the answer was
+/// being worked out: [`Ended::after_ask`] reads it as the asker leaving.
+const ASKER_LEFT_MIDWAY: &str =
+    "the asker hung up while its answer was being worked out, so the rest of it was not";
+
+/// How often the owner looks at an asker's socket while its answer is worked
+/// out. One non-blocking `recv` per look, for at most [`MAX_GATE_HANDLERS`]
+/// asks at once, and the longest an abandoned computation can run on is this
+/// plus the git child it is in the middle of, which the runner stops.
+const ASKER_WATCH_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Runs `call` for an abandonable ask, and stops it at its next safe point if
+/// the asker hangs up while it runs.
+///
+/// The sinks (the gate, the scan, the insights read) are fixed closures with no
+/// parameter to carry a cancellation, and their git reads already take one from
+/// the thread they run on: [`read_cancel`] is the scope `git_cli` checks
+/// before every spawn and polls while a child runs, so the kill is the runner's
+/// one kill, a SIGTERM and a grace. So the flag is put in force on this thread
+/// for the length of `call`, and a watcher sets it when the socket reads as
+/// hung up with nothing queued. Nothing further is spawned for that ask, and
+/// the child in flight is stopped. A sink that hands its work to another thread
+/// does not carry the flag along (it is thread-local); that work runs on, as it
+/// did before.
+///
+/// An ask whose asker left is reported as [`ASKER_LEFT_MIDWAY`] even if
+/// `call` finished first: the asker is not there to hear it, and what was
+/// computed after it left may be partial. Anything that stops the watch from
+/// running (no thread, no second descriptor) leaves the ask to run as it always
+/// did, never to fail.
+///
+/// [`read_cancel`]: crate::engine::process::read_cancel
+fn call_while_asker_stays(
+    stream: &UnixStream,
+    call: impl FnOnce() -> Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
+    use crate::engine::process::read_cancel;
+
+    let Ok(watched) = stream.try_clone() else {
+        return call();
+    };
+    let cancel = read_cancel::ReadCancel::new();
+    let finished = AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| {
+        let watch = std::thread::Builder::new()
+            .name("asker-watch".into())
+            .spawn_scoped(scope, || {
+                while !finished.load(Ordering::Acquire) {
+                    if crate::local_socket::peer_hung_up_silently(&watched) {
+                        cancel.cancel();
+                        return;
+                    }
+                    std::thread::park_timeout(ASKER_WATCH_INTERVAL);
+                }
+            });
+        let outcome = {
+            let _in_force = read_cancel::enter(watch.is_ok().then_some(&cancel));
+            call()
+        };
+        finished.store(true, Ordering::Release);
+        if let Ok(watch) = &watch {
+            watch.thread().unpark();
+        }
+        outcome
+    });
+    if cancel.is_cancelled() {
+        return Err(ASKER_LEFT_MIDWAY.to_string());
+    }
+    outcome
+}
+
 /// Runs `call` for a request answered on its own connection, and writes its
 /// reply, or its error as a refusal. A reply that would not fit one frame is a
 /// refusal too: the asker reads it at once and reads for itself, instead of
@@ -1989,6 +2060,8 @@ fn answer_asked(
         Err(format!("{name} is busy"))
     } else if abandonable && crate::local_socket::peer_hung_up_silently(stream) {
         return Err(ASKER_GONE.to_string());
+    } else if abandonable {
+        call_while_asker_stays(stream, call)
     } else {
         call()
     };
