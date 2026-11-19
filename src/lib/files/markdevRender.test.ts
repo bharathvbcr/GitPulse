@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestCpuOf, fastestOf } from "../__tests__/perfBudget";
+import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestCpuPerCall, fastestOf } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
   EMPTY_RENDER,
@@ -105,24 +105,16 @@ describe("markdevRender — document stats stay linear", () => {
     // not be seen; this is a synchronous pure function. Rounds alternate the
     // sizes so a drift in clock speed lands on both, and the minimum of each is
     // what the ratio is taken of.
-    // Batch multiple passes per CPU sample so Windows GetProcessTimes
-    // 15.625ms (1/64s) tick quantization does not inflate the 4x ratio.
-    const REPS_PER_SAMPLE = 5;
+    // Each reading spans >= 250 ms of CPU (`fastestCpuPerCall`): Windows
+    // accounts CPU time in 15.6 ms ticks, so single ~60 ms readings of the
+    // small size came out up to a quarter low, their minimum lower still, and
+    // the Windows runner read 5.81 against a linear 4. Batches make the tick a
+    // few percent of either reading.
     let cpuSmall = Number.POSITIVE_INFINITY;
     let cpuLarge = Number.POSITIVE_INFINITY;
-    for (let round = 0; round < 7; round += 1) {
-      cpuSmall = Math.min(
-        cpuSmall,
-        fastestCpuOf(1, () => {
-          for (let i = 0; i < REPS_PER_SAMPLE; i += 1) calculateDocumentStats(small);
-        }),
-      );
-      cpuLarge = Math.min(
-        cpuLarge,
-        fastestCpuOf(1, () => {
-          for (let i = 0; i < REPS_PER_SAMPLE; i += 1) calculateDocumentStats(large);
-        }),
-      );
+    for (let round = 0; round < 5; round += 1) {
+      cpuSmall = Math.min(cpuSmall, fastestCpuPerCall(1, () => void calculateDocumentStats(small)));
+      cpuLarge = Math.min(cpuLarge, fastestCpuPerCall(1, () => void calculateDocumentStats(large)));
     }
     expect(cpuLarge / cpuSmall).toBeLessThan(LINEAR_RATIO_LIMIT);
   }, STRESS_TIMEOUT_MS);

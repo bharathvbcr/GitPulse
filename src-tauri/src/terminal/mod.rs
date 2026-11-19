@@ -30,6 +30,7 @@ pub mod port_probe;
 mod readiness;
 mod ring;
 pub mod scratch_media;
+mod screen_feed;
 pub mod session_ledger;
 pub mod shell_integration;
 mod sink;
@@ -2726,6 +2727,17 @@ pub(in crate::terminal) fn engine_detach_all(engine: &Engine) -> usize {
 /// taken it over in between.
 fn let_go(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
     flow.detach();
+    unseen(flow, ring);
+}
+
+/// [`let_go`] for a view that still holds the session and is being replaced:
+/// its credit is kept as stale, because it can still repay it.
+fn take_from(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
+    flow.abandon();
+    unseen(flow, ring);
+}
+
+fn unseen(flow: &OutputFlow, ring: &Mutex<ring::Ring>) {
     let mut ring = ring
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2769,7 +2781,7 @@ impl Takeover {
         stall: Duration,
     ) -> Result<TerminalSpawned, String> {
         if forced {
-            let_go(&self.flow, &self.ring);
+            take_from(&self.flow, &self.ring);
         } else if !self.flow.is_detached() {
             // Refused before the ring's lock, which a reader waiting on the
             // holding view's credit keeps for as long as it waits.
@@ -10376,16 +10388,19 @@ mod tests {
         std::fs::create_dir_all(&versions).unwrap();
         let binary = versions.join("2.1.0");
         let (exe, args) = crate::sysload::procscan::tests::fixture_command();
-        // A clone (`clonefile` / `FICLONE`) or copy gives `versions/2.1.0` its
-        // own inode so macOS `proc_pidpath` resolves this path rather than the
-        // test harness's primary vnode name.
-        if crate::engine::cow_clone::reflink_copy_file(&exe, &binary).is_err() {
+        // The scan classifies the path the kernel reports for the process.
+        // macOS reports ONE name for an inode (proc_pidpath), whichever of its
+        // hard links it cached first, which is the test image's own name here
+        // and not `versions/2.1.0`: a version-named process whose reported path
+        // is not an agent is never read further, and the session vanished 9
+        // runs in 10. A copy is a distinct inode with exactly this name (APFS
+        // clones it, so it writes nothing). Linux reads the exec'd path from
+        // /proc, so a link is enough there and a copy would write the image.
+        #[cfg(target_os = "macos")]
+        std::fs::copy(&exe, &binary).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        if std::fs::hard_link(&exe, &binary).is_err() {
             std::fs::copy(&exe, &binary).unwrap();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
         }
         let bin = root.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();

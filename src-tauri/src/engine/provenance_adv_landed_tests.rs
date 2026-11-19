@@ -606,7 +606,10 @@ fn promisor_repo(config_text: &str) -> (R, String, PathBuf) {
     let script = r.path().join("helper.sh");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        format!(
+            "#!/bin/sh\ntouch '{}'\nexit 1\n",
+            marker.display().to_string().replace('\\', "/")
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -621,8 +624,11 @@ fn promisor_repo(config_text: &str) -> (R, String, PathBuf) {
     let config = r.work().join(".git/config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(&format!(
-        "[protocol \"ext\"]\n\tallow = always\n[remote \"origin\"]\n\turl = ext::{}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{config_text}",
-        script.display()
+        "[protocol \"ext\"]\n\tallow = always\n[remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{config_text}",
+        crate::test_support::env::git_config_value(&format!(
+            "ext::{}",
+            script.display().to_string().replace('\\', "/")
+        ))
     ));
     std::fs::write(&config, text).unwrap();
     (r, tip, marker)

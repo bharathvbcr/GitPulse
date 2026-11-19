@@ -7,6 +7,7 @@ import "../src/app.css";
 import { mount, unmount, tick } from "svelte";
 import { get } from "svelte/store";
 import { themeStore } from "../src/lib/stores/themeStore";
+import { setThemeAndLand } from "./theme";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { filterStore } from "../src/lib/stores/filterStore";
 import { toastStore } from "../src/lib/stores/toastStore";
@@ -18,7 +19,7 @@ import ToastContainer from "../src/lib/components/ToastContainer.svelte";
 import Tooltip from "../src/lib/components/Tooltip.svelte";
 import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 const params = new URLSearchParams(location.search);
-themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+await setThemeAndLand(themeStore, params.get("theme") === "light" ? "light" : "dark");
 const results = [], crashes = [], merges = [], copies = [], unexpected = [], transfers = [];
 const branchDeletes = [], tagDeletes = [], branchCreates = [], wtRemovals = [], wtCreates = [], hookApprovals = [];
 // The repository's hooks file as the host would read it; `approved` follows the last approval.
@@ -473,19 +474,26 @@ if(params.has("check")) {
     current = MANY_CURRENT;await repoStore.refresh();await settle();
     scroller.scrollTop = 0;await settle();
     await click("Locate checked-out branch");
-    // Wait for the scroll to come to rest, not merely to reach the row.
-    let restedAt = -1, resting = 0;
-    for (let i = 0; i < 200 && resting < 5; i++) {
-      await settle();await new Promise(resolve => setTimeout(resolve, 20));
-      resting = scroller.scrollTop === restedAt && scroller.scrollTop > 0 ? resting + 1 : 0;
-      restedAt = scroller.scrollTop;
-    }
-    const located = branchRows().find(x => x.classList.contains("ring-accent/40"));
+    // The gesture is a smooth scroll (BranchList.locateCurrentBranch), so it runs
+    // for as long as the engine's animation takes: a frame budget on a loaded
+    // 3-CPU runner reads mid-flight (scrollTop 82, row far below the fold). Wait on
+    // the condition the check asserts, and only on the scroll being at rest with it
+    // met; the deadline bounds a scroll that never arrives, and the check below
+    // still reports where it was.
     // The gesture parks the row a third of the way down the viewport (see
     // `scrollOffsetToCenter`), measured from the top edge of its row.
-    const fromTop = located ? located.getBoundingClientRect().top - scroller.getBoundingClientRect().top : -1;
-    const locatedOk = !!located && located.textContent.includes("topic-1") && inView(located)
-      && Math.abs(fromTop - scroller.clientHeight / 3) < 8;
+    const locatedNow = () => {
+      const row = branchRows().find(x => x.classList.contains("ring-accent/40"));
+      const top = row ? row.getBoundingClientRect().top - scroller.getBoundingClientRect().top : -1;
+      return {row, top, ok: !!row && row.textContent.includes("topic-1") && inView(row) && Math.abs(top - scroller.clientHeight / 3) < 8};
+    };
+    let restedAt = -1, resting = 0;
+    for (const deadline = performance.now() + 15000; performance.now() < deadline && resting < 5;) {
+      await settle();await new Promise(resolve => setTimeout(resolve, 20));
+      resting = scroller.scrollTop === restedAt && scroller.scrollTop > 0 && locatedNow().ok ? resting + 1 : 0;
+      restedAt = scroller.scrollTop;
+    }
+    const {row: located, top: fromTop, ok: locatedOk} = locatedNow();
     check(`locate lands on the checked-out branch, a third of the way down the viewport${locatedOk?"":` (found ${!!located}, row top ${Math.round(fromTop)} of ${scroller.clientHeight}, scrollTop ${Math.round(scroller.scrollTop)})`}`,locatedOk);
     // Put the fixture back exactly as the checks below were written for it.
     current = "main";branches = baseBranches;await repoStore.refresh();await settle();

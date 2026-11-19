@@ -132,12 +132,20 @@ fn adv2_unreadable_recheck_continues_silently() {
     let worktree = linked.into_iter().next().unwrap();
     let anchor = main.path().canonicalize().unwrap();
     fs::create_dir_all(anchor.join("node_modules")).unwrap();
-    for i in 0..3 {
-        fs::write(
-            anchor.join(format!("node_modules/f{i}")),
-            vec![1u8; 70 << 20],
-        )
-        .unwrap();
+    // Sparse sources, and only as much as reaches one re-check: the first
+    // file crosses `RECHECK_EVERY_BYTES` (read again between its chunks), the
+    // second is copied after the unreadable reading. Three dense 70 MiB files
+    // wrote 420 MiB here, which on Linux all counts against the suite's
+    // disk-write budget.
+    let sizes = [
+        crate::engine::cow_clone::RECHECK_EVERY_BYTES + (1 << 20),
+        1 << 20,
+    ];
+    for (i, size) in sizes.iter().enumerate() {
+        fs::File::create(anchor.join(format!("node_modules/f{i}")))
+            .unwrap()
+            .set_len(*size)
+            .unwrap();
     }
     let selection = CacheSelection {
         free_space: readable_once,
@@ -148,4 +156,17 @@ fn adv2_unreadable_recheck_continues_silently() {
     assert_eq!(report.copied.len(), 1, "{report:?}");
     assert!(report.low_disk.is_none());
     assert!(report.disk_unknown, "an unreadable re-check was not noted");
+    assert!(
+        CALLS.load(Ordering::SeqCst) >= 2,
+        "the copy was never read again mid-way"
+    );
+    for (i, size) in sizes.iter().enumerate() {
+        assert_eq!(
+            fs::metadata(worktree.join(format!("node_modules/f{i}")))
+                .map(|meta| meta.len())
+                .ok(),
+            Some(*size),
+            "f{i} was not copied whole after the unreadable re-check"
+        );
+    }
 }

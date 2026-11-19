@@ -61,9 +61,14 @@ use Marked as Sleepers;
 #[cfg(target_os = "linux")]
 use NamedSleepers as Sleepers;
 
-/// Sleepers whose kernel name is their marker: each is `/bin/sleep` run
-/// through a symlink named by the marker, with the marker as `argv[0]` too.
-/// The marker is at most 15 bytes so `comm` is not cut.
+/// Sleepers whose kernel name is their marker: each is this test binary, run
+/// into [`named_sleeper_body`] through a symlink named by the marker, with the
+/// marker as `argv[0]` too. The kernel names a process after the file it was
+/// started through, so `comm` is the marker; the marker is at most 15 bytes so
+/// `comm` is not cut. The link must not point at `/bin/sleep`: on Ubuntu 26.04
+/// that is rust-coreutils, which refuses to run under a name that is not the
+/// utility's ("Requested utility ... does not match executable name") and
+/// exits at once, so every sleeper was a zombie before the first `pgrep`.
 #[cfg(target_os = "linux")]
 struct NamedSleepers {
     marker: String,
@@ -84,12 +89,14 @@ impl NamedSleepers {
         let dir = std::env::temp_dir().join(format!("gpsg-{marker}"));
         std::fs::create_dir_all(&dir).expect("a directory for the symlink");
         let link = dir.join(&marker);
-        std::os::unix::fs::symlink("/bin/sleep", &link).expect("link sleep under the marker");
+        let exe = std::env::current_exe().expect("this test binary");
+        std::os::unix::fs::symlink(&exe, &link).expect("link the sleeper under the marker");
         let children = (0..count)
             .map(|_| {
                 Command::new(&link)
                     .arg0(&marker)
-                    .arg("600")
+                    .args(["--exact", "named_sleeper_body", "--test-threads=1", "-q"])
+                    .env(NAMED_SLEEPER, "1")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -120,6 +127,21 @@ impl NamedSleepers {
             .collect();
         pids.sort_unstable();
         pids
+    }
+}
+
+/// Set in a [`NamedSleepers`] child's environment to make
+/// [`named_sleeper_body`] sleep.
+#[cfg(target_os = "linux")]
+const NAMED_SLEEPER: &str = "GITPULSE_TEST_NAMED_SLEEPER";
+
+/// What a [`NamedSleepers`] child runs: ten minutes asleep. In a normal test
+/// run (no [`NAMED_SLEEPER`]) it returns at once.
+#[cfg(target_os = "linux")]
+#[test]
+fn named_sleeper_body() {
+    if std::env::var_os(NAMED_SLEEPER).is_some() {
+        std::thread::sleep(Duration::from_secs(600));
     }
 }
 

@@ -23,6 +23,7 @@
   import AppearanceHost from "./AppearanceHost.svelte";
   import { interfaceStore } from "../src/lib/stores/interfaceStore";
   import { themeStore } from "../src/lib/stores/themeStore";
+  import { setThemeAndLand } from "./theme";
   import { resetHostPlatformForTests } from "../src/lib/stores/platformStore";
   import { publishHostLoadPulseForTests } from "../src/lib/stores/hostLoadStore";
   import { publishNativeRenderingStatus, setNativeRenderingBoot } from "../src/lib/desktop/nativeRendering";
@@ -91,7 +92,7 @@
   document.addEventListener("click", (event) => { if (event.target?.closest?.("a[download]")) event.preventDefault(); }, true);
 
   async function run() {
-    themeStore.setTheme("dark");
+    await setThemeAndLand(themeStore, "dark");
     resetHostPlatformForTests({ os: "macos", dock_hiding: true, browser_sessions: false, native_material: true, liquid_glass: true, high_refresh: true });
     mount(AppearanceHost, { target: document.getElementById("app") });
     await settle();
@@ -101,7 +102,9 @@
     check("renders the seven groups of the design language", () =>
       ["theme", "colors", "type", "shape", "material", "motion", "density"].every((group) => $(`[data-group="${group}"]`)));
     check("keeps walkthrough replay and coach marks", () => $('[data-setting="walkthrough-replay"] button') && $('[data-setting="coach-marks"] button'));
-    check("the class macos survived the theme store, so the glass rules apply", () => root.classList.contains("macos") && root.classList.contains("dark"));
+    check("the class macos survived the theme store, so the glass rules apply", () =>
+      (root.classList.contains("macos") && root.classList.contains("dark"))
+      || (() => { throw new Error(`root classes "${root.className}"`); })());
     check("defaults: comfortable density is stamped", () => root.getAttribute("data-density") === "comfortable");
     check("defaults: the surface fill is the shipped half-transparent one", () => Math.abs(alphaOf(cs($("#probe-surface")).backgroundColor) - 0.5) < 0.03);
     check("defaults: the float computes the shipped blur(34px)", () => filterOf($("#probe-float")).includes("blur(34px)"));
@@ -153,10 +156,10 @@
     check("the computed --accent-color follows --c-accent (the graph reads it)", () => cs(root).getPropertyValue("--accent-color").match(/\d+/g).slice(0, 3).join(",") === channels(cs(root).getPropertyValue("--c-accent")).join(","));
     await setValue($("[data-accent-hex]"), "#8aa4ff");
     check("a colour that already reads passes unchanged", () => $('[data-accent-guard="passes"]'));
-    themeStore.setTheme("light"); await settle();
+    await setThemeAndLand(themeStore, "light"); await settle();
     const lightSurfaces = [[243, 244, 250], [255, 255, 255], [236, 238, 248]];
     check("switching theme re-derives the accent for light and keeps 4.5:1", () => { const accent = channels(cs(root).getPropertyValue("--c-accent")); return lightSurfaces.every((surface) => ratio(accent, surface) >= 4.5); });
-    themeStore.setTheme("dark"); await settle();
+    await setThemeAndLand(themeStore, "dark"); await settle();
     await press($('[data-setting="accent"]'), "Rose accent");
     check("choosing a preset clears the custom colour", () => get(interfaceStore).customAccent === "" && get(interfaceStore).accent === "rose" && !$("[data-accent-guard]"));
     await press($('[data-setting="accent"]'), "Blue accent");
@@ -260,14 +263,14 @@
     await press($('[data-saved-theme="Harness look"]'), "Remove “Harness look” from my themes");
     check("and Remove takes it off the shelf without taking it out of force", () => $('[data-saved-theme="Harness look"]') === null && $("[data-theme-active]") !== null);
     await press($("[data-current-look]"), "Remove theme");
-    themeStore.setTheme("dark"); await settle();
+    await setThemeAndLand(themeStore, "dark"); await settle();
     check("clearing the theme returns to the shipped palette", () => root.style.getPropertyValue("--c-bg") === "" && !root.hasAttribute("data-backdrop"));
 
     // --- light theme floor ---------------------------------------------------
-    themeStore.setTheme("light"); await settle();
+    await setThemeAndLand(themeStore, "light"); await settle();
     check("the light theme's slider floor is the measured 30%", () => Number($('[data-setting="material-intensity"] input[type="range"]').min) === 0.3);
     check("an intensity of 0 is held at the floor in light mode", () => cs(root).getPropertyValue("--gp-material").trim() === "0.3");
-    themeStore.setTheme("dark"); await settle();
+    await setThemeAndLand(themeStore, "dark"); await settle();
 
     // --- theme import / export ----------------------------------------------
     const theme = { schema: "gitpulse-theme/1", name: "Dusk", appearance: "dark", colors: { base: "#14101f", accent: "#c08cff", contrast: 0.5 }, shape: { radiusScale: 1.25 }, fonts: { ui: "Helvetica Neue", mono: "Menlo" } };
@@ -410,15 +413,19 @@
     // A real clip, recorded here from a canvas (red ground, a green bar moving),
     // through the real file input, the real decoder and IndexedDB.
     const wait = async (ok, ms = 8000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); await settle(); return ok(); };
+    let clipWhy = "";
     const recordClip = async () => {
-      if (typeof MediaRecorder === "undefined") return null;
+      if (typeof MediaRecorder === "undefined") { clipWhy = "MediaRecorder is undefined"; return null; }
       const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 200 });
       const ctx = canvas.getContext("2d");
       const stream = canvas.captureStream?.(30);
       // Record a type this engine can also play back: WebKit records WebM it cannot decode.
       const player = document.createElement("video");
       const type = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported?.(t) && player.canPlayType(t) !== "");
-      if (!stream || !type) return null;
+      if (!stream || !type) {
+        clipWhy = `MediaRecorder ${typeof MediaRecorder}, captureStream ${typeof canvas.captureStream}, stream ${!!stream}; ${["video/mp4", "video/webm"].map((t) => `${t}: record ${MediaRecorder.isTypeSupported?.(t)}, play "${player.canPlayType(t)}"`).join("; ")}`;
+        return null;
+      }
       let frame = 0;
       const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); };
       paint();
@@ -434,7 +441,7 @@
       return new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
     };
     const clip = await recordClip();
-    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with`, () => clip !== null && clip.size > 0);
+    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clip ? "" : ` (${clipWhy})`}`, () => clip !== null && clip.size > 0);
     if (clip) {
       const input = $("[data-wallpaper-input]");
       const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;

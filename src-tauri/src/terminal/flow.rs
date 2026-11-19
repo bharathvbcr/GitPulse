@@ -42,6 +42,12 @@ struct State {
     /// is not counted as outstanding: a view that never got it would never
     /// repay it, and the window would stay shut past the resume mark.
     uncertain: usize,
+    /// Credit a view that was still alive held when another view took the
+    /// session over (`abandon`). Its chunks were already on their way, so its
+    /// acknowledgements can still arrive after the new window began; they are
+    /// accepted, never counted against the new window, and one that never
+    /// comes costs nothing. Bounded by the window, like `uncertain`.
+    stale: usize,
 }
 
 /// What the reader does with a chunk it has read.
@@ -123,6 +129,23 @@ impl OutputFlow {
         state.lagged = false;
         state.pending = 0;
         state.uncertain = 0;
+        state.stale = 0;
+        self.changed.notify_all();
+    }
+    /// [`detach`](Self::detach) for a view that is taken over while it is
+    /// still alive: what it was sent and has not repaid may still be repaid
+    /// after the new view's window begins. That credit is kept as `stale`, so
+    /// the late acknowledgement is accepted instead of being counted against
+    /// the new window, which would leave the new view's own acknowledgement
+    /// to be refused for the same bytes.
+    pub(super) fn abandon(&self) {
+        let mut state = self.lock();
+        state.stale = (state.stale + state.pending + state.uncertain).min(OUTPUT_WINDOW);
+        state.detached = true;
+        state.shedding = false;
+        state.lagged = false;
+        state.pending = 0;
+        state.uncertain = 0;
         self.changed.notify_all();
     }
     /// A view takes the session over. Returns whether it had been detached;
@@ -173,12 +196,17 @@ impl OutputFlow {
     }
     pub(super) fn acknowledge(&self, bytes: usize) -> Result<(), String> {
         let mut state = self.lock();
-        if bytes == 0 || bytes > state.pending + state.uncertain {
+        if bytes == 0 || bytes > state.pending + state.uncertain + state.stale {
             return Err("Invalid terminal output acknowledgement".into());
         }
         let from_uncertain = bytes.min(state.uncertain);
         state.uncertain -= from_uncertain;
-        state.pending -= bytes - from_uncertain;
+        // The live window first: an abandoned view that never repays must not
+        // keep the new window's credit outstanding. Only what the window
+        // cannot account for is the old view's.
+        let from_pending = (bytes - from_uncertain).min(state.pending);
+        state.pending -= from_pending;
+        state.stale -= bytes - from_uncertain - from_pending;
         self.changed.notify_all();
         Ok(())
     }
@@ -457,6 +485,31 @@ mod tests {
         assert_eq!(flow.reserve(1, Duration::ZERO).unwrap(), Route::Deliver);
         flow.stop();
         assert!(flow.reserve(1, Duration::ZERO).is_err());
+    }
+
+    /// The defect: a view taken over while alive acknowledges chunks it was
+    /// sent before the takeover. Those were counted against the new window's
+    /// replay, so the new view's own acknowledgement of the replay was refused
+    /// ("Invalid terminal output acknowledgement").
+    #[test]
+    fn a_view_taken_over_alive_may_still_repay_its_chunks_without_costing_the_new_one() {
+        let flow = OutputFlow::default();
+        assert_eq!(flow.reserve(300, Duration::ZERO).unwrap(), Route::Deliver);
+        flow.abandon();
+        assert!(flow.attach());
+        // The replay of the same bytes, on the new view's window.
+        assert_eq!(flow.reserve(300, Duration::ZERO).unwrap(), Route::Deliver);
+        flow.acknowledge(300).unwrap(); // the old view's late repayment
+        flow.acknowledge(300).unwrap(); // the new view's
+        assert_eq!(flow.state.lock().unwrap().pending, 0);
+        assert!(flow.acknowledge(1).is_err(), "nothing else is owed");
+        // An old view that never repays leaves the new window exact.
+        assert_eq!(flow.reserve(100, Duration::ZERO).unwrap(), Route::Deliver);
+        flow.abandon();
+        assert!(flow.attach());
+        assert_eq!(flow.reserve(100, Duration::ZERO).unwrap(), Route::Deliver);
+        flow.acknowledge(100).unwrap();
+        assert_eq!(flow.state.lock().unwrap().pending, 0);
     }
 
     #[test]

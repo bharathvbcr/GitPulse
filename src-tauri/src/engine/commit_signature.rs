@@ -1891,7 +1891,10 @@ mod tests {
         let include = stub_one.path().join("signing.cfg");
         std::fs::write(
             &include,
-            format!("[gpg]\n\tprogram = {}\n", script_one.display()),
+            format!(
+                "[gpg]\n\tprogram = {}\n",
+                crate::test_support::env::git_config_value(&script_one.to_string_lossy())
+            ),
         )
         .unwrap();
         git_in(
@@ -1904,7 +1907,10 @@ mod tests {
         assert_eq!(verifier_spawns(&stub_one), 1);
         std::fs::write(
             &include,
-            format!("[gpg]\n\tprogram = {}\n# changed\n", script_two.display()),
+            format!(
+                "[gpg]\n\tprogram = {}\n# changed\n",
+                crate::test_support::env::git_config_value(&script_two.to_string_lossy())
+            ),
         )
         .unwrap();
         verify_commit_signature_with(&cache, now, path, &oid).unwrap();

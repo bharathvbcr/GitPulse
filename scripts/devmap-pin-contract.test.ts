@@ -52,7 +52,8 @@ export function devmapPinProblems(ci: string): string[] {
     // `actions/cache` saves in a post step that runs only if the whole job passed. These jobs'
     // suites are red on a runner more often than not, so the verified build is saved on its own.
     if (/uses: actions\/cache@/.test(job)) problems.push(`${id} caches devmap with actions/cache, which saves only when the whole job succeeds`);
-    const save = job.indexOf("actions/cache/save@");
+    // The save whose key is devmap's: a job may save other builds too (manvi).
+    const save = [...job.matchAll(/actions\/cache\/save@[^\n]*\n(?:(?! {6}- name:)[^\n]*\n)*?\s+key: devmap-/g)][0]?.index ?? -1;
     if (save === -1) problems.push(`${id} never saves its devmap build with actions/cache/save`);
     else if (check !== -1 && save < check) problems.push(`${id} saves its devmap build before check:vendor-schema has passed`);
   }
@@ -109,7 +110,9 @@ describe("devmap pin contract", () => {
     });
     it("a build that is restored but never saved, or saved before it is checked", () => {
       has(broken(/\n {6}- name: Keep the verified devmap build\n[\s\S]*?\n\n/, "\n\n"), "never saves its devmap build");
-      has(broken(/(\n {6}- name: Cache devmap\n)/, "\n      - name: Early\n        uses: actions/cache/save@x\n$1"), "before check:vendor-schema has passed");
+      has(broken(/(\n {6}- name: Cache devmap\n)/, "\n      - name: Early\n        uses: actions/cache/save@x\n        with:\n          path: ~/.cache/gitpulse-ci/devmap\n          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}\n$1"), "before check:vendor-schema has passed");
+      // Another build's save does not stand in for devmap's.
+      has(broken(/\n {6}- name: Keep the verified devmap build\n[\s\S]*?\n\n/, "\n\n      - name: Keep another build\n        uses: actions/cache/save@x\n        with:\n          path: ~/.cache/other\n          key: other-1\n\n"), "never saves its devmap build");
     });
   });
 });

@@ -658,20 +658,36 @@ fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
 #[test]
 fn an_unrelated_build_tool_process_does_not_block_cleanup() {
     use crate::procguard::LockedSpawn;
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let artifact = temp.path().join("target");
     fs::create_dir(&artifact).unwrap();
     // A process whose command name is `uv`, with its cwd and files elsewhere.
+    // It is the sleeping test fixture under that name, not a copy of
+    // `/bin/sleep`: on Ubuntu 26.04 that is the rust-coreutils multicall
+    // binary, which exits at once when started as `uv`, and the check then
+    // ran with no such process at all.
     let elsewhere = tempfile::tempdir().unwrap();
     let uv = elsewhere.path().join("uv");
-    fs::copy("/bin/sleep", &uv).unwrap();
-    fs::set_permissions(&uv, fs::Permissions::from_mode(0o755)).unwrap();
+    let (exe, args) = crate::sysload::procscan::tests::fixture_command();
+    if fs::hard_link(&exe, &uv).is_err() {
+        fs::copy(&exe, &uv).unwrap();
+    }
+    let pidfile = elsewhere.path().join("uv.pid");
     let mut child = std::process::Command::new(&uv)
-        .arg("30")
+        .args(&args)
+        .env(
+            crate::sysload::procscan::tests::FIXTURE_ENV,
+            format!("sleep=30,pidfile={}", pidfile.display()),
+        )
         .current_dir(elsewhere.path())
+        .stdout(std::process::Stdio::null())
         .spawn_locked()
         .expect("start the stand-in uv process");
+    crate::sysload::procscan::tests::fixture_pid(&pidfile);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the stand-in uv process must be running while the check runs"
+    );
     let verdict = super::activity_check(&artifact);
     let _ = child.kill();
     let _ = child.wait();

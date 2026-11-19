@@ -19,6 +19,7 @@ function reportStartupFailure(event) {
 import "../src/app.css";
 import {mount,unmount,tick} from "svelte";
 import {themeStore} from "../src/lib/stores/themeStore";
+import { setThemeAndLand } from "./theme";
 import {repoStore} from "../src/lib/stores/repoStore";
 import {conflictSessions} from "../src/lib/diff/conflictSession";
 import ConflictEditor from "../src/lib/components/ConflictEditor.svelte";
@@ -28,7 +29,7 @@ import {completePrompt} from "../src/lib/stores/modalStore";
 import {createChecks} from "./checks.ts";
 const params = new URLSearchParams(location.search);
 if(params.has("check"))conflictSessions.clear();
-themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
+await setThemeAndLand(themeStore, params.get("theme") === "light" ? "light" : "dark");
 const {results, check, stopped} = createChecks();
 const crashes=[], writes=[], calls=[], unexpected=[];
 let failedRead=false, failedPreview=false, failedStage=false, delayedRead=null, delayedPreview=null, delayedWrite=null;

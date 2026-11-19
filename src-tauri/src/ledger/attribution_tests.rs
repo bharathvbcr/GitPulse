@@ -3162,3 +3162,78 @@ fn w9r_lexical_reads_a_path_as_text() {
         );
     }
 }
+
+/// Windows spellings of one place are one text, so the equality the
+/// attribution rules rest on holds there. Before this every such path was
+/// `None`, every commit-making command read `Target::Unknown`, and no commit
+/// was linked to the session that ran it (the `command_target_unknown` run of
+/// failures in the Windows suite). The Windows run is the end-to-end check;
+/// these pin the reading on any host.
+#[test]
+fn w9w_windows_paths_read_as_text_in_one_spelling() {
+    use super::attribution::lexical;
+    let want = Some("c:/users/r/repo");
+    for path in [
+        r"C:\Users\r\repo",
+        "c:/users/R/repo/",
+        r"C:\Users\r\.\x\..\repo",
+        r"\\?\C:\Users\r\repo",
+        r"c:\USERS\r\repo\.",
+    ] {
+        assert_eq!(
+            lexical(path).as_deref().and_then(Path::to_str),
+            want,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        lexical(r"C:\..\..\x").as_deref().and_then(Path::to_str),
+        Some("c:/x"),
+        "`..` does not leave the drive"
+    );
+    assert_eq!(
+        lexical(r"\\?\UNC\Srv\Share\a\..\b")
+            .as_deref()
+            .and_then(Path::to_str),
+        Some(r"\\srv\share\b")
+    );
+    assert_eq!(
+        lexical(r"\\srv\share").as_deref().and_then(Path::to_str),
+        Some(r"\\srv\share")
+    );
+    // What it returns reads back to itself, which is what a platform's own
+    // `Path::join` of one more component relies on.
+    for path in ["c:/users/r/repo", r"\\srv\share\b", "c:/"] {
+        assert_eq!(lexical(path).as_deref().and_then(Path::to_str), Some(path));
+    }
+    for not_windows in [r"C:", r"C:x", r"\\?\Volume{1}\x", r"\\srv", "a\\b"] {
+        assert_eq!(lexical(not_windows), None, "{not_windows}");
+    }
+}
+
+#[test]
+fn w9w_a_plain_commit_in_a_windows_worktree_is_proved_to_run_there() {
+    let w = Path::new(r"C:\Users\runneradmin\Temp\.tmpAbC");
+    assert_eq!(
+        read_command_from("git commit -m x", w, Some(w)).0,
+        Target::Here
+    );
+    assert_eq!(
+        read_command_from(
+            r"git -C c:/users/RUNNERADMIN/temp/.tmpabc commit -m x",
+            w,
+            Some(w),
+        )
+        .0,
+        Target::Here
+    );
+    assert_eq!(
+        read_command_from(
+            r"git -C C:/Users/runneradmin/Temp/other commit -m x",
+            w,
+            Some(w),
+        )
+        .0,
+        Target::Unknown
+    );
+}

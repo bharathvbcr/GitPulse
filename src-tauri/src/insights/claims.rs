@@ -487,6 +487,9 @@ struct Prepared {
     end: u64,
     /// The file that was read, when the platform can say which.
     id: Option<(u64, u64)>,
+    /// The handle the read was made through, kept open while this lives so
+    /// `id` cannot come to name another file (see [`Loaded::held`]).
+    _held: Option<fs::File>,
     /// The new file, beside the store.
     tmp: PathBuf,
     committed: bool,
@@ -535,7 +538,13 @@ impl Prepared {
 
     /// Writes `text` to a file of its own beside `store`. The name carries this
     /// process and a counter, so hooks compacting together never share one.
-    fn write(store: &Path, end: u64, id: Option<(u64, u64)>, text: &str) -> Result<Self, String> {
+    fn write(
+        store: &Path,
+        end: u64,
+        id: Option<(u64, u64)>,
+        held: Option<fs::File>,
+        text: &str,
+    ) -> Result<Self, String> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp = store.with_extension(format!(
             "jsonl.{}.{}.tmp",
@@ -549,6 +558,7 @@ impl Prepared {
         let prepared = Prepared {
             end,
             id,
+            _held: held,
             tmp,
             committed: false,
         };
@@ -617,7 +627,7 @@ fn prepare_from_loaded(
         text.push('\n');
     }
     text.push_str(&rows_text);
-    Prepared::write(store, loaded.end, loaded.id, &text)
+    Prepared::write(store, loaded.end, loaded.id, loaded.held, &text)
 }
 
 /// `kept` (oldest first) as store text, with the oldest rows left out until it
@@ -839,7 +849,8 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
         file.seek(SeekFrom::Start(start)).map_err(read_error)?;
     }
     let mut buf = Vec::new();
-    file.take(MAX_STORE_BYTES)
+    (&file)
+        .take(MAX_STORE_BYTES)
         .read_to_end(&mut buf)
         .map_err(read_error)?;
     // The read stops at the last newline it saw. What follows it may be a row
@@ -857,6 +868,7 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
         skipped: parsed.skipped,
         end: start + complete as u64,
         id,
+        held: cfg!(unix).then_some(file),
     })
 }
 
@@ -871,6 +883,13 @@ struct Loaded {
     end: u64,
     /// The file that was read, from its own handle, when the platform can say.
     id: Option<(u64, u64)>,
+    /// That handle, still open. `id` is a (device, inode) pair, and a freed
+    /// inode number is given to the next file made: ext4 gives it to the very
+    /// next one, so after another writer renamed its compaction over the store
+    /// a temporary file beside it could carry this read's identity, be renamed
+    /// over the store in turn, and pass for the file that was read. An open
+    /// handle keeps the inode, and with it the number, from being freed.
+    held: Option<fs::File>,
 }
 
 /// A line a compaction writes when it had to drop live claims, so the next read
@@ -1596,6 +1615,77 @@ mod tests {
         assert!(
             rewrites > 0 && rewrites < 40,
             "{rewrites} rewrites in 400 appends"
+        );
+    }
+
+    /// A compaction checks that the store is still the file it read by that
+    /// file's (device, inode). On ext4 a freed inode number goes to the very
+    /// next file made: another writer's compaction renames its own file over
+    /// the store, the old one is freed, and the next temporary file beside it
+    /// takes the old number. Once that file is renamed over the store, a
+    /// compaction prepared from the first read took it for the file it had
+    /// read, copied what lay past its old offset, and renamed its own rows
+    /// over it: every claim the newer file held before that offset was lost
+    /// with every append `Ok` (`tests/claims_store_loss.rs` on ubuntu-latest,
+    /// 107 claims). macOS (APFS) was never seen to hand a freed number on.
+    #[cfg(unix)]
+    #[test]
+    fn a_compaction_never_takes_a_newer_file_that_reuses_the_read_files_inode_number() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("file-claims.jsonl");
+        let cap = 4;
+        let (threshold, _) = compaction_limits(cap);
+        let row =
+            |name: String| format!("{}\n", serde_json::to_string(&claim(&name, 1_000)).unwrap());
+        let mut index = 0u64;
+        while fs::metadata(&store).map_or(0, |meta| meta.len()) < threshold {
+            append_plain(&store, &row(format!("old-{index:03}.rs"))).unwrap();
+            index += 1;
+        }
+        let mut prepared = prepare_compaction(&store, &[], cap, DEFAULT_TTL_MS, 1_000).unwrap();
+        let read_ino = fs::metadata(&store).unwrap().ino();
+
+        // Another writer compacts: its file replaces the store, and the file
+        // that was read is freed.
+        let newer_rows = |tag: &str| -> String {
+            (0..cap * 3)
+                .map(|n| row(format!("{tag}-{n:03}-{}.rs", "x".repeat(40))))
+                .collect()
+        };
+        let replacement = dir.path().join("replacement.tmp");
+        fs::write(&replacement, newer_rows("replacement")).unwrap();
+        fs::rename(&replacement, &store).unwrap();
+        // Files made beside it until one is given the freed number, as ext4
+        // does at once; that file then becomes the store.
+        let mut reused = None;
+        for attempt in 0..64 {
+            let candidate = dir.path().join(format!("candidate-{attempt}.tmp"));
+            fs::write(&candidate, newer_rows("reused")).unwrap();
+            if fs::metadata(&candidate).unwrap().ino() == read_ino {
+                reused = Some(candidate);
+                break;
+            }
+        }
+        if let Some(candidate) = &reused {
+            fs::rename(candidate, &store).unwrap();
+        }
+        let before = on_disk_paths(&store);
+        assert!(
+            fs::metadata(&store).unwrap().len() >= prepared.end,
+            "the newer file must be at least as long as the read, or the length check alone refuses it"
+        );
+
+        let rewritten = compact_locked(&store, &mut prepared, "", true, threshold).unwrap();
+        let after = on_disk_paths(&store);
+        let lost: Vec<_> = before.iter().filter(|path| !after.contains(path)).collect();
+        assert!(
+            !rewritten && lost.is_empty(),
+            "a compaction from a read of another file replaced the store (inode number \
+             {read_ino} reused: {}): {} newer claim(s) lost, first {:?}",
+            reused.is_some(),
+            lost.len(),
+            lost.first()
         );
     }
 }

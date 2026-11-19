@@ -13,7 +13,8 @@ describe("browser regression gate", () => {
     expect(paths.sort()).toEqual([...BROWSER_HARNESSES].sort());
   });
   it("gives a long page its own deadline and keeps the minute for every other page", () => {
-    expect(harnessDeadlineSeconds("tasks")).toBe(150);
+    expect(harnessDeadlineSeconds("tasks")).toBe(300);
+    expect(harnessDeadlineSeconds("health")).toBe(120);
     for (const harness of BROWSER_HARNESSES.filter(name => !(name in HARNESS_DEADLINE_SECONDS))) expect(harnessDeadlineSeconds(harness)).toBe(DEFAULT_DEADLINE_SECONDS);
     expect(DEFAULT_DEADLINE_SECONDS).toBe(60);
     // Every override names a real page, and the WebKit runner is told the number.
@@ -49,6 +50,44 @@ describe("failure reporting a CI reader can see", () => {
       'crash: {"message":"boom"}',
       "unexpected commands: cmd_x",
     ]);
+  });
+
+  it("says why a browser runner exited before its verdict, not just its exit code", async () => {
+    const { browserExitMessage } = await import("./browser-regressions.mjs");
+    expect(browserExitMessage("WebKit", 3, "This Mac has Reduce Motion on, so ...\n"))
+      .toBe("WebKit exited before the verdict (3): This Mac has Reduce Motion on, so ...");
+    expect(browserExitMessage("Chrome", 1, "  \n")).toBe("Chrome exited before the verdict (1)");
+  });
+
+  // The macos-26 runner image has Reduce Motion on: WKWebView then matches
+  // prefers-reduced-motion and every animation check failed with "0 animate
+  // calls" (Frontend macos-latest, f9610b895). The runner refuses such a host
+  // with the reason, and CI turns the setting off before the WebKit step.
+  it("never measures motion on a host that asked for reduced motion", () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const runner = readFileSync(path.join(here, "webkit-regressions.swift"), "utf8");
+    const refusal = runner.indexOf("accessibilityDisplayShouldReduceMotion");
+    expect(refusal).toBeGreaterThan(-1);
+    expect(refusal).toBeLessThan(runner.indexOf("webview.load("));
+    const ci = readFileSync(path.join(here, "..", ".github", "workflows", "ci.yml"), "utf8");
+    const off = ci.indexOf("defaults write com.apple.universalaccess reduceMotion -bool false");
+    expect(off).toBeGreaterThan(-1);
+    expect(off).toBeLessThan(ci.indexOf("run: bun run test:webkit:all"));
+  });
+
+  // WebKit matches :focus only in a key window; on the runner a window that is
+  // never activated never becomes key, so the focus-edge check in tab-switch
+  // saw the resting edge. CI lets the runner take focus; a local run does not.
+  it("lets the WebKit runner take focus only when CI asks for it", () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const runner = readFileSync(path.join(here, "webkit-regressions.swift"), "utf8");
+    const gate = runner.indexOf('environment["GITPULSE_WEBKIT_TAKE_FOCUS"] == "1"');
+    expect(gate).toBeGreaterThan(-1);
+    expect(runner.indexOf("makeKeyAndOrderFront")).toBeGreaterThan(gate);
+    expect(runner.slice(0, gate)).not.toMatch(/activate\(|makeKey/);
+    const ci = readFileSync(path.join(here, "..", ".github", "workflows", "ci.yml"), "utf8");
+    const step = ci.slice(ci.indexOf("name: Native Renderer Regressions (WKWebView)"), ci.indexOf("run: bun run test:webkit:all"));
+    expect(step).toContain('GITPULSE_WEBKIT_TAKE_FOCUS: "1"');
   });
 
   it("escapes an annotation so its text cannot end the command early", async () => {

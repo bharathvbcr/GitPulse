@@ -3974,7 +3974,7 @@ pub fn dispatch(
         "collision-guard" => Ok(run_collision_guard(input)),
         "command-gate" => Ok(run_command_gate(input)),
         "session-brief" => Ok(run_session_brief(input)),
-        "notify" => run_notify(argument, input, notify_send),
+        "notify" => run_notify(argument, input, notify_send, notify_outcome::TRANSPORT_AVAILABLE),
         "deliver" => deliver::run(input),
         "peer-inbox" => Ok(run_peer_inbox(input)),
         "stop-or-notify" => run_stop_or_notify(input),
@@ -4207,6 +4207,7 @@ fn peer_inbox_in_default(input: &HookInput) -> Option<PeerInboxReady> {
             notify_send,
             &notify_drops::PROCESS_DROPS,
             Some(Duration::from_millis(300)),
+            notify_outcome::TRANSPORT_AVAILABLE,
         );
     })
 }
@@ -4450,6 +4451,7 @@ pub fn run_stop_or_notify(input: &HookInput) -> Result<HookOutput, HookError> {
         notify_send,
         &notify_drops::PROCESS_DROPS,
         Some(Duration::from_millis(800)),
+        notify_outcome::TRANSPORT_AVAILABLE,
     )
 }
 
@@ -4571,6 +4573,7 @@ fn run_notify(
     argument: Option<&str>,
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+    transport_available: bool,
 ) -> Result<HookOutput, HookError> {
     // A Claude Code `Stop` arrives here as `notify turn_finished`, and never
     // reaches `stop_continue_in` (Antigravity's stop path, which marks the peer
@@ -4580,7 +4583,14 @@ fn run_notify(
             let _ = upsert_hook_peer(&root, input, "idle");
         }
     }
-    let out = run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None);
+    let out = run_notify_within(
+        argument,
+        input,
+        send,
+        &notify_drops::PROCESS_DROPS,
+        None,
+        transport_available,
+    );
     if argument == Some("tool_finished") {
         report_agent_touched_file(input);
     }
@@ -4592,12 +4602,21 @@ fn run_notify(
 /// budget for the event ([`notify_input::budgets_for`]); a test passes a few
 /// milliseconds and a send that waits on a channel, so the give-up path runs
 /// without the suite sitting out a real deadline.
+///
+/// `transport_available` travels with `send` because it is a fact about the
+/// sender. Production passes [`notify_outcome::TRANSPORT_AVAILABLE`] beside
+/// `notify_send` (the platform's socket); a test that injects its own closure
+/// passes `INJECTED_TRANSPORT` (test-only), because that closure *is* a transport on
+/// every platform. Taking the platform constant here instead made every
+/// injected-sender test on Windows answer "unsupported" before reaching the
+/// closure it was written to observe.
 fn run_notify_within(
     argument: Option<&str>,
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
     drops: &NotifyDrops,
     send_budget: Option<Duration>,
+    transport_available: bool,
 ) -> Result<HookOutput, HookError> {
     run_notify_with(
         argument,
@@ -4605,10 +4624,17 @@ fn run_notify_within(
         send,
         drops,
         send_budget,
-        notify_outcome::TRANSPORT_AVAILABLE,
+        transport_available,
         socket_path_from_env,
     )
 }
+
+/// The transport a test's injected sender provides: the closure itself, which
+/// exists on every platform, so it is always available. Passed beside an
+/// injected `send` to [`run_notify`] / [`run_notify_within`]; production passes
+/// [`notify_outcome::TRANSPORT_AVAILABLE`] beside `notify_send` instead.
+#[cfg(test)]
+const INJECTED_TRANSPORT: bool = true;
 
 /// The socket a report goes to: `GITPULSE_NOTIFY_SOCKET` when set, else the
 /// one in GitPulse's configuration directory (`None` with no such directory).
@@ -10085,10 +10111,15 @@ done
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = seen.clone();
-        let result = run_notify(Some(event), input, move |_, payload| {
-            *sink.lock().unwrap() = Some(payload.to_owned());
-            Ok(())
-        });
+        let result = run_notify(
+            Some(event),
+            input,
+            move |_, payload| {
+                *sink.lock().unwrap() = Some(payload.to_owned());
+                Ok(())
+            },
+            INJECTED_TRANSPORT,
+        );
         (result, seen)
     }
 
@@ -10185,15 +10216,18 @@ done
         // The failure this catches is a plugin manifest updated without the
         // binary, which otherwise presents as "notifications stopped working".
         for event in ["", "Notification", "permission-prompt", "agent_completed "] {
-            let result = run_notify(Some(event), &notify_input(), |_, _| {
-                panic!("an unknown event reached the socket")
-            });
+            let result = run_notify(
+                Some(event),
+                &notify_input(),
+                |_, _| panic!("an unknown event reached the socket"),
+                INJECTED_TRANSPORT,
+            );
             let error = result
                 .expect_err(&format!("{event:?} was accepted"))
                 .to_string();
             assert!(error.contains("unknown notify event"), "{error}");
         }
-        assert!(run_notify(None, &notify_input(), |_, _| Ok(())).is_err());
+        assert!(run_notify(None, &notify_input(), |_, _| Ok(()), INJECTED_TRANSPORT).is_err());
     }
 
     #[test]
@@ -10238,10 +10272,15 @@ done
             dir.path().join("hook.sock"),
         );
         let started = std::time::Instant::now();
-        let error = run_notify(Some("idle_prompt"), &notify_input(), |_, _| {
-            thread::sleep(Duration::from_secs(30));
-            Ok(())
-        })
+        let error = run_notify(
+            Some("idle_prompt"),
+            &notify_input(),
+            |_, _| {
+                thread::sleep(Duration::from_secs(30));
+                Ok(())
+            },
+            INJECTED_TRANSPORT,
+        )
         .expect_err("a hung socket must not report success")
         .to_string();
         assert!(error.contains("deadline"), "{error}");
@@ -10280,6 +10319,7 @@ done
             },
             &drops,
             Some(Duration::from_millis(20)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a reply that never came must not report success");
         assert!(error.to_string().contains("deadline"), "{error}");
@@ -10310,6 +10350,7 @@ done
             |_, _| Ok(()),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         );
         assert!(delivered.expect("delivered").is_silent());
         let refused = run_notify_within(
@@ -10318,6 +10359,7 @@ done
             |_, _| Err(SendError::Failed("refused".into())),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         )
         .expect_err("a refusal is an error");
         assert!(matches!(refused, HookError::Failed(_)), "{refused:?}");
@@ -10327,6 +10369,7 @@ done
             |_, _| Err(SendError::Unsupported),
             &drops,
             in_time,
+            INJECTED_TRANSPORT,
         )
         .expect_err("an absent transport is not a delivery");
         assert!(
@@ -10352,6 +10395,7 @@ done
             |_, _| Err(SendError::NoReply),
             &drops,
             Some(Duration::from_secs(30)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("no reply is not a delivery");
         assert!(error.to_string().contains("got no reply"), "{error}");
@@ -10366,6 +10410,7 @@ done
             },
             &drops,
             Some(Duration::from_millis(20)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a reply past the outer budget is not a delivery");
         assert_eq!(drops.snapshot().dropped, 2);
@@ -10388,6 +10433,7 @@ done
             |_, _| panic!("worker fault"),
             &drops,
             Some(Duration::from_secs(30)),
+            INJECTED_TRANSPORT,
         )
         .expect_err("a dead worker did not deliver");
         assert!(
@@ -10721,9 +10767,12 @@ done
             .iter()
             .filter(|e| e.role != crate::alerts::bridge::Role::Banner)
         {
-            let result = run_notify(Some(event.name), &notify_input(), |_, _| {
-                panic!("a state with no session reached the socket")
-            });
+            let result = run_notify(
+                Some(event.name),
+                &notify_input(),
+                |_, _| panic!("a state with no session reached the socket"),
+                INJECTED_TRANSPORT,
+            );
             let output = result.unwrap_or_else(|e| panic!("{}: {e}", event.name));
             assert!(output.is_silent());
         }
@@ -11399,15 +11448,31 @@ done
             );
         }
 
-        /// A case-variant spelling of a file in a sibling that holds it dirty
-        /// (APFS is case-insensitive).
+        /// A case-variant spelling of a file in a sibling that holds it dirty.
+        /// On a volume that folds case (APFS by default) `SEED.TXT` is that
+        /// file and must be judged as it. On one that does not (ext4, as on
+        /// ubuntu-latest) it names another file that no worktree holds, and is
+        /// judged exactly as a fresh name in that sibling is.
         #[test]
         fn case_variant_spelling_of_a_sibling_file_is_still_judged() {
             let farm = farm_bound(true, false, 2);
             let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
             let upper = format!("{}/SEED.TXT", b.display());
             let output = guard_here(&edit_call(a.to_str().unwrap(), &upper));
-            assert!(asks(&output), "{}", rendered(&output));
+            let folds_case = std::fs::metadata(&upper).is_ok();
+            if folds_case {
+                assert!(asks(&output), "{}", rendered(&output));
+            } else {
+                let fresh = format!("{}/never-touched.txt", b.display());
+                let control = guard_here(&edit_call(a.to_str().unwrap(), &fresh));
+                assert_eq!(
+                    asks(&output),
+                    asks(&control),
+                    "on a case-sensitive volume SEED.TXT is a file of its own: {} vs {}",
+                    rendered(&output),
+                    rendered(&control)
+                );
+            }
         }
     }
 
@@ -13350,7 +13415,13 @@ done
             "an empty session mailbox must be answered without the session lock"
         );
 
-        let _ = run_notify(Some("turn_finished"), &stop, |_, _| Ok(())).unwrap();
+        let _ = run_notify(
+            Some("turn_finished"),
+            &stop,
+            |_, _| Ok(()),
+            INJECTED_TRANSPORT,
+        )
+        .unwrap();
         assert_eq!(
             peer_state().as_deref(),
             Some("idle"),

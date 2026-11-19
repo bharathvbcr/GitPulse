@@ -9048,7 +9048,10 @@ mod tests {
         let mut command = std::process::Command::new("git");
         crate::test_support::pin_git(&mut command);
         command
-            .args(args)
+            .args(
+                args.iter()
+                    .map(|arg| crate::test_support::plain_git_arg(arg)),
+            )
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "Test User")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -14225,7 +14228,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         .unwrap();
         crate::test_support::env::write_git_config(
             &home.join(".gitconfig"),
-            &format!("[mailmap]\n\tfile = {}\n", mailmap.display()),
+            &format!(
+                "[mailmap]\n\tfile = {}\n",
+                crate::test_support::env::git_config_value(&mailmap.to_string_lossy())
+            ),
         )
         .unwrap();
         mailmap

@@ -24,12 +24,19 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "devmap", "pull-r
  * and the synchronized-output phase (two seconds of frames in each of four
  * arms plus the real session) ~59 s cold. `coverage` took 48-53 s of its 60 on
  * the Linux runner (cold dependency optimisation, 163 checks) and timed out once
- * in three; it passed six of six with the cap lifted. A page that is long by design gets
+ * in three; it passed six of six with the cap lifted. `health` spends about 30
+ * of its seconds in the auto-scan lifecycle checks, which wait out the product's
+ * real 1.5 s settle a dozen times on purpose: 53 s on the development Mac, 57 s
+ * and 61-69 s on the macOS CI runner with window focus on and off (probe runs
+ * 44370388488: verdicts at 56.8, 56.7, 69.2 and 60.5 s), which a minute cannot
+ * hold. `tasks` is 688 sequential checks, each behind real settled waits: 141 s
+ * on the development Mac and 168 s (focus on) and 194 s (focus off) on the CI
+ * runner, with every section within the same ratio of its local time. A page that is long by design gets
  * its own number here; the rest keep the minute, so a hang anywhere else is
  * still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120, terminal: 210, coverage: 120 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 300, health: 120, "tab-switch": 120, terminal: 210, coverage: 120 }));
 
 /** @param {string} harness */
 export function harnessDeadlineSeconds(harness) {
@@ -181,6 +188,19 @@ export function startChrome(chrome, profile, url) {
   return child;
 }
 
+/** How much of a browser runner's stderr an early exit reports. */
+const STDERR_KEPT = 2000;
+
+/** The error for a browser that ended before writing a verdict. It carries
+ * what the runner printed: the WebKit runner refuses a host it cannot measure
+ * (Reduce Motion on) with a reason, and a bare exit code hid it.
+ * @param {string} engine @param {number | null} code @param {string} stderr
+ */
+export function browserExitMessage(engine, code, stderr) {
+  const said = stderr.trim();
+  return `${engine} exited before the verdict (${code})${said ? `: ${said}` : ""}`;
+}
+
 /** What a signal or an uncaught error must still undo: the live browser and
  * its profile. `finally` does it for every other exit.
  * @type {Set<() => void>}
@@ -212,12 +232,33 @@ async function runHarness(harness, webkit) {
   let deadline;
   let requests = 0;
   let lastRequest = "none";
+  const started = Date.now();
+  const since = () => ((Date.now() - started) / 1000).toFixed(1);
+  /** The page's own account of how far it got (harness/progress.ts), with when. */
+  const progress = { first: "", last: "" };
+  /** When the server finished starting, for the timing line. */
+  let listening = "";
   /** @type {import('vite').Plugin} */
   const receiver = { name: "gitpulse-browser-verdict" };
   const completed = new Promise((resolve, reject) => {
-    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest})`)), seconds * 1000);
+    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest}; ${progress.last ? `page progress: ${progress.last}` : "the page reported no check"}${listening ? `; server listening at ${listening}s` : "; server not yet listening"})`)), seconds * 1000);
     receiver.configureServer = (server) => {
       server.middlewares.use((request, _response, next) => { requests++; lastRequest = request.url ?? "unknown"; next(); });
+      server.middlewares.use(reportPath.replace("/__gp_result/", "/__gp_progress/"), (request, response) => {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", chunk => { if (body.length < 4096) body += chunk; });
+        request.on("end", () => {
+          response.end("ok");
+          try {
+            const beat = JSON.parse(body);
+            const text = `${beat.count} checks at ${since()}s, last: ${String(beat.name).slice(0, 160)}`;
+            if (process.env.GITPULSE_HARNESS_BEATS) console.log("beat:", text);
+            progress.first ||= text;
+            progress.last = text;
+          } catch { /* advisory */ }
+        });
+      });
       server.middlewares.use(reportPath, (request, response) => {
       if (request.method !== "POST") { response.statusCode = 405; response.end(); return; }
       let html = "";
@@ -248,24 +289,36 @@ async function runHarness(harness, webkit) {
       server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
     });
     await server.listen();
+    listening = since();
     const address = server.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");
     const chrome = chromeBinary();
     const version = await run(webkit ? "xcrun" : chrome, webkit ? ["swift", "--version"] : ["--version"], { timeout: 10_000 });
     console.log(version.stdout.trim());
     const url = `http://127.0.0.1:${address.port}/harness/${harness}.html?check=1&report=${reportPath}`;
+    /** The runner's own words, kept so an early exit can say why. */
+    let stderr = "";
     if (webkit) {
       // The Swift runner ends itself five seconds after this page's deadline.
       browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
         { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
+      browser.stderr?.on("data", chunk => { stderr = (stderr + chunk).slice(-STDERR_KEPT); });
     } else {
       browser = startChrome(chrome, profile, url);
     }
+    const engine = webkit ? "WebKit" : "Chrome";
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);
-      browser?.once("exit", code => reject(new Error(`${webkit ? "WebKit" : "Chrome"} exited before the verdict (${code})`)));
+      // `close` fires after the stderr pipe has drained, so the reason the
+      // runner printed is in hand; a grandchild still holding the pipe must
+      // not hold the report back, so `exit` reports anyway a moment later.
+      const report = (/** @type {number | null} */ code) => reject(new Error(browserExitMessage(engine, code, stderr)));
+      browser?.once("close", report);
+      browser?.once("exit", code => setTimeout(() => report(code), 1000).unref());
     });
-    console.log(await Promise.race([completed, exited]));
+    const verdict = await Promise.race([completed, exited]);
+    // Where each page's time goes, so a deadline is set from a measurement.
+    console.log(`${verdict} [timing: server listening ${listening}s; first beat ${progress.first || "none"}; verdict ${since()}s of ${seconds}s]`);
   } finally {
     clearTimeout(deadline);
     // A browser ended by a signal has no exit code; waiting for its `close`

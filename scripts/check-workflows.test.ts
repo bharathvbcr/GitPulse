@@ -251,6 +251,43 @@ describe("check:workflows", () => {
     expect(coverage).toMatch(/toolchain:\s*nightly-\d{4}-\d{2}-\d{2}/);
   });
 
+  // The MANVI gate tests drive a real `manvi`; no runner has one, so they failed
+  // with "No MANVI harness is installed" on every job that runs the lib suite.
+  it("builds the pinned manvi before every job that runs the lib suite", () => {
+    const read = (name: string) =>
+      readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
+    const jobsOf = (text: string) => {
+      const body = text.slice(text.search(/^jobs:\s*$/m));
+      const jobs = new Map<string, string>();
+      const heads = [...body.matchAll(/^ {2}([a-z0-9-]+):\s*$/gm)];
+      heads.forEach((head, i) => jobs.set(head[1], body.slice(head.index, heads[i + 1]?.index ?? body.length)));
+      return jobs;
+    };
+    const suites: Record<string, { jobs: string[]; testStep: RegExp }> = {
+      "ci.yml": { jobs: ["rust-test", "rust-test-macos"], testStep: /- name: Rust (Unit & Integration Tests|Tests)/ },
+      "coverage.yml": { jobs: ["coverage"], testStep: /- name: Generate Rust Coverage/ },
+      "test-parallel.yml": { jobs: ["rust-parallel"], testStep: /cargo test --manifest-path/ },
+    };
+    for (const [file, { jobs, testStep }] of Object.entries(suites)) {
+      const text = read(file);
+      expect(text, file).toMatch(/^ {2}MANVI_REV: [0-9a-f]{40}$/m);
+      const all = jobsOf(text);
+      for (const name of jobs) {
+        const job = all.get(name);
+        expect(job, `${file} ${name}`).toBeDefined();
+        const checkout = job!.indexOf('git -C "$src" checkout --quiet "$MANVI_REV"');
+        const install = job!.indexOf("- name: Install manvi");
+        const test = job!.search(testStep);
+        expect(checkout, `${file} ${name} checks Manvi out at MANVI_REV`).toBeGreaterThan(-1);
+        expect(install, `${file} ${name} installs manvi`).toBeGreaterThan(checkout);
+        expect(test, `${file} ${name} runs its tests after manvi`).toBeGreaterThan(install);
+        // The pins Manvi's own commit names, never whatever sibling happens to exist.
+        expect(job!.slice(install, test)).toContain('bash "$src/scripts/fetch-modules.sh"');
+        expect(job!.slice(install, test)).toContain('echo "$root/bin" >> "$GITHUB_PATH"');
+      }
+    }
+  });
+
   it("keeps the serial gate and also runs the suite in parallel, in its own workflow", () => {
     const read = (name: string) =>
       readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
