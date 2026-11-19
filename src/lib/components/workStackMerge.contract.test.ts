@@ -67,7 +67,10 @@ describe("Stack merged into Overview", () => {
   it("renders the collapsed card as a disclosure, not a pane", () => {
     // The toggle must carry aria-expanded and the lazy pane must be gated on
     // the same state, or the card is a button that does nothing.
-    expect(workSource).toContain("aria-expanded={showStackDetail}");
+    // The toggle is the shared detailToggle snippet, which carries
+    // aria-expanded={open}; the stack card passes showStackDetail as open.
+    expect(workSource).toMatch(/#snippet detailToggle\(open[^)]*\)[\s\S]*?aria-expanded=\{open\}[\s\S]*?\{\/snippet\}/);
+    expect(workSource).toContain("detailToggle(showStackDetail, () => (showStackDetail = !showStackDetail)");
     expect(workSource).toContain("{#if showStackDetail}");
   });
 
