@@ -38,6 +38,7 @@
     litBottom: "#d92d3f",
     shadeTop: "#b02636",
     shadeBottom: "#7a1626",
+    rim: "#ffffff",
   } as const;
 
   interface MarkPath {
@@ -117,7 +118,7 @@
     </defs>
     <rect width="320" height="320" rx="100" fill={`url(#${uid}-manvi-plate)`} />
     <rect width="320" height="320" rx="100" fill={`url(#${uid}-manvi-glow)`} />
-    <rect x="3" y="3" width="314" height="314" rx="97" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="6" />
+    <rect x="3" y="3" width="314" height="314" rx="97" fill="none" stroke={MANVI_PALETTE.rim} stroke-opacity="0.1" stroke-width="6" />
     <path d={MANVI_FOLD_OUTLINE} fill={`url(#${uid}-manvi-shade)`} />
     <path d={MANVI_FOLD_LIT} fill={`url(#${uid}-manvi-lit)`} />
   </svg>
