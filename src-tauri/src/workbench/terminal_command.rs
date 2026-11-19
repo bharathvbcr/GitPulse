@@ -3560,7 +3560,7 @@ mod hook_launch_tests {
         assert_eq!(
             argv.iter().filter(|a| *a == "--settings").count(),
             1,
-            "{argv:?}"
+            "expected exactly one --settings flag"
         );
         serde_json::from_str(&argv[at + 1]).expect("settings JSON")
     }
@@ -3907,5 +3907,9 @@ mod hook_launch_tests {
             .unwrap();
         assert!(prompt_pos + 1 < argv.len());
         assert!(argv[prompt_pos + 1].contains("Read the UTF-8 task brief at"));
+        assert!(!argv.iter().any(|a| a == "--settings"));
+        assert!(super::super::claude_hook::for_launch("agy")
+            .binary()
+            .is_none());
     }
 }

@@ -31,7 +31,7 @@ fn the_walk_reads_what_a_whole_parse_reads() {
             "toolCall" => {
                 json!({"id": "tc-1", "name": "run_command", "args": {"CommandLine": "ls"}})
             }
-            "fullyIdle" => json!(true),
+            "fullyIdle" | "continuationActive" => json!(true),
             "invocationNum" => json!(2),
             "cursor_version" => json!("1.2.3"),
             _ => json!(format!("v-{field}")),

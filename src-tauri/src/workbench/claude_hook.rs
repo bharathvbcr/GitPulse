@@ -614,6 +614,7 @@ mod tests {
     #[test]
     fn other_providers_are_never_injected() {
         assert_eq!(for_launch("codex"), HookInjection::NotApplicable);
+        assert_eq!(for_launch("agy"), HookInjection::NotApplicable);
     }
 
     /// Adversary: base 0ea2cc37's Unix renderer, reproduced literally, equals

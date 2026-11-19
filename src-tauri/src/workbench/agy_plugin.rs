@@ -488,6 +488,32 @@ mod tests {
             brief_cmd.contains("bin/gitpulse-hook' --host=agy session-brief"),
             "unexpected hook command: {brief_cmd}"
         );
+        let session_inbox_cmd = hooks_json["gitpulse"]["SessionStart"][1]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            session_inbox_cmd.contains("bin/gitpulse-hook' --host=agy peer-inbox"),
+            "missing SessionStart peer-inbox: {session_inbox_cmd}"
+        );
+        assert_eq!(hooks_json["gitpulse"]["PostToolUse"][0]["matcher"], "*");
+        assert!(
+            hooks_json["gitpulse"]["PostToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("bin/gitpulse-hook' --host=agy notify tool_finished")
+        );
+        assert!(hooks_json["gitpulse"]["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["gitpulse"]["PostInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy peer-inbox"));
+        assert!(hooks_json["gitpulse"]["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("bin/gitpulse-hook' --host=agy stop-or-notify"));
 
         // If `agy` is installed on the host, run `agy plugin validate --strict --json`.
         use crate::procguard::LockedSpawn;
@@ -530,5 +556,36 @@ mod tests {
         assert!(sync_under_home(&home, true, Some(&mcp), Some(&hook)).is_err());
         assert!(sync_under_home(&home, false, None, None).is_err());
         assert_eq!(std::fs::read_to_string(&custom_file).unwrap(), "user-owned");
+    }
+
+    #[test]
+    fn antigravity_plugin_hooks_match_gitpulse_agy_lifecycle_and_subcommands() {
+        let embedded: Value = serde_json::from_str(HOOKS_JSON).unwrap();
+        let agy_ref: Value =
+            serde_json::from_str(include_str!("../../../plugins/gitpulse-agy/hooks.json")).unwrap();
+
+        let extract = |root: &Value| -> Vec<(String, String, String)> {
+            let mut out = Vec::new();
+            for (event, entries) in root["gitpulse"].as_object().unwrap() {
+                for entry in entries.as_array().unwrap() {
+                    if let Some(nested) = entry.get("hooks").and_then(Value::as_array) {
+                        let matcher = entry["matcher"].as_str().unwrap_or_default().to_owned();
+                        for h in nested {
+                            let cmd = h["command"].as_str().unwrap();
+                            let norm = cmd.replace(" --host=agy ", " ");
+                            out.push((event.clone(), matcher.clone(), norm));
+                        }
+                    } else {
+                        let cmd = entry["command"].as_str().unwrap();
+                        let norm = cmd.replace(" --host=agy ", " ");
+                        out.push((event.clone(), String::new(), norm));
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+
+        assert_eq!(extract(&embedded), extract(&agy_ref));
     }
 }
