@@ -63,7 +63,7 @@
   import SidebarViewSwitch from "./SidebarViewSwitch.svelte";
   import { panelId, tabId } from "../dom/tablist";
   import { formatPathParts } from "../files/formatPath";
-  import { hasUnstagedChanges, statusForSide, summarizeStatuses } from "../files/fileStatus";
+  import { hasUnstagedChanges, statusForSide, summarizeStatuses, uniqueRowKeys } from "../files/fileStatus";
   import {
     layoutStore,
     loadSections,
@@ -444,6 +444,10 @@
       ? unstagedFiles.filter((f) => f.path.toLowerCase().includes(query))
       : unstagedFiles,
   );
+  // Row identity for VirtualList's keyed each, unique even if a status source
+  // ever reports one path twice in a list (see uniqueRowKeys).
+  let stagedKeys = $derived(uniqueRowKeys(filteredStaged.map((f) => f.path)));
+  let unstagedKeys = $derived(uniqueRowKeys(filteredUnstaged.map((f) => f.path)));
 
   function stageAll() {
     void repoStore.stageAll();
@@ -782,7 +786,7 @@
                 items={filteredStaged}
                 rowHeight={CHANGE_ROW_HEIGHT}
                 bind:scrollTop={stagedScroll}
-                key={(f) => f.path}
+                key={(_, i) => stagedKeys[i]}
                 class="h-full"
               >
                 {#snippet row(f)}
@@ -870,7 +874,7 @@
                 items={filteredUnstaged}
                 rowHeight={CHANGE_ROW_HEIGHT}
                 bind:scrollTop={unstagedScroll}
-                key={(f) => f.path}
+                key={(_, i) => unstagedKeys[i]}
                 class="h-full"
               >
                 {#snippet row(f)}

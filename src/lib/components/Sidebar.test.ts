@@ -304,8 +304,11 @@ describe("Sidebar change lists", () => {
     // Nothing renders the whole list or asks for the rest with a button.
     expect(source).not.toContain("FILE_LIST_STEP");
     expect(source).not.toMatch(/Show (all|\$\{)/);
-    // Rows are keyed by path so a stage button's focus never slides to the next file.
-    expect((source.match(/key=\{\(f\) => f\.path\}/g) ?? []).length).toBe(2);
+    // Rows are keyed by path (made unique per list) so a stage button's focus never slides to the next file.
+    expect(source).toContain("key={(_, i) => stagedKeys[i]}");
+    expect(source).toContain("key={(_, i) => unstagedKeys[i]}");
+    expect(source).toContain("uniqueRowKeys(filteredStaged.map((f) => f.path))");
+    expect(source).toContain("uniqueRowKeys(filteredUnstaged.map((f) => f.path))");
     expect(source).not.toContain("visibleStaged");
     expect(source).not.toContain("visibleUnstaged");
   });

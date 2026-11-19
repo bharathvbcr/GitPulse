@@ -11,6 +11,7 @@ import {
   statusBadgeClass,
   statusBadgeLabel,
   summarizeStatuses,
+  uniqueRowKeys,
   type StatusLike,
 } from "./fileStatus";
 
@@ -165,4 +166,19 @@ it("partial staging remains visible in both status scopes and counts the file on
   expect(statusMatchesScope(mixed, "unstaged")).toBe(true);
   expect(statusMatchesScope(mixed, "modified")).toBe(true);
   expect(summarizeStatuses([mixed])).toMatchObject({ staged: 1, unstaged: 1, dirty: 1, additions: 3, deletions: 2 });
+});
+
+describe("uniqueRowKeys", () => {
+  it("keeps distinct paths bare and never repeats a key for a repeated path", () => {
+    expect(uniqueRowKeys(["a", "b"])).toEqual(["a", "b"]);
+    const keys = uniqueRowKeys(["a", "a", "b", "a"]);
+    expect(keys[0]).toBe("a");
+    expect(new Set(keys).size).toBe(4);
+  });
+
+  it("cannot collide with a real path (none holds a NUL), and is case-sensitive like git", () => {
+    const keys = uniqueRowKeys(["a", "a", "a1", "a 1", "A"]);
+    expect(new Set(keys).size).toBe(5);
+    expect(uniqueRowKeys([])).toEqual([]);
+  });
 });

@@ -332,6 +332,22 @@ async function sidebarFocusChecks(){
   check("focus: focus is not left on another file's Stage button",!(live instanceof HTMLElement&&live.getAttribute("aria-label")==="Stage file"));
  }finally{files=saved;fixtures.cmd_stage_file=savedStage;await repoStore.refresh();await show("Sidebar");}
 }
+/*
+ * Duplicate paths (review 2 of AC6): a keyed each throws on a duplicate key. The
+ * same path twice in one list must render as two rows, with no runtime error.
+ */
+async function sidebarDuplicateChecks(){
+ const saved=files,before=crashes.length;
+ try{
+  files=[status("dup/a.ts",false,"M"),status("dup/a.ts",false,"M"),status("dup/b.ts",false,"M"),status("dup/s.ts",true,"M "),status("dup/s.ts",true,"M ")];
+  await repoStore.refresh();await show("Sidebar");await frames(3);
+  const rows=path=>surface.querySelectorAll('button[title="'+path+'"]').length;
+  check("duplicates: a path repeated in the unstaged list renders both rows ("+rows("dup/a.ts")+")",rows("dup/a.ts")===2);
+  check("duplicates: its neighbour still renders",rows("dup/b.ts")>=1);
+  check("duplicates: a path repeated in the staged list renders both rows ("+rows("dup/s.ts")+")",rows("dup/s.ts")>=2);
+  check("duplicates: rendering them raised no runtime error",crashes.length===before);
+ }finally{files=saved;await repoStore.refresh();await show("Sidebar");}
+}
 async function run(){
  document.getElementById("run").disabled=true;
  try{
@@ -455,6 +471,7 @@ async function run(){
   }finally{cancelPrompt();await unmount(prompt);promptTarget.remove();}
   await sidebarWindowChecks();
   await sidebarFocusChecks();
+  await sidebarDuplicateChecks();
  await agentCommitMenuChecks();
   check("No unexpected commands",unexpected.length===0);
   check("No runtime errors",crashes.length===0);
