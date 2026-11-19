@@ -37,5 +37,5 @@ The procedure above runs from the shell through the same binary when the MCP con
 gitpulse-mcp call gitpulse_collision_risk repo_path=/abs/repo path=src/lib.rs
 gitpulse-mcp call gitpulse_worktree_radar repo_path=/abs/repo
 gitpulse-mcp call gitpulse_active_changes repo_path=/abs/repo limit=50
-gitpulse-mcp call gitpulse_worktree_claim --write --json @claim.json
+gitpulse-mcp call gitpulse_worktree_claim --write --json @claim.json  # --write runs under Bash permission rules: do not allowlist `gitpulse-mcp call` broadly
 ```

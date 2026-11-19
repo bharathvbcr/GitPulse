@@ -62,7 +62,7 @@ gitpulse-mcp read gitpulse://server/manifest # lists the resources and their URI
 gitpulse-mcp read gitpulse://status/abs/repo  # a facet: its name, then the absolute repo path
 ```
 
-`call` runs the server's own request path in-process: the same schema check, result budget, repository trust and policy gates. `key=value` is typed by the tool's schema (a string property takes the text as it is; integers, booleans, arrays and objects take JSON), and `--json '<object>'`, `--json -` (stdin) or `--json @file` passes the whole argument object. A tool that is not `readOnlyHint: true` runs only with `--write`. Pass `repo_path` explicitly and absolute: a shell's working directory is not necessarily the worktree you mean. Terminal tools (`gitpulse_terminal_*`) act for the GitPulse terminal the shell runs in; see the gitpulse-terminal skill for what works outside one.
+`call` runs the server's own request path in-process: the same schema check, result budget, repository trust and policy gates. `key=value` is typed by the tool's schema (a string property takes the text as it is; integers, booleans, arrays and objects take JSON), and `--json '<object>'`, `--json -` (stdin) or `--json @file` passes the whole argument object. A tool that is not `readOnlyHint: true` runs only with `--write`. Pass `repo_path` explicitly as a literal absolute path (never `$PWD` or a relative path): a shell's working directory is not necessarily the worktree you mean. Terminal tools (`gitpulse_terminal_*`) act for the GitPulse terminal the shell runs in; see the gitpulse-terminal skill for what works outside one.
 
 Stdout carries only the JSON answer; warnings go to stderr. A `call` or `read` waits at most `--timeout-ms` (by default 60000 for a read, the server's own per-request budget, and 600000 for a write, since a write stopped midway is left half done), then stops the tool, takes its git children down and exits 4. The exit status keeps the honesty rules below:
 
@@ -74,7 +74,11 @@ Stdout carries only the JSON answer; warnings go to stderr. A `call` or `read` w
 | `3` | The answer says it is incomplete: `ok: false`, `<facet>_ok: false`, `deferred: true` or `truncated: true` on any object in it (`worktrees.ok`, `agents.live.ok`), or the result budget cut it. The partial answer is still printed and stderr names where; read its `error` fields |
 | `4` | No answer within `--timeout-ms`. Nothing is printed; a write's outcome is unknown, so read the state back before retrying |
 
-This replaces a missing transport, not a loaded host: a read deferred under load is deferred from the shell too, and `gitpulse-mcp` on `PATH` is whatever `bun run mcp:install` last installed.
+This replaces a missing transport, not a loaded host: a read deferred under load is deferred from the shell too.
+
+**Permissions.** Over MCP the host asks for approval per tool, so a destructive tool (`gitpulse_worktree_prune`, `gitpulse_worktree_merge`, `gitpulse_delete_task`) is approved on its own. Through `gitpulse-mcp call --write` it is an ordinary Bash command, judged by the host's Bash permission rules. `--write` is a guard against accidents, not a security boundary. So do not allowlist `gitpulse-mcp call` (or `Bash(gitpulse-mcp:*)`) broadly: that approves every write tool at once. Allow the read form narrowly if at all, and leave `--write` calls to prompt.
+
+**Which binary runs.** `gitpulse-mcp` on `PATH` is the first one found, not necessarily the newest install: `/Applications/GitPulse.app`'s copy can come before `~/.cargo/bin`, so `bun run mcp:install` alone may not change what the shell runs. Check `command -v gitpulse-mcp` and `gitpulse-mcp --version` (a `commands:` line lists the one-shot commands it supports); when the app's copy is the one found and is stale, rebuild or reinstall the app.
 
 ## Honesty rules this server already enforces
 
