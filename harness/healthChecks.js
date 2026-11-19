@@ -674,9 +674,16 @@ export async function runHostLoadChecks(ctx) {
     // A slow read must not stack: the mounted card's own adaptive timer keeps
     // ticking while one status read is pending, and none of those ticks may
     // issue a second cmd_host_load_status or blank the card. The card's
-    // 4 s cadence is shortened to 100 ms for this remount only (the shim
-    // counts and rewrites exactly the timer's 4000 ms arms), so several ticks
-    // fit in well under a second. Cost: about 1.5 s.
+    // 4 s cadence is shortened to 100 ms for this remount only, so several ticks
+    // fit in well under a second. Cost: about 1.5 s. The shim rewrites every arm
+    // in [CARD_REFRESH_MS, 8 x CARD_REFRESH_MS): the adaptive timer stretches its
+    // delay under event-loop lag (default ceiling 8 x base, loadCadence.ts), so a
+    // loaded host arms 4800 ms, not 4000 ms, and an exact match would see too few
+    // arms. Unrelated short timers (under 4 s) are untouched; the card's lease
+    // block, whose own timer has a 10 s base, falls in the range and is shortened
+    // too, which only makes it read its own endpoint more often.
+    // CARD_REFRESH_MS mirrors REFRESH_MS in HostLoadSection.svelte, which is a
+    // private constant of the component and is not exported.
     const calm = { ...hostLoadStatusFixture(), previous_boot: null, problems: [] };
     await show(calm);
     let started = 0;
@@ -689,10 +696,11 @@ export async function runHostLoadChecks(ctx) {
       peak = Math.max(peak, inFlight);
       return new Promise(resolve => pending.push(() => { inFlight -= 1; resolve(calm); }));
     };
+    const CARD_REFRESH_MS = 4000;
     const realSetTimeout = window.setTimeout;
     let timerArms = 0;
     window.setTimeout = (handler, ms, ...rest) => {
-      if (ms === 4000) { timerArms += 1; return realSetTimeout(handler, 100, ...rest); }
+      if (typeof ms === "number" && ms >= CARD_REFRESH_MS && ms < CARD_REFRESH_MS * 8) { timerArms += 1; return realSetTimeout(handler, 100, ...rest); }
       return realSetTimeout(handler, ms, ...rest);
     };
     // The timer pauses while the document is not focused, and headless WebKit
