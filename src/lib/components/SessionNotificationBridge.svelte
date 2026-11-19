@@ -24,6 +24,7 @@
   import { bindAttention, sessionActivity } from "../terminal/sessionActivity";
   import { standingAttention } from "../stores/sessionAlertsStore";
   import { LAYERS } from "../ui/layers";
+  import Logo from "./Logo.svelte";
 
   let missed = $state<string | null>(null);
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -87,7 +88,10 @@
 </script>
 
 {#if missed}
-  <div class="session-activation gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">{missed}</div>
+  <div class="session-activation gp-card shadow-float" style:z-index={LAYERS.MODAL} role="status">
+    <span class="session-activation-logo" aria-hidden="true"><Logo size={16} variant="badge" /></span>
+    <span class="session-activation-text">{missed}</span>
+  </div>
 {/if}
 
 <style>
@@ -99,5 +103,17 @@
     padding: 12px;
     font-size: var(--text-xs);
     color: rgb(var(--c-text));
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .session-activation-logo {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .session-activation-text {
+    min-width: 0;
+    flex: 1;
   }
 </style>

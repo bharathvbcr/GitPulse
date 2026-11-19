@@ -311,3 +311,63 @@ pub(super) fn local_minute() -> Result<u16, WorkbenchError> {
     u16::try_from(time.tm_hour * 60 + time.tm_min)
         .map_err(|_| WorkbenchError::new("clock_error", "Invalid local calendar minute."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbundled_center_and_notification_calls_fail_closed_with_unsupported() {
+        if NSBundle::mainBundle().bundleIdentifier().is_some() {
+            return;
+        }
+        assert_eq!(center().unwrap_err().code, "unsupported");
+        assert_eq!(authorization(false).unwrap_err().code, "unsupported");
+        assert_eq!(authorization(true).unwrap_err().code, "unsupported");
+        assert_eq!(
+            submit("gitpulse.test.event-1", "Title", false)
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        assert_eq!(
+            post(
+                "gitpulse.session.t1",
+                "Claude",
+                "Needs input",
+                true,
+                SESSION_CATEGORY,
+            )
+            .unwrap_err()
+            .code,
+            "unsupported"
+        );
+        assert_eq!(delivered().unwrap_err().code, "unsupported");
+
+        // Off-main-thread install must fail closed with worker_error regardless
+        // of whether the test runner executes tests on the main thread.
+        let install_err = std::thread::spawn(|| {
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let status = Arc::new(Mutex::new(Status::default()));
+            install(tx, status)
+        })
+        .join()
+        .expect("join install thread")
+        .unwrap_err();
+        assert_eq!(install_err.code, "worker_error");
+
+        // Safe no-op when unbundled.
+        withdraw(&["gitpulse.test.event-1".to_owned()]);
+    }
+
+    #[test]
+    fn notification_categories_and_local_minute_are_well_formed() {
+        assert_eq!(WORKBENCH_CATEGORY, "gitpulse-workbench");
+        assert_eq!(SESSION_CATEGORY, "gitpulse-session");
+        assert_eq!(SNOOZE_ACTION, "snooze");
+        assert_ne!(WORKBENCH_CATEGORY, SESSION_CATEGORY);
+
+        let minute = local_minute().expect("local_minute succeeds");
+        assert!(minute < 1440, "minute out of range: {minute}");
+    }
+}

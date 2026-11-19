@@ -1608,4 +1608,110 @@ mod tests {
         assert_eq!(rm_json["op"], "remove");
         assert_eq!(rm_json["key"], expected_key);
     }
+
+    #[test]
+    fn bundled_notification_icons_and_plugin_logo_match_current_brand() {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        const LEGACY_PLUGIN_LOGO_SHA256: &str =
+            "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tauri_conf_raw = std::fs::read_to_string(manifest_dir.join("tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let tauri_conf: Value =
+            serde_json::from_str(&tauri_conf_raw).expect("parse tauri.conf.json");
+
+        let icons = tauri_conf["bundle"]["icon"]
+            .as_array()
+            .expect("bundle.icon array");
+        let icon_strs: Vec<&str> = icons.iter().filter_map(Value::as_str).collect();
+        for expected in [
+            "icons/32x32.png",
+            "icons/128x128.png",
+            "icons/128x128@2x.png",
+            "icons/icon.icns",
+            "icons/icon.ico",
+        ] {
+            assert!(
+                icon_strs.contains(&expected),
+                "tauri.conf.json bundle.icon missing {expected}"
+            );
+        }
+        assert_eq!(
+            tauri_conf["bundle"]["resources"]["../plugins/gitpulse/"],
+            json!("plugin/")
+        );
+
+        let icns = std::fs::read(manifest_dir.join("icons/icon.icns")).expect("read icon.icns");
+        assert!(icns.starts_with(b"icns"), "icon.icns missing icns header");
+
+        let read_png_ihdr = |path: &std::path::Path| -> (u32, u32, u8, u8, Vec<u8>) {
+            let bytes =
+                std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert!(
+                bytes.len() >= 26,
+                "PNG {} too short ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
+            assert_eq!(
+                &bytes[0..8],
+                &PNG_MAGIC,
+                "bad PNG magic in {}",
+                path.display()
+            );
+            assert_eq!(
+                &bytes[12..16],
+                b"IHDR",
+                "missing IHDR in {}",
+                path.display()
+            );
+            let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+            let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+            let bit_depth = bytes[24];
+            let color_type = bytes[25];
+            (width, height, bit_depth, color_type, bytes)
+        };
+
+        for (rel, expected_w, expected_h) in [
+            ("icons/32x32.png", 32, 32),
+            ("icons/128x128.png", 128, 128),
+            ("icons/128x128@2x.png", 256, 256),
+            ("icons/icon.png", 512, 512),
+        ] {
+            let (w, h, _, _, _) = read_png_ihdr(&manifest_dir.join(rel));
+            assert_eq!(
+                (w, h),
+                (expected_w, expected_h),
+                "unexpected size for {rel}"
+            );
+        }
+
+        let (logo_w, logo_h, bit_depth, color_type, logo_bytes) =
+            read_png_ihdr(&manifest_dir.join("../plugins/gitpulse/assets/logo.png"));
+        assert_eq!((logo_w, logo_h), (256, 256));
+        assert_eq!(bit_depth, 8, "plugin logo must be 8-bit");
+        assert_eq!(color_type, 6, "plugin logo must be RGBA");
+
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(&logo_bytes) {
+            let _ = write!(digest, "{byte:02x}");
+        }
+        assert_ne!(
+            digest, LEGACY_PLUGIN_LOGO_SHA256,
+            "plugins/gitpulse/assets/logo.png still matches legacy Sep-14 pulse-only PNG"
+        );
+    }
+
+    #[test]
+    fn session_host_routes_through_session_category_and_preserves_activity_heading() {
+        assert_eq!(ACTIVITY_HEADING, "GitPulse activity");
+        #[cfg(target_os = "macos")]
+        assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
+        assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
+        assert_eq!(crate::alerts::NATIVE_PREFIX, "gitpulse.session.");
+    }
 }

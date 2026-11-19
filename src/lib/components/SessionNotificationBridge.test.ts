@@ -1,7 +1,8 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { compile } from "svelte/compiler";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const read = (...path: string[]) => readFileSync(join(root, ...path), "utf8");
@@ -42,5 +43,45 @@ describe("SessionNotificationBridge placement", () => {
     const backend = read("src-tauri", "src", "workbench", "notifications.rs");
     expect(backend).toContain('Some(key) => opening.emit("gitpulse-session-notification-open", key.clone())');
     expect(backend).toMatch(/if session\.is_none\(\) \{\s*if let Err\(error\) = activate\(&host, &native\)/);
+  });
+});
+
+describe("SessionNotificationBridge branding and compilation", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = read("src", "lib", "components", "SessionNotificationBridge.svelte");
+  const scratch = join(root, "tmp");
+  mkdirSync(scratch, { recursive: true });
+  const generatedDir = mkdtempSync(join(scratch, "vitest-session-bridge-"));
+  const generatedPath = join(generatedDir, "SessionNotificationBridgeMissed.svelte");
+  const MISSED_LINE = "let missed = $state<string | null>(null);";
+
+  beforeAll(() => {
+    expect(source).toContain(MISSED_LINE);
+    const renderedCopy = source
+      .replace(MISSED_LINE, 'let missed = $state<string | null>("That terminal session has ended.");')
+      .replace(/from "(\.\.?\/[^"]+)"/g, (_m, spec: string) => `from "${join(here, spec).replaceAll("\\", "/")}"`)
+      .replace(/from "\.\/Logo\.svelte"/g, `from "${join(here, "Logo.svelte").replaceAll("\\", "/")}"`);
+    writeFileSync(generatedPath, renderedCopy);
+  });
+
+  afterAll(() => {
+    rmSync(generatedDir, { recursive: true, force: true });
+  });
+
+  it("compiles cleanly and imports Logo inside aria-hidden", () => {
+    const { warnings } = compile(source, { generate: "client", filename: "SessionNotificationBridge.svelte" });
+    expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
+    expect(source).toMatch(/import Logo from "\.\/Logo\.svelte";/);
+    expect(source).toMatch(/aria-hidden="true"[^>]*><Logo\b/);
+  });
+
+  it("renders .session-activation with the current GitPulse badge Logo when a notice is active", async () => {
+    const component = (await import(/* @vite-ignore */ generatedPath)).default;
+    const { render } = await import("svelte/server");
+    const { body } = render(component);
+    expect(body).toMatch(/class="session-activation gp-card shadow-float\b/);
+    expect(body).toContain("That terminal session has ended.");
+    expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
+    expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
   });
 });
