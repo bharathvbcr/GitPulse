@@ -461,7 +461,10 @@ mod tests {
         let first = feed.take().unwrap();
         let second = feed.take().unwrap();
         assert_eq!(first.session, "flood");
-        assert_eq!(second.session, "echo", "echo waits one batch, not the flood");
+        assert_eq!(
+            second.session, "echo",
+            "echo waits one batch, not the flood"
+        );
     }
 
     #[test]
@@ -471,7 +474,10 @@ mod tests {
         feed.push("a", &vec![b'z'; 3 * BATCH_BYTES], true);
         let stale = feed.take().unwrap();
         feed.reset("a");
-        assert!(!feed.is_current(&stale), "a batch taken before a reset is stale");
+        assert!(
+            !feed.is_current(&stale),
+            "a batch taken before a reset is stale"
+        );
         feed.applied(&stale);
         let lag = feed.lag("a").unwrap();
         assert_eq!((lag.lag_bytes(), lag.gap_bytes), (0, 0), "{lag:?}");

@@ -4446,8 +4446,10 @@ pub(crate) mod tests {
             .unwrap()
         };
         assert!(
-            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(20)))
-                .is_ok(),
+            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                20
+            )))
+            .is_ok(),
             "delivery waited on the registry lock a reader held"
         );
         pusher.join().unwrap();
@@ -4484,7 +4486,10 @@ pub(crate) mod tests {
         );
         let inner = state.orchestration.lock();
         let (text, ..) = render_redacted_screen(inner.sessions.get(child).unwrap(), 50);
-        assert!(text.contains("TAIL_MARKER"), "the newest output survives: {text}");
+        assert!(
+            text.contains("TAIL_MARKER"),
+            "the newest output survives: {text}"
+        );
     }
 
     /// Output reaches the screen in the order it was delivered however it was
@@ -4527,14 +4532,21 @@ pub(crate) mod tests {
             json!({"complete": true, "lag_bytes": 0, "gap_bytes": 0})
         );
         let inner = state.orchestration.lock();
-        let rec = inner.sessions.get(child).expect("an ended shell child is retained");
+        let rec = inner
+            .sessions
+            .get(child)
+            .expect("an ended shell child is retained");
         let (text, lines, ..) = render_redacted_screen(rec, MAX_READ_LINES);
         assert_eq!(lines, MAX_READ_LINES);
         let seen: Vec<usize> = text
             .lines()
             .map(|l| l.strip_prefix("ROW").unwrap().parse().unwrap())
             .collect();
-        assert_eq!(*seen.last().unwrap(), rows, "the final row is on the screen");
+        assert_eq!(
+            *seen.last().unwrap(),
+            rows,
+            "the final row is on the screen"
+        );
         assert!(
             seen.windows(2).all(|w| w[1] == w[0] + 1),
             "rows are consecutive, so in order and none lost"
@@ -4596,7 +4608,9 @@ pub(crate) mod tests {
         let repo = dir.path().canonicalize().unwrap();
         let state = TerminalSessions::default();
         tracked_child(&state, &repo, "term-202-b");
-        state.orchestration.observe_output("term-202-b", b"hello\r\n");
+        state
+            .orchestration
+            .observe_output("term-202-b", b"hello\r\n");
         state.orchestration.remove_aborted("term-202-b");
         assert!(state.orchestration.feed.lag("term-202-b").is_none());
         assert_eq!(state.orchestration.screen_status("term-202-b"), Value::Null);
@@ -4610,8 +4624,10 @@ pub(crate) mod tests {
         })
         .unwrap();
         assert!(
-            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(20)))
-                .is_ok(),
+            rx.recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                20
+            )))
+            .is_ok(),
             "dropping the registry did not stop its worker"
         );
     }
