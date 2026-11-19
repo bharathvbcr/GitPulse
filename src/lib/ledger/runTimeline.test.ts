@@ -59,7 +59,7 @@ describe("stateFor", () => {
     expect(stateFor("tool_finished")).toBe("working");
     expect(stateFor("turn_finished")).toBe("idle");
     expect(stateFor("permission_request")).toBe("waiting_you");
-    expect(stateFor("idle_prompt")).toBe("waiting_you");
+    expect(stateFor("idle_prompt")).toBe("idle");
     expect(stateFor("error")).toBe("waiting_you");
     expect(stateFor("session_ended")).toBe("ended");
   });

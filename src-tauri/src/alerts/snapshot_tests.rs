@@ -116,6 +116,99 @@ fn hub_state_transitions_preserve_age_across_restatements_and_clear_on_end() {
     assert!(snapshot_of(&tracked, 42, 100, 6000).sessions.is_empty());
 }
 
+fn terminal_signal(key: &str, channel: &'static str, detail: Option<&str>) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Terminal,
+        label: "Claude Code".into(),
+        place: Some("/repo".into()),
+        event: None,
+        detail: detail.map(str::to_owned),
+        is_agent: true,
+        channel,
+        subject: None,
+        subagent: false,
+        agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
+    }
+}
+
+#[test]
+fn mapped_standing_state_separates_error_idle_and_informational_signals_from_blocked() {
+    let mut tracked: HashMap<String, Tracked> = HashMap::new();
+    let counters = Counters::default();
+    let t0 = Instant::now();
+
+    // Hook `error` maps to `"error"` (not `"blocked"`).
+    let _ = admit_at(
+        hook_notice("term-err", Some("error"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    // Bare BEL and informational OSC map to `"idle"` (never `"blocked"`).
+    let _ = admit_at(
+        terminal_signal("term-bell", "bell", None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        terminal_signal("term-osc", "osc9", Some("Build done")),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    // Hook `idle_prompt` maps to `"idle"`, while `agent_needs_input` maps to `"blocked"`.
+    let _ = admit_at(
+        hook_notice("term-idle", Some("idle_prompt"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        hook_notice("term-ask", Some("agent_needs_input"), None, None),
+        t0,
+        1_000,
+        &mut tracked,
+        &counters,
+    );
+
+    // Post-HOOK_SHADOW bare BEL and OSC 9 must never clobber `"blocked"` hook state.
+    let later = t0 + HOOK_SHADOW + Duration::from_secs(5);
+    let _ = admit_at(
+        terminal_signal("term-ask", "bell", None),
+        later,
+        20_000,
+        &mut tracked,
+        &counters,
+    );
+    let _ = admit_at(
+        terminal_signal("term-ask", "osc9", Some("FYI")),
+        later + Duration::from_secs(1),
+        21_000,
+        &mut tracked,
+        &counters,
+    );
+
+    let snap = snapshot_of(&tracked, 42, 100, 22_000);
+    let states: HashMap<&str, &str> = snap
+        .sessions
+        .iter()
+        .map(|s| (s.key.as_str(), s.state.as_str()))
+        .collect();
+    assert_eq!(states.get("term-err"), Some(&"error"));
+    assert_eq!(states.get("term-bell"), Some(&"idle"));
+    assert_eq!(states.get("term-osc"), Some(&"idle"));
+    assert_eq!(states.get("term-idle"), Some(&"idle"));
+    assert_eq!(states.get("term-ask"), Some(&"blocked"));
+}
+
 #[test]
 fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
     let dir = tempfile::TempDir::new().unwrap();

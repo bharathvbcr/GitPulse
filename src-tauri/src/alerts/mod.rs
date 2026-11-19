@@ -197,24 +197,38 @@ impl Notice {
             .map_or(bridge::Role::Banner, |event| event.role)
     }
 
-    /// What the user is asked for, `None` for a bare signal.
-    fn need(&self) -> Option<bridge::Need> {
-        self.event.and_then(bridge::event).map(|event| event.need)
-    }
-
     /// A terminal convention that says only that something was signalled.
     fn is_bare_signal(&self) -> bool {
         self.origin == Origin::Terminal && self.event.is_none()
     }
 
-    /// Lower first: a stalled agent outranks a finished one when the rate
-    /// limit decides which banner goes out now.
-    fn urgency(&self) -> u8 {
-        match self.need() {
-            Some(bridge::Need::Ask) => 0,
-            Some(bridge::Need::Error) => 1,
-            Some(bridge::Need::Finished) => 2,
-            None | Some(bridge::Need::Clear) => 3,
+    /// A bare `BEL` (`0x07`) from the PTY stream with no hook event.
+    fn is_bare_bell(&self) -> bool {
+        self.origin == Origin::Terminal && self.event.is_none() && self.channel == "bell"
+    }
+
+    /// An OSC notification (`OSC 9`, `OSC 777`, `OSC 99`) from the PTY stream.
+    fn is_osc_signal(&self) -> bool {
+        self.origin == Origin::Terminal
+            && self.event.is_none()
+            && matches!(self.channel, "osc9" | "osc777" | "osc99")
+    }
+
+    /// Semantic urgency of this notice.
+    pub fn urgency(&self) -> bridge::Urgency {
+        self.event
+            .and_then(bridge::event)
+            .map_or(bridge::Urgency::Informational, |event| event.urgency)
+    }
+
+    /// Lower first: a blocking agent outranks an error, which outranks an
+    /// informational notice, when the rate limit decides which banner goes out now.
+    fn banner_priority(&self) -> u8 {
+        match self.urgency() {
+            bridge::Urgency::Blocking => 0,
+            bridge::Urgency::Error => 1,
+            bridge::Urgency::Informational => 2,
+            bridge::Urgency::Clear => 3,
         }
     }
 
@@ -305,8 +319,12 @@ pub struct Attention {
     /// event whose need is [`bridge::Need::Clear`] tells the renderer that
     /// nothing stands any more.
     pub event: Option<&'static str>,
+    /// Semantic urgency (`"blocking" | "error" | "informational" | "clear"`).
+    pub urgency: &'static str,
     /// What the agent itself said, sanitized and bounded.
     pub detail: Option<String>,
+    /// Epoch milliseconds when this attention event was recorded.
+    pub at: u64,
     /// Optional turn-quiescence flag from Antigravity hooks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fully_idle: Option<bool>,
@@ -319,7 +337,7 @@ impl Attention {
     /// None for a notice the renderer can do nothing with: not an agent, or
     /// a hook report from outside any GitPulse terminal (keyed `hook-…`, which
     /// names no session a task attempt could own).
-    fn of(notice: &Notice) -> Option<Self> {
+    fn of(notice: &Notice, at: u64) -> Option<Self> {
         if !shows(notice) {
             return None;
         }
@@ -332,19 +350,23 @@ impl Attention {
             session: notice.key.clone(),
             channel: notice.channel,
             event: notice.event,
+            urgency: notice.urgency().as_str(),
             detail: notice.detail.as_deref().and_then(bound),
+            at,
             fully_idle: notice.fully_idle,
             provider_session_id: notice.provider_session_id.clone(),
         })
     }
 
     /// Tells the renderer that nothing stands for `session` any more.
-    fn cleared(session: &str, by: &Notice) -> Self {
+    fn cleared(session: &str, by: &Notice, at: u64) -> Self {
         Self {
             session: session.to_owned(),
             channel: by.channel,
             event: by.event,
+            urgency: bridge::Urgency::Clear.as_str(),
             detail: None,
+            at,
             fully_idle: by.fully_idle,
             provider_session_id: by.provider_session_id.clone(),
         }
@@ -867,6 +889,13 @@ impl Standing {
             .map(|event| event.need)
     }
 
+    fn urgency(&self) -> bridge::Urgency {
+        self.attention
+            .event
+            .and_then(bridge::event)
+            .map_or(bridge::Urgency::Informational, |event| event.urgency)
+    }
+
     fn is_permission(&self) -> bool {
         matches!(
             self.attention.event,
@@ -1280,6 +1309,8 @@ fn mapped_standing_state(standing: &Standing) -> &'static str {
     match standing.attention.event {
         Some("idle_prompt") => "idle",
         Some("agent_completed" | "turn_finished") => "done",
+        Some("error") => "error",
+        None if standing.attention.urgency == bridge::Urgency::Informational.as_str() => "idle",
         _ => "blocked",
     }
 }
@@ -1316,6 +1347,17 @@ fn update_hub_state(entry: &mut Tracked, event: Option<&'static str>, now_ms: u6
 fn admit(
     notice: Notice,
     now: Instant,
+    tracked: &mut HashMap<String, Tracked>,
+    counters: &Counters,
+) -> Option<Attention> {
+    admit_at(notice, now, wall_now_ms(), tracked, counters)
+}
+
+#[must_use = "an evicted session's unsaid announcement must be announced"]
+fn admit_at(
+    notice: Notice,
+    now: Instant,
+    now_ms: u64,
     tracked: &mut HashMap<String, Tracked>,
     counters: &Counters,
 ) -> Option<Attention> {
@@ -1367,8 +1409,8 @@ fn admit(
         entry.place = Some(place.to_owned());
     }
     let event = notice.event;
-    admit_body(entry, notice, known, now, counters);
-    update_hub_state(entry, event, wall_now_ms());
+    admit_body(entry, notice, known, now, now_ms, counters);
+    update_hub_state(entry, event, now_ms);
     farewell
 }
 
@@ -1377,32 +1419,43 @@ fn admit_body(
     mut notice: Notice,
     known: bool,
     now: Instant,
+    now_ms: u64,
     counters: &Counters,
 ) {
     match notice.role() {
         bridge::Role::Resolve => {
-            resolve(entry, &notice, known, counters);
+            resolve(entry, &notice, known, now_ms, counters);
             return;
         }
         bridge::Role::State => {
-            stand(entry, &notice);
+            stand(entry, &notice, now_ms);
             return;
         }
         bridge::Role::Banner => {}
     }
 
-    // One request, two channels. A bell right behind a hook report from the
+    // One request, two channels. A bare BEL right behind a hook report from the
     // same session is that report rung again, and has nothing to add.
-    if notice.is_bare_signal() && entry.hooked_within(now, HOOK_SHADOW) {
+    // OSC 9/777/99 carry structured text and are never dropped by HOOK_SHADOW.
+    if notice.is_bare_bell() && entry.hooked_within(now, HOOK_SHADOW) {
         counters.coalesced.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    // A bell later than that, while a hook's question still stands, is a
-    // reminder of that question — not a new, reasonless one replacing it.
-    // Likewise the `Notification` that follows `PermissionRequest`: same
-    // dialog, said less precisely. Either borrows what stands and leaves it.
+    // A bare BEL later than that, while a hook's question or an OSC signal
+    // with detail still stands, is a reminder — not a new, reasonless one
+    // replacing it. Likewise the `Notification` that follows `PermissionRequest`:
+    // same dialog, said less precisely. Either borrows what stands and leaves it.
     let restates = match &entry.standing {
-        Some(standing) if standing.from_hook && notice.is_bare_signal() => {
+        Some(standing) if standing.from_hook && notice.is_bare_bell() => {
+            notice.event = standing.attention.event;
+            true
+        }
+        Some(standing)
+            if notice.is_bare_bell()
+                && notice.detail.is_none()
+                && (matches!(standing.attention.channel, "osc9" | "osc777" | "osc99")
+                    || standing.attention.detail.is_some()) =>
+        {
             notice.event = standing.attention.event;
             true
         }
@@ -1421,7 +1474,28 @@ fn admit_body(
             }
         }
     } else {
-        stand(entry, &notice);
+        let keep_standing = notice.is_osc_signal()
+            && entry.standing.as_ref().is_some_and(|standing| {
+                standing.from_hook
+                    && matches!(
+                        standing.urgency(),
+                        bridge::Urgency::Blocking | bridge::Urgency::Error
+                    )
+            });
+        if !keep_standing {
+            stand(entry, &notice, now_ms);
+        }
+    }
+    // Informational signals never displace a Blocking or Error pending banner.
+    let keep_pending = entry.pending.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.urgency(),
+            bridge::Urgency::Blocking | bridge::Urgency::Error
+        ) && notice.urgency() == bridge::Urgency::Informational
+    });
+    if keep_pending {
+        counters.coalesced.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     // A notice this one displaces was never shown and never judged. Counting
     // it is what lets the offered total be reconciled against the outcomes,
@@ -1437,8 +1511,8 @@ fn admit_body(
 /// Records what a session now stands asking for and queues it to be
 /// announced. Newest wins: within the gap, what the agent asks for last is
 /// what it is waiting for.
-fn stand(entry: &mut Tracked, notice: &Notice) {
-    let Some(attention) = Attention::of(notice) else {
+fn stand(entry: &mut Tracked, notice: &Notice, now_ms: u64) {
+    let Some(attention) = Attention::of(notice, now_ms) else {
         return;
     };
     entry.standing = Some(Standing {
@@ -1457,13 +1531,13 @@ fn stand(entry: &mut Tracked, notice: &Notice) {
 /// still be showing what it was told then, and an answer from the user ends
 /// that whatever it was, so it is announced anyway: forgetting a session must
 /// not strand its pane on a question that has been answered.
-fn resolve(entry: &mut Tracked, notice: &Notice, known: bool, counters: &Counters) {
+fn resolve(entry: &mut Tracked, notice: &Notice, known: bool, now_ms: u64, counters: &Counters) {
     let Some(standing) = &entry.standing else {
         if notice.event == Some("prompt_submitted")
             && shows(notice)
             && (!known || notice.provider_session_id.is_some() || notice.fully_idle.is_some())
         {
-            entry.unannounced = Some(Attention::cleared(&notice.key, notice));
+            entry.unannounced = Some(Attention::cleared(&notice.key, notice, now_ms));
         }
         return;
     };
@@ -1494,7 +1568,7 @@ fn resolve(entry: &mut Tracked, notice: &Notice, known: bool, counters: &Counter
         return;
     }
     entry.standing = None;
-    entry.unannounced = Some(Attention::cleared(&notice.key, notice));
+    entry.unannounced = Some(Attention::cleared(&notice.key, notice, now_ms));
     // A banner still waiting out its window would now ask a question that
     // has been answered.
     if entry.pending.take().is_some() {
@@ -1532,7 +1606,7 @@ fn flush(
         .filter_map(|(key, entry)| {
             let notice = entry.pending.as_ref()?;
             let ready = final_pass || entry.due_at().is_some_and(|at| at <= now);
-            ready.then(|| (notice.urgency(), entry.pending_since, key.clone()))
+            ready.then(|| (notice.banner_priority(), entry.pending_since, key.clone()))
         })
         .collect();
     due.sort();

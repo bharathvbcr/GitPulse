@@ -481,17 +481,16 @@ fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
             Instant::now(),
         );
         assert_eq!(driver.recorder.count(), 0, "the banner was suppressed");
-        assert_eq!(
-            driver.recorder.announcements(),
-            vec![Attention {
-                session: "term-1".into(),
-                channel: "hook",
-                event: Some("permission_prompt"),
-                detail: Some("Bash: cargo test".into()),
-                fully_idle: None,
-                provider_session_id: None,
-            }]
-        );
+        let said = driver.recorder.announcements();
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].session, "term-1");
+        assert_eq!(said[0].channel, "hook");
+        assert_eq!(said[0].event, Some("permission_prompt"));
+        assert_eq!(said[0].urgency, "blocking");
+        assert_eq!(said[0].detail.as_deref(), Some("Bash: cargo test"));
+        assert!(said[0].at > 0);
+        assert_eq!(said[0].fully_idle, None);
+        assert_eq!(said[0].provider_session_id, None);
     }
 }
 
@@ -630,8 +629,8 @@ fn a_held_announcement_survives_pruning_until_it_is_made() {
 /// test (`src/lib/terminal/sessionActivity.test.ts`) reads these two literals
 /// and parses them, so a change to the struct's shape fails here first and
 /// then shows the renderer the shape it must accept.
-const WIRE_HOOK: &str = r#"{"session":"term-1","channel":"hook","event":"permission_prompt","detail":"Bash: cargo test"}"#;
-const WIRE_SIGNAL: &str = r#"{"session":"term-1","channel":"bell","event":null,"detail":null}"#;
+const WIRE_HOOK: &str = r#"{"session":"term-1","channel":"hook","event":"permission_prompt","urgency":"blocking","detail":"Bash: cargo test","at":1000}"#;
+const WIRE_SIGNAL: &str = r#"{"session":"term-1","channel":"bell","event":null,"urgency":"informational","detail":null,"at":1000}"#;
 
 #[test]
 fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
@@ -639,7 +638,9 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         session: "term-1".into(),
         channel: "hook",
         event: Some("permission_prompt"),
+        urgency: "blocking",
         detail: Some("Bash: cargo test".into()),
+        at: 1000,
         fully_idle: None,
         provider_session_id: None,
     };
@@ -648,7 +649,9 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         session: "term-1".into(),
         channel: "bell",
         event: None,
+        urgency: "informational",
         detail: None,
+        at: 1000,
         fully_idle: None,
         provider_session_id: None,
     };
@@ -657,13 +660,15 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         session: "term-1".into(),
         channel: "hook",
         event: Some("turn_finished"),
+        urgency: "informational",
         detail: None,
+        at: 2000,
         fully_idle: Some(true),
         provider_session_id: Some("conv-uuid-123".into()),
     };
     assert_eq!(
         serde_json::to_string(&agy_idle).unwrap(),
-        r#"{"session":"term-1","channel":"hook","event":"turn_finished","detail":null,"fully_idle":true,"provider_session_id":"conv-uuid-123"}"#
+        r#"{"session":"term-1","channel":"hook","event":"turn_finished","urgency":"informational","detail":null,"at":2000,"fully_idle":true,"provider_session_id":"conv-uuid-123"}"#
     );
 }
 
@@ -1094,4 +1099,201 @@ fn the_stale_counter_is_on_the_wire() {
     };
     let wire = serde_json::to_value(&status).unwrap();
     assert_eq!(wire["stale"], 3);
+}
+
+fn osc(key: &str, channel: &'static str, detail: &str) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Terminal,
+        label: "Claude Code".into(),
+        place: Some("GitPulse".into()),
+        event: None,
+        detail: Some(detail.to_owned()),
+        is_agent: true,
+        channel,
+        subject: None,
+        subagent: false,
+        agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
+    }
+}
+
+#[test]
+fn every_hook_event_carries_its_semantic_urgency_and_timestamp() {
+    let mut tracked: HashMap<String, Tracked> = HashMap::new();
+    let counters = Counters::default();
+    let now = Instant::now();
+
+    for (idx, event) in bridge::EVENTS.iter().enumerate() {
+        let key = format!("term-{idx}");
+        if event.role == bridge::Role::Resolve {
+            let _ = admit_at(
+                hook(&key, "agent_needs_input", None),
+                now,
+                1_000,
+                &mut tracked,
+                &counters,
+            );
+        }
+        let ts = 5_000 + idx as u64;
+        let _ = admit_at(
+            hook(&key, event.name, None),
+            now,
+            ts,
+            &mut tracked,
+            &counters,
+        );
+        let unannounced = tracked[&key]
+            .unannounced
+            .as_ref()
+            .expect("expected announcement");
+        assert_eq!(
+            unannounced.urgency,
+            event.urgency.as_str(),
+            "{}",
+            event.name
+        );
+        assert_eq!(unannounced.at, ts, "{}", event.name);
+    }
+}
+
+#[test]
+fn banner_priority_ranks_blocking_and_error_ahead_of_idle_prompt_and_finished() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    for session in 0..RATE_CAPACITY {
+        driver.tick(Some(notice(&format!("term-{session}"))), start);
+    }
+    // Queue informational idle_prompt and agent_completed first, then error, then blocking.
+    driver.tick(Some(hook("term-idle", "idle_prompt", None)), start);
+    driver.tick(
+        Some(hook("term-done", "agent_completed", None)),
+        start + Duration::from_millis(1),
+    );
+    driver.tick(
+        Some(hook("term-err", "error", None)),
+        start + Duration::from_millis(2),
+    );
+    driver.tick(
+        Some(hook("term-ask", "permission_prompt", None)),
+        start + Duration::from_millis(3),
+    );
+
+    driver.tick(None, start + RATE_REFILL);
+    assert_eq!(
+        driver.recorder.natives().last().map(String::as_str),
+        Some("gitpulse.session.term-ask"),
+        "blocking permission_prompt must outrank error and idle_prompt"
+    );
+    driver.tick(None, start + RATE_REFILL * 2);
+    assert_eq!(
+        driver.recorder.natives().last().map(String::as_str),
+        Some("gitpulse.session.term-err"),
+        "error must outrank idle_prompt"
+    );
+    driver.tick(None, start + RATE_REFILL * 3);
+    assert_eq!(
+        driver.recorder.natives().last().map(String::as_str),
+        Some("gitpulse.session.term-idle"),
+        "earliest informational banner goes next"
+    );
+}
+
+#[test]
+fn osc_notifications_bypass_hook_shadow_and_retain_own_channel_and_detail() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "turn_finished", None)), start);
+    // OSC 9 arriving inside HOOK_SHADOW must not be dropped or rewritten to turn_finished.
+    driver.tick(
+        Some(osc("term-1", "osc9", "Tests passed")),
+        start + Duration::from_secs(1),
+    );
+    driver.tick(None, start + COALESCE * 2);
+    assert_eq!(driver.recorder.bodies(), vec!["Tests passed".to_string()]);
+    let last = driver.recorder.announcements().pop().unwrap();
+    assert_eq!(last.channel, "osc9");
+    assert_eq!(last.event, None);
+    assert_eq!(last.urgency, "informational");
+    assert_eq!(last.detail.as_deref(), Some("Tests passed"));
+}
+
+#[test]
+fn post_hook_shadow_bare_bell_and_osc_never_overwrite_blocking_hook_standing() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(
+        Some(hook("term-1", "permission_prompt", Some("Bash: deploy"))),
+        start,
+    );
+    // Inside COALESCE window while permission_prompt is still pending (or after delivery),
+    // informational signals after HOOK_SHADOW must not overwrite blocking standing or pending banner.
+    let after_shadow = start + HOOK_SHADOW + Duration::from_secs(1);
+    driver.tick(Some(notice("term-1")), after_shadow);
+    driver.tick(
+        Some(osc("term-1", "osc777", "Background task finished")),
+        after_shadow + Duration::from_millis(50),
+    );
+    let standing = driver.tracked["term-1"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.event, Some("permission_prompt"));
+    assert_eq!(standing.attention.urgency, "blocking");
+    assert_eq!(standing.attention.detail.as_deref(), Some("Bash: deploy"));
+    assert!(standing.from_hook);
+
+    // Also verify pending Blocking banner is never displaced by an informational signal.
+    let mut driver2 = Driver::new();
+    driver2.tick(Some(hook("term-2", "agent_completed", None)), start);
+    let t_ask = start + Duration::from_millis(100);
+    driver2.tick(
+        Some(hook("term-2", "permission_prompt", Some("Bash: rm"))),
+        t_ask,
+    );
+    driver2.tick(
+        Some(osc("term-2", "osc99", "Minor note")),
+        t_ask + Duration::from_millis(20),
+    );
+    assert_eq!(
+        driver2.tracked["term-2"].pending.as_ref().unwrap().event,
+        Some("permission_prompt")
+    );
+}
+
+#[test]
+fn bare_bell_does_not_erase_standing_osc_detail() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(osc("term-1", "osc9", "Build finished")), start);
+    let later = start + HOOK_SHADOW + Duration::from_secs(5);
+    driver.tick(Some(notice("term-1")), later);
+    let standing = driver.tracked["term-1"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.channel, "osc9");
+    assert_eq!(standing.attention.detail.as_deref(), Some("Build finished"));
+    // Only the initial OSC announcement was emitted; bare BEL did not overwrite it.
+    assert_eq!(driver.recorder.announcements().len(), 1);
+}
+
+#[test]
+fn osc7501_idle_and_working_clear_standing_attention() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    let mut blocked = hook(
+        "term-1",
+        scan::HerdrState::Blocked.bridge_event(),
+        Some("Approve"),
+    );
+    blocked.origin = Origin::Terminal;
+    blocked.channel = "osc7501";
+    driver.tick(Some(blocked), start);
+    assert_eq!(driver.standing(), Some("agent_needs_input"));
+
+    let mut idle = hook("term-1", scan::HerdrState::Idle.bridge_event(), None);
+    idle.origin = Origin::Terminal;
+    idle.channel = "osc7501";
+    driver.tick(Some(idle), start + Duration::from_secs(2));
+    assert_eq!(driver.standing(), None);
+    assert_eq!(
+        driver.recorder.announcements().last().unwrap().urgency,
+        "clear"
+    );
 }
