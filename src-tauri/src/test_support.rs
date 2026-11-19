@@ -236,10 +236,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         && args.get(1).is_some_and(|key| key.starts_with("user."))
         && dir.join(".githooks/pre-commit").is_file()
     {
-        panic!(
-            "refusing to persist a fixture identity in {}; this checkout rejects it",
-            dir.display()
-        );
+        panic!("refusing to persist a fixture identity; this checkout rejects it");
     }
     let dir = plain_git_path(dir);
     let mut command = Command::new("git");
@@ -267,11 +264,63 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let output = child.wait_with_output().expect("wait for git");
     assert!(
         output.status.success(),
-        "git {args:?} failed with {}",
+        "fixture git command failed with {}",
         output.status
     );
     if args.first() == Some(&"init") {
+        pin_repo_local_identity(&dir);
         trust_repo(&dir);
+    }
+}
+
+/// Writes hermetic local identity/signing settings into a test repo's
+/// `.git/config` so production `git_cli` writes (which strip
+/// `GIT_CONFIG_GLOBAL`) can commit on runners whose passwd GECOS field is empty.
+#[cfg(test)]
+fn pin_repo_local_identity(dir: &Path) {
+    let dir = plain_git_path(dir);
+    if dir.join(".githooks/pre-commit").is_file() {
+        return;
+    }
+    for (key, value) in [
+        ("user.name", "GitPulse"),
+        ("user.email", "gitpulse@test.local"),
+        ("commit.gpgsign", "false"),
+    ] {
+        let mut cmd = Command::new("git");
+        pin_git(&mut cmd);
+        cmd.args(["config", "--local", key, value])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = cmd.output_locked().expect("spawn git config");
+        assert!(
+            output.status.success(),
+            "fixture git config failed with {}",
+            output.status
+        );
+    }
+}
+
+/// The hermetic config directory inside this test process's isolated `HOME`,
+/// unaffected by transient `HOME` rebinds on sibling threads.
+#[cfg(test)]
+pub(crate) fn hermetic_config_dir() -> PathBuf {
+    let home = env::hermetic::home();
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("GitPulse")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        home.join("AppData").join("Roaming").join("GitPulse")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        home.join(".config").join("gitpulse")
     }
 }
 
@@ -504,6 +553,7 @@ pub(crate) fn repo_parked_in_a_sequence(revert: bool) -> TempDir {
         ["side~1", "side"]
     };
     let mut command = Command::new("git");
+    pin_git(&mut command);
     command
         .args([
             "-c",
@@ -544,12 +594,15 @@ pub(crate) fn repo_parked_in_a_sequence(revert: bool) -> TempDir {
 #[cfg(test)]
 pub(crate) fn git_repo() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
-    let status = Command::new("git")
+    let mut cmd = Command::new("git");
+    pin_git(&mut cmd);
+    let status = cmd
         .args(["init", "-b", "main"])
         .current_dir(plain_git_path(dir.path()))
         .status_locked()
         .expect("git init");
     assert!(status.success());
+    pin_repo_local_identity(dir.path());
     trust_repo(dir.path());
     dir
 }

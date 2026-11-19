@@ -800,11 +800,42 @@ const TEXTCONV_SUBCOMMANDS: &[&str] = &["diff", "show", "log", "blame"];
 /// out of every bulk format string by a source-scan test.
 const SIGNATURE_PRINTING_SUBCOMMANDS: &[&str] = &["show", "log"];
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_PATH: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Current thread-local test `PATH` override for helpers that hop threads.
+#[cfg(test)]
+pub(crate) fn current_test_git_path() -> Option<std::ffi::OsString> {
+    TEST_GIT_PATH.with(|slot| slot.borrow().clone())
+}
+
+/// Overrides `PATH` for `git_command` on the current thread only, restoring on drop.
+#[cfg(test)]
+pub(crate) fn with_test_git_path<T>(path: &std::ffi::OsStr, f: impl FnOnce() -> T) -> T {
+    struct Reset(Option<std::ffi::OsString>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_GIT_PATH.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = TEST_GIT_PATH.with(|slot| slot.borrow_mut().replace(path.to_os_string()));
+    let _reset = Reset(prev);
+    f()
+}
+
 /// Reads `PATH`/`HOME` from the process and defers to
 /// [`git_command_with_env`], mirroring the [`capture_command`] /
 /// [`capture_command_with_env`] split so the environment stays injectable for
 /// tests instead of being read from under them.
 fn git_command(repo: Option<&Path>, args: &[&str]) -> Command {
+    #[cfg(test)]
+    let path_var = TEST_GIT_PATH
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| std::env::var_os("PATH"));
+    #[cfg(not(test))]
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     git_command_with_env(repo, args, path_var.as_deref(), home.as_deref())

@@ -308,6 +308,10 @@ where
     let clock = Arc::clone(clock);
     let flight = Arc::clone(flight);
     let key = key.to_string();
+    #[cfg(test)]
+    let test_git_path = crate::engine::git_cli::current_test_git_path();
+    #[cfg(test)]
+    let test_transcript = super::test_transcript_root::get();
     // The worker catches its own panic and turns it into the pass's reported
     // error, so waiters are always woken; the supervisor adds the Diagnostics
     // record for anything that escapes that.
@@ -318,13 +322,31 @@ where
         // dozens of worktrees cannot spend the reactive spawn budget the
         // interface reads from. The class is entered here, on the worker,
         // because a thread hop would otherwise start the pass as Reactive.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        let run_work = || {
+            let run_git = || {
+                crate::engine::process::with_background_processes(|| {
+                    work(&budget, &flight.progress)
+                })
+            };
+            let run_with_git = || match test_git_path.as_deref() {
+                Some(path) => crate::engine::git_cli::with_test_git_path(path, run_git),
+                None => run_git(),
+            };
+            match test_transcript.as_deref() {
+                Some(root) => super::test_transcript_root::with(root, run_with_git),
+                None => run_with_git(),
+            }
+        };
+        #[cfg(not(test))]
+        let run_work = || {
             crate::engine::process::with_background_processes(|| work(&budget, &flight.progress))
-        }))
-        .unwrap_or_else(|_| CatchUp {
-            error: "catch-up panicked".into(),
-            ..CatchUp::default()
-        });
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_work))
+            .unwrap_or_else(|_| CatchUp {
+                error: "catch-up panicked".into(),
+                ..CatchUp::default()
+            });
         flight.progress.enter(Phase::Done);
         // The slot is updated before the waiters are woken, so a caller
         // that returns and immediately asks again sees this result.

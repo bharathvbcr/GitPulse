@@ -494,9 +494,16 @@ fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Comm
 /// Renaming this would orphan the approvals [`legacy_record`] deliberately
 /// still reads, which is the whole of the upgrade path.
 pub(crate) fn persistent_root() -> Result<PathBuf, CommandError> {
-    crate::tool_config::default_config_dir()
-        .map(|dir| dir.join("repository-trust-v1"))
-        .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+    #[cfg(test)]
+    {
+        Ok(crate::test_support::hermetic_config_dir().join("repository-trust-v1"))
+    }
+    #[cfg(not(test))]
+    {
+        crate::tool_config::default_config_dir()
+            .map(|dir| dir.join("repository-trust-v1"))
+            .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
+    }
 }
 
 /// Whether `grant` reaches `current`: the same repository, and either the
