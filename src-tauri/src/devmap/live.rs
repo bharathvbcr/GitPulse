@@ -1119,6 +1119,11 @@ pub fn run_process_short_lived() {
     SHORT_LIVED_PROCESS.store(true, Ordering::Release);
 }
 
+/// Whether [`run_process_short_lived`] has been called in this process.
+pub fn process_is_short_lived() -> bool {
+    SHORT_LIVED_PROCESS.load(Ordering::Acquire)
+}
+
 /// What a seeding caller's request becomes in a process that is (or is not)
 /// short-lived: a background build would not outlive such a process.
 fn effective_seeded_run(run: SeededRefresh, short_lived: bool) -> SeededRefresh {

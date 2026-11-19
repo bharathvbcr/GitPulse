@@ -71,7 +71,7 @@ Stdout carries only the JSON answer; warnings go to stderr. A `call` or `read` w
 | `0` | The tool answered and no part of the answer carries an incompleteness flag (still read each facet) |
 | `1` | The tool reported an error, including an argument its schema refused, or it panicked |
 | `2` | The command line was wrong: unknown command, tool, option, key or resource, or a write without `--write` |
-| `3` | The answer says it is incomplete: `ok: false`, `<facet>_ok: false`, `deferred: true` or `truncated: true` on any object in it (`worktrees.ok`, `agents.live.ok`), or the result budget cut it. The partial answer is still printed and stderr names where; read its `error` fields |
+| `3` | The answer says it is incomplete: `ok: false`, `<facet>_ok: false`, `deferred: true`, `truncated: true`, `deadline_expired: true` or a non-empty `walk_incomplete` on any object in it (`worktrees.ok`, `agents.live.ok`), the result budget cut it, or a resource was cut at its size cap (`text/plain`). Inside an array, only those markers count, never a row's own `ok: false`, which is data. The partial answer is still printed and stderr names where; read its `error` fields |
 | `4` | No answer within `--timeout-ms`. Nothing is printed; a write's outcome is unknown, so read the state back before retrying |
 
 This replaces a missing transport, not a loaded host: a read deferred under load is deferred from the shell too.

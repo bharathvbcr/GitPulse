@@ -369,9 +369,12 @@ fn a_timed_out_call_leaves_no_git_child_behind() {
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap_or_default());
 
+    // The timeout stays under the gate's 2 s wait for a spawn token: past
+    // that, a loaded host defers a second git and the call ends with exit 3
+    // (incomplete) before the watchdog's exit 4, which this test must see.
     let repo_arg = format!("repo_path={}", repo.path().to_str().expect("utf-8 path"));
     let (code, stdout, stderr) = run_one_shot_with(
-        &["call", "gitpulse_status", &repo_arg, "--timeout-ms", "2500"],
+        &["call", "gitpulse_status", &repo_arg, "--timeout-ms", "1200"],
         None,
         false,
         &[("PATH", path.as_os_str())],

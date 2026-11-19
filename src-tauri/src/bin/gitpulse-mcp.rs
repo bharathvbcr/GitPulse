@@ -976,12 +976,7 @@ fn main() {
     }
 
     if let Some(args) = command {
-        // This process exits when its one command returns, which ends any
-        // background thread and, through `exit_reaping`, any child: a build a
-        // tool would start in the background (a worktree's seeded index
-        // refresh) must run here instead.
-        gitpulse_lib::devmap::live::run_process_short_lived();
-        exit_reaping(run_command(&args));
+        exit_reaping(run_one_shot(&args));
     }
 
     let wire = Arc::new(Wire::new());
@@ -1093,6 +1088,17 @@ impl CliOutput {
             stderr: format!("gitpulse-mcp: {message} (see --help)\n"),
         }
     }
+}
+
+/// Runs one command and returns its exit status.
+///
+/// This process exits when the command returns, which ends any background
+/// thread and, through `exit_reaping`, any child: a build a tool would start
+/// in the background (a worktree's seeded index refresh) must run here
+/// instead, so the process declares itself short-lived first.
+fn run_one_shot(args: &[String]) -> i32 {
+    gitpulse_lib::devmap::live::run_process_short_lived();
+    run_command(args)
 }
 
 fn run_command(args: &[String]) -> i32 {
@@ -1756,6 +1762,21 @@ mod test_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-shot entry declares the process short-lived before it runs a
+    /// command, so a shared handler's background seeded refresh runs inline
+    /// instead of dying with the process (feat/mcp-cli re-review). Nothing
+    /// else observed the declaration.
+    #[test]
+    fn the_one_shot_entry_declares_the_process_short_lived() {
+        // A refused command: it runs nothing and prints nothing to stdout.
+        let code = run_one_shot(&["call".to_owned(), "gitpulse_no_such_tool".to_owned()]);
+        assert_eq!(code, exit_status::USAGE);
+        assert!(
+            gitpulse_lib::devmap::live::process_is_short_lived(),
+            "run_one_shot must call run_process_short_lived before the command"
+        );
+    }
 
     /// A deferred and retried insights read, with its wait for budget at every
     /// spawn, still ends inside the per-call budget the watchdog enforces.
