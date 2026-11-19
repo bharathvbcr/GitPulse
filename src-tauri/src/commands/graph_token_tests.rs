@@ -298,3 +298,171 @@ fn a_load_with_a_warning_issues_no_token() {
         assert!(degraded.graph_token.is_none());
     });
 }
+
+/// A linear history of `commits` on `refs/heads/win`, with HEAD on it, written
+/// with one `git fast-import` so a window larger than a screen costs no more
+/// than a few spawns. Timestamps are fixed and old, as the other fixtures'.
+fn window_repo(commits: usize) -> tempfile::TempDir {
+    let repo = crate::test_support::git_repo();
+    let mut stream = String::new();
+    for n in 1..=commits {
+        let message = format!("commit {n}");
+        stream.push_str(&format!(
+            "commit refs/heads/win\nmark :{n}\ncommitter T <t@example.com> {} +0000\ndata {}\n{message}\n",
+            1_700_000_000 + n * 60,
+            message.len()
+        ));
+        if n > 1 {
+            stream.push_str(&format!("from :{}\n", n - 1));
+        }
+        stream.push_str("M 100644 inline f.txt\ndata 2\nx\n\n");
+    }
+    crate::engine::git_cli::git_with_stdin(
+        repo.path(),
+        &["fast-import", "--quiet"],
+        stream.as_bytes(),
+    )
+    .expect("fast-import");
+    crate::test_support::git_in(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/win"]);
+    repo
+}
+
+fn payload_bytes(payload: &CommitGraphPayload) -> usize {
+    serde_json::to_vec(payload).unwrap().len()
+}
+
+/// A ref change that leaves the loaded window's commits and their order alone
+/// is answered with the refs and no rows, whatever the ref change was: a new
+/// branch on a commit inside the window, a tag, a ref that moves deep in the
+/// history beyond the window. The bytes then depend on the refs, not on how
+/// many rows the window holds.
+#[test]
+fn a_ref_change_that_leaves_the_window_alone_is_answered_without_rows() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        crate::test_support::git_in(repo.path(), &["branch", "old", "win~250"]);
+        let full = page(&root, 100, None).expect("first load");
+        assert_eq!(full.rows.len(), 100);
+        let full_bytes = payload_bytes(&full);
+        let mut token = full
+            .graph_token
+            .clone()
+            .expect("a settled load issues a token");
+
+        // (change, a ref name the answer must now carry)
+        let changes: [(&[&str], &str); 3] = [
+            (&["branch", "side", "win~40"], "side"),
+            (&["tag", "v1", "win~5"], "v1"),
+            (&["branch", "-f", "old", "win~260"], "old"),
+        ];
+        for (change, name) in changes {
+            crate::test_support::git_in(repo.path(), change);
+            let answer = page(&root, 100, Some(&token)).expect("reload");
+            assert!(
+                answer.rows.is_empty(),
+                "{change:?}: the window is untouched, so no row is resent (got {})",
+                answer.rows.len()
+            );
+            assert!(
+                answer.window_unchanged && !answer.unchanged,
+                "{change:?}: said so, and is not the unchanged answer"
+            );
+            assert!(
+                answer.refs.iter().any(|r| r.name == name),
+                "{change:?}: the refreshed decorations name {name}"
+            );
+            assert!(
+                payload_bytes(&answer) * 20 < full_bytes,
+                "{change:?}: {} B against a full page of {full_bytes} B",
+                payload_bytes(&answer)
+            );
+            token = answer
+                .graph_token
+                .clone()
+                .expect("the state is vouched for again");
+        }
+
+        // The new token names the new state: the next reload is the cheapest answer.
+        let settled = page(&root, 100, Some(&token)).expect("reload");
+        assert!(settled.unchanged && settled.rows.is_empty() && settled.refs.is_empty());
+    });
+}
+
+/// The answer's size does not grow with the window: the same refs on a window
+/// three times the size cost the same bytes.
+#[test]
+fn a_refs_only_answer_costs_the_same_for_a_small_and_a_large_window() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let small = page(&root, 100, None).unwrap().graph_token.unwrap();
+        let large = page(&root, 300, None).unwrap().graph_token.unwrap();
+        crate::test_support::git_in(repo.path(), &["branch", "side", "win~40"]);
+        let small = page(&root, 100, Some(&small)).unwrap();
+        let large = page(&root, 300, Some(&large)).unwrap();
+        assert!(small.rows.is_empty() && large.rows.is_empty());
+        assert!(
+            payload_bytes(&small).abs_diff(payload_bytes(&large)) < 64,
+            "{} B for a window of 100, {} B for 300",
+            payload_bytes(&small),
+            payload_bytes(&large)
+        );
+    });
+}
+
+/// A ref move that changes the window is a full page, rows and all, never a
+/// patch: the lanes are solved over the whole new window.
+#[test]
+fn a_ref_move_that_changes_the_window_is_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let first = page(&root, 100, None).unwrap();
+        let token = first.graph_token.clone().unwrap();
+        crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "new tip"]);
+        let moved = page(&root, 100, Some(&token)).unwrap();
+        assert_eq!(moved.rows.len(), 100, "the whole new window comes back");
+        assert_eq!(moved.rows[0].summary, "new tip");
+        assert_ne!(moved.rows[0].id, first.rows[0].id);
+        assert!(!moved.unchanged);
+    });
+}
+
+/// A replace ref rewrites the parents git prints for a commit inside the
+/// window while every branch tip stays put: still a full page.
+#[test]
+fn a_replace_graft_inside_the_window_with_unchanged_tips_is_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let token = page(&root, 100, None).unwrap().graph_token.unwrap();
+        crate::test_support::git_in(repo.path(), &["replace", "--graft", "win~50"]);
+        let grafted = page(&root, 100, Some(&token)).unwrap();
+        assert!(
+            grafted.rows.len() == 51 && !grafted.unchanged,
+            "the grafted history is drawn: {} rows",
+            grafted.rows.len()
+        );
+    });
+}
+
+/// The straight mainline column follows the default branch. Moving it back
+/// while another branch keeps the old tip leaves every commit in the window
+/// where it was, and still changes how the lanes are solved: a full page.
+#[test]
+fn the_default_branch_moving_to_an_ancestor_is_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        crate::test_support::git_in(repo.path(), &["branch", "main", "win"]);
+        let first = page(&root, 100, None).unwrap();
+        let token = first.graph_token.clone().unwrap();
+        let tip = first.rows[0].id.clone();
+        assert_eq!(first.mainline_id.as_deref(), Some(tip.as_str()));
+        crate::test_support::git_in(repo.path(), &["branch", "-f", "main", "win~3"]);
+        let moved = page(&root, 100, Some(&token)).unwrap();
+        assert!(!moved.rows.is_empty(), "lanes are re-solved, not patched");
+        assert_ne!(moved.mainline_id.as_deref(), Some(tip.as_str()));
+    });
+}
