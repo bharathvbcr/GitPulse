@@ -63,6 +63,10 @@ describe("ranTests", () => {
     expect(() => ranTests("<html/>")).toThrow(CouldNotRun);
     expect(() => ranTests(`<testsuites><testcase name="t"/></testsuites>`)).toThrow(CouldNotRun);
   });
+
+  it("unescapes numeric entities in one pass without double-decoding &", () => {
+    expect(ranTests(report([["lib", "t::&#38;quot; &#x26;lt;"]]))).toEqual(["lib\tt::&quot; &lt;"]);
+  });
 });
 
 describe("compare", () => {
@@ -84,6 +88,10 @@ describe("compare", () => {
 
   it("names a test that ran but was never listed", () => {
     expect(compare(expected, [[...all, "lib\tghost"]]).unlisted).toEqual(["lib ghost"]);
+  });
+
+  it("replaces every tab in a reported test id, not only the first", () => {
+    expect(compare(expected, [[...all, "lib\tghost\textra"]]).unlisted).toEqual(["lib ghost extra"]);
   });
 });
 

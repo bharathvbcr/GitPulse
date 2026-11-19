@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { stripMarkupComments } from "../dom/markupText";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..", "..", "..");
@@ -21,11 +22,24 @@ function walkFiles(dir: string, exts: readonly string[], skipDir?: (full: string
   return results;
 }
 
+function stripBlockComments(source: string): string {
+  let out = source;
+  for (;;) {
+    const start = out.indexOf("/*");
+    if (start === -1) return out;
+    const end = out.indexOf("*/", start + 2);
+    if (end === -1) return out.slice(0, start);
+    out = out.slice(0, start) + out.slice(end + 2);
+  }
+}
+
 function stripJsAndSvelteComments(source: string): string {
-  return source
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+  let current = source;
+  for (let prev = ""; prev !== current; ) {
+    prev = current;
+    current = stripBlockComments(stripMarkupComments(current));
+  }
+  return current.replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
 function stripRustNonTestCode(source: string): string {
@@ -36,7 +50,11 @@ function stripRustNonTestCode(source: string): string {
     const m = pat.exec(head);
     if (m) head = head.slice(0, m.index);
   }
-  return head.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  for (let prev = ""; prev !== head; ) {
+    prev = head;
+    head = stripBlockComments(head);
+  }
+  return head.replace(/\/\/.*$/gm, "");
 }
 
 describe("S2-07 single resume-argv owner contract", () => {
@@ -133,5 +151,11 @@ describe("S2-07 single resume-argv owner contract", () => {
     expect(bridge).toContain("contains_forbidden_argv_field");
     expect(reason).toContain("ForbiddenArgvField");
     expect(instance).toContain("deny_unknown_fields");
+  });
+
+  it("strips nested markup and block comments whose removal exposes another opener", () => {
+    expect(stripJsAndSvelteComments('<!<!---->-- ["--resume"] -->')).toBe("");
+    expect(stripJsAndSvelteComments('<!/*x*/-- ["--session-id"] -->')).toBe("");
+    expect(stripJsAndSvelteComments('//**/* ["--fork-session"] */')).toBe("");
   });
 });

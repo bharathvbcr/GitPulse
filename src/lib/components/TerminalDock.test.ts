@@ -198,7 +198,9 @@ describe("App hosts the terminal as a dock, not a view", () => {
     expect(source).toContain('document.removeEventListener("dblclick", onDoubleClick, true);');
     expect(source).toMatch(/if \(!column \|\| !open\) return;\s*const scope/);
     // The tab bar the scope names is the view bar's root.
-    expect(readFileSync(join(here, "ViewBar.svelte"), "utf8")).toMatch(/<nav[^>]*\n(?:[^>]*\n)*?\s*data-viewbar\n/);
+    const viewBarTag = /<nav\b[^>]*\sdata-viewbar(?:\s|>)/;
+    expect(readFileSync(join(here, "ViewBar.svelte"), "utf8")).toMatch(viewBarTag);
+    expect(viewBarTag.test(`<nav\n${"\n".repeat(5000)}class="x">`)).toBe(false);
   });
 
   it("reads the dock's open state from the repository tab, not a workspace preference", () => {

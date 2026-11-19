@@ -707,8 +707,11 @@ fn labels_are_redacted_one_line_and_bounded() {
     assert_eq!(long.chars().count(), MAX_LABEL_CHARS);
     let multibyte = sanitize_label(&"\u{e9}".repeat(100_000));
     assert_eq!(multibyte.chars().count(), MAX_LABEL_CHARS);
-    let with_secret = sanitize_label(&format!("use {} now", secret()));
-    assert!(!with_secret.contains(&secret()), "{with_secret}");
+    let redacted_label = sanitize_label(&format!("use {} now", secret()));
+    assert!(
+        !redacted_label.contains(&secret()),
+        "secret token was not redacted from label"
+    );
 }
 
 #[test]
@@ -743,7 +746,10 @@ fn a_hostile_label_and_session_cannot_forge_a_trailer() {
     assert_eq!(entry.event.as_deref(), Some("turn_start"));
     assert_eq!(entry.omissions.untracked_found, 0);
     let session = entry.session_id.clone().unwrap();
-    assert!(!session.contains('\n'), "{session}");
+    assert!(
+        !session.contains('\n'),
+        "sanitized session id must not contain a newline"
+    );
     let message = git_ok(
         dir.path(),
         &["log", "-1", "--format=%B", &result.commit.unwrap()],

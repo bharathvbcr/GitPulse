@@ -191,18 +191,18 @@ fn s2_03_cmd_q_three_claude_tabs_app_quit_and_reopen_argv() {
         .expect("non-empty argv");
         assert!(
             argv.windows(2).any(|w| w == ["--resume", expected_sid]),
-            "expected [--resume, {expected_sid}] in {argv:?}"
+            "expected --resume pair in reopen argv"
         );
         if let Some(perm_val) = expected_flag {
             assert!(
                 argv.windows(2)
                     .any(|w| w == ["--permission-mode", perm_val]),
-                "expected [--permission-mode, {perm_val}] in {argv:?}"
+                "expected --permission-mode {perm_val} in reopen argv"
             );
         } else {
             assert!(
                 !argv.iter().any(|a| a == "--permission-mode"),
-                "did not expect --permission-mode in {argv:?}"
+                "did not expect --permission-mode in reopen argv"
             );
         }
     }

@@ -2781,7 +2781,7 @@ mod redaction_tests {
             let line = format!("refresh_token={t}");
             let found = find_secret(&line).expect(name);
             assert_eq!(found.name, name);
-            assert!(found.redacted.starts_with(shown), "{}", found.redacted);
+            assert!(found.redacted.starts_with(shown), "{name}");
             assert!(!redact_secrets(&line).contains(&BODY[10..]), "{name}");
         }
     }

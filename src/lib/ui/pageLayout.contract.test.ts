@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { dropElements, stripMarkupComments } from "../dom/markupText";
 
 /**
  * Page layout contract (DESIGN_LANGUAGE section 7a): page content is fluid and
@@ -24,7 +25,11 @@ const NOT_A_CAP = /^max-w-(?:full|none|min|max|fit|0|\[\d*\.?\d+%\]|\[var\(.*\)\
 
 /** Every `max-w-*` token on a tag that does not state a reason with `data-width-cap="..."`. */
 function unmarkedCaps(source: string): string[] {
-  const markup = source.replace(/<!--[\s\S]*?-->/g, "").replace(/<script[\s\S]*?<\/script>/g, "").replace(/<style[\s\S]*?<\/style>/g, "");
+  let markup = source;
+  for (let prev = ""; prev !== markup; ) {
+    prev = markup;
+    markup = dropElements(dropElements(stripMarkupComments(markup), "script"), "style");
+  }
   const found: string[] = [];
   for (const tag of markup.matchAll(/<[A-Za-z][^<>]*>/g)) {
     if (/data-width-cap="[^"]+"/.test(tag[0])) continue;
@@ -133,5 +138,19 @@ describe("migrated pages carry no fixed content cap", () => {
       const text = read(`src/lib/components/${name}.svelte`);
       expect(text.match(/(?<![\w@:-])(?:sm|md|lg|xl|2xl):(?:grid-cols|col-span|flex-row|flex-col)/g) ?? [], name).toEqual([]);
     }
+  });
+});
+
+describe("unmarkedCaps non-markup stripping", () => {
+  it("ignores max-w-* tokens inside upper-case SCRIPT/STYLE blocks and nested comment/script openers", () => {
+    const adversarial = [
+      '<SCRIPT lang="ts">const a = `<div class="max-w-md">`;</SCRIPT>',
+      '<STYLE>.x { content: "<div class=\\"max-w-lg\\">"; }</STYLE>',
+      '<!<!---->-- <div class="max-w-xl"> -->',
+      '<scr<script></script>ipt>const b = `<div class="max-w-2xl">`;</script>',
+      '<!<script></script>-- <div class="max-w-3xl"> -->',
+      '<div class="max-w-sm">real</div>',
+    ].join("\n");
+    expect(unmarkedCaps(adversarial)).toEqual(["max-w-sm"]);
   });
 });
