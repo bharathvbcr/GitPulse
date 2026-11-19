@@ -2345,7 +2345,15 @@ mod family_cost_tests {
         let (_dir, repo, siblings) = family_with_legacy_ledgers(3);
         let (first, spawned) = spawned_by(&repo, || repository_address(&repo));
         first.expect("first pass");
-        assert_eq!(hash_objects(&spawned), 3, "one key per never-seen sibling");
+        // Was 3 ("one key per never-seen sibling") while a never-seen source
+        // was keyed by spawning `git hash-object`. That number encoded the
+        // spawn, not a requirement: the key is the same, computed in process
+        // from the repository's declared object format, so the pin is now 0.
+        assert_eq!(
+            hash_objects(&spawned),
+            0,
+            "a never-seen sibling was keyed by spawning git: {spawned:?}"
+        );
 
         for (_, worktree) in &siblings {
             record(worktree);
@@ -2359,6 +2367,28 @@ mod family_cost_tests {
             0,
             "a second pass spawned git to re-key a known sibling: {spawned:?}"
         );
+    }
+
+    /// ft-5d772b44 AC4: git children per first consolidation pass over a farm of
+    /// siblings that hold ledger rows. Before the in-process key it was one
+    /// `git hash-object` per never-seen sibling (3 for 3, 4 for 4); it is now
+    /// asserted to be none, for every farm size.
+    #[test]
+    fn a_first_consolidation_pass_spawns_no_hash_object_whatever_the_farm_size() {
+        /// The documented old count: one `git hash-object --stdin` per sibling.
+        const BEFORE_SPAWNS_PER_SIBLING: usize = 1;
+        const AFTER_SPAWNS: usize = 0;
+        for siblings in [3usize, 4] {
+            let (_dir, repo, _siblings) = family_with_legacy_ledgers(siblings);
+            let (first, spawned) = spawned_by(&repo, || repository_address(&repo));
+            first.expect("first pass");
+            let after = hash_objects(&spawned);
+            eprintln!(
+                "hash-object children, first pass over {siblings} siblings: before={} after={after}",
+                siblings * BEFORE_SPAWNS_PER_SIBLING
+            );
+            assert_eq!(after, AFTER_SPAWNS, "{spawned:?}");
+        }
     }
 
     /// A hook is a process of its own with no memo to warm, so the keys must
@@ -2519,6 +2549,101 @@ mod family_cost_tests {
                 "a persisted key differs from git's"
             );
         }
+    }
+
+    /// A repository of each object format, with a linked worktree of it.
+    fn repo_in_format(format: &str) -> (tempfile::TempDir, String, tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(
+            dir.path(),
+            &["init", "-b", "main", &format!("--object-format={format}")],
+        );
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "seed.txt"]);
+        crate::test_support::git_in(dir.path(), &["commit", "-m", "seed"]);
+        let repo = canonical(dir.path());
+        let (parent, worktree) = linked(dir.path());
+        (dir, repo, parent, worktree)
+    }
+
+    /// ft-5d772b44 AC2: the in-process key equals `git hash-object --stdin` in
+    /// a SHA-1 and a SHA-256 repository, asked from the main checkout and from a
+    /// linked worktree (whose `.git` is a pointer file, with `commondir`), so
+    /// every stored `ledger_family_imports.source_key` still matches.
+    #[test]
+    fn the_in_process_key_equals_git_hash_object_in_both_formats_and_from_a_linked_worktree() {
+        for (format, digits) in [("sha1", 40usize), ("sha256", 64)] {
+            let (_dir, repo, _parent, worktree) = repo_in_format(format);
+            for checkout in [&repo, &worktree] {
+                for source in [worktree.as_str(), repo.as_str(), "", "a path with spaces/é"] {
+                    let want = real_key(checkout, source);
+                    assert_eq!(want.len(), digits, "{format}: git's own width");
+                    let got = crate::ledger::tests_support::in_process_key(
+                        std::path::Path::new(checkout),
+                        source,
+                    );
+                    assert_eq!(
+                        got.as_deref(),
+                        Some(want.as_str()),
+                        "{format} {checkout} {source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every doubt about the object format falls to Git: no key is computed
+    /// when the format is unknown, the config is unreadable or a pointer is
+    /// malformed, and the key family_source_key then returns is still Git's.
+    #[test]
+    fn an_undeterminable_object_format_is_left_to_git() {
+        let (_dir, repo, _parent, worktree) = repo_in_format("sha1");
+        let key = |at: &str| {
+            crate::ledger::tests_support::in_process_key(std::path::Path::new(at), "source")
+        };
+        assert!(key(&repo).is_some(), "control: the format is readable");
+
+        // An unknown format value.
+        let config = std::path::Path::new(&repo).join(".git/config");
+        let original = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            format!("{original}[extensions]\n\tobjectformat = md5\n"),
+        )
+        .unwrap();
+        assert_eq!(key(&repo), None, "an unknown format must not be keyed");
+        std::fs::write(&config, &original).unwrap();
+        assert!(key(&repo).is_some(), "control restored");
+
+        // An unreadable config.
+        // (An absent config is not this case: Git reads it as SHA-1.)
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        assert_eq!(key(&repo), None, "an unreadable config must not be keyed");
+        std::fs::remove_dir(&config).unwrap();
+        std::fs::write(&config, &original).unwrap();
+
+        // A malformed commondir pointer in a linked worktree.
+        let pointer =
+            std::fs::read_to_string(std::path::Path::new(&worktree).join(".git")).unwrap();
+        let git_dir =
+            std::path::PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        assert!(
+            key(&worktree).is_some(),
+            "control: the linked worktree resolves"
+        );
+        std::fs::write(git_dir.join("commondir"), "../does-not-exist\n").unwrap();
+        assert_eq!(
+            key(&worktree),
+            None,
+            "a dangling commondir must not be keyed"
+        );
+        std::fs::write(git_dir.join("commondir"), "\n").unwrap();
+        assert_eq!(key(&worktree), None, "an empty commondir must not be keyed");
+
+        // No repository at all.
+        let bare_dir = tempfile::tempdir().unwrap();
+        assert_eq!(key(bare_dir.path().to_str().unwrap()), None);
     }
 
     /// Gating consolidation on change must not turn into never consolidating:
