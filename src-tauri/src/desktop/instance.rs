@@ -1981,9 +1981,11 @@ const ASKER_WATCH_INTERVAL: Duration = Duration::from_millis(25);
 /// one kill, a SIGTERM and a grace. So the flag is put in force on this thread
 /// for the length of `call`, and a watcher sets it when the socket reads as
 /// hung up with nothing queued. Nothing further is spawned for that ask, and
-/// the child in flight is stopped. A sink that hands its work to another thread
-/// does not carry the flag along (it is thread-local); that work runs on, as it
-/// did before.
+/// the child in flight is stopped. The flag is thread-local, so a sink that
+/// hands its work to another thread carries it across with
+/// [`read_cancel::CallerScope`] (the scan's pool and scoped threads and the
+/// insights read's own thread do); a hand-off that does not capture it runs on
+/// under no flag, as it did before.
 ///
 /// An ask whose asker left is reported as [`ASKER_LEFT_MIDWAY`] even if
 /// `call` finished first: the asker is not there to hear it, and what was

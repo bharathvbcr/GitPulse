@@ -1213,7 +1213,7 @@ mod status_cell {
     fn is_a_cut(error: &CommandError) -> bool {
         error.message() == DEADLINE_PASSED
             || is_timed_out(error.message())
-            || error.message() == crate::engine::process::read_cancel::CANCELLED_MESSAGE
+            || crate::engine::process::read_cancel::is_cancelled_error(error)
     }
 
     /// A read that ran out of git's own time limit, as opposed to a deadline
@@ -1371,6 +1371,17 @@ mod status_cell {
         fn a_cancelled_read_is_a_cut_no_other_caller_inherits() {
             assert!(is_a_cut(&crate::engine::process::read_cancel::cancelled()));
             assert!(!is_a_cut(&"git status failed".to_string().into()));
+            // By kind, not words: git's own text that happens to match is no
+            // cancellation, and a wrapped cancellation still is one.
+            assert!(!is_a_cut(
+                &crate::engine::process::read_cancel::CANCELLED_MESSAGE
+                    .to_string()
+                    .into()
+            ));
+            assert!(is_a_cut(
+                &crate::engine::process::read_cancel::cancelled()
+                    .wrap(|e| format!("git status failed: {e}"))
+            ));
         }
     }
 }
@@ -2180,6 +2191,17 @@ pub fn list_worktrees_scanned(
     };
     // Every caller sharing this listing had arrived by `latest_arrival`, so a
     // status read begun after it is no older than any of their questions.
+    //
+    // A leader whose asker left (its `read_cancel` flag set) must not publish
+    // that cancellation to the callers that joined it: they never left, and
+    // the status cell's `is_a_cut` does this for its own single flight, which
+    // this one has no equivalent of. It is safe today because no caller that
+    // can carry a cancel flag lists through here: the cancellable asks (the
+    // gate, the scan and the insights read in `desktop::instance`, the
+    // commit-graph walk) list through the collision memo's `list_worktrees_lite`
+    // or not at all, and `cmd_list_worktrees` names no request id. Whoever
+    // makes this listing cancellable must make a cancelled leader hand its
+    // joiners a follow-up scan instead of its error.
     let outcome = scan_listing(repo_path, depth, latest_arrival);
     #[cfg(test)]
     before_publish_hook();
