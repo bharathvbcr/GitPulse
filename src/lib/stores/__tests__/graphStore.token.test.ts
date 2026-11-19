@@ -203,15 +203,24 @@ describe("graphStore revision token", () => {
     expect(get(store).rows).toBe(rows);
   });
 
-  it("a refs-only answer that carries no token leaves the held one in force", async () => {
+  it("a refs-only answer that carries no token drops the held one, so the next reload is a full read", async () => {
     const answer = { ...refsOnly("x", ["main"]), graph_token: null };
-    const { invoke, calls } = backend((n) => (n === 1 ? full("a", "t1") : answer));
+    const { invoke, calls } = backend((n) =>
+      n === 1 ? full("a", "t1") : n === 2 ? answer : full("a", "t3")
+    );
     const store = createGraphStore({ invoke });
     store.showRepo("/r/a");
     await store.loadGraph("/r/a");
     await store.loadGraph("/r/a");
+    expect(get(store).refs.map((r) => r.name)).toEqual(["main"]);
     await store.loadGraph("/r/a");
-    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", "t1"]);
+    // The old expectation ([null, "t1", "t1"]) kept t1 beside refs read after
+    // its state: a fingerprint that returned to t1 would then be answered
+    // unchanged with those refs still drawn. It encoded the bug.
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", null]);
+    // The full read it asked for issued a token, which is offered from then on.
+    await store.loadGraph("/r/a");
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", null, "t3"]);
   });
 
   it("asks again without a token when a refs-only answer arrives for a page it was not offered a token for", async () => {

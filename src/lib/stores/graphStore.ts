@@ -988,9 +988,13 @@ export function createGraphStore(
             previous.headId = payload.head_id;
             previous.notices = notices;
             previous.warnings = payload.warnings ?? [];
-            // Without a token of its own the answer leaves the one held, which
-            // still names this window: the next reload is another refs-only one.
-            previous.graphToken = payload.graph_token ?? knownToken;
+            // Without a token of its own the answer leaves none: the held one
+            // was issued for the refs before this move, and the refs now
+            // drawn are not the ones it vouches for. Keeping it would let a
+            // later reload whose fingerprint returned to the old one be
+            // answered unchanged while these refs stayed on screen.
+            previous.graphToken = payload.graph_token ?? null;
+            touch(repoPath, previous);
             previous.signature = graphSignatureFrom(
               {
                 head_id: payload.head_id,

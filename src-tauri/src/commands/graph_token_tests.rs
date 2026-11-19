@@ -466,3 +466,134 @@ fn the_default_branch_moving_to_an_ancestor_is_a_full_page() {
         assert_ne!(moved.mainline_id.as_deref(), Some(tip.as_str()));
     });
 }
+
+/// The refs of a moved state are never paired with the token of the state
+/// before. When the stamp has not settled by the time the refs-only answer is
+/// built, no token comes back: the held one would otherwise stay valid beside
+/// refs read after it, and a fingerprint that returned to it (a loose ref
+/// created then deleted) would be answered unchanged with the moved refs still
+/// drawn.
+#[test]
+fn a_refs_only_answer_with_an_unsettled_stamp_never_carries_the_held_token() {
+    let repo = window_repo(300);
+    let root = repo.path().to_string_lossy().into_owned();
+    let held = crate::engine::ref_cache::eager(|| {
+        page(&root, 100, None)
+            .unwrap()
+            .graph_token
+            .expect("a settled load issues a token")
+    });
+    // Outside `eager` this write is inside the racy window, so the stamp is
+    // unsettled while the answer is built.
+    crate::test_support::git_in(repo.path(), &["branch", "side", "win~40"]);
+    let moved = page(&root, 100, Some(&held)).unwrap();
+    assert!(
+        moved.window_unchanged && moved.refs.iter().any(|r| r.name == "side"),
+        "the window is untouched, so this is the refs-only answer"
+    );
+    assert_ne!(
+        moved.graph_token.as_deref(),
+        Some(held.as_str()),
+        "fresh refs must not ride the token of the state before them"
+    );
+    assert!(
+        moved.graph_token.is_none(),
+        "an unsettled stamp vouches for nothing"
+    );
+}
+
+/// Each of these changes what the walk returns or how the lanes are solved, or
+/// is a request the token never vouches for, so none may be answered refs-only.
+#[test]
+fn a_second_parent_inside_the_window_with_the_same_commit_set_is_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let first = page(&root, 100, None).unwrap();
+        let token = first.graph_token.clone().unwrap();
+        // win~10 gains win~20 as a second parent: both are already in the
+        // window, so the commits are the same and only parent_ids change.
+        crate::test_support::git_in(
+            repo.path(),
+            &["replace", "--graft", "win~10", "win~11", "win~20"],
+        );
+        let answer = page(&root, 100, Some(&token)).unwrap();
+        assert_eq!(
+            answer.rows.len(),
+            first.rows.len(),
+            "the commit set is unchanged"
+        );
+        assert!(
+            !answer.rows.is_empty() && !answer.unchanged && !answer.window_unchanged,
+            "parent_ids changed, so the lanes are re-solved: a full page"
+        );
+    });
+}
+
+#[test]
+fn a_filtered_view_is_never_answered_refs_only() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let filtered = |known: Option<&str>| {
+            commit_graph_page(
+                root.clone(),
+                100,
+                Some("commit".to_string()),
+                None,
+                None,
+                None,
+                known.map(str::to_string),
+            )
+            .unwrap()
+        };
+        let token = filtered(None)
+            .graph_token
+            .expect("a filtered view is tokened");
+        crate::test_support::git_in(repo.path(), &["branch", "side", "win~40"]);
+        let answer = filtered(Some(&token));
+        assert!(
+            !answer.window_unchanged,
+            "a filter's notices come from assembly"
+        );
+        assert!(!answer.rows.is_empty());
+    });
+}
+
+#[test]
+fn a_degraded_facet_whose_window_still_matches_is_a_full_page() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let token = page(&root, 100, None).unwrap().graph_token.unwrap();
+        // A ref file git cannot parse degrades the ref listing; the walked
+        // window is the same one the token names.
+        std::fs::write(
+            repo.path().join(".git/refs/heads/broken"),
+            "not an object id\n",
+        )
+        .unwrap();
+        let answer = page(&root, 100, Some(&token)).unwrap();
+        if answer.warnings.is_empty() {
+            panic!("the fixture must degrade a facet: {answer:?}");
+        }
+        assert!(!answer.window_unchanged && !answer.unchanged);
+        assert!(!answer.rows.is_empty(), "a degraded load is resent in full");
+        assert!(answer.graph_token.is_none(), "and vouched for by nothing");
+    });
+}
+
+#[test]
+fn a_token_in_the_old_48_character_format_is_refused() {
+    crate::engine::ref_cache::eager(|| {
+        let repo = window_repo(300);
+        let root = repo.path().to_string_lossy().into_owned();
+        let token = page(&root, 100, None).unwrap().graph_token.unwrap();
+        let (hashes, issued) = token.rsplit_once('-').expect("issued suffix");
+        assert_eq!(hashes.len(), 64, "four 16-digit hashes");
+        let old = format!("{}-{issued}", &hashes[..48]);
+        let answer = page(&root, 100, Some(&old)).unwrap();
+        assert!(!answer.unchanged && !answer.window_unchanged);
+        assert!(!answer.rows.is_empty());
+    });
+}

@@ -794,15 +794,21 @@ pub(super) fn commit_graph_page(
         if let (Some(known), Some(window)) = (known_token.as_deref(), window) {
             if tokenable && notes.warnings.is_empty() && token_names_window(known, view, window) {
                 // A token for the new state when the stamp has settled, else
-                // the one held: it still names this window.
+                // none. Never the one held: these refs were read after that
+                // token's state, so pairing them with it would let a later
+                // reload whose fingerprint returned to the old one (a loose
+                // ref created then deleted) match it and be answered
+                // unchanged while the client still draws the refs of the
+                // moved state. The client drops the token it offered when no
+                // new one comes back, so the next reload is a full read.
                 let token = match current {
                     Some((stamp, content))
                         if stamp_before.is_some()
                             && graph_stamp(&repo_path, ref_scope) == stamp_before =>
                     {
-                        issued_token(view, stamp, content, window, issued)
+                        Some(issued_token(view, stamp, content, window, issued))
                     }
-                    _ => known.to_string(),
+                    _ => None,
                 };
                 return Ok(CommitGraphPayload {
                     rows: Vec::new(),
@@ -813,7 +819,7 @@ pub(super) fn commit_graph_page(
                     notices: notes.notices,
                     mainline_id: None,
                     mainline_name: None,
-                    graph_token: Some(token),
+                    graph_token: token,
                     unchanged: false,
                     window_unchanged: true,
                 });
