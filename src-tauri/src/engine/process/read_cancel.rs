@@ -40,6 +40,13 @@ pub(crate) fn cancelled() -> CommandError {
     CommandError::typed(IpcErrorKind::ReadCancelled, CANCELLED_MESSAGE)
 }
 
+/// Whether `error` is a cancellation: decided by the kind its producer gave it
+/// ([`cancelled`], or a spawn refused because its caller had gone), never by its
+/// words, which git's stderr can imitate and a wrapping layer can change.
+pub(crate) fn is_cancelled_error(error: &CommandError) -> bool {
+    error.origin() == Some(IpcErrorKind::ReadCancelled)
+}
+
 /// Ids longer than this are not registered: the read runs, uncancellable.
 const MAX_ID_LEN: usize = 64;
 /// Reads that can be cancelled at once. A full registry makes a read

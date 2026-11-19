@@ -55,6 +55,7 @@ use super::{
     collision_from_list_reading, empty_collisions, entity_collision, live_in, live_sessions,
     CollisionRisk, CollisionScope, PathsRead,
 };
+use crate::engine::process::read_cancel;
 use crate::engine::worktree::{self, changed_paths_since, WorktreeInfo};
 
 /// How long a listing or a worktree's changed paths are served from memory.
@@ -156,7 +157,7 @@ impl<T: Clone> Memo<T> {
     }
 
     /// The kept answer while it is younger than `ttl`, else `fill`'s, which is
-    /// kept only when it succeeded. Returns the answer's age: zero when `fill`
+    /// kept only when it succeeded and its asker had not left while it ran. Returns the answer's age: zero when `fill`
     /// ran.
     fn get_or_fill(
         &self,
@@ -185,6 +186,14 @@ impl<T: Clone> Memo<T> {
             }
         }
         match fill() {
+            // A fill made while this thread's own asker has left was formed
+            // from reads that were refused or killed for that asker, not from
+            // the repository: it answers the asker that is gone and nobody
+            // else. The next caller of the key fills for itself.
+            Ok(value) if read_cancel::current().is_some_and(|flag| flag.is_cancelled()) => {
+                *held = None;
+                (Ok(value), Duration::ZERO)
+            }
             Ok(value) => {
                 *held = Some((Instant::now(), value.clone()));
                 (Ok(value), Duration::ZERO)
@@ -272,7 +281,7 @@ impl CollisionMemo {
             parties.sort_unstable();
             let verdict_key = format!("{key}\0{focus}\0{}", parties.join("\0"));
             let (verdict, age) = self.verdicts.get_or_fill(&verdict_key, self.ttl, || {
-                Ok(entity_collision::classify_overlapping_path(item))
+                entity_collision::try_classify_overlapping_path(item)
             });
             oldest.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
             item.entity = verdict.ok();
@@ -444,6 +453,25 @@ mod tests {
                 .0,
             Ok(5)
         );
+    }
+
+    /// A fill made while the asker's own flag is set is returned to that asker
+    /// and kept for nobody: the next caller fills for itself.
+    #[test]
+    fn a_fill_made_after_its_asker_left_is_not_kept() {
+        use crate::engine::process::read_cancel::{enter, ReadCancel};
+        let memo: Memo<u32> = Memo::new(4);
+        let ttl = Duration::from_secs(60);
+        let cancel = ReadCancel::new();
+        {
+            let _asker = enter(Some(&cancel));
+            cancel.cancel();
+            assert_eq!(memo.get_or_fill("a", ttl, || Ok(1)).0, Ok(1));
+        }
+        let (next, age) = memo.get_or_fill("a", ttl, || Ok(2));
+        assert_eq!(next, Ok(2), "the cancelled fill was served");
+        assert_eq!(age, Duration::ZERO);
+        assert_eq!(memo.get_or_fill("a", ttl, || Ok(3)).0, Ok(2), "kept");
     }
 
     /// One repository past the old listing cap, each with its status read still

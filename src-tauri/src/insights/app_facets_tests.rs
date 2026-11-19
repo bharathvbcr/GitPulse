@@ -680,3 +680,157 @@ fn a_partial_answer_is_not_a_snapshot() {
         assert!(refused.contains("partial"), "{refused}");
     }
 }
+
+/// One uncancelled scan of the contended file, on a memo of its own: the verdict
+/// the farm really has, for the cancelled runs below to be read against.
+fn baseline_collision(farm: &Farm) -> crate::insights::MemoizedCollision {
+    let answer = CollisionMemo::new(MEMO_TTL).risk_for_path(
+        &farm.repo,
+        "seed.txt",
+        &crate::insights::live_sessions::observe(),
+    );
+    assert!(answer.risk.ok, "{:?}", answer.risk.error);
+    assert_eq!(answer.risk.failed_worktrees, 0);
+    assert_eq!(answer.risk.scanned_worktrees as usize, farm.dirs.len());
+    let words = serde_json::to_string(&answer.risk).expect("encodes");
+    assert!(
+        !words.contains("cancelled") && !words.contains("untracked"),
+        "the baseline already says it: {words}"
+    );
+    answer
+}
+
+fn seed_verdict(
+    answer: &crate::insights::MemoizedCollision,
+) -> Option<crate::insights::EntityCollisionVerdict> {
+    answer
+        .risk
+        .items
+        .iter()
+        .find(|item| item.path == "seed.txt")
+        .and_then(|item| item.entity.clone())
+}
+
+fn ls_files_started(farm: &Farm) -> usize {
+    farm.dirs
+        .iter()
+        .map(|dir| {
+            spawns_in(dir)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == "ls-files"))
+                .count()
+        })
+        .sum()
+}
+
+/// Asker B is whole and says what an uncancelled scan says, whatever happened
+/// to asker A, and nothing cancelled was kept for the next caller.
+fn assert_b_is_unaffected(
+    farm: &Farm,
+    memo: &CollisionMemo,
+    baseline: &crate::insights::MemoizedCollision,
+    b: &crate::insights::MemoizedCollision,
+) {
+    let expected = seed_verdict(baseline).expect("the baseline classified the file");
+    assert!(b.risk.ok, "{:?}", b.risk.error);
+    assert_eq!(b.risk.failed_worktrees, 0, "{:?}", b.risk.error);
+    assert_eq!(b.risk.scanned_worktrees as usize, farm.dirs.len());
+    assert_eq!(seed_verdict(b).as_ref(), Some(&expected));
+    let words = serde_json::to_string(&b.risk).expect("encodes");
+    assert!(
+        !words.contains("cancelled") && !words.contains("untracked"),
+        "B was handed what A's cancellation left: {words}"
+    );
+    let later = memo.risk_for_path(
+        &farm.repo,
+        "seed.txt",
+        &crate::insights::live_sessions::observe(),
+    );
+    assert_eq!(
+        seed_verdict(&later).as_ref(),
+        Some(&expected),
+        "a later caller within the TTL was served a cancelled verdict"
+    );
+}
+
+/// Runs asker A (under `cancel`) and asker B (under no scope) at once against
+/// one memo, and gives B's answer. `release_b` is set by whatever cancels A.
+fn two_askers(
+    farm: &Farm,
+    memo: &CollisionMemo,
+    cancel: &crate::engine::process::read_cancel::ReadCancel,
+    release_b: &std::sync::atomic::AtomicBool,
+) -> crate::insights::MemoizedCollision {
+    use std::sync::atomic::Ordering;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _asker = crate::engine::process::read_cancel::enter(Some(cancel));
+            memo.risk_for_path(
+                &farm.repo,
+                "seed.txt",
+                &crate::insights::live_sessions::observe(),
+            )
+        });
+        scope
+            .spawn(|| {
+                let until = Instant::now() + Duration::from_secs(30);
+                while !release_b.load(Ordering::Acquire) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                memo.risk_for_path(
+                    &farm.repo,
+                    "seed.txt",
+                    &crate::insights::live_sessions::observe(),
+                )
+            })
+            .join()
+            .expect("B answers")
+    })
+}
+
+/// A asks and leaves at the first status read it makes. B asks for the same file and is
+/// answered from the repository, not from what A's cancelled reads left.
+#[test]
+fn an_asker_that_leaves_at_its_first_status_read_leaves_another_ask_whole() {
+    let farm = farm(3, true);
+    let baseline = baseline_collision(&farm);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let cancel = crate::engine::process::read_cancel::ReadCancel::new();
+    let release_b = std::sync::atomic::AtomicBool::new(true);
+    let leaves = cancel.clone();
+    let b = crate::engine::worktree::status_probes::with_probe(
+        &farm.dirs,
+        move |_| leaves.cancel(),
+        || two_askers(&farm, &memo, &cancel, &release_b),
+    );
+    assert_b_is_unaffected(&farm, &memo, &baseline, &b);
+}
+
+/// A asks and leaves while its verdict is being classified (its first
+/// `ls-files` is the mark). B, which arrives then, must not be served the
+/// verdict A's refused reads formed.
+#[test]
+fn an_asker_that_leaves_while_the_verdict_is_classified_leaves_another_ask_whole() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let farm = farm(3, true);
+    let baseline = baseline_collision(&farm);
+    let memo = CollisionMemo::new(MEMO_TTL);
+    let cancel = crate::engine::process::read_cancel::ReadCancel::new();
+    let release_b = AtomicBool::new(false);
+    let seen = ls_files_started(&farm);
+    let done = AtomicBool::new(false);
+    let b = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let until = Instant::now() + Duration::from_secs(30);
+            while ls_files_started(&farm) <= seen && Instant::now() < until {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            cancel.cancel();
+            release_b.store(true, Ordering::Release);
+            done.store(true, Ordering::Release);
+        });
+        two_askers(&farm, &memo, &cancel, &release_b)
+    });
+    assert!(done.load(Ordering::Acquire), "A never reached its verdict");
+    assert_b_is_unaffected(&farm, &memo, &baseline, &b);
+}
