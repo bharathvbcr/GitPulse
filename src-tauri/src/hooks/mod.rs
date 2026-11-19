@@ -12540,6 +12540,8 @@ done
             );
         }
 
+        // Binds a Unix socket, and the notify transport is unix-only.
+        #[cfg(unix)]
         #[test]
         fn stop_or_notify_routes_error_user_canceled_and_normal_stops() {
             let serial = crate::test_support::env::env_serial();
