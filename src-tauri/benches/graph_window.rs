@@ -126,6 +126,7 @@ fn main() {
         mainline_name: None,
         graph_token: Some("0123456789abcdef".to_string()),
         unchanged: true,
+        window_unchanged: false,
     };
 
     let mut cases: Vec<Case> = Vec::new();

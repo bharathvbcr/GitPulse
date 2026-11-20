@@ -50,6 +50,15 @@ pub struct CommitGraphPayload {
     /// are current as on any other answer.
     #[serde(default)]
     pub unchanged: bool,
+    /// True when the walk just read is, row for row and with the same mainline
+    /// anchor, the window the client's token was issued for, although a ref
+    /// moved since (a new branch or tag, a ref shifted within or beyond the
+    /// window): the client keeps the rows it holds and takes `refs`, which are
+    /// current and complete, in place of its own. `rows` is empty and no lane
+    /// was solved; the window is never patched, only recognised as identical.
+    /// Any difference in what the walk returned is a full page instead.
+    #[serde(default)]
+    pub window_unchanged: bool,
 }
 
 /// What a graph load has to say about itself, in the two kinds that must not
@@ -273,6 +282,7 @@ pub fn assemble_commit_graph(
         mainline_name,
         graph_token: None,
         unchanged: false,
+        window_unchanged: false,
     }
 }
 
@@ -324,7 +334,7 @@ pub async fn cmd_get_commit_graph(
     .await
 }
 
-/// A token names a graph page by three hashes and the second it was issued.
+/// A token names a graph page by four hashes and the second it was issued.
 ///
 /// * **view**: the arguments the page was asked for (repository, window size,
 ///   query, ref scope), so a token for one window cannot answer for another.
@@ -337,6 +347,11 @@ pub async fn cmd_get_commit_graph(
 ///   branch, notices), compared by content. A degraded facet (any warning) has
 ///   none, so a probe that failed is retried on the next reload instead of
 ///   being answered `unchanged` forever.
+/// * **window**: the commits the walk returned (every field of every row it
+///   read, the has_more probe included) and what anchors the mainline, so a
+///   ref change that moved nothing the page draws is recognised after the walk
+///   without a lane solve or a row on the wire; see [`window_key`]. Absent
+///   (zero) for a filtered view, whose notices come from assembly.
 ///
 /// The first two are known before anything is read, which is what lets a
 /// request decide whether the token can still hold without waiting for the
@@ -345,6 +360,7 @@ struct TokenParts<'a> {
     view: &'a str,
     stamp: &'a str,
     content: &'a str,
+    window: &'a str,
     issued: u64,
 }
 
@@ -353,13 +369,14 @@ const HASH_HEX: usize = 16;
 
 fn split_token(token: &str) -> Option<TokenParts<'_>> {
     let (hashes, issued) = token.split_once('-')?;
-    if hashes.len() != 3 * HASH_HEX || !hashes.is_ascii() {
+    if hashes.len() != 4 * HASH_HEX || !hashes.is_ascii() {
         return None;
     }
     Some(TokenParts {
         view: &hashes[..HASH_HEX],
         stamp: &hashes[HASH_HEX..2 * HASH_HEX],
-        content: &hashes[2 * HASH_HEX..],
+        content: &hashes[2 * HASH_HEX..3 * HASH_HEX],
+        window: &hashes[3 * HASH_HEX..],
         issued: issued.parse().ok()?,
     })
 }
@@ -400,8 +417,57 @@ fn content_key(
     Some(hash_of((head_id, &refs, default_branch, &notes.notices)))
 }
 
-fn issued_token(view: u64, stamp: u64, content: u64, issued: u64) -> String {
-    format!("{}{}{}-{issued}", hex(view), hex(stamp), hex(content))
+fn issued_token(view: u64, stamp: u64, content: u64, window: u64, issued: u64) -> String {
+    format!(
+        "{}{}{}{}-{issued}",
+        hex(view),
+        hex(stamp),
+        hex(content),
+        hex(window)
+    )
+}
+
+/// The hash of what a page draws that the walk decides: every field of every
+/// commit read (a replace ref changes a commit's parents under the same id) and
+/// the refs that anchor the straight mainline column. Equal hashes mean the
+/// lane solver gets the same input, so a ref that moved without changing either
+/// (a new branch or tag, a tip shared by two refs, a ref moving within or
+/// beyond the window) leaves the drawn page as it was. Never zero, which a
+/// token carries for "no window hash".
+fn window_key(
+    raw: &[RawCommitNode],
+    refs: &[RefDecoration],
+    default_branch: Option<&str>,
+    head_id: Option<&str>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.len().hash(&mut hasher);
+    for commit in raw {
+        commit.id.hash(&mut hasher);
+        commit.parent_ids.hash(&mut hasher);
+        commit.timestamp.hash(&mut hasher);
+        commit.author_name.hash(&mut hasher);
+        commit.author_email.hash(&mut hasher);
+        commit.summary.hash(&mut hasher);
+    }
+    let mainline = resolve_mainline_hint(refs, default_branch, head_id);
+    mainline.tips.hash(&mut hasher);
+    mainline.hint.fallback_tip.hash(&mut hasher);
+    // The fallback rail is labelled by the HEAD branch's name.
+    refs.iter()
+        .find(|r| r.is_head)
+        .map(|r| r.name.as_str())
+        .hash(&mut hasher);
+    hasher.finish() | 1
+}
+
+/// True when `known` was issued for this view, is still fresh and names this
+/// window, whatever refs have moved since.
+fn token_names_window(known: &str, view: u64, window: u64) -> bool {
+    split_token(known).is_some_and(|parts| {
+        parts.view == hex(view) && parts.window == hex(window) && token_fresh(parts.issued)
+    })
 }
 
 /// Seconds since the Unix epoch on the clock the ref cache judges stamps by.
@@ -698,6 +764,7 @@ pub(super) fn commit_graph_page(
                     // the load that really read the page.
                     graph_token: Some(known.to_string()),
                     unchanged: true,
+                    window_unchanged: false,
                 });
             }
         }
@@ -714,6 +781,50 @@ pub(super) fn commit_graph_page(
             Err(_) => Err("history walker panicked".into()),
         };
         let raw_commits = history?;
+        // What the walk returned, before any lane is solved. Computed for the
+        // plain view only: a filter's notices come from assembly.
+        let window = filter.is_empty().then(|| {
+            window_key(
+                &raw_commits,
+                &refs,
+                default_branch.as_deref(),
+                head_id.as_deref(),
+            )
+        });
+        if let (Some(known), Some(window)) = (known_token.as_deref(), window) {
+            if tokenable && notes.warnings.is_empty() && token_names_window(known, view, window) {
+                // A token for the new state when the stamp has settled, else
+                // none. Never the one held: these refs were read after that
+                // token's state, so pairing them with it would let a later
+                // reload whose fingerprint returned to the old one (a loose
+                // ref created then deleted) match it and be answered
+                // unchanged while the client still draws the refs of the
+                // moved state. The client drops the token it offered when no
+                // new one comes back, so the next reload is a full read.
+                let token = match current {
+                    Some((stamp, content))
+                        if stamp_before.is_some()
+                            && graph_stamp(&repo_path, ref_scope) == stamp_before =>
+                    {
+                        Some(issued_token(view, stamp, content, window, issued))
+                    }
+                    _ => None,
+                };
+                return Ok(CommitGraphPayload {
+                    rows: Vec::new(),
+                    head_id,
+                    refs,
+                    has_more: false,
+                    warnings: notes.warnings,
+                    notices: notes.notices,
+                    mainline_id: None,
+                    mainline_name: None,
+                    graph_token: token,
+                    unchanged: false,
+                    window_unchanged: true,
+                });
+            }
+        }
         let mut payload = assemble_commit_graph(
             raw_commits,
             max_commits,
@@ -729,8 +840,9 @@ pub(super) fn commit_graph_page(
         // them to one state.
         if tokenable && stamp_before.is_some() && graph_stamp(&repo_path, ref_scope) == stamp_before
         {
-            payload.graph_token =
-                current.map(|(stamp, content)| issued_token(view, stamp, content, issued));
+            payload.graph_token = current.map(|(stamp, content)| {
+                issued_token(view, stamp, content, window.unwrap_or(0), issued)
+            });
         }
         Ok(payload)
     }

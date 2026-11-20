@@ -942,6 +942,7 @@ fn commit_graph_payload_round_trips_warnings() {
         mainline_name: Some("main".to_string()),
         graph_token: None,
         unchanged: false,
+        window_unchanged: false,
     };
     let json = serde_json::to_string(&payload).unwrap();
     assert!(
