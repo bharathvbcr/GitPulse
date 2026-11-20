@@ -1699,7 +1699,16 @@ pub(crate) struct AgentThrottleCandidate {
     pub session_kind: AgentKind,
     pub session_cwd: Option<String>,
     pub is_session_root: bool,
+    /// Working directories of this process's ancestors, nearest first, up to
+    /// and including the session root (`/` and unreadable ones left out). A
+    /// build script or a dependency's `rustc` runs in the package's own
+    /// directory under the Cargo registry, outside every repository; the
+    /// `cargo` that started it is where the work belongs.
+    pub lineage_cwds: Vec<String>,
 }
+
+/// Most ancestor working directories one candidate carries.
+const MAX_LINEAGE_CWDS: usize = 8;
 
 /// Returns live current-user worker processes belonging to active agent session
 /// trees (`Claude`, `Codex`, `Antigravity`, `DevCouncil`), excluding GitPulse
@@ -1736,6 +1745,7 @@ impl Scanner {
             );
         }
         let mut out = Vec::new();
+        let mut ancestor_cwds: HashMap<i32, Option<String>> = HashMap::new();
         for (i, f) in self.facts.iter().enumerate() {
             let Some(s_idx) = self.session_of[i].map(|n| n as usize) else {
                 continue;
@@ -1793,6 +1803,7 @@ impl Scanner {
                 .filter(|p| p != std::path::Path::new("/"))
                 .map(|p| p.to_string_lossy().into_owned());
             let effective_cwd = own_cwd.or_else(|| session_cwds.get(s_idx).cloned().flatten());
+            let lineage_cwds = self.lineage_cwds(i, root_i, &mut ancestor_cwds);
             out.push(AgentThrottleCandidate {
                 pid: f.pid,
                 start_us: f.start_us,
@@ -1801,9 +1812,48 @@ impl Scanner {
                 session_kind,
                 session_cwd: effective_cwd,
                 is_session_root: false,
+                lineage_cwds,
             });
         }
         Ok(out)
+    }
+
+    /// Working directories of `i`'s ancestors, nearest first, through the
+    /// session root `root_i`, each read once per scan through `cache`.
+    fn lineage_cwds(
+        &self,
+        i: usize,
+        root_i: usize,
+        cache: &mut HashMap<i32, Option<String>>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH {
+            let Some(p) = at else { break };
+            let pid = self.facts[p].pid;
+            let cwd = cache
+                .entry(pid)
+                .or_insert_with(|| {
+                    self.source
+                        .cwd(pid)
+                        .filter(|c| c != Path::new("/"))
+                        .map(|c| c.to_string_lossy().into_owned())
+                })
+                .clone();
+            if let Some(cwd) = cwd {
+                if out.last() != Some(&cwd) {
+                    out.push(cwd);
+                    if out.len() >= MAX_LINEAGE_CWDS {
+                        break;
+                    }
+                }
+            }
+            if p == root_i {
+                break;
+            }
+            at = self.parent_of(p);
+        }
+        out
     }
 
     /// Whether an IDE's agent server lies strictly between process `i` and
@@ -7155,6 +7205,45 @@ pub(crate) mod tests {
             out[1].session_cwd.as_deref(),
             Some("/Users/dev/opted-out-repo"),
             "worker cwd must override IDE root cwd == /"
+        );
+    }
+
+    #[test]
+    fn a_worker_outside_every_repository_carries_its_ancestors_working_directories() {
+        let facts = Arc::new(Mutex::new(facts_of(vec![
+            p(100, 1, "/usr/local/bin/claude"),
+            p(101, 100, "/Users/dev/.cargo/bin/cargo"),
+            p(
+                102,
+                101,
+                "/Users/dev/repo/target/debug/build/serde-1/build-script-build",
+            ),
+            p(103, 102, "/usr/bin/cc"),
+        ])));
+        let registry = "/Users/dev/.cargo/registry/src/index/serde-1.0.0";
+        let mut scanner = Scanner::new(Box::new(Fixture {
+            facts,
+            cwds: HashMap::from([
+                (100, PathBuf::from("/Users/dev/repo")),
+                (101, PathBuf::from("/Users/dev/repo")),
+                (102, PathBuf::from(registry)),
+                (103, PathBuf::from(registry)),
+            ]),
+            fds: HashMap::new(),
+            fail: None,
+        }));
+        let out = scanner.collect_throttle_candidates(999).expect("scan");
+        let lineage = |pid: i32| {
+            out.iter()
+                .find(|c| c.pid == pid)
+                .map(|c| c.lineage_cwds.clone())
+                .unwrap_or_else(|| panic!("{pid} not a candidate: {out:?}"))
+        };
+        assert_eq!(lineage(102), vec!["/Users/dev/repo".to_string()]);
+        assert_eq!(
+            lineage(103),
+            vec![registry.to_string(), "/Users/dev/repo".to_string()],
+            "nearest first, each directory once"
         );
     }
 

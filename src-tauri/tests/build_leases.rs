@@ -761,7 +761,7 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
     )
     .unwrap();
     let active_json = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "writer_pid": std::process::id(),
         "writer_start_us": gitpulse_lib::sysload::process_start_us(std::process::id()).unwrap_or(0),
         "issued_at_ms": now_ms,

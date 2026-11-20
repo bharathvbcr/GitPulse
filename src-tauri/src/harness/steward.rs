@@ -220,6 +220,10 @@ pub(crate) struct ActiveThrottleRecord {
     pub repositories: Vec<String>,
 }
 
+/// Version 2 added `repositories`. A hook built before it would ignore that
+/// list and pace every repository, so it is handed a version it refuses.
+pub(crate) const LEASE_VERSION: u32 = 2;
+
 /// Most repositories one lease names; `MAX_ACTIVE_RECORD_BYTES` bounds the
 /// file as a whole.
 const MAX_LEASE_REPOSITORIES: usize = 64;
@@ -1427,8 +1431,9 @@ pub(crate) fn clear_active_throttle_if_owned_or_stale(
             && (raw.len() as u64) <= MAX_ACTIVE_RECORD_BYTES
         {
             if let Ok(record) = serde_json::from_slice::<ActiveThrottleRecord>(&raw) {
-                if record.version == 1
-                    && now_ms <= record.expires_at_ms
+                // A live foreign writer owns its lease whatever version it
+                // writes; an older GitPulse still running keeps its own.
+                if now_ms <= record.expires_at_ms
                     && record.writer_pid != std::process::id()
                 {
                     let foreign_writer_alive = crate::sysload::process_start_us(record.writer_pid)
@@ -1504,7 +1509,7 @@ fn active_throttle_for_cwd_with_settings(
         return None;
     }
     let mut record: ActiveThrottleRecord = serde_json::from_slice(&raw).ok()?;
-    if record.version != 1 || now_ms > record.expires_at_ms {
+    if record.version != LEASE_VERSION || now_ms > record.expires_at_ms {
         return None;
     }
     // The steward never issues a lease longer than `lease_ttl_ms` allows or
@@ -4071,11 +4076,21 @@ pub(crate) fn evaluate_tick_with(
                 // One line per cause: the same refusal (Linux limits, say)
                 // repeats for every process on every tick otherwise.
                 let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut common_of: HashMap<String, Option<String>> = HashMap::new();
                 for cand in candidates {
+                    // The process's own repository, or, for one working
+                    // outside every repository (a build script in the Cargo
+                    // registry), the nearest ancestor's.
                     let common = cand
                         .session_cwd
-                        .as_deref()
-                        .and_then(|cwd| deps.repo_common_dir(cwd));
+                        .iter()
+                        .chain(cand.lineage_cwds.iter())
+                        .find_map(|cwd| {
+                            common_of
+                                .entry(cwd.clone())
+                                .or_insert_with(|| deps.repo_common_dir(cwd))
+                                .clone()
+                        });
                     // Only work inside a trusted repository whose policy slows
                     // agents; anything else is left alone, or put back.
                     let in_scope = common.as_ref().is_some_and(|c| slow_scope.contains(c));
@@ -4203,7 +4218,7 @@ pub(crate) fn evaluate_tick_with(
                     )
                 };
                 let lease = ActiveThrottleRecord {
-                    version: 1,
+                    version: LEASE_VERSION,
                     writer_pid,
                     writer_start_us,
                     issued_at_ms: now_ms,
@@ -4810,7 +4825,7 @@ mod tests {
         write_active_throttle(
             tmp.path(),
             &ActiveThrottleRecord {
-                version: 1,
+                version: LEASE_VERSION,
                 writer_pid: std::process::id(),
                 writer_start_us: 0,
                 issued_at_ms: deps.now_ms,
@@ -4855,6 +4870,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
         let acted = evaluate_tick_with(&rt, "critical_wake", None, &deps);
         assert_eq!(acted.outcome, "acted");
@@ -4951,6 +4967,7 @@ mod tests {
                 session_kind: AgentKind::Claude,
                 session_cwd: Some("/trusted/a".into()),
                 is_session_root: false,
+                lineage_cwds: Vec::new(),
             },
             AgentThrottleCandidate {
                 pid: 5100,
@@ -4960,6 +4977,7 @@ mod tests {
                 session_kind: AgentKind::Codex,
                 session_cwd: Some("/opted_out/c".into()),
                 is_session_root: false,
+                lineage_cwds: Vec::new(),
             },
         ];
         deps.common_dirs
@@ -5017,6 +5035,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
         // Simulate the user switching `slow_critical = false` mid-tick while the
         // candidate scan is in flight, before `active.json` is written.
@@ -5096,7 +5115,7 @@ mod tests {
         write_active_throttle(
             tmp.path(),
             &ActiveThrottleRecord {
-                version: 1,
+                version: LEASE_VERSION,
                 writer_pid: std::process::id(),
                 writer_start_us: 0,
                 issued_at_ms: deps.now_ms,
@@ -5739,6 +5758,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
 
         // Case 1: Pulse wakes on `PressureInput::Critical` while `verdict.tier` is
@@ -6057,7 +6077,7 @@ mod tests {
             crate::sysload::process_start_us(foreign_pid).expect("live child start_us");
 
         let foreign_record = ActiveThrottleRecord {
-            version: 1,
+            version: LEASE_VERSION,
             writer_pid: foreign_pid,
             writer_start_us: foreign_start_us,
             issued_at_ms: deps.now_ms,
@@ -7105,6 +7125,7 @@ Trailing note {done}."#;
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }
     }
 
@@ -7274,7 +7295,7 @@ Trailing note {done}."#;
         let repo_str = repo.path().to_str().unwrap();
         let covered = canonical_common_dir(repo_str).unwrap();
         let lease = |issued: u64, expires: u64| ActiveThrottleRecord {
-            version: 1,
+            version: LEASE_VERSION,
             writer_pid: std::process::id(),
             writer_start_us: 1,
             issued_at_ms: issued,
@@ -7290,6 +7311,14 @@ Trailing note {done}."#;
             active_throttle_for_cwd_with_settings(tmp.path(), repo_str, now, None, slowing_on)
         };
         assert!(read(lease(now, now + 900_000)).is_some());
+        assert!(
+            read(ActiveThrottleRecord {
+                version: 1,
+                ..lease(now, now + 900_000)
+            })
+            .is_none(),
+            "a version-1 lease predates the repository list it must carry"
+        );
         assert!(
             read(lease(now, now + 3_600_000)).is_none(),
             "forged hour-long lease"
@@ -7325,7 +7354,7 @@ Trailing note {done}."#;
         write_active_throttle(
             tmp.path(),
             &ActiveThrottleRecord {
-                version: 1,
+                version: LEASE_VERSION,
                 writer_pid: std::process::id(),
                 writer_start_us: 1,
                 issued_at_ms: now,
@@ -7368,17 +7397,26 @@ Trailing note {done}."#;
             session_cwd: cwd.map(str::to_owned),
             ..agent_worker(pid)
         };
+        // A build script runs in its package's directory in the Cargo
+        // registry; the `cargo` above it says which repository it serves.
+        let registry = "/home/dev/.cargo/registry/src/index/serde-1.0.0";
+        let under = |pid: i32, session_repo: &str| AgentThrottleCandidate {
+            lineage_cwds: vec![registry.into(), session_repo.into()],
+            ..in_repo(pid, Some(registry))
+        };
         deps.candidates = vec![
             in_repo(4100, Some("/trusted/a")),
             in_repo(4500, Some("/untrusted/b")),
             in_repo(4600, None),
+            under(4700, "/trusted/a"),
+            under(4800, "/untrusted/b"),
         ];
         let rec = evaluate_tick_with(&rt, "critical_wake", None, &deps);
-        assert_eq!(rec.throttled_processes, 1);
+        assert_eq!(rec.throttled_processes, 2);
         assert_eq!(
             *deps.throttle_ops.borrow(),
-            vec![(4100, true)],
-            "an untrusted repository's agent, or one in no repository, is never slowed"
+            vec![(4100, true), (4700, true)],
+            "an untrusted repository's agent, or one in no repository, is never slowed; a build script outside the repository is judged by the session it serves"
         );
         let raw = fs::read(tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE)).unwrap();
         let lease: ActiveThrottleRecord = serde_json::from_slice(&raw).unwrap();

@@ -1666,7 +1666,7 @@ fn a_heavy_command_under_load_that_refuses_builds_is_not_told_every_slot_is_held
 
 fn active_steward(binding: &str, reason: &str) -> crate::harness::steward::ActiveThrottleRecord {
     crate::harness::steward::ActiveThrottleRecord {
-        version: 1,
+        version: crate::harness::steward::LEASE_VERSION,
         writer_pid: std::process::id(),
         writer_start_us: 1,
         issued_at_ms: 1_000,
