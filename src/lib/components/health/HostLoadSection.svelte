@@ -118,7 +118,7 @@
   const steward = $derived($manviSteward);
   const latestStewardTick = $derived(steward.history.length > 0 ? steward.history[0] : null);
   const stewardAnyEnabled = $derived(
-    isMasterStewardEnabled(steward.settings, steward.env_override),
+    isMasterStewardEnabled(steward.settings, steward.env_forced),
   );
 
   let stewardRunning = $state(false);
@@ -162,10 +162,7 @@
       await refreshManviSteward(null);
       stewardError = null;
     } catch (cause) {
-      const msg = cause instanceof Error ? cause.message : String(cause);
-      if (!msg.startsWith("Unimplemented fixture:")) {
-        stewardError = describeFailure({ verb: "read", object: "Manvi steward status" }, cause);
-      }
+      stewardError = describeFailure({ verb: "read", object: "Manvi steward status" }, cause);
     }
   }
 

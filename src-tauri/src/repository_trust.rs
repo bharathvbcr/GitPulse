@@ -3497,7 +3497,7 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "test@example.com")
                 .env("GIT_COMMITTER_NAME", "Test")
                 .env("GIT_COMMITTER_EMAIL", "test@example.com")
-                .output()
+                .output_locked()
                 .unwrap();
             assert!(out.status.success());
         };

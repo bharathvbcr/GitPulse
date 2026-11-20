@@ -681,6 +681,7 @@ export async function runHostLoadChecks(ctx) {
       effective: resolveEffectiveStewardPolicy(DEFAULT_MANVI_STEWARD_SETTINGS, null, null),
       repo_common_dir: null,
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",

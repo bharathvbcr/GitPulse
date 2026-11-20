@@ -69,6 +69,7 @@ describe("ManviStewardSettings", () => {
       effective: resolveEffectiveStewardPolicy(settings, commonDir, null),
       repo_common_dir: commonDir,
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "local",
       manvi_model: "qwen2.5-coder:14b",
@@ -221,14 +222,14 @@ describe("ManviStewardSettings", () => {
     const envForcedOff = resolveEffectiveStewardPolicy(
       base,
       commonDir,
-      "GITPULSE_MANVI_STEWARD=0 forces the steward off",
+      false,
     );
     expect(envForcedOff.enabled).toBe(false);
 
     const envForcedOn = resolveEffectiveStewardPolicy(
       { ...base, enabled: false },
       commonDir,
-      "GITPULSE_MANVI_STEWARD=1 forces the steward on",
+      true,
     );
     expect(envForcedOn.enabled).toBe(true);
   });

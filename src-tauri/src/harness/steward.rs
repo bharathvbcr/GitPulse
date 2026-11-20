@@ -181,7 +181,12 @@ pub struct ManviStewardStatus {
     pub settings: ManviStewardSettings,
     pub effective: EffectiveStewardPolicy,
     pub repo_common_dir: Option<String>,
+    /// What `GITPULSE_MANVI_STEWARD` says, for a person to read.
     pub env_override: Option<String>,
+    /// What `GITPULSE_MANVI_STEWARD` forces: `Some(true)` on, `Some(false)`
+    /// off, `None` when it is unset or unreadable. Code reads this, never the
+    /// note's text.
+    pub env_forced: Option<bool>,
     /// `"ready"` | `"not_chosen"` | `"not_installed"` | `"needs_update"` | `"failed"` | `"deferred"` | `"unsupported"`
     pub manvi_state: String,
     pub manvi_mode: String,
@@ -211,7 +216,7 @@ pub(crate) struct ActiveThrottleRecord {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ManviProbe {
-    Answered(ManviStatus),
+    Answered(Box<ManviStatus>),
     Deferred(String),
     /// `manvi use` could not be asked at all (spawn failure, timeout, bad
     /// output). Unlike an answer of `not_chosen`, this says nothing about
@@ -263,6 +268,9 @@ struct InnerState {
     last_critical_wake: Option<Instant>,
 }
 
+/// Publishes a status to the app (a Tauri event), set by [`install`].
+type StatusEmitter = Arc<dyn Fn(&ManviStewardStatus) + Send + Sync>;
+
 pub(crate) struct StewardRuntime {
     inner: Mutex<InnerState>,
     wake_cv: Condvar,
@@ -270,7 +278,7 @@ pub(crate) struct StewardRuntime {
     closed: AtomicBool,
     workbench: Mutex<Option<WorkbenchState>>,
     watcher: Mutex<Option<WatcherState>>,
-    emit: Mutex<Option<Arc<dyn Fn(&ManviStewardStatus) + Send + Sync>>>,
+    emit: Mutex<Option<StatusEmitter>>,
 }
 
 impl Default for StewardRuntime {
@@ -586,7 +594,7 @@ fn probe_live_manvi_on(rt: &StewardRuntime, disk_remedy: bool) -> ManviProbe {
             if verified != prev_verified {
                 crate::supervisor::lock_or_recover(&rt.inner).verified_keychain_key = verified;
             }
-            ManviProbe::Answered(status)
+            ManviProbe::Answered(Box::new(status))
         }
         Err(err) if err.origin() == Some(IpcErrorKind::DeferredUnderLoad) => {
             ManviProbe::Deferred(err.message().to_string())
@@ -625,8 +633,9 @@ fn unreadable_manvi_status(why: &str) -> ManviStatus {
 fn resolve_manvi_for_status(rt: &StewardRuntime) -> ManviStatus {
     match probe_live_manvi_on(rt, crate::sysload::disk_remedy_due()) {
         ManviProbe::Answered(status) => {
-            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi = Some(status.clone());
-            status
+            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi =
+                Some(ManviStatus::clone(&status));
+            *status
         }
         ManviProbe::Deferred(why) => {
             let cached = crate::supervisor::lock_or_recover(&rt.inner)
@@ -944,7 +953,7 @@ fn worker_loop(rt: &Arc<StewardRuntime>) {
     let (initial_forced, _) = env_override_of(std::env::var(STEWARD_ENV).ok().as_deref());
     if is_master_enabled(&initial_settings, initial_forced) {
         if let ManviProbe::Answered(initial) = probe_live_manvi_on(rt, false) {
-            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi = Some(initial);
+            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi = Some(*initial);
         }
         // Brief initial settle so the host-load sampler completes its first
         // ENTER_SAMPLES ticks, waking immediately on critical pulse or settings save.
@@ -1210,6 +1219,7 @@ pub(crate) fn build_status_with_env(
         effective,
         repo_common_dir,
         env_override: env_note,
+        env_forced: forced,
         manvi_state,
         manvi_mode,
         manvi_model,
@@ -1624,6 +1634,8 @@ pub(crate) trait StewardDeps {
         user: &str,
         max_tokens: i64,
     ) -> Result<String, String>;
+    // One call carries the whole directive envelope the bus and mailbox need.
+    #[allow(clippy::too_many_arguments)]
     fn deliver_repo_directive(
         &self,
         repo_root: &str,
@@ -3746,8 +3758,9 @@ pub(crate) fn evaluate_tick_with(
     // checked while existing throttles and the lease stay in place.
     let unchecked = match deps.manvi_probe(disk_remedy) {
         ManviProbe::Answered(status) => {
-            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi = Some(status.clone());
-            Ok(status)
+            crate::supervisor::lock_or_recover(&rt.inner).cached_manvi =
+                Some(ManviStatus::clone(&status));
+            Ok(*status)
         }
         ManviProbe::Deferred(why) => Err((
             "manvi_deferred",
@@ -4464,13 +4477,18 @@ mod tests {
         active_sessions_by_repo: HashMap<String, u32>,
         delivered: RefCell<Vec<(String, String)>>,
         candidates: Vec<AgentThrottleCandidate>,
-        on_throttle_scan: Option<Box<dyn Fn(&RefCell<ManviStewardSettings>)>>,
+        on_throttle_scan: Option<ThrottleScanHook>,
         throttle_ops: RefCell<Vec<(i32, bool)>>,
         /// Pids already at background priority: throttling one answers `Ok(false)`.
         already_background: RefCell<BTreeSet<i32>>,
         clean_result: CleanPassOutcome,
-        clean_calls: RefCell<Vec<(Vec<String>, Option<String>, bool)>>,
+        clean_calls: RefCell<Vec<CleanCall>>,
     }
+
+    /// Runs during the throttle scan, to change settings mid-tick.
+    type ThrottleScanHook = Box<dyn Fn(&RefCell<ManviStewardSettings>)>;
+    /// `(cleanable repos, shared-cache anchor, clean shared caches)` per clean call.
+    type CleanCall = (Vec<String>, Option<String>, bool);
 
     fn make_load(
         state: SensorState,
@@ -4696,7 +4714,7 @@ mod tests {
             config_dir: dir.to_path_buf(),
             settings: RefCell::new(ManviStewardSettings::default()),
             env_var: None,
-            manvi: ManviProbe::Answered(cloud_manvi()),
+            manvi: ManviProbe::Answered(Box::new(cloud_manvi())),
             manvi_probes: RefCell::new(0),
             load: make_load(SensorState::Fresh, Tier::Clear, None, true),
             disk_remedy: false,
@@ -4722,18 +4740,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
-        deps.manvi = ManviProbe::Answered(ManviStatus {
+        deps.manvi = ManviProbe::Answered(Box::new(ManviStatus {
             state: "not_chosen".into(),
             detail: "Choose a model first.".into(),
             ..ManviStatus::default()
-        });
+        }));
         let rec = evaluate_tick_with(&rt, "scheduled", None, &deps);
         assert_eq!(rec.outcome, "manvi_unconfigured");
         assert!(!rec.model_generated);
         assert_eq!(*deps.llm_calls.borrow(), 0);
 
         // Sensor dead must report sensor_unavailable, never healthy.
-        deps.manvi = ManviProbe::Answered(cloud_manvi());
+        deps.manvi = ManviProbe::Answered(Box::new(cloud_manvi()));
         deps.load = make_load(SensorState::Dead, Tier::Clear, None, true);
         let rec = evaluate_tick_with(&rt, "scheduled", None, &deps);
         assert_eq!(rec.outcome, "sensor_unavailable");
@@ -4774,7 +4792,7 @@ mod tests {
 
         // Once a calm tick caches `manvi use`, a subsequent severe-load deferral
         // reuses the cached model and still enforces critical slowdowns and directives!
-        deps.manvi = ManviProbe::Answered(cloud_manvi());
+        deps.manvi = ManviProbe::Answered(Box::new(cloud_manvi()));
         assert_eq!(
             evaluate_tick_with(&rt, "scheduled", None, &deps).outcome,
             "healthy"
@@ -4876,7 +4894,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
-        deps.manvi = ManviProbe::Answered(local_manvi());
+        deps.manvi = ManviProbe::Answered(Box::new(local_manvi()));
         deps.load = make_load(
             SensorState::Fresh,
             Tier::Severe,
@@ -5670,7 +5688,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
-        deps.manvi = ManviProbe::Answered(local_manvi());
+        deps.manvi = ManviProbe::Answered(Box::new(local_manvi()));
         deps.candidates = vec![AgentThrottleCandidate {
             pid: 7100,
             start_us: 12,
@@ -5970,11 +5988,12 @@ mod tests {
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
 
+        use crate::procguard::LockedSpawn;
         // Spawn a distinct live OS process to represent the elected primary GitPulse writer.
         let mut guard_child = ChildKillGuard(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
-                .spawn()
+                .spawn_locked()
                 .expect("spawn sleep"),
         );
         let foreign_pid = guard_child.0.id();

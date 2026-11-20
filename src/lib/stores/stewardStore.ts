@@ -22,7 +22,7 @@ export const DEFAULT_MANVI_STEWARD_SETTINGS: ManviStewardSettings = {
 export function resolveEffectiveStewardPolicy(
   settings: ManviStewardSettings,
   repoCommonDir: string | null,
-  envOverride: string | null,
+  envForced: boolean | null,
 ): EffectiveStewardPolicy {
   const ov = repoCommonDir ? settings.repositories[repoCommonDir] : undefined;
   const overridden = Boolean(
@@ -32,12 +32,8 @@ export function resolveEffectiveStewardPolicy(
         ov.slow_critical !== undefined ||
         ov.clean_critical !== undefined),
   );
-  let enabled = ov?.enabled ?? settings.enabled;
-  const lowerEnv = envOverride?.toLowerCase() ?? "";
-  if (lowerEnv.includes("forces the steward on")) enabled = true;
-  if (lowerEnv.includes("forces the steward off")) enabled = false;
   return {
-    enabled,
+    enabled: envForced ?? ov?.enabled ?? settings.enabled,
     interval_secs: settings.interval_secs,
     message_agents: ov?.message_agents ?? settings.message_agents,
     slow_critical: ov?.slow_critical ?? settings.slow_critical,
@@ -53,11 +49,9 @@ export function resolveEffectiveStewardPolicy(
  */
 export function isMasterStewardEnabled(
   settings: ManviStewardSettings,
-  envOverride: string | null,
+  envForced: boolean | null,
 ): boolean {
-  const lowerEnv = envOverride?.toLowerCase() ?? "";
-  if (lowerEnv.includes("forces the steward on")) return true;
-  if (lowerEnv.includes("forces the steward off")) return false;
+  if (envForced !== null) return envForced;
   return (
     settings.enabled ||
     Object.values(settings.repositories).some((ov) => ov?.enabled === true)
@@ -69,6 +63,7 @@ export const EMPTY_MANVI_STEWARD_STATUS: ManviStewardStatus = {
   effective: resolveEffectiveStewardPolicy(DEFAULT_MANVI_STEWARD_SETTINGS, null, null),
   repo_common_dir: null,
   env_override: null,
+  env_forced: null,
   manvi_state: "not_chosen",
   manvi_mode: "",
   manvi_model: "",
@@ -95,7 +90,7 @@ function mergeIncomingStewardStatus(
   const effective = resolveEffectiveStewardPolicy(
     incoming.settings,
     repoCommonDir,
-    incoming.env_override,
+    incoming.env_forced,
   );
   return {
     ...incoming,
@@ -164,7 +159,7 @@ export async function saveManviStewardSettings(
         ...prev,
         repo_common_dir: repoCommonDir,
         settings,
-        effective: resolveEffectiveStewardPolicy(settings, repoCommonDir, prev.env_override),
+        effective: resolveEffectiveStewardPolicy(settings, repoCommonDir, prev.env_forced),
       };
       return nextStatus;
     });

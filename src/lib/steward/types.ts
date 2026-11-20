@@ -67,7 +67,10 @@ export interface ManviStewardStatus {
   settings: ManviStewardSettings;
   effective: EffectiveStewardPolicy;
   repo_common_dir: string | null;
+  /** What GITPULSE_MANVI_STEWARD says, for a person to read. */
   env_override: string | null;
+  /** What GITPULSE_MANVI_STEWARD forces (true on, false off, null unset). */
+  env_forced: boolean | null;
   manvi_state: string;
   manvi_mode: string;
   manvi_model: string;

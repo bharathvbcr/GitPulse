@@ -67,6 +67,7 @@ describe("HostLoadSection", () => {
       effective: resolveEffectiveStewardPolicy(DEFAULT_MANVI_STEWARD_SETTINGS, null, null),
       repo_common_dir: null,
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
@@ -141,6 +142,7 @@ describe("HostLoadSection", () => {
       effective: resolveEffectiveStewardPolicy(globalOnRepoOff, "/repo/opted-out/.git", null),
       repo_common_dir: "/repo/opted-out/.git",
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
@@ -167,12 +169,13 @@ describe("HostLoadSection", () => {
       },
     };
     const forcedOffEnv = "GITPULSE_MANVI_STEWARD=0 forces the steward off";
-    expect(isMasterStewardEnabled(repoOnEnvForcedOff, forcedOffEnv)).toBe(false);
+    expect(isMasterStewardEnabled(repoOnEnvForcedOff, false)).toBe(false);
     setManviStewardForTest({
       settings: repoOnEnvForcedOff,
-      effective: resolveEffectiveStewardPolicy(repoOnEnvForcedOff, null, forcedOffEnv),
+      effective: resolveEffectiveStewardPolicy(repoOnEnvForcedOff, null, false),
       repo_common_dir: null,
       env_override: forcedOffEnv,
+      env_forced: false,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
@@ -194,6 +197,7 @@ describe("HostLoadSection", () => {
       effective: resolveEffectiveStewardPolicy(globalOnRepoOff, "/repo/opted-out/.git", null),
       repo_common_dir: "/repo/opted-out/.git",
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
@@ -210,6 +214,7 @@ describe("HostLoadSection", () => {
       effective: resolveEffectiveStewardPolicy(globalOnRepoOff, null, null),
       repo_common_dir: null,
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
@@ -232,6 +237,7 @@ describe("HostLoadSection", () => {
       effective: resolveEffectiveStewardPolicy(globalOnRepoOff, null, null),
       repo_common_dir: null,
       env_override: null,
+      env_forced: null,
       manvi_state: "ready",
       manvi_mode: "cloud",
       manvi_model: "claude-sonnet-4-6",
