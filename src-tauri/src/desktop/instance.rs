@@ -1971,6 +1971,15 @@ const ASKER_LEFT_MIDWAY: &str =
 /// plus the git child it is in the middle of, which the runner stops.
 const ASKER_WATCH_INTERVAL: Duration = Duration::from_millis(25);
 
+#[cfg(test)]
+thread_local! {
+    /// Test observer: when set on a handler thread, the asker watch started for
+    /// that thread's ask adds one per look at the socket, so a test waits on
+    /// the watch having looked rather than on a sleep.
+    static ASKER_WATCH_LOOKS: std::cell::RefCell<Option<Arc<AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Runs `call` for an abandonable ask, and stops it at its next safe point if
 /// the asker hangs up while it runs.
 ///
@@ -2010,8 +2019,14 @@ fn call_while_asker_stays(
     // panic instead of losing it.
     let watch = {
         let (finished, cancel) = (Arc::clone(&finished), cancel.clone());
+        #[cfg(test)]
+        let looks = ASKER_WATCH_LOOKS.with(|slot| slot.borrow().clone());
         crate::supervisor::spawn_once("asker-watch", "asker watch", move || {
             while !finished.load(Ordering::Acquire) {
+                #[cfg(test)]
+                if let Some(looks) = &looks {
+                    looks.fetch_add(1, Ordering::Release);
+                }
                 if crate::local_socket::peer_hung_up_silently(&watched) {
                     cancel.cancel();
                     return;

@@ -1134,19 +1134,27 @@ fn a_verdict_whose_asker_stays_is_computed_in_full_and_delivered() {
     let path = repo.path().to_path_buf();
     let spawned = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&spawned);
+    // The watch counts each look at the socket; the sink does not finish until
+    // it has looked a few times while the asker stays.
+    let looks = Arc::new(AtomicUsize::new(0));
+    ASKER_WATCH_LOOKS.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&looks)));
+    let looked = Arc::clone(&looks);
     *shared.gate.lock().unwrap() = Some(Arc::new(move |_: &str, _: &str| {
         let mut into = Vec::new();
         for _ in 0..3 {
             git_stage(&path, &mut into)?;
-            // Longer than several of the owner's watch intervals, so the watch
-            // has looked a few times while the asker stays. A floor on how long
-            // the ask lives: a slower host only looks more often.
-            std::thread::sleep(Duration::from_millis(150));
         }
+        assert!(
+            crate::test_support::env::wait_until(Duration::from_secs(10), || {
+                looked.load(Ordering::Acquire) >= 3
+            }),
+            "the asker watch never looked three times while the asker stayed"
+        );
         record.lock().unwrap().extend(into);
         Ok(serde_json::json!({ "decision": "allow" }))
     }));
     answer_gate(&mut server, &shared, "g-stay", "/", "ls").expect("answered");
+    ASKER_WATCH_LOOKS.with(|slot| *slot.borrow_mut() = None);
     let mut reader = BufReader::new(client);
     let ack: Ack = serde_json::from_str(&read_frame(&mut reader).unwrap().expect("ack")).unwrap();
     assert!(ack.accepted, "{:?}", ack.reason);
