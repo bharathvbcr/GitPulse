@@ -3734,9 +3734,13 @@ fn is_object_id(text: &str) -> bool {
 /// be mistaken for another sibling's.
 ///
 /// Answered from this process's memo, then from the row the anchor already
-/// stores for the source (`stored`, asked only on a memo miss), and only for a
-/// source never seen does it spawn `git hash-object --stdin`: Git is the
-/// authority on the object format, and an id computed here would be a guess at it.
+/// stores for the source (`stored`, asked only on a memo miss), then in process:
+/// the blob id [`blob_id`] computes, in the object format the anchor's own
+/// config declares (read, not guessed; see [`blob_id::blob_id_in_repo`]). Only
+/// when that format cannot be determined for certain (unreadable config, an
+/// unknown value, a malformed `.git` or `commondir` pointer) does it spawn
+/// `git hash-object --stdin`, so a doubt falls toward Git, the authority, and
+/// never toward a key of the wrong length. Both routes give the same key.
 fn family_source_key(
     anchor: &Path,
     source: &str,
@@ -3748,7 +3752,10 @@ fn family_source_key(
     let memo_key = (anchor.to_path_buf(), source.to_string());
     let key = match stored() {
         Some(key) => key,
-        None => hash_family_source(anchor, source)?,
+        None => match blob_id::blob_id_in_repo(anchor, source.as_bytes()) {
+            Some(key) => key,
+            None => hash_family_source(anchor, source)?,
+        },
     };
     family_keys()
         .lock()
@@ -6399,6 +6406,12 @@ pub(crate) mod tests_support {
                 .map_err(|error| super::LedgerError::new("query_failed", error.to_string()))
         })
         .expect("anchor ledger")
+    }
+
+    /// The key the in-process route gives `source` in the repository at
+    /// `anchor`, or `None` when it cannot tell the object format.
+    pub fn in_process_key(anchor: &std::path::Path, source: &str) -> Option<String> {
+        super::blob_id::blob_id_in_repo(anchor, source.as_bytes())
     }
 
     /// Forgets every sibling key this thread has worked out, as a new process
