@@ -188,6 +188,7 @@ pub struct ManviStewardStatus {
     /// note's text.
     pub env_forced: Option<bool>,
     /// `"ready"` | `"not_chosen"` | `"not_installed"` | `"needs_update"` | `"failed"` | `"deferred"` | `"unsupported"`
+    /// | `"rejected"` (Anthropic refused the key on the last model call)
     pub manvi_state: String,
     pub manvi_mode: String,
     pub manvi_model: String,
@@ -274,6 +275,12 @@ struct InnerState {
     /// (`find-generic-password` without `-w`) instead of decrypting the secret
     /// or prompting on a locked login Keychain every few minutes.
     verified_keychain_key: bool,
+    /// Set when Manvi answered the steward's last cloud model call with
+    /// `E_PROVIDER_AUTH`: the key passes its format check but Anthropic refused
+    /// it. The status then reads failed instead of ready. Cleared by the next
+    /// call that succeeds, by a saved or deleted Keychain key, and by a new
+    /// `manvi use` choice.
+    credential_rejected: bool,
     wake_requested: Option<&'static str>,
     last_critical_wake: Option<Instant>,
 }
@@ -698,6 +705,7 @@ pub fn note_manvi_status(status: &ManviStatus) {
     {
         let mut guard = crate::supervisor::lock_or_recover(&rt.inner);
         guard.cached_manvi = Some(status.clone());
+        guard.credential_rejected = false;
         guard.settings_epoch = guard.settings_epoch.wrapping_add(1);
     }
     rt.wake_cv.notify_one();
@@ -715,6 +723,7 @@ pub fn note_claude_credential_changed() {
         let mut guard = crate::supervisor::lock_or_recover(&rt.inner);
         guard.cached_manvi = None;
         guard.verified_keychain_key = false;
+        guard.credential_rejected = false;
         guard.settings_epoch = guard.settings_epoch.wrapping_add(1);
     }
     rt.wake_cv.notify_one();
@@ -1174,6 +1183,23 @@ fn present_manvi(manvi: &ManviStatus) -> (String, String, String, String) {
     )
 }
 
+/// A ready cloud model whose key Anthropic refused reads `rejected`, with the
+/// sentence that says what to do. Any other state is left as it is.
+fn present_rejected_credential(
+    credential_rejected: bool,
+    manvi_state: String,
+    manvi_detail: String,
+) -> (String, String) {
+    if credential_rejected && manvi_state == "ready" {
+        (
+            "rejected".to_string(),
+            crate::ai::REJECTED_KEY_MESSAGE.to_string(),
+        )
+    } else {
+        (manvi_state, manvi_detail)
+    }
+}
+
 fn build_status(
     rt: &StewardRuntime,
     settings: ManviStewardSettings,
@@ -1224,6 +1250,11 @@ pub(crate) fn build_status_with_env(
     } else {
         None
     };
+    // A rejected key still passes every local check, so only the provider's
+    // refusal can say it is not usable. Checks keep running (a refused call is
+    // not billed), and the first one that succeeds clears this.
+    let (manvi_state, manvi_detail) =
+        present_rejected_credential(guard.credential_rejected, manvi_state, manvi_detail);
     ManviStewardStatus {
         settings,
         effective,
@@ -1623,6 +1654,47 @@ pub(crate) fn merge_cleanup_candidate_repos(
     ordered
 }
 
+/// A failed steward model call. `credential_rejected` is Manvi's
+/// `E_PROVIDER_AUTH` code from an Anthropic route, read as data, never from
+/// the message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCallError {
+    pub message: String,
+    pub credential_rejected: bool,
+}
+
+impl From<String> for ModelCallError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            credential_rejected: false,
+        }
+    }
+}
+
+impl From<&str> for ModelCallError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl std::fmt::Display for ModelCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Reads one failed `work.assist.complete` answer. Only an Anthropic route's
+/// `E_PROVIDER_AUTH` marks the key rejected: a local server's refusal is not
+/// about the Claude key.
+fn model_call_error(provider: &str, failure: ManviError) -> ModelCallError {
+    ModelCallError {
+        credential_rejected: provider == "anthropic"
+            && failure.code == crate::ai::MANVI_PROVIDER_AUTH,
+        message: format!("{}: {}", failure.code, failure.message),
+    }
+}
+
 pub(crate) trait StewardDeps {
     fn now_ms(&self) -> u64;
     fn config_dir(&self) -> Option<PathBuf>;
@@ -1647,7 +1719,7 @@ pub(crate) trait StewardDeps {
         system: &str,
         user: &str,
         max_tokens: i64,
-    ) -> Result<String, String>;
+    ) -> Result<String, ModelCallError>;
     // One call carries the whole directive envelope the bus and mailbox need.
     #[allow(clippy::too_many_arguments)]
     fn deliver_repo_directive(
@@ -1690,15 +1762,14 @@ impl LiveDeps<'_> {
         user: &str,
         max_tokens: i64,
         reject_truncated: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, ModelCallError> {
         match self.workbench.assist_served(selection) {
             Ok(true) => {}
-            Ok(false) => return Err(crate::ai::OLD_MANVI_MESSAGE.to_string()),
+            Ok(false) => return Err(crate::ai::OLD_MANVI_MESSAGE.into()),
             Err(err) => {
-                return Err(format!(
-                    "Manvi worker unavailable ({}): {}",
-                    err.code, err.message
-                ))
+                return Err(
+                    format!("Manvi worker unavailable ({}): {}", err.code, err.message).into(),
+                )
             }
         }
         let route = self.workbench.assist_route(selection.clone());
@@ -1707,7 +1778,7 @@ impl LiveDeps<'_> {
             "user": user,
             "max_output_tokens": max_tokens,
         }))
-        .map_err(|ManviError { code, message }| format!("{code}: {message}"))?;
+        .map_err(|failure| model_call_error(route.provider, failure))?;
         if reply["ok"] != true {
             return Err("Manvi returned a non-ok completion response".into());
         }
@@ -1716,7 +1787,8 @@ impl LiveDeps<'_> {
             return Err(format!(
                 "Manvi answered from `{provider}` instead of expected `{}`",
                 route.provider
-            ));
+            )
+            .into());
         }
         if reject_truncated && reply["truncated"] == true {
             return Err(
@@ -1824,7 +1896,7 @@ impl StewardDeps for LiveDeps<'_> {
         system: &str,
         user: &str,
         max_tokens: i64,
-    ) -> Result<String, String> {
+    ) -> Result<String, ModelCallError> {
         let raw = self.call_manvi_assist_checked(selection, system, user, max_tokens, false)?;
         let text = sanitize_directive(&raw);
         if text.is_empty() {
@@ -1897,6 +1969,7 @@ impl StewardDeps for LiveDeps<'_> {
         if let Some(sel) = cloud_selection {
             let eval = |system: &str, user: &str, max_tokens: i64| {
                 self.call_manvi_assist_checked(sel, system, user, max_tokens, true)
+                    .map_err(|failure| failure.message)
             };
             run_critical_hygiene_pass_impl(
                 req.trusted_cleanable_repos,
@@ -4387,7 +4460,19 @@ pub(crate) fn evaluate_tick_with(
         )
     } else {
         let digest = telemetry_digest(&load, disk_remedy, throttled_now, reclaimed_bytes);
-        match deps.manvi_complete(selection, STEWARD_SYSTEM_PROMPT, &digest, MAX_OUTPUT_TOKENS) {
+        let answer =
+            deps.manvi_complete(selection, STEWARD_SYSTEM_PROMPT, &digest, MAX_OUTPUT_TOKENS);
+        // Only a call that reached the provider says anything about the key:
+        // success clears a rejection, Anthropic's refusal of the key sets it,
+        // and any other failure leaves it as it was.
+        match &answer {
+            Ok(_) => crate::supervisor::lock_or_recover(&rt.inner).credential_rejected = false,
+            Err(err) if err.credential_rejected => {
+                crate::supervisor::lock_or_recover(&rt.inner).credential_rejected = true
+            }
+            Err(_) => {}
+        }
+        match answer {
             Ok(text) => (text, true),
             Err(err) => {
                 warnings.push(format!(
@@ -4525,7 +4610,7 @@ mod tests {
         cleanup_repos: Vec<String>,
         trusted: BTreeSet<String>,
         common_dirs: HashMap<String, String>,
-        llm_reply: Result<String, String>,
+        llm_reply: Result<String, ModelCallError>,
         llm_calls: RefCell<usize>,
         active_sessions_by_repo: HashMap<String, u32>,
         delivered: RefCell<Vec<(String, String)>>,
@@ -4699,7 +4784,7 @@ mod tests {
             _system: &str,
             _user: &str,
             _max_tokens: i64,
-        ) -> Result<String, String> {
+        ) -> Result<String, ModelCallError> {
             *self.llm_calls.borrow_mut() += 1;
             self.llm_reply.clone()
         }
@@ -7485,6 +7570,76 @@ Trailing note {done}."#;
         assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
         assert!(restored.borrow().is_empty());
         assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+    }
+
+    #[test]
+    fn only_an_anthropic_routes_provider_auth_code_marks_the_key_rejected() {
+        let failure = |code: &str| ManviError {
+            code: code.into(),
+            message: "invalid x-api-key".into(),
+        };
+        assert!(
+            model_call_error("anthropic", failure(crate::ai::MANVI_PROVIDER_AUTH))
+                .credential_rejected
+        );
+        // The text names a key, but the code is an outage: not a rejection.
+        assert!(!model_call_error("anthropic", failure("E_DEPENDENCY")).credential_rejected);
+        // A local server's refusal is not about the Claude key.
+        assert!(
+            !model_call_error("local", failure(crate::ai::MANVI_PROVIDER_AUTH)).credential_rejected
+        );
+    }
+
+    #[test]
+    fn a_key_anthropic_refuses_reads_failed_until_a_call_with_it_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        deps.load = make_load(
+            SensorState::Fresh,
+            Tier::Elevated,
+            Some(Binding::CpuLoad),
+            true,
+        );
+        let status = |rt: &StewardRuntime, deps: &FakeDeps| {
+            build_status_with_env(rt, deps.settings(), &cloud_manvi(), None, None)
+        };
+        assert_eq!(status(&rt, &deps).manvi_state, "ready");
+
+        // A failure that is not the provider refusing the key changes nothing.
+        deps.llm_reply = Err("E_DEPENDENCY: overloaded".into());
+        evaluate_tick_with(&rt, "scheduled", None, &deps);
+        assert_eq!(*deps.llm_calls.borrow(), 1);
+        assert_eq!(status(&rt, &deps).manvi_state, "ready");
+
+        // Anthropic refused the key: the steward still messages with its own
+        // directive, and the status stops calling the model configured.
+        deps.llm_reply = Err(ModelCallError {
+            message: "E_PROVIDER_AUTH: assist completion unavailable: anthropic: 401".into(),
+            credential_rejected: true,
+        });
+        deps.now_ms += 1_000;
+        let refused = evaluate_tick_with(&rt, "scheduled", None, &deps);
+        assert_eq!(*deps.llm_calls.borrow(), 2);
+        assert!(!refused.model_generated);
+        let rejected = status(&rt, &deps);
+        assert_eq!(rejected.manvi_state, "rejected");
+        assert_eq!(rejected.manvi_detail, crate::ai::REJECTED_KEY_MESSAGE);
+        assert!(
+            rejected.next_check_ms.is_some(),
+            "checks keep running so a replaced key is noticed"
+        );
+
+        // A later outage does not clear it; a call that succeeds does.
+        deps.llm_reply = Err("E_DEPENDENCY: overloaded".into());
+        deps.now_ms += 1_000;
+        evaluate_tick_with(&rt, "scheduled", None, &deps);
+        assert_eq!(status(&rt, &deps).manvi_state, "rejected");
+        deps.llm_reply = Ok("CPU load is elevated. Cap cargo builds to 2 jobs.".into());
+        deps.now_ms += 1_000;
+        let fixed = evaluate_tick_with(&rt, "scheduled", None, &deps);
+        assert!(fixed.model_generated);
+        assert_eq!(status(&rt, &deps).manvi_state, "ready");
     }
 
     #[test]

@@ -146,6 +146,9 @@
       const mode = steward.manvi_mode === "cloud" ? "cloud" : "local";
       return `Active (${mode} · ${steward.manvi_model}) · checks every ${mins} min`;
     }
+    if (steward.manvi_state === "rejected") {
+      return "Anthropic rejected the API key";
+    }
     if (steward.manvi_state === "deferred" || steward.manvi_state === "failed" || steward.manvi_state === "unchecked") {
       return steward.manvi_state === "unchecked"
         ? "Manvi model not checked yet"

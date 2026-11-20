@@ -379,6 +379,40 @@ fn a_busy_manvi_gets_its_own_message() {
     );
 }
 
+#[test]
+fn a_key_anthropic_rejected_says_to_replace_the_key_whatever_the_text() {
+    // The code decides; text that merely mentions a key does not.
+    let rejected = ManviError {
+        code: crate::ai::MANVI_PROVIDER_AUTH.into(),
+        message: "assist completion unavailable: anthropic: 401".into(),
+    };
+    let (cloud, _calls) = fake_manvi(Value::Null, Some(rejected), 200_000);
+    let error = run_with(
+        Feature::ExplainCommit,
+        "/repo",
+        Route::Manvi(cloud),
+        turn("d"),
+        no_sweep,
+    )
+    .expect_err("rejected key");
+    assert_eq!(error.message(), crate::ai::REJECTED_KEY_MESSAGE);
+
+    let outage = ManviError {
+        code: "E_DEPENDENCY".into(),
+        message: "invalid x-api-key".into(),
+    };
+    let (cloud, _calls) = fake_manvi(Value::Null, Some(outage), 200_000);
+    let error = run_with(
+        Feature::ExplainCommit,
+        "/repo",
+        Route::Manvi(cloud),
+        turn("d"),
+        no_sweep,
+    )
+    .expect_err("dependency failure");
+    assert_eq!(error.message(), "Manvi: invalid x-api-key");
+}
+
 /// Manvi refuses when ceil((system+user) bytes / 3) + max_output exceeds the
 /// context window.
 #[test]
