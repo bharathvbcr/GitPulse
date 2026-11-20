@@ -136,6 +136,13 @@ describe("ManviStewardSettings", () => {
     expect(body).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
   });
 
+  it("messages agents by default and leaves cleaning and slowing for the person to switch on", () => {
+    expect(DEFAULT_MANVI_STEWARD_SETTINGS.enabled).toBe(true);
+    expect(DEFAULT_MANVI_STEWARD_SETTINGS.message_agents).toBe(true);
+    expect(DEFAULT_MANVI_STEWARD_SETTINGS.clean_critical).toBe(false);
+    expect(DEFAULT_MANVI_STEWARD_SETTINGS.slow_critical).toBe(false);
+  });
+
   it("keeps three days of build caches by default and selects the 3d choice", () => {
     expect(DEFAULT_MANVI_STEWARD_SETTINGS.clean_retention_days).toBe(3);
     const { body } = render(ManviStewardSettings, {
@@ -202,6 +209,7 @@ describe("ManviStewardSettings", () => {
       ...DEFAULT_MANVI_STEWARD_SETTINGS,
       enabled: true,
       slow_critical: true,
+      clean_critical: true,
       repositories: {
         [commonDir]: {
           slow_critical: false,

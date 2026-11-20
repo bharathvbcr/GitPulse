@@ -1272,6 +1272,12 @@ fn steward_default_true() -> bool {
     true
 }
 
+/// Cleaning and slowing act on the person's machine and agents, so each waits
+/// until they switch it on; messaging only advises and is on from the start.
+fn steward_default_false() -> bool {
+    false
+}
+
 fn steward_default_interval_secs() -> u64 {
     STEWARD_DEFAULT_INTERVAL_SECS
 }
@@ -1337,9 +1343,9 @@ pub struct ManviStewardSettings {
     pub interval_secs: u64,
     #[serde(default = "steward_default_true")]
     pub message_agents: bool,
-    #[serde(default = "steward_default_true")]
+    #[serde(default = "steward_default_false")]
     pub slow_critical: bool,
-    #[serde(default = "steward_default_true")]
+    #[serde(default = "steward_default_false")]
     pub clean_critical: bool,
     #[serde(default = "steward_default_retention_days")]
     pub clean_retention_days: u32,
@@ -1353,8 +1359,8 @@ impl Default for ManviStewardSettings {
             enabled: true,
             interval_secs: STEWARD_DEFAULT_INTERVAL_SECS,
             message_agents: true,
-            slow_critical: true,
-            clean_critical: true,
+            slow_critical: false,
+            clean_critical: false,
             clean_retention_days: STEWARD_DEFAULT_RETENTION_DAYS,
             repositories: std::collections::BTreeMap::new(),
         }
@@ -4396,6 +4402,24 @@ mod model_setting_tests {
                 "relative repository keys must be rejected"
             );
         });
+    }
+
+    #[test]
+    fn manvi_steward_messages_by_default_but_cleans_and_slows_only_when_switched_on() {
+        let defaults = ManviStewardSettings::default();
+        assert!(defaults.enabled && defaults.message_agents);
+        assert!(!defaults.clean_critical, "deleting build caches is opt-in");
+        assert!(!defaults.slow_critical, "slowing agents is opt-in");
+        // A settings file that never named them reads the same defaults.
+        let unnamed =
+            ManviStewardSettings::from_stored(serde_json::json!({ "interval_secs": 300 }));
+        assert!(!unnamed.clean_critical && !unnamed.slow_critical);
+        // A saved choice to switch them on is kept.
+        let chosen = ManviStewardSettings::from_stored(serde_json::json!({
+            "clean_critical": true,
+            "slow_critical": true
+        }));
+        assert!(chosen.clean_critical && chosen.slow_critical);
     }
 
     #[test]

@@ -13,8 +13,8 @@ export const DEFAULT_MANVI_STEWARD_SETTINGS: ManviStewardSettings = {
   enabled: true,
   interval_secs: 180,
   message_agents: true,
-  slow_critical: true,
-  clean_critical: true,
+  slow_critical: false,
+  clean_critical: false,
   clean_retention_days: 3,
   repositories: {},
 };

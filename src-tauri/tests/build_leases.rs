@@ -733,6 +733,17 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let mut world = World::new(r#"{"mode":"off","wait_max_s":15,"wait_hard_s":60}"#);
+    // Slowing is opt-in; this person switched it on.
+    std::fs::write(
+        &world.tools,
+        r#"{"version":1,"host_load_leases":{"mode":"off","wait_max_s":15,"wait_hard_s":60},"manvi_steward":{"slow_critical":true}}"#,
+    )
+    .unwrap();
+    // The steward names the trusted repositories a lease covers; the hook runs
+    // from this test's working directory, inside this repository.
+    let here = std::env::current_dir().unwrap();
+    let covered = gitpulse_lib::harness::steward::canonical_common_dir(here.to_str().unwrap())
+        .expect("the test runs inside a Git checkout");
     let steward_dir = config_dir(&world.home).join("steward");
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -759,6 +770,7 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
         "binding": "swap",
         "reason": "swap pressure",
         "pace_ms": 500u64,
+        "repositories": [covered],
     });
     let write_active = |path: &Path| {
         std::fs::write(path, serde_json::to_vec(&active_json).unwrap()).unwrap();
@@ -782,10 +794,27 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
         "expected steward slowdown announcement on stderr, got: {said_a}"
     );
 
+    // A build in a repository the lease does not name is not held: the
+    // steward only covers repositories it found trusted.
+    let elsewhere = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(elsewhere.path())
+        .status_locked()
+        .unwrap()
+        .success());
+    let (mut cmd_u, _stderr_u) = world.command("u", &["build"]);
+    cmd_u.current_dir(elsewhere.path()).env("NO_WAIT", "1");
+    let mut child_u = cmd_u.spawn_locked().unwrap();
+    wait_for("u, outside the lease, to run while a is held", || {
+        world.started() == ["u"]
+    });
+    assert_eq!(child_u.wait().unwrap().code(), Some(0));
+
     // Clearing `active.json` unblocks the queued build immediately.
     std::fs::remove_file(&active_path).unwrap();
     wait_for("a to start after active.json removal", || {
-        world.started() == ["a"]
+        world.started() == ["u", "a"]
     });
     world.release();
     assert_eq!(world.finish(), [Some(0)]);
@@ -805,7 +834,7 @@ fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config
     assert_eq!(status_b.code(), Some(0));
     assert_eq!(
         world.started(),
-        ["a", "b"],
+        ["u", "a", "b"],
         "GITPULSE_TOOL_CONFIG opt-out must let build b run immediately: {:?}",
         world.lines()
     );

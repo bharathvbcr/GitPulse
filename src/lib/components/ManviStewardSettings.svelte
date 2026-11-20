@@ -356,7 +356,7 @@
 
     <SettingToggle
       label="Slow agents when host load is critical"
-      description="Enforces command-gate refusals on heavy builds even when Advise is selected, paces rapid shell loops, and lowers OS scheduler and disk priority on agent worker processes until critical load clears."
+      description="Enforces command-gate refusals on heavy builds even when Advise is selected, paces rapid shell loops, and lowers OS scheduler and disk priority on agent worker processes until critical load clears. Applies only to agents working in repositories you trust."
       checked={settings.slow_critical}
       disabled={busy || !readOk || !settings.enabled}
       onchange={(next) => void saveGlobal({ slow_critical: next })}

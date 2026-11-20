@@ -1675,6 +1675,7 @@ fn active_steward(binding: &str, reason: &str) -> crate::harness::steward::Activ
         binding: binding.into(),
         reason: reason.into(),
         pace_ms: 900,
+        repositories: Vec::new(),
     }
 }
 
