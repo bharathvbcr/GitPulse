@@ -224,6 +224,13 @@ export interface CommitGraphPayload {
    * `warnings` and `notices` are current as on any answer.
    */
   unchanged?: boolean;
+  /**
+   * True when the walk behind this answer returned the window the client's
+   * token was issued for, though a ref moved: keep the rows held, take
+   * `refs` (current, complete), `head_id`, `notices` and `graph_token`.
+   * `rows` is empty. The window is recognised as identical, never patched.
+   */
+  window_unchanged?: boolean;
 }
 
 /**
@@ -322,6 +329,8 @@ interface CachedGraph {
    * watcher refresh, on top of the walk over the new payload.
    */
   signature: string;
+  /** The rows part of {@link signature}, kept so a refs-only answer can rebuild the whole without walking the rows. */
+  rowsSignature: string;
   /**
    * The backend's `graph_token` for this page, sent back as `knownToken` so
    * an unchanged repository costs no rows on the wire and no decode. Only a
@@ -437,10 +446,28 @@ export function graphPayloadSignature(payload: {
   mainline_id?: string | null;
   mainline_name?: string | null;
 }): string {
+  return graphSignatureFrom(payload, graphRowsSignature(payload.rows));
+}
+
+/** The part of {@link graphPayloadSignature} that walks the rows. */
+function graphRowsSignature(rows: readonly SignatureRow[]): string {
+  return rows.map(rowSignature).join(";");
+}
+
+function graphSignatureFrom(
+  payload: {
+    head_id: string | null;
+    refs?: readonly RefDecoration[] | null;
+    has_more?: boolean;
+    notices?: readonly string[] | null;
+    mainline_id?: string | null;
+    mainline_name?: string | null;
+  },
+  rows: string
+): string {
   const refs = (payload.refs ?? [])
     .map((r) => `${r.name}#${r.kind}@${r.commit_id}${r.is_head ? "*" : ""}`)
     .join(";");
-  const rows = payload.rows.map(rowSignature).join(";");
   const mainline = `${payload.mainline_id ?? ""}#${payload.mainline_name ?? ""}`;
   // Notices are part of the signature because they are RENDERED. Warnings are
   // not: they go to the diagnostics ring, which is why they are reported
@@ -450,6 +477,19 @@ export function graphPayloadSignature(payload: {
   // leave a stale count on screen.
   const notices = (payload.notices ?? []).join("\u0002");
   return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${notices}\u0001${rows}`;
+}
+
+/** What a graph store has decoded from the backend; see `createGraphStore`. */
+export interface GraphDecodeCounters {
+  answers: number;
+  /** Full pages: rows and refs swapped in. */
+  full: number;
+  /** Answers that named the page held and carried nothing. */
+  unchanged: number;
+  /** Answers that kept the rows held and carried only refs. */
+  refsOnly: number;
+  rowsDecoded: number;
+  refsDecoded: number;
 }
 
 export function createGraphStore(
@@ -529,6 +569,19 @@ export function createGraphStore(
    * repeating what has not changed.
    */
   const warnedSignatures = new Map<string, string>();
+  /**
+   * What the answers to `cmd_get_commit_graph` made this store decode: a count
+   * per kind of answer, and the rows and refs each carried. A refs-only or
+   * unchanged answer decodes no rows, which is the point of both.
+   */
+  const decodeCounters: GraphDecodeCounters = {
+    answers: 0,
+    full: 0,
+    unchanged: 0,
+    refsOnly: 0,
+    rowsDecoded: 0,
+    refsDecoded: 0,
+  };
   /** Monotonic per-repo ordering so a slow details fetch from an older
    * selection can never overwrite a newer one's pane. */
   const selections = new Map<string, number>();
@@ -867,6 +920,12 @@ export function createGraphStore(
         }
         const payload = await pending;
         if (!isCurrent(repoPath, token)) return;
+        decodeCounters.answers += 1;
+        decodeCounters.rowsDecoded += payload.rows?.length ?? 0;
+        decodeCounters.refsDecoded += payload.refs?.length ?? 0;
+        if (payload.unchanged === true) decodeCounters.unchanged += 1;
+        else if (payload.window_unchanged === true) decodeCounters.refsOnly += 1;
+        else decodeCounters.full += 1;
 
         // Assembly warnings ride along with an otherwise-good payload: each
         // one marks a degraded facet (the HEAD marker, ref labels) that would
@@ -910,6 +969,59 @@ export function createGraphStore(
         }
 
         const previous = cache.get(repoPath);
+        if (payload.window_unchanged === true) {
+          // The walk returned the window held, and a ref moved: keep the rows
+          // (and their identity, so canvas caches survive) and take the refs.
+          // Guarded as the unchanged answer is, against the token offered.
+          if (
+            knownToken !== null &&
+            previous !== undefined &&
+            previous.graphToken === knownToken &&
+            previous.query === query &&
+            previous.revision === revision &&
+            previous.refScope === refScope &&
+            previous.maxCommits === max
+          ) {
+            const refs = payload.refs ?? [];
+            const notices = payload.notices ?? [];
+            previous.refs = refs;
+            previous.headId = payload.head_id;
+            previous.notices = notices;
+            previous.warnings = payload.warnings ?? [];
+            // Without a token of its own the answer leaves none: the held one
+            // was issued for the refs before this move, and the refs now
+            // drawn are not the ones it vouches for. Keeping it would let a
+            // later reload whose fingerprint returned to the old one be
+            // answered unchanged while these refs stayed on screen.
+            previous.graphToken = payload.graph_token ?? null;
+            touch(repoPath, previous);
+            previous.signature = graphSignatureFrom(
+              {
+                head_id: payload.head_id,
+                refs,
+                has_more: previous.hasMore,
+                notices,
+                mainline_id: previous.mainlineId,
+                mainline_name: previous.mainlineName,
+              },
+              previous.rowsSignature
+            );
+            if (visiblePath === repoPath) {
+              update((s) => ({
+                ...s,
+                refs,
+                headId: payload.head_id,
+                notices,
+                warnings: previous.warnings,
+                isLoading: false,
+                error: null,
+                errorRequest: null,
+              }));
+            }
+            return;
+          }
+          return api.loadGraph(repoPath, query, revision, { ...opts, withoutToken: true });
+        }
         if (payload.unchanged === true) {
           // The token named the page held: nothing to decode, hash or swap.
           // Only trusted while the entry it was issued for is still the one
@@ -932,7 +1044,8 @@ export function createGraphStore(
         }
         // One walk over the payload per reload: the cached side was hashed
         // when it was stored, and the new entry keeps this one.
-        const signature = graphPayloadSignature(payload);
+        const rowsSignature = graphRowsSignature(payload.rows);
+        const signature = graphSignatureFrom(payload, rowsSignature);
         if (
           previous &&
           previous.query === query &&
@@ -991,6 +1104,7 @@ export function createGraphStore(
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
           signature,
+          rowsSignature,
           graphToken: payload.graph_token ?? null,
         };
         shed.delete(repoPath);
@@ -1132,7 +1246,7 @@ export function createGraphStore(
     }
   }
 
-  return api;
+  return { ...api, decodeCounters: (): GraphDecodeCounters => ({ ...decodeCounters }) };
 }
 
 export type GraphStoreApi = ReturnType<typeof createGraphStore>;

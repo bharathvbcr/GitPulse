@@ -40,6 +40,13 @@ pub(crate) fn cancelled() -> CommandError {
     CommandError::typed(IpcErrorKind::ReadCancelled, CANCELLED_MESSAGE)
 }
 
+/// Whether `error` is a cancellation: decided by the kind its producer gave it
+/// ([`cancelled`], or a spawn refused because its caller had gone), never by its
+/// words, which git's stderr can imitate and a wrapping layer can change.
+pub(crate) fn is_cancelled_error(error: &CommandError) -> bool {
+    error.origin() == Some(IpcErrorKind::ReadCancelled)
+}
+
 /// Ids longer than this are not registered: the read runs, uncancellable.
 const MAX_ID_LEN: usize = 64;
 /// Reads that can be cancelled at once. A full registry makes a read
@@ -94,6 +101,34 @@ impl Drop for ScopeGuard {
 /// spawns itself: the scope is thread-local and does not follow the spawn.
 pub(crate) fn enter(cancel: Option<&ReadCancel>) -> ScopeGuard {
     ScopeGuard::install(cancel.cloned())
+}
+
+/// What a thread's spawns run under that does not follow a hop to another
+/// thread: the admission class and the request's cancel flag, both
+/// thread-local. Captured where the work fans out, put back inside each worker,
+/// so a pool or scoped thread works as the request that asked for it. Nothing
+/// is put in force that the capturing thread did not have: with no scope set,
+/// a worker runs exactly as before.
+#[derive(Clone, Debug)]
+pub(crate) struct CallerScope {
+    class: super::Admission,
+    cancel: Option<ReadCancel>,
+}
+
+impl CallerScope {
+    /// The class and cancel flag in force on the calling thread.
+    pub(crate) fn capture() -> Self {
+        Self {
+            class: super::current_admission(),
+            cancel: current(),
+        }
+    }
+
+    /// Runs `body` on the current (worker) thread under what was captured.
+    pub(crate) fn run<T>(&self, body: impl FnOnce() -> T) -> T {
+        let _cancellable = enter(self.cancel.as_ref());
+        super::with_admission(self.class, body)
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<String, ReadCancel>> {

@@ -294,11 +294,23 @@ describe("Sidebar change lists", () => {
     expect(source).toContain("aria-expanded={!sections.unstaged}");
   });
 
-  it("grows result windows stepwise instead of jumping to full length", () => {
-    expect(source).toContain("FILE_LIST_STEP * 2");
-    expect(source).toContain("`Show ${remaining.toLocaleString()} more`");
-    expect(source).toContain("`Show all ${total.toLocaleString()}`");
-    expect(source).toContain("limit + FILE_LIST_STEP");
+  it("windows both lists through VirtualList instead of growing them in steps", () => {
+    expect(source).toContain('import VirtualList from "./VirtualList.svelte"');
+    expect(source).toContain("items={filteredStaged}");
+    expect(source).toContain("items={filteredUnstaged}");
+    expect((source.match(/rowHeight=\{CHANGE_ROW_HEIGHT\}/g) ?? []).length).toBe(2);
+    // The box is bounded, so the window is a handful of rows however many files changed.
+    expect(source).toContain("Math.min(count, MAX_LIST_ROWS) * CHANGE_ROW_HEIGHT");
+    // Nothing renders the whole list or asks for the rest with a button.
+    expect(source).not.toContain("FILE_LIST_STEP");
+    expect(source).not.toMatch(/Show (all|\$\{)/);
+    // Rows are keyed by path (made unique per list) so a stage button's focus never slides to the next file.
+    expect(source).toContain("key={(_, i) => stagedKeys[i]}");
+    expect(source).toContain("key={(_, i) => unstagedKeys[i]}");
+    expect(source).toContain("uniqueRowKeys(filteredStaged.map((f) => f.path))");
+    expect(source).toContain("uniqueRowKeys(filteredUnstaged.map((f) => f.path))");
+    expect(source).not.toContain("visibleStaged");
+    expect(source).not.toContain("visibleUnstaged");
   });
 
   it("styles conflicted paths warn-semibold in both lists via one helper", () => {

@@ -23,6 +23,18 @@ function unchanged(token: string) {
   return { rows: [], refs: [], head_id: "a", has_more: false, graph_token: token, unchanged: true };
 }
 
+/** A walk that returned the window held while a ref moved: refs only, no rows. */
+function refsOnly(token: string, refNames: string[]) {
+  return {
+    rows: [],
+    refs: refNames.map((name) => ({ name, kind: "local", commit_id: "a", is_head: false })),
+    head_id: "a",
+    has_more: false,
+    graph_token: token,
+    window_unchanged: true,
+  };
+}
+
 interface Seen {
   knownToken: unknown;
   maxCommits: unknown;
@@ -159,5 +171,68 @@ describe("graphStore revision token", () => {
     await store.loadGraph("/r/a");
     expect(get(store).rows).toBe(held);
     expect(get(store).selectedCommit?.id).toBe("a");
+  });
+
+  it("keeps the rows held on a refs-only answer, takes the new refs and token, and counts what it decoded", async () => {
+    const { invoke, calls } = backend((n) =>
+      n === 1 ? full("a", "t1") : n === 2 ? refsOnly("t2", ["main", "side"]) : unchanged("t2")
+    );
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const rows = get(store).rows;
+    expect(store.decodeCounters()).toMatchObject({ answers: 1, full: 1, rowsDecoded: 1, refsDecoded: 0 });
+
+    await store.loadGraph("/r/a");
+
+    expect(get(store).rows).toBe(rows);
+    expect(get(store).refs.map((r) => r.name)).toEqual(["main", "side"]);
+    expect(get(store).isLoading).toBe(false);
+    expect(store.decodeCounters()).toMatchObject({
+      answers: 2,
+      full: 1,
+      refsOnly: 1,
+      rowsDecoded: 1,
+      refsDecoded: 2,
+    });
+
+    // The refs-only answer's token is the one offered next, and answers unchanged.
+    await store.loadGraph("/r/a");
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", "t2"]);
+    expect(store.decodeCounters()).toMatchObject({ unchanged: 1, rowsDecoded: 1, refsDecoded: 2 });
+    expect(get(store).rows).toBe(rows);
+  });
+
+  it("a refs-only answer that carries no token drops the held one, so the next reload is a full read", async () => {
+    const answer = { ...refsOnly("x", ["main"]), graph_token: null };
+    const { invoke, calls } = backend((n) =>
+      n === 1 ? full("a", "t1") : n === 2 ? answer : full("a", "t3")
+    );
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    await store.loadGraph("/r/a");
+    expect(get(store).refs.map((r) => r.name)).toEqual(["main"]);
+    await store.loadGraph("/r/a");
+    // The old expectation ([null, "t1", "t1"]) kept t1 beside refs read after
+    // its state: a fingerprint that returned to t1 would then be answered
+    // unchanged with those refs still drawn. It encoded the bug.
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", null]);
+    // The full read it asked for issued a token, which is offered from then on.
+    await store.loadGraph("/r/a");
+    expect(calls.map((c) => c.knownToken)).toEqual([null, "t1", null, "t3"]);
+  });
+
+  it("asks again without a token when a refs-only answer arrives for a page it was not offered a token for", async () => {
+    const { invoke, calls } = backend((n) =>
+      n === 1 ? full("a", "t1") : n === 2 ? refsOnly("t2", ["x"]) : full("b", "t3")
+    );
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    // A different query offers no token, so a refs-only answer cannot vouch for it.
+    await store.loadGraph("/r/a", "author:ada");
+    expect(calls.map((c) => c.knownToken)).toEqual([null, null, null]);
+    expect(get(store).rows.map((r) => r.id)).toEqual(["b"]);
   });
 });

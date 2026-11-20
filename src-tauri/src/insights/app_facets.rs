@@ -109,7 +109,11 @@ pub fn serve(repo: &str) -> Result<AppFacets, String> {
         .into_owned();
     let reading = canonical.clone();
     let budget = scaled(APP_BUDGET);
+    // The reading runs on a thread of its own, which the request's cancel flag
+    // (thread-local) does not follow, so it is carried in by hand.
+    let cancel = crate::engine::process::read_cancel::current();
     serve_bounded(canonical, scaled(HANDLER_DEADLINE), move || {
+        let _cancellable = crate::engine::process::read_cancel::enter(cancel.as_ref());
         // The class the asker's own scan runs in (`gitpulse-mcp` is a
         // background process), so agents' reads do not compete with the UI's.
         with_admission(Admission::Background, || {

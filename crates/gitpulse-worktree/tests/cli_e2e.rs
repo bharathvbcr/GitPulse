@@ -367,6 +367,7 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
         ],
     );
     assert_eq!(created["devmap_seeded"], true, "{created}");
+    assert_eq!(created["devmap_refresh"]["kind"], "built", "{created}");
     let wt = wt.canonicalize().unwrap();
     assert!(devmap_query::paths::store_path(&wt).is_file());
 
@@ -382,6 +383,126 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
         "no devmap build ran in {} before create returned; devmap saw:\n{seen}",
         wt.display()
     );
+}
+
+/// A refresh that did not bring the seeded store to the worktree's tree is not
+/// a success. The worktree exists and its path is still reported, but the
+/// answer says `ok: false` with the refresh outcome, `devmap_seeded` is not
+/// claimed, and the exit status is 3, "done but incomplete" (card ft-63446aee,
+/// owner decision 2026-11-19), the status gitpulse-mcp uses for an answer that
+/// says it is incomplete: before, the outcome was dropped and a failed build
+/// exited 0 with `devmap_seeded: true`. Exit 1 stays for a create that failed.
+#[cfg(unix)]
+#[test]
+fn cli_create_reports_a_failed_seeded_refresh_and_exits_three() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("monorepo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    seed_monorepo_with_devmap_and_csr(&anchor);
+    approve_in_isolated_home(&anchor, home.path());
+
+    // A `devmap` that sees a stale store and then fails to build it.
+    let stub = devmap_stub_path(home.path());
+    fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         if [ \"$1\" = status ]; then printf '%s\\n' '{\"is_fresh\":false,\"schema_outdated\":false}'; exit 0; fi\n\
+         if [ \"$1\" = build ]; then echo 'index exploded' >&2; exit 1; fi\n\
+         exit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let wt = workspace.path().join("wt-failed-refresh");
+    let out = run_cli(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/failed-refresh",
+            "--target",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a failed refresh must exit 3 (done but incomplete):\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let answer: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nraw stdout: {stdout}"));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["devmap_refresh"]["kind"], "failed", "{answer}");
+    assert_eq!(answer["devmap_seeded"], false, "{answer}");
+    assert!(
+        answer["devmap_refresh"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("index exploded")),
+        "{answer}"
+    );
+    assert!(
+        answer["worktree_path"].as_str().is_some(),
+        "the created worktree must still be named: {answer}"
+    );
+    assert!(wt.exists(), "the worktree itself was created");
+    assert!(
+        stderr.contains("devmap refresh failed"),
+        "stderr must name the outcome: {stderr}"
+    );
+}
+
+/// A create that did not make the worktree is a failure, not "done but
+/// incomplete": git refuses the branch name, so the status is 1, the answer has
+/// no worktree and no refresh outcome, and nothing is on disk (ft-63446aee).
+#[test]
+fn cli_create_that_fails_to_add_the_worktree_still_exits_one() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("monorepo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    seed_monorepo_with_devmap_and_csr(&anchor);
+    approve_in_isolated_home(&anchor, home.path());
+    git(&anchor, &["branch", "agent/taken"]);
+
+    let wt = workspace.path().join("wt-branch-taken");
+    let out = run_cli(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/taken",
+            "--target",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a create that fails must exit 1:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let answer: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nraw stdout: {stdout}"));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(answer.get("devmap_refresh").is_none(), "{answer}");
+    assert!(!wt.exists(), "no worktree must be left behind");
 }
 
 /// The real `devmap` the zero-copy tests drive. An explicit, existing

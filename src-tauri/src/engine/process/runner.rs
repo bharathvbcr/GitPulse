@@ -404,7 +404,7 @@ pub fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> String {
 /// becomes error text, and a line of it that matched a marker must not pass for
 /// a cancel. The kind survives a layer that wraps the message.
 pub(super) fn is_cancellation(error: &CommandError) -> bool {
-    error.origin() == Some(crate::ipc_error::IpcErrorKind::ReadCancelled)
+    super::read_cancel::is_cancelled_error(error)
 }
 
 /// First sleep between `try_wait` polls, and the ceiling it grows to.

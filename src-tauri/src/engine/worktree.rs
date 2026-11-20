@@ -1296,10 +1296,13 @@ mod status_cell {
         state.held.as_ref().map(|held| held.started.elapsed())
     }
 
-    /// Whether an error is this caller's or somebody's clock running out,
-    /// which no other caller should inherit.
+    /// Whether an error is this caller's or somebody's clock running out, or
+    /// its asker leaving (a read cancelled for one caller), which no other
+    /// caller should inherit.
     fn is_a_cut(error: &CommandError) -> bool {
-        error.message() == DEADLINE_PASSED || is_timed_out(error.message())
+        error.message() == DEADLINE_PASSED
+            || is_timed_out(error.message())
+            || crate::engine::process::read_cancel::is_cancelled_error(error)
     }
 
     /// A read that ran out of git's own time limit, as opposed to a deadline
@@ -1444,6 +1447,31 @@ mod status_cell {
         });
         settle.finish(outcome.clone());
         outcome.map(|read| PorcelainRead { led: true, ..read })
+    }
+
+    #[cfg(test)]
+    mod cut_tests {
+        use super::is_a_cut;
+
+        /// A read stopped because its asker left is that asker's, as a deadline
+        /// is: a waiter on the same cell must read for itself, and what the cell
+        /// holds is not thrown away for it.
+        #[test]
+        fn a_cancelled_read_is_a_cut_no_other_caller_inherits() {
+            assert!(is_a_cut(&crate::engine::process::read_cancel::cancelled()));
+            assert!(!is_a_cut(&"git status failed".to_string().into()));
+            // By kind, not words: git's own text that happens to match is no
+            // cancellation, and a wrapped cancellation still is one.
+            assert!(!is_a_cut(
+                &crate::engine::process::read_cancel::CANCELLED_MESSAGE
+                    .to_string()
+                    .into()
+            ));
+            assert!(is_a_cut(
+                &crate::engine::process::read_cancel::cancelled()
+                    .wrap(|e| format!("git status failed: {e}"))
+            ));
+        }
     }
 }
 
@@ -2252,6 +2280,17 @@ pub fn list_worktrees_scanned(
     };
     // Every caller sharing this listing had arrived by `latest_arrival`, so a
     // status read begun after it is no older than any of their questions.
+    //
+    // A leader whose asker left (its `read_cancel` flag set) must not publish
+    // that cancellation to the callers that joined it: they never left, and
+    // the status cell's `is_a_cut` does this for its own single flight, which
+    // this one has no equivalent of. It is safe today because no caller that
+    // can carry a cancel flag lists through here: the cancellable asks (the
+    // gate, the scan and the insights read in `desktop::instance`, the
+    // commit-graph walk) list through the collision memo's `list_worktrees_lite`
+    // or not at all, and `cmd_list_worktrees` names no request id. Whoever
+    // makes this listing cancellable must make a cancelled leader hand its
+    // joiners a follow-up scan instead of its error.
     let outcome = scan_listing(repo_path, depth, latest_arrival);
     #[cfg(test)]
     before_publish_hook();
@@ -2389,7 +2428,7 @@ fn scan_listing(
         .take(MAX_DIRTY_SCANS)
         .collect();
 
-    let class = crate::engine::process::current_admission();
+    let caller = crate::engine::process::read_cancel::CallerScope::capture();
     // Asked once for the whole listing, whenever any scanned worktree is on a
     // branch: without the base no branch is known to be it, so even a lone
     // checkout of the default needs the answer to be called "no divergence".
@@ -2421,7 +2460,7 @@ fn scan_listing(
     if depth == ScanDepth::Full {
         base.routes = Some(PortlessSnapshot::load());
     }
-    let mut metrics = scan_in_waves(&scan_targets, class, None, |idx| {
+    let mut metrics = scan_in_waves(&scan_targets, &caller, None, |idx| {
         scan_worktree(&repo, &parsed[idx], depth, &base, None, &pass)
     });
 
@@ -2443,11 +2482,12 @@ fn scan_listing(
 }
 
 /// Runs `scan` for each of `targets`, [`DIRTY_SCAN_FAN_OUT`] at a time, each
-/// in `class`.
+/// under `caller`'s admission class and cancel flag.
 ///
 /// Scoped threads in bounded waves rather than rayon's pool: a pool thread
 /// starts in the default admission class, so the scans of a listing asked for
-/// as background work were promoted to refresh traffic.
+/// as background work were promoted to refresh traffic. Neither the class nor
+/// the cancel flag follows a spawn, so both are put back inside each thread.
 ///
 /// With a `deadline`, no wave starts once it has passed. A target that was
 /// never started has no entry in the result, which is how a caller tells "cut
@@ -2455,7 +2495,7 @@ fn scan_listing(
 /// by the same deadline inside their own status read.
 fn scan_in_waves<F>(
     targets: &[usize],
-    class: crate::engine::process::Admission,
+    caller: &crate::engine::process::read_cancel::CallerScope,
     deadline: Option<&ScanDeadline>,
     scan: F,
 ) -> HashMap<usize, WorktreeScan>
@@ -2472,8 +2512,7 @@ where
                 .iter()
                 .map(|&idx| {
                     let scan = &scan;
-                    let handle = scope
-                        .spawn(move || crate::engine::process::with_admission(class, || scan(idx)));
+                    let handle = scope.spawn(move || caller.run(|| scan(idx)));
                     (idx, handle)
                 })
                 .collect();
@@ -2568,11 +2607,11 @@ pub fn read_dirty(list: &mut [WorktreeInfo], deadline: &ScanDeadline) -> usize {
             ..ParsedWorktree::default()
         })
         .collect();
-    let class = crate::engine::process::current_admission();
+    let caller = crate::engine::process::read_cancel::CallerScope::capture();
     // The pass began when its clock did, so a status any stage of it read since
     // (the main checkout's, for one) is this stage's answer too.
     let pass = ScanPass::asked_at(deadline.started());
-    let mut scans = scan_in_waves(&targets, class, Some(deadline), |idx| {
+    let mut scans = scan_in_waves(&targets, &caller, Some(deadline), |idx| {
         // The repository path is read only at `Full` depth.
         scan_worktree(
             Path::new(&entries[idx].path),

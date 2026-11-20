@@ -39,7 +39,7 @@ pub use live_sessions::{
 use crate::codeintel::{self, CodeintelStatus};
 use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
-use crate::engine::process::{current_admission, with_admission};
+use crate::engine::process::read_cancel::CallerScope;
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
 use crate::engine::worktree::{self, agent_layout, changed_paths_within, StatusRead, WorktreeInfo};
@@ -2082,13 +2082,13 @@ fn collision_from_list_reading(
     }
     let unscanned = over_the_cap + cut_off;
 
-    // The pool's threads start in the default admission class, so the class
-    // the caller asked under travels in explicitly.
-    let class = current_admission();
+    // The pool's threads start in the default admission class and under no
+    // cancel flag, so what the caller asked under travels in explicitly.
+    let caller = CallerScope::capture();
     let to_read: Vec<&WorktreeInfo> = pending.iter().map(|&at| scans[at].0).collect();
     let fresh: Vec<Read> = to_read
         .into_par_iter()
-        .map(|wt| with_admission(class, || read(&wt.path, deadline)))
+        .map(|wt| caller.run(|| read(&wt.path, deadline)))
         .collect();
     for (at, read) in pending.into_iter().zip(fresh) {
         scans[at].1 = Some(read);
@@ -2314,14 +2314,14 @@ pub fn dirty_elsewhere(repo_path: &str) -> DirtyElsewhere {
         .filter(|w| !w.is_bare && !same_path(&w.path, repo_path))
         .collect();
     let unscanned = others.len().saturating_sub(MAX_COLLISION_SCANS);
-    let class = current_admission();
+    let caller = CallerScope::capture();
     let worktrees: Vec<DirtyElsewhereWorktree> = others
         .into_iter()
         .take(MAX_COLLISION_SCANS)
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|wt| {
-            let read = with_admission(class, || changed_paths_within(&wt.path, None));
+            let read = caller.run(|| changed_paths_within(&wt.path, None));
             let (files, truncated, error) = match read {
                 Ok((files, truncated)) => (files, truncated, String::new()),
                 Err(error) => (Vec::new(), false, error.into_message()),
