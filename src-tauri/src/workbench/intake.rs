@@ -1514,7 +1514,10 @@ fn add_task_once(
         )),
         Outcome::DeletedOnBoard => Err(WorkbenchError::new(
             "deleted_on_board",
-            format!("Task {:?} was deleted on the board and stays deleted; choose another task_id.", task.key),
+            format!(
+                "Task {:?} was deleted on the board and stays deleted; choose another task_id.",
+                task.key
+            ),
         )),
         outcome => {
             let item = placed.item.unwrap_or(Value::Null);
