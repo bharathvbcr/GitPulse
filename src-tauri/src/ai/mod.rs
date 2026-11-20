@@ -762,7 +762,15 @@ struct AssistReply {
 }
 
 fn assist_call(cloud: &ManviRoute, params: Value) -> Result<AssistReply, CommandError> {
-    let raw = (cloud.complete)(params).map_err(|e| CommandError::from(e.user_message()))?;
+    let dry_run = params.get("dry_run") == Some(&Value::Bool(true));
+    let answer = (cloud.complete)(params);
+    // Whatever feature finds the key refused (or working) tells the steward,
+    // so its status never calls a refused key configured.
+    crate::harness::steward::note_cloud_key_answer(
+        &cloud.model,
+        crate::harness::steward::key_answer_of(cloud.provider, dry_run, &answer),
+    );
+    let raw = answer.map_err(|e| CommandError::from(e.user_message()))?;
     let reply: AssistReply = serde_json::from_value(raw)
         .map_err(|e| CommandError::from(format!("Manvi returned an unreadable reply: {e}")))?;
     if !reply.ok {
