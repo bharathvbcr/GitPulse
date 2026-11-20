@@ -242,19 +242,15 @@ export function movePaneToSplit(
   return splitPane(root, targetPaneId, paneId, direction, position);
 }
 
-export function resizeBranch(
-  root: SplitNode | null,
+/** Rebuilds the branch `branchId` with `update`; returns `root` when it is absent or unchanged. */
+function replaceBranch(
+  root: SplitNode,
   branchId: string,
-  ratio: number,
-): SplitNode | null {
-  if (!root || !branchId) return root;
-  const clamped = clampSplitRatio(ratio);
-
+  update: (branch: SplitBranch) => SplitBranch,
+): SplitNode {
   const walk = (node: SplitNode): SplitNode => {
     if (node.kind === "leaf") return node;
-    if (node.id === branchId) {
-      return Math.abs(node.ratio - clamped) < 1e-6 ? node : { ...node, ratio: clamped };
-    }
+    if (node.id === branchId) return update(node);
     const nextA = walk(node.a);
     if (nextA !== node.a) return { ...node, a: nextA };
     const nextB = walk(node.b);
@@ -264,19 +260,118 @@ export function resizeBranch(
   return walk(root);
 }
 
+/**
+ * The panes of one same-direction run, as fractions of `node`'s box along
+ * `direction`. A run is a chain of branches that all split the same way: three
+ * side-by-side panes are `A | (B | C)`, one run of three segments. A leaf or a
+ * branch split the other way is one segment.
+ */
+function runSegments(node: SplitNode, direction: SplitDirection, share = 1, out: number[] = []): number[] {
+  if (node.kind === "branch" && node.direction === direction) {
+    const r = clampSplitRatio(node.ratio);
+    runSegments(node.a, direction, share * r, out);
+    runSegments(node.b, direction, share * (1 - r), out);
+  } else {
+    out.push(share);
+  }
+  return out;
+}
+
+/** Writes one size per segment of `branch`'s run back as ratios, keeping unchanged nodes. */
+function applyRunSizes(branch: SplitBranch, sizes: readonly number[]): SplitBranch {
+  let next = 0;
+  const walk = (node: SplitNode): { node: SplitNode; total: number } => {
+    if (node.kind !== "branch" || node.direction !== branch.direction) {
+      const total = sizes[next] ?? 0;
+      next += 1;
+      return { node, total };
+    }
+    const a = walk(node.a);
+    const b = walk(node.b);
+    const total = a.total + b.total;
+    // Rounded so a drag lands exactly on the clamp and float error does not
+    // build up over the many moves of one drag.
+    const ratio = clampSplitRatio(total > 0 ? Math.round((a.total / total) * 1e9) / 1e9 : 0.5);
+    if (Math.abs(ratio - node.ratio) < 1e-6 && a.node === node.a && b.node === node.b) {
+      return { node, total };
+    }
+    return { node: { ...node, ratio, a: a.node, b: b.node }, total };
+  };
+  return walk(branch).node as SplitBranch;
+}
+
+/**
+ * Moves the sash of `branchId` to `ratio` of its own box. Only the two panes
+ * beside that sash change size: inside a run (`A | (B | C)`), dragging the
+ * A|B sash leaves C where it is instead of rescaling B and C together. Each
+ * of the two panes keeps at least `SPLIT_RATIO_MIN` of the branch's box, and a
+ * pane already smaller than that is never shrunk further. The one exception:
+ * when a nested branch of the run is at its own ratio clamp (C already at its
+ * least share of B|C), C is pushed just enough to keep that share, so the
+ * sash still follows the pointer.
+ */
+export function resizeBranch(
+  root: SplitNode | null,
+  branchId: string,
+  ratio: number,
+): SplitNode | null {
+  if (!root || !branchId) return root;
+  const target = clampSplitRatio(ratio);
+  return replaceBranch(root, branchId, (branch) => {
+    const sizes = runSegments(branch, branch.direction);
+    const boundary = runSegments(branch.a, branch.direction).length;
+    const before = sizes.slice(0, boundary).reduce((sum, size) => sum + size, 0);
+    const left = sizes[boundary - 1];
+    const right = sizes[boundary];
+    const lo = Math.min(before, before - left + SPLIT_RATIO_MIN);
+    const hi = Math.max(before, before + right - SPLIT_RATIO_MIN);
+    const delta = Math.min(hi, Math.max(lo, target)) - before;
+    if (Math.abs(delta) < 1e-9) return branch;
+    const nextSizes = [...sizes];
+    nextSizes[boundary - 1] = left + delta;
+    nextSizes[boundary] = right - delta;
+    return applyRunSizes(branch, nextSizes);
+  });
+}
+
+/** The id of the outermost branch of the same-direction run holding `branchId`. */
+function runTopId(root: SplitNode, branchId: string): string | null {
+  const walk = (node: SplitNode, top: SplitBranch | null): string | null => {
+    if (node.kind === "leaf") return null;
+    const runTop = top && top.direction === node.direction ? top : node;
+    if (node.id === branchId) return runTop.id;
+    return walk(node.a, runTop) ?? walk(node.b, runTop);
+  };
+  return walk(root, null);
+}
+
+function equalizeRun(branch: SplitBranch): SplitBranch {
+  const count = runSegments(branch, branch.direction).length;
+  return applyRunSizes(branch, new Array<number>(count).fill(1 / count));
+}
+
+/**
+ * Gives every pane of a same-direction run an equal share: three side-by-side
+ * panes get a third each, not the 50/25/25 that halving every branch gives.
+ * With `branchId`, only the run holding that sash is equalized; without it,
+ * every run in the tree is. A share below `SPLIT_RATIO_MIN` of a branch (a
+ * run of seven or more nested one way) is held at that minimum.
+ */
 export function equalizeSplits(root: SplitNode | null, branchId?: string): SplitNode | null {
   if (!root) return null;
-  if (branchId) return resizeBranch(root, branchId, 0.5);
+  if (branchId) {
+    const topId = runTopId(root, branchId);
+    return topId ? replaceBranch(root, topId, equalizeRun) : root;
+  }
 
-  const walk = (node: SplitNode): SplitNode => {
+  const walk = (node: SplitNode, parentDirection: SplitDirection | null): SplitNode => {
     if (node.kind === "leaf") return node;
-    const nextA = walk(node.a);
-    const nextB = walk(node.b);
-    const sameRatio = Math.abs(node.ratio - 0.5) < 1e-6;
-    if (sameRatio && nextA === node.a && nextB === node.b) return node;
-    return { ...node, ratio: 0.5, a: nextA, b: nextB };
+    const nextA = walk(node.a, node.direction);
+    const nextB = walk(node.b, node.direction);
+    const inner = nextA === node.a && nextB === node.b ? node : { ...node, a: nextA, b: nextB };
+    return parentDirection === node.direction ? inner : equalizeRun(inner);
   };
-  return walk(root);
+  return walk(root, null);
 }
 
 /**
@@ -1830,6 +1925,7 @@ export function remapSplitTree(
 ): SplitNode | null {
   if (!tree) return null;
   const seen = new Set<string>();
+  const seenBranches = new Set<string>();
   const walk = (node: SplitNode, depth: number): SplitNode | null => {
     if (depth > MAX_SPLIT_PANES) return null;
     if (node.kind === "leaf") {
@@ -1843,9 +1939,13 @@ export function remapSplitTree(
     if (!a && !b) return null;
     if (!a) return b;
     if (!b) return a;
+    // Keep the branch's id: a sash drag holds it from pointer-down, and the
+    // sashes are keyed by it, so a fresh id on every write ends the drag.
+    const id = node.id && !seenBranches.has(node.id) ? node.id : mintBranchId();
+    seenBranches.add(id);
     return {
       kind: "branch",
-      id: mintBranchId(),
+      id,
       direction: node.direction,
       ratio: clampSplitRatio(node.ratio),
       a,
