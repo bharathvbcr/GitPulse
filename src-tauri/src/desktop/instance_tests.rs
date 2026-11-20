@@ -1024,13 +1024,9 @@ fn gate_in_stages(
         // Whatever the first stage did, the test is waiting to hang up.
         started.lock().unwrap().send(()).unwrap();
         wait_for_hang_up(&gone);
-        let until = Instant::now() + coverage_relaxed(Duration::from_secs(30));
-        while crate::engine::process::read_cancel::current()
-            .is_some_and(|flag| !flag.is_cancelled())
-            && Instant::now() < until
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let _ = crate::test_support::env::wait_until(Duration::from_secs(30), || {
+            !crate::engine::process::read_cancel::current().is_some_and(|flag| !flag.is_cancelled())
+        });
         for _ in 0..later {
             if git_stage(&repo, &mut stages.after).is_err() {
                 stages.cancelled += 1;
@@ -1142,8 +1138,10 @@ fn a_verdict_whose_asker_stays_is_computed_in_full_and_delivered() {
         let mut into = Vec::new();
         for _ in 0..3 {
             git_stage(&path, &mut into)?;
-            // Long enough for the owner's watch to have looked a few times.
-            std::thread::sleep(Duration::from_millis(60));
+            // Longer than several of the owner's watch intervals, so the watch
+            // has looked a few times while the asker stays. A floor on how long
+            // the ask lives: a slower host only looks more often.
+            std::thread::sleep(Duration::from_millis(150));
         }
         record.lock().unwrap().extend(into);
         Ok(serde_json::json!({ "decision": "allow" }))

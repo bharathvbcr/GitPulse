@@ -2004,29 +2004,32 @@ fn call_while_asker_stays(
         return call();
     };
     let cancel = read_cancel::ReadCancel::new();
-    let finished = AtomicBool::new(false);
-    let outcome = std::thread::scope(|scope| {
-        let watch = std::thread::Builder::new()
-            .name("asker-watch".into())
-            .spawn_scoped(scope, || {
-                while !finished.load(Ordering::Acquire) {
-                    if crate::local_socket::peer_hung_up_silently(&watched) {
-                        cancel.cancel();
-                        return;
-                    }
-                    std::thread::park_timeout(ASKER_WATCH_INTERVAL);
+    let finished = Arc::new(AtomicBool::new(false));
+    // One watcher per ask, started once and never restarted: a restart after a
+    // panic would watch an ask that is already over. The supervisor records a
+    // panic instead of losing it.
+    let watch = {
+        let (finished, cancel) = (Arc::clone(&finished), cancel.clone());
+        crate::supervisor::spawn_once("asker-watch", "asker watch", move || {
+            while !finished.load(Ordering::Acquire) {
+                if crate::local_socket::peer_hung_up_silently(&watched) {
+                    cancel.cancel();
+                    return;
                 }
-            });
-        let outcome = {
-            let _in_force = read_cancel::enter(watch.is_ok().then_some(&cancel));
-            call()
-        };
-        finished.store(true, Ordering::Release);
-        if let Ok(watch) = &watch {
-            watch.thread().unpark();
-        }
-        outcome
-    });
+                std::thread::park_timeout(ASKER_WATCH_INTERVAL);
+            }
+        })
+    };
+    let outcome = {
+        let _in_force = read_cancel::enter(watch.is_ok().then_some(&cancel));
+        call()
+    };
+    finished.store(true, Ordering::Release);
+    if let Ok(watch) = watch {
+        watch.thread().unpark();
+        // Ends within one poll, so the ask never leaves its watcher behind.
+        let _ = watch.join();
+    }
     if cancel.is_cancelled() {
         return Err(ASKER_LEFT_MIDWAY.to_string());
     }

@@ -773,10 +773,9 @@ fn two_askers(
         });
         scope
             .spawn(|| {
-                let until = Instant::now() + Duration::from_secs(30);
-                while !release_b.load(Ordering::Acquire) && Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let _ = crate::test_support::env::wait_until(Duration::from_secs(30), || {
+                    release_b.load(Ordering::Acquire)
+                });
                 memo.risk_for_path(
                     &farm.repo,
                     "seed.txt",
@@ -821,10 +820,9 @@ fn an_asker_that_leaves_while_the_verdict_is_classified_leaves_another_ask_whole
     let done = AtomicBool::new(false);
     let b = std::thread::scope(|scope| {
         scope.spawn(|| {
-            let until = Instant::now() + Duration::from_secs(30);
-            while ls_files_started(&farm) <= seen && Instant::now() < until {
-                std::thread::sleep(Duration::from_micros(200));
-            }
+            let _ = crate::test_support::env::wait_until(Duration::from_secs(30), || {
+                ls_files_started(&farm) > seen
+            });
             cancel.cancel();
             release_b.store(true, Ordering::Release);
             done.store(true, Ordering::Release);
