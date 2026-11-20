@@ -377,9 +377,13 @@ fn killed_owner_child_mode() {
         return;
     };
     let mut world = World::new(r#"{"slots":1}"#);
+    // b starts only once a holds the slot: both wrappers race for it, and an
+    // instrumented (coverage) hook starts slowly enough for b to win, which
+    // left a waiting for a slot that b held and this wait never satisfied.
     world.start("a");
-    world.start("b");
     wait_for("a to hold the slot", || world.started() == ["a"]);
+    world.start("b");
+    wait_for("b to queue behind a", || world.queued() == 1);
     let mut lines: Vec<String> = world.running.iter().map(|c| c.id().to_string()).collect();
     lines.push(world.root.display().to_string());
     let report = PathBuf::from(report);
