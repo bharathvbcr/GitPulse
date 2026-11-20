@@ -960,6 +960,73 @@ pub struct LiveRefreshOutcome {
     pub artifacts_restored: bool,
 }
 
+/// What a live refresh amounted to for a caller that must say whether the
+/// index is now current: a stable, serialisable reading of
+/// [`LiveRefreshOutcome`], so a one-shot CLI or tool answers with one name
+/// instead of re-deriving it from `decision`, `build` and `facts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRefreshKind {
+    /// A build ran and succeeded within its deadline.
+    Built,
+    /// The store was already current; nothing needed building.
+    Fresh,
+    /// The spawn gate shed the probe or the build under load, or the probe had
+    /// not answered: the index was not examined or not refreshed.
+    Deferred,
+    /// Automatic builds for this repository were paused (a cooldown or a
+    /// too-slow rest); nothing was built.
+    CooledDown,
+    /// Another build (or a daemon rebuild, or a background build still
+    /// running) owns the index; this ask built nothing.
+    Busy,
+    /// The build failed, timed out or could not run, or the index cannot be
+    /// brought current (no `devmap`, an outdated schema).
+    Failed,
+}
+
+impl LiveRefreshKind {
+    /// The wire name (`built`, `fresh`, `deferred`, `cooled_down`, `busy`,
+    /// `failed`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Fresh => "fresh",
+            Self::Deferred => "deferred",
+            Self::CooledDown => "cooled_down",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether the index is known to match the tree after this refresh. Only
+    /// `Built` and `Fresh` are; every other kind leaves it possibly stale.
+    pub fn index_is_current(self) -> bool {
+        matches!(self, Self::Built | Self::Fresh)
+    }
+}
+
+impl LiveRefreshOutcome {
+    /// This outcome as a [`LiveRefreshKind`].
+    pub fn kind(&self) -> LiveRefreshKind {
+        match self.decision {
+            LiveRefreshDecision::Refresh => match &self.build {
+                Some(build) if build.ok && !build.timed_out => LiveRefreshKind::Built,
+                _ => LiveRefreshKind::Failed,
+            },
+            LiveRefreshDecision::SkipFresh => LiveRefreshKind::Fresh,
+            LiveRefreshDecision::SkipDeferred => LiveRefreshKind::Deferred,
+            LiveRefreshDecision::SkipCooldown => LiveRefreshKind::CooledDown,
+            LiveRefreshDecision::SkipBuilding
+            | LiveRefreshDecision::SkipDaemon
+            | LiveRefreshDecision::Started => LiveRefreshKind::Busy,
+            LiveRefreshDecision::SkipSchemaOutdated | LiveRefreshDecision::SkipUnavailable => {
+                LiveRefreshKind::Failed
+            }
+        }
+    }
+}
+
 /// Serde mirror of [`LiveRefreshFacts`] for the command boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveRefreshFactsDto {
@@ -4810,5 +4877,89 @@ exit 2
         );
         holder.release_and_reap();
         fixture.finish();
+    }
+
+    /// A refresh outcome is only "current" when it built or found the store
+    /// fresh; a deferral, cooldown, busy or failed refresh never is (card
+    /// ft-63446aee).
+    #[test]
+    fn a_refresh_outcome_is_current_only_when_it_built_or_was_fresh() {
+        let with = |decision, build: Option<cli::BuildOutcome>| LiveRefreshOutcome {
+            decision,
+            build,
+            ..skip_deferred_outcome(UNEXAMINED, "gate".into())
+        };
+        let build = |ok, timed_out| cli::BuildOutcome {
+            ok,
+            binary: "devmap".into(),
+            lookup: cli::DevmapLookup::TestOverride,
+            exit_code: Some(i32::from(!ok)),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out,
+            report: None,
+        };
+        let cases = [
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(true, false))),
+                LiveRefreshKind::Built,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(false, false))),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, Some(build(true, true))),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::Refresh, None),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::SkipFresh, None),
+                LiveRefreshKind::Fresh,
+            ),
+            (
+                skip_deferred_outcome(UNEXAMINED, "shed".into()),
+                LiveRefreshKind::Deferred,
+            ),
+            (
+                skip_cooldown_outcome(Duration::from_secs(5), WaitKind::Echo),
+                LiveRefreshKind::CooledDown,
+            ),
+            (
+                with(LiveRefreshDecision::SkipBuilding, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::SkipDaemon, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::Started, None),
+                LiveRefreshKind::Busy,
+            ),
+            (
+                with(LiveRefreshDecision::SkipUnavailable, None),
+                LiveRefreshKind::Failed,
+            ),
+            (
+                with(LiveRefreshDecision::SkipSchemaOutdated, None),
+                LiveRefreshKind::Failed,
+            ),
+        ];
+        for (outcome, want) in cases {
+            assert_eq!(outcome.kind(), want, "{:?}", outcome.decision);
+            assert_eq!(
+                want.index_is_current(),
+                matches!(want, LiveRefreshKind::Built | LiveRefreshKind::Fresh)
+            );
+        }
+        assert_eq!(LiveRefreshKind::CooledDown.as_str(), "cooled_down");
+        assert_eq!(
+            serde_json::to_value(LiveRefreshKind::CooledDown).unwrap(),
+            serde_json::json!("cooled_down")
+        );
     }
 }

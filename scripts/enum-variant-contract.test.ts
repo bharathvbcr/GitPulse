@@ -124,6 +124,10 @@ const NO_TS_MIRROR = new Map<string, string>([
     "CampaignViolation",
     "campaign audit findings (engine/campaign_formal.rs): reported to agents over MCP (`gitpulse_campaign_audit`) and by the gitpulse-worktree CLI; no Tauri command returns them and the frontend has no consumer",
   ],
+  [
+    "LiveRefreshKind",
+    "devmap live-refresh outcome (devmap/live.rs): reaches agents as `devmap_refresh.kind` in the gitpulse-worktree CLI's JSON answer; no Tauri command returns it and the frontend has no consumer",
+  ],
   // Argument-only enums found when this check began reading `Deserialize`
   // enums. Each is a known gap, named rather than fixed here.
   [

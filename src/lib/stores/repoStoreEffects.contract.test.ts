@@ -195,7 +195,6 @@ describe("array operations on $repoStore", () => {
     "lib/components/GitHubPanel.svelte": 2,
     "lib/components/RepoPanel.svelte": 1,
     "lib/components/RepoTabBar.svelte": 11,
-    "lib/components/StatusBar.svelte": 3,
     "lib/components/TaskAgentPanel.svelte": 1,
     "lib/components/TaskBoard.svelte": 1,
     "lib/components/TerminalDock.svelte": 2,
@@ -213,6 +212,19 @@ describe("array operations on $repoStore", () => {
       if (count > 0) found[rel(file)] = count;
     }
     expect(found).toEqual(KNOWN);
+  });
+});
+
+/**
+ * The status bar is mounted for the life of the app, so a whole-store read
+ * there re-runs its derivations on every publish of any session. It subscribes
+ * to field stores (`const x = repoStore.field`) only; see StatusBar.fanout.test.ts
+ * for the per-publish behaviour.
+ */
+describe("StatusBar takes no whole-store read", () => {
+  it("never reads $repoStore, in script or markup", () => {
+    const bar = readFileSync(join(SRC, "lib", "components", "StatusBar.svelte"), "utf8");
+    expect(bar).not.toMatch(/\$repoStore\b/);
   });
 });
 

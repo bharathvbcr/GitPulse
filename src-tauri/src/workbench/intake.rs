@@ -569,6 +569,21 @@ pub(crate) enum Outcome {
     DeletedOnBoard,
 }
 
+/// The refusal for a key that is already on the board. It names the card it
+/// collided with so a caller can tell "same task" from "unrelated task that
+/// happens to share the key", and offers both ways forward.
+fn already_on_board_message(key: &str, item_id: &str, item: Option<&Value>) -> String {
+    let title = item
+        .and_then(|i| i["title"].as_str())
+        .unwrap_or("(untitled)");
+    let status = item.and_then(|i| i["status"].as_str()).unwrap_or("unknown");
+    format!(
+        "Task {key:?} is already on the board as {item_id} (title {title:?}, status {status}). \
+         If this IS the same task, pass overwrite: true to fold your content into that card. \
+         If it is new work, choose a different task_id; overwrite: true would replace that card's content."
+    )
+}
+
 pub(crate) struct Placed {
     pub outcome: Outcome,
     pub item_id: String,
@@ -1495,14 +1510,14 @@ fn add_task_once(
     match placed.outcome {
         Outcome::AlreadyPresent => Err(WorkbenchError::new(
             "already_exists",
-            format!(
-                "Task {:?} is already on the board as {}. Pass overwrite: true to replace its content.",
-                task.key, placed.item_id
-            ),
+            already_on_board_message(&task.key, &placed.item_id, placed.item.as_ref()),
         )),
         Outcome::DeletedOnBoard => Err(WorkbenchError::new(
             "deleted_on_board",
-            format!("Task {:?} was deleted on the board and stays deleted; choose another task_id.", task.key),
+            format!(
+                "Task {:?} was deleted on the board and stays deleted; choose another task_id.",
+                task.key
+            ),
         )),
         outcome => {
             let item = placed.item.unwrap_or(Value::Null);
