@@ -385,6 +385,10 @@ pub(crate) mod hermetic {
         "CODEX_HOME",
         "ANTIGRAVITY_HOME",
         "GITPULSE_BACKUPS_DIR",
+        // Claude Code exports it into every session; steward's hygiene sweep
+        // (`default_session_tmp_roots`) adds it as a root to clean, so an
+        // inherited value would point a test at the developer's real tmp dir.
+        "CLAUDE_CODE_TMPDIR",
     ];
 
     /// Name prefixes whose inherited values are removed: every variable a
