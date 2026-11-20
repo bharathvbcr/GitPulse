@@ -51,7 +51,7 @@ export function isMasterStewardEnabled(
   settings: ManviStewardSettings,
   envForced: boolean | null,
 ): boolean {
-  if (envForced !== null) return envForced;
+  if (typeof envForced === "boolean") return envForced;
   return (
     settings.enabled ||
     Object.values(settings.repositories).some((ov) => ov?.enabled === true)

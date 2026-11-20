@@ -155,6 +155,11 @@ describe("HostLoadSection", () => {
       history: [],
     });
     expect(isMasterStewardEnabled(globalOnRepoOff, null)).toBe(true);
+    // A status from a build that predates `env_forced` carries no key at all:
+    // that is "no override", not "forced to something".
+    const missingKey = (undefined as unknown) as boolean | null;
+    expect(isMasterStewardEnabled(globalOnRepoOff, missingKey)).toBe(true);
+    expect(isMasterStewardEnabled({ ...globalOnRepoOff, enabled: false }, missingKey)).toBe(false);
     const activeBody = render(HostLoadSection).body;
     expect(activeBody).toContain("Active (cloud · claude-sonnet-4-6) · checks every 3 min");
     expect(activeBody).not.toContain("Switched off in Settings");
