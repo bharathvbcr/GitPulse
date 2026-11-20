@@ -109,6 +109,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     options.thresholds = Box::new(|| tool_config::host_load_settings().thresholds);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {
+        harness::steward::notify_pulse(&pulse);
         if let Err(error) = emitter.emit("host-load-pulse", pulse) {
             log::debug!(target: "host_load", "pulse not delivered: {error}");
         }
@@ -359,6 +360,14 @@ pub fn run() {
             // that). A second GitPulse beside this one loses the snapshot's
             // writer election and reads instead.
             start_host_load_sampler(app.handle());
+            {
+                use tauri::Manager as _;
+                harness::steward::install(
+                    app.handle(),
+                    app.state::<workbench::WorkbenchState>().inner().clone(),
+                    app.state::<watcher::WatcherState>().inner().clone(),
+                );
+            }
             // Off the setup path: making the links runs the hook beside this
             // executable to ask whether it is a lease wrapper, bounded at two
             // seconds a probe, which startup must not wait for.
@@ -622,6 +631,10 @@ pub fn run() {
             cmd_policy_check_command,
             cmd_ai_status,
             cmd_manvi_use,
+            cmd_manvi_steward_status,
+            cmd_manvi_steward_save,
+            cmd_manvi_steward_set_repo,
+            cmd_manvi_steward_run_now,
             cmd_apple_intelligence_status,
             cmd_apple_intelligence_draft,
             cmd_ai_generate_commit_message,

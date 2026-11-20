@@ -173,24 +173,38 @@ pub(crate) fn render_message(envelope: &ClaimedEnvelope, repo_root: Option<&Path
                 msg_id, from_peer, provider, branch, thread_key, *hop, *max_hops, &body,
             )
         }
+        EnvelopeProvenance::SystemSteward {
+            msg_id,
+            model,
+            mode,
+            tier,
+            binding,
+            ..
+        } => format_steward_xml(msg_id, model, mode, tier, binding, &envelope.claim.text),
     }
 }
 
-/// Marks a peer envelope read on the bus by `reader_id`. A human-confirmed
-/// message has no bus copy, so there is nothing to mark. Call it only for a
-/// message that is being delivered: it is what tells the sender it was read.
+/// Marks a peer or steward envelope read on the bus by `reader_id`. A
+/// human-confirmed message has no bus copy, so there is nothing to mark. Call
+/// it only for a message that is being delivered: it is what tells the sender
+/// it was read.
 pub(crate) fn acknowledge_read(
     envelope: &ClaimedEnvelope,
     repo_root: Option<&Path>,
     reader_id: Option<&str>,
 ) {
-    let EnvelopeProvenance::PeerAgent {
-        msg_id,
-        repo_root: prov_repo_root,
-        ..
-    } = &envelope.provenance
-    else {
-        return;
+    let (msg_id, prov_repo_root) = match &envelope.provenance {
+        EnvelopeProvenance::PeerAgent {
+            msg_id,
+            repo_root: prov_repo_root,
+            ..
+        }
+        | EnvelopeProvenance::SystemSteward {
+            msg_id,
+            repo_root: prov_repo_root,
+            ..
+        } => (msg_id.as_str(), prov_repo_root.as_str()),
+        EnvelopeProvenance::HumanConfirmed => return,
     };
     let (Some(root), Some(reader)) = (
         trusted_bus_root(repo_root, prov_repo_root),
@@ -201,8 +215,32 @@ pub(crate) fn acknowledge_read(
     let _ = crate::engine::agent_bus::ack_messages(
         &root.to_string_lossy(),
         reader,
-        std::slice::from_ref(msg_id),
+        &[msg_id.to_string()],
     );
+}
+
+pub(crate) fn format_steward_xml(
+    msg_id: &str,
+    model: &str,
+    mode: &str,
+    tier: &str,
+    binding: &str,
+    body: &str,
+) -> String {
+    format!(
+        "GitPulse Manvi system steward directive (host resource protection; follow immediately \
+         to prevent host hangs or disk exhaustion):\n\
+         <gitpulse-system-steward trust=\"host_governor\" msg_id=\"{}\" mode=\"{}\" model=\"{}\" \
+         tier=\"{}\" binding=\"{}\">\n\
+         {}\n\
+         </gitpulse-system-steward>\n",
+        xml_escape_attr(msg_id),
+        xml_escape_attr(mode),
+        xml_escape_attr(model),
+        xml_escape_attr(tier),
+        xml_escape_attr(binding),
+        xml_escape_body(body),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,11 +313,14 @@ fn recognized_pool(input: &HookInput) -> Option<(WaitPool, Option<std::path::Pat
 }
 
 /// Returns whether a mailbox envelope is eligible to auto-wake a `Stop` waiter.
-/// `HumanConfirmed` always wakes; `PeerAgent` wakes only while `hop < max_hops`.
+/// `HumanConfirmed` always wakes; `PeerAgent` wakes only while `hop < max_hops`;
+/// `SystemSteward` never wakes an idle stopped session (waking a quiet session
+/// under host pressure would add load).
 pub(crate) fn wake_filter(prov: &EnvelopeProvenance) -> bool {
     match prov {
         EnvelopeProvenance::HumanConfirmed => true,
         EnvelopeProvenance::PeerAgent { hop, max_hops, .. } => hop < max_hops,
+        EnvelopeProvenance::SystemSteward { .. } => false,
     }
 }
 

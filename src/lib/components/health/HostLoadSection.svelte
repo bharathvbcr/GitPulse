@@ -14,8 +14,10 @@
    * that it is still the same orphan before it signals anything.
    */
   import { onDestroy, onMount } from "svelte";
+  import { RefreshCw } from "@lucide/svelte";
   import { keyedList } from "../../ui/eachKeys";
   import { LIST_PREVIEW_ROWS, previewSlice } from "../../ui/previewList";
+  import BrandMark from "../BrandMark.svelte";
   import ListPreviewToggle from "../ListPreviewToggle.svelte";
   import HealthTable from "./HealthTable.svelte";
   import HostLoadLeases from "./HostLoadLeases.svelte";
@@ -26,6 +28,15 @@
     terminateOrphan,
     type Orphan,
   } from "../../stores/hostLoadStore";
+  import {
+    isMasterStewardEnabled,
+    manviSteward,
+    refreshManviSteward,
+    runManviStewardNow,
+  } from "../../stores/stewardStore";
+  import { redactDiagnosticText } from "../../diagnostics/diagnostics";
+  import { manviFocusHint } from "../../ui/manviFocus";
+  import { openManviFocus } from "../../ui/openManviFocus";
   import {
     admissionLine,
     fillRateLine,
@@ -104,6 +115,72 @@
   const fillLine = $derived(status ? fillRateLine(snap, status.governor.disk_fill) : null);
   const procs = $derived(status?.procs ?? null);
   const fastest = $derived(procs ? fastestWriter(procs.sessions, procs.sessions_truncated) : null);
+  const steward = $derived($manviSteward);
+  const latestStewardTick = $derived(steward.history.length > 0 ? steward.history[0] : null);
+  const stewardAnyEnabled = $derived(
+    isMasterStewardEnabled(steward.settings, steward.env_override),
+  );
+
+  let stewardRunning = $state(false);
+  let stewardError = $state<FailureCopy | null>(null);
+
+  function humanizeStewardToken(value: string): string {
+    return value.replaceAll("_", " ").trim();
+  }
+
+  function formatStewardTime(ms: number | null): string {
+    if (ms === null || ms <= 0) return "Not checked yet";
+    return new Date(ms).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+
+  function stewardSummaryLine(): string {
+    const mins = Math.max(1, Math.round(steward.settings.interval_secs / 60));
+    if (!stewardAnyEnabled) {
+      return "Switched off in Settings";
+    }
+    if (steward.manvi_state === "ready") {
+      const mode = steward.manvi_mode === "cloud" ? "cloud" : "local";
+      return `Active (${mode} · ${steward.manvi_model}) · checks every ${mins} min`;
+    }
+    if (steward.manvi_state === "deferred" || steward.manvi_state === "failed" || steward.manvi_state === "unchecked") {
+      return steward.manvi_state === "unchecked"
+        ? "Manvi model not checked yet"
+        : "Couldn't check Manvi model right now";
+    }
+    if (steward.manvi_state === "not_installed" || steward.manvi_state === "needs_update") {
+      return "Manvi unavailable on this computer";
+    }
+    return "Manvi model not configured yet";
+  }
+
+  async function refreshSteward() {
+    try {
+      await refreshManviSteward(null);
+      stewardError = null;
+    } catch (cause) {
+      const msg = cause instanceof Error ? cause.message : String(cause);
+      if (!msg.startsWith("Unimplemented fixture:")) {
+        stewardError = describeFailure({ verb: "read", object: "Manvi steward status" }, cause);
+      }
+    }
+  }
+
+  async function runStewardCheck() {
+    if (stewardRunning || steward.running) return;
+    stewardRunning = true;
+    stewardError = null;
+    try {
+      await runManviStewardNow(null);
+    } catch (cause) {
+      stewardError = describeFailure({ verb: "run", object: "Manvi steward check" }, cause);
+    } finally {
+      stewardRunning = false;
+    }
+  }
 
   async function refresh() {
     try {
@@ -116,6 +193,7 @@
 
   onMount(() => {
     void refresh();
+    void refreshSteward();
     // Stops while the window is hidden and refreshes once when it returns.
     stopRefresh = createAdaptiveTimer(() => void refresh(), REFRESH_MS);
   });
@@ -375,6 +453,85 @@
     {/if}
 
     <HostLoadLeases />
+
+    <div class="rounded-2xl border border-edge bg-surface p-3 shadow-card space-y-2" data-testid="host-load-steward">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-2 min-w-0">
+          <BrandMark mark="manvi" size={15} class="shrink-0" />
+          <h4 class="gp-label">Manvi system steward</h4>
+        </div>
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            class="gp-btn inline-flex items-center gap-1.5"
+            data-size="sm"
+            data-testid="host-load-steward-run"
+            disabled={stewardRunning || steward.running}
+            onclick={() => void runStewardCheck()}
+            title="Run one Manvi steward check immediately"
+          >
+            <RefreshCw size={12} class={stewardRunning || steward.running ? "animate-spin" : ""} />
+            <span>Run check</span>
+          </button>
+          <button
+            type="button"
+            class="gp-btn"
+            data-size="sm"
+            data-testid="host-load-steward-configure"
+            onclick={() => openManviFocus("steward")}
+            title={manviFocusHint("steward")}
+          >
+            Open Settings
+          </button>
+        </div>
+      </div>
+
+      <p class="text-textMuted" data-testid="host-load-steward-summary">
+        {stewardSummaryLine()}
+      </p>
+
+      {#if steward.critical_throttle_active}
+        <div class="gp-notice" data-tone="warn" data-testid="host-load-steward-throttle">
+          <div class="min-w-0 flex-1">
+            <div class="font-medium">
+              Critical slowdown active · {steward.throttled_count} agent worker {steward.throttled_count === 1 ? "process" : "processes"} throttled
+            </div>
+            <p class="text-textMuted text-micro">
+              Heavy build commands are queued or refused and rapid shell calls are paced until severe pressure clears.
+            </p>
+          </div>
+        </div>
+      {/if}
+
+      {#if latestStewardTick}
+        <div class="space-y-1 text-micro" data-testid="host-load-steward-last-tick">
+          <p class="text-textPrimary font-medium">
+            Last check: {formatStewardTime(latestStewardTick.ran_at_ms)} · {humanizeStewardToken(latestStewardTick.outcome)}
+            {#if latestStewardTick.tier && latestStewardTick.tier !== "clear"}
+              ({humanizeStewardToken(latestStewardTick.tier)}{latestStewardTick.binding && latestStewardTick.binding !== "none" ? ` · ${humanizeStewardToken(latestStewardTick.binding)}` : ""})
+            {/if}
+            {#if latestStewardTick.reclaimed_bytes > 0}
+              · Reclaimed {bytes(latestStewardTick.reclaimed_bytes)}
+            {/if}
+          </p>
+          <p class="text-textMuted">{redactDiagnosticText(latestStewardTick.summary)}</p>
+          {#if latestStewardTick.directive}
+            <p class="text-textPrimary leading-relaxed" data-testid="host-load-steward-directive">
+              {redactDiagnosticText(latestStewardTick.directive)}
+            </p>
+          {/if}
+        </div>
+      {/if}
+
+      {#if stewardError}
+        <div role="status" class="gp-notice" data-tone="unknown" data-testid="host-load-steward-error">
+          <div class="min-w-0 flex-1">
+            <span class="font-medium">{stewardError.headline}</span>
+            {#if stewardError.detail} {stewardError.detail}{/if}
+          </div>
+        </div>
+      {/if}
+    </div>
 
     {#if status.previous_boot}
       <div class="space-y-1" data-testid="host-load-previous-boot">

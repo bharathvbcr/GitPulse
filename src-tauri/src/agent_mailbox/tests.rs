@@ -1178,3 +1178,55 @@ fn has_unclaimed_takes_no_lock_and_sees_only_pending_envelopes() {
         "an invalid session key is an error, not an empty mailbox"
     );
 }
+
+#[test]
+fn system_steward_deposits_supersede_older_unclaimed_directives_without_filling_mailbox() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for tick in 0..(MAX_PENDING + 4) {
+        let req_id = format!("steward-tick-{tick}");
+        mailbox
+            .deposit_with_provenance(
+                SESSION,
+                &req_id,
+                &format!("directive #{tick}"),
+                EnvelopeProvenance::SystemSteward {
+                    msg_id: req_id.clone(),
+                    model: "claude-sonnet-4-6".into(),
+                    mode: "cloud".into(),
+                    tier: "severe".into(),
+                    binding: "memory_pressure".into(),
+                    repo_root: String::new(),
+                    bus_seq: tick as u64 + 1,
+                },
+                now + Duration::from_secs(tick as u64),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        mailbox.pending(SESSION),
+        1,
+        "only the latest unclaimed steward directive should remain pending"
+    );
+
+    // Human-confirmed and peer messages still fit cleanly alongside the steward slot.
+    for n in 0..(MAX_PENDING - 1) {
+        mailbox
+            .deposit(
+                SESSION,
+                &format!("human-{n}"),
+                &format!("user note {n}"),
+                now + Duration::from_secs(100 + n as u64),
+            )
+            .unwrap();
+    }
+    assert_eq!(mailbox.pending(SESSION), MAX_PENDING);
+
+    let claimed = mailbox
+        .try_claim_batch(SESSION, MAX_PENDING, now + Duration::from_secs(200))
+        .unwrap();
+    assert_eq!(
+        claimed[0].claim.text,
+        format!("directive #{}", MAX_PENDING + 3)
+    );
+}

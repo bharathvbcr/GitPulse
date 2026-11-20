@@ -727,3 +727,86 @@ fn an_unleased_build_that_cannot_be_counted_says_so() {
         "a miss Health cannot count is said, not dropped: {said}"
     );
 }
+
+#[test]
+fn steward_slowdown_gates_builds_when_leases_off_and_honors_gitpulse_tool_config_opt_out() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut world = World::new(r#"{"mode":"off","wait_max_s":15,"wait_hard_s":60}"#);
+    let steward_dir = config_dir(&world.home).join("steward");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&steward_dir)
+        .unwrap();
+    let active_path = steward_dir.join("active.json");
+    // A lease the steward could issue: readers refuse one longer than 15
+    // minutes or dated in the future.
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let active_json = serde_json::json!({
+        "version": 1,
+        "writer_pid": std::process::id(),
+        "writer_start_us": gitpulse_lib::sysload::process_start_us(std::process::id()).unwrap_or(0),
+        "issued_at_ms": now_ms,
+        "expires_at_ms": now_ms + 900_000,
+        "tier": "severe",
+        "binding": "swap",
+        "reason": "swap pressure",
+        "pace_ms": 500u64,
+    });
+    let write_active = |path: &Path| {
+        std::fs::write(path, serde_json::to_vec(&active_json).unwrap()).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write_active(&active_path);
+
+    // 1. Even with `host_load_leases.mode = "off"`, an active steward critical slowdown
+    //    forces `gitpulse-hook lease -- cargo build` into the queue at 0 refusing slots.
+    let stderr_a = world.start("a");
+    wait_for("a to queue under steward slowdown", || world.queued() == 1);
+    settle();
+    assert!(
+        world.started().is_empty(),
+        "build ran while steward critical slowdown held capacity at 0: {:?}",
+        world.lines()
+    );
+    let said_a = std::fs::read_to_string(&stderr_a).unwrap_or_default();
+    assert!(
+        said_a.contains("Manvi system steward critical slowdown is active"),
+        "expected steward slowdown announcement on stderr, got: {said_a}"
+    );
+
+    // Clearing `active.json` unblocks the queued build immediately.
+    std::fs::remove_file(&active_path).unwrap();
+    wait_for("a to start after active.json removal", || {
+        world.started() == ["a"]
+    });
+    world.release();
+    assert_eq!(world.finish(), [Some(0)]);
+
+    // 2. Re-publish `active.json`, then disable `manvi_steward` in `GITPULSE_TOOL_CONFIG`
+    //    (outside `config_dir(&world.home)`). The hook subprocess must honor
+    //    `GITPULSE_TOOL_CONFIG` and pass straight through without queueing.
+    write_active(&active_path);
+    std::fs::write(
+        &world.tools,
+        r#"{"version":1,"host_load_leases":{"mode":"off","wait_max_s":15,"wait_hard_s":60},"manvi_steward":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let (mut cmd_b, _stderr_b) = world.command("b", &["build"]);
+    cmd_b.env("NO_WAIT", "1");
+    let status_b = cmd_b.spawn_locked().unwrap().wait().unwrap();
+    assert_eq!(status_b.code(), Some(0));
+    assert_eq!(
+        world.started(),
+        ["a", "b"],
+        "GITPULSE_TOOL_CONFIG opt-out must let build b run immediately: {:?}",
+        world.lines()
+    );
+}

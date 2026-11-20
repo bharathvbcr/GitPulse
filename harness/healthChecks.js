@@ -22,6 +22,8 @@ import { formatSectionCount } from "../src/lib/health/counts";
 import { formatDeadCodeStatus, coverageGap } from "../src/lib/health/report";
 import { hostLoadStatusFixture, idleReportFixture, leaseStatusFixture, previousBootFixture, procViewFixture } from "./hostLoadFixture.ts";
 import { refreshHostLoad } from "../src/lib/stores/hostLoadStore";
+import { DEFAULT_MANVI_STEWARD_SETTINGS, refreshManviSteward, resolveEffectiveStewardPolicy } from "../src/lib/stores/stewardStore";
+import { manviFocusRequest, takeManviFocus } from "../src/lib/ui/manviFocus";
 import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/format";
 
 const REPO = "/fixture/GitPulse";
@@ -670,9 +672,78 @@ export async function runHostLoadChecks(ctx) {
       !fastest() && !has(card(), "at least") && !/NaN|undefined/.test(card().textContent));
     await show(withProcs([rate(0), rate(4096), rate(0)]));
     check("when nobody writes above the threshold no session is named", () => !fastest());
+
+    // Manvi system steward block inside Health > Host load: live critical slowdown,
+    // latest directive/reclaimed bytes, Run check action, and Open Settings deep link.
+    let stewardRunCalls = 0;
+    const stewardFixture = () => ({
+      settings: { ...DEFAULT_MANVI_STEWARD_SETTINGS },
+      effective: resolveEffectiveStewardPolicy(DEFAULT_MANVI_STEWARD_SETTINGS, null, null),
+      repo_common_dir: null,
+      env_override: null,
+      manvi_state: "ready",
+      manvi_mode: "cloud",
+      manvi_model: "claude-sonnet-4-6",
+      manvi_detail: "Claude API via Manvi",
+      running: false,
+      critical_throttle_active: true,
+      throttled_count: 2,
+      last_check_ms: 1_763_550_000_000,
+      next_check_ms: 1_763_550_180_000,
+      history: [{
+        id: "steward-live-check",
+        trigger: stewardRunCalls > 0 ? "manual" : "critical_wake",
+        ran_at_ms: 1_763_550_000_000,
+        outcome: "acted",
+        tier: "severe",
+        binding: "low_disk",
+        manvi_mode: "cloud",
+        manvi_model: "claude-sonnet-4-6",
+        model_generated: true,
+        summary: "Host severe (free disk space); reclaimed eligible caches and messaged sessions.",
+        directive: "Pause heavy builds until free disk recovers above the configured floor.",
+        messaged_sessions: 2,
+        messaged_repositories: 1,
+        skipped_untrusted_repositories: 0,
+        throttled_processes: 2,
+        restored_processes: 0,
+        reclaimed_bytes: 2 * 1024 * 1024 * 1024,
+        cleaned_items: [],
+        warnings: [],
+      }],
+    });
+    knobs.manviSteward = cmd => {
+      if (cmd === "cmd_manvi_steward_run_now") stewardRunCalls += 1;
+      return stewardFixture();
+    };
+    await refreshManviSteward(null);
+    await tick();
+    await wait(80);
+    const stewardBlock = () => root.querySelector('[data-testid="host-load-steward"]');
+    check("Health > Host load renders the Manvi system steward status block", () =>
+      !!stewardBlock()
+        && has(stewardBlock(), "Active (cloud · claude-sonnet-4-6) · checks every 3 min")
+        && has(stewardBlock(), "Critical slowdown active · 2 agent worker processes throttled")
+        && has(stewardBlock(), "Pause heavy builds until free disk recovers"));
+    const runBtn = root.querySelector('[data-testid="host-load-steward-run"]');
+    await until(() => !!runBtn && !runBtn.disabled);
+    runBtn.click();
+    await until(() => stewardRunCalls === 1 && !runBtn.disabled);
+    check("Run check on Health > Host load invokes cmd_manvi_steward_run_now", () => stewardRunCalls === 1);
+    takeManviFocus();
+    let settingsEvents = 0;
+    const onSettings = () => { settingsEvents += 1; };
+    window.addEventListener("gitpulse:settings", onSettings);
+    root.querySelector('[data-testid="host-load-steward-configure"]').click();
+    await tick();
+    window.removeEventListener("gitpulse:settings", onSettings);
+    check("Open Settings on the steward block deep-links to Settings → Agents → Manvi system steward", () =>
+      get(manviFocusRequest) === "steward" && settingsEvents === 1);
+    takeManviFocus();
   } finally {
     knobs.hostLoad = null;
     knobs.hostLoadLeases = null;
     knobs.hostLoadIdle = null;
+    knobs.manviSteward = null;
   }
 }

@@ -137,6 +137,82 @@ impl AdmittedPair {
         &self.common
     }
 
+    /// Best-effort zero-spawn list of *registered* checkouts sharing [`Self::common_dir`],
+    /// excluding unverified caller inputs so a hand-written gitfile cannot claim
+    /// membership when `git worktree list` is shed under severe host load.
+    pub(crate) fn best_effort_registered_checkouts(&self) -> Vec<PathBuf> {
+        let raw = match self.registered_checkouts() {
+            Some(paths) => paths,
+            None => {
+                let mut paths = Vec::new();
+                let primary = if self.common.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                    self.common.parent().map(Path::to_path_buf)
+                } else {
+                    Some(self.common.clone())
+                };
+                if let Some(primary) = primary {
+                    if matches!(
+                        crate::repository_trust::git_directories(&primary),
+                        Ok((private, common)) if private == self.common && common == self.common
+                    ) {
+                        paths.push(primary);
+                    }
+                }
+                if let Ok(entries) = std::fs::read_dir(self.common.join("worktrees")) {
+                    for entry in entries.take(MAX_REGISTRY_ENTRIES).flatten() {
+                        let entry_dir = entry.path();
+                        let Ok(Some(pointer)) = read_registry_pointer(&entry_dir.join("gitdir"))
+                        else {
+                            continue;
+                        };
+                        let Some(checkout) =
+                            entry_dir.join(pointer).parent().map(Path::to_path_buf)
+                        else {
+                            continue;
+                        };
+                        let Ok(canonical) = std::fs::canonicalize(checkout) else {
+                            continue;
+                        };
+                        if matches!(
+                            crate::repository_trust::git_directories(&canonical),
+                            Ok((_, common)) if common == self.common
+                        ) {
+                            paths.push(canonical);
+                        }
+                    }
+                }
+                paths
+            }
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut deduped = Vec::with_capacity(raw.len());
+        for path in raw {
+            if seen.insert(path.clone()) {
+                deduped.push(path);
+            }
+        }
+        deduped
+    }
+
+    /// Best-effort zero-spawn list of checkouts sharing [`Self::common_dir`],
+    /// used when `git worktree list` is shed under severe host load.
+    ///
+    /// Prefers [`Self::metadata_checkouts`] when complete; when an `[include]`
+    /// stanza or unreadable entry prevents a proven-complete metadata view,
+    /// still collects the primary working tree (when its metadata proves this
+    /// common directory), the admitted pair, and every readable
+    /// `<common>/worktrees/<entry>/gitdir` checkout whose own Git metadata points
+    /// back to [`Self::common_dir`].
+    pub(crate) fn best_effort_checkouts(&self) -> Vec<PathBuf> {
+        let mut out = self.best_effort_registered_checkouts();
+        for extra in [&self.repo, &self.worktree] {
+            if !out.contains(extra) {
+                out.push(extra.clone());
+            }
+        }
+        out
+    }
+
     fn scan_checkouts(&self, with_pair: bool) -> Option<Vec<PathBuf>> {
         // Git lists the primary working tree first: the directory holding
         // `.git`, or the repository itself when it is bare. The candidate is
@@ -528,6 +604,19 @@ fn read_registry_pointer(path: &Path) -> Result<Option<PathBuf>, ()> {
         return Err(());
     }
     Ok(Some(PathBuf::from(pointer)))
+}
+
+/// Reads the checked-out local branch name (`refs/heads/<branch>`) of `checkout`
+/// directly from its private `HEAD` file without spawning `git`. Returns `None`
+/// for detached `HEAD`, unborn/corrupt `HEAD`, or unreadable metadata.
+pub(crate) fn head_branch_from_metadata(checkout: &Path) -> Option<String> {
+    let (private, _) = crate::repository_trust::git_directories(checkout).ok()?;
+    let head = crate::repository_trust::bounded_text(&private.join("HEAD"), 512).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?.trim();
+    if branch.is_empty() || branch.contains('\0') {
+        return None;
+    }
+    Some(branch.to_string())
 }
 
 /// How many worktrees get a dirty-file scan when listing. Worktrees number in

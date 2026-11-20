@@ -283,6 +283,16 @@ impl WatcherState {
         guard.get(key)?.filter.clone()
     }
 
+    /// Canonical paths of repositories currently watched in this app instance.
+    pub(crate) fn watched_roots(&self) -> Vec<String> {
+        let Ok(guard) = self.lock_sessions() else {
+            return Vec::new();
+        };
+        let mut keys: Vec<String> = guard.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// Drops a reserved slot only if it is still the session we inserted.
     /// Used when thread spawn fails after the sessions lock has been released.
     fn abandon_watch_slot(&self, key: &str, stop: &Arc<StopSignal>) -> Result<(), String> {

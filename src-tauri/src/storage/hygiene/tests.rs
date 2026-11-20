@@ -29,7 +29,7 @@ pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 /// storage cleaner exists to avoid, aimed at ourselves -- a check that never
 /// ran must not report the same result as a check that ran and failed. Every
 /// assertion is unchanged; only the failure count is now truthful.
-pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

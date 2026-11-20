@@ -344,6 +344,60 @@
               collect_forced_off: false, socket: null, store: null, transport_supported: false,
             };
           }
+          if (cmd === "cmd_manvi_steward_status" || cmd === "cmd_manvi_steward_save" || cmd === "cmd_manvi_steward_set_repo" || cmd === "cmd_manvi_steward_run_now") {
+            if (!window.__gpSteward) {
+              window.__gpSteward = {
+                settings: { enabled: true, interval_secs: 180, message_agents: true, slow_critical: true, clean_critical: true, clean_retention_days: 3, repositories: {} },
+                runs: 0,
+              };
+            }
+            if (cmd === "cmd_manvi_steward_save" && args?.settings) {
+              window.__gpSteward.settings = structuredClone(args.settings);
+            }
+            if (cmd === "cmd_manvi_steward_set_repo" && args?.repoPath) {
+              const key = `${args.repoPath}/.git`;
+              if (args.overridePolicy) window.__gpSteward.settings.repositories[key] = structuredClone(args.overridePolicy);
+              else delete window.__gpSteward.settings.repositories[key];
+            }
+            if (cmd === "cmd_manvi_steward_run_now") {
+              window.__gpSteward.runs += 1;
+            }
+            const s = structuredClone(window.__gpSteward.settings);
+            const common = args?.repoPath ? `${args.repoPath}/.git` : null;
+            const ov = common ? s.repositories[common] : undefined;
+            return {
+              settings: s,
+              effective: {
+                enabled: ov?.enabled ?? s.enabled,
+                interval_secs: s.interval_secs,
+                message_agents: ov?.message_agents ?? s.message_agents,
+                slow_critical: ov?.slow_critical ?? s.slow_critical,
+                clean_critical: ov?.clean_critical ?? s.clean_critical,
+                clean_retention_days: s.clean_retention_days,
+                overridden: Boolean(ov),
+              },
+              repo_common_dir: common,
+              env_override: null,
+              manvi_state: "ready",
+              manvi_mode: "cloud",
+              manvi_model: "claude-sonnet-4-6",
+              manvi_detail: "Claude API via Manvi",
+              running: false,
+              critical_throttle_active: false,
+              throttled_count: 0,
+              last_check_ms: window.__gpSteward.runs > 0 ? 1_763_550_000_000 : null,
+              next_check_ms: s.enabled ? 1_763_550_180_000 : null,
+              history: window.__gpSteward.runs > 0 ? [{
+                id: "steward-settings-1", trigger: "manual", ran_at_ms: 1_763_550_000_000,
+                outcome: "healthy", tier: "clear", binding: "none", manvi_mode: "cloud",
+                manvi_model: "claude-sonnet-4-6", model_generated: false,
+                summary: "Host load and storage are clear; no intervention needed.",
+                directive: "", messaged_sessions: 0, messaged_repositories: 0,
+                skipped_untrusted_repositories: 0, throttled_processes: 0, restored_processes: 0,
+                reclaimed_bytes: 0, cleaned_items: [], warnings: [],
+              }] : [],
+            };
+          }
           return null;
         },
       };
@@ -446,6 +500,7 @@
           check("selecting Agents shows its panel and hides Appearance", !panel("agents").hidden && panel("appearance").hidden);
           const agents = panel("agents");
           check("Agents carries a Manvi policy card", heading(agents, "Manvi policy"));
+          check("Agents carries a Manvi system steward card", heading(agents, "Manvi system steward"));
           check("Agents carries a Capability boundary card", heading(agents, "Capability boundary"));
           check("Agents carries a Local model servers card", heading(agents, "Local model servers"));
           check("no card is called Harness & AI", !/Harness & AI|MANVI harness/.test(agents.textContent));
@@ -473,7 +528,7 @@
           const externalHeadings =[...agents.querySelectorAll("h4")].filter((h) => h.textContent.trim() === "External CLIs");
           check("External CLIs renders exactly once", externalHeadings.length === 1);
           check("the model card lists the resolved local endpoint", document.getElementById("manvi-section-model").textContent.includes("llama3.2:3b"));
-          check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1);
+          check("the Manvi card anchors are focusable and distinct", document.getElementById("manvi-section-harness")?.tabIndex === -1 && document.getElementById("manvi-section-model")?.tabIndex === -1 && document.getElementById("manvi-section-steward")?.tabIndex === -1);
 
 
           // Connect your agent: rendered and clicked, through the app's own confirm dialog.
@@ -773,10 +828,31 @@
           await typeSearch("capability");
           check("searching 'capability' finds the policy card", shownRow("manvi-policy") && !shownRow("local-model-servers"));
           await typeSearch("manvi");
-          check("searching 'manvi' finds both Manvi cards", shownRow("manvi-policy") && shownRow("local-model-servers"));
+          check("searching 'manvi' finds all three Manvi cards", shownRow("manvi-policy") && shownRow("manvi-steward") && shownRow("local-model-servers"));
+          await typeSearch("steward");
+          check("searching 'steward' narrows to the Manvi system steward card", shownRow("manvi-steward") && !shownRow("manvi-policy") && !shownRow("local-model-servers"));
           await typeSearch("policy");
           check("searching 'policy' finds the policy card", shownRow("manvi-policy"));
           await typeSearch("");
+
+          // Manvi system steward toggle + Run check round-trip and "steward" deep link.
+          const stewardCard = document.getElementById("manvi-section-steward");
+          const stewardRunBtn = stewardCard.querySelector('[data-testid="manvi-steward-run-now"]');
+          await until(() => !stewardRunBtn.disabled);
+          const stewardIntervalFive = [...stewardCard.querySelectorAll("button")].find((b) => b.textContent.trim() === "5m");
+          stewardIntervalFive.click();
+          await until(() => stewardIntervalFive.getAttribute("aria-pressed") === "true" && !stewardRunBtn.disabled);
+          check("changing the steward interval persists interval_secs to cmd_manvi_steward_save", window.__gpSteward?.settings?.interval_secs === 300 && stewardIntervalFive.getAttribute("aria-pressed") === "true");
+          stewardRunBtn.click();
+          await until(() => window.__gpSteward?.runs === 1 && stewardCard.textContent.includes("Host load and storage are clear") && !stewardRunBtn.disabled);
+          check("Run check on the steward card invokes cmd_manvi_steward_run_now and renders the latest check", window.__gpSteward?.runs === 1 && stewardCard.textContent.includes("Host load and storage are clear"));
+
+          tab("appearance").click();
+          await wait(60);
+          requestManviFocus("steward");
+          await wait(500);
+          check("requestManviFocus('steward') opens Settings → Agents and focuses the steward card", !panel("agents").hidden && document.activeElement === stewardCard && inView(stewardCard) && stewardCard.classList.contains("gp-focus-flash") && get(manviFocusRequest) === null);
+          await wait(1500);
 
           // Deep links: from another section with a search hiding the card.
           tab("appearance").click();

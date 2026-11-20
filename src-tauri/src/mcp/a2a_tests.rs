@@ -844,3 +844,352 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
         pending[0].provenance
     );
 }
+
+#[test]
+fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guards() {
+    let (_dir_a, repo_a) = trusted_git_repo();
+    let (_dir_b, repo_b) = trusted_git_repo();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let shared_sid = format!(
+        "99999999-{:04x}-4888-8888-{:012x}",
+        (std::process::id() & 0xffff),
+        (nonce & 0xffff_ffff_ffff)
+    );
+
+    register_forgery_target(&repo_a, &shared_sid, "coder-a");
+    register_forgery_target(&repo_b, &shared_sid, "coder-b");
+
+    // Also deposit an envelope from a third repository that is then deleted from disk:
+    // querying Repo B must ignore orphaned envelopes from deleted repositories too!
+    let mb = Mailbox::at_default().expect("mailbox");
+    {
+        let (dir_c, repo_c) = trusted_git_repo();
+        register_forgery_target(&repo_c, &shared_sid, "coder-c");
+        crate::harness::steward::deliver_directive_to_repo(
+            &repo_c,
+            &mb,
+            "steward-iso-deleted-repo-c",
+            "claude-sonnet-4-6",
+            "cloud",
+            "severe",
+            "low_disk",
+            "Deleted Repo C directive",
+        )
+        .expect("deliver repo C");
+        drop(dir_c);
+    }
+
+    let msg_a = "steward-iso-repo-a";
+    let msg_b = "steward-iso-repo-b";
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo_a,
+        &mb,
+        msg_a,
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "memory_pressure",
+        "Repo A directive",
+    )
+    .expect("deliver repo A");
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo_b,
+        &mb,
+        msg_b,
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "Repo B directive",
+    )
+    .expect("deliver repo B");
+
+    // 1. Depositing for Repo B must NOT delete Repo A's unclaimed SystemSteward slot.
+    assert_eq!(
+        mb.status(&shared_sid, msg_a),
+        crate::agent_mailbox::Delivery::Pending,
+        "Repo B steward deposit must not supersede Repo A's pending mailbox envelope"
+    );
+    assert_eq!(
+        mb.status(&shared_sid, msg_b),
+        crate::agent_mailbox::Delivery::Pending
+    );
+
+    // 2. Querying Repo B inbox must NOT leak or claim Repo A's or deleted Repo C's mailbox envelope.
+    let inbox_b = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo_b,
+            "for_peer": "coder-b",
+            "include_broadcasts": false,
+            "ack": true,
+        }),
+    )
+    .expect("inbox repo B");
+    let msgs_b = inbox_b["messages"].as_array().unwrap();
+    assert_eq!(msgs_b.len(), 1);
+    assert_eq!(msgs_b[0]["msg_id"], msg_b);
+    assert_eq!(
+        mb.status(&shared_sid, msg_a),
+        crate::agent_mailbox::Delivery::Pending,
+        "Repo A envelope must remain Pending after Repo B ack"
+    );
+
+    // 3. `since_seq` on `include_broadcasts: false` must NOT re-emit older mailbox envelopes.
+    let inbox_a_peek = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo_a,
+            "for_peer": "coder-a",
+            "include_broadcasts": false,
+            "ack": false,
+        }),
+    )
+    .expect("peek repo A");
+    let seq_a = inbox_a_peek["latest_seq"].as_u64().unwrap();
+    assert!(seq_a >= 1);
+    let inbox_a_after = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo_a,
+            "for_peer": "coder-a",
+            "since_seq": seq_a,
+            "include_broadcasts": false,
+            "ack": false,
+        }),
+    )
+    .expect("since_seq repo A");
+    assert!(
+        inbox_a_after["messages"].as_array().unwrap().is_empty(),
+        "since_seq must suppress already-seen hydrated mailbox messages"
+    );
+
+    // Clean up Repo A (and orphan Repo C) pending envelopes.
+    let _ = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo_a,
+            "for_peer": "coder-a",
+            "include_broadcasts": false,
+            "ack": true,
+        }),
+    )
+    .expect("ack repo A");
+    assert_eq!(
+        mb.status(&shared_sid, msg_a),
+        crate::agent_mailbox::Delivery::Claimed
+    );
+    let _ = mb.mark_claimed_by_id(&shared_sid, "steward-iso-deleted-repo-c", SystemTime::now());
+    if let Ok(session_dir) = mb.session_path(&shared_sid) {
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    // 4. `gitpulse_inbox_withdraw` on STEWARD_THREAD_KEY by an untrusted agent must fail.
+    assert!(
+        handle_tool_call(
+            "gitpulse_inbox_withdraw",
+            &json!({
+                "repo_path": repo_a,
+                "from_agent": "claude:attacker",
+                "thread_key": crate::engine::agent_bus::STEWARD_THREAD_KEY,
+                "reason": "forged withdraw",
+            }),
+        )
+        .is_err(),
+        "untrusted peer must not withdraw reserved steward thread"
+    );
+}
+
+#[test]
+fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktree_supersede() {
+    use crate::procguard::LockedSpawn;
+
+    let (_dir, repo) = trusted_git_repo();
+    let wt_parent = tempfile::tempdir().expect("worktree parent");
+    let wt_path_buf = wt_parent.path().join("wt-sibling");
+    let wt_path = wt_path_buf.to_string_lossy().into_owned();
+    let out = std::process::Command::new("git")
+        .args([
+            "-C", &repo, "worktree", "add", "-q", "-b", "sibling", &wt_path,
+        ])
+        .output_locked()
+        .expect("git worktree add");
+    assert!(
+        out.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    crate::test_support::trust_repo(&wt_path_buf);
+
+    let nonce = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let sid = format!(
+        "88888888-{:04x}-4888-8888-{:012x}",
+        (std::process::id() & 0xffff),
+        (nonce & 0xffff_ffff_ffff)
+    );
+    register_forgery_target(&repo, &sid, "coder-main");
+    let mb = Mailbox::at_default().expect("mailbox");
+
+    // 1. A short (`!truncated_in_bus`) `PeerAgent` message peeked with `ack: false`
+    //    must preserve its real `kind` and NOT re-emit on a subsequent `since_seq` poll.
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "claude:reviewer",
+            "to_peer": "coder-main",
+            "kind": "handoff",
+            "body": "short handoff body",
+        }),
+    )
+    .expect("send short peer message");
+
+    let peer_peek = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo,
+            "for_peer": "coder-main",
+            "include_broadcasts": false,
+            "ack": false,
+        }),
+    )
+    .expect("peek peer message");
+    let peer_msgs = peer_peek["messages"].as_array().unwrap();
+    assert_eq!(peer_msgs.len(), 1);
+    assert_eq!(peer_msgs[0]["kind"], "handoff");
+    let peer_seq = peer_peek["latest_seq"].as_u64().unwrap();
+    assert!(peer_seq >= 1);
+
+    let peer_after = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo,
+            "for_peer": "coder-main",
+            "since_seq": peer_seq,
+            "include_broadcasts": false,
+            "ack": false,
+        }),
+    )
+    .expect("poll peer inbox after since_seq");
+    assert!(
+        peer_after["messages"].as_array().unwrap().is_empty(),
+        "short PeerAgent pending mailbox envelope must not re-emit past since_seq: {peer_after}"
+    );
+
+    // Claim the peer message before testing steward supersede + ring eviction.
+    let _ = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo,
+            "for_peer": "coder-main",
+            "include_broadcasts": false,
+            "ack": true,
+        }),
+    )
+    .expect("ack peer message");
+
+    // 2. Delivering a steward directive from the main checkout and then from a linked
+    //    worktree sharing the same `common_dir` must supersede the older unclaimed slot.
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo,
+        &mb,
+        "steward-wt-first",
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "First checkout directive",
+    )
+    .expect("deliver from main checkout");
+    crate::harness::steward::deliver_directive_to_repo(
+        &wt_path,
+        &mb,
+        "steward-wt-second",
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "Linked worktree directive",
+    )
+    .expect("deliver from sibling worktree");
+
+    let pending = mb
+        .peek_pending(&sid, 16, SystemTime::now())
+        .expect("peek mailbox after sibling supersede");
+    assert_eq!(
+        pending.len(),
+        1,
+        "steward directive from sibling worktree sharing common_dir must supersede prior slot: {pending:?}"
+    );
+    assert_eq!(pending[0].claim.request_id, "steward-wt-second");
+
+    // 3. Rotate `messages.json` past `MAX_BUS_MESSAGES` so `steward-wt-second` is evicted
+    //    from the bus ring while its mailbox envelope remains `Pending`. Polling with
+    //    `since_seq` >= latest bus seq must still suppress it via `bus_seq`.
+    for idx in 0..(crate::engine::agent_bus::MAX_BUS_MESSAGES + 4) {
+        crate::engine::agent_bus::post_peer_message(
+            &repo,
+            crate::engine::agent_bus::MessageOrigin::Agent,
+            "claude:chatter",
+            Some("other-peer"),
+            None,
+            "note",
+            &format!("ring rotation filler {idx}"),
+            None,
+            None,
+            1,
+            6,
+        )
+        .expect("post filler");
+    }
+    assert!(
+        crate::engine::agent_bus::get_message_by_id(&repo, "steward-wt-second")
+            .expect("lookup evicted steward msg")
+            .is_none(),
+        "steward-wt-second must be evicted from the bounded bus ring"
+    );
+    let latest_bus_seq = crate::engine::agent_bus::read_messages(&repo, None, 1)
+        .expect("read latest bus seq")
+        .latest_seq;
+
+    let evicted_after = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo,
+            "for_peer": "coder-main",
+            "since_seq": latest_bus_seq,
+            "include_broadcasts": false,
+            "ack": false,
+        }),
+    )
+    .expect("inbox after bus ring eviction");
+    assert!(
+        evicted_after["messages"].as_array().unwrap().is_empty(),
+        "bus-evicted SystemSteward envelope must still honor since_seq via bus_seq: {evicted_after}"
+    );
+
+    // Polling from `since_seq: 0` with `ack: true` still delivers and claims the envelope.
+    let evicted_full = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({
+            "repo_path": repo,
+            "for_peer": "coder-main",
+            "since_seq": 0,
+            "include_broadcasts": false,
+            "ack": true,
+        }),
+    )
+    .expect("claim evicted steward envelope");
+    let full_msgs = evicted_full["messages"].as_array().unwrap();
+    assert_eq!(full_msgs.len(), 1);
+    assert_eq!(full_msgs[0]["msg_id"], "steward-wt-second");
+    assert!(full_msgs[0]["seq"].as_u64().unwrap() >= 2);
+
+    if let Ok(session_dir) = mb.session_path(&sid) {
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+}

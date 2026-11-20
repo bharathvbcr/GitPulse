@@ -483,6 +483,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "local model servers ollama lm studio llama.cpp vllm endpoint scan discover pick pin select model manvi claude anthropic api key keychain loopback chat completion tools context window",
   },
   {
+    id: "manvi-steward",
+    section: "agents",
+    label: "Manvi system steward",
+    keywords: "manvi steward monitor system stats periodic interval cloud local message agents slow critical throttle pace clean storage cargo cache disk memory pressure global repository override",
+  },
+  {
     id: "external-tools",
     section: "agents",
     label: "DevMap and Manvi",

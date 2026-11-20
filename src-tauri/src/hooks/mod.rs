@@ -2214,7 +2214,12 @@ fn command_gate_call(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
-    command_gate_call_with(input, run, || load_gate::gather_live(&input.cwd))
+    command_gate_call_with_steward(
+        input,
+        run,
+        || load_gate::gather_live(&input.cwd),
+        || load_gate::live_steward_throttle(&input.cwd),
+    )
 }
 
 /// [`command_gate_call`] with what the load stage reads from the world
@@ -2226,16 +2231,26 @@ fn command_gate_call(
 /// [`signal_guard::combine`] keeps its first argument's decision, which an
 /// advice-only answer must not displace. Bypass mode does not waive it (see
 /// `load_gate`).
+#[cfg(test)]
 fn command_gate_call_with(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
     gather: impl FnOnce() -> load_gate::Gathered,
 ) -> HookOutput {
+    command_gate_call_with_steward(input, run, gather, || None)
+}
+
+fn command_gate_call_with_steward(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+    gather: impl FnOnce() -> load_gate::Gathered,
+    unclassified_steward: impl FnOnce() -> Option<crate::harness::steward::ActiveThrottleRecord>,
+) -> HookOutput {
     let guard = under_bypass(input, signal_guard::run(input));
     if signal_guard::refuses(&guard) {
         return guard;
     }
-    let load = load_gate::judge(input, gather);
+    let load = load_gate::judge_with_steward(input, gather, unclassified_steward);
     let gate = command_gate_with(input, run);
     load_gate::fold(signal_guard::combine(guard, gate), load)
 }

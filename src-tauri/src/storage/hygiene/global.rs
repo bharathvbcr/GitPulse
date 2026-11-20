@@ -131,7 +131,7 @@ pub struct ReclaimScopes {
 /// and `ls-files` in `agent.rs`) the cleaner asks that are admitted while the
 /// disk is the only reason the host sheds work. The relief is granted around
 /// this one spawn, never around a whole scan.
-pub(super) fn listed_worktrees(
+pub(crate) fn listed_worktrees(
     repo_path: &str,
 ) -> Result<Vec<crate::engine::worktree::WorktreeInfo>, CommandError> {
     crate::engine::process::with_disk_relief(|| {
@@ -562,7 +562,7 @@ pub(super) struct AgentMachine {
 }
 // Explicit unlock matters after fork/dup: closing only the owner's descriptor
 // can leave a shared file description locked until a child reaches exec.
-pub(super) struct CleanerLock(File);
+pub(crate) struct CleanerLock(File);
 impl std::ops::Deref for CleanerLock {
     type Target = File;
     fn deref(&self) -> &File {
@@ -2373,7 +2373,7 @@ fn status_in(root: &Path, under: Option<&str>) -> Result<Vec<u8>, CommandError> 
 /// No active task lease applies. With `branch`, a lease applies when it names
 /// that branch or names none (then it could be anywhere); without, every lease
 /// applies.
-fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandError> {
+pub(crate) fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandError> {
     let tasks = crate::tasks::view(repo);
     if !tasks.error.is_empty() {
         return Err(format!("Task activity could not be checked: {}", tasks.error).into());
@@ -2392,7 +2392,7 @@ fn leases_clear(repo: &str, branch: Option<Option<&str>>) -> Result<(), CommandE
 /// artifact (its parent) refuses it; work elsewhere in the repository does
 /// not. An artifact at the repository root falls back to the whole
 /// repository. Leases stay repository-wide.
-fn quiet_project(repo: &str, artifact: &str) -> Result<(), CommandError> {
+pub(crate) fn quiet_project(repo: &str, artifact: &str) -> Result<(), CommandError> {
     let root = crate::engine::git_cli::validate_repo(repo)?;
     let project = Path::new(artifact)
         .parent()
@@ -2413,7 +2413,7 @@ fn quiet_project(repo: &str, artifact: &str) -> Result<(), CommandError> {
 /// The worktree-scope veto: no process works anywhere in the worktree, its
 /// tree is clean, and no task lease names its branch. A process table that
 /// could not be read refuses.
-fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandError> {
+pub(crate) fn quiet_worktree(worktree: &str, branch: Option<&str>) -> Result<(), CommandError> {
     let root = crate::engine::git_cli::validate_repo(worktree)?;
     match crate::sysload::procscan::processes_using(&root) {
         Ok(pids) if pids.is_empty() => {}
@@ -2457,7 +2457,7 @@ fn veto_key(candidate: &CleanerCandidate, scopes: ReclaimScopes) -> String {
     }
 }
 
-pub(super) fn mutation_lock() -> Result<CleanerLock, CommandError> {
+pub(crate) fn mutation_lock() -> Result<CleanerLock, CommandError> {
     service()?.lock("mutation.lock")
 }
 

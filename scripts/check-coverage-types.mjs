@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 129 contracts over
- * 345 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 131 contracts over
+ * 351 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -353,6 +353,8 @@ export const CONTRACTS = Object.freeze([
   { label: "browser", rustPath: rust("browser", "mod.rs"), tsPath: ts("browser", "browserSession.ts"), structs: ["BrowserSnapshotPreview", "BrowserElementRect", "BrowserElementPick"] },
   { label: "terminal-agent-events", rustPath: TERMINAL_RUST_SOURCE, tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalAgentMetaPayload", "TerminalAgentTouchedFilePayload"] },
   { label: "terminal-orchestrate-events", rustPath: rust("terminal", "orchestrate.rs"), tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalChildSpawnedPayload", "TerminalChildClosedPayload", "TerminalOpenFileRequestPayload"] },
+  { label: "manvi-steward-settings", rustPath: rust("tool_config.rs"), tsPath: ts("steward", "types.ts"), structs: ["RepoStewardOverride", "EffectiveStewardPolicy", "ManviStewardSettings"] },
+  { label: "manvi-steward", rustPath: rust("harness", "steward.rs"), tsPath: ts("steward", "types.ts"), structs: ["StewardCleanItem", "StewardTickRecord", "ManviStewardStatus"] },
 ]);
 
 /**

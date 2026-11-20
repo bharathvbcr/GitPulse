@@ -25,6 +25,7 @@ const icons = { work: GitBranch, code: FileCode, history: Search, insights: Perc
 const MANVI_PALETTE_LABELS: Readonly<Record<ManviFocusId, string>> = {
   harness: "Open Manvi policy settings — connection and capability boundary",
   model: "Open local model servers — the models Manvi and agents can use",
+  steward: "Open Manvi system steward — periodic host checks, critical slowdown and cleanup",
   activity: "Open policy activity — Manvi verdicts, grants and the agent journal",
   cleanup: "Open branch and tag cleanup — merged branches and tags safe to delete",
 };

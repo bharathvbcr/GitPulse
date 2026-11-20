@@ -2282,3 +2282,93 @@ fn a_removal_stopped_part_way_reports_the_bytes_it_removed() {
     );
     assert!(failure.message().contains("partly removed"));
 }
+
+/// Zero-day retention (used by Manvi cloud under critical disk) admits a
+/// recently built idle scratch target and records its `newest_secs`, while
+/// still refusing future-dated timestamps and active process use.
+#[test]
+fn zero_retention_admits_recent_idle_scratch_but_still_refuses_future_dates_and_active_use() {
+    let (_temp, root) = temp_root();
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    crate::engine::git_cli::git_global(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+    crate::test_support::trust_repo(&repo);
+    fs::write(repo.join(".git/info/exclude"), ".gitpulse/\n").unwrap();
+
+    let repo_scratch = repo.join(".gitpulse/scratch");
+    fs::create_dir_all(&repo_scratch).unwrap();
+
+    let recent = repo_scratch.join("recent-target");
+    cargo_target(&recent, 0);
+
+    let future = repo_scratch.join("future-target");
+    cargo_target(&future, 0);
+    crate::test_support::set_modified(
+        &future.join("debug/app.o"),
+        SystemTime::now() + Duration::from_secs(3_600),
+    )
+    .unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let live = nobody();
+    let now_secs = now();
+    let ctx = Context {
+        now: now_secs,
+        retention_days: 0,
+        live: &live,
+        use_of: &idle,
+        cancel: &cancel,
+        deadline: Instant::now() + Duration::from_secs(30),
+        target_budget: CARGO_TARGET_BUDGET,
+        removals: None,
+    };
+
+    let scan = scan_repository(&repo, &ctx, false);
+    assert!(scan.complete, "{:?}", scan.issues);
+    assert_eq!(scan.candidates.len(), 1, "{:?}", scan.candidates);
+    let cand = &scan.candidates[0];
+    assert!(cand.path.ends_with("recent-target"), "{cand:?}");
+    let recorded_newest = *scan
+        .newest_secs
+        .get(&cand.path)
+        .expect("newest_secs recorded for candidate");
+    assert!(
+        recorded_newest <= now_secs.saturating_add(5)
+            && now_secs.saturating_sub(recorded_newest) < 120,
+        "recorded_newest={recorded_newest} now_secs={now_secs}"
+    );
+
+    let future_kept = scan
+        .kept
+        .iter()
+        .find(|k| k.path.ends_with("future-target"))
+        .unwrap_or_else(|| panic!("future target must be kept: {:?}", scan.kept));
+    assert!(
+        future_kept.reason.contains("dated in the future"),
+        "{future_kept:?}"
+    );
+
+    // If a process starts using the recent target before removal, `remove_judged`
+    // still refuses even with `retention_days == 0`.
+    let busy_use = |_: &Path| {
+        Ok(DirUse {
+            users: vec![(4242, UseKind::Executable)],
+            ..DirUse::default()
+        })
+    };
+    let busy_ctx = Context {
+        use_of: &busy_use,
+        ..ctx
+    };
+    let refused = remove_judged(cand, &busy_ctx, u64::MAX).unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::Kept(why) if why.contains("process 4242")),
+        "{refused:?}"
+    );
+    assert!(recent.exists());
+
+    // When genuinely idle, `remove_judged` with `retention_days == 0` reclaims it.
+    let freed = remove_judged(cand, &ctx, u64::MAX).expect("reclaims recent idle scratch");
+    assert!(freed >= 4096, "{freed}");
+    assert!(!recent.exists());
+}

@@ -117,7 +117,8 @@ fn io(context: &str, error: &std::io::Error) -> MailboxError {
 }
 
 /// Who originated a mailbox envelope, governing whether delivery frames it as
-/// human-confirmed instructions or untrusted peer-agent output.
+/// human-confirmed instructions, host-governor Manvi steward guidance, or
+/// untrusted peer-agent output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum EnvelopeProvenance {
@@ -137,6 +138,35 @@ pub(crate) enum EnvelopeProvenance {
         #[serde(default)]
         repo_root: String,
     },
+    SystemSteward {
+        msg_id: String,
+        model: String,
+        mode: String,
+        tier: String,
+        binding: String,
+        #[serde(default)]
+        repo_root: String,
+        #[serde(default)]
+        bus_seq: u64,
+    },
+}
+
+fn same_steward_repo(existing_root: &str, new_root: &str) -> bool {
+    let a = existing_root.trim();
+    let b = new_root.trim();
+    if a == b {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    match (
+        crate::harness::steward::canonical_common_dir(a),
+        crate::harness::steward::canonical_common_dir(b),
+    ) {
+        (Some(ca), Some(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 /// Which waiter quota pool a `Stop` `deliver` process belongs to.
@@ -175,11 +205,12 @@ pub(crate) struct Claim {
     pub(crate) text: String,
 }
 
-/// A claimed message paired with its verified provenance.
+/// A claimed message paired with its verified provenance and deposit timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaimedEnvelope {
     pub(crate) claim: Claim,
     pub(crate) provenance: EnvelopeProvenance,
+    pub(crate) created_at_ms: u64,
 }
 
 /// Where one deposited message stands.
@@ -660,7 +691,34 @@ impl Mailbox {
                 }
             }
         }
-        let pending = files.iter().filter(|(n, _)| n.starts_with("p-")).count();
+        let mut pending = 0usize;
+        let steward_repo = match &provenance {
+            EnvelopeProvenance::SystemSteward { repo_root, .. } => Some(repo_root.as_str()),
+            _ => None,
+        };
+        for (name, _) in &files {
+            if !name.starts_with("p-") {
+                continue;
+            }
+            if let Some(new_repo) = steward_repo {
+                if let Some((_, _, id)) = parse_message_name(name) {
+                    if id != request_id
+                        && matches!(
+                            self.read_provenance(&key, id),
+                            Ok(EnvelopeProvenance::SystemSteward { ref repo_root, .. })
+                                if same_steward_repo(repo_root, new_repo)
+                        )
+                    {
+                        // Supersede older unclaimed steward advisories for this repository so
+                        // periodic host directives never consume more than one mailbox slot.
+                        let _ = std::fs::remove_file(dir.join(name));
+                        self.remove_provenance(&key, id);
+                        continue;
+                    }
+                }
+            }
+            pending += 1;
+        }
         if pending >= MAX_PENDING {
             return Err(MailboxError::Full(format!(
                 "This session already has {MAX_PENDING} messages waiting for it."
@@ -728,6 +786,7 @@ impl Mailbox {
 
     /// Non-blocking batch claim of up to `max_items` oldest pending envelopes
     /// under the session's cross-process advisory `flock`.
+    #[cfg(test)]
     pub(crate) fn try_claim_batch(
         &self,
         session: &str,
@@ -784,8 +843,8 @@ impl Mailbox {
                 continue;
             }
             let claimed = format!("c-{}", &name[2..]);
-            let id = parse_message_name(&claimed)
-                .map(|(_, _, id)| id.to_owned())
+            let (created_at_ms, id) = parse_message_name(&claimed)
+                .map(|(_, stamp, id)| (stamp, id.to_owned()))
                 .unwrap_or_default();
             match (
                 read_message(&dir.join(&claimed)),
@@ -798,6 +857,7 @@ impl Mailbox {
                             text,
                         },
                         provenance,
+                        created_at_ms,
                     });
                 }
                 (Err(error), _) | (_, Err(error)) => {
@@ -866,7 +926,7 @@ impl Mailbox {
             if out.len() >= max_items {
                 break;
             }
-            let Some((_, _, id)) = parse_message_name(&name) else {
+            let Some((_, created_at_ms, id)) = parse_message_name(&name) else {
                 continue;
             };
             match (
@@ -883,6 +943,7 @@ impl Mailbox {
                                     text,
                                 },
                                 provenance,
+                                created_at_ms,
                             },
                         ));
                     }
