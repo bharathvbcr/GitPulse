@@ -235,8 +235,9 @@
   <p class="text-textMuted text-micro leading-snug">
     Uses your configured Manvi model (cloud or local) every few minutes to watch memory pressure,
     CPU load, thermal state and free disk space. When agent sessions ignore normal guards, the
-    steward messages active sessions, enforces critical slowdowns, and reclaims leftover build
-    caches in trusted repositories.
+    steward messages active sessions. Slowing agents under critical load and reclaiming leftover
+    build caches when disk space is critical stay off until you switch them on below, and apply
+    only in trusted repositories.
   </p>
 
   {#if view.manvi_state === "ready"}
@@ -356,7 +357,7 @@
 
     <SettingToggle
       label="Slow agents when host load is critical"
-      description="Enforces command-gate refusals on heavy builds even when Advise is selected, paces rapid shell loops, and lowers OS scheduler and disk priority on agent worker processes until critical load clears."
+      description="Enforces command-gate refusals on heavy builds even when Advise is selected, paces rapid shell loops, and lowers OS scheduler and disk priority on agent worker processes until critical load clears. Applies only to agents working in repositories you trust."
       checked={settings.slow_critical}
       disabled={busy || !readOk || !settings.enabled}
       onchange={(next) => void saveGlobal({ slow_critical: next })}

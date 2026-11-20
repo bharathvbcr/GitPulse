@@ -212,7 +212,21 @@ pub(crate) struct ActiveThrottleRecord {
     pub binding: String,
     pub reason: String,
     pub pace_ms: u64,
+    /// Canonical common Git directories of the repositories this slowdown
+    /// covers: trusted ones whose policy slows agents. The steward decides
+    /// trust in-process, where session-only grants are visible, so a hook
+    /// never reads the trust store. A command anywhere else is not paced.
+    #[serde(default)]
+    pub repositories: Vec<String>,
 }
+
+/// Version 2 added `repositories`. A hook built before it would ignore that
+/// list and pace every repository, so it is handed a version it refuses.
+pub(crate) const LEASE_VERSION: u32 = 2;
+
+/// Most repositories one lease names; `MAX_ACTIVE_RECORD_BYTES` bounds the
+/// file as a whole.
+const MAX_LEASE_REPOSITORIES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ManviProbe {
@@ -240,10 +254,6 @@ struct InnerState {
     history: Vec<StewardTickRecord>,
     last_check_ms: Option<u64>,
     last_clean_ms: Option<u64>,
-    /// True when `last_clean_ms` ran with `disk_critical == true` (so a prior
-    /// resource-only sweep never blocks a subsequent critical-disk sweep that
-    /// unlocks recent scratch builds).
-    last_clean_disk_critical: bool,
     /// `(common_dir_or_root) -> (last_messaged_ms, last_tier_rank, last_binding)`
     last_messaged: HashMap<String, (u64, u8, String)>,
     /// Processes whose OS background throttle WE turned on, or that inherited
@@ -1421,10 +1431,9 @@ pub(crate) fn clear_active_throttle_if_owned_or_stale(
             && (raw.len() as u64) <= MAX_ACTIVE_RECORD_BYTES
         {
             if let Ok(record) = serde_json::from_slice::<ActiveThrottleRecord>(&raw) {
-                if record.version == 1
-                    && now_ms <= record.expires_at_ms
-                    && record.writer_pid != std::process::id()
-                {
+                // A live foreign writer owns its lease whatever version it
+                // writes; an older GitPulse still running keeps its own.
+                if now_ms <= record.expires_at_ms && record.writer_pid != std::process::id() {
                     let foreign_writer_alive = crate::sysload::process_start_us(record.writer_pid)
                         .is_some_and(|live_start| live_start == record.writer_start_us);
                     if foreign_writer_alive {
@@ -1498,7 +1507,7 @@ fn active_throttle_for_cwd_with_settings(
         return None;
     }
     let mut record: ActiveThrottleRecord = serde_json::from_slice(&raw).ok()?;
-    if record.version != 1 || now_ms > record.expires_at_ms {
+    if record.version != LEASE_VERSION || now_ms > record.expires_at_ms {
         return None;
     }
     // The steward never issues a lease longer than `lease_ttl_ms` allows or
@@ -1521,9 +1530,14 @@ fn active_throttle_for_cwd_with_settings(
     if forced_enabled == Some(false) {
         return None;
     }
+    // Only a repository the steward found trusted and covered: a command
+    // outside every repository, or in one it did not name, is not paced.
+    let common_dir = canonical_common_dir(cwd)?;
+    if !record.repositories.contains(&common_dir) {
+        return None;
+    }
     let settings = load_settings();
-    let common_dir = canonical_common_dir(cwd);
-    let effective = effective_policy_for(&settings, common_dir.as_deref(), forced_enabled);
+    let effective = effective_policy_for(&settings, Some(common_dir.as_str()), forced_enabled);
     if !effective.enabled || !effective.slow_critical {
         return None;
     }
@@ -2650,7 +2664,7 @@ fn run_critical_hygiene_pass_impl(
         } else {
             out.deferred_or_busy = true;
             out.warnings.push(
-                "Shared-cache pruning skipped: no trusted repository is available to anchor policy checks."
+                "Shared-cache pruning skipped: no trusted repository with cleanup switched on to run it under."
                     .into(),
             );
         }
@@ -3475,6 +3489,21 @@ fn clean_session_agent_scratchpads(
 /// and harness-gate checks, always cancelling `plan.id` on pre-execution failure
 /// so `PLANS.pending` (`MAX_PLANS = 4`) never leaks. Returns `false` only when
 /// the global mutation/execution lock is busy.
+/// The under-lock policy recheck for one target. A shared cache answers to the
+/// global switch AND to the repository it is pruned under, which must still be
+/// trusted and still have cleanup on; any other target answers to its own
+/// repository.
+fn recheck_target_policy(
+    repo_root: &str,
+    target: &str,
+    policy_still_allows: PreMutationPolicyCheck<'_>,
+) -> Result<(), String> {
+    if target.starts_with("cache:") {
+        policy_still_allows(None)?;
+    }
+    policy_still_allows(Some(repo_root))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_single_hygiene_target(
     repo_root: &str,
@@ -3513,12 +3542,7 @@ fn execute_single_hygiene_target(
     let mut skipped_by_precheck = false;
     let outcome = crate::engine::process::with_disk_relief(|| {
         crate::storage::hygiene::execute(repo_root, &plan.id, |argv, path| {
-            let policy_scope = if target.starts_with("cache:") {
-                None
-            } else {
-                Some(repo_root)
-            };
-            if let Err(why) = policy_still_allows(policy_scope) {
+            if let Err(why) = recheck_target_policy(repo_root, target, policy_still_allows) {
                 skipped_by_precheck = true;
                 return Err(crate::ipc_error::CommandError::from(why));
             }
@@ -3986,19 +4010,23 @@ pub(crate) fn evaluate_tick_with(
     let mut skipped_untrusted = 0u32;
     let mut message_targets: BTreeMap<String, String> = BTreeMap::new();
     let mut clean_repos = Vec::new();
-    let mut any_trusted_repo: Option<String> = None;
+    // Common directories of the trusted repositories whose policy slows
+    // agents: the only places an agent process is throttled or a command paced.
+    let mut slow_scope: BTreeSet<String> = BTreeSet::new();
     for repo_root in &candidate_repos {
         if !deps.repo_trusted(repo_root) {
             skipped_untrusted = skipped_untrusted.saturating_add(1);
             continue;
         }
-        if any_trusted_repo.is_none() {
-            any_trusted_repo = Some(repo_root.clone());
-        }
         let common = deps.repo_common_dir(repo_root);
         let eff = effective_policy_for(&settings, common.as_deref(), forced_enabled);
         if !eff.enabled {
             continue;
+        }
+        if eff.slow_critical {
+            if let Some(common) = &common {
+                slow_scope.insert(common.clone());
+            }
         }
         if eff.message_agents {
             let bus_key = common.unwrap_or_else(|| repo_root.clone());
@@ -4049,13 +4077,28 @@ pub(crate) fn evaluate_tick_with(
                     }
                 }
 
+                // One line per cause: the same refusal (Linux limits, say)
+                // repeats for every process on every tick otherwise.
+                let mut refused: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut common_of: HashMap<String, Option<String>> = HashMap::new();
                 for cand in candidates {
+                    // The process's own repository, or, for one working
+                    // outside every repository (a build script in the Cargo
+                    // registry), the nearest ancestor's.
                     let common = cand
                         .session_cwd
-                        .as_deref()
-                        .and_then(|cwd| deps.repo_common_dir(cwd));
-                    let eff = effective_policy_for(&settings, common.as_deref(), forced_enabled);
-                    if !eff.enabled || !eff.slow_critical {
+                        .iter()
+                        .chain(cand.lineage_cwds.iter())
+                        .find_map(|cwd| {
+                            common_of
+                                .entry(cwd.clone())
+                                .or_insert_with(|| deps.repo_common_dir(cwd))
+                                .clone()
+                        });
+                    // Only work inside a trusted repository whose policy slows
+                    // agents; anything else is left alone, or put back.
+                    let in_scope = common.as_ref().is_some_and(|c| slow_scope.contains(c));
+                    if !in_scope {
                         if let Some((prev_start, _)) = desired.remove(&cand.pid) {
                             if matches!(
                                 deps.set_process_throttle(cand.pid, prev_start, false),
@@ -4090,11 +4133,21 @@ pub(crate) fn evaluate_tick_with(
                                 desired.insert(cand.pid, (cand.start_us, common));
                             }
                         }
-                        Err(err) => warnings.push(format!(
-                            "Could not throttle {} (pid {}): {err}",
-                            cand.name, cand.pid
-                        )),
+                        Err(err) => refused
+                            .entry(err)
+                            .or_default()
+                            .push(format!("{} (pid {})", cand.name, cand.pid)),
                     }
+                }
+                for (err, procs) in refused {
+                    let shown: Vec<&str> = procs.iter().take(3).map(String::as_str).collect();
+                    let more = procs.len().saturating_sub(shown.len());
+                    let tail = if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    };
+                    warnings.push(format!("Could not slow {}{tail}: {err}", shown.join(", ")));
                 }
             }
             Err(err) => warnings.push(format!("Agent process throttle scan failed: {err}")),
@@ -4169,7 +4222,7 @@ pub(crate) fn evaluate_tick_with(
                     )
                 };
                 let lease = ActiveThrottleRecord {
-                    version: 1,
+                    version: LEASE_VERSION,
                     writer_pid,
                     writer_start_us,
                     issued_at_ms: now_ms,
@@ -4178,6 +4231,11 @@ pub(crate) fn evaluate_tick_with(
                     binding: b_key.to_string(),
                     reason: lease_reason,
                     pace_ms: CRITICAL_PACE_MS,
+                    repositories: slow_scope
+                        .iter()
+                        .take(MAX_LEASE_REPOSITORIES)
+                        .cloned()
+                        .collect(),
                 };
                 if let Err(err) = deps.write_active_lease(&dir, &lease) {
                     warnings.push(format!("Could not publish critical throttle lease: {err}"));
@@ -4222,10 +4280,10 @@ pub(crate) fn evaluate_tick_with(
         }
     }
 
-    // 2. Critical storage/resource cache cleanup via canonical `storage::hygiene`.
-    //    When Manvi cloud is configured, it evaluates pre-verified candidate
-    //    inventory under critical storage OR critical host resource pressure
-    //    (including recent idle scratch builds when disk itself is critical).
+    // 2. Critical storage cleanup via canonical `storage::hygiene`, only when
+    //    disk is what is critical: deleting build caches frees no memory or
+    //    CPU. With Manvi cloud configured, the model chooses among the
+    //    pre-verified candidates (including recent idle scratch builds).
     //    Closed/idle trusted repositories (from `repository_trust` and Global
     //    Cleaner `roots`) are discovered ONLY when `should_clean` is true so
     //    ordinary Elevated messaging ticks never walk cold checkouts.
@@ -4236,7 +4294,7 @@ pub(crate) fn evaluate_tick_with(
             .disk_fill
             .as_ref()
             .is_some_and(|df| df.tier >= Tier::Severe);
-    let should_clean = storage_critical || (manvi.mode == "cloud" && critical);
+    let should_clean = storage_critical;
     if should_clean {
         let mut seen_clean: BTreeSet<String> = candidate_repos.iter().cloned().collect();
         for extra_root in deps.cleanup_candidate_repos(&load, explicit_repo) {
@@ -4245,9 +4303,6 @@ pub(crate) fn evaluate_tick_with(
             }
             if !deps.repo_trusted(&extra_root) {
                 continue;
-            }
-            if any_trusted_repo.is_none() {
-                any_trusted_repo = Some(extra_root.clone());
             }
             let common = deps.repo_common_dir(&extra_root);
             let eff = effective_policy_for(&settings, common.as_deref(), forced_enabled);
@@ -4264,16 +4319,15 @@ pub(crate) fn evaluate_tick_with(
     if should_clean && any_clean_enabled {
         let cooldown_ok = trigger == "manual" || {
             let guard = crate::supervisor::lock_or_recover(&rt.inner);
-            (storage_critical && !guard.last_clean_disk_critical)
-                || guard
-                    .last_clean_ms
-                    .is_none_or(|last| now_ms.saturating_sub(last) >= AUTO_CLEAN_COOLDOWN_MS)
+            guard
+                .last_clean_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= AUTO_CLEAN_COOLDOWN_MS)
         };
         if cooldown_ok {
-            let trusted_anchor = clean_repos
-                .first()
-                .map(String::as_str)
-                .or(any_trusted_repo.as_deref());
+            // Shared caches are pruned under one repository's trust and
+            // command policy. It must be one with cleanup switched on: a
+            // repository that opted out is never the one a prune runs under.
+            let trusted_anchor = clean_repos.first().map(String::as_str);
             let clean_out = deps.clean_critical_storage(&CriticalCleanRequest {
                 trusted_cleanable_repos: &clean_repos,
                 trusted_anchor_repo: trusted_anchor,
@@ -4286,7 +4340,6 @@ pub(crate) fn evaluate_tick_with(
             if clean_out.reclaimed_bytes > 0 || !clean_out.deferred_or_busy {
                 let mut guard = crate::supervisor::lock_or_recover(&rt.inner);
                 guard.last_clean_ms = Some(now_ms);
-                guard.last_clean_disk_critical = storage_critical;
             }
             reclaimed_bytes = clean_out.reclaimed_bytes;
             cleaned_items = clean_out.items;
@@ -4712,7 +4765,13 @@ mod tests {
         FakeDeps {
             now_ms: 1_800_000_000_000,
             config_dir: dir.to_path_buf(),
-            settings: RefCell::new(ManviStewardSettings::default()),
+            // A person who switched cleaning and slowing on: the cases these
+            // tests exercise. `out_of_the_box_...` covers the defaults.
+            settings: RefCell::new(ManviStewardSettings {
+                slow_critical: true,
+                clean_critical: true,
+                ..ManviStewardSettings::default()
+            }),
             env_var: None,
             manvi: ManviProbe::Answered(Box::new(cloud_manvi())),
             manvi_probes: RefCell::new(0),
@@ -4770,7 +4829,7 @@ mod tests {
         write_active_throttle(
             tmp.path(),
             &ActiveThrottleRecord {
-                version: 1,
+                version: LEASE_VERSION,
                 writer_pid: std::process::id(),
                 writer_start_us: 0,
                 issued_at_ms: deps.now_ms,
@@ -4779,6 +4838,7 @@ mod tests {
                 binding: "memory_pressure".into(),
                 reason: "kernel pressure".into(),
                 pace_ms: 1_000,
+                repositories: Vec::new(),
             },
         )
         .unwrap();
@@ -4814,6 +4874,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
         let acted = evaluate_tick_with(&rt, "critical_wake", None, &deps);
         assert_eq!(acted.outcome, "acted");
@@ -4910,6 +4971,7 @@ mod tests {
                 session_kind: AgentKind::Claude,
                 session_cwd: Some("/trusted/a".into()),
                 is_session_root: false,
+                lineage_cwds: Vec::new(),
             },
             AgentThrottleCandidate {
                 pid: 5100,
@@ -4919,6 +4981,7 @@ mod tests {
                 session_kind: AgentKind::Codex,
                 session_cwd: Some("/opted_out/c".into()),
                 is_session_root: false,
+                lineage_cwds: Vec::new(),
             },
         ];
         deps.common_dirs
@@ -4976,6 +5039,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
         // Simulate the user switching `slow_critical = false` mid-tick while the
         // candidate scan is in flight, before `active.json` is written.
@@ -5033,8 +5097,8 @@ mod tests {
 
         // Verify `active_throttle_for_cwd_with_env` honors `GITPULSE_MANVI_STEWARD=1`
         // even when `tools.json` has `enabled: false` (and `slow_critical: true`).
-        let repo_dir = tmp.path().join("work-repo");
-        fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        let repo_holder = crate::test_support::git_repo();
+        let repo_dir = repo_holder.path().to_path_buf();
         let disabled_cfg = serde_json::json!({
             "version": 1,
             "manvi_steward": {
@@ -5055,7 +5119,7 @@ mod tests {
         write_active_throttle(
             tmp.path(),
             &ActiveThrottleRecord {
-                version: 1,
+                version: LEASE_VERSION,
                 writer_pid: std::process::id(),
                 writer_start_us: 0,
                 issued_at_ms: deps.now_ms,
@@ -5064,6 +5128,7 @@ mod tests {
                 binding: "cpu_load".into(),
                 reason: "high load".into(),
                 pace_ms: 1_000,
+                repositories: vec![canonical_common_dir(repo_dir.to_str().unwrap()).unwrap()],
             },
         )
         .unwrap();
@@ -5697,6 +5762,7 @@ mod tests {
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }];
 
         // Case 1: Pulse wakes on `PressureInput::Critical` while `verdict.tier` is
@@ -5870,11 +5936,24 @@ mod tests {
             "opted-out repo must not be in trusted_cleanable_repos"
         );
         assert_eq!(
-            calls[0].1.as_deref(),
-            Some("/trusted/a"),
-            "trusted_anchor_repo must still fall back to /trusted/a so shared caches can prune"
+            calls[0].1, None,
+            "a repository that opted out is never the one a shared-cache prune runs under"
         );
         assert!(calls[0].2, "clean_shared_caches must be true");
+        drop(calls);
+
+        // With another trusted repository that keeps cleanup on, that one anchors.
+        deps.now_ms += AUTO_CLEAN_COOLDOWN_MS;
+        deps.repos.push("/trusted/c".into());
+        deps.trusted.insert("/trusted/c".into());
+        deps.common_dirs
+            .insert("/trusted/c".into(), "/trusted/c/.git".into());
+        evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        let calls = deps.clean_calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, vec!["/trusted/c".to_string()]);
+        assert_eq!(calls[1].1.as_deref(), Some("/trusted/c"));
+        drop(calls);
 
         // Now verify `clean_session_agent_scratchpads` (`SCOPE_SESSION`):
         // 1. Reclaims a finished session's aged Cargo target under `<tmp>/claude-<uid>/<project>/<session>/scratchpad`
@@ -6002,7 +6081,7 @@ mod tests {
             crate::sysload::process_start_us(foreign_pid).expect("live child start_us");
 
         let foreign_record = ActiveThrottleRecord {
-            version: 1,
+            version: LEASE_VERSION,
             writer_pid: foreign_pid,
             writer_start_us: foreign_start_us,
             issued_at_ms: deps.now_ms,
@@ -6011,6 +6090,7 @@ mod tests {
             binding: "swap".into(),
             reason: "primary writer swap pressure".into(),
             pace_ms: CRITICAL_PACE_MS,
+            repositories: Vec::new(),
         };
         let active_file = tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE);
         write_active_throttle(tmp.path(), &foreign_record).expect("write foreign active.json");
@@ -6705,9 +6785,8 @@ mod tests {
         );
         assert!(fallback_out.reclaimed_bytes >= 4_000);
 
-        // Case 4: Escalation in `evaluate_tick_with` from non-disk critical (`Swap`) to
-        //         `LowDisk` (`storage_critical = true`) within 30 minutes bypasses the
-        //         non-disk cooldown so recent scratch builds can be evaluated immediately!
+        // Case 4: Critical swap is not a disk problem: even with Manvi cloud,
+        //         deleting build caches frees no memory, so nothing is cleaned.
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
         deps.load = make_load(SensorState::Fresh, Tier::Severe, Some(Binding::Swap), false);
@@ -6716,12 +6795,11 @@ mod tests {
         assert_eq!(swap_tick.outcome, "acted");
         assert_eq!(
             deps.clean_calls.borrow().len(),
-            1,
-            "Manvi cloud evaluates cleanup when host resources are critical"
+            0,
+            "cleanup waits for disk to be what is critical, cloud model or not"
         );
 
-        // 2 minutes later, disk itself becomes critical (`disk_remedy = true`) -> MUST NOT be
-        // blocked by the 30-minute cooldown from the earlier non-disk Swap pass!
+        // 2 minutes later, disk itself becomes critical (`disk_remedy = true`): cleaned at once.
         deps.now_ms += 120_000;
         deps.load = make_load(
             SensorState::Fresh,
@@ -6734,8 +6812,8 @@ mod tests {
         assert_eq!(disk_tick.outcome, "acted");
         assert_eq!(
             deps.clean_calls.borrow().len(),
-            2,
-            "escalation to critical disk must bypass prior non-disk cleanup cooldown"
+            1,
+            "critical disk is cleaned on the tick it is seen"
         );
     }
 
@@ -7051,6 +7129,7 @@ Trailing note {done}."#;
             session_kind: AgentKind::Claude,
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
+            lineage_cwds: Vec::new(),
         }
     }
 
@@ -7188,6 +7267,7 @@ Trailing note {done}."#;
         let rt = StewardRuntime::default();
         let settings = ManviStewardSettings {
             interval_secs: 3_600,
+            slow_critical: true,
             ..ManviStewardSettings::default()
         };
         let now = 1_800_000_000_000;
@@ -7215,8 +7295,11 @@ Trailing note {done}."#;
     fn a_lease_longer_than_the_steward_issues_or_dated_ahead_is_not_believed() {
         let tmp = tempfile::tempdir().unwrap();
         let now = 1_800_000_000_000;
+        let repo = crate::test_support::git_repo();
+        let repo_str = repo.path().to_str().unwrap();
+        let covered = canonical_common_dir(repo_str).unwrap();
         let lease = |issued: u64, expires: u64| ActiveThrottleRecord {
-            version: 1,
+            version: LEASE_VERSION,
             writer_pid: std::process::id(),
             writer_start_us: 1,
             issued_at_ms: issued,
@@ -7225,14 +7308,21 @@ Trailing note {done}."#;
             binding: "memory_pressure".into(),
             reason: "test".into(),
             pace_ms: CRITICAL_PACE_MS,
+            repositories: vec![covered.clone()],
         };
         let read = |record: ActiveThrottleRecord| {
             write_active_throttle(tmp.path(), &record).unwrap();
-            active_throttle_for_cwd_with_settings(tmp.path(), "/nowhere", now, None, || {
-                ManviStewardSettings::default()
-            })
+            active_throttle_for_cwd_with_settings(tmp.path(), repo_str, now, None, slowing_on)
         };
         assert!(read(lease(now, now + 900_000)).is_some());
+        assert!(
+            read(ActiveThrottleRecord {
+                version: 1,
+                ..lease(now, now + 900_000)
+            })
+            .is_none(),
+            "a version-1 lease predates the repository list it must carry"
+        );
         assert!(
             read(lease(now, now + 3_600_000)).is_none(),
             "forged hour-long lease"
@@ -7241,6 +7331,122 @@ Trailing note {done}."#;
             read(lease(now + 120_000, now + 600_000)).is_none(),
             "issued in the future"
         );
+    }
+
+    fn slowing_on() -> ManviStewardSettings {
+        ManviStewardSettings {
+            slow_critical: true,
+            ..ManviStewardSettings::default()
+        }
+    }
+
+    #[test]
+    fn a_lease_paces_only_inside_the_trusted_repositories_the_steward_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000;
+        let (named_repo, other_repo) = (
+            crate::test_support::git_repo(),
+            crate::test_support::git_repo(),
+        );
+        let (named, other) = (
+            named_repo.path().to_path_buf(),
+            other_repo.path().to_path_buf(),
+        );
+        fs::create_dir_all(named.join("src")).unwrap();
+        let outside = tmp.path().join("no-repo");
+        fs::create_dir_all(&outside).unwrap();
+        write_active_throttle(
+            tmp.path(),
+            &ActiveThrottleRecord {
+                version: LEASE_VERSION,
+                writer_pid: std::process::id(),
+                writer_start_us: 1,
+                issued_at_ms: now,
+                expires_at_ms: now + 300_000,
+                tier: "severe".into(),
+                binding: "swap".into(),
+                reason: "test".into(),
+                pace_ms: CRITICAL_PACE_MS,
+                repositories: vec![canonical_common_dir(named.to_str().unwrap()).unwrap()],
+            },
+        )
+        .unwrap();
+        let read = |cwd: &Path| {
+            active_throttle_for_cwd_with_settings(
+                tmp.path(),
+                cwd.to_str().unwrap(),
+                now,
+                None,
+                slowing_on,
+            )
+        };
+        assert!(read(&named).is_some());
+        assert!(read(&named.join("src")).is_some(), "anywhere inside it");
+        assert!(
+            read(&other).is_none(),
+            "a repository the steward did not name"
+        );
+        assert!(read(&outside).is_none(), "outside every repository");
+    }
+
+    #[test]
+    fn slowing_skips_agents_outside_trusted_repositories_and_the_lease_names_only_trusted_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        deps.load = critical_memory();
+        deps.common_dirs
+            .insert("/untrusted/b".into(), "/untrusted/b/.git".into());
+        let in_repo = |pid: i32, cwd: Option<&str>| AgentThrottleCandidate {
+            session_cwd: cwd.map(str::to_owned),
+            ..agent_worker(pid)
+        };
+        // A build script runs in its package's directory in the Cargo
+        // registry; the `cargo` above it says which repository it serves.
+        let registry = "/home/dev/.cargo/registry/src/index/serde-1.0.0";
+        let under = |pid: i32, session_repo: &str| AgentThrottleCandidate {
+            lineage_cwds: vec![registry.into(), session_repo.into()],
+            ..in_repo(pid, Some(registry))
+        };
+        deps.candidates = vec![
+            in_repo(4100, Some("/trusted/a")),
+            in_repo(4500, Some("/untrusted/b")),
+            in_repo(4600, None),
+            under(4700, "/trusted/a"),
+            under(4800, "/untrusted/b"),
+        ];
+        let rec = evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        assert_eq!(rec.throttled_processes, 2);
+        assert_eq!(
+            *deps.throttle_ops.borrow(),
+            vec![(4100, true), (4700, true)],
+            "an untrusted repository's agent, or one in no repository, is never slowed; a build script outside the repository is judged by the session it serves"
+        );
+        let raw = fs::read(tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE)).unwrap();
+        let lease: ActiveThrottleRecord = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(lease.repositories, vec!["/trusted/a/.git".to_string()]);
+    }
+
+    #[test]
+    fn out_of_the_box_the_steward_messages_but_neither_cleans_nor_slows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        *deps.settings.borrow_mut() = ManviStewardSettings::default();
+        deps.load = make_load(
+            SensorState::Fresh,
+            Tier::Severe,
+            Some(Binding::LowDisk),
+            false,
+        );
+        deps.disk_remedy = true;
+        deps.candidates = vec![agent_worker(4100)];
+        let rec = evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        assert_eq!(rec.outcome, "acted");
+        assert!(!deps.delivered.borrow().is_empty(), "agents are messaged");
+        assert!(deps.clean_calls.borrow().is_empty(), "nothing is deleted");
+        assert!(deps.throttle_ops.borrow().is_empty(), "nothing is slowed");
+        assert!(!tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE).exists());
     }
 
     #[test]
@@ -7279,5 +7485,50 @@ Trailing note {done}."#;
         assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
         assert!(restored.borrow().is_empty());
         assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+    }
+
+    #[test]
+    fn a_shared_cache_is_not_pruned_under_a_repository_that_opted_out_since_planning() {
+        // The person switched cleanup off for /opted/out (or stopped trusting
+        // it) after the pass was planned; the global switch is still on.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let policy = |scope: Option<&str>| -> Result<(), String> {
+            asked.borrow_mut().push(scope.map(str::to_string));
+            match scope {
+                Some("/opted/out") => Err("cleanup is off for this repository".into()),
+                _ => Ok(()),
+            }
+        };
+
+        assert_eq!(
+            recheck_target_policy("/opted/out", "cache:cargo-registry", &policy),
+            Err("cleanup is off for this repository".to_string())
+        );
+        assert_eq!(*asked.borrow(), vec![None, Some("/opted/out".to_string())]);
+
+        // A repository-owned target is judged by its repository alone.
+        asked.borrow_mut().clear();
+        assert!(recheck_target_policy("/opted/out", "target", &policy).is_err());
+        assert_eq!(*asked.borrow(), vec![Some("/opted/out".to_string())]);
+
+        // Under a repository that still allows it, a shared cache passes only
+        // after the global switch has been asked too.
+        asked.borrow_mut().clear();
+        assert_eq!(
+            recheck_target_policy("/still/on", "cache:cargo-registry", &policy),
+            Ok(())
+        );
+        assert_eq!(*asked.borrow(), vec![None, Some("/still/on".to_string())]);
+
+        // A global refusal stops a shared cache before the repository is asked.
+        let global_off = |scope: Option<&str>| -> Result<(), String> {
+            scope
+                .map(|_| ())
+                .ok_or_else(|| "steward cleanup is off".to_string())
+        };
+        assert_eq!(
+            recheck_target_policy("/still/on", "cache:cargo-registry", &global_off),
+            Err("steward cleanup is off".to_string())
+        );
     }
 }
