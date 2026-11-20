@@ -41,6 +41,23 @@ export function statusForSide<T extends Pick<StatusLike, "is_staged" | "addition
     deletions: (staged ? status.staged_deletions : status.unstaged_deletions) ?? status.deletions };
 }
 
+/**
+ * One key per row of a keyed list, unique by construction. A path's first row
+ * keeps the bare path; a repeat gets an occurrence suffix after a NUL, which no
+ * path can contain, so it can never collide with another path. A keyed each
+ * throws on a duplicate key where an index-keyed one cannot, and this is what
+ * keeps a repeated row (a status source that reports one path twice) a repeated
+ * row instead of a crashed sidebar.
+ */
+export function uniqueRowKeys(paths: readonly string[]): string[] {
+  const seen = new Map<string, number>();
+  return paths.map((path) => {
+    const n = seen.get(path) ?? 0;
+    seen.set(path, n + 1);
+    return n === 0 ? path : `${path}\0${n}`;
+  });
+}
+
 export function classifyFileChange(status: StatusLike | null | undefined): FileChangeKind {
   if (!status) return "clean";
   if (status.is_conflicted) return "conflict";
