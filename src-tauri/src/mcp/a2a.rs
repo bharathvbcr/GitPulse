@@ -179,19 +179,43 @@ pub(crate) fn dispatch_kickoff_spawn(
 pub(crate) fn handle_agent_register(a: super::AgentRegisterArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
+
+    if let Some(ref explicit_provider) = a.provider {
+        agent_bus::require_agent_sender(explicit_provider).map_err(CommandError::into_message)?;
+    }
+    if let Some(ref explicit_id) = a.peer_id {
+        agent_bus::require_agent_sender(explicit_id).map_err(CommandError::into_message)?;
+    }
+    if let Some(ref explicit_role) = a.role {
+        agent_bus::require_role_not_steward(explicit_role).map_err(CommandError::into_message)?;
+    }
+
     crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
 
-    let family = crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path)
-        .map_err(CommandError::into_message)?;
-    let worktree_path = family.worktree.to_string_lossy().into_owned();
+    let worktree_pb =
+        match crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path) {
+            Ok(family) => family.worktree,
+            Err(err) if err.origin() == Some(crate::ipc_error::IpcErrorKind::DeferredUnderLoad) => {
+                let pair = crate::engine::worktree::admit_worktree_pair(&a.repo_path, &a.repo_path)
+                    .map_err(CommandError::into_message)?;
+                let registered = pair.best_effort_registered_checkouts();
+                if !registered.iter().any(|p| p == pair.repo_path()) {
+                    return Err(err.into_message());
+                }
+                pair.repo_path().to_path_buf()
+            }
+            Err(err) => return Err(err.into_message()),
+        };
+    let worktree_path = worktree_pb.to_string_lossy().into_owned();
     let branch = a.branch.clone().or_else(|| {
-        crate::engine::worktree::list_worktrees(&a.repo_path)
+        crate::engine::worktree::list_worktrees_lite(&a.repo_path)
             .ok()
             .and_then(|wts| {
                 wts.into_iter()
                     .find(|w| w.path == worktree_path)
                     .and_then(|w| w.branch)
             })
+            .or_else(|| crate::engine::worktree::head_branch_from_metadata(&worktree_pb))
     });
 
     let mut peer_id = a.peer_id.clone();
@@ -562,7 +586,7 @@ fn collect_deduped_peer_inbox(
         aliases.insert(sid.clone());
     }
 
-    let alias_vec: Vec<String> = aliases.into_iter().collect();
+    let alias_vec: Vec<String> = aliases.iter().cloned().collect();
     let bus_page = agent_bus::read_messages_for_peer(
         repo_path,
         &alias_vec,
@@ -589,80 +613,159 @@ fn collect_deduped_peer_inbox(
         }
     }
 
-    // Merge direct mailbox envelopes (e.g. UI Send-to-Agent or pointer envelopes)
-    // and deduplicate by `msg_id` (`request_id`).
+    // Merge direct mailbox envelopes (e.g. UI Send-to-Agent, steward directives, or
+    // pointer envelopes) and deduplicate by `msg_id` (`request_id`). Peek first and
+    // claim only returned envelopes below so `thread_key` filters, `since_seq` bounds,
+    // cross-repository scopes, and `limit` caps never consume unreturned mailbox messages.
+    let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
+    let caller_common = crate::harness::steward::canonical_common_dir(repo_path);
+    let mut mailbox_req_by_msg_id = std::collections::HashMap::<String, String>::new();
     if let (Some(ref sid), Ok(mb)) = (&resolved_session_id, Mailbox::at_default()) {
         let now = SystemTime::now();
-        let envelopes = if ack {
-            mb.try_claim_batch(sid, limit.saturating_add(1), now)
-                .unwrap_or_default()
-        } else {
-            mb.peek_pending(sid, limit.saturating_add(1), now)
-                .unwrap_or_default()
-        };
+        let now_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let envelopes = mb
+            .peek_pending(sid, crate::agent_mailbox::MAX_PENDING, now)
+            .unwrap_or_default();
         for env in envelopes {
+            let env_repo_root = match &env.provenance {
+                EnvelopeProvenance::PeerAgent { repo_root, .. }
+                | EnvelopeProvenance::SystemSteward { repo_root, .. }
+                    if !repo_root.trim().is_empty() =>
+                {
+                    Some(repo_root.trim())
+                }
+                _ => None,
+            };
+            if let (Some(ref want_common), Some(recorded_root)) = (&caller_common, env_repo_root) {
+                let matches_repo = crate::harness::steward::canonical_common_dir(recorded_root)
+                    .as_ref()
+                    == Some(want_common);
+                if !matches_repo {
+                    continue;
+                }
+            }
+
             let env_id = match &env.provenance {
-                EnvelopeProvenance::PeerAgent { msg_id, .. } => msg_id.clone(),
+                EnvelopeProvenance::PeerAgent { msg_id, .. }
+                | EnvelopeProvenance::SystemSteward { msg_id, .. } => msg_id.clone(),
                 EnvelopeProvenance::HumanConfirmed => env.claim.request_id.clone(),
             };
-            if !seen_ids.insert(env_id.clone()) {
-                continue;
-            }
-            if let EnvelopeProvenance::PeerAgent {
-                ref msg_id,
-                ref from_peer,
-                ref branch,
-                ref thread_key,
-                hop,
-                max_hops,
-                truncated_in_bus,
-                ..
-            } = env.provenance
-            {
-                let hydrated = if truncated_in_bus {
-                    agent_bus::get_message_by_id(repo_path, msg_id)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
-                if let Some(full_msg) = hydrated {
-                    combined.push(full_msg);
-                } else {
-                    combined.push(AgentBusMessage {
-                        seq: bus_page.latest_seq,
-                        from_agent: from_peer.clone(),
-                        to_agent: Some(canonical_reader.clone()),
-                        kind: "note".to_string(),
-                        body: env.claim.text,
-                        branch: (!branch.is_empty()).then(|| branch.clone()),
-                        created_at_ms: now
-                            .duration_since(UNIX_EPOCH)
-                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
-                        thread_key: (!thread_key.is_empty()).then(|| thread_key.clone()),
-                        msg_id: Some(env_id),
-                        read_by: Vec::new(),
-                        hop: Some(hop),
-                        max_hops: Some(max_hops),
-                    });
-                }
+            let env_created_ms = if env.created_at_ms > 0 {
+                env.created_at_ms
             } else {
-                combined.push(AgentBusMessage {
-                    seq: bus_page.latest_seq,
-                    from_agent: "developer".to_string(),
-                    to_agent: Some(canonical_reader.clone()),
-                    kind: "human".to_string(),
-                    body: env.claim.text,
-                    branch: None,
-                    created_at_ms: now
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0)),
-                    thread_key: None,
-                    msg_id: Some(env_id),
-                    read_by: Vec::new(),
-                    hop: Some(0),
-                    max_hops: Some(agent_bus::DEFAULT_MAX_HOPS),
-                });
+                now_ms
+            };
+            if !seen_ids.contains(&env_id) {
+                let (synthesized, from_bus, has_bus_seq) = match env.provenance {
+                    EnvelopeProvenance::PeerAgent {
+                        ref msg_id,
+                        ref from_peer,
+                        ref branch,
+                        ref thread_key,
+                        hop,
+                        max_hops,
+                        ..
+                    } => {
+                        match agent_bus::get_message_by_id(repo_path, msg_id)
+                            .ok()
+                            .flatten()
+                        {
+                            Some(bus_msg) => (bus_msg, true, true),
+                            None => (
+                                AgentBusMessage {
+                                    seq: bus_page.latest_seq,
+                                    from_agent: from_peer.clone(),
+                                    to_agent: Some(canonical_reader.clone()),
+                                    kind: "note".to_string(),
+                                    body: env.claim.text,
+                                    branch: (!branch.is_empty()).then(|| branch.clone()),
+                                    created_at_ms: env_created_ms,
+                                    thread_key: (!thread_key.is_empty())
+                                        .then(|| thread_key.clone()),
+                                    msg_id: Some(env_id.clone()),
+                                    read_by: Vec::new(),
+                                    hop: Some(hop),
+                                    max_hops: Some(max_hops),
+                                },
+                                false,
+                                false,
+                            ),
+                        }
+                    }
+                    EnvelopeProvenance::SystemSteward {
+                        ref msg_id,
+                        bus_seq,
+                        ..
+                    } => {
+                        match agent_bus::get_message_by_id(repo_path, msg_id)
+                            .ok()
+                            .flatten()
+                        {
+                            Some(bus_msg) => (bus_msg, true, true),
+                            None => (
+                                AgentBusMessage {
+                                    seq: if bus_seq > 0 {
+                                        bus_seq
+                                    } else {
+                                        bus_page.latest_seq
+                                    },
+                                    from_agent: agent_bus::STEWARD_SENDER.to_string(),
+                                    to_agent: None,
+                                    kind: agent_bus::STEWARD_MESSAGE_KIND.to_string(),
+                                    body: env.claim.text,
+                                    branch: None,
+                                    created_at_ms: env_created_ms,
+                                    thread_key: Some(agent_bus::STEWARD_THREAD_KEY.to_string()),
+                                    msg_id: Some(env_id.clone()),
+                                    read_by: Vec::new(),
+                                    hop: Some(0),
+                                    max_hops: Some(1),
+                                },
+                                false,
+                                bus_seq > 0,
+                            ),
+                        }
+                    }
+                    EnvelopeProvenance::HumanConfirmed => (
+                        AgentBusMessage {
+                            seq: bus_page.latest_seq,
+                            from_agent: "developer".to_string(),
+                            to_agent: Some(canonical_reader.clone()),
+                            kind: "human".to_string(),
+                            body: env.claim.text,
+                            branch: None,
+                            created_at_ms: env_created_ms,
+                            thread_key: None,
+                            msg_id: Some(env_id.clone()),
+                            read_by: Vec::new(),
+                            hop: Some(0),
+                            max_hops: Some(agent_bus::DEFAULT_MAX_HOPS),
+                        },
+                        false,
+                        false,
+                    ),
+                };
+                if from_bus && synthesized.read_by.iter().any(|r| aliases.contains(r)) {
+                    if ack {
+                        let _ = mb.mark_claimed_by_id(sid, &env.claim.request_id, now);
+                    }
+                    continue;
+                }
+                if (from_bus || has_bus_seq) && synthesized.seq <= since_seq {
+                    continue;
+                }
+                if let Some(tk) = t_filter {
+                    if synthesized.thread_key.as_deref() != Some(tk) {
+                        continue;
+                    }
+                }
+                mailbox_req_by_msg_id.insert(env_id.clone(), env.claim.request_id);
+                seen_ids.insert(env_id);
+                combined.push(synthesized);
+            } else {
+                mailbox_req_by_msg_id.insert(env_id, env.claim.request_id);
             }
         }
     }
@@ -675,16 +778,24 @@ fn collect_deduped_peer_inbox(
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
         let returned_ids: Vec<String> = combined.iter().filter_map(|m| m.msg_id.clone()).collect();
-        acked_count =
+        let bus_acked =
             agent_bus::ack_messages(repo_path, &canonical_reader, &returned_ids).unwrap_or(0);
+        let mut mb_only_acked = 0usize;
         if let (Some(ref sid), Ok(mb)) = (&resolved_session_id, Mailbox::at_default()) {
             let now = SystemTime::now();
             for mid in &returned_ids {
-                if mb.mark_claimed_by_id(sid, mid, now).unwrap_or(false) && acked_count == 0 {
-                    acked_count += 1;
+                let mut claimed = mb.mark_claimed_by_id(sid, mid, now).unwrap_or(false);
+                if let Some(req_id) = mailbox_req_by_msg_id.get(mid) {
+                    if req_id != mid {
+                        claimed |= mb.mark_claimed_by_id(sid, req_id, now).unwrap_or(false);
+                    }
+                }
+                if claimed {
+                    mb_only_acked += 1;
                 }
             }
         }
+        acked_count = bus_acked.max(mb_only_acked);
     }
 
     Ok((

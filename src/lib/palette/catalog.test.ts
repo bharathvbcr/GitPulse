@@ -143,6 +143,7 @@ describe("command catalog and context", () => {
       expect(rankItems(views, "policy")[0]?.id).toMatch(/^manvi:/);
       expect(rankItems(views, "branch cleanup")[0]?.id).toBe("manvi:cleanup");
       expect(rankItems(views, "model servers")[0]?.id).toBe("manvi:model");
+      expect(rankItems(views, "system steward")[0]?.id).toBe("manvi:steward");
       await commands.find(command => command.id === "manvi:cleanup")?.action();
       expect(navigate).toHaveBeenLastCalledWith("work", "overview");
       expect(takeManviFocus()).toBe("cleanup");
@@ -152,6 +153,9 @@ describe("command catalog and context", () => {
       expect(dispatchEvent).toHaveBeenCalledTimes(1);
       expect(dispatchEvent.mock.lastCall?.[0].type).toBe("gitpulse:settings");
       expect(takeManviFocus()).toBe("harness");
+      await commands.find(command => command.id === "manvi:steward")?.action();
+      expect(dispatchEvent).toHaveBeenCalledTimes(2);
+      expect(takeManviFocus()).toBe("steward");
     } finally {
       vi.unstubAllGlobals();
     }

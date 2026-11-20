@@ -80,7 +80,7 @@ impl Keychain {
     }
 
     #[cfg(all(test, unix))]
-    fn at(program: PathBuf) -> Self {
+    pub(crate) fn at(program: PathBuf) -> Self {
         Self { program }
     }
 
@@ -124,6 +124,27 @@ impl Keychain {
     /// Whether a key is saved, without handing it to the caller.
     pub(crate) fn present(&self) -> Result<bool, CommandError> {
         self.load().map(|key| key.is_some())
+    }
+
+    /// Whether the Keychain holds an item for GitPulse's Claude key, checked
+    /// from its unencrypted attributes (`find-generic-password` without `-w`)
+    /// so periodic background checks never decrypt the secret into memory or
+    /// trigger a macOS login-Keychain unlock prompt while the screen is locked.
+    pub(crate) fn item_exists(&self) -> Result<bool, CommandError> {
+        let (ok, _, stderr, code) = self.run_with_code(
+            &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT],
+            None,
+            "",
+        )?;
+        if code == NOT_FOUND {
+            return Ok(false);
+        }
+        if !ok {
+            return Err(
+                format!("Could not check the Claude API key in the Keychain: {stderr}").into(),
+            );
+        }
+        Ok(true)
     }
 
     /// Removes the saved key. Removing a key that is not there succeeds.
@@ -295,5 +316,23 @@ exit 2
             "the stored value must not be echoed: {error}",
             error = error.message()
         );
+    }
+
+    #[test]
+    fn item_exists_checks_metadata_without_passing_password_decrypt_flags() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let keychain = fake_security(dir.path(), false);
+        assert_eq!(keychain.item_exists(), Ok(false));
+        std::fs::write(dir.path().join("item"), KEY).unwrap();
+        assert_eq!(keychain.item_exists(), Ok(true));
+        let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
+        for line in argv.lines() {
+            assert!(
+                !line
+                    .split_whitespace()
+                    .any(|arg| arg == "-w" || arg == "-g"),
+                "item_exists must never pass -w or -g: {line}"
+            );
+        }
     }
 }

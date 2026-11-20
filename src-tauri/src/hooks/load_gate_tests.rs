@@ -41,6 +41,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         disk: plenty_of_disk(),
         read_free: |_| Free::Missing,
         lease: LeaseSource::Fixed(LeaseFacts::default()),
+        steward_throttle: None,
     }
 }
 
@@ -1661,4 +1662,128 @@ fn a_heavy_command_under_load_that_refuses_builds_is_not_told_every_slot_is_held
         !text.contains("slot is held") && !text.contains("()"),
         "{text}"
     );
+}
+
+fn active_steward(binding: &str, reason: &str) -> crate::harness::steward::ActiveThrottleRecord {
+    crate::harness::steward::ActiveThrottleRecord {
+        version: 1,
+        writer_pid: std::process::id(),
+        writer_start_us: 1,
+        issued_at_ms: 1_000,
+        expires_at_ms: u64::MAX / 2,
+        tier: "severe".into(),
+        binding: binding.into(),
+        reason: reason.into(),
+        pace_ms: 900,
+    }
+}
+
+#[test]
+fn steward_critical_slowdown_enforces_heavy_refusal_even_in_advise_or_off_and_respects_exempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let throttle = active_steward("swap", "swap in use is critically high");
+
+    // Even when `host_load_hook_mode` is `Advise`, active steward slowdown refuses heavy builds.
+    let mut advise_g = severe(dir.path());
+    advise_g.mode = HostLoadHookMode::Advise;
+    advise_g.steward_throttle = Some(throttle.clone());
+    let out = judged("cargo test", &advise_g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(reason(&out).contains("swap in use"), "{}", reason(&out));
+
+    // Even when `host_load_hook_mode` is `Off` or the snapshot temporarily reads Clear,
+    // an active steward critical lease still refuses heavy builds.
+    let mut off_g = gathered(verdict(Tier::Clear, None, true), dir.path());
+    off_g.mode = HostLoadHookMode::Off;
+    off_g.steward_throttle = Some(throttle.clone());
+    let out = judged("cargo build", &off_g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(
+        reason(&out).contains("Manvi system steward critical slowdown"),
+        "{}",
+        reason(&out)
+    );
+    // The gate's own setting does not lift a steward refusal, so the text must
+    // name the steward's switch instead.
+    assert!(
+        reason(&out).contains("Slow agents when host load is critical")
+            && !reason(&out).contains("Advise or Off"),
+        "{}",
+        reason(&out)
+    );
+
+    // Disk-bound steward slowdown gives disk recovery instructions rather than "wait".
+    let mut disk_g = gathered(verdict(Tier::Clear, None, true), dir.path());
+    disk_g.steward_throttle = Some(active_steward(
+        "low_disk",
+        "free disk space is critically low",
+    ));
+    let out = judged("cargo build", &disk_g);
+    assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+    assert!(
+        reason(&out).contains("free disk space first"),
+        "{}",
+        reason(&out)
+    );
+
+    // Heavy-lane holder (`exempt = true`) is never blocked by steward slowdown.
+    let mut exempt_g = off_g;
+    exempt_g.exempt = true;
+    assert!(judged("cargo build", &exempt_g).is_silent());
+}
+
+#[test]
+fn steward_critical_slowdown_paces_unclassified_and_advise_commands_within_hook_budget() {
+    let throttle = active_steward("memory_pressure", "the kernel reports memory pressure");
+
+    let paced = Cell::new(Duration::ZERO);
+    let out = judge_with_steward_and_pacer(
+        &call("python3 scripts/custom_runner.py"),
+        || unreachable!("unclassified commands do not gather snapshot"),
+        || Some(throttle.clone()),
+        Some(std::time::Instant::now()),
+        |d| paced.set(d),
+    );
+    assert_eq!(
+        decision_of(&out),
+        None,
+        "unclassified shell calls are paced, not hard-denied"
+    );
+    assert_eq!(paced.get(), Duration::from_millis(900));
+    assert!(
+        context(&out).contains("Manvi system steward critical slowdown")
+            && context(&out).contains("900ms"),
+        "{}",
+        context(&out)
+    );
+
+    // When `STARTED` has nearly consumed the non-reserved window, pacing clamps so
+    // `command_gate_with` never loses its 6s reserve.
+    let started_late = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(2_400))
+        .unwrap_or_else(std::time::Instant::now);
+    assert_eq!(pace_duration_for(1_000, Some(started_late)), Duration::ZERO);
+}
+
+#[test]
+fn without_a_hook_deadline_the_steward_slowdown_advises_but_never_sleeps() {
+    // The app judges each input line of an orchestrated child terminal with no
+    // hook deadline; a pause per line there would stall it for the whole send.
+    let throttle = active_steward("memory_pressure", "the kernel reports memory pressure");
+    let paced = Cell::new(Some(Duration::from_secs(99)));
+    let out = judge_with_steward_and_pacer(
+        &call("python3 scripts/custom_runner.py"),
+        || unreachable!("unclassified commands do not gather snapshot"),
+        || Some(throttle.clone()),
+        None,
+        |d| paced.set(Some(d)),
+    );
+    assert_eq!(paced.get(), Some(Duration::ZERO));
+    assert_eq!(decision_of(&out), None);
+    let text = context(&out);
+    assert!(
+        text.contains("Manvi system steward critical slowdown"),
+        "{text}"
+    );
+    assert!(!text.contains("paced this command"), "{text}");
 }

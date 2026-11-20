@@ -29,6 +29,7 @@ function componentSource(name: string): string {
 const CARD_OWNER: Record<ManviFocusId, string> = {
   harness: "ManviConnection.svelte",
   model: "LocalModelServers.svelte",
+  steward: "ManviStewardSettings.svelte",
   activity: "PolicyActivity.svelte",
   cleanup: "BranchTagCleanup.svelte",
 };
@@ -68,6 +69,7 @@ describe("Manvi focus catalog", () => {
       expect(hint).toContain(target.label);
     }
     expect(manviFocusHint("model")).toBe("Opens Settings → Agents → Local model servers.");
+    expect(manviFocusHint("steward")).toBe("Opens Settings → Agents → Manvi system steward.");
     expect(manviFocusHint("cleanup")).toBe("Opens Work → Overview → Branch and tag cleanup.");
   });
 

@@ -20,6 +20,7 @@ mod scratch;
 #[cfg(all(test, unix))]
 mod scratch_attack_tests;
 pub mod sidecar;
+pub mod steward;
 
 #[cfg(all(test, unix))]
 mod concurrent_tests;

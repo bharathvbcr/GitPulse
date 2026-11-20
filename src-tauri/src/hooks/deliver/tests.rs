@@ -500,3 +500,49 @@ fn peer_agent_messages_render_untrusted_xml_framing_and_pause_auto_wake_at_max_h
     );
     assert_eq!(mailbox.pending(SESSION), 1);
 }
+
+#[test]
+fn system_steward_envelope_never_wakes_idle_stop_and_renders_escaped_governor_xml() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "steward-msg-1",
+            "Cap <cargo> & pause \"heavy\" runs",
+            EnvelopeProvenance::SystemSteward {
+                msg_id: "steward-msg-1".into(),
+                model: "claude-sonnet-4-6".into(),
+                mode: "cloud".into(),
+                tier: "severe".into(),
+                binding: "memory_pressure".into(),
+                repo_root: String::new(),
+                bus_seq: 1,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+
+    // Idle Stop hook declines auto-wake without consuming the envelope, so an idle
+    // session is never woken up into consuming more memory during a host crisis.
+    let stop_out = run_in(&mailbox, &stop(SESSION), Duration::from_millis(50));
+    assert!(
+        matches!(stop_out, Ok(ref out) if out.is_silent()),
+        "{stop_out:?}"
+    );
+    assert_eq!(mailbox.pending(SESSION), 1);
+
+    // Active session boundary (`try_claim_batch` + `render_message`) claims and renders it cleanly.
+    let claimed = mailbox
+        .try_claim_batch(SESSION, 4, SystemTime::now())
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let rendered = render_message(&claimed[0], None);
+    assert!(rendered.contains("<gitpulse-system-steward "), "{rendered}");
+    assert!(rendered.contains("trust=\"host_governor\""), "{rendered}");
+    assert!(rendered.contains("tier=\"severe\""), "{rendered}");
+    assert!(
+        rendered.contains("Cap &lt;cargo&gt; &amp; pause &quot;heavy&quot; runs")
+            || rendered.contains("Cap &lt;cargo&gt; &amp; pause \"heavy\" runs"),
+        "{rendered}"
+    );
+}

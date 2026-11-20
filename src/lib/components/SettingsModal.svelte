@@ -77,6 +77,7 @@
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
   import ManviConnection from "./ManviConnection.svelte";
   import LocalModelServers from "./LocalModelServers.svelte";
+  import ManviStewardSettings from "./ManviStewardSettings.svelte";
   import { harnessStore } from "../stores/harnessStore";
   import {
     MANVI_FOCUS_TARGETS,
@@ -1164,6 +1165,9 @@
                 </div>
                 <div data-setting="local-model-servers" hidden={!shown("local-model-servers")}>
                   <LocalModelServers />
+                </div>
+                <div data-setting="manvi-steward" hidden={!shown("manvi-steward")}>
+                  <ManviStewardSettings active={isOpen && activeSection === "agents"} repoPath={$repoStore.currentPath} />
                 </div>
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["apple-intelligence"])}>
                   <h3 class="gp-label">Apple Intelligence</h3>

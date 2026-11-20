@@ -346,9 +346,14 @@ describe("annotated but unregistered commands", () => {
     // cmd_host_load_leases, cmd_host_load_idle and cmd_host_load_park (build
     // slots and idle sessions, from the load-leases branch). 336 with
     // cmd_terminal_set_title (a renamed terminal keeps its title across
-    // reloads and restarts), from the terminal landing in e8f7bad9c.
-    expect(found.size).toBe(336);
+    // reloads and restarts), from the terminal landing in e8f7bad9c. 340 with
+    // the Manvi system steward's cmd_manvi_steward_status, _save, _set_repo
+    // and _run_now.
+    expect(found.size).toBe(340);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
+    for (const steward of ["status", "save", "set_repo", "run_now"]) {
+      expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);
+    }
     expect(found.has("cmd_manvi_use")).toBe(true);
     expect(found.has("cmd_host_load_leases")).toBe(true);
     expect(found.has("cmd_host_load_idle")).toBe(true);

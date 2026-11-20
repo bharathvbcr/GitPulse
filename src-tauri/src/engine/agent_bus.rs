@@ -23,7 +23,10 @@ use crate::codeintel::worktree_overlay::{
 use crate::engine::git_cli::{resolve_git_common_dir, validate_repo};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
 use crate::engine::process::DEFAULT_TIMEOUT;
-use crate::engine::worktree::{list_worktrees, WorktreeInfo};
+use crate::engine::worktree::{
+    admit_worktree_pair, head_branch_from_metadata, list_worktrees, list_worktrees_lite,
+    WorktreeInfo,
+};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -639,6 +642,7 @@ pub fn register_or_update_lane_with_conflicts(
     claimed_symbols: &[String],
 ) -> Result<(AgentLaneClaim, Vec<ClaimConflict>), CommandError> {
     let agent = sanitize_token("agent_id", agent_id, 128)?;
+    require_agent_sender(&agent)?;
     let branch_clean = sanitize_token("branch", branch, 256)?;
     let cone_clean = sanitize_claim_paths(sparse_cone, "sparse_cone")?;
     let files_clean = sanitize_claim_paths(claimed_files, "claimed_files")?;
@@ -817,25 +821,40 @@ pub fn lanes_messages_path(repo_path: &str, create_dir: bool) -> Result<PathBuf,
     Ok(lanes_dir.join(MESSAGES_FILE))
 }
 
+/// Canonical bus sender identity reserved exclusively for GitPulse's in-process
+/// Manvi system steward (`harness::steward`, [`MessageOrigin::SystemSteward`]).
+pub const STEWARD_SENDER: &str = "manvi-steward";
+/// Canonical bus thread key for Manvi system steward operational directives.
+pub const STEWARD_THREAD_KEY: &str = "manvi-system-steward";
+/// Canonical bus message kind for Manvi system steward operational directives.
+pub const STEWARD_MESSAGE_KIND: &str = "system-advisory";
+
 /// Who a bus message comes from, decided by the entry point that accepted it and never by
 /// the sender name the caller supplied.
 ///
-/// Only the app's own Tauri commands (a person using the UI) pass [`MessageOrigin::Person`].
-/// Every MCP tool, CLI and hook passes [`MessageOrigin::Agent`].
+/// Only the app's own Tauri commands (a person using the UI) pass [`MessageOrigin::Person`],
+/// and only the app's in-process steward (`harness::steward`) passes
+/// [`MessageOrigin::SystemSteward`]. Every MCP tool, CLI and hook passes
+/// [`MessageOrigin::Agent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageOrigin {
     /// A person acting in the GitPulse UI. Hop 0, and exempt from the hop limit.
     Person,
+    /// GitPulse's in-process Manvi system steward (`harness::steward`). Hop 0,
+    /// and the only origin permitted to post under [`STEWARD_SENDER`] or
+    /// [`STEWARD_MESSAGE_KIND`].
+    SystemSteward,
     /// An agent, whatever name it gives itself. Hop at least 1, and the hop limit applies.
     Agent,
 }
 
 impl MessageOrigin {
-    /// The hop this origin may carry: a person's message is hop 0, an agent's is never below 1.
+    /// The hop this origin may carry: a person's or system steward's message is hop 0,
+    /// an agent's is never below 1.
     #[must_use]
     pub fn effective_hop(self, requested: u32) -> u32 {
         match self {
-            Self::Person => 0,
+            Self::Person | Self::SystemSteward => 0,
             Self::Agent => requested.max(1),
         }
     }
@@ -850,12 +869,54 @@ fn is_reserved_person_name(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
-/// Refuses a sender name reserved for a person. Every agent entry point calls this before it
-/// acts on the name, and [`post_peer_message`] calls it again for the posts it owns.
+/// Sender names reserved for GitPulse's Manvi system steward, including `prefix:id`
+/// peer forms, so no untrusted agent can spoof a host-governor directive on the bus.
+fn is_reserved_steward_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let head = lower.split(':').next().unwrap_or(lower.as_str());
+    matches!(
+        head,
+        "manvi-steward" | "system-steward" | "manvi-system-steward" | "gitpulse-steward"
+    )
+}
+
+/// Message kinds reserved for [`MessageOrigin::SystemSteward`].
+fn is_reserved_steward_kind(kind: &str) -> bool {
+    let lower = kind.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "system-advisory" | "system_steward")
+}
+
+/// Thread keys reserved for [`MessageOrigin::SystemSteward`] so untrusted agents
+/// cannot inject messages into or withdraw the system steward thread.
+fn is_reserved_steward_thread_key(thread_key: &str) -> bool {
+    let lower = thread_key.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "manvi-system-steward" | "system-steward")
+}
+
+/// Refuses a sender name reserved for a person or GitPulse's Manvi system steward.
+/// Every agent entry point calls this before it acts on the name, and
+/// [`post_peer_message`] calls it again for the posts it owns.
 pub fn require_agent_sender(from_agent: &str) -> Result<(), CommandError> {
     if is_reserved_person_name(from_agent) {
         return Err(CommandError::from(
             "from_agent is a name reserved for the person using GitPulse; an agent must send as its own peer id",
+        ));
+    }
+    if is_reserved_steward_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is reserved for GitPulse's Manvi system steward; an agent must send as its own peer id",
+        ));
+    }
+    Ok(())
+}
+
+/// A peer's role is a description ("developer", "reviewer"), never shown as a
+/// sender, so the person's names stay usable; only the steward's are refused,
+/// so no peer can present itself as the host governor.
+pub fn require_role_not_steward(role: &str) -> Result<(), CommandError> {
+    if is_reserved_steward_name(role) {
+        return Err(CommandError::from(
+            "role is reserved for GitPulse's Manvi system steward",
         ));
     }
     Ok(())
@@ -908,9 +969,26 @@ pub fn post_peer_message(
 ) -> Result<AgentBusMessage, CommandError> {
     if origin == MessageOrigin::Agent {
         require_agent_sender(from_agent)?;
+        if is_reserved_steward_kind(kind) {
+            return Err(CommandError::from(
+                "kind is reserved for GitPulse's Manvi system steward",
+            ));
+        }
+        if let Some(tk) = thread_key {
+            if is_reserved_steward_thread_key(tk) {
+                return Err(CommandError::from(
+                    "thread_key is reserved for GitPulse's Manvi system steward",
+                ));
+            }
+        }
     }
     let hop = origin.effective_hop(hop);
     let from = sanitize_token("from_agent", from_agent, 128)?;
+    if origin == MessageOrigin::SystemSteward && from != STEWARD_SENDER {
+        return Err(CommandError::from(format!(
+            "SystemSteward origin requires from_agent = '{STEWARD_SENDER}'"
+        )));
+    }
     let to = match to_agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(target) => Some(sanitize_token("to_agent", target, 128)?),
         None => None,
@@ -920,6 +998,11 @@ pub fn post_peer_message(
         None => None,
     };
     let msg_kind = sanitize_token("kind", kind, 64)?;
+    if origin == MessageOrigin::SystemSteward && msg_kind != STEWARD_MESSAGE_KIND {
+        return Err(CommandError::from(format!(
+            "SystemSteward origin requires kind = '{STEWARD_MESSAGE_KIND}'"
+        )));
+    }
     let normalized_body = crate::agent_mailbox::normalize_crlf(body);
     let trimmed_body = normalized_body.trim();
     if trimmed_body.is_empty() || trimmed_body.contains('\0') {
@@ -1178,7 +1261,12 @@ pub fn read_messages_for_peer(
             .filter(|m| !unread_only || !m.read_by.iter().any(|r| aliases.contains(r)))
             .filter(|m| match &m.to_agent {
                 Some(to) => aliases.is_empty() || aliases.contains(to),
-                None => include_broadcasts,
+                None => {
+                    include_broadcasts
+                        || (m.from_agent == STEWARD_SENDER
+                            && m.kind == STEWARD_MESSAGE_KIND
+                            && m.hop == Some(0))
+                }
             })
             .collect();
         Ok(AgentInboxPage {
@@ -1311,6 +1399,11 @@ pub fn upsert_peer(repo_path: &str, update: PeerUpsert) -> Result<PeerRecord, Co
         .filter(|s| !s.is_empty())
         .map(|s| sanitize_token("role", s, 64))
         .transpose()?;
+    require_agent_sender(&provider)?;
+    require_agent_sender(&derived_peer_id)?;
+    if let Some(ref r) = role {
+        require_role_not_steward(r)?;
+    }
     let branch = update
         .branch
         .as_deref()
@@ -1495,16 +1588,60 @@ pub(crate) fn list_reconciled_peers_from_observation(
     alive_probe: &dyn Fn(u32, u128) -> crate::workbench::process_birth::Liveness,
     has_transcript: &dyn Fn(&str, &str) -> bool,
 ) -> Result<Vec<ReconciledPeer>, CommandError> {
-    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    let (repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    let repo_common = resolve_git_common_dir(&repo).ok();
     let stored: PeersState = with_bus_lock(&lanes_dir, false, || {
         read_json_bounded(&lanes_dir.join(PEERS_FILE), 4 * 1024 * 1024)
     })?;
-    let worktrees = list_worktrees(repo_path).unwrap_or_default();
-    let wt_paths: Vec<String> = worktrees.iter().map(|w| w.path.clone()).collect();
-    let wt_branch_by_path: HashMap<String, Option<String>> = worktrees
-        .iter()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-        .collect();
+    let worktrees = list_worktrees_lite(repo_path).unwrap_or_default();
+    let mut wt_paths: Vec<String> = Vec::new();
+    let mut wt_seen: BTreeSet<String> = BTreeSet::new();
+    let mut wt_branch_by_path: HashMap<String, Option<String>> = HashMap::new();
+    for wt in &worktrees {
+        if wt_seen.insert(wt.path.clone()) {
+            wt_paths.push(wt.path.clone());
+        }
+        wt_branch_by_path.insert(wt.path.clone(), wt.branch.clone());
+    }
+    // When `git worktree list` is shed under `Tier::Severe`, discover the primary
+    // checkout and every registered linked worktree from `<common_dir>/worktrees/<entry>/gitdir`
+    // and `<private_git_dir>/HEAD` with zero subprocess spawns so active sessions in
+    // sibling linked worktrees are never invisible during critical pressure.
+    if wt_paths.is_empty() {
+        let fallback_checkouts = admit_worktree_pair(repo_path, repo_path)
+            .map(|pair| pair.best_effort_checkouts())
+            .unwrap_or_else(|_| vec![repo.clone()]);
+        for checkout in fallback_checkouts {
+            let path_str = checkout.to_string_lossy().into_owned();
+            if wt_seen.insert(path_str.clone()) {
+                wt_paths.push(path_str.clone());
+            }
+            wt_branch_by_path
+                .entry(path_str)
+                .or_insert_with(|| head_branch_from_metadata(&checkout));
+        }
+    }
+    // Also retain any stored peer checkout that belongs to this same common Git dir.
+    if let Some(ref common) = repo_common {
+        for peer in &stored.peers {
+            let candidate = Path::new(peer.worktree_path.trim());
+            let Ok(canonical) = fs::canonicalize(candidate) else {
+                continue;
+            };
+            if resolve_git_common_dir(&canonical).ok().as_ref() == Some(common) {
+                let path_str = canonical.to_string_lossy().into_owned();
+                if wt_seen.insert(path_str.clone()) {
+                    wt_paths.push(path_str.clone());
+                }
+                wt_branch_by_path
+                    .entry(path_str)
+                    .or_insert_with(|| head_branch_from_metadata(&canonical));
+            }
+        }
+    }
+    if wt_paths.is_empty() {
+        wt_paths.push(repo.to_string_lossy().into_owned());
+    }
 
     let live_facet = crate::insights::live_sessions::attribute(live_obs, &wt_paths);
     let mut live_by_pid: HashMap<u32, (&crate::insights::LiveSession, &str)> = HashMap::new();
@@ -3068,6 +3205,31 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_may_describe_itself_as_a_developer_but_never_as_the_steward() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let peer = |role: &str| PeerUpsert {
+            provider: "claude".into(),
+            surface: "terminal".into(),
+            provider_session_id: Some("0f0e0d0c-0b0a-4909-8807-060504030201".into()),
+            worktree_path: anchor.into(),
+            role: Some(role.into()),
+            ..Default::default()
+        };
+        let registered = upsert_peer(anchor, peer("developer")).unwrap();
+        assert_eq!(registered.role.as_deref(), Some("developer"));
+        for reserved in ["system-steward", "Manvi-Steward:worker"] {
+            assert!(
+                upsert_peer(anchor, peer(reserved)).is_err(),
+                "role {reserved} must be refused"
+            );
+        }
+        // The sender identity itself still may not be a person's name.
+        assert!(require_agent_sender("developer").is_err());
+    }
+
+    #[test]
     fn peer_registry_reconciles_antigravity_presence_flock_and_resumable_transcripts() {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path().to_str().unwrap();
@@ -3604,5 +3766,152 @@ mod tests {
         assert_eq!(by_pid(88002).record.run_id.as_deref(), Some("r1"));
         assert_eq!(by_pid(88003).record.surface, "managed");
         assert_eq!(by_pid(88004).record.surface, "external_cli");
+    }
+
+    #[test]
+    fn reconcile_discovers_sibling_linked_worktree_sessions_under_severe_governor_without_git_spawns(
+    ) {
+        use crate::procguard::LockedSpawn;
+        use crate::sysload::{inject_governor_with_history, GovernorInput, Level};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(tmp.path()).unwrap();
+        let main_repo = root.join("main-repo");
+        let sibling_wt = root.join("sibling-lane");
+        fs::create_dir_all(&main_repo).unwrap();
+
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Bus Test"],
+            vec!["config", "user.email", "bus@example.com"],
+            vec!["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main_repo)
+                .status_locked()
+                .unwrap()
+                .success());
+        }
+        assert!(std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/sibling",
+                sibling_wt.to_str().unwrap(),
+            ])
+            .current_dir(&main_repo)
+            .status_locked()
+            .unwrap()
+            .success());
+
+        // Also append an `[include]` stanza to `.git/config` so `metadata_checkouts()`
+        // returns `None`, exercising `best_effort_checkouts()`'s direct `<common>/worktrees/<entry>/gitdir`
+        // + `HEAD` fallback!
+        let cfg_path = main_repo.join(".git/config");
+        let mut cfg_text = fs::read_to_string(&cfg_path).unwrap();
+        cfg_text.push_str("\n[include]\n\tpath = nonexistent-optional.gitconfig\n");
+        fs::write(&cfg_path, cfg_text).unwrap();
+
+        crate::test_support::trust_repo(&main_repo);
+        crate::test_support::trust_repo(&sibling_wt);
+
+        // Inject a REAL Severe governor (`Level::Critical`) so `list_worktrees_lite` is shed!
+        let _gov = inject_governor_with_history(std::iter::repeat_n(
+            GovernorInput::test_pressure(Level::Critical),
+            10,
+        ));
+        assert!(
+            list_worktrees_lite(main_repo.to_str().unwrap()).is_err(),
+            "Severe governor must shed git worktree list subprocesses"
+        );
+
+        let sibling_str = sibling_wt.to_string_lossy().into_owned();
+        let obs = vec![crate::insights::live_sessions::KindObservation {
+            kind: "codex".into(),
+            ok: true,
+            live: vec![crate::insights::LiveSession {
+                kind: "codex".into(),
+                pid: 99123,
+                entrypoint: String::new(),
+                status: "working".into(),
+                cwd: sibling_str.clone(),
+                tree: None,
+                run_id: None,
+                parent_pid: None,
+                session_id: None,
+                proc_start: None,
+                registry_cwd: None,
+                start_us: None,
+                is_caller: false,
+                ide_hosted: false,
+                terminal_session_id: None,
+            }],
+            ..Default::default()
+        }];
+
+        let reconciled = list_reconciled_peers_from_observation(
+            main_repo.to_str().unwrap(),
+            &[],
+            &obs,
+            &|_, _| crate::workbench::process_birth::Liveness::Gone,
+            &|_, _| false,
+        )
+        .expect("reconcile succeeds with zero git spawns under Tier::Severe");
+
+        let found = reconciled
+            .iter()
+            .find(|p| p.record.pid == Some(99123))
+            .unwrap_or_else(|| panic!("missing sibling worktree session in {reconciled:?}"));
+        assert_eq!(found.liveness, "live");
+        assert_eq!(found.record.worktree_path, sibling_str);
+        assert_eq!(found.record.branch.as_deref(), Some("feat/sibling"));
+
+        // Also verify `best_effort_registered_checkouts()` discovers both `main_repo`
+        // and `sibling_wt` with zero git spawns under `Tier::Severe` (even with
+        // `[include]` in `.git/config`), while excluding an unregistered hand-written
+        // gitfile, AND `handle_agent_register` rejects reserved steward provider names
+        // before touching the worktree gate!
+        let forged_wt = tmp.path().join("forged-wt");
+        fs::create_dir_all(&forged_wt).unwrap();
+        let real_gitfile = fs::read_to_string(sibling_wt.join(".git")).unwrap();
+        fs::write(forged_wt.join(".git"), real_gitfile).unwrap();
+        crate::test_support::trust_repo(&forged_wt);
+        let canon_forged = crate::engine::process::canonicalize_plain(&forged_wt).unwrap();
+        let forged_pair = crate::engine::worktree::admit_worktree_pair(
+            forged_wt.to_str().unwrap(),
+            forged_wt.to_str().unwrap(),
+        )
+        .unwrap();
+        let verified_checkouts = forged_pair.best_effort_registered_checkouts();
+        assert!(
+            verified_checkouts
+                .iter()
+                .any(|p| p.to_string_lossy() == sibling_str),
+            "verified linked worktree must be discovered from <common>/worktrees/*/gitdir"
+        );
+        assert!(
+            !verified_checkouts.contains(&canon_forged),
+            "unregistered hand-written gitfile must NOT appear in best_effort_registered_checkouts"
+        );
+
+        let spoof_err = crate::mcp::parse::<crate::mcp::AgentRegisterArgs>(
+            "gitpulse_agent_register",
+            &serde_json::json!({
+                "repo_path": sibling_str,
+                "provider": "manvi-steward",
+                "role": "worker",
+            }),
+        )
+        .and_then(crate::mcp::a2a::handle_agent_register)
+        .expect_err(
+            "reserved steward provider must fail before guard_command even under Severe load",
+        );
+        assert!(
+            spoof_err.contains("Manvi system steward"),
+            "unexpected error: {spoof_err}"
+        );
     }
 }

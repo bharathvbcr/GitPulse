@@ -1,7 +1,7 @@
 //! Reviewable repository hygiene and tool-owned shared-cache maintenance.
 pub(crate) mod agent;
 pub(crate) mod background;
-mod discovery;
+pub(crate) mod discovery;
 pub mod global;
 pub(crate) mod long_lived;
 pub mod providers;
@@ -648,4 +648,4 @@ fn execute_with_activity<T>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
