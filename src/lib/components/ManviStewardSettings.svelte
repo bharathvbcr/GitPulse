@@ -235,8 +235,9 @@
   <p class="text-textMuted text-micro leading-snug">
     Uses your configured Manvi model (cloud or local) every few minutes to watch memory pressure,
     CPU load, thermal state and free disk space. When agent sessions ignore normal guards, the
-    steward messages active sessions, enforces critical slowdowns, and reclaims leftover build
-    caches in trusted repositories.
+    steward messages active sessions. Slowing agents under critical load and reclaiming leftover
+    build caches when disk space is critical stay off until you switch them on below, and apply
+    only in trusted repositories.
   </p>
 
   {#if view.manvi_state === "ready"}

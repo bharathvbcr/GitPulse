@@ -1433,9 +1433,7 @@ pub(crate) fn clear_active_throttle_if_owned_or_stale(
             if let Ok(record) = serde_json::from_slice::<ActiveThrottleRecord>(&raw) {
                 // A live foreign writer owns its lease whatever version it
                 // writes; an older GitPulse still running keeps its own.
-                if now_ms <= record.expires_at_ms
-                    && record.writer_pid != std::process::id()
-                {
+                if now_ms <= record.expires_at_ms && record.writer_pid != std::process::id() {
                     let foreign_writer_alive = crate::sysload::process_start_us(record.writer_pid)
                         .is_some_and(|live_start| live_start == record.writer_start_us);
                     if foreign_writer_alive {
@@ -3491,6 +3489,21 @@ fn clean_session_agent_scratchpads(
 /// and harness-gate checks, always cancelling `plan.id` on pre-execution failure
 /// so `PLANS.pending` (`MAX_PLANS = 4`) never leaks. Returns `false` only when
 /// the global mutation/execution lock is busy.
+/// The under-lock policy recheck for one target. A shared cache answers to the
+/// global switch AND to the repository it is pruned under, which must still be
+/// trusted and still have cleanup on; any other target answers to its own
+/// repository.
+fn recheck_target_policy(
+    repo_root: &str,
+    target: &str,
+    policy_still_allows: PreMutationPolicyCheck<'_>,
+) -> Result<(), String> {
+    if target.starts_with("cache:") {
+        policy_still_allows(None)?;
+    }
+    policy_still_allows(Some(repo_root))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_single_hygiene_target(
     repo_root: &str,
@@ -3529,18 +3542,9 @@ fn execute_single_hygiene_target(
     let mut skipped_by_precheck = false;
     let outcome = crate::engine::process::with_disk_relief(|| {
         crate::storage::hygiene::execute(repo_root, &plan.id, |argv, path| {
-            // A shared cache answers to the global switch AND to the
-            // repository it is pruned under, which must still be trusted and
-            // still have cleanup on; any other target to its own repository.
-            let mut scopes = vec![Some(repo_root)];
-            if target.starts_with("cache:") {
-                scopes.insert(0, None);
-            }
-            for scope in scopes {
-                if let Err(why) = policy_still_allows(scope) {
-                    skipped_by_precheck = true;
-                    return Err(crate::ipc_error::CommandError::from(why));
-                }
+            if let Err(why) = recheck_target_policy(repo_root, target, policy_still_allows) {
+                skipped_by_precheck = true;
+                return Err(crate::ipc_error::CommandError::from(why));
             }
             let exclusions = fresh_cleaner_exclusions(initial_exclusions);
             if path_matches_exclusions(Path::new(path), &exclusions) {
@@ -7481,5 +7485,50 @@ Trailing note {done}."#;
         assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
         assert!(restored.borrow().is_empty());
         assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+    }
+
+    #[test]
+    fn a_shared_cache_is_not_pruned_under_a_repository_that_opted_out_since_planning() {
+        // The person switched cleanup off for /opted/out (or stopped trusting
+        // it) after the pass was planned; the global switch is still on.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let policy = |scope: Option<&str>| -> Result<(), String> {
+            asked.borrow_mut().push(scope.map(str::to_string));
+            match scope {
+                Some("/opted/out") => Err("cleanup is off for this repository".into()),
+                _ => Ok(()),
+            }
+        };
+
+        assert_eq!(
+            recheck_target_policy("/opted/out", "cache:cargo-registry", &policy),
+            Err("cleanup is off for this repository".to_string())
+        );
+        assert_eq!(*asked.borrow(), vec![None, Some("/opted/out".to_string())]);
+
+        // A repository-owned target is judged by its repository alone.
+        asked.borrow_mut().clear();
+        assert!(recheck_target_policy("/opted/out", "target", &policy).is_err());
+        assert_eq!(*asked.borrow(), vec![Some("/opted/out".to_string())]);
+
+        // Under a repository that still allows it, a shared cache passes only
+        // after the global switch has been asked too.
+        asked.borrow_mut().clear();
+        assert_eq!(
+            recheck_target_policy("/still/on", "cache:cargo-registry", &policy),
+            Ok(())
+        );
+        assert_eq!(*asked.borrow(), vec![None, Some("/still/on".to_string())]);
+
+        // A global refusal stops a shared cache before the repository is asked.
+        let global_off = |scope: Option<&str>| -> Result<(), String> {
+            scope
+                .map(|_| ())
+                .ok_or_else(|| "steward cleanup is off".to_string())
+        };
+        assert_eq!(
+            recheck_target_policy("/still/on", "cache:cargo-registry", &global_off),
+            Err("steward cleanup is off".to_string())
+        );
     }
 }
