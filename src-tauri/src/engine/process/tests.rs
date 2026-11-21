@@ -5666,3 +5666,27 @@ fn carry_admission_puts_the_callers_class_on_the_thread_that_runs_the_body() {
         "the user action ends with its body"
     );
 }
+
+/// Unmetered spawns (a `devmap` read) neither wait for nor spend a git rate
+/// token, but are still concurrency-limited: a spent bucket sheds background
+/// work, and the same thread inside `with_unmetered_spawn_rate` is admitted.
+#[test]
+fn an_unmetered_background_spawn_is_admitted_on_a_spent_bucket_a_metered_one_is_shed() {
+    let gate = spent_gate();
+    let far = || Instant::now() + Duration::from_secs(5);
+    with_background_processes(|| {
+        assert_eq!(
+            gate.acquire_until(far(), &|| false).err(),
+            Some(Refusal::Shed),
+            "the control: a metered background spawn on this bucket is shed"
+        );
+        let permit = with_unmetered_spawn_rate(|| gate.acquire_until(far(), &|| false));
+        assert!(permit.is_ok(), "{:?}", permit.err());
+        assert_eq!(
+            gate.counters()[Admission::Background.index()].admitted,
+            1,
+            "it holds a slot like any other spawn"
+        );
+    });
+    assert_eq!(gate.state.lock().unwrap().tokens, 0, "no token was spent");
+}

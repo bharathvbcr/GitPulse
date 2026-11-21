@@ -553,6 +553,129 @@ fn limit_build_threads(cmd: &mut Command) {
     cmd.env(VAR, crate::pools::rayon_threads(cpus).to_string());
 }
 
+/// Verbs that only read the store. Their child is `devmap`, not git, so they
+/// are admitted outside the git spawn budget (see
+/// [`process::with_unmetered_spawn_rate`]) and bound by [`ReadBudget`] instead.
+/// A verb not named here (a build, `seed`, an `integrate` action) stays on the
+/// git budget.
+const READ_VERBS: [&str; 3] = ["status", "preview", "doctor"];
+
+/// `devmap` reads in flight at once, across every repository.
+///
+/// The git budget cannot bound these: a read on a stacked lane starts git
+/// inside `devmap`, where the gate does not see it, and every read costs the
+/// store's CPU and file cache whatever it spawns. A few at a time is what the
+/// code map needs (one probe per open repository, see `live::PROBE_LIMIT`).
+pub(crate) const READ_SLOTS: usize = 4;
+
+/// How long a read waits for one of [`READ_SLOTS`] before it is deferred. The
+/// same bound a reactive git read waits for a spawn token.
+const READ_WAIT: Duration = process::SPAWN_QUEUE_BUDGET;
+
+/// The devmap read budget: a counted slot with a bounded wait.
+pub(crate) struct ReadBudget {
+    slots: usize,
+    in_flight: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// One of the budget's slots, returned on drop.
+pub(crate) struct ReadPermit<'a>(&'a ReadBudget);
+
+impl Drop for ReadPermit<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl ReadBudget {
+    pub(crate) const fn new(slots: usize) -> Self {
+        Self {
+            slots,
+            in_flight: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// A slot, waiting at most `wait` for one. A refusal is a deferral in the
+    /// shape every reader of one matches, and names this budget, not git's.
+    pub(crate) fn admit(&self, wait: Duration) -> Result<ReadPermit<'_>, CommandError> {
+        let began = Instant::now();
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *in_flight >= self.slots {
+            let left = wait.saturating_sub(began.elapsed());
+            if left.is_zero() {
+                return Err(process::deferred_under_load_error(
+                    "devmap",
+                    began.elapsed(),
+                    &format!(
+                        "{} devmap reads are already running and none finished in time",
+                        self.slots
+                    ),
+                ));
+            }
+            in_flight = self
+                .freed
+                .wait_timeout(in_flight, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        *in_flight += 1;
+        Ok(ReadPermit(self))
+    }
+}
+
+fn read_budget() -> &'static ReadBudget {
+    #[cfg(test)]
+    if let Some(budget) = TEST_READ_BUDGET.get() {
+        return budget;
+    }
+    static BUDGET: ReadBudget = ReadBudget::new(READ_SLOTS);
+    &BUDGET
+}
+
+/// The budget (and wait) this thread's reads use instead of the process's:
+/// set by [`with_read_budget`], so a test can fill the slots without taking
+/// them from every other test.
+#[cfg(test)]
+thread_local! {
+    static TEST_READ_BUDGET: std::cell::Cell<Option<&'static ReadBudget>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_READ_WAIT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_read_budget<T>(budget: &'static ReadBudget, wait: Duration, body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(
+        (
+            TEST_READ_BUDGET.replace(Some(budget)),
+            TEST_READ_WAIT.replace(Some(wait)),
+        ),
+        |(budget, wait)| {
+            TEST_READ_BUDGET.set(budget);
+            TEST_READ_WAIT.set(wait);
+        },
+    );
+    body()
+}
+
+fn read_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_READ_WAIT.get() {
+        return wait;
+    }
+    READ_WAIT
+}
+
 fn run_devmap(
     binary: &ResolvedDevmap,
     repo: &Path,
@@ -591,6 +714,12 @@ fn run_devmap(
     // above) so it cannot take the machine from the UI.
     let result = if is_build {
         process::with_background_band(|| run(&mut cmd))
+    } else if args.first().is_some_and(|verb| READ_VERBS.contains(verb)) {
+        // A read starts `devmap`, not git: it is admitted outside the git
+        // budget and held to the read budget instead.
+        read_budget()
+            .admit(read_wait())
+            .and_then(|_slot| process::with_unmetered_spawn_rate(|| run(&mut cmd)))
     } else {
         run(&mut cmd)
     };
@@ -2489,6 +2618,155 @@ exit 2
             !log.lines().any(|line| line.starts_with("build ")),
             "a deferred probe spawned a build:\n{log}"
         );
+    }
+
+    /// `devmap status` with the git spawn budget spent, in the class the code
+    /// map's probe runs in. Returns the answer and what an index build, which
+    /// stays on the git budget, said under the same bucket.
+    #[cfg(unix)]
+    fn status_and_build_with_the_git_budget_spent(
+        stacked: bool,
+    ) -> (CliStatus, Result<BuildOutcome, String>) {
+        use crate::engine::process::{spent_gate, with_background_processes, with_gate_for_test};
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        if stacked {
+            let lease = devmap_query::paths::stack_lease_path(&canonical);
+            fs::create_dir_all(lease.parent().unwrap()).unwrap();
+            fs::write(&lease, r#"{"format_version":1}"#).unwrap();
+        }
+        write_stub_artifacts(repo.path());
+        let _devmap = bind_recording_devmap(repo.path());
+        let path = canonical.to_str().unwrap();
+        let gate = spent_gate();
+        with_gate_for_test(gate, || {
+            with_background_processes(|| (status(path), refresh(path)))
+        })
+    }
+
+    /// A `devmap status` read spawns no git, so it is not admitted against the
+    /// git spawn budget. The code map's probe was shed at 0.000 s fifteen times
+    /// in four minutes on 2026-11-21 ("background work is shed while the git
+    /// spawn rate budget is low (shared bucket: 0-22 tokens, needs more than
+    /// 48)") and devmap never ran (card ft-f815889e, criterion C6). The build
+    /// beside it is the control: it spends the same bucket and is still refused.
+    #[test]
+    #[cfg(unix)]
+    fn a_status_read_is_answered_while_the_git_spawn_budget_is_spent() {
+        let (answer, build) = status_and_build_with_the_git_budget_spent(false);
+        assert!(answer.available, "the read was refused: {answer:?}");
+        assert!(answer.status.is_some(), "{answer:?}");
+        let build = build.expect_err("a build draws from the git budget");
+        assert!(
+            crate::engine::process::is_deferred_under_load(&build),
+            "the control build was not refused by the budget: {build}"
+        );
+    }
+
+    /// The same on a stacked lane, whose reads do spawn git (inside `devmap`,
+    /// where the gate cannot see it): the answer is not "no git cost, so no
+    /// budget" but a budget of their own, see the next test.
+    #[test]
+    #[cfg(unix)]
+    fn a_stacked_lane_status_read_is_answered_while_the_git_spawn_budget_is_spent() {
+        let (answer, _) = status_and_build_with_the_git_budget_spent(true);
+        assert!(answer.available, "the read was refused: {answer:?}");
+    }
+
+    /// A stacked lane's reads start git of their own inside `devmap`, where the
+    /// git budget cannot see it, so reads have a budget of their own: with every
+    /// slot taken a read waits the bound and is then deferred, in the sentence
+    /// every reader of a deferral matches and without blaming the git budget.
+    #[test]
+    #[cfg(unix)]
+    fn a_read_waits_a_bounded_time_for_the_devmap_read_budget_then_defers() {
+        use crate::engine::process::{spent_gate, with_background_processes, with_gate_for_test};
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let lease = devmap_query::paths::stack_lease_path(&canonical);
+        fs::create_dir_all(lease.parent().unwrap()).unwrap();
+        fs::write(&lease, r#"{"format_version":1}"#).unwrap();
+        let _devmap = bind_recording_devmap(repo.path());
+        let path = canonical.to_str().unwrap();
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2)));
+        let held: Vec<_> = (0..2)
+            .map(|_| budget.admit(Duration::ZERO).expect("a free slot"))
+            .collect();
+        let read = || {
+            with_read_budget(budget, Duration::from_millis(150), || {
+                with_gate_for_test(spent_gate(), || with_background_processes(|| status(path)))
+            })
+        };
+
+        let began = Instant::now();
+        let refused = read();
+        let waited = began.elapsed();
+        let reason = refused.reason.clone().unwrap_or_default();
+        assert!(!refused.available, "{refused:?}");
+        assert!(
+            crate::engine::process::is_deferred_under_load(&reason),
+            "not a deferral: {reason}"
+        );
+        assert!(!reason.contains("git"), "blames the git budget: {reason}");
+        assert!(
+            waited >= Duration::from_millis(140)
+                && waited < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+            "waited {waited:?}, expected about 150 ms"
+        );
+
+        drop(held);
+        let answered = read();
+        assert!(
+            answered.available,
+            "a freed slot admits the read: {answered:?}"
+        );
+    }
+
+    /// More readers than slots never run more children than slots, and the ones
+    /// that had to wait are answered once a slot frees.
+    #[test]
+    #[cfg(unix)]
+    fn devmap_reads_never_run_more_children_than_the_read_budget_has_slots() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let stub = repo.path().join("devmap");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'S\\n' >> depth.log\nsleep 0.3\nprintf 'E\\n' >> depth.log\nprintf '%s\\n' '{\"is_fresh\":true,\"schema_outdated\":false}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let _devmap = bind_test_binary(stub.to_string_lossy().into_owned());
+        let path = canonical.to_str().unwrap();
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2)));
+        let answers: Vec<CliStatus> = std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..6)
+                .map(|_| {
+                    scope.spawn(|| {
+                        with_read_budget(budget, Duration::from_secs(20), || status(path))
+                    })
+                })
+                .collect();
+            readers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert!(answers.iter().all(|a| a.available), "{answers:?}");
+        let (mut depth, mut deepest) = (0usize, 0usize);
+        for line in fs::read_to_string(canonical.join("depth.log"))
+            .unwrap()
+            .lines()
+        {
+            match line {
+                "S" => depth += 1,
+                _ => depth -= 1,
+            }
+            deepest = deepest.max(depth);
+        }
+        assert_eq!(depth, 0);
+        assert!(deepest <= 2, "{deepest} children at once, budget is 2");
     }
 
     /// A build that ran out of time is an outcome with `timed_out`; one that

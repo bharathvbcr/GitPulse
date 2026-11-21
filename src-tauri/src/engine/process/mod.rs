@@ -66,10 +66,11 @@ pub(crate) use gate::with_disk_only_answer;
 #[cfg(any(not(unix), test))]
 pub(in crate::engine::process) use gate::SpawnPermit;
 pub(crate) use gate::{
-    background_deferral_cause, current_admission, grant_post_action_credit_now,
-    is_deferred_under_load, is_slot_wait_timeout, mark_user_action, production_spawn_rate,
-    run_command_scope, with_admission, with_background_processes, with_disk_relief,
-    with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
+    background_deferral_cause, current_admission, deferred_under_load_error,
+    grant_post_action_credit_now, is_deferred_under_load, is_slot_wait_timeout, mark_user_action,
+    production_spawn_rate, run_command_scope, with_admission, with_background_processes,
+    with_disk_relief, with_spawn_source, with_unmetered_spawn_rate, Admission, SPAWN_QUEUE_BUDGET,
+    TIMEOUT_MARKER,
 };
 pub use gate::{
     carry_admission, current_admission_name, run_as_user_action, run_process_as_background,
@@ -87,8 +88,8 @@ pub(in crate::engine::process) use gate::{
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use gate::{
-    frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log,
-    take_post_action_credit, with_background_budget_wait, Refusal, SpawnGate,
+    frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log, spent_gate,
+    take_post_action_credit, with_background_budget_wait, with_gate_for_test, Refusal, SpawnGate,
     POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
 };
 
