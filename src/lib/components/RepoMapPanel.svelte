@@ -70,6 +70,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
+  import { deferredStripText, isStatusDeferred } from "../codeintel/indexDeferral";
   import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
   import { Loader2, Network } from "@lucide/svelte";
@@ -296,12 +297,13 @@
   const mapFailureMode = $derived(
     classifyMapFailure({
       cliAvailable: cliStatus?.available ?? null,
+      cliDeferred: isStatusDeferred(cliStatus),
       mapAvailable: load?.available ?? null,
       mapFailure: load?.failure,
     }),
   );
   const mapFailureText = $derived(
-    !load?.available || (cliStatus && !cliStatus.available)
+    !load?.available || (cliStatus && !cliStatus.available && !isStatusDeferred(cliStatus))
       ? mapFailureMessage(mapFailureMode, errorMsg ?? load?.reason ?? cliStatus?.reason)
       : null,
   );
@@ -337,6 +339,10 @@
           : "The automatic index failed.";
       case "paused":
         return indexPausedText(snapshot.reason);
+      case "deferred":
+        // Not an error and not a missing index: the check was put off under
+        // load and the map on screen, if any, is the last good one.
+        return "Index check deferred under load — the map shown is the last good one. It checks again on its own.";
       case "skipped":
         // A skip the user needs to know about is one a rebuild cannot fix.
         return snapshot.decision === "skip_schema_outdated" && snapshot.reason
@@ -360,7 +366,9 @@
     const snapshot = $indexSnapshots[currentRepo];
     return snapshot?.phase === "paused" ? indexPausedText(snapshot.reason) : null;
   });
-  const cliKnownAbsent = $derived(cliStatus != null && !cliStatus.available);
+  // A deferred probe did not run, so the tool is not known to be absent.
+  const cliKnownAbsent = $derived(cliStatus != null && !cliStatus.available && !isStatusDeferred(cliStatus));
+  const deferredStatus = $derived(isStatusDeferred(cliStatus) ? deferredStripText(cliStatus.deferral) : null);
   const areaRows = $derived(map ? buildAreaTree(map.subsystems) : []);
   const filtering = $derived(treeFilter.trim() !== "");
   const treeCollapsed = $derived(filtering ? NO_KEYS : collapsed);
@@ -1011,6 +1019,18 @@
       {/if}
     <!-- `mapFailureMessage` bounds what it returns, but these fallbacks reach
          the strip without passing through it, and both are process output. -->
+    {:else if deferredStatus}
+      <!-- Deferred under load: not an error, and never "Fresh". The text carries
+           the last good generation and its age; the check retries on its own. -->
+      <span
+        class="gp-chip"
+        data-tone="warn"
+        data-testid="map-status-deferred"
+        title="The app is busy, so the index check was put off. Nothing is wrong with the index."
+      >
+        {deferredStatus.headline}
+      </span>
+      <span data-testid="map-status-last-good">{deferredStatus.detail}</span>
     {:else if cliStatus && !cliStatus.available}
       <span class="text-warn">{mapFailureText ?? boundStrip(cliStatus.reason) ?? "The code map tool isn't installed"}</span>
     {:else if load && !load.available}
@@ -1064,7 +1084,7 @@
     <p class="shrink-0 px-3 py-1 text-meta text-textMuted" role="status">{copyLogsNote}</p>
   {/if}
 
-  {#if cliStatus && !cliStatus.available}
+  {#if cliKnownAbsent}
     <div class="gp-notice gp-notice-warn shrink-0 space-y-2">
       <p class="text-xs text-textPrimary">{mapFailureMessage("no_cli")}</p>
       <button

@@ -149,6 +149,105 @@ pub struct CliStatus {
     pub lookup: Option<DevmapLookup>,
     pub reason: Option<String>,
     pub status: Option<Value>,
+    /// Present when the spawn gate declined to start the probe under load, so
+    /// nothing was examined: the status is not unavailable, it is unknown. Typed
+    /// so a reader never has to read the sentence in `reason` to tell "devmap
+    /// is missing" from "ask again shortly".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral: Option<Deferral>,
+}
+
+/// What a deferred status still knows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Deferral {
+    /// The last answer this process got from `devmap status` for the
+    /// repository, or `None` when it never had one.
+    pub last_good: Option<LastGoodIndex>,
+}
+
+/// The last good `devmap status` reading of a repository, and how old it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LastGoodIndex {
+    pub generation_id: Option<u64>,
+    /// Milliseconds since that reading was taken.
+    pub age_ms: u64,
+    /// Whether the index matches the tree *now*: `true`, `false` or `null`
+    /// (not known), the same three readings DevMap's own `source_freshness`
+    /// gives. Never `true` here: nothing was re-examined, and a reading from
+    /// before the deferral cannot vouch for the tree after it. `false` is kept
+    /// when that reading already said the index was stale (a build may have
+    /// since fixed it, but it was not fresh when last seen); otherwise `null`.
+    pub fresh: Option<bool>,
+    /// Why `fresh` is what it is.
+    pub fresh_reason: String,
+}
+
+/// Last good readings kept, one per repository path. A bound so a process
+/// that opens many repositories over a long session does not grow it.
+const LAST_GOOD_CAP: usize = 256;
+
+fn last_good_readings() -> &'static Mutex<HashMap<String, GoodReading>> {
+    static READINGS: OnceLock<Mutex<HashMap<String, GoodReading>>> = OnceLock::new();
+    READINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct GoodReading {
+    generation_id: Option<u64>,
+    is_fresh: Option<bool>,
+    at: Instant,
+}
+
+/// Remembers `status` as the last good reading of `repo`.
+fn remember_good_status(repo: &Path, status: &Value) {
+    let mut readings = last_good_readings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = repo.to_string_lossy().into_owned();
+    if readings.len() >= LAST_GOOD_CAP && !readings.contains_key(&key) {
+        if let Some(oldest) = readings
+            .iter()
+            .min_by_key(|(_, reading)| reading.at)
+            .map(|(key, _)| key.clone())
+        {
+            readings.remove(&oldest);
+        }
+    }
+    readings.insert(
+        key,
+        GoodReading {
+            generation_id: status.get("generation_id").and_then(Value::as_u64),
+            is_fresh: status.get("is_fresh").and_then(Value::as_bool),
+            at: Instant::now(),
+        },
+    );
+}
+
+/// What a deferred status of `repo` can still say about its last good reading.
+fn deferral_for(repo: &Path) -> Deferral {
+    let readings = last_good_readings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last_good = readings
+        .get(repo.to_string_lossy().as_ref())
+        .map(|reading| {
+            let age = reading.at.elapsed();
+            let (fresh, said) = match reading.is_fresh {
+                Some(false) => (Some(false), "it already said the index was stale"),
+                Some(true) => (None, "it said the index was fresh then"),
+                None => (None, "it did not say whether the index was fresh"),
+            };
+            LastGoodIndex {
+                generation_id: reading.generation_id,
+                age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                fresh,
+                fresh_reason: format!(
+                    "devmap status was deferred under load, so freshness was not re-checked; \
+                 the last reading was {} s ago and {said}",
+                    age.as_secs()
+                ),
+            }
+        });
+    Deferral { last_good }
 }
 
 /// One file's preview result.
@@ -357,6 +456,7 @@ pub(crate) fn available_status(payload: &str) -> CliStatus {
         status: Some(
             serde_json::from_str(payload).expect("canned status payload must be valid JSON"),
         ),
+        deferral: None,
     }
 }
 
@@ -371,6 +471,7 @@ pub(crate) fn unavailable_status(reason: &str) -> CliStatus {
         lookup: Some(DevmapLookup::TestOverride),
         reason: Some(reason.into()),
         status: None,
+        deferral: None,
     }
 }
 
@@ -1292,6 +1393,7 @@ pub fn status(repo_path: &str) -> CliStatus {
                 lookup: None,
                 reason: Some(e.into_message()),
                 status: None,
+                deferral: None,
             }
         }
     };
@@ -1304,19 +1406,23 @@ pub fn status(repo_path: &str) -> CliStatus {
                 lookup: None,
                 reason: Some(e),
                 status: None,
+                deferral: None,
             }
         }
     };
     let run = match run_devmap(&binary, &repo, &["status", "--json"], None, STATUS_DEADLINE) {
         Ok(run) => run,
         Err(e) => {
+            let reason = e.into_message();
+            let deferral = process::is_deferred_under_load(&reason).then(|| deferral_for(&repo));
             return CliStatus {
                 available: false,
                 binary: Some(binary.path),
                 lookup: Some(binary.lookup),
-                reason: Some(e.into_message()),
+                reason: Some(reason),
                 status: None,
-            }
+                deferral,
+            };
         }
     };
     let stdout = bytes_to_string(run.stdout);
@@ -1333,22 +1439,28 @@ pub fn status(repo_path: &str) -> CliStatus {
             lookup: Some(binary.lookup),
             reason: Some(detail),
             status: parse_json_stdout(&stdout),
+            deferral: None,
         };
     }
     match parse_json_stdout(&stdout) {
-        Some(status) => CliStatus {
-            available: true,
-            binary: Some(binary.path),
-            lookup: Some(binary.lookup),
-            reason: None,
-            status: Some(status),
-        },
+        Some(status) => {
+            remember_good_status(&repo, &status);
+            CliStatus {
+                available: true,
+                binary: Some(binary.path),
+                lookup: Some(binary.lookup),
+                reason: None,
+                status: Some(status),
+                deferral: None,
+            }
+        }
         None => CliStatus {
             available: false,
             binary: Some(binary.path),
             lookup: Some(binary.lookup),
             reason: Some("devmap status returned non-JSON stdout".into()),
             status: None,
+            deferral: None,
         },
     }
 }
@@ -2672,6 +2784,58 @@ exit 2
     fn a_stacked_lane_status_read_is_answered_while_the_git_spawn_budget_is_spent() {
         let (answer, _) = status_and_build_with_the_git_budget_spent(true);
         assert!(answer.available, "the read was refused: {answer:?}");
+    }
+
+    /// A status the gate deferred says so in a typed field, carrying the last
+    /// good generation and how old that reading is, and is never fresh: nothing
+    /// was examined, so the reading before it cannot vouch for the tree now
+    /// (card ft-f815889e, criteria C7 and (b)). The code map reads this field
+    /// instead of mistaking the deferral for a missing tool.
+    #[test]
+    #[cfg(unix)]
+    fn a_deferred_status_carries_the_last_good_generation_and_its_age_and_is_never_fresh() {
+        use crate::engine::process::with_forced_deferral;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let path = canonical.to_str().unwrap();
+        fs::write(
+            canonical.join("status.json"),
+            r#"{"is_fresh":true,"schema_outdated":false,"generation_id":41}"#,
+        )
+        .unwrap();
+        let _devmap = bind_recording_devmap(repo.path());
+        let good = status(path);
+        assert!(good.available, "{good:?}");
+
+        let shed = serde_json::to_value(with_forced_deferral(|| status(path))).unwrap();
+        assert_eq!(shed["available"], false, "{shed}");
+        let last = &shed["deferral"]["last_good"];
+        assert_eq!(last["generation_id"], 41, "{shed}");
+        assert!(last["age_ms"].is_u64(), "{shed}");
+        assert_ne!(
+            last["fresh"],
+            serde_json::json!(true),
+            "a reading from before the deferral cannot say the index is fresh now: {shed}"
+        );
+        assert!(
+            last["fresh_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not re-checked")),
+            "{shed}"
+        );
+
+        let other = git_repo();
+        let other_path = other.path().canonicalize().unwrap();
+        let unread = serde_json::to_value(with_forced_deferral(|| {
+            status(other_path.to_str().unwrap())
+        }))
+        .unwrap();
+        assert!(unread["deferral"].is_object(), "{unread}");
+        assert!(
+            unread["deferral"]["last_good"].is_null(),
+            "no reading was ever taken of this repository: {unread}"
+        );
     }
 
     /// A stacked lane's reads start git of their own inside `devmap`, where the

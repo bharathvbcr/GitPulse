@@ -641,7 +641,8 @@ describe("liveIndex controller", () => {
     expect(maybeRefresh).toHaveBeenCalledTimes(6);
     expect(maybeRefresh.mock.calls.every(([, changed]) => changed === true)).toBe(true);
     const settled = index.get("/repo");
-    expect(settled.phase).toBe("failed");
+    // Not "failed": nothing was examined, so the index is not known broken.
+    expect(settled.phase).toBe("deferred");
     expect(settled.reason).toContain("deferred under load");
     expect(vi.getTimerCount()).toBe(0);
     // A new change is a new request.
@@ -662,7 +663,7 @@ describe("liveIndex controller", () => {
     const tabs = ["/focused", "/restored"];
     index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
     await vi.advanceTimersByTimeAsync(10 * 60_000);
-    expect(index.get("/restored").phase).toBe("failed");
+    expect(index.get("/restored").phase).toBe("deferred");
     const restoredCalls = () => maybeRefresh.mock.calls.filter(([repo]) => repo === "/restored").length;
     expect(restoredCalls()).toBe(6);
     // An identical apply is not a request; this is the 1 Hz loop the
