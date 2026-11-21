@@ -4211,8 +4211,12 @@ pub fn add_worktree_with_devmap(
     if let Some(selection) = caches {
         let repo = validate_repo(repo_path)?;
         let (cache_outcome, devmap_outcome) = std::thread::scope(|scope| {
-            let cache_task = scope.spawn(|| clone_ignored_caches(&repo, target, selection));
-            let devmap_task = scope.spawn(provision);
+            // A new thread starts in the process default class; both tasks are
+            // part of the creation that asked for them.
+            let cache_task = scope.spawn(crate::engine::process::carry_admission(|| {
+                clone_ignored_caches(&repo, target, selection)
+            }));
+            let devmap_task = scope.spawn(crate::engine::process::carry_admission(provision));
             let devmap_outcome = devmap_task
                 .join()
                 .unwrap_or_else(|_| DevmapOutcome::Failed {
@@ -8381,14 +8385,16 @@ fn add_sparse_worktree_zero_copy_optional_branch(
 
     let ((caches_cloned, cache_error), devmap_outcome, overlay_path) =
         std::thread::scope(|scope| {
-            let cache_task = scope.spawn(|| {
+            // A new thread starts in the process default class; both tasks are
+            // part of the creation that asked for them.
+            let cache_task = scope.spawn(crate::engine::process::carry_admission(|| {
                 if selective_cache {
                     clone_scoped_caches_for_cone(&anchor, target, &cone_dirs)
                 } else {
                     (Vec::new(), None)
                 }
-            });
-            let devmap_task = scope.spawn(|| {
+            }));
+            let devmap_task = scope.spawn(crate::engine::process::carry_admission(|| {
                 if zero_copy_devmap {
                     Some(crate::codeintel::provision_worktree_devmap_zero_copy(
                         &anchor, target,
@@ -8398,7 +8404,7 @@ fn add_sparse_worktree_zero_copy_optional_branch(
                 } else {
                     None
                 }
-            });
+            }));
             let c = cache_task
                 .join()
                 .unwrap_or_else(|_| (Vec::new(), Some("selective cache worker panicked".into())));

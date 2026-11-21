@@ -78,6 +78,30 @@ pub(super) fn default_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no per-user config directory (HOME / APPDATA unset)".to_string())
 }
 
+/// Spends the per-user record down to nothing (the state a storm leaves it in)
+/// and returns how many tokens that took.
+///
+/// For integration tests of the shipped binaries, which draw from this record
+/// in their own isolated profile: it is how a test says "the git spawn budget is
+/// exhausted" without a real storm. Callers must run under the profile whose
+/// record they mean to spend (`HOME`), never the developer's own.
+#[doc(hidden)]
+pub fn exhaust_per_user_record() -> Result<u32, String> {
+    let (burst, per_sec) = super::gate::production_spawn_rate();
+    let budget = SharedBudget::open(&default_path()?)?;
+    let mut spent = 0;
+    // A full record holds `burst` tokens, so more takes than that means the
+    // record is not draining.
+    while spent <= burst {
+        match budget.take_leveled(0, burst, per_sec).0 {
+            Take::Granted => spent += 1,
+            Take::Denied | Take::DeniedUnrecorded(_) => return Ok(spent),
+            Take::Unavailable(reason) => return Err(reason),
+        }
+    }
+    Err(format!("the record still granted after {spent} takes"))
+}
+
 pub(super) struct SharedBudget {
     /// The record, reachable only through [`SharedBudget::lock`], which
     /// excludes this process's other threads before taking the advisory lock

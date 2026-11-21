@@ -47,6 +47,25 @@ fn approve_subprocess_fixture_helper() {
     gitpulse_lib::repository_trust::grant(&repo, &view.identity, true).unwrap();
 }
 
+#[test]
+#[ignore = "subprocess helper invoked by exhaust_budget_in_isolated_home"]
+fn exhaust_budget_subprocess_helper() {
+    let spent = gitpulse_lib::engine::process::exhaust_per_user_record().expect("spend the record");
+    assert!(spent > 0, "the record held nothing to spend");
+}
+
+/// Leaves the isolated profile's per-user git spawn budget empty, as a storm
+/// does: every CLI run in `home` then finds the shared bucket at zero.
+fn exhaust_budget_in_isolated_home(home: &Path) {
+    fs::create_dir_all(home).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "exhaust_budget_subprocess_helper", "--ignored"])
+        .envs(profile_env(home))
+        .status_locked()
+        .unwrap();
+    assert!(status.success(), "exhausting the isolated budget failed");
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(repo)
@@ -382,6 +401,68 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
         built_here,
         "no devmap build ran in {} before create returned; devmap saw:\n{seen}",
         wt.display()
+    );
+}
+
+/// The inline refresh of a create is the user's own one-shot command, so it is
+/// not shed when the per-user git spawn budget is empty (a loaded host, or
+/// agents spending it): it builds, and the answer says `built`, not
+/// `deferred` with exit 3 (card ft-63446aee, criterion C5). This is the
+/// load-proof form of the assertion in
+/// `cli_create_seeds_the_worktree_store_and_builds_it_in_place`: the budget is
+/// spent first instead of left to whatever else is running.
+#[cfg(unix)]
+#[test]
+fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let anchor = workspace.path().join("monorepo");
+    fs::create_dir_all(&anchor).unwrap();
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["config", "user.name", "E2E Agent"]);
+    git(&anchor, &["config", "user.email", "agent@example.com"]);
+    seed_monorepo_with_devmap_and_csr(&anchor);
+    approve_in_isolated_home(&anchor, home.path());
+
+    let stub = devmap_stub_path(home.path());
+    fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         if [ \"$1\" = status ]; then printf '%s\\n' '{\"is_fresh\":false,\"schema_outdated\":false}'; exit 0; fi\n\
+         if [ \"$1\" = build ]; then printf '%s\\n' '{\"ok\":true}'; exit 0; fi\n\
+         exit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    exhaust_budget_in_isolated_home(home.path());
+
+    let wt = workspace.path().join("wt-spent-budget");
+    let out = run_cli(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/spent-budget",
+            "--target",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let answer: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+    assert_eq!(
+        answer["devmap_refresh"]["kind"], "built",
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

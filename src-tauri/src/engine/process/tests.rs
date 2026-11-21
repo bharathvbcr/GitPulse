@@ -5644,3 +5644,25 @@ fn the_observer_is_told_when_the_runner_itself_stopped_the_child() {
     );
     assert_eq!(facts.raw_wait_status, None, "no status was read: {facts:?}");
 }
+
+/// A body that hands work to another thread keeps its admission class only if
+/// it carries it: a new thread starts in the process default, which turned a
+/// worktree create's devmap provisioning back into optional work.
+#[test]
+fn carry_admission_puts_the_callers_class_on_the_thread_that_runs_the_body() {
+    let (plain, carried) = run_as_user_action(|| {
+        assert_eq!(current_admission(), Admission::Interactive);
+        thread::scope(|scope| {
+            let plain = scope.spawn(current_admission);
+            let carried = scope.spawn(carry_admission(current_admission));
+            (plain.join().unwrap(), carried.join().unwrap())
+        })
+    });
+    assert_eq!(plain, Admission::Reactive, "a bare spawn keeps the default");
+    assert_eq!(carried, Admission::Interactive);
+    assert_eq!(
+        current_admission(),
+        Admission::Reactive,
+        "the user action ends with its body"
+    );
+}

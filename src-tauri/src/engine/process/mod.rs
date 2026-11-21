@@ -71,6 +71,10 @@ pub(crate) use gate::{
     run_command_scope, with_admission, with_background_processes, with_disk_relief,
     with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
 };
+pub use gate::{
+    carry_admission, current_admission_name, run_as_user_action, run_process_as_background,
+    run_process_awaiting_background_budget, run_process_with_unlimited_spawn_rate,
+};
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use gate::{
@@ -79,10 +83,6 @@ pub(in crate::engine::process) use gate::{
     spawn_gate, spawn_limit, AdmissionCounters, BucketLevel, LabelCounts, RefusingBucket,
     CANCELLED_BEFORE_SPAWN, POST_ACTION_CREDIT_REPOS, POST_ACTION_CREDIT_WINDOW,
     UNATTRIBUTED_SOURCE,
-};
-pub use gate::{
-    current_admission_name, run_process_as_background, run_process_awaiting_background_budget,
-    run_process_with_unlimited_spawn_rate,
 };
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
@@ -131,6 +131,7 @@ pub(in crate::engine::process) use runner::{
 };
 pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 
+pub use shared_budget::exhaust_per_user_record;
 pub(crate) use shared_read::run_read_shared;
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]

@@ -552,6 +552,27 @@ pub(crate) fn background_deferral_cause() -> Option<&'static str> {
     }
 }
 
+/// Runs a one-shot command's body as the user's own action ([`Admission::Interactive`]):
+/// concurrency-limited, never shed, never drawing a rate token. For a binary
+/// whose process default is background (see [`run_process_as_background`]) and
+/// whose one command the user (or an agent on the user's behalf) asked for by
+/// name, so that no amount of other traffic on the shared budget can refuse
+/// the command that was typed. Only the thread that calls it is promoted: work
+/// the body hands to another thread keeps that thread's class.
+pub fn run_as_user_action<T>(body: impl FnOnce() -> T) -> T {
+    with_admission(Admission::Interactive, body)
+}
+
+/// Wraps `body` so that it runs under the admission class the calling thread
+/// has *now*, wherever it is run: the way a body that hands work to another
+/// thread (`thread::scope`, a pool) carries the class across, since a new thread
+/// starts in the process default and would otherwise turn a user action's
+/// follow-up work back into optional work.
+pub fn carry_admission<T>(body: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    let class = current_admission();
+    move || with_admission(class, body)
+}
+
 /// Applies only inside a synchronous blocking operation.
 pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
     with_admission(Admission::Background, body)
