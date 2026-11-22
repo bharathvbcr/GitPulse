@@ -540,6 +540,19 @@ pub fn park_session(
     session_id: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
 ) -> Result<String, String> {
+    if state.session_ledger().is_protected(session_id) {
+        // Refused before the dialog, and before the row is marked parked: a
+        // parked mark on a session that keeps running would offer a reopen of
+        // a conversation that is still open.
+        let origin = crate::terminal::KillOrigin::LoadGovernor;
+        state.session_ledger().record_lifecycle(
+            "kill_skipped_protected",
+            serde_json::json!({ "session_id": session_id, "origin": origin }),
+        );
+        return Err(crate::terminal::lifecycle::skipped_protected_message(
+            session_id, origin,
+        ));
+    }
     let min_idle_ms = crate::tool_config::host_load_idle()
         .park_after_s
         .saturating_mul(1000);
@@ -558,8 +571,22 @@ pub fn park_session(
                 .and_then(|l| l.into_iter().find(|s| s.id == session_id))
                 .map(|s| s.repo);
             let ledger = state.session_ledger();
+            // `park_session` refused a protected session before the dialog; this
+            // covers a flag set while the dialog was open.
             let (marked, close_error) = close_parked(
-                || crate::terminal::kill_session(state, session_id),
+                || match crate::terminal::kill_session(
+                    state,
+                    session_id,
+                    crate::terminal::KillOrigin::LoadGovernor,
+                )? {
+                    crate::terminal::KillOutcome::Killed => Ok(()),
+                    crate::terminal::KillOutcome::SkippedProtected => {
+                        Err(crate::terminal::lifecycle::skipped_protected_message(
+                            session_id,
+                            crate::terminal::KillOrigin::LoadGovernor,
+                        ))
+                    }
+                },
                 || ledger.mark_parked(session_id),
             );
             let recorded = repo.is_some_and(|repo| {
