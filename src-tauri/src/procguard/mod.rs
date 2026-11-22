@@ -136,14 +136,14 @@ const ENTRY_LOCK_BUDGET: Duration = Duration::from_millis(100);
 /// Poll interval while waiting out [`CHILD_GRACE`].
 const LIVENESS_POLL: Duration = Duration::from_millis(10);
 
-/// How long a reap waits for a child it has just killed to be collectable.
+/// How long a reap waits for a child whose kill the signal guard *refused*.
 ///
-/// A SIGKILLed child is collectable almost at once, so this only fires when the
-/// kill did not land: the signal guard refused it ([`Registration::kill_tree`]
-/// then deliberately skips the direct `Child::kill` backstop) or the process is
-/// stuck in the kernel. An unbounded `wait` there hangs every exit path that
-/// reaps. Four graces is generous for a slow teardown under load and still
-/// well inside [`HANDOVER`].
+/// Applies only to a refused kill ([`Registration::kill_tree`] then
+/// deliberately skips the direct `Child::kill` backstop, so nothing is coming
+/// to end the child and an unbounded `wait` would hang every exit path that
+/// reaps). A kill that was delivered always makes the child collectable, so
+/// that reap blocks until it is. Four graces is generous and still well inside
+/// [`HANDOVER`].
 const REAP_BOUND: Duration = CHILD_GRACE.saturating_mul(4);
 
 /// How long [`exit`] waits for the shutdown watcher to finish its sweep.
@@ -334,6 +334,12 @@ impl Registration {
     /// kill stays as a backstop for a group the leader has already left, and
     /// on Windows the tree kill is all there is.
     pub fn kill_tree(&self, child: &mut Child) {
+        self.kill_tree_outcome(child);
+    }
+
+    /// [`Self::kill_tree`], reporting what it did so a reap can tell a kill
+    /// that is coming from one that never will.
+    fn kill_tree_outcome(&self, child: &mut Child) -> KillOutcome {
         let pid = lock(&self.slot.pid);
         match *pid {
             Some(pid) => {
@@ -344,6 +350,7 @@ impl Registration {
                         if !signalled {
                             let _ = child.kill();
                         }
+                        KillOutcome::Delivered
                     }
                     Err(error) => {
                         if is_refusal(&error) {
@@ -352,9 +359,11 @@ impl Registration {
                                 "kill_tree for {} (pid {pid}) REFUSED by signal guard: {error}; suppressing direct child.kill() backstop",
                                 self.slot.label
                             );
+                            KillOutcome::Refused
                         } else {
                             // System call failed unexpectedly; attempt direct kill as emergency fallback
                             let _ = child.kill();
+                            KillOutcome::Delivered
                         }
                     }
                 }
@@ -367,6 +376,7 @@ impl Registration {
                     "kill_tree skipped for {}: pid already reaped",
                     self.slot.label
                 );
+                KillOutcome::NothingToKill
             }
         }
     }
@@ -407,6 +417,18 @@ impl Registration {
         grace: Duration,
         wait: &mut dyn FnMut(Duration),
     ) -> io::Result<ExitStatus> {
+        self.stop_and_reap_bounded(child, grace, wait, REAP_BOUND)
+    }
+
+    /// [`Self::stop_and_reap_waiting`] with the bound on a refused kill's reap
+    /// as a parameter, so a test can shrink it.
+    fn stop_and_reap_bounded(
+        &self,
+        child: &mut Child,
+        grace: Duration,
+        wait: &mut dyn FnMut(Duration),
+        refused_bound: Duration,
+    ) -> io::Result<ExitStatus> {
         let deadline = Instant::now() + grace;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -415,8 +437,12 @@ impl Registration {
             }
             wait(remaining.min(LIVENESS_POLL));
         }
-        self.kill_tree(child);
-        self.reap_within(child, REAP_BOUND)
+        let outcome = self.kill_tree_outcome(child);
+        if outcome.bounds_reap() {
+            self.reap_within(child, refused_bound)
+        } else {
+            self.reap(|| child.wait())
+        }
     }
 
     /// Collects `child` without ever blocking past `bound`.
@@ -1047,6 +1073,28 @@ enum Ask {
     Busy,
     /// The platform has no graceful step; the kill pass decides everything.
     NotSupported,
+}
+
+/// What [`Registration::kill_tree`] did to a child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillOutcome {
+    /// A kill was sent (to the group or straight to the child), so the child
+    /// becomes collectable and a blocking wait ends.
+    Delivered,
+    /// The signal guard refused the kill and the direct backstop was withheld:
+    /// nothing is coming to end the child.
+    Refused,
+    /// The pid was already cleared, so nothing was signalled; the following
+    /// wait is on a child that is already collected or collectable.
+    NothingToKill,
+}
+
+impl KillOutcome {
+    /// Whether the reap that follows must give up after a bound instead of
+    /// blocking: only when the kill was refused.
+    fn bounds_reap(self) -> bool {
+        self == Self::Refused
+    }
 }
 
 /// What one attempt to kill a registered child's group came to.
@@ -3035,6 +3083,31 @@ mod adv_keep_pid_tests {
 
     fn exit_code(status: ExitStatus) -> Option<i32> {
         status.code()
+    }
+
+    #[test]
+    fn only_a_refused_kill_bounds_the_reap() {
+        assert!(KillOutcome::Refused.bounds_reap());
+        assert!(!KillOutcome::Delivered.bounds_reap());
+        assert!(!KillOutcome::NothingToKill.bounds_reap());
+    }
+
+    /// A delivered kill must be waited out however short the refused-kill
+    /// bound is: the child is reaped with its signal status and unregistered,
+    /// never reported NOT reaped and left a zombie.
+    #[test]
+    fn a_delivered_kill_is_reaped_by_a_blocking_wait_not_the_refused_bound() {
+        for _ in 0..8 {
+            let (mut child, guard) = registered_sh("exec sleep 30", "delivered-kill", false);
+            let status = guard
+                .stop_and_reap_bounded(&mut child, Duration::ZERO, &mut |_| {}, Duration::ZERO)
+                .expect("a delivered kill is waited out");
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL)
+            );
+            assert_eq!(guard.pid(), None, "a reaped child stayed registered");
+        }
     }
 
     /// ATTACK 2a: a child that already exited and was never waited on is a
