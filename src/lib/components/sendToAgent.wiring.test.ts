@@ -39,9 +39,13 @@ describe("sending code to an agent: wiring that has no other test", () => {
     expect(code).toMatch(/!e\.altKey && !e\.shiftKey && e\.key\.toLowerCase\(\) === "l"/);
   });
 
-  it("the viewer sends the lines it shows, and labels a draft only while the editor holds a different one", () => {
+  it("the viewer sends the lines it shows, and labels a draft only while it differs from what was read", () => {
     expect(code).toContain("lines: rawLines.slice(selectionRange.lo - 1, selectionRange.hi)");
-    expect(code).toContain("unsaved: isEditing && editDraft !== editBaseline");
+    // The shared document's draft decides when the host supplies one (a draft
+    // typed in the other view counts); otherwise the viewer's own editor does.
+    expect(code).toContain(
+      "unsaved: draftContent !== null ? draftContent !== editBaseline : isEditing && editDraft !== editBaseline",
+    );
   });
 
   it("the Code page hands its sends to the dock channel, which reports failure", () => {
