@@ -255,6 +255,44 @@ export function createTerminalLaunchRequests() {
 
 export const terminalLaunchRequests = createTerminalLaunchRequests();
 
+/** How a claimed file request is to be opened in the panel that claimed it. */
+export interface ClaimedFileOpen {
+  mode: "tab" | "split";
+  filePath: string;
+  line: number | null;
+  column: number | null;
+  focus: boolean;
+  keep: boolean;
+  /**
+   * The checkout the file is opened in and kept in: always the panel's own
+   * (undefined). A request names a repository, and `take` hands it to the
+   * panel whose checkout is that repository, so the file belongs there even
+   * when the active tab is an agent hosted in another checkout of it.
+   */
+  checkout: undefined;
+}
+
+/**
+ * The options a panel opens a claimed `requestFile` request with, or null for
+ * a request that is no file open. Pure, so the claim path (a Svelte `$effect`
+ * vitest does not run) is testable.
+ */
+export function claimedFileOpen(
+  request: Pick<LaunchRequest, "launcher" | "filePath" | "line" | "column" | "fileOpenMode" | "fileFocus" | "fileKeep">,
+): ClaimedFileOpen | null {
+  if (request.launcher !== "file" || !request.filePath) return null;
+  const mode = request.fileOpenMode === "tab" ? "tab" : "split";
+  return {
+    mode,
+    filePath: request.filePath,
+    line: request.line ?? null,
+    column: request.column ?? null,
+    focus: request.fileFocus ?? mode === "tab",
+    keep: request.fileKeep === true,
+    checkout: undefined,
+  };
+}
+
 export const AGENT_KICKOFF_EVENT = "gitpulse-agent-kickoff";
 const MAX_QUEUED_KICKOFF = 8;
 const KICKOFF_WAIT_MS = 10_000;

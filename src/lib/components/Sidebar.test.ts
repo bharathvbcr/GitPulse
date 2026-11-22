@@ -379,10 +379,12 @@ describe("Sidebar change lists", () => {
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-tab"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-split"');
     expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-dock-terminal"');
-    // Routing goes through the shared resolver: `resolveSidebarOpen` (which
-    // lets a double-click follow its own clicks) delegates every fresh
-    // decision to `resolveSidebarFileAction`, unit-tested in layoutStore.test.
-    expect(explorerPaneSource).toContain("resolveSidebarOpen(");
+    expect(explorerPaneSource).toContain('data-testid="sidebar-explorer-target-auto"');
+    // Routing goes through the one shared resolver, `resolveFileOpen` (which
+    // lets a double-click follow its own clicks), unit-tested in
+    // layoutStore.test. "Auto" needs the last-used surface and the dock's state.
+    expect(explorerPaneSource).toContain("resolveFileOpen(");
+    expect(explorerPaneSource).toContain('terminalActive: $lastSurface === "terminal" && $repoStore.terminalOpen');
     expect(explorerPaneSource).not.toMatch(/altKey \? "split"|metaOrCtrlKey \? /);
     // A double-click (onPinFile) asks to keep the file's tab.
     expect(explorerPaneSource).toContain("onPinFile={(path) => void handleOpenFile(path, null, null, true)}");

@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { Columns2, FileCode, FileText, Maximize2, SquareTerminal } from "@lucide/svelte";
+  import { Columns2, FileCode, FileText, Maximize2, SquareTerminal, Sparkles } from "@lucide/svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import { opensExplorerPage } from "../files/explorerPageGesture";
   import { requestPin } from "../files/pinRequests";
   import { requestReveal } from "../files/revealRequests";
   import {
-    resolveSidebarOpen,
+    resolveFileOpen,
     sidebarNavStore,
     type SidebarFileOpenTarget,
     type SidebarLastOpen,
@@ -16,6 +16,7 @@
   import { terminalExplorerSidebar } from "../terminal/explorerSidebar";
   import { TERMINAL_SESSION_CANCELED, terminalLaunchRequests } from "../terminal/launchRequests";
   import { describeError } from "../ui/copy/describeFailure";
+  import { lastSurface } from "../ui/lastSurface";
   import { platformChord } from "../ui/platformCopy";
   import { hostPlatform } from "../stores/platformStore";
 
@@ -30,7 +31,7 @@
   const openTarget = $derived($sidebarNavStore.openTarget);
   const dockedInTerminal = $derived($terminalExplorerSidebar.open && $repoStore.terminalOpen);
   let lastClickMods = { altKey: false, metaOrCtrlKey: false };
-  /** Where the last click on a file sent it; a double-click follows it (`resolveSidebarOpen`). */
+  /** Where the last click on a file sent it; a double-click follows it (`resolveFileOpen`). */
   let lastOpen: SidebarLastOpen | null = null;
   let inflightOpen: { key: string; controller: AbortController } | null = null;
 
@@ -69,12 +70,15 @@
     const mods = lastClickMods;
     lastClickMods = { altKey: false, metaOrCtrlKey: false };
     const now = Date.now();
-    const action = resolveSidebarOpen({
+    const action = resolveFileOpen({
       path,
       pin,
       lastOpen,
       now,
       defaultTarget: openTarget,
+      // A click here is on the sidebar, which `lastSurface` ignores, so this
+      // is where the user was before it; the dock must also be showing.
+      terminalActive: $lastSurface === "terminal" && $repoStore.terminalOpen,
       altKey: mods.altKey,
       metaOrCtrlKey: mods.metaOrCtrlKey,
     });
@@ -143,6 +147,19 @@
       role="group"
       aria-label="Open clicked files in"
     >
+      <button
+        type="button"
+        data-testid="sidebar-explorer-target-auto"
+        aria-pressed={openTarget === "auto"}
+        class="inline-flex flex-1 justify-center items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {openTarget === 'auto'
+          ? 'bg-accent/15 text-accent font-medium'
+          : 'text-textMuted hover:text-textPrimary'}"
+        title="Open clicked files beside the terminal when it was the last thing you used, otherwise in Code view"
+        onclick={() => setTarget("auto")}
+      >
+        <Sparkles size={11} class="shrink-0" />
+        <span>Auto</span>
+      </button>
       <button
         type="button"
         data-testid="sidebar-explorer-target-code"

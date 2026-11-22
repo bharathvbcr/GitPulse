@@ -8,10 +8,11 @@
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
-  import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import { claimedFileOpen, isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { requestPin } from "../files/pinRequests";
   import { opensExplorerPage } from "../files/explorerPageGesture";
-  import { doubleClickFollows } from "../sidebar/layoutStore";
+  import { resolveFileOpen, sidebarNavStore, type ResolvedFileOpen, type SidebarFileOpenTarget } from "../sidebar/layoutStore";
+  import { lastSurface } from "../ui/lastSurface";
   import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
@@ -53,6 +54,7 @@
     ChevronsUpDown,
     Eye,
     RotateCw,
+    Sparkles,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -65,12 +67,10 @@
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import {
     clampExplorerSidebarWidth,
-    resolveExplorerFileAction,
     TERMINAL_EXPLORER_WIDTH_DEFAULT,
     TERMINAL_EXPLORER_WIDTH_MAX,
     TERMINAL_EXPLORER_WIDTH_MIN,
     terminalExplorerSidebar,
-    type ExplorerOpenTarget,
   } from "../terminal/explorerSidebar";
   import {
     NO_FOLLOW_TARGET,
@@ -378,6 +378,10 @@
   });
 
   onMount(() => {
+    // A store listens only while someone is subscribed. The sidebar explorer
+    // mounts lazily, after the user may already have typed here, so the dock
+    // holds the subscription that records "the terminal was last used".
+    const releaseLastSurface = lastSurface.subscribe(() => {});
     inputEl?.focus();
     // The session limit is an agent default; read it before the first
     // session so the panel stops where the backend does.
@@ -398,6 +402,7 @@
     return () => {
       window.removeEventListener("pagehide", flushPendingSplitPersist);
       flushPendingSplitPersist();
+      releaseLastSurface();
       unsubAgentPanel();
       unsubSessionLedger();
       if (adoptionFallbackTimer !== null) clearTimeout(adoptionFallbackTimer);
@@ -485,7 +490,8 @@
   let groupContextMenu = $state<{ groupId: string; x: number; y: number } | null>(null);
   let groupContextMenuOpener: HTMLElement | null = null;
   const explorerSidebarOpen = $derived($terminalExplorerSidebar.open);
-  const explorerOpenTarget = $derived<ExplorerOpenTarget>($terminalExplorerSidebar.target);
+  /** The app-wide open target, one setting for this explorer and the sidebar's (`resolveFileOpen`). */
+  const explorerOpenTarget = $derived<SidebarFileOpenTarget>($sidebarNavStore.openTarget);
   const explorerSidebarWidth = $derived($terminalExplorerSidebar.width);
   let explorerResizing = $state(false);
   let selectedExplorerFile = $state<string | null>(null);
@@ -493,7 +499,7 @@
   /** Where the docked explorer's last click sent a file, for its double-click. */
   let lastExplorerOpen: {
     path: string;
-    action: ReturnType<typeof resolveExplorerFileAction>;
+    action: ResolvedFileOpen;
     at: number;
   } | null = null;
   let inlineRenameTabId = $state<string | null>(null);
@@ -2114,17 +2120,18 @@
         return;
       }
       if (claimed.launcher === "file") {
-        const err =
-          claimed.fileOpenMode === "tab"
-            ? openFileTabFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-                focus: claimed.fileFocus ?? true,
-              })
-            : openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-                focus: claimed.fileFocus ?? false,
-              });
-        if (!err && claimed.fileKeep && claimed.filePath) {
-          keepFileShown(claimed.filePath, activeTab?.checkout);
+        const plan = claimedFileOpen(claimed);
+        if (!plan) {
+          claimed.complete("A file request needs a repository-relative path");
+          return;
         }
+        // One checkout for the open and the keep: the panel's own (see
+        // `ClaimedFileOpen.checkout`), not whichever tab happens to be active.
+        const err =
+          plan.mode === "tab"
+            ? openFileTabFor(plan.filePath, plan.line, plan.column, { focus: plan.focus, checkout: plan.checkout })
+            : openFileSplitFor(plan.filePath, plan.line, plan.column, { focus: plan.focus, checkout: plan.checkout });
+        if (!err && plan.keep) keepFileShown(plan.filePath, plan.checkout);
         claimed.complete(err);
         return;
       }
@@ -2772,11 +2779,11 @@
     filePath?: string,
     line: number | null = null,
     column: number | null = null,
-    options?: { focus?: boolean },
+    options?: { focus?: boolean; checkout?: string },
   ): string | undefined {
     if (!repoPath) return "Open a repository first";
     const shouldFocus = options?.focus ?? true;
-    const checkout = activeTab?.checkout;
+    const checkout = options?.checkout;
     // A kept pane keeps its file: the new one opens in a tab of its own.
     const visibleFile =
       tabState.tabs.find(
@@ -2824,8 +2831,8 @@
     }
   }
 
-  function setExplorerOpenTarget(target: ExplorerOpenTarget) {
-    terminalExplorerSidebar.setTarget(target);
+  function setExplorerOpenTarget(target: SidebarFileOpenTarget) {
+    sidebarNavStore.setOpenTarget(target);
   }
 
   function dockFileTabToSidebar(id: string) {
@@ -2897,27 +2904,29 @@
     lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
     selectedExplorerFile = filePath;
     const checkout = activeTab?.checkout;
-    // A double-click (`keep`) follows where its own clicks sent the file: they
-    // already used and cleared the modifier keys (`doubleClickFollows`).
+    // The click is inside the dock, so the terminal is the active surface: under
+    // "auto" this explorer opens a split. A double-click (`keep`) follows where
+    // its own clicks sent the file (`resolveFileOpen`).
     const now = Date.now();
-    const action =
-      keep && lastExplorerOpen && doubleClickFollows(lastExplorerOpen, filePath, now)
-        ? lastExplorerOpen.action
-        : resolveExplorerFileAction({
-            defaultTarget: explorerOpenTarget,
-            altKey: mods.altKey,
-            metaOrCtrlKey: mods.metaOrCtrlKey,
-            hasVisibleFilePane,
-          });
+    const action = resolveFileOpen({
+      path: filePath,
+      pin: keep,
+      lastOpen: lastExplorerOpen,
+      now,
+      defaultTarget: explorerOpenTarget,
+      terminalActive: true,
+      altKey: mods.altKey,
+      metaOrCtrlKey: mods.metaOrCtrlKey,
+    });
     lastExplorerOpen = { path: filePath, action, at: now };
 
-    if (action === "open-code" && onOpenInCodeView) {
+    if (action === "code" && onOpenInCodeView) {
       // Code owns its tabs: ask it to keep this one rather than preview it.
       if (keep) requestPin(repoPath, filePath);
       onOpenInCodeView(filePath, line);
       return;
     }
-    if (action === "open-split") {
+    if (action === "split") {
       const err = openFileSplitFor(filePath, line, column, {
         focus: false,
         checkout,
@@ -2926,9 +2935,10 @@
       else if (keep) keepFileShown(filePath, checkout);
       return;
     }
-    if (action === "update-visible-pane") {
-      // A kept pane is never repointed at another file; the file then opens
-      // in a tab of its own below.
+    if (action === "tab") {
+      // A tab retargets a file pane already on screen rather than opening
+      // another. A kept pane is never repointed at another file; the file then
+      // opens in a tab of its own below.
       const visibleFile =
         tabState.tabs.find(
           (tab) =>
@@ -6362,6 +6372,17 @@
                 role="group"
                 aria-label="Open files in"
               >
+                <button
+                  type="button"
+                  data-testid="terminal-explorer-target-auto"
+                  aria-pressed={explorerOpenTarget === "auto"}
+                  aria-label="Auto"
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'auto' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  title="Auto: files clicked here open beside the terminal; from the sidebar they follow the last surface you used. The setting is shared with the sidebar Explorer"
+                  onclick={() => setExplorerOpenTarget("auto")}
+                >
+                  <Sparkles size={10} class="shrink-0" />
+                </button>
                 <button
                   type="button"
                   data-testid="terminal-explorer-target-tab"

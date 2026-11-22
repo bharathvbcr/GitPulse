@@ -2516,12 +2516,13 @@
           const explorerAside = await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]')[0]);
           check("G1: toggling File Explorer sidebar docks beside a 2-pane split without forcing a 3rd split pane", () => {
             const panes = visible('[role="tabpanel"]');
-            const tabTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-tab"]');
+            // The open target is the app-wide setting, "auto" by default.
+            const autoTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-auto"]');
             const splitTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-split"]');
             return (
               Boolean(explorerAside) &&
               panes.length === 2 &&
-              tabTarget?.getAttribute("aria-pressed") === "true" &&
+              autoTarget?.getAttribute("aria-pressed") === "true" &&
               Boolean(splitTarget)
             );
           });

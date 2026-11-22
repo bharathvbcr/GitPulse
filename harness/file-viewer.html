@@ -81,7 +81,8 @@ mockIPCWithEvents((cmd, args) => {
 });
 // Live pulse visibility is remembered; start each run from the default (shown).
 localStorage.removeItem("gitpulse.explorer.livePulse");
-// The sidebar explorer's open target is remembered too; its default is Code.
+// The sidebar explorer's open target is remembered too; its default is Auto,
+// which opens Code until the terminal has been the last surface used.
 localStorage.removeItem("gitpulse_sidebar_nav");
 const { mount, tick, unmount } = await import("svelte");
 const { get } = await import("svelte/store");
