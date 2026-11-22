@@ -19,13 +19,23 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { askConfirm } from "../stores/modalStore";
-  import type { FileBlob, SavedFile } from "../files/types";
+  import type { FileBlob } from "../files/types";
   import type { DiffPayload } from "../repos/storeTypes";
   import { parseUnifiedDiff, type AnnotatedDiffLine } from "../diff/wordDiff";
-  import type { Guarded } from "../stores/harnessStore";
-  import { recordEditorDrafts } from "../files/editorDraftRegistry";
-  import { editorFileSaveQueue, fileSaveKey } from "../files/serialSave";
-  import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
+  import { editorFileSaveQueue } from "../files/serialSave";
+  import {
+    discardDraft,
+    documentConflict,
+    documentIn,
+    documentKey,
+    editDocument,
+    hasDraft,
+    holdDocument,
+    isHeldElsewhere,
+    loadDocument,
+    openDocuments,
+    saveDocument,
+  } from "../files/openDocuments";
   import { overwriteNote } from "../files/overwriteNote";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
   import { getNeighbors, symbolsForFile } from "../codeintel/client";
@@ -40,12 +50,6 @@
   import MediaViewer from "./files/MediaViewer.svelte";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
-
-  interface PaneDraft {
-    content: string;
-    sourceContent: string;
-    base: string | null;
-  }
 
   let {
     tabId,
@@ -89,7 +93,10 @@
     onSendToAgent?: (reference: string) => void;
   } = $props();
 
-  const draftOwner = $derived(`terminal-file:${tabId}`);
+  // How this pane names itself to the open-file store (`files/openDocuments`),
+  // which owns the text, draft and save of every file shown here and on the
+  // Code page.
+  const holder = $derived(`terminal-file:${tabId}`);
 
   // Start with the explorer open when opened without a target path or snippet, unless overridden by the docked sidebar.
   let explorerOpen = $state(untrack(() => defaultExplorerOpen ?? (!filePath && !snippet)));
@@ -116,8 +123,9 @@
     });
   });
   let viewMode = $state<"code" | "diff">(untrack(() => initialViewMode));
-  let activeBlob = $state<FileBlob | null>(null);
-  let isLoading = $state(false);
+  // The read this pane asked for, including a retry on `fallbackPath`; the
+  // document itself knows only its own read.
+  let reading = $state(false);
   let loadError = $state<string | null>(null);
   let diffPayload = $state<DiffPayload | null>(null);
   let diffSource = $state<"unstaged" | "staged">("unstaged");
@@ -132,17 +140,19 @@
   let copiedPath = $state(false);
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
   let inflight: AsyncGuard | null = null;
-  let loadedKey = "";
 
-  let drafts = $state<Record<string, PaneDraft>>({});
-  let saveRefusal = $state<{ path: string; actual: string | null } | null>(null);
+  /** Documents this pane holds (the open file and its fallback), by store key. */
+  const held = new Map<string, () => void>();
+  /** Every file this pane has shown: the ones whose drafts closing it must answer for. */
+  const visited = new Map<string, { repo: string; path: string }>();
   let paneRoot: HTMLDivElement | undefined = $state();
 
-  const currentDraft = $derived(filePath ? drafts[filePath] ?? null : null);
+  const doc = $derived(documentIn($openDocuments, repoPath, filePath));
+  const activeBlob = $derived(doc?.blob ?? null);
+  const isLoading = $derived(reading || Boolean(doc?.loading));
+  const currentDraft = $derived(doc?.draft ?? null);
   const isDirty = $derived(Boolean(currentDraft));
-  const activeConflict = $derived(
-    filePath && currentDraft && saveRefusal?.path === filePath ? saveRefusal : null,
-  );
+  const activeConflict = $derived(documentConflict(doc));
   const revealTarget = $derived(
     revealSeq > 0 ? { line: revealLine, column: revealColumn, seq: revealSeq } : null,
   );
@@ -164,58 +174,65 @@
       : null,
   );
 
-  function syncDraftRegistry(nextDrafts: Record<string, PaneDraft>) {
-    if (!repoPath) return;
-    recordEditorDrafts(repoPath, Object.keys(nextDrafts), draftOwner);
-  }
+  // Hold the shown file (and its fallback) for as long as it is shown, so the
+  // store keeps its text loaded and unloads it once no host shows it.
+  $effect(() => {
+    const repo = repoPath;
+    const wanted = new Map<string, string>();
+    for (const path of [filePath, fallbackPath]) {
+      if (repo && path) wanted.set(documentKey(repo, path), path);
+    }
+    untrack(() => {
+      for (const [key, release] of held) {
+        if (wanted.has(key)) continue;
+        release();
+        held.delete(key);
+      }
+      for (const [key, path] of wanted) {
+        if (!held.has(key)) held.set(key, holdDocument(repo, path, holder));
+      }
+      if (repo && filePath) visited.set(documentKey(repo, filePath), { repo, path: filePath });
+    });
+  });
 
-  async function loadBlob(targetPath: string | undefined, force = false) {
-    if (!repoPath || !targetPath) {
-      inflight?.cancel();
-      activeBlob = null;
+  /**
+   * Reads `target` into its document. A read that fails retries on
+   * `fallbackPath` (a stack-trace path that missed on a subdirectory) and
+   * hands the parent the path that resolved.
+   */
+  async function loadFile(target: string | undefined, force = false, remount = false) {
+    inflight?.cancel();
+    if (!repoPath || !target) {
       loadError = null;
-      loadedKey = "";
+      reading = false;
       return;
     }
-    const key = `${repoPath}\0${targetPath}`;
-    if (!force && key === loadedKey && activeBlob?.path === targetPath) return;
-    inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
-    isLoading = true;
+    reading = true;
     loadError = null;
     try {
-      const blob = await invoke<FileBlob>("cmd_get_file_blob", {
-        repoPath,
-        filePath: targetPath,
-        commitId: null,
-      });
-      if (!guard.isLive()) return;
-      activeBlob = blob;
-      loadedKey = key;
-    } catch (err: unknown) {
-      if (!guard.isLive()) return;
-      if (fallbackPath && fallbackPath !== targetPath) {
-        try {
-          const fallbackBlob = await invoke<FileBlob>("cmd_get_file_blob", {
-            repoPath,
-            filePath: fallbackPath,
-            commitId: null,
-          });
-          if (!guard.isLive()) return;
-          activeBlob = fallbackBlob;
-          loadedKey = `${repoPath}\0${fallbackPath}`;
+      const result = await loadDocument(repoPath, target, { force, remount });
+      if (!guard.isLive() || result.status !== "failed") return;
+      if (fallbackPath && fallbackPath !== target) {
+        const fallback = await loadDocument(repoPath, fallbackPath, { force });
+        if (!guard.isLive()) return;
+        if (fallback.status === "loaded") {
           onResolvedPath?.(fallbackPath);
           return;
-        } catch {
-          if (!guard.isLive()) return;
         }
       }
-      loadError = formatError(err);
-      activeBlob = null;
+      loadError = result.error;
     } finally {
-      if (guard.isLive()) isLoading = false;
+      if (guard.isLive()) reading = false;
     }
+  }
+
+  /** Drafts on files this pane showed that no other host shows: the ones closing it would lose. */
+  function ownDirtyPaths(): string[] {
+    return [...visited.values()]
+      .filter((v) => v.repo === repoPath && hasDraft(v.repo, v.path) && !isHeldElsewhere(v.repo, v.path, holder))
+      .map((v) => v.path);
   }
 
   async function loadDiff(targetPath: string | undefined, force = false) {
@@ -273,7 +290,7 @@
     const mode = viewMode;
     void repo;
     untrack(() => {
-      void loadBlob(target);
+      void loadFile(target);
       if (mode === "diff" && target) {
         void loadDiff(target);
       }
@@ -344,24 +361,8 @@
   }
 
   function handleDraftChange(newContent: string, sourceContent: string) {
-    const path = filePath;
-    if (!path) return;
-    if (newContent === sourceContent) {
-      const { [path]: _clean, ...rest } = drafts;
-      drafts = rest;
-      if (saveRefusal?.path === path) saveRefusal = null;
-      syncDraftRegistry(rest);
-      return;
-    }
-    const existing = drafts[path];
-    const base = existing ? existing.base : (activeBlob?.path === path ? activeBlob.disk_base ?? null : null);
-    if (!existing && saveRefusal?.path === path) saveRefusal = null;
-    const next = {
-      ...drafts,
-      [path]: { content: newContent, sourceContent, base },
-    };
-    drafts = next;
-    syncDraftRegistry(next);
+    if (!repoPath || !filePath) return;
+    editDocument(repoPath, filePath, newContent, sourceContent);
   }
 
   async function saveFile(
@@ -369,68 +370,16 @@
     overrideBase?: string | null,
     overwrite = false,
   ): Promise<void> {
-    const path = filePath;
-    const repo = repoPath;
-    if (!repo || !path) throw new Error("No active file to save");
-    try {
-      await editorFileSaveQueue.run(fileSaveKey(repo, path), async () => {
-        const current = drafts[path];
-        const judged = saveBase(
-          current ? { base: current.base } : undefined,
-          activeBlob?.path === path ? activeBlob.disk_base ?? null : null,
-          overrideBase,
-        );
-        if (judged === "unbased") throw new UnbasedDraft(path);
-        const saved = await invoke<Guarded<SavedFile>>("cmd_write_file_content", {
-          repoPath: repo,
-          filePath: path,
-          content: newContent,
-          expectedBase: judged.base,
-          ...(overwrite ? { overwrite: true } : {}),
-        });
-        const latest = drafts[path];
-        if (latest && latest.content !== newContent) {
-          const updated = {
-            ...drafts,
-            [path]: {
-              content: latest.content,
-              sourceContent: newContent,
-              base: saved.output.disk_base,
-            },
-          };
-          drafts = updated;
-          syncDraftRegistry(updated);
-        } else {
-          const { [path]: _saved, ...rest } = drafts;
-          drafts = rest;
-          syncDraftRegistry(rest);
-        }
-        if (activeBlob?.path === path) {
-          activeBlob = {
-            ...activeBlob,
-            text: newContent,
-            disk_base: saved.output.disk_base,
-          };
-        }
-      });
-      saveRefusal = null;
-    } catch (err: unknown) {
-      const typed = readFileWriteError(err);
-      if (typed?.code === "changed_on_disk") {
-        saveRefusal = { path, actual: typed.actual };
-        void loadBlob(path, true);
-      } else if (err instanceof UnbasedDraft) {
-        saveRefusal = { path, actual: null };
-      }
-      throw err;
-    }
+    if (!repoPath || !filePath) throw new Error("No active file to save");
+    await saveDocument(repoPath, filePath, newContent, { overrideBase, overwrite });
   }
 
   async function requestDiscardCurrent(): Promise<boolean> {
     const path = filePath;
-    if (!path || !drafts[path]) return true;
-    await editorFileSaveQueue.whenIdle(fileSaveKey(repoPath, path));
-    if (!drafts[path]) return true;
+    const repo = repoPath;
+    if (!repo || !path || !hasDraft(repo, path)) return true;
+    await editorFileSaveQueue.whenIdle(documentKey(repo, path));
+    if (!hasDraft(repo, path)) return true;
     const ok = await askConfirm({
       title: "Discard unsaved edits?",
       message: `Discard the unsaved editor draft for ${path}?`,
@@ -438,19 +387,14 @@
       cancelLabel: "Keep editing",
     });
     if (!ok) return false;
-    const { [path]: _gone, ...rest } = drafts;
-    drafts = rest;
-    if (saveRefusal?.path === path) saveRefusal = null;
-    syncDraftRegistry(rest);
+    discardDraft(repo, path);
     return true;
   }
 
   async function reloadFromDisk() {
     if (!filePath) return;
     if (!(await requestDiscardCurrent())) return;
-    saveRefusal = null;
-    activeBlob = null;
-    await loadBlob(filePath, true);
+    await loadFile(filePath, true, true);
     if (viewMode === "diff") {
       await loadDiff(filePath, true);
     }
@@ -465,12 +409,12 @@
 
   /**
    * Refreshes the open file or working-tree diff from disk when Follow Agent
-   * observes an edit, preserving any unsaved user draft in `drafts`.
+   * observes an edit, preserving any unsaved user draft.
    */
   export function reloadIfClean() {
     if (!filePath) return;
-    if (!drafts[filePath]) {
-      void loadBlob(filePath, true);
+    if (!hasDraft(repoPath, filePath)) {
+      void loadFile(filePath, true);
     }
     if (viewMode === "diff") {
       void loadDiff(filePath, true);
@@ -515,10 +459,10 @@
   }
 
   export async function confirmClose(): Promise<boolean> {
-    const dirtyPaths = Object.keys(drafts);
+    const dirtyPaths = ownDirtyPaths();
     if (dirtyPaths.length === 0) return true;
-    await editorFileSaveQueue.whenIdle(dirtyPaths.map((p) => fileSaveKey(repoPath, p)));
-    const remaining = Object.keys(drafts);
+    await editorFileSaveQueue.whenIdle(dirtyPaths.map((p) => documentKey(repoPath, p)));
+    const remaining = ownDirtyPaths();
     if (remaining.length === 0) return true;
     const summary = remaining.length <= 3 ? remaining.map((p) => `• ${p}`).join("\n") : `${remaining.length} files`;
     return askConfirm({
@@ -534,8 +478,8 @@
     inflight?.cancel();
     diffInflight?.cancel();
     lensInflight?.cancel();
-    drafts = {};
-    if (repoPath) recordEditorDrafts(repoPath, [], draftOwner);
+    // Closing was confirmed: drafts another host still shows are its to keep.
+    for (const path of ownDirtyPaths()) discardDraft(repoPath, path);
   }
 
   export function reveal(): void {
@@ -555,7 +499,8 @@
     diffInflight?.cancel();
     lensInflight?.cancel();
     if (copiedTimer) clearTimeout(copiedTimer);
-    if (repoPath) recordEditorDrafts(repoPath, [], draftOwner);
+    for (const release of held.values()) release();
+    held.clear();
   });
 </script>
 
@@ -716,10 +661,10 @@
   {#if activeConflict && filePath && currentDraft}
     <EditorConflictBanner
       path={filePath}
-      disk={activeBlob?.path === filePath ? activeBlob.text ?? "" : ""}
+      disk={activeBlob?.text ?? ""}
       draft={currentDraft.content}
       unbased={activeConflict.actual === null}
-      overwriteNote={activeBlob?.path === filePath ? overwriteNote(activeBlob) : null}
+      overwriteNote={activeBlob ? overwriteNote(activeBlob) : null}
       onReload={() => void reloadFromDisk()}
       onOverwrite={() => void overwriteCurrent()}
     />

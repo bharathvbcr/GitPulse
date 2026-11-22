@@ -172,6 +172,8 @@ describe("two hosts on one file", () => {
 
     expect(host.writes).toHaveLength(1);
     expect(host.writes[0]).toMatchObject({ filePath: "a.ts", content: "one\ntwo\n", expectedBase: "b1" });
+    // Only Overwrite asks the host to skip its encoder check.
+    expect(host.writes[0]).not.toHaveProperty("overwrite");
     const doc = getDocument(REPO, "a.ts");
     expect(doc?.draft).toBeNull();
     expect(doc?.blob).toMatchObject({ text: "one\ntwo\n", disk_base: "w1" });
@@ -263,6 +265,20 @@ describe("save lifecycle", () => {
     expect(getDocument(REPO, "a.ts")?.draft).toBeNull();
   });
 
+  it("keeps the draft when the write fails for any other reason, and records no conflict", async () => {
+    fakeHost({ [`${REPO}:a.ts`]: { text: "one\n", base: "b1" } });
+    holdDocument(REPO, "a.ts", "code");
+    await loadDocument(REPO, "a.ts");
+    editDocument(REPO, "a.ts", "two\n", "one\n");
+    invokeMock.mockImplementationOnce((async () => {
+      throw new Error("disk full");
+    }) as unknown as typeof invoke);
+    await expect(saveDocument(REPO, "a.ts", "two\n")).rejects.toThrow("disk full");
+    expect(getDocument(REPO, "a.ts")?.draft?.content).toBe("two\n");
+    expect(documentConflict(getDocument(REPO, "a.ts"))).toBeNull();
+    expect(unsavedEditorDrafts()).toEqual([{ repo: REPO, paths: ["a.ts"] }]);
+  });
+
   it("does not write when the host's precondition refuses, and leaves the draft", async () => {
     const host = fakeHost({ [`${REPO}:a.ts`]: { text: "one\n", base: "b1" } });
     holdDocument(REPO, "a.ts", "code");
@@ -319,6 +335,37 @@ describe("drafts", () => {
     editDocument(REPO, "a.ts", "one\n", "one\n");
     expect(getDocument(REPO, "a.ts")?.draft).toBeNull();
     expect(unsavedEditorDrafts()).toEqual([]);
+  });
+
+  it("drops the draft when it is edited back to the text it was made from, even after a reload", async () => {
+    const files = { [`${REPO}:a.ts`]: { text: "v1 text", base: "3:v1" } };
+    fakeHost(files);
+    holdDocument(REPO, "a.ts", "code");
+    await loadDocument(REPO, "a.ts");
+    editDocument(REPO, "a.ts", "mine", "v1 text");
+    files[`${REPO}:a.ts`] = { text: "agent text", base: "9:v2" };
+    await loadDocument(REPO, "a.ts", { force: true });
+    // The editor now reports the reloaded text as its baseline with every keystroke.
+    editDocument(REPO, "a.ts", "v1 text", "agent text");
+    expect(getDocument(REPO, "a.ts")?.draft).toBeNull();
+  });
+
+  it("compares disk versions as tokens: only a different one on both sides is a conflict", async () => {
+    fakeHost({ [`${REPO}:a.ts`]: { text: "v1 text", base: "3:v1" } });
+    holdDocument(REPO, "a.ts", "code");
+    await loadDocument(REPO, "a.ts");
+    editDocument(REPO, "a.ts", "mine", "v1 text");
+    const doc = getDocument(REPO, "a.ts");
+    if (!doc?.blob) throw new Error("document not loaded");
+    const reloaded = (disk_base: string | null | undefined) => ({ ...doc, blob: { ...doc.blob!, disk_base } });
+    expect(documentConflict(reloaded("9:v2"))).toEqual({ actual: "9:v2" });
+    expect(documentConflict(reloaded("3:v1"))).toBeNull();
+    expect(documentConflict(reloaded(null))).toBeNull();
+    expect(documentConflict(reloaded(undefined))).toBeNull();
+    expect(documentConflict(undefined)).toBeNull();
+    expect(documentConflict({ ...doc, draft: null })).toBeNull();
+    // A draft with no recorded base has nothing to compare, until a save refuses it.
+    expect(documentConflict({ ...reloaded("9:v2"), draft: { ...doc.draft!, base: null } })).toBeNull();
   });
 
   it("goes only when discarded, with its refusal", async () => {

@@ -11,12 +11,27 @@ const mediaSource = readFileSync(join(here, "files", "MediaViewer.svelte"), "utf
 const railSource = readFileSync(join(here, "files", "ExplorerRail.svelte"), "utf8");
 
 describe("TerminalFilePane contracts", () => {
-  it("reuses ExplorerRail, MediaViewer, and EditorConflictBanner with shared serialSave + draft registry", () => {
+  it("reuses ExplorerRail, MediaViewer, and EditorConflictBanner, and reads, drafts and saves through the shared open-file store", () => {
     expect(source).toContain('import ExplorerRail from "./files/ExplorerRail.svelte"');
     expect(source).toContain('import MediaViewer from "./files/MediaViewer.svelte"');
     expect(source).toContain('import EditorConflictBanner from "./files/EditorConflictBanner.svelte"');
-    expect(source).toContain("editorFileSaveQueue.run(fileSaveKey(repo, path)");
-    expect(source).toContain("recordEditorDrafts(repoPath");
+    // One document per (checkout, path), shared with the Code page: no draft,
+    // save queue run or registry write of the pane's own.
+    expect(source).toContain('from "../files/openDocuments"');
+    expect(source).toContain("saveDocument(repoPath, filePath, newContent, { overrideBase, overwrite })");
+    expect(source).toContain("editDocument(repoPath, filePath, newContent, sourceContent)");
+    expect(source).toContain("holdDocument(repo, path, holder)");
+    expect(source).not.toContain("editorFileSaveQueue.run");
+    expect(source).not.toContain("recordEditorDrafts");
+    expect(source).not.toContain("let drafts");
+  });
+
+  it("answers for the drafts of the files it showed, except those another host still shows", () => {
+    const own = source.slice(source.indexOf("function ownDirtyPaths"), source.indexOf("$effect(() => {", source.indexOf("function ownDirtyPaths")));
+    expect(own).toContain("hasDraft(v.repo, v.path)");
+    expect(own).toContain("!isHeldElsewhere(v.repo, v.path, holder)");
+    expect(source).toContain("const dirtyPaths = ownDirtyPaths();");
+    expect(source).toContain("for (const path of ownDirtyPaths()) discardDraft(repoPath, path);");
   });
 
   it("threads explicit repoPath into ExplorerRail, MediaViewer, and MarkDevViewer, and retries fallbackPath on subdir false-hits", () => {

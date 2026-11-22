@@ -91,6 +91,7 @@
   let saveSuccess = $state(false);
   let copied = $state(false);
   let previousFilePath = "";
+  let restoredBefore: string | null = null;
   let editorGeneration = 0;
 
   let wordWrap = $state(false);
@@ -441,6 +442,7 @@
     const source = editBaseline;
     if (path !== previousFilePath) {
       previousFilePath = path;
+      restoredBefore = restored;
       untrack(() => {
         editorGeneration += 1;
         editDraft = restored ?? source;
@@ -450,6 +452,8 @@
       });
       return;
     }
+    const droppedDraft = restoredBefore !== null && restored === null;
+    restoredBefore = restored;
     if (restored !== null && !isEditing) {
       untrack(() => {
         editDraft = restored;
@@ -458,6 +462,22 @@
     } else if (restored === null && !isEditing) {
       untrack(() => {
         editDraft = source;
+      });
+    } else if (restored !== null) {
+      // The draft is shared with another view of this file (the Code page and
+      // a terminal split hold one): follow its typing instead of keeping a
+      // textarea that could save over it. Our own input already equals it.
+      untrack(() => {
+        if (editDraft !== restored) editDraft = restored;
+      });
+    } else if (droppedDraft) {
+      // Saved or discarded in the other view. A buffer that now equals the
+      // file stays open, as after an Overwrite from the banner; one that does
+      // not (a discard) has nothing left to keep and goes back to the file.
+      untrack(() => {
+        if (editDraft === source) return;
+        editDraft = source;
+        isEditing = false;
       });
     }
   });

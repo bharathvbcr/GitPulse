@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "../FileViewer.svelte"), "utf8");
+const storeSource = readFileSync(join(here, "../../files/openDocuments.ts"), "utf8");
 
 describe("FileViewer", () => {
   it("imports and orchestrates the Explorer rail, MediaViewer, and LivePulseDashboard", () => {
@@ -23,19 +24,19 @@ describe("FileViewer", () => {
     expect(source).toContain("<LazyView load={loadBlame}");
   });
 
-  it("loads file content via cmd_get_file_blob with async protection", () => {
-    // FileBlobPayload was a component-local copy of the canonical FileBlob,
-    // field-for-field identical and unable to fail on drift. Asserting the
-    // shared type keeps a local re-declaration from creeping back.
-    expect(source).toContain('invoke<FileBlob>("cmd_get_file_blob"');
-    expect(source).toContain('import type { FileBlob } from "../files/types"');
-    expect(source).toContain("createAsyncGuard");
-    expect(source).toContain("guard.isLive()");
+  it("reads the open file through the open-file store, which guards every read", () => {
+    // The read, its stale-answer guard and the FileBlob type live in the
+    // store (see openDocuments.test.ts for the behaviour); the page only asks.
+    expect(source).toContain("loadDocument(repo, path, { force: true })");
+    expect(source).not.toContain("cmd_get_file_blob");
+    expect(storeSource).toContain('invoke<FileBlob>("cmd_get_file_blob"');
+    expect(storeSource).toContain("latestRead.get(key) !== token");
+    expect(storeSource).toContain('import type { FileBlob, SavedFile } from "./types"');
   });
 
   it("sends overwrite only from the banner's Overwrite, so no ordinary save can skip the encoder", () => {
     expect(source).toContain("saveDraft(path, draft.content, conflict.actual, true)");
-    expect(source).toContain("...(overwrite ? { overwrite: true } : {})");
+    expect(storeSource).toContain("...(options.overwrite ? { overwrite: true } : {})");
     expect(source).toContain("overwriteNote={overwriteNote(activeBlob)}");
     expect(source).not.toMatch(/onSave=\{[^}]*true\)/);
   });
@@ -52,36 +53,34 @@ describe("FileViewer", () => {
     expect(source).toContain("pathSegments");
   });
 
-  it("owns per-path drafts inside the per-repository tab cache", () => {
-    expect(source).toContain("updateEditorDraft");
-    expect(source).toContain("editorDraft(tabState, activeTabPath)");
-    expect(source).toContain("hasDirtyEditorTabs");
-    expect(source).toContain("canEvict:");
+  it("reads per-path drafts from the open-file store and keeps a repository's tabs while it owes one", () => {
+    expect(source).toContain("documentIn($openDocuments, $currentRepoPath, activeTabPath)");
+    expect(source).toContain("let activeDraft = $derived(activeDoc?.draft ?? undefined)");
+    expect(source).toContain("canEvict: (_cached, repo) => draftPaths(repo).length === 0");
     expect(source).toContain("draftContent={activeDraft?.content ?? null}");
     expect(source).toContain("onDraftChange=");
+    // The tabs no longer carry drafts: there is one copy, and it is the store's.
+    expect(source).not.toContain("drafts:");
+    expect(source).not.toContain("tabState.drafts");
   });
 
-  it("publishes every cached draft transition to the app-close registry", () => {
-    const persist = source.slice(
-      source.indexOf("function persistTabs"),
-      source.indexOf("async function loadFileContent"),
-    );
-    expect(source).toContain('import { recordEditorDrafts } from "../files/editorDraftRegistry"');
-    expect(persist).toContain("tabCache.set(repo");
-    expect(persist).toContain("recordEditorDrafts(repo, Object.keys(tabState.drafts))");
-    expect(persist.indexOf("recordEditorDrafts")).toBeGreaterThan(
-      persist.indexOf("tabCache.set"),
-    );
+  it("leaves the app-close registry to the store, the one owner of editor drafts", () => {
+    // Two owners publishing the same file is how the quit guard could count it
+    // twice; the store publishes after every change to a draft.
+    expect(source).not.toContain("recordEditorDrafts");
+    expect(storeSource).toContain('recordEditorDrafts(repo, paths, "documents")');
+    expect(storeSource).toContain("if (next.draft !== doc.draft) publishDrafts(repo)");
   });
 
   it("asks before close operations only when they remove dirty drafts", () => {
     expect(source).toContain("await fileSaveQueue.whenIdle(saveKeys)");
-    expect(source).toContain("dirtyEditorTabPaths(tabState, candidatePaths)");
-    expect(source).toContain("if (dirtyPaths.length === 0) return true;");
-    expect(source).toContain("return askConfirm({");
-    expect(source).toContain("await confirmDiscardDrafts([path])");
-    expect(source).toContain("await confirmDiscardDrafts(pathsAtRequest)");
-    expect(source).toContain("await confirmDiscardDrafts(pathsToClose)");
+    expect(source).toContain("dirtyEditorTabPaths(");
+    expect(source).toContain("hasDraft(repo, path) && !(closing && isHeldElsewhere(repo, path, HOLDER))");
+    expect(source).toContain("if (dirtyPaths.length === 0) return [];");
+    expect(source).toContain("const confirmed = await askConfirm({");
+    expect(source).toContain("await closeTabsAfterConfirm([path])");
+    expect(source).toContain("await closeTabsAfterConfirm(pathsAtRequest)");
+    expect(source).toContain("await closeTabsAfterConfirm(pathsToClose)");
   });
 
   it("applies delayed bulk closes only to the tabs captured by that request", () => {
@@ -90,96 +89,96 @@ describe("FileViewer", () => {
       source.indexOf("async function closeOtherTabs"),
     );
     expect(closeAll).toContain("const pathsAtRequest = tabState.tabs.map");
-    expect(closeAll).toContain("await confirmDiscardDrafts(pathsAtRequest)");
-    expect(closeAll).toContain("closeEditorTabs(tabState, pathsAtRequest)");
+    expect(closeAll).toContain("await closeTabsAfterConfirm(pathsAtRequest)");
     expect(closeAll).not.toContain("closeAllEditorTabs()");
+
+    const closer = source.slice(
+      source.indexOf("async function closeTabsAfterConfirm"),
+      source.indexOf("function isCurrentViewer"),
+    );
+    expect(closer).toContain("closeEditorTabs(tabState, paths)");
+    // Drafts go only after the user said so, and only the ones this close removes.
+    expect(closer.indexOf("confirmDiscardDrafts(paths, true)")).toBeLessThan(closer.indexOf("discardDraft(repo, path)"));
 
     const closeOthers = source.slice(
       source.indexOf("async function closeOtherTabs"),
       source.indexOf("function handleDraftChange"),
     );
     expect(closeOthers).toContain("const keepPath = tabState.active");
-    expect(closeOthers).toContain("closeEditorTabs(tabState, pathsToClose)");
+    expect(closeOthers).toContain("closeTabsAfterConfirm(pathsToClose)");
     expect(closeOthers).not.toContain("closeOtherEditorTabs(tabState");
   });
 
   it("clears a draft only after its write succeeds", () => {
-    const save = source.slice(
-      source.indexOf("async function handleFileSave"),
-      source.indexOf("function openInDefaultApp"),
+    const save = storeSource.slice(
+      storeSource.indexOf("export async function saveDocument"),
+      storeSource.indexOf("function refuse"),
     );
     const write = save.indexOf('await invoke<Guarded<SavedFile>>("cmd_write_file_content"');
-    const complete = save.indexOf("completeCachedEditorSave");
+    const complete = save.indexOf("completeSave(repo, target");
     expect(write).toBeGreaterThan(-1);
     expect(complete).toBeGreaterThan(write);
-    expect(save).not.toContain("catch (");
+    // The catch only records a refusal; it never completes (clears) a draft.
+    expect(save.slice(save.indexOf("} catch"))).not.toContain("completeSave(");
   });
 
   it("serializes the complete save lifecycle by canonical repository and path", () => {
-    const save = source.slice(
-      source.indexOf("async function handleFileSave"),
-      source.indexOf("function openInDefaultApp"),
+    const save = storeSource.slice(
+      storeSource.indexOf("export async function saveDocument"),
+      storeSource.indexOf("function refuse"),
     );
-    const queued = save.indexOf("fileSaveQueue.run(fileSaveKey(repo, path)");
+    const queued = save.indexOf("editorFileSaveQueue.run(fileSaveKey(repo, target)");
     const write = save.indexOf('invoke<Guarded<SavedFile>>("cmd_write_file_content"');
-    const complete = save.indexOf("completeCachedEditorSave(repo, path, newContent, saved.output.disk_base)");
-    const refresh = save.indexOf("repoStore.refresh()");
+    const complete = save.indexOf("completeSave(repo, target, content, saved.output.disk_base)");
+    const after = save.indexOf("await options.afterSave?.()");
     expect(queued).toBeGreaterThan(-1);
     expect(write).toBeGreaterThan(queued);
     expect(complete).toBeGreaterThan(write);
-    expect(refresh).toBeGreaterThan(complete);
+    expect(after).toBeGreaterThan(complete);
+    // The page's refresh runs as that hook, so it stays ordered with the write.
+    expect(source).toContain("afterSave: async () => {");
+    expect(source).toContain("await repoStore.refresh()");
   });
 
-  it("completes saves from the latest cache without letting a stale instance mutate local state", () => {
-    const complete = source.slice(
-      source.indexOf("function completeCachedEditorSave"),
-      source.indexOf("async function handleFileSave"),
-    );
-    const cacheRead = complete.indexOf("tabCache.get(repo)");
-    const transition = complete.indexOf("completeEditorSave(cached.tabs, path, savedContent, savedBase)");
-    const cacheWrite = complete.indexOf("tabCache.set(repo");
-    const ownerDispatch = complete.indexOf("viewerOwners.current(repo)?.completeSave");
-    expect(cacheRead).toBeGreaterThan(-1);
-    expect(transition).toBeGreaterThan(cacheRead);
-    expect(cacheWrite).toBeGreaterThan(transition);
-    expect(ownerDispatch).toBeGreaterThan(cacheWrite);
-    expect(complete).toContain("recordEditorDrafts(repo, Object.keys(tabs.drafts))");
-    expect(complete).not.toContain("completeEditorSave(tabState");
-    expect(complete).not.toContain("tabState = tabs");
-  });
-
-  it("routes a settled save to the newest live viewer from latest cached tabs", () => {
-    const apply = source.slice(
-      source.indexOf("function applyCompletedSaveToCurrentViewer"),
-      source.indexOf("function completeCachedEditorSave"),
-    );
-    expect(apply).toContain("if (!isCurrentViewer(repo)) return");
-    expect(apply).toContain("tabState = tabs");
-    expect(source).toContain("completeSave: (path, savedContent, tabs, savedBase) =>");
-    expect(source).toContain("applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs, savedBase)");
+  it("has no per-viewer copy of a draft to complete: a save lands on the one document", () => {
+    // It used to complete against the tab cache and dispatch to the newest
+    // viewer so a remounted page saw the result. The document is global, so a
+    // viewer of any age reads the completed state (openDocuments.test.ts:
+    // "keeps text typed while a write was in flight ...").
+    expect(source).not.toContain("completeCachedEditorSave");
+    expect(source).not.toContain("applyCompletedSaveToCurrentViewer");
+    expect(source).not.toContain("completeEditorSave");
+    expect(source).toContain("const activeDoc = $derived(documentIn(");
   });
 
   it("binds writes to the repository that owns the displayed editor", () => {
     const save = source.slice(
-      source.indexOf("async function handleFileSave"),
-      source.indexOf("function openInDefaultApp"),
+      source.indexOf("async function saveDraft"),
+      source.indexOf("/** Overwrite: save the draft"),
     );
     expect(save).toContain("const repo = hydratedRepo;");
     expect(save).toContain("$repoStore.currentPath !== repo");
-    expect(save.indexOf("$repoStore.currentPath !== repo")).toBeLessThan(
-      save.indexOf('await invoke<Guarded<SavedFile>>("cmd_write_file_content"'),
-    );
+    // Checked before the queue is entered and again inside it, just before the write.
+    expect(save.indexOf("repositoryChanged();")).toBeLessThan(save.indexOf("await saveDocument("));
+    expect(save).toContain("beforeWrite: repositoryChanged");
   });
 
   it("shows dirty state and forwards explicit draft/discard ownership", () => {
-    expect(source).toContain("isEditorTabDirty(tabState, tab.path)");
+    expect(source).toContain("isTabDirty(tab.path)");
     expect(source).toContain("Unsaved changes");
     expect(source).toContain("onRequestDiscard=");
   });
 
   it("does not apply a pending discard decision after the repository changes", () => {
-    const guards = source.match(/!isCurrentViewer\(repo\)/g) ?? [];
-    expect(guards.length).toBeGreaterThanOrEqual(4);
+    for (const fn of ["async function confirmDiscardDrafts", "async function closeTabsAfterConfirm", "async function requestDiscardDraft"]) {
+      const start = source.indexOf(fn);
+      const body = source.slice(start, source.indexOf("\n  }\n", start));
+      expect(body, fn).toContain("!isCurrentViewer(repo)");
+    }
+    // Only the viewer that asked may discard after the answer: the discards
+    // follow the check, not the confirmation.
+    const closer = source.slice(source.indexOf("async function closeTabsAfterConfirm"));
+    expect(closer.indexOf("!isCurrentViewer(repo)")).toBeLessThan(closer.indexOf("discardDraft(repo, path)"));
   });
 
   it("synchronizes the shared file selection after every tab-closing operation", () => {
@@ -294,41 +293,43 @@ describe("FileViewer", () => {
     expect(source).toContain("preferredSidePane = \"explorer\";");
   });
 
-  it("writes file content via cmd_write_file_content and opens through the shell gate", () => {
-    expect(source).toContain('invoke<Guarded<SavedFile>>("cmd_write_file_content"');
+  it("writes file content via the store's cmd_write_file_content and opens through the shell gate", () => {
+    expect(storeSource).toContain('invoke<Guarded<SavedFile>>("cmd_write_file_content"');
+    expect(source).toContain("saveDocument(repo, path, newContent");
     expect(source).toContain("openInDefaultApp");
     expect(source).not.toContain("@tauri-apps/plugin-opener");
-    expect(source).toContain("formatError");
+    expect(source).toContain("describeError");
   });
 
-  it("sends the draft's base with every save and re-bases the viewer on the saved one", () => {
-    const save = source.slice(
-      source.indexOf("async function handleFileSave"),
-      source.indexOf("function openInDefaultApp"),
+  it("sends the draft's base with every save and re-bases the document on the saved one", () => {
+    const save = storeSource.slice(
+      storeSource.indexOf("export async function saveDocument"),
+      storeSource.indexOf("function refuse"),
     );
-    expect(save).toContain("expectedBase,");
-    expect(save).toContain("tabCache.get(repo)?.tabs.drafts[path]");
-    expect(save).toContain("saveBase(");
+    expect(save).toContain("expectedBase: judged.base");
+    expect(save).toContain("saveBase(doc?.draft ?? undefined, doc?.blob?.disk_base ?? null, options.overrideBase)");
     expect(save).toContain('judged === "unbased"');
-    expect(save).toContain("overrideBase,");
-    expect(source).toContain("disk_base: savedBase");
+    expect(storeSource).toContain("disk_base: savedBase");
     // The first dirtying keystroke is what records the base.
-    expect(source).toContain("updateEditorDraft(tabState, path, newContent, sourceContent, base)");
+    expect(source).toContain("editDocument(repo, path, newContent, sourceContent)");
+    expect(storeSource).toContain("base: existing ? existing.base : doc.blob?.disk_base ?? null");
   });
 
   it("answers a changed_on_disk refusal with a kept draft and Reload / Overwrite / Compare", () => {
-    const refusal = source.slice(
-      source.indexOf("async function saveDraft"),
-      source.indexOf("async function requestDiscardDraft"),
+    const save = storeSource.slice(
+      storeSource.indexOf("export async function saveDocument"),
+      storeSource.indexOf("function refuse"),
     );
-    expect(refusal).toContain('typed?.code === "changed_on_disk"');
-    expect(refusal).toContain("saveRefusal = { repo, path, actual: typed.actual }");
+    expect(save).toContain('typed?.code === "changed_on_disk"');
+    expect(save).toContain("refuse(repo, target, typed.actual)");
+    expect(save).toContain("void loadDocument(repo, target, { force: true })");
     // The error is rethrown so the editor stays in edit mode and the draft stays dirty.
-    expect(refusal).toContain("throw err;");
-    expect(refusal).toContain("saveDraft(path, draft.content, conflict.actual, true)");
-    expect(refusal).toContain("requestDiscardDraft(path)");
-    expect(refusal.indexOf("requestDiscardDraft(path)")).toBeLessThan(
-      refusal.indexOf("await loadFileContent(path)"),
+    expect(save).toContain("throw err;");
+    const page = source.slice(source.indexOf("async function overwriteDraft"), source.indexOf("async function requestDiscardDraft"));
+    expect(page).toContain("saveDraft(path, draft.content, conflict.actual, true)");
+    expect(page).toContain("requestDiscardDraft(path)");
+    expect(page.indexOf("requestDiscardDraft(path)")).toBeLessThan(
+      page.indexOf("await loadDocument(repo, path, { force: true, remount: true })"),
     );
     expect(source).toContain("<EditorConflictBanner");
     expect(source).toContain("onReload=");
@@ -337,7 +338,8 @@ describe("FileViewer", () => {
   });
 
   it("marks a draft conflicted as soon as the reloaded blob's base differs", () => {
-    expect(source).toContain("isEditorDraftConflicted(activeDraft, diskBase)");
+    expect(source).toContain("documentConflict(activeDoc)");
+    expect(storeSource).toContain("diskBase != null && diskBase !== doc.draft.base");
   });
 
   it("surfaces clipboard failure when copying the active path", () => {

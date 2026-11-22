@@ -22,6 +22,11 @@ addEventListener("error", event => errors.push(event.message));
 addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
 const root = "/fixture/GitPulse";
 const file = "src/app.ts";
+// A second file, open on the Code page and in a terminal split at once: the
+// "one file model" checks at the end of the run.
+const splitFile = "src/split.ts";
+let splitDisk = { text: "alpha\n", base: "6:s000" };
+const splitSaves = [];
 const unexpected = [], saves = [], blobReads = [], searches = [], blameReads = [];
 // While set, a file read answers only once this promise settles.
 let blobGate = null;
@@ -40,6 +45,7 @@ const fileCommits = [
 ];
 const graphReads = [], fileDiffReads = [];
 let historyFails = false;
+const splitBlob = () => ({ path: splitFile, is_binary: false, is_image: false, mime: "application/octet-stream", text: splitDisk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: splitDisk.base });
 const blob = () => ({ path: file, is_binary: false, is_image: false, mime: "application/octet-stream", text: disk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: disk.base });
 mockIPCWithEvents((cmd, args) => {
   switch (cmd) {
@@ -48,8 +54,14 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_get_status": return statuses;
     case "cmd_detect_language": return { name: "TypeScript", color_hex: "#3178c6", category: "Programming" };
     case "cmd_syntax_highlight": return [];
-    case "cmd_get_file_blob": blobReads.push(args); if (blobFails) throw new Error("unreadable by fixture"); if (blobGate) return blobGate.then(() => blob()); return blob();
+    case "cmd_get_file_blob": if (args.filePath === splitFile) return splitBlob(); blobReads.push(args); if (blobFails) throw new Error("unreadable by fixture"); if (blobGate) return blobGate.then(() => blob()); return blob();
     case "cmd_write_file_content":
+      if (args.filePath === splitFile) {
+        splitSaves.push(args);
+        if (args.expectedBase !== splitDisk.base) throw { code: "changed_on_disk", message: `'${args.filePath}' changed on disk since it was opened. Nothing was written.`, path: args.filePath, expected: args.expectedBase ?? "", actual: splitDisk.base };
+        splitDisk = { text: args.content, base: `s${splitSaves.length}` };
+        return { policy: null, output: { disk_base: splitDisk.base } };
+      }
       saves.push(args);
       if (args.expectedBase !== disk.base) throw { code: "changed_on_disk", message: `'${args.filePath}' changed on disk since it was opened. Nothing was written.`, path: args.filePath, expected: args.expectedBase ?? "", actual: disk.base };
       disk = { text: args.content, base: nextBase };
@@ -580,6 +592,62 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("and Try again reads it again", () => items().length === 2);
     menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick(); await wait(120);
     check("Escape closes the menu", () => !menu());
+  }
+
+
+  // --- One file model: the same file on the Code page and in a terminal split ---
+  // The two hosts used to load, draft and save a file each, so one file open in
+  // both held two drafts that could diverge and be saved over each other. It is
+  // one document now: a draft typed in either shows in the other, one save
+  // writes it, and one refusal is answered once.
+  {
+    const splitHost = document.createElement("div");
+    splitHost.style.cssText = "position:fixed;right:0;top:0;width:520px;height:420px;display:flex;flex-direction:column;background:#0b0f19";
+    document.body.append(splitHost);
+    const Pane = (await import("../src/lib/components/TerminalFilePane.svelte")).default;
+    const inSplit = label => [...splitHost.querySelectorAll("button")].find(el => el.textContent.trim().startsWith(label));
+    const splitArea = () => splitHost.querySelector("textarea");
+    const splitBanner = () => splitHost.querySelector('[data-testid="editor-conflict"]');
+    const typeIn = async (area, value) => { area.value = value; area.dispatchEvent(new Event("input", { bubbles: true })); await tick(); await wait(120); };
+    const tabDirty = () => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(splitFile))?.getAttribute("title")?.includes("Unsaved");
+
+    repoStore.selectFilePath(splitFile); await tick(); await wait(120);
+    const pane = mount(Pane, { target: splitHost, props: { tabId: "split-1", repoPath: root, filePath: splitFile, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => button("Edit") && inSplit("Edit"), "the file is open on the Code page and in the split");
+
+    button("Edit").click();
+    await until(textarea, "the Code page editor opens");
+    await type("alpha\nbeta\n");
+    await wait(200);
+    check("a draft typed on the Code page shows in the split as unsaved", () => /Unsaved/.test(splitHost.textContent));
+    check("and the split's editor holds that same text", () => splitArea()?.value === "alpha\nbeta\n");
+
+    if (!splitArea()) { inSplit("Edit")?.click(); await wait(120); }
+    if (splitArea()) await typeIn(splitArea(), "alpha\nbeta\ngamma\n");
+    await wait(200);
+    check("typing in the split shows in the Code page's editor: one draft, not two", () => textarea()?.value === "alpha\nbeta\ngamma\n");
+
+    const writesBefore = splitSaves.length;
+    inSplit("Save")?.click();
+    await wait(400);
+    check("saving from the split writes once, with that draft", () => splitSaves.length === writesBefore + 1 && splitSaves.at(-1)?.content === "alpha\nbeta\ngamma\n" && splitDisk.text === "alpha\nbeta\ngamma\n");
+    // The Code page's editor may stay open on the text it now matches, as it does after the banner's Overwrite.
+    check("and leaves neither host with a draft", () => !tabDirty() && !/Unsaved/.test(splitHost.textContent) && !splitArea() && (!textarea() || textarea().value === "alpha\nbeta\ngamma\n"));
+
+    // A refusal is one conflict, answered from either host.
+    if (button("Edit")) { button("Edit").click(); await wait(120); }
+    if (textarea()) await type("alpha\nbeta\ngamma\ndelta\n");
+    splitDisk = { text: "agent\n", base: "6:s999" };
+    inSplit("Save")?.click();
+    await wait(400);
+    check("a refused save raises the conflict banner in both hosts", () => Boolean(banner()) && Boolean(splitBanner()));
+    const overwriteBase = splitDisk.base;
+    [...(banner()?.querySelectorAll("button") ?? [])].find(el => el.textContent.trim() === "Overwrite")?.click();
+    await wait(400);
+    check("Overwrite from the Code page saves the one draft over the version the refusal saw", () => splitSaves.at(-1)?.expectedBase === overwriteBase && splitDisk.text === "alpha\nbeta\ngamma\ndelta\n");
+    check("and clears the banner in both hosts", () => !banner() && !splitBanner());
+
+    await unmount(pane); splitHost.remove(); await tick();
   }
 
   check("No unexpected commands", () => unexpected.length === 0);
