@@ -255,6 +255,52 @@ export function buildRestoredStrip(plan: RestorePlan): RestoredStrip {
   return { state: { ...state, activeId: activeId ?? state.activeId }, idMap, deferred };
 }
 
+export type RestoreStep = "wait" | "open-fallback-shell" | "restore";
+
+/**
+ * What the panel does next while a saved strip is waiting to be restored.
+ *
+ * Restoring needs the host's session list, which under load can take longer
+ * than any fixed timeout (and a reload after a crash is exactly when the host
+ * is busy). So the timeout only releases the fresh-shell fallback, so the dock
+ * is not empty; the restore itself waits for the listing to settle and never
+ * gives up. Until it has run, the saved strip is left untouched.
+ */
+export function restoreStep(input: {
+  pending: boolean;
+  settled: boolean;
+  timedOut: boolean;
+  hasTabs: boolean;
+  requestWillOpenFirstTab: boolean;
+  fallbackOpened: boolean;
+}): RestoreStep {
+  if (!input.pending) return "wait";
+  if (input.settled) return "restore";
+  if (input.timedOut && !input.hasTabs && !input.requestWillOpenFirstTab && !input.fallbackOpened) {
+    return "open-fallback-shell";
+  }
+  return "wait";
+}
+
+/**
+ * Puts restored tabs ahead of whatever the dock opened while it waited (a
+ * request's tab, the fallback shell). Whether the fallback shell was typed
+ * into is not known cheaply, so it is kept, after the restored tabs; but it
+ * does not keep focus over the tabs being restored. A tab the reader or a
+ * request chose keeps focus.
+ */
+export function mergeRestoredTabs(
+  restored: TabState,
+  existing: TabState,
+  fallbackShellId: string | null,
+  maxTabs: number,
+): TabState {
+  const tabs = [...restored.tabs, ...existing.tabs].slice(0, maxTabs);
+  const keepExisting = existing.activeId !== null && existing.activeId !== fallbackShellId;
+  const wanted = keepExisting ? existing.activeId : (restored.activeId ?? existing.activeId);
+  return { tabs, activeId: wanted !== null && tabs.some((tab) => tab.id === wanted) ? wanted : (tabs[0]?.id ?? null) };
+}
+
 /** Whether a saved strip is worth holding the dock empty for until adoption has listed sessions. */
 export function stripWorthWaitingFor(strip: PersistedTabStrip | null): boolean {
   return strip !== null && strip.order.some((id) => Boolean(strip.leaves[id]?.backendSessionId));

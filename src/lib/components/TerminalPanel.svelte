@@ -97,6 +97,8 @@
     buildTabStrip,
     composeWorkspaceWithStrip,
     leafMetaForTab,
+    mergeRestoredTabs,
+    restoreStep,
     parsePersistedTabStrip,
     planReloadRestore,
     stripWorthWaitingFor,
@@ -472,6 +474,8 @@
   let stripRestorePending = $state(untrack(() => savedStripToRestore() !== null));
   /** Saved tab id to this page's tab id for the restored strip; the split hydration remaps its leaves through it. */
   let restoredIdMap: ReadonlyMap<string, string> | null = null;
+  /** The shell opened when the host was slow to list its sessions, so the dock was not left empty. */
+  let fallbackShellId: string | null = null;
   /** Restored background tabs whose session is taken over only when first shown. */
   let deferredTabs = $state<ReadonlySet<string>>(new Set());
   let tabState = $state<TabState>(untrack(initialTabs));
@@ -781,8 +785,32 @@
   $effect(() => {
     if (!stripRestorePending) return;
     const key = splitStorageKey(repoPath);
-    const ready = !isTauri() || $detachedAdoptionSettled || adoptionTimedOut;
-    if (!key || !ready) return;
+    if (!key) return;
+    const settled = $detachedAdoptionSettled;
+    const timedOut = adoptionTimedOut;
+    const hasTabs = tabState.tabs.length > 0;
+    // The timeout only opens the fallback shell so the dock is not empty; the
+    // restore waits for the listing however long it takes, and the saved strip
+    // is not touched (the persist and hydrate effects wait on the flag) until it ran.
+    const step = untrack(() =>
+      restoreStep({
+        pending: true,
+        settled,
+        timedOut,
+        hasTabs,
+        requestWillOpenFirstTab: requestWillOpenFirstTab(),
+        fallbackOpened: fallbackShellId !== null,
+      }),
+    );
+    if (step === "wait") return;
+    if (step === "open-fallback-shell") {
+      untrack(() => {
+        const shell = initialState();
+        fallbackShellId = shell.activeId;
+        tabState = shell;
+      });
+      return;
+    }
     untrack(() => {
       stripRestorePending = false;
       let restored = false;
@@ -817,11 +845,9 @@
             const id = built.idMap.get(entry.oldId);
             if (id) next = applyPersistedLeafMeta(next, id, entry.meta);
           }
-          // Tabs a launch request opened while the host was being listed stay, after these.
-          const existing = tabState.tabs;
-          const tabs = [...next.tabs, ...existing].slice(0, MAX_STRIP_TABS);
-          // The tab a request is opening keeps focus; otherwise the saved one has it.
-          tabState = { tabs, activeId: tabState.activeId ?? next.activeId };
+          // Tabs opened while the host was being listed (a request's, the fallback
+          // shell) stay, after these; a request's tab keeps focus, the saved tab has it otherwise.
+          tabState = mergeRestoredTabs(next, tabState, fallbackShellId, MAX_STRIP_TABS);
           restoredIdMap = built.idMap;
           deferredTabs = built.deferred;
           restored = true;
@@ -2183,6 +2209,13 @@
    * same question through the registry's `confirmClose`, so a session in
    * another repository's dock asks too.
    */
+  /** The Sessions record still holding a restored tab's process, or null once handed over or ended. */
+  function adoptedRecordFor(tabId: string): TerminalSessionRecord | null {
+    const attach = tabState.tabs.find((tab) => tab.id === tabId)?.attachSessionId;
+    if (!attach) return null;
+    return get(terminalSessions).find((record) => isAdoptedSession(record) && record.sessionId === attach) ?? null;
+  }
+
   async function requestClose(id: string) {
     if (closing.has(id)) return;
     closing.add(id);
@@ -2191,7 +2224,13 @@
       // Close ends the process here, explicitly. Dropping the tab only
       // unmounts it, and an unmount keeps whatever is still running.
       try {
-        await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
+        if (deferredTabs.has(id)) {
+          // Never mounted, so no session to close: the Sessions record that still
+          // holds this process kills it, exactly as Stop in that list does.
+          await adoptedRecordFor(id)?.close();
+        } else {
+          await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
+        }
       } catch (error: unknown) {
         sessionError = describeError(error, "terminal");
         return;
@@ -2212,7 +2251,9 @@
     const status = tabStatuses[id];
     const agent = tab.launcher === "shell" ? null : {
       name: launcherLabel(tab.launcher),
-      running: status === "starting" || status === "running",
+      // A restored tab not yet shown has no mounted session to report a status,
+      // but its process is running by definition: ask as for a running agent.
+      running: status === "starting" || status === "running" || deferredTabs.has(id),
       taskAttempt: Boolean(tab.taskRunId),
     };
     // A tab with no mounted session to ask is unknown, not idle.

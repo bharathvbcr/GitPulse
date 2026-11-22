@@ -598,6 +598,19 @@ describe("TerminalPanel reload restore wiring", () => {
     const body = source.slice(source.indexOf("function initialTabs(): TabState"), source.indexOf("let tabState = $state<TabState>"));
     expect(body).toContain("if (stripRestorePending) return { tabs: [], activeId: null };");
   });
+  it("waits for the settled listing, never the timeout, before restoring", () => {
+    const effect = source.slice(source.indexOf("if (!stripRestorePending) return;"), source.indexOf("planReloadRestore({"));
+    expect(effect).toContain("restoreStep({");
+    expect(effect).not.toContain("|| adoptionTimedOut");
+    expect(effect.indexOf("if (step === \"wait\") return;")).toBeLessThan(effect.indexOf("stripRestorePending = false"));
+  });
+  it("closing a not-yet-shown restored tab asks as for a running agent and kills its session", () => {
+    expect(source).toContain('deferredTabs.has(id),');
+    const body = source.slice(source.indexOf("async function requestClose("), source.indexOf("/** Whether closing this tab may go ahead"));
+    expect(body).toContain("if (deferredTabs.has(id))");
+    expect(body).toContain("await adoptedRecordFor(id)?.close();");
+    expect(body.indexOf("await confirmClose(id)")).toBeLessThan(body.indexOf("adoptedRecordFor(id)?.close()"));
+  });
   it("mounts a restored background tab's session only when it is first shown", () => {
     expect(source).toContain("{:else if !deferredTabs.has(tab.id)}");
     expect(source).toContain("if (attach) reclaimAdoptedSession(attach);");

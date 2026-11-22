@@ -3,7 +3,9 @@ import {
   buildRestoredStrip,
   buildTabStrip,
   composeWorkspaceWithStrip,
+  mergeRestoredTabs,
   parsePersistedTabStrip,
+  restoreStep,
   planReloadRestore,
   stripWorthWaitingFor,
   type AdoptedFact,
@@ -137,6 +139,60 @@ describe("buildRestoredStrip", () => {
     const built = buildRestoredStrip(plan(null, []));
     expect(built.state.tabs).toEqual([]);
     expect(built.state.activeId).toBeNull();
+  });
+});
+
+describe("restoreStep (the timeout may only release the fallback shell)", () => {
+  const base = { pending: true, settled: false, timedOut: false, hasTabs: false, requestWillOpenFirstTab: false, fallbackOpened: false };
+
+  it("settled before the timeout: restores, with no fallback shell ever opened", () => {
+    expect(restoreStep(base)).toBe("wait");
+    expect(restoreStep({ ...base, settled: true })).toBe("restore");
+  });
+
+  it("settled after the timeout: the shell opens first, then the restore still runs", () => {
+    expect(restoreStep({ ...base, timedOut: true })).toBe("open-fallback-shell");
+    expect(restoreStep({ ...base, timedOut: true, hasTabs: true, fallbackOpened: true })).toBe("wait");
+    expect(restoreStep({ ...base, timedOut: true, hasTabs: true, fallbackOpened: true, settled: true })).toBe("restore");
+  });
+
+  it("timeout with nothing ever settling keeps the shell and never restores or gives up", () => {
+    const steps = [
+      restoreStep({ ...base, timedOut: true }),
+      restoreStep({ ...base, timedOut: true, hasTabs: true, fallbackOpened: true }),
+      restoreStep({ ...base, timedOut: true, hasTabs: true, fallbackOpened: true }),
+    ];
+    expect(steps).toEqual(["open-fallback-shell", "wait", "wait"]);
+  });
+
+  it("opens no fallback shell when a request will open the first tab", () => {
+    expect(restoreStep({ ...base, timedOut: true, requestWillOpenFirstTab: true })).toBe("wait");
+  });
+
+  it("does nothing when no restore is pending", () => {
+    expect(restoreStep({ ...base, pending: false, settled: true, timedOut: true })).toBe("wait");
+  });
+});
+
+describe("mergeRestoredTabs", () => {
+  const tabs = (...ids: string[]) => ids.map((id) => ({ id, launcher: "shell" as const, title: null }));
+
+  it("puts restored tabs ahead of the fallback shell, kept after them, and focuses the restored active tab", () => {
+    const merged = mergeRestoredTabs({ tabs: tabs("r1", "r2"), activeId: "r2" }, { tabs: tabs("fb"), activeId: "fb" }, "fb", 32);
+    expect(merged.tabs.map((t) => t.id)).toEqual(["r1", "r2", "fb"]);
+    expect(merged.activeId).toBe("r2");
+  });
+
+  it("leaves focus on a tab a request opened", () => {
+    const merged = mergeRestoredTabs({ tabs: tabs("r1"), activeId: "r1" }, { tabs: tabs("req"), activeId: "req" }, null, 32);
+    expect(merged.tabs.map((t) => t.id)).toEqual(["r1", "req"]);
+    expect(merged.activeId).toBe("req");
+  });
+
+  it("is bounded, with restored tabs first, and never focuses a cut tab", () => {
+    const merged = mergeRestoredTabs({ tabs: tabs("r1", "r2"), activeId: "r1" }, { tabs: tabs("a", "b"), activeId: "b" }, null, 3);
+    expect(merged.tabs.map((t) => t.id)).toEqual(["r1", "r2", "a"]);
+    expect(merged.activeId).toBe("r1");
   });
 });
 
