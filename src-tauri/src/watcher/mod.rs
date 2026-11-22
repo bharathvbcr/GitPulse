@@ -2151,10 +2151,28 @@ mod tests {
     /// batch. This asserts all three still deliver.
     #[test]
     fn batched_registration_watches_every_path_it_was_given() {
+        probe_batched_registration(true);
+    }
+
+    /// A linked worktree keeps its git dir and the common dir outside the
+    /// worktree root. Nested under the root, the root's own recursive watch
+    /// delivers events for them, so a dropped common-dir path hides; with the
+    /// roots disjoint, each one is delivered only by its own registration.
+    #[test]
+    fn batched_registration_watches_roots_that_are_not_under_the_worktree() {
+        probe_batched_registration(false);
+    }
+
+    fn probe_batched_registration(nested: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonicalize");
-        let git_dir = root.join(".git");
-        let common = root.join("common.git");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let outside = elsewhere.path().canonicalize().expect("canonicalize");
+        let (git_dir, common) = if nested {
+            (root.join(".git"), root.join("common.git"))
+        } else {
+            (outside.join("wt.git"), outside.join("common.git"))
+        };
         std::fs::create_dir_all(&git_dir).expect("git dir");
         std::fs::create_dir_all(&common).expect("common dir");
 
