@@ -25,6 +25,16 @@
 //!   arrives is recorded as `could_not_run`: its own state, in the logs and
 //!   as an evidence row, so it reads as neither a failure nor a pass. The gate
 //!   treats it as a hold. It is not retried on its own; Verify on the card is.
+//! - What a claim verifies is the `repo_path` the agent passed to
+//!   `gitpulse_complete_task`: that checkout, at its HEAD when the claim was
+//!   made (the `verification-target` line of the held block). A lane's own
+//!   worktree judges the lane's work; the main checkout judges its tip commit.
+//!   A claim whose range is empty (base == head) is refused with that said.
+//! - A pass whose commit has since landed on the default branch is still a
+//!   pass when the claimed worktree has moved on or is gone: [`decide` offers
+//!   it to the gate](gate::check), which accepts only a commit that is an
+//!   ancestor of the default branch's tip and holds otherwise. A hold is
+//!   asked again at most once a minute.
 //! - A worktree whose head cannot be read (deleted, moved) is recorded as
 //!   `could_not_run` once per claim. The stored record is read before the
 //!   head, so neither that record nor a settled verdict is written again.
@@ -56,6 +66,9 @@ pub(crate) const MAX_ACTIVE: usize = 2;
 const WAIT_LIMIT: Duration = Duration::from_secs(20 * 60);
 const SWEEP_PERIOD: Duration = Duration::from_secs(3);
 const TARGET_PREFIX: &str = "verification-target: ";
+/// How long a landed-commit pass the gate held is left alone before the gate
+/// is asked again (the lane may be merged later).
+const LANDED_RETRY: Duration = Duration::from_secs(60);
 /// Review cards read per sweep, in pages of 200.
 const MAX_PAGES: usize = 5;
 
@@ -74,7 +87,9 @@ pub(crate) fn target_line(repo_path: &str) -> String {
     };
     match gate::current_head(&local.path) {
         Ok(head) => format!(
-            "\n{TARGET_PREFIX}{}",
+            "\nThe verification target is the repo_path this claim was made from ({}, at {}); to have a lane's work judged, claim from the lane's own worktree.\n{TARGET_PREFIX}{}",
+            local.path,
+            head.get(..12).unwrap_or(&head),
             json!({"worktree": local.path, "head": head})
         ),
         Err(_) => String::new(),
@@ -170,6 +185,9 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
         // Read before the head: a claim whose worktree is gone stays gone, and
         // without this every sweep wrote another `could_not_run` for it. A
         // settled verdict is not written over either.
+        // A passed record for the claimed commit does not need the worktree:
+        // the gate decides whether that commit has landed.
+        Err(_) if landed_candidate(record, facts.logs) => return Step::Promote,
         Err(_)
             if record.is_some_and(|r| r.state == STATE_COULD_NOT_RUN || r.state == "settled") =>
         {
@@ -180,7 +198,13 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
         }
     };
     if *head != facts.target.head {
-        return Step::Skip;
+        // A newer head is a newer claim, but the commit that was judged may
+        // have landed on the default branch meanwhile.
+        return if landed_candidate(record, facts.logs) {
+            Step::Promote
+        } else {
+            Step::Skip
+        };
     }
     let waited = |elapsed: Duration| {
         if elapsed >= WAIT_LIMIT {
@@ -225,10 +249,21 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
     }
 }
 
+/// A settled pass, for the claimed commit, that no verdict note has recorded.
+fn landed_candidate(record: Option<&Record>, logs: &str) -> bool {
+    record.is_some_and(|r| {
+        r.state == "settled"
+            && r.outcome == "passed"
+            && !logs.contains(&recorded_marker(&r.request_id))
+    })
+}
+
 /// The driver's memory between sweeps.
 #[derive(Default)]
 pub(crate) struct Driver {
     attempts: HashMap<(String, String), Attempt>,
+    /// Cards whose landed-commit pass the gate held, and when to ask again.
+    landed_held: HashMap<(String, String), Instant>,
 }
 
 /// What a sweep did, for the log line and for tests.
@@ -341,6 +376,7 @@ impl Driver {
         // A card that was moved, edited out of its claim, deleted or left for
         // a newer head is no longer waited on.
         self.attempts.retain(|key, _| seen.contains(key));
+        self.landed_held.retain(|key, _| seen.contains(key));
         report
     }
 
@@ -404,6 +440,10 @@ impl Driver {
                 }
             }
             Step::Promote => {
+                let moved_on = facts.current_head.as_deref().ok() != Some(target.head.as_str());
+                if moved_on && self.landed_held.get(key).is_some_and(|until| now < *until) {
+                    return;
+                }
                 let outcome = gate::check(
                     backend.memo(),
                     store,
@@ -425,6 +465,9 @@ impl Driver {
                     }
                     Gate::Held(reason) => {
                         log::warn!(target: "workbench", "verification of {id} passed but the gate holds it: {reason}");
+                        if moved_on {
+                            self.landed_held.insert(key.clone(), now + LANDED_RETRY);
+                        }
                     }
                 }
                 self.attempts.remove(key);
@@ -506,6 +549,14 @@ fn start(
         return Err("the claimed worktree belongs to another repository".into());
     }
     let base = backend.base_of(&target.worktree, &target.head)?;
+    if base == target.head {
+        return Err(format!(
+            "the claim's range is empty (base and head are both {}), so there is nothing to verify. The claim target is the repo_path passed to gitpulse_complete_task ({}); claim from the lane's own worktree",
+            target.head.get(..12).unwrap_or(&target.head),
+            target.worktree
+        )
+        .into());
+    }
     let input = json!({
         "id": id, "request_id": request_id(id, &target.head),
         "worktree": target.worktree, "base": base, "head": target.head,
@@ -631,17 +682,12 @@ pub(crate) fn run_now(
         .ok_or_else(|| WorkbenchError::new("not_found", "The task does not exist."))?;
     let identity = repository_identity(store, &card)?;
     let checkout = || {
-        identity
-            .strip_prefix("local:")
-            .and_then(|git_dir| git_dir.strip_suffix("/.git").or(Some(git_dir)))
-            .filter(|path| Path::new(path).is_dir())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                WorkbenchError::new(
-                    "repository_unavailable",
-                    "This task's repository has no local checkout to verify.",
-                )
-            })
+        gate::checkout_of(&identity).ok_or_else(|| {
+            WorkbenchError::new(
+                "repository_unavailable",
+                "This task's repository has no local checkout to verify.",
+            )
+        })
     };
     // The checkout stands in for a claimed worktree only once it holds the
     // claimed commit; otherwise it would stand in for work that never reached it.

@@ -142,6 +142,13 @@ fn a_verification_still_running_is_not_a_verdict() {
 #[test]
 fn a_passed_record_for_an_older_head_is_stale() {
     let (_d, store, repo, id) = setup();
+    // The work is on a lane that has not landed: a head that moved past a
+    // pass on the default branch itself would be landed work.
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "lane"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "lane work"],
+    );
     verified(&store, &repo, &id);
     crate::test_support::git_in(
         repo.path(),
@@ -350,4 +357,115 @@ fn a_start_request_cannot_carry_a_command_or_a_bad_identity() {
         get_params(r#"{"id":"item-1"}"#).unwrap(),
         json!({"item_id": "item-1"})
     );
+}
+
+/// A lane worktree with one commit of its own, verified at that commit. Returns
+/// the lane directory (keep it alive), the lane path and the verified commit.
+fn verified_lane(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+) -> (tempfile::TempDir, String, String) {
+    let parent = tempfile::tempdir().unwrap();
+    let lane = parent.path().join("lane").to_str().unwrap().to_owned();
+    crate::test_support::git_in(repo.path(), &["worktree", "add", "-q", "-b", "lane", &lane]);
+    crate::test_support::git_in(
+        std::path::Path::new(&lane),
+        &["commit", "-q", "--allow-empty", "-m", "the work"],
+    );
+    let m = current_head(&lane).unwrap();
+    let mut passed = record(id, "passed", "settled", repo, &m);
+    passed["worktree"] = json!(lane);
+    store_record(store, id, &passed);
+    (parent, lane, m)
+}
+
+fn land(repo: &tempfile::TempDir) {
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "land the lane", "lane"],
+    );
+}
+
+fn tear_down(repo: &tempfile::TempDir, lane: &str) {
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", lane]);
+}
+
+#[test]
+fn a_pass_for_a_commit_that_landed_on_the_default_branch_survives_the_lane_being_removed() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    crate::test_support::git_in(repo.path(), &["branch", "-q", "-D", "lane"]);
+    let response = claim(&store, &repo, &id, Some("Landed"));
+    assert_eq!(response["status"], "done", "{response}");
+    assert_eq!(response["held_for_review"], false);
+    assert!(
+        response["verification"]
+            .as_str()
+            .unwrap()
+            .contains("default branch"),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_pass_for_a_landed_commit_passes_while_the_lane_moved_on_past_it() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    crate::test_support::git_in(
+        std::path::Path::new(&lane),
+        &["commit", "-q", "--allow-empty", "-m", "unrelated follow-up"],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_eq!(response["status"], "done", "{response}");
+}
+
+#[test]
+fn a_pass_for_a_commit_that_never_landed_stays_held_when_the_lane_is_gone() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    tear_down(&repo, &lane);
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "not on the default branch");
+}
+
+#[test]
+fn a_lane_that_moved_to_a_commit_without_the_verified_one_stays_held() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    let lane_path = std::path::Path::new(&lane);
+    crate::test_support::git_in(lane_path, &["reset", "-q", "--hard", "HEAD~1"]);
+    crate::test_support::git_in(
+        lane_path,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a different line of work",
+        ],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(
+        &store,
+        &id,
+        &response,
+        "the work changed after it was verified",
+    );
+    assert_held(&store, &id, &response, "not on the default branch");
+}
+
+#[test]
+fn a_record_whose_commit_the_repository_does_not_know_stays_held() {
+    let (_d, store, repo, id) = setup();
+    let gone = tempfile::tempdir().unwrap();
+    let mut passed = record(&id, "passed", "settled", &repo, &"ab".repeat(20));
+    passed["worktree"] = json!(gone.path().join("nowhere").to_str().unwrap());
+    store_record(&store, &id, &passed);
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "could not be resolved");
+    assert_held(&store, &id, &response, "could not be read");
 }

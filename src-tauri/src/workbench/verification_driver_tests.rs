@@ -28,6 +28,8 @@ struct Fake {
     head_error: RefCell<Option<String>>,
     /// When set, `base_of` returns this instead of a base.
     base_error: RefCell<Option<String>>,
+    /// When set, `base_of` answers the head itself: an empty range.
+    base_is_head: Cell<bool>,
     /// Its own memo, so what one test reads is not another's to evict.
     memo: Memo,
 }
@@ -42,6 +44,7 @@ impl Fake {
             epoch: Instant::now(),
             head_error: RefCell::new(None),
             base_error: RefCell::new(None),
+            base_is_head: Cell::new(false),
             memo: Memo::new(),
         }
     }
@@ -64,9 +67,12 @@ impl Backend for Fake {
         }
         gate::current_head(worktree)
     }
-    fn base_of(&self, _: &str, _: &str) -> Result<String, CommandError> {
+    fn base_of(&self, _: &str, head: &str) -> Result<String, CommandError> {
         if let Some(err) = self.base_error.borrow().clone() {
             return Err(err.into());
+        }
+        if self.base_is_head.get() {
+            return Ok(head.to_owned());
         }
         Ok("base-oid".into())
     }
@@ -193,6 +199,10 @@ fn a_new_head_after_the_claim_is_stale_and_is_neither_started_nor_promoted() {
 #[test]
 fn a_pass_recorded_for_an_older_head_does_not_promote_the_card() {
     let (_d, store, repo, id) = setup();
+    // On a lane that has not landed: older work on the default branch itself
+    // is landed work and does promote.
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "lane"]);
+    commit(repo.path(), "lane work");
     claim(&store, &repo, &id);
     let fake = Fake::new();
     let mut driver = Driver::default();
@@ -1860,4 +1870,197 @@ fn the_driver_reopens_a_store_that_was_replaced() {
     std::fs::remove_file(&path).unwrap();
     assert!(driver_store(Some(path.clone()), &mut held).is_none());
     assert!(driver_store(None, &mut held).is_none());
+}
+
+/// A backend that answers like the real one where it matters to the claim: the
+/// base is read from git, and a started verification settles as passed under
+/// the request, worktree and head it was sent.
+struct Manvi<'a> {
+    fake: Fake,
+    store: &'a Store,
+}
+
+impl Backend for Manvi<'_> {
+    fn start(&self, params: Value) -> Result<Value, WorkbenchError> {
+        let response = self.fake.start(params.clone())?;
+        store_record(
+            self.store,
+            params["item_id"].as_str().unwrap(),
+            &json!({
+                "request_id": params["request_id"], "item_id": params["item_id"],
+                "state": "settled", "outcome": "passed",
+                "worktree": params["worktree"], "head": params["head"],
+                "criteria": [], "degraded": [],
+            }),
+        );
+        Ok(response)
+    }
+    fn head_of(&self, worktree: &str) -> Result<String, CommandError> {
+        self.fake.head_of(worktree)
+    }
+    fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError> {
+        verification_base(std::path::Path::new(worktree), head)
+    }
+    fn now(&self) -> Instant {
+        self.fake.now()
+    }
+    fn cancelled(&self) -> bool {
+        self.fake.cancelled()
+    }
+    fn memo(&self) -> &Memo {
+        self.fake.memo()
+    }
+}
+
+fn commit(path: &std::path::Path, message: &str) {
+    crate::test_support::git_in(path, &["commit", "-q", "--allow-empty", "-m", message]);
+}
+
+#[test]
+fn a_seeded_claim_verified_by_a_manvi_like_backend_leaves_a_passed_record_and_reaches_done() {
+    let (_d, store, repo, id) = setup();
+    commit(repo.path(), "second");
+    claim(&store, &repo, &id);
+    let manvi = Manvi {
+        fake: Fake::new(),
+        store: &store,
+    };
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &manvi).started, 1);
+    let shown = status(&store, &manvi, &id).unwrap();
+    assert_eq!(shown["state"], "passed", "{shown}");
+    assert_eq!(shown["record"]["head"], head_of(&repo));
+    assert_eq!(driver.sweep(&store, &manvi).promoted, 1);
+    assert_eq!(status_of(&store, &id), "done");
+}
+
+#[test]
+fn a_claim_whose_branch_moved_on_before_the_verdict_still_reaches_done_once_it_is_on_the_default_branch(
+) {
+    // The checkout the claim was taken in is the default branch itself, and
+    // other work lands on it while Manvi verifies: the commit that was judged
+    // is still an ancestor of the tip.
+    let (_d, store, repo, id) = setup();
+    commit(repo.path(), "second");
+    claim(&store, &repo, &id);
+    let manvi = Manvi {
+        fake: Fake::new(),
+        store: &store,
+    };
+    let mut driver = Driver::default();
+    driver.sweep(&store, &manvi);
+    commit(repo.path(), "someone else lands work");
+    assert_eq!(driver.sweep(&store, &manvi).promoted, 1);
+    assert_eq!(status_of(&store, &id), "done");
+}
+
+#[test]
+fn a_lane_merged_and_removed_after_it_was_verified_reaches_done() {
+    let (_d, store, repo, id) = setup();
+    commit(repo.path(), "second");
+    let parent = tempfile::tempdir().unwrap();
+    let lane = parent.path().join("lane");
+    crate::test_support::git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane",
+            lane.to_str().unwrap(),
+        ],
+    );
+    commit(&lane, "the work");
+    let held = complete_task(
+        &store,
+        lane.to_str().unwrap(),
+        &id,
+        "done",
+        None,
+        Some("done"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(held["status"], "review", "{held}");
+    let manvi = Manvi {
+        fake: Fake::new(),
+        store: &store,
+    };
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &manvi).started, 1);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "land the lane", "lane"],
+    );
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "remove", "--force", lane.to_str().unwrap()],
+    );
+    assert_eq!(driver.sweep(&store, &manvi).promoted, 1);
+    assert_eq!(status_of(&store, &id), "done");
+    assert!(logs(&store, &id).contains("moved to done"));
+}
+
+#[test]
+fn a_passed_lane_that_never_landed_is_not_promoted_and_does_not_spin() {
+    let (_d, store, repo, id) = setup();
+    commit(repo.path(), "second");
+    let parent = tempfile::tempdir().unwrap();
+    let lane = parent.path().join("lane");
+    crate::test_support::git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "lane",
+            lane.to_str().unwrap(),
+        ],
+    );
+    commit(&lane, "the work");
+    complete_task(
+        &store,
+        lane.to_str().unwrap(),
+        &id,
+        "done",
+        None,
+        Some("done"),
+        None,
+    )
+    .unwrap();
+    let manvi = Manvi {
+        fake: Fake::new(),
+        store: &store,
+    };
+    let mut driver = Driver::default();
+    driver.sweep(&store, &manvi);
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "remove", "--force", lane.to_str().unwrap()],
+    );
+    assert_eq!(driver.sweep(&store, &manvi), Report::default());
+    assert_eq!(status_of(&store, &id), "review");
+    assert_eq!(driver.sweep(&store, &manvi), Report::default());
+}
+
+#[test]
+fn a_claim_with_an_empty_range_is_refused_and_says_where_the_target_comes_from() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let held = logs(&store, &id);
+    assert!(
+        held.contains("repo_path"),
+        "the held claim names its source: {held}"
+    );
+    let fake = Fake::new();
+    fake.base_is_head.set(true);
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).could_not_run, 1);
+    assert!(fake.starts.borrow().is_empty());
+    let after = logs(&store, &id);
+    assert!(after.contains("range is empty"), "{after}");
+    assert!(after.contains("repo_path"), "{after}");
+    assert_eq!(status_of(&store, &id), "review");
 }
