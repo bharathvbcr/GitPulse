@@ -1203,6 +1203,40 @@ enum WatchLoopExit {
     EventStreamClosed,
 }
 
+/// Where the debounce loop gets its time and its events. Production reads the
+/// monotonic clock and the notify channel ([`RealLoopEnv`]); a test supplies a
+/// clock it advances itself and events it schedules, so the debounce rules run
+/// with no sleeping. Monomorphised, so production pays nothing for the seam.
+trait LoopEnv {
+    fn now(&self) -> Instant;
+    /// The next event, waiting at most `wait`.
+    fn recv(
+        &self,
+        watcher: &RepoFileWatcher,
+        wait: Duration,
+    ) -> Result<Result<Event, notify::Error>, std::sync::mpsc::RecvTimeoutError>;
+    /// An event already queued behind the one just received, without waiting.
+    fn try_next(&self, watcher: &RepoFileWatcher) -> Option<Result<Event, notify::Error>>;
+}
+
+struct RealLoopEnv;
+
+impl LoopEnv for RealLoopEnv {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn recv(
+        &self,
+        watcher: &RepoFileWatcher,
+        wait: Duration,
+    ) -> Result<Result<Event, notify::Error>, std::sync::mpsc::RecvTimeoutError> {
+        watcher.receiver.recv_timeout(wait)
+    }
+    fn try_next(&self, watcher: &RepoFileWatcher) -> Option<Result<Event, notify::Error>> {
+        watcher.receiver.try_recv().ok()
+    }
+}
+
 fn run_watch_loop<F>(
     watcher: &RepoFileWatcher,
     ctx: WatchLoopContext,
@@ -1214,6 +1248,30 @@ fn run_watch_loop<F>(
 where
     F: Fn(RepoChangedPayload),
 {
+    run_watch_loop_with(
+        &RealLoopEnv,
+        watcher,
+        ctx,
+        stop,
+        sessions,
+        session_stop,
+        on_change,
+    )
+}
+
+fn run_watch_loop_with<E, F>(
+    env: &E,
+    watcher: &RepoFileWatcher,
+    ctx: WatchLoopContext,
+    stop: Arc<StopSignal>,
+    sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
+    session_stop: Arc<StopSignal>,
+    on_change: F,
+) -> WatchLoopExit
+where
+    E: LoopEnv,
+    F: Fn(RepoChangedPayload),
+{
     let WatchLoopContext {
         git_dir,
         internal_roots,
@@ -1221,7 +1279,7 @@ where
         timer_wakes,
     } = ctx;
     let mut pending = false;
-    let mut last_event = Instant::now();
+    let mut last_event = env.now();
     let mut first_pending: Option<Instant> = None;
     let mut last_scan: Option<Instant> = None;
     // What the pending window has touched; taken by each emission.
@@ -1247,7 +1305,7 @@ where
         None => load_rules(),
     };
     registration.apply_rules(&rules);
-    let mut last_rules_load = Instant::now();
+    let mut last_rules_load = env.now();
     // A rule file or a new directory was seen since the last load. Remembered
     // until the coalesce window allows the reload, so an edit made just after a
     // load is not lost.
@@ -1281,20 +1339,23 @@ where
         if watcher.take_overflow() {
             change.kind(ChangeKind::Unknown);
             if !pending {
-                first_pending = Some(Instant::now());
+                first_pending = Some(env.now());
             }
             pending = true;
-            last_event = Instant::now();
+            last_event = env.now();
         }
-        if revalidate_wanted && last_revalidate.is_none_or(|at| at.elapsed() >= SCAN_COALESCE) {
+        if revalidate_wanted
+            && last_revalidate
+                .is_none_or(|at| env.now().saturating_duration_since(at) >= SCAN_COALESCE)
+        {
             revalidate_wanted = false;
-            last_revalidate = Some(Instant::now());
+            last_revalidate = Some(env.now());
             registration.revalidate();
         }
         // A re-registration the rate bound held back, whose window has ended.
         registration.run_pending();
         let wait = next_wait(&WaitPlan {
-            now: Instant::now(),
+            now: env.now(),
             pending,
             last_event,
             first_pending,
@@ -1304,14 +1365,14 @@ where
                 rules_retry_at(&rules, last_rules_load),
                 reload_wanted.then(|| last_rules_load + SCAN_COALESCE),
                 revalidate_wanted
-                    .then(|| last_revalidate.map_or_else(Instant::now, |at| at + SCAN_COALESCE)),
+                    .then(|| last_revalidate.map_or_else(|| env.now(), |at| at + SCAN_COALESCE)),
                 registration.pending_at(),
             ]
             .into_iter()
             .flatten()
             .min(),
         });
-        match watcher.receiver.recv_timeout(wait) {
+        match env.recv(watcher, wait) {
             // A stop wakes the loop with a path-less event; it is not a change.
             Ok(_) if stop.is_stopped() => break,
             Ok(Ok(event)) => {
@@ -1337,7 +1398,7 @@ where
                     &rules,
                     &mut change,
                 );
-                for leftover in watcher.receiver.try_iter() {
+                while let Some(leftover) = env.try_next(watcher) {
                     significant |= match leftover {
                         Ok(event) => {
                             reload_wanted |= event_may_change_ignore_rules(
@@ -1362,10 +1423,10 @@ where
                         }
                     };
                 }
-                if rules_due(&rules, last_rules_load, Instant::now(), reload_wanted) {
+                if rules_due(&rules, last_rules_load, env.now(), reload_wanted) {
                     rules = load_rules();
                     registration.apply_rules(&rules);
-                    last_rules_load = Instant::now();
+                    last_rules_load = env.now();
                     reload_wanted = false;
                 }
                 // Noise never opens or extends the pending window, but it
@@ -1376,18 +1437,12 @@ where
                 // check never ran).
                 if significant {
                     if !pending {
-                        first_pending = Some(Instant::now());
+                        first_pending = Some(env.now());
                     }
                     pending = true;
-                    last_event = Instant::now();
+                    last_event = env.now();
                 }
-                if scan_is_due(
-                    pending,
-                    last_event,
-                    first_pending,
-                    last_scan,
-                    Instant::now(),
-                ) {
+                if scan_is_due(pending, last_event, first_pending, last_scan, env.now()) {
                     if !git_dir.exists() {
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
@@ -1395,7 +1450,7 @@ where
                     on_change(emit(&mut change));
                     pending = false;
                     first_pending = None;
-                    last_scan = Some(Instant::now());
+                    last_scan = Some(env.now());
                 }
             }
             // A notify backend error carries no classifiable path; per the
@@ -1404,10 +1459,10 @@ where
             Ok(Err(_)) => {
                 change.kind(ChangeKind::Unknown);
                 if !pending {
-                    first_pending = Some(Instant::now());
+                    first_pending = Some(env.now());
                 }
                 pending = true;
-                last_event = Instant::now();
+                last_event = env.now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 timer_wakes.fetch_add(1, Ordering::Relaxed);
@@ -1418,19 +1473,13 @@ where
                     exit = WatchLoopExit::EventStreamClosed;
                     break;
                 }
-                if rules_due(&rules, last_rules_load, Instant::now(), reload_wanted) {
+                if rules_due(&rules, last_rules_load, env.now(), reload_wanted) {
                     rules = load_rules();
                     registration.apply_rules(&rules);
-                    last_rules_load = Instant::now();
+                    last_rules_load = env.now();
                     reload_wanted = false;
                 }
-                if scan_is_due(
-                    pending,
-                    last_event,
-                    first_pending,
-                    last_scan,
-                    Instant::now(),
-                ) {
+                if scan_is_due(pending, last_event, first_pending, last_scan, env.now()) {
                     if !git_dir.exists() {
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
@@ -1438,7 +1487,7 @@ where
                     on_change(emit(&mut change));
                     pending = false;
                     first_pending = None;
-                    last_scan = Some(Instant::now());
+                    last_scan = Some(env.now());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2112,41 +2161,61 @@ mod tests {
         let watcher = RepoFileWatcher::watch_repo(&git_dir, Some(&root), Some(&common))
             .expect("watch_repo should install every path");
 
-        // Let the backend install before touching anything.
-        thread::sleep(Duration::from_millis(400));
-
-        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").expect("write HEAD");
-        std::fs::write(common.join("packed-refs"), b"# pack\n").expect("write packed-refs");
-        std::fs::write(root.join("tracked.txt"), b"hello\n").expect("write worktree file");
-
-        // Collect whatever arrives within a generous window and check that the
-        // three roots are all represented. Bounded rather than blocking: a
-        // dropped path shows up as a missing root, not as a hang.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut saw_git_dir = false;
-        let mut saw_common = false;
-        let mut saw_worktree = false;
-        while Instant::now() < deadline && !(saw_git_dir && saw_common && saw_worktree) {
-            match watcher.receiver.recv_timeout(Duration::from_millis(250)) {
-                Ok(Ok(event)) => {
-                    for path in &event.paths {
-                        if path.starts_with(&common) {
-                            saw_common = true;
-                        } else if path.starts_with(&git_dir) {
-                            saw_git_dir = true;
-                        } else if path.starts_with(&root) {
-                            saw_worktree = true;
-                        }
-                    }
+        // FSEvents gives no delivery guarantee for a write racing stream
+        // installation, so no fixed wait can say the backend is ready. Each
+        // root that has not yet been heard from is re-probed with a fresh file
+        // name every slice until an event under it arrives or PRIME_DEADLINE
+        // passes; the roots are tracked separately, so one that never fires is
+        // named instead of hiding behind the others.
+        let roots = [
+            ("git dir", &git_dir),
+            ("common dir", &common),
+            ("worktree root", &root),
+        ];
+        let mut seen = [false; 3];
+        let deadline = Instant::now() + PRIME_DEADLINE;
+        let mut probes = 0_u32;
+        while !seen.iter().all(|s| *s) && Instant::now() < deadline {
+            for (idx, (_, dir)) in roots.iter().enumerate() {
+                if !seen[idx] {
+                    std::fs::write(dir.join(format!("probe-{probes}.txt")), b"x")
+                        .expect("write probe");
                 }
-                Ok(Err(_)) => {}
-                Err(_) => {}
+            }
+            probes += 1;
+            let slice_ends = (Instant::now() + Duration::from_millis(250)).min(deadline);
+            while let Some(left) = slice_ends.checked_duration_since(Instant::now()) {
+                let Ok(Ok(event)) = watcher.receiver.recv_timeout(left) else {
+                    continue;
+                };
+                for path in &event.paths {
+                    // The common dir and the git dir both live under the root,
+                    // so the most specific prefix owns the path.
+                    let owner = if path.starts_with(&common) {
+                        1
+                    } else if path.starts_with(&git_dir) {
+                        0
+                    } else if path.starts_with(&root) {
+                        2
+                    } else {
+                        continue;
+                    };
+                    seen[owner] = true;
+                }
             }
         }
-
-        assert!(saw_git_dir, "git dir events were not delivered");
-        assert!(saw_common, "common dir events were not delivered");
-        assert!(saw_worktree, "worktree root events were not delivered");
+        let silent: Vec<String> = roots
+            .iter()
+            .zip(seen)
+            .filter(|(_, heard)| !heard)
+            .map(|((name, dir), _)| format!("{name} ({})", dir.display()))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "no event was delivered under {silent:?} after {probes} probe rounds within \
+             {PRIME_DEADLINE:?}; the batched registration dropped that path or the OS stream \
+             never installed"
+        );
     }
 
     /// A missing worktree root must fail before anything is installed.
@@ -5170,6 +5239,169 @@ mod tests {
         fn send(&self, event: notify::Event) {
             self.events.send(Ok(event)).unwrap();
         }
+    }
+
+    /// A clock and an event queue the test owns. `recv` moves time forward to
+    /// the next scheduled event, or by the whole wait when none is due in it,
+    /// so a loop that sleeps for 30 s runs in microseconds and the test never
+    /// sleeps. Past `horizon` the source hangs up, which ends the loop.
+    struct ScriptedEnv {
+        base: Instant,
+        elapsed: std::cell::Cell<Duration>,
+        horizon: Duration,
+        /// A loop that asks for a wait of zero without time ever moving is
+        /// spinning; fail instead of hanging the suite.
+        calls: std::cell::Cell<u32>,
+        script: std::cell::RefCell<std::collections::VecDeque<(Duration, notify::Event)>>,
+    }
+
+    impl ScriptedEnv {
+        fn at(&self) -> Duration {
+            self.elapsed.get()
+        }
+        fn pop_due(&self, limit: Duration) -> Option<notify::Event> {
+            let mut script = self.script.borrow_mut();
+            if script.front().is_some_and(|(at, _)| *at <= limit) {
+                let (at, event) = script.pop_front()?;
+                self.elapsed.set(self.elapsed.get().max(at));
+                return Some(event);
+            }
+            None
+        }
+    }
+
+    impl LoopEnv for ScriptedEnv {
+        fn now(&self) -> Instant {
+            self.base + self.elapsed.get()
+        }
+        fn recv(
+            &self,
+            _watcher: &RepoFileWatcher,
+            wait: Duration,
+        ) -> Result<Result<Event, notify::Error>, std::sync::mpsc::RecvTimeoutError> {
+            self.calls.set(self.calls.get() + 1);
+            assert!(
+                self.calls.get() < 10_000,
+                "the watch loop spun without time advancing"
+            );
+            let limit = (self.elapsed.get() + wait).min(self.horizon);
+            if let Some(event) = self.pop_due(limit) {
+                return Ok(Ok(event));
+            }
+            self.elapsed.set(limit);
+            if limit >= self.horizon {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            }
+        }
+        fn try_next(&self, _watcher: &RepoFileWatcher) -> Option<Result<Event, notify::Error>> {
+            self.pop_due(self.elapsed.get()).map(Ok)
+        }
+    }
+
+    /// Which event of the script touches what, so a test reads as a timeline.
+    enum Beat {
+        Change,
+        Noise,
+    }
+
+    /// Runs the real loop over a scripted timeline (milliseconds from the
+    /// start) and returns the offset of every emission.
+    fn emissions(timeline: &[(u64, Beat)], horizon_ms: u64) -> Vec<Duration> {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path().canonicalize().unwrap();
+        let git_dir = root.join(".git");
+        let watcher = RepoFileWatcher::watch(&git_dir).unwrap();
+        let script = timeline
+            .iter()
+            .map(|(ms, beat)| {
+                let path = match beat {
+                    Beat::Change => root.join("src").join("main.rs"),
+                    Beat::Noise => git_dir.join("index.lock"),
+                };
+                (Duration::from_millis(*ms), modify(path))
+            })
+            .collect();
+        let env = ScriptedEnv {
+            base: Instant::now(),
+            elapsed: std::cell::Cell::new(Duration::ZERO),
+            horizon: Duration::from_millis(horizon_ms),
+            calls: std::cell::Cell::new(0),
+            script: std::cell::RefCell::new(script),
+        };
+        let ctx = WatchLoopContext {
+            git_dir: git_dir.clone(),
+            internal_roots: vec![git_dir],
+            emit_path: root.to_string_lossy().into_owned(),
+            timer_wakes: Arc::default(),
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let stop = StopSignal::new();
+        run_watch_loop_with(&env, &watcher, ctx, stop.clone(), None, stop, |_| {
+            seen.borrow_mut().push(env.at());
+        });
+        seen.into_inner()
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// One change, then silence: the refresh goes out when the quiet window
+    /// ends, not a tick before or after.
+    #[test]
+    fn a_lone_change_is_emitted_exactly_when_the_quiet_window_ends() {
+        let got = emissions(&[(0, Beat::Change)], 5_000);
+        assert_eq!(got, vec![DEBOUNCE_QUIET]);
+    }
+
+    /// Each further change restarts the quiet window.
+    #[test]
+    fn a_later_change_pushes_the_quiet_window_out() {
+        let got = emissions(&[(0, Beat::Change), (300, Beat::Change)], 5_000);
+        assert_eq!(got, vec![ms(300) + DEBOUNCE_QUIET]);
+    }
+
+    /// Churn that never goes quiet is cut off DEBOUNCE_MAX_WAIT after the
+    /// first pending event, even though events keep arriving.
+    #[test]
+    fn continuous_churn_is_emitted_at_the_max_wait() {
+        let churn: Vec<(u64, Beat)> = (0..=12).map(|n| (n * 200, Beat::Change)).collect();
+        let got = emissions(&churn, 2_000);
+        assert_eq!(got.first(), Some(&DEBOUNCE_MAX_WAIT), "{got:?}");
+    }
+
+    /// The churn stops just before the cap, so the quiet window would end after
+    /// it: the cap wins, and it is the wait the loop computes that delivers it,
+    /// since no event arrives to trigger the check.
+    #[test]
+    fn the_wait_is_clamped_to_the_max_wait_when_churn_stops_near_the_cap() {
+        let churn: Vec<(u64, Beat)> = (0..=6).map(|n| (n * 300, Beat::Change)).collect();
+        let got = emissions(&churn, 5_000);
+        assert_eq!(got, vec![DEBOUNCE_MAX_WAIT]);
+    }
+
+    /// Git-internal noise neither opens a window nor moves one that is open.
+    #[test]
+    fn noise_does_not_extend_the_quiet_window() {
+        let got = emissions(
+            &[
+                (0, Beat::Change),
+                (100, Beat::Noise),
+                (250, Beat::Noise),
+                (350, Beat::Noise),
+            ],
+            5_000,
+        );
+        assert_eq!(got, vec![DEBOUNCE_QUIET]);
+    }
+
+    #[test]
+    fn noise_alone_never_emits() {
+        let noise: Vec<(u64, Beat)> = (0..=40).map(|n| (n * 100, Beat::Noise)).collect();
+        assert!(emissions(&noise, 10_000).is_empty());
     }
 
     impl Drop for FedLoop {
