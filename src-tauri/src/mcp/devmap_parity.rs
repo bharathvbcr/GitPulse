@@ -3,9 +3,10 @@
 //! Upstream `devmap_serve::mcp::TOOL_NAMES` is the published surface of the
 //! standalone `devmap mcp` server. GitPulse does not vendor that crate (it
 //! pulls `hyper` / HTTP transport crates GitPulse does not otherwise need);
-//! instead this module owns the same ordered name list and the in-process
-//! dispatch through [`crate::codeintel`], so `tools/list` cannot silently drop
-//! a tool the global server still advertises.
+//! instead this module serves a subset of it (11 of upstream's tools) with
+//! in-process dispatch through [`crate::codeintel`]. That every name served
+//! here is one upstream publishes is checked by `scripts/check-schema-parity.mjs`
+//! against `TOOL_NAMES` at the DevCouncil commit vendored in VENDOR.json.
 //!
 //! Every call still requires GitPulse's `repo_path` — this process mediates
 //! many repositories. The standalone `devmap mcp` server accepts the same
@@ -19,10 +20,15 @@ use crate::codeintel::{NameQueryOptions, WalkBounds, MCP_DEFAULT_WALK_DEPTH};
 use super::validate::{tool_args, Spec, ToolArgs, Unit};
 use super::{budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, MAX_ARG_CHARS};
 
-/// Ordered tool names matching `devmap_serve::mcp::TOOL_NAMES`.
+/// The `devmap_*` tools GitPulse serves: a subset of
+/// `devmap_serve::mcp::TOOL_NAMES` (upstream publishes more), listed in the
+/// order GitPulse advertises them.
 ///
-/// Keep this list identical to upstream. The parity test fails when either
-/// side grows without the other.
+/// GitPulse does not vendor devmap-serve, so nothing in this crate can read
+/// upstream's list. The test below only checks `tool_definitions()` against
+/// this list. That every name here is one upstream publishes is checked by the
+/// tool-list row of `scripts/check-schema-parity.mjs` (`bun run
+/// check:schema-parity`), at the DevCouncil commit vendored in VENDOR.json.
 pub const TOOL_NAMES: &[&str] = &[
     "devmap_status",
     "devmap_search",
@@ -648,6 +654,9 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, CommandError> {
 mod tests {
     use super::*;
 
+    // Checks only that `tool_definitions()` advertises exactly this module's
+    // `TOOL_NAMES`, in order, and that there are 11. It cannot see upstream's
+    // list; that comparison is in `scripts/check-schema-parity.mjs`.
     #[test]
     fn advertised_names_match_upstream_tool_names() {
         let definitions = tool_definitions();
