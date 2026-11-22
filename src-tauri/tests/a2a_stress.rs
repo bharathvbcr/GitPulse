@@ -98,34 +98,92 @@ fn pending_in_mailbox(sid: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn mailbox_text(sid: &str) -> String {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let mut out = String::new();
+    let mut stack = vec![home];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.parent().and_then(|x| x.file_name()).is_some_and(|n| n == sid)
+                && e.file_name().to_string_lossy().starts_with("p-")
+            {
+                out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+    out
+}
+
 fn post(repo: &str, from: &str, to: Option<&str>, body: &str) -> Result<u64, String> {
     post_peer_message(repo, MessageOrigin::Agent, from, to, None, "note", body, None, None, 1, 6)
         .map(|m| m.seq)
         .map_err(|e| e.message().to_string())
 }
 
-/// A body within the 16 KiB cap must never make the bus unusable. The cap counts raw bytes;
-/// the 8 MiB read cap counts the pretty-printed JSON, where a quote or a control byte grows.
+/// The body cap counts the body as stored (JSON-escaped), so no run of accepted posts can push
+/// the bus past its read cap. Oversized bodies are refused at the boundary, naming the size,
+/// and the bus stays usable throughout.
 #[test]
-fn escape_heavy_bodies_within_the_body_cap_never_brick_the_bus() {
-    for (label, unit) in [("quote", "\""), ("control_0x01", "\u{1}")] {
-        let dir = repo();
-        let r = dir.path().to_str().unwrap();
-        let body = unit.repeat(16 * 1024 / unit.len());
-        let mut first_err = None;
-        for i in 0..300 {
-            if let Err(e) = post(r, "claude:src", Some("claude:sink"), &body) {
-                first_err = Some((i, e));
-                break;
+fn escape_heavy_bodies_are_refused_at_the_boundary_and_never_brick_the_bus() {
+    let dir = repo();
+    let r = dir.path().to_str().unwrap();
+    // 16 KiB of quotes is 32 KiB stored: refused. 8000 quotes is under 16 KiB stored: accepted.
+    let too_big = "\"".repeat(16 * 1024);
+    let fits = "\"".repeat(8000);
+    let mut refusals = 0;
+    for i in 0..300 {
+        let body = if i % 2 == 0 { &too_big } else { &fits };
+        match post(r, "claude:src", Some("claude:sink"), body) {
+            Ok(_) => assert!(i % 2 == 1, "a 32 KiB-stored body was accepted at post {i}"),
+            Err(e) => {
+                assert!(i % 2 == 0, "a body under the stored cap was refused at post {i}: {e}");
+                assert!(e.contains("bytes"), "the refusal names the size: {e}");
+                refusals += 1;
             }
         }
-        let size = std::fs::metadata(dir.path().join(".git/gitpulse/lanes/messages.json")).map(|m| m.len()).unwrap_or(0);
-        let after = post(r, "claude:src", Some("claude:sink"), "a short follow-up");
-        let read = read_messages_for_peer(r, &["claude:sink".into()], 0, None, false, true).map(|p| p.messages.len());
-        eprintln!("[{label}] first failure: {first_err:?}; messages.json = {size} bytes; short post after: {after:?}; reader: {:?}", read.as_ref().map_err(|e| e.message().to_string()));
-        assert!(first_err.is_none(), "[{label}] bus refused post #{:?} ({size} bytes on disk)", first_err.map(|f| f.0));
-        assert!(after.is_ok() && read.is_ok(), "[{label}] the bus stays usable");
     }
+    let size = std::fs::metadata(dir.path().join(".git/gitpulse/lanes/messages.json")).map(|m| m.len()).unwrap_or(0);
+    let after = post(r, "claude:src", Some("claude:sink"), "a short follow-up");
+    let read = read_messages_for_peer(r, &["claude:sink".into()], 0, None, false, true).map(|p| p.messages.len());
+    eprintln!("[quote] refusals {refusals}; messages.json = {size} bytes; short post after: {after:?}; reader ok: {}", read.is_ok());
+    assert_eq!(refusals, 150);
+    assert!(size <= 8 * 1024 * 1024, "the bus grew past its read cap: {size} bytes");
+    assert!(after.is_ok() && read.is_ok(), "the bus stays usable");
+}
+
+/// A bus file already over its cap (written by an older build, or by hand) heals on the next
+/// write: the oldest rows go, loudly, and the sequence never rewinds, because readers page by it.
+#[test]
+fn an_over_cap_bus_heals_on_the_next_post_without_rewinding_the_sequence() {
+    let dir = repo();
+    let r = dir.path().to_str().unwrap();
+    let lanes = dir.path().join(".git/gitpulse/lanes");
+    std::fs::create_dir_all(&lanes).unwrap();
+    let big = "a".repeat(30 * 1024);
+    let messages: Vec<Value> = (1..=300u64)
+        .map(|seq| serde_json::json!({
+            "seq": seq, "from_agent": "claude:old", "to_agent": "claude:sink", "kind": "note",
+            "body": big, "branch": null, "created_at_ms": 1_795_000_000_000u64 + seq,
+            "thread_key": null, "msg_id": format!("old-{seq}"), "read_by": [], "hop": 1, "max_hops": 6
+        }))
+        .collect();
+    let state = serde_json::json!({ "next_seq": 300, "dropped_before_seq": 0, "messages": messages });
+    std::fs::write(lanes.join("messages.json"), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let before = std::fs::metadata(lanes.join("messages.json")).unwrap().len();
+    assert!(before > 8 * 1024 * 1024, "fixture must start over the cap ({before})");
+    let seq = post(r, "claude:new", Some("claude:sink"), "after the heal");
+    let size = std::fs::metadata(lanes.join("messages.json")).unwrap().len();
+    let page = read_messages_for_peer(r, &["claude:sink".into()], 0, None, false, true);
+    eprintln!("[heal] post -> {seq:?}; {before} -> {size} bytes; dropped_before_seq {:?}", page.as_ref().map(|p| p.dropped_before_seq));
+    assert_eq!(seq, Ok(301), "the next post continues the sequence");
+    assert!(size <= 8 * 1024 * 1024, "the healed bus is under its cap: {size}");
+    let page = page.expect("the healed bus reads");
+    assert!(page.dropped_before_seq > 1, "the dropped rows are reported through dropped_before_seq");
+    assert!(page.messages.iter().any(|m| m.seq == 301), "the new row is readable");
 }
 
 /// An unread direct message must not be evicted by other agents' traffic.
@@ -142,53 +200,75 @@ fn an_unread_direct_message_survives_other_agents_traffic() {
     assert_eq!(page.messages.len(), 1, "the quiet peer's only message was evicted by another pair's chatter");
 }
 
-/// When the recipient's mailbox refuses the envelope (full, or text it will not carry), the
-/// sender must be told: the mailbox is what wakes the recipient.
+/// The mailbox is what wakes the recipient, so a send whose envelope was not deposited must say
+/// so (delivery_outcome "bus_only", mailbox.deposited false, mailbox.reason), and a full mailbox
+/// keeps its last slot for one notice telling the recipient that more is waiting on the bus.
 #[test]
 fn a_send_whose_mailbox_deposit_fails_says_so() {
     let dir = repo();
     let r = dir.path().to_str().unwrap();
     let sid = "77777777-7777-4777-8777-777777777771";
     register(r, sid, "reviewer");
-    let mut outcomes = Vec::new();
+    let mut rows = Vec::new();
     for i in 0..10 {
         let (code, v, raw) = send(r, "claude:coder", sid, &format!("finding {i}"), &[]);
         assert_eq!(code, 0, "send {i}: {raw}");
-        outcomes.push(v["delivery_outcome"].as_str().unwrap_or("?").to_string());
+        rows.push((
+            v["delivery_outcome"].as_str().unwrap_or("?").to_string(),
+            v["mailbox"]["deposited"].as_bool(),
+            v["mailbox"]["reason"].as_str().map(str::to_string),
+        ));
     }
     let pending = pending_in_mailbox(sid);
-    let (_, ctl, _) = send(r, "claude:coder", "reviewer", "colour \u{1b}[31mred\u{1b}[0m", &[]);
-    eprintln!("outcomes = {outcomes:?}; envelopes pending = {pending}; control-char send = {}", ctl["delivery_outcome"]);
-    assert_eq!(pending, 10, "only {pending} of 10 sends reached the mailbox, and every send reported {outcomes:?}");
+    eprintln!("rows = {rows:?}; envelopes pending = {pending}");
+    for (i, row) in rows.iter().enumerate() {
+        if i < 7 {
+            assert_eq!(row.1, Some(true), "send {i} should deposit: {row:?}");
+            assert_ne!(row.0, "bus_only", "send {i}: {row:?}");
+        } else {
+            assert_eq!(row.0, "bus_only", "send {i} did not reach the mailbox and must say so: {row:?}");
+            assert_eq!(row.1, Some(false), "send {i}: {row:?}");
+            assert_eq!(row.2.as_deref(), Some("full"), "send {i}: {row:?}");
+        }
+    }
+    assert_eq!(pending, 8, "seven peer envelopes plus one overflow notice");
+    assert!(mailbox_text(sid).contains("gitpulse_agent_inbox"), "the overflow notice tells the recipient how to read the rest");
 }
 
-/// The hop ceiling exists to stop agent ping-pong. It should engage on a reply chain without
-/// each agent having to thread or count correctly, and a caller should not be able to lower it.
+/// The hop ceiling exists to stop agent ping-pong. A reply names what it answers (in_reply_to,
+/// or a thread), the count climbs from that, and a caller's explicit hop can raise it but never
+/// lower it.
 #[test]
 fn the_hop_ceiling_engages_on_a_reply_chain() {
     let dir = repo();
     let r = dir.path().to_str().unwrap();
     register(r, "77777777-7777-4777-8777-777777777772", "ping");
     register(r, "77777777-7777-4777-8777-777777777773", "pong");
-    // A threaded chain: hops should climb to the ceiling.
     let mut threaded = Vec::new();
     for i in 0..8 {
         let (to, from) = if i % 2 == 0 { ("pong", "agy:ping") } else { ("ping", "agy:pong") };
-        let (_, v, raw) = send(r, from, to, &format!("t{i}"), &[("thread_key", s("loop"))]);
-        threaded.push((v["hop"].as_u64(), v["delivery_outcome"].as_str().map(str::to_string), raw.len()));
+        let (_, v, _) = send(r, from, to, &format!("t{i}"), &[("thread_key", s("loop"))]);
+        threaded.push((v["hop"].as_u64(), v["delivery_outcome"].as_str().map(str::to_string)));
     }
-    // The same thread, the caller naming hop=1 again.
     let (_, reset, _) = send(r, "agy:ping", "pong", "reset", &[("thread_key", s("loop")), ("hop", s(1))]);
-    // An unthreaded chain.
-    let mut bare = Vec::new();
+    let mut chain = Vec::new();
+    let mut prev: Option<String> = None;
     for i in 0..8 {
         let (to, from) = if i % 2 == 0 { ("pong", "agy:ping") } else { ("ping", "agy:pong") };
-        let (_, v, _) = send(r, from, to, &format!("b{i}"), &[]);
-        bare.push(v["hop"].as_u64());
+        let mut extra = Vec::new();
+        if let Some(ref id) = prev {
+            extra.push(("in_reply_to", id.clone()));
+        }
+        let (code, v, raw) = send(r, from, to, &format!("c{i}"), &extra);
+        assert_eq!(code, 0, "chain {i}: {raw}");
+        prev = v["msg_id"].as_str().map(str::to_string);
+        chain.push((v["hop"].as_u64(), v["delivery_outcome"].as_str().map(str::to_string)));
     }
-    eprintln!("threaded = {threaded:?}\nexplicit hop=1 on that thread -> hop {} outcome {}\nunthreaded hops = {bare:?}", reset["hop"], reset["delivery_outcome"]);
-    assert_ne!(reset["hop"].as_u64(), Some(1), "a caller reset the thread's hop count to 1");
-    assert!(bare.iter().any(|h| h.unwrap_or(0) >= 6), "an unthreaded 8-message exchange never left hop 1: {bare:?}");
+    eprintln!("threaded = {threaded:?}\nexplicit hop=1 on that thread -> hop {} outcome {}\nin_reply_to chain = {chain:?}", reset["hop"], reset["delivery_outcome"]);
+    assert_eq!(threaded.iter().map(|t| t.0).collect::<Vec<_>>(), (1..=8).map(Some).collect::<Vec<_>>());
+    assert!(reset["hop"].as_u64().unwrap_or(0) > 8, "a caller lowered the thread's hop count: {}", reset["hop"]);
+    assert_eq!(chain.iter().map(|c| c.0).collect::<Vec<_>>(), (1..=8).map(Some).collect::<Vec<_>>(), "in_reply_to carries the count");
+    assert_eq!(chain[6].1.as_deref(), Some("paused_hop_limit"), "the ceiling engages on an unthreaded reply chain");
 }
 
 /// A reader naming another peer, with the default ack, must not consume that peer's messages.
@@ -220,9 +300,12 @@ fn a_recipient_can_reply_to_whoever_wrote_to_it() {
     let (c, v, raw) = send(r, "claude:never-registered", "target", "question?", &[]);
     assert_eq!(c, 0, "{raw}");
     let from = v["message"]["from_agent"].as_str().unwrap().to_string();
-    let (code, _, reply) = send(r, "agy:target", &from, "answer", &[]);
+    let (code, rv, reply) = send(r, "agy:target", &from, "answer", &[]);
     eprintln!("reply to {from}: exit {code}: {}", reply.trim());
     assert_eq!(code, 0, "the recipient cannot address a reply to the sender it was handed");
+    assert_eq!(rv["delivery_outcome"], "bus_only", "a reply to an unregistered sender reaches the bus only: {reply}");
+    let page = read_messages_for_peer(r, &[from.clone()], 0, None, false, true).unwrap();
+    assert!(page.messages.iter().any(|m| m.body == "answer"), "the reply is on the bus, addressed to {from}");
 }
 
 /// Many agents sending at once, each its own process: nothing lost, duplicated or corrupted.
@@ -267,36 +350,33 @@ fn concurrent_senders_in_separate_processes_lose_nothing() {
 }
 
 
-/// Control bytes escape to six bytes each, so a much smaller run reaches the cap.
+/// Control bytes other than newline and tab are refused at the boundary, by the same rule the
+/// mailbox applies, so a body the bus accepts is always one the mailbox can carry.
 #[test]
-fn control_byte_bodies_never_brick_the_bus() {
+fn control_byte_bodies_are_refused_and_never_brick_the_bus() {
     let dir = repo();
     let r = dir.path().to_str().unwrap();
-    let body = "\u{1}".repeat(16 * 1024);
-    let mut first_err = None;
-    for i in 0..300 {
-        if let Err(e) = post(r, "claude:src", Some("claude:sink"), &body) {
-            first_err = Some((i, e.chars().take(80).collect::<String>()));
-            break;
-        }
-    }
-    eprintln!("[control] first failure: {first_err:?}");
-    assert!(first_err.is_none(), "bus refused post #{:?}", first_err.map(|f| f.0));
+    let refused = post(r, "claude:src", Some("claude:sink"), &"\u{1}".repeat(16 * 1024));
+    let tabbed = post(r, "claude:src", Some("claude:sink"), "a\tb\nc");
+    eprintln!("[control] {refused:?}; tab/newline {tabbed:?}");
+    assert!(refused.as_ref().is_err_and(|e| e.contains("control")), "{refused:?}");
+    assert!(tabbed.is_ok(), "newline and tab stay allowed: {tabbed:?}");
 }
 
-/// A body the bus accepts but the mailbox refuses (a terminal escape) still has to reach,
-/// or be reported as not reaching, an empty mailbox.
+/// A terminal escape is refused at send, loudly, instead of being stored on the bus and
+/// silently skipped by the mailbox.
 #[test]
-fn a_body_the_mailbox_refuses_is_reported() {
+fn a_body_the_mailbox_would_refuse_is_refused_at_send() {
     let dir = repo();
     let r = dir.path().to_str().unwrap();
     let sid = "77777777-7777-4777-8777-777777777777";
     register(r, sid, "colour");
-    let (code, v, raw) = send(r, "claude:coder", "colour", "build is \u{1b}[31mred\u{1b}[0m", &[]);
+    let (code, _, raw) = send(r, "claude:coder", "colour", "build is \u{1b}[31mred\u{1b}[0m", &[]);
     let pending = pending_in_mailbox(sid);
-    eprintln!("exit {code}; outcome {}; envelopes pending {pending}", v["delivery_outcome"]);
-    assert_eq!(code, 0, "{raw}");
-    assert_eq!(pending, 1, "the send reported {} but deposited nothing", v["delivery_outcome"]);
+    eprintln!("exit {code}; envelopes pending {pending}; {}", raw.trim());
+    assert_ne!(code, 0, "the send must be refused: {raw}");
+    assert!(raw.contains("control"), "the refusal names the cause: {raw}");
+    assert_eq!(pending, 0);
 }
 
 /// The same concurrency, with a bus near its size: every write rewrites the whole file under
