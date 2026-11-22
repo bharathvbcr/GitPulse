@@ -6,6 +6,7 @@
   import type { FileSidePane } from "../files/filePaneLayout";
   import { livePulsePref } from "../files/livePulsePref";
   import { consumePin, pinRequest } from "../files/pinRequests";
+  import { requestTreeReveal, treeRevealRequest } from "../files/revealRequests";
   import { overwriteNote } from "../files/overwriteNote";
   import { draftPaths } from "../files/openDocuments";
   import { loadPersistedEditorTabs, savePersistedEditorTabs } from "../files/editorTabPersist";
@@ -121,7 +122,6 @@
   let fileViewWidth = $state(0);
   let preferredSidePane = $state<FileSidePane>("explorer");
   let compactPane = $state<FileSidePane | null>(null);
-  let revealRequest = $state<{ path: string; nonce: number }>({ path: "", nonce: 0 });
 
   /** How this page names itself to the open-file store, which owns every file's text, draft and save. */
   const HOLDER = "code-page";
@@ -467,7 +467,7 @@
   function revealDirectory(dir: string) {
     if (!dir) return;
     if (!paneLayout.explorerVisible) toggleSidePane("explorer");
-    revealRequest = { path: dir, nonce: revealRequest.nonce + 1 };
+    requestTreeReveal(dir);
   }
 
   function toggleSidePane(pane: FileSidePane) {
@@ -970,7 +970,7 @@
   {#snippet explorerTree()}
     <ExplorerRail
       selectedFile={activeTabPath}
-      {revealRequest}
+      revealRequest={$treeRevealRequest}
       onSelectFile={(path) => previewFile(path)}
       onPinFile={(path) => pinFile(path)}
     />

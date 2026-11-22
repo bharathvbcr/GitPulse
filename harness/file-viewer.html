@@ -545,6 +545,24 @@ const type = async value => { const area = textarea(); area.value = value; area.
     const tabFor = path => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(path));
     const isPreview = path => (tabFor(path)?.getAttribute("title") ?? "").includes("(preview");
     await until(() => Boolean(row("third.ts")), "the sidebar tree lists the widened fixture");
+    // The palette's "Reveal active file in explorer" posts a tree reveal request: a folded folder
+    // opens to the file, and the selection is not touched (clearing it can release the document).
+    {
+      const { requestTreeReveal } = await import("../src/lib/files/revealRequests");
+      const openFolder = () => [...side.querySelectorAll('[role="treeitem"][aria-expanded="true"]')].find(el => el.textContent.includes("src"));
+      const selectedBefore = get(repoStore).selectedFilePath;
+      openFolder().click(); await tick();
+      await until(() => !row("third.ts"), "the folder folds");
+      requestTreeReveal(third);
+      await until(() => Boolean(row("third.ts")), "the tree request opens the folder to the file");
+      check("a tree reveal request opens a folded folder down to the file, in the sidebar tree", () => Boolean(row("third.ts")));
+      check("and leaves the selection as it was", () => get(repoStore).selectedFilePath === selectedBefore);
+      openFolder().click(); await tick();
+      await until(() => !row("third.ts"), "the folder folds again");
+      requestTreeReveal(third);
+      await until(() => Boolean(row("third.ts")), "a repeat request for the same file is acted on");
+      check("a repeat request for the same file is a new request", () => Boolean(row("third.ts")));
+    }
     const doubleClick = async el => {
       el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 })); await tick();
       el.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 2 })); await tick();

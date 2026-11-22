@@ -6,6 +6,7 @@ import { clearActiveSelection, setActiveSelection } from "../terminal/activeSele
 import { addToTray, contextTrays } from "../terminal/contextTray";
 import { terminalLaunchRequests } from "../terminal/launchRequests";
 import { explorerLens, resetExplorerLens } from "../files/explorerLens";
+import { clearTreeReveal, treeRevealRequest } from "../files/revealRequests";
 import { buildCommands } from "./catalog";
 
 const sendToAgentFromPage = vi.hoisted(() => vi.fn(async () => true));
@@ -86,7 +87,8 @@ describe("palette: the active file", () => {
     expect(calls).toEqual(["request", "dock"]);
   });
 
-  it("reveals it in the explorer: Code page, file tree rail, and the file selected anew, since a tree only reveals on a change", async () => {
+  it("reveals it in the explorer: Code page, file tree rail, and a tree reveal request, with the selection left alone", async () => {
+    clearTreeReveal();
     expect(find(ready(), "file-reveal-in-explorer").disabledReason).toBe("Open a file in Explorer first.");
     const setTab = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
     const select = vi.spyOn(repoStore, "selectFilePath").mockImplementation(() => {});
@@ -94,7 +96,21 @@ describe("palette: the active file", () => {
     await find(ready({ selectedFilePath: "src/a.ts" }), "file-reveal-in-explorer").action();
     expect(surface).toHaveBeenCalledWith("repository");
     expect(setTab).toHaveBeenCalledWith("code");
-    expect(select.mock.calls).toEqual([[null], ["src/a.ts"]]);
+    // The old way cleared the selection and re-selected it; with a shared open-file
+    // store a null selection can release the shown document.
+    expect(select).not.toHaveBeenCalled();
+    expect(get(treeRevealRequest)).toMatchObject({ path: "src/a.ts" });
     expect(get(explorerLens).rail).toBe("files");
+  });
+
+  it("a second reveal of the same file is a new request", async () => {
+    clearTreeReveal();
+    vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+    const command = find(ready({ selectedFilePath: "src/a.ts" }), "file-reveal-in-explorer");
+    await command.action();
+    const first = get(treeRevealRequest)?.nonce;
+    await command.action();
+    expect(get(treeRevealRequest)?.nonce).toBeGreaterThan(first ?? 0);
   });
 });

@@ -4,7 +4,7 @@
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import { opensExplorerPage } from "../files/explorerPageGesture";
   import { requestPin } from "../files/pinRequests";
-  import { requestReveal } from "../files/revealRequests";
+  import { requestReveal, treeRevealRequest } from "../files/revealRequests";
   import {
     resolveFileOpen,
     sidebarNavStore,
@@ -230,6 +230,7 @@
     <ExplorerRail
       repoPath={effectiveRepoPath}
       selectedFile={$repoStore.selectedFilePath}
+      revealRequest={$treeRevealRequest}
       onSelectFile={(path) => void handleOpenFile(path, null, null)}
       onPinFile={(path) => void handleOpenFile(path, null, null, true)}
       onSelectMatch={(path, line, col) => void handleOpenFile(path, line, col)}

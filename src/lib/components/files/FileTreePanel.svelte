@@ -42,6 +42,7 @@
     type FileRow,
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
+  import { REVEAL_TTL_MS } from "../../files/revealRequests";
   import { consumeSearchFocus, explorerLens, showExplorerRail, type ExplorerRail } from "../../files/explorerLens";
   import {
     CONTENTS_TOGGLE_LABEL,
@@ -101,7 +102,7 @@
      * twice for the same folder is a real second request, and comparing paths
      * alone would swallow it.
      */
-    revealRequest?: { path: string; nonce: number } | null;
+    revealRequest?: { path: string; nonce: number; at?: number } | null;
     /** What the field holds in Contents mode; the host's content search reads it. */
     contentQuery?: string;
     /** Enter in the field while in Contents mode. */
@@ -991,6 +992,8 @@
     const request = revealRequest;
     if (!request?.path || request.nonce === lastRevealNonce) return;
     lastRevealNonce = request.nonce;
+    // A request made long before this tree mounted is not one anybody is waiting on.
+    if (request.at !== undefined && Date.now() - request.at > REVEAL_TTL_MS) return;
     untrack(() => {
       const next = { ...collapsed };
       for (const dir of [...ancestorsOf(request.path), request.path]) next[dir] = false;

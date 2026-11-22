@@ -1,4 +1,3 @@
-import { tick } from "svelte";
 import { get } from "svelte/store";
 import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
@@ -9,6 +8,7 @@ import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY, describeDestination } from "../views/viewRegistry";
 import { openSuspectsFor } from "../codeintel/openSuspects";
 import { setEditorLens, showExplorerRail } from "../files/explorerLens";
+import { requestTreeReveal } from "../files/revealRequests";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
 import { openSetupWizard } from "../tools/onboardingStore";
 import { SESSION_TYPES } from "../terminal/tabs";
@@ -118,12 +118,9 @@ function agentSendCommands(state: RepoState, unavailable: string | undefined, ch
         interfaceStore.setGlobalSurface("repository");
         repoStore.setActiveTab("code");
         showExplorerRail("files");
-        // The tree reveals a file when the selection changes to it, and it is
-        // already the selection when this is asked for. Clear it for a frame so
-        // that selecting it again is a change.
-        repoStore.selectFilePath(null);
-        await tick();
-        repoStore.selectFilePath(file);
+        // The file is already the selection, so the trees' own reveal-on-selection
+        // would not fire. Ask them directly; the selection is left alone.
+        requestTreeReveal(file);
       },
     },
   ];
