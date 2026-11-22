@@ -51,6 +51,16 @@ describe("the coverage exclusion list", () => {
     expect(due.getTime(), `review date ${match![2]} has passed; look at this exclusion again`).toBeGreaterThan(Date.now());
   });
 
+  it("writes the frontend report even when a test fails, so the floor is always measured", () => {
+    // Vitest writes no coverage report on a failing run unless told to, which left
+    // coverage/lcov.info missing and the floor gate reporting an invalid report
+    // instead of a number (ft-5cdbd8ce). The failing test still fails the run.
+    const source = readFileSync(CONFIG, "utf8");
+    const coverage = /coverage:\s*\{([\s\S]*?)\n    \},/.exec(source);
+    expect(coverage, "vitest.config.ts has no coverage block").not.toBeNull();
+    expect(coverage![1]).toMatch(/^\s*reportOnFailure:\s*true,/m);
+  });
+
   it("reads an entry without a comment as having none, which the check above then refuses", () => {
     const parsed = parseExclusions('exclude: [\n  "src/x.ts",\n ],\n');
     expect(parsed).toEqual([{ glob: "src/x.ts", comment: "" }]);
