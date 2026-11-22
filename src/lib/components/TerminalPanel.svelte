@@ -90,7 +90,17 @@
   import { panelTabCounts } from "../terminal/panelTabCounts";
   import { activityAttentionLabel, activityToAgentStatus, sessionActivity } from "../terminal/sessionActivity";
   import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
-  import { detachedAdoptionSettled, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import { detachedAdoptionSettled, isAdoptedSession, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import {
+    buildRestoredStrip,
+    buildTabStrip,
+    composeWorkspaceWithStrip,
+    leafMetaForTab,
+    parsePersistedTabStrip,
+    planReloadRestore,
+    stripWorthWaitingFor,
+    type AdoptedFact,
+  } from "../terminal/reloadRestore";
   import { isTauri } from "../platform";
   import {
     describeEndState,
@@ -137,7 +147,6 @@
     flipSplitOrientation,
     hasPane,
     leafPaneIds,
-    MAX_PERSISTED_SNIPPET_CHARS,
     MAX_SPLIT_PANES,
     minimumSplitHeight,
     movePaneToSplit,
@@ -425,20 +434,45 @@
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
-  function initialTabs(): TabState {
+  /** Whether a queued launch or task request will open this panel's first tab itself. */
+  function requestWillOpenFirstTab(): boolean {
     const launch = get(terminalLaunchRequests);
     if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) {
       const needsAnchorShell =
         launch.launcher === "file" &&
         launch.fileOpenMode !== "tab" &&
         get(terminalSessions).length < get(terminalSessionLimit);
-      if (!needsAnchorShell) return { tabs: [], activeId: null };
+      if (!needsAnchorShell) return true;
     }
     // A panel mounted for a queued request starts empty: the request opener
     // below opens its tab, through the same admission as every other.
-    if (requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts)) return { tabs: [], activeId: null };
+    return Boolean(requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts));
+  }
+  function initialTabs(): TabState {
+    if (requestWillOpenFirstTab()) return { tabs: [], activeId: null };
+    // A reload leaves this repository's tabs saved by session id. Starting with
+    // a fresh shell would hide them in Sessions; start empty and let the
+    // restore below decide once the host's sessions have been listed.
+    if (stripRestorePending) return { tabs: [], activeId: null };
     return initialState();
   }
+  /** The tab strip a reload left saved for this repository, if the host can still hold its sessions. */
+  function savedStripToRestore() {
+    if (!isTauri()) return null;
+    const key = splitStorageKey(repoPath);
+    if (!key) return null;
+    try {
+      const strip = parsePersistedTabStrip(globalThis.localStorage?.getItem(key));
+      return stripWorthWaitingFor(strip) ? strip : null;
+    } catch {
+      return null;
+    }
+  }
+  let stripRestorePending = $state(untrack(() => savedStripToRestore() !== null));
+  /** Saved tab id to this page's tab id for the restored strip; the split hydration remaps its leaves through it. */
+  let restoredIdMap: ReadonlyMap<string, string> | null = null;
+  /** Restored background tabs whose session is taken over only when first shown. */
+  let deferredTabs = $state<ReadonlySet<string>>(new Set());
   let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
@@ -735,11 +769,97 @@
   }
 
   let hydratedSplitForRepo: string | null = null;
+
+  /**
+   * After a reload: the tabs this repository's dock had, taken over from the
+   * sessions the host kept (`reloadRestore`). Runs once the host's sessions
+   * have been listed, before the split hydration below, which then remaps its
+   * leaves through `restoredIdMap` instead of opening a second set of tabs.
+   * Nothing restorable (every session ended) falls back to today's fresh shell.
+   */
+  $effect(() => {
+    if (!stripRestorePending) return;
+    const key = splitStorageKey(repoPath);
+    const ready = !isTauri() || $detachedAdoptionSettled || adoptionTimedOut;
+    if (!key || !ready) return;
+    untrack(() => {
+      stripRestorePending = false;
+      let restored = false;
+      try {
+        const raw = globalThis.localStorage?.getItem(key);
+        const strip = parsePersistedTabStrip(raw);
+        const available: AdoptedFact[] = [];
+        for (const record of get(terminalSessions)) {
+          if (!isAdoptedSession(record) || !record.sessionId || !record.reveal || record.taskRunId) continue;
+          available.push({
+            sessionId: record.sessionId,
+            repoPath: record.repoPath,
+            launcher: record.launcher as AdoptedFact["launcher"],
+            ...(record.title ? { title: record.title } : {}),
+          });
+        }
+        const split = parsePersistedSplitWorkspace(raw);
+        const plan = planReloadRestore({
+          strip,
+          available,
+          belongsHere: (fact, meta) =>
+            Boolean(repoPath) &&
+            (sameRepo(fact.repoPath, repoPath as string, pathOpts) ||
+              (meta.checkout !== undefined && sameRepo(fact.repoPath, meta.checkout, pathOpts))),
+          splitLeafIds: new Set(split ? split.groups.flatMap((group) => leafPaneIds(group.tree)) : []),
+          maxTabs: MAX_STRIP_TABS,
+        });
+        if (plan.tabs.length > 0) {
+          const built = buildRestoredStrip(plan);
+          let next = built.state;
+          for (const entry of plan.tabs) {
+            const id = built.idMap.get(entry.oldId);
+            if (id) next = applyPersistedLeafMeta(next, id, entry.meta);
+          }
+          // Tabs a launch request opened while the host was being listed stay, after these.
+          const existing = tabState.tabs;
+          const tabs = [...next.tabs, ...existing].slice(0, MAX_STRIP_TABS);
+          // The tab a request is opening keeps focus; otherwise the saved one has it.
+          tabState = { tabs, activeId: tabState.activeId ?? next.activeId };
+          restoredIdMap = built.idMap;
+          deferredTabs = built.deferred;
+          restored = true;
+        }
+      } catch {
+        /* localStorage unavailable: nothing to restore */
+      }
+      if (!restored && tabState.tabs.length === 0 && !requestWillOpenFirstTab()) tabState = initialState();
+    });
+  });
+
+  /**
+   * A restored background tab takes its session over when it is first shown,
+   * not at reload: every tab attaching at once would put a terminal, a watch
+   * and an output stream for each of 17+ sessions on a page that is still
+   * starting. Until then its session stays listed in Sessions, still
+   * counted against the limit and still watched for its exit.
+   */
+  $effect(() => {
+    if (deferredTabs.size === 0) return;
+    const shown = splitIds ?? (tabState.activeId ? [tabState.activeId] : []);
+    const due = shown.filter((id) => deferredTabs.has(id));
+    if (due.length === 0) return;
+    untrack(() => {
+      for (const id of due) {
+        const attach = tabState.tabs.find((tab) => tab.id === id)?.attachSessionId;
+        if (attach) reclaimAdoptedSession(attach);
+      }
+      const next = new Set(deferredTabs);
+      for (const id of due) next.delete(id);
+      deferredTabs = next;
+    });
+  });
+
   $effect(() => {
     const key = splitStorageKey(repoPath);
     const readyToHydrate = !isTauri() || $detachedAdoptionSettled || adoptionTimedOut;
     const ids = new Set(tabState.tabs.map((tab) => tab.id));
-    if (!key || !readyToHydrate || hydratedSplitForRepo === key || ids.size === 0) return;
+    if (!key || !readyToHydrate || stripRestorePending || hydratedSplitForRepo === key || ids.size === 0) return;
     hydratedSplitForRepo = key;
     untrack(() => {
       if (splitGroups.length > 0) return;
@@ -748,16 +868,21 @@
         const parsed = parsePersistedSplitWorkspace(stored);
         if (!parsed || parsed.groups.length === 0) return;
         const paneIdMap = new Map<string, string>();
-        for (const id of ids) paneIdMap.set(id, id);
+        // After a restore the saved ids belong to the old page; this page's
+        // tab-N ids are fresh, so identity would pair a leaf with whatever
+        // tab happens to carry the same number.
+        if (restoredIdMap) for (const [oldId, newId] of restoredIdMap) paneIdMap.set(oldId, newId);
+        else for (const id of ids) paneIdMap.set(id, id);
         let nextState = tabState;
         const usedCurrentTabs = new Set<string>();
         const allPersistedLeaves = parsed.groups.flatMap((group) => leafPaneIds(group.tree));
         for (const leafId of allPersistedLeaves) {
-          if (usedCurrentTabs.has(leafId)) continue;
+          const mappedId = paneIdMap.get(leafId);
+          if (mappedId !== undefined && usedCurrentTabs.has(mappedId)) continue;
           const meta = parsed.leaves[leafId];
-          if (paneIdMap.has(leafId)) {
-            usedCurrentTabs.add(leafId);
-            nextState = applyPersistedLeafMeta(nextState, leafId, meta);
+          if (mappedId !== undefined) {
+            usedCurrentTabs.add(mappedId);
+            nextState = applyPersistedLeafMeta(nextState, mappedId, meta);
             continue;
           }
           if (!meta) continue;
@@ -828,6 +953,9 @@
               }
             }
           }
+          // After a restore a session leaf whose session is gone has no tab; pairing
+          // it with any other tab of its launcher would split the wrong session.
+          if (restoredIdMap && meta.backendSessionId) continue;
           const fallbackExisting = nextState.tabs.find(
             (tab) => !usedCurrentTabs.has(tab.id) && tab.launcher === meta.launcher,
           );
@@ -903,6 +1031,15 @@
       flushPendingSplitPersist();
     }
     if (!key || hydratedSplitForRepo !== key) return;
+    // Saved beside the split layout, by backend session id, so a reload can put
+    // every tab back (`reloadRestore`). Read here so the effect follows it.
+    const backendIdOf = (tab: TerminalTab) => backendSessionIdByTabId[tab.id] || tab.attachSessionId;
+    const strip = buildTabStrip(
+      tabState.tabs,
+      tabState.activeId,
+      backendIdOf,
+      (tab) => tabStatuses[tab.id] === "exited",
+    );
     if (currentGroups.length === 0) {
       if (pendingSplitWrite?.key === key) {
         if (splitPersistTimer !== null) {
@@ -911,12 +1048,13 @@
         }
         pendingSplitWrite = null;
       }
+      const stripOnly = composeWorkspaceWithStrip(null, strip);
       if (
         lastPersistedSplitKey !== key ||
-        lastPersistedSplitJson !== null ||
-        lastPersistedStructuralJson !== null
+        lastPersistedSplitJson !== stripOnly ||
+        lastPersistedStructuralJson !== stripOnly
       ) {
-        writeSplitStorage(key, null, null);
+        writeSplitStorage(key, stripOnly, stripOnly);
       }
       return;
     }
@@ -928,39 +1066,21 @@
     const structuralLeaves: Record<string, PersistedSplitLeafMeta> = {};
     currentTabs.forEach((tab, slotIndex) => {
       if (!groupedLeaves.has(tab.id)) return;
-      const backendId = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
-      const structuralMeta: PersistedSplitLeafMeta = {
-        launcher: tab.launcher,
-        slotIndex,
-        ...(tab.name ? { name: tab.name } : {}),
-        ...(tab.launchName ? { launchName: tab.launchName } : {}),
-        ...(tab.userNamed ? { userNamed: true } : {}),
-        ...(tab.pinned ? { pinned: true } : {}),
-        ...(tab.kept ? { kept: true } : {}),
-        ...(backendId ? { backendSessionId: backendId } : {}),
-        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
-        ...(tab.filePath ? { filePath: tab.filePath } : {}),
-        ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
-        ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
-        ...(tab.snippet
-          ? {
-              snippet: {
-                title: tab.snippet.title,
-                content: tab.snippet.content.slice(0, MAX_PERSISTED_SNIPPET_CHARS),
-              },
-            }
-          : {}),
-        ...(tab.url ? { url: tab.url } : {}),
-        ...(tab.checkout ? { checkout: tab.checkout } : {}),
-      };
+      const structuralMeta = leafMetaForTab(tab, slotIndex, backendIdOf(tab));
       leaves[tab.id] = tab.title ? { ...structuralMeta, title: tab.title } : structuralMeta;
       if (!draggingSash) structuralLeaves[tab.id] = structuralMeta;
     });
 
-    const serialized = serializeSplitWorkspace(currentGroups, leaves, currentActiveGroupId);
+    const serialized = composeWorkspaceWithStrip(
+      serializeSplitWorkspace(currentGroups, leaves, currentActiveGroupId),
+      strip,
+    );
     const structuralJson = draggingSash
       ? lastPersistedStructuralJson
-      : serializeSplitWorkspace(currentGroups, structuralLeaves, currentActiveGroupId);
+      : composeWorkspaceWithStrip(
+          serializeSplitWorkspace(currentGroups, structuralLeaves, currentActiveGroupId),
+          strip,
+        );
     const latestKey = pendingSplitWrite ? pendingSplitWrite.key : lastPersistedSplitKey;
     const latestSerialized = pendingSplitWrite
       ? pendingSplitWrite.serialized
@@ -6888,7 +7008,7 @@
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
             />
-            {:else}
+            {:else if !deferredTabs.has(tab.id)}
             <TerminalSession
               taskRunId={tab.taskRunId}
               resume={tab.resume}

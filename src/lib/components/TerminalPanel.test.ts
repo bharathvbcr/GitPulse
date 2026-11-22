@@ -521,8 +521,8 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
 
     // 5. Cold-boot file split preserves an anchor shell, folder drops on file panes forward to session, and ledger rows suppress generic startup titles
     const initialTabsBody = source.slice(
+      source.indexOf("function requestWillOpenFirstTab(): boolean"),
       source.indexOf("function initialTabs(): TabState"),
-      source.indexOf("let tabState = $state<TabState>"),
     );
     expect(initialTabsBody).toContain('launch.launcher === "file"');
     expect(initialTabsBody).toContain('launch.fileOpenMode !== "tab"');
@@ -579,5 +579,27 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain('data-testid="terminal-tab-opt-copy-on-select"');
     expect(source).toContain("initialCommand={tab.initialCommand}");
     expect(source).toContain("onRunInNewShell={(cmd, sub) => void runCommandInNewSplitShell(tab.id, cmd, sub)}");
+  });
+});
+
+describe("TerminalPanel reload restore wiring", () => {
+  // The restore decisions are pure (reloadRestore.test.ts); these pin that the
+  // effects stay thin callers and run in the order the design needs.
+  it("restores the saved strip before the split hydration, which remaps through it", () => {
+    const restore = source.indexOf("if (!stripRestorePending) return;");
+    const hydrate = source.indexOf("stripRestorePending || hydratedSplitForRepo === key");
+    expect(restore).toBeGreaterThan(-1);
+    expect(hydrate).toBeGreaterThan(restore);
+    expect(source).toContain("if (restoredIdMap) for (const [oldId, newId] of restoredIdMap) paneIdMap.set(oldId, newId);");
+    expect(source).toContain("planReloadRestore({");
+    expect(source).toContain("composeWorkspaceWithStrip(");
+  });
+  it("starts empty, not with a fresh shell, while a saved strip awaits the host's session list", () => {
+    const body = source.slice(source.indexOf("function initialTabs(): TabState"), source.indexOf("let tabState = $state<TabState>"));
+    expect(body).toContain("if (stripRestorePending) return { tabs: [], activeId: null };");
+  });
+  it("mounts a restored background tab's session only when it is first shown", () => {
+    expect(source).toContain("{:else if !deferredTabs.has(tab.id)}");
+    expect(source).toContain("if (attach) reclaimAdoptedSession(attach);");
   });
 });
