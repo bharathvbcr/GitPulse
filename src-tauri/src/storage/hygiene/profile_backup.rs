@@ -167,6 +167,9 @@ pub(super) fn resolve(profile: &Path, name: &str) -> Result<PathBuf, CommandErro
     Ok(path)
 }
 
+/// Shown on the preview and in the native confirmation: one copy of the text.
+pub(super) const WARNING: &str = "Removes this pre-upgrade copy of the workbench profile permanently. Without it that schema upgrade cannot be rolled back. Only this confirmed action removes it; no scheduled run does.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +307,7 @@ mod tests {
             },
             busy,
             resolver,
+            |_, _| true,
         )
         .unwrap();
 
@@ -322,6 +326,131 @@ mod tests {
         ] {
             assert!(dir.join(kept).exists(), "{kept} must survive");
         }
+    }
+
+    fn backup_plan(repo: &str, resolver: impl Fn() -> Result<PathBuf, CommandError>) -> String {
+        prepare_with_profile(
+            repo,
+            &format!("{TARGET_PREFIX}{BACKUP}"),
+            30,
+            |_| Ok(()),
+            resolver,
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn a_declined_confirmation_leaves_the_backup_and_returns_a_refusal() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(repo, resolver);
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let result = execute_with_profile(
+            repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |title, message| {
+                asked
+                    .borrow_mut()
+                    .push((title.to_owned(), message.to_owned()));
+                false
+            },
+        );
+
+        let Err(error) = result else {
+            panic!("a declined removal is a refusal");
+        };
+        assert!(error.message().contains("declined"), "{}", error.message());
+        assert!(dir.join(BACKUP).exists(), "nothing is removed on a decline");
+        let asked = asked.borrow();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0]
+            .1
+            .contains(&dir.join(BACKUP).to_string_lossy().into_owned()));
+        assert!(asked[0].1.contains("cannot be rolled back"));
+    }
+
+    #[test]
+    fn an_accepted_confirmation_removes_the_backup() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(repo, resolver);
+
+        let (_, outcome) =
+            execute_with_profile(repo, &id, |_, _| Ok(()), |_| Ok(()), resolver, |_, _| true)
+                .unwrap();
+
+        assert!(outcome.success, "{}", outcome.message);
+        assert!(!dir.join(BACKUP).exists());
+    }
+
+    #[test]
+    fn the_confirmation_is_asked_before_the_policy_gate() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(repo, resolver);
+        let order = std::cell::RefCell::new(Vec::new());
+
+        execute_with_profile(
+            repo,
+            &id,
+            |_, _| {
+                order.borrow_mut().push("gate");
+                Ok(())
+            },
+            |_| Ok(()),
+            resolver,
+            |_, _| {
+                order.borrow_mut().push("confirm");
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*order.borrow(), ["confirm", "gate"]);
+    }
+
+    #[test]
+    fn a_declined_confirmation_never_reaches_the_gate() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(repo, resolver);
+        let mut gated = false;
+
+        let result = execute_with_profile(
+            repo,
+            &id,
+            |_, _| {
+                gated = true;
+                Ok(())
+            },
+            |_| Ok(()),
+            resolver,
+            |_, _| false,
+        );
+
+        assert!(result.is_err());
+        assert!(!gated);
     }
 
     #[test]
@@ -459,8 +588,15 @@ mod tests {
             resolver,
         )
         .unwrap();
-        let (_, outcome) =
-            execute_with_profile(repo, &plan.id, |_, _| Ok(()), |_| Ok(()), resolver).unwrap();
+        let (_, outcome) = execute_with_profile(
+            repo,
+            &plan.id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| true,
+        )
+        .unwrap();
         assert!(outcome.success, "{}", outcome.message);
         assert!(!dir.join("workbench.sqlite.hard.bak").exists());
         assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
@@ -485,7 +621,14 @@ mod tests {
         fs::remove_file(dir.join(BACKUP)).unwrap();
         std::os::unix::fs::symlink(&profile, dir.join(BACKUP)).unwrap();
 
-        let result = execute_with_profile(repo, &plan.id, |_, _| Ok(()), |_| Ok(()), resolver);
+        let result = execute_with_profile(
+            repo,
+            &plan.id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| true,
+        );
 
         assert!(
             result.is_err(),
@@ -523,6 +666,7 @@ mod tests {
             },
             |_| Ok(()),
             resolver,
+            |_, _| true,
         );
         assert!(result.is_err() || fs::symlink_metadata(&swapped).is_err());
         assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");

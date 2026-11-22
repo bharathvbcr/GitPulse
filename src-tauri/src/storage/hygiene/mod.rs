@@ -460,7 +460,13 @@ fn prepare_with_profile(
         (path, native, label, "repository", "Removes the reviewed generated files permanently. Rebuilding costs time. Sizes are logical bytes, not guaranteed free disk space; hardlinks and filesystem clones can share storage.")
     } else if let Some(name) = target.strip_prefix(profile_backup::TARGET_PREFIX) {
         let path = profile_backup::resolve(&profile()?, name)?;
-        (path, None, format!("profile backup {name}"), profile_backup::SCOPE, "Removes this pre-upgrade copy of the workbench profile permanently. Without it that schema upgrade cannot be rolled back. Only this confirmed action removes it; no scheduled run does.")
+        (
+            path,
+            None,
+            format!("profile backup {name}"),
+            profile_backup::SCOPE,
+            profile_backup::WARNING,
+        )
     } else if let Some(id) = target.strip_prefix("cache:") {
         let home = home_dir()?;
         let path = managed_cache_path(&cache_path(id, &home)?, &home)?;
@@ -555,7 +561,29 @@ pub fn execute<T>(
     mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
 ) -> Result<(T, HygieneOutcome), CommandError> {
     let _lock = global::mutation_lock()?;
+    // No confirmation channel here: a profile backup is declined, so a caller
+    // that cannot ask the person (the steward, scheduled runs) cannot remove one.
     execute_with_activity(repo_path, id, &mut gate, activity_check)
+}
+
+/// `execute` for a caller that can ask the person: `confirm(title, message)`
+/// must be a native prompt that page script cannot answer. It is asked only for
+/// a profile backup, before the gate runs.
+pub fn execute_confirmed<T>(
+    repo_path: &str,
+    id: &str,
+    mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
+    confirm: impl Fn(&str, &str) -> bool,
+) -> Result<(T, HygieneOutcome), CommandError> {
+    let _lock = global::mutation_lock()?;
+    execute_with_profile(
+        repo_path,
+        id,
+        &mut gate,
+        activity_check,
+        profile_path,
+        confirm,
+    )
 }
 
 fn execute_with_activity<T>(
@@ -564,7 +592,7 @@ fn execute_with_activity<T>(
     gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
     activity: impl Fn(&Path) -> Result<(), CommandError>,
 ) -> Result<(T, HygieneOutcome), CommandError> {
-    execute_with_profile(repo_path, id, gate, activity, profile_path)
+    execute_with_profile(repo_path, id, gate, activity, profile_path, |_, _| false)
 }
 
 fn execute_with_profile<T>(
@@ -573,6 +601,7 @@ fn execute_with_profile<T>(
     mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
     activity: impl Fn(&Path) -> Result<(), CommandError>,
     profile: impl Fn() -> Result<PathBuf, CommandError>,
+    confirm: impl Fn(&str, &str) -> bool,
 ) -> Result<(T, HygieneOutcome), CommandError> {
     let _lock = exclusive(
         &EXECUTION,
@@ -635,6 +664,16 @@ fn execute_with_profile<T>(
         }
     };
     in_use(path)?;
+    // Asked before the gate so the snapshot recheck after it also covers the
+    // time the dialog was open.
+    if plan.view.scope == profile_backup::SCOPE
+        && !confirm(
+            "Remove workbench profile backup",
+            &format!("{}\n\n{}", plan.view.path, profile_backup::WARNING),
+        )
+    {
+        return Err("You declined to remove this profile backup; nothing was removed".into());
+    }
     let policy = gate(
         plan.invocation.as_ref().map(|i| i.argv.as_slice()),
         &plan.view.path,
