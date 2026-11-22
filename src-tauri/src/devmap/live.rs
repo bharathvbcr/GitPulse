@@ -477,7 +477,7 @@ const PROBE_FRESH: Duration = Duration::from_secs(2);
 /// Status probes in flight at once across every repository. A probe that hangs
 /// holds a thread for up to [`cli::STATUS_DEADLINE`]; this is what keeps a
 /// restore of many tabs from holding one each.
-const PROBE_LIMIT: usize = 4;
+pub(crate) const PROBE_LIMIT: usize = 4;
 
 /// What [`start_refresh`] knows about the `devmap status` probe of one repository.
 enum ProbeSlot {

@@ -661,76 +661,129 @@ fn limit_build_threads(cmd: &mut Command) {
 /// git budget.
 const READ_VERBS: [&str; 3] = ["status", "preview", "doctor"];
 
-/// `devmap` reads in flight at once, across every repository.
+/// `devmap` reads in flight at once, across every repository of this process
+/// (the bound is per process, not per user: the git budget's shared record does
+/// not see these children).
 ///
 /// The git budget cannot bound these: a read on a stacked lane starts git
 /// inside `devmap`, where the gate does not see it, and every read costs the
-/// store's CPU and file cache whatever it spawns. A few at a time is what the
-/// code map needs (one probe per open repository, see `live::PROBE_LIMIT`).
-pub(crate) const READ_SLOTS: usize = 4;
+/// store's CPU and file cache whatever it spawns. The slots are split by
+/// admission class the way the git gate splits its own ([`Admission`]):
+/// background reads (the code map's probes, at most `live::PROBE_LIMIT` of them)
+/// may hold only [`BACKGROUND_READ_SLOTS`], and the rest are kept for the user's
+/// own reads (a Refresh, doctor, preview: reactive or interactive work), so a
+/// full set of probes, each holding a slot for as long as its child runs, can
+/// never defer them.
+pub(crate) const BACKGROUND_READ_SLOTS: usize = super::live::PROBE_LIMIT;
+
+/// Slots kept for reads that are not background work.
+const USER_READ_SLOTS: usize = 2;
+
+pub(crate) const READ_SLOTS: usize = BACKGROUND_READ_SLOTS + USER_READ_SLOTS;
 
 /// How long a read waits for one of [`READ_SLOTS`] before it is deferred. The
 /// same bound a reactive git read waits for a spawn token.
 const READ_WAIT: Duration = process::SPAWN_QUEUE_BUDGET;
 
-/// The devmap read budget: a counted slot with a bounded wait.
+/// The devmap read budget: counted slots with a bounded wait, a share of them
+/// closed to background work.
 pub(crate) struct ReadBudget {
     slots: usize,
-    in_flight: Mutex<usize>,
+    background_slots: usize,
+    held: Mutex<ReadsHeld>,
     freed: std::sync::Condvar,
 }
 
+#[derive(Default)]
+struct ReadsHeld {
+    total: usize,
+    background: usize,
+}
+
 /// One of the budget's slots, returned on drop.
-pub(crate) struct ReadPermit<'a>(&'a ReadBudget);
+pub(crate) struct ReadPermit<'a> {
+    budget: &'a ReadBudget,
+    background: bool,
+}
 
 impl Drop for ReadPermit<'_> {
     fn drop(&mut self) {
-        *self
-            .0
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
-        self.0.freed.notify_one();
+        {
+            let mut held = self
+                .budget
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.total -= 1;
+            held.background -= usize::from(self.background);
+        }
+        // Waiters of different classes are blocked by different conditions, so
+        // waking one could wake a background waiter that still cannot run.
+        self.budget.freed.notify_all();
     }
 }
 
 impl ReadBudget {
-    pub(crate) const fn new(slots: usize) -> Self {
+    pub(crate) const fn new(slots: usize, background_slots: usize) -> Self {
         Self {
             slots,
-            in_flight: Mutex::new(0),
+            background_slots,
+            held: Mutex::new(ReadsHeld {
+                total: 0,
+                background: 0,
+            }),
             freed: std::sync::Condvar::new(),
         }
     }
 
-    /// A slot, waiting at most `wait` for one. A refusal is a deferral in the
-    /// shape every reader of one matches, and names this budget, not git's.
+    /// A slot for the calling thread's admission class, waiting at most `wait`
+    /// for one. A refusal is a deferral in the shape every reader of one
+    /// matches, and names this budget, not git's.
     pub(crate) fn admit(&self, wait: Duration) -> Result<ReadPermit<'_>, CommandError> {
+        let background = process::current_admission_name() == "background";
+        let cap = if background {
+            self.background_slots.min(self.slots)
+        } else {
+            self.slots
+        };
         let began = Instant::now();
-        let mut in_flight = self
-            .in_flight
+        let mut held = self
+            .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *in_flight >= self.slots {
+        loop {
+            let open = held.total < self.slots && (!background || held.background < cap);
+            if open {
+                break;
+            }
             let left = wait.saturating_sub(began.elapsed());
             if left.is_zero() {
                 return Err(process::deferred_under_load_error(
                     "devmap",
                     began.elapsed(),
                     &format!(
-                        "{} devmap reads are already running and none finished in time",
-                        self.slots
+                        "{} of {} devmap read slots are already held and none was released in time",
+                        if background {
+                            held.background
+                        } else {
+                            held.total
+                        },
+                        if background { cap } else { self.slots }
                     ),
                 ));
             }
-            in_flight = self
+            held = self
                 .freed
-                .wait_timeout(in_flight, left)
+                .wait_timeout(held, left)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        *in_flight += 1;
-        Ok(ReadPermit(self))
+        held.total += 1;
+        held.background += usize::from(background);
+        Ok(ReadPermit {
+            budget: self,
+            background,
+        })
     }
 }
 
@@ -739,13 +792,13 @@ fn read_budget() -> &'static ReadBudget {
     if let Some(budget) = TEST_READ_BUDGET.get() {
         return budget;
     }
-    static BUDGET: ReadBudget = ReadBudget::new(READ_SLOTS);
+    static BUDGET: ReadBudget = ReadBudget::new(READ_SLOTS, BACKGROUND_READ_SLOTS);
     &BUDGET
 }
 
-/// The budget (and wait) this thread's reads use instead of the process's:
-/// set by [`with_read_budget`], so a test can fill the slots without taking
-/// them from every other test.
+// The budget (and wait) this thread's reads use instead of the process's:
+// set by `with_read_budget`, so a test can fill the slots without taking
+// them from every other test.
 #[cfg(test)]
 thread_local! {
     static TEST_READ_BUDGET: std::cell::Cell<Option<&'static ReadBudget>> =
@@ -2854,7 +2907,7 @@ exit 2
         fs::write(&lease, r#"{"format_version":1}"#).unwrap();
         let _devmap = bind_recording_devmap(repo.path());
         let path = canonical.to_str().unwrap();
-        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2)));
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2, 2)));
         let held: Vec<_> = (0..2)
             .map(|_| budget.admit(Duration::ZERO).expect("a free slot"))
             .collect();
@@ -2906,7 +2959,7 @@ exit 2
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
         let _devmap = bind_test_binary(stub.to_string_lossy().into_owned());
         let path = canonical.to_str().unwrap();
-        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2)));
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2, 2)));
         let answers: Vec<CliStatus> = std::thread::scope(|scope| {
             let readers: Vec<_> = (0..6)
                 .map(|_| {
@@ -2931,6 +2984,102 @@ exit 2
         }
         assert_eq!(depth, 0);
         assert!(deepest <= 2, "{deepest} children at once, budget is 2");
+    }
+
+    /// The reserve is real in both directions: background reads stop at their
+    /// share however many slots are free, and a slot that is not theirs is
+    /// there for a read that is not background work.
+    #[test]
+    fn background_reads_cannot_take_the_slots_kept_for_the_user() {
+        use crate::engine::process::with_background_processes;
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(3, 2)));
+        let held: Vec<_> = with_background_processes(|| {
+            (0..2)
+                .map(|_| budget.admit(Duration::ZERO).expect("a background slot"))
+                .collect()
+        });
+        let refused = with_background_processes(|| budget.admit(Duration::ZERO))
+            .err()
+            .expect("a third background read has no slot");
+        assert!(
+            crate::engine::process::is_deferred_under_load(refused.message()),
+            "not a deferral: {}",
+            refused.message()
+        );
+        let user = budget.admit(Duration::ZERO).expect("the reserved slot");
+        assert!(budget.admit(Duration::ZERO).is_err(), "all three are held");
+        drop(held);
+        drop(user);
+        assert!(budget.admit(Duration::ZERO).is_ok(), "every slot came back");
+    }
+
+    /// A budget shaped as the process's own, leaked so a test can hold slots.
+    fn production_shaped_budget() -> &'static ReadBudget {
+        Box::leak(Box::new(ReadBudget::new(READ_SLOTS, BACKGROUND_READ_SLOTS)))
+    }
+
+    /// The code map's probes run as background work, up to `live::PROBE_LIMIT`
+    /// at once, and a probe holds a slot for as long as its child runs. A
+    /// user's own read (Refresh, doctor, preview: reactive or interactive work)
+    /// must not queue behind them: it is admitted at once beside a full set of
+    /// probes, while the probes themselves are still admitted up to their limit
+    /// (card ft-f815889e, review finding C6).
+    #[test]
+    #[cfg(unix)]
+    fn a_users_devmap_read_is_not_deferred_by_a_full_set_of_background_probes() {
+        use crate::engine::process::{run_as_user_action, with_background_processes};
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let stub = repo.path().join("devmap");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'S\\n' >> depth.log\nsleep 2\nprintf '%s\\n' '{\"is_fresh\":true,\"schema_outdated\":false}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let _devmap = bind_test_binary(stub.to_string_lossy().into_owned());
+        let path = canonical.to_str().unwrap();
+        let budget = production_shaped_budget();
+        let started =
+            || fs::read_to_string(canonical.join("depth.log")).map_or(0, |log| log.lines().count());
+        let (background, user, interactive) = std::thread::scope(|scope| {
+            let probes: Vec<_> = (0..crate::devmap::live::PROBE_LIMIT)
+                .map(|_| {
+                    scope.spawn(|| {
+                        with_read_budget(budget, Duration::from_secs(20), || {
+                            with_background_processes(|| status(path))
+                        })
+                    })
+                })
+                .collect();
+            let patience = Instant::now();
+            while started() < crate::devmap::live::PROBE_LIMIT
+                && patience.elapsed()
+                    < crate::test_support::coverage_relaxed(Duration::from_secs(10))
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                started(),
+                crate::devmap::live::PROBE_LIMIT,
+                "every probe up to the probe limit is admitted at once"
+            );
+            let user = with_read_budget(budget, Duration::from_millis(150), || status(path));
+            let interactive = with_read_budget(budget, Duration::from_millis(150), || {
+                run_as_user_action(|| status(path))
+            });
+            let background: Vec<CliStatus> =
+                probes.into_iter().map(|p| p.join().unwrap()).collect();
+            (background, user, interactive)
+        });
+        assert!(background.iter().all(|a| a.available), "{background:?}");
+        assert!(user.available, "a reactive read was deferred: {user:?}");
+        assert!(
+            interactive.available,
+            "a user action's read was deferred: {interactive:?}"
+        );
     }
 
     /// A build that ran out of time is an outcome with `timed_out`; one that
