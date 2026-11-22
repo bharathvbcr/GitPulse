@@ -555,7 +555,9 @@ pub fn provision_worktree_devmap(
     let target_compact_graph = devmap_query::paths::compact_code_graph_path(&worktree);
 
     let (csr_seeded, repo_map_seeded) = std::thread::scope(|scope| {
-        let csr_task = scope.spawn(|| {
+        // New threads start in the process default class; both tasks read git
+        // (`check-ignore`) for the provisioning the caller asked for.
+        let csr_task = scope.spawn(crate::engine::process::carry_admission(|| {
             if anchor_csr.is_file()
                 && !target_csr.exists()
                 && reflink_copy_file(&anchor_csr, &target_csr).is_ok()
@@ -576,9 +578,9 @@ pub fn provision_worktree_devmap(
                 return true;
             }
             materialize_csr_from_store(&seeded_store, &target_csr)
-        });
+        }));
 
-        let manifest_task = scope.spawn(|| {
+        let manifest_task = scope.spawn(crate::engine::process::carry_admission(|| {
             let map_ok = devmap_store::seed::seed_artifact(&anchor_repo_map, &target_repo_map)
                 .ok()
                 .flatten()
@@ -600,7 +602,7 @@ pub fn provision_worktree_devmap(
                 }
             }
             map_ok
-        });
+        }));
 
         (
             csr_task.join().unwrap_or(false),

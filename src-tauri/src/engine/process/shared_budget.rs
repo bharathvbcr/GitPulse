@@ -79,9 +79,30 @@ pub(super) fn default_path() -> Result<PathBuf, String> {
 }
 
 /// The environment variable an isolated test profile sets to allow
-/// [`exhaust_per_user_record`].
+/// [`exhaust_per_user_record`]. Its value is the profile's home directory: the
+/// spend is refused unless the per-user record lives under it.
 #[doc(hidden)]
 pub const EXHAUST_RECORD_MARKER: &str = "GITPULSE_TEST_ISOLATED_PROFILE_MAY_EXHAUST_SPAWN_BUDGET";
+
+/// Whether a profile that set the marker to `marker` may spend the record at
+/// `record`: only when the record is under the directory the marker names.
+pub(super) fn spend_allowed(marker: Option<&std::ffi::OsStr>, record: &Path) -> Result<(), String> {
+    let Some(home) = marker.filter(|home| !home.is_empty()) else {
+        return Err(format!(
+            "refusing to spend the per-user spawn budget record: {EXHAUST_RECORD_MARKER} is not set, \
+             so this may not be an isolated test profile"
+        ));
+    };
+    if record.starts_with(home) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to spend {}: it is not under the isolated profile {}",
+            record.display(),
+            Path::new(home).display()
+        ))
+    }
+}
 
 /// Spends the per-user record down to nothing (the state a storm leaves it in)
 /// and returns how many tokens that took.
@@ -95,14 +116,10 @@ pub const EXHAUST_RECORD_MARKER: &str = "GITPULSE_TEST_ISOLATED_PROFILE_MAY_EXHA
 /// cannot drain the real record.
 #[doc(hidden)]
 pub fn exhaust_per_user_record() -> Result<u32, String> {
-    if std::env::var_os(EXHAUST_RECORD_MARKER).is_none() {
-        return Err(format!(
-            "refusing to spend the per-user spawn budget record: {EXHAUST_RECORD_MARKER} is not set, \
-             so this may not be an isolated test profile"
-        ));
-    }
+    let path = default_path()?;
+    spend_allowed(std::env::var_os(EXHAUST_RECORD_MARKER).as_deref(), &path)?;
     let (burst, per_sec) = super::gate::production_spawn_rate();
-    let budget = SharedBudget::open(&default_path()?)?;
+    let budget = SharedBudget::open(&path)?;
     let mut spent = 0;
     // A full record holds `burst` tokens, so more takes than that means the
     // record is not draining.

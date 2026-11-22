@@ -56,15 +56,28 @@ fn exhaust_budget_subprocess_helper() {
 
 /// Leaves the isolated profile's per-user git spawn budget empty, as a storm
 /// does: every CLI run in `home` then finds the shared bucket at zero.
-fn exhaust_budget_in_isolated_home(home: &Path) {
+fn try_exhaust_budget_in_isolated_home(home: &Path) -> bool {
     fs::create_dir_all(home).unwrap();
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "exhaust_budget_subprocess_helper", "--ignored"])
         .envs(profile_env(home))
-        .env(gitpulse_lib::engine::process::EXHAUST_RECORD_MARKER, "1")
-        .status_locked()
-        .unwrap();
-    assert!(status.success(), "exhausting the isolated budget failed");
+        .env(gitpulse_lib::engine::process::EXHAUST_RECORD_MARKER, home)
+        .status_locked();
+    matches!(status, Ok(status) if status.success())
+}
+
+/// [`try_exhaust_budget_in_isolated_home`], retried: one failed helper start
+/// (a loaded host) is not a failed test.
+fn exhaust_budget_in_isolated_home(home: &Path) {
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if try_exhaust_budget_in_isolated_home(home) {
+            return;
+        }
+    }
+    panic!("exhausting the isolated budget failed after 5 attempts");
 }
 
 /// Runs `body` while a second thread keeps the isolated profile's per-user git
@@ -73,18 +86,27 @@ fn exhaust_budget_in_isolated_home(home: &Path) {
 /// under test a budget it should not have had, and a test of "not shed when
 /// the budget is spent" would pass on code that sheds.
 fn with_budget_kept_spent<T>(home: &Path, body: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the keeper however `body` ends, so a panicking body fails the test
+    /// instead of leaving the scope waiting on a keeper that never stops.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     exhaust_budget_in_isolated_home(home);
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let keeper = scope.spawn(|| {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                exhaust_budget_in_isolated_home(home);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                // A helper that failed to start is retried on the next pass.
+                try_exhaust_budget_in_isolated_home(home);
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         });
-        let result = body();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        keeper.join().expect("budget keeper");
-        result
+        let _stop = Stop(&stop);
+        body()
     })
 }
 
@@ -492,6 +514,12 @@ fn assert_built_with_the_budget_spent(home: &Path, args: &[&str]) -> Value {
 #[test]
 fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
     let (home, workspace, anchor) = spent_budget_fixture();
+    // Copy-mode provisioning rebuilds a missing anchor CSR sidecar, which needs
+    // a git read (`check-ignore`) on a thread of its own.
+    let anchor_csr = Store::csr_sidecar_path(&devmap_query::paths::store_path(
+        anchor.canonicalize().unwrap(),
+    ));
+    fs::remove_file(&anchor_csr).expect("the fixture seeds an anchor CSR");
     let wt = workspace.path().join("wt-spent-budget");
     assert_built_with_the_budget_spent(
         home.path(),
@@ -505,6 +533,10 @@ fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() 
             wt.to_str().unwrap(),
             "--json",
         ],
+    );
+    assert!(
+        anchor_csr.is_file(),
+        "the anchor CSR sidecar was not rebuilt: its thread was shed"
     );
 }
 
