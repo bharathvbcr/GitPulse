@@ -2186,6 +2186,7 @@
       checkout: tab.checkout ?? here ?? "",
       live: tabStatuses[tab.id] !== "exited" && tabStatuses[tab.id] !== "error",
       visible: visibleIds.includes(tab.id),
+      name: tabLabel(tab),
     }));
     untrack(() => {
       if (publishedRecipientsFor && publishedRecipientsFor !== here) forgetRecipients(publishedRecipientsFor);

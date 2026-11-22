@@ -227,10 +227,29 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await repoStore.refresh(root);
   await wait(300);
 
+  // Lines 1-2 selected before editing: the editor has no line numbers to select by, so a selection made now is what a send from the draft uses.
+  {
+    const lineButton = n => [...host.querySelectorAll("button")].find(b => b.textContent.trim() === String(n) && b.className.includes("w-12"));
+    await until(() => lineButton(1) && lineButton(2), "line numbers to select by");
+    lineButton(1).click(); lineButton(2).dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })); await tick();
+  }
   button("Edit").click();
   await until(textarea, "the editor opens");
   await type("one\ntwo\nmine\n");
   check("a clean file shows no conflict banner", () => banner() === null);
+
+  // With a draft in the editor the lines sent are the draft's, and the header says so.
+  {
+    const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+    await type("draft one\ntwo\nmine\n");
+    textarea().dispatchEvent(new KeyboardEvent("keydown", { key: "L", code: "KeyL", metaKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    await until(() => get(terminalLaunchRequests), "the draft's content request reaches the launch channel");
+    check("⌘⇧L over an unsaved draft sends the draft's lines and labels the block as an unsaved buffer", () =>
+      get(terminalLaunchRequests).reference === `File: ${file}, lines 1-2, checkout GitPulse (unsaved buffer)\n\`\`\`typescript\ndraft one\ntwo\n\`\`\``);
+    terminalLaunchRequests.take(root).complete();
+    await tick(); await wait(40);
+    await type("one\ntwo\nmine\n");
+  }
 
   // The agent rewrites the file while the draft is open.
   disk = { text: "agent one\nagent two\n", base: "20:bbbb" };

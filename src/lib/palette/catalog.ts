@@ -1,3 +1,4 @@
+import { tick } from "svelte";
 import { get } from "svelte/store";
 import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
@@ -111,12 +112,17 @@ function agentSendCommands(state: RepoState, unavailable: string | undefined, ch
       description: file ? `Shows ${file} in the Code page's file tree.` : "Shows the file Explorer has open in the Code page's file tree.",
       keywords: "file reveal explorer tree locate code page", category: "Workspace", icon: FileCode,
       disabledReason: unavailable ?? (file ? undefined : noFile),
-      action: () => {
+      action: async () => {
         checkOrigin();
         if (!file) throw Error(noFile);
         interfaceStore.setGlobalSurface("repository");
         repoStore.setActiveTab("code");
         showExplorerRail("files");
+        // The tree reveals a file when the selection changes to it, and it is
+        // already the selection when this is asked for. Clear it for a frame so
+        // that selecting it again is a change.
+        repoStore.selectFilePath(null);
+        await tick();
         repoStore.selectFilePath(file);
       },
     },

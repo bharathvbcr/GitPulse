@@ -33,6 +33,8 @@ export interface RecipientCandidate {
   live: boolean;
   /** The session's pane is on screen. */
   visible: boolean;
+  /** The tab's own title, to tell two sessions of one kind in one checkout apart. */
+  name?: string;
 }
 
 /** Sessions text can be typed into: not a browser, not a file pane. */
@@ -63,6 +65,11 @@ export function pickRecipient(
 /** "claude · feature-x": the session and the checkout it works in. */
 export function recipientLabel(candidate: RecipientCandidate): string {
   return `${candidate.launcher} · ${displayName(candidate.checkout)}`;
+}
+
+/** A picker row: the label, and the tab's title where that tells apart two sessions that would read alike. */
+export function recipientOptionLabel(candidate: RecipientCandidate): string {
+  return candidate.name ? `${recipientLabel(candidate)} (${candidate.name})` : recipientLabel(candidate);
 }
 
 /** What a viewer shows for a repository: the session text will go to, and every one it could go to. */

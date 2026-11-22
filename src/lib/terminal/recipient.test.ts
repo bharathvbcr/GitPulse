@@ -8,6 +8,7 @@ import {
   recipientChoice,
   recipientDirectory,
   recipientLabel,
+  recipientOptionLabel,
   recipientView,
   type RecipientCandidate,
 } from "./recipient";
@@ -70,6 +71,15 @@ describe("recipientView and label", () => {
 
   it("names the session and its checkout", () => {
     expect(recipientLabel(tab("a", "claude", wt))).toBe("claude · feature-x");
+  });
+
+  it("tells two sessions of one kind in one checkout apart in the picker by the tab's title", () => {
+    const one = tab("a", "claude", main, { name: "Fix importer" });
+    const two = tab("b", "claude", main, { name: "Review" });
+    expect(recipientLabel(one)).toBe(recipientLabel(two));
+    expect(recipientOptionLabel(one)).toBe("claude · repo (Fix importer)");
+    expect(recipientOptionLabel(two)).not.toBe(recipientOptionLabel(one));
+    expect(recipientOptionLabel(tab("c", "shell"))).toBe("shell · repo");
   });
 });
 

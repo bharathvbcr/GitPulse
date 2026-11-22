@@ -86,15 +86,15 @@ describe("palette: the active file", () => {
     expect(calls).toEqual(["request", "dock"]);
   });
 
-  it("reveals it in the explorer: Code page, file tree rail, file selected", () => {
+  it("reveals it in the explorer: Code page, file tree rail, and the file selected anew, since a tree only reveals on a change", async () => {
     expect(find(ready(), "file-reveal-in-explorer").disabledReason).toBe("Open a file in Explorer first.");
     const setTab = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
     const select = vi.spyOn(repoStore, "selectFilePath").mockImplementation(() => {});
     const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
-    void find(ready({ selectedFilePath: "src/a.ts" }), "file-reveal-in-explorer").action();
+    await find(ready({ selectedFilePath: "src/a.ts" }), "file-reveal-in-explorer").action();
     expect(surface).toHaveBeenCalledWith("repository");
     expect(setTab).toHaveBeenCalledWith("code");
-    expect(select).toHaveBeenCalledWith("src/a.ts");
+    expect(select.mock.calls).toEqual([[null], ["src/a.ts"]]);
     expect(get(explorerLens).rail).toBe("files");
   });
 });

@@ -1428,6 +1428,31 @@
             const refused = await terminalLaunchRequests.requestReference(repo, "File: a.ts, lines 1-2\n```\nx\ny\n```", repo).then(() => null, (error) => error.message);
             await wait(100);
             check("a block of lines is refused, with the reason, by a shell that is not in bracketed-paste mode, and nothing is typed", () => /bracketed-paste/.test(refused ?? "") && written.join("") === "");
+            // The same block once the shell has asked for bracketed paste: one paste, never typed line by line.
+            const block = "File: a.ts, lines 1-2\n```\nx\ny\n```";
+            await output(lastWriteId, "\u001b[?2004h");
+            await wait(100);
+            written = [];
+            const delivered = await terminalLaunchRequests.requestReference(repo, block, repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`with bracketed paste on, the block arrives as one bracketed paste (${delivered ?? "ok"})`, () =>
+              delivered === null && written.join("") === `\u001b[200~${block.replaceAll("\n", "\r")}\u001b[201~`);
+            await output(lastWriteId, "\u001b[?2004l");
+            await wait(100);
+            // The context tray: chip with count and bytes, Insert all types the references, Clear empties it.
+            const { addToTray, trayFor } = await import("../src/lib/terminal/contextTray");
+            addToTray(repo, { checkout: repo, path: "a.ts", startLine: 1, endLine: 3 });
+            addToTray(repo, { checkout: repo, path: "b.ts", startLine: 7, endLine: 7 });
+            const chip = () => document.querySelector('[data-testid="terminal-context-tray"]');
+            for (let waited = 0; !chip() && waited < 3000; waited += 50) await wait(50);
+            check("the terminal header shows the tray's count and byte size", () => Boolean(chip()) && chip().textContent.includes("2 references") && chip().textContent.includes("21 B"));
+            written = [];
+            chip().querySelector('[data-testid="terminal-context-tray-insert"]').click();
+            await wait(150);
+            check("Insert all types the references into the live session, unsubmitted, and keeps the tray", () => written.join("") === "@a.ts#L1-L3 @b.ts#L7 " && trayFor(repo).length === 2);
+            chip().querySelector('[data-testid="terminal-context-tray-clear"]').click();
+            await wait(100);
+            check("Clear empties the tray and removes the chip", () => trayFor(repo).length === 0 && !chip());
           }
           // Synthetic Backspace plus the insertText WebKit emits after it.
           // The guard must write one DEL and must not forward the line.

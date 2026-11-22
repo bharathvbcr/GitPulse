@@ -636,7 +636,7 @@
           class="gp-btn py-0! px-1.5! text-micro! flex items-center gap-1"
           title="Insert @path into the active agent terminal"
           data-testid="terminal-file-send-path"
-          onclick={() => filePath && onSendToAgent(`@${filePath} `)}
+          onclick={() => filePath && onSendToAgent(`@${filePath} `, repoPath)}
         >
           <Send size={10} />
           <span>@file</span>
@@ -920,6 +920,7 @@
                         callers: quickLensCallers,
                         totalCallers: quickLensTotalCallers,
                       }),
+                      repoPath,
                     )}
                 >
                   @symbol

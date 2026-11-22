@@ -40,7 +40,7 @@
   import { LAYERS } from "../../ui/layers";
   import { displayName } from "../../repos/paths";
   import { toastStore } from "../../stores/toastStore";
-  import { chooseRecipient, recipientChoice, recipientDirectory, recipientLabel, recipientView } from "../../terminal/recipient";
+  import { chooseRecipient, recipientChoice, recipientDirectory, recipientLabel, recipientOptionLabel, recipientView } from "../../terminal/recipient";
   import { addToTray, MAX_TRAY_ENTRIES } from "../../terminal/contextTray";
   import { composeSelectionContent, formatSelectionRef } from "../../terminal/selectionContent";
   import { clearActiveSelection, setActiveSelection } from "../../terminal/activeSelection";
@@ -506,7 +506,8 @@
   function handleKeydown(e: KeyboardEvent) {
     const sendChord = (e.metaKey || e.ctrlKey) && onSendSelectionToAgent;
     // ⌥ changes `key` on macOS, so the chord with it is matched by the physical key.
-    if (sendChord && e.altKey && !e.shiftKey && e.code === "KeyL") {
+    // Ctrl+Alt is AltGr on some Windows layouts, where it types a character instead.
+    if (sendChord && e.altKey && !e.shiftKey && e.code === "KeyL" && !e.getModifierState("AltGraph")) {
       e.preventDefault();
       e.stopPropagation();
       addSelectionToTray();
@@ -732,7 +733,9 @@
           class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta border-accent/35 text-accent"
           title={recipientText
             ? `Send ${rangeText ? `${rangeText} of ` : ""}${filePath} as @file#Lstart-Lend to ${recipientText}. ${shortcutTextLabel("⌘⇧L", $hostPlatform.os)} sends the lines themselves.`
-            : "No live agent or shell session: this opens the terminal, and fails if there is none to send to"}
+            : $recipientDirectory[sendRepo]
+              ? "No live agent or shell session to send to: open one first"
+              : "No terminal has reported its sessions yet: this opens the terminal, and says so if it has no live agent or shell to send to"}
         >
           <Send size={11} />
           <span>{rangeText ? `Send ${rangeText}` : "Send @file"}{#if recipientText}<span data-testid="code-send-recipient"> → {recipientText}</span>{/if}</span>
@@ -789,7 +792,7 @@
                   restoreFocusTo(pickerAnchor);
                 }}
               >
-                <span class="truncate">{recipientLabel(option)}</span>
+                <span class="truncate">{recipientOptionLabel(option)}</span>
                 {#if option.id === recipients.chosen?.id}<Check size={11} class="shrink-0" />{/if}
               </button>
             {/each}
