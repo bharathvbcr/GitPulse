@@ -592,6 +592,14 @@ pub async fn cmd_terminal_set_title(
                     "changed": flag_changed,
                 }),
             );
+            // `set_protected` answers false both for "already so" and for a
+            // session the ledger has no row for. Only the first is a success:
+            // a lock shown for a flag that was never stored would be a lie.
+            if state.session_ledger().is_protected(&session_id) != protected {
+                return Err(IpcError::from(
+                    "That session is not recorded in the session ledger, so its protection could not be changed.",
+                ));
+            }
             if title.is_none() {
                 return Ok(flag_changed);
             }

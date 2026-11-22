@@ -189,6 +189,7 @@ fn serve(
                             parent_session_id: None,
                             title: None,
                             quiet_ms: None,
+                            protected: false,
                         })
                         .collect();
                     serde_json::to_value(sessions)

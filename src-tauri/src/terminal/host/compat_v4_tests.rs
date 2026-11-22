@@ -278,6 +278,7 @@ fn compat_v4_and_proto_agree_on_every_frame_while_proto_is_v4() {
         parent_session_id: Some("term-0-a".into()),
         title: Some("t".into()),
         quiet_ms: Some(7),
+        protected: false,
     };
     let live_json = serde_json::to_vec(&live).unwrap();
     let frozen: Listing = decode(&live_json).unwrap();
@@ -286,6 +287,7 @@ fn compat_v4_and_proto_agree_on_every_frame_while_proto_is_v4() {
         parent_session_id: None,
         title: None,
         quiet_ms: None,
+        protected: false,
         ..live.clone()
     };
     let bare_json = serde_json::to_vec(&bare).unwrap();

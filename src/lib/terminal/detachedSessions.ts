@@ -31,6 +31,7 @@ import { terminalSessions, type createSessionRegistry, type TerminalSessionRecor
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
+import { replaceProtection } from "./protection";
 
 export const DETACHED_STATUS = "Still running — not shown in any tab";
 /** A session whose terminal closed but whose process has not exited: stoppable, never shown. */
@@ -135,6 +136,7 @@ export function parseListing(raw: unknown): TerminalListing | null {
     ...(row.ending === true ? { ending: true } : {}),
     ...(typeof row.parent_session_id === "string" ? { parent_session_id: row.parent_session_id } : {}),
     ...(parsedTitle ? { title: parsedTitle } : {}),
+    ...(row.protected === true ? { protected: true } : {}),
   };
 }
 
@@ -296,7 +298,10 @@ export async function adoptDetachedSessions(deps: {
     const raw = await invoke<unknown>("cmd_terminal_sessions");
     if (!Array.isArray(raw)) throw new Error("The terminal host returned an invalid session list.");
     let adopted = 0;
-    for (const listing of raw.map(parseListing)) {
+    const listings = raw.map(parseListing);
+    // The locks a reload would otherwise forget: protection lives on the ledger.
+    replaceProtection(listings.filter((row): row is TerminalListing => row !== null));
+    for (const listing of listings) {
       if (!listing?.detached) continue;
       // Adopting twice must not list a session twice.
       if (get(registry).some((record) => record.sessionId === listing.id)) continue;

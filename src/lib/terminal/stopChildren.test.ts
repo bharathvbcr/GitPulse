@@ -36,7 +36,7 @@ describe("Stop children call site", () => {
 
   it("asks, destructively, before closing any child, and stops when declined", () => {
     const ask = body.indexOf("askConfirm(");
-    const close = body.indexOf(".close()");
+    const close = body.indexOf(".close(\"stop_children\")");
     expect(ask).toBeGreaterThan(-1);
     expect(close).toBeGreaterThan(ask);
     expect(body).toContain("destructive: true");

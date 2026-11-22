@@ -53,6 +53,8 @@
     ChevronsUpDown,
     Eye,
     RotateCw,
+    Lock,
+    LockOpen,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -82,7 +84,8 @@
   } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { stopChildrenQuestion } from "../terminal/stopChildren";
-  import type { KillOrigin } from "../terminal/killOrigin";
+  import { protectedSkipOf, type KillOrigin } from "../terminal/killOrigin";
+  import { noteProtection, partitionByProtection, protectedSessions, setSessionProtected, sparedNotice } from "../terminal/protection";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
@@ -2200,6 +2203,30 @@
   /** Ids with a close question already on screen, so a second press does not ask twice. */
   const closing = new Set<string>();
 
+  /** What the last batch close or Stop children left running because it is protected; dismissible. */
+  let protectionNotice = $state<string | null>(null);
+  /** Whether the tab's process is protected from batch closes (a restored tab not yet shown is read by its saved session id). */
+  function isTabProtected(tabId: string): boolean {
+    const backendId = backendSessionIdByTabId[tabId];
+    return Boolean(backendId) && $protectedSessions.has(backendId);
+  }
+  function labelOfTabId(tabId: string): string {
+    const tab = tabState.tabs.find((candidate) => candidate.id === tabId);
+    return tab ? tabLabel(tab) : "";
+  }
+  async function toggleTabProtection(tabId: string) {
+    const backendId = backendSessionIdByTabId[tabId];
+    if (!backendId) {
+      sessionError = "This tab has no running session to protect yet.";
+      return;
+    }
+    try {
+      await setSessionProtected(backendId, !$protectedSessions.has(backendId));
+    } catch (error: unknown) {
+      sessionError = describeError(error, "terminal");
+    }
+  }
+
   /**
    * Close, asking first when a job is running in the foreground or the tab's
    * own process is a running agent (see `closeQuestion`). A shell whose
@@ -2217,11 +2244,11 @@
     return get(terminalSessions).find((record) => isAdoptedSession(record) && record.sessionId === attach) ?? null;
   }
 
-  async function requestClose(id: string, origin: KillOrigin = "tab_close") {
-    if (closing.has(id)) return;
+  async function requestClose(id: string, origin: KillOrigin = "tab_close"): Promise<"closed" | "declined" | "spared" | "failed"> {
+    if (closing.has(id)) return "declined";
     closing.add(id);
     try {
-      if (!(await confirmClose(id))) return;
+      if (!(await confirmClose(id))) return "declined";
       // Close ends the process here, explicitly. Dropping the tab only
       // unmounts it, and an unmount keeps whatever is still running.
       try {
@@ -2233,10 +2260,19 @@
           await (sessions[id]?.close(origin) ?? browsers[id]?.close() ?? filePanes[id]?.close());
         }
       } catch (error: unknown) {
+        // A batch route spared a protected session this page had not learned
+        // was protected: it runs on, which is the flag working, not a failure.
+        const spared = protectedSkipOf(error);
+        if (spared !== null) {
+          noteProtection(spared, true);
+          protectionNotice = sparedNotice([labelOfTabId(id)], "batch close");
+          return "spared";
+        }
         sessionError = describeError(error, "terminal");
-        return;
+        return "failed";
       }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
+      return "closed";
     } finally {
       closing.delete(id);
     }
@@ -2686,7 +2722,8 @@
   }
 
   async function stopActiveChildren() {
-    const targets = [...activeChildTabs];
+    const { closable: targets, spared } = partitionByProtection([...activeChildTabs], (child) => isTabProtected(child.id));
+    protectionNotice = sparedNotice(spared.map((child) => tabLabel(child)), "Stop children");
     if (targets.length === 0) return;
     // Stopping ends whatever each child is doing and cannot be undone, so it
     // is asked first, naming what will stop (as closing a running agent's tab does).
@@ -3684,11 +3721,20 @@
     }
   }
 
-  async function closeTabsBatch(ids: readonly string[]) {
+  async function closeTabsBatch(allIds: readonly string[]) {
+    // Decided before anything is asked or closed: protected tabs are left
+    // running and named, so a batch never asks about a session it will not close.
+    const { closable: ids, spared } = partitionByProtection(allIds, isTabProtected);
+    protectionNotice = sparedNotice(
+      spared.map((id) => labelOfTabId(id)),
+      "batch close",
+    );
     for (const id of ids) {
       if (!tabState.tabs.some((candidate) => candidate.id === id)) continue;
-      await requestClose(id, "batch_close");
-      if (tabState.tabs.some((candidate) => candidate.id === id)) break;
+      const outcome = await requestClose(id, "batch_close");
+      // A declined question or a failed close stops the batch; a protected
+      // session being spared does not.
+      if (outcome !== "spared" && tabState.tabs.some((candidate) => candidate.id === id)) break;
     }
   }
 
@@ -4573,6 +4619,13 @@
       {/if}
     </div>
   {/if}
+  {#if protectionNotice}
+    <div class="gp-notice flex items-start gap-1.5" data-tone="warn" role="status" data-testid="terminal-protection-notice">
+      <Lock size={13} class="shrink-0 mt-0.5" />
+      <span class="flex-1" style="overflow-wrap:anywhere">{protectionNotice}</span>
+      <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (protectionNotice = null)}>✕</button>
+    </div>
+  {/if}
   {#if sessionError}
     <div class="gp-notice flex items-start gap-1.5" data-tone="danger" role="alert" data-testid="terminal-session-error">
       <AlertCircle size={13} class="shrink-0 mt-0.5" />
@@ -4890,7 +4943,7 @@
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${display.fullTitle}${groupMeta ? ` (${groupMeta.label} #${groupMeta.slot}${isActiveTab ? ", active" : ""})` : isActiveTab ? " (Active)" : ""}${tab.pinned ? " · Pinned in split" : ""}${canOpenInSplit ? " · Drag to reorder · Alt+Drag or Alt+Click to split · Right-click for options" : " · Drag to reorder · Right-click for options"}`}
           >
-            <LauncherIcon kind={tab.launcher} size={12} class="mr-1 align-[-2px]" />{#if splitSlot}<span aria-hidden="true" data-testid="terminal-tab-split-slot" class="inline-flex items-center justify-center min-w-3.5 h-3.5 px-1 mr-1 rounded text-micro tabular-nums align-[1px] {isActiveTab ? 'bg-accent/15 text-accent border border-accent/65 font-semibold' : 'bg-surfaceHover text-textMuted border border-border/65'}">{splitSlot}</span>{/if}{#if tab.pinned}<span aria-hidden="true" data-testid="terminal-tab-pinned-icon" class="inline-flex mr-1 align-[-1px] text-accent"><Pin size={10} /></span>{/if}{#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(effectiveAgentStatuses[tab.id])}{@const badge = oscStatusBadge(effectiveAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={effectiveAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
+            <LauncherIcon kind={tab.launcher} size={12} class="mr-1 align-[-2px]" />{#if splitSlot}<span aria-hidden="true" data-testid="terminal-tab-split-slot" class="inline-flex items-center justify-center min-w-3.5 h-3.5 px-1 mr-1 rounded text-micro tabular-nums align-[1px] {isActiveTab ? 'bg-accent/15 text-accent border border-accent/65 font-semibold' : 'bg-surfaceHover text-textMuted border border-border/65'}">{splitSlot}</span>{/if}{#if tab.pinned}<span aria-hidden="true" data-testid="terminal-tab-pinned-icon" class="inline-flex mr-1 align-[-1px] text-accent"><Pin size={10} /></span>{/if}{#if isTabProtected(tab.id)}<span data-testid="terminal-tab-protected-icon" class="inline-flex mr-1 align-[-1px] text-textMuted" role="img" aria-label="Protected from batch close" title="Protected from batch close"><Lock size={10} /></span>{/if}{#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(effectiveAgentStatuses[tab.id])}{@const badge = oscStatusBadge(effectiveAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={effectiveAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
           {#if canOpenInSplit}
             <button
@@ -5871,6 +5924,30 @@
               <span>Pin Tab</span>
             {/if}
           </button>
+          {#if ctxTab.launcher !== "browser" && ctxTab.launcher !== "file" && backendSessionIdByTabId[ctxTab.id]}
+            {@const ctxProtected = isTabProtected(ctxTab.id)}
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={ctxProtected}
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-protect"
+              title="A protected session is skipped by Close Other Tabs, Close Tabs to the Right, Close Ended Tabs, Stop children and agent closes. Closing its tab directly still stops it."
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                void toggleTabProtection(targetId);
+              }}
+            >
+              {#if ctxProtected}
+                <LockOpen size={13} class="shrink-0" />
+                <span>Remove Protection</span>
+              {:else}
+                <Lock size={13} class="shrink-0" />
+                <span>Protect from Batch Close</span>
+              {/if}
+            </button>
+          {/if}
           <button
             type="button"
             role="menuitem"

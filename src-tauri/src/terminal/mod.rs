@@ -2629,6 +2629,12 @@ pub struct TerminalListing {
     /// "quiet".
     #[serde(default)]
     pub quiet_ms: Option<u64>,
+    /// The session is spared by batch closes, "Stop children", agent closes and
+    /// the load governor. Never set by the host that holds the PTY: the app
+    /// fills it from the session ledger in `list_sessions`, so a reloaded page
+    /// can show the lock. Absent from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub protected: bool,
 }
 
 /// Every session the terminal host (or non-Unix engine) still owns, live or
@@ -2649,6 +2655,7 @@ pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, S
         item.title = state
             .session_ledger()
             .resolved_title_for_terminal(&item.id, item.title.as_deref());
+        item.protected = state.session_ledger().is_protected(&item.id);
     }
     Ok(listed)
 }
@@ -2681,6 +2688,7 @@ pub(in crate::terminal) fn engine_list_sessions(
                 parent_session_id: s.parent_session_id.clone(),
                 title: s.child_title.clone().or(osc_title),
                 quiet_ms: Some(clock_ms().saturating_sub(s.last_output_ms.load(Ordering::Relaxed))),
+                protected: false,
             }
         })
         .collect();
@@ -10953,6 +10961,31 @@ mod tests {
         assert!(wait_until(Duration::from_secs(5), || !is_listed(
             &state, &id
         )));
+    }
+
+    /// Before: the flag lived on the ledger row only, so a reloaded page had no
+    /// way to learn which tabs were protected and drew none of them locked.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_listing_says_which_sessions_are_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ledger, id) = recorded_sleeper(dir.path());
+        let listed = |state: &TerminalSessions| {
+            list_sessions(state)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .expect("listed")
+        };
+        assert!(!listed(&state).protected);
+        assert!(!serde_json::to_string(&listed(&state))
+            .unwrap()
+            .contains("protected"));
+        assert!(ledger.set_protected(&id, true));
+        assert!(listed(&state).protected);
+        assert!(ledger.set_protected(&id, false));
+        assert!(!listed(&state).protected);
+        let _ = kill_session(&state, &id, KillOrigin::TabClose);
     }
 
     #[cfg(unix)]

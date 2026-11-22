@@ -332,3 +332,16 @@ describe("a tab's process kept after its view went away", () => {
     expect(get(liveBeatsStaleRegistry)[0]?.title).toBe("User Pinned Name");
   });
 });
+
+describe("protection a reload would otherwise forget", () => {
+  it("is read from the host listing, and the listing's absence of it clears it", async () => {
+    const { protectedSessions } = await import("./protection");
+    expect(parseListing({ ...row(), protected: true })?.protected).toBe(true);
+    expect(parseListing({ ...row(), protected: "yes" })?.protected).toBeUndefined();
+    const locked = setup([row({ protected: true }), row({ id: "term-1-b", detached: false })]);
+    await locked.adopt();
+    expect([...get(protectedSessions)]).toEqual(["term-1-a"]);
+    await setup([row()]).adopt();
+    expect(get(protectedSessions).size).toBe(0);
+  });
+});

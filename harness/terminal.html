@@ -118,6 +118,8 @@
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
           case "cmd_terminal_set_title":
+            // A flag-only call (no title) is the protection toggle; the host answers true once it stored it.
+            if (args.protected !== undefined) { (report.protection ??= []).push({ sessionId: args.sessionId, protected: args.protected, titleSent: "title" in args }); return true; }
             return null;
           case "cmd_terminal_session_ledger":
             return { offers: [], reopenable_count: 0, unreadable_count: 0 };
@@ -1234,6 +1236,41 @@
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
           check("close chord kills only its session", () => visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
           check("a single tab's close sends the tab_close origin", () => report.killOrigins.length === 1 && report.killOrigins[0].origin === "tab_close");
+          {
+            // Protection: a protected tab is skipped (named, never killed) by a batch close, and the
+            // same batch with the flag removed closes it with the batch_close origin.
+            const tabCards = () => visible('[role="tab"]').map((el) => el.closest("[data-terminal-tab]"));
+            const openTabMenu = async (card) => {
+              const box = card.getBoundingClientRect();
+              card.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: box.left + 8, clientY: box.bottom - 2 }));
+              return waitFor(() => visible('[data-testid="terminal-tab-context-menu"]')[0]);
+            };
+            const cards = tabCards();
+            const lastCard = cards.at(-1), anchorCard = cards.at(-2);
+            const lastId = lastCard.querySelector('[role="tab"]').id.replace("terminal-tab-", "");
+            const tabsBeforeProtect = cards.length;
+            const killsBeforeProtect = report.killed;
+            let menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            check("Protect from Batch Close sends the flag alone, without touching the title", () =>
+              report.protection?.length === 1 && report.protection[0].protected === true && report.protection[0].titleSent === false);
+            check("a protected tab shows its lock", () => Boolean(lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]')));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            const notice = await waitFor(() => visible('[data-testid="terminal-protection-notice"]')[0]);
+            await wait(200);
+            check("a batch close leaves a protected tab running and names it", () =>
+              report.killed === killsBeforeProtect && visible('[role="tab"]').length === tabsBeforeProtect && Boolean(notice) && notice.textContent.includes("protected from batch close"));
+            menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => !lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            await waitFor(() => visible('[role="tab"]').length === tabsBeforeProtect - 1);
+            check("with the protection removed the same batch closes it, as batch_close", () =>
+              report.killed === killsBeforeProtect + 1 && report.killOrigins.at(-1).origin === "batch_close" && report.killOrigins.at(-1).sessionId !== undefined && lastId !== "");
+          }
           // A shell tab opened beside another starts where that shell is.
           contextDir = "src/lib";
           const spawnsBeforeHere = report.spawned;
