@@ -698,10 +698,14 @@ pub(crate) struct ReadBudget {
 struct ReadsHeld {
     total: usize,
     background: usize,
-    /// Reads that are not background work and are waiting for a slot. While
-    /// any wait, background reads are not admitted, so a probe that arrives as
-    /// a slot frees cannot jump a user's read that was there first (the git
-    /// gate's `waiting_interactive`).
+    /// Reads that are not background work (reactive and interactive both) and
+    /// are waiting for a slot. While any wait, a background read is admitted
+    /// only if it is the first background read in flight, so a probe arriving
+    /// as a slot frees cannot jump a user's read that was there first, and a
+    /// steady stream of reactive reads cannot defer every probe forever. The
+    /// git gate does the same, with a narrower count: it holds background back
+    /// only for waiting interactive callers (`waiting_interactive`), and lets a
+    /// waiting background caller run when no background child is running.
     waiting_user: usize,
 }
 
@@ -778,7 +782,8 @@ impl ReadBudget {
         let mut waiting = false;
         let outcome = loop {
             let open = held.total < self.slots
-                && (!background || (held.background < cap && held.waiting_user == 0));
+                && (!background
+                    || (held.background < cap && (held.waiting_user == 0 || held.background == 0)));
             if open {
                 break Ok(());
             }
@@ -3063,7 +3068,9 @@ exit 2
             });
             std::thread::scope(|scope| {
                 let user = scope.spawn(|| budget.admit(Duration::from_secs(10)));
+                let deadline = Instant::now() + Duration::from_secs(10);
                 while budget.waiting_user_now() == 0 {
+                    assert!(Instant::now() < deadline, "the user's read never waited");
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 let mut held = held;
@@ -3078,6 +3085,39 @@ exit 2
                     .expect("the waiting user's read is admitted");
             });
         }
+    }
+
+    /// Reactive reads that keep the budget busy and always have one waiting do
+    /// not starve the probes: with no background read held, a probe is admitted
+    /// whatever user reads wait (the git gate's anti-starvation rule).
+    #[test]
+    fn a_steady_flood_of_user_reads_cannot_defer_a_probe_forever() {
+        use crate::engine::process::with_background_processes;
+        let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2, 2)));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let admitted = std::thread::scope(|scope| {
+            // Four readers on two slots: someone is always waiting.
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Ok(slot) = budget.admit(Duration::from_secs(10)) {
+                            std::thread::sleep(Duration::from_millis(5));
+                            drop(slot);
+                        }
+                    }
+                });
+            }
+            while budget.waiting_user_now() == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let probe = with_background_processes(|| budget.admit(Duration::from_secs(2)));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            probe.map(drop)
+        });
+        assert!(
+            admitted.is_ok(),
+            "a probe was deferred behind user reads: {admitted:?}"
+        );
     }
 
     /// A budget shaped as the process's own, leaked so a test can hold slots.
