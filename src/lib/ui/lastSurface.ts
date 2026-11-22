@@ -28,11 +28,19 @@ export function classifySurface(target: unknown): Surface | null {
   return null;
 }
 
-type ListenerHost = Pick<Document, "addEventListener" | "removeEventListener">;
+/** Events only a person produces; `focusin` is deliberately absent (see `createLastSurface`). */
+const USER_EVENTS = ["pointerdown", "keyup"] as const;
+
+type ListenerHost =Pick<Document, "addEventListener" | "removeEventListener">;
 
 /**
- * The surface the user last interacted with (a pointer press or focus landing
- * in it), null until they have. A readable listens only while something is
+ * The surface the user last interacted with, null until they have. Only what a
+ * person does counts: a pointer press, or a key release. A key release lands on
+ * whatever holds focus after the key acted, so Tab into the page, a shortcut
+ * that moves focus, and typing in the terminal all count. Focus alone does not:
+ * code moves focus too (the dock focuses its terminal when it mounts, so a dock
+ * restored open at launch would otherwise read as "the user is in the
+ * terminal" before they have touched anything). A readable listens only while something is
  * subscribed, so a consumer that mounts late (the lazily loaded sidebar
  * explorer) must not be the only subscriber: the terminal panel holds one for
  * as long as the dock lives, and this keeps the last value across a stop.
@@ -44,11 +52,9 @@ export function createLastSurface(host: ListenerHost | undefined): Readable<Surf
       const surface = classifySurface(event.target);
       if (surface) set(surface);
     };
-    host.addEventListener("pointerdown", record, true);
-    host.addEventListener("focusin", record, true);
+    for (const type of USER_EVENTS) host.addEventListener(type, record, true);
     return () => {
-      host.removeEventListener("pointerdown", record, true);
-      host.removeEventListener("focusin", record, true);
+      for (const type of USER_EVENTS) host.removeEventListener(type, record, true);
     };
   });
 }

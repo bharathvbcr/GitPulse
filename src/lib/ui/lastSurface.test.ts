@@ -81,17 +81,31 @@ describe("createLastSurface", () => {
     };
   }
 
-  it("is null until a surface is used, then follows pointer presses and focus", () => {
+  it("is null until a surface is used, then follows pointer presses and key releases", () => {
     const host = fakeHost();
     const surface = createLastSurface(host as unknown as Document);
     const stop = surface.subscribe(() => {});
     expect(get(surface)).toBeNull();
     host.fire("pointerdown", terminalInput);
     expect(get(surface)).toBe("terminal");
-    host.fire("focusin", pageContent);
+    // Tab out of the terminal: the key's release lands on the page element it focused.
+    host.fire("keyup", pageContent);
     expect(get(surface)).toBe("page");
-    host.fire("focusin", terminalInput);
+    host.fire("keyup", terminalInput);
     expect(get(surface)).toBe("terminal");
+    stop();
+  });
+
+  it("focus moved by code is not the user arriving: a dock restored open at launch does not count", () => {
+    const host = fakeHost();
+    const surface = createLastSurface(host as unknown as Document);
+    const stop = surface.subscribe(() => {});
+    // The panel focuses its terminal on mount; no person did anything.
+    host.fire("focusin", terminalInput);
+    expect(get(surface)).toBeNull();
+    host.fire("pointerdown", pageContent);
+    host.fire("focusin", terminalInput);
+    expect(get(surface)).toBe("page");
     stop();
   });
 
@@ -101,7 +115,7 @@ describe("createLastSurface", () => {
     const stop = surface.subscribe(() => {});
     host.fire("pointerdown", terminalInput);
     host.fire("pointerdown", sidebar);
-    host.fire("focusin", sidebar);
+    host.fire("keyup", sidebar);
     host.fire("pointerdown", portaledMenu);
     expect(get(surface)).toBe("terminal");
     stop();
@@ -111,7 +125,7 @@ describe("createLastSurface", () => {
     const host = fakeHost();
     const surface = createLastSurface(host as unknown as Document);
     const keepAlive = surface.subscribe(() => {});
-    host.fire("focusin", terminalInput);
+    host.fire("keyup", terminalInput);
     // The lazily mounted sidebar explorer subscribes only now.
     expect(get(surface)).toBe("terminal");
     keepAlive();
