@@ -74,7 +74,7 @@ impl Backend for Fake {
         if self.base_is_head.get() {
             return Ok(head.to_owned());
         }
-        Ok("base-oid".into())
+        Ok("1".repeat(40))
     }
     fn now(&self) -> Instant {
         self.epoch + self.clock.get()

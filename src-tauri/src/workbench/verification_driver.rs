@@ -549,6 +549,13 @@ fn start(
         return Err("the claimed worktree belongs to another repository".into());
     }
     let base = backend.base_of(&target.worktree, &target.head)?;
+    if !gate::is_full_commit_id(&base) || !gate::is_full_commit_id(&target.head) {
+        return Err(format!(
+            "the verification base {base:?} or the claimed head {:?} is not a full commit id, so the range cannot be shown to be non-empty. The claim target is the repo_path passed to gitpulse_complete_task ({})",
+            target.head, target.worktree
+        )
+        .into());
+    }
     if base == target.head {
         return Err(format!(
             "the claim's range is empty (base and head are both {}), so there is nothing to verify. The claim target is the repo_path passed to gitpulse_complete_task ({}); claim from the lane's own worktree",

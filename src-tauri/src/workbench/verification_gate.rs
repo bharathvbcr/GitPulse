@@ -193,6 +193,14 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
 /// What the spawn-gate report calls the launches [`landed_on_default`] makes.
 pub(crate) const LANDED_SOURCE: &str = "verification_gate.landed_on_default";
 
+/// A full, lowercase commit id: 40 hex digits (SHA-1) or 64 (SHA-256), exactly.
+pub(crate) fn is_full_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64)
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The local checkout a repository identity (`local:<git dir>`) names, when it
 /// is a directory on this machine.
 pub(crate) fn checkout_of(repository_identity: &str) -> Option<String> {
@@ -207,8 +215,8 @@ pub(crate) fn checkout_of(repository_identity: &str) -> Option<String> {
 /// repository `repository_identity` names. `Err` says what could not be read:
 /// that is not a "no".
 pub(crate) fn landed_on_default(repository_identity: &str, commit: &str) -> Result<bool, String> {
-    if !(7..=64).contains(&commit.len()) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{commit:?} is not a commit id"));
+    if !is_full_commit_id(commit) {
+        return Err(format!("{commit:?} is not a full commit id"));
     }
     let checkout = checkout_of(repository_identity)
         .ok_or_else(|| "the task's repository has no local checkout to read".to_owned())?;
@@ -219,6 +227,22 @@ pub(crate) fn landed_on_default(repository_identity: &str, commit: &str) -> Resu
         .base
         .map(|(_, oid)| oid)
         .ok_or_else(|| "the repository has no default branch".to_owned())?;
+    // A name that is shaped like an id (a tag, a branch) resolves to whatever
+    // it names; only the id itself, byte for byte, is the verified commit.
+    let spec = format!("{commit}^{{commit}}");
+    let resolved = crate::engine::process::with_spawn_source(LANDED_SOURCE, || {
+        crate::engine::git_cli::git_text(
+            checkout,
+            &["rev-parse", "--verify", "--end-of-options", &spec],
+        )
+    })
+    .map_err(|e| format!("the verified commit could not be resolved: {}", e.message()))?;
+    if resolved.trim() != commit {
+        return Err(format!(
+            "the verified head {commit:?} does not resolve to itself (it resolves to {:?})",
+            resolved.trim()
+        ));
+    }
     crate::engine::process::with_spawn_source(LANDED_SOURCE, || {
         crate::harness::review::contains(checkout, &tip, commit)
     })
