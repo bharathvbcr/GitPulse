@@ -1,6 +1,7 @@
 pub mod accessibility;
 pub mod actions;
 pub mod confirm;
+pub mod editor;
 pub mod exit;
 #[cfg(target_os = "macos")]
 pub mod instance;

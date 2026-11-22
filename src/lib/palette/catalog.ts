@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
+import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, SquareArrowOutUpRight, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -23,6 +23,7 @@ import { harnessStore } from "../stores/harnessStore";
 import { activeSelection } from "../terminal/activeSelection";
 import { trayFor, trayProblem, trayText } from "../terminal/contextTray";
 import { sendToAgentFromPage } from "../terminal/sendFromPage";
+import { openInPreferredEditor } from "../desktop/openInEditor";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
@@ -60,6 +61,16 @@ export function worktreeUnavailable(state: RepoState): string | undefined {
 export interface PaletteHostActions {
   onClone?: () => void;
   onRebase?: () => void;
+}
+
+/**
+ * The line the viewer has selected in `file`, or undefined: a selection in a
+ * different file says nothing about where to land in this one. Compared as
+ * repository paths, folding case where the file system does.
+ */
+function lineInEditor(file: string): number | undefined {
+  const selection = activeSelection();
+  return selection && sameRepo(selection.path, file, { caseInsensitive: isCaseInsensitiveFs() }) ? selection.startLine : undefined;
 }
 
 /** The palette's doors to sending code to an agent and to the open file. */
@@ -105,6 +116,22 @@ function agentSendCommands(state: RepoState, unavailable: string | undefined, ch
         const opened = terminalLaunchRequests.requestFile(path, file, null, null, undefined, { mode: "split", focus: true });
         repoStore.setTerminalOpen(true);
         await opened;
+      },
+    },
+    {
+      id: "file-open-in-editor", label: "Open active file in editor — your external editor, at the selected line",
+      description: file
+        ? `Opens ${file}${lineInEditor(file) ? ` at line ${lineInEditor(file)}` : ""} in the editor chosen in Settings (VS Code, Cursor or Zed).`
+        : "Opens the file Explorer has open in the external editor chosen in Settings, at the selected line when the viewer has one.",
+      keywords: "file open external editor ide vscode vs code cursor zed line goto launch", category: "Workspace", icon: SquareArrowOutUpRight,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: async () => {
+        checkOrigin();
+        // `checkOrigin` proved the active repository is still the one this palette was built for.
+        const path = state.currentPath;
+        if (!path || !file) throw Error(noFile);
+        // Read again now: the selection may have moved since the palette was built.
+        await openInPreferredEditor(path, file, { line: lineInEditor(file) });
       },
     },
     {

@@ -676,6 +676,7 @@ pub fn run() {
             cmd_resolve_git_root,
             cmd_open_worktree_path,
             cmd_reveal_worktree_path,
+            desktop::editor::cmd_open_in_editor,
             desktop::shell::cmd_reveal_repository,
             cmd_set_exit_guard_ready,
             cmd_exit_app,

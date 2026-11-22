@@ -27,6 +27,7 @@
     PencilLine,
     Trash2,
     TextSearch,
+    SquareArrowOutUpRight,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -65,6 +66,7 @@
   } from "../../files/fileStatus";
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
+  import { openInPreferredEditor, reportEditorFailure } from "../../desktop/openInEditor";
   import { askConfirm, askText } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
   import type { MutationTarget } from "../../repos/storeTypes";
@@ -841,6 +843,17 @@
     }
   }
 
+  async function openInExternalEditor(filePath: string) {
+    closeContextMenu();
+    const repo = effectiveRepoPath;
+    if (!repo) return;
+    try {
+      await openInPreferredEditor(repo, filePath);
+    } catch (err) {
+      reportEditorFailure(err);
+    }
+  }
+
   async function revealInFinder(filePath: string) {
     closeContextMenu();
     const repo = effectiveRepoPath;
@@ -1487,6 +1500,10 @@
     {:else}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
+        <span>Open in viewer</span>
+      </button>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInExternalEditor(row.path)}>
+        <SquareArrowOutUpRight size={13} class="text-textMuted" />
         <span>Open in editor</span>
       </button>
 

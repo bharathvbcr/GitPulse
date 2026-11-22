@@ -96,6 +96,7 @@
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
   import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
   import WatchScopeSetting from "./WatchScopeSetting.svelte";
+  import { EDITOR_CHOICES } from "../desktop/editorChoice";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -1047,7 +1048,7 @@
                   </div>
                   </section>
 
-                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["tab-width"])}>
+                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["tab-width", "preferred-editor"])}>
                     <h3 class="gp-label">Code display</h3>
                   <div data-setting="tab-width" hidden={!shown("tab-width")}>
                     <div class="text-textPrimary text-meta font-medium mb-2">Tab width</div>
@@ -1062,6 +1063,20 @@
                       Columns a literal tab advances to, in the diff, the file viewer,
                       blame and the conflict editor. Display only — GitPulse never
                       rewrites the bytes in the file.
+                    </p>
+                  </div>
+                  <div data-setting="preferred-editor" hidden={!shown("preferred-editor")}>
+                    <div class="text-textPrimary text-meta font-medium mb-2">External editor</div>
+                    <SettingSegment
+                      ariaLabel="External editor"
+                      options={EDITOR_CHOICES}
+                      value={$interfaceStore.preferredEditor}
+                      onselect={(editor) => interfaceStore.setPreferredEditor(editor)}
+                    />
+                    <p class="text-textMuted text-micro mt-1.5">
+                      Where Open in editor sends a file, at the selected line when there is
+                      one. Auto takes the first installed of VS Code, Cursor and Zed; a
+                      named editor that is not installed is an error, never a substitute.
                     </p>
                   </div>
                   </section>
