@@ -5404,6 +5404,358 @@ mod tests {
         assert!(emissions(&noise, 10_000).is_empty());
     }
 
+    // ---- adversarial attacks on the scripted-clock seam (adv/bl1121w3-watch) ----
+
+    /// One scripted step. Resolved to paths and events inside `drive`.
+    enum Act {
+        Change,
+        Noise,
+        BackendError,
+        Rewind(u64),
+        Stop,
+        RemoveGitDir,
+    }
+
+    enum Step {
+        Event(notify::Event),
+        Fail,
+        Rewind(Duration),
+        Stop,
+        RemoveGitDir,
+    }
+
+    /// Like `ScriptedEnv`, but the clock may be rewound, ticks on every read,
+    /// can start anywhere, and the script can stop the loop or delete the repo.
+    struct AttackEnv {
+        base: Instant,
+        elapsed: std::cell::Cell<Duration>,
+        horizon: Duration,
+        tick: Duration,
+        calls: std::cell::Cell<u32>,
+        stop: Arc<StopSignal>,
+        git_dir: PathBuf,
+        script: std::cell::RefCell<std::collections::VecDeque<(Duration, Step)>>,
+    }
+
+    impl LoopEnv for AttackEnv {
+        fn now(&self) -> Instant {
+            let at = self.base + self.elapsed.get();
+            self.elapsed.set(self.elapsed.get() + self.tick);
+            at
+        }
+        fn recv(
+            &self,
+            _watcher: &RepoFileWatcher,
+            wait: Duration,
+        ) -> Result<Result<Event, notify::Error>, std::sync::mpsc::RecvTimeoutError> {
+            self.calls.set(self.calls.get() + 1);
+            assert!(self.calls.get() < 10_000, "the watch loop spun");
+            let limit = (self.elapsed.get() + wait).min(self.horizon);
+            let due = self
+                .script
+                .borrow()
+                .front()
+                .is_some_and(|(at, _)| *at <= limit);
+            if due {
+                let (at, step) = self.script.borrow_mut().pop_front().expect("front checked");
+                self.elapsed.set(self.elapsed.get().max(at));
+                return match step {
+                    Step::Event(event) => Ok(Ok(event)),
+                    Step::Fail => Ok(Err(notify::Error::generic("scripted backend error"))),
+                    Step::Rewind(to) => {
+                        self.elapsed.set(to);
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    }
+                    Step::Stop => {
+                        self.stop.stop();
+                        Ok(Ok(notify::Event::new(notify::EventKind::Other)))
+                    }
+                    Step::RemoveGitDir => {
+                        std::fs::remove_dir_all(&self.git_dir).expect("remove git dir");
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    }
+                };
+            }
+            self.elapsed.set(limit);
+            if limit >= self.horizon {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            }
+        }
+        fn try_next(&self, _watcher: &RepoFileWatcher) -> Option<Result<Event, notify::Error>> {
+            let mut script = self.script.borrow_mut();
+            let ready = script.front().is_some_and(|(at, step)| {
+                *at <= self.elapsed.get() && matches!(step, Step::Event(_))
+            });
+            if !ready {
+                return None;
+            }
+            match script.pop_front() {
+                Some((_, Step::Event(event))) => Some(Ok(event)),
+                _ => None,
+            }
+        }
+    }
+
+    struct Outcome {
+        emits: Vec<Duration>,
+        exit: WatchLoopExit,
+        wakes: u64,
+    }
+
+    #[derive(Default)]
+    struct Cfg {
+        tick: Duration,
+        base: Option<Instant>,
+        /// Delete the git dir after the watcher exists, before the loop runs.
+        vanished: bool,
+    }
+
+    /// The Instant farthest from now that still exists, less an hour of headroom.
+    fn latest_instant() -> Instant {
+        let now = Instant::now();
+        let (mut lo, mut hi) = (0_u64, u64::MAX / 2);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if now.checked_add(Duration::from_secs(mid)).is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        now + Duration::from_secs(lo.saturating_sub(3600))
+    }
+
+    fn drive(timeline: &[(u64, Act)], horizon_ms: u64, cfg: Cfg) -> Outcome {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let root = dir.path().canonicalize().unwrap();
+        let git_dir = root.join(".git");
+        let watcher = RepoFileWatcher::watch(&git_dir).unwrap();
+        if cfg.vanished {
+            std::fs::remove_dir_all(&git_dir).unwrap();
+        }
+        let script = timeline
+            .iter()
+            .map(|(at, act)| {
+                let step = match act {
+                    Act::Change => Step::Event(modify(root.join("src").join("main.rs"))),
+                    Act::Noise => Step::Event(modify(git_dir.join("index.lock"))),
+                    Act::BackendError => Step::Fail,
+                    Act::Rewind(to) => Step::Rewind(ms(*to)),
+                    Act::Stop => Step::Stop,
+                    Act::RemoveGitDir => Step::RemoveGitDir,
+                };
+                (ms(*at), step)
+            })
+            .collect();
+        let stop = StopSignal::new();
+        let env = AttackEnv {
+            base: cfg.base.unwrap_or_else(Instant::now),
+            elapsed: std::cell::Cell::new(Duration::ZERO),
+            horizon: ms(horizon_ms),
+            tick: cfg.tick,
+            calls: std::cell::Cell::new(0),
+            stop: stop.clone(),
+            git_dir: git_dir.clone(),
+            script: std::cell::RefCell::new(script),
+        };
+        let wakes = Arc::<std::sync::atomic::AtomicU64>::default();
+        let ctx = WatchLoopContext {
+            git_dir: git_dir.clone(),
+            internal_roots: vec![git_dir],
+            emit_path: root.to_string_lossy().into_owned(),
+            timer_wakes: Arc::clone(&wakes),
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let exit = run_watch_loop_with(&env, &watcher, ctx, stop.clone(), None, stop, |_| {
+            seen.borrow_mut().push(env.elapsed.get());
+        });
+        Outcome {
+            emits: seen.into_inner(),
+            exit,
+            wakes: wakes.load(Ordering::Relaxed),
+        }
+    }
+
+    fn quiet() -> Duration {
+        DEBOUNCE_QUIET
+    }
+
+    #[test]
+    fn adv_burst_at_one_instant_is_one_emission_at_quiet() {
+        let burst: Vec<(u64, Act)> = (0..200)
+            .map(|n| (100, if n % 3 == 0 { Act::Noise } else { Act::Change }))
+            .collect();
+        let got = drive(&burst, 5_000, Cfg::default());
+        assert_eq!(got.emits, vec![ms(100) + quiet()]);
+        assert_eq!(got.exit, WatchLoopExit::EventStreamClosed);
+    }
+
+    #[test]
+    fn adv_noise_before_signal_in_one_queue_still_counts() {
+        for order in [[Act::Noise, Act::Change], [Act::Change, Act::Noise]] {
+            let [a, b] = order;
+            let got = drive(&[(0, a), (0, b)], 5_000, Cfg::default());
+            assert_eq!(got.emits, vec![quiet()]);
+        }
+    }
+
+    #[test]
+    fn adv_noise_one_ms_before_quiet_does_not_delay_the_emit() {
+        let got = drive(
+            &[(0, Act::Change), (399, Act::Noise)],
+            5_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![quiet()]);
+    }
+
+    #[test]
+    fn adv_noise_exactly_at_quiet_emits_at_quiet_not_after() {
+        let got = drive(
+            &[(0, Act::Change), (400, Act::Noise)],
+            5_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![quiet()]);
+    }
+
+    #[test]
+    fn adv_change_exactly_at_quiet_extends_the_window() {
+        let got = drive(
+            &[(0, Act::Change), (400, Act::Change)],
+            5_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![ms(800)]);
+    }
+
+    #[test]
+    fn adv_change_one_ms_before_quiet_extends_the_window() {
+        let got = drive(
+            &[(0, Act::Change), (399, Act::Change)],
+            5_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![ms(799)]);
+    }
+
+    #[test]
+    fn adv_next_scan_waits_out_the_coalesce_window() {
+        // Emit at 400; a change at 500 is quiet by 900 but may not scan before 400 + 2000.
+        let got = drive(
+            &[(0, Act::Change), (500, Act::Change)],
+            10_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![quiet(), quiet() + SCAN_COALESCE]);
+    }
+
+    #[test]
+    fn adv_stop_in_the_pending_window_drops_it_and_reports_stopped() {
+        let got = drive(&[(0, Act::Change), (200, Act::Stop)], 5_000, Cfg::default());
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::Stopped);
+    }
+
+    #[test]
+    fn adv_disconnect_in_the_pending_window_drops_it_and_reports_stream_closed() {
+        let got = drive(&[(0, Act::Change)], 200, Cfg::default());
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::EventStreamClosed);
+    }
+
+    #[test]
+    fn adv_idle_loop_wakes_once_per_heartbeat() {
+        let got = drive(&[], 100_000, Cfg::default());
+        assert_eq!(got.wakes, 3, "30 s, 60 s and 90 s");
+        assert!(got.emits.is_empty());
+    }
+
+    #[test]
+    fn adv_a_lone_change_costs_one_timer_wake() {
+        let got = drive(&[(0, Act::Change)], 5_000, Cfg::default());
+        assert_eq!(got.wakes, 1);
+    }
+
+    #[test]
+    fn adv_backend_error_is_signal_and_emits_at_quiet() {
+        let got = drive(&[(100, Act::BackendError)], 5_000, Cfg::default());
+        assert_eq!(got.emits, vec![ms(100) + quiet()]);
+    }
+
+    #[test]
+    fn adv_clock_running_backwards_does_not_panic_or_spin() {
+        // Change at 1000, then the clock jumps back to 0: the loop waits for
+        // the clock to catch up to last_event + quiet and then emits once.
+        let got = drive(
+            &[(1_000, Act::Change), (1_000, Act::Rewind(0))],
+            10_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![ms(1_400)]);
+    }
+
+    #[test]
+    fn adv_instant_at_the_edge_of_the_range_does_not_overflow() {
+        let got = drive(
+            &[(0, Act::Change)],
+            5_000,
+            Cfg {
+                base: Some(latest_instant()),
+                ..Cfg::default()
+            },
+        );
+        assert_eq!(got.emits, vec![quiet()]);
+    }
+
+    #[test]
+    fn adv_a_clock_that_ticks_on_every_read_is_read_fresh() {
+        // 1 ms per read: a loop that cached "now" across the turn would emit
+        // on the stale reading; a fresh read emits within a few ticks of quiet.
+        let got = drive(
+            &[(0, Act::Change)],
+            5_000,
+            Cfg {
+                tick: ms(1),
+                ..Cfg::default()
+            },
+        );
+        assert_eq!(got.emits.len(), 1);
+        assert!(
+            got.emits[0] >= quiet() && got.emits[0] < quiet() + ms(50),
+            "{:?}",
+            got.emits
+        );
+    }
+
+    #[test]
+    fn adv_repo_missing_from_the_start_exits_dead_after_three_misses() {
+        let got = drive(
+            &[],
+            60_000,
+            Cfg {
+                vanished: true,
+                ..Cfg::default()
+            },
+        );
+        assert_eq!(got.exit, WatchLoopExit::DeadRepo);
+        assert!(got.emits.is_empty());
+    }
+
+    #[test]
+    fn adv_repo_vanishing_in_the_pending_window_is_never_announced() {
+        let got = drive(
+            &[(0, Act::Change), (100, Act::RemoveGitDir)],
+            60_000,
+            Cfg::default(),
+        );
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::DeadRepo);
+    }
+
     impl Drop for FedLoop {
         fn drop(&mut self) {
             self.stop.stop();
