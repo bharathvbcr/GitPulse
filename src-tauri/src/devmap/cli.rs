@@ -698,6 +698,11 @@ pub(crate) struct ReadBudget {
 struct ReadsHeld {
     total: usize,
     background: usize,
+    /// Reads that are not background work and are waiting for a slot. While
+    /// any wait, background reads are not admitted, so a probe that arrives as
+    /// a slot frees cannot jump a user's read that was there first (the git
+    /// gate's `waiting_interactive`).
+    waiting_user: usize,
 }
 
 /// One of the budget's slots, returned on drop.
@@ -731,16 +736,35 @@ impl ReadBudget {
             held: Mutex::new(ReadsHeld {
                 total: 0,
                 background: 0,
+                waiting_user: 0,
             }),
             freed: std::sync::Condvar::new(),
         }
+    }
+
+    /// (total, background) slots held now.
+    #[cfg(test)]
+    fn held_now(&self) -> (usize, usize) {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (held.total, held.background)
+    }
+
+    #[cfg(test)]
+    fn waiting_user_now(&self) -> usize {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiting_user
     }
 
     /// A slot for the calling thread's admission class, waiting at most `wait`
     /// for one. A refusal is a deferral in the shape every reader of one
     /// matches, and names this budget, not git's.
     pub(crate) fn admit(&self, wait: Duration) -> Result<ReadPermit<'_>, CommandError> {
-        let background = process::current_admission_name() == "background";
+        let background = process::current_admission() == process::Admission::Background;
         let cap = if background {
             self.background_slots.min(self.slots)
         } else {
@@ -751,14 +775,16 @@ impl ReadBudget {
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            let open = held.total < self.slots && (!background || held.background < cap);
+        let mut waiting = false;
+        let outcome = loop {
+            let open = held.total < self.slots
+                && (!background || (held.background < cap && held.waiting_user == 0));
             if open {
-                break;
+                break Ok(());
             }
             let left = wait.saturating_sub(began.elapsed());
             if left.is_zero() {
-                return Err(process::deferred_under_load_error(
+                break Err(process::deferred_under_load_error(
                     "devmap",
                     began.elapsed(),
                     &format!(
@@ -772,12 +798,22 @@ impl ReadBudget {
                     ),
                 ));
             }
+            if !background && !waiting {
+                waiting = true;
+                held.waiting_user += 1;
+            }
             held = self
                 .freed
                 .wait_timeout(held, left)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
+        };
+        if waiting {
+            held.waiting_user -= 1;
+            // Background reads held back by this waiter may run now.
+            self.freed.notify_all();
         }
+        outcome?;
         held.total += 1;
         held.background += usize::from(background);
         Ok(ReadPermit {
@@ -3013,6 +3049,37 @@ exit 2
         assert!(budget.admit(Duration::ZERO).is_ok(), "every slot came back");
     }
 
+    /// A user's read already waiting for a slot is served before a background
+    /// read that arrives as the slot frees (the git gate's `waiting_interactive`).
+    #[test]
+    fn a_probe_arriving_as_a_slot_frees_cannot_jump_a_waiting_user_read() {
+        use crate::engine::process::with_background_processes;
+        for round in 0..40 {
+            let budget: &'static ReadBudget = Box::leak(Box::new(ReadBudget::new(2, 2)));
+            let held: Vec<_> = with_background_processes(|| {
+                (0..2)
+                    .map(|_| budget.admit(Duration::ZERO).expect("a background slot"))
+                    .collect()
+            });
+            std::thread::scope(|scope| {
+                let user = scope.spawn(|| budget.admit(Duration::from_secs(10)));
+                while budget.waiting_user_now() == 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let mut held = held;
+                drop(held.pop());
+                let probe = with_background_processes(|| budget.admit(Duration::ZERO));
+                assert!(
+                    probe.is_err(),
+                    "round {round}: a probe took the slot a user's read was waiting for"
+                );
+                user.join()
+                    .unwrap()
+                    .expect("the waiting user's read is admitted");
+            });
+        }
+    }
+
     /// A budget shaped as the process's own, leaked so a test can hold slots.
     fn production_shaped_budget() -> &'static ReadBudget {
         Box::leak(Box::new(ReadBudget::new(READ_SLOTS, BACKGROUND_READ_SLOTS)))
@@ -3027,7 +3094,9 @@ exit 2
     #[test]
     #[cfg(unix)]
     fn a_users_devmap_read_is_not_deferred_by_a_full_set_of_background_probes() {
-        use crate::engine::process::{run_as_user_action, with_background_processes};
+        use crate::engine::process::{
+            run_as_user_action, with_background_processes, with_gate_for_test,
+        };
         use std::os::unix::fs::PermissionsExt;
         let _lock = crate::harness::sidecar::test_serial();
         let repo = git_repo();
@@ -3042,14 +3111,20 @@ exit 2
         let _devmap = bind_test_binary(stub.to_string_lossy().into_owned());
         let path = canonical.to_str().unwrap();
         let budget = production_shaped_budget();
+        // A gate roomy enough for four background children whatever the host's
+        // core count (background work gets a quarter of the slots): the test
+        // must discriminate on a small host as well as on a large one.
+        let gate = crate::engine::process::leak_gate(crate::engine::process::SpawnGate::new(16));
         let started =
             || fs::read_to_string(canonical.join("depth.log")).map_or(0, |log| log.lines().count());
         let (background, user, interactive) = std::thread::scope(|scope| {
             let probes: Vec<_> = (0..crate::devmap::live::PROBE_LIMIT)
                 .map(|_| {
                     scope.spawn(|| {
-                        with_read_budget(budget, Duration::from_secs(20), || {
-                            with_background_processes(|| status(path))
+                        with_gate_for_test(gate, || {
+                            with_read_budget(budget, Duration::from_secs(20), || {
+                                with_background_processes(|| status(path))
+                            })
                         })
                     })
                 })
@@ -3066,9 +3141,21 @@ exit 2
                 crate::devmap::live::PROBE_LIMIT,
                 "every probe up to the probe limit is admitted at once"
             );
-            let user = with_read_budget(budget, Duration::from_millis(150), || status(path));
-            let interactive = with_read_budget(budget, Duration::from_millis(150), || {
-                run_as_user_action(|| status(path))
+            assert_eq!(
+                budget.held_now(),
+                (
+                    crate::devmap::live::PROBE_LIMIT,
+                    crate::devmap::live::PROBE_LIMIT
+                ),
+                "the probes hold every background slot before the user's read is issued"
+            );
+            let user = with_gate_for_test(gate, || {
+                with_read_budget(budget, Duration::from_millis(150), || status(path))
+            });
+            let interactive = with_gate_for_test(gate, || {
+                with_read_budget(budget, Duration::from_millis(150), || {
+                    run_as_user_action(|| status(path))
+                })
             });
             let background: Vec<CliStatus> =
                 probes.into_iter().map(|p| p.join().unwrap()).collect();
