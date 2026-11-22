@@ -1955,17 +1955,20 @@ fn resolve<'a>(words: &'a [Word], binds: &Binds) -> Result<Resolved<'a>, Unresol
                 k
             }
             "sudo" | "doas" => {
-                let other_user = words[i + 1..]
+                // The options are scanned once, and `-u` is looked for only among
+                // them, so a chain of wrappers is read in linear time.
+                let k = skip_options(
+                    words,
+                    i + 1,
+                    &["-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-T", "-U"],
+                );
+                let other_user = words[i + 1..k.min(words.len())]
                     .iter()
                     .position(|w| w.text == "-u")
                     .and_then(|p| words.get(i + 2 + p))
                     .is_some_and(|w| w.text != "root");
                 elevated = elevated || !other_user;
-                skip_options(
-                    words,
-                    i + 1,
-                    &["-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-T", "-U"],
-                )
+                k
             }
             "command" => {
                 if words
@@ -5196,35 +5199,47 @@ fn unread(plan: &Plan, why: &str) -> HookOutput {
 /// planning as well as deciding: the host's own hook timeout is longer than
 /// this, and a host that times a guard out runs the command unguarded.
 pub(crate) fn run(input: &HookInput) -> HookOutput {
-    guarded(&input.command, GUARD_BUDGET, plan)
+    guarded(&input.command, GUARD_BUDGET, plan, answer)
 }
 
-/// [`run`] with its budget and planner named. An empty command is silent
-/// without a worker; anything else is planned and answered on one worker, and
-/// a worker that does not finish is a question, never silence.
+/// [`run`] with its budget, planner and answerer named. One deadline spans
+/// both steps. Planning that does not finish is a question, because there is
+/// no plan to judge. A plan that needs no process table is answered inline (it
+/// is pure). One that does is answered on a worker with what is left of the
+/// budget, and a worker that does not finish falls back to [`unread`], which
+/// still refuses what needs no table (`kill -1`) rather than turning it into
+/// a question.
 fn guarded(
     command: &str,
     budget: Duration,
     planner: impl FnOnce(&str) -> Plan + Send + 'static,
+    answerer: impl FnOnce(&Plan) -> HookOutput + Send + 'static,
 ) -> HookOutput {
     if command.is_empty() {
         return HookOutput::silent();
     }
-    let command = command.to_string();
-    super::within_budget(budget, move || {
-        let plan = planner(&command);
-        if plan.is_empty() {
-            HookOutput::silent()
-        } else {
-            answer(&plan)
-        }
-    })
-    .unwrap_or_else(|| {
-        question(format!(
-            "GitPulse could not finish checking this command for signals within {}s, so it \
-             could not tell which processes it would signal. Confirm before it runs.",
+    let deadline = std::time::Instant::now() + budget;
+    let owned = command.to_string();
+    let Some(plan) = super::within_budget(budget, move || planner(&owned)) else {
+        return question(format!(
+            "GitPulse could not finish reading this command within {}s, so it could not tell \
+             which processes it would signal. Confirm before it runs.",
             budget.as_secs_f32()
-        ))
+        ));
+    };
+    if plan.is_empty() {
+        return HookOutput::silent();
+    }
+    if !plan.needs_table() {
+        return answerer(&plan);
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let job_plan = plan.clone();
+    super::within_budget(remaining, move || answerer(&job_plan)).unwrap_or_else(|| {
+        unread(
+            &plan,
+            &format!("it did not finish within {}s", budget.as_secs()),
+        )
     })
 }
 
@@ -8195,6 +8210,58 @@ mod tests {
         }
     }
 
+    /// `kill -1` is refused with no process table at all, so a table read
+    /// that times out must still refuse it, not ask.
+    #[test]
+    fn a_timed_out_table_read_still_refuses_what_needs_no_table() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let output = guarded(
+            "kill -1; pkill -f sleep",
+            Duration::from_millis(300),
+            plan,
+            move |_| {
+                let _ = held.recv();
+                HookOutput::silent()
+            },
+        );
+        drop(release);
+        assert!(refuses(&output), "{:?}", output.render());
+    }
+
+    #[test]
+    fn sudo_user_option_is_read_from_its_own_options_only() {
+        let elevated = |command: &str| {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            let w = words(&parts);
+            resolve(&w).expect("resolves").elevated
+        };
+        let table = [
+            ("sudo -u root kill 1", true),
+            ("sudo -E -u x kill 1", false),
+            ("sudo -- kill 1", true),
+            ("sudo -E sudo -u x kill 1", true),
+            ("sudo -u x sudo kill 1", true),
+            ("doas -u x kill 1", false),
+            ("sudo kill 1 -u x", true),
+        ];
+        for (command, want) in table {
+            assert_eq!(elevated(command), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn plan_of_an_eval_chain_at_the_size_cap_is_linear() {
+        let command = format!("{}ls", "eval ".repeat(MAX_COMMAND_BYTES * 95 / 100 / 5));
+        let started = std::time::Instant::now();
+        let _ = super::plan(&command);
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            "planning {} bytes of eval took {:?}",
+            command.len(),
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn run_on_a_star_bomb_answers_within_the_budget_and_never_allows() {
         let command = format!("{}x; true", "*".repeat(60));
@@ -8214,21 +8281,29 @@ mod tests {
     #[test]
     fn a_planner_that_does_not_finish_is_a_question() {
         let (release, held) = std::sync::mpsc::channel::<()>();
-        let output = guarded("kill 1", Duration::from_millis(100), move |_| {
-            let _ = held.recv();
-            Plan::default()
-        });
+        let output = guarded(
+            "kill 1",
+            Duration::from_millis(100),
+            move |_| {
+                let _ = held.recv();
+                Plan::default()
+            },
+            answer,
+        );
         drop(release);
         let json = output.render().unwrap_or_default();
         assert!(json.contains("\"ask\""), "{json}");
-        assert!(json.contains("could not finish checking"), "{json}");
+        assert!(json.contains("could not finish reading"), "{json}");
     }
 
     #[test]
     fn an_empty_command_is_silent_without_a_planner() {
-        let output = guarded("", Duration::from_millis(100), |_| -> Plan {
-            panic!("an empty command is never planned")
-        });
+        let output = guarded(
+            "",
+            Duration::from_millis(100),
+            |_| -> Plan { panic!("an empty command is never planned") },
+            answer,
+        );
         assert!(output.is_silent());
     }
 
