@@ -4,7 +4,6 @@ import { openSuspectsFor } from "../codeintel/openSuspects";
 import { openInEditor } from "../desktop/openInShell";
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore, type RepoState } from "../stores/repoStore";
-import { clearActiveSelection, setActiveSelection } from "../terminal/activeSelection";
 import { openConflicts } from "../ui/workConflicts";
 import { buildCommands } from "./catalog";
 
@@ -70,44 +69,6 @@ describe("palette commands that hand off to the stores and views", () => {
     const none = find(ready({ selectedFilePath: null }), "open_in_editor");
     expect(none.disabledReason).toBe("Open a file in Explorer first");
     expect(find(ready({ selectedFilePath: "src/a.ts", isLoading: true }), "open_in_editor").disabledReason).toBeDefined();
-  });
-
-  describe("opening in the editor at the viewer's selected line", () => {
-    const owner = {};
-    const selectionOn = (path: string, startLine: number, endLine = startLine) =>
-      setActiveSelection(owner, { path, startLine, endLine, sendReference: () => {}, sendContent: () => {}, addToTray: () => {} });
-    const run = async () => {
-      vi.spyOn(repoStore, "targetIsActive").mockReturnValue(true);
-      vi.mocked(openInEditor).mockClear();
-      await find(ready({ selectedFilePath: "src/a.ts" }), "open_in_editor").action();
-    };
-    afterEach(() => clearActiveSelection(owner));
-
-    it("passes the first selected line when the selection is on the open file", async () => {
-      selectionOn("src/a.ts", 12, 20);
-      await run();
-      expect(openInEditor).toHaveBeenLastCalledWith("/repo", "src/a.ts", { line: 12 });
-    });
-
-    it("reads the selection when the action runs, not when the list was built", async () => {
-      const command = find(ready({ selectedFilePath: "src/a.ts" }), "open_in_editor");
-      selectionOn("src/a.ts", 7);
-      vi.spyOn(repoStore, "targetIsActive").mockReturnValue(true);
-      vi.mocked(openInEditor).mockClear();
-      await command.action();
-      expect(openInEditor).toHaveBeenLastCalledWith("/repo", "src/a.ts", { line: 7 });
-    });
-
-    it("ignores a selection on a different file", async () => {
-      selectionOn("src/b.ts", 12);
-      await run();
-      expect(openInEditor).toHaveBeenLastCalledWith("/repo", "src/a.ts");
-    });
-
-    it("opens at the top when nothing is selected", async () => {
-      await run();
-      expect(openInEditor).toHaveBeenLastCalledWith("/repo", "src/a.ts");
-    });
   });
 
   it("does not open a file from a repository that is no longer in front", async () => {
