@@ -431,6 +431,10 @@ struct Inner {
     leaving: AtomicBool,
     /// What is wrong with the host, said plainly, when something is.
     trouble: Mutex<Vec<String>>,
+    /// Hosts of other protocols that still hold sessions, as the last probe
+    /// found them (`probe_other_protocols`), including the ones that could not
+    /// be listed. Replaced, not appended to, by every probe.
+    legacy: Mutex<Vec<super::legacy::LegacyHostReport>>,
     /// Permanent host-directory initialization failure; every connect refuses
     /// immediately without attempting socket setup or falling back in-process.
     unavailable: Option<String>,
@@ -483,6 +487,7 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                legacy: Mutex::default(),
                 unavailable: None,
                 #[cfg(test)]
                 starter: None,
@@ -523,6 +528,7 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::new(vec![reason.clone()]),
+                legacy: Mutex::default(),
                 unavailable: Some(reason),
                 #[cfg(test)]
                 starter: None,
@@ -560,6 +566,7 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                legacy: Mutex::default(),
                 unavailable: None,
                 starter: Some(Arc::new(starter)),
                 orchestration,
@@ -588,6 +595,39 @@ impl HostClient {
     /// would not start. Empty when nothing is known to be wrong.
     pub fn trouble(&self) -> Vec<String> {
         lock(&self.inner.trouble).clone()
+    }
+
+    /// Hosts of another protocol that still hold sessions, as the last
+    /// connection found them: each with its sessions when they could be
+    /// listed, or why they could not. Empty before a connection has probed and
+    /// when no such host exists. An idle other-protocol host is not here: it is
+    /// asked to exit.
+    pub fn legacy_hosts(&self) -> Vec<super::legacy::LegacyHostReport> {
+        lock(&self.inner.legacy).clone()
+    }
+
+    /// Stops `session` on the host of the earlier `protocol`, then drops the
+    /// connection (so that host's own app can return). Opens its own
+    /// connection: it does not touch this app's host connection.
+    pub fn legacy_kill(
+        &self,
+        protocol: u32,
+        session: &str,
+    ) -> Result<(), super::legacy::LegacyError> {
+        super::legacy::LegacyHost::connect(&self.inner.config.dir, protocol)?.kill(session)
+    }
+
+    /// The newest `max_bytes` of `session`'s saved output on the host of the
+    /// earlier `protocol`, read-only.
+    pub fn legacy_transcript(
+        &self,
+        protocol: u32,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+    ) -> Result<crate::terminal::TranscriptRead, super::legacy::LegacyError> {
+        super::legacy::LegacyHost::connect(&self.inner.config.dir, protocol)?
+            .transcript_tail(session, max_bytes, redact)
     }
 
     /// Connects (starting the host if nothing answers), adopts what it holds
@@ -2022,26 +2062,43 @@ impl Inner {
     }
 
     /// Hosts of other protocol versions in the host directory: one with no
-    /// sessions is asked to go; one with sessions is left running and reported,
-    /// because this version cannot show them and must not pretend there are
-    /// none.
+    /// sessions is asked to go; one with sessions is left running, reported in
+    /// `trouble()` (this version cannot attach to them), and recorded for
+    /// `legacy_hosts()` with whatever the frozen dialect for its protocol could
+    /// list of what it holds.
     fn probe_other_protocols(&self) {
+        self.probe_other_protocols_for(PROTOCOL);
+    }
+
+    /// `probe_other_protocols` for an app that speaks `current`: the protocol
+    /// is a parameter so a test can be the app of a later protocol without
+    /// this build bumping its own.
+    fn probe_other_protocols_for(&self, current: u32) {
         let Ok(entries) = std::fs::read_dir(&self.config.dir) else {
             return;
         };
+        let mut legacy = Vec::new();
         for entry in entries.flatten().take(64) {
             let name = entry.file_name();
             let Some(protocol) = name.to_str().and_then(super::socket_protocol) else {
                 continue;
             };
-            if protocol == PROTOCOL {
+            if protocol == current {
                 continue;
             }
             let path = entry.path();
+            let mut holds = |hello_build: &str, pid: u32, sessions: usize| {
+                self.note_trouble(skew(current, protocol, hello_build, pid, sessions));
+                legacy.push(super::legacy::LegacyHostReport {
+                    protocol,
+                    socket: path.clone(),
+                    status: super::legacy::inspect(&self.config.dir, protocol),
+                });
+            };
             match probe(
                 &path,
                 Request::Hello {
-                    protocol: PROTOCOL,
+                    protocol: current,
                     build: crate::updates::CURRENT_VERSION.to_owned(),
                 },
             )
@@ -2054,17 +2111,13 @@ impl Inner {
                         Ok(Retired { retired: true, .. }) => {
                             log::info!(target: "terminal", "an idle terminal host of protocol {protocol} (build {}) was asked to exit", hello.build)
                         }
-                        Ok(Retired { sessions, .. }) => {
-                            self.note_trouble(skew(protocol, &hello.build, hello.pid, sessions))
-                        }
+                        Ok(Retired { sessions, .. }) => holds(&hello.build, hello.pid, sessions),
                         Err(error) => {
                             log::warn!(target: "terminal", "an idle terminal host of protocol {protocol} did not retire: {error}")
                         }
                     }
                 }
-                Ok(hello) => {
-                    self.note_trouble(skew(protocol, &hello.build, hello.pid, hello.sessions))
-                }
+                Ok(hello) => holds(&hello.build, hello.pid, hello.sessions),
                 // Nothing listening: a socket a dead host left. Not ours to
                 // delete; its own next start replaces it.
                 Err(error) => {
@@ -2072,12 +2125,13 @@ impl Inner {
                 }
             }
         }
+        *lock(&self.legacy) = legacy;
     }
 }
 
-fn skew(protocol: u32, build: &str, pid: u32, sessions: usize) -> String {
+fn skew(current: u32, protocol: u32, build: &str, pid: u32, sessions: usize) -> String {
     format!(
-        "A terminal host from another GitPulse version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {PROTOCOL} and cannot show them; they keep running until they end or that host is stopped."
+        "A terminal host from another GitPulse version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {current} and cannot show them; they keep running until they end or that host is stopped."
     )
 }
 
