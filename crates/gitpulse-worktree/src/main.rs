@@ -1263,14 +1263,20 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let anchor = &family.anchor;
             let target = &family.worktree;
             let (cache_res, devmap_res) = std::thread::scope(|scope| {
-                let c = scope.spawn(|| clone_ignored_caches(anchor, target, &selection));
-                let d = scope.spawn(|| match effective_mode {
-                    CliDevmapMode::Stacked => {
-                        provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                // New threads start in the process default (background); both
+                // are part of the command the user asked for.
+                let c = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    clone_ignored_caches(anchor, target, &selection)
+                }));
+                let d = scope.spawn(gitpulse_lib::engine::process::carry_admission(|| {
+                    match effective_mode {
+                        CliDevmapMode::Stacked => {
+                            provision_worktree_devmap_zero_copy(anchor, target).map(Some)
+                        }
+                        CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
+                        CliDevmapMode::None => Ok(None),
                     }
-                    CliDevmapMode::Copy => provision_worktree_devmap(anchor, target).map(Some),
-                    CliDevmapMode::None => Ok(None),
-                });
+                }));
                 let cr = c
                     .join()
                     .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")));

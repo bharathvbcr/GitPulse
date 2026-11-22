@@ -50,8 +50,8 @@ fn approve_subprocess_fixture_helper() {
 #[test]
 #[ignore = "subprocess helper invoked by exhaust_budget_in_isolated_home"]
 fn exhaust_budget_subprocess_helper() {
-    let spent = gitpulse_lib::engine::process::exhaust_per_user_record().expect("spend the record");
-    assert!(spent > 0, "the record held nothing to spend");
+    // Zero is fine: the record may already be spent (see with_budget_kept_spent).
+    gitpulse_lib::engine::process::exhaust_per_user_record().expect("spend the record");
 }
 
 /// Leaves the isolated profile's per-user git spawn budget empty, as a storm
@@ -61,9 +61,31 @@ fn exhaust_budget_in_isolated_home(home: &Path) {
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "exhaust_budget_subprocess_helper", "--ignored"])
         .envs(profile_env(home))
+        .env(gitpulse_lib::engine::process::EXHAUST_RECORD_MARKER, "1")
         .status_locked()
         .unwrap();
     assert!(status.success(), "exhausting the isolated budget failed");
+}
+
+/// Runs `body` while a second thread keeps the isolated profile's per-user git
+/// spawn budget spent: the shared bucket refills at a few tokens a second, so
+/// one spend followed by a slow start (a loaded host) would hand the command
+/// under test a budget it should not have had, and a test of "not shed when
+/// the budget is spent" would pass on code that sheds.
+fn with_budget_kept_spent<T>(home: &Path, body: impl FnOnce() -> T) -> T {
+    exhaust_budget_in_isolated_home(home);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let keeper = scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                exhaust_budget_in_isolated_home(home);
+            }
+        });
+        let result = body();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        keeper.join().expect("budget keeper");
+        result
+    })
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -411,9 +433,10 @@ fn cli_create_seeds_the_worktree_store_and_builds_it_in_place() {
 /// load-proof form of the assertion in
 /// `cli_create_seeds_the_worktree_store_and_builds_it_in_place`: the budget is
 /// spent first instead of left to whatever else is running.
+/// A trusted monorepo in an isolated profile whose devmap stub builds, with
+/// the profile's per-user git spawn budget not yet spent.
 #[cfg(unix)]
-#[test]
-fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+fn spent_budget_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -424,7 +447,6 @@ fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() 
     git(&anchor, &["config", "user.email", "agent@example.com"]);
     seed_monorepo_with_devmap_and_csr(&anchor);
     approve_in_isolated_home(&anchor, home.path());
-
     let stub = devmap_stub_path(home.path());
     fs::write(
         &stub,
@@ -435,22 +457,14 @@ fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() 
     )
     .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-    exhaust_budget_in_isolated_home(home.path());
+    (home, workspace, anchor)
+}
 
-    let wt = workspace.path().join("wt-spent-budget");
-    let out = run_cli(
-        home.path(),
-        &[
-            "create",
-            "--repo",
-            anchor.to_str().unwrap(),
-            "--branch",
-            "agent/spent-budget",
-            "--target",
-            wt.to_str().unwrap(),
-            "--json",
-        ],
-    );
+/// Runs the CLI with the budget kept spent and asserts the one-shot command
+/// was not shed: the seeded store built and the exit status is 0.
+#[cfg(unix)]
+fn assert_built_with_the_budget_spent(home: &Path, args: &[&str]) -> Value {
+    let out = with_budget_kept_spent(home, || run_cli(home, args));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let answer: Value = serde_json::from_str(stdout.trim())
@@ -464,6 +478,88 @@ fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() 
         Some(0),
         "stdout: {stdout}\nstderr: {stderr}"
     );
+    answer
+}
+
+/// The inline refresh of a create is the user's own one-shot command, so it is
+/// not shed when the per-user git spawn budget is empty (a loaded host, or
+/// agents spending it): it builds, and the answer says `built`, not
+/// `deferred` with exit 3 (card ft-63446aee, criterion C5). This is the
+/// load-proof form of the assertion in
+/// `cli_create_seeds_the_worktree_store_and_builds_it_in_place`: the budget is
+/// kept spent for the whole run instead of left to whatever else is running.
+#[cfg(unix)]
+#[test]
+fn cli_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, workspace, anchor) = spent_budget_fixture();
+    let wt = workspace.path().join("wt-spent-budget");
+    assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "create",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/spent-budget",
+            "--target",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+}
+
+/// `switch --create` makes a worktree like `create` does and is admitted the same way.
+#[cfg(unix)]
+#[test]
+fn cli_switch_create_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, _workspace, anchor) = spent_budget_fixture();
+    let answer = assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "switch",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--branch",
+            "agent/spent-switch",
+            "--create",
+            "--json",
+        ],
+    );
+    assert_eq!(answer["created"], true, "{answer}");
+}
+
+/// `isolate` provisions the caches and the devmap store of an existing
+/// worktree on two threads of its own; they carry the command's admission
+/// class, so a spent budget does not shed them (they start in the process
+/// default, background).
+#[cfg(unix)]
+#[test]
+fn cli_isolate_builds_the_seeded_store_even_when_the_git_spawn_budget_is_spent() {
+    let (home, workspace, anchor) = spent_budget_fixture();
+    let wt = workspace.path().join("wt-spent-isolate");
+    git(
+        &anchor,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/spent-isolate",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let answer = assert_built_with_the_budget_spent(
+        home.path(),
+        &[
+            "isolate",
+            "--repo",
+            anchor.to_str().unwrap(),
+            "--worktree",
+            wt.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(answer["devmap_seeded"], true, "{answer}");
 }
 
 /// A refresh that did not bring the seeded store to the worktree's tree is not

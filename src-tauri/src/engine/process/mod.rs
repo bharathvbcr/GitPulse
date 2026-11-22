@@ -132,7 +132,7 @@ pub(in crate::engine::process) use runner::{
 };
 pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 
-pub use shared_budget::exhaust_per_user_record;
+pub use shared_budget::{exhaust_per_user_record, EXHAUST_RECORD_MARKER};
 pub(crate) use shared_read::run_read_shared;
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]

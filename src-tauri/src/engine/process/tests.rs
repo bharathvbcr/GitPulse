@@ -5667,6 +5667,16 @@ fn carry_admission_puts_the_callers_class_on_the_thread_that_runs_the_body() {
     );
 }
 
+/// A hand-run `--ignored` helper must not drain the developer's own per-user
+/// record: without the marker an isolated test profile sets, the spend is
+/// refused before the record is opened.
+#[test]
+fn exhaust_per_user_record_refuses_without_the_isolated_profile_marker() {
+    assert!(std::env::var_os(super::EXHAUST_RECORD_MARKER).is_none());
+    let refused = exhaust_per_user_record().expect_err("no marker, no spend");
+    assert!(refused.contains(super::EXHAUST_RECORD_MARKER), "{refused}");
+}
+
 /// Unmetered spawns (a `devmap` read) neither wait for nor spend a git rate
 /// token, but are still concurrency-limited: a spent bucket sheds background
 /// work, and the same thread inside `with_unmetered_spawn_rate` is admitted.

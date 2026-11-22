@@ -78,15 +78,29 @@ pub(super) fn default_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no per-user config directory (HOME / APPDATA unset)".to_string())
 }
 
+/// The environment variable an isolated test profile sets to allow
+/// [`exhaust_per_user_record`].
+#[doc(hidden)]
+pub const EXHAUST_RECORD_MARKER: &str = "GITPULSE_TEST_ISOLATED_PROFILE_MAY_EXHAUST_SPAWN_BUDGET";
+
 /// Spends the per-user record down to nothing (the state a storm leaves it in)
 /// and returns how many tokens that took.
 ///
 /// For integration tests of the shipped binaries, which draw from this record
 /// in their own isolated profile: it is how a test says "the git spawn budget is
 /// exhausted" without a real storm. Callers must run under the profile whose
-/// record they mean to spend (`HOME`), never the developer's own.
+/// record they mean to spend (`HOME`), never the developer's own: it refuses
+/// unless [`EXHAUST_RECORD_MARKER`] is set in the environment, which only the
+/// test that built an isolated profile does, so a hand-run `--ignored` helper
+/// cannot drain the real record.
 #[doc(hidden)]
 pub fn exhaust_per_user_record() -> Result<u32, String> {
+    if std::env::var_os(EXHAUST_RECORD_MARKER).is_none() {
+        return Err(format!(
+            "refusing to spend the per-user spawn budget record: {EXHAUST_RECORD_MARKER} is not set, \
+             so this may not be an isolated test profile"
+        ));
+    }
     let (burst, per_sec) = super::gate::production_spawn_rate();
     let budget = SharedBudget::open(&default_path()?)?;
     let mut spent = 0;
