@@ -287,6 +287,14 @@ pub(crate) fn session_key(raw: &str) -> Result<String, MailboxError> {
     }
 }
 
+/// True when `text` holds a control character other than a line break or tab. The one
+/// definition of that rule, shared by the mailbox and the coordination bus so a body one
+/// accepts is never refused by the other.
+pub(crate) fn has_disallowed_control(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+}
+
 /// Checks a message: nonblank, bounded, and free of control characters other
 /// than line breaks and tabs.
 pub(crate) fn validate_message(text: &str) -> Result<(), MailboxError> {
@@ -299,10 +307,7 @@ pub(crate) fn validate_message(text: &str) -> Result<(), MailboxError> {
             text.len()
         )));
     }
-    if text
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
-    {
+    if has_disallowed_control(text) {
         return Err(MailboxError::Invalid(
             "A message cannot contain control characters other than line breaks and tabs.".into(),
         ));

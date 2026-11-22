@@ -124,6 +124,13 @@ hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff me
 every sibling lane. You can send an agent a message yourself with **Send to agent** on a live session;
 GitPulse shows a preview and waits for your confirmation before delivering it.
 
+The bus keeps the newest 256 messages. When it is full, the oldest message goes first, except that open
+asks and each recipient's unread direct messages from the last 2 hours (up to 8 per recipient, 64 in
+all) are kept for as long as anything else can go instead. A body may hold line breaks and tabs but no
+other control characters, and the 16 KiB limit counts the body as stored, where a quote or backslash
+takes two bytes. If the bus file ever outgrows its 8 MiB limit, the next post or acknowledgement drops
+the oldest rows to bring it back under, logs a warning, and never reuses a sequence number.
+
 ![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 
 ## The collision workflow
