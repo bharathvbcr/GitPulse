@@ -81,6 +81,7 @@
     type FollowTarget,
   } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
+  import { stopChildrenQuestion } from "../terminal/stopChildren";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
@@ -2644,6 +2645,10 @@
 
   async function stopActiveChildren() {
     const targets = [...activeChildTabs];
+    if (targets.length === 0) return;
+    // Stopping ends whatever each child is doing and cannot be undone, so it
+    // is asked first, naming what will stop (as closing a running agent's tab does).
+    if (!(await askConfirm({ ...stopChildrenQuestion(targets.map((child) => tabLabel(child))), confirmLabel: "Stop", destructive: true }))) return;
     for (const child of targets) {
       try {
         await sessions[child.id]?.close();
