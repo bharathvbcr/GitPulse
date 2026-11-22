@@ -995,9 +995,9 @@ describe("notify routes", () => {
 });
 
 
-describe("gitpulse-terminal plugin skill contract", () => {
+describe("gitpulse:terminal plugin skill contract", () => {
   const skillMd = readFileSync(
-    path.join(PLUGIN, "skills", "gitpulse-terminal", "SKILL.md"),
+    path.join(PLUGIN, "skills", "terminal", "SKILL.md"),
     "utf8",
   );
   const mcpModRs = readFileSync(path.join(ROOT, "src-tauri", "src", "mcp", "mod.rs"), "utf8");

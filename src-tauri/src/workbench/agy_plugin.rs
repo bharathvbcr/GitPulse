@@ -41,18 +41,15 @@ const PLUGIN_JSON: &str = include_str!("../../../plugins/gitpulse/plugin.json");
 #[cfg(unix)]
 const HOOKS_JSON: &str = include_str!("../../../plugins/gitpulse/hooks.json");
 #[cfg(unix)]
-const SKILL_COLLISIONS: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-collisions/SKILL.md");
+const SKILL_COLLISIONS: &str = include_str!("../../../plugins/gitpulse/skills/collisions/SKILL.md");
 #[cfg(unix)]
-const SKILL_INSIGHTS: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-insights/SKILL.md");
+const SKILL_INSIGHTS: &str = include_str!("../../../plugins/gitpulse/skills/insights/SKILL.md");
 #[cfg(unix)]
-const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-load/SKILL.md");
+const SKILL_LOAD: &str = include_str!("../../../plugins/gitpulse/skills/load/SKILL.md");
 #[cfg(unix)]
-const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md");
+const SKILL_TASKS: &str = include_str!("../../../plugins/gitpulse/skills/tasks/SKILL.md");
 #[cfg(unix)]
-const SKILL_TERMINAL: &str =
-    include_str!("../../../plugins/gitpulse/skills/gitpulse-terminal/SKILL.md");
+const SKILL_TERMINAL: &str = include_str!("../../../plugins/gitpulse/skills/terminal/SKILL.md");
 
 /// Producer marker proving GitPulse created `~/.gemini/config/plugins/gitpulse`.
 #[cfg(unix)]
@@ -60,6 +57,13 @@ pub(crate) const PRODUCER_MARKER: &str = ".gitpulse-managed";
 #[cfg(unix)]
 const PRODUCER_MARKER_BODY: &str = "managed_by=gitpulse\nschema=agent-plugins-1.0.0\n";
 
+/// Antigravity runs a plugin's skill as a bare `/<skill-name>`, with no plugin
+/// namespace, so its copies keep this prefix (`/gitpulse-insights`). Hosts
+/// that namespace by plugin read `plugins/gitpulse/skills/<name>` as it is and
+/// show `gitpulse:insights`.
+pub(crate) const ANTIGRAVITY_SKILL_PREFIX: &str = "gitpulse-";
+
+/// Installed directory name, then the bundled `SKILL.md` it is written from.
 #[cfg(unix)]
 const SKILLS: [(&str, &str); 5] = [
     ("gitpulse-collisions", SKILL_COLLISIONS),
@@ -255,6 +259,43 @@ fn verify_owned_or_absent(plugin_dir: &Path) -> Result<bool, String> {
     }
 }
 
+/// What a skill is called where `provider` runs it: Antigravity has no plugin
+/// namespace, so it gets [`ANTIGRAVITY_SKILL_PREFIX`]; the other hosts
+/// qualify a plugin's skills by the plugin's name.
+pub(crate) fn skill_reference(provider: &str, skill: &str) -> String {
+    if provider == "agy" {
+        format!("{ANTIGRAVITY_SKILL_PREFIX}{skill}")
+    } else {
+        format!("gitpulse:{skill}")
+    }
+}
+
+/// The bundled `SKILL.md` as Antigravity's copy at `installed`: the frontmatter
+/// `name:` becomes the installed directory name, and every `gitpulse:<skill>`
+/// reference to a bundled skill becomes its Antigravity name, so the copy
+/// names skills the way Antigravity runs them.
+#[cfg(unix)]
+fn for_antigravity(installed: &str, body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 64);
+    let mut renamed = false;
+    for line in body.split_inclusive('\n') {
+        if !renamed && line.starts_with("name:") {
+            out.push_str("name: ");
+            out.push_str(installed);
+            out.push('\n');
+            renamed = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    for (other, _) in SKILLS {
+        if let Some(short) = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX) {
+            out = out.replace(&format!("gitpulse:{short}"), other);
+        }
+    }
+    out
+}
+
 #[cfg(unix)]
 fn remove_managed_plugin(plugin_dir: &Path) -> Result<(), String> {
     let exists = verify_owned_or_absent(plugin_dir)?;
@@ -382,7 +423,11 @@ pub(crate) fn sync_under_home(
     for (skill_name, skill_body) in SKILLS {
         let skill_dir = skills_root.join(skill_name);
         ensure_non_symlink_dir(&skill_dir)?;
-        write_regular_file(&skill_dir.join("SKILL.md"), skill_body.as_bytes(), false)?;
+        write_regular_file(
+            &skill_dir.join("SKILL.md"),
+            for_antigravity(skill_name, skill_body).as_bytes(),
+            false,
+        )?;
     }
 
     Ok(())
@@ -463,6 +508,28 @@ mod tests {
             .join("skills/gitpulse-terminal/SKILL.md")
             .is_file());
         assert!(plugin_dir.join("skills/gitpulse-load/SKILL.md").is_file());
+        // Antigravity has no plugin namespace: each copy is named for its
+        // directory and names its sibling skills the same way.
+        for (installed, _) in SKILLS {
+            let body =
+                std::fs::read_to_string(plugin_dir.join("skills").join(installed).join("SKILL.md"))
+                    .unwrap();
+            assert!(
+                installed.starts_with(ANTIGRAVITY_SKILL_PREFIX),
+                "{installed}"
+            );
+            assert!(
+                body.contains(&format!("\nname: {installed}\n")),
+                "{installed} frontmatter must carry its installed name"
+            );
+            for (other, _) in SKILLS {
+                let short = other.strip_prefix(ANTIGRAVITY_SKILL_PREFIX).unwrap();
+                assert!(
+                    !body.contains(&format!("gitpulse:{short}")),
+                    "{installed} names gitpulse:{short}, which Antigravity cannot run"
+                );
+            }
+        }
 
         let mcp_json: Value =
             serde_json::from_str(&std::fs::read_to_string(plugin_dir.join("mcp.json")).unwrap())

@@ -1,5 +1,5 @@
 ---
-name: gitpulse-tasks
+name: tasks
 description: File, import, list, read, complete, merge and delete tasks on the GitPulse task board over MCP — the board a person sees in GitPulse and launches agents from. Use when an agent needs to record follow-up work, plan upcoming tasks, put Markdown task briefs from a repository's tasks/ folder onto the board, read a task's brief before implementing it, mark the task it was launched on done when the work is finished, merge duplicate tasks into one, or delete a task that should not exist, with a recorded reason.
 license: MIT
 compatibility: Requires the gitpulse-mcp binary on PATH, an absolute git repository path, and a repository the person has trusted in GitPulse.
@@ -31,7 +31,7 @@ repository is refused with `untrusted_repository`; ask the person to open it in
 GitPulse and trust it. No write can start an agent run, and only
 `gitpulse_delete_task` and `gitpulse_merge_tasks` remove a card.
 
-Without a loaded MCP connection the same tools run from the shell (see the gitpulse-insights skill for the exit statuses). Writes need `--write` (which runs them under Bash permission rules, not the host's per-tool approval: do not allowlist `gitpulse-mcp call` broadly), and a brief is easiest passed as one JSON object on stdin:
+Without a loaded MCP connection the same tools run from the shell (see the `gitpulse:insights` skill for the exit statuses). Writes need `--write` (which runs them under Bash permission rules, not the host's per-tool approval: do not allowlist `gitpulse-mcp call` broadly), and a brief is easiest passed as one JSON object on stdin:
 
 ```sh
 gitpulse-mcp call gitpulse_list_tasks repo_path=/abs/repo limit=50

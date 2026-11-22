@@ -1,5 +1,5 @@
 ---
-name: gitpulse-load
+name: load
 description: Check host load before heavy builds and tests, and know what to do when GitPulse refuses one. Use before running cargo, go, npm/bun/pnpm test, vitest or jest, before an unbounded grep, rg or go test, and whenever a command was refused for host load or the session brief says host load is elevated, severe or UNKNOWN.
 license: MIT
 compatibility: The refusal and the advice come from the gitpulse-hook command-gate (any Claude Code session with the GitPulse plugin). It reads what the GitPulse app publishes, so it speaks only while the app is running.

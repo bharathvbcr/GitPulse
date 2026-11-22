@@ -1,5 +1,5 @@
 ---
-name: gitpulse-terminal
+name: terminal
 description: Orchestrate scoped child terminal sessions and split-pane file previews inside GitPulse over MCP or gitpulse-hook term. Use when an agent running in a GitPulse PTY wants to spin up a child shell or sub-agent (Claude Code, Antigravity, Codex, Manvi, Grok), wait on semantic prompt/agent idle or a dev-server URL without sleep-polling, read secret-redacted 2D terminal screen output, send policy-gated input, or open a repository file in a side-by-side split pane.
 license: MIT
 compatibility: Requires a running GitPulse desktop window on macOS, a trusted git repository, and caller session credentials (GITPULSE_TERMINAL_SESSION or GITPULSE_SESSION_ID, plus GITPULSE_SESSION_TOKEN) inherited from a GitPulse PTY.
@@ -50,7 +50,7 @@ gitpulse-hook term list
 gitpulse-hook term open-file src/main.rs --line 42
 ```
 
-`gitpulse-mcp call gitpulse_terminal_* --write ...` (the one-shot form the gitpulse-insights skill describes) acts for `GITPULSE_TERMINAL_SESSION` inside a GitPulse terminal, as the MCP tools do. Outside one, each call is a new `mcp-<pid>` caller that cannot reach a child an earlier call left open, so only a self-contained call is useful there: `gitpulse_terminal_exec` with `keep_open: false`, or `gitpulse_terminal_open_file`. `gitpulse-hook term` outside a GitPulse terminal acts for its parent shell (`ext-<ppid>`), so spawn, wait, read and close from one shell script reach the same child; separate agent shell commands are separate parents.
+`gitpulse-mcp call gitpulse_terminal_* --write ...` (the one-shot form the `gitpulse:insights` skill describes) acts for `GITPULSE_TERMINAL_SESSION` inside a GitPulse terminal, as the MCP tools do. Outside one, each call is a new `mcp-<pid>` caller that cannot reach a child an earlier call left open, so only a self-contained call is useful there: `gitpulse_terminal_exec` with `keep_open: false`, or `gitpulse_terminal_open_file`. `gitpulse-hook term` outside a GitPulse terminal acts for its parent shell (`ext-<ppid>`), so spawn, wait, read and close from one shell script reach the same child; separate agent shell commands are separate parents.
 
 ## Workflow guidelines
 

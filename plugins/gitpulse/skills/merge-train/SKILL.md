@@ -1,5 +1,5 @@
 ---
-name: gitpulse-merge-train
+name: merge-train
 description: Verify several branches together with ONE full gate run instead of one per branch, in GitPulse, DevCouncil, Manvi or ScholarLM. Merges the batch onto a persistent integration worktree, runs the repository's own full gate once, compares individual failures against main (main is often already red), re-checks suspected failures alone, and bisects with only the failing tests to name the branch that broke them. Use when two or more finished branches or lanes are waiting to merge, when asked to "verify these branches together", "run a merge train", or "check what this batch breaks". Produces a verified train branch and a report; it never lands, pushes or deletes anything.
 license: MIT
 compatibility: macOS with git 2.38+ (merge-tree --write-tree), Go 1.27+ to build the failset tool, and each repository's own gate toolchain (bun, cargo, go).
