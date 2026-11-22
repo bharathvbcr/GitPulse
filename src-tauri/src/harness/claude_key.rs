@@ -70,13 +70,17 @@ impl Keychain {
     /// other platform every operation is refused rather than silently storing
     /// nothing.
     pub(crate) fn system() -> Result<Self, String> {
-        if cfg!(target_os = "macos") {
-            Ok(Self {
-                program: PathBuf::from("/usr/bin/security"),
-            })
-        } else {
-            Err("Saving a Claude API key needs the macOS Keychain.".into())
+        if !cfg!(target_os = "macos") {
+            return Err("Saving a Claude API key needs the macOS Keychain.".into());
         }
+        if let Some(why) = super::login_keychain::refusal() {
+            return Err(format!(
+                "The Claude API key cannot use the login Keychain: {why}"
+            ));
+        }
+        Ok(Self {
+            program: PathBuf::from("/usr/bin/security"),
+        })
     }
 
     #[cfg(all(test, unix))]
@@ -290,6 +294,17 @@ exit 2
             "{error}",
             error = error.message()
         );
+    }
+
+    /// Lib tests run under the hermetic `HOME`, which has no login Keychain:
+    /// asking `security` there puts a "Keychain Not Found" dialog on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_keychain_is_refused_under_a_home_that_is_not_the_accounts() {
+        let error = Keychain::system()
+            .err()
+            .expect("the login Keychain must not be asked under a foreign HOME");
+        assert!(error.contains("not the account's home"), "{error}");
     }
 
     #[test]
