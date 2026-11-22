@@ -184,8 +184,9 @@ function listDetached(
     ...(family ? { family } : {}),
     status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
     sessionId: listing.id,
-    async close() {
-      await invoke("cmd_terminal_kill", { sessionId: listing.id });
+    async close(origin) {
+      // Stop in the Sessions list unless a tab's close (a restored tab not yet shown) says otherwise.
+      await invoke("cmd_terminal_kill", { sessionId: listing.id, origin: origin ?? "sessions_list_stop" });
       settle("closed");
       drop();
     },

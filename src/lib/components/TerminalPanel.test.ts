@@ -608,11 +608,25 @@ describe("TerminalPanel reload restore wiring", () => {
     expect(source).toContain('deferredTabs.has(id),');
     const body = source.slice(source.indexOf("async function requestClose("), source.indexOf("/** Whether closing this tab may go ahead"));
     expect(body).toContain("if (deferredTabs.has(id))");
-    expect(body).toContain("await adoptedRecordFor(id)?.close();");
-    expect(body.indexOf("await confirmClose(id)")).toBeLessThan(body.indexOf("adoptedRecordFor(id)?.close()"));
+    expect(body).toContain("await adoptedRecordFor(id)?.close(origin);");
+    expect(body.indexOf("await confirmClose(id)")).toBeLessThan(body.indexOf("adoptedRecordFor(id)?.close(origin)"));
   });
   it("mounts a restored background tab's session only when it is first shown", () => {
     expect(source).toContain("{:else if !deferredTabs.has(tab.id)}");
     expect(source).toContain("if (attach) reclaimAdoptedSession(attach);");
+  });
+});
+
+describe("TerminalPanel names the route of every close", () => {
+  // The panel's closes run in the Svelte component, which vitest does not
+  // mount; harness/terminal.html asserts the origin each route sends at run time.
+  it("sends tab_close for a single tab, batch_close for the batch routes", () => {
+    expect(source).toContain('async function requestClose(id: string, origin: KillOrigin = "tab_close")');
+    expect(source).toContain('await requestClose(id, "batch_close");');
+    expect(source).toContain('?.close(origin)');
+  });
+  it("sends stop_children from Stop children and sessions_list_stop from the Sessions list", () => {
+    expect(source).toContain('sessions[child.id]?.close("stop_children")');
+    expect(source).toContain('closeWithConfirmation(session, "sessions_list_stop")');
   });
 });

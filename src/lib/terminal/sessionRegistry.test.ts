@@ -1,6 +1,7 @@
 import { get } from "svelte/store";
 import { describe, expect, it, vi } from "vitest";
 import {
+  closeWithConfirmation,
   createSessionRegistry,
   runningAgents,
   sessionByNativeId,
@@ -388,5 +389,15 @@ describe("live title updates via slot.retitle", () => {
     slot.retitle("Should not publish");
     expect(get(registry)).toHaveLength(0);
     stop();
+  });
+});
+
+describe("closeWithConfirmation origin", () => {
+  it("passes the route to the record's close, and none when there is none", async () => {
+    const close = vi.fn(async () => {});
+    await closeWithConfirmation({ close }, "sessions_list_stop");
+    expect(close).toHaveBeenLastCalledWith("sessions_list_stop");
+    await closeWithConfirmation({ close });
+    expect(close).toHaveBeenLastCalledWith();
   });
 });

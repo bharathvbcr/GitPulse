@@ -137,7 +137,7 @@
             resizeLog.push({ id: args.sessionId, rows: args.rows, cols: args.cols });
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
-          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; (report.killOrigins ??= []).push({ sessionId: args.sessionId, origin: args.origin ?? null }); showReport(); return null;
           // A tab unmounted without Close: the host keeps the process.
           case "cmd_terminal_detach": {
             const kept = sessions.has(args.sessionId);
@@ -1233,6 +1233,7 @@
           const tabCount = visible('[role="tab"]').length;
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
           check("close chord kills only its session", () => visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
+          check("a single tab's close sends the tab_close origin", () => report.killOrigins.length === 1 && report.killOrigins[0].origin === "tab_close");
           // A shell tab opened beside another starts where that shell is.
           contextDir = "src/lib";
           const spawnsBeforeHere = report.spawned;

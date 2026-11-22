@@ -8,6 +8,7 @@ import { SessionCapacityError, type createSessionRegistry } from "./sessionRegis
 import { TASK_TERMINAL_STARTING } from "./sessionMessages";
 import type { LauncherKind } from "./tabs";
 import { describeError } from "../ui/copy/describeFailure";
+import { protectedSkipOf, type KillOrigin } from "./killOrigin";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -22,7 +23,8 @@ export interface SessionTransport {
   spawn(): Promise<TerminalSpawned>;
   write(id: string, data: string, binary: boolean): Promise<void>;
   resize(id: string, rows: number, cols: number): Promise<void>;
-  kill(id: string): Promise<void>;
+  /** `origin` is sent only when a caller named one; absent is `unspecified` (a direct close). */
+  kill(id: string, origin?: KillOrigin): Promise<void>;
   /**
    * Leave the process running with no view (`cmd_terminal_detach`). Resolves
    * whether there was a live session to keep.
@@ -170,7 +172,14 @@ export function createSessionLifecycle(options: {
     if (retain) lossNotice = mergeTerminalNotice(lossNotice, message);
     state("error", message);
   }
-  async function closeCurrent() {
+  /** The input queue for the live process `sessionId`; one owner, so a refused close can put it back. */
+  function openInput(sessionId: string) {
+    return createTerminalInput((data, binary) => transport.write(sessionId, data, binary), (message, fatal) => {
+      if (fatal) fail(message);
+      else if (!disposed) hooks.warning(message);
+    }, { clock: options.clock, onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
+  }
+  async function closeCurrent(origin?: KillOrigin) {
     if (closing) return closing;
     const target = id;
     if (!target) { release(); return; }
@@ -182,7 +191,7 @@ export function createSessionLifecycle(options: {
     // the view and in Sessions, and retracted when it settles. A window nobody
     // can see does not count against it: the failure it would report, "Close
     // failed", could not be seen either, and the kill lands regardless.
-    closing = terminalDeadline(transport.kill(target), KILL_HARD_MS, "Closing terminal", {
+    closing = terminalDeadline(origin ? transport.kill(target, origin) : transport.kill(target), KILL_HARD_MS, "Closing terminal", {
       clock: options.clock,
       pauseWhileHidden: true,
       softMs: KILL_SOFT_MS,
@@ -203,15 +212,25 @@ export function createSessionLifecycle(options: {
         }
       }
     }).catch((error: unknown) => {
+      // A protected session spared by a batch route is not a failed close: the
+      // process runs on, so the tab keeps its input and says nothing is wrong.
+      if (protectedSkipOf(error) !== null) {
+        if (id === target && !disposed) {
+          input = openInput(target);
+          slot?.update(notice ?? "running");
+        }
+        throw error;
+      }
       // Keep the slot and process id: a failed kill is not a closed process.
       state("error", `Close failed; use Sessions to try again. ${describeError(error, "terminal")}`);
       throw error;
     }).finally(() => { closing = null; });
     return closing;
   }
-  async function close() {
+  /** `origin` is the route that asked (`killOrigin.ts`); a caller that names none is a direct close. */
+  async function close(origin?: KillOrigin) {
     if (starting) await starting;
-    await closeCurrent();
+    await closeCurrent(origin);
   }
   /**
    * The view is going away and nobody asked to close it: an unmount from a
@@ -324,10 +343,7 @@ export function createSessionLifecycle(options: {
       // and it is not shown, typed into or journaled. It is still watched
       // below: its output is acknowledged and its exit releases its slot.
       if (!disposed) {
-        input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
-          if (fatal) fail(message);
-          else if (!disposed) hooks.warning(message);
-        }, { clock: options.clock, onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
+        input = openInput(spawned.id);
         state("running");
         if (!reattached) {
           // This id belongs to a new process. Its predecessor's loss does not.

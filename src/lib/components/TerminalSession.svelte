@@ -1361,7 +1361,7 @@
         },
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
-        kill: (sessionId) => invoke("cmd_terminal_kill", { sessionId }),
+        kill: (sessionId, origin) => invoke("cmd_terminal_kill", origin ? { sessionId, origin } : { sessionId }),
         detach: (sessionId) => invoke<boolean>("cmd_terminal_detach", { sessionId }),
       },
       // Only a plain shell positively at its prompt may end with its view.
@@ -1597,7 +1597,7 @@
    * the unmount that follows has nothing left to keep. Rejects when the
    * process could not be stopped; the tab then stays, with its retry.
    */
-  export async function close(): Promise<void> { await lifecycle?.close(); }
+  export async function close(origin?: import("../terminal/killOrigin").KillOrigin): Promise<void> { await lifecycle?.close(origin); }
 
   /**
    * The attempt this tab belongs to: its own, or the one a resumed

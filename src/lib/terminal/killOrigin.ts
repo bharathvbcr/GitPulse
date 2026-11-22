@@ -17,3 +17,16 @@ export type KillOrigin =
   | "load_governor"
   | "quit_stop_all"
   | "unspecified";
+
+/**
+ * The session a close was refused for because it is protected, or null when
+ * `error` is anything else. The backend answers `cmd_terminal_kill` with a
+ * plain string naming the session (`skipped_protected_message`), so this is the
+ * one place that reads it; a refusal is the session being spared, not a
+ * failure to close it.
+ */
+export function protectedSkipOf(error: unknown): string | null {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : null;
+  if (!message) return null;
+  return /session (\S+) is protected and was not closed by /.exec(message)?.[1] ?? null;
+}

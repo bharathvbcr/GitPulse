@@ -741,3 +741,36 @@ describe("a view that goes away without Close", () => {
     await flush();
   });
 });
+
+describe("the route a close came by", () => {
+  it("names the origin to the transport, and sends none when the caller named none", async () => {
+    const f = fixture();
+    await f.owner.start(); await f.owner.close("batch_close");
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a", "batch_close");
+    const g = fixture();
+    await g.owner.start(); await g.owner.close();
+    expect(g.transport.kill).toHaveBeenCalledWith("native-a");
+    f.owner.dispose(); g.owner.dispose(); await flush();
+  });
+
+  it("reaches the transport through a Sessions record's close", async () => {
+    const f = fixture();
+    await f.owner.start(); await get(f.registry)[0].close("sessions_list_stop");
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a", "sessions_list_stop");
+    f.owner.dispose(); await flush();
+  });
+
+  it("keeps a protected session usable when a batch route is refused", async () => {
+    const refusal = "session native-a is protected and was not closed by batch_close; close its tab directly to stop it";
+    const kill = vi.fn<() => Promise<void>>(async () => { throw refusal; });
+    const f = fixture({ kill });
+    await f.owner.start();
+    await expect(f.owner.close("batch_close")).rejects.toBe(refusal);
+    // Not a failed close: no error is painted and the session still takes input.
+    expect(f.hooks.state).not.toHaveBeenCalledWith("error", expect.anything());
+    expect(get(f.registry)[0].status).toBe("running");
+    expect(f.owner.write("still here\n")).toBe(true);
+    expect(f.transport.write).toHaveBeenCalledWith("native-a", "still here\n", false);
+    f.owner.dispose(); await flush();
+  });
+});

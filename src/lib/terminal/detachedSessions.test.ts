@@ -76,7 +76,7 @@ describe("sessions a reloaded page left running", () => {
     expect(record.status).toBe(ENDING_STATUS);
     expect(record.reveal).toBeUndefined();
     await record.close();
-    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } });
+    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } });
     expect(get(registry)).toEqual([]);
   });
 
@@ -84,7 +84,7 @@ describe("sessions a reloaded page left running", () => {
     const { registry, calls, adopt } = setup([row()]);
     await adopt();
     await get(registry)[0].close();
-    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } });
+    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } });
     expect(get(registry)).toEqual([]);
   });
 
@@ -251,7 +251,7 @@ describe("a tab's process kept after its view went away", () => {
     const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => { calls.push({ command, args }); return null as T; };
     keepDetached(row(), tabSlot, { invoke, bus, confirm: async () => true });
     await get(registry)[0].close();
-    expect(calls).toEqual([{ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } }]);
+    expect(calls).toEqual([{ command: "cmd_terminal_kill", args: { sessionId: "term-1-a", origin: "sessions_list_stop" } }]);
     expect(get(registry)).toHaveLength(0);
   });
 

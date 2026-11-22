@@ -82,6 +82,7 @@
   } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { stopChildrenQuestion } from "../terminal/stopChildren";
+  import type { KillOrigin } from "../terminal/killOrigin";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
@@ -2190,7 +2191,7 @@
   /** The Sessions list's close: the panel's question first, then stop the process. */
   async function closeListed(session: TerminalSessionRecord) {
     try {
-      await closeWithConfirmation(session);
+      await closeWithConfirmation(session, "sessions_list_stop");
     } catch (error: unknown) {
       sessionError = describeError(error, "terminal");
     }
@@ -2216,7 +2217,7 @@
     return get(terminalSessions).find((record) => isAdoptedSession(record) && record.sessionId === attach) ?? null;
   }
 
-  async function requestClose(id: string) {
+  async function requestClose(id: string, origin: KillOrigin = "tab_close") {
     if (closing.has(id)) return;
     closing.add(id);
     try {
@@ -2227,9 +2228,9 @@
         if (deferredTabs.has(id)) {
           // Never mounted, so no session to close: the Sessions record that still
           // holds this process kills it, exactly as Stop in that list does.
-          await adoptedRecordFor(id)?.close();
+          await adoptedRecordFor(id)?.close(origin);
         } else {
-          await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
+          await (sessions[id]?.close(origin) ?? browsers[id]?.close() ?? filePanes[id]?.close());
         }
       } catch (error: unknown) {
         sessionError = describeError(error, "terminal");
@@ -2692,7 +2693,7 @@
     if (!(await askConfirm({ ...stopChildrenQuestion(targets.map((child) => tabLabel(child))), confirmLabel: "Stop", destructive: true }))) return;
     for (const child of targets) {
       try {
-        await sessions[child.id]?.close();
+        await sessions[child.id]?.close("stop_children");
       } catch (error: unknown) {
         sessionError = describeError(error, "terminal");
         continue;
@@ -3686,7 +3687,7 @@
   async function closeTabsBatch(ids: readonly string[]) {
     for (const id of ids) {
       if (!tabState.tabs.some((candidate) => candidate.id === id)) continue;
-      await requestClose(id);
+      await requestClose(id, "batch_close");
       if (tabState.tabs.some((candidate) => candidate.id === id)) break;
     }
   }
