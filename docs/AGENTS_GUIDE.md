@@ -124,6 +124,8 @@ hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff me
 every sibling lane. You can send an agent a message yourself with **Send to agent** on a live session;
 GitPulse shows a preview and waits for your confirmation before delivering it.
 
+The `gitpulse_agent_send` result has a `mailbox` object saying whether the recipient's mailbox took the message (`deposited`, with a `reason` of `full`, `refused`, `no_session` or `unavailable` when it did not). A peer may hold at most 7 pending messages per session; the last slot carries one notice per repository pointing the recipient at `gitpulse_agent_inbox`. A `delivery_outcome` of `bus_only` means the message is on the bus but not in the mailbox, so only an inbox or wait call will show it.
+
 ![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 
 ## The collision workflow

@@ -187,6 +187,45 @@ impl WaitPool {
     }
 }
 
+/// What became of a peer deposit made through [`Mailbox::deposit_peer_or_overflow`].
+#[derive(Debug)]
+pub(crate) enum PeerDeposit {
+    /// The envelope is in the mailbox (or was already, for a retried send).
+    Deposited(Deposit),
+    /// The peer cap was reached, so the envelope was not stored. `notice` is what became
+    /// of the overflow notice that tells the recipient to read the rest from the bus.
+    Overflowed {
+        notice: Result<Deposit, MailboxError>,
+    },
+}
+
+/// Pending slots peer-agent envelopes may hold; the last slot of [`MAX_PENDING`] is kept for
+/// the one overflow notice per repository, so a flood of peer messages can still say it overflowed.
+const MAX_PEER_PENDING: usize = MAX_PENDING - 1;
+
+const OVERFLOW_ID_PREFIX: &str = "bus-overflow-";
+const OVERFLOW_FROM_PEER: &str = "gitpulse";
+
+/// The request id of a repository's overflow notice: stable across calls and processes, so a
+/// second overflow finds the first notice instead of adding another.
+fn overflow_notice_id(repo_root: &str) -> String {
+    let identity = crate::harness::steward::canonical_common_dir(repo_root)
+        .unwrap_or_else(|| repo_root.to_owned());
+    // FNV-1a: `DefaultHasher` is not guaranteed stable between builds, and two builds
+    // sharing a mailbox must agree on the id.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in identity.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{OVERFLOW_ID_PREFIX}{hash:08x}")
+}
+
+fn is_overflow_notice(request_id: &str, provenance: &EnvelopeProvenance) -> bool {
+    request_id.starts_with(OVERFLOW_ID_PREFIX)
+        && matches!(provenance, EnvelopeProvenance::PeerAgent { from_peer, .. } if from_peer == OVERFLOW_FROM_PEER)
+}
+
 /// What became of a deposit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Deposit {
@@ -669,9 +708,18 @@ impl Mailbox {
         let _session_lock = self.lock_session(&key)?;
         self.expire_session(&key, &dir, now);
         let files = regular_files(&dir);
+        let overflow_notice = is_overflow_notice(request_id, &provenance);
         for (name, _) in &files {
-            if let Some((_, stamp, id)) = parse_message_name(name) {
+            if let Some((kind, stamp, id)) = parse_message_name(name) {
                 if id == request_id {
+                    if overflow_notice && kind == 'c' {
+                        // The recipient already took an earlier notice. A new overflow needs a
+                        // fresh one, so the claimed copy must not make it a duplicate.
+                        std::fs::remove_file(dir.join(name))
+                            .map_err(|e| io("could not clear the claimed overflow notice", &e))?;
+                        self.remove_provenance(&key, id);
+                        continue;
+                    }
                     let same_text =
                         read_message(&dir.join(name)).is_ok_and(|held| held == normalized.as_ref());
                     let same_prov = self
@@ -692,6 +740,9 @@ impl Mailbox {
             }
         }
         let mut pending = 0usize;
+        let mut peer_pending = 0usize;
+        let counts_as_peer =
+            matches!(provenance, EnvelopeProvenance::PeerAgent { .. }) && !overflow_notice;
         let steward_repo = match &provenance {
             EnvelopeProvenance::SystemSteward { repo_root, .. } => Some(repo_root.as_str()),
             _ => None,
@@ -718,6 +769,22 @@ impl Mailbox {
                 }
             }
             pending += 1;
+            if counts_as_peer {
+                if let Some((_, _, id)) = parse_message_name(name) {
+                    if matches!(
+                        self.read_provenance(&key, id),
+                        Ok(ref held @ EnvelopeProvenance::PeerAgent { .. })
+                            if !is_overflow_notice(id, held)
+                    ) {
+                        peer_pending += 1;
+                    }
+                }
+            }
+        }
+        if counts_as_peer && peer_pending >= MAX_PEER_PENDING {
+            return Err(MailboxError::Full(format!(
+                "This session already has {MAX_PEER_PENDING} peer messages waiting for it."
+            )));
         }
         if pending >= MAX_PENDING {
             return Err(MailboxError::Full(format!(
@@ -742,6 +809,57 @@ impl Mailbox {
             created_at_ms: created,
             expires_at_ms: created + millis_of(PENDING_TTL),
             duplicate: false,
+        })
+    }
+
+    /// Deposits one peer-agent envelope, or, when the peer cap is reached, leaves the
+    /// repository's single overflow notice in the reserved last slot.
+    ///
+    /// The notice tells the recipient that more peer messages are on the bus and how to read
+    /// them. Only `PeerAgent` provenance is held to the peer cap; any other provenance is
+    /// deposited as `deposit_with_provenance` would.
+    pub(crate) fn deposit_peer_or_overflow(
+        &self,
+        session: &str,
+        request_id: &str,
+        text: &str,
+        provenance: EnvelopeProvenance,
+        now: SystemTime,
+    ) -> Result<PeerDeposit, MailboxError> {
+        let (repo_root, max_hops) = match &provenance {
+            EnvelopeProvenance::PeerAgent {
+                repo_root,
+                max_hops,
+                ..
+            } => (repo_root.clone(), *max_hops),
+            _ => {
+                return self
+                    .deposit_with_provenance(session, request_id, text, provenance, now)
+                    .map(PeerDeposit::Deposited)
+            }
+        };
+        match self.deposit_with_provenance(session, request_id, text, provenance, now) {
+            Err(MailboxError::Full(_)) => {}
+            other => return other.map(PeerDeposit::Deposited),
+        }
+        let notice_text = format!(
+            "More peer messages are waiting on the GitPulse agent bus for this session in {repo_root}. \
+             Call gitpulse_agent_inbox with repo_path={repo_root} to read them."
+        );
+        let notice_id = overflow_notice_id(&repo_root);
+        let notice = EnvelopeProvenance::PeerAgent {
+            msg_id: notice_id.clone(),
+            from_peer: OVERFLOW_FROM_PEER.to_owned(),
+            provider: OVERFLOW_FROM_PEER.to_owned(),
+            branch: String::new(),
+            thread_key: String::new(),
+            hop: 0,
+            max_hops,
+            truncated_in_bus: false,
+            repo_root,
+        };
+        Ok(PeerDeposit::Overflowed {
+            notice: self.deposit_with_provenance(session, &notice_id, &notice_text, notice, now),
         })
     }
 
