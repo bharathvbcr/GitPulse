@@ -304,7 +304,7 @@ fn a_recipient_can_reply_to_whoever_wrote_to_it() {
     eprintln!("reply to {from}: exit {code}: {}", reply.trim());
     assert_eq!(code, 0, "the recipient cannot address a reply to the sender it was handed");
     assert_eq!(rv["delivery_outcome"], "bus_only", "a reply to an unregistered sender reaches the bus only: {reply}");
-    let page = read_messages_for_peer(r, &[from.clone()], 0, None, false, true).unwrap();
+    let page = read_messages_for_peer(r, std::slice::from_ref(&from), 0, None, false, true).unwrap();
     assert!(page.messages.iter().any(|m| m.body == "answer"), "the reply is on the bus, addressed to {from}");
 }
 
