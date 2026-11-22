@@ -4,6 +4,7 @@ pub(crate) mod background;
 pub(crate) mod discovery;
 pub mod global;
 pub(crate) mod long_lived;
+mod profile_backup;
 pub mod providers;
 pub(crate) mod tree;
 
@@ -28,6 +29,11 @@ pub struct CacheEntry {
     pub action: Option<String>,
     pub note: String,
     pub error: Option<String>,
+    /// Last modification, seconds since the epoch, for entries that have an age.
+    pub modified_at: Option<u64>,
+    /// Removable only through a user-confirmed preview: no scheduled or agent
+    /// run may select it. See [`requires_user_confirmation`].
+    pub confirm_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +143,16 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Whether a hygiene target may only be previewed and executed on a user's
+/// explicit confirmation. Scheduled and agent runs must never select one.
+pub(crate) fn requires_user_confirmation(target: &str) -> bool {
+    target.starts_with(profile_backup::TARGET_PREFIX)
+}
+
+fn profile_path() -> Result<PathBuf, CommandError> {
+    crate::workbench::intake::default_profile_path().map_err(|e| CommandError::from(e.message))
 }
 
 fn home_dir() -> Result<PathBuf, CommandError> {
@@ -274,7 +290,7 @@ pub fn cache_inventory() -> Result<CacheInventory, CommandError> {
         ("uv", "uv cache", Some("Prune unused cache entries"), "uv owns cache locks and pruning. Pruning can also remove centralized project environments, which uv recreates. Local virtual environments are preserved; future installs may need downloads."),
         ("pnpm", "pnpm store", Some("Prune unreferenced packages"), "Remove packages the store considers unreferenced. Switching branches may require downloading them again."),
     ] {
-        let mut item = CacheEntry { id: id.into(), label: label.into(), path: None, bytes: None, action: action.map(str::to_owned), note: note.into(), error: None };
+        let mut item = CacheEntry { id: id.into(), label: label.into(), path: None, bytes: None, action: action.map(str::to_owned), note: note.into(), error: None, modified_at: None, confirm_only: false };
         let result = (|| {
             if started.elapsed() > Duration::from_secs(45) { return Err("Shared-cache scan budget reached; this provider was not scanned".into()); }
             let path = cache_path(id, &home)?;
@@ -298,6 +314,8 @@ pub fn cache_inventory() -> Result<CacheInventory, CommandError> {
         if let Err(error) = result { item.error = Some(error.into_message()); item.action = None; }
         entries.push(item);
     }
+    let profile = profile_path();
+    entries.extend(profile_backup::entries(profile.as_deref()));
     Ok(CacheInventory {
         entries,
         measured_at: now(),
@@ -415,6 +433,16 @@ fn prepare_with_activity(
     min_age_days: u32,
     activity: impl Fn(&Path) -> Result<(), CommandError>,
 ) -> Result<HygienePlan, CommandError> {
+    prepare_with_profile(repo_path, target, min_age_days, activity, profile_path)
+}
+
+fn prepare_with_profile(
+    repo_path: &str,
+    target: &str,
+    min_age_days: u32,
+    activity: impl Fn(&Path) -> Result<(), CommandError>,
+    profile: impl Fn() -> Result<PathBuf, CommandError>,
+) -> Result<HygienePlan, CommandError> {
     let _lock = exclusive(&PREPARATION, "Another cleanup preview is being inspected")?;
     let repo = validate_repo(repo_path)?;
     devmap_query::hygiene::validate_retention(min_age_days, false)?;
@@ -430,6 +458,9 @@ fn prepare_with_activity(
             None
         };
         (path, native, label, "repository", "Removes the reviewed generated files permanently. Rebuilding costs time. Sizes are logical bytes, not guaranteed free disk space; hardlinks and filesystem clones can share storage.")
+    } else if let Some(name) = target.strip_prefix(profile_backup::TARGET_PREFIX) {
+        let path = profile_backup::resolve(&profile()?, name)?;
+        (path, None, format!("profile backup {name}"), profile_backup::SCOPE, "Removes this pre-upgrade copy of the workbench profile permanently. Without it that schema upgrade cannot be rolled back. Only this confirmed action removes it; no scheduled run does.")
     } else if let Some(id) = target.strip_prefix("cache:") {
         let home = home_dir()?;
         let path = managed_cache_path(&cache_path(id, &home)?, &home)?;
@@ -442,7 +473,9 @@ fn prepare_with_activity(
     if scope == "repository" {
         tree::require_age(&snapshot, min_age_days, SystemTime::now())?;
     }
-    activity(&path)?;
+    if scope != profile_backup::SCOPE {
+        activity(&path)?;
+    }
     let command = match &invocation {
         Some(invocation) => crate::harness::render_command(
             &invocation
@@ -528,8 +561,18 @@ pub fn execute<T>(
 fn execute_with_activity<T>(
     repo_path: &str,
     id: &str,
+    gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
+    activity: impl Fn(&Path) -> Result<(), CommandError>,
+) -> Result<(T, HygieneOutcome), CommandError> {
+    execute_with_profile(repo_path, id, gate, activity, profile_path)
+}
+
+fn execute_with_profile<T>(
+    repo_path: &str,
+    id: &str,
     mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
     activity: impl Fn(&Path) -> Result<(), CommandError>,
+    profile: impl Fn() -> Result<PathBuf, CommandError>,
 ) -> Result<(T, HygieneOutcome), CommandError> {
     let _lock = exclusive(
         &EXECUTION,
@@ -561,6 +604,10 @@ fn execute_with_activity<T>(
         if local_checks(&repo, relative)? != path {
             return Err("Artifact path changed".into());
         }
+    } else if let Some(name) = plan.view.target.strip_prefix(profile_backup::TARGET_PREFIX) {
+        if profile_backup::resolve(&profile()?, name)? != path {
+            return Err("Backup path changed".into());
+        }
     } else {
         let home = home_dir()?;
         let id = plan
@@ -579,7 +626,15 @@ fn execute_with_activity<T>(
     if plan.view.scope == "repository" {
         tree::require_age(&current, plan.min_age_days, SystemTime::now())?;
     }
-    activity(path)?;
+    // A backup is a cold file: the stamp comparison above is its in-use check.
+    let in_use = |p: &Path| {
+        if plan.view.scope == profile_backup::SCOPE {
+            Ok(())
+        } else {
+            activity(p)
+        }
+    };
+    in_use(path)?;
     let policy = gate(
         plan.invocation.as_ref().map(|i| i.argv.as_slice()),
         &plan.view.path,
@@ -596,9 +651,12 @@ fn execute_with_activity<T>(
             return Err("Artifact path changed while checking policy".into());
         }
     }
-    activity(path)?;
+    in_use(path)?;
     let started = Instant::now();
     let result = match &plan.invocation {
+        None if plan.view.scope == profile_backup::SCOPE => {
+            profile_backup::remove(path, &current, &plan.cancel)
+        }
         None => tree::remove_reviewed(path, &current, &plan.cancel).map_err(CommandError::from),
         Some(invocation) => {
             let args: Vec<&str> = invocation.argv[1..].iter().map(String::as_str).collect();

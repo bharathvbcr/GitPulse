@@ -29,6 +29,13 @@ anywhere enables it everywhere, and reviewing from one repository satisfies the
 week for all of them. It is measurement only; nothing is removed without a
 preview you accept.
 
+The same list shows the **workbench profile backups** the profile store writes
+beside the profile before a schema upgrade (`workbench.sqlite.pre-schema-<N>.bak`
+and the other `workbench.sqlite.<stamp>.bak` copies), with size and age. They
+are the only way back from an upgrade, so they are removed only through a
+`backup:<file name>` preview you confirm: no retention age, scheduled hygiene run
+or agent-driven cleanup selects them.
+
 Settings written by an earlier build were a single flat record per repository.
 Each one is adopted the next time its repository is opened: a retention that
 differed from the old hardcoded 30 days becomes that repository's override, a

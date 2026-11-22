@@ -2619,6 +2619,11 @@ fn run_critical_hygiene_pass_impl(
                         {
                             out.deferred_or_busy = true;
                         }
+                        // Profile backups are the only way back from a schema
+                        // upgrade: a user-confirmed action removes them, never this run.
+                        if entry.confirm_only {
+                            continue;
+                        }
                         let Some(bytes) = entry.bytes else {
                             continue;
                         };
@@ -3519,6 +3524,18 @@ fn execute_single_hygiene_target(
     policy_still_allows: PreMutationPolicyCheck<'_>,
     out: &mut CleanPassOutcome,
 ) -> bool {
+    if crate::storage::hygiene::requires_user_confirmation(target) {
+        out.items.push(StewardCleanItem {
+            repo_path: repo_root.to_string(),
+            target: display_target.to_string(),
+            status: "skipped".into(),
+            measured_bytes: 0,
+            bytes_after: None,
+            detail: "Removal needs a user-confirmed action; the scheduled steward does not run it."
+                .into(),
+        });
+        return true;
+    }
     let plan = match crate::engine::process::with_disk_relief(|| {
         crate::storage::hygiene::prepare(repo_root, target, retention_days)
     }) {
@@ -7530,5 +7547,40 @@ Trailing note {done}."#;
             recheck_target_policy("/still/on", "cache:cargo-registry", &global_off),
             Err("steward cleanup is off".to_string())
         );
+    }
+
+    #[test]
+    fn the_steward_never_runs_a_user_confirmed_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("workbench.sqlite.pre-schema-11.bak");
+        std::fs::write(&backup, "rollback copy").unwrap();
+        let mut out = CleanPassOutcome::default();
+        let allow = |_: Option<&str>| -> Result<(), String> { Ok(()) };
+
+        let proceed = execute_single_hygiene_target(
+            "/not/a/repo",
+            "backup:workbench.sqlite.pre-schema-11.bak",
+            "backup:workbench.sqlite.pre-schema-11.bak",
+            0,
+            false,
+            None,
+            None,
+            false,
+            "",
+            &[],
+            &allow,
+            &mut out,
+        );
+
+        assert!(proceed);
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].status, "skipped");
+        assert!(
+            out.items[0].detail.contains("user-confirmed"),
+            "{}",
+            out.items[0].detail
+        );
+        assert_eq!(out.reclaimed_bytes, 0);
+        assert!(backup.exists());
     }
 }
