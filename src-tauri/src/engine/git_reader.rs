@@ -1512,9 +1512,11 @@ impl GitReader {
     /// Lists every path the file explorer may show: tracked files plus
     /// untracked-but-not-ignored working-tree files.
     ///
-    /// Returns working-tree file paths using `dcgrep` + `.git/index` when a
-    /// compatible `dcgrep` binary is available, falling back to `git ls-files
-    /// -z --cached --others --exclude-standard`.
+    /// Returns working-tree file paths from `git ls-files -z --cached --others
+    /// --exclude-standard`. This deliberately does not go through `dcgrep
+    /// files`: on a 4,000-file repository `scripts/bench-dcgrep.mjs` measured
+    /// it 2.2-2.5x slower than `git ls-files` (dcgrep search is the faster arm
+    /// and stays on dcgrep).
     ///
     /// `--cached --others --exclude-standard` is deliberately the same
     /// enumeration [`GitReader::get_repo_language_stats`] uses: `--cached`
@@ -1527,10 +1529,6 @@ impl GitReader {
     /// quotes, glob characters, and non-ASCII names survive verbatim.
     pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
-        if let Some(files) = crate::engine::dcgrep::list_working_tree_files(&repo, MAX_REPO_FILES)?
-        {
-            return Ok(files);
-        }
         let stdout = git_text(
             &repo,
             &[
