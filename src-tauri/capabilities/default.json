@@ -234,7 +234,6 @@
     "allow-cmd-native-rendering-apply",
     "allow-cmd-note-tab-activated",
     "allow-cmd-onboarding-clone-source",
-    "allow-cmd-open-in-editor",
     "allow-cmd-open-worktree-path",
     "allow-cmd-pick-folder",
     "allow-cmd-preview-conflict",

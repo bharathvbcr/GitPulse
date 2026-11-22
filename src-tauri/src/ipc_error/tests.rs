@@ -116,8 +116,7 @@ fn the_kind_list_is_the_whole_enum() {
             | IpcErrorKind::LedgerFailed
             | IpcErrorKind::AiEndpointUnconfirmed
             | IpcErrorKind::ReadCancelled
-            | IpcErrorKind::SecretScanBlocked
-            | IpcErrorKind::EditorNotFound => {}
+            | IpcErrorKind::SecretScanBlocked => {}
         }
     }
     let mut names: Vec<String> = IpcErrorKind::ALL.into_iter().map(kind_name).collect();

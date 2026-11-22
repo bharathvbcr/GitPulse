@@ -227,8 +227,7 @@ describe("SettingsModal layout options", () => {
     const pressed = [...layout.matchAll(/aria-pressed="true"[^>]*>\s*([^<]*?)\s*</g)].map(
       (match) => match[1],
     );
-    // "Auto-detect" is the Open in editor setting's default, which lives in this panel.
-    expect(pressed.sort()).toEqual(["Always", "Auto-detect", "Automatic", "Full", "Only code files"]);
+    expect(pressed.sort()).toEqual(["Always", "Automatic", "Full", "Only code files"]);
   });
 });
 

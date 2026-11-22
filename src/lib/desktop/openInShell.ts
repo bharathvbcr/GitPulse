@@ -18,9 +18,7 @@
  * Both reject rather than resolve on failure, so callers surface the reason
  * instead of a silently dead menu item.
  */
-import { get } from "svelte/store";
 import { invoke } from "../ipc/invoke";
-import { interfaceStore } from "../stores/interfaceStore";
 
 /** Opens a repo-relative path with the OS default application. */
 export async function openInDefaultApp(repo: string, relative: string): Promise<void> {
@@ -35,26 +33,4 @@ export async function revealInFileManager(repo: string, relative: string): Promi
 /** Reveals the canonical Git root; file paths retain their stricter containment API. */
 export async function revealRepository(repo: string): Promise<void> {
   await invoke("cmd_reveal_repository", { repo });
-}
-
-/**
- * Opens a repo-relative file in the user's own editor (VS Code, Cursor or
- * Zed), at a line and column when the caller has them, so the extensions the
- * user runs there keep working. The editor is the "Open in editor" setting: one
- * of four names, never a program, which `desktop::shell` maps to a fixed
- * launcher. Rejects with the backend's reason, including the typed
- * `editor_not_found` error when no editor is installed.
- */
-export async function openInEditor(
-  repo: string,
-  relative: string,
-  position: { line?: number; column?: number } = {},
-): Promise<void> {
-  await invoke("cmd_open_in_editor", {
-    repo,
-    relative,
-    line: position.line ?? null,
-    column: position.column ?? null,
-    editor: get(interfaceStore).externalEditor,
-  });
 }

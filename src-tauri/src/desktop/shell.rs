@@ -20,8 +20,6 @@
 //! NOT granted in `capabilities/default.json`; they take an absolute path
 //! straight from the webview and would make this gate optional.
 
-mod editor;
-
 use crate::ipc_error::CommandError;
 use std::path::{Path, PathBuf};
 
@@ -194,48 +192,6 @@ pub fn cmd_reveal_repository(app: AppHandle, repo: String) -> Result<(), String>
     app.opener()
         .reveal_item_in_dir(std::path::Path::new(&resolved.path))
         .map_err(|error| format!("Could not reveal repository: {error}"))
-}
-
-/// Opens a repo-relative file in the user's editor, at a line and column when
-/// the caller knows them. `editor` is a closed choice, never a program name;
-/// see [`editor`].
-///
-/// A file, not a launcher: the execution-risk confirmation of the OS-default
-/// open does not apply, because nothing here executes the file — the editor
-/// shows it. Containment and trust are the same as for every other command
-/// here.
-#[tauri::command(async)]
-pub fn cmd_open_in_editor(
-    repo: String,
-    relative: String,
-    line: Option<u32>,
-    column: Option<u32>,
-    editor: Option<editor::EditorChoice>,
-) -> Result<(), crate::ipc_error::IpcError> {
-    // Named, so the error carries the kind its producer gave it; not on the
-    // replay-safe list, because opening an editor is a user action.
-    crate::ipc_error::run_command_as(Some("cmd_open_in_editor"), || {
-        // A click: the editor must not be deferred behind background reads.
-        crate::engine::process::mark_user_action(&repo);
-        let target = resolve_worktree_path(&repo, &relative)?;
-        crate::repository_trust::require(Path::new(&repo))?;
-        let root = Path::new(&repo)
-            .canonicalize()
-            .map_err(|e| format!("Cannot read the repository at {repo}: {e}"))?;
-        editor::open_in_editor(
-            &root,
-            &target,
-            line,
-            column,
-            editor.unwrap_or_default(),
-            &editor::EditorEnv {
-                use_bundles: cfg!(target_os = "macos"),
-                bundle_exists: &|path| Path::new(path).is_file(),
-                on_path: &crate::engine::process::find_external_tool,
-                run: &editor::run_launcher,
-            },
-        )
-    })
 }
 
 #[cfg(test)]
@@ -454,105 +410,5 @@ mod tests {
             prepare_open(&root, risky, &|_, _| true).expect("confirmed");
         }
         assert!(execution_risk(&repo.path().join("Tool.APP")).is_some());
-    }
-
-    /// An editor CLI hands the file to a window and exits, leaving the editor
-    /// running. The runner reaps what it started when the launcher exits; this
-    /// proves a process the launcher left behind (the editor, in production)
-    /// is not taken down with it, through the production launcher path.
-    #[cfg(unix)]
-    #[test]
-    fn an_editor_the_launcher_leaves_running_survives_the_launcher() {
-        use std::os::unix::fs::PermissionsExt;
-        let repo = trusted_repo_with(&[]);
-        let bin = tempfile::tempdir().expect("bin dir");
-        let script = bin.path().join("fake-editor.sh");
-        fs::write(
-            &script,
-            "#!/bin/sh\nsleep 60 </dev/null >/dev/null 2>&1 &\necho $! > \"$1\"\nexit 0\n",
-        )
-        .expect("script");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode");
-        let pidfile = bin.path().join("editor.pid");
-
-        let (success, _) = editor::run_launcher(
-            script.to_str().expect("utf8"),
-            &[pidfile.to_string_lossy().into_owned()],
-            &repo.path().canonicalize().expect("root"),
-        )
-        .expect("launcher ran");
-        assert!(success, "the fake launcher exits 0");
-
-        let pid = fs::read_to_string(&pidfile)
-            .expect("the launcher recorded the editor it left running")
-            .trim()
-            .to_string();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid])
-            .status_locked()
-            .expect("kill -0")
-            .success();
-        // Stop the stand-in editor this test started, by the pid it recorded.
-        let _ = std::process::Command::new("kill").arg(&pid).status_locked();
-        assert!(
-            alive,
-            "the editor left running by the launcher was killed with it"
-        );
-    }
-
-    /// Every refusal below happens before a launcher is chosen, so these never
-    /// start an editor, whichever are installed on the machine running them.
-    #[cfg(unix)]
-    #[test]
-    fn open_in_editor_refuses_an_untrusted_repository() {
-        let dir = repo_with(&["notes.txt"]);
-        let init = std::process::Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(dir.path())
-            .status_locked()
-            .expect("git init");
-        assert!(init.success());
-        let root = dir.path().to_string_lossy().into_owned();
-        let err = cmd_open_in_editor(root, "notes.txt".into(), Some(1), None, None)
-            .expect_err("untrusted");
-        assert_eq!(
-            err.kind,
-            crate::ipc_error::IpcErrorKind::RepositoryTrustRequired
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_in_editor_refuses_paths_outside_the_repository() {
-        let outside = tempfile::tempdir().expect("outside");
-        fs::write(outside.path().join("secret.txt"), b"x").expect("file");
-        let repo = trusted_repo_with(&[("src/a.rs", 0o644)]);
-        std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).expect("symlink");
-        let root = repo.path().to_string_lossy().into_owned();
-        for escape in [
-            "../outside.txt",
-            "/etc/passwd",
-            "src/../../x",
-            "link/secret.txt",
-            "missing.rs",
-            "",
-        ] {
-            let err = cmd_open_in_editor(root.clone(), escape.into(), Some(1), None, None)
-                .expect_err(escape);
-            // The path gate's own wording, so a refusal later than the gate
-            // (the editor lookup, or a launcher actually starting) fails here.
-            assert!(
-                [
-                    "outside the repository",
-                    "Not a repository-relative path",
-                    "Cannot read",
-                    "No file path was given",
-                ]
-                .iter()
-                .any(|reason| err.message.contains(reason)),
-                "{escape:?} was not refused by the path gate: {err}"
-            );
-        }
     }
 }

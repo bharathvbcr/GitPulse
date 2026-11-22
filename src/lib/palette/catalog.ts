@@ -7,7 +7,6 @@ import { askText } from "../stores/modalStore";
 import { promptQuickCommit } from "../commit/quickCommit";
 import { VIEW_REGISTRY, describeDestination } from "../views/viewRegistry";
 import { openSuspectsFor } from "../codeintel/openSuspects";
-import { openInEditor } from "../desktop/openInShell";
 import { setEditorLens, showExplorerRail } from "../files/explorerLens";
 import { requestTreeReveal } from "../files/revealRequests";
 import { displayName, isCaseInsensitiveFs, isPathAmong, sameRepo } from "../repos/paths";
@@ -284,24 +283,6 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     // now (no line selected, nothing in the tray, no open file) rather than hidden.
     ...agentSendCommands(state, unavailable, checkOrigin),
     { id: "refresh", label: "Refresh repository status", category: "Repository", icon: RefreshCw, shortcut: "⌘R", disabledReason: unavailable, action: () => repoStore.refresh() },
-    {
-      // The file open in Explorer, handed to the editor the user already runs
-      // (the "Open in editor" setting), so their extensions keep working.
-      id: "open_in_editor", label: "Open the open file in your editor",
-      description: state.selectedFilePath
-        ? `Open ${state.selectedFilePath} in your editor — VS Code, Cursor or Zed, so your extensions keep working there.`
-        : "Open a file in Explorer first.",
-      keywords: "external editor vs code visual studio code cursor zed open file goto extensions",
-      category: "Repository", icon: FileCode,
-      disabledReason: unavailable ?? (state.selectedFilePath ? undefined : "Open a file in Explorer first"),
-      action: async () => {
-        // The file and repository this entry was built for: refuse rather than
-        // open a path from whichever repository is in front now.
-        checkOrigin();
-        if (!state.currentPath || !state.selectedFilePath) throw Error("Open a file in Explorer first.");
-        await openInEditor(state.currentPath, state.selectedFilePath);
-      },
-    },
     { id: "quick_commit", label: "Quick commit…", description: "Stage all changes and commit with a message", category: "Git actions", icon: GitCommit, shortcut: "⌘Enter", closeBefore: true, disabledReason: worktree ?? (state.statuses.length ? undefined : "Nothing to commit."), action: () => promptQuickCommit() },
     { id: "new_branch", label: "Create branch…", category: "Git actions", icon: Plus, closeBefore: true, disabledReason: worktree, action: async () => {
       const name = await askText({ title: "Create branch", message: "New branch name", placeholder: "feat/name", confirmLabel: "Create" });

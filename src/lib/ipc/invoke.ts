@@ -24,7 +24,6 @@ export const IPC_ERROR_KINDS = [
   "ai_endpoint_unconfirmed",
   "read_cancelled",
   "secret_scan_blocked",
-  "editor_not_found",
 ] as const;
 
 export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];

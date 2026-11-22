@@ -64,7 +64,7 @@
     summarizeStatuses,
   } from "../../files/fileStatus";
   import { copyText } from "../../desktop/clipboard";
-  import { openInDefaultApp, openInEditor, revealInFileManager } from "../../desktop/openInShell";
+  import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
   import type { MutationTarget } from "../../repos/storeTypes";
@@ -841,17 +841,6 @@
     }
   }
 
-  async function openInExternalEditor(filePath: string) {
-    closeContextMenu();
-    const repo = effectiveRepoPath;
-    if (!repo) return;
-    try {
-      await openInEditor(repo, filePath);
-    } catch (err) {
-      repoStore.setError(describeError(err, "repo"));
-    }
-  }
-
   async function revealInFinder(filePath: string) {
     closeContextMenu();
     const repo = effectiveRepoPath;
@@ -1557,12 +1546,6 @@
       </button>
     {/if}
 
-    {#if row.kind === "file"}
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInExternalEditor(row.path)}>
-        <ExternalLink size={13} class="text-textMuted" />
-        <span>Open in editor</span>
-      </button>
-    {/if}
     <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInSystem(row.path)}>
       <ExternalLink size={13} class="text-textMuted" />
       <span>Open with default app</span>

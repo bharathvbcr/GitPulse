@@ -1,7 +1,6 @@
 import { get } from "svelte/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openSuspectsFor } from "../codeintel/openSuspects";
-import { openInEditor } from "../desktop/openInShell";
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { openConflicts } from "../ui/workConflicts";
@@ -9,10 +8,6 @@ import { buildCommands } from "./catalog";
 
 vi.mock("../codeintel/openSuspects", () => ({ openSuspectsFor: vi.fn() }));
 vi.mock("../ui/workConflicts", () => ({ openConflicts: vi.fn() }));
-vi.mock("../desktop/openInShell", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../desktop/openInShell")>()),
-  openInEditor: vi.fn(),
-}));
 
 const snapshot = (patch: Partial<RepoState> = {}): RepoState => ({ ...get(repoStore), ...patch });
 const ready = (patch: Partial<RepoState> = {}) =>
@@ -55,28 +50,6 @@ describe("palette commands that hand off to the stores and views", () => {
     await command.action();
     expect(surface).toHaveBeenCalledWith("repository");
     expect(openConflicts).toHaveBeenCalledTimes(1);
-  });
-
-  it("hands the open file to the editor, and refuses until a file is open", async () => {
-    const withFile = ready({ selectedFilePath: "src/a.ts" });
-    const command = find(withFile, "open_in_editor");
-    expect(command.disabledReason).toBeUndefined();
-    expect(command.description).toContain("src/a.ts");
-    vi.spyOn(repoStore, "targetIsActive").mockReturnValue(true);
-    await command.action();
-    expect(openInEditor).toHaveBeenLastCalledWith("/repo", "src/a.ts");
-
-    const none = find(ready({ selectedFilePath: null }), "open_in_editor");
-    expect(none.disabledReason).toBe("Open a file in Explorer first");
-    expect(find(ready({ selectedFilePath: "src/a.ts", isLoading: true }), "open_in_editor").disabledReason).toBeDefined();
-  });
-
-  it("does not open a file from a repository that is no longer in front", async () => {
-    const command = find(ready({ selectedFilePath: "src/a.ts" }), "open_in_editor");
-    vi.spyOn(repoStore, "targetIsActive").mockReturnValue(false);
-    vi.mocked(openInEditor).mockClear();
-    await expect(Promise.resolve().then(() => command.action())).rejects.toThrow("active repository changed");
-    expect(openInEditor).not.toHaveBeenCalled();
   });
 
   it("opens the agents plane", async () => {
