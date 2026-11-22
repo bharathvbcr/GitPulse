@@ -95,7 +95,7 @@
   import { panelTabCounts } from "../terminal/panelTabCounts";
   import { activityAttentionLabel, activityToAgentStatus, sessionActivity } from "../terminal/sessionActivity";
   import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
-  import { detachedAdoptionSettled, isAdoptedSession, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import { detachedAdoptionFailed, detachedAdoptionSettled, isAdoptedSession, reclaimAdoptedSession } from "../terminal/detachedSessions";
   import {
     buildRestoredStrip,
     buildTabStrip,
@@ -791,6 +791,7 @@
     const key = splitStorageKey(repoPath);
     if (!key) return;
     const settled = $detachedAdoptionSettled;
+    const failed = $detachedAdoptionFailed;
     const timedOut = adoptionTimedOut;
     const hasTabs = tabState.tabs.length > 0;
     // The timeout only opens the fallback shell so the dock is not empty; the
@@ -800,6 +801,7 @@
       restoreStep({
         pending: true,
         settled,
+        failed,
         timedOut,
         hasTabs,
         requestWillOpenFirstTab: requestWillOpenFirstTab(),

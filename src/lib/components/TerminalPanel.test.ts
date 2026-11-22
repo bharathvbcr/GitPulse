@@ -630,3 +630,13 @@ describe("TerminalPanel names the route of every close", () => {
     expect(source).toContain('closeWithConfirmation(session, "sessions_list_stop")');
   });
 });
+
+describe("TerminalPanel reads a failed listing as failed, not empty", () => {
+  it("hands the failed latch to restoreStep, and the bridge retries the listing", () => {
+    const effect = source.slice(source.indexOf("if (!stripRestorePending) return;"), source.indexOf("A restored background tab takes its session over"));
+    expect(effect).toContain("const failed = $detachedAdoptionFailed;");
+    expect(effect).toMatch(/settled,\s+failed,\s+timedOut,/);
+    const bridge = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "SessionNotificationBridge.svelte"), "utf8");
+    expect(bridge).toContain("retryListing(() => adoptDetachedSessions(");
+  });
+});

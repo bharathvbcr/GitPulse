@@ -345,3 +345,20 @@ describe("protection a reload would otherwise forget", () => {
     expect(get(protectedSessions).size).toBe(0);
   });
 });
+
+describe("the adoption latches tell a failed listing from an empty one", () => {
+  it("a failed listing does not settle, and says it failed; a later success settles", async () => {
+    const { detachedAdoptionSettled, detachedAdoptionFailed } = await import("./detachedSessions");
+    const { terminalSessions } = await import("./sessionRegistry");
+    const bus = fakeBus().bus;
+    const confirm = async () => true;
+    const down = async <T,>(): Promise<T> => { throw new Error("host busy"); };
+    await expect(adoptDetachedSessions({ invoke: down, bus, registry: terminalSessions, confirm })).rejects.toThrow("host busy");
+    expect(get(detachedAdoptionSettled)).toBe(false);
+    expect(get(detachedAdoptionFailed)).toBe(true);
+    const up = async <T,>(): Promise<T> => [] as T;
+    expect(await adoptDetachedSessions({ invoke: up, bus, registry: terminalSessions, confirm })).toBe(0);
+    expect(get(detachedAdoptionSettled)).toBe(true);
+    expect(get(detachedAdoptionFailed)).toBe(false);
+  });
+});

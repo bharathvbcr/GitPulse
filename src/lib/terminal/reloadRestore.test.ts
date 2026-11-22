@@ -5,7 +5,9 @@ import {
   composeWorkspaceWithStrip,
   mergeRestoredTabs,
   parsePersistedTabStrip,
+  LISTING_RETRY_DELAYS_MS,
   restoreStep,
+  retryListing,
   planReloadRestore,
   stripWorthWaitingFor,
   type AdoptedFact,
@@ -143,7 +145,7 @@ describe("buildRestoredStrip", () => {
 });
 
 describe("restoreStep (the timeout may only release the fallback shell)", () => {
-  const base = { pending: true, settled: false, timedOut: false, hasTabs: false, requestWillOpenFirstTab: false, fallbackOpened: false };
+  const base = { pending: true, settled: false, failed: false, timedOut: false, hasTabs: false, requestWillOpenFirstTab: false, fallbackOpened: false };
 
   it("settled before the timeout: restores, with no fallback shell ever opened", () => {
     expect(restoreStep(base)).toBe("wait");
@@ -256,5 +258,53 @@ describe("strip persistence", () => {
   it("only holds the dock open for a strip that names a session", () => {
     expect(stripWorthWaitingFor(null)).toBe(false);
     expect(stripWorthWaitingFor(strip([{ id: "tab-1", session: "a" }]))).toBe(true);
+  });
+});
+
+describe("a failed listing is not an empty one", () => {
+  const base = { pending: true, settled: false, failed: false, timedOut: false, hasTabs: false, requestWillOpenFirstTab: false, fallbackOpened: false };
+
+  it("failed: opens the fallback shell at once and never restores from nothing", () => {
+    expect(restoreStep({ ...base, failed: true })).toBe("open-fallback-shell");
+    // Before: the failure set `settled`, so this was "restore" with no session to find.
+    const steps = [
+      restoreStep({ ...base, failed: true, hasTabs: true, fallbackOpened: true }),
+      restoreStep({ ...base, failed: true, timedOut: true, hasTabs: true, fallbackOpened: true }),
+    ];
+    expect(steps).toEqual(["wait", "wait"]);
+  });
+
+  it("failed, then listed: the strip is restored", () => {
+    expect(restoreStep({ ...base, failed: true, hasTabs: true, fallbackOpened: true })).toBe("wait");
+    expect(restoreStep({ ...base, failed: false, settled: true, hasTabs: true, fallbackOpened: true })).toBe("restore");
+    expect(restoreStep({ ...base, failed: true, settled: true, hasTabs: true, fallbackOpened: true })).toBe("restore");
+  });
+
+  it("failed with a request opening the first tab: no shell is added", () => {
+    expect(restoreStep({ ...base, failed: true, requestWillOpenFirstTab: true })).toBe("wait");
+  });
+});
+
+describe("retryListing", () => {
+  const noSleep = async () => {};
+  it("returns the first success without waiting", async () => {
+    const slept: number[] = [];
+    expect(await retryListing(async () => 7, { sleep: async (ms) => { slept.push(ms); } })).toBe(7);
+    expect(slept).toEqual([]);
+  });
+
+  it("a transient failure still restores: tries again after each pause", async () => {
+    let calls = 0;
+    const slept: number[] = [];
+    const result = await retryListing(async () => { calls += 1; if (calls < 3) throw new Error("host busy"); return "listed"; }, { sleep: async (ms) => { slept.push(ms); } });
+    expect(result).toBe("listed");
+    expect(calls).toBe(3);
+    expect(slept).toEqual([...LISTING_RETRY_DELAYS_MS]);
+  });
+
+  it("is bounded: three tries, then the last error stands", async () => {
+    let calls = 0;
+    await expect(retryListing(async () => { calls += 1; throw new Error(`failure ${calls}`); }, { sleep: noSleep })).rejects.toThrow("failure 3");
+    expect(calls).toBe(LISTING_RETRY_DELAYS_MS.length + 1);
   });
 });

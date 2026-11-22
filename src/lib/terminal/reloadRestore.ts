@@ -265,10 +265,21 @@ export type RestoreStep = "wait" | "open-fallback-shell" | "restore";
  * is busy). So the timeout only releases the fresh-shell fallback, so the dock
  * is not empty; the restore itself waits for the listing to settle and never
  * gives up. Until it has run, the saved strip is left untouched.
+ *
+ * `settled` means the host was listed. A listing that FAILED is not an empty
+ * one: restoring from it would find no session for any saved tab, open a fresh
+ * shell and let the persisted strip be overwritten with it, which is how a
+ * transient failure used to lose every tab. A failure opens the fallback shell
+ * at once (the dock is usable) and waits: the strip stays as saved, and a later
+ * successful listing (`retryListing`) restores it. If every retry fails the
+ * strip stays frozen for the rest of this page, so new tabs here are not saved
+ * and the next reload still finds the old ones.
  */
 export function restoreStep(input: {
   pending: boolean;
   settled: boolean;
+  /** The host's session listing failed (and may be retried). */
+  failed: boolean;
   timedOut: boolean;
   hasTabs: boolean;
   requestWillOpenFirstTab: boolean;
@@ -276,10 +287,34 @@ export function restoreStep(input: {
 }): RestoreStep {
   if (!input.pending) return "wait";
   if (input.settled) return "restore";
-  if (input.timedOut && !input.hasTabs && !input.requestWillOpenFirstTab && !input.fallbackOpened) {
+  if ((input.timedOut || input.failed) && !input.hasTabs && !input.requestWillOpenFirstTab && !input.fallbackOpened) {
     return "open-fallback-shell";
   }
   return "wait";
+}
+
+/** Pauses before the second and third listing tries: 3 tries in all, then the failure stands. */
+export const LISTING_RETRY_DELAYS_MS: readonly number[] = [500, 2000];
+
+/**
+ * Runs `attempt` (the host's session listing), trying again after each delay
+ * when it throws, and throws the last error once the delays are spent. Bounded:
+ * a host that never answers is reported, not asked forever.
+ */
+export async function retryListing<T>(
+  attempt: () => Promise<T>,
+  options: { delays?: readonly number[]; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<T> {
+  const delays = options.delays ?? LISTING_RETRY_DELAYS_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let tries = 0; ; tries += 1) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (tries >= delays.length) throw error;
+      await sleep(delays[tries]);
+    }
+  }
 }
 
 /**

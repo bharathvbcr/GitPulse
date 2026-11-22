@@ -42,6 +42,7 @@ type Confirm = (options: { title: string; message: string; confirmLabel: string;
 
 const KEY_PREFIX = "detached:";
 const adoptionSettledStore = writable(false);
+const adoptionFailedStore = writable(false);
 const adoptedDrops = new Map<string, () => void>();
 
 /**
@@ -51,6 +52,16 @@ const adoptedDrops = new Map<string, () => void>();
  */
 export const detachedAdoptionSettled: Readable<boolean> = {
   subscribe: adoptionSettledStore.subscribe,
+};
+
+/**
+ * The latest listing of the host failed. Not the same as settled-and-empty: a
+ * reload restore must keep the saved tab strip and retry, not open a fresh
+ * shell over it (`reloadRestore.restoreStep`). `detachedAdoptionSettled` is set
+ * only by a listing that succeeded.
+ */
+export const detachedAdoptionFailed: Readable<boolean> = {
+  subscribe: adoptionFailedStore.subscribe,
 };
 
 /**
@@ -315,10 +326,13 @@ export async function adoptDetachedSessions(deps: {
       listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
       adopted += 1;
     }
-    return adopted;
-  } finally {
     if (!deps.registry || deps.registry === terminalSessions) {
+      adoptionFailedStore.set(false);
       adoptionSettledStore.set(true);
     }
+    return adopted;
+  } catch (error) {
+    if (!deps.registry || deps.registry === terminalSessions) adoptionFailedStore.set(true);
+    throw error;
   }
 }
