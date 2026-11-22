@@ -222,7 +222,7 @@ export function loadDocument(
     error: null,
     blob: options.remount ? null : doc.blob,
   }));
-  const read: Promise<DocumentLoad> = (async (): Promise<DocumentLoad> => {
+  const answer = async (): Promise<DocumentLoad> => {
     try {
       const blob = await invoke<FileBlob>("cmd_get_file_blob", {
         repoPath: repo,
@@ -237,10 +237,11 @@ export function loadDocument(
       const error = formatError(err);
       patch(repo, target, (doc) => ({ ...doc, blob: null, loading: false, error }));
       return { status: "failed", error };
-    } finally {
-      if (inflight.get(key) === read) inflight.delete(key);
     }
-  })();
+  };
+  const read: Promise<DocumentLoad> = answer().finally(() => {
+    if (inflight.get(key) === read) inflight.delete(key);
+  });
   inflight.set(key, read);
   return read;
 }
