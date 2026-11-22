@@ -114,6 +114,23 @@ export function isWatchScope(value: unknown): value is WatchScope {
   return value === "narrow" || value === "whole";
 }
 
+/**
+ * The editor "Open in editor" hands a file to. These four names are the whole
+ * vocabulary: the backend maps one to a fixed launcher, so a stored value that
+ * is not one of them reads as "auto" instead of reaching the backend.
+ */
+export type EditorChoice = "auto" | "code" | "cursor" | "zed";
+export const EXTERNAL_EDITOR_LABELS: Readonly<Record<EditorChoice, string>> = {
+  auto: "Auto-detect",
+  code: "VS Code",
+  cursor: "Cursor",
+  zed: "Zed",
+};
+
+export function isExternalEditor(value: unknown): value is EditorChoice {
+  return typeof value === "string" && Object.hasOwn(EXTERNAL_EDITOR_LABELS, value);
+}
+
 export interface InterfacePrefs extends AppearancePrefs {
   /**
    * Which accent tint the window wears. Applied as an inline `--c-accent`
@@ -456,6 +473,11 @@ export interface InterfacePrefs extends AppearancePrefs {
    * (`repoStore` subscribes).
    */
   watchScope: WatchScope;
+  /**
+   * Editor for "Open in editor". "auto" takes the first installed of VS Code,
+   * Cursor and Zed. An unknown stored value reads as "auto".
+   */
+  externalEditor: EditorChoice;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -579,6 +601,7 @@ const DEFAULTS: InterfacePrefs = {
   bellAsksForReader: false,
   bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
   watchScope: "narrow",
+  externalEditor: "auto",
 };
 
 /**
@@ -795,6 +818,9 @@ function readPrefs(): InterfacePrefs {
       ),
       bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
       watchScope: isWatchScope(parsed.watchScope) ? parsed.watchScope : DEFAULTS.watchScope,
+      externalEditor: isExternalEditor(parsed.externalEditor)
+        ? parsed.externalEditor
+        : DEFAULTS.externalEditor,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -1140,6 +1166,8 @@ function createInterfaceStore() {
     resetCoachMarks: () => patch({ seenCoachMarks: {} }),
     setBellAsksForReader: (on: boolean) => patch({ bellAsksForReader: on }),
     setWatchScope: (scope: WatchScope) => patch({ watchScope: isWatchScope(scope) ? scope : "narrow" }),
+    setExternalEditor: (editor: EditorChoice) =>
+      patch({ externalEditor: isExternalEditor(editor) ? editor : "auto" }),
     reset: () => commit(freshDefaults()),
   };
 }

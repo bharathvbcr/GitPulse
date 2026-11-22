@@ -348,8 +348,9 @@ describe("annotated but unregistered commands", () => {
     // cmd_terminal_set_title (a renamed terminal keeps its title across
     // reloads and restarts), from the terminal landing in e8f7bad9c. 340 with
     // the Manvi system steward's cmd_manvi_steward_status, _save, _set_repo
-    // and _run_now.
-    expect(found.size).toBe(340);
+    // and _run_now. 341 with cmd_open_in_editor (a file at a line in the
+    // user's own editor).
+    expect(found.size).toBe(341);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     for (const steward of ["status", "save", "set_repo", "run_now"]) {
       expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);

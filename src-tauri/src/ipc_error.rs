@@ -85,12 +85,18 @@ pub enum IpcErrorKind {
     /// (never the value) and each skipped file; the commit view offers a person
     /// "commit anyway".
     SecretScanBlocked,
+    /// Open in editor found no editor to open the file with: none of the
+    /// known launchers is installed, or the one the user chose is not. Nothing
+    /// ran. The message names the "Open in editor" setting; the frontend does
+    /// not branch on this kind yet (there is no Settings opener to call), it
+    /// shows the message.
+    EditorNotFound,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -101,6 +107,7 @@ impl IpcErrorKind {
         Self::AiEndpointUnconfirmed,
         Self::ReadCancelled,
         Self::SecretScanBlocked,
+        Self::EditorNotFound,
     ];
 }
 

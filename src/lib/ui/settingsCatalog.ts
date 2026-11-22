@@ -57,6 +57,8 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tray background close hide window repository conflicts menu bar stash pulse fleet terminal dock launch login autostart counts" },
   // macOS-only: the activation-policy path behind it is compiled only there,
   // and Windows and Linux have no Dock to hide.
+  { id: "external-editor", section: "layout", label: "Open in editor",
+    keywords: "external editor vs code visual studio code cursor zed open file line goto extensions launcher cli automatic" },
   { id: "hide-dock", section: "layout", label: "Hide Dock icon while closed",
     keywords: "dock accessory menu bar hide closed window", requires: "dockHiding" },
   { id: "status-icon-counts", section: "layout", label: "Show counts beside the icon",

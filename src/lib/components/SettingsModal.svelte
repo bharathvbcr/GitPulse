@@ -96,6 +96,7 @@
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
   import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
   import WatchScopeSetting from "./WatchScopeSetting.svelte";
+  import ExternalEditorSetting from "./ExternalEditorSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -896,6 +897,12 @@
                         checked={$interfaceStore.collapseInactiveIncludeShells}
                         onchange={(next) => interfaceStore.setCollapseInactiveIncludeShells(next)}
                       />
+                    </div>
+                  </section>
+
+                  <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["external-editor"])}>
+                    <div data-setting="external-editor" hidden={!shown("external-editor")}>
+                      <ExternalEditorSetting />
                     </div>
                   </section>
                 </div>

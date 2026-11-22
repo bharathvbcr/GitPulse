@@ -2,8 +2,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { invoke } from "@tauri-apps/api/core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { openInDefaultApp, revealInFileManager } from "./openInShell";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { openInDefaultApp, openInEditor, revealInFileManager } from "./openInShell";
+import { interfaceStore } from "../stores/interfaceStore";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -65,6 +66,40 @@ describe("openInShell", () => {
     await expect(openInDefaultApp("/repos/gitpulse", "../etc/passwd")).rejects.toThrow(
       "outside the repository",
     );
+  });
+
+  describe("openInEditor", () => {
+    afterEach(() => interfaceStore.setExternalEditor("auto"));
+
+    it("sends the root, the relative path and the editor choice, never a program", async () => {
+      interfaceStore.setExternalEditor("zed");
+      await openInEditor("/repos/gitpulse", "src/main.rs");
+      expect(invoke).toHaveBeenCalledWith("cmd_open_in_editor", {
+        repo: "/repos/gitpulse",
+        relative: "src/main.rs",
+        line: null,
+        column: null,
+        editor: "zed",
+      });
+    });
+
+    it("carries a line and column, and defaults the editor to auto", async () => {
+      await openInEditor("/repos/gitpulse", "src/main.rs", { line: 42, column: 7 });
+      expect(invoke).toHaveBeenCalledWith("cmd_open_in_editor", {
+        repo: "/repos/gitpulse",
+        relative: "src/main.rs",
+        line: 42,
+        column: 7,
+        editor: "auto",
+      });
+    });
+
+    it("rejects with the backend's reason when no editor is installed", async () => {
+      vi.mocked(invoke).mockRejectedValueOnce(
+        Object.assign(new Error("No editor was found."), { kind: "editor_not_found" }),
+      );
+      await expect(openInEditor("/repos/gitpulse", "src/main.rs")).rejects.toThrow("No editor was found");
+    });
   });
 
   it("propagates a reveal refusal too", async () => {

@@ -677,6 +677,7 @@ pub fn run() {
             cmd_open_worktree_path,
             cmd_reveal_worktree_path,
             desktop::shell::cmd_reveal_repository,
+            desktop::shell::cmd_open_in_editor,
             cmd_set_exit_guard_ready,
             cmd_exit_app,
             cmd_exit_request_answer,
