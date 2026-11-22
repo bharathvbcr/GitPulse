@@ -5502,6 +5502,8 @@ mod tests {
         emits: Vec<Duration>,
         exit: WatchLoopExit,
         wakes: u64,
+        ended: Duration,
+        recvs: u32,
     }
 
     #[derive(Default)]
@@ -5576,6 +5578,8 @@ mod tests {
             emits: seen.into_inner(),
             exit,
             wakes: wakes.load(Ordering::Relaxed),
+            ended: env.elapsed.get(),
+            recvs: env.calls.get(),
         }
     }
 
@@ -5743,6 +5747,79 @@ mod tests {
         );
         assert_eq!(got.exit, WatchLoopExit::DeadRepo);
         assert!(got.emits.is_empty());
+    }
+
+    #[test]
+    fn adv_burst_is_drained_in_one_batch_not_one_turn_per_event() {
+        let burst: Vec<(u64, Act)> = (0..200).map(|_| (100, Act::Change)).collect();
+        let got = drive(&burst, 5_000, Cfg::default());
+        assert!(
+            got.recvs <= 5,
+            "200 queued events took {} receives",
+            got.recvs
+        );
+    }
+
+    #[test]
+    fn adv_a_noise_event_after_quiet_does_not_beat_the_coalesce_window() {
+        // Emit at 400. The change at 500 is quiet by 900, and the noise at 1000
+        // runs the emission check with the quiet rule met but the coalesce
+        // window (until 2400) not: nothing may go out at 1000.
+        let got = drive(
+            &[(0, Act::Change), (500, Act::Change), (1_000, Act::Noise)],
+            10_000,
+            Cfg::default(),
+        );
+        assert_eq!(got.emits, vec![quiet(), quiet() + SCAN_COALESCE]);
+    }
+
+    #[test]
+    fn adv_stop_exactly_at_the_quiet_boundary_does_not_emit() {
+        let got = drive(&[(0, Act::Change), (400, Act::Stop)], 5_000, Cfg::default());
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::Stopped);
+    }
+
+    #[test]
+    fn adv_repo_vanishing_then_an_event_at_the_due_moment_is_never_announced() {
+        let got = drive(
+            &[
+                (0, Act::Change),
+                (100, Act::RemoveGitDir),
+                (400, Act::Noise),
+            ],
+            60_000,
+            Cfg::default(),
+        );
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::DeadRepo);
+    }
+
+    #[test]
+    fn adv_dead_repo_takes_three_misses_two_dead_rechecks_apart() {
+        let got = drive(
+            &[],
+            60_000,
+            Cfg {
+                vanished: true,
+                ..Cfg::default()
+            },
+        );
+        assert_eq!(got.exit, WatchLoopExit::DeadRepo);
+        assert_eq!(got.ended, DEAD_RECHECK * 2);
+        assert_eq!(got.wakes, 2);
+    }
+
+    #[test]
+    fn adv_stop_at_the_max_wait_instant_does_not_emit() {
+        // Churn keeps the quiet window open; the stop lands exactly when the
+        // max wait is reached. A path-less stop event must be dropped, not
+        // run through the emission check (which the max wait would release).
+        let mut script: Vec<(u64, Act)> = (0..=9).map(|n| (n * 200, Act::Change)).collect();
+        script.push((2_000, Act::Stop));
+        let got = drive(&script, 5_000, Cfg::default());
+        assert!(got.emits.is_empty(), "{:?}", got.emits);
+        assert_eq!(got.exit, WatchLoopExit::Stopped);
     }
 
     #[test]
