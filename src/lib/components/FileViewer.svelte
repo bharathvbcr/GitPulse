@@ -59,6 +59,7 @@
   import { askConfirm } from "../stores/modalStore";
   import { openInDefaultApp } from "../desktop/openInShell";
   import {
+    claimDocuments,
     discardDraft,
     documentConflict,
     documentIn,
@@ -200,6 +201,9 @@
       explorerOpen,
       preferredSidePane,
     });
+    // Open tabs outlive this component (the cache, then storage), so they are
+    // claimed in the store whether or not they are on screen.
+    claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path));
     savePersistedEditorTabs(repo, {
       tabs: tabState.tabs.map((tab) => ({ path: tab.path, preview: tab.preview })),
       active: tabState.active,
@@ -593,6 +597,8 @@
         explorerOpen = true;
         preferredSidePane = "explorer";
       }
+      // Tabs restored from storage are open before any mutation announces them.
+      claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path));
     });
     prevLoadKey = "";
   });

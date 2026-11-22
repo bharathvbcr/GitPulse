@@ -8,7 +8,8 @@
  * disk and at most one draft, and every host reads and writes through here.
  * The hosts keep only what is theirs: which file is on screen, tabs, layout.
  *
- * Lifetime: a document exists while some host holds it or it carries a draft.
+ * Lifetime: a document exists while some host holds (shows) it or it carries a
+ * draft; a host that merely has it open claims it (see `claimDocuments`).
  * A draft is process-lifetime on purpose (it survives a view remount, never a
  * quit: `editorTabPersist` keeps only which files were open); a document with
  * neither a holder nor a draft is dropped, so closing a file frees its text.
@@ -105,6 +106,7 @@ export function documentKey(repo: string, path: string): string {
 const state = writable<ReadonlyMap<string, OpenDocument>>(new Map());
 let documents: ReadonlyMap<string, OpenDocument> = new Map();
 const holders = new Map<string, Set<string>>();
+const claims = new Map<string, { claimant: string; keys: Set<string> }>();
 /** The read whose answer a document will take; an older one is stale. */
 const latestRead = new Map<string, number>();
 const inflight = new Map<string, Promise<DocumentLoad>>();
@@ -186,10 +188,27 @@ export function holdDocument(repo: string, path: string, holder: string): () => 
   };
 }
 
-/** True when a holder other than `holder` shows this document. */
+/**
+ * `claimant` has these files open in `repo` whether or not it is showing them
+ * (the Code page's tabs, which persist across its remounts and restarts).
+ * Replaces that claimant's earlier claim on the repository. A claim keeps no
+ * text loaded; it only tells another host closing the file that a draft on it
+ * is not that host's alone to discard.
+ */
+export function claimDocuments(repo: string, claimant: string, paths: readonly string[]): void {
+  const id = `${claimant}\0${repo}`;
+  if (paths.length === 0) claims.delete(id);
+  else claims.set(id, { claimant, keys: new Set(paths.map((path) => documentKey(repo, path))) });
+}
+
+/** True when a host other than `holder` shows this document, or has it open. */
 export function isHeldElsewhere(repo: string, path: string, holder: string): boolean {
-  for (const other of holders.get(documentKey(repo, path)) ?? []) {
+  const key = documentKey(repo, path);
+  for (const other of holders.get(key) ?? []) {
     if (other !== holder) return true;
+  }
+  for (const claim of claims.values()) {
+    if (claim.claimant !== holder && claim.keys.has(key)) return true;
   }
   return false;
 }
@@ -375,6 +394,7 @@ function refuse(repo: string, path: string, actual: string | null): void {
 export function clearOpenDocumentsForTests(): void {
   for (const doc of documents.values()) recordEditorDrafts(doc.repo, [], "documents");
   holders.clear();
+  claims.clear();
   latestRead.clear();
   inflight.clear();
   commit(new Map());

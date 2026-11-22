@@ -7,6 +7,7 @@ import { invoke } from "../ipc/invoke";
 import { clearEditorDraftRegistryForTests, unsavedEditorDrafts } from "./editorDraftRegistry";
 import { UnbasedDraft } from "./fileWrite";
 import {
+  claimDocuments,
   clearOpenDocumentsForTests,
   discardDraft,
   documentConflict,
@@ -479,6 +480,27 @@ describe("unloading", () => {
     open();
     expect(await read).toEqual({ status: "superseded" });
     expect(getDocument(REPO, "a.ts")).toBeUndefined();
+  });
+
+  it("counts a host's open-but-unshown file as held, per checkout, until it stops claiming it", async () => {
+    fakeHost({ [`${REPO}:a.ts`]: { text: "one\n", base: "b1" } });
+    holdDocument(REPO, "a.ts", "terminal-file:1");
+    // The Code page has a.ts as a background tab; nothing of it is on screen.
+    claimDocuments(REPO, "code-page", ["a.ts", "b.ts"]);
+    expect(isHeldElsewhere(REPO, "a.ts", "terminal-file:1")).toBe(true);
+    expect(isHeldElsewhere(REPO, "./b.ts", "terminal-file:1")).toBe(true);
+    expect(isHeldElsewhere(REPO, "c.ts", "terminal-file:1")).toBe(false);
+    expect(isHeldElsewhere("/work/other", "a.ts", "terminal-file:1")).toBe(false);
+    // A host's own claim is not "elsewhere" to it.
+    expect(isHeldElsewhere(REPO, "a.ts", "code-page")).toBe(true);
+    expect(isHeldElsewhere(REPO, "b.ts", "code-page")).toBe(false);
+    // A claim keeps no text: once the split leaves, nothing is loaded.
+    expect(getDocument(REPO, "b.ts")).toBeUndefined();
+    // A new claim replaces the old one.
+    claimDocuments(REPO, "code-page", ["b.ts"]);
+    expect(isHeldElsewhere(REPO, "a.ts", "terminal-file:1")).toBe(false);
+    claimDocuments(REPO, "code-page", []);
+    expect(isHeldElsewhere(REPO, "b.ts", "terminal-file:1")).toBe(false);
   });
 
   it("tells a host whether another still shows the file, and a release twice is one release", async () => {

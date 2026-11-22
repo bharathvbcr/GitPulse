@@ -605,49 +605,119 @@ const type = async value => { const area = textarea(); area.value = value; area.
     splitHost.style.cssText = "position:fixed;right:0;top:0;width:520px;height:420px;display:flex;flex-direction:column;background:#0b0f19";
     document.body.append(splitHost);
     const Pane = (await import("../src/lib/components/TerminalFilePane.svelte")).default;
+    const { openDocuments } = await import("../src/lib/files/openDocuments");
+    const { unsavedEditorDrafts } = await import("../src/lib/files/editorDraftRegistry");
     const inSplit = label => [...splitHost.querySelectorAll("button")].find(el => el.textContent.trim().startsWith(label));
     const splitArea = () => splitHost.querySelector("textarea");
     const splitBanner = () => splitHost.querySelector('[data-testid="editor-conflict"]');
-    const typeIn = async (area, value) => { area.value = value; area.dispatchEvent(new Event("input", { bubbles: true })); await tick(); await wait(120); };
-    const tabDirty = () => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(splitFile))?.getAttribute("title")?.includes("Unsaved");
+    const typeIn = async (area, value) => { area.value = value; area.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
+    const splitTab = () => [...host.querySelectorAll('[role="tab"]')].find(el => (el.getAttribute("title") ?? "").startsWith(splitFile));
+    const tabDirty = () => Boolean(splitTab()?.getAttribute("title")?.includes("Unsaved"));
+    const draftPathsNow = () => unsavedEditorDrafts().filter(r => r.repo === root).flatMap(r => r.paths).filter(p => p === splitFile);
+    // A window for a thing that must NOT happen; waiting on it would never end.
+    const settle = () => wait(250);
+    const docs = () => [...get(openDocuments).values()].filter(d => d.repo === root && d.path === splitFile);
 
-    repoStore.selectFilePath(splitFile); await tick(); await wait(120);
+    repoStore.selectFilePath(splitFile); await tick();
+    await until(() => button("Edit"), "the file is open on the Code page");
     const pane = mount(Pane, { target: splitHost, props: { tabId: "split-1", repoPath: root, filePath: splitFile, onscreen: true, defaultExplorerOpen: false } });
-    await until(() => button("Edit") && inSplit("Edit"), "the file is open on the Code page and in the split");
+    await until(() => inSplit("Edit"), "the file is open in the split");
+    check("one file open in both hosts is one document", () => docs().length === 1);
 
     button("Edit").click();
     await until(textarea, "the Code page editor opens");
     await type("alpha\nbeta\n");
-    await wait(200);
+    await until(() => /Unsaved/.test(splitHost.textContent), "the split shows the draft as unsaved").catch(() => {});
     check("a draft typed on the Code page shows in the split as unsaved", () => /Unsaved/.test(splitHost.textContent));
+    await until(() => splitArea()?.value === "alpha\nbeta\n", "the split's editor holds the draft").catch(() => {});
     check("and the split's editor holds that same text", () => splitArea()?.value === "alpha\nbeta\n");
+    check("with one dirty entry for the quit guard", () => draftPathsNow().length === 1);
 
-    if (!splitArea()) { inSplit("Edit")?.click(); await wait(120); }
+    if (!splitArea()) { inSplit("Edit")?.click(); await settle(); }
     if (splitArea()) await typeIn(splitArea(), "alpha\nbeta\ngamma\n");
-    await wait(200);
+    await until(() => textarea()?.value === "alpha\nbeta\ngamma\n", "the Code page follows the split's typing").catch(() => {});
     check("typing in the split shows in the Code page's editor: one draft, not two", () => textarea()?.value === "alpha\nbeta\ngamma\n");
+
+    // A draft lives in the document, not in a host: the Code page unmounted
+    // (another view on screen) and remounted still has it.
+    await unmount(app); await tick();
+    check("the draft survives the Code page leaving the screen", () => docs()[0]?.draft?.content === "alpha\nbeta\ngamma\n");
+    // The split closing while the Code page still has the file open as a tab
+    // must not offer to throw away work the Code page owns.
+    const closing = await Promise.race([pane.confirmClose(), wait(400).then(() => "asked")]);
+    check("closing the split asks nothing while the Code page still has the file open, even off screen", () => closing === true && get(promptState) === null);
+    if (get(promptState)) completePrompt(false);
+    check("and leaves the draft where it is", () => docs()[0]?.draft?.content === "alpha\nbeta\ngamma\n");
+    app = mount(Viewer, { target: host });
+    await until(() => textarea()?.value === "alpha\nbeta\ngamma\n", "the remounted Code page restores the draft");
+    check("the remounted Code page restores the draft in its editor, still the one draft", () => textarea().value === "alpha\nbeta\ngamma\n" && draftPathsNow().length === 1 && tabDirty());
+
+    // Closing the Code page's tab while the split shows the file: the draft is
+    // the split's now, so nothing is asked and nothing is lost.
+    splitTab().querySelector('button[aria-label^="Close"]').click();
+    await settle();
+    check("closing the Code tab asks nothing while a split shows the file", () => get(promptState) === null && !splitTab());
+    if (get(promptState)) completePrompt(false);
+    check("and the split keeps the draft", () => splitArea()?.value === "alpha\nbeta\ngamma\n" && /Unsaved/.test(splitHost.textContent) && draftPathsNow().length === 1);
+    // With no Code tab left the split is the draft's last owner and must ask.
+    const lastClose = pane.confirmClose();
+    await until(() => get(promptState), "the last owner is asked");
+    check("closing the split that is the draft's last owner asks, naming the file", () => get(promptState).options.message.includes(splitFile));
+    completePrompt(false);
+    const keptOpen = await lastClose;
+    check("and Keep open keeps it", () => keptOpen === false && draftPathsNow().length === 1);
+    const closeAgain = pane.confirmClose();
+    await until(() => get(promptState), "asked again");
+    completePrompt(true);
+    const mayClose = await closeAgain;
+    check("Discard and close lets the split close", () => mayClose === true);
+    await pane.close();
+    check("and drops the draft, once", () => draftPathsNow().length === 0 && docs().length === 1 && docs()[0].draft === null);
+    await unmount(pane); await tick();
+    check("a document nothing shows and no draft owes is unloaded", () => docs().length === 0);
+
+    // A read-only snippet never becomes a document.
+    const before = get(openDocuments).size;
+    const snippetHost = document.createElement("div");
+    snippetHost.style.cssText = "position:fixed;left:0;top:0;width:480px;height:300px;display:flex;flex-direction:column";
+    document.body.append(snippetHost);
+    const snippetPane = mount(Pane, { target: snippetHost, props: { tabId: "snippet-1", repoPath: root, snippet: { title: "git log output", content: "commit abc\n" }, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => snippetHost.textContent.includes("commit abc"), "the snippet shows");
+    check("a snippet's command output never enters the store", () => get(openDocuments).size === before && [...get(openDocuments).values()].every(d => d.path !== "git log output"));
+    await unmount(snippetPane); snippetHost.remove();
+
+    // Back to two hosts for the save and conflict paths.
+    repoStore.selectFilePath(splitFile); await tick();
+    await until(() => button("Edit"), "the file is open on the Code page again");
+    const pane2 = mount(Pane, { target: splitHost, props: { tabId: "split-2", repoPath: root, filePath: splitFile, onscreen: true, defaultExplorerOpen: false } });
+    await until(() => inSplit("Edit"), "the file is open in the second split");
+    button("Edit").click();
+    await until(textarea, "the Code page editor opens again");
+    await type("alpha\nbeta\ngamma\n");
+    await until(() => splitArea()?.value === "alpha\nbeta\ngamma\n", "the split follows");
 
     const writesBefore = splitSaves.length;
     inSplit("Save")?.click();
-    await wait(400);
+    await until(() => splitSaves.length > writesBefore && !/Unsaved/.test(splitHost.textContent), "the split's save lands");
     check("saving from the split writes once, with that draft", () => splitSaves.length === writesBefore + 1 && splitSaves.at(-1)?.content === "alpha\nbeta\ngamma\n" && splitDisk.text === "alpha\nbeta\ngamma\n");
     // The Code page's editor may stay open on the text it now matches, as it does after the banner's Overwrite.
-    check("and leaves neither host with a draft", () => !tabDirty() && !/Unsaved/.test(splitHost.textContent) && !splitArea() && (!textarea() || textarea().value === "alpha\nbeta\ngamma\n"));
+    check("and leaves neither host with a draft", () => !tabDirty() && !/Unsaved/.test(splitHost.textContent) && !splitArea() && (!textarea() || textarea().value === "alpha\nbeta\ngamma\n") && draftPathsNow().length === 0);
 
     // A refusal is one conflict, answered from either host.
-    if (button("Edit")) { button("Edit").click(); await wait(120); }
-    if (textarea()) await type("alpha\nbeta\ngamma\ndelta\n");
+    if (button("Edit")) { button("Edit").click(); await until(textarea, "the Code page editor opens a third time"); }
+    await type("alpha\nbeta\ngamma\ndelta\n");
+    await until(() => /Unsaved/.test(splitHost.textContent), "the split sees the new draft");
     splitDisk = { text: "agent\n", base: "6:s999" };
     inSplit("Save")?.click();
-    await wait(400);
+    await until(() => banner() && splitBanner(), "the conflict banner in both hosts").catch(() => {});
     check("a refused save raises the conflict banner in both hosts", () => Boolean(banner()) && Boolean(splitBanner()));
     const overwriteBase = splitDisk.base;
     [...(banner()?.querySelectorAll("button") ?? [])].find(el => el.textContent.trim() === "Overwrite")?.click();
-    await wait(400);
+    await until(() => !banner() && !splitBanner(), "the banner goes in both hosts").catch(() => {});
     check("Overwrite from the Code page saves the one draft over the version the refusal saw", () => splitSaves.at(-1)?.expectedBase === overwriteBase && splitDisk.text === "alpha\nbeta\ngamma\ndelta\n");
     check("and clears the banner in both hosts", () => !banner() && !splitBanner());
 
-    await unmount(pane); splitHost.remove(); await tick();
+    await unmount(pane2); splitHost.remove(); await tick();
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

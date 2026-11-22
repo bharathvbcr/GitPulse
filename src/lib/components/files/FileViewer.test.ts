@@ -64,6 +64,13 @@ describe("FileViewer", () => {
     expect(source).not.toContain("tabState.drafts");
   });
 
+  it("claims its open tabs in the store on every change and on hydration, shown or not", () => {
+    const persist = source.slice(source.indexOf("function persistTabs"), source.indexOf("function previewFile"));
+    expect(persist).toContain("claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path))");
+    const hydrate = source.slice(source.indexOf("let cached = tabCache.get(repo)"), source.indexOf("const storeSelection"));
+    expect(hydrate).toContain("claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path))");
+  });
+
   it("leaves the app-close registry to the store, the one owner of editor drafts", () => {
     // Two owners publishing the same file is how the quit guard could count it
     // twice; the store publishes after every change to a draft.
