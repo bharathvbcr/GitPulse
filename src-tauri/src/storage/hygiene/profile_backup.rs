@@ -360,4 +360,270 @@ mod tests {
         }
         assert!(dir.join("workbench.sqlite").exists() && dir.join(BACKUP).exists());
     }
+
+    fn refused(profile: &Path, name: &str) -> bool {
+        resolve(profile, name).is_err()
+    }
+
+    #[test]
+    fn hostile_names_never_resolve_to_anything() {
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let long = format!("workbench.sqlite.{}.bak", "a".repeat(5000));
+        let hostile = [
+            "..",
+            ".",
+            "/etc/passwd",
+            "workbench.sqlite.x.bak/",
+            "workbench.sqlite.x/../workbench.sqlite.bak",
+            "..\\workbench.sqlite.x.bak",
+            "workbench.sqlite.x\\y.bak",
+            "workbench.sqlite.x\0.bak",
+            "workbench.sqlite.\u{2215}etc.bak",
+            "workbench.sqlite.\u{ff0e}\u{ff0e}.bak",
+            "workbench.sqlite.caf\u{e9}.bak",
+            "workbench.sqlite.x .bak",
+            "workbench.sqlite.x.bak ",
+            "workbench.sqlite.bak",
+            "workbench.sqlite..bak",
+            "workbench.sqlite.x.bak.partial",
+            "workbench.sqlite-wal",
+            "workbench.sqlite-shm",
+            "workbench.sqlite",
+            "WORKBENCH.SQLITE.pre-schema-11.bak",
+            "workbench.sqlite.pre-schema-11.BAK",
+            "workbench.sqlite.pre-schema-11.bak\n",
+            "",
+            long.as_str(),
+        ];
+        for name in hostile {
+            assert!(refused(&profile, name), "{name:?} must be refused");
+            assert!(
+                !is_backup_name("workbench.sqlite", name) || name == long,
+                "{name:?}"
+            );
+        }
+        assert!(dir.join("workbench.sqlite").exists());
+    }
+
+    #[test]
+    fn a_directory_a_fifo_and_a_symlink_named_like_a_backup_are_refused_and_untouched() {
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        fs::create_dir(dir.join("workbench.sqlite.d.bak")).unwrap();
+        let fifo = dir.join("workbench.sqlite.f.bak");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink(&profile, dir.join("workbench.sqlite.s.bak")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("nowhere"),
+            dir.join("workbench.sqlite.dangling.bak"),
+        )
+        .unwrap();
+        for name in [
+            "workbench.sqlite.d.bak",
+            "workbench.sqlite.f.bak",
+            "workbench.sqlite.s.bak",
+            "workbench.sqlite.dangling.bak",
+        ] {
+            assert!(refused(&profile, name), "{name} must be refused");
+        }
+        let (rows, omitted) = list(&profile).unwrap();
+        let listed: Vec<&str> = rows.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(omitted, 0);
+        assert!(
+            listed.iter().all(|n| !n.ends_with(".d.bak")
+                && !n.ends_with(".f.bak")
+                && !n.ends_with(".s.bak")
+                && !n.ends_with(".dangling.bak")),
+            "{listed:?}"
+        );
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+    }
+
+    #[test]
+    fn a_hardlink_to_the_live_profile_removes_only_its_own_name() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        fs::hard_link(&profile, dir.join("workbench.sqlite.hard.bak")).unwrap();
+        let resolver = || Ok(profile.clone());
+        let plan = prepare_with_profile(
+            repo,
+            &format!("{TARGET_PREFIX}workbench.sqlite.hard.bak"),
+            30,
+            |_| Ok(()),
+            resolver,
+        )
+        .unwrap();
+        let (_, outcome) =
+            execute_with_profile(repo, &plan.id, |_, _| Ok(()), |_| Ok(()), resolver).unwrap();
+        assert!(outcome.success, "{}", outcome.message);
+        assert!(!dir.join("workbench.sqlite.hard.bak").exists());
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+    }
+
+    #[test]
+    fn a_backup_swapped_for_a_symlink_to_the_live_profile_between_preview_and_execute_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let plan = prepare_with_profile(
+            repo,
+            &format!("{TARGET_PREFIX}{BACKUP}"),
+            30,
+            |_| Ok(()),
+            resolver,
+        )
+        .unwrap();
+        fs::remove_file(dir.join(BACKUP)).unwrap();
+        std::os::unix::fs::symlink(&profile, dir.join(BACKUP)).unwrap();
+
+        let result = execute_with_profile(repo, &plan.id, |_, _| Ok(()), |_| Ok(()), resolver);
+
+        assert!(
+            result.is_err(),
+            "a symlink in place of the backup must be refused"
+        );
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+    }
+
+    #[test]
+    fn a_swap_to_a_symlink_inside_the_policy_gate_never_reaches_the_live_profile() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let plan = prepare_with_profile(
+            repo,
+            &format!("{TARGET_PREFIX}{BACKUP}"),
+            30,
+            |_| Ok(()),
+            resolver,
+        )
+        .unwrap();
+        let swapped = dir.join(BACKUP);
+        let target = profile.clone();
+        // The gate runs after the first stamp check: swap there.
+        let result = execute_with_profile(
+            repo,
+            &plan.id,
+            |_, _| {
+                fs::remove_file(&swapped).unwrap();
+                std::os::unix::fs::symlink(&target, &swapped).unwrap();
+                Ok(())
+            },
+            |_| Ok(()),
+            resolver,
+        );
+        assert!(result.is_err() || fs::symlink_metadata(&swapped).is_err());
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+    }
+
+    #[test]
+    fn remove_refuses_a_symlink_and_never_touches_the_file_it_points_at() {
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        let cancel = AtomicBool::new(false);
+        let link = dir.join("workbench.sqlite.l.bak");
+        std::os::unix::fs::symlink(&profile, &link).unwrap();
+        // The reviewer refuses to measure a symlink at all, so no stamp can
+        // authorise unlinking one through the backup path.
+        assert!(tree::snapshot(&link, false, &cancel).is_err());
+        let foreign = tree::snapshot(&dir.join(BACKUP), false, &cancel).unwrap();
+        assert!(remove(&link, &foreign, &cancel).is_err());
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+
+        // A stamp taken of a real backup does not authorise unlinking a swap.
+        let reviewed = tree::snapshot(&dir.join(BACKUP), false, &cancel).unwrap();
+        fs::remove_file(dir.join(BACKUP)).unwrap();
+        std::os::unix::fs::symlink(&profile, dir.join(BACKUP)).unwrap();
+        assert!(remove(&dir.join(BACKUP), &reviewed, &cancel).is_err());
+        assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
+    }
+
+    #[test]
+    fn more_than_the_listing_bound_says_so_and_stays_sorted() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        for n in 0..(MAX_LISTED + 7) {
+            fs::write(dir.join(format!("workbench.sqlite.{n:04}.bak")), "x").unwrap();
+        }
+        let rows = entries(Ok(&dir.join("workbench.sqlite")));
+        assert_eq!(rows.len(), MAX_LISTED + 1);
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.error.as_deref(),
+            Some("7 more backups were found and are not listed")
+        );
+        assert!(last.action.is_none() && last.confirm_only);
+        assert!(rows[..MAX_LISTED]
+            .iter()
+            .all(|r| r.error.is_none() && r.confirm_only));
+    }
+
+    #[test]
+    fn an_unreadable_profile_directory_is_an_error_row_and_a_missing_one_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_keep, dir) = profile_dir();
+        let profile = dir.join("workbench.sqlite");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let rows = entries(Ok(&profile));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if fs::read_dir(&dir).is_ok() && rows.iter().all(|r| r.error.is_none()) && rows.len() > 1 {
+            // Running with privileges that ignore directory modes (root): the
+            // denial cannot be constructed here.
+            return;
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Cannot read")));
+        assert!(rows[0].action.is_none() && rows[0].confirm_only);
+
+        let gone = dir.join("no-such-dir").join("workbench.sqlite");
+        assert!(entries(Ok(&gone)).is_empty());
+    }
+
+    #[test]
+    fn a_profile_directory_reached_through_a_symlink_lists_and_still_refuses_traversal() {
+        let (_keep, dir) = profile_dir();
+        let holder = tempfile::tempdir().unwrap();
+        let via = crate::engine::process::canonicalize_plain(holder.path())
+            .unwrap()
+            .join("alias");
+        std::os::unix::fs::symlink(&dir, &via).unwrap();
+        let profile = via.join("workbench.sqlite");
+        let rows = entries(Ok(&profile));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(refused(&profile, "../workbench.sqlite.x.bak"));
+        assert!(resolve(&profile, BACKUP).is_ok());
+    }
+
+    #[test]
+    fn a_profile_path_that_is_not_utf8_or_has_no_directory_is_an_error_row() {
+        let rows = entries(Ok(Path::new("/")));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].error.is_some() && rows[0].confirm_only);
+        assert!(resolve(Path::new("/"), BACKUP).is_err());
+    }
+
+    #[test]
+    fn every_non_ui_hygiene_target_builder_is_refused_for_backup_targets_by_the_gate() {
+        assert!(requires_user_confirmation("backup:x"));
+        assert!(!requires_user_confirmation(" backup:x"));
+        assert!(!requires_user_confirmation("BACKUP:x"));
+        assert!(!requires_user_confirmation("cache:backup:x"));
+        assert!(!requires_user_confirmation("local:backup:x"));
+    }
 }
