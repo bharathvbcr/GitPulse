@@ -19,6 +19,9 @@ import { openManviFocus } from "../ui/openManviFocus";
 import { openConflicts } from "../ui/workConflicts";
 import { policyActivityVisible } from "../harness/policyActivityVisible";
 import { harnessStore } from "../stores/harnessStore";
+import { activeSelection } from "../terminal/activeSelection";
+import { trayFor, trayProblem, trayText } from "../terminal/contextTray";
+import { sendToAgentFromPage } from "../terminal/sendFromPage";
 
 const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
@@ -56,6 +59,68 @@ export function worktreeUnavailable(state: RepoState): string | undefined {
 export interface PaletteHostActions {
   onClone?: () => void;
   onRebase?: () => void;
+}
+
+/** The palette's doors to sending code to an agent and to the open file. */
+function agentSendCommands(state: RepoState, unavailable: string | undefined, checkOrigin: () => void): PaletteItem[] {
+  const selection = activeSelection();
+  const noSelection = "Select lines in an open file first: click a line number, shift-click to extend.";
+  const range = selection ? `${selection.path} L${selection.startLine}${selection.endLine !== selection.startLine ? `–${selection.endLine}` : ""}` : null;
+  const tray = state.currentPath ? trayFor(state.currentPath) : [];
+  const file = state.selectedFilePath;
+  const noFile = "Open a file in Explorer first.";
+  return [
+    {
+      id: "agent-send-selection", label: "Send selection to agent — @file#Lx-Ly into the recipient session",
+      description: range ? `Inserts a reference to ${range}, unsubmitted.` : "Inserts a reference to the selected lines, unsubmitted.",
+      keywords: "agent terminal send reference mention selection lines claude codex", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? (selection ? undefined : noSelection),
+      action: () => { checkOrigin(); selection?.sendReference(); },
+    },
+    {
+      id: "agent-send-selection-content", label: "Send selection content to agent — the lines in a code block",
+      description: range ? `Inserts ${range} as a fenced block, unsubmitted, at most 8 KiB with any cut stated.` : "Inserts the selected lines as a fenced block, unsubmitted.",
+      keywords: "agent terminal send code content snippet selection lines claude codex", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? (selection ? undefined : noSelection),
+      action: () => { checkOrigin(); selection?.sendContent(); },
+    },
+    {
+      id: "agent-insert-tray", label: "Insert context tray — every set-aside range, as references",
+      description: tray.length ? `Inserts ${tray.length} ${tray.length === 1 ? "reference" : "references"}, unsubmitted.` : "Set ranges aside with Add to tray in a file viewer, then insert them together.",
+      keywords: "agent terminal context tray references insert all ranges", category: "Workspace", icon: Bot,
+      disabledReason: unavailable ?? trayProblem(tray) ?? undefined,
+      action: async () => { checkOrigin(); await sendToAgentFromPage(trayText(tray)); },
+    },
+    {
+      id: "file-open-in-terminal-split", label: "Open active file in terminal split — beside the sessions",
+      description: file ? `Opens ${file} in a pane of the terminal dock.` : "Opens the file Explorer has open in a pane of the terminal dock.",
+      keywords: "file terminal split pane open dock", category: "Workspace", icon: Terminal,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: async () => {
+        checkOrigin();
+        const path = get(repoStore).currentPath;
+        if (!path || !file) throw Error(noFile);
+        // Request first, then show the dock, as the session launchers do.
+        const opened = terminalLaunchRequests.requestFile(path, file, null, null, undefined, { mode: "split", focus: true });
+        repoStore.setTerminalOpen(true);
+        await opened;
+      },
+    },
+    {
+      id: "file-reveal-in-explorer", label: "Reveal active file in explorer — in the file tree",
+      description: file ? `Shows ${file} in the Code page's file tree.` : "Shows the file Explorer has open in the Code page's file tree.",
+      keywords: "file reveal explorer tree locate code page", category: "Workspace", icon: FileCode,
+      disabledReason: unavailable ?? (file ? undefined : noFile),
+      action: () => {
+        checkOrigin();
+        if (!file) throw Error(noFile);
+        interfaceStore.setGlobalSurface("repository");
+        repoStore.setActiveTab("code");
+        showExplorerRail("files");
+        repoStore.selectFilePath(file);
+      },
+    },
+  ];
 }
 
 export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) => void, host: PaletteHostActions = {}): PaletteItem[] {
@@ -211,6 +276,9 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
         await launched;
       },
     })),
+    // Sending code to an agent. Each is listed with its reason when it cannot run
+    // now (no line selected, nothing in the tray, no open file) rather than hidden.
+    ...agentSendCommands(state, unavailable, checkOrigin),
     { id: "refresh", label: "Refresh repository status", category: "Repository", icon: RefreshCw, shortcut: "⌘R", disabledReason: unavailable, action: () => repoStore.refresh() },
     { id: "quick_commit", label: "Quick commit…", description: "Stage all changes and commit with a message", category: "Git actions", icon: GitCommit, shortcut: "⌘Enter", closeBefore: true, disabledReason: worktree ?? (state.statuses.length ? undefined : "Nothing to commit."), action: () => promptQuickCommit() },
     { id: "new_branch", label: "Create branch…", category: "Git actions", icon: Plus, closeBefore: true, disabledReason: worktree, action: async () => {

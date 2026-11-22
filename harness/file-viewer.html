@@ -114,6 +114,7 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(() => host.textContent.includes("Ln 2, Col 1"), "the reveal request lands on its line");
   check("a reveal for the file already open lands on the named line", () => host.textContent.includes("Ln 2, Col 1"));
   check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
+  await sendToAgentChecks();
 
   // Find used to open a second bar under the toolbar, styled unlike the
   // diff's. It is the same in-place field now: the pill widens where it sat.
@@ -581,6 +582,76 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("and Try again reads it again", () => items().length === 2);
     menu().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await tick(); await wait(120);
     check("Escape closes the menu", () => !menu());
+  }
+
+  // --- Send to an agent from the Code page: ⌘L, the recipient on the button, the picker, content and tray ---
+  // Declared here, run early (above): the editor checks below leave a draft open, which has no line numbers to select.
+  async function sendToAgentChecks() {
+    const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+    const { toastStore } = await import("../src/lib/stores/toastStore");
+    const { publishRecipients, forgetRecipients } = await import("../src/lib/terminal/recipient");
+    const { trayFor, clearTray } = await import("../src/lib/terminal/contextTray");
+    repoStore.setActiveTab("code"); repoStore.selectFilePath(file); await tick(); await wait(120);
+    const send = () => host.querySelector('[data-testid="code-send-to-agent"]');
+    const recipient = () => host.querySelector('[data-testid="code-send-recipient"]');
+    const lineButton = n => [...host.querySelectorAll("button")].find(b => b.textContent.trim() === String(n) && b.className.includes("w-12"));
+    const viewer = () => host.querySelector('[aria-label="Code viewer"]');
+    const chord = init => viewer().dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init }));
+    const toasts = () => get(toastStore).map(t => t.message);
+    await until(() => Boolean(send()) && Boolean(lineButton(1)) && Boolean(lineButton(2)), "the Code page offers Send and line numbers");
+    check("the Code page's file viewer offers Send (it was given no handler before)", () => Boolean(send()));
+    lineButton(1).click(); lineButton(2).dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: true })); await tick();
+    check("Send names the selected range", () => send().textContent.includes("Send L1–2"));
+    check("and names no recipient while no live session has been published", () => !recipient());
+
+    const claude = { id: "t1", launcher: "claude", checkout: root, live: true, visible: true };
+    const shell = { id: "t2", launcher: "shell", checkout: root, live: true, visible: false };
+    publishRecipients(root, [claude]); await tick(); await wait(40);
+    check("a published session is named on the button, with its checkout", () => recipient()?.textContent.includes("claude · GitPulse"));
+    check("one eligible session offers no picker", () => !host.querySelector('[data-testid="code-send-recipient-picker"]'));
+
+    publishRecipients(root, [claude, shell]); await tick(); await wait(40);
+    const picker = () => host.querySelector('[data-testid="code-send-recipient-picker"]');
+    check("two eligible sessions offer a picker", () => Boolean(picker()));
+    picker().click(); await tick();
+    await until(() => document.querySelector('[data-testid="code-send-recipient-menu"]'), "the picker menu opens");
+    const options = () => [...document.querySelectorAll('[data-testid="code-send-recipient-option"]')];
+    check("the picker lists both sessions and marks the one sends go to", () =>
+      options().length === 2 && options()[0].getAttribute("aria-checked") === "true" && options()[1].getAttribute("aria-checked") === "false");
+    options()[1].click(); await tick(); await wait(80);
+    check("choosing a session puts it on the button", () => recipient()?.textContent.includes("shell · GitPulse"));
+    publishRecipients(root, [claude, { ...shell, live: false }]); await tick(); await wait(40);
+    check("the choice is dropped when that session ends, and the rule picks again", () => recipient()?.textContent.includes("claude · GitPulse") && !picker());
+
+    // ⌘L from the Code page: a request the panel would claim, never a silent no-op.
+    const pendingRequest = () => get(terminalLaunchRequests);
+    chord({ key: "l", code: "KeyL", metaKey: true });
+    await until(() => pendingRequest(), "the reference request reaches the launch channel");
+    check("⌘L from the Code page requests a reference for the selected range, naming the file's checkout", () =>
+      pendingRequest().launcher === "reference" && pendingRequest().reference === `@${file}#L1-L2 ` && pendingRequest().referenceCheckout === root);
+    terminalLaunchRequests.take(root).complete("Open an agent or shell session first to send a reference.");
+    await until(() => toasts().some(m => m.includes("Open an agent or shell session first")), "the refusal is reported");
+    check("a refusal from the panel is an error toast, not silence", () => toasts().some(m => m.startsWith("Not sent to an agent:")));
+
+    // ⌘⇧L sends the lines themselves, fenced, with the checkout in the header.
+    chord({ key: "L", code: "KeyL", metaKey: true, shiftKey: true });
+    await until(() => pendingRequest(), "the content request reaches the launch channel");
+    check("⌘⇧L requests the selected lines in a fenced block under a header", () =>
+      pendingRequest().reference === `File: ${file}, lines 1-2, checkout GitPulse\n\`\`\`typescript\none\ntwo\n\`\`\``);
+    terminalLaunchRequests.take(root).complete();
+    await tick(); await wait(40);
+
+    // ⌥⌘L sets the range aside; ⌥ changes `key` on macOS, so the chord is the physical key.
+    chord({ key: "¬", code: "KeyL", metaKey: true, altKey: true });
+    await tick();
+    check("⌥⌘L adds the range to the repository's context tray", () => trayFor(root).length === 1 && trayFor(root)[0].startLine === 1 && trayFor(root)[0].endLine === 2);
+    chord({ key: "¬", code: "KeyL", metaKey: true, altKey: true });
+    await tick();
+    check("and the same range is not added twice", () => trayFor(root).length === 1);
+    clearTray(root); forgetRecipients(root);
+    // Selecting lines moved the cursor; put it back where the checks after this expect it.
+    requestReveal(file, 2, 1);
+    await until(() => host.textContent.includes("Ln 2, Col 1"), "the cursor is back on line 2");
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

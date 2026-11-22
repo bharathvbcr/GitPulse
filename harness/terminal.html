@@ -1415,6 +1415,20 @@
           await wait(150);
           check("a paste carrying a bracket terminator asks, and declining sends nothing",
             () => Boolean(injectAsk?.options.message.includes("ends a paste early")) && written.join("") === "");
+          // Text sent to an agent from outside the panel (the Code page's ⌘L): the panel
+          // claims the request and types it into the live session, unsubmitted, or says why not.
+          {
+            const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+            const repo = "/fixture/GitPulse";
+            written = [];
+            const sent = await terminalLaunchRequests.requestReference(repo, "@src/main.ts#L1-L2 ", repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`a reference request is claimed and typed into the live shell, unsubmitted (${sent ?? "ok"})`, () => sent === null && written.join("") === "@src/main.ts#L1-L2 ");
+            written = [];
+            const refused = await terminalLaunchRequests.requestReference(repo, "File: a.ts, lines 1-2\n```\nx\ny\n```", repo).then(() => null, (error) => error.message);
+            await wait(100);
+            check("a block of lines is refused, with the reason, by a shell that is not in bracketed-paste mode, and nothing is typed", () => /bracketed-paste/.test(refused ?? "") && written.join("") === "");
+          }
           // Synthetic Backspace plus the insertText WebKit emits after it.
           // The guard must write one DEL and must not forward the line.
           written = [];

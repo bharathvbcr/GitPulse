@@ -71,6 +71,7 @@
   import { explorerLens, toggleBlameLens } from "../files/explorerLens";
   import { sidebarExplorerDocked } from "../sidebar/layoutStore";
   import MediaViewer from "./files/MediaViewer.svelte";
+  import { sendToAgentFromPage } from "../terminal/sendFromPage";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import FileHistoryMenu from "./files/FileHistoryMenu.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -1111,6 +1112,7 @@
             onDraftChange={(newContent, sourceContent) =>
               handleDraftChange(activeTabPath, newContent, sourceContent)}
             onRequestDiscard={() => requestDiscardDraft(activeTabPath)}
+            onSendSelectionToAgent={(text, checkout) => void sendToAgentFromPage(text, checkout)}
           />
         {:else}
           <EmptyState

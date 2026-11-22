@@ -8,7 +8,15 @@
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
-  import { claimedFileOpen, isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import { claimedFileOpen, claimedReference, isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import {
+    forgetRecipients,
+    pickRecipient,
+    publishRecipients,
+    recipientChoice,
+    type RecipientCandidate,
+  } from "../terminal/recipient";
+  import { clearTray, contextTrays, trayBytes, trayProblem, trayText } from "../terminal/contextTray";
   import { requestPin } from "../files/pinRequests";
   import { opensExplorerPage } from "../files/explorerPageGesture";
   import { resolveFileOpen, sidebarNavStore, type ResolvedFileOpen, type SidebarFileOpenTarget } from "../sidebar/layoutStore";
@@ -55,6 +63,7 @@
     Eye,
     RotateCw,
     Sparkles,
+    ListPlus,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -2115,6 +2124,12 @@
       const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
       mode = "shell";
+      // Text for a session, not a session to open: branch before anything that opens a tab.
+      if (claimed.launcher === "reference") {
+        const reference = claimedReference(claimed);
+        claimed.complete(reference ? sendReferenceToAgent(reference.text, reference.checkout || undefined) : "There is nothing to send.");
+        return;
+      }
       if (claimed.launcher === "browser") {
         claimed.complete(openBrowserFor(claimed.url));
         return;
@@ -2159,7 +2174,40 @@
     });
   });
 
+  // Publishes the sessions text can go to, for the Send label in file viewers
+  // outside this panel (`recipient.ts`). Liveness comes from `tabStatuses`,
+  // which is reactive; `sendReferenceToAgent` asks the session itself.
+  let publishedRecipientsFor: string | null = null;
+  $effect(() => {
+    const here = repoPath;
+    const rows: RecipientCandidate[] = tabState.tabs.map((tab) => ({
+      id: tab.id,
+      launcher: tab.launcher,
+      checkout: tab.checkout ?? here ?? "",
+      live: tabStatuses[tab.id] !== "exited" && tabStatuses[tab.id] !== "error",
+      visible: visibleIds.includes(tab.id),
+    }));
+    untrack(() => {
+      if (publishedRecipientsFor && publishedRecipientsFor !== here) forgetRecipients(publishedRecipientsFor);
+      publishedRecipientsFor = here || null;
+      if (here) publishRecipients(here, rows);
+    });
+  });
+
+  const trayEntries = $derived(repoPath ? ($contextTrays[repoPath] ?? []) : []);
+
+  /** Types every reference in the context tray into the recipient session, unsubmitted, and keeps the tray. */
+  function insertContextTray() {
+    const problem = trayProblem(trayEntries);
+    if (problem) {
+      sessionError = problem;
+      return;
+    }
+    sendReferenceToAgent(trayText(trayEntries));
+  }
+
   onDestroy(() => {
+    if (publishedRecipientsFor) forgetRecipients(publishedRecipientsFor);
     flushPendingSplitPersist();
     for (const tab of tabState.tabs) {
       terminalLaunchRequests.forget(tab.id);
@@ -3053,27 +3101,47 @@
     );
   }
 
-  function preferredRecipientSessionTab() {
-    const liveCandidates = tabState.tabs.filter(
-      (tab) => tab.launcher !== "browser" && tab.launcher !== "file" && sessions[tab.id]?.isLive(),
-    );
-    return (
-      liveCandidates.find((tab) => visibleIds.includes(tab.id) && isPromptLauncher(tab.launcher)) ??
-      liveCandidates.find((tab) => isPromptLauncher(tab.launcher)) ??
-      liveCandidates.find((tab) => visibleIds.includes(tab.id)) ??
-      liveCandidates[0]
-    );
+  /** Every tab as a send candidate: liveness asked of the session itself, which is the truth at the moment of sending. */
+  function recipientCandidates(): RecipientCandidate[] {
+    return tabState.tabs.map((tab) => ({
+      id: tab.id,
+      launcher: tab.launcher,
+      checkout: tab.checkout ?? repoPath ?? "",
+      live: Boolean(sessions[tab.id]?.isLive()),
+      visible: visibleIds.includes(tab.id),
+    }));
   }
 
-  /** Routes `@file#Lstart-Lend` or `@snapshot.png` attachments to the best live agent/shell session. */
-  function sendReferenceToAgent(reference: string) {
-    const preferred = preferredRecipientSessionTab();
-    if (!preferred) {
-      sessionError = "Open an agent or shell session first to send a reference.";
-      return;
-    }
-    selectTab(preferred.id);
-    sessions[preferred.id]?.insertText(reference, { focus: true });
+  /**
+   * The session text goes to: the person's pick for this repository while it
+   * lives, else one in `checkout` (the file's own), else any — the one rule in
+   * `recipient.ts`, which the file viewers' Send label applies too.
+   */
+  function preferredRecipientSessionTab(checkout: string | null = null) {
+    const picked = pickRecipient(recipientCandidates(), {
+      checkout,
+      stickyId: (repoPath ? $recipientChoice[repoPath] : null) ?? null,
+    });
+    return picked ? tabState.tabs.find((tab) => tab.id === picked.id) : undefined;
+  }
+
+  /**
+   * Routes `@file#Lstart-Lend`, a composed code block or `@snapshot.png` to the
+   * best live agent/shell session, unsubmitted. `checkout` is the checkout of
+   * the file it is about. Returns why nothing was sent, or undefined; the same
+   * reason is shown in the panel, and a caller outside it (the Code page)
+   * reports it itself.
+   */
+  function sendReferenceToAgent(reference: string, checkout?: string): string | undefined {
+    const preferred = preferredRecipientSessionTab(checkout ?? null);
+    if (preferred) selectTab(preferred.id);
+    // null is success; undefined is a tab whose session is not mounted.
+    const outcome = preferred
+      ? sessions[preferred.id]?.insertChecked(reference, { focus: true })
+      : "Open an agent or shell session first to send a reference.";
+    const refusal = outcome === undefined ? "That session is not ready for input yet." : outcome;
+    if (refusal !== null) sessionError = refusal;
+    return refusal ?? undefined;
   }
 
   /** Formats dropped/pasted paths for the actual recipient session (`@path` for agents, shell-escaped for shells). */
@@ -4146,6 +4214,19 @@
             {/if}
             <span class="text-accent shrink-0">→ Shell</span>
           </button>
+        {/if}
+        {#if trayEntries.length > 0}
+          <span
+            class="gp-chip shrink-0 tabular-nums inline-flex items-center gap-1"
+            data-tone="accent"
+            data-testid="terminal-context-tray"
+            title="File ranges set aside in this repository. Kept in memory only: they are gone after a restart."
+          >
+            <ListPlus size={10} class="shrink-0" />
+            {trayEntries.length} {trayEntries.length === 1 ? "reference" : "references"} · {trayBytes(trayEntries)} B
+            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-insert" onclick={insertContextTray}>Insert all</button>
+            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-clear" onclick={() => repoPath && clearTray(repoPath)}>Clear</button>
+          </span>
         {/if}
         {#if mode === "shell" && splitRoot && allSplitLeafIds.length > 1}
           <span
@@ -6908,6 +6989,7 @@
               onOpenExplorerPage={onOpenExplorerPage}
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
+              agentRepoPath={repoPath}
             />
             {:else}
             <TerminalSession

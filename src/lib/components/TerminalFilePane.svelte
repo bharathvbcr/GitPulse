@@ -66,6 +66,7 @@
     onOpenExplorerPage,
     onDockToSidebar,
     onSendToAgent,
+    agentRepoPath,
   }: {
     tabId: string;
     repoPath: string;
@@ -86,7 +87,9 @@
     /** Shows the full Explorer page; the toolbar button and a double-click on the Explorer card's empty space call it. */
     onOpenExplorerPage?: () => void;
     onDockToSidebar?: () => void;
-    onSendToAgent?: (reference: string) => void;
+    onSendToAgent?: (reference: string, checkout?: string) => unknown;
+    /** The repository whose terminal and context tray this pane's sends use; `repoPath` is the checkout the file is in. */
+    agentRepoPath?: string;
   } = $props();
 
   const draftOwner = $derived(`terminal-file:${tabId}`);
@@ -936,6 +939,7 @@
               onRequestDiscard={requestDiscardCurrent}
               {revealTarget}
               onSendSelectionToAgent={onSendToAgent}
+              agentSend={agentRepoPath ? { repoPath: agentRepoPath, checkout: repoPath } : undefined}
             />
           </div>
         </div>

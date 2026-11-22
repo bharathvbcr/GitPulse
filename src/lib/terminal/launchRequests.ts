@@ -13,6 +13,7 @@ import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
 import { formatError } from "../ui/formatError";
+import { AGENT_MESSAGE_MAX_BYTES } from "../workbench/sendToAgent";
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
@@ -76,7 +77,14 @@ interface LaunchRequest {
    * request, open a tab and report capacity refusals, and `agentPromptArgs`
    * already returns "no arguments" for a promptless launch of any kind.
    */
-  launcher: TabKind;
+  launcher: TabKind | "reference";
+  /**
+   * Text to type into the panel's recipient session (`requestReference`), not
+   * a session to open. The panel's own checkout is `repoPath`; `referenceCheckout`
+   * is the checkout of the file the text is about, which leads the recipient choice.
+   */
+  reference?: string;
+  referenceCheckout?: string;
   /** Absent for a plain session; a literal CLI argument when present. */
   prompt?: string;
   /** A browser session's first address (`requestBrowser`); absent otherwise. */
@@ -118,7 +126,11 @@ export function createTerminalLaunchRequests() {
   let busy = false;
 
   /** Hands one launch to the panel for `fields.repoPath`; resolves once it is claimed and opened. */
-  function enqueue(fields: Omit<LaunchRequest, "complete">, signal?: AbortSignal): Promise<void> {
+  function enqueue(
+    fields: Omit<LaunchRequest, "complete">,
+    signal?: AbortSignal,
+    timeoutMessage = "The terminal did not open. Try again or copy the prompt.",
+  ): Promise<void> {
     if (!fields.repoPath.trim()) return Promise.reject(new Error("Open a repository before starting a terminal session"));
     if (signal?.aborted) return Promise.reject(new Error(TERMINAL_SESSION_CANCELED));
     if (busy) return Promise.reject(new Error(TERMINAL_SESSION_PENDING));
@@ -137,7 +149,7 @@ export function createTerminalLaunchRequests() {
         else resolve();
       };
       const abort = () => complete(TERMINAL_SESSION_CANCELED);
-      const timer = setTimeout(() => complete("The terminal did not open. Try again or copy the prompt."), 10000);
+      const timer = setTimeout(() => complete(timeoutMessage), 10000);
       signal?.addEventListener("abort", abort, { once: true });
       pending = { ...fields, complete };
       store.set(pending);
@@ -234,6 +246,24 @@ export function createTerminalLaunchRequests() {
         signal,
       );
     },
+    /**
+     * Types `reference` (a `@path#Lx-Ly` mention or a composed block) into the
+     * session `repoPath`'s terminal panel would send it to, unsubmitted. Resolves
+     * once the panel has inserted it; rejects with the reason when no session
+     * could take it, the panel never claimed it, or `signal` aborted. `checkout`
+     * is the checkout of the file the text is about.
+     */
+    async requestReference(repoPath: string, reference: string, checkout: string, signal?: AbortSignal): Promise<void> {
+      if (!reference.trim()) throw new Error("There is nothing to send.");
+      if (new TextEncoder().encode(reference).length > AGENT_MESSAGE_MAX_BYTES) {
+        throw new Error(`The text is longer than the ${AGENT_MESSAGE_MAX_BYTES} bytes that can be sent to an agent.`);
+      }
+      return enqueue(
+        { repoPath, launcher: "reference", reference, referenceCheckout: checkout },
+        signal,
+        "The terminal did not take the text in time. Open a terminal session and send it again.",
+      );
+    },
     /** Whether a launch is waiting to be claimed; a caller with its own queue waits for this. */
     get busy(): boolean {
       return busy;
@@ -293,6 +323,19 @@ export function claimedFileOpen(
     keep: request.fileKeep === true,
     checkout: "",
   };
+}
+
+/**
+ * The text and checkout of a claimed `requestReference` request, or null for a
+ * request that carries none. Pure, so the claim path (a Svelte `$effect`
+ * vitest does not run) is testable: the panel must branch on this before it
+ * treats any other request as a session to open.
+ */
+export function claimedReference(
+  request: Pick<LaunchRequest, "launcher" | "reference" | "referenceCheckout">,
+): { text: string; checkout: string } | null {
+  if (request.launcher !== "reference" || !request.reference) return null;
+  return { text: request.reference, checkout: request.referenceCheckout ?? "" };
 }
 
 export const AGENT_KICKOFF_EVENT = "gitpulse-agent-kickoff";

@@ -32,7 +32,18 @@
     Hash,
     Loader2,
     Send,
+    ChevronDown,
+    ListPlus,
   } from "@lucide/svelte";
+  import { portal } from "../../dom/portal";
+  import { popover, popoverExit, restoreFocusTo, type PopoverOptions } from "../../ui/popover";
+  import { LAYERS } from "../../ui/layers";
+  import { displayName } from "../../repos/paths";
+  import { toastStore } from "../../stores/toastStore";
+  import { chooseRecipient, recipientChoice, recipientDirectory, recipientLabel, recipientView } from "../../terminal/recipient";
+  import { addToTray, MAX_TRAY_ENTRIES } from "../../terminal/contextTray";
+  import { composeSelectionContent, formatSelectionRef } from "../../terminal/selectionContent";
+  import { clearActiveSelection, setActiveSelection } from "../../terminal/activeSelection";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import FindField from "../FindField.svelte";
@@ -57,6 +68,7 @@
     onRequestDiscard,
     revealTarget = null,
     onSendSelectionToAgent,
+    agentSend,
   }: {
     filePath: string;
     content: string;
@@ -74,8 +86,19 @@
     onRequestDiscard?: () => Promise<boolean>;
     /** Pane-local line reveal target (used by `TerminalFilePane` so split panes never collide on the global `revealRequest` store). */
     revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
-    /** Inserts `@path#Lstart-Lend` into the active agent terminal (`⌘L`). */
-    onSendSelectionToAgent?: (reference: string) => void;
+    /**
+     * Inserts text (`@path#Lstart-Lend` for `⌘L`, a fenced block for `⌘⇧L`) into an
+     * agent terminal, unsubmitted. `checkout` is the checkout of this file, so
+     * the host can prefer a session working in it. A host that can fail reports
+     * it itself; the return value is not read.
+     */
+    onSendSelectionToAgent?: (reference: string, checkout?: string) => unknown;
+    /**
+     * Where this file lives, for the send controls: the repository whose terminal
+     * and context tray it uses, and the checkout the file is in. Absent, both are
+     * the active repository's.
+     */
+    agentSend?: { repoPath: string; checkout: string };
   } = $props();
 
   let ROW_HEIGHT = $derived(rowHeight("code", $densityStore));
@@ -383,21 +406,119 @@
     setTimeout(() => (copied = false), 1800);
   }
 
+  /** The selected range as `lo <= hi`, or null with no line selected. */
+  let selectionRange = $derived(
+    selectedLine === null
+      ? null
+      : { lo: Math.min(selectedLine, selectedLineEnd ?? selectedLine), hi: Math.max(selectedLine, selectedLineEnd ?? selectedLine) },
+  );
+  /** The checkout this file is in, and the repository whose terminal and tray it uses. */
+  let sendCheckout = $derived(agentSend?.checkout ?? $repoStore.currentPath ?? "");
+  let sendRepo = $derived(agentSend?.repoPath ?? $repoStore.currentPath ?? "");
+  /** The one rule (`recipient.ts`) the panel sends by, over the sessions it last published. */
+  let recipients = $derived(
+    recipientView($recipientDirectory[sendRepo] ?? [], { checkout: sendCheckout || null, stickyId: $recipientChoice[sendRepo] }),
+  );
+  let recipientText = $derived(recipients.chosen ? recipientLabel(recipients.chosen) : null);
+  let rangeText = $derived(
+    selectionRange
+      ? `L${selectionRange.lo}${selectionRange.hi !== selectionRange.lo ? `–${selectionRange.hi}` : ""}`
+      : null,
+  );
+  let pickerOpen = $state(false);
+  let pickerAnchor: HTMLElement | undefined = $state();
+  const pickerDismissal = $derived<PopoverOptions>({
+    anchor: { kind: "element", element: pickerAnchor, gap: 4, place: "below", align: "end" },
+    estimate: { width: 220, height: 120 },
+    inset: 8,
+    dismiss: { inside: "[data-agent-recipient-picker], [data-agent-recipient-trigger]", pointer: "pointerdown", escape: "capture" },
+    onDismiss: () => (pickerOpen = false),
+  });
+
+  /** The reference for what is selected, or for the whole file with no line selected. */
   function formatAgentSelectionRef(): string {
-    if (selectedLine === null) return `@${filePath} `;
-    const end = selectedLineEnd ?? selectedLine;
-    const lo = Math.min(selectedLine, end);
-    const hi = Math.max(selectedLine, end);
-    return lo === hi ? `@${filePath}#L${lo} ` : `@${filePath}#L${lo}-L${hi} `;
+    return formatSelectionRef(filePath, selectionRange?.lo ?? null, selectionRange?.hi ?? null);
   }
 
   function sendSelectionToAgent() {
     if (!onSendSelectionToAgent || !filePath) return;
-    onSendSelectionToAgent(formatAgentSelectionRef());
+    onSendSelectionToAgent(formatAgentSelectionRef(), sendCheckout || undefined);
   }
 
+  /** Sends the selected lines themselves: a fenced block, cut at the bound with the cut stated. */
+  function sendSelectionContent() {
+    if (!onSendSelectionToAgent || !filePath) return;
+    if (!selectionRange) {
+      toastStore.error("Select lines first: click a line number, shift-click to extend.");
+      return;
+    }
+    const composed = composeSelectionContent({
+      path: filePath,
+      checkoutName: displayName(sendCheckout || filePath),
+      startLine: selectionRange.lo,
+      lines: rawLines.slice(selectionRange.lo - 1, selectionRange.hi),
+      // The lines are the editor's draft, not the file, only while it differs from what was read.
+      unsaved: isEditing && editDraft !== editBaseline,
+    });
+    if (!composed.text) {
+      toastStore.error("That selection is past the end of the file.");
+      return;
+    }
+    if (composed.omittedLines > 0) {
+      toastStore.warning(`The selection is too long to send whole: ${composed.omittedLines} lines were left out, and the text says so.`);
+    }
+    onSendSelectionToAgent(composed.text, sendCheckout || undefined);
+  }
+
+  function addSelectionToTray() {
+    if (!onSendSelectionToAgent || !filePath) return;
+    if (!selectionRange) {
+      toastStore.error("Select lines first: click a line number, shift-click to extend.");
+      return;
+    }
+    const added = addToTray(sendRepo, {
+      checkout: sendCheckout,
+      path: filePath,
+      startLine: selectionRange.lo,
+      endLine: selectionRange.hi,
+    });
+    if (!added.ok) toastStore.error(added.reason);
+    else if (added.added) toastStore.info(`Added ${rangeText} of ${filePath} to the context tray (up to ${MAX_TRAY_ENTRIES}).`);
+    else toastStore.info("That range is already in the context tray.");
+  }
+
+  // The palette's way to this selection; see `activeSelection.ts`.
+  const selectionOwner = {};
+  $effect(() => {
+    const range = selectionRange;
+    if (!onSendSelectionToAgent || !range || !filePath) return;
+    setActiveSelection(selectionOwner, {
+      path: filePath,
+      startLine: range.lo,
+      endLine: range.hi,
+      sendReference: sendSelectionToAgent,
+      sendContent: sendSelectionContent,
+      addToTray: addSelectionToTray,
+    });
+    return () => clearActiveSelection(selectionOwner);
+  });
+
   function handleKeydown(e: KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l" && onSendSelectionToAgent) {
+    const sendChord = (e.metaKey || e.ctrlKey) && onSendSelectionToAgent;
+    // ⌥ changes `key` on macOS, so the chord with it is matched by the physical key.
+    if (sendChord && e.altKey && !e.shiftKey && e.code === "KeyL") {
+      e.preventDefault();
+      e.stopPropagation();
+      addSelectionToTray();
+      return;
+    }
+    if (sendChord && !e.altKey && e.shiftKey && e.key.toLowerCase() === "l") {
+      e.preventDefault();
+      e.stopPropagation();
+      sendSelectionContent();
+      return;
+    }
+    if (sendChord && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "l") {
       e.preventDefault();
       e.stopPropagation();
       sendSelectionToAgent();
@@ -609,12 +730,71 @@
           onclick={sendSelectionToAgent}
           data-testid="code-send-to-agent"
           class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta border-accent/35 text-accent"
-          title="Send selected line range as @file#Lstart-Lend to the active terminal"
+          title={recipientText
+            ? `Send ${rangeText ? `${rangeText} of ` : ""}${filePath} as @file#Lstart-Lend to ${recipientText}. ${shortcutTextLabel("⌘⇧L", $hostPlatform.os)} sends the lines themselves.`
+            : "No live agent or shell session: this opens the terminal, and fails if there is none to send to"}
         >
           <Send size={11} />
-          <span>{selectedLine !== null ? `Send L${Math.min(selectedLine, selectedLineEnd ?? selectedLine)}${selectedLineEnd && selectedLineEnd !== selectedLine ? `–${Math.max(selectedLine, selectedLineEnd)}` : ""}` : "Send @file"}</span>
+          <span>{rangeText ? `Send ${rangeText}` : "Send @file"}{#if recipientText}<span data-testid="code-send-recipient"> → {recipientText}</span>{/if}</span>
           <span class="gp-keycap text-micro!">{shortcutTextLabel("⌘L", $hostPlatform.os)}</span>
         </button>
+        {#if recipients.options.length > 1}
+          <button
+            type="button"
+            bind:this={pickerAnchor}
+            onclick={() => (pickerOpen = !pickerOpen)}
+            data-agent-recipient-trigger
+            data-testid="code-send-recipient-picker"
+            class="gp-icon-btn text-accent"
+            data-size="sm"
+            aria-haspopup="menu"
+            aria-expanded={pickerOpen}
+            aria-label="Choose which session receives sends"
+            title="Choose which session receives sends"
+          >
+            <ChevronDown size={12} />
+          </button>
+        {/if}
+        <button
+          type="button"
+          onclick={addSelectionToTray}
+          data-testid="code-add-to-tray"
+          class="gp-btn py-0.5! px-2! flex items-center gap-1 text-meta"
+          title="Set this range aside in the context tray, to insert with others ({shortcutTextLabel('⌥⌘L', $hostPlatform.os)})"
+        >
+          <ListPlus size={11} />
+          <span>Tray</span>
+        </button>
+        {#if pickerOpen && recipients.options.length > 1}
+          <div
+            use:portal={"body"}
+            use:popover={pickerDismissal} out:popoverExit
+            data-agent-recipient-picker
+            class="fixed gp-menu gp-pop p-1 min-w-48 max-w-[calc(100vw-16px)] flex flex-col font-sans"
+            style="z-index: {LAYERS.MENU}"
+            role="menu"
+            aria-label="Session that receives sends"
+            data-testid="code-send-recipient-menu"
+          >
+            {#each recipients.options as option (option.id)}
+              <button
+                type="button"
+                role="menuitemradio"
+                aria-checked={option.id === recipients.chosen?.id}
+                class="gp-menu-item text-meta text-left px-2 py-1 rounded flex items-center gap-2 {option.id === recipients.chosen?.id ? 'text-accent' : 'text-textPrimary'}"
+                data-testid="code-send-recipient-option"
+                onclick={() => {
+                  chooseRecipient(sendRepo, option.id);
+                  pickerOpen = false;
+                  restoreFocusTo(pickerAnchor);
+                }}
+              >
+                <span class="truncate">{recipientLabel(option)}</span>
+                {#if option.id === recipients.chosen?.id}<Check size={11} class="shrink-0" />{/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
       {/if}
     </div>
 
