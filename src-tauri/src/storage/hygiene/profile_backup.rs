@@ -170,6 +170,37 @@ pub(super) fn resolve(profile: &Path, name: &str) -> Result<PathBuf, CommandErro
 /// Shown on the preview and in the native confirmation: one copy of the text.
 pub(super) const WARNING: &str = "Removes this pre-upgrade copy of the workbench profile permanently. Without it that schema upgrade cannot be rolled back. Only this confirmed action removes it; no scheduled run does.";
 
+/// The text a native dialog may show for a backup: its bare file name (which
+/// `is_backup_name` already constrains), with every control, bidi and format
+/// character written as a visible `\u{..}` escape and the length capped, so a
+/// hostile path cannot put misleading text ahead of the warning.
+pub(super) fn dialog_name(path: &Path) -> String {
+    const MAX: usize = 120;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut shown = String::new();
+    for (index, c) in name.chars().enumerate() {
+        if index == MAX {
+            shown.push('…');
+            break;
+        }
+        let hidden = c.is_control()
+            || matches!(
+                c,
+                '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    | '\u{061c}' | '\u{feff}'
+            );
+        if hidden {
+            shown.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,9 +403,7 @@ mod tests {
         assert!(dir.join(BACKUP).exists(), "nothing is removed on a decline");
         let asked = asked.borrow();
         assert_eq!(asked.len(), 1);
-        assert!(asked[0]
-            .1
-            .contains(&dir.join(BACKUP).to_string_lossy().into_owned()));
+        assert!(asked[0].1.contains(BACKUP));
         assert!(asked[0].1.contains("cannot be rolled back"));
     }
 
@@ -1161,6 +1190,9 @@ mod tests {
         });
         eprintln!("LIVENESS while confirm open: {probes:#?}");
         let (lock, steward, confirmed, cleaner, prepared_ok, cancelled, probe_ms, first) = probes;
+        // The second plan was only probed against: release its pending slot so
+        // the shared plan budget is not left spent for other tests.
+        let _ = cancel(&repo, &id2);
         assert!(
             lock.is_some(),
             "mutation_lock was free while the dialog was open"
@@ -1222,12 +1254,12 @@ mod tests {
         let _serial = crate::storage::hygiene::tests::serial();
         let (message, dir) = hostile_message();
         assert!(message.ends_with(WARNING), "{message:?}");
-        assert!(message.starts_with(&dir.to_string_lossy().into_owned()));
+        assert!(message.starts_with(BACKUP), "{message:?}");
+        assert!(!message.contains(&*dir.to_string_lossy()));
         assert!(message.contains("cannot be rolled back"));
     }
 
     #[test]
-    #[ignore = "BREAK demonstrated: the dialog embeds the raw path (newlines, bidi override, unbounded length)"]
     fn adv_hostile_path_is_neutralised_before_it_reaches_the_dialog() {
         let _serial = crate::storage::hygiene::tests::serial();
         let (message, _dir) = hostile_message();

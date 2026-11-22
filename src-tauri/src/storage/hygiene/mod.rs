@@ -568,7 +568,9 @@ pub fn execute<T>(
 
 /// `execute` for a caller that can ask the person: `confirm(title, message)`
 /// must be a native prompt that page script cannot answer. It is asked only for
-/// a profile backup, before the gate runs.
+/// a profile backup, before the gate runs. While the dialog is open the steward
+/// and Global Cleaner are refused at once by try-locks (deferred or skipped),
+/// not hung.
 pub fn execute_confirmed<T>(
     repo_path: &str,
     id: &str,
@@ -669,7 +671,11 @@ fn execute_with_profile<T>(
     if plan.view.scope == profile_backup::SCOPE
         && !confirm(
             "Remove workbench profile backup",
-            &format!("{}\n\n{}", plan.view.path, profile_backup::WARNING),
+            &format!(
+                "{}\n\n{}",
+                profile_backup::dialog_name(path),
+                profile_backup::WARNING
+            ),
         )
     {
         return Err("You declined to remove this profile backup; nothing was removed".into());
