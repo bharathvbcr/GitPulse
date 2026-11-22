@@ -10,7 +10,8 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
-    set_background_sessions, spawn_session, write_to_session, OutputSink, TerminalSessions,
+    set_background_sessions, spawn_session, write_to_session, KillOrigin, OutputSink,
+    TerminalSessions,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -308,7 +309,7 @@ fn hidden_tab_backpressure_sheds_buffer_without_terminating_process() {
     assert!(alive(pid), "process still alive after catch-up");
 
     // Cleanly kill the session
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     let exit = view.exits.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(exit["id"], id.as_str());
     assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
@@ -402,7 +403,8 @@ fn stress_concurrent_spawn_write_detach_kill_cycles() {
             let state_clone = state.clone();
             let id_clone = id.clone();
             std::thread::spawn(move || {
-                kill_session(&state_clone, &id_clone).expect("kill session");
+                kill_session(&state_clone, &id_clone, KillOrigin::Unspecified)
+                    .expect("kill session");
             })
         })
         .collect();
@@ -481,7 +483,7 @@ fn hidden_tab_with_failing_sink_sheds_and_preserves_child() {
     let listed = list_sessions(&state).unwrap();
     assert!(listed.iter().any(|s| s.id == session.id && !s.ending));
 
-    kill_session(&state, &session.id).unwrap();
+    kill_session(&state, &session.id, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(3), || !alive(pid)));
 }
 
@@ -568,7 +570,7 @@ fn rapid_visibility_toggling_under_heavy_output_does_not_crash_or_wedge() {
     let sessions = list_sessions(&view.state).unwrap();
     assert!(sessions.iter().any(|s| s.id == id && !s.ending));
 
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     let exit = view.exits.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(exit["id"], id.as_str());
     assert!(wait_until(Duration::from_secs(3), || !alive(pid)));

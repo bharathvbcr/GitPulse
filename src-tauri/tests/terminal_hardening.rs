@@ -13,7 +13,7 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, kill_session, list_sessions, resize_session, spawn_session,
-    write_to_session, TerminalSessions,
+    write_to_session, KillOrigin, TerminalSessions,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -148,7 +148,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
     // Lazily created process-wide state (ledger, alert hub, pools) is not a
     // leak, so it is paid for before the baseline is taken.
     let warm = launch("sleep 300").unwrap();
-    kill_session(&state, &warm.id).unwrap();
+    kill_session(&state, &warm.id, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
@@ -168,7 +168,7 @@ fn a_hundred_concurrent_sessions_open_and_close_without_leaking_descriptors_or_t
         std::thread::scope(|scope| {
             for id in &ids {
                 let state = &state;
-                scope.spawn(move || kill_session(state, id).unwrap());
+                scope.spawn(move || kill_session(state, id, KillOrigin::Unspecified).unwrap());
             }
         });
         assert!(
@@ -436,7 +436,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
-    kill_session(&state, &live.id).unwrap();
+    kill_session(&state, &live.id, KillOrigin::Unspecified).unwrap();
     let started = Instant::now();
     for _ in 0..1_000 {
         assert!(write_to_session(&state, &live.id, "x").is_err());

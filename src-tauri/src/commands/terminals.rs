@@ -304,22 +304,37 @@ pub async fn cmd_terminal_detach(
 ///
 /// A close waits out a hangup grace and polls for cleanup for seconds, which is
 /// why it is on the control pool and never on a session's input lane.
+///
+/// `origin` says which route asked (`terminal::KillOrigin`); a caller that
+/// does not say is `unspecified` and treated as a direct close. A session that
+/// is protected from a batch route (`batch_close`, `stop_children`) is left
+/// running and the call answers an error naming it, so a batch can report
+/// what it skipped.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(
     app: AppHandle,
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
+    origin: Option<crate::terminal::KillOrigin>,
 ) -> Result<(), String> {
+    let origin = origin.unwrap_or_default();
     let ledger = state.session_ledger().clone();
     let kill_id = session_id.clone();
-    let result = crate::terminal::control_async(&state, "terminal_kill", move |state| {
-        crate::terminal::kill_session(state, &kill_id)
+    let outcome = crate::terminal::control_async(&state, "terminal_kill", move |state| {
+        crate::terminal::kill_session(state, &kill_id, origin)
     })
-    .await;
-    if result.is_ok() && ledger.mark_user_closed(&session_id) {
-        ledger.emit_view(&app);
+    .await?;
+    match outcome {
+        crate::terminal::KillOutcome::Killed => {
+            if ledger.mark_user_closed(&session_id) {
+                ledger.emit_view(&app);
+            }
+            Ok(())
+        }
+        crate::terminal::KillOutcome::SkippedProtected => Err(
+            crate::terminal::lifecycle::skipped_protected_message(&session_id, origin),
+        ),
     }
-    result
 }
 
 /// Mass external-signal deaths recorded this run, newest first and bounded.
@@ -548,6 +563,11 @@ pub async fn cmd_terminal_session_ledger_reopen_check(
 /// Persists a stabilized live or user-renamed session title in the durable
 /// session ledger so detached listings and crash/quit recovery offers retain
 /// the session's human-meaningful title across reloads and restarts.
+///
+/// The same command carries the session's kill protection: `protected: true`
+/// spares it from batch closes, "Stop children", agent closes and the load
+/// governor (see `terminal::KillOrigin::respects_protection`); it is kept on
+/// the ledger row so it survives a reload and a restart.
 #[tauri::command(async)]
 pub async fn cmd_terminal_set_title(
     app: AppHandle,
@@ -555,9 +575,27 @@ pub async fn cmd_terminal_set_title(
     session_id: String,
     title: Option<String>,
     user_named: Option<bool>,
+    protected: Option<bool>,
 ) -> Result<bool, IpcError> {
     let state = state.inner().clone();
     off_thread(move || {
+        // `protected` set means this call is about protection: the title is
+        // only touched when one is given, so a caller can flip the flag
+        // without clearing the name.
+        if let Some(protected) = protected {
+            let flag_changed = state.session_ledger().set_protected(&session_id, protected);
+            state.session_ledger().record_lifecycle(
+                "protection",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "protected": protected,
+                    "changed": flag_changed,
+                }),
+            );
+            if title.is_none() {
+                return Ok(flag_changed);
+            }
+        }
         let (changed, offer_changed) = state.session_ledger().set_title(
             &session_id,
             title.as_deref(),

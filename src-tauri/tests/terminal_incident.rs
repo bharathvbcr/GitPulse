@@ -6,7 +6,7 @@
 //! signalled.
 #![cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
-use gitpulse_lib::terminal::{kill_session, spawn_session};
+use gitpulse_lib::terminal::{kill_session, spawn_session, KillOrigin};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
@@ -85,7 +85,7 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
         gitpulse_lib::terminal::OutputSink::events(app.handle()),
     )
     .unwrap();
-    kill_session(&state, &warm.id).unwrap();
+    kill_session(&state, &warm.id, KillOrigin::Unspecified).unwrap();
     let closed = exits
         .recv_timeout(Duration::from_secs(10))
         .expect("the warm-up session reports its end");
@@ -166,7 +166,8 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
     // App-side cleanup: sessions gone, slots free, nothing left to close, no
     // descriptor left over.
     for id in &ids {
-        kill_session(&state, id).expect("closing a finished session is a no-op");
+        kill_session(&state, id, KillOrigin::Unspecified)
+            .expect("closing a finished session is a no-op");
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while open_fds() > fds_before + 2 && Instant::now() < deadline {
@@ -206,7 +207,7 @@ fn sessions_closed_through_gitpulse_are_never_an_incident() {
         ids.push(spawned.id);
     }
     for id in &ids {
-        kill_session(&state, id).unwrap();
+        kill_session(&state, id, KillOrigin::Unspecified).unwrap();
     }
     std::thread::sleep(Duration::from_millis(2600));
     assert!(state.incidents().is_empty(), "{:?}", state.incidents());

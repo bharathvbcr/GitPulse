@@ -85,6 +85,18 @@ pub fn on_terminated<R: Runtime>(webview: &Webview<R>) {
             format!("in {}s", delay.as_secs())
         }
     );
+    if let Some(sessions) = webview.try_state::<crate::terminal::TerminalSessions>() {
+        // Off this callback: listing the sessions asks the terminal host.
+        let sessions = sessions.inner().clone();
+        let crashed = label.clone();
+        if let Err(error) = crate::supervisor::spawn_once(
+            "webview-crash-record",
+            "webview crash record",
+            move || crate::terminal::record_webview_terminated(&sessions, &crashed, count),
+        ) {
+            log::warn!(target: "desktop", "the crash was not recorded in the session lifecycle log: {error}");
+        }
+    }
     if label == "main" {
         super::exit::disarm(webview.app_handle(), "the main window's page crashed");
     }

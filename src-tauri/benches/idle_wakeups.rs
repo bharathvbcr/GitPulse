@@ -53,7 +53,7 @@ mod imp {
     use super::common::fixture::{git, trust_repo};
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
-        acknowledge_output, kill_session, shutdown_sessions, spawn_session,
+        acknowledge_output, kill_session, shutdown_sessions, spawn_session, KillOrigin,
     };
     use std::time::{Duration, Instant};
     use tauri::Listener;
@@ -163,7 +163,7 @@ mod imp {
             let elapsed = started.elapsed();
             let after = counters();
             for id in &ids {
-                let _ = kill_session(&state, id);
+                let _ = kill_session(&state, id, KillOrigin::Unspecified);
             }
             let secs = elapsed.as_secs_f64();
             Sample::default()

@@ -11,6 +11,7 @@
 //! - `lost`: left `running` by a prior `SIGKILL`, crash, or reboot and reconciled at startup
 //! - `unreadable`: corrupt JSONL line on disk, preserved and surfaced as `"unreadable"`
 
+use super::lifecycle::{self, KillOrigin, RotatingJsonl};
 use crate::workbench::{conversation, terminal_command};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -119,6 +120,14 @@ struct StoredRow {
     title_pinned: bool,
     #[serde(default)]
     withdrawn: bool,
+    /// The route the close came by (`KillOrigin`), set when a close is
+    /// requested. Absent on rows written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_by: Option<KillOrigin>,
+    /// Spared by batch closes, "Stop children", agent closes and the load
+    /// governor. Kept on the row so it survives a page reload and a restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    protected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +162,19 @@ struct LedgerState {
 pub struct SessionLedger {
     path: Option<PathBuf>,
     state: Mutex<LedgerState>,
+    /// Append-only record of every spawn, attach, detach, close request and
+    /// exit, beside the ledger. `None` for an in-memory ledger.
+    lifecycle: Option<RotatingJsonl>,
+    /// Rows the cap evicted, kept so a row is never silently lost.
+    archive: Option<RotatingJsonl>,
+}
+
+/// What a close needs to know about a session, from its ledger row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBrief {
+    pub launcher: String,
+    pub repo_path: String,
+    pub protected: bool,
 }
 
 impl SessionLedger {
@@ -165,6 +187,8 @@ impl SessionLedger {
                 entries: Vec::new(),
                 load_error: None,
             }),
+            lifecycle: None,
+            archive: None,
         }
     }
 
@@ -180,8 +204,19 @@ impl SessionLedger {
     /// Opens (or initializes) a durable ledger backed by `path`.
     pub fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
+        let lifecycle = path
+            .parent()
+            .map(|dir| RotatingJsonl::standard(dir.join(lifecycle::LIFECYCLE_FILE)));
+        let archive = path
+            .parent()
+            .map(|dir| RotatingJsonl::standard(dir.join(lifecycle::ARCHIVE_FILE)));
+        let mut trimmed_on_load = false;
         let (entries, load_error) = match load_entries(&path) {
-            Ok(entries) => (entries, None),
+            Ok((entries, evicted)) => {
+                archive_evicted(archive.as_ref(), &evicted);
+                trimmed_on_load = !evicted.is_empty();
+                (entries, None)
+            }
             Err(error) => {
                 log::warn!(
                     target: "terminal",
@@ -191,13 +226,173 @@ impl SessionLedger {
                 (Vec::new(), Some(error))
             }
         };
-        Self {
+        let ledger = Self {
             path: Some(path),
             state: Mutex::new(LedgerState {
                 entries,
                 load_error,
             }),
+            lifecycle,
+            archive,
+        };
+        if trimmed_on_load {
+            // The evicted rows are archived now; rewriting the file keeps the
+            // next open from archiving them a second time.
+            let guard = ledger
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.persist_locked(&guard.entries);
         }
+        ledger
+    }
+
+    /// Appends one record to the lifecycle log: `event` plus `fields` (a JSON
+    /// object), stamped with the time and this process. Never fails or blocks
+    /// the caller on an I/O error; an in-memory ledger records nothing.
+    pub fn record_lifecycle(&self, event: &str, fields: serde_json::Value) {
+        let Some(log) = &self.lifecycle else { return };
+        let mut record = serde_json::Map::new();
+        record.insert("ts_ms".into(), now_ms().into());
+        record.insert("pid".into(), std::process::id().into());
+        record.insert("event".into(), event.into());
+        if let serde_json::Value::Object(extra) = fields {
+            for (key, value) in extra {
+                record.insert(key, clamp_field(value));
+            }
+        }
+        match serde_json::to_string(&serde_json::Value::Object(record)) {
+            Ok(line) => log.append(&line),
+            Err(error) => {
+                log::warn!(target: "terminal", "lifecycle record {event} not serialized: {error}");
+            }
+        }
+    }
+
+    /// Every retained lifecycle line, oldest first (tests and tooling).
+    pub fn lifecycle_lines(&self) -> Vec<String> {
+        self.lifecycle
+            .as_ref()
+            .map_or_else(Vec::new, RotatingJsonl::read_all)
+    }
+
+    /// Every retained archived row, oldest first (tests and tooling).
+    pub fn archived_lines(&self) -> Vec<String> {
+        self.archive
+            .as_ref()
+            .map_or_else(Vec::new, RotatingJsonl::read_all)
+    }
+
+    /// The launcher, repository and protection of the newest row for
+    /// `terminal_id`, or `None` for a session this ledger never recorded.
+    pub fn brief(&self, terminal_id: &str) -> Option<SessionBrief> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Valid(row) if row.terminal_id.as_deref() == Some(terminal_id) => {
+                Some(SessionBrief {
+                    launcher: row.launcher.clone(),
+                    repo_path: row.repo_path.clone(),
+                    // Only a live, unwithdrawn row protects: terminal ids
+                    // repeat across restarts, and an old row that ended must
+                    // never shield an unrelated session that reuses its id.
+                    protected: row.protected
+                        && !row.withdrawn
+                        && row.end_state == SessionEndState::Running,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether `terminal_id` is protected from batch closes, agent closes and
+    /// the load governor. A session the ledger does not know is not.
+    pub fn is_protected(&self, terminal_id: &str) -> bool {
+        self.brief(terminal_id).is_some_and(|brief| brief.protected)
+    }
+
+    /// Sets or clears the protected flag on the newest row for `terminal_id`.
+    /// Returns whether the flag changed (false for an unknown session).
+    pub fn set_protected(&self, terminal_id: &str, protected: bool) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for entry in guard.entries.iter_mut().rev() {
+            let Entry::Valid(row) = entry else { continue };
+            if row.terminal_id.as_deref() != Some(terminal_id) {
+                continue;
+            }
+            if row.protected != protected {
+                row.protected = protected;
+                changed = true;
+            }
+            break;
+        }
+        if changed {
+            self.persist_locked(&guard.entries);
+        }
+        changed
+    }
+
+    /// Notes which route asked for each of `terminal_ids` to be closed, in one
+    /// write. Returns how many rows changed.
+    pub fn set_closed_by_many(&self, terminal_ids: &[String], origin: KillOrigin) -> usize {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = 0;
+        for id in terminal_ids {
+            let newest = guard
+                .entries
+                .iter_mut()
+                .rev()
+                .find_map(|entry| match entry {
+                    Entry::Valid(row) if row.terminal_id.as_deref() == Some(id.as_str()) => {
+                        Some(row)
+                    }
+                    _ => None,
+                });
+            if let Some(row) = newest {
+                if row.closed_by != Some(origin) {
+                    row.closed_by = Some(origin);
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.persist_locked(&guard.entries);
+        }
+        changed
+    }
+
+    /// Notes which route asked for `terminal_id` to be closed. Returns whether
+    /// a row changed; a session with no row has nowhere to carry it.
+    pub fn set_closed_by(&self, terminal_id: &str, origin: KillOrigin) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for entry in guard.entries.iter_mut().rev() {
+            let Entry::Valid(row) = entry else { continue };
+            if row.terminal_id.as_deref() != Some(terminal_id) {
+                continue;
+            }
+            if row.closed_by != Some(origin) {
+                row.closed_by = Some(origin);
+                changed = true;
+            }
+            break;
+        }
+        if changed {
+            self.persist_locked(&guard.entries);
+        }
+        changed
     }
 
     /// Path of the durable `.jsonl` file, or `None` when in-memory.
@@ -254,10 +449,26 @@ impl SessionLedger {
             title: inherited_title,
             title_pinned: inherited_pinned,
             withdrawn: false,
+            closed_by: None,
+            protected: false,
         };
+        let spawned_launcher = row.launcher.clone();
+        let spawned_repo = row.repo_path.clone();
+        let spawned_terminal = row.terminal_id.clone();
         guard.entries.push(Entry::Valid(Box::new(row)));
-        enforce_bound(&mut guard.entries);
+        let evicted = enforce_bound(&mut guard.entries);
         self.persist_locked(&guard.entries);
+        drop(guard);
+        archive_evicted(self.archive.as_ref(), &evicted);
+        self.record_lifecycle(
+            "spawn",
+            serde_json::json!({
+                "session_id": spawned_terminal,
+                "row_id": row_id,
+                "launcher": spawned_launcher,
+                "repo": spawned_repo,
+            }),
+        );
         row_id
     }
 
@@ -898,13 +1109,70 @@ fn project_valid_row_with_status(
     }
 }
 
-fn enforce_bound(entries: &mut Vec<Entry>) {
+/// Longest string a lifecycle field keeps: several fields are IPC arguments
+/// (a session id the caller made up), and the log is bounded in size, not in
+/// what one line may carry.
+const MAX_LIFECYCLE_FIELD_BYTES: usize = 512;
+
+fn clamp_field(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(mut text) if text.len() > MAX_LIFECYCLE_FIELD_BYTES => {
+            let mut end = MAX_LIFECYCLE_FIELD_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            serde_json::Value::String(text)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(clamp_field).collect())
+        }
+        other => other,
+    }
+}
+
+/// Appends evicted rows to the archive so the cap never silently loses one.
+fn archive_evicted(archive: Option<&RotatingJsonl>, evicted: &[Entry]) {
+    let Some(archive) = archive else { return };
+    let archived_at = now_ms();
+    for entry in evicted {
+        let line = match entry {
+            Entry::Valid(row) => serde_json::to_value(row).map(|mut value| {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("archived_at".into(), archived_at.into());
+                }
+                value
+            }),
+            Entry::Corrupt {
+                row_id,
+                raw_line,
+                detail,
+            } => Ok(serde_json::json!({
+                "archived_at": archived_at,
+                "row_id": row_id,
+                "corrupt": raw_line,
+                "detail": detail,
+            })),
+        };
+        match line.and_then(|value| serde_json::to_string(&value)) {
+            Ok(text) => archive.append(&text),
+            Err(error) => {
+                log::warn!(target: "terminal", "evicted ledger row not archived: {error}");
+            }
+        }
+    }
+}
+
+/// Trims `entries` to [`MAX_LEDGER_ROWS`] and returns what it removed, oldest
+/// first, for [`archive_evicted`].
+fn enforce_bound(entries: &mut Vec<Entry>) -> Vec<Entry> {
+    let mut evicted = Vec::new();
     while entries.len() > MAX_LEDGER_ROWS {
         if let Some(pos) = entries
             .iter()
             .position(|e| matches!(e, Entry::Valid(r) if r.withdrawn))
         {
-            entries.remove(pos);
+            evicted.push(entries.remove(pos));
             continue;
         }
         if let Some(pos) = entries.iter().position(|e| {
@@ -913,7 +1181,7 @@ fn enforce_bound(entries: &mut Vec<Entry>) {
                 Entry::Valid(r) if r.end_state == SessionEndState::ExitedClean
             )
         }) {
-            entries.remove(pos);
+            evicted.push(entries.remove(pos));
             continue;
         }
         if let Some(pos) = entries.iter().position(|e| {
@@ -922,18 +1190,19 @@ fn enforce_bound(entries: &mut Vec<Entry>) {
                 Entry::Valid(r) if r.end_state != SessionEndState::Running
             )
         }) {
-            entries.remove(pos);
+            evicted.push(entries.remove(pos));
             continue;
         }
         if let Some(pos) = entries
             .iter()
             .position(|e| matches!(e, Entry::Corrupt { .. }))
         {
-            entries.remove(pos);
+            evicted.push(entries.remove(pos));
             continue;
         }
-        entries.remove(0);
+        evicted.push(entries.remove(0));
     }
+    evicted
 }
 
 fn now_ms() -> u64 {
@@ -986,7 +1255,8 @@ fn sanitize_raw_line(line: &str) -> String {
     clean
 }
 
-fn load_entries(path: &Path) -> Result<Vec<Entry>, String> {
+/// Reads the ledger; the second list is what the row cap evicted.
+fn load_entries(path: &Path) -> Result<(Vec<Entry>, Vec<Entry>), String> {
     if let Some(parent) = path.parent() {
         check_not_symlink(parent)?;
     }
@@ -1005,7 +1275,9 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>, String> {
                 ));
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()))
+        }
         Err(error) => return Err(format!("could not stat {}: {error}", path.display())),
     }
     let contents = fs::read_to_string(path)
@@ -1051,8 +1323,8 @@ fn load_entries(path: &Path) -> Result<Vec<Entry>, String> {
             }
         }
     }
-    enforce_bound(&mut entries);
-    Ok(entries)
+    let evicted = enforce_bound(&mut entries);
+    Ok((entries, evicted))
 }
 
 fn unique_corrupt_id(idx: usize, trimmed: &str, seen: &mut HashSet<String>) -> String {
@@ -1481,6 +1753,116 @@ mod tests {
         assert_eq!(
             reloaded.resolved_title_for_terminal("term-reopened-pinned", None),
             Some("Auth Reviewer".into())
+        );
+    }
+
+    #[test]
+    fn rows_past_the_cap_are_archived_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
+        let ledger = SessionLedger::open(&ledger_path);
+        let extra = 7;
+        for i in 0..(MAX_LEDGER_ROWS + extra) {
+            ledger.record_spawn(spawn_spec(
+                &format!("term-arch-{i}"),
+                "claude",
+                Some(UUID_1),
+                dir.path(),
+                None,
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(&ledger_path).unwrap().lines().count(),
+            MAX_LEDGER_ROWS
+        );
+        let archived = ledger.archived_lines();
+        assert_eq!(archived.len(), extra, "{archived:?}");
+        for i in 0..extra {
+            assert!(
+                archived
+                    .iter()
+                    .any(|l| l.contains(&format!("\"term-arch-{i}\""))),
+                "row {i} was evicted without being archived"
+            );
+        }
+        assert!(archived[0].contains("archived_at"));
+    }
+
+    #[test]
+    fn an_old_shaped_ledger_loads_and_new_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
+        // A row exactly as written before `closed_by` and `protected` existed.
+        let old = format!(
+            "{{\"v\":1,\"row_id\":\"row-old\",\"terminal_id\":\"term-old\",\"launcher\":\"claude\",\"native_id\":\"{UUID_1}\",\"repo_path\":\"/r\",\"start_dir\":null,\"cwd\":\"/r\",\"mode\":null,\"started_at\":1,\"ended_at\":null,\"end_state\":\"running\",\"signal\":null,\"exit_code\":null,\"last_error\":null,\"withdrawn\":false}}\n"
+        );
+        fs::write(&ledger_path, old).unwrap();
+        let ledger = SessionLedger::open(&ledger_path);
+        let brief = ledger
+            .brief("term-old")
+            .expect("old row loads as a valid row");
+        assert!(!brief.protected);
+        assert!(ledger.set_protected("term-old", true));
+        assert!(ledger.set_closed_by("term-old", KillOrigin::BatchClose));
+        let reopened = SessionLedger::open(&ledger_path);
+        assert!(
+            reopened.is_protected("term-old"),
+            "protection survives a reload"
+        );
+        let text = fs::read_to_string(&ledger_path).unwrap();
+        assert!(text.contains("\"closed_by\":\"batch_close\""), "{text}");
+        assert_eq!(reopened.view().unreadable_count, 0);
+    }
+
+    #[test]
+    fn a_finished_protected_row_does_not_shield_a_session_that_reuses_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec("term-7-1", "claude", None, dir.path(), None));
+        assert!(ledger.set_protected("term-7-1", true));
+        assert!(ledger.is_protected("term-7-1"));
+        // The session exits on its own, then the id is reused after a restart.
+        assert!(ledger.record_exit("term-7-1", false, Some(0), None));
+        assert!(
+            !ledger.is_protected("term-7-1"),
+            "an ended row protects nothing"
+        );
+        ledger.record_spawn(spawn_spec("term-7-1", "claude", None, dir.path(), None));
+        assert!(
+            !ledger.is_protected("term-7-1"),
+            "the new session starts unprotected"
+        );
+    }
+
+    #[test]
+    fn lifecycle_records_spawn_and_an_unwritable_log_does_not_fail_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join(SESSION_LEDGER_FILE);
+        let ledger = SessionLedger::open(&ledger_path);
+        ledger.record_spawn(spawn_spec("term-life", "claude", None, dir.path(), None));
+        let lines = ledger.lifecycle_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("\"event\":\"spawn\""));
+        assert!(lines[0].contains("\"session_id\":\"term-life\""));
+        ledger.record_lifecycle(
+            "protection",
+            serde_json::json!({ "session_id": "x".repeat(100_000) }),
+        );
+        let last = ledger.lifecycle_lines().pop().unwrap();
+        assert!(
+            last.len() < 1024,
+            "an IPC-sized id is clamped, got {} bytes",
+            last.len()
+        );
+
+        // A directory where the lifecycle file belongs: every append fails.
+        let blocked = tempfile::tempdir().unwrap();
+        fs::create_dir(blocked.path().join(lifecycle::LIFECYCLE_FILE)).unwrap();
+        let ledger = SessionLedger::open(blocked.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec("term-blocked", "claude", None, dir.path(), None));
+        assert!(
+            ledger.brief("term-blocked").is_some(),
+            "the spawn still recorded"
         );
     }
 }
