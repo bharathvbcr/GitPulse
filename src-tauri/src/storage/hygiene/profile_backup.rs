@@ -770,4 +770,481 @@ mod tests {
         assert!(!requires_user_confirmation("cache:backup:x"));
         assert!(!requires_user_confirmation("local:backup:x"));
     }
+
+    // ---- Adversarial tests for the native confirmation (ft-845b7f1b) ----
+
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    type Fixture = (
+        tempfile::TempDir,
+        PathBuf,
+        tempfile::TempDir,
+        String,
+        PathBuf,
+    );
+
+    fn setup() -> Fixture {
+        let (keep, dir) = profile_dir();
+        let (repo_keep, repo) = repo();
+        let profile = dir.join("workbench.sqlite");
+        (
+            keep,
+            dir,
+            repo_keep,
+            repo.to_str().unwrap().to_owned(),
+            profile,
+        )
+    }
+
+    /// Previews BACKUP, then executes with a confirmation that runs
+    /// `mutate` while the dialog is "open" and then answers yes. Returns the
+    /// refusal text (or "removed") and whether the live profile survived.
+    fn accept_after(mutate: impl Fn(&Path, &Path)) -> (String, bool, bool) {
+        let (_k, dir, _rk, repo, profile) = setup();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(&repo, resolver);
+        let backup = dir.join(BACKUP);
+        let result = execute_with_profile(
+            &repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| {
+                mutate(&backup, &profile);
+                true
+            },
+        );
+        let text = match result {
+            Ok((_, outcome)) if outcome.success => "removed".to_owned(),
+            Ok((_, outcome)) => format!("outcome-failed: {}", outcome.message),
+            Err(error) => error.message().to_owned(),
+        };
+        let exists = fs::symlink_metadata(&backup).is_ok();
+        let live = fs::read_to_string(&profile).is_ok_and(|s| s == "live profile");
+        (text, exists, live)
+    }
+
+    #[test]
+    fn adv_confirm_open_then_backup_appended_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (text, exists, live) = accept_after(|backup, _| {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(backup)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+        });
+        assert!(text.contains("changed"), "{text}");
+        assert!(exists && live);
+    }
+
+    #[test]
+    fn adv_confirm_open_then_same_size_rewrite_with_mtime_restored_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (text, exists, live) = accept_after(|backup, _| {
+            let before = fs::metadata(backup).unwrap().modified().unwrap();
+            fs::write(backup, vec![9u8; 4096]).unwrap();
+            crate::test_support::set_modified(backup, before).unwrap();
+        });
+        assert!(text != "removed", "removed a rewritten file: {text}");
+        assert!(exists && live, "{text}");
+    }
+
+    #[test]
+    fn adv_confirm_open_then_replaced_by_new_inode_with_same_size_and_mtime_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (text, exists, live) = accept_after(|backup, _| {
+            let before = fs::metadata(backup).unwrap().modified().unwrap();
+            let fresh = backup.with_extension("bak.swap");
+            fs::write(&fresh, vec![9u8; 4096]).unwrap();
+            crate::test_support::set_modified(&fresh, before).unwrap();
+            fs::rename(&fresh, backup).unwrap();
+        });
+        assert!(text != "removed", "removed a replaced file: {text}");
+        assert!(exists && live, "{text}");
+    }
+
+    #[test]
+    fn adv_confirm_open_then_swapped_for_symlink_to_live_profile_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (text, _exists, live) = accept_after(|backup, profile| {
+            fs::remove_file(backup).unwrap();
+            std::os::unix::fs::symlink(profile, backup).unwrap();
+        });
+        assert!(text != "removed", "{text}");
+        assert!(live, "the live profile must survive: {text}");
+    }
+
+    #[test]
+    fn adv_confirm_open_then_swapped_for_a_directory_or_deleted_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (text, exists, live) = accept_after(|backup, _| {
+            fs::remove_file(backup).unwrap();
+            fs::create_dir(backup).unwrap();
+            fs::write(backup.join("inner"), "x").unwrap();
+        });
+        assert!(text != "removed", "{text}");
+        assert!(exists && live, "{text}");
+        let (text, _exists, live) = accept_after(|backup, _| fs::remove_file(backup).unwrap());
+        assert!(text != "removed" || live, "{text}");
+        assert!(live);
+    }
+
+    #[test]
+    fn adv_confirm_accepts_but_the_gate_refuses_removes_nothing() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_k, dir, _rk, repo, profile) = setup();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(&repo, resolver);
+        let result = execute_with_profile(
+            &repo,
+            &id,
+            |_, _| Err::<(), _>(CommandError::from("policy refused")),
+            |_| Ok(()),
+            resolver,
+            |_, _| true,
+        );
+        assert!(result.is_err());
+        assert!(dir.join(BACKUP).exists());
+    }
+
+    #[test]
+    fn adv_a_declined_plan_is_consumed_and_a_retry_with_the_same_id_is_refused() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_k, dir, _rk, repo, profile) = setup();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(&repo, resolver);
+        let first = execute_with_profile(
+            &repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| false,
+        );
+        assert!(first.is_err());
+        let asked = std::cell::Cell::new(false);
+        let retry = execute_with_profile(
+            &repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| {
+                asked.set(true);
+                true
+            },
+        );
+        let Err(error) = retry else {
+            panic!("a retry of a declined plan must be refused");
+        };
+        assert!(
+            error.message().contains("already used"),
+            "{}",
+            error.message()
+        );
+        assert!(!asked.get(), "no dialog for a consumed plan");
+        assert!(dir.join(BACKUP).exists());
+        assert!(crate::storage::hygiene::cancel(&repo, &id).is_ok());
+    }
+
+    #[test]
+    fn adv_the_decline_all_entry_points_cannot_remove_a_real_backup() {
+        use crate::storage::hygiene::{execute, execute_with_activity, prepare};
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let profile = crate::storage::hygiene::profile_path().unwrap();
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        let path = profile.with_file_name("workbench.sqlite.advw3decline.bak");
+        fs::write(&path, "backup body").unwrap();
+        let _cleanup = RemoveOnDrop(path.clone());
+        let target = "backup:workbench.sqlite.advw3decline.bak";
+
+        let gated = std::cell::Cell::new(false);
+        let id = prepare(repo, target, 30).unwrap().id;
+        let steward = execute(repo, &id, |_, _| {
+            gated.set(true);
+            Ok(())
+        });
+        assert!(
+            steward.is_err(),
+            "steward path removed or accepted a backup"
+        );
+        assert!(path.exists() && !gated.get(), "steward reached the gate");
+
+        let id = prepare(repo, target, 30).unwrap().id;
+        let cleaner = execute_with_activity(
+            repo,
+            &id,
+            |_, _| {
+                gated.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        assert!(
+            cleaner.is_err(),
+            "cleaner path removed or accepted a backup"
+        );
+        assert!(path.exists() && !gated.get(), "cleaner reached the gate");
+    }
+
+    #[test]
+    fn adv_a_plan_whose_scope_was_not_profile_backup_for_a_backup_target_is_not_removed() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_k, dir, _rk, repo, profile) = setup();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(&repo, resolver);
+        crate::test_support::set_modified(
+            &dir.join(BACKUP),
+            SystemTime::now() - Duration::from_secs(100 * 86_400),
+        )
+        .unwrap();
+        // Not reachable through the public API (prepare is the only inserter and
+        // sets scope and target together); forced here to see what the confirm
+        // gate, which keys on scope, would do if the two ever disagreed.
+        crate::storage::hygiene::lock_plans()
+            .pending
+            .get_mut(&id)
+            .unwrap()
+            .view
+            .scope = "repository".into();
+        let result = execute_with_profile(
+            &repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, _| false,
+        );
+        let exists = dir.join(BACKUP).exists();
+        eprintln!(
+            "MISMATCH result: {:?}",
+            result
+                .as_ref()
+                .map(|r| r.1.message.clone())
+                .map_err(|e| e.message().to_owned())
+        );
+        assert!(
+            exists,
+            "backup removed with no confirmation: {:?}",
+            result
+                .as_ref()
+                .map(|r| r.1.message.clone())
+                .map_err(|e| e.message().to_owned())
+        );
+    }
+
+    #[test]
+    fn adv_no_local_or_cache_target_can_name_the_profile_directory() {
+        let profile = crate::storage::hygiene::profile_path().unwrap();
+        let dir = profile.parent().unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let relative = dir
+            .strip_prefix(&home)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            crate::storage::hygiene::providers::local_provider(Path::new(&home), &relative)
+                .is_err(),
+            "{relative} is a recognised local artifact directory"
+        );
+    }
+
+    #[test]
+    fn adv_a_confirm_that_panics_leaves_no_lock_held() {
+        use crate::storage::hygiene::{execute_confirmed, prepare};
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let profile = crate::storage::hygiene::profile_path().unwrap();
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        let path = profile.with_file_name("workbench.sqlite.advw3panic.bak");
+        fs::write(&path, "backup body").unwrap();
+        let _cleanup = RemoveOnDrop(path.clone());
+        let target = "backup:workbench.sqlite.advw3panic.bak";
+        let id = prepare(repo, target, 30).unwrap().id;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = execute_confirmed(repo, &id, |_, _| Ok(()), |_, _| panic!("dialog failed"));
+        }));
+        assert!(unwound.is_err());
+        assert!(path.exists());
+        let id = prepare(repo, target, 30).unwrap().id;
+        let (_, outcome) = execute_confirmed(repo, &id, |_, _| Ok(()), |_, _| true)
+            .expect("locks must be free after a panicking confirm");
+        assert!(outcome.success && !path.exists());
+    }
+
+    #[test]
+    fn adv_liveness_what_is_refused_while_the_confirmation_is_open() {
+        use crate::storage::hygiene::{
+            cancel, execute, execute_confirmed, execute_with_activity, global, prepare,
+        };
+        use std::sync::mpsc;
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap().to_owned();
+        let profile = crate::storage::hygiene::profile_path().unwrap();
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        let first = profile.with_file_name("workbench.sqlite.advw3live1.bak");
+        let second = profile.with_file_name("workbench.sqlite.advw3live2.bak");
+        fs::write(&first, "one").unwrap();
+        fs::write(&second, "two").unwrap();
+        let _c1 = RemoveOnDrop(first.clone());
+        let _c2 = RemoveOnDrop(second.clone());
+        let id1 = prepare(&repo, "backup:workbench.sqlite.advw3live1.bak", 30)
+            .unwrap()
+            .id;
+        let id2 = prepare(&repo, "backup:workbench.sqlite.advw3live2.bak", 30)
+            .unwrap()
+            .id;
+
+        let (open_tx, open_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (repo_ref, id1_ref) = (&repo, &id1);
+        let probes = std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                execute_confirmed(
+                    repo_ref,
+                    id1_ref,
+                    |_, _| Ok(()),
+                    move |_, _| {
+                        open_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(60)).is_ok()
+                    },
+                )
+            });
+            open_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the confirmation never opened");
+            let msg = |e: CommandError| e.message().to_owned();
+            let started = std::time::Instant::now();
+            let lock = global::mutation_lock().err().map(msg);
+            let steward = execute(&repo, &id2, |_, _| Ok(())).err().map(msg);
+            let confirmed =
+                execute_confirmed(&repo, &id2, |_, _| Ok(()), |_, _| panic!("must not ask"))
+                    .err()
+                    .map(msg);
+            let cleaner = execute_with_activity(&repo, &id2, |_, _| Ok(()), |_| Ok(()))
+                .err()
+                .map(msg);
+            let prepared = prepare(&repo, "backup:workbench.sqlite.advw3live2.bak", 30);
+            let prepared_ok = prepared.is_ok();
+            let cancelled = prepared
+                .map(|p| cancel(&repo, &p.id).is_ok())
+                .unwrap_or(false);
+            let probe_ms = started.elapsed().as_millis();
+            release_tx.send(()).unwrap();
+            let first_result = holder.join().unwrap();
+            (
+                lock,
+                steward,
+                confirmed,
+                cleaner,
+                prepared_ok,
+                cancelled,
+                probe_ms,
+                first_result
+                    .map(|r| r.1.success)
+                    .map_err(|e| e.message().to_owned()),
+            )
+        });
+        eprintln!("LIVENESS while confirm open: {probes:#?}");
+        let (lock, steward, confirmed, cleaner, prepared_ok, cancelled, probe_ms, first) = probes;
+        assert!(
+            lock.is_some(),
+            "mutation_lock was free while the dialog was open"
+        );
+        assert!(steward.is_some() && confirmed.is_some() && cleaner.is_some());
+        assert!(
+            prepared_ok && cancelled,
+            "prepare/cancel must not be blocked"
+        );
+        assert!(
+            probe_ms < 5_000,
+            "probes waited {probe_ms} ms: refusals must be immediate"
+        );
+        assert_eq!(first, Ok(true));
+        assert!(!first_path_exists(&profile));
+        assert!(second.exists());
+    }
+
+    fn first_path_exists(profile: &Path) -> bool {
+        profile
+            .with_file_name("workbench.sqlite.advw3live1.bak")
+            .exists()
+    }
+
+    fn hostile_message() -> (String, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        let evil = format!(
+            "evil\n\nNothing will be removed.\u{202e}\"'{}",
+            "x".repeat(150)
+        );
+        let dir = root.join(&evil).join("y".repeat(200));
+        fs::create_dir_all(&dir).unwrap();
+        let profile = dir.join("workbench.sqlite");
+        fs::write(&profile, "live profile").unwrap();
+        fs::write(dir.join(BACKUP), "body").unwrap();
+        let (_repo_keep, repo) = repo();
+        let repo = repo.to_str().unwrap();
+        let resolver = || Ok(profile.clone());
+        let id = backup_plan(repo, resolver);
+        let seen = std::cell::RefCell::new(String::new());
+        let _ = execute_with_profile(
+            repo,
+            &id,
+            |_, _| Ok(()),
+            |_| Ok(()),
+            resolver,
+            |_, message| {
+                *seen.borrow_mut() = message.to_owned();
+                false
+            },
+        );
+        let message = seen.into_inner();
+        (message, dir)
+    }
+
+    #[test]
+    fn adv_hostile_path_still_ends_with_the_rollback_warning() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (message, dir) = hostile_message();
+        assert!(message.ends_with(WARNING), "{message:?}");
+        assert!(message.starts_with(&dir.to_string_lossy().into_owned()));
+        assert!(message.contains("cannot be rolled back"));
+    }
+
+    #[test]
+    #[ignore = "BREAK demonstrated: the dialog embeds the raw path (newlines, bidi override, unbounded length)"]
+    fn adv_hostile_path_is_neutralised_before_it_reaches_the_dialog() {
+        let _serial = crate::storage::hygiene::tests::serial();
+        let (message, _dir) = hostile_message();
+        let shown = message
+            .strip_suffix(WARNING)
+            .unwrap()
+            .trim_end_matches('\n');
+        assert!(
+            !shown.chars().any(|c| c.is_control()
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)),
+            "control or bidi characters reach the dialog: {shown:?}"
+        );
+        assert!(
+            shown.chars().count() < 400,
+            "{} chars",
+            shown.chars().count()
+        );
+    }
 }
