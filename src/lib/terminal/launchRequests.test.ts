@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { claimedFileOpen, createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS, TERMINAL_SESSION_CANCELED } from "./launchRequests";
 import { TERMINAL_SESSION_PENDING } from "./sessionMessages";
+import { keepFileTabFor, openFileTab, setTabFile } from "./tabs";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
@@ -198,12 +199,30 @@ describe("claimedFileOpen: which checkout a sidebar file request opens and keeps
   const request = (extra: Record<string, unknown>) =>
     ({ launcher: "file", filePath: "src/a.ts", line: 3, column: null, ...extra }) as Parameters<typeof claimedFileOpen>[0];
 
-  it("opens a tab and a split in the panel's own checkout, one value for opening and keeping", () => {
+  const agentCheckout = "/repo/.claude/worktrees/agent";
+
+  it("a visible file pane in an agent's checkout is repointed into the panel's own", () => {
+    // `openFileTabFor` repoints any visible unkept file pane, whatever its
+    // checkout, through `setTabFile`, which reads an absent checkout as "keep
+    // the pane's". The plan's value must therefore be one `setTabFile` applies.
+    const opened = openFileTab({ tabs: [], activeId: null }, { filePath: "src/old.ts", checkout: agentCheckout });
+    expect(opened.id).not.toBeNull();
     for (const fileOpenMode of ["tab", "split"]) {
-      const plan = claimedFileOpen(request({ fileOpenMode, fileKeep: true }));
-      expect(plan).toMatchObject({ keep: true });
-      expect(plan?.checkout).toBeUndefined();
+      const plan = claimedFileOpen(request({ fileOpenMode }))!;
+      const repointed = setTabFile(opened.state, opened.id!, plan.filePath, plan.line, plan.column, { checkout: plan.checkout });
+      expect(repointed.tabs[0]).toMatchObject({ filePath: "src/a.ts" });
+      expect(repointed.tabs[0].checkout).toBeUndefined();
     }
+  });
+
+  it("a double-click keeps the panel's own pane, not the same file open in an agent's checkout", () => {
+    const own = openFileTab({ tabs: [], activeId: null }, { filePath: "src/a.ts", reuseExisting: false });
+    const both = openFileTab(own.state, { filePath: "src/a.ts", checkout: agentCheckout, reuseExisting: false });
+    const plan = claimedFileOpen(request({ fileOpenMode: "split", fileKeep: true }))!;
+    expect(plan.keep).toBe(true);
+    const kept = keepFileTabFor(both.state, plan.filePath, plan.checkout);
+    expect(kept.id).toBe(own.id);
+    expect(kept.state.tabs.map((tab) => tab.kept === true)).toEqual([true, false]);
   });
 
   it("the panel's claim path takes the checkout from the plan, never from the active tab", () => {

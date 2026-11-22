@@ -264,12 +264,14 @@ export interface ClaimedFileOpen {
   focus: boolean;
   keep: boolean;
   /**
-   * The checkout the file is opened in and kept in: always the panel's own
-   * (undefined). A request names a repository, and `take` hands it to the
-   * panel whose checkout is that repository, so the file belongs there even
-   * when the active tab is an agent hosted in another checkout of it.
+   * The checkout the file is opened in and kept in: always the panel's own,
+   * spelled "" because `setTabFile` reads an absent checkout as "keep the
+   * pane's current one", which would leave a repointed pane in an agent's
+   * worktree. A request names a repository, and `take` hands it to the panel
+   * whose checkout is that repository, so the file belongs there even when
+   * the active tab is an agent hosted in another checkout of it.
    */
-  checkout: undefined;
+  checkout: "";
 }
 
 /**
@@ -289,7 +291,7 @@ export function claimedFileOpen(
     column: request.column ?? null,
     focus: request.fileFocus ?? mode === "tab",
     keep: request.fileKeep === true,
-    checkout: undefined,
+    checkout: "",
   };
 }
 

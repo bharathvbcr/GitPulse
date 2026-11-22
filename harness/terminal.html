@@ -2999,6 +2999,36 @@
               check(`G8c: a click in a kept pane's own explorer opens beside it instead of replacing the kept file (${innerTabsSeen})`, () =>
                 innerKeptBeside,
               );
+
+              // G8d: under Auto, a sidebar click goes where the user last worked.
+              // A real pointerdown (a programmatic .click() fires none) inside the
+              // dock makes the terminal that surface, so the file opens as a split;
+              // one inside the page (a stand-in view bar) sends the next to Code.
+              const { repoStore: autoRepoStore } = await import("../src/lib/stores/repoStore.ts");
+              const tabBeforeAuto = getStore(autoRepoStore).activeTab;
+              sidebarNavStore.setView("files");
+              const autoPane = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-explorer-pane"]'));
+              autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"]')?.click();
+              const autoPressed = Boolean(await waitFor(() => autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"][aria-pressed="true"]')));
+              const dockSurface = document.querySelector("[data-terminal-dock] .xterm-rows") ?? document.querySelector("[data-terminal-dock]");
+              dockSurface?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              const panelsBeforeAuto = terminalPanels().length;
+              (await waitFor(() => treeItem(autoPane, "main.ts")))?.click();
+              await waitFor(() => terminalPanels().length === panelsBeforeAuto + 1);
+              const autoSplit = terminalPanels().length === panelsBeforeAuto + 1 && getStore(autoRepoStore).activeTab === tabBeforeAuto;
+              const standInPage = document.createElement("div");
+              standInPage.setAttribute("data-viewbar", "");
+              document.body.appendChild(standInPage);
+              standInPage.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              treeItem(autoPane, "lib.ts")?.click();
+              await waitFor(() => getStore(autoRepoStore).activeTab === "code");
+              const autoCode = terminalPanels().length === panelsBeforeAuto + 1;
+              standInPage.remove();
+              autoRepoStore.setActiveTab(tabBeforeAuto);
+              await closeFileTab("main.ts");
+              check(`G8d: Auto opens a terminal split after the dock was last used, and the Code page after the page was (pressed ${autoPressed}, split ${autoSplit}, code ${autoCode}, panels ${panelsBeforeAuto}->${terminalPanels().length})`, () =>
+                autoPressed && autoSplit && autoCode,
+              );
             } finally {
               await unmountComp(mountedSidebar);
               sidebarHost.remove();
