@@ -8171,6 +8171,30 @@ mod tests {
         );
     }
 
+    /// Planning is bounded by the guard budget, so a plan that is merely slow
+    /// is answered with a question. But in the long-lived app
+    /// (`gate_child_command`) the abandoned worker keeps running, so the planner
+    /// itself must be linear in the command: a wrapper chain at the size cap
+    /// must not cost seconds. `sudo`/`doas` rescan every later word for `-u`
+    /// at each wrapper, which is quadratic in the chain length.
+    #[test]
+    fn plan_of_a_wrapper_chain_at_the_size_cap_is_linear() {
+        for wrapper in ["sudo -E ", "sudo env ", "doas "] {
+            let command = format!(
+                "{}ls",
+                wrapper.repeat(MAX_COMMAND_BYTES * 95 / 100 / wrapper.len())
+            );
+            let started = std::time::Instant::now();
+            let _ = super::plan(&command);
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+                "planning {} bytes of {wrapper:?} took {:?}",
+                command.len(),
+                started.elapsed()
+            );
+        }
+    }
+
     #[test]
     fn run_on_a_star_bomb_answers_within_the_budget_and_never_allows() {
         let command = format!("{}x; true", "*".repeat(60));
