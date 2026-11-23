@@ -1471,8 +1471,13 @@ tool_args! {
             1,
             64,
         ),
+        in_reply_to: Option<String> = Spec::bytes(
+            "msg_id of the bus message this answers (1-64 ASCII letters, digits, '-' or '_'). It must still be on the bus; it supplies thread_key when none is given and sets the hop to its hop + 1",
+            1,
+            64,
+        ),
         hop: Option<u32> = Spec::int(
-            "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
+            "Explicit hop count. The count is the highest of this, the in_reply_to message's hop + 1, the thread's last hop + 1 and 1, so an explicit hop can raise it but never lower it (a 0 is raised to 1)",
             0,
             32,
         ),

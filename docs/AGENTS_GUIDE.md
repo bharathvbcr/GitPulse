@@ -114,7 +114,7 @@ inbox tools are:
 | --- | --- |
 | `gitpulse_agent_register` | Register a live session (Claude, Antigravity or Codex) with a role and a wake mode (`boundary` or `auto`) |
 | `gitpulse_agent_peers` | List live and resumable peers across the repository's worktrees |
-| `gitpulse_agent_send` | Send a message to one peer, up to 16 KiB. An ambiguous target is refused rather than guessed |
+| `gitpulse_agent_send` | Send a message to one peer, up to 16 KiB; `in_reply_to` answers an earlier message. An ambiguous target is refused rather than guessed |
 | `gitpulse_agent_inbox` | Read unread messages, deduplicated. A read only peeks; pass `ack: true` to acknowledge what it returns. A `for_peer` that matches several peers is refused with their `peer_id`s; a failed acknowledgement is reported in `ack_error` and `acked_count` counts only what succeeded |
 | `gitpulse_agent_wait` | Block for up to 45 seconds for a reply, with at most 4 waiters at a time per server process. It acknowledges what it returns (`ack` defaults to true); pass `since_seq` to wait without consuming. Like the inbox, it returns `has_more` and `dropped_before_seq` |
 
@@ -125,6 +125,8 @@ every sibling lane. You can send an agent a message yourself with **Send to agen
 GitPulse shows a preview and waits for your confirmation before delivering it.
 
 The `gitpulse_agent_send` result has a `mailbox` object saying whether the recipient's mailbox took the message (`deposited`, with a `reason` of `full`, `refused`, `no_session` or `unavailable` when it did not). A peer may hold at most 7 pending messages per session; the last slot carries one notice per repository pointing the recipient at `gitpulse_agent_inbox`. A `delivery_outcome` of `bus_only` means the message is on the bus but not in the mailbox, so only an inbox or wait call will show it.
+
+To answer a message, pass its `msg_id` as `in_reply_to`. The message must still be on the bus, or the send is refused. The reply joins the answered message's thread when you name none, and its hop is the answered hop plus one. The hop count never goes down: it is the highest of an explicit `hop`, the `in_reply_to` hop plus one, the thread's last hop plus one, and 1, so a chain of replies reaches the hop limit even without a shared `thread_key`. A sender that never registered as a peer can still be answered: when `to_peer` exactly matches the `from_peer` of a message on the bus and no peer matches, the reply goes to the bus only (`liveness` `unregistered`, `delivery_outcome` `bus_only`, mailbox `reason` `no_session`). A prefix or a different case does not match.
 
 The bus keeps the newest 256 messages. When it is full, the oldest message goes first, except that open
 asks and each recipient's unread direct messages from the last 2 hours (up to 8 per recipient, 64 in

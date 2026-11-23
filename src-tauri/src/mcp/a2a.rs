@@ -443,30 +443,98 @@ fn deposit_into_mailbox(
     }
 }
 
+/// Where a send goes: a registered peer, or the identity of an unregistered sender being
+/// answered, which has no session and so no mailbox.
+struct SendTarget {
+    peer_id: String,
+    branch: Option<String>,
+    session_id: Option<String>,
+    liveness: String,
+}
+
 pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
     crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
 
-    let target = agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer)
-        .map_err(|e| e.into_command_error().into_message())?;
+    // The message being answered is read first: it supplies the thread and the hop, and a
+    // reply to a message that is not on the bus is refused instead of sent unthreaded.
+    let answered = match a
+        .in_reply_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => {
+            if !crate::agent_mailbox::valid_request_id(id) {
+                return Err("in_reply_to must be 1 to 64 ASCII letters, digits, '-' or '_'".into());
+            }
+            let found = agent_bus::get_message_by_id(&a.repo_path, id)
+                .map_err(CommandError::into_message)?;
+            Some(found.ok_or_else(|| {
+                format!(
+                    "in_reply_to '{id}' names no message on the bus; it may have been evicted, so send without in_reply_to or name a retained msg_id"
+                )
+            })?)
+        }
+        None => None,
+    };
+    let thread_key: Option<String> = a
+        .thread_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| answered.as_ref().and_then(|m| m.thread_key.clone()));
+
+    let target = match agent_bus::resolve_target_peer(&a.repo_path, &a.to_peer) {
+        Ok(peer) => SendTarget {
+            peer_id: peer.record.peer_id,
+            branch: peer.record.branch,
+            session_id: peer.record.provider_session_id,
+            liveness: peer.liveness,
+        },
+        // A sender that never registered cannot be found as a peer, but a reply to it must
+        // still work: the message it sent is on the bus under that exact identity. Only an
+        // exact match counts, and an ambiguous peer stays an error.
+        Err(agent_bus::PeerResolutionError::NotFound { target }) => {
+            match agent_bus::find_bus_sender(&a.repo_path, &a.to_peer)
+                .map_err(CommandError::into_message)?
+            {
+                Some(identity) => SendTarget {
+                    peer_id: identity,
+                    branch: None,
+                    session_id: None,
+                    liveness: "unregistered".to_string(),
+                },
+                None => {
+                    return Err(agent_bus::PeerResolutionError::NotFound { target }
+                        .into_command_error()
+                        .into_message())
+                }
+            }
+        }
+        Err(e) => return Err(e.into_command_error().into_message()),
+    };
 
     // An MCP caller is always an agent: it is never the person using GitPulse, whatever
     // `from_peer` says. `post_peer_message` refuses the names reserved for a person.
     let origin = agent_bus::MessageOrigin::Agent;
-    let requested_hop = if let Some(explicit) = a.hop {
-        explicit
-    } else if let Some(ref tk) = a.thread_key {
+    // The count only climbs: an explicit hop can raise it but never lower what the answered
+    // message or the thread already reached, or a caller could restart the loop guard.
+    let mut requested_hop = a.hop.unwrap_or(1).max(1);
+    if let Some(m) = &answered {
+        requested_hop = requested_hop.max(m.hop.unwrap_or(0).saturating_add(1));
+    }
+    if let Some(tk) = &thread_key {
         // A failed read must fail the send: guessing hop 1 would reset the ping-pong count.
-        agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
+        let last = agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
             .map_err(CommandError::into_message)?
             .messages
             .last()
-            .map(|m| m.hop.unwrap_or(0) + 1)
-            .unwrap_or(1)
-    } else {
-        1
-    };
+            .map(|m| m.hop.unwrap_or(0).saturating_add(1));
+        requested_hop = requested_hop.max(last.unwrap_or(1));
+    }
     let hop = origin.effective_hop(requested_hop);
     let max_hops = a.max_hops.unwrap_or(agent_bus::DEFAULT_MAX_HOPS);
 
@@ -478,11 +546,11 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         &a.repo_path,
         origin,
         &a.from_peer,
-        Some(&target.record.peer_id),
-        a.thread_key.as_deref(),
+        Some(&target.peer_id),
+        thread_key.as_deref(),
         a.kind.as_deref().unwrap_or("note"),
         &a.body,
-        target.record.branch.as_deref(),
+        target.branch.as_deref(),
         a.msg_id.as_deref(),
         hop,
         max_hops,
@@ -512,12 +580,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         truncated_in_bus: truncated_in_mailbox,
         repo_root: root_repo.clone(),
     };
-    let mailbox = deposit_into_mailbox(
-        target.record.provider_session_id.as_deref(),
-        &msg_id,
-        &preview,
-        provenance,
-    );
+    let mailbox = deposit_into_mailbox(target.session_id.as_deref(), &msg_id, &preview, provenance);
     let deposited = mailbox["deposited"].as_bool().unwrap_or(false);
 
     notify_in_process_waiters();
@@ -528,7 +591,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     let desktop_outcome = if hop < max_hops && target.liveness == "live" {
         match reach_desktop_agent_deliver(
             &root_repo,
-            &target.record.peer_id,
+            &target.peer_id,
             &msg_id,
             None,
             None,
@@ -561,8 +624,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         }
     } else {
         let listening = target
-            .record
-            .provider_session_id
+            .session_id
             .as_deref()
             .and_then(|sid| {
                 Mailbox::at_default()
@@ -581,7 +643,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         "ok": true,
         "repo_path": a.repo_path,
         "msg_id": msg_id,
-        "to_peer": target.record.peer_id,
+        "to_peer": target.peer_id,
         "liveness": target.liveness,
         "delivery_outcome": delivery_outcome,
         "hop": hop,
