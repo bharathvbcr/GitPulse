@@ -178,6 +178,20 @@
             : { process: null, busy: null, cwd: null, repo_dir: null }
         ),
       };
+      // ?mavi=1: three Mavi threads, so the window's Mavi rows can be seen.
+      // For looking only: the checks below describe the plane without them
+      // (two are live, so the "nothing is live" check stops a ?mavi=1 run).
+      const withMavi = new URLSearchParams(location.search).get("mavi") === "1";
+      if (withMavi) {
+        const now = Date.now();
+        const summary = (id, phase, extra = {}) => ({ id, target: { kind: "local", root: MAIN }, mode: "ask", model: null, phase, conversation_id: null, pending: phase === "approval" ? 1 : 0, turns: 2, cost_usd: 0.4, touched: ["src/charge.ts", "src/charge.test.ts"], background_tasks: 0, started_at_ms: now - 600000, last_activity_ms: now - 20000, exit: null, exit_ok: false, last_turn: "ok", ...extra });
+        localStorage.setItem("gitpulse.mavi.threads.v1", JSON.stringify([
+          { key: "m1", sessionId: "mavi-1-0", title: "Back off retries when the gateway times out", target: { kind: "local", root: MAIN }, mode: "ask", model: null, conversationId: null, createdAt: 1, lastActivityAt: now - 20000, seenAt: 0, movedToTerminalAt: null },
+          { key: "m2", sessionId: "mavi-1-1", title: "Profile the slow nightly build", target: { kind: "local", root: MAIN }, mode: "inspect", model: null, conversationId: null, createdAt: 1, lastActivityAt: now - 60000, seenAt: now, movedToTerminalAt: null },
+          { key: "m3", sessionId: null, title: "Profile the ingest worker", target: { kind: "ssh", host: "gpu-box", dir: "~/ingest" }, mode: "edit", model: null, conversationId: "1f0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b99", createdAt: 1, lastActivityAt: now - 86400000, seenAt: now, movedToTerminalAt: null },
+        ]));
+        fixtures.cmd_mavi_list = () => [summary("mavi-1-0", "approval"), summary("mavi-1-1", "working", { touched: [] })];
+      }
       mockIPCWithEvents((cmd, args) => {
         if (cmd.startsWith("plugin:")) return null;
         if (fixtures[cmd]) return fixtures[cmd](args ?? {});
@@ -225,6 +239,7 @@
         noteForegroundFocus(true);
         await repoStore.openRepo(MAIN);
         interfaceStore.setAgentsOpen(true);
+        if (withMavi) await (await import("../src/lib/mavi/store.svelte.ts")).maviStore.init();
         mount(AgentsView, { target: stage });
         await settle();
 

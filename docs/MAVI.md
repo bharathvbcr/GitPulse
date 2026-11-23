@@ -105,9 +105,24 @@ same conversation would both write to one Claude Code transcript. So:
 
 - **Continue in Mavi** (a Claude Code tab's menu in the dock): moves the tab's conversation into a Mavi thread, with its earlier turns. Before the tab's session ends it checks that the conversation is saved for this checkout (not a subdirectory or another worktree, where Claude Code alone can resume it), that no Mavi thread already works in that worktree, and that Mavi has room; then it asks (Bypass is named in the question), ends the tab's process, waits until it has exited, and only then starts the Mavi agent. A conversation that was a Mavi thread before it moved goes back to that thread.
 
-SSH threads cannot move to the local dock, and the Agents window does not list
-Mavi threads yet (its rows come from terminals, worktrees and task runs), so it
-undercounts running agents while Mavi threads run.
+SSH threads cannot move to the local dock.
+
+### The Agents window
+
+Mavi threads are listed under the plane's rows (checkouts, terminals, task
+runs), in the same columns, and counted in the headline ("3 Mavi threads, 2
+running, 1 waiting for you"). They follow the window's filter and repository
+scope: **Needs action** keeps threads waiting for an answer, failed, or ready
+for review; **Live** keeps threads whose agent is running; **Parallel** never
+lists one (a worktree holds one live thread). Each row says where it runs
+(the repository or the SSH host), its presence (Working, Waiting for you,
+Running idle, In a terminal tab, Not running), what it asks of you, and how
+many files the agent edited, with **Open** and, while it runs, **End**.
+
+They are rows of their own rather than plane rows: the plane's projection is
+built from processes GitPulse hosts in a terminal and from worktrees, and a
+thread is neither. With Mavi threads present the window still says when the
+plane is still reading or could not read, but no longer says "No agent work".
 
 ### Earlier turns, from the transcript
 

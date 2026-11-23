@@ -40,6 +40,9 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   to Mavi, Continue in Mavi) now shows the earlier turns, read from Claude
   Code's own transcript and rendered like live ones, edits and their hunks
   included, instead of an empty timeline.
+- **The Agents window lists Mavi threads**, under the plane's rows and in its
+  columns, counted in the headline, and following its filter and repository
+  scope, with Open and End.
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.
