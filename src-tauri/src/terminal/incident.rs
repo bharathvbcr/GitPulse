@@ -449,6 +449,32 @@ fn local_log_time(ms: u64) -> Option<String> {
     ))
 }
 
+/// Runs `/usr/bin/log` with `args` through the bounded spawn path and says what
+/// came back. Shared by every unified-log question this module asks.
+#[cfg(target_os = "macos")]
+fn run_log_show(args: &[&str], deadline: Duration) -> LogQuery {
+    match crate::engine::process::run_captured(
+        "/usr/bin/log",
+        args,
+        None,
+        deadline,
+        &[],
+        QUERY_OUTPUT_CAP,
+    ) {
+        Ok(crate::engine::process::RunOutcome::TimedOut(_)) => LogQuery::TimedOut,
+        Ok(crate::engine::process::RunOutcome::Finished(run)) if run.success => LogQuery::Output {
+            bytes: run.stdout_tail.into_bytes(),
+            truncated: run.truncated,
+        },
+        Ok(crate::engine::process::RunOutcome::Finished(run)) => LogQuery::Failed(format!(
+            "exit status {}: {}",
+            run.status_code,
+            run.stderr_tail.chars().take(160).collect::<String>()
+        )),
+        Err(error) => LogQuery::Failed(error.message().chars().take(200).collect()),
+    }
+}
+
 /// Asks the macOS unified log who signalled launchd's jobs around `incident`.
 /// Blocking: call it off the UI and async-runtime threads. Runs through
 /// `crate::engine::process::run_captured`, the project's bounded spawn path (procguard
@@ -472,34 +498,400 @@ pub fn attribute_sender(incident: &Incident) -> Attribution {
             "--predicate",
             r#"process == "launchd" AND eventMessage CONTAINS "sent by""#,
         ];
-        match crate::engine::process::run_captured(
-            "/usr/bin/log",
-            &args,
-            None,
-            QUERY_DEADLINE,
-            &[],
-            QUERY_OUTPUT_CAP,
-        ) {
-            Ok(crate::engine::process::RunOutcome::TimedOut(_)) => LogQuery::TimedOut,
-            Ok(crate::engine::process::RunOutcome::Finished(run)) if run.success => {
-                LogQuery::Output {
-                    bytes: run.stdout_tail.into_bytes(),
-                    truncated: run.truncated,
-                }
-            }
-            Ok(crate::engine::process::RunOutcome::Finished(run)) => LogQuery::Failed(format!(
-                "exit status {}: {}",
-                run.status_code,
-                run.stderr_tail.chars().take(160).collect::<String>()
-            )),
-            Err(error) => LogQuery::Failed(error.message().chars().take(200).collect()),
-        }
+        run_log_show(&args, QUERY_DEADLINE)
     })
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn attribute_sender(_incident: &Incident) -> Attribution {
     Attribution::none("attribution unavailable on this platform")
+}
+
+// -- a webview's content process was signalled ---------------------------------
+
+/// The service label launchd files a WebKit content process under.
+const WEBCONTENT_MARKER: &str = "com.apple.WebKit.WebContent";
+/// How far before the termination the content-process query starts. It runs
+/// to now, so a re-read seconds later still covers the termination.
+#[cfg(target_os = "macos")]
+const WEBCONTENT_LOOKBACK_MS: u64 = 10_000;
+/// How long one content-process query may run. `log show` pays 4-7 s to open
+/// the store (see [`QUERY_DEADLINE`]), so this leaves room for the slowest
+/// measured open and bounds the whole thing.
+#[cfg(target_os = "macos")]
+const WEBCONTENT_DEADLINE: Duration = Duration::from_secs(10);
+/// Pause before the one re-read when the first found no line: the unified log
+/// can lag the event by a moment.
+#[cfg(target_os = "macos")]
+const WEBCONTENT_RETRY_PAUSE: Duration = Duration::from_secs(2);
+/// Signal lines one attribution keeps.
+const MAX_WEBCONTENT_SIGNALS: usize = 8;
+
+/// One `signal service` line launchd logged against a WebKit content process:
+/// who sent it, which signal, and which process it went to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WebContentSignal {
+    pub caller: Sender,
+    /// The raw value launchd printed (`0x9` is 9).
+    pub value: u32,
+    pub signal: Option<&'static str>,
+    pub webcontent_pid: u32,
+    /// The app process that owns the content process (`pid/<owner>/…`).
+    pub owner_pid: Option<u32>,
+    pub at: String,
+}
+
+/// What [`parse_webcontent_signals`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignalParsed {
+    pub signals: Vec<WebContentSignal>,
+    pub unreadable: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct ServiceRow {
+    #[serde(rename = "eventMessage")]
+    event_message: Option<String>,
+    subsystem: Option<String>,
+    timestamp: Option<String>,
+}
+
+/// Reads `signal service: caller = <name>[<pid>], value = 0x9` and the
+/// `pid/<owner>/com.apple.WebKit.WebContent.<UUID> [<pid>]` subsystem launchd
+/// files it under. `None` for any other line.
+fn webcontent_signal(row: ServiceRow) -> Option<WebContentSignal> {
+    let (message, subsystem) = (row.event_message?, row.subsystem?);
+    if !subsystem.contains(WEBCONTENT_MARKER) {
+        return None;
+    }
+    let rest = message.split_once("signal service: caller = ")?.1;
+    let (name, tail) = rest.split_once('[')?;
+    let (caller_pid, tail) = tail.split_once(']')?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return None;
+    }
+    let raw = tail.split_once("value = ")?.1.trim();
+    let value = match raw.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => raw.parse().ok()?,
+    };
+    let webcontent_pid = subsystem
+        .rsplit_once('[')?
+        .1
+        .split_once(']')?
+        .0
+        .trim()
+        .parse()
+        .ok()?;
+    let owner_pid = subsystem
+        .strip_prefix("pid/")
+        .and_then(|after| after.split('/').next())
+        .and_then(|owner| owner.parse().ok());
+    Some(WebContentSignal {
+        caller: Sender {
+            pid: caller_pid.trim().parse().ok()?,
+            name: name.to_string(),
+        },
+        value,
+        signal: launchd_signal_name(&value.to_string()),
+        webcontent_pid,
+        owner_pid,
+        at: row.timestamp.unwrap_or_default().chars().take(40).collect(),
+    })
+}
+
+/// Collects the WebContent `signal service` lines in `log show --style ndjson`
+/// output. Like [`parse_launchd_ndjson`] it tolerates truncation, garbage and
+/// giant lines: a bad one is counted, never fatal.
+pub fn parse_webcontent_signals(bytes: &[u8]) -> SignalParsed {
+    let mut parsed = SignalParsed::default();
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        if line.len() > MAX_LINE_BYTES {
+            parsed.unreadable += 1;
+            continue;
+        }
+        let Ok(row) = serde_json::from_slice::<ServiceRow>(line) else {
+            parsed.unreadable += 1;
+            continue;
+        };
+        if let Some(signal) = webcontent_signal(row) {
+            if parsed.signals.len() < MAX_WEBCONTENT_SIGNALS {
+                parsed.signals.push(signal);
+            }
+        }
+    }
+    parsed
+}
+
+/// What the unified log said about a content process's death. The three cases
+/// stay apart: a query that could not run is not a query that found nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebOutcome {
+    Found(Vec<WebContentSignal>),
+    /// The log was read and held no such line. Not proof that nothing
+    /// signalled: the log can lag, and `unreadable` rows were skipped.
+    NotFound {
+        unreadable: usize,
+    },
+    /// The log could not be read; the reason.
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAttribution {
+    pub outcome: WebOutcome,
+    pub truncated: bool,
+    pub attempts: u32,
+}
+
+impl WebAttribution {
+    fn unavailable(reason: impl Into<String>, attempts: u32) -> Self {
+        Self {
+            outcome: WebOutcome::Unavailable(reason.into()),
+            truncated: false,
+            attempts,
+        }
+    }
+
+    /// The content process pid the log names, when it does.
+    pub fn webcontent_pid(&self) -> Option<u32> {
+        match &self.outcome {
+            WebOutcome::Found(signals) => signals.first().map(|s| s.webcontent_pid),
+            _ => None,
+        }
+    }
+
+    /// One line for the app log.
+    pub fn summary(&self) -> String {
+        let cut = if self.truncated {
+            " (log output was truncated)"
+        } else {
+            ""
+        };
+        match &self.outcome {
+            WebOutcome::Unavailable(reason) => format!("attribution unavailable: {reason}"),
+            WebOutcome::NotFound { unreadable } => format!(
+                "launchd logged no signal service line for a WebContent process around the \
+                 termination after {} read(s), {unreadable} row(s) unreadable; the log can \
+                 lag, so this is not proof nothing signalled it{cut}",
+                self.attempts
+            ),
+            WebOutcome::Found(signals) => {
+                let me = std::process::id();
+                let lines: Vec<String> = signals
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}[{}]{} sent {} ({:#x}) to WebContent pid {} (owner pid {})",
+                            s.caller.name,
+                            s.caller.pid,
+                            if s.caller.pid == me {
+                                " (this app)"
+                            } else {
+                                ""
+                            },
+                            s.signal.unwrap_or("an unnamed signal"),
+                            s.value,
+                            s.webcontent_pid,
+                            s.owner_pid
+                                .map_or_else(|| "unknown".to_string(), |p| p.to_string()),
+                        )
+                    })
+                    .collect();
+                format!("launchd: {}{cut}", lines.join("; "))
+            }
+        }
+    }
+
+    /// The lifecycle-record form.
+    pub fn to_json(&self) -> serde_json::Value {
+        let me = std::process::id();
+        let (status, detail) = match &self.outcome {
+            WebOutcome::Found(signals) => (
+                "found",
+                serde_json::json!(signals
+                    .iter()
+                    .map(|s| serde_json::json!({
+                        "caller": s.caller.name,
+                        "caller_pid": s.caller.pid,
+                        "caller_is_this_app": s.caller.pid == me,
+                        "value": s.value,
+                        "signal": s.signal,
+                        "webcontent_pid": s.webcontent_pid,
+                        "owner_pid": s.owner_pid,
+                        "at": s.at,
+                    }))
+                    .collect::<Vec<_>>()),
+            ),
+            WebOutcome::NotFound { unreadable } => (
+                "not_found",
+                serde_json::json!({ "unreadable_rows": unreadable }),
+            ),
+            WebOutcome::Unavailable(reason) => ("unavailable", serde_json::json!(reason)),
+        };
+        serde_json::json!({
+            "status": status,
+            "detail": detail,
+            "attempts": self.attempts,
+            "truncated": self.truncated,
+            "summary": self.summary(),
+        })
+    }
+}
+
+/// Turns up to two log reads (one retry after `pause` when the first held no
+/// line) into a [`WebAttribution`]. Never guesses: a read that could not run
+/// is `Unavailable`, never `NotFound`.
+pub fn attribute_webcontent_with(
+    mut query: impl FnMut() -> LogQuery,
+    pause: Duration,
+) -> WebAttribution {
+    let mut last = WebAttribution::unavailable("no log read was attempted", 0);
+    for attempt in 1..=2u32 {
+        match query() {
+            LogQuery::TimedOut => {
+                return WebAttribution::unavailable("log query timed out", attempt)
+            }
+            LogQuery::Failed(error) => {
+                return WebAttribution::unavailable(format!("log query failed: {error}"), attempt)
+            }
+            LogQuery::Output { bytes, truncated } => {
+                let parsed = parse_webcontent_signals(&bytes);
+                if !parsed.signals.is_empty() {
+                    return WebAttribution {
+                        outcome: WebOutcome::Found(parsed.signals),
+                        truncated,
+                        attempts: attempt,
+                    };
+                }
+                last = WebAttribution {
+                    outcome: WebOutcome::NotFound {
+                        unreadable: parsed.unreadable,
+                    },
+                    truncated,
+                    attempts: attempt,
+                };
+            }
+        }
+        if attempt == 1 {
+            std::thread::sleep(pause);
+        }
+    }
+    last
+}
+
+/// Asks the unified log who signalled a WebKit content process in the last
+/// seconds before `at_ms` (epoch ms). Blocking: call it off the UI thread.
+#[cfg(target_os = "macos")]
+pub fn attribute_webcontent(at_ms: u64) -> WebAttribution {
+    let Some(start) = local_log_time(at_ms.saturating_sub(WEBCONTENT_LOOKBACK_MS)) else {
+        return WebAttribution::unavailable("could not format the search window", 0);
+    };
+    attribute_webcontent_with(
+        || {
+            let predicate = format!(
+                r#"process == "launchd" AND eventMessage CONTAINS "signal service" AND subsystem CONTAINS "{WEBCONTENT_MARKER}""#
+            );
+            let args = [
+                "show",
+                "--style",
+                "ndjson",
+                "--start",
+                start.as_str(),
+                "--predicate",
+                predicate.as_str(),
+            ];
+            run_log_show(&args, WEBCONTENT_DEADLINE)
+        },
+        WEBCONTENT_RETRY_PAUSE,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn attribute_webcontent(_at_ms: u64) -> WebAttribution {
+    WebAttribution::unavailable("attribution unavailable on this platform", 0)
+}
+
+/// The newest JetsamEvent report in a diagnostics directory. Only names and
+/// modification times are read: a report's contents are never opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JetsamProbe {
+    Newest { name: String, mtime_ms: u64 },
+    NoneFound { scanned: usize },
+    Unreadable(String),
+}
+
+impl JetsamProbe {
+    /// The record form. `since_ms` is the wall clock a report must not
+    /// predate to count as written for this termination.
+    pub fn to_json(&self, since_ms: u64) -> serde_json::Value {
+        match self {
+            Self::Newest { name, mtime_ms } => serde_json::json!({
+                "status": "newest",
+                "name": name,
+                "mtime_ms": mtime_ms,
+                "written_since_termination_window": *mtime_ms >= since_ms,
+            }),
+            Self::NoneFound { scanned } => {
+                serde_json::json!({ "status": "none_found", "entries_scanned": scanned })
+            }
+            Self::Unreadable(reason) => {
+                serde_json::json!({ "status": "unavailable", "reason": reason })
+            }
+        }
+    }
+}
+
+/// `~/Library/Logs/DiagnosticReports`, when `HOME` names a home.
+pub fn diagnostic_reports_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(std::path::Path::new(&home).join("Library/Logs/DiagnosticReports"))
+}
+
+/// Entries read from the directory before giving up: the directory is
+/// user-writable and unbounded.
+const MAX_REPORT_ENTRIES: usize = 20_000;
+
+pub fn newest_jetsam_report(dir: &std::path::Path) -> JetsamProbe {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return JetsamProbe::Unreadable(format!("{}: {error}", dir.display())),
+    };
+    let mut scanned = 0usize;
+    let mut newest: Option<(String, u64)> = None;
+    for entry in entries.flatten() {
+        scanned += 1;
+        if scanned > MAX_REPORT_ENTRIES {
+            return JetsamProbe::Unreadable(format!(
+                "more than {MAX_REPORT_ENTRIES} entries in {}",
+                dir.display()
+            ));
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("JetsamEvent-") {
+            continue;
+        }
+        let Some(mtime_ms) = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(_, best)| mtime_ms > *best) {
+            newest = Some((name, mtime_ms));
+        }
+    }
+    match newest {
+        Some((name, mtime_ms)) => JetsamProbe::Newest { name, mtime_ms },
+        None => JetsamProbe::NoneFound { scanned },
+    }
 }
 
 // -- the event ------------------------------------------------------------------
@@ -1380,5 +1772,143 @@ mod tests {
         wait_until("the attribution place to be returned", || {
             rec.attributing.load(Ordering::Acquire) == 0
         });
+    }
+}
+
+#[cfg(test)]
+mod webcontent_tests {
+    use super::*;
+
+    /// The shape `log show --style ndjson` printed for the 2026-11-21 kill
+    /// (identifiers shortened to the fields that matter).
+    const KILL: &str = r#"{"subsystem":"pid\/1328\/com.apple.WebKit.WebContent.506CDAA8-546C-4B62-8F91-8D2162A79ACA [1591]","processImagePath":"\/sbin\/launchd","timestamp":"2026-11-21 21:35:50.854622-0800","eventMessage":"signal service: caller = gitpulse[1328], value = 0x9"}"#;
+    const OTHER_SERVICE: &str = r#"{"subsystem":"pid\/1328\/com.apple.WebKit.Networking [1600]","timestamp":"t","eventMessage":"signal service: caller = gitpulse[1328], value = 0x9"}"#;
+    const NOT_A_SIGNAL: &str = r#"{"subsystem":"pid\/1328\/com.apple.WebKit.WebContent.X [1591]","timestamp":"t","eventMessage":"service exited"}"#;
+
+    fn output(lines: &[&str]) -> LogQuery {
+        LogQuery::Output {
+            bytes: lines.join("\n").into_bytes(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_signal_service_line_names_caller_signal_and_both_pids() {
+        let parsed = parse_webcontent_signals(KILL.as_bytes());
+        let [signal] = parsed.signals.as_slice() else {
+            panic!("{parsed:?}");
+        };
+        assert_eq!(signal.caller.name, "gitpulse");
+        assert_eq!(signal.caller.pid, 1328);
+        assert_eq!(signal.value, 9);
+        assert_eq!(signal.signal, Some("SIGKILL"));
+        assert_eq!(signal.webcontent_pid, 1591);
+        assert_eq!(signal.owner_pid, Some(1328));
+        assert!(signal.at.starts_with("2026-11-21 21:35:50"));
+    }
+
+    #[test]
+    fn other_services_other_messages_and_garbage_are_not_signals() {
+        let bytes = [OTHER_SERVICE, NOT_A_SIGNAL, "not json", "", KILL].join("\n");
+        let parsed = parse_webcontent_signals(bytes.as_bytes());
+        assert_eq!(parsed.signals.len(), 1);
+        assert_eq!(parsed.unreadable, 1);
+    }
+
+    #[test]
+    fn a_found_signal_is_attributed_and_summarised() {
+        let found = attribute_webcontent_with(|| output(&[KILL]), Duration::ZERO);
+        assert_eq!(found.webcontent_pid(), Some(1591));
+        assert_eq!(found.attempts, 1);
+        let line = found.summary();
+        assert!(line.contains("gitpulse[1328]"), "{line}");
+        assert!(
+            line.contains("SIGKILL (0x9) to WebContent pid 1591"),
+            "{line}"
+        );
+        assert_eq!(found.to_json()["status"], "found");
+    }
+
+    #[test]
+    fn a_log_query_that_could_not_run_is_unavailable_never_no_cause() {
+        for (query, reason) in [
+            (LogQuery::TimedOut, "log query timed out"),
+            (
+                LogQuery::Failed("exit status 1".into()),
+                "log query failed: exit status 1",
+            ),
+        ] {
+            let mut once = Some(query);
+            let result = attribute_webcontent_with(
+                move || once.take().expect("a failed read is not retried"),
+                Duration::ZERO,
+            );
+            assert_eq!(result.outcome, WebOutcome::Unavailable(reason.into()));
+            assert!(result.summary().starts_with("attribution unavailable:"));
+            assert_eq!(result.to_json()["status"], "unavailable");
+        }
+    }
+
+    #[test]
+    fn an_empty_read_is_retried_once_and_then_not_found_with_the_caveat() {
+        let mut reads = 0;
+        let result = attribute_webcontent_with(
+            || {
+                reads += 1;
+                output(&[NOT_A_SIGNAL])
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(reads, 2, "the log can lag: read once more");
+        assert_eq!(result.outcome, WebOutcome::NotFound { unreadable: 0 });
+        assert!(result.summary().contains("not proof nothing signalled"));
+    }
+
+    #[test]
+    fn a_line_that_lands_on_the_retry_is_found() {
+        let mut reads = 0;
+        let result = attribute_webcontent_with(
+            || {
+                reads += 1;
+                if reads == 1 {
+                    output(&[])
+                } else {
+                    output(&[KILL])
+                }
+            },
+            Duration::ZERO,
+        );
+        assert_eq!((result.attempts, result.webcontent_pid()), (2, Some(1591)));
+    }
+
+    #[test]
+    fn the_newest_jetsam_report_is_named_and_never_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            newest_jetsam_report(dir.path()),
+            JetsamProbe::NoneFound { scanned: 0 }
+        );
+        std::fs::write(dir.path().join("Other-1.ips"), "x").unwrap();
+        std::fs::write(dir.path().join("JetsamEvent-old.ips"), "x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("JetsamEvent-old.ips"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(dir.path().join("JetsamEvent-new.ips"), "x").unwrap();
+        let JetsamProbe::Newest { name, .. } = newest_jetsam_report(dir.path()) else {
+            panic!("a report exists");
+        };
+        assert_eq!(name, "JetsamEvent-new.ips");
+    }
+
+    #[test]
+    fn an_unreadable_diagnostics_directory_is_unavailable_not_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = newest_jetsam_report(&dir.path().join("missing"));
+        assert!(matches!(probe, JetsamProbe::Unreadable(_)), "{probe:?}");
+        assert_eq!(probe.to_json(0)["status"], "unavailable");
     }
 }

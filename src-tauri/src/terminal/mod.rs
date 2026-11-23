@@ -2795,6 +2795,40 @@ pub fn record_webview_terminated(state: &TerminalSessions, label: &str, crashes:
     );
 }
 
+/// How many live sessions had a view attached and how many were detached, or
+/// `None` when there is no host to ask or it cannot answer: unknown is not zero.
+pub fn session_attachment_counts(state: &TerminalSessions) -> Option<(usize, usize)> {
+    if cfg!(unix) && state.host_pid().is_none() {
+        return None;
+    }
+    let listed = list_sessions(state).ok()?;
+    let live = listed.iter().filter(|s| !s.ending);
+    let (mut attached, mut detached) = (0, 0);
+    for session in live {
+        if session.detached {
+            detached += 1;
+        } else {
+            attached += 1;
+        }
+    }
+    Some((attached, detached))
+}
+
+/// Adds one evidence record about a webview termination to the lifecycle log
+/// (`event` is `webview_terminated_context` or `webview_terminated_attribution`),
+/// joined to [`record_webview_terminated`]'s by `label`.
+pub fn record_webview_evidence(
+    state: &TerminalSessions,
+    event: &str,
+    label: &str,
+    mut evidence: serde_json::Value,
+) {
+    if let Some(map) = evidence.as_object_mut() {
+        map.insert("label".into(), serde_json::json!(label));
+    }
+    state.session_ledger().record_lifecycle(event, evidence);
+}
+
 /// The page holding every session is being replaced (a webview reload).
 /// Each live session stops waiting on that page's acknowledgements; none is
 /// stopped. Returns how many were detached.
