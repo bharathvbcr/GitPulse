@@ -205,6 +205,18 @@ describe("TerminalPanel dock sections", () => {
     expect(reveal).toContain("TAB_STRIP_CUE_INSET_PX,");
   });
 
+  it("lets the Files rail keep focus when entering Files also reveals the panes", () => {
+    // Agents/Console -> Files flips `mode` back to shell, so the pane-reveal
+    // effect focuses the active pane after a tick. The rail must win.
+    const files = source.slice(source.indexOf("let filesFocusReady"), source.indexOf("let selectedExplorerFile"));
+    expect(files).toContain("if (paneRevealPending) return;");
+    expect(files).toContain("filesFocusOwed = true;");
+    const reveal = source.slice(source.indexOf("const revealedId = $derived"), source.indexOf("// Any split sibling brought on screen"));
+    expect(reveal).toContain("paneRevealPending = true;");
+    // The rail takes its owed focus only after the pane has been revealed.
+    expect(reveal.indexOf("settleFilesFocus();", reveal.indexOf("revealTab(id);"))).toBeGreaterThan(reveal.indexOf("revealTab(id);"));
+  });
+
   it("shows the explorer in Files without writing the saved preference", () => {
     expect(source).toContain('(explorerPreferenceOpen || section === "files")');
     expect(source).toContain("explorerPreferenceOpen");

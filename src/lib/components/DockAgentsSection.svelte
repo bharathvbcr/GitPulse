@@ -64,7 +64,10 @@
 </script>
 
 {#snippet rowList(rows: DockAgentRow[], onPick: (id: string) => void, isHere: boolean)}
-  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -- arrow roving for the native row buttons inside -->
+  <!-- Justified: the list only hosts ArrowUp/ArrowDown roving between the
+       native row buttons inside it; the buttons are the controls and the
+       list itself never takes focus. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <ul role="list" class="flex flex-col gap-0.5" onkeydown={onListKeydown}>
     {#each rows as row (row.id)}
       <li>

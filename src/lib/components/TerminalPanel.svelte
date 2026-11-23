@@ -513,16 +513,39 @@
    * Keyed on the section alone: nothing the rail does may pull focus again.
    */
   let filesFocusReady = false;
+  /** The rail is owed focus, but a pane reveal is still in flight. */
+  let filesFocusOwed = false;
+  /**
+   * Set while the pane-reveal effect below has a reveal scheduled. Entering
+   * Files from Agents or Console brings the panes back on screen too, and
+   * that reveal focuses the active pane after a tick: run first, the rail's
+   * focus would be taken straight back. So the rail waits for the reveal and
+   * takes focus after it (`settleFilesFocus`).
+   */
+  let paneRevealPending = false;
+  function focusExplorerRail() {
+    explorerAsideEl
+      ?.querySelector<HTMLElement>('[role="tree"], [role="treeitem"], input, button:not(:disabled)')
+      ?.focus({ preventScroll: true });
+  }
+  /** Called by the pane reveal once it has run: the rail takes the focus it was owed. */
+  function settleFilesFocus() {
+    if (!filesFocusOwed) return;
+    filesFocusOwed = false;
+    if (section === "files") focusExplorerRail();
+  }
   $effect(() => {
     const entering = section === "files";
     const was = untrack(() => filesFocusReady);
     filesFocusReady = entering;
+    if (!entering) filesFocusOwed = false;
     if (!entering || was || !visible) return;
     if (untrack(() => explorerPreferenceOpen)) return;
+    filesFocusOwed = true;
     void tick().then(() => {
-      explorerAsideEl
-        ?.querySelector<HTMLElement>('[role="tree"], [role="treeitem"], input, button:not(:disabled)')
-        ?.focus({ preventScroll: true });
+      // A reveal is in flight: it hands focus back through settleFilesFocus.
+      if (paneRevealPending) return;
+      settleFilesFocus();
     });
   });
   let selectedExplorerFile = $state<string | null>(null);
@@ -3396,11 +3419,18 @@
     untrack(() => {
       if (unread.has(id)) unread = new Set([...unread].filter((key) => key !== id));
     });
+    paneRevealPending = true;
     void tick().then(() => {
-      if (!visible || mode !== "shell" || activeId !== id) return;
+      paneRevealPending = false;
+      if (!visible || mode !== "shell" || activeId !== id) {
+        settleFilesFocus();
+        return;
+      }
       // Looked up once the tab has mounted, outside the effect's tracking.
       revealTab(id);
       if (focusTabStrip) tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
+      // Entering Files with the reveal: the rail, not the pane, ends with focus.
+      settleFilesFocus();
     });
   });
 

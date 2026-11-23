@@ -12,6 +12,8 @@
  */
 
 import { writable, type Readable } from "svelte/store";
+import type { HostOS } from "../platform";
+import { platformChord } from "../ui/platformCopy";
 
 export type DockSection = "shell" | "agents" | "files" | "console";
 
@@ -58,9 +60,9 @@ export function dockSectionForChord(
 }
 
 /** The chord a section answers to, for tooltips and the shortcut guide. */
-export function dockSectionChordLabel(section: DockSection, os: string): string {
+export function dockSectionChordLabel(section: DockSection, os: HostOS): string {
   const index = DOCK_SECTIONS.findIndex((entry) => entry.id === section) + 1;
-  return os === "macos" ? `⌥⇧⌘${index}` : `Ctrl+Alt+Shift+${index}`;
+  return platformChord(`⌥⇧⌘${index}`, `Ctrl+Alt+Shift+${index}`, os);
 }
 
 interface StorageLike {
