@@ -1971,6 +1971,7 @@ pub(crate) fn complete_task(
                 store,
                 &id,
                 &repository_identity,
+                verification_gate::current_head(repo_path).ok().as_deref(),
             )
         });
         let held = match &gate {
