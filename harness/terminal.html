@@ -3123,6 +3123,13 @@
           const done = () => { acked += chunk.length; };
           if (viaWriter) writer.push(chunk, done); else write(chunk, done);
         });
+        // The last chunks may still be queued in xterm's write buffer: wait
+        // for every write callback, then for the frame that follows the last
+        // parse (its callbacks, ours and xterm's paint, all run before this
+        // timeout), so the tail is counted on both sides. A backlog that never
+        // drains is the ack check's to report.
+        for (const until = performance.now() + 5000; acked < received && performance.now() < until;) await wait(5);
+        await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
         // Read in the task the loop stops in: no frame runs in between.
         counting = false;
         const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, frames, owed, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
