@@ -248,13 +248,15 @@ impl SessionLedger {
     }
 
     /// Appends one record to the lifecycle log: `event` plus `fields` (a JSON
-    /// object), stamped with the time and this process. Never fails or blocks
-    /// the caller on an I/O error; an in-memory ledger records nothing.
+    /// object), stamped with the time and this app's pid (`app_pid`, never the
+    /// session's process, which the host protocol does not report). Never
+    /// fails or blocks the caller on an I/O error; an in-memory ledger records
+    /// nothing.
     pub fn record_lifecycle(&self, event: &str, fields: serde_json::Value) {
         let Some(log) = &self.lifecycle else { return };
         let mut record = serde_json::Map::new();
         record.insert("ts_ms".into(), now_ms().into());
-        record.insert("pid".into(), std::process::id().into());
+        record.insert("app_pid".into(), std::process::id().into());
         record.insert("event".into(), event.into());
         if let serde_json::Value::Object(extra) = fields {
             for (key, value) in extra {
@@ -1844,6 +1846,12 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("\"event\":\"spawn\""));
         assert!(lines[0].contains("\"session_id\":\"term-life\""));
+        // The writer's pid goes under a name nobody reads as the session's
+        // process: a bare `pid` beside `session_id` was read that way in the
+        // first real-app reload test.
+        let record: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(record["app_pid"], u64::from(std::process::id()), "{record}");
+        assert!(record.get("pid").is_none(), "no ambiguous bare pid: {record}");
         ledger.record_lifecycle(
             "protection",
             serde_json::json!({ "session_id": "x".repeat(100_000) }),
