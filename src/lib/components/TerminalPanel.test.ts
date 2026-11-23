@@ -479,7 +479,12 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain('data-testid="terminal-explorer-target-tab"');
     expect(source).toContain('data-testid="terminal-explorer-target-split"');
     expect(source).toContain('data-testid="terminal-explorer-target-code"');
-    expect(source).toContain("resolveExplorerFileAction(");
+    expect(source).toContain('data-testid="terminal-explorer-target-auto"');
+    // The same resolver and the same stored setting as the sidebar's explorer.
+    expect(source).toContain("resolveFileOpen(");
+    expect(source).toContain("$sidebarNavStore.openTarget");
+    expect(source).not.toContain("resolveExplorerFileAction(");
+    expect(source).not.toContain("terminalExplorerSidebar.setTarget");
     expect(source).not.toContain("function toggleFilePaneSplit()");
 
     // 2. Session Typer includes File Explorer via dockTabTypesFor + renders LauncherIcon on trigger and presets

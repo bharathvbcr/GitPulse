@@ -377,6 +377,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tab size indent indentation columns spaces 2 4 8",
   },
   {
+    id: "preferred-editor",
+    section: "diff",
+    label: "External editor",
+    keywords: "open in editor external ide vs code vscode antigravity cursor zed line goto launch preferred default auto",
+  },
+  {
     id: "auto-github-alerts",
     section: "analysis",
     label: "Check GitHub alerts on launch",

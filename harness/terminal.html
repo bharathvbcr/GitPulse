@@ -1486,6 +1486,45 @@
           await wait(150);
           check("a paste carrying a bracket terminator asks, and declining sends nothing",
             () => Boolean(injectAsk?.options.message.includes("ends a paste early")) && written.join("") === "");
+          // Text sent to an agent from outside the panel (the Code page's ⌘L): the panel
+          // claims the request and types it into the live session, unsubmitted, or says why not.
+          {
+            const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests");
+            const repo = "/fixture/GitPulse";
+            written = [];
+            const sent = await terminalLaunchRequests.requestReference(repo, "@src/main.ts#L1-L2 ", repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`a reference request is claimed and typed into the live shell, unsubmitted (${sent ?? "ok"})`, () => sent === null && written.join("") === "@src/main.ts#L1-L2 ");
+            written = [];
+            const refused = await terminalLaunchRequests.requestReference(repo, "File: a.ts, lines 1-2\n```\nx\ny\n```", repo).then(() => null, (error) => error.message);
+            await wait(100);
+            check("a block of lines is refused, with the reason, by a shell that is not in bracketed-paste mode, and nothing is typed", () => /bracketed-paste/.test(refused ?? "") && written.join("") === "");
+            // The same block once the shell has asked for bracketed paste: one paste, never typed line by line.
+            const block = "File: a.ts, lines 1-2\n```\nx\ny\n```";
+            await output(lastWriteId, "\u001b[?2004h");
+            await wait(100);
+            written = [];
+            const delivered = await terminalLaunchRequests.requestReference(repo, block, repo).then(() => null, (error) => error.message);
+            await wait(150);
+            check(`with bracketed paste on, the block arrives as one bracketed paste (${delivered ?? "ok"})`, () =>
+              delivered === null && written.join("") === `\u001b[200~${block.replaceAll("\n", "\r")}\u001b[201~`);
+            await output(lastWriteId, "\u001b[?2004l");
+            await wait(100);
+            // The context tray: chip with count and bytes, Insert all types the references, Clear empties it.
+            const { addToTray, trayFor } = await import("../src/lib/terminal/contextTray");
+            addToTray(repo, { checkout: repo, path: "a.ts", startLine: 1, endLine: 3 });
+            addToTray(repo, { checkout: repo, path: "b.ts", startLine: 7, endLine: 7 });
+            const chip = () => document.querySelector('[data-testid="terminal-context-tray"]');
+            for (let waited = 0; !chip() && waited < 3000; waited += 50) await wait(50);
+            check("the terminal header shows the tray's count and byte size", () => Boolean(chip()) && chip().textContent.includes("2 references") && chip().textContent.includes("21 B"));
+            written = [];
+            chip().querySelector('[data-testid="terminal-context-tray-insert"]').click();
+            await wait(150);
+            check("Insert all types the references into the live session, unsubmitted, and keeps the tray", () => written.join("") === "@a.ts#L1-L3 @b.ts#L7 " && trayFor(repo).length === 2);
+            chip().querySelector('[data-testid="terminal-context-tray-clear"]').click();
+            await wait(100);
+            check("Clear empties the tray and removes the chip", () => trayFor(repo).length === 0 && !chip());
+          }
           // Synthetic Backspace plus the insertText WebKit emits after it.
           // The guard must write one DEL and must not forward the line.
           written = [];
@@ -2587,12 +2626,13 @@
           const explorerAside = await waitFor(() => visible('[data-testid="terminal-explorer-sidebar"]')[0]);
           check("G1: toggling File Explorer sidebar docks beside a 2-pane split without forcing a 3rd split pane", () => {
             const panes = visible('[role="tabpanel"]');
-            const tabTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-tab"]');
+            // The open target is the app-wide setting, "auto" by default.
+            const autoTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-auto"]');
             const splitTarget = explorerAside?.querySelector('[data-testid="terminal-explorer-target-split"]');
             return (
               Boolean(explorerAside) &&
               panes.length === 2 &&
-              tabTarget?.getAttribute("aria-pressed") === "true" &&
+              autoTarget?.getAttribute("aria-pressed") === "true" &&
               Boolean(splitTarget)
             );
           });
@@ -3068,6 +3108,36 @@
               );
               check(`G8c: a click in a kept pane's own explorer opens beside it instead of replacing the kept file (${innerTabsSeen})`, () =>
                 innerKeptBeside,
+              );
+
+              // G8d: under Auto, a sidebar click goes where the user last worked.
+              // A real pointerdown (a programmatic .click() fires none) inside the
+              // dock makes the terminal that surface, so the file opens as a split;
+              // one inside the page (a stand-in view bar) sends the next to Code.
+              const { repoStore: autoRepoStore } = await import("../src/lib/stores/repoStore.ts");
+              const tabBeforeAuto = getStore(autoRepoStore).activeTab;
+              sidebarNavStore.setView("files");
+              const autoPane = await waitFor(() => sidebarHost.querySelector('[data-testid="sidebar-explorer-pane"]'));
+              autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"]')?.click();
+              const autoPressed = Boolean(await waitFor(() => autoPane?.querySelector('[data-testid="sidebar-explorer-target-auto"][aria-pressed="true"]')));
+              const dockSurface = document.querySelector("[data-terminal-dock] .xterm-rows") ?? document.querySelector("[data-terminal-dock]");
+              dockSurface?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              const panelsBeforeAuto = terminalPanels().length;
+              (await waitFor(() => treeItem(autoPane, "main.ts")))?.click();
+              await waitFor(() => terminalPanels().length === panelsBeforeAuto + 1);
+              const autoSplit = terminalPanels().length === panelsBeforeAuto + 1 && getStore(autoRepoStore).activeTab === tabBeforeAuto;
+              const standInPage = document.createElement("div");
+              standInPage.setAttribute("data-viewbar", "");
+              document.body.appendChild(standInPage);
+              standInPage.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+              treeItem(autoPane, "lib.ts")?.click();
+              await waitFor(() => getStore(autoRepoStore).activeTab === "code");
+              const autoCode = terminalPanels().length === panelsBeforeAuto + 1;
+              standInPage.remove();
+              autoRepoStore.setActiveTab(tabBeforeAuto);
+              await closeFileTab("main.ts");
+              check(`G8d: Auto opens a terminal split after the dock was last used, and the Code page after the page was (pressed ${autoPressed}, split ${autoSplit}, code ${autoCode}, panels ${panelsBeforeAuto}->${terminalPanels().length})`, () =>
+                autoPressed && autoSplit && autoCode,
               );
             } finally {
               await unmountComp(mountedSidebar);

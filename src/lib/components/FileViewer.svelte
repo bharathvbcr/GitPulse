@@ -2,18 +2,17 @@
   import { createRepoPanelCache } from "../panels/repoPanelCache";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
-  import { hasDirtyEditorTabs, type EditorTabState } from "../files/editorTabs";
+  import type { EditorTabState } from "../files/editorTabs";
   import type { FileSidePane } from "../files/filePaneLayout";
   import { livePulsePref } from "../files/livePulsePref";
   import { consumePin, pinRequest } from "../files/pinRequests";
-  import type { FileBlob } from "../files/types";
+  import { requestTreeReveal, treeRevealRequest } from "../files/revealRequests";
   import { overwriteNote } from "../files/overwriteNote";
-  import { recordEditorDrafts } from "../files/editorDraftRegistry";
+  import { draftPaths } from "../files/openDocuments";
   import { loadPersistedEditorTabs, savePersistedEditorTabs } from "../files/editorTabPersist";
   import {
     createLatestOwnerRegistry,
     editorFileSaveQueue,
-    fileSaveKey,
     type LatestOwnerLease,
   } from "../files/serialSave";
 
@@ -23,7 +22,9 @@
     preferredSidePane: FileSidePane;
   }>({
     // A cache bound may discard clean navigation history, never unsaved work.
-    canEvict: ({ tabs }) => !hasDirtyEditorTabs(tabs),
+    // The drafts are the open-file store's, not the tabs': a repository that
+    // still owes one keeps its tabs too.
+    canEvict: (_cached, repo) => draftPaths(repo).length === 0,
   });
   // Both registries must outlive a rendered FileViewer: App remounts this
   // component when switching views while an accepted write may still settle.
@@ -31,15 +32,14 @@
   // Module scope so LazyView sees one stable loader (see LazyView). Blame is
   // the editor's other lens and stays out of the Code chunk until it is used.
   const loadBlame = () => import("./BlameViewer.svelte");
-  const viewerOwners = createLatestOwnerRegistry<{
-    completeSave(path: string, savedContent: string, tabs: EditorTabState, savedBase: string | null): void;
-  }>();
+  // The newest live viewer of a repository is the only one whose pending
+  // decisions (a discard confirmation) may still be applied.
+  const viewerOwners = createLatestOwnerRegistry<true>();
 </script>
 
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
-  import { invoke } from "../ipc/invoke";
   import {
     PanelLeftClose,
     PanelLeftOpen,
@@ -55,15 +55,24 @@
     Columns2,
     XCircle,
   } from "@lucide/svelte";
-  import { createAsyncGuard, type AsyncGuard } from "../async/guard";
-  import { formatError } from "../ui/formatError";
   import { describeError } from "../ui/copy/describeFailure";
   import { copyText } from "../desktop/clipboard";
   import { askConfirm } from "../stores/modalStore";
   import { openInDefaultApp } from "../desktop/openInShell";
-  import type { Guarded } from "../stores/harnessStore";
-  import type { SavedFile } from "../files/types";
-  import { readFileWriteError, saveBase, UnbasedDraft } from "../files/fileWrite";
+  import {
+    claimDocuments,
+    discardDraft,
+    documentConflict,
+    documentIn,
+    documentKey,
+    editDocument,
+    hasDraft,
+    holdDocument,
+    isHeldElsewhere,
+    loadDocument,
+    openDocuments,
+    saveDocument,
+  } from "../files/openDocuments";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
   import FileTreeColumn from "./files/FileTreeColumn.svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
@@ -71,6 +80,7 @@
   import { explorerLens, toggleBlameLens } from "../files/explorerLens";
   import { sidebarExplorerDocked } from "../sidebar/layoutStore";
   import MediaViewer from "./files/MediaViewer.svelte";
+  import { sendToAgentFromPage } from "../terminal/sendFromPage";
   import LivePulseDashboard from "./files/LivePulseDashboard.svelte";
   import FileHistoryMenu from "./files/FileHistoryMenu.svelte";
   import EmptyState from "./EmptyState.svelte";
@@ -87,19 +97,12 @@
   } from "../files/filePaneLayout";
   import {
     activateEditorTab,
-    completeEditorSave,
-    closeEditorTab,
     closeEditorTabs,
     dirtyEditorTabPaths,
-    discardEditorDraft,
-    editorDraft,
     emptyEditorTabs,
-    isEditorDraftConflicted,
-    isEditorTabDirty,
     openPinned,
     openPreview,
     pinEditorTab,
-    updateEditorDraft,
     type EditorTabState as Tabs,
   } from "../files/editorTabs";
 
@@ -119,54 +122,43 @@
   let fileViewWidth = $state(0);
   let preferredSidePane = $state<FileSidePane>("explorer");
   let compactPane = $state<FileSidePane | null>(null);
-  let revealRequest = $state<{ path: string; nonce: number }>({ path: "", nonce: 0 });
 
-  let activeBlob = $state<FileBlob | null>(null);
-  let isLoadingFile = $state(false);
-  /** The repository `activeBlob` was read from; a blob is only "current" for its own repository's path. */
-  let blobRepo = $state<string | null>(null);
-  let fileError = $state<string | null>(null);
-  let inflightGuard: AsyncGuard | null = null;
+  /** How this page names itself to the open-file store, which owns every file's text, draft and save. */
+  const HOLDER = "code-page";
   let prevLoadKey = "";
   let hydratedRepo: string | null = null;
   let lastAppliedStoreFile = "";
   let viewerLease: LatestOwnerLease | null = null;
 
-  /** The disk version a refused save saw, for the file it was refused on. */
-  let saveRefusal = $state<{ repo: string; path: string; actual: string | null } | null>(null);
-
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
+  /** The open file's document: its text, its one draft, and a refused save's conflict. */
+  const activeDoc = $derived(documentIn($openDocuments, $currentRepoPath, activeTabPath));
   /**
-   * The blob on screen is the open file's own. A reload of it (a status change,
-   * an agent edit, a refused save) swaps the blob in place, so the viewer keeps
-   * its scroll, selection, find bar and view mode; only a different file, or a
-   * different repository's file of the same name, shows the placeholder.
+   * A reload of the open file (a status change, an agent edit, a refused save)
+   * swaps the blob in place, so the viewer keeps its scroll, selection, find
+   * bar and view mode; only a different file, or a different repository's file
+   * of the same name (its own document), shows the placeholder.
    */
-  const blobIsCurrent = $derived(
-    activeBlob !== null && activeBlob.path === activeTabPath && blobRepo === $currentRepoPath,
-  );
-  let activeDraft = $derived(
-    activeTabPath ? editorDraft(tabState, activeTabPath) : undefined,
-  );
-  let activeTabDirty = $derived(
-    activeTabPath ? isEditorTabDirty(tabState, activeTabPath) : false,
-  );
+  const activeBlob = $derived(activeDoc?.blob ?? null);
+  const isLoadingFile = $derived(Boolean(activeDoc?.loading));
+  const fileError = $derived(activeDoc?.error ?? null);
+  let activeDraft = $derived(activeDoc?.draft ?? undefined);
+  let activeTabDirty = $derived(activeDraft !== undefined);
+  /** True when `path` carries a draft in the repository on screen; tracked when read in a template. */
+  function isTabDirty(path: string): boolean {
+    return documentIn($openDocuments, $currentRepoPath, path)?.draft != null;
+  }
+  /** The same question, answered from the store as it is now (for state transitions, which must not wait for a render). */
+  function isDirtyHere(path: string): boolean {
+    return hydratedRepo !== null && hasDraft(hydratedRepo, path);
+  }
   /**
    * Set while the open file's draft was made from a version of it that is no
    * longer on disk: a save was refused, or the blob that reloaded carries a
    * different base than the draft. `actual` is the version Overwrite saves over.
    */
-  let activeConflict = $derived.by(() => {
-    if (!activeTabPath || !activeDraft) return null;
-    if (saveRefusal?.repo === hydratedRepo && saveRefusal.path === activeTabPath) {
-      return { actual: saveRefusal.actual };
-    }
-    const diskBase = activeBlob?.path === activeTabPath ? activeBlob.disk_base : null;
-    return isEditorDraftConflicted(activeDraft, diskBase) && diskBase
-      ? { actual: diskBase }
-      : null;
-  });
+  let activeConflict = $derived(documentConflict(activeDoc));
   const outerExplorerDocked = $derived($sidebarExplorerDocked);
   let explorerForcedWithOuterSidebar = $state(false);
   $effect(() => {
@@ -206,51 +198,23 @@
       tabs: {
         tabs: tabState.tabs,
         active: tabState.active,
-        drafts: tabState.drafts,
       },
       explorerOpen,
       preferredSidePane,
     });
-    recordEditorDrafts(repo, Object.keys(tabState.drafts));
+    // Open tabs outlive this component (the cache, then storage), so they are
+    // claimed in the store whether or not they are on screen.
+    claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path));
     savePersistedEditorTabs(repo, {
       tabs: tabState.tabs.map((tab) => ({ path: tab.path, preview: tab.preview })),
       active: tabState.active,
     }, commit);
   }
 
-  async function loadFileContent(path: string) {
-    const repo = $repoStore.currentPath;
-    if (!repo || !path) {
-      activeBlob = null;
-      return;
-    }
-    inflightGuard?.cancel();
-    const guard = createAsyncGuard();
-    inflightGuard = guard;
-    isLoadingFile = true;
-    fileError = null;
-    try {
-      const blob = await invoke<FileBlob>("cmd_get_file_blob", {
-        repoPath: repo,
-        filePath: path,
-        commitId: null,
-      });
-      if (!guard.isLive()) return;
-      activeBlob = blob;
-      blobRepo = repo;
-    } catch (err: unknown) {
-      if (!guard.isLive()) return;
-      fileError = formatError(err);
-      activeBlob = null;
-    } finally {
-      if (guard.isLive()) isLoadingFile = false;
-    }
-  }
-
   function previewFile(path: string) {
     if (!path) return;
     compactPane = null;
-    tabState = openPreview(tabState, path);
+    tabState = openPreview(tabState, path, isDirtyHere);
     repoStore.selectFilePath(path);
     persistTabs(hydratedRepo);
   }
@@ -270,26 +234,52 @@
     persistTabs(hydratedRepo);
   }
 
-  async function confirmDiscardDrafts(candidatePaths: readonly string[]): Promise<boolean> {
+  /**
+   * Asks before the drafts of `candidatePaths` are thrown away. Resolves the
+   * paths whose drafts the caller must now discard, or null when the user kept
+   * them. `closing` is a tab going away rather than a draft being thrown away:
+   * a draft another host (a terminal split) still shows is that host's to
+   * keep, so it neither asks nor goes.
+   */
+  async function confirmDiscardDrafts(
+    candidatePaths: readonly string[],
+    closing: boolean,
+  ): Promise<string[] | null> {
     const repo = hydratedRepo;
-    if (!repo) return false;
+    if (!repo) return null;
     // An accepted save owns the disk outcome. Let it settle before deciding
     // what remains dirty, so “Discard” can never race a queued write that
     // later persists the content the user explicitly chose to discard.
-    const saveKeys = [...new Set(candidatePaths)].map((path) => fileSaveKey(repo, path));
+    const saveKeys = [...new Set(candidatePaths)].map((path) => documentKey(repo, path));
     await fileSaveQueue.whenIdle(saveKeys);
-    if (!isCurrentViewer(repo)) return false;
-    const dirtyPaths = dirtyEditorTabPaths(tabState, candidatePaths);
-    if (dirtyPaths.length === 0) return true;
+    if (!isCurrentViewer(repo)) return null;
+    const dirtyPaths = dirtyEditorTabPaths(
+      tabState,
+      candidatePaths,
+      (path) => hasDraft(repo, path) && !(closing && isHeldElsewhere(repo, path, HOLDER)),
+    );
+    if (dirtyPaths.length === 0) return [];
     const names = dirtyPaths.length <= 3
       ? dirtyPaths.map((path) => `• ${path}`).join("\n")
       : `${dirtyPaths.length} files`;
-    return askConfirm({
+    const confirmed = await askConfirm({
       title: "Discard Unsaved Edits?",
       message: `These editor drafts have not been saved:\n${names}`,
       confirmLabel: "Discard Unsaved Edits",
       cancelLabel: "Keep Editing",
     });
+    return confirmed ? dirtyPaths : null;
+  }
+
+  /** Closes exactly these tabs after asking about their drafts; false when the user kept them. */
+  async function closeTabsAfterConfirm(paths: readonly string[]): Promise<boolean> {
+    const repo = hydratedRepo;
+    if (!repo) return false;
+    const discarded = await confirmDiscardDrafts(paths, true);
+    if (discarded === null || !isCurrentViewer(repo)) return false;
+    for (const path of discarded) discardDraft(repo, path);
+    tabState = closeEditorTabs(tabState, paths);
+    return true;
   }
 
   function isCurrentViewer(repo: string): boolean {
@@ -305,30 +295,20 @@
     event?.stopPropagation();
     const repo = hydratedRepo;
     if (!repo) return;
-    if (!(await confirmDiscardDrafts([path]))) return;
-    if (!isCurrentViewer(repo)) return;
-    tabState = closeEditorTab(tabState, path);
+    if (!(await closeTabsAfterConfirm([path]))) return;
     syncSelectedFilePath();
     persistTabs(repo, true);
-    if (!tabState.active) {
-      activeBlob = null;
-      prevLoadKey = "";
-    }
+    if (!tabState.active) prevLoadKey = "";
   }
 
   async function closeAllTabs() {
     const repo = hydratedRepo;
     if (!repo) return;
     const pathsAtRequest = tabState.tabs.map((tab) => tab.path);
-    if (!(await confirmDiscardDrafts(pathsAtRequest))) return;
-    if (!isCurrentViewer(repo)) return;
-    tabState = closeEditorTabs(tabState, pathsAtRequest);
+    if (!(await closeTabsAfterConfirm(pathsAtRequest))) return;
     syncSelectedFilePath();
     persistTabs(repo, true);
-    if (!tabState.active) {
-      activeBlob = null;
-      prevLoadKey = "";
-    }
+    if (!tabState.active) prevLoadKey = "";
   }
 
   async function closeOtherTabs() {
@@ -339,30 +319,27 @@
     const pathsToClose = tabState.tabs
       .filter((tab) => tab.path !== keepPath)
       .map((tab) => tab.path);
-    if (!(await confirmDiscardDrafts(pathsToClose))) return;
-    if (!isCurrentViewer(repo)) return;
-    tabState = pinEditorTab(closeEditorTabs(tabState, pathsToClose), keepPath);
+    if (!(await closeTabsAfterConfirm(pathsToClose))) return;
+    tabState = pinEditorTab(tabState, keepPath);
     syncSelectedFilePath();
     persistTabs(repo, true);
   }
 
   function handleDraftChange(path: string, newContent: string, sourceContent: string) {
+    const repo = hydratedRepo;
+    if (!repo) return;
     // The first keystroke records the disk version this draft is made from;
-    // `updateEditorDraft` ignores the base on every later one.
-    const base = activeBlob?.path === path ? activeBlob.disk_base ?? null : null;
-    // A refusal belongs to the draft it refused; a new draft starts clean.
-    if (!tabState.drafts[path] && saveRefusal?.repo === hydratedRepo && saveRefusal.path === path) {
-      saveRefusal = null;
-    }
-    tabState = updateEditorDraft(tabState, path, newContent, sourceContent, base);
-    persistTabs(hydratedRepo);
+    // the store ignores the base on every later one.
+    editDocument(repo, path, newContent, sourceContent);
   }
 
   /**
-   * A save that carries the draft's base. A `changed_on_disk` refusal keeps
-   * the draft, records the disk version it saw (the Overwrite base), and
-   * reloads the blob so Compare shows what is there now; the error is still
-   * thrown so the editor stays in edit mode.
+   * A save of `path` in the repository this page is on. The store carries the
+   * draft's base, completes the draft and, on a refusal, keeps it and records
+   * the disk version it saw (see `saveDocument`); the error is still thrown so
+   * the editor stays in edit mode. `overrideBase` undefined saves against the
+   * draft's own base; a string saves against that version, which is how
+   * Overwrite names the one it already saw; null is an unconditional write.
    */
   async function saveDraft(
     path: string,
@@ -370,23 +347,24 @@
     overrideBase?: string | null,
     overwrite = false,
   ) {
-    // The repository the save was started in: a refusal belongs to it, not to
-    // whichever repository has the same relative path open when it settles.
+    // The repository the save was started in, not whichever repository is open
+    // when it settles.
     const repo = hydratedRepo;
-    try {
-      await handleFileSave(path, newContent, overrideBase, overwrite);
-      saveRefusal = null;
-    } catch (err: unknown) {
-      const typed = readFileWriteError(err);
-      if (repo && typed?.code === "changed_on_disk") {
-        saveRefusal = { repo, path, actual: typed.actual };
-        void loadFileContent(path);
-      } else if (repo && err instanceof UnbasedDraft) {
-        // No version to judge by: the banner offers Overwrite as the way out.
-        saveRefusal = { repo, path, actual: null };
+    if (!repo || !path) throw new Error("No active file to save");
+    const repositoryChanged = () => {
+      if ($repoStore.currentPath !== repo) {
+        throw new Error("Repository changed before save; the editor draft was kept");
       }
-      throw err;
-    }
+    };
+    repositoryChanged();
+    await saveDocument(repo, path, newContent, {
+      overrideBase,
+      overwrite,
+      beforeWrite: repositoryChanged,
+      afterSave: async () => {
+        if ($repoStore.currentPath === repo) await repoStore.refresh();
+      },
+    });
   }
 
   /** Overwrite: save the draft over exactly the disk version the refusal saw. */
@@ -422,100 +400,21 @@
     const path = activeTabPath;
     if (!path) return;
     if (!(await requestDiscardDraft(path))) return;
-    saveRefusal = null;
+    const repo = hydratedRepo;
+    if (!repo) return;
     // The draft is gone and the editor must close on the disk version, which a
     // viewer kept mounted across an in-place reload would not do; dropping the
-    // blob brings the placeholder back and remounts it.
-    activeBlob = null;
-    await loadFileContent(path);
+    // blob (`remount`) brings the placeholder back and remounts it.
+    await loadDocument(repo, path, { force: true, remount: true });
   }
 
   async function requestDiscardDraft(path: string): Promise<boolean> {
     const repo = hydratedRepo;
     if (!repo) return false;
-    if (!(await confirmDiscardDrafts([path]))) return false;
-    if (!isCurrentViewer(repo)) return false;
-    tabState = discardEditorDraft(tabState, path);
-    persistTabs(repo);
+    const discarded = await confirmDiscardDrafts([path], false);
+    if (discarded === null || !isCurrentViewer(repo)) return false;
+    for (const draftPath of discarded) discardDraft(repo, draftPath);
     return true;
-  }
-
-  function applyCompletedSaveToCurrentViewer(
-    repo: string,
-    path: string,
-    savedContent: string,
-    tabs: Tabs,
-    savedBase: string | null,
-  ) {
-    if (!isCurrentViewer(repo)) return;
-    tabState = tabs;
-    if (activeTabPath === path && activeBlob?.path === path) {
-      // The blob now is what was written, so its base is the saved one: left
-      // stale it would read as an external change to the next keystroke.
-      activeBlob = { ...activeBlob, text: savedContent, disk_base: savedBase };
-    }
-  }
-
-  function completeCachedEditorSave(
-    repo: string,
-    path: string,
-    savedContent: string,
-    savedBase: string | null,
-  ) {
-    const cached = tabCache.get(repo);
-    if (!cached) return;
-    // The cache is synchronously updated on every keystroke. Completing
-    // against this latest state, rather than the initiating instance's state,
-    // preserves a draft typed while the backend write was in flight.
-    const tabs = completeEditorSave(cached.tabs, path, savedContent, savedBase);
-    tabCache.set(repo, { ...cached, tabs });
-    recordEditorDrafts(repo, Object.keys(tabs.drafts));
-    // Dispatch through the registry rather than this initiating component:
-    // after a view remount the newest owner receives the latest cached state.
-    viewerOwners.current(repo)?.completeSave(path, savedContent, tabs, savedBase);
-  }
-
-  /**
-   * `overrideBase` undefined saves against the draft's own base (or, with no
-   * draft, the blob just shown); a string saves against that version, which is
-   * how Overwrite names the one it already saw; null is an unconditional write.
-   */
-  async function handleFileSave(
-    path: string,
-    newContent: string,
-    overrideBase?: string | null,
-    overwrite = false,
-  ) {
-    const repo = hydratedRepo;
-    if (!repo || !path) throw new Error("No active file to save");
-    if ($repoStore.currentPath !== repo) {
-      throw new Error("Repository changed before save; the editor draft was kept");
-    }
-    // Save requests can survive a view remount. The module-level queue binds
-    // every accepted operation to its canonical repository and relative path,
-    // and keeps completion/refresh order the same as disk-write order.
-    return fileSaveQueue.run(fileSaveKey(repo, path), async () => {
-      if ($repoStore.currentPath !== repo) {
-        throw new Error("Repository changed before save; the editor draft was kept");
-      }
-      const judged = saveBase(
-        tabCache.get(repo)?.tabs.drafts[path],
-        activeBlob?.path === path ? activeBlob.disk_base : null,
-        overrideBase,
-      );
-      if (judged === "unbased") throw new UnbasedDraft(path);
-      const expectedBase = judged.base;
-      const saved = await invoke<Guarded<SavedFile>>("cmd_write_file_content", {
-        repoPath: repo,
-        filePath: path,
-        content: newContent,
-        expectedBase,
-        // Sent only for Overwrite, so an ordinary save's payload is unchanged.
-        ...(overwrite ? { overwrite: true } : {}),
-      });
-      completeCachedEditorSave(repo, path, newContent, saved.output.disk_base);
-      if ($repoStore.currentPath === repo) await repoStore.refresh();
-    });
   }
 
   function openActiveInDefaultApp() {
@@ -568,7 +467,7 @@
   function revealDirectory(dir: string) {
     if (!dir) return;
     if (!paneLayout.explorerVisible) toggleSidePane("explorer");
-    revealRequest = { path: dir, nonce: revealRequest.nonce + 1 };
+    requestTreeReveal(dir);
   }
 
   function toggleSidePane(pane: FileSidePane) {
@@ -666,18 +565,12 @@
     if (hydratedRepo) untrack(() => persistTabs(hydratedRepo));
     viewerLease?.release();
     hydratedRepo = repo;
-    viewerLease = repo
-      ? viewerOwners.claim(repo, {
-          completeSave: (path, savedContent, tabs, savedBase) =>
-            applyCompletedSaveToCurrentViewer(repo, path, savedContent, tabs, savedBase),
-        })
-      : null;
+    viewerLease = repo ? viewerOwners.claim(repo, true) : null;
     lastAppliedStoreFile = "";
     if (!repo) {
       untrack(() => {
         compactPane = null;
         tabState = emptyEditorTabs();
-        activeBlob = null;
       });
       prevLoadKey = "";
       return;
@@ -705,6 +598,8 @@
         explorerOpen = true;
         preferredSidePane = "explorer";
       }
+      // Tabs restored from storage are open before any mutation announces them.
+      claimDocuments(repo, HOLDER, tabState.tabs.map((tab) => tab.path));
     });
     prevLoadKey = "";
   });
@@ -720,7 +615,7 @@
     lastAppliedStoreFile = storeSelected;
     untrack(() => {
       if (!tabState.tabs.some((t) => t.path === storeSelected)) {
-        tabState = openPreview(tabState, storeSelected);
+        tabState = openPreview(tabState, storeSelected, isDirtyHere);
         persistTabs(hydratedRepo);
       } else {
         tabState = activateEditorTab(tabState, storeSelected);
@@ -745,6 +640,34 @@
     });
   });
 
+  // The open file is held while it is shown, so the store keeps its text
+  // loaded and drops it once no host shows it. Declared before the read below,
+  // which needs the hold in place.
+  $effect(() => {
+    const repo = $currentRepoPath;
+    const path = tabState.active;
+    if (!repo || !path) return;
+    return holdDocument(repo, path, HOLDER);
+  });
+
+  // A tab that owns unsaved work is kept: the draft may have been typed in a
+  // terminal split, which this page's own handlers never see.
+  $effect(() => {
+    const docs = $openDocuments;
+    const repo = $currentRepoPath;
+    const tabs = tabState.tabs;
+    if (!repo) return;
+    untrack(() => {
+      let next = tabState;
+      for (const tab of tabs) {
+        if (tab.preview && documentIn(docs, repo, tab.path)?.draft) next = pinEditorTab(next, tab.path);
+      }
+      if (next === tabState) return;
+      tabState = next;
+      persistTabs(hydratedRepo);
+    });
+  });
+
   const activeStatusCode = $derived(
     tabState.active ? ($repoStore.statuses.find((s) => s.path === tabState.active)?.status_code ?? "") : "",
   );
@@ -755,17 +678,15 @@
     const key = `${repo ?? ""}\u0000${path ?? ""}\u0000${code}`;
     if (key === prevLoadKey) return;
     prevLoadKey = key;
-    if (!repo || !path) {
-      if (!path) activeBlob = null;
-      return;
-    }
-    void loadFileContent(path);
+    if (!repo || !path) return;
+    // Forced: the open file is read again on every activation and status
+    // change, kept on screen meanwhile. Held above, so the store keeps it.
+    void loadDocument(repo, path, { force: true });
   });
 
   $effect(() => {
     return () => {
       viewerLease?.release();
-      inflightGuard?.cancel();
     };
   });
 
@@ -851,7 +772,7 @@
       >
         {#each openTabs as tab (tab.path)}
           {@const isActive = tab.path === activeTabPath}
-          {@const tabDirty = isEditorTabDirty(tabState, tab.path)}
+          {@const tabDirty = isTabDirty(tab.path)}
           {@const tabKind = classifyFileChange($repoStore.statuses.find((s) => s.path === tab.path))}
           <div
             role="tab"
@@ -1049,7 +970,7 @@
   {#snippet explorerTree()}
     <ExplorerRail
       selectedFile={activeTabPath}
-      {revealRequest}
+      revealRequest={$treeRevealRequest}
       onSelectFile={(path) => previewFile(path)}
       onPinFile={(path) => pinFile(path)}
     />
@@ -1080,7 +1001,7 @@
           <!-- Blame reads the same selection the tabs drive, so it follows
                the active tab. It does not wait for the editor's read. -->
           <LazyView load={loadBlame} name="Blame" />
-        {:else if isLoadingFile && !blobIsCurrent}
+        {:else if isLoadingFile && !activeBlob}
           <div class="flex-1 flex flex-col items-center justify-center text-textMuted text-xs gap-2">
             <span>Loading file contents…</span>
           </div>
@@ -1111,6 +1032,7 @@
             onDraftChange={(newContent, sourceContent) =>
               handleDraftChange(activeTabPath, newContent, sourceContent)}
             onRequestDiscard={() => requestDiscardDraft(activeTabPath)}
+            onSendSelectionToAgent={(text, checkout) => void sendToAgentFromPage(text, checkout)}
           />
         {:else}
           <EmptyState

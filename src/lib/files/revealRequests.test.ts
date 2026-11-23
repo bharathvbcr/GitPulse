@@ -9,7 +9,37 @@ import {
   MAX_REVEAL_LINE,
   MAX_REVEAL_PATH,
   REVEAL_TTL_MS,
+  clearTreeReveal,
+  requestTreeReveal,
+  treeRevealRequest,
 } from "./revealRequests";
+
+describe("tree reveal requests", () => {
+  beforeEach(() => clearTreeReveal());
+
+  it("carries the path with a sequence number, and a repeat of the same path is a new request", () => {
+    expect(requestTreeReveal("src/a.ts", 1_000)).toBe(true);
+    const first = get(treeRevealRequest);
+    expect(first).toMatchObject({ path: "src/a.ts", at: 1_000 });
+    requestTreeReveal("src/a.ts", 2_000);
+    expect(get(treeRevealRequest)!.nonce).toBeGreaterThan(first!.nonce);
+  });
+
+  it("refuses an empty or oversized path and leaves the pending request alone", () => {
+    requestTreeReveal("src/a.ts");
+    const before = get(treeRevealRequest);
+    expect(requestTreeReveal("")).toBe(false);
+    expect(requestTreeReveal("x".repeat(MAX_REVEAL_PATH + 1))).toBe(false);
+    expect(get(treeRevealRequest)).toBe(before);
+  });
+
+  it("does not disturb a pending line request", () => {
+    clearReveal();
+    requestReveal("src/a.ts", 4, null, 1_000);
+    requestTreeReveal("src/a.ts");
+    expect(consumeReveal("src/a.ts", 1_000)).toMatchObject({ line: 4 });
+  });
+});
 
 describe("reveal requests", () => {
   beforeEach(() => clearReveal());

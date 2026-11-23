@@ -141,7 +141,7 @@
   import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
   import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
-  import { planPaste } from "../terminal/pasteGuard";
+  import { planInsert, planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
   import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
   import { createRafWriteQueue } from "../terminal/rafWriteQueue";
@@ -1839,21 +1839,31 @@
 
   /** Injects text (file `@path` reference, selection range, or dropped paths) into the live PTY. */
   export function insertText(text: string, options?: { focus?: boolean }): boolean {
-    if (!text || disposed || exited) return false;
+    return insertChecked(text, options) === null;
+  }
+
+  /**
+   * `insertText` that says why it did nothing: null when the text went in, the
+   * reason otherwise. A block with line breaks goes in only as one bracketed
+   * paste (`planInsert`); typed, its first break would submit it.
+   */
+  export function insertChecked(text: string, options?: { focus?: boolean }): string | null {
+    if (!text) return "There is nothing to insert.";
+    if (disposed || exited) return "That session has ended.";
     if (term) {
-      if (launcher === "shell" && term.modes.bracketedPasteMode) {
-        term.paste(planPaste(text, true).text);
-      } else {
-        term.input(text, true);
-      }
+      const plan = planInsert(text, { bracketed: term.modes.bracketedPasteMode, shell: launcher === "shell" });
+      if (plan.kind === "refuse") return plan.reason;
+      if (plan.kind === "paste") term.paste(plan.text);
+      else term.input(plan.text, true);
       if (options?.focus !== false) term.focus();
-      return true;
+      return null;
     }
     if (lifecycle) {
+      if (/[\r\n]/.test(text)) return "That session has no terminal to paste a block of lines into yet.";
       lifecycle.write(text);
-      return true;
+      return null;
     }
-    return false;
+    return "That session is not ready for input yet.";
   }
 
   export function isLive(): boolean {

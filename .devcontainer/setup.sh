@@ -38,4 +38,8 @@ cargo install cargo-llvm-cov --locked
 # The node feature supplies npm; pin to the same version package.json names.
 npm install -g bun@1.4.2
 
+# DevMap at the repo's pin (DEVMAP_REV in ci.yml): one installer shared with the
+# cloud/SSH bootstrap. --strict so a container without it refuses to come up.
+bash "$(dirname "$0")/../scripts/cloud/setup.sh" --strict
+
 echo "GitPulse dev container ready. Run 'bun install --frozen-lockfile' then 'bun run ci:local'."
