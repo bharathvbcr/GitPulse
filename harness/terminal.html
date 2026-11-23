@@ -1042,7 +1042,7 @@
             await run("git log");
             check("an incomplete output carries the backend's reason, never an invented cap",
               () => consoleText().includes("[Output is incomplete: the stream was not read to the end]") && !consoleText().includes("exceeded cap") && consoleText().includes("exit 2"));
-            button("Clear")?.click(); await wait();
+            await dockMenu("dock-menu-clear-output");
             check("Clear empties the Console's output", () => !consoleText().includes("On branch main") && !consoleText().includes("the stream was not read"));
           }
           [...document.querySelectorAll('[data-testid="dock-section-shell"]')].find((el) => el.getClientRects().length).click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
