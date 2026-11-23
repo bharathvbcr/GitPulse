@@ -416,33 +416,49 @@
     let clipWhy = "";
     const recordClip = async () => {
       if (typeof MediaRecorder === "undefined") { clipWhy = "MediaRecorder is undefined"; return null; }
+      // The canvas is put on the page while it records: WebKit captures a canvas
+      // frame only when it prepares that canvas's display buffer, which it does
+      // only for a canvas that is rendered, so a detached canvas (fine in Chrome)
+      // gave WebKit's MediaRecorder no frames and an empty clip.
       const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 200 });
+      canvas.setAttribute("aria-hidden", "true");
+      Object.assign(canvas.style, { position: "fixed", right: "0", bottom: "0", width: "320px", height: "200px", pointerEvents: "none", zIndex: "2147483647" });
+      document.body.append(canvas);
       const ctx = canvas.getContext("2d");
       const stream = canvas.captureStream?.(30);
       // Record a type this engine can also play back: WebKit records WebM it cannot decode.
       const player = document.createElement("video");
       const type = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported?.(t) && player.canPlayType(t) !== "");
       if (!stream || !type) {
+        canvas.remove();
         clipWhy = `MediaRecorder ${typeof MediaRecorder}, captureStream ${typeof canvas.captureStream}, stream ${!!stream}; ${["video/mp4", "video/webm"].map((t) => `${t}: record ${MediaRecorder.isTypeSupported?.(t)}, play "${player.canPlayType(t)}"`).join("; ")}`;
         return null;
       }
       let frame = 0;
-      const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); };
+      const [track] = stream.getVideoTracks();
+      const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); track?.requestFrame?.(); };
       paint();
       const painter = setInterval(paint, 33);
       const recorder = new MediaRecorder(stream, { mimeType: type });
       const chunks = [];
-      recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+      let events = 0;
+      let recorderError = "";
+      recorder.ondataavailable = (event) => { events++; if (event.data.size > 0) chunks.push(event.data); };
+      recorder.onerror = (event) => { recorderError = event.error?.name ?? event.error?.message ?? "error"; };
       const stopped = new Promise((resolve) => (recorder.onstop = resolve));
       recorder.start(100);
       await new Promise((r) => setTimeout(r, 1500));
+      const trackState = `track ${track?.readyState ?? "none"}, muted ${track?.muted}`;
       recorder.stop(); await stopped; clearInterval(painter);
-      for (const track of stream.getTracks()) track.stop();
-      return new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
+      for (const t of stream.getTracks()) t.stop();
+      canvas.remove();
+      const file = new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
+      if (file.size === 0) clipWhy = `empty: ${frame} frames painted, ${events} dataavailable events, ${trackState}${recorderError ? `, recorder error ${recorderError}` : ""}`;
+      return file;
     };
     const clip = await recordClip();
-    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clip ? "" : ` (${clipWhy})`}`, () => clip !== null && clip.size > 0);
-    if (clip) {
+    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clipWhy ? ` (${clipWhy})` : ""}`, () => clip !== null && clip.size > 0);
+    if (clip?.size) {
       const input = $("[data-wallpaper-input]");
       const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;
       input.dispatchEvent(new Event("change", { bubbles: true }));
