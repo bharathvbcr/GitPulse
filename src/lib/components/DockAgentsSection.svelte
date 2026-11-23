@@ -126,12 +126,18 @@
       data-testid="dock-agents-follow"
       aria-pressed={followAgent}
       disabled={!canFollow}
+      title={canFollow ? "Show the files agents modify in one split pane" : "Open a repository to follow agent edits"}
       onclick={onToggleFollow}
     >
       <Eye size={12} aria-hidden="true" />
       Follow edits
     </button>
   </div>
+  {#if launchers.length > 0 && launchers.every((launcher) => launcher.disabled)}
+    <!-- A disabled button cannot take focus, so its tooltip is hover-only:
+         say in view why nothing can start. -->
+    <p class="mt-1.5 text-micro text-warn" role="status" data-testid="dock-agents-blocked">{launchers[0].title}</p>
+  {/if}
 
   {#if empty}
     <div class="flex flex-col items-center gap-1 py-10 text-center" data-testid="dock-agents-empty">

@@ -150,11 +150,71 @@
   let exitMs = $state(motionMs("fast"));
   const phase = $derived(leaving ? "slide-out" : "slide-in");
 
+  let sheet: HTMLDivElement | undefined = $state();
+  /**
+   * Where an interrupted slide resumes from. Toggling the dock mid-slide
+   * (⌃` twice, or Hide while it is still rising) swaps the animation, which
+   * would restart from its keyframe's own start: a fully hidden sheet
+   * snapping back into view, or a rising one snapping open before it sinks.
+   * Instead the next slide starts where the sheet is (`--gp-dock-from`).
+   */
+  let slideFrom = $state<number | null>(null);
+  let pendingSlideFrom: number | null = null;
+
+  /** The sheet's offset while a slide is in flight, or null when it is at rest. */
+  function inFlightOffset(): number | null {
+    const el = sheet;
+    if (!el || !el.getClientRects().length) return null;
+    if (!el.getAnimations().some((animation) => animation.playState === "running")) return null;
+    const y = new DOMMatrixReadOnly(getComputedStyle(el).transform).m42;
+    return y > 0.5 && y < el.offsetHeight - 0.5 ? Math.round(y) : null;
+  }
+
+  /**
+   * Focus the dock took is given back when it closes. Hidden is display:none,
+   * so focus left on the shell (or the Hide button) would sit in an invisible
+   * subtree: the browser drops it to <body> and the reader loses their place.
+   * The status-bar pill is never the target: focusing it opens its menu.
+   */
+  let returnFocusTo: HTMLElement | null = null;
+  // svelte-ignore state_referenced_locally
+  // Justified: like `wasOpen`, only ever compared with the next value.
+  let preWasOpen = open;
+
+  // Before the DOM changes: once `open` flips the sheet may already be
+  // display:none, with no position left to read and focus already dropped.
+  $effect.pre(() => {
+    const isOpen = open;
+    untrack(() => {
+      if (isOpen === preWasOpen) return;
+      preWasOpen = isOpen;
+      pendingSlideFrom = inFlightOffset();
+      const active = document.activeElement;
+      if (isOpen) {
+        returnFocusTo =
+          active instanceof HTMLElement && active !== document.body && !host?.contains(active) && !active.closest(DOCK_TRIGGER)
+            ? active
+            : null;
+        return;
+      }
+      if (!(active instanceof HTMLElement) || !host?.contains(active)) return;
+      const target = returnFocusTo;
+      returnFocusTo = null;
+      if (target?.isConnected && target.getClientRects().length && !target.closest(DOCK_TRIGGER)) {
+        target.focus({ preventScroll: true });
+      } else {
+        active.blur();
+      }
+    });
+  });
+
   $effect(() => {
     const isOpen = open;
     untrack(() => {
       if (isOpen === wasOpen) return;
       wasOpen = isOpen;
+      slideFrom = pendingSlideFrom;
+      pendingSlideFrom = null;
       if (leaveTimer) clearTimeout(leaveTimer);
       leaveTimer = null;
       exitMs = motionMs("fast");
@@ -347,7 +407,9 @@
     data-dock-mode={overlay ? "overlay" : "docked"}
   >
   <div
+    bind:this={sheet}
     class="gp-dock-motion flex flex-col flex-1 min-h-0 overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'shadow-float' : ''}"
+    style:--gp-dock-from={slideFrom === null ? undefined : `${slideFrom}px`}
     data-dock-sheet
     data-phase={phase}
   >

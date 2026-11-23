@@ -2685,13 +2685,16 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
  *
  * Transform only, never size: the sheet keeps its height while it moves, so
  * no terminal is re-fitted and no PTY told a new size by the motion. The
- * workspace column clips the sheet below its bottom edge. `--gp-dock-exit-ms`
+ * workspace column clips the sheet below its bottom edge. A slide that
+ * interrupts another starts where the sheet is, through `--gp-dock-from`
+ * (set by the host), instead of jumping to its keyframe's start.
+ * `--gp-dock-exit-ms`
  * is set by the host from the `fast` token, so no duration literal lives in
  * a component.
  */
 @keyframes gp-dock-slide-in {
   from {
-    transform: translate3d(0, 100%, 0);
+    transform: translate3d(0, var(--gp-dock-from, 100%), 0);
   }
   to {
     transform: translate3d(0, 0, 0);
@@ -2700,7 +2703,7 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
 
 @keyframes gp-dock-slide-out {
   from {
-    transform: translate3d(0, 0, 0);
+    transform: translate3d(0, var(--gp-dock-from, 0px), 0);
   }
   to {
     transform: translate3d(0, 100%, 0);

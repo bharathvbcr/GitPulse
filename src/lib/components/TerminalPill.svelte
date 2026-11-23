@@ -4,7 +4,7 @@
   import { describeError } from "../ui/copy/describeFailure";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { LAYERS } from "../ui/layers";
-  import { Eye, EyeOff, PanelBottom, Plus, SquareTerminal } from "@lucide/svelte";
+  import { ChevronDown, ChevronUp, PanelBottom, Plus, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { onDestroy, tick, untrack } from "svelte";
   import { portal } from "../dom/portal";
@@ -327,7 +327,6 @@
       data-testid="terminal-pill"
       aria-pressed={$repoStore.terminalOpen}
       aria-expanded={menuOpen}
-      aria-haspopup="menu"
       aria-controls="terminal-pill-menu"
       aria-label={pillLabel}
       onclick={toggleDock}
@@ -364,7 +363,7 @@
       data-testid="terminal-pill-menu"
       data-terminal-pill-menu
       role="group"
-      aria-label="Dock options"
+      aria-label="Dock sessions"
       use:portal={"body"}
       use:popover={menuPopover} out:popoverExit
       onpointerenter={showMenu}
@@ -442,7 +441,7 @@
         data-testid="terminal-pill-toggle"
         onclick={() => { toggleDock(); closeMenu(); }}
       >
-        {#if $repoStore.terminalOpen}<EyeOff size={13} class="shrink-0 text-textMuted" />{:else}<Eye size={13} class="shrink-0 text-textMuted" />{/if}
+        {#if $repoStore.terminalOpen}<ChevronDown size={13} class="shrink-0 text-textMuted" />{:else}<ChevronUp size={13} class="shrink-0 text-textMuted" />{/if}
         <span>{$repoStore.terminalOpen ? "Hide dock" : "Show dock"}</span>
       </button>
       {#if terminalPill.focusKey}

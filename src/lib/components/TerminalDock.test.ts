@@ -140,6 +140,23 @@ describe("TerminalDock modes", () => {
     expect(source).toContain("{#if mounted}");
   });
 
+  it("resumes an interrupted slide from where the sheet is, read before the DOM changes", () => {
+    // $effect.pre: once `open` flips, the sheet can already be display:none.
+    const pre = source.slice(source.indexOf("$effect.pre("), source.indexOf("$effect(() => {\n    const isOpen = open;"));
+    expect(pre).toContain("pendingSlideFrom = inFlightOffset();");
+    expect(source).toContain('animation.playState === "running"');
+    expect(source).toContain("slideFrom = pendingSlideFrom;");
+    expect(source).toContain("style:--gp-dock-from={slideFrom === null ? undefined : `${slideFrom}px`}");
+    expect(source).toContain("bind:this={sheet}");
+  });
+
+  it("gives focus back when it closes, never to its own pill, and never leaves it in the hidden dock", () => {
+    const pre = source.slice(source.indexOf("$effect.pre("), source.indexOf("$effect(() => {\n    const isOpen = open;"));
+    expect(pre).toContain("!host?.contains(active) && !active.closest(DOCK_TRIGGER)");
+    expect(pre).toContain("target.focus({ preventScroll: true });");
+    expect(pre).toContain("active.blur();");
+  });
+
   it("leaves with the exit token when docked too, not only when floating", () => {
     expect(source).toContain("if (isOpen || exitMs === 0) {");
     expect(source).not.toMatch(/isOpen \|\| !overlay/);

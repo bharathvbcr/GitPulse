@@ -424,7 +424,7 @@
           role="menuitem"
           class="gp-menu-item"
           data-testid="dock-menu-clear-output"
-          title="Clear terminal output"
+          title="Clear the Console's output"
           onclick={() => runItem(onClearOutput)}
         ><Trash2 size={13} class="shrink-0 text-textMuted" /><span>Clear output</span></button>
       {/if}

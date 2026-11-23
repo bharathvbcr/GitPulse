@@ -121,4 +121,18 @@ describe("DockAgentsSection", () => {
   it("renders heading counts as count chips", () => {
     expect(html()).toContain('data-kind="count"');
   });
+
+  it("says in view why no agent can start when every launcher is disabled", () => {
+    const full = "All 32 terminal sessions are open — close one under ⋯ → All sessions, or raise the limit in Settings → Agents";
+    const blocked = html({ launchers: launchers.map((launcher) => ({ ...launcher, disabled: true, title: full })) });
+    expect(blocked).toContain('data-testid="dock-agents-blocked"');
+    expect(blocked).toContain('role="status"');
+    expect(blocked).toContain(full);
+    // One launcher still able to start: no blocked notice, the tooltips carry the rest.
+    expect(html()).not.toContain("dock-agents-blocked");
+  });
+
+  it("explains a disabled Follow edits", () => {
+    expect(html({ canFollow: false })).toContain('title="Open a repository to follow agent edits"');
+  });
 });

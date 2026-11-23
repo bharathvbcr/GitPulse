@@ -1321,7 +1321,7 @@
   const canCreate = $derived(!stripFull && $terminalSessions.length < $terminalSessionLimit);
   const capacityTitle = $derived(canCreate ? "New terminal session" : stripFull
     ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
-    : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
+    : `All ${$terminalSessionLimit} terminal sessions are open — close one under ⋯ → All sessions, or raise the limit in Settings → Agents`);
   /**
    * A browser session holds a tab but no process slot, so only the strip
    * bounds it here; the backend caps open pages (`browser::MAX_PANES`) and
@@ -7130,7 +7130,7 @@
           <Terminal size={28} />
         </div>
           <div>
-            <h3 class="font-semibold text-textPrimary text-sm">Direct repository terminal</h3>
+            <h3 class="font-semibold text-textPrimary text-sm">Run one command, directly</h3>
             <p class="text-xs text-textMuted mt-1">
               Execute commands directly in your repository — no shell in between, so arguments stay
               literal. Git commands are judged by the Manvi gate before they run; other tools run
