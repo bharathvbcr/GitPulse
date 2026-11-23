@@ -3417,6 +3417,34 @@ mod os {
         super::outranks_reader(target_permitted, own_effective)
     }
 
+    /// Whether the kernel keeps `pid`'s memory and working directory from its
+    /// own user because `pid` is not dumpable: it changed credentials without
+    /// exec'ing (PAM's `(sd-pam)`, forked by systemd as root and dropped to
+    /// the user), it marked itself so (`ssh-agent`, `gpg-agent`,
+    /// `prctl(PR_SET_DUMPABLE, 0)`), or it runs a set-id program.
+    ///
+    /// The kernel says so in `/proc` itself: `task_dump_owner` gives such a
+    /// process's files (`environ`, `status`, ...) to root while `/proc/<pid>`
+    /// stays the user's. That is the case asked here: `/proc/<pid>` ours,
+    /// `/proc/<pid>/environ` root's. A reader that is root learns nothing
+    /// from it and never asks. A process in another user namespace has its
+    /// files given to that namespace's root instead, which is not 0 here, so
+    /// it is not explained by this and stays unproven.
+    fn withheld_from_its_user(pid: i32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let me = uid();
+        if me == 0 {
+            return false;
+        }
+        let (Ok(dir), Ok(environ)) = (
+            std::fs::symlink_metadata(format!("/proc/{pid}")),
+            std::fs::symlink_metadata(format!("/proc/{pid}/environ")),
+        ) else {
+            return false;
+        };
+        dir.uid() == me && environ.uid() == 0
+    }
+
     fn read_identity(pid: i32, name: String, ours: bool) -> Identity {
         if !ours {
             return Identity::new(name, None, Vec::new(), None);
@@ -3654,12 +3682,14 @@ mod os {
         }
         // On the user's own uid, a read the kernel refused because the process
         // holds capabilities this one lacks (a helper given file capabilities,
-        // an agent a supervisor started privileged) is not a failure to look:
-        // the process cannot be inspected without privilege, as another
+        // an agent a supervisor started privileged), or because the process
+        // is not dumpable and the kernel has given its /proc files to root
+        // (`(sd-pam)`, `ssh-agent`, a set-id program), is not a failure to
+        // look: the process cannot be inspected without privilege, as another
         // user's cannot, and is counted as one. A refusal with no such cause
         // stays unproven.
         let refused = argv.is_none() || env.is_none() || cwd.is_none();
-        let mine = !(refused && outranks_this_process(pid));
+        let mine = !(refused && (outranks_this_process(pid) || withheld_from_its_user(pid)));
         let detail = refused.then(|| format!("{pid} {}: {}", info.name, failed.join(", ")));
         Some(super::ProcessUse {
             pid,
@@ -4582,6 +4612,100 @@ pub(crate) mod tests {
             command.env("CARGO_TARGET_DIR", scratch);
         }
         command.spawn_locked().expect("spawn")
+    }
+
+    /// The child for the test below: marks itself not dumpable, as
+    /// `ssh-agent` does and as `(sd-pam)` is after PAM drops it to the user,
+    /// then holds still until its stdin closes. Only with
+    /// `GITPULSE_NOT_DUMPABLE_CHILD` set; as an ordinary test it does nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn not_dumpable_child_holds_still_until_stdin_closes() {
+        if std::env::var_os("GITPULSE_NOT_DUMPABLE_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` takes no pointers and changes
+        // only this process's dumpable flag.
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0)");
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+    }
+
+    /// A process of the user's own uid that the kernel will not let its user
+    /// inspect, because it is not dumpable, is counted like another user's
+    /// process, not left unproven: on GitHub's ubuntu runner `(sd-pam)` is one,
+    /// and it held every worktree teardown ("1 of your processes could not be
+    /// read"). The same child left dumpable is still read in full.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_the_kernel_withholds_from_its_own_user_is_counted_not_unproven() {
+        use crate::procguard::LockedSpawn;
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root can read a process that is not dumpable");
+            return;
+        }
+        let spawn = |not_dumpable: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    if not_dumpable {
+                        "sysload::procscan::tests::not_dumpable_child_holds_still_until_stdin_closes"
+                    } else {
+                        "sysload::procscan::tests::directory_use_child_holds_still_until_stdin_closes"
+                    },
+                    "--nocapture",
+                ])
+                .env(
+                    if not_dumpable { "GITPULSE_NOT_DUMPABLE_CHILD" } else { "GITPULSE_DIR_USE_CHILD" },
+                    "1",
+                )
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn_locked().expect("spawn")
+        };
+        let mut withheld = spawn(true);
+        let mut plain = spawn(false);
+        let (withheld_pid, plain_pid) = (
+            i32::try_from(withheld.id()).unwrap(),
+            i32::try_from(plain.id()).unwrap(),
+        );
+        // The child is withheld once its own environment is closed to us.
+        let closed =
+            crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+                std::fs::read(format!("/proc/{withheld_pid}/environ"))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            });
+        let mut buf = Vec::new();
+        let withheld_row = os::read_use(withheld_pid, &mut buf);
+        let plain_row = os::read_use(plain_pid, &mut buf);
+        let reading = dir_use(Path::new("/nonexistent-gitpulse-test-dir")).expect("scan");
+        for child in [&mut withheld, &mut plain] {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(closed, "the child never became not dumpable");
+        let withheld_row = withheld_row.expect("the not-dumpable child is a row");
+        assert!(withheld_row.env.is_none(), "{withheld_row:?}");
+        assert!(
+            !withheld_row.mine && !withheld_row.unproven(),
+            "counted like another user's process, not unproven: {withheld_row:?}"
+        );
+        assert!(
+            !reading.unreadable.contains(&withheld_pid),
+            "{:?}",
+            reading.unreadable_notes
+        );
+        let plain_row = plain_row.expect("the plain child is a row");
+        assert!(plain_row.mine && !plain_row.unproven(), "{plain_row:?}");
+        assert!(
+            plain_row.env.is_some(),
+            "a dumpable child is still read in full"
+        );
     }
 
     /// The same shape against real processes: neither child stands in the
