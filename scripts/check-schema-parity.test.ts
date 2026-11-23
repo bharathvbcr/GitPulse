@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import {
   SERVE_CONTRACT,
   contractRow,
   devmapReading,
+  gitpulseToolNames,
   jarvisPin,
   judge,
   manviPin,
@@ -20,6 +21,9 @@ import {
   rustConstant,
   schemasAt,
   summarize,
+  toolNamesRow,
+  toolNamesRowAt,
+  upstreamToolNames,
 } from "./check-schema-parity.mjs";
 
 const owner = { store: 27, dcStore: 9, workbench: 13, extract: 94, lease: 2 };
@@ -417,5 +421,93 @@ describe("parseArgs", () => {
     expect(parseArgs(["--json", "--app", "/x/GitPulse.app", "--timeout", "500"])).toEqual({ app: "/x/GitPulse.app", timeoutMs: 500, json: true });
     expect(parseArgs(["--timeout", "0"])).toHaveProperty("error");
     expect(parseArgs(["--bogus"])).toHaveProperty("error");
+  });
+});
+
+describe("devmap tool-list row", () => {
+  const UPSTREAM_SRC = `
+const TOOLS: &[(&str, &str)] = &[
+    ("devmap_status", "status"),
+    // ("devmap_commented", "commented"),
+    ("devmap_search", "search"),
+    ("devmap_ask", "ask"),
+];
+pub const TOOL_NAMES: &[&str] = &{ [] };
+`;
+  const GITPULSE_SRC = `
+/// "devmap_doc" is prose.
+pub const TOOL_NAMES: &[&str] = &[
+    "devmap_search",
+    "devmap_status",
+];
+`;
+  const upstream = { names: ["devmap_status", "devmap_search", "devmap_ask"] };
+  const REV = "a".repeat(40);
+  const shown = (stdout: string) => ((..._a: unknown[]) => ({ status: 0, stdout, stderr: "" }) as never) as never;
+
+  // The real list, parsed from the file GitPulse serves it from. Properties
+  // only: a legitimate tool addition must not turn these red.
+  const realNames = gitpulseToolNames(
+    readFileSync(fileURLToPath(new URL("../src-tauri/src/mcp/devmap_parity.rs", import.meta.url)), "utf8"),
+  );
+  // A fixture upstream built from the real list plus tools GitPulse does not serve.
+  const upstreamFixture = `const TOOLS: &[(&str, &str)] = &[${[...(realNames ?? []), "devmap_not_served_here"]
+    .map((n) => `("${n}", "x"),`)
+    .join("")}];`;
+
+  it("parses upstream's TOOLS table and skips commented entries", () => {
+    expect(upstreamToolNames(UPSTREAM_SRC)).toEqual(["devmap_status", "devmap_search", "devmap_ask"]);
+  });
+  it("parses GitPulse's TOOL_NAMES and skips doc comments", () => {
+    expect(gitpulseToolNames(GITPULSE_SRC)).toEqual(["devmap_search", "devmap_status"]);
+  });
+  it("returns null when there is no list", () => {
+    expect(upstreamToolNames("fn main() {}")).toBeNull();
+    expect(gitpulseToolNames("const TOOL_NAMES: &[&str] = &[];")).toBeNull();
+  });
+
+  it("GitPulse's real list is non-empty, unique and devmap_-prefixed", () => {
+    expect(realNames).not.toBeNull();
+    const names = realNames ?? [];
+    expect(names.length).toBeGreaterThan(0);
+    expect(new Set(names).size).toBe(names.length);
+    for (const name of names) {
+      expect(name.startsWith("devmap_"), name).toBe(true);
+    }
+  });
+  it("matches GitPulse's real list against the fixture upstream", () => {
+    expect(toolNamesRowAt("/nowhere", REV, shown(upstreamFixture)).verdict).toBe("match");
+  });
+
+  it("passes a subset, whatever the order", () => {
+    expect(toolNamesRow(["devmap_search", "devmap_status"], upstream).verdict).toBe("match");
+  });
+  it("fails a GitPulse name upstream does not publish, and names it", () => {
+    const row = toolNamesRow(["devmap_status", "devmap_invented"], upstream);
+    expect(row.verdict).toBe("stale");
+    expect(row.detail).toContain("devmap_invented");
+    expect(summarize([row]).ok).toBe(false);
+  });
+  it("fails distinctly, as unverifiable, when upstream is unreadable", () => {
+    const row = toolNamesRow(["devmap_status"], { error: "no commit" });
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("unreadable");
+    expect(summarize([row]).ok).toBe(false);
+  });
+  it("is unverifiable when GitPulse's own list could not be read", () => {
+    expect(toolNamesRow(null, upstream).verdict).toBe("unverifiable");
+  });
+
+  it("is unverifiable when the vendored rev names no commit", () => {
+    expect(toolNamesRowAt("/nowhere", null, shown(UPSTREAM_SRC)).verdict).toBe("unverifiable");
+  });
+  it("is unverifiable when git cannot show the file at the rev", () => {
+    const fail = ((..._a: unknown[]) => ({ status: 128, stdout: "", stderr: "fatal: bad object" }) as never) as never;
+    const row = toolNamesRowAt("/nowhere", REV, fail);
+    expect(row.verdict).toBe("unverifiable");
+    expect(row.detail).toContain("bad object");
+  });
+  it("is unverifiable when the file at the rev has no TOOLS table", () => {
+    expect(toolNamesRowAt("/nowhere", REV, shown("fn x() {}")).verdict).toBe("unverifiable");
   });
 });
