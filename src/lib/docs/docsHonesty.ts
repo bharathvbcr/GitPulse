@@ -42,6 +42,15 @@ function listed(items: string[], separator: string): string {
   return more > 0 ? `${shown} and ${more} more` : shown;
 }
 
+/**
+ * A link to a note whose name holds `#`, `?` or `%` is written escaped but is
+ * not in the vault's index, so the rename can neither find nor rewrite it and
+ * never counts it as left broken. The outcome cannot detect this, so any
+ * rename line that is shown carries it.
+ */
+export const DOCS_RENAME_ESCAPED_NAME_LIMIT =
+  "links to notes whose names contain #, ? or % are not checked";
+
 export function docsRenameHonesty(outcome: DocRenameOutcome | null | undefined): string | null {
   if (!outcome) return null;
   const parts: string[] = [];
@@ -70,7 +79,7 @@ export function docsRenameHonesty(outcome: DocRenameOutcome | null | undefined):
   const lead = outcome.complete
     ? "Renamed, with gaps"
     : `Renamed, but incomplete (${outcome.rewrittenPaths.length} note(s) rewritten)`;
-  return `${lead}: ${parts.join(" · ")}`;
+  return `${lead}: ${parts.join(" · ")} · Not covered: ${DOCS_RENAME_ESCAPED_NAME_LIMIT}`;
 }
 
 export function docsSearchHonesty(

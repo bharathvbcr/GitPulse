@@ -68,6 +68,12 @@ describe("docsRenameHonesty", () => {
     expect(line).toContain("3 notes were not scanned");
   });
 
+  it("states that links to notes named with #, ? or % are not checked", () => {
+    const line = docsRenameHonesty({ ...clean, scan: { ...scan, notScanned: 1 } });
+    expect(line).toContain("Not covered");
+    expect(line).toContain("#, ? or %");
+  });
+
   it("names conflicts, failures and links left behind, and says the rename is incomplete", () => {
     const line = docsRenameHonesty({
       ...clean,
