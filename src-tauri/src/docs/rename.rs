@@ -52,6 +52,9 @@ pub struct DocRenameOutcome {
     /// Links that resolved before the rename and would not after it, as the
     /// rewritten vault reads them. A reference-style definition
     /// (`[ref]: Note.md`) is the case this exists for: it is not rewritten.
+    /// Also listed: a link in the moved note to a plain file that resolved
+    /// before the move and is not rewritten (an HTML `src`/`href`, or a link
+    /// through a symlink), as source = the note's new path, target = the link.
     /// Not covered: a link to a name holding `#`, `?` or `%`, which is written
     /// escaped but which the vault does not index, so it is never "broken"
     /// here either.
@@ -147,8 +150,13 @@ pub fn rename_doc(
     let untracked = super::list_untracked_markdown_paths(&repo)?;
     scan.not_scanned = scan.not_scanned.saturating_add(untracked.len() as u32);
 
-    let edits = plan_edits(vault, &from, &to)?;
-    let left_broken = links_the_rename_breaks(&repo, vault, &from, &to, &edits);
+    let (edits, unrewritten) = plan_edits(&repo, vault, &from, &to)?;
+    let mut left_broken = links_the_rename_breaks(&repo, vault, &from, &to, &edits);
+    for link in unrewritten {
+        if !left_broken.contains(&link) {
+            left_broken.push(link);
+        }
+    }
     let rewrites: Vec<String> = edits.iter().map(|edit| edit.path.clone()).collect();
 
     // Move first so a failed mv leaves rewrites unapplied. The gate runs inside
@@ -244,7 +252,12 @@ fn write_planned(
 }
 
 /// Every rewrite the rename makes, against the snapshot, before any is applied.
-pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, String> {
+pub(super) fn plan_edits(
+    repo: &Path,
+    vault: &Vault,
+    from: &str,
+    to: &str,
+) -> Result<(Vec<PlannedEdit>, Vec<BrokenLink>), String> {
     let old_stem = stem(from);
     let new_stem = stem(to);
     let new_path = strip_markdown_extension(to).to_string();
@@ -254,6 +267,9 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
         .any(|note| note.path != from && stem(&note.path).eq_ignore_ascii_case(&new_stem));
 
     let mut edits = Vec::new();
+    // Links of the moved note to files that resolve today and will not after
+    // the move, which this plan does not rewrite.
+    let mut unrewritten = Vec::new();
     for note in vault.notes() {
         let moved = note.path == from;
         let linking_old = note.path.as_str();
@@ -275,7 +291,21 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
         };
         let mut resolve_markdown = |written: &str| -> Option<String> {
             let dest = split_written(written).dest;
-            let resolved = vault.resolve_from(linking_old, dest, None)?;
+            let Some(resolved) = vault.resolve_from(linking_old, dest, None) else {
+                // Not a note. A moved note's relative link to a plain file
+                // (an image, a CSV) is re-expressed from its new folder.
+                if !moved {
+                    return None;
+                }
+                return match asset_link(repo, linking_old, linking_new, written) {
+                    AssetLink::Rewrite(replacement) => Some(replacement),
+                    AssetLink::Refused => {
+                        note_broken(&mut unrewritten, linking_new, dest);
+                        None
+                    }
+                    AssetLink::Leave => None,
+                };
+            };
             let to_the_moved_note = resolved.path == from;
             if !moved && !to_the_moved_note {
                 return None;
@@ -301,12 +331,23 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
         };
 
         let protected = ProtectedRanges::for_document(&note.text);
-        let (text, links) = rewrite_links_in(
+        let (mut text, mut links) = rewrite_links_in(
             &note.text,
             &protected,
             &mut resolve_wiki,
             &mut resolve_markdown,
         );
+        if moved {
+            let (rewritten_text, definitions) = asset_references_outside_the_scanner(
+                repo,
+                linking_old,
+                linking_new,
+                &text,
+                &mut unrewritten,
+            );
+            text = rewritten_text;
+            links += definitions;
+        }
         if links == 0 || text == note.text {
             continue;
         }
@@ -323,7 +364,306 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
             links: links as u32,
         });
     }
-    Ok(edits)
+    Ok((edits, unrewritten))
+}
+
+/// What a moved note's relative link to a non-note file needs.
+enum AssetLink {
+    /// Resolves today and would not from the new folder: this spelling does.
+    Rewrite(String),
+    /// Resolves today through a symlink, which is never followed or rewritten,
+    /// and would not from the new folder: to be reported.
+    Refused,
+    /// Nothing to do: a URL or anchor, a root-relative link, a target outside
+    /// the repository or inside `.git`, a directory, a missing file, or a link
+    /// that reads the same from the new folder.
+    Leave,
+}
+
+enum FileKind {
+    Regular,
+    /// A file reached through a symlink (the target or a folder on the way).
+    Linked,
+    Missing,
+}
+
+/// The repository-relative components `dest` names from the folder
+/// `base_dir`, or `None` when it cannot name a repository file: empty,
+/// root-relative, an anchor, a URL, outside the repository, or under `.git`.
+fn asset_components(base_dir: &str, dest: &str) -> Option<Vec<String>> {
+    if dest.is_empty() || dest.starts_with('/') || dest.starts_with('#') || has_scheme(dest) {
+        return None;
+    }
+    let decoded = if has_percent_escape(dest) {
+        percent_decode(dest)?
+    } else {
+        dest.to_string()
+    };
+    let mut parts: Vec<String> = base_dir
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .map(String::from)
+        .collect();
+    for component in decoded.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            name => parts.push(name.to_string()),
+        }
+    }
+    let first = parts.first()?;
+    (!first.eq_ignore_ascii_case(".git")).then_some(parts)
+}
+
+fn file_kind(repo: &Path, parts: &[String]) -> FileKind {
+    let mut abs = repo.to_path_buf();
+    let mut linked = false;
+    for part in parts {
+        abs.push(part);
+        match std::fs::symlink_metadata(&abs) {
+            Ok(meta) => linked |= meta.file_type().is_symlink(),
+            Err(_) => return FileKind::Missing,
+        }
+    }
+    match (linked, std::fs::metadata(&abs)) {
+        (_, Err(_)) => FileKind::Missing,
+        (_, Ok(meta)) if !meta.is_file() => FileKind::Missing,
+        (true, Ok(_)) => FileKind::Linked,
+        (false, Ok(_)) => FileKind::Regular,
+    }
+}
+
+/// What a moved note's relative link `written` (a destination as the scanner
+/// hands it over) to a file that exists in the repository needs once the note
+/// is at `linking_new`. A `?query` or `#fragment` is not part of the path and
+/// is carried over byte for byte; the author's spelling is kept as for notes.
+fn asset_link(repo: &Path, linking_old: &str, linking_new: &str, written: &str) -> AssetLink {
+    let parts = split_written(written);
+    let cut = parts.dest.find(['?', '#']).unwrap_or(parts.dest.len());
+    let (path_part, suffix) = parts.dest.split_at(cut);
+    let Some(components) = asset_components(parent_dir(linking_old), path_part) else {
+        return AssetLink::Leave;
+    };
+    if parent_dir(linking_old) == parent_dir(linking_new) {
+        return AssetLink::Leave;
+    }
+    match file_kind(repo, &components) {
+        FileKind::Missing => AssetLink::Leave,
+        FileKind::Linked => AssetLink::Refused,
+        FileKind::Regular => {
+            let bare = format!("{}{}{}", parts.open, path_part, parts.close);
+            let Some(mut replacement) =
+                express_link(&bare, parent_dir(linking_new), &components.join("/"))
+            else {
+                return AssetLink::Leave;
+            };
+            replacement.insert_str(replacement.len() - parts.close.len(), suffix);
+            replacement.push_str(parts.tail);
+            if replacement == written {
+                AssetLink::Leave
+            } else {
+                AssetLink::Rewrite(replacement)
+            }
+        }
+    }
+}
+
+fn note_broken(broken: &mut Vec<BrokenLink>, source: &str, target: &str) {
+    let link = BrokenLink {
+        source: source.to_string(),
+        target: target.to_string(),
+    };
+    if !broken.contains(&link) {
+        broken.push(link);
+    }
+}
+
+/// The parts of a moved note the markdown scanner never sees. A reference
+/// definition (`[r]: pic.png`) to a plain file is rewritten like an inline
+/// link. An HTML `src`/`href` is only reported: nothing here rewrites HTML.
+/// Fenced code, frontmatter, and a line that would continue a paragraph are
+/// left alone. Returns the text and how many definitions were rewritten.
+fn asset_references_outside_the_scanner(
+    repo: &Path,
+    linking_old: &str,
+    linking_new: &str,
+    text: &str,
+    broken: &mut Vec<BrokenLink>,
+) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut rewritten = 0;
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_frontmatter = false;
+    let mut after_blank = true;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let trimmed = body.trim_start_matches(' ');
+        let indent = body.len() - trimmed.len();
+        if index == 0 && body == "---" {
+            in_frontmatter = true;
+            out.push_str(line);
+            continue;
+        }
+        if in_frontmatter {
+            in_frontmatter = !(body == "---" || body == "...");
+            out.push_str(line);
+            continue;
+        }
+        if indent <= 3 {
+            let marker = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'));
+            if let Some(marker) = marker {
+                let run = trimmed.chars().take_while(|c| *c == marker).count();
+                if run >= 3 {
+                    match fence {
+                        Some((open, len)) if open == marker && run >= len => {
+                            if trimmed[run..].trim().is_empty() {
+                                fence = None;
+                            }
+                        }
+                        None => fence = Some((marker, run)),
+                        Some(_) => {}
+                    }
+                    out.push_str(line);
+                    after_blank = false;
+                    continue;
+                }
+            }
+        }
+        if fence.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        let mut handled = false;
+        if indent <= 3 && after_blank {
+            if let Some((head, written)) = reference_definition(trimmed) {
+                handled = true;
+                let skip_note = split_written(written)
+                    .dest
+                    .split(['?', '#'])
+                    .next()
+                    .is_some_and(has_markdown_extension);
+                match (
+                    skip_note,
+                    asset_link(repo, linking_old, linking_new, written),
+                ) {
+                    (false, AssetLink::Rewrite(replacement)) => {
+                        let lead = &body[..indent];
+                        out.push_str(lead);
+                        out.push_str(head);
+                        out.push_str(&replacement);
+                        out.push_str(&line[body.len()..]);
+                        rewritten += 1;
+                        after_blank = true;
+                        continue;
+                    }
+                    (false, AssetLink::Refused) => {
+                        note_broken(broken, linking_new, split_written(written).dest);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !handled {
+            for value in html_references(body) {
+                let cut = value.find(['?', '#']).unwrap_or(value.len());
+                let path_part = &value[..cut];
+                if has_markdown_extension(path_part) {
+                    continue;
+                }
+                if !matches!(
+                    asset_link(repo, linking_old, linking_new, value),
+                    AssetLink::Leave
+                ) {
+                    note_broken(broken, linking_new, value);
+                }
+            }
+        }
+        out.push_str(line);
+        after_blank = body.trim().is_empty() || handled;
+    }
+    (out, rewritten)
+}
+
+/// `[label]: destination…` as written after the indent: the text up to and
+/// including the whitespace after the colon, and the destination part. A
+/// footnote (`[^1]:`) is not a definition.
+fn reference_definition(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let label = &rest[..close];
+    if label.is_empty() || label.starts_with('^') {
+        return None;
+    }
+    let after = rest[close + 1..].strip_prefix(':')?;
+    let value = after.trim_start_matches([' ', '\t']);
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some((&line[..line.len() - value.len()], value))
+}
+
+/// The values of `src="…"` and `href="…"` attributes on a line, skipping any
+/// that sit inside an inline code span (an odd number of backticks before it).
+fn html_references(line: &str) -> Vec<&str> {
+    let lower = line.to_ascii_lowercase();
+    let mut values = Vec::new();
+    for attribute in ["src=", "href="] {
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(attribute) {
+            let at = from + found;
+            from = at + attribute.len();
+            let boundary = at == 0
+                || !lower.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[at - 1] != b'-';
+            let quote = line[from..].chars().next();
+            if !boundary || line[..at].matches('`').count() % 2 == 1 {
+                continue;
+            }
+            if let Some(quote @ ('"' | '\'')) = quote {
+                let start = from + 1;
+                if let Some(len) = line[start..].find(quote) {
+                    values.push(&line[start..start + len]);
+                }
+            }
+        }
+    }
+    values
+}
+
+/// `scheme:` before any `/`: `https://…`, `mailto:…`, `data:…`.
+fn has_scheme(dest: &str) -> bool {
+    let head = dest.split('/').next().unwrap_or("");
+    head.split_once(':').is_some_and(|(scheme, _)| {
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// One percent-decoding pass; `None` when the bytes are not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Links that are broken in the vault the rename would leave and were not

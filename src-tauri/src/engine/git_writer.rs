@@ -568,6 +568,24 @@ fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, CommandEr
     Ok(paths)
 }
 
+/// Creates each folder in `levels` (shallowest first) and records the ones this
+/// call made. A level that appeared since the caller looked (a neighbour made
+/// it) is not ours: it is neither recorded, so a failure never removes it, nor
+/// an error, as `create_dir_all` also tolerated it.
+fn create_levels(
+    levels: &[&std::path::Path],
+    created: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for dir in levels {
+        match std::fs::create_dir(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// What [`GitWriter::move_path`] decided to run, handed to its gate before
 /// anything moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -983,19 +1001,42 @@ impl GitWriter {
             }
         };
         gate(&plan)?;
-        if let Some(parent) = to_abs.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create destination parent: {e}"))?;
-        }
-        match &plan {
-            MovePlan::Git { argv } => {
-                let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-                git_text(&repo, &args)?;
+        // `git mv` into a missing folder fails, so the folder must exist
+        // first. Which levels this call creates is recorded so a failure
+        // removes exactly those, and never a folder that was already there.
+        let mut created: Vec<std::path::PathBuf> = Vec::new();
+        let moved = (|| -> Result<(), CommandError> {
+            if let Some(parent) = to_abs.parent() {
+                let mut missing: Vec<&std::path::Path> = parent
+                    .ancestors()
+                    .take_while(|dir| std::fs::symlink_metadata(dir).is_err())
+                    .collect();
+                missing.reverse();
+                create_levels(&missing, &mut created)
+                    .map_err(|e| format!("Failed to create destination parent: {e}"))?;
             }
-            MovePlan::Untracked { .. } => {
-                std::fs::rename(&from_abs, &to_abs)
-                    .map_err(|e| format!("Failed to move {from} to {to}: {e}"))?;
+            match &plan {
+                MovePlan::Git { argv } => {
+                    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+                    git_text(&repo, &args)?;
+                }
+                MovePlan::Untracked { .. } => {
+                    std::fs::rename(&from_abs, &to_abs)
+                        .map_err(|e| format!("Failed to move {from} to {to}: {e}"))?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = moved {
+            // Deepest first, plain `remove_dir`: it refuses a non-empty
+            // folder and does not follow a symlink, so anything that appeared
+            // there meanwhile survives.
+            for dir in created.iter().rev() {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+            }
+            return Err(error);
         }
         Ok(plan)
     }
@@ -10330,6 +10371,109 @@ mod bound_to_checked_state {
             }),
             "the prune failure is recorded on the snapshot's row"
         );
+    }
+}
+
+/// A move that does not happen leaves no new folder behind.
+#[cfg(test)]
+mod move_path_leftovers {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            crate::test_support::git_in(dir.path(), &args);
+        }
+        std::fs::write(dir.path().join("t.txt"), "x\n").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "."]);
+        crate::test_support::git_in(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    /// A gate that lets the move through, then takes the index lock so
+    /// `git mv` fails after the destination folders exist.
+    fn lock_gate(dir: &tempfile::TempDir) -> impl FnOnce(&MovePlan) -> Result<(), CommandError> {
+        let lock = dir.path().join(".git/index.lock");
+        move |_| {
+            std::fs::write(&lock, "").unwrap();
+            Ok(())
+        }
+    }
+
+    fn mv(
+        dir: &tempfile::TempDir,
+        to: &str,
+        gate: impl FnOnce(&MovePlan) -> Result<(), CommandError>,
+    ) -> Result<MovePlan, CommandError> {
+        GitWriter::move_path(dir.path().to_str().unwrap(), "t.txt", to, gate)
+    }
+
+    #[test]
+    fn a_gate_refusal_leaves_no_new_folder() {
+        let dir = repo();
+        let result = mv(&dir, "a/b/t.txt", |_| Err("refused".into()));
+        assert!(result.is_err());
+        assert!(!dir.path().join("a").exists());
+        assert!(dir.path().join("t.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_git_mv_removes_every_folder_it_created() {
+        let dir = repo();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert!(!dir.path().join("a").exists(), "a/ left behind");
+        assert!(dir.path().join("t.txt").exists());
+    }
+
+    #[test]
+    fn a_folder_that_existed_before_survives_a_failed_move() {
+        let dir = repo();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert!(dir.path().join("a").is_dir(), "pre-existing a/ was removed");
+        assert!(!dir.path().join("a/b").exists(), "a/b/ left behind");
+    }
+
+    #[test]
+    fn a_non_empty_pre_existing_folder_is_never_removed() {
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(dir.path().join("a/b/keep.txt"), "k").unwrap();
+        let result = mv(&dir, "a/b/t.txt", lock_gate(&dir));
+        std::fs::remove_file(dir.path().join(".git/index.lock")).ok();
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/keep.txt")).unwrap(),
+            "k"
+        );
+    }
+
+    #[test]
+    fn a_level_a_neighbour_created_first_is_not_recorded_as_ours() {
+        let dir = repo();
+        let a = dir.path().join("a");
+        let ab = a.join("b");
+        std::fs::create_dir(&a).unwrap();
+        let mut created = Vec::new();
+        create_levels(&[a.as_path(), ab.as_path()], &mut created).expect("create");
+        assert_eq!(created, vec![ab]);
+        assert!(a.is_dir());
+    }
+
+    #[test]
+    fn a_successful_move_keeps_the_folders_it_created() {
+        let dir = repo();
+        mv(&dir, "a/b/t.txt", |_| Ok(())).expect("move");
+        assert!(dir.path().join("a/b/t.txt").exists());
     }
 }
 
