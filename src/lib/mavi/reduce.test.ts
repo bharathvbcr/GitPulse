@@ -343,3 +343,33 @@ describe("ids and restarts", () => {
     expect(state.items.filter((i) => i.kind === "user").map((i) => i.turn)).toEqual([1, 2, 3]);
   });
 });
+
+describe("subagents and groups", () => {
+  it("keeps a subagent's prose out of the main flow and its stream apart", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "go", turn: 1 }));
+    const ev = (event: unknown, parent: string | null = null) =>
+      applyLine(state, JSON.stringify({ type: "stream_event", parent_tool_use_id: parent, event }));
+    ev({ type: "message_start", message: { id: "main" } });
+    ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    ev({ type: "message_start", message: { id: "sub" } }, "task1");
+    ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, "task1");
+    ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "sub words" } }, "task1");
+    ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Main words" } });
+    applyLine(state, JSON.stringify({ type: "assistant", parent_tool_use_id: "task1", message: { id: "sub", content: [{ type: "text", text: "sub words" }] } }));
+    const prose = state.items.filter((i) => i.kind === "assistant").map((i) => (i.kind === "assistant" ? i.text : ""));
+    expect(prose).toEqual(["Main words"]);
+  });
+
+  it("keeps a tool group's key when an answered request joins it", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "go", turn: 1 }));
+    applyLine(state, JSON.stringify({ type: "assistant", message: { id: "m", content: [{ type: "tool_use", id: "x", name: "Bash", input: { command: "ls" } }, { type: "tool_use", id: "y", name: "Read", input: { file_path: "/repo/a" } }] } }));
+    applyLine(state, JSON.stringify({ type: "control_request", request_id: "r", request: { subtype: "can_use_tool", tool_name: "Bash", tool_use_id: "x", input: { command: "ls" } } }));
+    const before = toRows(state.items, "/repo").find((r) => r.kind === "tools")!.key;
+    applyLine(state, JSON.stringify({ type: "mavi_answered", request_id: "r", decision: "allow" }));
+    const after = toRows(state.items, "/repo").filter((r) => r.kind === "tools");
+    expect(after).toHaveLength(1);
+    expect(after[0]!.key).toBe(before);
+  });
+});

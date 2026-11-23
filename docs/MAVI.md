@@ -26,7 +26,9 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   request. **Allow** or **Deny** (with an optional note for the agent). There is
   no single-key shortcut: someone who lands on the card and starts typing must
   never allow a command by accident. A subagent's request is shown in the main
-  flow, marked as a subagent's, never folded away under its Task row. A request
+  flow, marked as a subagent's, never folded away under its Task row. A
+  subagent's own prose stays with its Task (whose result reports it), and its
+  streamed output is kept apart from the main agent's. A request
   whose input the host withheld (too large to show safely) says so, with its
   size; Allow still runs exactly what the agent sent. A request whose tool has
   already finished, or that the agent cancels, closes by itself. Only when a
@@ -37,7 +39,8 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   free. A queued turn the host could not take goes back to the front of the
   queue, and messages still queued when the agent ends come back to the
   composer as a draft instead of being sent after a resume. Each thread keeps
-  its own unsent draft. **Stop** (or Esc from an empty composer) interrupts the
+  its own unsent draft, saved across a quit; the quit question names threads
+  with queued messages, which come back as that draft. **Stop** (or Esc from an empty composer) interrupts the
   turn; **End agent** in the header ends the agent's process (asking first
   while a turn runs), and the conversation can be resumed.
 - **Threads** can be renamed in place (the pencil, or a double-click on the
@@ -214,6 +217,14 @@ Mavi view (Svelte)                       Rust host (src-tauri/src/mavi)
   one-process-per-conversation rule and the live-thread limit under one lock
   and holds a claim until the new thread is registered, so two quick starts
   cannot both pass.
+- **Windows paths.** File paths are matched to the worktree with `\` and `/`
+  as one separator, and a drive-letter root without letter case, so edit
+  chips, the Changes column and file reloads work on Windows checkouts. The
+  agent runs in the ordinary spelling of the checkout (no `\\?\` prefix);
+  repository trust is still judged on the canonical one.
+- **"Seen" means seen.** A thread counts as seen only while the Mavi view is
+  on screen: not while an expanded terminal dock covers it, and not while the
+  window is hidden.
 - **An SSH thread's file diff** reads only paths relative to the thread's
   directory; an absolute path is refused, so a diff request cannot read other
   files on the host. A tracked file with no difference reads as unchanged,

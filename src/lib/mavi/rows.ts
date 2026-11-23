@@ -49,12 +49,25 @@ export function toolPath(tool: ToolItem): string | null {
   return typeof candidate === "string" && candidate ? candidate : null;
 }
 
+/**
+ * `path` relative to `root` with `/` separators, or null when it lies outside.
+ * Claude Code reports Windows paths with `\` and git with `/`, so both are
+ * compared as one; a drive-letter or UNC root is compared without case, as
+ * Windows does.
+ */
+export function relativeTo(path: string, root: string): string | null {
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const base = norm(root).replace(/\/+$/, "");
+  const full = norm(path);
+  if (!base || full.length <= base.length + 1 || full[base.length] !== "/") return null;
+  const windows = /^[A-Za-z]:\//.test(base) || base.startsWith("//");
+  const head = full.slice(0, base.length);
+  if (windows ? head.toLowerCase() !== base.toLowerCase() : head !== base) return null;
+  return full.slice(base.length + 1);
+}
+
 export function shortPath(path: string, root: string | null): string {
-  if (root) {
-    const prefix = root.endsWith("/") ? root : `${root}/`;
-    if (path.startsWith(prefix)) return path.slice(prefix.length);
-  }
-  return path;
+  return (root && relativeTo(path, root)) || path;
 }
 
 function plural(n: number, one: string, many: string): string {
@@ -148,6 +161,11 @@ function lastRunning(tools: readonly ToolItem[]): ToolItem | null {
 export function toRows(items: readonly TimelineItem[], root: string | null): Row[] {
   const rows: Row[] = [];
   let group: ToolItem[] = [];
+  // A group's key names the message row before it and its place after that
+  // row, not its first tool: an answered request that joins the group must
+  // not rename it (that would collapse a group the reader had opened).
+  let anchor = "start";
+  let nth = 0;
   const close = () => {
     if (!group.length) return;
     const tools = group;
@@ -161,7 +179,7 @@ export function toRows(items: readonly TimelineItem[], root: string | null): Row
     }
     rows.push({
       kind: "tools",
-      key: `g:${tools[0]!.id}`,
+      key: `g:${anchor}:${nth++}`,
       tools,
       summary: summarize(tools),
       failed: tools.filter((t) => t.status === "error" || t.status === "denied").length,
@@ -190,6 +208,8 @@ export function toRows(items: readonly TimelineItem[], root: string | null): Row
     }
     close();
     rows.push({ kind: "item", key: item.id, item: item as Exclude<TimelineItem, ToolItem> });
+    anchor = item.id;
+    nth = 0;
   }
   close();
   return rows;

@@ -67,7 +67,7 @@
     {/if}
   </button>
   {#if running && !expanded}
-    <div class="mavi-live text-meta text-textMuted truncate" aria-live="polite">
+    <div class="mavi-live text-meta text-textMuted truncate">
       <span class="animate-pulse">{activity ?? `${running.name}: ${describeTool(running, root)}`}</span>
     </div>
   {/if}

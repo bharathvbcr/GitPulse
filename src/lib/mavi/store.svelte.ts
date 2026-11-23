@@ -28,6 +28,28 @@ function storage(): Storage | null {
   }
 }
 
+const UNSENT_KEY = "gitpulse.mavi.unsent";
+
+/**
+ * Unsent words per thread: the composer's draft and messages still queued.
+ * Kept across a quit, which ends every agent: what was queued comes back as
+ * the thread's draft, never sent by itself.
+ */
+function readUnsent(store: Storage | null): Record<string, string> {
+  try {
+    const raw = store?.getItem(UNSENT_KEY);
+    const value: unknown = raw ? JSON.parse(raw) : null;
+    if (!value || typeof value !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [key, text] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof text === "string" && text.trim()) out[key] = text.slice(0, 100_000);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 function newKey(): string {
   try {
     return crypto.randomUUID();
@@ -84,6 +106,10 @@ class MaviStore {
   async #start(): Promise<void> {
     if (!this.#started) {
       this.records = readThreadRecords(storage());
+      const known = new Set(this.records.map((r) => r.key));
+      for (const [key, text] of Object.entries(readUnsent(storage()))) {
+        if (known.has(key) && !this.drafts[key]) this.drafts[key] = text;
+      }
       await onMaviEvents((id, entries) => this.#onEntries(id, entries));
       await onMaviStatus((summary) => this.#onSummary(summary));
       this.#started = true;
@@ -117,6 +143,32 @@ class MaviStore {
 
   #persist(): void {
     writeThreadRecords(storage(), this.records);
+  }
+
+  /** Writes every thread's unsent words: its draft, then anything queued. */
+  #saveUnsent(): void {
+    const out: Record<string, string> = {};
+    for (const record of this.records) {
+      // Queued messages first: they were written before the draft.
+      const queued = this.queues[record.key] ?? [];
+      const draft = this.drafts[record.key]?.trim();
+      const parts = [...queued, ...(draft ? [draft] : [])];
+      if (parts.length) out[record.key] = parts.join("\n\n");
+    }
+    try {
+      const store = storage();
+      if (Object.keys(out).length) store?.setItem(UNSENT_KEY, JSON.stringify(out));
+      else store?.removeItem(UNSENT_KEY);
+    } catch {
+      /* storage full or blocked: in memory only */
+    }
+  }
+
+  /** The composer's text for a thread changed. */
+  setDraft(key: string, text: string): void {
+    if (text) this.drafts[key] = text;
+    else delete this.drafts[key];
+    this.#saveUnsent();
   }
 
   #onSummary(summary: MaviSummary): void {
@@ -154,6 +206,7 @@ class MaviStore {
     const draft = this.drafts[key]?.trim();
     this.drafts[key] = [...queue, ...(draft ? [draft] : [])].join("\n\n");
     delete this.queues[key];
+    this.#saveUnsent();
   }
 
   #fileListeners = new Set<(record: ThreadRecord, path: string) => void>();
@@ -277,6 +330,7 @@ class MaviStore {
       // second agent (and, with a new worktree, a second worktree). The
       // message waits in the thread's composer with the reason beside it.
       this.drafts[record.key] = options.firstMessage;
+      this.#saveUnsent();
       this.errors[record.key] = error instanceof Error ? error.message : String(error);
     }
     return record.key;
@@ -395,6 +449,7 @@ class MaviStore {
     const summary = this.summaries[record.sessionId];
     if (summary && (summary.phase === "working" || summary.phase === "approval")) {
       this.queues[key] = [...(this.queues[key] ?? []), text];
+      this.#saveUnsent();
       return;
     }
     await maviClient.send(record.sessionId, text);
@@ -404,6 +459,7 @@ class MaviStore {
     const queue = this.queues[key];
     if (!queue) return;
     this.queues[key] = queue.filter((_, i) => i !== index);
+    this.#saveUnsent();
   }
 
   async #flushQueue(key: string): Promise<void> {
@@ -418,10 +474,12 @@ class MaviStore {
       this.queues[key] = [];
       await maviClient.send(record.sessionId, text);
       delete this.errors[key];
+      this.#saveUnsent();
     } catch (error) {
       // Not sent (a turn the agent started itself, say): the messages go back
       // to the front of the queue, ahead of anything written since.
       this.queues[key] = [...queue, ...(this.queues[key] ?? [])];
+      this.#saveUnsent();
       this.errors[key] = error instanceof Error ? error.message : String(error);
     } finally {
       this.#flushing.delete(key);
@@ -451,6 +509,7 @@ class MaviStore {
     delete this.timelines[key];
     delete this.queues[key];
     delete this.drafts[key];
+    this.#saveUnsent();
     delete this.errors[key];
     this.#buffer.delete(key);
     if (record?.sessionId) delete this.summaries[record.sessionId];

@@ -439,7 +439,11 @@
       onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatErrorRaw(error)}`),
     });
     // Mavi agents end with the app whatever the terminal backend keeps.
-    const maviAgents = maviQuitRisks(maviStore.records, (record) => maviStore.summaryOf(record));
+    const maviAgents = maviQuitRisks(
+      maviStore.records,
+      (record) => maviStore.summaryOf(record),
+      (record) => maviStore.queues[record.key]?.length ?? 0,
+    );
     const agents = [...terminalAgents, ...maviAgents];
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");

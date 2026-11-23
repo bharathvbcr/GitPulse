@@ -29,4 +29,9 @@ describe("maviQuitRisks", () => {
       { label: "Mavi: T b", repoPath: "h:~/d", resumable: false },
     ]);
   });
+
+  it("says when queued messages will come back as a draft", () => {
+    const [risk] = maviQuitRisks([record("a")], () => ({ phase: "working" }), () => 2);
+    expect(risk!.label).toBe("Mavi: T a (2 queued messages, kept as a draft)");
+  });
 });

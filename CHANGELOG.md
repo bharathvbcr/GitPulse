@@ -53,6 +53,13 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   in one pass. The host refuses SSH diffs of absolute paths, never shows a
   tracked unchanged file as new, keeps oversized permission requests
   answerable, and reserves a worktree and conversation while a thread starts.
+- **Mavi: the rest of the audit.** Windows paths match their worktree (edit
+  chips, the Changes column, file reloads); a thread is not marked seen under
+  an expanded terminal dock; drafts and queued messages survive a quit, and the
+  quit question names queued messages; a subagent's streamed output is kept
+  apart from the main agent's and its prose stays with its Task; one quiet
+  screen-reader announcement per state change; tool groups keep their key (and
+  their expanded state) when an answered request joins them.
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.

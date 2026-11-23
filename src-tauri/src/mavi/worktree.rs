@@ -229,6 +229,29 @@ fn tracked(root: &Path, path: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// `path` relative to `root` with `/` separators, when it lies inside it.
+///
+/// Claude Code reports Windows paths with `\`, git porcelain with `/`; both
+/// must name the same file, so separators are compared as one and, on
+/// Windows only, letter case is ignored (NTFS paths are case-insensitive).
+pub(crate) fn relative_text(root: &str, path: &str) -> Option<String> {
+    let norm = |s: &str| s.replace('\\', "/");
+    let root = norm(root);
+    let root = root.trim_end_matches('/');
+    let path = norm(path);
+    if root.is_empty() || path.len() <= root.len() + 1 {
+        return None;
+    }
+    let (head, rest) = path.split_at(root.len());
+    let same = if cfg!(windows) {
+        head.eq_ignore_ascii_case(root)
+    } else {
+        head == root
+    };
+    let rest = rest.strip_prefix('/')?;
+    (same && !rest.is_empty()).then(|| rest.to_owned())
+}
+
 pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), String> {
     if !safe_relative(path) {
         return Err("That path is not inside this worktree.".into());
@@ -302,6 +325,22 @@ mod tests {
         std::fs::write(root.join("new.txt"), "n\n").unwrap();
         assert_eq!(file_diff(root, "same.txt").unwrap().0, "");
         assert!(file_diff(root, "new.txt").unwrap().0.contains("+n"));
+    }
+
+    #[test]
+    fn paths_relative_to_a_root_whatever_the_separator() {
+        assert_eq!(
+            relative_text("/repo", "/repo/src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(relative_text("/repo/", "/repo/a").as_deref(), Some("a"));
+        assert_eq!(
+            relative_text(r"C:\repo", r"C:\repo\src\a.ts").as_deref(),
+            Some("src/a.ts")
+        );
+        assert_eq!(relative_text("/repo", "/repository/a"), None);
+        assert_eq!(relative_text("/repo", "/repo"), None);
+        assert_eq!(relative_text("/repo", "/other/a"), None);
     }
 
     #[test]

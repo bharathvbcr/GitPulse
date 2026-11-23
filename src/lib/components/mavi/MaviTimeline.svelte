@@ -97,6 +97,18 @@
     return () => observer.disconnect();
   });
 
+  /**
+   * The one thing a screen reader hears unprompted: the thread's state when it
+   * changes (working, waiting for an answer, done), never each tool or token,
+   * which the visible activity lines show.
+   */
+  let announcement = $derived.by(() => {
+    if (thread.items.some((i) => i.kind === "tool" && i.approval?.state === "open")) return "The agent is waiting for your answer.";
+    if (working) return "The agent is working.";
+    if (thread.ended) return "The agent ended.";
+    return thread.turn > 0 ? "The agent finished the turn." : "";
+  });
+
   function jump() {
     pinned = true;
     void toBottom(true);
@@ -222,10 +234,11 @@
         {/if}
       {/each}
       {#if working && thread.items[thread.items.length - 1]?.kind !== "tool"}
-        <div class="mavi-row text-meta text-textMuted animate-pulse" aria-live="polite">{thread.activity ?? "Working"}</div>
+        <div class="mavi-row text-meta text-textMuted animate-pulse">{thread.activity ?? "Working"}</div>
       {/if}
     </div>
   </div>
+  <div class="sr-only" aria-live="polite">{announcement}</div>
   {#if !pinned}
     <button class="mavi-latest gp-btn" data-variant="secondary" onclick={jump}>
       <ArrowDown size={12} aria-hidden="true" /> Latest

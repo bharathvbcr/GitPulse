@@ -245,10 +245,13 @@ fn start(
         (Some(repo), None) => {
             let root = worktree_root(repo)?;
             crate::repository_trust::require(&root)?;
-            let root_text = root.to_string_lossy().into_owned();
+            // Trust is judged on the canonical spelling; the agent and its
+            // reports use the ordinary one (no `\\?\` prefix on Windows),
+            // so that is the root its paths are matched against.
+            let root_text = crate::engine::process::plain_path_text(&root.to_string_lossy());
             let (program, path) = resolve("claude")?;
             let mut command = command_for(&program, path);
-            command.args(&args).current_dir(&root);
+            command.args(&args).current_dir(&root_text);
             (MaviTarget::Local { root: root_text }, command)
         }
         (None, Some(host)) => {
@@ -603,13 +606,7 @@ pub async fn cmd_mavi_file_diff(
 /// A path the page holds (absolute, from a tool call, or relative, from the
 /// turn's fingerprint) as a path relative to the worktree root.
 fn relative_to(root: &Path, path: &str) -> String {
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        if let Ok(rest) = candidate.strip_prefix(root) {
-            return rest.to_string_lossy().into_owned();
-        }
-    }
-    path.to_owned()
+    worktree::relative_text(&root.to_string_lossy(), path).unwrap_or_else(|| path.to_owned())
 }
 
 /// Whether a conversation can be resumed in `repo_path`: its transcript is

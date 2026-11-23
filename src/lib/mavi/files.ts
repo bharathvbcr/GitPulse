@@ -6,9 +6,9 @@
  * and only matching lines are parsed.
  */
 import type { MaviEntry } from "./types";
+import { relativeTo } from "./rows";
 
 export function changedPaths(root: string, entries: readonly Pick<MaviEntry, "line">[]): string[] {
-  const base = root.replace(/[\\/]+$/, "");
   const paths: string[] = [];
   for (const { line } of entries) {
     const edit = line.includes('"tool_use_result"') && line.includes('"filePath"');
@@ -23,7 +23,8 @@ export function changedPaths(root: string, entries: readonly Pick<MaviEntry, "li
     if (value.type === "user" && edit) {
       const result = value.tool_use_result as Record<string, unknown> | undefined;
       const file = typeof result?.filePath === "string" ? result.filePath : null;
-      if (file?.startsWith(`${base}/`)) paths.push(file.slice(base.length + 1));
+      const relative = file ? relativeTo(file, root) : null;
+      if (relative) paths.push(relative);
     } else if (value.type === "mavi_turn_files" && Array.isArray(value.moved)) {
       for (const m of value.moved) {
         const path = m && typeof m === "object" ? (m as Record<string, unknown>).path : null;

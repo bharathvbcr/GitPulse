@@ -56,6 +56,8 @@
       document.hasFocus() &&
       $interfaceStore.globalSurface === "repository" &&
       $repoStore.activeTab === "mavi" &&
+      // False while an expanded terminal dock covers the view.
+      maviStore.viewing &&
       maviStore.openKey === key
     );
   }

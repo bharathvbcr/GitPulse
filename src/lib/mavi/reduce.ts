@@ -66,10 +66,12 @@ function arr(value: unknown): unknown[] {
 
 /** Per-thread scratch the reducer needs but components never read. */
 interface Scratch {
-  /** The API message id the current deltas belong to. */
-  messageId: string | null;
-  /** Delta block index → item id, for the current message. */
-  blocks: Map<number, string>;
+  /**
+   * The message being streamed, per agent: the main agent under "" and each
+   * subagent under its Task call's id, so their interleaved deltas never
+   * write into one another's blocks.
+   */
+  streams: Map<string, Stream>;
   /** A `post_turn_summary` waiting for its `result`. */
   summary: TurnSummary | null;
   /** The cumulative cost at the end of the previous turn. */
@@ -83,12 +85,29 @@ interface Scratch {
   turnBase: number;
 }
 
+interface Stream {
+  /** The API message id the current deltas belong to. */
+  messageId: string | null;
+  /** Delta block index → item id, for the current message. */
+  blocks: Map<number, string>;
+}
+
 const scratch = new WeakMap<ThreadState, Scratch>();
+
+function streamOf(s: Scratch, parent: string | null): Stream {
+  const key = parent ?? "";
+  let stream = s.streams.get(key);
+  if (!stream) {
+    stream = { messageId: null, blocks: new Map() };
+    s.streams.set(key, stream);
+  }
+  return stream;
+}
 
 function scratchOf(state: ThreadState): Scratch {
   let s = scratch.get(state);
   if (!s) {
-    s = { messageId: null, blocks: new Map(), summary: null, costBefore: state.costUsd, nextId: state.items.length, turnBase: 0 };
+    s = { streams: new Map(), summary: null, costBefore: state.costUsd, nextId: state.items.length, turnBase: 0 };
     scratch.set(state, s);
   }
   return s;
@@ -118,8 +137,7 @@ export function continueInNewSession(state: ThreadState): void {
   const s = scratchOf(state);
   s.turnBase = state.turn;
   s.costBefore = 0;
-  s.messageId = null;
-  s.blocks.clear();
+  s.streams.clear();
   s.summary = null;
   state.lastSeq = 0;
   state.ended = null;
@@ -205,33 +223,37 @@ function onStreamEvent(state: ThreadState, line: Json, s: Scratch): void {
   const event = obj(line.event);
   if (!event) return;
   const parent = str(line.parent_tool_use_id);
+  const stream = streamOf(s, parent);
   switch (event.type) {
     case "message_start": {
-      s.messageId = str(obj(event.message)?.id) ?? `m${uid(state)}`;
-      s.blocks.clear();
+      stream.messageId = str(obj(event.message)?.id) ?? `m${uid(state)}`;
+      stream.blocks.clear();
       break;
     }
     case "content_block_start": {
       const index = num(event.index) ?? 0;
       const block = obj(event.content_block);
-      const messageId = s.messageId ?? "m";
+      const messageId = stream.messageId ?? "m";
       if (!block) break;
       const id = `${messageId}:${index}`;
+      // A subagent's prose and thinking belong to its Task, whose result
+      // reports what it found; only its tool calls are tracked here.
+      if (parent && block.type !== "tool_use") break;
       if (block.type === "text") {
         push(state, { kind: "assistant", id, turn: state.turn, messageId, text: str(block.text) ?? "", streaming: true, final: false });
-        s.blocks.set(index, id);
+        stream.blocks.set(index, id);
       } else if (block.type === "thinking") {
         push(state, { kind: "thinking", id, turn: state.turn, messageId, text: "", streaming: true, final: false });
-        s.blocks.set(index, id);
+        stream.blocks.set(index, id);
       } else if (block.type === "tool_use") {
         const toolId = str(block.id) ?? id;
         if (!toolById(state, toolId)) newTool(state, toolId, str(block.name) ?? "tool", {}, parent);
-        s.blocks.set(index, toolId);
+        stream.blocks.set(index, toolId);
       }
       break;
     }
     case "content_block_delta": {
-      const id = s.blocks.get(num(event.index) ?? -1);
+      const id = stream.blocks.get(num(event.index) ?? -1);
       const delta = obj(event.delta);
       if (!id || !delta) break;
       if (delta.type === "text_delta") {
@@ -247,7 +269,7 @@ function onStreamEvent(state: ThreadState, line: Json, s: Scratch): void {
       break;
     }
     case "content_block_stop": {
-      const id = s.blocks.get(num(event.index) ?? -1);
+      const id = stream.blocks.get(num(event.index) ?? -1);
       if (!id) break;
       const item = find(state, "assistant", id) ?? find(state, "thinking", id);
       if (item) item.streaming = false;
@@ -266,6 +288,8 @@ function onAssistant(state: ThreadState, line: Json): void {
   for (const raw of arr(message.content)) {
     const block = obj(raw);
     if (!block) continue;
+    // A subagent's prose stays with its Task (see onStreamEvent).
+    if (parent && block.type !== "tool_use") continue;
     if (block.type === "text") {
       const text = str(block.text) ?? "";
       const open = unfinished(state, "assistant", messageId);

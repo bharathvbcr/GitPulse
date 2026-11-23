@@ -54,14 +54,23 @@
   let resumeError = $state<string | null>(null);
   let resuming = $state(false);
 
+  let viewEl: HTMLDivElement | undefined = $state();
+
   onMount(() => {
     maviStore.init().catch((e) => (initError = e instanceof Error ? e.message : String(e)));
-    // The open thread counts as seen only while this view is on screen.
-    const visible = () => maviStore.setViewing(document.visibilityState === "visible");
+    // The open thread counts as seen only while this view is on screen: the
+    // window visible, and not covered by an expanded terminal dock (which
+    // keeps the view mounted but inert underneath it).
+    const covered = () => !!viewEl?.closest("[inert]");
+    const visible = () => maviStore.setViewing(document.visibilityState === "visible" && !covered());
     visible();
     document.addEventListener("visibilitychange", visible);
+    const pane = viewEl?.closest(".gp-view");
+    const watch = typeof MutationObserver === "undefined" || !pane ? null : new MutationObserver(visible);
+    if (pane) watch?.observe(pane, { attributes: true, attributeFilter: ["inert"] });
     return () => {
       document.removeEventListener("visibilitychange", visible);
+      watch?.disconnect();
       maviStore.setViewing(false);
     };
   });
@@ -265,7 +274,7 @@
   }
 </script>
 
-<div class="mavi-view flex-1 flex min-h-0" data-testid="mavi-view">
+<div class="mavi-view flex-1 flex min-h-0" data-testid="mavi-view" bind:this={viewEl}>
   {#if railOpen}
     <div class="mavi-rail-col">
       <MaviRail onNew={() => (composing = true)} onOpen={open} />
@@ -367,7 +376,7 @@
             queue={maviStore.queues[record.key] ?? []}
             pendingApprovals={offScreenApprovals}
             draft={maviStore.drafts[record.key] ?? ""}
-            onDraft={(text) => (maviStore.drafts[record.key] = text)}
+            onDraft={(text) => maviStore.setDraft(record.key, text)}
             {modeLabel}
             onSend={(text) => maviStore.send(record.key, text)}
             onStop={() => maviStore.interrupt(record.key)}

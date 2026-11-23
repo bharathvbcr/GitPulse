@@ -868,11 +868,7 @@ impl Session {
     fn relative(&self, path: &str) -> String {
         match &self.target {
             MaviTarget::Local { root } => {
-                let root = root.trim_end_matches('/');
-                path.strip_prefix(root)
-                    .and_then(|rest| rest.strip_prefix('/'))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| path.to_owned())
+                worktree::relative_text(root, path).unwrap_or_else(|| path.to_owned())
             }
             MaviTarget::Ssh { .. } => path.to_owned(),
         }
