@@ -70,7 +70,7 @@ function context(stdout: string): string {
 describe("scripts/cloud/session-start.sh", () => {
   it("is silent and exits 0 when CLAUDE_CODE_REMOTE is not true", () => {
     const s = sandbox();
-    for (const env of [{}, { CLAUDE_CODE_REMOTE: "false" }, { CLAUDE_CODE_REMOTE: "1" }]) {
+    for (const env of [{}, { CLAUDE_CODE_REMOTE: "false" }, { CLAUDE_CODE_REMOTE: "1" }] as Record<string, string>[]) {
       const r = s.run(hook, [], env);
       expect(r.status).toBe(0);
       expect(r.stdout).toBe("");
