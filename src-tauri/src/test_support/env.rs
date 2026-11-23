@@ -301,7 +301,9 @@ pub(crate) fn git_config_value(text: &str) -> String {
 /// pointed it at.
 const ROOT_MARKER: &str = "GITPULSE_TEST_HERMETIC_ROOT";
 /// The developer's real `HOME`, kept so a canary can prove nothing resolves
-/// under it. Informational only; nothing reads state from it.
+/// under it. The suite reads no state from it; only the opt-in live test
+/// `harness::steward::live_key_tests` binds it, while it starts a Manvi worker
+/// on the developer's own Anthropic account.
 const REAL_HOME_MARKER: &str = "GITPULSE_TEST_REAL_HOME";
 /// The pid whose constructor has already started the disk-write guard.
 const GUARDED_MARKER: &str = "GITPULSE_TEST_GUARDED_PID";
