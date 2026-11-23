@@ -315,9 +315,19 @@ fn a_send_whose_mailbox_deposit_fails_says_so() {
         }
     }
     assert_eq!(pending, 8, "seven peer envelopes plus one overflow notice");
+    let notice = mailbox_text(sid);
     assert!(
-        mailbox_text(sid).contains("gitpulse_agent_inbox"),
+        notice.contains("gitpulse_agent_inbox"),
         "the overflow notice tells the recipient how to read the rest"
+    );
+    // The inbox needs for_peer, and a read only peeks: the notice must give both.
+    assert!(
+        notice.contains("for_peer") && notice.contains(sid),
+        "the overflow notice names for_peer with this session's id: {notice}"
+    );
+    assert!(
+        notice.contains("ack"),
+        "the overflow notice says how to acknowledge what it reads: {notice}"
     );
 }
 
