@@ -4049,4 +4049,220 @@ mod tests {
             "unexpected error: {spoof_err}"
         );
     }
+
+    fn bus_row(seq: u64, to: Option<&str>, created_at_ms: u64, body: String) -> AgentBusMessage {
+        AgentBusMessage {
+            seq,
+            from_agent: "agy:filler".to_string(),
+            to_agent: to.map(str::to_string),
+            kind: "note".to_string(),
+            body,
+            branch: None,
+            created_at_ms,
+            thread_key: None,
+            msg_id: Some(format!("seed-{seq}")),
+            read_by: Vec::new(),
+            hop: Some(1),
+            max_hops: Some(6),
+        }
+    }
+
+    /// A trusted repo whose `messages.json` already holds `rows`, as an older build or a busy
+    /// bus would have left it.
+    fn repo_with_seeded_bus(rows: Vec<AgentBusMessage>) -> tempfile::TempDir {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir.path().to_str().unwrap();
+        let state = MessagesState {
+            next_seq: rows.iter().map(|m| m.seq).max().unwrap_or(0),
+            dropped_before_seq: 0,
+            messages: rows,
+        };
+        fs::write(
+            lanes_messages_path(repo, true).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Posts one broadcast so the write path runs its eviction, and returns what is stored.
+    fn post_then_stored(dir: &tempfile::TempDir) -> MessagesState {
+        let repo = dir.path().to_str().unwrap();
+        post_thread_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:lead",
+            None,
+            None,
+            "note",
+            "trigger",
+            None,
+        )
+        .unwrap();
+        read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap()
+    }
+
+    fn stored_seqs(state: &MessagesState) -> BTreeSet<u64> {
+        state.messages.iter().map(|m| m.seq).collect()
+    }
+
+    /// `count` broadcast rows numbered from `first_seq`; broadcasts are never pinned.
+    fn broadcasts(first_seq: u64, count: u64, now: u64) -> Vec<AgentBusMessage> {
+        (first_seq..first_seq + count)
+            .map(|seq| bus_row(seq, None, now, "filler".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_chatty_recipient_keeps_only_its_newest_eight_unread_pinned_and_a_quiet_one_survives() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "quiet".into())];
+        rows.extend((2..=10).map(|seq| bus_row(seq, Some("claude:chatty"), now, "chatty".into())));
+        rows.extend(broadcasts(11, 250, now));
+        let state = post_then_stored(&repo_with_seeded_bus(rows));
+        let kept = stored_seqs(&state);
+
+        assert_eq!(state.messages.len(), MAX_BUS_MESSAGES);
+        assert!(
+            kept.contains(&1),
+            "the quiet peer's only unread message must survive"
+        );
+        assert!(
+            (3..=10).all(|seq| kept.contains(&seq)),
+            "newest 8 of the chatty recipient are pinned"
+        );
+        assert!(
+            !kept.contains(&2),
+            "the ninth-newest unread is an ordinary row and goes first"
+        );
+    }
+
+    #[test]
+    fn at_most_sixty_four_unread_direct_messages_are_pinned_across_recipients() {
+        let now = now_epoch_ms();
+        // Nine recipients with eight unread messages each: 72 candidates for 64 pins.
+        let mut rows: Vec<AgentBusMessage> = (1..=72u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, "unread".into())
+            })
+            .collect();
+        rows.extend(broadcasts(73, 300, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            (9..=72).all(|seq| kept.contains(&seq)),
+            "the newest 64 are pinned"
+        );
+        assert!(
+            (1..=8).all(|seq| !kept.contains(&seq)),
+            "the oldest beyond the cap are evicted"
+        );
+    }
+
+    #[test]
+    fn an_unread_direct_message_older_than_the_pending_ttl_is_not_pinned() {
+        let now = now_epoch_ms();
+        let stale =
+            now - u64::try_from(crate::agent_mailbox::PENDING_TTL.as_millis()).unwrap() - 1_000;
+        let mut rows = vec![
+            bus_row(1, Some("claude:late"), stale, "stale".into()),
+            bus_row(2, Some("claude:late"), now, "fresh".into()),
+        ];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            !kept.contains(&1),
+            "an expired unread message is the oldest ordinary row"
+        );
+        assert!(kept.contains(&2), "a fresh unread message is pinned");
+        assert!(
+            !kept.contains(&3),
+            "the next oldest ordinary row goes after it"
+        );
+        assert!(kept.contains(&4));
+    }
+
+    #[test]
+    fn a_direct_message_somebody_has_read_is_not_pinned() {
+        let now = now_epoch_ms();
+        let mut read = bus_row(1, Some("claude:late"), now, "read".into());
+        read.read_by.push("claude:late".to_string());
+        let mut rows = vec![read, bus_row(2, Some("claude:late"), now, "unread".into())];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(!kept.contains(&1), "a read message is an ordinary row");
+        assert!(kept.contains(&2), "the unread one beside it is pinned");
+        assert!(!kept.contains(&3));
+    }
+
+    #[test]
+    fn size_healing_keeps_pinned_rows_while_unpinned_rows_can_pay_and_never_moves_next_seq() {
+        let now = now_epoch_ms();
+        // 256 rows of 40 KB is over the 8 MiB cap, as an older build could leave it.
+        let big = || "x".repeat(40_000);
+        let mut rows = vec![
+            bus_row(1, Some("claude:quiet"), now, big()),
+            bus_row(2, Some("claude:quiet"), now, big()),
+        ];
+        rows.extend((3..=256).map(|seq| bus_row(seq, None, now, big())));
+        let dir = repo_with_seeded_bus(rows);
+        let path = lanes_messages_path(dir.path().to_str().unwrap(), false).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MESSAGES_FILE_CAP);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(fs::metadata(&path).unwrap().len() <= MESSAGES_FILE_CAP);
+        assert!(
+            kept.contains(&1) && kept.contains(&2),
+            "pinned rows outlast unpinned ones"
+        );
+        assert_eq!(state.next_seq, 257, "healing never moves next_seq");
+        assert!(state.dropped_before_seq > 3);
+        assert!(kept.contains(&257), "the new post is kept");
+    }
+
+    #[test]
+    fn size_healing_evicts_every_unpinned_row_before_any_pinned_one() {
+        let now = now_epoch_ms();
+        let big = || "x".repeat(72_000);
+        // 64 unread directs and 64 open asks, each large enough that together they alone
+        // exceed the cap, then 128 tiny ordinary rows.
+        let mut rows: Vec<AgentBusMessage> = (1..=64u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, big())
+            })
+            .collect();
+        rows.extend((65..=128u64).map(|seq| {
+            let mut ask = bus_row(seq, None, now, big());
+            ask.kind = "ask".to_string();
+            ask.thread_key = Some(format!("ask-{seq}"));
+            ask
+        }));
+        rows.extend(broadcasts(129, 128, now));
+        let dir = repo_with_seeded_bus(rows);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(
+            (129..=256).all(|seq| !kept.contains(&seq)),
+            "every ordinary row goes before a pinned one is touched"
+        );
+        let survivors: Vec<u64> = (1..=128).filter(|seq| kept.contains(seq)).collect();
+        assert!(
+            survivors.len() < 128,
+            "pinned rows are the last resort and were needed"
+        );
+        let first = survivors[0];
+        assert!(first > 1, "the oldest pinned row goes first");
+        assert!(
+            survivors.iter().copied().eq(first..=128),
+            "pinned rows go oldest first"
+        );
+        assert_eq!(state.next_seq, 257);
+    }
 }
