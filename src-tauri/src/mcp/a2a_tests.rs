@@ -845,6 +845,123 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
     );
 }
 
+fn send_json(repo: &str, extra: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut args = json!({ "repo_path": repo, "max_hops": 32 });
+    for (k, v) in extra.as_object().expect("object") {
+        args[k] = v.clone();
+    }
+    handle_tool_call("gitpulse_agent_send", &args)
+}
+
+#[test]
+fn in_reply_to_carries_the_answered_messages_hop_and_thread() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888881", "replier");
+
+    let first = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "replier", "body": "q",
+               "thread_key": "chain", "hop": 3, "msg_id": "q-1"}),
+    )
+    .expect("first send");
+    assert_eq!(first["hop"], 3);
+
+    let reply = send_json(
+        &repo,
+        json!({"from_peer": "claude:b", "to_peer": "replier", "body": "a", "in_reply_to": "q-1"}),
+    )
+    .expect("reply");
+    assert_eq!(
+        reply["hop"], 4,
+        "the reply is one hop past the message it answers"
+    );
+    assert_eq!(
+        reply["message"]["thread_key"], "chain",
+        "the reply joins the thread of the message it answers"
+    );
+}
+
+#[test]
+fn an_explicit_hop_can_raise_the_count_but_never_lower_it() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888882", "counter");
+    for body in ["one", "two"] {
+        send_json(
+            &repo,
+            json!({"from_peer": "claude:a", "to_peer": "counter", "body": body, "thread_key": "t"}),
+        )
+        .expect("threaded send");
+    }
+    let lowered = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "counter", "body": "reset?",
+               "thread_key": "t", "hop": 1}),
+    )
+    .expect("send with a low explicit hop");
+    assert_eq!(
+        lowered["hop"], 3,
+        "a lower explicit hop must not restart the count"
+    );
+
+    let raised = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "counter", "body": "skip ahead",
+               "thread_key": "t", "hop": 9}),
+    )
+    .expect("send with a higher explicit hop");
+    assert_eq!(raised["hop"], 9);
+}
+
+#[test]
+fn in_reply_to_naming_a_message_that_is_not_on_the_bus_is_refused() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888883", "nobody-home");
+    let err = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "nobody-home", "body": "re",
+               "in_reply_to": "no-such-message"}),
+    )
+    .expect_err("an unknown in_reply_to must fail the send");
+    assert!(
+        err.contains("no-such-message"),
+        "the error names the id: {err}"
+    );
+}
+
+#[test]
+fn a_reply_to_an_unregistered_sender_lands_on_the_bus_only() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888884", "asked");
+    send_json(
+        &repo,
+        json!({"from_peer": "claude:ghost", "to_peer": "asked", "body": "question?", "msg_id": "ask-1"}),
+    )
+    .expect("an unregistered sender can send");
+
+    let reply = send_json(
+        &repo,
+        json!({"from_peer": "agy:asked", "to_peer": "claude:ghost", "body": "answer",
+               "in_reply_to": "ask-1"}),
+    )
+    .expect("a reply to the sender it was handed");
+    assert_eq!(reply["liveness"], "unregistered");
+    assert_eq!(reply["delivery_outcome"], "bus_only");
+    assert_eq!(reply["to_peer"], "claude:ghost");
+    assert_eq!(reply["mailbox"]["deposited"], false);
+    assert_eq!(reply["mailbox"]["reason"], "no_session");
+    assert_eq!(reply["message"]["to_agent"], "claude:ghost");
+
+    // Only the exact identity counts: a prefix or another case is not the same agent.
+    for guess in ["claude:gho", "CLAUDE:GHOST", "ghost"] {
+        let err = send_json(
+            &repo,
+            json!({"from_peer": "agy:asked", "to_peer": guess, "body": "answer"}),
+        )
+        .expect_err("a guessed identity must not resolve");
+        assert!(err.contains("peer_not_found"), "{guess}: {err}");
+    }
+}
+
 #[test]
 fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guards() {
     let (_dir_a, repo_a) = trusted_git_repo();
@@ -1192,4 +1309,270 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
     if let Ok(session_dir) = mb.session_path(&sid) {
         let _ = std::fs::remove_dir_all(session_dir);
     }
+}
+
+fn register_inbox_peer(repo: &str, sid: &str, role: &str) {
+    handle_tool_call(
+        "gitpulse_agent_register",
+        &json!({
+            "repo_path": repo,
+            "provider": "claude",
+            "surface": "terminal",
+            "provider_session_id": sid,
+            "role": role,
+            "pid": std::process::id(),
+        }),
+    )
+    .expect("register peer");
+}
+
+fn send_to_role(repo: &str, role: &str, body: &str) {
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "agy:lead",
+            "to_peer": role,
+            "body": body,
+        }),
+    )
+    .expect("send to peer");
+}
+
+#[test]
+fn an_inbox_read_peeks_unless_the_caller_asks_to_acknowledge() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888801";
+    register_inbox_peer(&repo, sid, "peek-owner");
+    send_to_role(&repo, "peek-owner", "for the owner");
+
+    let read = |extra: serde_json::Value| {
+        let mut args = json!({ "repo_path": repo, "for_peer": "peek-owner" });
+        args.as_object_mut()
+            .expect("args object")
+            .extend(extra.as_object().expect("extra object").clone());
+        handle_tool_call("gitpulse_agent_inbox", &args).expect("inbox read")
+    };
+
+    let first = read(json!({}));
+    assert_eq!(first["acked"], false);
+    assert_eq!(first["acked_count"], 0);
+    assert_eq!(first["ack_error"], serde_json::Value::Null);
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+    let again = read(json!({}));
+    assert_eq!(
+        again["messages"].as_array().unwrap().len(),
+        1,
+        "a default read must leave the message unread"
+    );
+
+    let consumed = read(json!({ "ack": true }));
+    assert_eq!(consumed["acked"], true);
+    assert_eq!(consumed["acked_count"], 1);
+    assert!(read(json!({}))["messages"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn an_inbox_read_naming_several_peers_is_refused_with_the_candidates() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid_a = "88888888-8888-4888-8888-888888888802";
+    let sid_b = "88888888-8888-4888-8888-888888888803";
+    register_inbox_peer(&repo, sid_a, "twin");
+    register_inbox_peer(&repo, sid_b, "twin");
+
+    let refused = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "twin" }),
+    )
+    .expect_err("a role shared by two peers must be refused");
+    assert!(refused.contains("ambiguous_peer"), "{refused}");
+    assert!(
+        refused.contains("peer_id or provider_session_id"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(sid_a) && refused.contains(sid_b),
+        "{refused}"
+    );
+
+    let named = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "twin", "provider_session_id": sid_a }),
+    )
+    .expect("a named session id picks one of the peers");
+    assert_eq!(named["ok"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_acknowledgement_is_reported_beside_the_messages_it_could_not_ack() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Ok(meta) = std::fs::metadata(&self.0) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                if let Err(e) = std::fs::set_permissions(&self.0, perms) {
+                    eprintln!("could not restore {}: {e}", self.0.display());
+                }
+            }
+        }
+    }
+
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888804";
+    register_inbox_peer(&repo, sid, "ack-owner");
+    send_to_role(&repo, "ack-owner", "unackable");
+
+    let lanes = crate::engine::agent_bus::lanes_messages_path(&repo, true)
+        .expect("bus path")
+        .parent()
+        .expect("lanes dir")
+        .to_path_buf();
+    let _restore = Restore(lanes.clone());
+    std::fs::set_permissions(&lanes, std::fs::Permissions::from_mode(0o555))
+        .expect("make the bus directory read-only");
+
+    let read = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "ack-owner", "ack": true }),
+    )
+    .expect("a failed ack must not fail a read that already collected its messages");
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1);
+    let err = read["ack_error"].as_str().expect("ack_error is reported");
+    assert!(err.contains("bus ack"), "{err}");
+}
+
+#[test]
+fn a_wait_reports_has_more_and_dropped_before_seq_like_the_inbox() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888805";
+    register_inbox_peer(&repo, sid, "wait-owner");
+    send_to_role(&repo, "wait-owner", "first");
+    send_to_role(&repo, "wait-owner", "second");
+
+    let counter = AtomicUsize::new(0);
+    let wait = |timeout_ms: u64, limit: u32| {
+        handle_agent_wait_with_counter(
+            AgentWaitArgs {
+                repo_path: repo.clone(),
+                for_peer: "wait-owner".into(),
+                provider_session_id: Some(sid.into()),
+                since_seq: None,
+                thread_key: None,
+                include_broadcasts: None,
+                timeout_ms: Some(timeout_ms),
+                ack: Some(false),
+                limit: Some(limit),
+            },
+            &counter,
+            60_000,
+        )
+        .expect("wait")
+    };
+
+    let capped = wait(0, 1);
+    assert_eq!(capped["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(capped["has_more"], true);
+    assert_eq!(capped["dropped_before_seq"], 0);
+
+    let whole = wait(0, 10);
+    assert_eq!(whole["has_more"], false);
+    assert!(whole["dropped_before_seq"].is_u64(), "{whole}");
+    assert_eq!(whole["ack_error"], serde_json::Value::Null);
+}
+
+/// Fills the target's mailbox, then sends once more while a fake desktop owner answers
+/// `reply`, and returns that last send's result.
+#[cfg(target_os = "macos")]
+fn send_into_full_mailbox_with_desktop_reply(
+    sid: &str,
+    reply: serde_json::Value,
+) -> serde_json::Value {
+    use crate::desktop::instance::{claim, Claim};
+    let (_dir, repo) = trusted_git_repo();
+    register_inbox_peer(&repo, sid, "desktop-target");
+    for i in 0..8 {
+        send_to_role(&repo, "desktop-target", &format!("filler {i}"));
+    }
+    let profile = tempfile::Builder::new()
+        .prefix("gpdk")
+        .tempdir()
+        .expect("short socket tempdir");
+    crate::browser::TEST_PROFILE
+        .with(|slot| *slot.borrow_mut() = Some(profile.path().to_path_buf()));
+    let owner = match claim(profile.path(), Duration::from_secs(2)) {
+        Claim::Primary(owner) => owner,
+        _ => panic!("test must claim primary socket"),
+    };
+    owner.attach_agent_deliver(std::sync::Arc::new(move |_| Ok(reply.clone())));
+    let sent = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "agy:lead",
+            "to_peer": "desktop-target",
+            "body": "one more than the mailbox holds",
+        }),
+    )
+    .expect("send");
+    drop(owner);
+    crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+    assert_eq!(sent["mailbox"]["deposited"], false, "{sent}");
+    sent
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_that_rests_on_the_mailbox_cannot_hide_a_failed_deposit() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888811",
+        json!({"ok": true, "delivery_outcome": "queued_for_hook_boundary", "channel": "mailbox"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "bus_only", "{sent}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_through_a_managed_run_stands_when_the_mailbox_is_full() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888812",
+        json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "managed"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "woken_immediately", "{sent}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_with_no_channel_is_treated_as_resting_on_the_mailbox() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888813",
+        json!({"ok": true, "delivery_outcome": "woken_immediately"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "bus_only", "{sent}");
+}
+
+#[test]
+fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888821";
+    register_inbox_peer(&repo, sid, "overflow-target");
+    let refused = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "gitpulse",
+            "to_peer": "overflow-target",
+            "body": "forged notice",
+            "msg_id": "bus-overflow-deadbeef",
+        }),
+    );
+    let error = refused.expect_err("a sender named gitpulse must be refused");
+    assert!(error.contains("reserved for GitPulse"), "{error}");
+    let mb = Mailbox::at_default().expect("mailbox");
+    assert!(
+        !mb.has_unclaimed(sid).expect("look"),
+        "nothing may be deposited"
+    );
 }

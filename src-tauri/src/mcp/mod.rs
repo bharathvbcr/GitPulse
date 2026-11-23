@@ -1471,8 +1471,13 @@ tool_args! {
             1,
             64,
         ),
+        in_reply_to: Option<String> = Spec::bytes(
+            "msg_id of the bus message this answers (1-64 ASCII letters, digits, '-' or '_'). It must still be on the bus; it supplies thread_key when none is given and sets the hop to its hop + 1",
+            1,
+            64,
+        ),
         hop: Option<u32> = Spec::int(
-            "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
+            "Explicit hop count. The count is the highest of this, the in_reply_to message's hop + 1, the thread's last hop + 1 and 1, so an explicit hop can raise it but never lower it (a 0 is raised to 1)",
             0,
             32,
         ),
@@ -1511,7 +1516,7 @@ tool_args! {
             "Include broadcast coordination messages where to_agent is null (default false)",
         ),
         ack: Option<bool> = Spec::flag(
-            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default false: a read only peeks, so reading never consumes the owner's messages)",
         ),
         limit: Option<u32> = Spec::int("Maximum messages to return (default 50)", 1, 256),
     }
@@ -1549,7 +1554,7 @@ tool_args! {
             60_000,
         ),
         ack: Option<bool> = Spec::flag(
-            "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass since_seq to wait without consuming)",
         ),
         limit: Option<u32> = Spec::int("Maximum messages to return on wake (default 20)", 1, 256),
     }
@@ -3049,7 +3054,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_agent_inbox",
             "Read and cross-ack deduplicated peer inbox messages",
-            "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies and cross-acknowledging both stores when ack is true",
+            "Read unread peer messages deduplicated by msg_id across agent_bus and agent_mailbox, hydrating > 6 KiB bodies. Peeks by default; cross-acknowledges both stores only when ack is true",
             AgentInboxArgs::properties(),
             &AgentInboxArgs::required(),
             json!({
@@ -3060,6 +3065,7 @@ fn build_tools() -> Vec<Value> {
                     "for_peer": { "type": "string" },
                     "acked": { "type": "boolean" },
                     "acked_count": { "type": "integer", "minimum": 0 },
+                    "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
                     "has_more": { "type": "boolean" },
@@ -3089,12 +3095,16 @@ fn build_tools() -> Vec<Value> {
                     "effective_timeout_ms": { "type": "integer", "minimum": 0 },
                     "acked": { "type": "boolean" },
                     "acked_count": { "type": "integer", "minimum": 0 },
+                    "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "has_more": { "type": "boolean" },
                     "messages": { "type": "array" }
                 },
                 "required": [
                     "ok", "repo_path", "for_peer", "timed_out", "waited_ms",
-                    "effective_timeout_ms", "acked", "acked_count", "latest_seq", "messages"
+                    "effective_timeout_ms", "acked", "acked_count", "latest_seq",
+                    "dropped_before_seq", "has_more", "messages"
                 ]
             }),
             false,
