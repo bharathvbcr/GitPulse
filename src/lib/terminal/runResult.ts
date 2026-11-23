@@ -225,6 +225,8 @@ export interface TerminalListing {
    * PTY can say. Absent is unknown, never quiet.
    */
   quiet_ms?: number | null;
+  /** Spared by batch closes, Stop children, agent closes and the load governor. Absent is not protected. */
+  protected?: boolean;
 }
 
 /**

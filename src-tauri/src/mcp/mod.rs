@@ -7898,7 +7898,11 @@ mod tests {
                 &mut validated,
             );
 
-            let _ = crate::terminal::kill_session(&term_state, &child_id);
+            let _ = crate::terminal::kill_session(
+                &term_state,
+                &child_id,
+                crate::terminal::KillOrigin::Unspecified,
+            );
             drop(owner);
             crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
         }

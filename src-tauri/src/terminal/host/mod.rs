@@ -6,9 +6,13 @@
 //! unix socket ([`proto`]); [`client`] is the app's side, behind the unchanged
 //! `terminal::` functions; [`receipts`] keeps every exit on disk until an app
 //! has recorded it; [`transcripts`] keeps each session's output on disk, bounded,
-//! so it can be read after the session is gone.
+//! so it can be read after the session is gone. [`legacy`] reaches the host of
+//! the previous protocol through [`compat_v4`], a frozen copy of its frames, so
+//! a protocol bump does not orphan the sessions that host still holds.
 
 pub mod client;
+pub mod compat_v4;
+pub mod legacy;
 pub mod proto;
 mod receipts;
 pub mod server;

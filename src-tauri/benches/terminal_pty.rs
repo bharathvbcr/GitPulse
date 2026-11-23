@@ -41,6 +41,7 @@ mod imp {
     use super::common::{interleave, Case, Report, Sample};
     use gitpulse_lib::terminal::{
         acknowledge_output, kill_session, shutdown_sessions, spawn_session, write_to_session,
+        KillOrigin,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -189,9 +190,9 @@ mod imp {
                     "the flood delivered nothing while the keystrokes were timed: this is an idle row"
                 );
             }
-            let _ = kill_session(&state, &echo_id);
+            let _ = kill_session(&state, &echo_id, KillOrigin::Unspecified);
             if let Some(flood_id) = flood_id {
-                let _ = kill_session(&state, &flood_id);
+                let _ = kill_session(&state, &flood_id, KillOrigin::Unspecified);
             }
             latencies.sort();
             let median = latencies[latencies.len() / 2];

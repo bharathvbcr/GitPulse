@@ -10,7 +10,7 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, kill_session, session_context, spawn_session, spawn_session_in,
-    write_to_session, TerminalSessions,
+    write_to_session, KillOrigin, TerminalSessions,
 };
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -147,7 +147,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         "output printed before the exit is still delivered"
     );
     // The slot is free again: Close on an ended session is a no-op, not a retry.
-    kill_session(&h.state, &session.id).unwrap();
+    kill_session(&h.state, &session.id, KillOrigin::Unspecified).unwrap();
     // SAFETY: the job is this test's own grandchild.
     unsafe { libc::kill(job, libc::SIGKILL) };
 }
@@ -187,7 +187,8 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     let job = read_pid(&pidfile, Duration::from_secs(5));
     assert!(alive(job));
     let started = Instant::now();
-    kill_session(&h.state, &session.id).expect("Close must finish, not ask for a retry");
+    kill_session(&h.state, &session.id, KillOrigin::Unspecified)
+        .expect("Close must finish, not ask for a retry");
     assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     let deadline = Instant::now() + Duration::from_secs(3);
     while alive(job) && Instant::now() < deadline {
@@ -226,7 +227,7 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
     .unwrap();
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
     let started = Instant::now();
-    kill_session(&h.state, &session.id).unwrap();
+    kill_session(&h.state, &session.id, KillOrigin::Unspecified).unwrap();
     // A program that ignores the hangup is given the 2.5 s grace (an agent's
     // SessionEnd needs seconds) and is then killed; the bound is that grace
     // plus slack, which is what keeps Close from hanging on it.
@@ -513,7 +514,8 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
                         }
                     });
                     std::thread::sleep(Duration::from_millis(5 * (round as u64 % 4)));
-                    kill_session(&state, &session.id).expect("close finishes under contention");
+                    kill_session(&state, &session.id, KillOrigin::Unspecified)
+                        .expect("close finishes under contention");
                     let answered = reads.join().expect("the reader never panics");
                     assert!(answered < 1_000_000);
                 }
@@ -594,7 +596,8 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
     std::thread::scope(|scope| {
         for _ in 0..16 {
             scope.spawn(|| {
-                kill_session(&h.state, &doomed.id).expect("every closer is answered");
+                kill_session(&h.state, &doomed.id, KillOrigin::Unspecified)
+                    .expect("every closer is answered");
             });
         }
     });
@@ -606,7 +609,8 @@ fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
     // SAFETY: the job is this test's own grandchild.
     unsafe { libc::kill(job, libc::SIGKILL) };
     assert!(!survived, "the session's job outlived its close");
-    kill_session(&h.state, &doomed.id).expect("closing a closed session is a no-op");
+    kill_session(&h.state, &doomed.id, KillOrigin::Unspecified)
+        .expect("closing a closed session is a no-op");
     assert!(
         outsider.try_wait().unwrap().is_none(),
         "a close reached a process outside the session"
@@ -650,7 +654,7 @@ fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
     .unwrap();
     assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
     std::thread::scope(|scope| {
-        let closer = scope.spawn(|| kill_session(&h.state, &session.id));
+        let closer = scope.spawn(|| kill_session(&h.state, &session.id, KillOrigin::Unspecified));
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() {
             assert!(Instant::now() < deadline, "the hangup never arrived");

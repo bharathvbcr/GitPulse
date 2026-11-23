@@ -304,22 +304,84 @@ pub async fn cmd_terminal_detach(
 ///
 /// A close waits out a hangup grace and polls for cleanup for seconds, which is
 /// why it is on the control pool and never on a session's input lane.
+///
+/// `origin` says which route asked (`terminal::KillOrigin`); a caller that
+/// does not say is `unspecified` and treated as a direct close. A session that
+/// is protected from a batch route (`batch_close`, `stop_children`) is left
+/// running and the call answers `skipped_protected`, so a batch can report
+/// what it skipped without reading an error's text.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(
     app: AppHandle,
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
-) -> Result<(), String> {
+    origin: Option<crate::terminal::KillOrigin>,
+) -> Result<crate::terminal::KillOutcome, String> {
+    let origin = origin.unwrap_or_default();
     let ledger = state.session_ledger().clone();
     let kill_id = session_id.clone();
-    let result = crate::terminal::control_async(&state, "terminal_kill", move |state| {
-        crate::terminal::kill_session(state, &kill_id)
+    let outcome = crate::terminal::control_async(&state, "terminal_kill", move |state| {
+        crate::terminal::kill_session(state, &kill_id, origin)
     })
-    .await;
-    if result.is_ok() && ledger.mark_user_closed(&session_id) {
+    .await?;
+    if outcome == crate::terminal::KillOutcome::Killed && ledger.mark_user_closed(&session_id) {
         ledger.emit_view(&app);
     }
-    result
+    Ok(outcome)
+}
+
+/// Terminal hosts left running by an earlier GitPulse version (an older
+/// protocol) that still hold sessions, asked again now: each with its sessions,
+/// or why they could not be listed. Empty when there are none. Their sessions
+/// are not this app's: they can be stopped and their output read
+/// (`cmd_terminal_legacy_kill`, `cmd_terminal_legacy_transcript`), never
+/// attached or typed into.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_hosts(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<Vec<crate::terminal::LegacyHostReport>, String> {
+    crate::terminal::control_async(&state, "terminal_legacy_hosts", |state| {
+        Ok(state.legacy_hosts())
+    })
+    .await
+}
+
+/// Stops one session on an earlier version's terminal host. A separate path
+/// from `cmd_terminal_kill`: terminal ids repeat across hosts, so the id is
+/// never looked up among this app's sessions or marked on its ledger. Recorded
+/// in the lifecycle log as `legacy_kill` with the `sessions_list_stop` origin.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_kill(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    protocol: u32,
+    session_id: String,
+) -> Result<(), String> {
+    crate::terminal::control_async(&state, "terminal_legacy_kill", move |state| {
+        state.legacy_kill(protocol, &session_id)
+    })
+    .await
+}
+
+/// The newest `max_bytes` (default and ceiling: `MAX_TRANSCRIPT_TAIL_BYTES`)
+/// of a session's saved output on an earlier version's terminal host.
+/// Read-only: it never attaches. `redact` masks secrets in that host.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_transcript(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    protocol: u32,
+    session_id: String,
+    max_bytes: Option<usize>,
+    redact: Option<bool>,
+) -> Result<crate::terminal::TranscriptRead, String> {
+    crate::terminal::control_async(&state, "terminal_legacy_transcript", move |state| {
+        state.legacy_transcript(
+            protocol,
+            &session_id,
+            max_bytes.unwrap_or(crate::terminal::MAX_TRANSCRIPT_TAIL_BYTES),
+            redact.unwrap_or(false),
+        )
+    })
+    .await
 }
 
 /// Mass external-signal deaths recorded this run, newest first and bounded.
@@ -548,6 +610,11 @@ pub async fn cmd_terminal_session_ledger_reopen_check(
 /// Persists a stabilized live or user-renamed session title in the durable
 /// session ledger so detached listings and crash/quit recovery offers retain
 /// the session's human-meaningful title across reloads and restarts.
+///
+/// The same command carries the session's kill protection: `protected: true`
+/// spares it from batch closes, "Stop children", agent closes and the load
+/// governor (see `terminal::KillOrigin::respects_protection`); it is kept on
+/// the ledger row so it survives a reload and a restart.
 #[tauri::command(async)]
 pub async fn cmd_terminal_set_title(
     app: AppHandle,
@@ -555,9 +622,36 @@ pub async fn cmd_terminal_set_title(
     session_id: String,
     title: Option<String>,
     user_named: Option<bool>,
+    protected: Option<bool>,
 ) -> Result<bool, IpcError> {
     let state = state.inner().clone();
     off_thread(move || {
+        // `protected` set means this call is about protection: the title is
+        // only touched when one is given, so a caller can flip the flag
+        // without clearing the name.
+        if let Some(protected) = protected {
+            let flag_changed = state.session_ledger().set_protected(&session_id, protected);
+            state.session_ledger().record_lifecycle(
+                "protection",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "protected": protected,
+                    "changed": flag_changed,
+                }),
+            );
+            // `set_protected` answers false both for "already so" and for a
+            // session the ledger has no row for. Only the first is a success:
+            // a lock shown for a flag that was never stored would be a lie.
+            if state.session_ledger().is_protected(&session_id) != protected {
+                return Err(
+                    "That session is not recorded in the session ledger, so its protection could not be changed."
+                        .into(),
+                );
+            }
+            if title.is_none() {
+                return Ok(flag_changed);
+            }
+        }
         let (changed, offer_changed) = state.session_ledger().set_title(
             &session_id,
             title.as_deref(),

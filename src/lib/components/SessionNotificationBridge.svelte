@@ -19,6 +19,7 @@
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
   import { adoptDetachedSessions } from "../terminal/detachedSessions";
+  import { retryListing } from "../terminal/retryListing";
   import { repoStore } from "../stores/repoStore";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import { bindAttention, sessionActivity } from "../terminal/sessionActivity";
@@ -62,7 +63,8 @@
     if (!isTauri()) return;
     // Once per page. After a reload the host still runs what the previous
     // page started; without this they would be invisible and uncounted.
-    void adoptDetachedSessions({ familyOf: (path) => repoStore.familyOf(path) }).then(
+    // A failed listing is not an empty one: it is tried again (bounded) before the dock gives up on restoring.
+    void retryListing(() => adoptDetachedSessions({ familyOf: (path) => repoStore.familyOf(path) })).then(
       (count) => {
         if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the terminal dock.`, 10000);
       },

@@ -315,6 +315,10 @@ site | src/terminal/host/client_tests.rs | a_failed_first_listing_is_retried_in_
 site | src/terminal/host/client_tests.rs | a_session_that_exited_is_no_longer_known | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | delivered_exits_are_not_vouched_for_while_their_recording_is_pending | 0 | bounded-poll
 
+# src/terminal/host/legacy_tests.rs
+site | src/terminal/host/legacy_tests.rs | Fake::on | 0 | unbounded-poll
+site | src/terminal/host/legacy_tests.rs | a_host_that_answers_a_byte_at_a_time_cannot_stretch_the_deadline | 0 | fixture-delay
+
 # src/terminal/incident.rs
 site | src/terminal/incident.rs | wait_until | 0 | bounded-poll
 

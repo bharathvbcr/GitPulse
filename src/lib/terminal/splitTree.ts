@@ -1784,7 +1784,7 @@ function parseRawSplitNode(value: unknown, depth: number): SplitNode | null {
   return null;
 }
 
-function parsePersistedLeaves(rawLeaves: unknown): Record<string, PersistedSplitLeafMeta> {
+export function parsePersistedLeaves(rawLeaves: unknown): Record<string, PersistedSplitLeafMeta> {
   const leavesRaw =
     rawLeaves && typeof rawLeaves === "object" && !Array.isArray(rawLeaves)
       ? (rawLeaves as Record<string, unknown>)

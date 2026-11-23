@@ -80,6 +80,17 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
     }
 
     fn exit(&self, ended: SessionEnded) {
+        self.session_ledger.record_lifecycle(
+            "exit",
+            serde_json::json!({
+                "session_id": ended.payload.id,
+                "exit_code": ended.payload.exit_code,
+                "signal": ended.payload.signal,
+                "ended_by_gitpulse": ended.ended_by_gitpulse,
+                "program": ended.program,
+                "cwd": ended.cwd,
+            }),
+        );
         if self.session_ledger.record_exit(
             &ended.payload.id,
             ended.ended_by_gitpulse,

@@ -18,8 +18,8 @@ use base64::Engine;
 use gitpulse_lib::commands::{cmd_terminal_resize, cmd_terminal_write};
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
-    acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, TerminalSessions,
-    GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
+    acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, KillOrigin,
+    TerminalSessions, GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
 };
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -394,7 +394,7 @@ fn a_resize_does_not_block_the_thread_that_polls_it() {
     tauri::async_runtime::block_on(resize).unwrap();
     releaser.join().unwrap();
     assert!(list_sessions(&state).unwrap().iter().any(|s| s.id == id));
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// Polls `call` once with no waker, as the runtime does the first time it sees
@@ -481,7 +481,7 @@ fn a_full_resize_queue_is_refused_at_once_and_what_was_accepted_still_completes(
         80,
     ))
     .unwrap();
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// Calls whose futures are dropped (a webview that went away mid-command)
@@ -526,7 +526,7 @@ fn dropped_calls_do_not_wedge_a_lane() {
         "the lane was still draining cancelled resizes after {:?}",
         started.elapsed()
     );
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// A write to a session that is gone is refused with the old message, without
@@ -622,7 +622,9 @@ fn writes_queued_or_in_flight_when_a_session_ends_are_answered_as_gone() {
         // writes queued behind it: it is bounded by its own cleanup wait.
         let closing = Instant::now();
         match ending {
-            Ending::Kill => kill_session(&state, &id).unwrap(),
+            Ending::Kill => {
+                kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
+            }
             Ending::Shutdown => gitpulse_lib::terminal::shutdown_sessions(&state).unwrap(),
             Ending::SelfExit => {}
         }
@@ -696,7 +698,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         None,
     ))
     .unwrap();
-    kill_session(&state, &warm).unwrap();
+    kill_session(&state, &warm, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )
@@ -830,7 +832,7 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
     std::thread::scope(|scope| {
         for id in &ids {
             let state = &state;
-            scope.spawn(move || kill_session(state, id).unwrap());
+            scope.spawn(move || kill_session(state, id, KillOrigin::Unspecified).unwrap());
         }
     });
     assert!(
@@ -955,7 +957,7 @@ fn concurrent_writers_to_one_session_keep_each_callers_order_and_every_byte() {
             "writer {writer}'s writes arrived out of order"
         );
     }
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// Webview reloads drop command futures mid-flight, often. A write whose
@@ -1110,7 +1112,7 @@ fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
         fours.len(),
         kept_ids.len()
     );
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// Views attach and detach (a reload, a tab moved to another window) while
@@ -1187,7 +1189,7 @@ fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
             "writer {writer} reordered"
         );
     }
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// A storm of resizes from many callers, then a run of resizes queued in order
@@ -1247,7 +1249,7 @@ fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
         *sizes.last().unwrap(),
         "the PTY was left at a size other than the last one asked for"
     );
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// The control pool (context, close, attach) can be full — every thread busy
@@ -1264,7 +1266,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
     ) -> Result<(), String> {
         let kill_id = session_id.clone();
         gitpulse_lib::terminal::control_async(&state, "terminal_kill", move |state| {
-            kill_session(state, &kill_id)
+            kill_session(state, &kill_id, KillOrigin::Unspecified).map(|_| ())
         })
         .await
     }
@@ -1404,7 +1406,7 @@ fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() 
         id.clone(),
     ))
     .unwrap();
-    kill_session(&state, &id).unwrap();
+    kill_session(&state, &id, KillOrigin::Unspecified).unwrap();
 }
 
 /// The session cap's worth of sessions, each with both lanes started: the lane
@@ -1425,7 +1427,7 @@ fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
 
     let warm = start_cat(&app, &state, &output, dir.path());
     write_now(&handle, &warm, "warm".into()).unwrap();
-    kill_session(&state, &warm).unwrap();
+    kill_session(&state, &warm, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(10), || list_sessions(
         &state
     )

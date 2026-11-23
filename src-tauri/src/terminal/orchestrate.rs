@@ -23,6 +23,7 @@ use crate::terminal::{
     bounded_pty_size, detach_session, is_session_id, spawn_at, write_input, OutputSink, Place,
     SessionEvents, SharedSessionTelemetry, TerminalSessions,
 };
+use crate::terminal::{KillOrigin, KillOutcome};
 #[cfg(unix)]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -2364,6 +2365,7 @@ fn close_child_internal(
     caller_key: &str,
     child_session_id: &str,
     canonical_repo: &str,
+    origin: KillOrigin,
 ) -> Result<bool, String> {
     let already_ended = {
         let inner = state.orchestration.lock();
@@ -2378,7 +2380,16 @@ fn close_child_internal(
     };
 
     if !already_ended {
-        crate::terminal::kill_session(state, child_session_id)?;
+        // The caller rides with the origin into the log and lifecycle record.
+        match crate::terminal::kill_session_as(state, child_session_id, origin, Some(caller_key))? {
+            KillOutcome::Killed => {}
+            KillOutcome::SkippedProtected => {
+                return Err(crate::terminal::lifecycle::skipped_protected_message(
+                    child_session_id,
+                    origin,
+                ));
+            }
+        }
         state.orchestration.mark_ended(child_session_id, None);
     }
 
@@ -2541,6 +2552,7 @@ pub(crate) fn execute_with_shell_reads(
                             caller.parent_key(),
                             &target_id,
                             &canonical_repo,
+                            KillOrigin::AgentExecCleanup,
                         );
                     }
                     return Err(err);
@@ -2637,6 +2649,7 @@ pub(crate) fn execute_with_shell_reads(
                     caller.parent_key(),
                     &target_id,
                     &canonical_repo,
+                    KillOrigin::AgentExecCleanup,
                 )?;
                 true
             } else {
@@ -3051,6 +3064,7 @@ pub(crate) fn execute_with_shell_reads(
                 caller.parent_key(),
                 &child_session_id,
                 &canonical_repo,
+                KillOrigin::AgentClose,
             )?;
 
             Ok(json!({
@@ -3331,8 +3345,8 @@ pub(crate) mod tests {
         .unwrap_err();
         assert_eq!(revoked_err, CREDENTIAL_REFUSAL);
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
-        let _ = crate::terminal::kill_session(&state, &child_a);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
+        let _ = crate::terminal::kill_session(&state, &child_a, KillOrigin::Unspecified);
     }
 
     #[test]
@@ -3459,7 +3473,7 @@ pub(crate) mod tests {
         );
         assert!(traversal.is_err(), "{traversal:?}");
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[cfg(unix)]
@@ -3561,7 +3575,7 @@ pub(crate) mod tests {
             "GITPULSE_SESSION_TOKEN leaked in screen read: {text}"
         );
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[test]
@@ -3737,7 +3751,7 @@ pub(crate) mod tests {
             "stale Turn-1 herdr_status woke Turn-2 Wait prematurely: {early_wait}"
         );
 
-        let _ = crate::terminal::kill_session(&state, &child);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
     }
 
     #[cfg(unix)]
@@ -3964,11 +3978,85 @@ pub(crate) mod tests {
             .unwrap()
             .to_string();
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
-        let _ = crate::terminal::kill_session(&state, &replacement_id);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
+        let _ = crate::terminal::kill_session(&state, &replacement_id, KillOrigin::Unspecified);
         for cid in children_a.iter().skip(1) {
-            let _ = crate::terminal::kill_session(&state, cid);
+            let _ = crate::terminal::kill_session(&state, cid, KillOrigin::Unspecified);
         }
+    }
+
+    /// Before: an agent's close (`gitpulse_terminal_close`, `term close`) always
+    /// ended the child, whatever the user had asked to keep.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_close_skips_a_protected_child_and_says_why() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90007-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("kept".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let ledger = state.session_ledger();
+        ledger.record_spawn(crate::terminal::session_ledger::NewSessionRow {
+            terminal_id: child.clone(),
+            launcher: "shell".into(),
+            native_id: None,
+            repo_path: repo.clone(),
+            start_dir: None,
+            cwd: repo.clone(),
+            mode: None,
+            reopen_row_id: None,
+        });
+        assert!(ledger.set_protected(&child, true));
+        let close = || {
+            execute(
+                &state,
+                &ui,
+                OrchestrateCall::Close {
+                    repo_path: repo.clone(),
+                    caller_session_id: Some(parent.into()),
+                    caller_token: Some(token.clone()),
+                    external_caller_id: None,
+                    child_session_id: child.clone(),
+                },
+            )
+        };
+        let refusal = close().unwrap_err();
+        assert!(
+            refusal.contains("is protected") && refusal.contains(&child),
+            "{refusal}"
+        );
+        assert!(
+            ui.closed.lock().unwrap().is_empty(),
+            "no child_closed event"
+        );
+        assert!(crate::terminal::list_sessions(&state)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == child && !s.ending));
+        assert!(ledger.set_protected(&child, false));
+        assert_eq!(close().expect("close once unprotected")["ok"], true);
     }
 
     #[test]
@@ -4387,7 +4475,7 @@ pub(crate) mod tests {
             LINEAGE_REFUSAL
         );
 
-        let _ = crate::terminal::kill_session(&state, &user_shell.id);
+        let _ = crate::terminal::kill_session(&state, &user_shell.id, KillOrigin::Unspecified);
     }
 
     /// A tracked shell child of a synthetic parent, in `state`.
