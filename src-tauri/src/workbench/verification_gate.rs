@@ -152,7 +152,19 @@ fn parse_record(data: &str) -> Result<Record, String> {
 /// while the store has not changed). The caller names the memo: a caller that
 /// carries a backend asks the backend's, so a test can give each run its own,
 /// and one with none asks [`Memo::shared`].
-pub(crate) fn check(memo: &Memo, store: &Store, item_id: &str, repository_identity: &str) -> Gate {
+///
+/// `claimant_head` is the commit the caller claims done for: the claim's head
+/// for the driver, the checkout's HEAD for a claim made through
+/// `complete_task`. `None` is a head that could not be read. It matters only
+/// to the landed path: a pass whose worktree no longer answers for it counts
+/// only when it is for exactly the claimed commit.
+pub(crate) fn check(
+    memo: &Memo,
+    store: &Store,
+    item_id: &str,
+    repository_identity: &str,
+    claimant_head: Option<&str>,
+) -> Gate {
     match memo.latest(store, item_id) {
         Err(reason) => Gate::Held(reason),
         Ok(None) => Gate::Held(
@@ -164,6 +176,7 @@ pub(crate) fn check(memo: &Memo, store: &Store, item_id: &str, repository_identi
             repository_identity,
             &current_head,
             &landed_on_default,
+            claimant_head,
         ),
     }
 }
@@ -255,6 +268,7 @@ pub(crate) fn judge(
     repository_identity: &str,
     head_of: &dyn Fn(&str) -> Result<String, CommandError>,
     landed: &dyn Fn(&str, &str) -> Result<bool, String>,
+    claimant_head: Option<&str>,
 ) -> Gate {
     let verdict = summarize(record);
     if record.item_id != item_id {
@@ -312,6 +326,24 @@ pub(crate) fn judge(
             record.worktree, error.message
         ),
     };
+    // Landed work is a pass only for the commit it was verified at: commits
+    // that landed on top of it were never judged.
+    match claimant_head {
+        None => {
+            return Gate::Held(format!(
+                "{moved}; the head the claim is for could not be read, so the verified commit {} cannot be tied to it",
+                short(&record.head)
+            ))
+        }
+        Some(claimed) if claimed != record.head => {
+            return Gate::Held(format!(
+                "{moved}; the claim is for {} but the verified commit is {}. Verify again",
+                short(claimed),
+                short(&record.head)
+            ))
+        }
+        Some(_) => {}
+    }
     match landed(repository_identity, &record.head) {
         Ok(true) => Gate::Passed(format!(
             "{verdict}\nThe verified commit {} is on the default branch.",

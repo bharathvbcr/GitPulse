@@ -449,6 +449,7 @@ impl Driver {
                     store,
                     id,
                     &repository_identity(store, card).unwrap_or_default(),
+                    Some(&target.head),
                 );
                 match outcome {
                     Gate::Passed(verdict) => {

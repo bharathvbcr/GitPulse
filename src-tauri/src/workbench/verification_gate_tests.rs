@@ -140,7 +140,7 @@ fn a_verification_still_running_is_not_a_verdict() {
 }
 
 #[test]
-fn a_passed_record_for_an_older_head_is_stale() {
+fn a_passed_record_for_an_older_head_on_an_unlanded_lane_is_stale() {
     let (_d, store, repo, id) = setup();
     // The work is on a lane that has not landed: a head that moved past a
     // pass on the default branch itself would be landed work.
@@ -161,6 +161,48 @@ fn a_passed_record_for_an_older_head_is_stale() {
         &response,
         "the work changed after it was verified",
     );
+}
+
+/// The main-checkout case: the record is for the default branch's own head M,
+/// new commits land on top, and the claim is made from that checkout. M is an
+/// ancestor of the tip, but the claim is for M2, which was never verified.
+#[test]
+fn a_passed_record_for_an_older_head_is_stale() {
+    let (_d, store, repo, id) = setup();
+    verified(&store, &repo, &id);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more work"],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(
+        &store,
+        &id,
+        &response,
+        "the work changed after it was verified",
+    );
+}
+
+/// A verified lane landed and was removed, then more commits landed on top: a
+/// claim from the main checkout is for the new tip, not the verified commit.
+#[test]
+fn a_landed_pass_does_not_cover_commits_that_landed_after_it() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    crate::test_support::git_in(
+        repo.path(),
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "unverified follow-up",
+        ],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "the claim is for");
 }
 
 #[test]
@@ -387,6 +429,12 @@ fn land(repo: &tempfile::TempDir) {
     );
 }
 
+/// Land the lane by fast-forward, so the default branch's tip is the verified
+/// commit itself and a claim made from that checkout is for that commit.
+fn land_ff(repo: &tempfile::TempDir) {
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--ff-only", "lane"]);
+}
+
 fn tear_down(repo: &tempfile::TempDir, lane: &str) {
     crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", lane]);
 }
@@ -395,7 +443,7 @@ fn tear_down(repo: &tempfile::TempDir, lane: &str) {
 fn a_pass_for_a_commit_that_landed_on_the_default_branch_survives_the_lane_being_removed() {
     let (_d, store, repo, id) = setup();
     let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
-    land(&repo);
+    land_ff(&repo);
     tear_down(&repo, &lane);
     crate::test_support::git_in(repo.path(), &["branch", "-q", "-D", "lane"]);
     let response = claim(&store, &repo, &id, Some("Landed"));
@@ -414,7 +462,7 @@ fn a_pass_for_a_commit_that_landed_on_the_default_branch_survives_the_lane_being
 fn a_pass_for_a_landed_commit_passes_while_the_lane_moved_on_past_it() {
     let (_d, store, repo, id) = setup();
     let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
-    land(&repo);
+    land_ff(&repo);
     crate::test_support::git_in(
         std::path::Path::new(&lane),
         &["commit", "-q", "--allow-empty", "-m", "unrelated follow-up"],
@@ -426,8 +474,11 @@ fn a_pass_for_a_landed_commit_passes_while_the_lane_moved_on_past_it() {
 #[test]
 fn a_pass_for_a_commit_that_never_landed_stays_held_when_the_lane_is_gone() {
     let (_d, store, repo, id) = setup();
-    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
     tear_down(&repo, &lane);
+    // The claim is for the verified commit itself, so the landed check is
+    // reached and says the commit is not on the default branch.
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "--detach", &m]);
     let response = claim(&store, &repo, &id, None);
     assert_held(&store, &id, &response, "not on the default branch");
 }
@@ -455,7 +506,6 @@ fn a_lane_that_moved_to_a_commit_without_the_verified_one_stays_held() {
         &response,
         "the work changed after it was verified",
     );
-    assert_held(&store, &id, &response, "not on the default branch");
 }
 
 #[test]
@@ -467,7 +517,7 @@ fn a_record_whose_commit_the_repository_does_not_know_stays_held() {
     store_record(&store, &id, &passed);
     let response = claim(&store, &repo, &id, None);
     assert_held(&store, &id, &response, "could not be resolved");
-    assert_held(&store, &id, &response, "could not be read");
+    assert_held(&store, &id, &response, "the claim is for");
 }
 
 // ---- Adversarial attacks on the landed-commit relaxation (bl1121w3) ----
@@ -485,6 +535,17 @@ fn claim_with_record(
     let mut passed = record(id, "passed", "settled", repo, head);
     passed["worktree"] = json!(worktree);
     store_record(store, id, &passed);
+    // The claim is for the commit the checkout is at. Put it at the recorded
+    // head where the repository has that commit, so the landed check itself is
+    // what the attack meets rather than a claim for some other commit.
+    if crate::engine::git_cli::git_text(
+        repo.path(),
+        &["cat-file", "-e", &format!("{head}^{{commit}}")],
+    )
+    .is_ok()
+    {
+        crate::test_support::git_in(repo.path(), &["checkout", "-q", "--detach", head]);
+    }
     claim(store, repo, id, None)
 }
 

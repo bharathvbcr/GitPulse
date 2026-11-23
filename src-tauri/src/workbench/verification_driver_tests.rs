@@ -294,7 +294,7 @@ fn a_sidecar_that_is_down_is_recorded_as_could_not_run_not_failed_and_not_retrie
     assert_eq!(driver.sweep(&store, &fake), Report::default());
     assert!(fake.starts.borrow().is_empty());
     let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
-    let held = gate::check(fake.memo(), &store, &id, &identity);
+    let held = gate::check(fake.memo(), &store, &id, &identity, None);
     assert!(matches!(held, gate::Gate::Held(m) if m.contains("could not run")));
 }
 
