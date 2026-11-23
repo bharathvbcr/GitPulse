@@ -2244,9 +2244,39 @@ pub(crate) fn dir_use(dir: &Path) -> Result<DirUse, String> {
 pub(crate) fn processes_using(dir: &Path) -> Result<Vec<i32>, String> {
     let reading = dir_use(dir)?;
     if reading.users.is_empty() && !reading.unreadable.is_empty() {
-        return Err(reading.why_kept().unwrap_or_default());
+        let why = reading.why_kept().unwrap_or_default();
+        return Err(format!(
+            "{why} ({})",
+            name_unreadable(&reading.unreadable, |pid| {
+                probe_one(pid).map(|facts| facts.ident.name.clone())
+            })
+        ));
     }
     Ok(reading.pids())
+}
+
+/// How many unreadable processes a refusal names; the rest are counted.
+const MAX_NAMED_UNREADABLE: usize = 5;
+
+/// `pid 812 ssh-agent, pid 1195 gitpulse-nodump, and 3 more`: which processes
+/// could not be read, so the person (or a CI log) can see what is holding a
+/// directory. A process's name is in `/proc/<pid>/stat` even when its
+/// environment and working directory are closed (not dumpable); one that has
+/// exited since is named by its pid alone.
+fn name_unreadable(pids: &[i32], name_of: impl Fn(i32) -> Option<String>) -> String {
+    let mut named: Vec<String> = pids
+        .iter()
+        .take(MAX_NAMED_UNREADABLE)
+        .map(|&pid| match name_of(pid) {
+            Some(name) if !name.is_empty() => format!("pid {pid} {name}"),
+            _ => format!("pid {pid}"),
+        })
+        .collect();
+    let rest = pids.len().saturating_sub(MAX_NAMED_UNREADABLE);
+    if rest > 0 {
+        named.push(format!("and {rest} more"));
+    }
+    named.join(", ")
 }
 
 /// Every pid in the process table, bounded by [`MAX_SCANNED_PROCESSES`].
@@ -3274,7 +3304,13 @@ mod os {
         cpu_ticks: u64,
         start_ticks: u64,
         zombie: bool,
+        /// `PF_KTHREAD` is set in the process flags: a kernel thread.
+        kernel_thread: bool,
     }
+
+    /// `PF_KTHREAD` in `include/linux/sched.h`, the `flags` field of
+    /// `/proc/<pid>/stat`.
+    const PF_KTHREAD: u64 = 0x0020_0000;
 
     fn stat(pid: i32) -> Option<Stat> {
         let raw = read_bounded(&format!("/proc/{pid}/stat"), 8192).ok()?;
@@ -3287,6 +3323,9 @@ mod os {
         Some(Stat {
             name,
             zombie: fields.first() == Some(&"Z"),
+            // Fields after the name: state, ppid, pgrp, session, tty_nr,
+            // tpgid, flags.
+            kernel_thread: field(6).is_some_and(|flags| flags & PF_KTHREAD != 0),
             ppid: field(1).and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             cpu_ticks: field(11)?.saturating_add(field(12)?),
             start_ticks: field(19)?,
@@ -3515,11 +3554,18 @@ mod os {
     }
 
     /// What `pid` shows of itself to this user, for the directory-use check.
-    /// `None` when it is gone. Anything of the user's that cannot be read is
-    /// `None` in the row, never an empty list.
+    /// `None` when it is gone, a zombie, or a kernel thread. Anything of the
+    /// user's that cannot be read is `None` in the row, never an empty list.
+    ///
+    /// A kernel thread (`kworker`, `ksoftirqd`, ...) runs no program: it has
+    /// no address space, so no argument list or environment to read, and it
+    /// cannot hold a directory open the way a user's process does. To root
+    /// it is "the user's own" and its `environ` read fails, so keeping it
+    /// would make every directory unprovable when GitPulse runs as root (a
+    /// container, a CI image): it is left out like a zombie.
     pub(crate) fn read_use(pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
         let info = stat(pid)?;
-        if info.zombie {
+        if info.zombie || info.kernel_thread {
             return None;
         }
         let cwd = cwd(pid);
@@ -4014,6 +4060,68 @@ pub(crate) mod tests {
             ..unreadable
         };
         assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
+    }
+
+    /// A refusal for unreadable processes names them, so whoever reads it can
+    /// see what is holding the directory; past a handful the rest are counted.
+    #[test]
+    fn unreadable_processes_are_named_in_the_refusal() {
+        let names = |pid: i32| match pid {
+            812 => Some("ssh-agent".to_string()),
+            813 => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            super::name_unreadable(&[812, 813, 9], names),
+            "pid 812 ssh-agent, pid 813, pid 9"
+        );
+        let many: Vec<i32> = (1..=8).collect();
+        assert_eq!(
+            super::name_unreadable(&many, |_| Some("x".to_string())),
+            "pid 1 x, pid 2 x, pid 3 x, pid 4 x, pid 5 x, and 3 more"
+        );
+    }
+
+    /// Kernel threads are not in the directory-use table: they run no program
+    /// and cannot use a directory, and to root they are "the user's own" with
+    /// an `environ` that cannot be read, which made every directory unprovable
+    /// (and every worktree teardown refused) when GitPulse ran as root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_threads_are_left_out_of_the_directory_use_table() {
+        let kernel_threads: Vec<i32> = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|text| {
+                        let rest = text.get(text.rfind(')')? + 1..)?.to_string();
+                        rest.split_whitespace().nth(6)?.parse::<u64>().ok()
+                    })
+                    .is_some_and(|flags| flags & 0x0020_0000 != 0)
+            })
+            .collect();
+        if kernel_threads.is_empty() {
+            // A pid namespace that shows no kernel thread: nothing to check.
+            eprintln!("skipped: no kernel thread is visible in /proc");
+            return;
+        }
+        let mut buf = Vec::new();
+        for pid in &kernel_threads {
+            assert!(
+                os::read_use(*pid, &mut buf).is_none(),
+                "kernel thread {pid} is in the directory-use table"
+            );
+        }
+        let table = read_use_table().expect("read the process table");
+        assert!(
+            table.iter().all(|row| !kernel_threads.contains(&row.pid)),
+            "a kernel thread is in the directory-use table"
+        );
+        // This process is not a kernel thread and is still read.
+        let me = i32::try_from(std::process::id()).expect("pid");
+        assert!(table.iter().any(|row| row.pid == me));
     }
 
     fn unreadable_row(pid: i32) -> ProcessUse {
