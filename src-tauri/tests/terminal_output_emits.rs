@@ -562,16 +562,14 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
             > 512 * 1024),
         "the stream never got going"
     );
+    // The flow-control window: credit the host can have sent and the view not
+    // yet acknowledged. It is all that can still be on its way at the detach.
+    const WINDOW: usize = 512 * 1024;
+    let at_detach = received(&tallies, &id);
     assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
-    // Whatever was already in flight lands; then it is quiet.
-    std::thread::sleep(Duration::from_millis(300));
-    let settled = received(&tallies, &id);
-    std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        received(&tallies, &id),
-        settled,
-        "a detached session was still being sent output"
-    );
+    // Detached for a while. `yes` keeps writing throughout; a host that kept
+    // sending would deliver megabytes in this time, not one window.
+    std::thread::sleep(Duration::from_millis(700));
     assert!(
         gitpulse_lib::terminal::list_sessions(&state)
             .unwrap()
@@ -579,17 +577,24 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
             .any(|s| s.id == id && s.detached),
         "the process must still be running, detached"
     );
-    gitpulse_lib::terminal::attach_session(
-        &state,
-        &id,
-        24,
-        80,
-        gitpulse_lib::terminal::OutputSink::events(app.handle()),
-    )
-    .unwrap();
+    // A view takes it over, on a channel of its own so its replay and stream
+    // are told apart from what the first view was sent. `attach` answers only
+    // once everything the host sent before its reply has been delivered
+    // (`call_in_order`), so what the first view has now is final: what was
+    // in flight at the detach has landed, however slowly this host delivers.
+    // A fixed 300 ms wait for that read a still-landing backlog as output
+    // sent after the detach (85 KB on a loaded Linux runner).
+    let (viewer, sink) = Viewer::new(&state, true);
+    gitpulse_lib::terminal::attach_session(&state, &id, 24, 80, sink).unwrap();
+    viewer.bind(&id);
+    let late = received(&tallies, &id) - at_detach;
     assert!(
-        wait_for(Duration::from_secs(20), || received(&tallies, &id)
-            > settled + 512 * 1024),
+        late <= WINDOW,
+        "a detached session was still being sent output: {late} bytes reached the first view \
+         after the detach, more than the {WINDOW}-byte window that could have been in flight"
+    );
+    assert!(
+        wait_for(Duration::from_secs(20), || viewer.bytes() > 512 * 1024),
         "a reattached session never streamed again"
     );
     gitpulse_lib::terminal::kill_session(&state, &id).unwrap();
@@ -943,10 +948,18 @@ fn coalesced_late_acknowledgements_across_a_shed_keep_credit_exact() {
             let mut stalled = false;
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline {
-                // One stall, long enough to be shed, once the stream is going.
-                if !stalled && owed.lock().unwrap().values().sum::<usize>() > 64 * 1024 {
+                // One stall, once the stream is going, that lasts until the
+                // view is shed: the window fills, the stall timeout passes and
+                // the loss is reported. It used to wait for more than 64 KiB
+                // owed and then a fixed 400 ms. The host relays one chunk of
+                // at most OUTPUT_CHUNK_BYTES (64 KiB) between two passes of
+                // this loop, so the owed total sat at exactly 64 KiB and the
+                // stall never began; and how long a fixed stall takes to fill
+                // the window is the relay's speed, not the behaviour here.
+                if !stalled && owed.lock().unwrap().values().sum::<usize>() > 0 {
                     stalled = true;
-                    std::thread::sleep(Duration::from_millis(400));
+                    let shed = || *losses.lock().unwrap() > 0;
+                    wait_for(deadline.saturating_duration_since(Instant::now()), shed);
                 }
                 let batch: Vec<(String, usize)> = owed.lock().unwrap().drain().collect();
                 for (session, bytes) in batch {
