@@ -1273,6 +1273,17 @@ fn peer_envelopes_leave_the_last_slot_for_one_overflow_notice() {
         mailbox.deposit(SESSION, "human", "hello", now),
         Err(MailboxError::Full(_))
     ));
+    let notice = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    let text = &notice
+        .iter()
+        .find(|c| c.claim.text.contains("gitpulse_agent_inbox"))
+        .expect("the notice is pending")
+        .claim
+        .text;
+    assert!(text.contains("repo_path=/repo"), "{text}");
+    assert!(text.contains(&format!("for_peer={SESSION}")), "{text}");
+    assert!(text.contains("ack=true"), "{text}");
+    assert!(text.contains("since_seq"), "{text}");
 }
 
 #[test]

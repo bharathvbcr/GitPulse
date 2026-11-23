@@ -847,9 +847,11 @@ impl Mailbox {
             Err(MailboxError::Full(_)) => {}
             other => return other.map(PeerDeposit::Deposited),
         }
+        let for_peer = session.to_ascii_lowercase();
         let notice_text = format!(
             "More peer messages are waiting on the GitPulse agent bus for this session in {repo_root}. \
-             Call gitpulse_agent_inbox with repo_path={repo_root} to read them."
+             Call gitpulse_agent_inbox with repo_path={repo_root} and for_peer={for_peer} to read them; \
+             pass ack=true to mark what it reads as read, or since_seq to page."
         );
         let notice_id = overflow_notice_id(&repo_root);
         let notice = EnvelopeProvenance::PeerAgent {
