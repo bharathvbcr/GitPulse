@@ -5672,7 +5672,7 @@ mod tests {
             10_000,
             Cfg::default(),
         );
-        assert_eq!(got.emits, vec![quiet(), quiet() + SCAN_COALESCE]);
+        assert_eq!(got.emits, vec![quiet(), ms(2_400)]);
     }
 
     #[test]
@@ -5788,7 +5788,7 @@ mod tests {
             10_000,
             Cfg::default(),
         );
-        assert_eq!(got.emits, vec![quiet(), quiet() + SCAN_COALESCE]);
+        assert_eq!(got.emits, vec![quiet(), ms(2_400)]);
     }
 
     #[test]
