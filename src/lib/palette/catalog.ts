@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
+import { Bot, Bug, MessagesSquare, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type MutationTarget, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -20,7 +20,7 @@ import { openConflicts } from "../ui/workConflicts";
 import { policyActivityVisible } from "../harness/policyActivityVisible";
 import { harnessStore } from "../stores/harnessStore";
 
-const icons = { work: GitBranch, code: FileCode, history: Search, insights: Percent };
+const icons = { work: GitBranch, mavi: MessagesSquare, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
 const MANVI_PALETTE_LABELS: Readonly<Record<ManviFocusId, string>> = {
   harness: "Open Manvi policy settings — connection and capability boundary",

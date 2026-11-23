@@ -18,7 +18,7 @@ GitPulse is also the successor to the deprecated [LiquiTask](https://github.com/
 | --- | --- |
 | Install a pre-built app | [[Installation]] |
 | Open a repository and find my way around | [[Getting Started]] |
-| Understand the four views | [[Views]] |
+| Understand the five views | [[Views]] |
 | Organize tasks and saved workspaces | [Tasks and workspaces](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TASKS_AND_WORKSPACES.md) |
 | Look up a shortcut | [[Keyboard Shortcuts]] |
 | Run agents: launch, guards, messaging, collisions | [Agents guide](https://github.com/bharathvbcr/GitPulse/blob/main/docs/AGENTS_GUIDE.md) |
@@ -33,7 +33,7 @@ Four **views**, each a header tab. Sections inside a view are lenses on the same
 
 ```mermaid
 flowchart LR
-    subgraph Views["The four views"]
+    subgraph Views["The five views"]
         Work["Work — Overview · Remote · Tasks"]
         Code["Code — Explorer (Search and Blame toggles) · Map"]
         History["History — Graph (commits / HEAD moves / suspects) · Diff"]

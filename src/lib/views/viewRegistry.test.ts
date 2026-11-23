@@ -69,6 +69,7 @@ describe("viewRegistry", () => {
   it("keeps declaration order stable, because it is the header order", () => {
     expect(REGISTERED_VIEWS.map((view) => view.id)).toEqual([
       "work",
+      "mavi",
       "code",
       "history",
       "insights",

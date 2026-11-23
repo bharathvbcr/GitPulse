@@ -11,6 +11,23 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ## [Unreleased]
 
+### Added
+
+- **Mavi**, a chat-first view for coding agents ([docs/MAVI.md](docs/MAVI.md)).
+  Claude Code runs in its structured stream-json mode, here or on an SSH host,
+  and its work reads as a timeline: tool runs collapsed by what they did,
+  permission requests answered in place against the change they propose, a
+  queue for messages written while a turn runs, Stop, and Resume of the
+  conversation after a quit. SSH uses the system `ssh` with `BatchMode` and
+  strict host keys, and checks a host before starting with a typed answer.
+- **Live changes per turn.** Mavi's Changes column shows, per file, the edit an
+  agent is asking to make, the exact hunks of each edit it made, and paths that
+  changed during the turn outside its edit tools ("Other", from a read-only
+  worktree fingerprint at each turn boundary), for one turn or the whole thread.
+- **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
+  Mavi threads working in the repository, badges and lists first the files they
+  touched, and warns before discarding a file an agent is editing right now.
+
 ## [0.2.0-beta.1] - 2026-11-18
 
 The first beta of GitPulse 0.2.0 (see [GitPulse 0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md)),

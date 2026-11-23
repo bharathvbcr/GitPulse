@@ -120,6 +120,7 @@
   const loadTaskBoard = () => import("./lib/components/TaskBoard.svelte");
   const loadCodeView = () => import("./lib/components/CodeView.svelte");
   const loadHistoryView = () => import("./lib/components/HistoryView.svelte");
+  const loadMaviView = () => import("./lib/components/mavi/MaviView.svelte");
 
   // Overlays. None of these is on screen at startup and most sessions open
   // none of them, yet all six were parsed at boot because App mounted them
@@ -1280,6 +1281,8 @@
                   loadGitHub={loadGitHubPanel}
                   loadStack={loadCodeStackViewer}
                 />
+              {:else if $repoStore.activeTab === "mavi"}
+                <LazyView load={loadMaviView} name="Mavi" />
               {:else if $repoStore.activeTab === "code"}
                 <LazyView
                   load={loadCodeView}

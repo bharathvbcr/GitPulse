@@ -145,13 +145,14 @@ Install and wire up the complete GitPulse, DevCouncil, Manvi, and MCP toolchain 
 Report what succeeded, what could not run, exact paths of installed binaries, and any MCP/plugin config changes made or awaiting approval.
 ````
 
-## Four views, one workspace
+## Five views, one workspace
 
-GitPulse has 4 application views with 11 specialized sections. Each view keeps related sections together.
+GitPulse has 5 application views with 11 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Remote · Tasks |
+| **Mavi** | Work with a coding agent as a conversation, here or on an SSH host: approve each tool call against the change it proposes, and review what every turn changed | One pane: threads · conversation · changes |
 | **Code** | Browse, search and blame files, explore structure | Explorer (with Search and Blame toggles) · Map |
 | **History** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
@@ -248,7 +249,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 11 Sections<br/>(Work, Code, History, Insights)"]
+        Views["5 Views · 11 Sections<br/>(Work, Mavi, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end

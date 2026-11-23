@@ -14,9 +14,9 @@ session; use the sections below for controls, prerequisites, and limits.
 - [Command palette](COMMAND_PALETTE.md), [terminal](TERMINAL.md), and [native menus](MACOS_MENUS.md)
 - [Trust and permissions](SECURITY.md)
 
-## Four views, one workspace
+## Five views, one workspace
 
-GitPulse has 4 application views with 11 specialized sections. Each view keeps related sections together.
+GitPulse has 5 application views with 11 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
@@ -27,7 +27,7 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 
 Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
 
-GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
+GitPulse provides 5 application views — **Work**, **Mavi**, **Code**, **History** and **Insights** — all five of them header tabs. Mavi is the one single-pane view: a thread rail, the conversation and its changes, with no sections. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
 **Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi for policy, workbench, and agent hosting, and DevCouncil's `devmap` module for the Code → Map code graph. See [Module integration](MODULE_INTEGRATION.md).
 
@@ -49,7 +49,7 @@ appearance stay in the panel; Open GitPulse restores the main window. See the
 
 ```mermaid
 flowchart TD
-    subgraph ViewGroup["The four views"]
+    subgraph ViewGroup["The five views"]
         Work["<b>Work</b> (<code>work</code>)<br/>Overview · Remote · Tasks"]
         Code["<b>Code</b> (<code>code</code>)<br/>Explorer (Search and Blame toggles) · Map — files, text search, blame and code/docs map"]
         History["<b>History</b> (<code>history</code>)<br/>Graph (commits, HEAD moves or suspects) · Diff — lenses on commit history"]
@@ -273,6 +273,17 @@ See [Tasks and workspaces](TASKS_AND_WORKSPACES.md) for the workflow, shortcuts,
 copy limits and the distinction between terminal handoffs and managed runs.
 
 ---
+
+## Mavi (`mavi`)
+
+Coding agents as conversations instead of terminals. One pane, no sections:
+a thread rail (grouped by repository or SSH host, each thread with one status:
+Needs you, Working, Failed, Ready for review, Done, Idle, Not running), the
+conversation (tool runs collapsed by verb, permission requests answered in
+place against the change they propose, a queue while a turn runs), and a
+Changes column showing what a turn or the whole thread changed, including
+paths changed outside the agent's edit tools. ⌥⌘4 on macOS, Ctrl+Shift+4
+elsewhere. Full write-up: [Mavi](MAVI.md).
 
 ## 2. Code (`code`)
 
@@ -543,7 +554,7 @@ view, and one is scoped to the workspace rather than to a repository.
 
 ### 5.1 Terminal — a dock, not a view (`⌃\``)
 
-The terminal is **not** one of the 4 views. It renders as a resizable dock
+The terminal is **not** one of the 5 views. It renders as a resizable dock
 *beneath* whichever view is on screen, reached with `⌃\``, the status bar's
 Terminal chip, the command palette, or **View → Terminal**.
 

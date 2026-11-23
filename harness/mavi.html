@@ -1,0 +1,70 @@
+<!doctype html>
+<html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Mavi verification</title></head>
+<body style="margin:0;height:100vh"><div id="app" style="height:100vh;display:flex"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:6px;max-width:420px;white-space:pre-wrap;display:none"></pre>
+<script type="module">
+  import { mockIPCWithEvents } from "./tauriMocks";
+  import "../src/app.css";
+  import { mount } from "svelte";
+  import MaviView from "../src/lib/components/mavi/MaviView.svelte";
+  import { mainLines, doneLines, summary, MAIN_SESSION, DONE_SESSION, SNAPSHOT_PATCH } from "./maviFixture.ts";
+
+  // Disposable fixture: the host is simulated. What is real is the view, the
+  // store, the reducer, the rows, the changes model and every component.
+  const params = new URLSearchParams(location.search);
+  if (params.get("theme") === "light") document.documentElement.classList.remove("dark");
+  const calls = { answers: [], sends: [], diffs: [], errors: [] };
+  const show = () => { const el = document.getElementById("result"); el.textContent = JSON.stringify(calls); };
+  addEventListener("error", e => { calls.errors.push(e.message); show(); });
+  addEventListener("unhandledrejection", e => { calls.errors.push(String(e.reason)); show(); });
+  window.__mavi = calls;
+
+  const escape = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const md = text => text.split(/\n\n+/).map(block => block.startsWith("- ")
+    ? `<ul>${block.split("\n").map(l => `<li>${escape(l.slice(2)).replace(/`([^`]+)`/g, "<code>$1</code>")}</li>`).join("")}</ul>`
+    : `<p>${escape(block).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>")}</p>`).join("");
+
+  const entries = lines => lines.map((line, i) => ({ seq: i + 1, line }));
+  const scenario = params.get("scenario") ?? "approval";
+
+  localStorage.setItem("gitpulse.mavi.threads.v1", JSON.stringify(scenario === "empty" ? [] : [
+    { key: "k-main", sessionId: MAIN_SESSION, title: "Back off retries when the gateway times out", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "ask", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 20_000, seenAt: 0 },
+    { key: "k-done", sessionId: DONE_SESSION, title: "Why is the nightly build slow?", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "inspect", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 3_500_000, seenAt: 0 },
+    { key: "k-ssh", sessionId: null, title: "Profile the ingest worker", target: { kind: "ssh", host: "gpu-box", dir: "~/ingest" }, mode: "edit", model: null, conversationId: "1f0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b99", createdAt: 1, lastActivityAt: Date.now() - 86_400_000, seenAt: Date.now() },
+  ]));
+
+  mockIPCWithEvents(async (cmd, args) => {
+    switch (cmd) {
+      case "cmd_mavi_list":
+        return scenario === "empty" ? [] : [summary(MAIN_SESSION, "approval"), summary(DONE_SESSION, "idle", { touched: [], cost_usd: 0.08 })];
+      case "cmd_mavi_events":
+        if (args.id === MAIN_SESSION) return { entries: entries(mainLines()), next_seq: 999, summary: summary(MAIN_SESSION, "approval") };
+        return { entries: entries(doneLines()), next_seq: 99, summary: summary(DONE_SESSION, "idle", { touched: [] }) };
+      case "cmd_mavi_ssh_hosts":
+        return ["devbox", "gpu-box", "build-01"];
+      case "cmd_mavi_ssh_probe":
+        return { kind: "ok", message: "Ready.", root: "/home/me/ingest", millis: 182 };
+      case "cmd_mavi_file_diff":
+        calls.diffs.push(args.path); show();
+        return { patch: SNAPSHOT_PATCH, truncated: false };
+      case "cmd_mavi_answer":
+        calls.answers.push([args.requestId, args.decision]); show();
+        return null;
+      case "cmd_mavi_send":
+        calls.sends.push(args.text); show();
+        return 1;
+      case "cmd_markdown_render":
+        return { html: md(args.text), headings: [], frontmatter: [], omittedBytes: 0 };
+      default:
+        return null;
+    }
+  });
+
+  mount(MaviView, { target: document.getElementById("app") });
+  if (scenario !== "empty" && scenario !== "new") {
+    const { maviStore } = await import("../src/lib/mavi/store.svelte.ts");
+    await maviStore.init();
+    await maviStore.open("k-main");
+    if (params.get("file")) setTimeout(() => document.querySelector(`[data-path="${params.get("file")}"]`)?.click(), 50);
+  }
+</script>
+</body></html>
