@@ -60,7 +60,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::early_exit;
+    use super::{USAGE, early_exit};
     use std::ffi::OsString;
 
     fn args(rest: &[&str]) -> Vec<OsString> {
@@ -95,5 +95,72 @@ mod tests {
     #[test]
     fn help_is_recognised_only_as_the_first_argument() {
         assert!(early_exit(&args(&["--cleaner-due", "--help"])).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_first_argument_falls_through_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        for bytes in [
+            vec![0xff],
+            vec![b'-', b'-', b'h', b'e', b'l', b'p', 0xff],
+            vec![0xc0, 0x80],
+        ] {
+            assert!(
+                early_exit(&[OsString::from_vec(bytes.clone())]).is_none(),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_with_trailing_arguments_still_prints_usage() {
+        // Pinned: only the first argument is read, so `--help extra` is help.
+        for case in [
+            &["--help", "extra"][..],
+            &["-h", "--cleaner-due"],
+            &["--help", "--help"],
+        ] {
+            let (_, code) = early_exit(&args(case)).expect("first argument decides");
+            assert_eq!(code, 0, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn near_miss_spellings_fall_through_to_the_app() {
+        // Exact, case-sensitive match: none of these is help.
+        for case in [
+            &["-h="][..],
+            &["--help="],
+            &["--HELP"],
+            &["-H"],
+            &["-help"],
+            &["--", "--help"],
+            &[""],
+            &[" --help"],
+            &["--help "],
+        ] {
+            assert!(early_exit(&args(case)).is_none(), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn usage_text_is_plain_ascii_lines_naming_real_tools() {
+        assert!(USAGE.is_ascii());
+        assert!(USAGE.ends_with('\n'));
+        for name in ["gitpulse-mcp", "gitpulse-hook"] {
+            assert!(USAGE.contains(name), "{name}");
+        }
+        // Every one-shot command the text names is in gitpulse-mcp's CLI_COMMANDS.
+        let mcp = include_str!("bin/gitpulse-mcp.rs");
+        assert!(
+            mcp.contains(
+                r#"const CLI_COMMANDS: [&str; 4] = ["tools", "describe", "call", "read"];"#
+            )
+        );
+        for command in ["tools", "describe", "call", "read"] {
+            assert!(USAGE.contains(command), "{command}");
+        }
+        assert!(!USAGE.contains("--cleaner-due"));
     }
 }
