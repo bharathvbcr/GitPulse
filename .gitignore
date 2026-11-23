@@ -220,6 +220,11 @@ opencode.json
 !/.claude-plugin/marketplace.json
 !/plugins/gitpulse/.claude-plugin/
 !/plugins/gitpulse/.claude-plugin/plugin.json
+# The shared Claude Code settings (SessionStart hook for cloud sessions) must be
+# committed: cloud sessions read only what is in the repository.
+!/.claude/
+/.claude/*
+!/.claude/settings.json
 .cursor/
 .openhands/
 .opencode/
