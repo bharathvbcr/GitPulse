@@ -1911,6 +1911,11 @@ pub(crate) struct ProcessUse {
     pub exe: Option<String>,
     pub argv: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
+    /// What the process is and which reads failed, when one did ("1412
+    /// systemd: environ EACCES, cwd"). Said in a refusal so a person can tell
+    /// which process holds the directory. `None` where the OS reader does not
+    /// say.
+    pub detail: Option<String>,
 }
 
 impl ProcessUse {
@@ -1929,6 +1934,9 @@ pub(crate) struct DirUse {
     /// The user's own processes whose arguments or environment could not be
     /// read, so they cannot be shown not to use the directory.
     pub unreadable: Vec<i32>,
+    /// For each of `unreadable`, in order, what was read of it: its pid, and
+    /// its name and the reads that failed where the OS reader said.
+    pub unreadable_notes: Vec<String>,
     /// Other users' processes, which are not inspected.
     pub other_users: usize,
 }
@@ -1960,8 +1968,14 @@ impl DirUse {
             let shown: Vec<String> = self
                 .unreadable
                 .iter()
+                .enumerate()
                 .take(NAMED)
-                .map(i32::to_string)
+                .map(|(at, pid)| {
+                    self.unreadable_notes
+                        .get(at)
+                        .cloned()
+                        .unwrap_or_else(|| pid.to_string())
+                })
                 .collect();
             let more = self.unreadable.len().saturating_sub(NAMED);
             format!(
@@ -2176,6 +2190,12 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
             // for a directory removed under a process, so that case reads as a
             // user of that path; a failed lookup is what lands here.)
             out.unreadable.push(process.pid);
+            out.unreadable_notes.push(
+                process
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| process.pid.to_string()),
+            );
         }
     }
     out
@@ -3047,6 +3067,7 @@ mod os {
                 exe: Some(exe),
                 argv: Some(argv),
                 env: Some(env),
+                detail: None,
             }),
             // The kernel refused the argument block. A process that is
             // exiting refuses it too, so ask once more and look at the
@@ -3061,6 +3082,7 @@ mod os {
                     exe: Some(exe),
                     argv: Some(argv),
                     env: Some(env),
+                    detail: None,
                 }),
                 None => basic(pid)
                     .is_some_and(|now| !now.zombie && super::process_exists(pid))
@@ -3228,6 +3250,19 @@ mod os {
     use std::sync::Arc;
 
     pub(super) const SUPPORTED: bool = true;
+
+    /// `EACCES`, `EPERM`, `ESRCH`... for an I/O error from `/proc`, or its
+    /// kind when it carries no errno.
+    fn errno_name(error: &std::io::Error) -> String {
+        match error.raw_os_error() {
+            Some(libc::EACCES) => "EACCES".to_string(),
+            Some(libc::EPERM) => "EPERM".to_string(),
+            Some(libc::ESRCH) => "ESRCH".to_string(),
+            Some(libc::ENOENT) => "ENOENT".to_string(),
+            Some(code) => format!("errno {code}"),
+            None => format!("{:?}", error.kind()),
+        }
+    }
 
     fn read_bounded(path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
         use std::io::Read;
@@ -3600,12 +3635,19 @@ mod os {
                 .map(|item| String::from_utf8_lossy(item).into_owned())
                 .collect()
         };
-        let argv = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
-            .ok()
-            .map(split);
-        let env = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
-            .ok()
-            .map(split);
+        let argv_read = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20);
+        let env_read = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20);
+        let failed: Vec<String> = [("cmdline", &argv_read), ("environ", &env_read)]
+            .into_iter()
+            .filter_map(|(what, read)| {
+                read.as_ref()
+                    .err()
+                    .map(|e| format!("{what} {}", errno_name(e)))
+            })
+            .chain(cwd.is_none().then(|| "cwd".to_string()))
+            .collect();
+        let argv = argv_read.ok().map(split);
+        let env = env_read.ok().map(split);
         // A process that exited while it was read holds nothing to read.
         if (argv.is_none() || env.is_none()) && stat(pid).is_none_or(|now| now.zombie) {
             return None;
@@ -3618,6 +3660,7 @@ mod os {
         // stays unproven.
         let refused = argv.is_none() || env.is_none() || cwd.is_none();
         let mine = !(refused && outranks_this_process(pid));
+        let detail = refused.then(|| format!("{pid} {}: {}", info.name, failed.join(", ")));
         Some(super::ProcessUse {
             pid,
             mine,
@@ -3625,6 +3668,7 @@ mod os {
             exe: exe_path(pid),
             argv,
             env,
+            detail,
         })
     }
 
@@ -3904,6 +3948,7 @@ pub(crate) mod tests {
             exe: Some(exe.into()),
             argv: Some(argv.iter().map(|a| (*a).into()).collect()),
             env: Some(env.iter().map(|e| (*e).into()).collect()),
+            detail: None,
         }
     }
 
@@ -4108,6 +4153,21 @@ pub(crate) mod tests {
         );
         let one = dir_use_in(dir, &table[..1], 1).why_kept().expect("kept");
         assert!(one.ends_with("(pids 10)"), "{one}");
+        // Where the OS reader said what it is and which reads failed, that is
+        // what the refusal names.
+        let described = ProcessUse {
+            pid: 1412,
+            mine: true,
+            detail: Some("1412 systemd: environ EACCES, cwd".into()),
+            ..Default::default()
+        };
+        let reading = dir_use_in(dir, &[described, table[0].clone()], 1);
+        assert_eq!(reading.unreadable, vec![1412, 10]);
+        let why = reading.why_kept().expect("kept");
+        assert!(
+            why.ends_with("(pids 1412 systemd: environ EACCES, cwd, 10)"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -4171,6 +4231,7 @@ pub(crate) mod tests {
             exe: Some("/bin/tool".into()),
             argv: Some(vec!["tool".into()]),
             env: Some(Vec::new()),
+            detail: None,
         }
     }
 
@@ -4383,6 +4444,7 @@ pub(crate) mod tests {
             exe: Some("/bin/tool".into()),
             argv: Some(vec!["t".into()]),
             env: Some(vec![]),
+            detail: None,
         };
         let reading = dir_use_in(dir, std::slice::from_ref(&hidden), 1);
         assert_eq!(reading.unreadable, vec![7]);
