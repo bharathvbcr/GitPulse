@@ -845,6 +845,123 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
     );
 }
 
+fn send_json(repo: &str, extra: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut args = json!({ "repo_path": repo, "max_hops": 32 });
+    for (k, v) in extra.as_object().expect("object") {
+        args[k] = v.clone();
+    }
+    handle_tool_call("gitpulse_agent_send", &args)
+}
+
+#[test]
+fn in_reply_to_carries_the_answered_messages_hop_and_thread() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888881", "replier");
+
+    let first = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "replier", "body": "q",
+               "thread_key": "chain", "hop": 3, "msg_id": "q-1"}),
+    )
+    .expect("first send");
+    assert_eq!(first["hop"], 3);
+
+    let reply = send_json(
+        &repo,
+        json!({"from_peer": "claude:b", "to_peer": "replier", "body": "a", "in_reply_to": "q-1"}),
+    )
+    .expect("reply");
+    assert_eq!(
+        reply["hop"], 4,
+        "the reply is one hop past the message it answers"
+    );
+    assert_eq!(
+        reply["message"]["thread_key"], "chain",
+        "the reply joins the thread of the message it answers"
+    );
+}
+
+#[test]
+fn an_explicit_hop_can_raise_the_count_but_never_lower_it() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888882", "counter");
+    for body in ["one", "two"] {
+        send_json(
+            &repo,
+            json!({"from_peer": "claude:a", "to_peer": "counter", "body": body, "thread_key": "t"}),
+        )
+        .expect("threaded send");
+    }
+    let lowered = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "counter", "body": "reset?",
+               "thread_key": "t", "hop": 1}),
+    )
+    .expect("send with a low explicit hop");
+    assert_eq!(
+        lowered["hop"], 3,
+        "a lower explicit hop must not restart the count"
+    );
+
+    let raised = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "counter", "body": "skip ahead",
+               "thread_key": "t", "hop": 9}),
+    )
+    .expect("send with a higher explicit hop");
+    assert_eq!(raised["hop"], 9);
+}
+
+#[test]
+fn in_reply_to_naming_a_message_that_is_not_on_the_bus_is_refused() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888883", "nobody-home");
+    let err = send_json(
+        &repo,
+        json!({"from_peer": "claude:a", "to_peer": "nobody-home", "body": "re",
+               "in_reply_to": "no-such-message"}),
+    )
+    .expect_err("an unknown in_reply_to must fail the send");
+    assert!(
+        err.contains("no-such-message"),
+        "the error names the id: {err}"
+    );
+}
+
+#[test]
+fn a_reply_to_an_unregistered_sender_lands_on_the_bus_only() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(&repo, "88888888-8888-4888-8888-888888888884", "asked");
+    send_json(
+        &repo,
+        json!({"from_peer": "claude:ghost", "to_peer": "asked", "body": "question?", "msg_id": "ask-1"}),
+    )
+    .expect("an unregistered sender can send");
+
+    let reply = send_json(
+        &repo,
+        json!({"from_peer": "agy:asked", "to_peer": "claude:ghost", "body": "answer",
+               "in_reply_to": "ask-1"}),
+    )
+    .expect("a reply to the sender it was handed");
+    assert_eq!(reply["liveness"], "unregistered");
+    assert_eq!(reply["delivery_outcome"], "bus_only");
+    assert_eq!(reply["to_peer"], "claude:ghost");
+    assert_eq!(reply["mailbox"]["deposited"], false);
+    assert_eq!(reply["mailbox"]["reason"], "no_session");
+    assert_eq!(reply["message"]["to_agent"], "claude:ghost");
+
+    // Only the exact identity counts: a prefix or another case is not the same agent.
+    for guess in ["claude:gho", "CLAUDE:GHOST", "ghost"] {
+        let err = send_json(
+            &repo,
+            json!({"from_peer": "agy:asked", "to_peer": guess, "body": "answer"}),
+        )
+        .expect_err("a guessed identity must not resolve");
+        assert!(err.contains("peer_not_found"), "{guess}: {err}");
+    }
+}
+
 #[test]
 fn system_steward_mailbox_isolation_respects_common_dir_since_seq_and_spoof_guards() {
     let (_dir_a, repo_a) = trusted_git_repo();

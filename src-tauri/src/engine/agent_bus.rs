@@ -1122,7 +1122,7 @@ pub fn post_peer_message(
             max_hops: Some(effective_max_hops),
         };
         state.messages.push(msg.clone());
-        let bytes = compact_messages_for_write(&mut state, &messages_path)?;
+        let bytes = compact_messages_for_write(&mut state, &messages_path, Some(seq))?;
         devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
             CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
         })?;
@@ -1228,12 +1228,20 @@ fn drop_message_seqs(state: &mut MessagesState, seqs: &[u64]) {
 fn compact_messages_for_write(
     state: &mut MessagesState,
     messages_path: &Path,
+    keep_seq: Option<u64>,
 ) -> Result<Vec<u8>, CommandError> {
     let now_ms = now_epoch_ms();
+    // The row being posted is never a candidate: an Ok from a post means the message is on
+    // the bus, so a state that cannot hold it fails the post instead.
+    let order_for = |messages: &[AgentBusMessage]| {
+        let mut order = eviction_order(messages, now_ms);
+        order.retain(|seq| Some(*seq) != keep_seq);
+        order
+    };
     if state.messages.len() > MAX_BUS_MESSAGES {
         let excess = state.messages.len() - MAX_BUS_MESSAGES;
-        let order = eviction_order(&state.messages, now_ms);
-        drop_message_seqs(state, &order[..excess]);
+        let order = order_for(&state.messages);
+        drop_message_seqs(state, &order[..excess.min(order.len())]);
     }
     let serialize = |state: &MessagesState| {
         serde_json::to_vec_pretty(state)
@@ -1245,7 +1253,7 @@ fn compact_messages_for_write(
     }
 
     let rows_before = state.messages.len();
-    let order = eviction_order(&state.messages, now_ms);
+    let order = order_for(&state.messages);
     let row_bytes: HashMap<u64, usize> = state
         .messages
         .iter()
@@ -1264,10 +1272,16 @@ fn compact_messages_for_write(
             next += 1;
         }
         if next == start {
-            return Err(CommandError::from(format!(
-                "cannot compact {} under its {MESSAGES_FILE_CAP} byte cap",
-                messages_path.display()
-            )));
+            return Err(CommandError::from(match keep_seq {
+                Some(_) => format!(
+                    "the new message does not fit in {} under its {MESSAGES_FILE_CAP} byte cap even with every other message evicted",
+                    messages_path.display()
+                ),
+                None => format!(
+                    "cannot compact {} under its {MESSAGES_FILE_CAP} byte cap",
+                    messages_path.display()
+                ),
+            }));
         }
         drop_message_seqs(state, &order[start..next]);
         bytes = serialize(state)?;
@@ -1337,7 +1351,7 @@ pub fn ack_messages(
             }
         }
         let rows_before = state.messages.len();
-        let bytes = compact_messages_for_write(&mut state, &messages_path)?;
+        let bytes = compact_messages_for_write(&mut state, &messages_path, None)?;
         if updated > 0 || state.messages.len() != rows_before {
             devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
                 CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
@@ -1944,6 +1958,25 @@ pub fn resolve_target_peer(
 ) -> Result<ReconciledPeer, PeerResolutionError> {
     let peers = list_reconciled_peers(repo_path).map_err(PeerResolutionError::Bus)?;
     resolve_target_from_list(&peers, target)
+}
+
+/// The `from_agent` of a message still on the bus that is exactly `target` (after trim), so a
+/// reply can reach a sender that never registered as a peer. Never a prefix or case match:
+/// a guessed identity would deliver to the wrong agent.
+pub fn find_bus_sender(repo_path: &str, target: &str) -> Result<Option<String>, CommandError> {
+    let clean = target.trim();
+    if clean.is_empty() {
+        return Ok(None);
+    }
+    let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
+    with_bus_lock(&lanes_dir, false, || {
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
+        Ok(state
+            .messages
+            .iter()
+            .find(|m| m.from_agent == clean)
+            .map(|m| m.from_agent.clone()))
+    })
 }
 
 pub(crate) fn resolve_target_from_list(
@@ -4223,6 +4256,56 @@ mod tests {
         assert_eq!(state.next_seq, 257, "healing never moves next_seq");
         assert!(state.dropped_before_seq > 3);
         assert!(kept.contains(&257), "the new post is kept");
+    }
+
+    #[test]
+    fn a_post_into_an_over_cap_file_of_pinned_rows_keeps_the_new_row_or_fails() {
+        let now = now_epoch_ms();
+        let big = || "x".repeat(72_000);
+        // 64 unread directs and 64 open asks: every row is pinned and together they are over
+        // the cap, so the only unpinned row is the broadcast being posted.
+        let mut rows: Vec<AgentBusMessage> = (1..=64u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, big())
+            })
+            .collect();
+        rows.extend((65..=128u64).map(|seq| {
+            let mut ask = bus_row(seq, None, now, big());
+            ask.kind = "ask".to_string();
+            ask.thread_key = Some(format!("ask-{seq}"));
+            ask
+        }));
+        let state = post_then_stored(&repo_with_seeded_bus(rows));
+
+        assert!(
+            state.messages.iter().any(|m| m.body == "trigger"),
+            "the post returned Ok, so its row must be stored"
+        );
+        assert!(
+            state.messages.iter().all(|m| m.seq > 1) || state.dropped_before_seq > 1,
+            "the oldest pinned rows paid instead"
+        );
+    }
+
+    #[test]
+    fn a_state_that_cannot_hold_the_new_row_fails_the_post() {
+        let now = now_epoch_ms();
+        let mut state = MessagesState {
+            next_seq: 1,
+            dropped_before_seq: 0,
+            messages: vec![bus_row(
+                1,
+                None,
+                now,
+                "x".repeat(usize::try_from(MESSAGES_FILE_CAP).unwrap()),
+            )],
+        };
+        let err = compact_messages_for_write(&mut state, Path::new("messages.json"), Some(1))
+            .expect_err("a row larger than the cap cannot be kept");
+        assert!(err
+            .into_message()
+            .contains("even with every other message evicted"));
     }
 
     #[test]
