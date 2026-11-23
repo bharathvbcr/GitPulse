@@ -32,7 +32,7 @@ describe("parseLegacyHosts", () => {
       const view = legacyView({ kind: "ok", hosts });
       expect(view.rows).toEqual([]);
       expect(view.problems).toHaveLength(1);
-      expect(view.problems[0]).toContain("could not be listed");
+      expect(view.problems[0]).toContain("couldn't be listed");
     }
   });
 
@@ -53,7 +53,7 @@ describe("readLegacyHosts", () => {
   it("answers a failed question as failed, not as no hosts", async () => {
     const read = await readLegacyHosts((async () => { throw new Error("host busy"); }) as never);
     expect(read.kind).toBe("failed");
-    expect(legacyView(read).problems[0]).toContain("could not be listed");
+    expect(legacyView(read).problems[0]).toContain("couldn't be listed");
     expect(legacyView(read).rows).toEqual([]);
   });
   it("answers a malformed list as failed", async () => {

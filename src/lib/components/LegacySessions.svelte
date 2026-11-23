@@ -162,6 +162,6 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     font-family: var(--font-mono, monospace);
-    font-size: 0.75rem;
+    font-size: var(--text-xs);
   }
 </style>

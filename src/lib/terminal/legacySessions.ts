@@ -9,7 +9,7 @@
  * across hosts, so each is keyed by protocol AND id, and none is ever sent
  * through `cmd_terminal_kill` or `cmd_terminal_transcript`.
  *
- * A host that could not be listed is reported as that, never as holding
+ * A host that couldn't be listed is reported as that, never as holding
  * nothing: the sessions may well be running.
  */
 
@@ -122,12 +122,12 @@ export function legacyView(read: LegacyHostsRead | null): {
   problems: string[];
 } {
   if (!read) return { rows: [], problems: [] };
-  if (read.kind === "failed") return { rows: [], problems: [`Sessions in a previous version's terminal host could not be listed: ${read.reason}`] };
+  if (read.kind === "failed") return { rows: [], problems: [`Sessions in a previous version's terminal host couldn't be listed: ${read.reason}`] };
   const rows: { key: string; protocol: number; session: LegacySession }[] = [];
   const problems: string[] = [];
   for (const host of read.hosts) {
     if (host.state === "unlisted") {
-      problems.push(`A previous version's terminal host (protocol ${host.protocol}) is running sessions that could not be listed: ${host.reason}.`);
+      problems.push(`A previous version's terminal host (protocol ${host.protocol}) is running sessions that couldn't be listed: ${host.reason}.`);
       continue;
     }
     for (const session of host.sessions) rows.push({ key: `legacy:${host.protocol}:${session.id}`, protocol: host.protocol, session });
