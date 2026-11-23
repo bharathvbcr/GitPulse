@@ -22,10 +22,17 @@ fn early_exit(args: &[std::ffi::OsString]) -> Option<(String, i32)> {
     }
 }
 
+/// Writes `text` and flushes. The result is dropped on purpose: a reader that
+/// has already gone away (EPIPE) must not turn `--help` into a panic, since
+/// Rust ignores SIGPIPE and `print!` would abort with exit 101.
+fn write_usage(out: &mut impl std::io::Write, text: &str) {
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
 fn main() {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some((text, code)) = early_exit(&args) {
-        print!("{text}");
+        write_usage(&mut std::io::stdout().lock(), &text);
         std::process::exit(code);
     }
     // The app spends the per-user spawn budget its agent servers and hooks
@@ -60,7 +67,28 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{USAGE, early_exit};
+    use super::write_usage;
+
+    struct BrokenPipe;
+
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn closed_reader_does_not_panic_and_open_reader_gets_the_text() {
+        write_usage(&mut BrokenPipe, "usage");
+        let mut sink = Vec::new();
+        write_usage(&mut sink, "usage");
+        assert_eq!(sink, b"usage");
+    }
+
+    use super::{early_exit, USAGE};
     use std::ffi::OsString;
 
     fn args(rest: &[&str]) -> Vec<OsString> {
@@ -153,11 +181,8 @@ mod tests {
         }
         // Every one-shot command the text names is in gitpulse-mcp's CLI_COMMANDS.
         let mcp = include_str!("bin/gitpulse-mcp.rs");
-        assert!(
-            mcp.contains(
-                r#"const CLI_COMMANDS: [&str; 4] = ["tools", "describe", "call", "read"];"#
-            )
-        );
+        assert!(mcp
+            .contains(r#"const CLI_COMMANDS: [&str; 4] = ["tools", "describe", "call", "read"];"#));
         for command in ["tools", "describe", "call", "read"] {
             assert!(USAGE.contains(command), "{command}");
         }
