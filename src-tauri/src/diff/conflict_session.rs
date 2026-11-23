@@ -1126,6 +1126,11 @@ mod tests {
         crate::test_support::git_in(&repo, &["checkout", "main"]);
         commit_file(&repo, "ours\n", ours_exec, "ours");
         assert!(git(&repo, &["merge", "incoming"]).is_err());
+        let unmerged = git(&repo, &["ls-files", "--unmerged"]).unwrap();
+        assert!(
+            !unmerged.is_empty(),
+            "merge failed without leaving unmerged stages for conflict resolution"
+        );
         temp
     }
 
