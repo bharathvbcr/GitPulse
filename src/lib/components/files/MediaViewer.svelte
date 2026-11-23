@@ -29,6 +29,7 @@
     onRequestDiscard,
     revealTarget = null,
     onSendSelectionToAgent,
+    agentSend,
   }: {
     filePath: string;
     blob: {
@@ -49,7 +50,8 @@
     onDraftChange?: (newContent: string, sourceContent: string) => void;
     onRequestDiscard?: () => Promise<boolean>;
     revealTarget?: { line: number | null; column?: number | null; seq: number } | null;
-    onSendSelectionToAgent?: (reference: string) => void;
+    onSendSelectionToAgent?: (reference: string, checkout?: string) => unknown;
+    agentSend?: { repoPath: string; checkout: string };
   } = $props();
 
   const effectiveRepoPath = $derived(repoPath ?? $repoStore.currentPath);
@@ -195,6 +197,7 @@
       onRequestDiscard,
       revealTarget,
       onSendSelectionToAgent,
+      agentSend,
     }}
   />
 {:else if blob.is_binary}
@@ -259,5 +262,6 @@
     {onRequestDiscard}
     {revealTarget}
     {onSendSelectionToAgent}
+    {agentSend}
   />
 {/if}

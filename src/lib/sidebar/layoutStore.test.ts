@@ -12,8 +12,7 @@ import {
   loadLayout,
   loadSections,
   loadSidebarNav,
-  resolveSidebarFileAction,
-  resolveSidebarOpen,
+  resolveFileOpen,
   SIDEBAR_DOUBLE_CLICK_WINDOW_MS,
   saveSections,
   saveSidebarNav,
@@ -327,7 +326,8 @@ describe("loadLayout fuzz/stress", () => {
 
   it("persists sidebar navigation view and explicit file open target safely without guessing", () => {
     for (const raw of [null, "", "{bad", "[]", "42", '{"view":"bogus","openTarget":"guess"}']) {
-      expect(loadSidebarNav(raw)).toEqual({ view: "git", openTarget: "code" });
+      // "auto" is the default now; this test encoded the old default, "code".
+      expect(loadSidebarNav(raw)).toEqual({ view: "git", openTarget: "auto" });
     }
     expect(loadSidebarNav('{"view":"files","openTarget":"split"}')).toEqual({
       view: "files",
@@ -338,18 +338,12 @@ describe("loadLayout fuzz/stress", () => {
       openTarget: "tab",
     });
 
-    expect(resolveSidebarFileAction({ defaultTarget: "code" })).toBe("code");
-    expect(resolveSidebarFileAction({ defaultTarget: "tab" })).toBe("tab");
-    expect(resolveSidebarFileAction({ defaultTarget: "split" })).toBe("split");
-    expect(resolveSidebarFileAction({ defaultTarget: "code", altKey: true })).toBe("split");
-    expect(resolveSidebarFileAction({ defaultTarget: "split", metaOrCtrlKey: true })).toBe("code");
-    expect(resolveSidebarFileAction({ defaultTarget: "code", metaOrCtrlKey: true })).toBe("tab");
-
     const backing: Record<string, string> = {};
     const restore = installStorage(backing);
     try {
       saveSidebarNav({ view: "files", openTarget: "tab" });
       expect(JSON.parse(backing[SIDEBAR_NAV_STORAGE_KEY])).toEqual({
+        v: 2,
         view: "files",
         openTarget: "tab",
       });
@@ -359,37 +353,37 @@ describe("loadLayout fuzz/stress", () => {
       navStore.setView("git");
       expect(get(navStore)).toEqual({ view: "git", openTarget: "split" });
       navStore.reset();
-      expect(get(navStore)).toEqual({ view: "git", openTarget: "code" });
+      expect(get(navStore)).toEqual({ view: "git", openTarget: "auto" });
     } finally {
       restore();
     }
   });
 });
 
-describe("resolveSidebarOpen: a double-click follows its own clicks", () => {
-  const base = { path: "a.ts", now: 10_000, defaultTarget: "code" as const };
+describe("resolveFileOpen: a double-click follows its own clicks", () => {
+  const base = { path: "a.ts", now: 10_000, defaultTarget: "code" as const, terminalActive: false };
 
   it("resolves a plain click from the target and modifier keys", () => {
-    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: null })).toBe("code");
-    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: null, altKey: true })).toBe("split");
+    expect(resolveFileOpen({ ...base, pin: false, lastOpen: null })).toBe("code");
+    expect(resolveFileOpen({ ...base, pin: false, lastOpen: null, altKey: true })).toBe("split");
   });
 
   it("keeps an Alt-double-click a split instead of pinning in Code", () => {
     const lastOpen = { path: "a.ts", action: "split" as const, at: 9_800 };
     // The double-click itself carries no modifiers: its clicks consumed them.
-    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen })).toBe("split");
+    expect(resolveFileOpen({ ...base, pin: true, lastOpen })).toBe("split");
   });
 
   it("re-resolves when the last click was another file, too old, or in the future", () => {
-    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "b.ts", action: "split", at: 9_900 } })).toBe("code");
+    expect(resolveFileOpen({ ...base, pin: true, lastOpen: { path: "b.ts", action: "split", at: 9_900 } })).toBe("code");
     expect(
-      resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now - SIDEBAR_DOUBLE_CLICK_WINDOW_MS - 1 } }),
+      resolveFileOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now - SIDEBAR_DOUBLE_CLICK_WINDOW_MS - 1 } }),
     ).toBe("code");
-    expect(resolveSidebarOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now + 1 } })).toBe("code");
+    expect(resolveFileOpen({ ...base, pin: true, lastOpen: { path: "a.ts", action: "split", at: base.now + 1 } })).toBe("code");
   });
 
   it("never lets a single click reuse the last action", () => {
-    expect(resolveSidebarOpen({ ...base, pin: false, lastOpen: { path: "a.ts", action: "split", at: 9_900 } })).toBe("code");
+    expect(resolveFileOpen({ ...base, pin: false, lastOpen: { path: "a.ts", action: "split", at: 9_900 } })).toBe("code");
   });
 });
 
@@ -422,6 +416,122 @@ describe("sidebarViewForKey: arrow keys move the Git | Explorer tabs", () => {
   it("leaves every other key to the caller", () => {
     for (const key of ["Enter", " ", "Tab", "ArrowDown", "ArrowUp", "a"]) {
       expect(sidebarViewForKey("git", key)).toBeNull();
+    }
+  });
+});
+
+describe("resolveFileOpen: the one decision table", () => {
+  const base = { path: "a.ts", pin: false, lastOpen: null, now: 10_000 };
+
+  it("explicit targets and modifiers, ported from the two resolvers it replaced", () => {
+    // [defaultTarget, altKey, metaOrCtrlKey] -> where it opens. Alt wins over
+    // Cmd/Ctrl; Cmd/Ctrl swaps code <-> terminal (code -> tab, else -> code).
+    // An explicit target ignores whether the terminal is active.
+    const table: Array<["code" | "tab" | "split", boolean, boolean, string]> = [
+      ["code", false, false, "code"],
+      ["tab", false, false, "tab"],
+      ["split", false, false, "split"],
+      ["code", true, false, "split"],
+      ["tab", true, false, "split"],
+      ["split", true, false, "split"],
+      ["code", false, true, "tab"],
+      ["tab", false, true, "code"],
+      ["split", false, true, "code"],
+      ["code", true, true, "split"],
+      ["tab", true, true, "split"],
+      ["split", true, true, "split"],
+    ];
+    for (const [defaultTarget, altKey, metaOrCtrlKey, expected] of table) {
+      for (const terminalActive of [false, true]) {
+        expect(resolveFileOpen({ ...base, defaultTarget, altKey, metaOrCtrlKey, terminalActive })).toBe(expected);
+      }
+    }
+  });
+
+  it("auto: a terminal split while the terminal is active, Code otherwise", () => {
+    const table: Array<[boolean, boolean, boolean, string]> = [
+      // [terminalActive, altKey, metaOrCtrlKey] -> where it opens
+      [false, false, false, "code"],
+      [true, false, false, "split"],
+      [false, true, false, "split"],
+      [true, true, false, "split"],
+      // Cmd/Ctrl swaps the decided base, so it is never a no-op under auto.
+      [false, false, true, "tab"],
+      [true, false, true, "code"],
+      [false, true, true, "split"],
+      [true, true, true, "split"],
+    ];
+    for (const [terminalActive, altKey, metaOrCtrlKey, expected] of table) {
+      expect(resolveFileOpen({ ...base, defaultTarget: "auto", terminalActive, altKey, metaOrCtrlKey })).toBe(expected);
+    }
+  });
+
+  it("a double-click follows its click even when it carries modifiers, whatever the setting", () => {
+    const lastOpen = { path: "a.ts", action: "split" as const, at: 5_000 };
+    for (const defaultTarget of ["auto", "code", "tab", "split"] as const) {
+      expect(
+        resolveFileOpen({ path: "a.ts", pin: true, lastOpen, now: 5_100, defaultTarget, terminalActive: false, metaOrCtrlKey: true }),
+      ).toBe("split");
+    }
+  });
+
+  it("a double-click follows at exactly the window edge and not one ms later", () => {
+    const at = 5_000;
+    const lastOpen = { path: "a.ts", action: "tab" as const, at };
+    const follow = { path: "a.ts", pin: true, lastOpen, defaultTarget: "code" as const, terminalActive: false };
+    expect(resolveFileOpen({ ...follow, now: at + SIDEBAR_DOUBLE_CLICK_WINDOW_MS })).toBe("tab");
+    expect(resolveFileOpen({ ...follow, now: at + SIDEBAR_DOUBLE_CLICK_WINDOW_MS + 1 })).toBe("code");
+  });
+});
+
+describe("loadSidebarNav: the versioned open target", () => {
+  it("reads an unversioned blob's explicit tab and split, and anything else as auto", () => {
+    expect(loadSidebarNav('{"view":"files"}')).toEqual({ view: "files", openTarget: "auto" });
+    // The old default was written on every commit, so an unversioned "code" is
+    // not a choice.
+    expect(loadSidebarNav('{"view":"git","openTarget":"code"}')).toEqual({ view: "git", openTarget: "auto" });
+    expect(loadSidebarNav('{"view":"git","openTarget":"tab"}')).toEqual({ view: "git", openTarget: "tab" });
+    expect(loadSidebarNav('{"view":"git","openTarget":"split"}')).toEqual({ view: "git", openTarget: "split" });
+    expect(loadSidebarNav('{"view":"git","openTarget":"auto"}')).toEqual({ view: "git", openTarget: "auto" });
+    expect(loadSidebarNav('{"view":"git","openTarget":"nope"}')).toEqual({ view: "git", openTarget: "auto" });
+  });
+
+  it("keeps every choice, code included, in a version-2 blob; an unknown one is auto", () => {
+    for (const openTarget of ["auto", "code", "tab", "split"]) {
+      expect(loadSidebarNav(JSON.stringify({ v: 2, view: "files", openTarget }))).toEqual({ view: "files", openTarget });
+    }
+    expect(loadSidebarNav('{"v":2,"view":"git","openTarget":"nope"}')).toEqual({ view: "git", openTarget: "auto" });
+    expect(loadSidebarNav('{"v":3,"view":"git","openTarget":"code"}')).toEqual({ view: "git", openTarget: "auto" });
+  });
+
+  it("an explicit code survives a save and a reload instead of migrating to auto again", () => {
+    const backing: Record<string, string> = {};
+    const restore = installStorage(backing);
+    try {
+      createSidebarNavStore().setOpenTarget("code");
+      expect(JSON.parse(backing[SIDEBAR_NAV_STORAGE_KEY])).toEqual({ v: 2, view: "git", openTarget: "code" });
+      expect(get(createSidebarNavStore())).toEqual({ view: "git", openTarget: "code" });
+      // A view switch re-commits the target; it must stay as chosen.
+      const again = createSidebarNavStore();
+      again.setView("files");
+      expect(get(createSidebarNavStore())).toEqual({ view: "files", openTarget: "code" });
+    } finally {
+      restore();
+    }
+  });
+
+  it("migrates a stored legacy code to auto on load, then persists the migration only on a commit", () => {
+    const backing: Record<string, string> = {
+      [SIDEBAR_NAV_STORAGE_KEY]: '{"view":"files","openTarget":"code"}',
+    };
+    const restore = installStorage(backing);
+    try {
+      const store = createSidebarNavStore();
+      expect(get(store)).toEqual({ view: "files", openTarget: "auto" });
+      store.setView("git");
+      expect(JSON.parse(backing[SIDEBAR_NAV_STORAGE_KEY])).toEqual({ v: 2, view: "git", openTarget: "auto" });
+    } finally {
+      restore();
     }
   });
 });

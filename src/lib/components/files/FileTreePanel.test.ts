@@ -38,6 +38,18 @@ describe("FileTreePanel source contracts", () => {
   });
 
   /**
+   * The external editor goes through the preference helper and Rust's gate,
+   * and the in-app viewer keeps its own, differently named, row: two rows both
+   * called "Open in editor" would be one the user cannot tell apart.
+   */
+  it("offers the external editor beside the in-app viewer under distinct names", () => {
+    expect(source).toContain("openInPreferredEditor(repo, filePath)");
+    expect(source).toContain("reportEditorFailure(err)");
+    expect(source.match(/<span>Open in editor<\/span>/g)).toHaveLength(1);
+    expect(source.match(/<span>Open in viewer<\/span>/g)).toHaveLength(1);
+  });
+
+  /**
    * New File and New Folder's `.gitkeep` used to go through the editor's
    * overwrite command with empty content, which truncated an existing file.
    * The rendered behaviour (existing name refused, nothing written) is the

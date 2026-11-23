@@ -10,7 +10,15 @@ export const SECTION_STORAGE_KEY = "gitpulse_sidebar_sections";
 export const SIDEBAR_NAV_STORAGE_KEY = "gitpulse_sidebar_nav";
 
 export type SidebarView = "git" | "files";
-export type SidebarFileOpenTarget = "code" | "tab" | "split";
+/**
+ * Where a clicked file opens. "auto" is the surface the user last worked in:
+ * a terminal split while the terminal was, the Code page otherwise
+ * (`resolveFileOpen`); the others pin it.
+ */
+export type SidebarFileOpenTarget = "auto" | "code" | "tab" | "split";
+
+/** A target after "auto" has been decided: where a file actually opens. */
+export type ResolvedFileOpen = Exclude<SidebarFileOpenTarget, "auto">;
 
 export interface SidebarNavPrefs {
   view: SidebarView;
@@ -170,8 +178,16 @@ export const layoutStore = createLayoutStore();
 
 const DEFAULT_SIDEBAR_NAV: SidebarNavPrefs = {
   view: "git",
-  openTarget: "code",
+  openTarget: "auto",
 };
+
+/**
+ * Version of the persisted nav blob. Unversioned blobs always carry an
+ * `openTarget`, because every commit (a view switch included) wrote it, so a
+ * stored "code" there could be the old default rather than a choice; version 2
+ * is the first in which "code" is only ever chosen.
+ */
+const SIDEBAR_NAV_VERSION = 2;
 
 export function normalizeSidebarView(raw: unknown): SidebarView {
   return raw === "files" ? "files" : "git";
@@ -192,35 +208,17 @@ export function sidebarViewForKey(current: SidebarView, key: string): SidebarVie
 }
 
 export function normalizeSidebarOpenTarget(raw: unknown): SidebarFileOpenTarget {
-  if (raw === "tab" || raw === "split" || raw === "code") return raw;
-  return "code";
-}
-
-/**
- * Resolves where clicking a file in the main left sidebar's File Explorer
- * opens it: modifier keys take priority (`Alt+Click` -> terminal split,
- * `⌘/Ctrl+Click` -> Code view, or terminal tab when already on Code),
- * otherwise the user's explicit target preference (`code` | `tab` | `split`).
- */
-export function resolveSidebarFileAction(options: {
-  defaultTarget: SidebarFileOpenTarget;
-  altKey?: boolean;
-  metaOrCtrlKey?: boolean;
-}): SidebarFileOpenTarget {
-  if (options.altKey) return "split";
-  if (options.metaOrCtrlKey) {
-    return options.defaultTarget === "code" ? "tab" : "code";
-  }
-  return normalizeSidebarOpenTarget(options.defaultTarget);
+  if (raw === "tab" || raw === "split" || raw === "code" || raw === "auto") return raw;
+  return "auto";
 }
 
 /** How long after a click its double-click is taken to belong to it. */
 export const SIDEBAR_DOUBLE_CLICK_WINDOW_MS = 1500;
 
-/** Where the sidebar explorer's last click on a file sent it. */
+/** Where an explorer's last click on a file sent it. */
 export interface SidebarLastOpen {
   path: string;
-  action: SidebarFileOpenTarget;
+  action: ResolvedFileOpen;
   at: number;
 }
 
@@ -243,29 +241,51 @@ export function doubleClickFollows(
 }
 
 /**
- * Where a click or double-click in the sidebar's File Explorer opens a file.
+ * The one rule for where a click or double-click on a file in either explorer
+ * (the app sidebar's, the terminal dock's) opens it. In order:
  *
- * A double-click (`pin`) arrives after its two clicks have already resolved
- * (and consumed) the modifier keys, so it follows the target its own clicks
- * chose instead of resolving again with none held. Otherwise an
- * Alt-double-click, a split, would pin the file in Code and switch views.
+ * 1. A double-click (`pin`) arrives after its two clicks have already resolved
+ *    (and consumed) the modifier keys, so it follows the target its own clicks
+ *    chose instead of resolving again with none held. Otherwise an
+ *    Alt-double-click, a split, would pin the file in Code and switch views.
+ * 2. `Alt+Click` opens a terminal split.
+ * 3. The setting decides the base: "auto" is a terminal split while the
+ *    terminal is the active surface (`terminalActive`) and the Code page
+ *    otherwise; "code", "tab" and "split" are what they say.
+ * 4. `⌘/Ctrl+Click` swaps the base's side: Code becomes a terminal tab, any
+ *    terminal target becomes Code. The swap applies to the decided base, so
+ *    under "auto" it is never a no-op.
+ *
+ * A "tab" reuses an unkept file pane already on screen rather than adding
+ * one; that is how the terminal runs it, not a decision made here.
  */
-export function resolveSidebarOpen(options: {
+export function resolveFileOpen(options: {
   path: string;
   pin: boolean;
   lastOpen: SidebarLastOpen | null;
   now: number;
   defaultTarget: SidebarFileOpenTarget;
+  /** Whether the terminal dock is open for this repository and was the last surface used. */
+  terminalActive: boolean;
   altKey?: boolean;
   metaOrCtrlKey?: boolean;
-}): SidebarFileOpenTarget {
+}): ResolvedFileOpen {
   const { lastOpen } = options;
   if (options.pin && lastOpen && doubleClickFollows(lastOpen, options.path, options.now)) {
     return lastOpen.action;
   }
-  return resolveSidebarFileAction(options);
+  if (options.altKey) return "split";
+  const target = normalizeSidebarOpenTarget(options.defaultTarget);
+  const base: ResolvedFileOpen = target === "auto" ? (options.terminalActive ? "split" : "code") : target;
+  if (options.metaOrCtrlKey) return base === "code" ? "tab" : "code";
+  return base;
 }
 
+/**
+ * Pure parse of the persisted nav blob. Only a version-2 blob's "code" is a
+ * choice (`SIDEBAR_NAV_VERSION`); an unversioned one keeps "tab" and "split"
+ * and reads anything else, "code" included, as the "auto" default.
+ */
 export function loadSidebarNav(raw: string | null): SidebarNavPrefs {
   if (!raw) return { ...DEFAULT_SIDEBAR_NAV };
   let parsed: unknown;
@@ -278,9 +298,12 @@ export function loadSidebarNav(raw: string | null): SidebarNavPrefs {
     return { ...DEFAULT_SIDEBAR_NAV };
   }
   const record = parsed as Record<string, unknown>;
+  const stored = normalizeSidebarOpenTarget(record.openTarget);
+  const openTarget =
+    record.v === SIDEBAR_NAV_VERSION || stored === "tab" || stored === "split" ? stored : "auto";
   return {
     view: normalizeSidebarView(record.view),
-    openTarget: normalizeSidebarOpenTarget(record.openTarget),
+    openTarget,
   };
 }
 
@@ -290,7 +313,8 @@ export function saveSidebarNav(
 ): void {
   if (!storage) return;
   try {
-    const sanitized: SidebarNavPrefs = {
+    const sanitized = {
+      v: SIDEBAR_NAV_VERSION,
       view: normalizeSidebarView(prefs.view),
       openTarget: normalizeSidebarOpenTarget(prefs.openTarget),
     };

@@ -69,3 +69,32 @@ export function planPaste(raw: string, bracketed: boolean): PastePlan {
   }
   return { text, question: null };
 }
+
+export type InsertPlan =
+  | { kind: "input" | "paste"; text: string }
+  | { kind: "refuse"; reason: string };
+
+/**
+ * How text GitPulse itself inserts (a reference, a code block) reaches a
+ * session without a person typing it. A single line is typed as before. A
+ * block with line breaks must arrive as one bracketed paste, because typed it
+ * would submit at its first break: a shell would run each line, an agent would
+ * send a half-written message. A session that has not asked for bracketed
+ * paste gets nothing, and the reason, instead.
+ */
+export function planInsert(raw: string, session: { bracketed: boolean; shell: boolean }): InsertPlan {
+  const text = stripPasteMarkers(raw);
+  if (!/[\r\n]/.test(text)) {
+    return { kind: session.shell && session.bracketed ? "paste" : "input", text };
+  }
+  if (text.match(CONTROL)) {
+    return { kind: "refuse", reason: "The text holds control characters, which would act on the session instead of being typed into it." };
+  }
+  if (!session.bracketed) {
+    return {
+      kind: "refuse",
+      reason: "This session is not in bracketed-paste mode, so a block of several lines would be submitted line by line. Nothing was inserted.",
+    };
+  }
+  return { kind: "paste", text };
+}

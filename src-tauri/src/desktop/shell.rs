@@ -133,6 +133,16 @@ fn execution_risk(target: &Path) -> Option<String> {
     None
 }
 
+/// The two checks every hand-off of a repository path shares: the path stays
+/// inside the repository, and the repository is trusted. An editor launch
+/// ([`super::editor`]) stops here; handing a path to the OS goes on to
+/// [`prepare_open`]'s confirmation, because the OS may run it.
+pub(super) fn resolve_trusted(repo: &str, relative: &str) -> Result<PathBuf, CommandError> {
+    let target = resolve_worktree_path(repo, relative)?;
+    crate::repository_trust::require(Path::new(repo))?;
+    Ok(target)
+}
+
 /// Everything that must hold before a repo-relative path is handed to the OS:
 /// the path stays inside the repository, the repository is trusted, and an
 /// executable or launcher is confirmed by the user in a dialog the page cannot
@@ -142,8 +152,7 @@ fn prepare_open(
     relative: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
 ) -> Result<PathBuf, CommandError> {
-    let target = resolve_worktree_path(repo, relative)?;
-    crate::repository_trust::require(Path::new(repo))?;
+    let target = resolve_trusted(repo, relative)?;
     if let Some(risk) = execution_risk(&target) {
         let message = format!(
             "{relative} is {risk}. Opening it can run code from this repository.\n\nOpen it anyway?"

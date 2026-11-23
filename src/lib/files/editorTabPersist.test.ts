@@ -25,7 +25,8 @@ describe("editor tab persistence", () => {
     expect(loaded?.tabs).toHaveLength(8);
     expect(loaded?.active).toBe("src/file-3.ts");
     expect(loaded?.tabs.filter((tab) => tab.preview).map((tab) => tab.path)).toEqual(["src/file-7.ts"]);
-    expect(loaded?.drafts).toEqual({});
+    // Draft text is never persisted; the open-file store holds it for the session.
+    expect(loaded).not.toHaveProperty("drafts");
   });
 
   it("commits an explicit close", () => {

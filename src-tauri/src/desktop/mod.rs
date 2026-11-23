@@ -1,6 +1,7 @@
 pub mod accessibility;
 pub mod actions;
 pub mod confirm;
+pub mod editor;
 pub mod exit;
 #[cfg(any(target_os = "macos", test))]
 pub mod identity_migration;

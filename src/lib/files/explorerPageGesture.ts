@@ -10,7 +10,7 @@
  * the reader can already act on keeps its own double-click:
  *
  * - A file row's double-click keeps the file open where its click sent it
- *   (`resolveSidebarOpen`), so it pins in Code, a Files tab or a split. Making
+ *   (`resolveFileOpen`), so it pins in Code, a Files tab or a split. Making
  *   it also switch the page would pull a reader who chose "open in the
  *   terminal" away from the terminal. A folder row's two clicks fold it and
  *   unfold it.

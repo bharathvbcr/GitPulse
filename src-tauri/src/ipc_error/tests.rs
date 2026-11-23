@@ -81,6 +81,14 @@ fn produced(kind: IpcErrorKind) -> IpcError {
             assert_eq!(refused.message(), message, "the committed message");
             run_command(|| Err::<(), _>(refused)).expect_err("the body failed")
         }
+        // The real producer, so the committed case is what the command sends.
+        IpcErrorKind::EditorNotFound => {
+            let refused = crate::desktop::editor::not_found(
+                crate::desktop::editor::EditorChoice::Cursor,
+                message,
+            );
+            run_command(|| Err::<(), _>(refused)).expect_err("the body failed")
+        }
         _ => written_as(kind, message),
     }
 }
@@ -116,7 +124,8 @@ fn the_kind_list_is_the_whole_enum() {
             | IpcErrorKind::LedgerFailed
             | IpcErrorKind::AiEndpointUnconfirmed
             | IpcErrorKind::ReadCancelled
-            | IpcErrorKind::SecretScanBlocked => {}
+            | IpcErrorKind::SecretScanBlocked
+            | IpcErrorKind::EditorNotFound => {}
         }
     }
     let mut names: Vec<String> = IpcErrorKind::ALL.into_iter().map(kind_name).collect();

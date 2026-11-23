@@ -27,6 +27,7 @@
     PencilLine,
     Trash2,
     TextSearch,
+    SquareArrowOutUpRight,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -42,6 +43,7 @@
     type FileRow,
   } from "../../files/fileTree";
   import { filterPathsByFileQuery, parseFileQuery } from "../../files/fileQuery";
+  import { REVEAL_TTL_MS } from "../../files/revealRequests";
   import { consumeSearchFocus, explorerLens, showExplorerRail, type ExplorerRail } from "../../files/explorerLens";
   import {
     CONTENTS_TOGGLE_LABEL,
@@ -64,6 +66,7 @@
   } from "../../files/fileStatus";
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
+  import { openInPreferredEditor, reportEditorFailure } from "../../desktop/openInEditor";
   import { askConfirm, askText } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
   import type { MutationTarget } from "../../repos/storeTypes";
@@ -101,7 +104,7 @@
      * twice for the same folder is a real second request, and comparing paths
      * alone would swallow it.
      */
-    revealRequest?: { path: string; nonce: number } | null;
+    revealRequest?: { path: string; nonce: number; at?: number } | null;
     /** What the field holds in Contents mode; the host's content search reads it. */
     contentQuery?: string;
     /** Enter in the field while in Contents mode. */
@@ -840,6 +843,17 @@
     }
   }
 
+  async function openInExternalEditor(filePath: string) {
+    closeContextMenu();
+    const repo = effectiveRepoPath;
+    if (!repo) return;
+    try {
+      await openInPreferredEditor(repo, filePath);
+    } catch (err) {
+      reportEditorFailure(err);
+    }
+  }
+
   async function revealInFinder(filePath: string) {
     closeContextMenu();
     const repo = effectiveRepoPath;
@@ -991,6 +1005,8 @@
     const request = revealRequest;
     if (!request?.path || request.nonce === lastRevealNonce) return;
     lastRevealNonce = request.nonce;
+    // A request made long before this tree mounted is not one anybody is waiting on.
+    if (request.at !== undefined && Date.now() - request.at > REVEAL_TTL_MS) return;
     untrack(() => {
       const next = { ...collapsed };
       for (const dir of [...ancestorsOf(request.path), request.path]) next[dir] = false;
@@ -1484,6 +1500,10 @@
     {:else}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
+        <span>Open in viewer</span>
+      </button>
+      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => openInExternalEditor(row.path)}>
+        <SquareArrowOutUpRight size={13} class="text-textMuted" />
         <span>Open in editor</span>
       </button>
 
