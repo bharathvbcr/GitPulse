@@ -1956,9 +1956,19 @@ impl DirUse {
             ));
         }
         (!self.unreadable.is_empty()).then(|| {
+            const NAMED: usize = 8;
+            let shown: Vec<String> = self
+                .unreadable
+                .iter()
+                .take(NAMED)
+                .map(i32::to_string)
+                .collect();
+            let more = self.unreadable.len().saturating_sub(NAMED);
             format!(
-                "{} of your processes could not be read, so none of them can be shown not to use it",
-                self.unreadable.len()
+                "{} of your processes could not be read, so none of them can be shown not to use it (pids {}{})",
+                self.unreadable.len(),
+                shown.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
             )
         })
     }
@@ -2347,6 +2357,31 @@ pub(crate) fn parse_status_uids(status: &str) -> Option<Creds> {
         saved: ids.next()??,
     })
 }
+
+/// A capability set line of `/proc/<pid>/status` (`CapPrm:`, `CapEff:`), a
+/// 64-bit hexadecimal mask. `None` when the line is absent or malformed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_status_caps(status: &str, field: &str) -> Option<u64> {
+    let value = status.lines().find_map(|l| l.strip_prefix(field))?;
+    u64::from_str_radix(value.trim(), 16).ok()
+}
+
+/// Whether a process on the reader's own uid holds capabilities the reader
+/// lacks: its permitted set is not inside the reader's. Linux's
+/// `cap_ptrace_access_check` then keeps the process's memory and working
+/// directory from the reader unless the reader has `CAP_SYS_PTRACE` in the
+/// process's user namespace. Asked only after a read was refused, so a reader
+/// that had that privilege would not be asking: the process cannot be
+/// inspected without privilege, as another user's cannot.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn outranks_reader(target_permitted: u64, own_permitted: u64) -> bool {
+    target_permitted & !own_permitted != 0
+}
+
+/// `PF_KTHREAD` in the flags field of `/proc/<pid>/stat`: a kernel thread,
+/// which has no user memory, arguments or environment of its own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const PF_KTHREAD: u64 = 0x0020_0000;
 
 /// Whether `path` is a dynamic loader (`ld-linux-aarch64.so.1`, `ld.so`,
 /// `ld-2.31.so`): a program run as `ld.so PROGRAM` has the loader as its
@@ -3274,6 +3309,8 @@ mod os {
         cpu_ticks: u64,
         start_ticks: u64,
         zombie: bool,
+        /// `PF_KTHREAD` is set: a kernel thread, not a user process.
+        kernel_thread: bool,
     }
 
     fn stat(pid: i32) -> Option<Stat> {
@@ -3287,6 +3324,7 @@ mod os {
         Some(Stat {
             name,
             zombie: fields.first() == Some(&"Z"),
+            kernel_thread: field(6).is_some_and(|flags| flags & super::PF_KTHREAD != 0),
             ppid: field(1).and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             cpu_ticks: field(11)?.saturating_add(field(12)?),
             start_ticks: field(19)?,
@@ -3321,6 +3359,24 @@ mod os {
         std::fs::metadata(format!("/proc/{pid}"))
             .ok()
             .map(|m| m.uid())
+    }
+
+    /// Whether `pid` holds capabilities this process lacks, so the kernel
+    /// keeps its memory and working directory from it
+    /// ([`super::outranks_reader`]). `false` when either status cannot be
+    /// read: an unexplained refusal stays one.
+    fn outranks_this_process(pid: i32) -> bool {
+        let caps = |path: &str| -> Option<u64> {
+            let raw = read_bounded(path, 8192).ok()?;
+            super::parse_status_caps(&String::from_utf8_lossy(&raw), "CapPrm:")
+        };
+        let (Some(target_permitted), Some(own_permitted)) = (
+            caps(&format!("/proc/{pid}/status")),
+            caps("/proc/self/status"),
+        ) else {
+            return false;
+        };
+        super::outranks_reader(target_permitted, own_permitted)
     }
 
     fn read_identity(pid: i32, name: String, ours: bool) -> Identity {
@@ -3519,7 +3575,11 @@ mod os {
     /// `None` in the row, never an empty list.
     pub(crate) fn read_use(pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
         let info = stat(pid)?;
-        if info.zombie {
+        // A kernel thread has no user memory, arguments or environment, and
+        // stands in no directory a person made: it uses nothing. Read as one
+        // of the user's own (running as root) its unreadable environment made
+        // every teardown refuse.
+        if info.zombie || info.kernel_thread {
             return None;
         }
         let cwd = cwd(pid);
@@ -3547,9 +3607,17 @@ mod os {
         if (argv.is_none() || env.is_none()) && stat(pid).is_none_or(|now| now.zombie) {
             return None;
         }
+        // On the user's own uid, a read the kernel refused because the process
+        // holds capabilities this one lacks (a helper given file capabilities,
+        // an agent a supervisor started privileged) is not a failure to look:
+        // the process cannot be inspected without privilege, as another
+        // user's cannot, and is counted as one. A refusal with no such cause
+        // stays unproven.
+        let refused = argv.is_none() || env.is_none() || cwd.is_none();
+        let mine = !(refused && outranks_this_process(pid));
         Some(super::ProcessUse {
             pid,
-            mine: true,
+            mine,
             cwd,
             exe: exe_path(pid),
             argv,
@@ -4014,6 +4082,72 @@ pub(crate) mod tests {
             ..unreadable
         };
         assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
+    }
+
+    #[test]
+    fn a_kept_directory_names_the_unreadable_pids() {
+        let dir = Path::new("/work/x");
+        let table: Vec<ProcessUse> = (10..22)
+            .map(|pid| ProcessUse {
+                pid,
+                mine: true,
+                ..Default::default()
+            })
+            .collect();
+        let why = dir_use_in(dir, &table, 1).why_kept().expect("kept");
+        assert!(
+            why.starts_with("12 of your processes could not be read"),
+            "{why}"
+        );
+        assert!(
+            why.ends_with("(pids 10, 11, 12, 13, 14, 15, 16, 17 and 4 more)"),
+            "{why}"
+        );
+        let one = dir_use_in(dir, &table[..1], 1).why_kept().expect("kept");
+        assert!(one.ends_with("(pids 10)"), "{one}");
+    }
+
+    #[test]
+    fn status_capability_sets_parse_and_compare_as_the_kernel_does() {
+        let status = "Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\n\
+                      CapEff:\t000001fffeffffff\n";
+        assert_eq!(parse_status_caps(status, "CapPrm:"), Some(0x1ff_ffff_ffff));
+        assert_eq!(parse_status_caps(status, "CapEff:"), Some(0x1ff_feff_ffff));
+        assert_eq!(parse_status_caps(status, "CapBnd:"), None);
+        assert_eq!(parse_status_caps("CapPrm:\tzz\n", "CapPrm:"), None);
+        // A process with a capability the reader's permitted set lacks
+        // outranks it (measured: a container's init holding CAP_SYS_RESOURCE,
+        // bit 24, which the reader had dropped).
+        assert!(outranks_reader(0x1ff_ffff_ffff, 0x1ff_feff_ffff));
+        assert!(outranks_reader(1 << 24, 0));
+        assert!(!outranks_reader(1 << 24, 1 << 24));
+        // No capabilities at all, the common case: nothing outranks anything.
+        assert!(!outranks_reader(0, 0));
+        assert!(!outranks_reader(0, 1 << 3));
+    }
+
+    /// A kernel thread is never a row of the use table: it has no user memory
+    /// to read and stands in no directory. Read as the user's own (as root),
+    /// it made every teardown refuse with "N of your processes could not be
+    /// read". `kthreadd` is pid 2 wherever kernel threads are visible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_thread_is_not_read_as_a_process_that_could_use_a_directory() {
+        let flags = std::fs::read_to_string("/proc/2/stat").ok().and_then(|s| {
+            let rest = s.get(s.rfind(')')? + 1..)?.to_string();
+            rest.split_whitespace().nth(6)?.parse::<u64>().ok()
+        });
+        if !flags.is_some_and(|f| f & PF_KTHREAD != 0) {
+            eprintln!("skipped: pid 2 is not a visible kernel thread here");
+            return;
+        }
+        let mut buf = Vec::new();
+        assert!(os::read_use(2, &mut buf).is_none());
+        let table = read_use_table().expect("table");
+        assert!(
+            table.iter().all(|row| row.pid != 2),
+            "kthreadd in the use table"
+        );
     }
 
     fn unreadable_row(pid: i32) -> ProcessUse {
