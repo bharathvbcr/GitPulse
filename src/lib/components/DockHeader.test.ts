@@ -124,6 +124,15 @@ describe("DockHeader context and status", () => {
   });
 });
 
+describe("DockHeader session limit", () => {
+  it("keeps the count in the ⋯ menu until every slot is taken, then shows it in the header", () => {
+    expect(html({ sessionCountLabel: "3 open / 32 limit" })).not.toContain("dock-session-limit");
+    const full = html({ sessionCountLabel: "32 open / 32 limit", sessionsAtLimit: true });
+    expect(tagOf(full, 'data-testid="dock-session-limit"')).toContain('data-tone="warn"');
+    expect(full).toContain("32 open / 32 limit");
+  });
+});
+
 describe("DockHeader window controls", () => {
   it("offers Find where the panes are on screen (Shell and Files)", () => {
     expect(html({ section: "shell" })).toContain('aria-label="Find in terminal"');

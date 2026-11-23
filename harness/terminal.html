@@ -1170,13 +1170,19 @@
             await wait(40);
           }
           check("global session limit spans both repositories", () => report.spawned === SESSION_LIMIT && button("New Shell session").disabled);
-          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
+          check("the session count names the limit, in the header once every slot is taken",
+            () => visible('[data-testid="dock-session-limit"]')[0]?.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
           // The limit is live: raising it in Settings frees a place at once
           // (a waiting task terminal opens off the same `canCreate`), and
           // lowering it again closes nothing.
           setTerminalSessionLimit(SESSION_LIMIT + 1); await wait();
+          // Below the limit the count is back in the ⋯ menu, not the header.
+          const limitChipGone = !visible('[data-testid="dock-session-limit"]').length;
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
+          const menuCount = document.querySelector('[data-testid="dock-overflow-menu"]')?.textContent ?? "";
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
           check("raising the limit frees a place at once",
-            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
+            () => !button("New Shell session").disabled && limitChipGone && menuCount.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
           setTerminalSessionLimit(undefined); await wait();
           check("lowering it again closes nothing",
             () => button("New Shell session").disabled && report.spawned === SESSION_LIMIT && report.killed === 0);
@@ -1514,7 +1520,7 @@
           }
           check("a live oversized chunk stays on the status row", () =>
             liveStatus.includes("exceeded its limit") && !liveStatus.includes("This session ended."));
-          await dockMenu("terminal-session-count");
+          if (!label("Sessions across repositories")) await dockMenu("terminal-session-count");
           const listDeadline = performance.now() + 2000;
           let closeSession = null;
           while (performance.now() < listDeadline) {

@@ -4252,6 +4252,7 @@
     canClearOutput={executions.length > 0}
     onClearOutput={clearOutput}
     sessionCountLabel={sessionCountLabel($terminalSessions.length, $terminalSessionLimit)}
+    sessionsAtLimit={$terminalSessions.length >= $terminalSessionLimit}
     {sessionListOpen}
     onToggleSessionList={toggleSessionList}
     {dockMode}

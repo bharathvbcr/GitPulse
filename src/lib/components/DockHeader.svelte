@@ -71,6 +71,11 @@
     canClearOutput?: boolean;
     onClearOutput?: () => void;
     sessionCountLabel: string;
+    /**
+     * Every session slot is taken. The count leaves the ⋯ menu for the header
+     * then, because it is the reason a New session button is disabled.
+     */
+    sessionsAtLimit?: boolean;
     sessionListOpen?: boolean;
     onToggleSessionList: () => void;
     dockMode?: "docked" | "overlay";
@@ -109,6 +114,7 @@
     canClearOutput = false,
     onClearOutput,
     sessionCountLabel,
+    sessionsAtLimit = false,
     sessionListOpen = false,
     onToggleSessionList,
     dockMode = "docked",
@@ -243,6 +249,19 @@
       >
         {status.primary.label}{#if status.others.length > 0}<span class="ml-1 tabular-nums">+{status.others.length}</span>{/if}
       </span>
+    {/if}
+
+    {#if sessionsAtLimit}
+      <button
+        type="button"
+        class="gp-chip shrink-0 cursor-pointer tabular-nums"
+        data-tone="warn"
+        data-testid="dock-session-limit"
+        aria-expanded={sessionListOpen}
+        aria-controls="terminal-session-list"
+        title="Every session slot is in use — show all sessions to close one, or raise the limit in Settings"
+        onclick={onToggleSessionList}
+      >{sessionCountLabel}</button>
     {/if}
 
     {#if (section === "agents" || section === "console") && activeSession}
