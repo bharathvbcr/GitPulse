@@ -653,6 +653,27 @@ pub(crate) mod diskio {
     /// repository, a build of a cache) is not mistaken for a runaway.
     pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(30);
     /// Bytes one test process may write in total.
+    ///
+    /// It is the whole lib suite's budget when the suite runs in one process,
+    /// as the coverage workflow runs it (`cargo llvm-cov ... --test-threads=1`).
+    /// On 2026-11-23 that run went over it: coverage runs 192 and 208 aborted
+    /// at 8216 and 8196 MiB, and `scripts/test-disk-writes.mjs` summed the
+    /// lib tests to 8608 MiB. That was not growth but waste. A model check
+    /// replaced a small file with `fs::write` ~180 000 times, 1.3 GiB;
+    /// fixtures wrote 64-300 MiB to cross a limit a test seam can lower; and
+    /// SQLite fixtures committed every row through the WAL with a sync. After
+    /// those were cut, the per-test sum was about 5.4 GiB, and the coverage
+    /// command, instrumented, in one process, wrote 6904 MiB before the last
+    /// cut (384 MiB of copy fixtures) and stayed under this budget, which is
+    /// kept. Measure before raising it.
+    ///
+    /// What the Linux counter charges, for whoever is next: a page is counted
+    /// when it goes from clean to dirty. Rewriting a dirty page in place is
+    /// free; truncating a file to zero and writing it again is a fresh 4 KiB
+    /// block every time; an `fsync` cleans every page it flushes, so the next
+    /// write to each is counted again; and a WAL commit appends new frames,
+    /// which the checkpoint then writes a second time. Deleting a file
+    /// afterwards takes nothing back.
     pub(crate) const MAX_TOTAL_WRITES: u64 = 8 * 1024 * 1024 * 1024;
     const SAMPLE_EVERY: Duration = Duration::from_millis(500);
     /// `0` disables the watchdog, for a run that is meant to write. Any other
