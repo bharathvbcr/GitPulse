@@ -53,6 +53,14 @@ workspace tabs.
 - If DevMap is unavailable or stale, state the reason and use source inspection
   while rebuilding with `devmap build --manifest`. An unavailable query is not
   evidence that there are no callers or affected tests.
+- If the tools are not installed at all (`devmap` or `gitpulse-mcp`: command
+  not found, MCP server not loaded), which is the normal state of a cloud or
+  SSH session, say so once in your reply (name the missing command), skip
+  the `devmap paths`/`status`/`build` steps above, and navigate by source
+  inspection. That is the declared fallback, not a silent one.
+  `gitpulse-mcp` has no Linux build and refuses a repository the desktop app
+  has not trusted. `scripts/cloud/setup.sh` installs `devmap`. See
+  [docs/CLOUD_SESSIONS.md](docs/CLOUD_SESSIONS.md).
 
 ## Tool precedence and skills
 
