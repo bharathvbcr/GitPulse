@@ -19,7 +19,7 @@
     Maximize2,
     Minimize2,
     Pin,
-    PinOff,
+    Check,
     Ellipsis,
     Search,
     Settings2,
@@ -62,6 +62,8 @@
     /** Detail for the primary status chip's tooltip (files, error text). */
     statusDetail?: string | null;
     activeSession?: ActiveSessionSummary | null;
+    /** The active session is already a highlighted row in the Agents list, so the return chip would repeat it there. */
+    activeSessionListed?: boolean;
     onReturnToShell?: () => void;
     findDisabled?: boolean;
     onFind?: () => void;
@@ -106,6 +108,7 @@
     status = { primary: null, others: [] },
     statusDetail = null,
     activeSession = null,
+    activeSessionListed = false,
     onReturnToShell,
     findDisabled = true,
     onFind,
@@ -131,6 +134,7 @@
     menuOpen = $bindable(false),
   }: Props = $props();
 
+  const FOCUS_RING = "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
   const SECTION_ICONS = { shell: SquareTerminal, agents: Bot, files: FolderTree, console: ListChecks } as const;
 
   const contextParts = $derived([repoName ?? "No repository", checkoutLabel, branch].filter((part): part is string => Boolean(part)));
@@ -146,11 +150,16 @@
     return lines.join("\n");
   });
 
+  const hasClearItem = $derived(section === "shell" || section === "files" || (section === "console" && canClearOutput));
+  const showReturnChip = $derived(
+    Boolean(activeSession) && (section === "console" || (section === "agents" && !activeSessionListed)),
+  );
+
   const menuPopover = $derived({
     anchor: { kind: "element" as const, element: overflowEl, gap: 6, align: "end" as const },
     estimate: { width: 248, height: 220 },
     inset: 8,
-    revision: `${section}:${canClearScrollback}:${canClearOutput}:${canFindSession}:${Boolean(onToggleDockMode)}`,
+    revision: `${section}:${canClearScrollback}:${canClearOutput}:${canFindSession}:${canTabOptions}:${Boolean(onToggleDockMode)}`,
     dismiss: {
       // The ⋯ button counts as inside, or the pointerdown that closes the
       // menu reopens it on the click that follows. The menu wears `gp-menu`,
@@ -210,23 +219,24 @@
   }
 </script>
 
-<div class="px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0" data-testid="dock-header">
+<div class="@container px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0" data-testid="dock-header">
   <div class="flex flex-1 items-center gap-2 min-w-0">
     <div class="gp-segmented shrink-0" role="group" aria-label="Dock section">
-      {#each DOCK_SECTIONS as entry (entry.id)}
+      {#each DOCK_SECTIONS as entry, index (entry.id)}
         {@const Icon = SECTION_ICONS[entry.id]}
         <button
           type="button"
           aria-pressed={section === entry.id}
           data-active={section === entry.id ? "true" : "false"}
           data-testid="dock-section-{entry.id}"
-          class="gp-seg-btn text-meta! relative"
+          class="gp-seg-btn text-meta! relative inline-flex items-center gap-1 {FOCUS_RING}"
+          aria-keyshortcuts={os === "macos" ? `Alt+Shift+Meta+${index + 1}` : `Control+Alt+Shift+${index + 1}`}
           title="{entry.hint} ({dockSectionChordLabel(entry.id, os)})"
           onclick={() => onSection(entry.id)}
         >
-          <Icon size={11} class="inline mr-1 -mt-0.5" />{entry.label}
+          <Icon size={13} class="shrink-0" /><span class="@max-[34rem]:sr-only">{entry.label}</span>
           {#if entry.id === "agents" && agentAttention > 0}
-            <span class="inline-block h-1.5 w-1.5 ml-1 rounded-full bg-warn align-middle" aria-hidden="true" data-testid="dock-agents-attention"></span>
+            <span class="inline-block h-1.5 w-1.5 rounded-full bg-warn shrink-0" aria-hidden="true" data-testid="dock-agents-attention"></span>
             <span class="sr-only">, {agentAttention} {agentAttention === 1 ? "agent needs" : "agents need"} you</span>
           {/if}
         </button>
@@ -234,20 +244,19 @@
     </div>
 
     <span
-      class="gp-chip min-w-0 max-w-64 truncate font-mono"
-      data-tone="neutral"
+      class="min-w-0 max-w-64 truncate font-mono text-micro text-textMuted @max-[34rem]:hidden"
       data-testid="terminal-checkout-pill"
       title={contextTitle ?? repoPath ?? "No repository"}
     >{contextParts.join(" · ")}</span>
 
     {#if status.primary}
       <span
-        class="gp-chip shrink-0"
+        class="gp-chip min-w-0 max-w-48"
         data-tone={status.primary.tone}
         data-testid={STATUS_TESTID[status.primary.kind]}
         title={statusTitle}
       >
-        {status.primary.label}{#if status.others.length > 0}<span class="ml-1 tabular-nums">+{status.others.length}</span>{/if}
+        <span class="truncate">{status.primary.label}</span>{#if status.others.length > 0}<span class="ml-1 shrink-0 tabular-nums">+{status.others.length}</span>{/if}
       </span>
     {/if}
 
@@ -264,15 +273,16 @@
       >{sessionCountLabel}</button>
     {/if}
 
-    {#if (section === "agents" || section === "console") && activeSession}
+    {#if showReturnChip && activeSession}
       <button
         type="button"
-        class="inline-flex items-center gap-1.5 min-w-0 max-w-72 px-2 py-0.5 rounded border border-border/65 bg-surface hover:bg-surfaceHover text-micro text-textPrimary cursor-pointer transition-colors"
+        class="gp-chip min-w-0 max-w-72 cursor-pointer {FOCUS_RING}"
+        data-tone="accent"
         data-testid="terminal-active-session-summary"
         title={`Show active ${activeSession.launcherLabel} session — ${activeSession.fullTitle}`}
         onclick={onReturnToShell}
       >
-        <LauncherIcon kind={activeSession.launcher} size={11} class="shrink-0" />
+        <LauncherIcon kind={activeSession.launcher} size={13} class="shrink-0" />
         <span class="font-medium truncate">{activeSession.primary}</span>
         {#if activeSession.secondary}
           <span class="text-textMuted truncate max-w-28">· {activeSession.secondary}</span>
@@ -289,7 +299,7 @@
     {#if section === "shell" || section === "files"}
       <button
         type="button"
-        class="gp-icon-btn"
+        class="gp-icon-btn {FOCUS_RING}"
         disabled={findDisabled}
         aria-label="Find in terminal"
         title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', os)})"
@@ -299,7 +309,7 @@
     <button
       bind:this={overflowEl}
       type="button"
-      class="gp-icon-btn"
+      class="gp-icon-btn {FOCUS_RING}"
       aria-label="Dock options"
       aria-haspopup="menu"
       aria-expanded={menuOpen || sessionListOpen}
@@ -307,11 +317,11 @@
       data-testid="dock-overflow"
       title="Dock options"
       onclick={() => (menuOpen = !menuOpen)}
-    ><Ellipsis size={14} /></button>
+    ><Ellipsis size={13} /></button>
     {#if onToggleExpanded}
       <button
         type="button"
-        class="gp-icon-btn"
+        class="gp-icon-btn {FOCUS_RING}"
         aria-label={expanded ? "Restore dock size" : "Expand the dock"}
         title={expanded ? "Restore dock size" : "Expand the dock"}
         onclick={onToggleExpanded}
@@ -322,11 +332,11 @@
     {#if onClose}
       <button
         type="button"
-        class="gp-icon-btn"
+        class="gp-icon-btn {FOCUS_RING}"
         aria-label="Hide the dock"
         title="Hide the dock ({shortcutTextLabel('⌃`', os)}) — sessions keep running"
         onclick={onClose}
-      ><ChevronDown size={14} /></button>
+      ><ChevronDown size={13} /></button>
     {/if}
   </div>
 </div>
@@ -346,26 +356,6 @@
     tabindex="-1"
     onkeydown={onMenuKey}
   >
-    {#if section === "shell" || section === "files"}
-      <button
-        type="button"
-        role="menuitem"
-        class="gp-menu-item"
-        data-testid="dock-menu-clear-scrollback"
-        disabled={!canClearScrollback}
-        title="Clear scrollback; keep the current prompt and session"
-        onclick={() => runItem(onClearScrollback)}
-      ><Trash2 size={13} class="shrink-0 text-textMuted" /><span>Clear scrollback</span></button>
-    {:else if section === "console" && canClearOutput}
-      <button
-        type="button"
-        role="menuitem"
-        class="gp-menu-item"
-        data-testid="dock-menu-clear-output"
-        title="Clear terminal output"
-        onclick={() => runItem(onClearOutput)}
-      ><Trash2 size={13} class="shrink-0 text-textMuted" /><span>Clear output</span></button>
-    {/if}
     <button
       type="button"
       role="menuitem"
@@ -378,7 +368,7 @@
     >
       <Layers size={13} class="shrink-0 text-textMuted" />
       <span class="truncate">All sessions</span>
-      <span class="ml-auto shrink-0 text-micro tabular-nums">{sessionCountLabel}</span>
+      <span class="ml-auto shrink-0 text-micro tabular-nums text-textMuted">{sessionCountLabel}</span>
     </button>
     {#if canFindSession}
       <button
@@ -411,9 +401,33 @@
         title={dockMode === "overlay" ? "Give the dock its own row under the view" : "Let the dock float over the view"}
         onclick={() => runItem(onToggleDockMode)}
       >
-        {#if dockMode === "overlay"}<PinOff size={13} class="shrink-0 text-accent" />{:else}<Pin size={13} class="shrink-0 text-textMuted" />{/if}
+        <Pin size={13} class="shrink-0 text-textMuted" />
         <span>Float over the view</span>
+        {#if dockMode === "overlay"}<Check size={13} class="ml-auto shrink-0 text-accent" />{/if}
       </button>
+    {/if}
+    {#if hasClearItem}
+      <div class="gp-menu-sep" role="separator"></div>
+      {#if section === "shell" || section === "files"}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="dock-menu-clear-scrollback"
+          disabled={!canClearScrollback}
+          title="Clear scrollback; keep the current prompt and session"
+          onclick={() => runItem(onClearScrollback)}
+        ><Trash2 size={13} class="shrink-0 text-textMuted" /><span>Clear scrollback</span></button>
+      {:else if section === "console" && canClearOutput}
+        <button
+          type="button"
+          role="menuitem"
+          class="gp-menu-item"
+          data-testid="dock-menu-clear-output"
+          title="Clear terminal output"
+          onclick={() => runItem(onClearOutput)}
+        ><Trash2 size={13} class="shrink-0 text-textMuted" /><span>Clear output</span></button>
+      {/if}
     {/if}
   </div>
 {/if}

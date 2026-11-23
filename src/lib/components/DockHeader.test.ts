@@ -58,6 +58,27 @@ describe("DockHeader section switcher", () => {
     expect(tagOf(html({ os: "linux" }), 'data-testid="dock-section-files"')).toContain("Ctrl+Alt+Shift+3");
   });
 
+  it("names each section button by its label text and gives its chord as aria-keyshortcuts", () => {
+    const mac = html({ os: "macos" });
+    const other = html({ os: "linux" });
+    ["Shell", "Agents", "Files", "Console"].forEach((label, i) => {
+      const id = label.toLowerCase();
+      // Named by its (visually collapsible) label text, never an aria-label,
+      // which would drop the Agents button's screen-reader attention count.
+      expect(tagOf(mac, `data-testid="dock-section-${id}"`)).not.toContain("aria-label=");
+      expect(mac).toContain(`<span class="@max-[34rem]:sr-only">${label}</span>`);
+      expect(tagOf(mac, `data-testid="dock-section-${id}"`)).toContain(`aria-keyshortcuts="Alt+Shift+Meta+${i + 1}"`);
+      expect(tagOf(other, `data-testid="dock-section-${id}"`)).toContain(`aria-keyshortcuts="Control+Alt+Shift+${i + 1}"`);
+    });
+  });
+
+  it("collapses to icons in a narrow dock via a container query", () => {
+    const body = html();
+    expect(tagOf(body, 'data-testid="dock-header"')).toContain("@container");
+    expect(body).toContain("@max-[34rem]:sr-only");
+    expect(tagOf(body, 'data-testid="terminal-checkout-pill"')).toContain("@max-[34rem]:hidden");
+  });
+
   it("calls back with the chosen section", () => {
     // Wiring is asserted on the source: the server renderer drops handlers.
     expect(source).toContain("onclick={() => onSection(entry.id)}");
@@ -78,6 +99,8 @@ describe("DockHeader context and status", () => {
     const chip = tagOf(body, 'data-testid="terminal-checkout-pill"');
     expect(chip).toContain('title="/work/gitpulse"');
     expect(body).toContain("gitpulse · feature-x · main");
+    // A label, not a control: no pill chrome.
+    expect(chip).not.toContain("gp-chip");
     expect(html({ repoName: null, repoPath: null, checkoutLabel: null, branch: null })).toContain("No repository");
   });
 
@@ -121,6 +144,18 @@ describe("DockHeader context and status", () => {
       expect(body).toContain('data-testid="terminal-active-session-summary"');
       expect(body).toContain("→ Shell");
     }
+  });
+});
+
+describe("DockHeader return chip in Agents", () => {
+  it("is dropped in Agents when the active session is already a listed row, but kept in Console", () => {
+    const session = { launcher: "claude" as const, launcherLabel: "Claude", primary: "Fix tests", fullTitle: "Fix tests" };
+    expect(html({ section: "agents", activeSession: session, activeSessionListed: true })).not.toContain("terminal-active-session-summary");
+    expect(html({ section: "agents", activeSession: session, activeSessionListed: false })).toContain("terminal-active-session-summary");
+    const consoleBody = html({ section: "console", activeSession: session, activeSessionListed: true });
+    const chip = tagOf(consoleBody, 'data-testid="terminal-active-session-summary"');
+    expect(chip).toContain("gp-chip");
+    expect(chip).toContain('data-tone="accent"');
   });
 });
 
@@ -192,6 +227,27 @@ describe("DockHeader overflow menu", () => {
     expect(tagOf(over, "data-terminal-dock-mode-toggle")).toContain('aria-checked="true"');
     const docked = html({ menuOpen: true, dockMode: "docked", onToggleDockMode: () => {} });
     expect(tagOf(docked, "data-terminal-dock-mode-toggle")).toContain('aria-checked="false"');
+  });
+
+  it("puts the destructive Clear item last, after a separator, so the first item is All sessions", () => {
+    const body = html({ menuOpen: true, canClearScrollback: true, canTabOptions: true, canFindSession: true, onToggleDockMode: () => {} });
+    const order = ["All sessions", "Find session in this repository", "Tab options", "Float over the view", "Clear scrollback"].map((s) => body.indexOf(s));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    const seps = [...body.matchAll(/role="separator"/g)].map((m) => m.index ?? 0);
+    expect(seps).toHaveLength(2);
+    expect(seps[1]).toBeGreaterThan(body.indexOf("Float over the view"));
+    expect(seps[1]).toBeLessThan(body.indexOf("Clear scrollback"));
+    // No clear item and no float toggle: no separators at all.
+    expect(html({ menuOpen: true, section: "agents" })).not.toContain('role="separator"');
+  });
+
+  it("shows a trailing Check on the float item only when floating", () => {
+    const over = html({ menuOpen: true, dockMode: "overlay", onToggleDockMode: () => {} });
+    const docked = html({ menuOpen: true, dockMode: "docked", onToggleDockMode: () => {} });
+    expect(over).toContain("lucide-check");
+    expect(docked).not.toContain("lucide-check");
+    expect(over).not.toContain("lucide-pin-off");
   });
 
   it("swaps the clear item with the section and drops items that do not apply", () => {
