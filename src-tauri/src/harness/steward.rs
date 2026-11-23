@@ -1356,8 +1356,11 @@ pub(crate) fn build_status_with_env(
         None
     };
     // A rejected key still passes every local check, so only the provider's
-    // refusal can say it is not usable. Checks keep running (a refused call is
-    // not billed), and the first one that succeeds clears this.
+    // refusal can say it is not usable, and only a call that succeeds clears
+    // this: the steward's own calls, which it makes only under load (a calm,
+    // healthy tick calls no model), or any AI feature's. A fix the app cannot
+    // see (`~/.anthropic-accounts` edited) therefore reads rejected until one of
+    // those calls is made.
     let (manvi_state, manvi_detail) = present_rejected_credential(
         guard.credential_rejected.as_deref(),
         manvi,
@@ -7808,7 +7811,7 @@ Trailing note {done}."#;
         assert_eq!(rejected.manvi_detail, crate::ai::REJECTED_KEY_MESSAGE);
         assert!(
             rejected.next_check_ms.is_some(),
-            "checks keep running so a replaced key is noticed"
+            "loaded ticks keep checking so a replaced key is noticed"
         );
         // The refusal was about that cloud model's key: a local model chosen
         // since, or another cloud model, does not read rejected.
