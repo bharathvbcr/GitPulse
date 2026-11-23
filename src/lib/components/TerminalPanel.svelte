@@ -239,6 +239,7 @@
     stepSearchIndex,
   } from "../terminal/tabSearch";
   import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
+  import { observeResize } from "../dom/observeResize";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
@@ -3424,11 +3425,29 @@
     });
   });
 
+  /**
+   * The tab strip's width. Narrowing the dock (or the window) can push the
+   * active tab past the strip's edge with nothing else changing, so the
+   * reveal below listens to this too.
+   */
+  let tabStripWidth = $state(0);
+  $effect(() => {
+    const scroller = tabScroller;
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    return observeResize(scroller, ([entry]) => {
+      tabStripWidth = Math.round(entry.contentRect.width);
+    });
+  });
+
+  /** Clear room at a scrollable edge for the strip's ScrollCue button (20px plus its margin). */
+  const TAB_STRIP_CUE_INSET_PX = 28;
+
   // OSC titles can widen a tab after it is selected. Keep its entire control
   // (including Close) visible without refocusing the shell on every title.
   $effect(() => {
     const activeScrollLabel = activeTab ? tabLabel(activeTab) : "";
     void activeScrollLabel;
+    void tabStripWidth;
     if (!visible || mode !== "shell") return;
     const id = activeId;
     const scroller = tabScroller;
@@ -3438,10 +3457,11 @@
       if (scroller && node instanceof HTMLElement) {
         const strip = scroller.getBoundingClientRect();
         const tab = node.getBoundingClientRect();
-        scroller.scrollLeft = scrollChildIntoHorizontalView(scroller, {
-          offsetLeft: tab.left - strip.left + scroller.scrollLeft,
-          offsetWidth: tab.width,
-        });
+        scroller.scrollLeft = scrollChildIntoHorizontalView(
+          scroller,
+          { offsetLeft: tab.left - strip.left + scroller.scrollLeft, offsetWidth: tab.width },
+          TAB_STRIP_CUE_INSET_PX,
+        );
       }
     });
   });
@@ -4806,7 +4826,7 @@
           {#if canOpenInSplit}
             <button
               type="button"
-              class="gp-icon-btn opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-accent"
+              class="terminal-tab-open-split gp-icon-btn opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-accent"
               data-size="sm"
               data-testid="terminal-tab-open-in-split"
               onclick={(event) => {
@@ -5170,7 +5190,7 @@
         {/each}
         <button
           type="button"
-          class="gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
+          class="terminal-follow-agent gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
           aria-label={followAgent ? "Stop following agent edits" : "Follow agent file edits in split"}
           aria-pressed={followAgent}
           disabled={!repoPath}
@@ -7340,6 +7360,16 @@
     }
     .terminal-tab-scroller[data-crowded="true"] .terminal-tab-label {
       max-width: 4rem;
+    }
+    /* Room for the tabs themselves. Each tab's inline "open in split" is an
+       invisible 24px slot until hover; Alt+Click and the tab's context menu
+       do the same. The Follow toggle is the Agents section's Follow edits.
+       Both split buttons stay: a narrow dock stacks panes with Split down,
+       and still splits right on purpose. */
+    .terminal-tab-label { max-width: 7rem; }
+    .terminal-tab-open-split,
+    .terminal-follow-agent:not([aria-pressed="true"]) {
+      display: none;
     }
   }
   .terminal-panes { container-type: inline-size; overflow: auto; }

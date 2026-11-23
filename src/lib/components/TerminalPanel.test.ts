@@ -191,6 +191,20 @@ describe("TerminalPanel dock sections", () => {
     expect(source).toContain("{activeSessionListed}");
   });
 
+  it("gives a narrow tab strip's room to the tabs and keeps the active tab in view", () => {
+    const narrow = source.slice(source.indexOf("@container terminal-strip (max-width: 520px)"));
+    // The Follow toggle (also in Agents) gives way unless it is on; both split buttons stay.
+    expect(narrow).toMatch(/\.terminal-tab-open-split,\s*\.terminal-follow-agent:not\(\[aria-pressed="true"\]\) \{\s*display: none;/);
+    expect(source).toContain('class="terminal-tab-open-split gp-icon-btn');
+    expect(source).toContain('class="terminal-follow-agent gp-icon-btn');
+    expect(source).not.toMatch(/terminal-split-(right|down)/);
+    // Resizing the strip re-runs the reveal, which keeps clear of the scroll cue.
+    const reveal = source.slice(source.indexOf("let tabStripWidth"), source.indexOf("async function splitActive"));
+    expect(reveal).toContain("observeResize(scroller");
+    expect(reveal).toContain("void tabStripWidth;");
+    expect(reveal).toContain("TAB_STRIP_CUE_INSET_PX,");
+  });
+
   it("shows the explorer in Files without writing the saved preference", () => {
     expect(source).toContain('(explorerPreferenceOpen || section === "files")');
     expect(source).toContain("explorerPreferenceOpen");
