@@ -70,6 +70,8 @@
         workflow_runs: [], runs_error: null, runs_truncated: false, releases: [], releases_truncated: false,
         releases_error: null, warnings: [], error: "" };
       const fixtures = {
+        // Mavi's store asks the host which agent threads run (Live pulse mounts it); none here.
+        cmd_mavi_list: () => [],
         cmd_resolve_repo: (a) => ({ path: a.repoPath ?? a.path, name: "churn", is_bare: false }),
         // The missing-tool notice: no code index, devmap not installed.
         cmd_codeintel_status: () => ({available:false,is_fresh:false,freshness_reason:null,source_freshness:false,analyzer_freshness:false,pending_count:0,db_path:null,generation_id:null,total_files:0,total_symbols:0,total_edges:0,reason:"no code index in this fixture"}),
