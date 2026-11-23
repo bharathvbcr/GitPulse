@@ -100,6 +100,16 @@ describe("rows with a terminal or a run keep their moves", () => {
     const row = only(plane.rows, (item) => item.taskRunId === "run-1");
     expect(kinds(row)).toEqual(["terminal", "task", "checkout"]);
   });
+
+  it("names each move for the row it acts on, so a screen reader can tell rows' buttons apart", () => {
+    const plane = project({ tasks: tasks({ tasks: [task({ disconnected: true, tone: "problem" })] }) });
+    const row = only(plane.rows, (item) => item.taskRunId === "run-1");
+    const [terminal, taskAction] = agentRowActions(row, null, "shell");
+    expect(terminal.label).toBe("Show terminal");
+    expect(terminal.ariaLabel).toBe(`Show terminal for ${row.session}`);
+    expect(taskAction.label).toBe("Open task");
+    expect(taskAction.ariaLabel).toBe(`Open task for ${row.session}`);
+  });
 });
 
 describe("a child agent process", () => {
