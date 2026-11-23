@@ -495,7 +495,7 @@ fn docs_rename_benchmark() {
     ] {
         let mut edits = Vec::new();
         let plan_ms = min_ms(RUNS, || {
-            edits = super::rename::plan_edits(&built.vault, from, to).unwrap();
+            edits = super::rename::plan_edits(&repo, &built.vault, from, to).unwrap();
         });
         let precheck_ms = min_ms(RUNS, || {
             super::rename::links_the_rename_breaks(&repo, &built.vault, from, to, &edits);
@@ -1703,21 +1703,41 @@ fn adversarial_an_image_whose_source_is_a_note_follows_the_note_or_is_left_alone
 }
 
 #[test]
-fn adversarial_the_moved_notes_non_note_assets_are_a_silent_residual() {
-    // `pic.png` next to the moved note stops resolving after the move. The brief
-    // lists this as out of scope; this pins what the outcome says about it.
+fn the_moved_notes_relative_asset_links_still_resolve_after_a_cross_folder_move() {
     let dir = repo_with(&[
-        ("docs/A.md", "![y](pic.png) [d](data.csv)\n"),
+        ("docs/A.md", "![y](pic.png) [d](./data.csv) [s](<my file.txt>) [e](gone.png) [u](https://x.org/a.png) [h](#top) [r](/docs/pic.png)\n"),
         ("docs/pic.png", "png"),
         ("docs/data.csv", "1"),
+        ("docs/my file.txt", "t"),
     ]);
     let path = dir.path().to_str().unwrap();
     let outcome = rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
-    assert_eq!(read(&dir, "notes/A.md"), "![y](pic.png) [d](data.csv)\n");
-    assert!(
-        outcome.left_broken.is_empty(),
-        "asset links are invisible to the vault, so the outcome cannot warn: {outcome:?}"
+    assert_eq!(
+        read(&dir, "notes/A.md"),
+        "![y](../docs/pic.png) [d](../docs/data.csv) [s](<../docs/my file.txt>) [e](gone.png) [u](https://x.org/a.png) [h](#top) [r](/docs/pic.png)\n"
     );
+    assert!(outcome.complete, "{outcome:?}");
+}
+
+#[test]
+fn asset_links_are_left_alone_when_they_leave_the_repo_or_are_symlinks() {
+    let dir = repo_with(&[
+        (
+            "docs/A.md",
+            "[o](../../outside-bl1121w4.txt) [l](link.png) [d](sub)\n",
+        ),
+        ("docs/sub/x.txt", "x"),
+    ]);
+    let outside = dir.path().parent().unwrap().join("outside-bl1121w4.txt");
+    let _ = std::fs::write(&outside, "o");
+    std::os::unix::fs::symlink(&outside, dir.path().join("docs/link.png")).unwrap();
+    let path = dir.path().to_str().unwrap();
+    rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
+    assert_eq!(
+        read(&dir, "notes/A.md"),
+        "[o](../../outside-bl1121w4.txt) [l](link.png) [d](sub)\n"
+    );
+    let _ = std::fs::remove_file(&outside);
 }
 
 #[test]
@@ -1929,14 +1949,12 @@ fn adversarial_a_held_index_lock_refuses_the_rename_before_anything_moves() {
     std::fs::remove_file(&lock).ok();
     assert!(result.is_err(), "{result:?}");
     assert!(dir.path().join("docs/Roadmap.md").exists());
-    // Known limit: `GitWriter::move_path` creates the destination's parent
-    // directory before it runs `git mv`, so a refused move leaves an empty
-    // `plans/` behind. Nothing else is left: no file moved or written there.
-    // Follow-up (orchestrator): create the parent only after the move succeeds.
-    let leftover: Vec<_> = std::fs::read_dir(dir.path().join("plans"))
-        .map(|entries| entries.flatten().collect())
-        .unwrap_or_default();
-    assert!(leftover.is_empty(), "files left behind: {leftover:?}");
+    // `GitWriter::move_path` creates the destination's parent before it runs
+    // `git mv` and removes what it created when the move fails.
+    assert!(
+        !dir.path().join("plans").exists(),
+        "a refused move left plans/ behind"
+    );
     assert_eq!(
         read(&dir, "docs/Guide.md"),
         "# Guide\n\nSee [[Roadmap]] and [x](Roadmap.md).\n"

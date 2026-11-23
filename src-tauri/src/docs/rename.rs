@@ -147,7 +147,7 @@ pub fn rename_doc(
     let untracked = super::list_untracked_markdown_paths(&repo)?;
     scan.not_scanned = scan.not_scanned.saturating_add(untracked.len() as u32);
 
-    let edits = plan_edits(vault, &from, &to)?;
+    let edits = plan_edits(&repo, vault, &from, &to)?;
     let left_broken = links_the_rename_breaks(&repo, vault, &from, &to, &edits);
     let rewrites: Vec<String> = edits.iter().map(|edit| edit.path.clone()).collect();
 
@@ -244,7 +244,12 @@ fn write_planned(
 }
 
 /// Every rewrite the rename makes, against the snapshot, before any is applied.
-pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<PlannedEdit>, String> {
+pub(super) fn plan_edits(
+    repo: &Path,
+    vault: &Vault,
+    from: &str,
+    to: &str,
+) -> Result<Vec<PlannedEdit>, String> {
     let old_stem = stem(from);
     let new_stem = stem(to);
     let new_path = strip_markdown_extension(to).to_string();
@@ -275,7 +280,15 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
         };
         let mut resolve_markdown = |written: &str| -> Option<String> {
             let dest = split_written(written).dest;
-            let resolved = vault.resolve_from(linking_old, dest, None)?;
+            let Some(resolved) = vault.resolve_from(linking_old, dest, None) else {
+                // Not a note. A moved note's relative link to a plain file
+                // (an image, a CSV) is re-expressed from its new folder.
+                return if moved {
+                    existing_file_link(repo, linking_old, linking_new, written, dest)
+                } else {
+                    None
+                };
+            };
             let to_the_moved_note = resolved.path == from;
             if !moved && !to_the_moved_note {
                 return None;
@@ -324,6 +337,96 @@ pub(super) fn plan_edits(vault: &Vault, from: &str, to: &str) -> Result<Vec<Plan
         });
     }
     Ok(edits)
+}
+
+/// A moved note's relative link `dest` to a regular file that exists in the
+/// repository, re-expressed so it resolves from the note's new folder, in the
+/// spelling the author used. `None` leaves the link byte-identical: a URL or
+/// anchor, a root-relative link (unchanged by a move), a target outside the
+/// repository, a symlink (or a path through one), a directory, or a file that
+/// does not exist.
+fn existing_file_link(
+    repo: &Path,
+    linking_old: &str,
+    linking_new: &str,
+    written: &str,
+    dest: &str,
+) -> Option<String> {
+    if dest.is_empty() || dest.starts_with('/') || dest.starts_with('#') || has_scheme(dest) {
+        return None;
+    }
+    let decoded = if has_percent_escape(dest) {
+        percent_decode(dest)?
+    } else {
+        dest.to_string()
+    };
+    let mut parts: Vec<&str> = parent_dir(linking_old)
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    for component in decoded.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            name => parts.push(name),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut abs = repo.to_path_buf();
+    for part in &parts {
+        abs.push(part);
+        if std::fs::symlink_metadata(&abs)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return None;
+        }
+    }
+    if !std::fs::symlink_metadata(&abs).ok()?.is_file() {
+        return None;
+    }
+    let target = parts.join("/");
+    let replacement = express_link(written, parent_dir(linking_new), &target)?;
+    (replacement != written).then_some(replacement)
+}
+
+/// `scheme:` before any `/`: `https://…`, `mailto:…`, `data:…`.
+fn has_scheme(dest: &str) -> bool {
+    let head = dest.split('/').next().unwrap_or("");
+    head.split_once(':').is_some_and(|(scheme, _)| {
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// One percent-decoding pass; `None` when the bytes are not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Links that are broken in the vault the rename would leave and were not
