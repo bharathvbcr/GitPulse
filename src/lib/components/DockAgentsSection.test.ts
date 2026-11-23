@@ -54,8 +54,8 @@ describe("DockAgentsSection", () => {
   });
 
   it("wires here rows to onSelect and elsewhere rows to onGoTo", () => {
-    expect(source).toContain("{@render rowList(here, onSelect)}");
-    expect(source).toContain("{@render rowList(elsewhere, onGoTo)}");
+    expect(source).toContain("{@render rowList(here, onSelect, true)}");
+    expect(source).toContain("{@render rowList(elsewhere, onGoTo, false)}");
     expect(source).toContain("onclick={() => onPick(row.id)}");
   });
 
@@ -87,5 +87,38 @@ describe("DockAgentsSection", () => {
     expect(html({ followAgent: true })).toMatch(/data-testid="dock-agents-follow"[^>]*aria-pressed="true"|aria-pressed="true"[^>]*data-testid="dock-agents-follow"/);
     expect(html({ followAgent: false })).toMatch(/aria-pressed="false"/);
     expect(html({ canFollow: false })).toMatch(/<button[^>]*data-testid="dock-agents-follow"[^>]*disabled/);
+  });
+
+  it("always shows a status slot: Idle fallback only when status is absent", () => {
+    expect(html()).toContain(">Idle<");
+    const withStatus = html({ elsewhere: [] });
+    expect(withStatus).toContain(">Working<");
+    expect(withStatus).not.toContain(">Idle<");
+  });
+
+  it("gives rows an action title", () => {
+    const body = html();
+    expect(body).toContain("Show in Shell \u2014 Fix login");
+    expect(body).toContain("Go to Docs pass in other/wt");
+    expect(html({ elsewhere: [{ ...elseRow, detail: "" }] })).toContain('title="Go to Docs pass"');
+  });
+
+  it("adds accent classes to Follow only when pressed", () => {
+    const on = html({ followAgent: true });
+    const off = html({ followAgent: false });
+    expect(on).toMatch(/<button[^>]*data-testid="dock-agents-follow"[^>]*/);
+    expect(on.match(/<button[^>]*data-testid="dock-agents-follow"[^>]*>/)![0]).toContain("text-accent bg-accent/15");
+    expect(off.match(/<button[^>]*data-testid="dock-agents-follow"[^>]*>/)![0]).not.toContain("bg-accent/15");
+    expect(on).toContain("Follow edits");
+  });
+
+  it("draws a hover/focus arrow that is aria-hidden", () => {
+    expect(source).toContain("group-hover:opacity-100 group-focus-visible:opacity-100");
+    const body = html();
+    expect(body).toMatch(/<svg[^>]*opacity-0[^>]*aria-hidden="true"|<svg[^>]*aria-hidden="true"[^>]*opacity-0/);
+  });
+
+  it("renders heading counts as count chips", () => {
+    expect(html()).toContain('data-kind="count"');
   });
 });

@@ -20,7 +20,7 @@
 </script>
 
 <script lang="ts">
-  import { Eye } from "@lucide/svelte";
+  import { ArrowRight, Eye } from "@lucide/svelte";
   import LauncherIcon from "./LauncherIcon.svelte";
 
   interface Props {
@@ -38,6 +38,11 @@
   let { here, elsewhere, launchers, followAgent, canFollow, onSelect, onGoTo, onLaunch, onToggleFollow }: Props = $props();
 
   const empty = $derived(here.length === 0 && elsewhere.length === 0);
+
+  function rowTitle(row: DockAgentRow, here: boolean): string {
+    if (here) return `Show in Shell \u2014 ${row.title}`;
+    return row.detail ? `Go to ${row.title} in ${row.detail}` : `Go to ${row.title}`;
+  }
 
   function attentionTone(label: string): "danger" | "warn" {
     return /fail|error/i.test(label) ? "danger" : "warn";
@@ -58,18 +63,19 @@
   }
 </script>
 
-{#snippet rowList(rows: DockAgentRow[], onPick: (id: string) => void)}
+{#snippet rowList(rows: DockAgentRow[], onPick: (id: string) => void, isHere: boolean)}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -- arrow roving for the native row buttons inside -->
   <ul role="list" class="flex flex-col gap-0.5" onkeydown={onListKeydown}>
     {#each rows as row (row.id)}
       <li>
         <button
           type="button"
-          class="gp-menu-item min-w-0 focus-visible:outline-2 focus-visible:outline-accent {row.active ? 'bg-accent/10' : ''} {row.disabled ? 'opacity-50' : ''}"
+          class="gp-menu-item group min-w-0 focus-visible:outline-2 focus-visible:outline-accent {row.active ? 'bg-accent/10' : ''} {row.disabled ? 'opacity-50' : ''}"
           data-testid="dock-agent-row"
           data-agent-id={row.id}
           aria-current={row.active ? "true" : undefined}
           disabled={row.disabled}
+          title={rowTitle(row, isHere)}
           onclick={() => onPick(row.id)}
         >
           <LauncherIcon kind={row.launcher} size={14} class="shrink-0" />
@@ -80,9 +86,6 @@
                 <span class="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" aria-hidden="true"></span>
                 <span class="sr-only">Unread output</span>
               {/if}
-              {#if row.status}
-                <span class="shrink-0 text-micro {row.status.cls}">{row.status.label}</span>
-              {/if}
               {#if row.attention}
                 <span class="gp-chip shrink-0" data-tone={attentionTone(row.attention)} data-kind="label">{row.attention}</span>
               {/if}
@@ -91,6 +94,8 @@
               <span class="truncate font-mono text-micro text-textMuted">{row.detail}</span>
             {/if}
           </span>
+          <span class="ml-auto shrink-0 text-micro {row.status ? row.status.cls : 'text-textMuted'}" data-testid="dock-agent-status">{row.status ? row.status.label : "Idle"}</span>
+          <ArrowRight size={12} class="shrink-0 text-textMuted opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100" aria-hidden="true" />
         </button>
       </li>
     {/each}
@@ -98,8 +103,8 @@
 {/snippet}
 
 <section aria-label="Agents" data-testid="dock-agents" class="h-full min-h-0 overflow-y-auto px-3 py-3">
-  <div class="flex flex-wrap items-center gap-2">
-    <span class="gp-label">Start an agent</span>
+  <div class="flex flex-wrap items-center gap-1.5 pb-3">
+    <span class="text-micro text-textMuted">Start an agent</span>
     {#each launchers as launcher (launcher.kind)}
       <button
         type="button"
@@ -116,7 +121,7 @@
     {/each}
     <button
       type="button"
-      class="gp-btn ml-auto"
+      class="gp-btn ml-auto {followAgent ? 'text-accent bg-accent/15' : ''}"
       data-size="sm"
       data-testid="dock-agents-follow"
       aria-pressed={followAgent}
@@ -134,18 +139,18 @@
       <p class="text-micro text-textMuted">Start one above — it opens as a tab in Shell, beside your terminals.</p>
     </div>
   {:else}
-    <div class="mt-4">
-      <h3 class="gp-label mb-1.5">In this repository <span class="font-mono text-textMuted">{here.length}</span></h3>
+    <div class="mt-5">
+      <h3 class="gp-label mb-1.5">In this repository <span class="gp-chip" data-kind="count">{here.length}</span></h3>
       {#if here.length > 0}
-        {@render rowList(here, onSelect)}
+        {@render rowList(here, onSelect, true)}
       {:else}
         <p class="px-2.5 text-micro text-textMuted">None in this repository</p>
       {/if}
     </div>
     {#if elsewhere.length > 0}
-      <div class="mt-4">
-        <h3 class="gp-label mb-1.5">Other repositories <span class="font-mono text-textMuted">{elsewhere.length}</span></h3>
-        {@render rowList(elsewhere, onGoTo)}
+      <div class="mt-5">
+        <h3 class="gp-label mb-1.5">Other repositories <span class="gp-chip" data-kind="count">{elsewhere.length}</span></h3>
+        {@render rowList(elsewhere, onGoTo, false)}
       </div>
     {/if}
   {/if}
