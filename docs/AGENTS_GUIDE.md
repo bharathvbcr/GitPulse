@@ -115,8 +115,8 @@ inbox tools are:
 | `gitpulse_agent_register` | Register a live session (Claude, Antigravity or Codex) with a role and a wake mode (`boundary` or `auto`) |
 | `gitpulse_agent_peers` | List live and resumable peers across the repository's worktrees |
 | `gitpulse_agent_send` | Send a message to one peer, up to 16 KiB. An ambiguous target is refused rather than guessed |
-| `gitpulse_agent_inbox` | Read unread messages, deduplicated; acknowledging them is optional |
-| `gitpulse_agent_wait` | Block for up to 45 seconds for a reply, with at most 4 waiters at a time per server process |
+| `gitpulse_agent_inbox` | Read unread messages, deduplicated. A read only peeks; pass `ack: true` to acknowledge what it returns. A `for_peer` that matches several peers is refused with their `peer_id`s; a failed acknowledgement is reported in `ack_error` and `acked_count` counts only what succeeded |
+| `gitpulse_agent_wait` | Block for up to 45 seconds for a reply, with at most 4 waiters at a time per server process. It acknowledges what it returns (`ack` defaults to true); pass `since_seq` to wait without consuming. Like the inbox, it returns `has_more` and `dropped_before_seq` |
 
 A session also sees unread peer messages when it starts and after tool calls, through the `peer-inbox`
 hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff messages

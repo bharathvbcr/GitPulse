@@ -1193,3 +1193,175 @@ fn peer_and_evicted_steward_mailbox_envelopes_honor_since_seq_and_sibling_worktr
         let _ = std::fs::remove_dir_all(session_dir);
     }
 }
+
+fn register_inbox_peer(repo: &str, sid: &str, role: &str) {
+    handle_tool_call(
+        "gitpulse_agent_register",
+        &json!({
+            "repo_path": repo,
+            "provider": "claude",
+            "surface": "terminal",
+            "provider_session_id": sid,
+            "role": role,
+            "pid": std::process::id(),
+        }),
+    )
+    .expect("register peer");
+}
+
+fn send_to_role(repo: &str, role: &str, body: &str) {
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "agy:lead",
+            "to_peer": role,
+            "body": body,
+        }),
+    )
+    .expect("send to peer");
+}
+
+#[test]
+fn an_inbox_read_peeks_unless_the_caller_asks_to_acknowledge() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888801";
+    register_inbox_peer(&repo, sid, "peek-owner");
+    send_to_role(&repo, "peek-owner", "for the owner");
+
+    let read = |extra: serde_json::Value| {
+        let mut args = json!({ "repo_path": repo, "for_peer": "peek-owner" });
+        args.as_object_mut()
+            .expect("args object")
+            .extend(extra.as_object().expect("extra object").clone());
+        handle_tool_call("gitpulse_agent_inbox", &args).expect("inbox read")
+    };
+
+    let first = read(json!({}));
+    assert_eq!(first["acked"], false);
+    assert_eq!(first["acked_count"], 0);
+    assert_eq!(first["ack_error"], serde_json::Value::Null);
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+    let again = read(json!({}));
+    assert_eq!(
+        again["messages"].as_array().unwrap().len(),
+        1,
+        "a default read must leave the message unread"
+    );
+
+    let consumed = read(json!({ "ack": true }));
+    assert_eq!(consumed["acked"], true);
+    assert_eq!(consumed["acked_count"], 1);
+    assert!(read(json!({}))["messages"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn an_inbox_read_naming_several_peers_is_refused_with_the_candidates() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid_a = "88888888-8888-4888-8888-888888888802";
+    let sid_b = "88888888-8888-4888-8888-888888888803";
+    register_inbox_peer(&repo, sid_a, "twin");
+    register_inbox_peer(&repo, sid_b, "twin");
+
+    let refused = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "twin" }),
+    )
+    .expect_err("a role shared by two peers must be refused");
+    assert!(refused.contains("ambiguous_peer"), "{refused}");
+    assert!(
+        refused.contains("peer_id or provider_session_id"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(sid_a) && refused.contains(sid_b),
+        "{refused}"
+    );
+
+    let named = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "twin", "provider_session_id": sid_a }),
+    )
+    .expect("a named session id picks one of the peers");
+    assert_eq!(named["ok"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_acknowledgement_is_reported_beside_the_messages_it_could_not_ack() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Ok(meta) = std::fs::metadata(&self.0) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                if let Err(e) = std::fs::set_permissions(&self.0, perms) {
+                    eprintln!("could not restore {}: {e}", self.0.display());
+                }
+            }
+        }
+    }
+
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888804";
+    register_inbox_peer(&repo, sid, "ack-owner");
+    send_to_role(&repo, "ack-owner", "unackable");
+
+    let lanes = crate::engine::agent_bus::lanes_messages_path(&repo, true)
+        .expect("bus path")
+        .parent()
+        .expect("lanes dir")
+        .to_path_buf();
+    let _restore = Restore(lanes.clone());
+    std::fs::set_permissions(&lanes, std::fs::Permissions::from_mode(0o555))
+        .expect("make the bus directory read-only");
+
+    let read = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "ack-owner", "ack": true }),
+    )
+    .expect("a failed ack must not fail a read that already collected its messages");
+    assert_eq!(read["messages"].as_array().unwrap().len(), 1);
+    let err = read["ack_error"].as_str().expect("ack_error is reported");
+    assert!(err.contains("bus ack"), "{err}");
+}
+
+#[test]
+fn a_wait_reports_has_more_and_dropped_before_seq_like_the_inbox() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888805";
+    register_inbox_peer(&repo, sid, "wait-owner");
+    send_to_role(&repo, "wait-owner", "first");
+    send_to_role(&repo, "wait-owner", "second");
+
+    let counter = AtomicUsize::new(0);
+    let wait = |timeout_ms: u64, limit: u32| {
+        handle_agent_wait_with_counter(
+            AgentWaitArgs {
+                repo_path: repo.clone(),
+                for_peer: "wait-owner".into(),
+                provider_session_id: Some(sid.into()),
+                since_seq: None,
+                thread_key: None,
+                include_broadcasts: None,
+                timeout_ms: Some(timeout_ms),
+                ack: Some(false),
+                limit: Some(limit),
+            },
+            &counter,
+            60_000,
+        )
+        .expect("wait")
+    };
+
+    let capped = wait(0, 1);
+    assert_eq!(capped["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(capped["has_more"], true);
+    assert_eq!(capped["dropped_before_seq"], 0);
+
+    let whole = wait(0, 10);
+    assert_eq!(whole["has_more"], false);
+    assert!(whole["dropped_before_seq"].is_u64(), "{whole}");
+    assert_eq!(whole["ack_error"], serde_json::Value::Null);
+}
