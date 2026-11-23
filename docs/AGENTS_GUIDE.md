@@ -124,6 +124,8 @@ hook. Separately, the `gitpulse_worktree_*` family carries lane-level handoff me
 every sibling lane. You can send an agent a message yourself with **Send to agent** on a live session;
 GitPulse shows a preview and waits for your confirmation before delivering it.
 
+The `gitpulse_agent_send` result has a `mailbox` object saying whether the recipient's mailbox took the message (`deposited`, with a `reason` of `full`, `refused`, `no_session` or `unavailable` when it did not). A peer may hold at most 7 pending messages per session; the last slot carries one notice per repository pointing the recipient at `gitpulse_agent_inbox`. A `delivery_outcome` of `bus_only` means the message is on the bus but not in the mailbox, so only an inbox or wait call will show it.
+
 The bus keeps the newest 256 messages. When it is full, the oldest message goes first, except that open
 asks and each recipient's unread direct messages from the last 2 hours (up to 8 per recipient, 64 in
 all) are kept for as long as anything else can go instead. A body may hold line breaks and tabs but no

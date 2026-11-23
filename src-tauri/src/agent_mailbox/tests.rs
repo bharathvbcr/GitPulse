@@ -1230,3 +1230,76 @@ fn system_steward_deposits_supersede_older_unclaimed_directives_without_filling_
         format!("directive #{}", MAX_PENDING + 3)
     );
 }
+
+fn peer(msg_id: &str, repo: &str) -> EnvelopeProvenance {
+    EnvelopeProvenance::PeerAgent {
+        msg_id: msg_id.to_owned(),
+        from_peer: "claude:coder".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 1,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: false,
+        repo_root: repo.to_owned(),
+    }
+}
+
+#[test]
+fn peer_envelopes_leave_the_last_slot_for_one_overflow_notice() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for i in 0..MAX_PEER_PENDING {
+        let id = format!("m{i}");
+        let kept = mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+        assert!(matches!(kept, PeerDeposit::Deposited(_)), "{i}");
+    }
+    // Every further peer message overflows, and they all share the one notice.
+    for i in 0..3 {
+        let id = format!("extra{i}");
+        match mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap()
+        {
+            PeerDeposit::Overflowed { notice } => assert!(notice.is_ok(), "{notice:?}"),
+            other => panic!("expected overflow: {other:?}"),
+        }
+    }
+    assert_eq!(names(&mailbox, SESSION).len(), MAX_PENDING);
+    // A human message still has the full cap, so it is refused only at MAX_PENDING.
+    assert!(matches!(
+        mailbox.deposit(SESSION, "human", "hello", now),
+        Err(MailboxError::Full(_))
+    ));
+}
+
+#[test]
+fn a_claimed_overflow_notice_is_reissued_by_the_next_overflow() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    for i in 0..=MAX_PEER_PENDING {
+        let id = format!("m{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+    }
+    let claimed = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    assert!(claimed
+        .iter()
+        .any(|c| c.claim.text.contains("gitpulse_agent_inbox")));
+    for i in 0..=MAX_PEER_PENDING {
+        let id = format!("n{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "peer text", peer(&id, "/repo"), now)
+            .unwrap();
+    }
+    let again = mailbox.try_claim_batch(SESSION, MAX_PENDING, now).unwrap();
+    assert!(
+        again
+            .iter()
+            .any(|c| c.claim.text.contains("gitpulse_agent_inbox")),
+        "the recipient was never told about the second overflow"
+    );
+}

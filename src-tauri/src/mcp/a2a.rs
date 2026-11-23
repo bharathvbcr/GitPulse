@@ -9,7 +9,7 @@
 //! - `desktop::instance::Request::AgentDeliver` (`#[cfg(target_os = "macos")]` when
 //!   a live GitPulse GUI owner is running).
 
-use crate::agent_mailbox::{EnvelopeProvenance, Mailbox};
+use crate::agent_mailbox::{EnvelopeProvenance, Mailbox, MailboxError, PeerDeposit};
 use crate::engine::agent_bus::{
     self, AgentBusMessage, ClaimConflict, PeerResolutionError, PeerUpsert,
 };
@@ -377,6 +377,72 @@ pub(crate) fn handle_agent_peers(a: super::AgentPeersArgs) -> Result<Value, Stri
     }))
 }
 
+/// Puts the envelope in the target session's mailbox and says what happened, so the send
+/// result never claims a delivery the mailbox did not take.
+fn deposit_into_mailbox(
+    session: Option<&str>,
+    msg_id: &str,
+    preview: &str,
+    provenance: EnvelopeProvenance,
+) -> Value {
+    let report = |deposited: bool,
+                  reason: Option<&str>,
+                  detail: Option<String>,
+                  duplicate: bool,
+                  overflow_notice: bool| {
+        json!({
+            "deposited": deposited,
+            "reason": reason,
+            "detail": detail,
+            "duplicate": duplicate,
+            "overflow_notice": overflow_notice,
+        })
+    };
+    let Some(sid) = session.filter(|s| crate::workbench::terminal_command::is_canonical_uuid(s))
+    else {
+        return report(
+            false,
+            Some("no_session"),
+            Some(
+                "The target has no Claude session id, so there is no mailbox to deposit into."
+                    .into(),
+            ),
+            false,
+            false,
+        );
+    };
+    let mb = match Mailbox::at_default() {
+        Ok(mb) => mb,
+        Err(e) => {
+            return report(
+                false,
+                Some("unavailable"),
+                Some(e.to_string()),
+                false,
+                false,
+            )
+        }
+    };
+    match mb.deposit_peer_or_overflow(sid, msg_id, preview, provenance, SystemTime::now()) {
+        Ok(PeerDeposit::Deposited(d)) => report(true, None, None, d.duplicate, false),
+        Ok(PeerDeposit::Overflowed { notice }) => report(
+            false,
+            Some("full"),
+            Some(match &notice {
+                Ok(_) => "The session's mailbox is full of peer messages; the message is on the bus and an overflow notice points the recipient at gitpulse_agent_inbox.".to_string(),
+                Err(e) => format!("The session's mailbox is full of peer messages and the overflow notice could not be left: {e}"),
+            }),
+            false,
+            notice.is_ok(),
+        ),
+        Err(e @ MailboxError::Full(_)) => report(false, Some("full"), Some(e.to_string()), false, false),
+        Err(e @ MailboxError::Invalid(_)) => {
+            report(false, Some("refused"), Some(e.to_string()), false, false)
+        }
+        Err(e) => report(false, Some("unavailable"), Some(e.to_string()), false, false),
+    }
+}
+
 pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String> {
     crate::repository_trust::require(Path::new(&a.repo_path))
         .map_err(CommandError::into_message)?;
@@ -391,9 +457,12 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     let requested_hop = if let Some(explicit) = a.hop {
         explicit
     } else if let Some(ref tk) = a.thread_key {
+        // A failed read must fail the send: guessing hop 1 would reset the ping-pong count.
         agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
-            .ok()
-            .and_then(|page| page.messages.last().map(|m| m.hop.unwrap_or(0) + 1))
+            .map_err(CommandError::into_message)?
+            .messages
+            .last()
+            .map(|m| m.hop.unwrap_or(0) + 1)
             .unwrap_or(1)
     } else {
         1
@@ -430,59 +499,66 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         .map(|(p, _)| p.to_string())
         .unwrap_or_else(|| "peer".to_string());
 
-    let mut truncated_in_mailbox = false;
-    if let Some(ref sid) = target.record.provider_session_id {
-        if crate::workbench::terminal_command::is_canonical_uuid(sid) {
-            if let Ok(mb) = Mailbox::at_default() {
-                let (preview, truncated) =
-                    crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
-                truncated_in_mailbox = truncated;
-                let provenance = EnvelopeProvenance::PeerAgent {
-                    msg_id: msg_id.clone(),
-                    from_peer: message.from_agent.clone(),
-                    provider: sender_provider,
-                    branch: message.branch.clone().unwrap_or_default(),
-                    thread_key: message.thread_key.clone().unwrap_or_default(),
-                    hop,
-                    max_hops,
-                    truncated_in_bus: truncated,
-                    repo_root: root_repo.clone(),
-                };
-                let _ = mb.deposit_with_provenance(
-                    sid,
-                    &msg_id,
-                    &preview,
-                    provenance,
-                    SystemTime::now(),
-                );
-            }
-        }
-    }
+    let (preview, truncated_in_mailbox) =
+        crate::agent_mailbox::preview_for_mailbox(&message.body, &msg_id);
+    let provenance = EnvelopeProvenance::PeerAgent {
+        msg_id: msg_id.clone(),
+        from_peer: message.from_agent.clone(),
+        provider: sender_provider,
+        branch: message.branch.clone().unwrap_or_default(),
+        thread_key: message.thread_key.clone().unwrap_or_default(),
+        hop,
+        max_hops,
+        truncated_in_bus: truncated_in_mailbox,
+        repo_root: root_repo.clone(),
+    };
+    let mailbox = deposit_into_mailbox(
+        target.record.provider_session_id.as_deref(),
+        &msg_id,
+        &preview,
+        provenance,
+    );
+    let deposited = mailbox["deposited"].as_bool().unwrap_or(false);
 
     notify_in_process_waiters();
 
+    // The mailbox is all the push paths read, so a message that never reached it can only
+    // be surfaced by an inbox or wait call. An answer from the desktop deliver path still
+    // wins, because that path surfaced the message by another route.
+    let desktop_outcome = if hop < max_hops && target.liveness == "live" {
+        match reach_desktop_agent_deliver(
+            &root_repo,
+            &target.record.peer_id,
+            &msg_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            Some(Ok(reply)) => Some(
+                reply["delivery_outcome"]
+                    .as_str()
+                    .unwrap_or("queued_for_hook_boundary")
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let delivery_outcome = if hop >= max_hops {
         "paused_hop_limit".to_string()
+    } else if let Some(outcome) = desktop_outcome {
+        outcome
+    } else if !deposited {
+        "bus_only".to_string()
     } else if target.liveness != "live" {
         if target.liveness == "resumable" {
             "requires_resume".to_string()
         } else {
             "queued_for_hook_boundary".to_string()
         }
-    } else if let Some(Ok(reply)) = reach_desktop_agent_deliver(
-        &root_repo,
-        &target.record.peer_id,
-        &msg_id,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ) {
-        reply["delivery_outcome"]
-            .as_str()
-            .unwrap_or("queued_for_hook_boundary")
-            .to_string()
     } else {
         let listening = target
             .record
@@ -511,6 +587,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         "hop": hop,
         "max_hops": max_hops,
         "truncated_in_mailbox": truncated_in_mailbox,
+        "mailbox": mailbox,
         "message": message,
     }))
 }
