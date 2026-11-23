@@ -1,5 +1,5 @@
 ---
-name: gitpulse-collisions
+name: collisions
 description: Detect overlapping uncommitted edits across GitPulse worktrees and agent sessions. Use when two agents, worktrees, or checkouts might be touching the same files, before merging or continuing a parked rebase, or when the user asks who is editing what.
 license: MIT
 compatibility: Requires gitpulse-mcp on PATH and an absolute git repository path.
@@ -31,7 +31,7 @@ A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, o
 
 ## When the MCP tools are not available
 
-The procedure above runs from the shell through the same binary when the MCP connection is not loaded or has dropped (the gitpulse-insights skill covers argument typing, `--json` and the exit statuses). Exit 3 is the incomplete answer this skill warns about: a worktree that was not read, so an empty list is not a clear path.
+The procedure above runs from the shell through the same binary when the MCP connection is not loaded or has dropped (the `gitpulse:insights` skill covers argument typing, `--json` and the exit statuses). Exit 3 is the incomplete answer this skill warns about: a worktree that was not read, so an empty list is not a clear path.
 
 ```sh
 gitpulse-mcp call gitpulse_collision_risk repo_path=/abs/repo path=src/lib.rs

@@ -9157,7 +9157,7 @@ mod tests {
         use crate::tasks::file_tasks as ft;
         let skill = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../plugins/gitpulse/skills/gitpulse-tasks/SKILL.md"),
+                .join("../plugins/gitpulse/skills/tasks/SKILL.md"),
         )
         .unwrap();
         let grouped = |n: usize| {

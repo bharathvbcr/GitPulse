@@ -105,6 +105,14 @@ const ASSIST_MAX_USER_BYTES: usize = 2_097_152;
 /// What the user reads when Manvi predates the op.
 pub const OLD_MANVI_MESSAGE: &str = "This Manvi does not offer work.assist.complete. Update Manvi to run GitPulse's AI features through it.";
 
+/// Manvi's `work.assist.complete` code for a credential the provider refused
+/// (Anthropic: HTTP 401, a wrong, revoked or disabled key). Read as data, never
+/// from the message.
+pub const MANVI_PROVIDER_AUTH: &str = "E_PROVIDER_AUTH";
+
+/// What the user reads when the provider refused the key Manvi sent.
+pub const REJECTED_KEY_MESSAGE: &str = "Anthropic rejected the API key Manvi used: it is wrong, revoked or disabled. Replace the Claude key in GitPulse settings, or fix the account in ~/.anthropic-accounts when you use one.";
+
 /// A failed `work.assist.complete` call: the worker's code and message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManviError {
@@ -120,6 +128,8 @@ impl ManviError {
             OLD_MANVI_MESSAGE.to_string()
         } else if self.code == "E_BUSY" {
             "Manvi is busy with two other AI requests; try again.".to_string()
+        } else if self.code == MANVI_PROVIDER_AUTH {
+            REJECTED_KEY_MESSAGE.to_string()
         } else {
             format!("Manvi: {}", self.message)
         }
@@ -752,7 +762,15 @@ struct AssistReply {
 }
 
 fn assist_call(cloud: &ManviRoute, params: Value) -> Result<AssistReply, CommandError> {
-    let raw = (cloud.complete)(params).map_err(|e| CommandError::from(e.user_message()))?;
+    let dry_run = params.get("dry_run") == Some(&Value::Bool(true));
+    let answer = (cloud.complete)(params);
+    // Whatever feature finds the key refused (or working) tells the steward,
+    // so its status never calls a refused key configured.
+    crate::harness::steward::note_cloud_key_answer(
+        &cloud.model,
+        crate::harness::steward::key_answer_of(cloud.provider, dry_run, &answer),
+    );
+    let raw = answer.map_err(|e| CommandError::from(e.user_message()))?;
     let reply: AssistReply = serde_json::from_value(raw)
         .map_err(|e| CommandError::from(format!("Manvi returned an unreadable reply: {e}")))?;
     if !reply.ok {

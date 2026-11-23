@@ -661,8 +661,8 @@ pass). It only reads; refreshing the cache is the host's plugin update.
 line right under its header, where the brief's 2,000-byte cap never cuts: tier and
 what binds it with the sensor's state, or `UNKNOWN (why)` and that heavy commands
 are not load-checked, and the Claude and Codex sessions launched and observed. It
-reads the same snapshot and never samples. The `gitpulse-load` skill
-(`plugins/gitpulse/skills/gitpulse-load`) says what to do with it and with a
+reads the same snapshot and never samples. The `gitpulse:load` skill
+(`plugins/gitpulse/skills/load`) says what to do with it and with a
 refusal; the terminal launch prompt names it, because `dc-store` owns the shared
 brief and does not.
 

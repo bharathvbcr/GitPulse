@@ -252,6 +252,14 @@
         {/if}
       </div>
     </div>
+  {:else if view.manvi_state === "rejected"}
+    <div class="gp-notice" data-tone="warn" data-testid="manvi-steward-model-rejected">
+      <ShieldAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />
+      <div class="min-w-0 flex-1 space-y-1">
+        <div class="font-medium">Anthropic rejected the API key</div>
+        <p class="text-textMuted text-micro leading-relaxed">{redactDiagnosticText(view.manvi_detail)}</p>
+      </div>
+    </div>
   {:else if view.manvi_state === "failed" || view.manvi_state === "deferred" || view.manvi_state === "unchecked"}
     <div class="gp-notice" data-tone="unknown" data-testid="manvi-steward-model-unknown">
       <ShieldAlert size={14} class="mt-0.5 shrink-0" style="color: var(--gp-notice-ink)" />

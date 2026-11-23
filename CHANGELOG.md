@@ -11,6 +11,18 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ## [Unreleased]
 
+### Changed
+
+- **Plugin skills drop the repeated `gitpulse-` prefix.** Hosts already put the
+  plugin's name in front of its skills, so they showed as
+  `gitpulse:gitpulse-insights`. They are now `gitpulse:insights`,
+  `gitpulse:collisions`, `gitpulse:tasks`, `gitpulse:terminal`, `gitpulse:load`
+  and `gitpulse:merge-train` (`plugins/gitpulse/skills/<name>`). Antigravity runs
+  a plugin's skill as a bare `/<name>` with no plugin namespace, so the managed
+  Antigravity plugin keeps the prefixed names (`/gitpulse-insights`) and its
+  copies name each other that way; a GitPulse terminal launch tells each agent
+  the spelling its host uses.
+
 ## [0.2.0-beta.1] - 2026-11-18
 
 The first beta of GitPulse 0.2.0 (see [GitPulse 0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md)),

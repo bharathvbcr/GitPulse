@@ -167,6 +167,28 @@ describe("HostLoadSection", () => {
     expect(activeBody).toContain("Active (cloud · claude-sonnet-4-6) · checks every 3 min");
     expect(activeBody).not.toContain("Switched off in Settings");
 
+    // A key Anthropic refused is not an active model.
+    setManviStewardForTest({
+      settings: globalOnRepoOff,
+      effective: resolveEffectiveStewardPolicy(globalOnRepoOff, "/repo/opted-out/.git", null),
+      repo_common_dir: "/repo/opted-out/.git",
+      env_override: null,
+      env_forced: null,
+      manvi_state: "rejected",
+      manvi_mode: "cloud",
+      manvi_model: "claude-sonnet-4-6",
+      manvi_detail: "Anthropic rejected the API key Manvi used.",
+      running: false,
+      critical_throttle_active: false,
+      throttled_count: 0,
+      last_check_ms: null,
+      next_check_ms: 1_763_550_180_000,
+      history: [],
+    });
+    const rejectedBody = render(HostLoadSection).body;
+    expect(rejectedBody).toContain("Anthropic rejected the API key");
+    expect(rejectedBody).not.toContain("Active (cloud");
+
     // Case 2: `GITPULSE_MANVI_STEWARD=0` forces steward off even when a repository override
     // has `enabled = true`. Machine-wide Health summary must report "Switched off in Settings"!
     const repoOnEnvForcedOff = {

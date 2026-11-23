@@ -169,6 +169,29 @@ describe("ManviStewardSettings", () => {
     expect(pressedLabels).not.toContain("3d");
   });
 
+  it("says Anthropic rejected the key instead of calling the model active or unchecked", () => {
+    const detail =
+      "Anthropic rejected the API key Manvi used: it is wrong, revoked or disabled. Replace the Claude key in GitPulse settings, or fix the account in ~/.anthropic-accounts when you use one.";
+    setManviStewardForTest({
+      ...EMPTY_MANVI_STEWARD_STATUS,
+      manvi_state: "rejected",
+      manvi_mode: "cloud",
+      manvi_model: "claude-sonnet-5-5",
+      manvi_detail: detail,
+    });
+    const { body } = render(ManviStewardSettings, {
+      props: { active: false, repoPath: null },
+    });
+    expect(body).toContain('data-testid="manvi-steward-model-rejected"');
+    expect(body).toContain("Anthropic rejected the API key");
+    expect(body).not.toContain('data-testid="manvi-steward-model-ready"');
+    expect(body).not.toContain('data-testid="manvi-steward-model-unknown"');
+    const visibleText = stripHtmlTags(body);
+    expect(findBannedTerms(visibleText, BANNED_UI_TERMS)).toEqual([]);
+    expect(findBannedTerms(visibleText, RETIRED_VERB_TERMS)).toEqual([]);
+    expect(findBannedTerms(visibleText, VOICE_TERMS)).toEqual([]);
+  });
+
   it("distinguishes deferred or failed Manvi checks from an unchosen model", () => {
     setManviStewardForTest({
       ...EMPTY_MANVI_STEWARD_STATUS,
