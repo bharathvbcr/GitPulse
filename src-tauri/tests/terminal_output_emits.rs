@@ -565,8 +565,10 @@ fn detaching_and_reattaching_mid_stream_stops_and_restarts_delivery() {
     // The flow-control window: credit the host can have sent and the view not
     // yet acknowledged. It is all that can still be on its way at the detach.
     const WINDOW: usize = 512 * 1024;
-    let at_detach = received(&tallies, &id);
     assert!(gitpulse_lib::terminal::detach_session(&state, &id).unwrap());
+    // Counted once the host has applied the detach: until then the view is
+    // still attached and acknowledging, and what the host sends it is not late.
+    let at_detach = received(&tallies, &id);
     // Detached for a while. `yes` keeps writing throughout; a host that kept
     // sending would deliver megabytes in this time, not one window.
     std::thread::sleep(Duration::from_millis(700));
