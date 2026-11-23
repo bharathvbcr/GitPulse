@@ -289,10 +289,17 @@ export function bindHorizontalWheel(el: HorizontalWheelTarget): () => void {
 /**
  * The smallest scrollLeft that keeps `child` fully inside the scroller.
  * `scrollIntoView` can pan a parent instead of this strip; this cannot.
+ *
+ * `inset` keeps that much clear at each edge the strip can still scroll
+ * past, where a scroll cue (`ScrollCue`) is drawn over the content: a child
+ * revealed flush to the edge would sit under the cue's button. At the real
+ * ends (scrollLeft 0 or the maximum) there is no cue, so the clamp lets the
+ * child sit flush.
  */
 export function scrollChildIntoHorizontalView(
   scroller: { scrollLeft: number; clientWidth: number; scrollWidth: number },
   child: { offsetLeft: number; offsetWidth: number },
+  inset = 0,
 ): number {
   const view = finiteNonNegative(scroller.clientWidth);
   const size = finiteNonNegative(scroller.scrollWidth);
@@ -302,8 +309,11 @@ export function scrollChildIntoHorizontalView(
   const right = left + width;
   const start = Number.isFinite(scroller.scrollLeft) ? scroller.scrollLeft : 0;
   if (view <= 0) return start;
-  if (left < start) return Math.min(max, left);
-  if (right > start + view) return Math.min(max, Math.max(0, right - view));
+  // Never more than a third of the view each side, so a narrow strip still
+  // has room left for the child itself.
+  const pad = Math.min(finiteNonNegative(inset), view / 3);
+  if (left - pad < start) return Math.min(max, Math.max(0, left - pad));
+  if (right + pad > start + view) return Math.min(max, Math.max(0, right + pad - view));
   return Math.min(max, Math.max(0, start));
 }
 

@@ -191,6 +191,25 @@ describe("scrollChildIntoHorizontalView", () => {
     expect(scrollChildIntoHorizontalView({ ...strip, scrollLeft: 400 }, { offsetLeft: 0, offsetWidth: 80 })).toBe(0);
   });
 
+  it("keeps an inset clear of a scroll cue at an edge the strip can still scroll past", () => {
+    const strip = { scrollLeft: 0, clientWidth: 200, scrollWidth: 800 };
+    // Past the right edge: lands 28px short of it, clear of the cue.
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 250, offsetWidth: 80 }, 28)).toBe(158);
+    // Past the left edge: lands 28px after it.
+    expect(scrollChildIntoHorizontalView({ ...strip, scrollLeft: 400 }, { offsetLeft: 300, offsetWidth: 80 }, 28)).toBe(272);
+    // At the true start there is no cue, so the child may sit flush.
+    expect(scrollChildIntoHorizontalView({ ...strip, scrollLeft: 400 }, { offsetLeft: 10, offsetWidth: 80 }, 28)).toBe(0);
+    // And at the true end it clamps to the maximum.
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 720, offsetWidth: 80 }, 28)).toBe(600);
+    // A child already clear of both cues does not move.
+    expect(scrollChildIntoHorizontalView({ ...strip, scrollLeft: 100 }, { offsetLeft: 150, offsetWidth: 80 }, 28)).toBe(100);
+  });
+
+  it("caps the inset at a third of the view so a narrow strip still fits the child", () => {
+    const strip = { scrollLeft: 0, clientWidth: 90, scrollWidth: 800 };
+    expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 200, offsetWidth: 40 }, 100)).toBe(180);
+  });
+
   it("does not overscroll a strip that is already showing the child", () => {
     const strip = { scrollLeft: 100, clientWidth: 200, scrollWidth: 800 };
     expect(scrollChildIntoHorizontalView(strip, { offsetLeft: 120, offsetWidth: 40 })).toBe(100);

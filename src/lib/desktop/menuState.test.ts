@@ -87,7 +87,7 @@ describe("native menu projection", () => {
     const state = buildMenuState(repo, prefs(), "light", {}, false);
     expect(state.checked).toEqual(expect.arrayContaining(["theme-light", "tab-history", "section:history:diff", "terminal-dock"]));
     expect(state.checked).not.toContain("theme-system");
-    expect(state.labels).toContainEqual({ id: "terminal-dock", text: "Hide Terminal" });
+    expect(state.labels).toContainEqual({ id: "terminal-dock", text: "Hide Dock" });
   });
   it("only exposes supported operation actions and permits staging resolutions", () => {
     const repo: RepoState = { ...loaded(), statuses: [{ path: "a", is_staged: false, is_conflicted: true,

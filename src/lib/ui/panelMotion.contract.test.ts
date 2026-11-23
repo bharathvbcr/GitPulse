@@ -34,14 +34,22 @@ describe("lane D motion vocabulary in app.css", () => {
     expect(table).not.toMatch(/animate-\[gp-slide/);
   });
 
-  it("slides the dock on transform and opacity only, with a shorter exit than entrance", () => {
-    for (const name of ["gp-dock-in", "gp-dock-slide-in", "gp-dock-slide-out"]) {
+  it("slides the dock sheet its full height on transform only, with a shorter exit than entrance", () => {
+    for (const name of ["gp-dock-slide-in", "gp-dock-slide-out"]) {
       const frames = blockOf(`@keyframes ${name} {`);
+      // Never size or layout: a terminal re-fitted mid-slide would tell its PTY a new size.
       expect(frames, name).not.toMatch(/\b(width|height|margin|padding|top|left|bottom|filter|box-shadow|backdrop-filter)\s*:/);
+      // A real slide: the sheet travels its own full height, not a nudge.
+      expect(frames, name).toMatch(/translate3d\(0, (?:var\(--gp-dock-from, )?100%\)?, 0\)/);
     }
-    expect(css).toContain("animation: gp-dock-slide-in var(--gp-dur-slow)");
-    expect(css).toContain("animation: gp-dock-slide-out var(--gp-dock-exit-ms, var(--gp-dur-instant))");
-    expect(css).toContain("animation: gp-dock-in var(--gp-dur-base)");
+    // Interruptible: each slide starts where the sheet is when the host says so.
+    expect(blockOf("@keyframes gp-dock-slide-in {")).toContain("translate3d(0, var(--gp-dock-from, 100%), 0)");
+    expect(blockOf("@keyframes gp-dock-slide-out {")).toContain("translate3d(0, var(--gp-dock-from, 0px), 0)");
+    // In on the spatial spring at `slow`; out on the exit curve at the host's `fast` (140 < 320).
+    expect(css).toContain("animation: gp-dock-slide-in var(--gp-dur-slow) var(--gp-ease-spatial)");
+    expect(css).toContain("animation: gp-dock-slide-out var(--gp-dock-exit-ms, var(--gp-dur-instant)) var(--gp-ease-exit)");
+    // The old 8px settle is gone: docked and floating share the one slide.
+    expect(css).not.toContain("@keyframes gp-dock-in ");
   });
 });
 

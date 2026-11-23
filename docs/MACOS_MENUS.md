@@ -39,7 +39,7 @@ Menu order: **GitPulse · File · Edit · View · Go · Repository · Window · 
 | GitPulse | About, Settings, Check for Updates, Services, Hide, Hide Others, Show All, Quit. Update checks report available/current/failed and do not install anything. |
 | File | Open/Clone Repository, Open Recent, Clear Recent Repositories, Open Repositories, Close/Reopen Repository Tab, Next/Previous Repository Tab, Close Window. Recent history is capped at 12; identical names display distinguishing paths. Clearing history preserves repositories, tabs and closed-tab recovery. |
 | Edit | Native Undo, Redo, Cut, Copy, Paste, Select All for the focused control. |
-| View | Work, Code, History, Insights, Fleet, Show/Hide Terminal, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
+| View | Work, Code, History, Insights, Fleet, Show/Hide Dock, Search Commits, Command Palette, Refresh, System/Light/Dark Appearance, Toggle Dark/Light, Full Screen, Zoom In, Zoom Out, Actual Size. |
 | Go → Work | Overview, Remote, Tasks. |
 | Go → Code | Explorer, Map. (Search and Blame are toggles inside Explorer.) |
 | Go → History | Graph, Diff. The reflog and regression suspects are Graph's *HEAD moves* and *Suspects* lists (command palette: *Open Reflog*, *Find regression suspects*). |
@@ -53,7 +53,7 @@ Go uses the existing view registry and per-repository section persistence. Navig
 ## State, targeting and recovery
 
 - Availability follows loaded repository state, bare repositories, conflicts, stash-read failures, supported parked-operation actions and running Git work. Refresh remains available for recovery from a failed load. Stage All can stage conflict resolutions; Continue waits until conflicts are resolved.
-- Checkmarks reflect the active view, section, repository, Terminal and explicit appearance preference. The Terminal checkmark and its Show/Hide label follow the ACTIVE repository tab, because the dock belongs to one repository rather than the workspace: switching to a repository whose terminal is closed says Show Terminal. Labels show Show/Hide Terminal and work in progress. Native checkmarks are reconciled after clicks and recent-menu rebuilds.
+- Checkmarks reflect the active view, section, repository, Dock and explicit appearance preference. The Dock checkmark and its Show/Hide label follow the ACTIVE repository tab, because the dock belongs to one repository rather than the workspace: switching to a repository whose terminal is closed says Show Dock. Labels show Show/Hide Dock and work in progress. Native checkmarks are reconciled after clicks and recent-menu rebuilds.
 - Native events capture the repository path. The frontend rejects stale events and rechecks path, generation, branch and operation after dialogs. Bulk staging captures the original repository session for every file. Quick Commit cannot retarget another repository when its dialog completes.
 - Git mutations reuse the existing guarded store and backend commands. They report actual outcomes, including partial bulk failures. Interactive rebase now uses the same mutation/activity owner. Abort/Skip retain consequence confirmations.
 - Copy HEAD resolves a current full object ID. Remote Website uses the default/origin remote, rejects ambiguous or truncated-only choices and unsupported URLs, and strips embedded credentials before opening the browser. Repository reveal uses the existing repository resolver.
