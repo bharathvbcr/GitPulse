@@ -51,6 +51,7 @@ mod sensor;
 mod snapshot;
 mod thresholds;
 mod trace;
+pub(crate) mod webcontent;
 
 pub use exec_probe::ExecLatency;
 pub(crate) use thresholds::format_latency;

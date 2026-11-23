@@ -2668,6 +2668,18 @@ pub(crate) fn all_pids() -> Result<Vec<i32>, String> {
     Ok(pids)
 }
 
+/// A process's executable path, when the OS will say. macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) fn exec_path_of(pid: i32) -> Option<String> {
+    os::pidpath(pid)
+}
+
+/// A process's phys footprint (bytes) and CPU time (ns). macOS only.
+#[cfg(target_os = "macos")]
+pub(crate) fn footprint_cpu_of(pid: i32) -> Option<(u64, u64)> {
+    os::footprint_cpu(pid)
+}
+
 /// A process's working directory, when the OS will say.
 pub(crate) fn cwd_of(pid: i32) -> Option<PathBuf> {
     os::cwd(pid)
@@ -3529,7 +3541,17 @@ mod os {
         }
     }
 
-    fn pidpath(pid: i32) -> Option<String> {
+    /// Phys footprint (bytes) and CPU time (ns) of `pid` from
+    /// `proc_pid_rusage`; `None` when the process is gone or unreadable.
+    pub(crate) fn footprint_cpu(pid: i32) -> Option<(u64, u64)> {
+        let usage = usage(pid, timebase());
+        match (usage.footprint, usage.cpu_ns) {
+            (Reading::Value(footprint), Reading::Value(cpu_ns)) => Some((footprint, cpu_ns)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pidpath(pid: i32) -> Option<String> {
         let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         // SAFETY: `buf` is PROC_PIDPATHINFO_MAXSIZE bytes, which is what the
         // call writes into.
