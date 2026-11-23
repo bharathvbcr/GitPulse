@@ -2,7 +2,7 @@
   import { onDestroy, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
-  import { ChevronDown, SquareTerminal } from "@lucide/svelte";
+  import { ChevronDown, PanelBottom } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";
   import type { MutationTarget } from "../repos/storeTypes";
@@ -33,7 +33,7 @@
   import { popover, type PopoverOptions } from "../ui/popover";
 
   /**
-   * The terminal, docked beneath the active view.
+   * The dock, docked beneath the active view: shell, agents, files and console.
    *
    * Two things this shape gets right that a view could not. A PTY has to
    * outlive a view switch, so the pane was already mounted once and hidden
@@ -341,7 +341,7 @@
     <div
       role="separator"
       aria-orientation="horizontal"
-      aria-label="Resize the terminal dock"
+      aria-label="Resize the dock"
       aria-valuenow={height}
       aria-valuemin={TERMINAL_DOCK_MIN_HEIGHT}
       aria-valuemax={heightCeiling}
@@ -356,15 +356,15 @@
 
     {#if hostedTabs.length === 0}
     <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 select-none">
-      <SquareTerminal size={12} class="text-accent shrink-0" />
-      <span class="text-meta font-medium text-textPrimary">Terminal</span>
+      <PanelBottom size={12} class="text-accent shrink-0" />
+      <span class="text-meta font-medium text-textPrimary">Dock</span>
       <div class="flex-1"></div>
       <button
         type="button"
         onclick={onClose}
         class="gp-icon-btn" data-size="sm"
-        title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — the session keeps running"
-        aria-label="Hide the terminal dock"
+        title="Hide the dock ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — sessions keep running"
+        aria-label="Hide the dock"
       >
         <ChevronDown size={13} />
       </button>

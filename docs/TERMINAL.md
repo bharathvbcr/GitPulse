@@ -1,5 +1,10 @@
 # Terminal
 
+The **Dock** is the panel beneath the active view. It has four sections: **Shell**,
+**Agents**, **Files** and **Console**. Toggle it with **Ctrl+`** (⌃` on macOS) and
+switch sections with **⌥⌘1–4** (**Ctrl+Alt+1–4** on Windows and Linux). Each
+session inside the Dock is a terminal, and the rest of this page is about those.
+
 Open the dock with **Ctrl+`**. It stays below the current view; **Expand terminal**
 gives it as much of the window as will fit (up to 2400px) and **Restore terminal
 size** returns to its previous height. When expanded, the dock hides and marks `inert`

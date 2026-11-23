@@ -26,7 +26,7 @@ describe("TerminalDock", () => {
       props: { open: true, onClose: () => {}, load: loader },
     }).body;
     expect(body).toContain("data-terminal-dock");
-    expect(body).toContain("Terminal");
+    expect(body).toContain("Dock");
     expect(body).toContain("rounded-t-lg");
     expect(body).not.toContain("rounded-b-lg");
   });
@@ -144,7 +144,7 @@ describe("TerminalDock modes", () => {
 
   it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
     expect(source).toContain('onToggleDockMode: () => panelModes.toggle("dock")');
-    expect(source).toContain('aria-label="Resize the terminal dock"');
+    expect(source).toContain('aria-label="Resize the dock"');
     expect(source).toContain("data-terminal-host={tab.id}");
     expect(source).toContain("data-terminal-dock");
   });

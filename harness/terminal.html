@@ -540,7 +540,7 @@
           await press(document.activeElement, "ArrowRight");
           check("ArrowRight selects next tab and keeps strip focus", () => document.activeElement === visible('[role="tab"]')[1]);
           const beforeHide = report.spawned;
-          button("Hide the terminal dock").click(); await wait();
+          button("Hide the dock").click(); await wait();
           button("Show terminal").click(); await wait();
           check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
           // A double-click on the page hides the dock (the shell keeps running);
@@ -667,7 +667,7 @@
             check("the on-screen session's canvas holds a live WebGL2 context", () => !!firstGl && !firstGl.isContextLost());
 
             // -- A tab flick inside the hold keeps the warm context.
-            button("Hide the terminal dock").click(); await wait(150);
+            button("Hide the dock").click(); await wait(150);
             check("hiding the dock keeps the session's context through the hold: same canvas, live, still webgl",
               () => target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
             await showAndProbe();
@@ -691,7 +691,7 @@
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(900);
             check("a session that stays hidden past the hold gives its context up",
               () => other.dataset.renderer === "dom" && !other.querySelector("canvas"));
-            button("Hide the terminal dock").click(); await wait(900);
+            button("Hide the dock").click(); await wait(900);
             check("hiding the dock past the hold releases the on-screen session's context too",
               () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
@@ -705,7 +705,7 @@
             gpuPolicy.hideGraceMs = 3000;
             const beforeFlicks = glCanvas(target);
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
             }
             await wait(100);
@@ -717,7 +717,7 @@
             gpuPolicy.hideGraceMs = 0;
             const everAttached = [];
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
               const attached = glCanvas(target)?.getContext("webgl2");
               if (attached && !everAttached.includes(attached)) everAttached.push(attached);
@@ -931,7 +931,7 @@
               () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost() && gpuNote() === "");
             await loseNow();
             check("the second loss is recoverable too (inside the budget)", () => target.dataset.renderer === "reset");
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !target.querySelector("canvas"));
             await showAndProbe(); await wait(100);
             check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
@@ -939,7 +939,7 @@
             // session's held one: that ends the hold, it is not a counted loss.
             const graceBefore = gpuPolicy.hideGraceMs;
             gpuPolicy.hideGraceMs = 3000;
-            button("Hide the terminal dock").click(); await wait(100);
+            button("Hide the dock").click(); await wait(100);
             const heldCanvas = glCanvas(target);
             check("a hidden session holds its context through the hold", () => !!heldCanvas && target.dataset.renderer === "webgl");
             heldCanvas.getContext("webgl2").getExtension("WEBGL_lose_context").loseContext();
@@ -951,7 +951,7 @@
             await loseNow();
             check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             button("Show terminal").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a session past its budget is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
@@ -995,7 +995,7 @@
           {
             // The resize handle is a WAI-ARIA separator: it reports its value,
             // and the arrow keys nudge the dock without a pointer.
-            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const handle = visible('[role="separator"][aria-label="Resize the dock"]')[0];
             const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
             if (handle) await press(handle, "ArrowUp");
             const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
@@ -1653,13 +1653,13 @@
         await section(async (check) => {
           tabs()[0].click(); await wait(300);
           let mark = resizeLog.length;
-          button("Hide the terminal dock").click(); await wait(400);
+          button("Hide the dock").click(); await wait(400);
           button("Show terminal").click(); await wait(400);
           check(`hiding and showing the dock tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
           check("the grid survives the dock being hidden and shown", () => sameGrid() && shownPanels().every(fitsHeight));
           // Resized while hidden: nothing may be told until it is shown, and
           // then once.
-          button("Hide the terminal dock").click(); await wait(300);
+          button("Hide the dock").click(); await wait(300);
           mark = resizeLog.length;
           await setDockHeight(300);
           check(`a dock resized while hidden tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
