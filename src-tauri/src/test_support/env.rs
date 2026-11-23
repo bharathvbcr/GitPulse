@@ -676,6 +676,12 @@ pub(crate) mod diskio {
     /// afterwards takes nothing back.
     pub(crate) const MAX_TOTAL_WRITES: u64 = 8 * 1024 * 1024 * 1024;
     const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+    /// The watchdog prints the process's running total each time it passes
+    /// another multiple of this. Under `--test-threads=1` each line lands
+    /// beside the test that was running, so a whole-suite run that nears the
+    /// budget shows which stretch of the suite wrote it; the per-test script
+    /// cannot, since it runs each test in a process of its own.
+    pub(crate) const MILESTONE_EVERY: u64 = 512 * 1024 * 1024;
     /// `0` disables the watchdog, for a run that is meant to write. Any other
     /// number replaces both limits with that many MiB (total) and MiB/s (rate),
     /// which is how the guard's own test gives a child a budget it can break in
@@ -799,6 +805,13 @@ pub(crate) mod diskio {
         })
     }
 
+    /// The milestone `now` has reached, when it is past the one `before`
+    /// had reached (a multiple of [`MILESTONE_EVERY`]).
+    pub(crate) fn milestone_passed(before: u64, now: u64) -> Option<u64> {
+        let reached = now / MILESTONE_EVERY;
+        (reached > before / MILESTONE_EVERY).then_some(reached * MILESTONE_EVERY)
+    }
+
     fn append_report() {
         let (Some(path), Some(bytes)) = (std::env::var_os(REPORT_ENV), bytes_written()) else {
             return;
@@ -835,9 +848,20 @@ pub(crate) mod diskio {
             .spawn(move || {
                 let started = Instant::now();
                 let mut samples: Vec<(Duration, u64)> = Vec::new();
+                let mut last = 0;
                 loop {
                     std::thread::sleep(SAMPLE_EVERY);
                     let Some(written) = bytes_written() else { return };
+                    if let Some(mark) = milestone_passed(last, written) {
+                        eprintln!(
+                            "[gitpulse-write-watchdog] {} MiB written by this process after {} s \
+                             (budget {} MiB)",
+                            mark >> 20,
+                            started.elapsed().as_secs(),
+                            limits.total >> 20
+                        );
+                    }
+                    last = written;
                     samples.push((started.elapsed(), written));
                     // Older than twice the window is never consulted.
                     let keep_from = samples
@@ -850,8 +874,10 @@ pub(crate) mod diskio {
                     if let Some(why) = verdict(&samples, &limits) {
                         eprintln!(
                             "\nDISK WRITE BUDGET EXCEEDED: {why}. A test is writing far more than any \
-                             measured test does; aborting the run. Find it with \
-                             `node scripts/test-disk-writes.mjs`; set {BUDGET_ENV}=0 to disable."
+                             measured test does; aborting the run. The \
+                             [gitpulse-write-watchdog] lines above mark where the total grew; \
+                             find single tests with `node scripts/test-disk-writes.mjs`; set \
+                             {BUDGET_ENV}=0 to disable."
                         );
                         std::process::abort();
                     }
