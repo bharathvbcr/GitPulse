@@ -15,6 +15,7 @@
 
 use super::wire::{self, Signal};
 use super::worktree::{self, Fingerprint};
+use crate::procguard::LockedSpawn;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
@@ -170,7 +171,7 @@ impl Session {
             command.process_group(0);
         }
         let mut child: Child = command
-            .spawn()
+            .spawn_locked()
             .map_err(|e| format!("Could not start the agent: {e}"))?;
         let stdin = child.stdin.take().ok_or("The agent has no input pipe.")?;
         let stdout = child.stdout.take().ok_or("The agent has no output pipe.")?;
@@ -812,13 +813,13 @@ fn terminate_group(pid: u32, kill: bool) {
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .status_locked();
         } else {
             let _ = Command::new("taskkill")
                 .args(["/PID", &pid.to_string(), "/T"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .status_locked();
         }
     }
 }
@@ -828,7 +829,9 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn collector() -> (Emit, Arc<Mutex<Vec<(&'static str, Value)>>>) {
+    type Seen = Arc<Mutex<Vec<(&'static str, Value)>>>;
+
+    fn collector() -> (Emit, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         (
@@ -891,7 +894,7 @@ mod tests {
                 ])
                 .args(args)
                 .current_dir(root)
-                .status()
+                .status_locked()
                 .unwrap()
                 .success())
         };
@@ -1029,7 +1032,7 @@ read never
                 ])
                 .args(args)
                 .current_dir(&root)
-                .status()
+                .status_locked()
                 .unwrap()
                 .success())
         };

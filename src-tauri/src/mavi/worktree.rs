@@ -22,6 +22,7 @@
 //! during the turn is indistinguishable from the agent's shell; the page calls
 //! those paths "other changes during this turn", never "the agent's".
 
+use crate::procguard::LockedSpawn;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path};
@@ -72,7 +73,7 @@ pub(crate) fn run_capped(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .map_err(|e| format!("Could not start {program}: {e}"))?;
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -251,7 +252,7 @@ mod tests {
             ])
             .args(args)
             .current_dir(root)
-            .status()
+            .status_locked()
             .unwrap()
             .success();
         assert!(ok, "git {args:?}");

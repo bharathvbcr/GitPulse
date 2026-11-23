@@ -19,6 +19,7 @@
 //!   shell ([`quote`]). Nothing the page sends is pasted into a command line
 //!   unquoted.
 
+use crate::procguard::LockedSpawn;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -349,7 +350,7 @@ pub(crate) fn probe(host: &str, dir: &str) -> MaviProbe {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_locked()
     {
         Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -466,7 +467,7 @@ mod tests {
         // And `sh` itself round-trips it: the script runs, not its quotes.
         let out = Command::new("sh")
             .args(["-c", &in_sh("printf '%s' \"it's ok\"")])
-            .output()
+            .output_locked()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "it's ok");
     }
@@ -499,7 +500,7 @@ mod tests {
         let out = Command::new("sh")
             .args(["-c", &command])
             .env("HOME", base.path())
-            .output()
+            .output_locked()
             .unwrap();
         assert!(
             out.status.success(),
@@ -518,7 +519,10 @@ mod tests {
         );
         // A directory that is not there stops before the program runs.
         let missing = remote_command("/nonexistent/mavi", program.to_str().unwrap(), &[]);
-        let out = Command::new("sh").args(["-c", &missing]).output().unwrap();
+        let out = Command::new("sh")
+            .args(["-c", &missing])
+            .output_locked()
+            .unwrap();
         assert_eq!(out.status.code(), Some(97));
         assert!(out.stdout.is_empty());
     }
