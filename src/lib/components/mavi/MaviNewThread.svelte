@@ -5,17 +5,58 @@
    * checked before anything starts, with an answer that says what to fix
    * (sign-in, host key, missing Claude Code, wrong directory); ssh never
    * prompts here, so a host that needs a password says so instead of hanging.
+   *
+   * The mode and model start from Settings → Agents (Claude's defaults), so a
+   * thread starts with the same authority an agent terminal would. Bypass
+   * still needs its acknowledgement here, whatever the default says. "Run in
+   * a new worktree" creates a sibling worktree first; it is ticked for the
+   * person when this repository already has a live thread, which the host
+   * would refuse.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { Laptop, Server, LoaderCircle, CircleCheck, TriangleAlert } from "@lucide/svelte";
   import { MAVI_MODES, maviClient, type MaviModeId, type Probe } from "../../mavi/client";
   import { maviStore } from "../../mavi/store.svelte";
-  import { currentRepoPath } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
+  import { agentDefaults } from "../../stores/agentDefaultsStore";
+  import { effectiveMode, modelChoiceOf } from "../../terminal/agentDefaults";
+  import { planWorktree, slugFromMessage } from "../../mavi/worktreeStart";
+  import { reportFailure } from "../../stores/mutationOutcome";
+  import { worktreeSetupNotices } from "../../branches/types";
+  import { toastStore } from "../../stores/toastStore";
+  import { runningAgents, terminalSessions } from "../../terminal/sessionRegistry";
+  import { sameRepo, isCaseInsensitiveFs } from "../../repos/paths";
   import Checkbox from "../Checkbox.svelte";
   import { shortcutTextLabel } from "../../ui/platformCopy";
   import { hostPlatform } from "../../stores/platformStore";
 
-  let { onStarted, onCancel }: { onStarted: (key: string) => void; onCancel?: () => void } = $props();
+  let {
+    onStarted,
+    onCancel,
+    prefill = "",
+    preferWorktree = false,
+  }: {
+    onStarted: (key: string) => void;
+    onCancel?: () => void;
+    /** The start of the first message, from a request elsewhere in the app. */
+    prefill?: string;
+    preferWorktree?: boolean;
+  } = $props();
+
+  function seededMode(): MaviModeId {
+    try {
+      return (effectiveMode(agentDefaults().defaults, "claude") ?? "ask") as MaviModeId;
+    } catch {
+      return "ask";
+    }
+  }
+  function seededModel(): string {
+    try {
+      return modelChoiceOf(agentDefaults().defaults, "claude").model ?? "";
+    } catch {
+      return "";
+    }
+  }
 
   let where = $state<"local" | "ssh">("local");
   let host = $state("");
@@ -23,10 +64,31 @@
   let hosts = $state<string[]>([]);
   let probe = $state<Probe | null>(null);
   let probing = $state(false);
-  let mode = $state<MaviModeId>("ask");
+  let mode = $state<MaviModeId>(seededMode());
   let acknowledged = $state(false);
-  let model = $state("");
-  let message = $state("");
+  let model = $state(seededModel());
+  let message = $state(untrack(() => prefill));
+  /** A live thread already works in this repository: the host allows one per worktree. */
+  let busyHere = $derived(
+    !!$currentRepoPath &&
+      maviStore.records.some((r) => {
+        if (r.target.kind !== "local") return false;
+        const phase = maviStore.summaryOf(r)?.phase;
+        return !!phase && phase !== "ended" && r.target.root.replace(/[\\/]+$/, "") === $currentRepoPath!.replace(/[\\/]+$/, "");
+      }),
+  );
+  /** Agent terminals already working in this checkout (their edits are not this thread's). */
+  let terminalAgentsHere = $derived(
+    $currentRepoPath
+      ? runningAgents($terminalSessions).filter((record) =>
+          sameRepo(record.checkout ?? record.repoPath, $currentRepoPath!, { caseInsensitive: isCaseInsensitiveFs() }),
+        ).length
+      : 0,
+  );
+  let newWorktree = $state(untrack(() => preferWorktree));
+  $effect(() => {
+    if (busyHere) newWorktree = true;
+  });
   let starting = $state(false);
   let error = $state<string | null>(null);
 
@@ -66,10 +128,15 @@
     starting = true;
     error = null;
     try {
+      let repoPath = $currentRepoPath;
+      if (where === "local" && newWorktree && repoPath) {
+        repoPath = await createWorktree(repoPath);
+        if (!repoPath) return;
+      }
       const key = await maviStore.create({
         target:
           where === "local"
-            ? { kind: "local", repoPath: $currentRepoPath! }
+            ? { kind: "local", repoPath: repoPath! }
             : { kind: "ssh", host: host.trim(), dir: dir.trim() },
         mode,
         acknowledged: mode === "bypass" ? acknowledged : false,
@@ -82,6 +149,37 @@
     } finally {
       starting = false;
     }
+  }
+
+  /** Creates the sibling worktree; its path, or null after saying why not. */
+  async function createWorktree(repo: string): Promise<string | null> {
+    const plan = planWorktree(repo, slugFromMessage(message));
+    if (!plan) {
+      error = "Couldn't work out where to put a sibling worktree for this repository.";
+      return null;
+    }
+    const outcome = await repoStore.addWorktree(
+      {
+        targetPath: plan.path,
+        newBranch: plan.branch,
+        startPoint: null,
+        detach: false,
+        cowCaches: true,
+        runHooks: false,
+        zeroCopyDevmap: false,
+        seedDevmap: true,
+        sparsePaths: null,
+      },
+      repoStore.captureTarget() ?? undefined,
+      true,
+    );
+    if (!outcome.ok) {
+      if (outcome.refused) reportFailure(outcome, "Couldn't create the worktree");
+      else error = `Couldn't create the worktree: ${outcome.error ?? "it did not complete."}`;
+      return null;
+    }
+    for (const notice of worktreeSetupNotices(outcome.output ?? {}, "create")) toastStore.warning(notice);
+    return outcome.output?.path ?? plan.path;
   }
 
   function onKeydown(event: KeyboardEvent) {
@@ -107,6 +205,24 @@
     </div>
     {#if where === "local"}
       <p class="text-meta text-textMuted mt-1.5 font-mono truncate">{$currentRepoPath ?? "Open a repository first."}</p>
+      {#if $currentRepoPath}
+        <div class="mt-1.5">
+          <Checkbox
+            label="Run in a new worktree"
+            description={busyHere
+              ? "Another Mavi thread is working in this repository; a thread needs a worktree of its own."
+              : "A sibling worktree on a new mavi/ branch, so this thread's changes stay apart."}
+            checked={newWorktree}
+            onchange={(next) => (newWorktree = next)}
+          />
+        </div>
+        {#if terminalAgentsHere > 0 && !newWorktree}
+          <p class="text-meta text-warn mt-1.5" role="status">
+            {terminalAgentsHere === 1 ? "An agent terminal is" : `${terminalAgentsHere} agent terminals are`} running in this checkout.
+            Its edits would show in this thread as other changes; a new worktree keeps them apart.
+          </p>
+        {/if}
+      {/if}
     {:else}
       <div class="grid gap-2 mt-2 mavi-ssh">
         <label class="grid gap-1">

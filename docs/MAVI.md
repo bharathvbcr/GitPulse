@@ -71,6 +71,45 @@ this repository, badges the files it touched ("Agent editing"), lists those
 first while it works, and warns before **Discard** on a file an agent is
 editing right now.
 
+## Mavi and the rest of GitPulse
+
+Mavi starts with the app (after the first paint), so these work before the
+Mavi view is ever opened.
+
+| Where | What it does |
+| --- | --- |
+| Header | The Mavi view tab carries an amber count of threads waiting for your answer, or a red dot for one that failed and that you have not looked at. |
+| Toasts | A thread that starts waiting for an answer, or fails, says so with **Open**, unless it is on screen in a focused window. Only changes seen while GitPulse runs are announced (a reload is quiet), a finished turn is not announced, and the same request is not repeated within a minute. |
+| Command palette | **New Mavi thread**, **Ask about the open file in Mavi** (starts a thread with `@path`), and **Open Mavi thread: …** for up to 12 threads, most urgent first. |
+| Settings → Agents | A new thread starts with Claude Code's default permission mode and model from Settings. Bypass still needs its acknowledgement in the form. |
+| Worktrees | **Run in a new worktree** creates a sibling `<repo>.wt-<slug>` on a `mavi/<slug>` branch, the same way the dock's isolated-agent preset does. It is ticked for you when this repository already has a live thread, which the host would refuse. The form warns when an agent terminal already works in the checkout, since its edits would show as Other changes. |
+| Explorer | Live pulse shows which thread is editing the repository (see above). |
+| Quit | Threads in the middle of a turn are listed in the same "Quit while agents are running?" question as terminal agents, whatever the terminal backend keeps running, because Mavi agents always end with the app. |
+
+### The terminal dock
+
+- **New Mavi thread** in the dock's **+** menu. Mavi is not a session kind; nothing starts in the dock.
+- **The terminal pill's menu lists live Mavi threads** beside terminal sessions, with the same status words as the rail.
+- **Files a Mavi agent changes reach the dock** the way a terminal agent's do (`agentEvents.dispatchTouchedFile`): open file panes showing them reload, and **Follow agent** can show them. This covers each applied edit and, at the end of a turn, the Other changes.
+- **Open a terminal here** (thread header): a shell in the thread's worktree, in the dock.
+- **Continue in terminal** (thread header, local threads with a saved conversation): moves the conversation to a Claude Code tab in the dock, resuming it with the thread's permission mode. **Bring back to Mavi** moves it back once the terminal session has ended.
+
+**One process per conversation.** A Mavi agent and a terminal tab resuming the
+same conversation would both write to one Claude Code transcript. So:
+
+- the move is offered only between turns, with nothing queued, so there is no interrupt to race and no queued message to lose;
+- before anything is stopped it checks that the agent saved the conversation, that no terminal tab already has it (if one does, it shows that tab), that the dock has room, and that the repository opens as a tab;
+- then the Mavi agent ends and the move waits until it has exited (up to 5 s) before the terminal tab starts. A failure after that point says the conversation is intact and can be resumed in Mavi;
+- Mavi refuses to resume a conversation a terminal tab is still running (and shows that tab), and the host refuses to start a second Mavi thread on a conversation another thread already runs;
+- the moved state is saved with the thread, so a reload still shows "This conversation continues in a terminal tab".
+
+Not yet: **Continue in Mavi** from a terminal tab. Mavi does not yet render a
+conversation's earlier history from the transcript, so an adopted conversation
+would arrive as an empty timeline; that direction waits for history rendering.
+SSH threads cannot move to the local dock, and the Agents window does not list
+Mavi threads yet (its rows come from terminals, worktrees and task runs), so it
+undercounts running agents while Mavi threads run.
+
 ## How it works
 
 ```

@@ -223,3 +223,25 @@ describe("parsePatch", () => {
     expect(parsePatch("Binary files a and b differ").binary).toBe(true);
   });
 });
+
+describe("thread status from the host alone", () => {
+  it("says Failed for an unseen thread whose last turn failed, without a timeline", async () => {
+    const { threadStatus } = await import("./threads");
+    const summary = { phase: "idle" as const, last_activity_ms: 10, background_tasks: 0, exit_ok: false, last_turn: "failed" };
+    expect(threadStatus({ seenAt: 0 }, summary, null, false)).toBe("failed");
+    expect(threadStatus({ seenAt: 20 }, summary, null, false)).toBe("idle");
+    expect(threadStatus({ seenAt: 0 }, { ...summary, last_turn: "interrupted" }, null, false)).toBe("done");
+  });
+});
+
+describe("an edit the agent never got to apply", () => {
+  it("reads Not applied, not Failed, and does not count", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "x", turn: 1 }));
+    applyLine(state, JSON.stringify({ type: "assistant", message: { id: "m", content: [{ type: "tool_use", id: "t", name: "Edit", input: { file_path: "/repo/a.ts", old_string: "a", new_string: "b" } }] } }));
+    applyLine(state, JSON.stringify({ type: "control_request", request_id: "r", request: { subtype: "can_use_tool", tool_use_id: "t", input: {} } }));
+    applyLine(state, JSON.stringify({ type: "mavi_exit", exit: "stopped by signal 15", ok: true, stderr: [] }));
+    const [change] = collectChanges(state, "/repo", { kind: "turn", turn: 1 });
+    expect(change).toMatchObject({ latestState: "not_applied", added: 0, removed: 0 });
+  });
+});

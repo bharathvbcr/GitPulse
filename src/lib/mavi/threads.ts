@@ -26,6 +26,12 @@ export interface ThreadRecord {
   lastActivityAt: number;
   /** When the person last had this thread open. */
   seenAt: number;
+  /**
+   * When the conversation was moved to a terminal tab ("Continue in
+   * terminal"). While set, Mavi does not start an agent for it on its own:
+   * the conversation belongs to the terminal until it is brought back.
+   */
+  movedToTerminalAt: number | null;
 }
 
 type StorageLike = Pick<Storage, "getItem" | "setItem">;
@@ -65,6 +71,7 @@ export function readThreadRecords(storage: StorageLike | null): ThreadRecord[] {
         createdAt: typeof r.createdAt === "number" ? r.createdAt : 0,
         lastActivityAt: typeof r.lastActivityAt === "number" ? r.lastActivityAt : 0,
         seenAt: typeof r.seenAt === "number" ? r.seenAt : 0,
+        movedToTerminalAt: typeof r.movedToTerminalAt === "number" ? r.movedToTerminalAt : null,
       });
       if (out.length >= MAX_THREAD_RECORDS) break;
     }
@@ -135,7 +142,8 @@ export const STATUS_LABEL: Record<ThreadStatus, string> = {
 
 export function threadStatus(
   record: Pick<ThreadRecord, "seenAt">,
-  summary: Pick<MaviSummary, "phase" | "last_activity_ms" | "background_tasks" | "exit_ok"> | null,
+  summary: Pick<MaviSummary, "phase" | "last_activity_ms" | "background_tasks" | "exit_ok"> &
+    Partial<Pick<MaviSummary, "last_turn">> | null,
   state: Pick<ThreadState, "items"> | null,
   open: boolean,
 ): ThreadStatus {
@@ -153,6 +161,8 @@ export function threadStatus(
     if (lastEnd.summary?.category === "review_ready" || lastEnd.summary?.needsAction) return "review";
     return "done";
   }
+  // A thread no page has replayed this run: the host's own account of the turn.
+  if (unseen && !lastEnd && summary.last_turn === "failed") return "failed";
   if (unseen && phase === "idle") return "done";
   if (summary.background_tasks > 0) return "background";
   return "idle";

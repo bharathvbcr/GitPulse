@@ -93,6 +93,9 @@ pub struct MaviSummary {
     pub exit: Option<String>,
     /// Ended cleanly: exit code 0, or stopped here on the person's request.
     pub exit_ok: bool,
+    /// How the last turn ended: `ok`, `failed`, or `interrupted` (by the
+    /// person). Lets the rail say "Failed" for a thread no page has replayed.
+    pub last_turn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +124,9 @@ struct Core {
     /// `stop` was called: a signal exit is then the one this host sent.
     stopped: bool,
     exit_ok: bool,
+    /// An interrupt was sent during the running turn.
+    interrupting: bool,
+    last_turn: Option<String>,
 }
 
 pub(crate) struct Session {
@@ -204,6 +210,8 @@ impl Session {
                 interrupts: 0,
                 stopped: false,
                 exit_ok: false,
+                interrupting: false,
+                last_turn: None,
             }),
             emit,
         });
@@ -282,6 +290,7 @@ impl Session {
             last_activity_ms: core.last_activity_ms,
             exit: core.exit.clone(),
             exit_ok: core.exit_ok,
+            last_turn: core.last_turn.clone(),
         }
     }
 
@@ -452,6 +461,7 @@ impl Session {
                 return Err("No turn is running.".into());
             }
             core.interrupts += 1;
+            core.interrupting = true;
             core.pending.clear();
             format!("mavi-interrupt-{}", core.interrupts)
         };
@@ -601,6 +611,24 @@ impl Session {
                     core.phase = MaviPhase::Idle;
                 }
                 core.pending.clear();
+                let value = prepared.value.as_ref();
+                let succeeded = value.and_then(|v| v.get("subtype")).and_then(Value::as_str)
+                    == Some("success")
+                    && value
+                        .and_then(|v| v.get("is_error"))
+                        .and_then(Value::as_bool)
+                        != Some(true);
+                core.last_turn = Some(
+                    if succeeded {
+                        "ok"
+                    } else if core.interrupting {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned(),
+                );
+                core.interrupting = false;
                 if let Some(cost) = prepared
                     .value
                     .as_ref()
@@ -956,6 +984,7 @@ read never
         assert_eq!(summary.phase, MaviPhase::Idle);
         assert_eq!(summary.turns, 1);
         assert_eq!(summary.cost_usd, 0.5);
+        assert_eq!(summary.last_turn.as_deref(), Some("ok"));
         assert_eq!(summary.touched, vec!["a.txt"]);
         assert_eq!(
             summary.conversation_id.as_deref(),

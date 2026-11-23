@@ -99,6 +99,7 @@ export function summary(idText: string, phase: string, extra: Record<string, unk
     last_activity_ms: Date.now() - 20_000,
     exit: null,
     exit_ok: false,
+    last_turn: "ok",
     ...extra,
   };
 }

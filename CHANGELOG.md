@@ -24,6 +24,16 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   agent is asking to make, the exact hunks of each edit it made, and paths that
   changed during the turn outside its edit tools ("Other", from a read-only
   worktree fingerprint at each turn boundary), for one turn or the whole thread.
+- **Mavi is part of the app and the terminal dock.** The Mavi tab carries a
+  count of threads waiting for you; a thread that starts waiting or fails
+  raises a toast with Open; the command palette starts, asks about the open
+  file, and opens threads; new threads take Claude's defaults from Settings →
+  Agents and can start in a new worktree. In the dock: New Mavi thread in the
+  + menu, live threads in the terminal pill's menu, open file panes reload
+  (and Follow agent works) as a Mavi agent edits, Open a terminal here, and
+  **Continue in terminal / Bring back to Mavi**, which moves a conversation
+  between Mavi and a Claude Code tab without ever running it twice. Running
+  Mavi threads are named in the quit question.
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.

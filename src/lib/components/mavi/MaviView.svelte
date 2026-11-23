@@ -8,7 +8,11 @@
    * a thread changes a file, and from any file chip or turn footer.
    */
   import { onMount } from "svelte";
-  import { PanelLeftClose, PanelLeftOpen, PanelRightOpen, Server, Laptop, Play, Square, RotateCcw } from "@lucide/svelte";
+  import { PanelLeftClose, PanelLeftOpen, PanelRightOpen, Server, Laptop, Play, Square, RotateCcw, SquareTerminal, ArrowRightLeft } from "@lucide/svelte";
+  import { bringBackToMavi, canContinueInTerminal, continueInTerminal, openShellHere, terminalHolding } from "../../mavi/handoff";
+  import { focusTerminalSession } from "../../terminal/sessionFocus";
+  import { askConfirm } from "../../stores/modalStore";
+  import { toastStore } from "../../stores/toastStore";
   import { maviStore } from "../../mavi/store.svelte";
   import { MAVI_MODES } from "../../mavi/client";
   import { openApprovals } from "../../mavi/reduce";
@@ -52,12 +56,87 @@
 
   onMount(() => {
     maviStore.init().catch((e) => (initError = e instanceof Error ? e.message : String(e)));
+    // The open thread counts as seen only while this view is on screen.
+    const visible = () => maviStore.setViewing(document.visibilityState === "visible");
+    visible();
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      document.removeEventListener("visibilitychange", visible);
+      maviStore.setViewing(false);
+    };
   });
+
+  // "New Mavi thread" from the palette, the dock or Explorer.
+  let prefill = $state("");
+  let preferWorktree = $state(false);
+  let composeId = $state(0);
+  /** The last request taken; plain, so the effect never reads what it writes. */
+  let handledCompose = 0;
+  $effect(() => {
+    const request = maviStore.composeRequest;
+    if (!request || request.id === handledCompose) return;
+    handledCompose = request.id;
+    composeId = request.id;
+    prefill = request.message;
+    preferWorktree = request.newWorktree;
+    composing = true;
+  });
+
+  let moving = $state(false);
+
+  async function moveToTerminal() {
+    if (!record || moving) return;
+    const bypass = record.mode === "bypass";
+    const ok = await askConfirm({
+      title: "Continue in a terminal",
+      message:
+        `Moves this conversation to a Claude Code tab in the terminal dock, in ${targetLabel(record.target)}. ` +
+        "Mavi's agent for it ends first; the terminal resumes the same conversation with the same permission mode" +
+        (bypass ? " (Bypass: the tab will ask you to acknowledge it again)." : ".") +
+        " You can bring it back to Mavi once the terminal session ends.",
+      confirmLabel: "Move to terminal",
+    });
+    if (!ok) return;
+    moving = true;
+    try {
+      const result = await continueInTerminal(record.key);
+      if (!result.ok) toastStore.warning(result.reason);
+      else if (result.note) toastStore.info(result.note);
+    } finally {
+      moving = false;
+    }
+  }
+
+  async function bringBack() {
+    if (!record || moving) return;
+    moving = true;
+    resumeError = null;
+    try {
+      const result = await bringBackToMavi(record.key, record.mode === "bypass" ? resumeAck : false);
+      if (!result.ok) resumeError = result.reason;
+    } finally {
+      moving = false;
+    }
+  }
+
+  async function showTerminalTab() {
+    const holder = record?.conversationId ? terminalHolding(record.conversationId) : null;
+    if (holder) await focusTerminalSession(holder);
+    else toastStore.info("No terminal tab is running this conversation now; bring it back to Mavi to continue.");
+  }
+
+  async function shellHere() {
+    if (!record) return;
+    const result = await openShellHere(record.key);
+    if (!result.ok) toastStore.warning(result.reason);
+  }
 
   let record = $derived(maviStore.openKey ? maviStore.record(maviStore.openKey) : undefined);
   let summary = $derived(record ? maviStore.summaryOf(record) : null);
   let thread = $derived(record ? maviStore.timelines[record.key] : undefined);
   let root = $derived(record?.target.kind === "local" ? record.target.root : null);
+  let moved = $derived(!!record?.movedToTerminalAt);
+  let movable = $derived(record ? canContinueInTerminal(record) : { ok: false as const, reason: "" });
   let working = $derived(summary?.phase === "working" || summary?.phase === "approval");
   let running = $derived(!!summary && summary.phase !== "ended");
   let approvals = $derived(thread ? openApprovals(thread) : []);
@@ -107,7 +186,14 @@
     resuming = true;
     resumeError = null;
     try {
-      await maviStore.resume(record.key, record.mode === "bypass" ? resumeAck : false);
+      const ack = record.mode === "bypass" ? resumeAck : false;
+      if (record.conversationId) {
+        // Refuses while a terminal tab still runs this conversation.
+        const result = await bringBackToMavi(record.key, ack);
+        if (!result.ok) resumeError = result.reason;
+      } else {
+        await maviStore.resume(record.key, ack);
+      }
     } catch (e) {
       resumeError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -144,6 +230,22 @@
             {#if status}<span>· {STATUS_LABEL[status]}</span>{/if}
           </div>
         </div>
+        {#if record.target.kind === "local"}
+          <button class="gp-icon-btn" aria-label="Open a terminal here" title="Open a shell in this thread's worktree, in the terminal dock" onclick={shellHere}>
+            <SquareTerminal size={14} aria-hidden="true" />
+          </button>
+          {#if !moved}
+            <button
+              class="gp-btn"
+              data-variant="ghost"
+              disabled={!movable.ok || moving}
+              title={movable.ok ? "Move this conversation to a Claude Code tab in the terminal dock" : movable.reason}
+              onclick={moveToTerminal}
+            >
+              <ArrowRightLeft size={11} aria-hidden="true" /> Continue in terminal
+            </button>
+          {/if}
+        {/if}
         {#if running}
           <button class="gp-btn" data-variant="ghost" title="End this thread's agent" onclick={() => record && maviStore.stop(record.key)}>
             <Square size={11} aria-hidden="true" /> End
@@ -174,7 +276,9 @@
               </p>
             </div>
           {/if}
-          <MaviNewThread onStarted={(key) => open(key)} onCancel={record ? () => (composing = false) : undefined} />
+          {#key composeId}
+            <MaviNewThread {prefill} {preferWorktree} onStarted={(key) => open(key)} onCancel={record ? () => (composing = false) : undefined} />
+          {/key}
         </div>
       </div>
     {:else if record && thread}
@@ -200,6 +304,18 @@
           onUnqueue={(i) => maviStore.unqueue(record.key, i)}
           onReviewApproval={reviewApproval}
         />
+      {:else if moved}
+        <div class="mavi-resume flex flex-wrap items-center gap-2 justify-center text-xs text-textMuted">
+          <span>This conversation continues in a terminal tab.</span>
+          <button class="gp-btn" onclick={showTerminalTab}><SquareTerminal size={12} aria-hidden="true" /> Show the tab</button>
+          {#if record.mode === "bypass"}
+            <Checkbox label="Bypass: run everything without asking" checked={resumeAck} onchange={(next) => (resumeAck = next)} />
+          {/if}
+          <button class="gp-btn" data-variant="primary" disabled={moving || (record.mode === "bypass" && !resumeAck)} onclick={bringBack}>
+            <ArrowRightLeft size={12} aria-hidden="true" /> Bring back to Mavi
+          </button>
+          {#if resumeError}<span class="w-full text-center text-danger" role="alert">{resumeError}</span>{/if}
+        </div>
       {:else}
         <div class="mavi-resume flex flex-wrap items-center gap-2 justify-center text-xs text-textMuted">
           <span>{record.conversationId ? "This thread's agent is not running." : "This thread's agent ended before it saved a conversation."}</span>

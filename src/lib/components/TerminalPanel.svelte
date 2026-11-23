@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { composeMaviThread } from "../mavi/navigate";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
@@ -40,6 +41,7 @@
     Columns2,
     Rows2,
     FolderTree,
+    MessagesSquare,
     PanelLeftClose,
     FileText,
     ExternalLink,
@@ -5298,6 +5300,24 @@
           {:else}
             <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
+        </div>
+        <div class="gp-menu-sep my-1"></div>
+        <!-- Mavi is a view, not a session kind: this starts no process here. -->
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Mavi">
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-launcher-new-mavi"
+            disabled={!repoPath}
+            title="Start a conversation with an agent in Mavi, the chat view for agents"
+            onclick={() => {
+              launcherMenuOpen = false;
+              composeMaviThread();
+            }}
+          >
+            <MessagesSquare size={13} class="text-accent shrink-0" />
+            <span class="truncate">New Mavi Thread</span>
+          </button>
         </div>
         <div class="gp-menu-sep my-1"></div>
         <div class="flex flex-col gap-0.5" role="group" aria-label="Sidebar and file explorer">

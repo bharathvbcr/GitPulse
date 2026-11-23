@@ -260,6 +260,27 @@ fn start(
     };
     {
         let sessions = state.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        // One process per conversation: two would append to one transcript.
+        if let Some(resume) = request
+            .resume
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let open_here = sessions.values().any(|s| {
+                let summary = s.summary();
+                summary.phase != session::MaviPhase::Ended
+                    && summary
+                        .conversation_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(resume))
+            });
+            if open_here {
+                return Err(CommandError::plain(
+                    "This conversation is already open in another Mavi thread.",
+                ));
+            }
+        }
         if sessions.values().filter(|s| s.is_live()).count() >= MAX_LIVE {
             return Err(CommandError::plain(format!(
                 "{MAX_LIVE} Mavi threads are already running. Stop one first."

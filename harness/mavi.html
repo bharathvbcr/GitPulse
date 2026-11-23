@@ -27,7 +27,7 @@
   const scenario = params.get("scenario") ?? "approval";
 
   localStorage.setItem("gitpulse.mavi.threads.v1", JSON.stringify(scenario === "empty" ? [] : [
-    { key: "k-main", sessionId: MAIN_SESSION, title: "Back off retries when the gateway times out", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "ask", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 20_000, seenAt: 0 },
+    { key: "k-main", sessionId: MAIN_SESSION, title: "Back off retries when the gateway times out", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "ask", model: null, conversationId: scenario === "moved" ? "7c0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b21" : null, createdAt: 1, lastActivityAt: Date.now() - 20_000, seenAt: 0, movedToTerminalAt: scenario === "moved" ? Date.now() - 5_000 : null },
     { key: "k-done", sessionId: DONE_SESSION, title: "Why is the nightly build slow?", target: { kind: "local", root: "/Users/me/code/payments" }, mode: "inspect", model: null, conversationId: null, createdAt: 1, lastActivityAt: Date.now() - 3_500_000, seenAt: 0 },
     { key: "k-ssh", sessionId: null, title: "Profile the ingest worker", target: { kind: "ssh", host: "gpu-box", dir: "~/ingest" }, mode: "edit", model: null, conversationId: "1f0e6c1a-4d1f-4c55-9b0e-2f8f5a1d3b99", createdAt: 1, lastActivityAt: Date.now() - 86_400_000, seenAt: Date.now() },
   ]));
@@ -35,9 +35,9 @@
   mockIPCWithEvents(async (cmd, args) => {
     switch (cmd) {
       case "cmd_mavi_list":
-        return scenario === "empty" ? [] : [summary(MAIN_SESSION, "approval"), summary(DONE_SESSION, "idle", { touched: [], cost_usd: 0.08 })];
+        return scenario === "empty" ? [] : [summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}), summary(DONE_SESSION, "idle", { touched: [], cost_usd: 0.08 })];
       case "cmd_mavi_events":
-        if (args.id === MAIN_SESSION) return { entries: entries(mainLines()), next_seq: 999, summary: summary(MAIN_SESSION, "approval") };
+        if (args.id === MAIN_SESSION) return { entries: entries(scenario === "moved" ? [...mainLines(), JSON.stringify({ type: "mavi_exit", exit: "stopped by signal 15", ok: true, stderr: [] })] : mainLines()), next_seq: 999, summary: summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}) };
         return { entries: entries(doneLines()), next_seq: 99, summary: summary(DONE_SESSION, "idle", { touched: [] }) };
       case "cmd_mavi_ssh_hosts":
         return ["devbox", "gpu-box", "build-01"];

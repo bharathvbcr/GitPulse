@@ -16,7 +16,11 @@
 import type { MaviHunk, ThreadState, ToolItem } from "./types";
 import { isEditTool, shortPath, toolPath } from "./rows";
 
-export type ChangeState = "proposed" | "applying" | "applied" | "denied" | "failed";
+/**
+ * `not_applied`: the call never ran (stopped, or its request was voided when
+ * the turn or the agent ended). Distinct from `failed`, which ran and erred.
+ */
+export type ChangeState = "proposed" | "applying" | "applied" | "denied" | "failed" | "not_applied";
 
 export interface ChangeEdit {
   readonly toolId: string;
@@ -122,7 +126,8 @@ function editOf(tool: ToolItem): ChangeEdit | null {
   let state: ChangeState;
   if (tool.approval?.state === "open") state = "proposed";
   else if (tool.status === "denied" || tool.approval?.state === "denied") state = "denied";
-  else if (tool.status === "error" || tool.status === "interrupted") state = "failed";
+  else if (tool.approval?.state === "void" || tool.status === "interrupted") state = "not_applied";
+  else if (tool.status === "error") state = "failed";
   else if (tool.status === "ok") state = "applied";
   else state = "applying";
   const reported = tool.patch && tool.patch.length ? tool.patch : null;
@@ -165,7 +170,7 @@ export function collectChanges(state: ThreadState, root: string | null, scope: C
     for (const moved of files.moved) codes.set(moved.path, moved.code);
   }
   for (const [path, entry] of byPath) {
-    const counted = entry.edits.filter((e) => e.state !== "denied" && e.state !== "failed");
+    const counted = entry.edits.filter((e) => e.state !== "denied" && e.state !== "failed" && e.state !== "not_applied");
     const { added, removed } = countLines(counted.flatMap((e) => e.hunks));
     out.push({
       path,

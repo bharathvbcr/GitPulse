@@ -100,6 +100,7 @@
     applied: "",
     denied: "Denied",
     failed: "Failed",
+    not_applied: "Not applied",
     moved: "",
   };
 </script>
@@ -156,7 +157,7 @@
               <ShieldQuestion size={13} class="text-warn shrink-0" aria-hidden="true" />
             {:else if change.latestState === "applying"}
               <LoaderCircle size={13} class="text-accent shrink-0 animate-spin" aria-hidden="true" />
-            {:else if change.latestState === "denied"}
+            {:else if change.latestState === "denied" || change.latestState === "not_applied"}
               <Ban size={13} class="text-textMuted shrink-0" aria-hidden="true" />
             {:else if change.latestState === "failed"}
               <TriangleAlert size={13} class="text-danger shrink-0" aria-hidden="true" />
@@ -186,7 +187,7 @@
                   <div class="text-micro text-textMuted mb-1 mt-2 flex items-center gap-1.5">
                     <span>{edit.toolName}</span>
                     {#if wholeThread}<span>· turn {edit.turn}</span>{/if}
-                    <span>· {edit.state === "proposed" ? "proposed, waiting for you" : edit.state === "applying" ? "being applied" : edit.state}</span>
+                    <span>· {edit.state === "proposed" ? "proposed, waiting for you" : edit.state === "applying" ? "being applied" : edit.state === "not_applied" ? "not applied" : edit.state}</span>
                   </div>
                   {#if edit.hunks.length}
                     <MaviHunks hunks={edit.hunks} numbered={!edit.fromInput} maxLines={400} />

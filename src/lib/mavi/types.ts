@@ -29,6 +29,8 @@ export interface MaviSummary {
   readonly exit: string | null;
   /** Ended cleanly: exit code 0, or stopped on the person's request. */
   readonly exit_ok: boolean;
+  /** How the last turn ended: "ok", "failed" or "interrupted"; null before any. */
+  readonly last_turn: string | null;
 }
 
 export interface MaviEntry {

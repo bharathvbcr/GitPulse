@@ -8,6 +8,7 @@
  * showing.
  */
 import { applyLine, emptyThread } from "./reduce";
+import { changedPaths } from "./files";
 import { maviClient, onMaviEvents, onMaviStatus, type MaviModeId, type StartRequest } from "./client";
 import {
   readThreadRecords,
@@ -50,6 +51,14 @@ class MaviStore {
   /** Messages written while a turn runs, sent in order when it ends. */
   queues = $state<Record<string, string[]>>({});
   openKey = $state<string | null>(null);
+  /**
+   * The Mavi view is on screen (mounted, and the window visible). Only then
+   * does the open thread count as seen: being the last thread opened, while
+   * the person reads Explorer, is not seeing it.
+   */
+  viewing = $state(false);
+  /** A request from elsewhere in the app to show the new-thread form. */
+  composeRequest = $state<{ id: number; message: string; newWorktree: boolean } | null>(null);
   errors = $state<Record<string, string>>({});
   #started = false;
   #buffer = new Map<string, MaviEntry[]>();
@@ -89,7 +98,7 @@ class MaviStore {
   }
 
   status(record: ThreadRecord): ThreadStatus {
-    return threadStatus(record, this.summaryOf(record), this.timelines[record.key] ?? null, this.openKey === record.key);
+    return threadStatus(record, this.summaryOf(record), this.timelines[record.key] ?? null, this.viewing && this.openKey === record.key);
   }
 
   #persist(): void {
@@ -104,15 +113,35 @@ class MaviStore {
       if (summary.conversation_id && record.conversationId !== summary.conversation_id) {
         record.conversationId = summary.conversation_id;
       }
-      if (this.openKey === record.key) record.seenAt = Date.now();
+      if (this.viewing && this.openKey === record.key) record.seenAt = Date.now();
       this.#persist();
       if (summary.phase === "idle" || summary.phase === "ready") void this.#flushQueue(record.key);
+    }
+  }
+
+  #fileListeners = new Set<(record: ThreadRecord, path: string) => void>();
+
+  /**
+   * Called with a repository-relative path each time a local thread's agent
+   * applies an edit, and for each path that moved outside its edit tools when
+   * a turn ends. Every thread, opened or not: the dock reloads open panes.
+   */
+  onFileChanged(listener: (record: ThreadRecord, path: string) => void): () => void {
+    this.#fileListeners.add(listener);
+    return () => this.#fileListeners.delete(listener);
+  }
+
+  #announceFiles(record: ThreadRecord, entries: MaviEntry[]): void {
+    if (this.#fileListeners.size === 0 || record.target.kind !== "local") return;
+    for (const path of changedPaths(record.target.root, entries)) {
+      for (const listener of this.#fileListeners) listener(record, path);
     }
   }
 
   #onEntries(sessionId: string, entries: MaviEntry[]): void {
     const record = this.recordFor(sessionId);
     if (!record) return;
+    this.#announceFiles(record, entries);
     if (this.#loading.has(record.key)) {
       const pending = this.#buffer.get(record.key) ?? [];
       pending.push(...entries);
@@ -181,6 +210,7 @@ class MaviStore {
       createdAt: now,
       lastActivityAt: now,
       seenAt: now,
+      movedToTerminalAt: null,
     };
     this.records = [record, ...this.records];
     this.summaries[summary.id] = summary;
@@ -287,11 +317,65 @@ class MaviStore {
     this.#persist();
   }
 
+  /** Records that the conversation now lives in a terminal tab, or no longer does. */
+  markMoved(key: string, moved: boolean): void {
+    const record = this.record(key);
+    if (!record) return;
+    record.movedToTerminalAt = moved ? Date.now() : null;
+    this.#persist();
+  }
+
+  /** Waits until the host says the thread's agent has exited, up to `ms`. */
+  async waitForEnd(key: string, ms = 5000): Promise<boolean> {
+    const started = Date.now();
+    for (;;) {
+      const record = this.record(key);
+      const summary = record ? this.summaryOf(record) : null;
+      if (!summary || summary.phase === "ended") return true;
+      if (Date.now() - started > ms) return false;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
   rename(key: string, title: string): void {
     const record = this.record(key);
     if (!record) return;
     record.title = title.trim().slice(0, 200) || record.title;
     this.#persist();
+  }
+
+  setViewing(on: boolean): void {
+    this.viewing = on;
+    const record = on && this.openKey ? this.record(this.openKey) : undefined;
+    if (record) {
+      record.seenAt = Date.now();
+      this.#persist();
+    }
+  }
+
+  requestCompose(message: string, options: { newWorktree?: boolean } = {}): void {
+    this.composeRequest = {
+      id: (this.composeRequest?.id ?? 0) + 1,
+      message,
+      newWorktree: options.newWorktree === true,
+    };
+  }
+
+  /** How many threads need the reader, for the header badge and the dock pill. */
+  attention(): { needsYou: number; failed: number; firstNeedsYou: string | null } {
+    let needsYou = 0;
+    let failed = 0;
+    let firstNeedsYou: string | null = null;
+    for (const record of this.records) {
+      const status = this.status(record);
+      if (status === "needs_you") {
+        needsYou += 1;
+        firstNeedsYou ??= record.key;
+      } else if (status === "failed") {
+        failed += 1;
+      }
+    }
+    return { needsYou, failed, firstNeedsYou };
   }
 
   /** Files running threads in `root` have edited, for the Explorer's Live pulse. */

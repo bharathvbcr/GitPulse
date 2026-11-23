@@ -18,7 +18,13 @@ import { MANVI_FOCUS_LIST, type ManviFocusId } from "../ui/manviFocus";
 import { openManviFocus } from "../ui/openManviFocus";
 import { openConflicts } from "../ui/workConflicts";
 import { policyActivityVisible } from "../harness/policyActivityVisible";
+import { maviStore } from "../mavi/store.svelte";
+import { composeMaviThread, showMaviThread } from "../mavi/navigate";
+import { STATUS_LABEL, STATUS_PRIORITY, targetLabel } from "../mavi/threads";
 import { harnessStore } from "../stores/harnessStore";
+
+/** The most Mavi threads the palette lists by name. */
+const MAX_PALETTE_THREADS = 12;
 
 const icons = { work: GitBranch, mavi: MessagesSquare, code: FileCode, history: Search, insights: Percent };
 /** Palette phrases for the Manvi cards Policy used to hold, by focus target. */
@@ -178,6 +184,31 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "fleet", label: "Open Fleet — every repository at a glance", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setFleetOpen(true) },
     { id: "agents", label: "Open Agents — sessions, worktrees, and what needs you", category: "Workspace", icon: Bot, shortcut: "⌘⇧A", action: () => interfaceStore.setAgentsOpen(true) },
     { id: "terminal-dock", label: "Toggle terminal — the shell, docked under this repository", category: "Workspace", icon: Terminal, shortcut: "⌃`", disabledReason: unavailable, action: () => repoStore.toggleTerminal() },
+    { id: "mavi:new", label: "New Mavi thread — ask an agent in a conversation", category: "Mavi", icon: MessagesSquare, keywords: "agent chat claude conversation", disabledReason: unavailable, action: () => composeMaviThread() },
+    {
+      id: "mavi:ask-file",
+      label: "Ask about the open file in Mavi",
+      description: state.selectedFilePath ?? undefined,
+      category: "Mavi",
+      icon: MessagesSquare,
+      keywords: "agent chat explain review",
+      disabledReason: unavailable ?? (state.selectedFilePath ? undefined : "Open a file in Explorer first."),
+      action: () => composeMaviThread(`@${state.selectedFilePath} `),
+    },
+    // The threads people come back to: those that need them first, capped so
+    // a long history cannot flood the palette.
+    ...[...maviStore.records]
+      .sort((a, b) => STATUS_PRIORITY.indexOf(maviStore.status(a)) - STATUS_PRIORITY.indexOf(maviStore.status(b)) || b.lastActivityAt - a.lastActivityAt)
+      .slice(0, MAX_PALETTE_THREADS)
+      .map((record) => ({
+        id: `mavi:thread:${record.key}`,
+        label: `Open Mavi thread: ${record.title}`,
+        description: targetLabel(record.target),
+        category: "Mavi",
+        icon: MessagesSquare,
+        badge: STATUS_LABEL[maviStore.status(record)],
+        action: () => showMaviThread(record.key),
+      })),
     // Starting a session had exactly one door: open the dock, then find the
     // launcher dropdown and the + beside it. Naming each launcher here makes
     // "give me Claude in this repository" one phrase, and it works whether or
