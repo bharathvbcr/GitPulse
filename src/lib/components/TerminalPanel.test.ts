@@ -168,6 +168,29 @@ describe("TerminalPanel dock sections", () => {
     expect(source).toContain('{#if section === "agents"}');
   });
 
+  it("keeps the explorer's open-target row to the house segmented control, without a second Explorer title", () => {
+    const aside = source.slice(source.indexOf('data-testid="terminal-explorer-sidebar"'), source.indexOf('data-testid="terminal-explorer-send-file"'));
+    expect(aside).toContain('class="gp-segmented min-w-0" data-size="sm" role="group" aria-label="Open files in"');
+    expect(aside.match(/class="gp-seg-btn/g)?.length).toBe(3);
+    expect(aside).not.toContain('<span class="truncate">Explorer</span>');
+    // Narrow asides keep icons with an accessible name rather than clipping labels.
+    expect(aside).toContain('<span class="@max-2xs:sr-only">Split</span>');
+  });
+
+  it("gives the sidebar toggle its own icon, distinct from the Files section", () => {
+    const toggle = source.slice(source.indexOf('data-testid="terminal-explorer-sidebar-toggle"'), source.indexOf("</button>", source.indexOf('data-testid="terminal-explorer-sidebar-toggle"')));
+    expect(toggle).toContain("<PanelLeft size={13} />");
+    expect(toggle).not.toContain("FolderTree");
+    expect(toggle).not.toContain("3rd split pane");
+  });
+
+  it("counts agents elsewhere that need the reader in the Agents dot, and tells the header when the active tab is listed", () => {
+    const attention = source.slice(source.indexOf("const agentAttention"), source.indexOf("function selectAgentRow"));
+    expect(attention).toContain("agentRowsElsewhere.filter((row) => row.attention)");
+    expect(attention).toContain("const activeSessionListed");
+    expect(source).toContain("{activeSessionListed}");
+  });
+
   it("shows the explorer in Files without writing the saved preference", () => {
     expect(source).toContain('(explorerPreferenceOpen || section === "files")');
     expect(source).toContain("explorerPreferenceOpen");

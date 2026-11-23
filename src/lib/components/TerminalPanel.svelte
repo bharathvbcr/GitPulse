@@ -40,6 +40,7 @@
     Columns2,
     Rows2,
     FolderTree,
+    PanelLeft,
     PanelLeftClose,
     FileText,
     ExternalLink,
@@ -1240,7 +1241,12 @@
       })),
   );
   /** Agents here that want the reader: the dot on the header's Agents button. */
-  const agentAttention = $derived(agentRowsHere.filter((row) => row.attention || row.unread).length);
+  const agentAttention = $derived(
+    agentRowsHere.filter((row) => row.attention || row.unread).length +
+      agentRowsElsewhere.filter((row) => row.attention).length,
+  );
+  /** The active tab is an agent, so the Agents list already highlights it. */
+  const activeSessionListed = $derived(agentRowsHere.some((row) => row.active));
 
   function selectAgentRow(id: string) {
     selectTab(id);
@@ -4224,6 +4230,7 @@
     onSection={setSection}
     os={$hostPlatform.os}
     {agentAttention}
+    {activeSessionListed}
     repoName={repoPath?.split(/[\\/]/).pop() ?? null}
     {repoPath}
     {contextTitle}
@@ -4525,13 +4532,13 @@
           aria-label={explorerSidebarOpen ? "Hide file explorer sidebar" : "Show file explorer sidebar"}
           aria-pressed={explorerSidebarOpen}
           disabled={!repoPath}
-          title={explorerSidebarOpen ? "Hide docked Explorer sidebar" : "Dock Explorer sidebar beside terminal (never forces a 3rd split pane)"}
+          title={explorerSidebarOpen ? "Hide the files sidebar" : "Show files beside your sessions"}
           onclick={toggleExplorerSidebar}
         >
           {#if explorerSidebarOpen}
             <PanelLeftClose size={13} />
           {:else}
-            <FolderTree size={13} />
+            <PanelLeft size={13} />
           {/if}
         </button>
       </div>
@@ -6418,53 +6425,53 @@
             lastExplorerMod = { altKey: event.altKey, metaOrCtrlKey: event.metaKey || event.ctrlKey };
           }}
         >
-          <div class="h-8 shrink-0 px-2 bg-surface/80 flex items-center justify-between gap-1 select-none">
-            <div class="flex items-center gap-1.5 min-w-0 text-micro font-medium text-textPrimary">
-              <FolderTree size={12} class="text-accent shrink-0" />
-              <span class="truncate">Explorer</span>
-            </div>
-            <div class="flex items-center gap-0.5 shrink-0">
-              <div
-                class="inline-flex items-center gap-0.5 p-0.5 rounded-md bg-background/80 border border-border/65"
-                role="group"
-                aria-label="Open files in"
-              >
+          <!-- The rail below carries its own "Explorer" heading and the dock
+               section is called Files, so this row is only where clicks go. -->
+          <div class="@container h-8 shrink-0 px-2 bg-surface/80 flex items-center justify-between gap-1 select-none">
+            <div class="flex items-center gap-1.5 min-w-0">
+              <span class="text-micro text-textMuted shrink-0 @max-[13rem]:hidden" aria-hidden="true">Open in</span>
+              <div class="gp-segmented min-w-0" data-size="sm" role="group" aria-label="Open files in">
                 <button
                   type="button"
                   data-testid="terminal-explorer-target-tab"
                   aria-pressed={explorerOpenTarget === "tab"}
-                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'tab' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  data-active={explorerOpenTarget === "tab" ? "true" : "false"}
+                  class="gp-seg-btn inline-flex items-center gap-1"
                   title={`Open clicked files in a Files tab (or update an already-visible file pane) without adding a 3rd split pane · Alt+Click splits · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("tab")}
                 >
-                  <FileText size={10} class="shrink-0" />
-                  <span>Tab</span>
+                  <FileText size={11} class="shrink-0" aria-hidden="true" />
+                  <span class="@max-2xs:sr-only">Tab</span>
                 </button>
                 <button
                   type="button"
                   data-testid="terminal-explorer-target-split"
                   aria-pressed={explorerOpenTarget === "split"}
-                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'split' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  data-active={explorerOpenTarget === "split" ? "true" : "false"}
+                  class="gp-seg-btn inline-flex items-center gap-1"
                   title={`Open clicked files side-by-side in split view · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("split")}
                 >
-                  <Columns2 size={10} class="shrink-0" />
-                  <span>Split</span>
+                  <Columns2 size={11} class="shrink-0" aria-hidden="true" />
+                  <span class="@max-2xs:sr-only">Split</span>
                 </button>
                 {#if onOpenInCodeView}
                   <button
                     type="button"
                     data-testid="terminal-explorer-target-code"
                     aria-pressed={explorerOpenTarget === "code"}
-                    class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'code' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                    data-active={explorerOpenTarget === "code" ? "true" : "false"}
+                    class="gp-seg-btn inline-flex items-center gap-1"
                     title={`Open clicked files in the full Code view · ${codeViewClick} opens a Files tab · Alt+Click splits`}
                     onclick={() => setExplorerOpenTarget("code")}
                   >
-                    <ExternalLink size={10} class="shrink-0" />
-                    <span>Code</span>
+                    <ExternalLink size={11} class="shrink-0" aria-hidden="true" />
+                    <span class="@max-2xs:sr-only">Code</span>
                   </button>
                 {/if}
               </div>
+            </div>
+            <div class="flex items-center gap-0.5 shrink-0">
               {#if activeExplorerFile}
                 <button
                   type="button"
