@@ -19,7 +19,7 @@
   import { createListenerTracker } from "../dom/listenerTracker";
   import { sessionByNativeId, terminalSessions } from "../terminal/sessionRegistry";
   import { adoptDetachedSessions } from "../terminal/detachedSessions";
-  import { retryListing } from "../terminal/reloadRestore";
+  import { retryListing } from "../terminal/retryListing";
   import { repoStore } from "../stores/repoStore";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import { bindAttention, sessionActivity } from "../terminal/sessionActivity";
