@@ -19,10 +19,8 @@
 //!   shell ([`quote`]). Nothing the page sends is pasted into a command line
 //!   unquoted.
 
-use crate::procguard::LockedSpawn;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The most hosts read from `~/.ssh/config`.
@@ -345,75 +343,58 @@ pub(crate) fn probe(host: &str, dir: &str) -> MaviProbe {
             None,
         );
     }
-    let mut child = match Command::new("ssh")
-        .args(ssh_args(host, &probe_script(dir)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn_locked()
+    use crate::engine::process::{self, Incomplete};
+    let Some(program) = process::find_external_tool("ssh") else {
+        return done(
+            MaviProbeKind::SshMissing,
+            "ssh is not installed on this computer.".into(),
+            None,
+        );
+    };
+    // Through the process seam: its deadline stops ssh (and anything it
+    // started), and both streams are capped.
+    let args = ssh_args(host, &probe_script(dir));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let cmd = process::build_capture_command(
+        &program,
+        &refs,
+        None,
+        &[],
+        path_var.as_deref(),
+        home.as_deref(),
+    );
+    let run = match process::run_bounded_capped(cmd, "ssh", PROBE_DEADLINE, None, MAX_PROBE_OUTPUT)
     {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return done(
-                MaviProbeKind::SshMissing,
-                "ssh is not installed on this computer.".into(),
-                None,
-            )
-        }
+        Ok(run) => run,
         Err(e) => {
             return done(
                 MaviProbeKind::Failed,
-                format!("Could not start ssh: {e}"),
+                format!("Could not start ssh: {}", e.message()),
                 None,
             )
         }
     };
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(pipe) = pipe {
-                let _ = pipe.take(MAX_PROBE_OUTPUT as u64).read_to_end(&mut buf);
-            }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-    };
-    let out = read(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let err = read(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() > PROBE_DEADLINE => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return done(
-                    MaviProbeKind::Timeout,
-                    "The host took too long to answer.".into(),
-                    None,
-                );
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break None,
-        }
-    };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    let (kind, message, root) = classify_probe(status.and_then(|s| s.code()), &stdout, &stderr);
+    if matches!(run.incomplete, Some(Incomplete::Deadline { .. })) {
+        return done(
+            MaviProbeKind::Timeout,
+            "The host took too long to answer.".into(),
+            None,
+        );
+    }
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let code = (run.signal.is_none() && run.status_code >= 0).then_some(run.status_code);
+    let (kind, message, root) = classify_probe(code, &stdout, &stderr);
     done(kind, message, root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
+    use std::process::Command;
 
     #[test]
     fn host_names_cannot_smuggle_options() {

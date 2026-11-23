@@ -221,18 +221,15 @@ fn command_for(program: &str, path: Option<std::ffi::OsString>) -> Command {
 fn worktree_root(repo_path: &str) -> Result<PathBuf, String> {
     let dir =
         std::fs::canonicalize(repo_path).map_err(|_| "That folder does not exist.".to_string())?;
-    let (ok, out, _) = worktree::run_capped(
-        "git",
-        &["rev-parse", "--show-toplevel"],
-        &dir,
-        Duration::from_secs(10),
-        16 * 1024,
-    )?;
-    if !ok {
-        return Err("That folder is not in a Git repository.".into());
-    }
-    let root = String::from_utf8_lossy(&out).trim().to_owned();
-    std::fs::canonicalize(&root).map_err(|e| e.to_string())
+    // The nearest ancestor holding `.git` (a directory, or a linked worktree's
+    // `.git` file) is what `git rev-parse --show-toplevel` answers. Found
+    // without running git, because nothing runs in a repository before its
+    // trust is checked, and that check needs the root this finds.
+    let root = dir
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .ok_or_else(|| "That folder is not in a Git repository.".to_string())?;
+    Ok(root.to_path_buf())
 }
 
 fn start(
@@ -586,7 +583,7 @@ pub async fn cmd_mavi_file_diff(
                 let (ok, bytes, truncated) = worktree::run_capped(
                     &program,
                     &refs,
-                    Path::new("/"),
+                    None,
                     Duration::from_secs(30),
                     worktree::MAX_DIFF_BYTES,
                 )?;

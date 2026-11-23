@@ -22,12 +22,9 @@
 //! during the turn is indistinguishable from the agent's shell; the page calls
 //! those paths "other changes during this turn", never "the agent's".
 
-use crate::procguard::LockedSpawn;
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Component, Path};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) const MAX_ENTRIES: usize = 5_000;
 const STATUS_DEADLINE: Duration = Duration::from_secs(20);
@@ -57,56 +54,45 @@ pub(crate) struct Moved {
     pub code: String,
 }
 
-/// Runs `program args` in `cwd` with a deadline and an output cap.
+/// Runs `program args` in `cwd` with a deadline and an output cap, through the
+/// process seam (`engine::process`): trust admission, the descriptor gate and
+/// the deadline are its, so a Mavi read is bounded like every other one.
+///
+/// Returns whether it exited cleanly, what it printed (at most `max` bytes) and
+/// whether that was cut at the cap. Past the deadline it is an error: a
+/// fingerprint or a patch read halfway is not one to show.
 pub(crate) fn run_capped(
     program: &str,
     args: &[&str],
-    cwd: &Path,
+    cwd: Option<&Path>,
     deadline: Duration,
     max: usize,
 ) -> Result<(bool, Vec<u8>, bool), String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn_locked()
-        .map_err(|e| format!("Could not start {program}: {e}"))?;
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut cut = false;
-        if let Some(pipe) = stdout {
-            let mut limited = pipe.take(max as u64 + 1);
-            let _ = limited.read_to_end(&mut buf);
-            if buf.len() > max {
-                buf.truncate(max);
-                cut = true;
-            }
+    use crate::engine::process::{self, Incomplete};
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let cmd = process::build_capture_command(
+        program,
+        args,
+        cwd,
+        &[("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")],
+        path_var.as_deref(),
+        home.as_deref(),
+    );
+    let run = process::run_bounded_capped(cmd, program, deadline, None, max)
+        .map_err(|e| format!("Could not run {program}: {}", e.message()))?;
+    let cut = match &run.incomplete {
+        None => false,
+        Some(Incomplete::OverCap(_)) => true,
+        Some(Incomplete::Deadline { .. }) => {
+            return Err(format!(
+                "{program} took longer than {}s.",
+                deadline.as_secs()
+            ))
         }
-        (buf, cut)
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{program} took longer than {}s.",
-                    deadline.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(e.to_string()),
-        }
+        Some(other) => return Err(format!("{program} output {}", other.describe())),
     };
-    let (buf, cut) = reader.join().map_err(|_| "reader panicked".to_string())?;
-    Ok((status.success(), buf, cut))
+    Ok((run.success, run.stdout, cut))
 }
 
 /// Parses `git status --porcelain=v1 -z --untracked-files=all` output into
@@ -140,7 +126,7 @@ pub(crate) fn fingerprint(root: &Path) -> Result<Fingerprint, String> {
             "--untracked-files=all",
             "--ignore-submodules=dirty",
         ],
-        root,
+        Some(root),
         STATUS_DEADLINE,
         MAX_STATUS_BYTES,
     )?;
@@ -219,7 +205,7 @@ fn tracked(root: &Path, path: &str) -> bool {
             "--",
             path,
         ],
-        root,
+        Some(root),
         STATUS_DEADLINE,
         4096,
     )
@@ -265,7 +251,8 @@ pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), Strin
     let mut args = vec!["--no-optional-locks", "diff", "HEAD"];
     args.extend(flags);
     args.extend(["--", path]);
-    let (_, mut bytes, mut cut) = run_capped("git", &args, root, STATUS_DEADLINE, MAX_DIFF_BYTES)?;
+    let (_, mut bytes, mut cut) =
+        run_capped("git", &args, Some(root), STATUS_DEADLINE, MAX_DIFF_BYTES)?;
     if bytes.is_empty() && root.join(path).is_file() && !tracked(root, path) {
         // Untracked: `diff --no-index` exits 1 when the files differ, which is
         // the answer, not a failure. A tracked file with no diff is unchanged
@@ -273,7 +260,7 @@ pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), Strin
         let mut args = vec!["--no-optional-locks", "diff", "--no-index"];
         args.extend(flags);
         args.extend(["--", "/dev/null", path]);
-        (_, bytes, cut) = run_capped("git", &args, root, STATUS_DEADLINE, MAX_DIFF_BYTES)?;
+        (_, bytes, cut) = run_capped("git", &args, Some(root), STATUS_DEADLINE, MAX_DIFF_BYTES)?;
     }
     let text = String::from_utf8_lossy(&bytes);
     Ok((dc_redact::redact_secrets(&text), cut))
@@ -282,6 +269,8 @@ pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
+    use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
         let ok = Command::new("git")
@@ -319,6 +308,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "-q"]);
+        // Every git run in a worktree goes through the process seam, which
+        // admits only trusted repositories.
+        crate::test_support::trust_repo(root);
         std::fs::write(root.join("same.txt"), "a\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "init"]);
@@ -358,6 +350,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "-q"]);
+        // Every git run in a worktree goes through the process seam, which
+        // admits only trusted repositories.
+        crate::test_support::trust_repo(root);
         std::fs::write(root.join("kept.txt"), "a\n").unwrap();
         std::fs::write(root.join("reverted.txt"), "a\n").unwrap();
         git(root, &["add", "."]);

@@ -15,7 +15,6 @@
 
 use super::wire::{self, Signal};
 use super::worktree::{self, Fingerprint};
-use crate::procguard::LockedSpawn;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
@@ -44,6 +43,10 @@ const MAX_STDERR_LINES: usize = 200;
 const MAX_TOUCHED: usize = 500;
 /// How long a stopped agent gets to exit before its process group is killed.
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How often the waiter checks whether the agent has exited.
+const WAIT_POLL: Duration = Duration::from_millis(50);
+/// Supervisor name for every thread a Mavi session runs.
+const SUBSYSTEM: &str = "mavi";
 /// The longest a new turn waits for the previous turn's closing fingerprint.
 const FINISH_WAIT: Duration = Duration::from_secs(25);
 /// How long the exit waits for the output pipes to drain after the process
@@ -143,9 +146,14 @@ pub(crate) struct Session {
     pub mode: String,
     pub model: Option<String>,
     pub started_at_ms: u64,
-    pid: u32,
-    /// Set once the process has been reaped: after that its pid (and so its
-    /// process group id) can belong to someone else, and is never signalled.
+    /// The agent while it is unreaped. The waiter takes it out when it reaps
+    /// it; until then a stop or a kill reaches it through `registration`,
+    /// never through a pid that could already name another process.
+    child: Arc<Mutex<Option<Child>>>,
+    /// The agent's entry in `procguard`'s registry: its group kill, and the
+    /// sweep that stops it if GitPulse exits first.
+    registration: Arc<crate::procguard::Registration>,
+    /// Set once the process has been reaped.
     exited: Arc<std::sync::atomic::AtomicBool>,
     /// The conversation this session was started to resume, for the
     /// one-process-per-conversation check before its `init` line arrives.
@@ -189,15 +197,10 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Its own process group, so stopping the agent also stops the shells
-        // and background tasks it started.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child: Child = command
-            .spawn_locked()
+        // `procguard::spawn` puts the agent in its own process group (so a
+        // stop also stops the shells and background tasks it started), admits
+        // its directory, and registers it for the exit sweep.
+        let (mut child, registration) = crate::procguard::spawn(&mut command, "mavi agent")
             .map_err(|e| format!("Could not start the agent: {e}"))?;
         let stdin = child.stdin.take().ok_or("The agent has no input pipe.")?;
         let stdout = child.stdout.take().ok_or("The agent has no output pipe.")?;
@@ -210,7 +213,8 @@ impl Session {
             mode,
             model,
             started_at_ms: now,
-            pid: child.id(),
+            child: Arc::new(Mutex::new(None)),
+            registration: Arc::new(registration),
             exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resumed,
             events: Mutex::new(None),
@@ -251,20 +255,18 @@ impl Session {
         }
 
         // Writer.
-        std::thread::Builder::new()
-            .name("mavi-stdin".into())
-            .spawn(move || {
-                let mut stdin = stdin;
-                for line in stdin_rx {
-                    if stdin.write_all(line.as_bytes()).is_err()
-                        || stdin.write_all(b"\n").is_err()
-                        || stdin.flush().is_err()
-                    {
-                        break;
-                    }
+        crate::supervisor::spawn_one_of_many("mavi-stdin", SUBSYSTEM, move || {
+            let mut stdin = stdin;
+            for line in stdin_rx {
+                if stdin.write_all(line.as_bytes()).is_err()
+                    || stdin.write_all(b"\n").is_err()
+                    || stdin.flush().is_err()
+                {
+                    break;
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            }
+        })
+        .map_err(|e| e.to_string())?;
 
         let (tx, rx) = mpsc::channel::<Msg>();
         *session.events.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx.clone());
@@ -274,27 +276,23 @@ impl Session {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let out_tx = tx.clone();
         let out_done = done_tx.clone();
-        std::thread::Builder::new()
-            .name("mavi-stdout".into())
-            .spawn(move || {
-                read_lines(stdout, |line| {
-                    let _ = out_tx.send(Msg::Line(line));
-                });
-                let _ = out_done.send(());
-            })
-            .map_err(|e| e.to_string())?;
+        crate::supervisor::spawn_one_of_many("mavi-stdout", SUBSYSTEM, move || {
+            read_lines(stdout, |line| {
+                let _ = out_tx.send(Msg::Line(line));
+            });
+            let _ = out_done.send(());
+        })
+        .map_err(|e| e.to_string())?;
         let readers = if let Some(stderr) = stderr {
             let err_tx = tx.clone();
             let err_done = done_tx.clone();
-            std::thread::Builder::new()
-                .name("mavi-stderr".into())
-                .spawn(move || {
-                    read_lines(stderr, |line| {
-                        let _ = err_tx.send(Msg::Stderr(line));
-                    });
-                    let _ = err_done.send(());
-                })
-                .map_err(|e| e.to_string())?;
+            crate::supervisor::spawn_one_of_many("mavi-stderr", SUBSYSTEM, move || {
+                read_lines(stderr, |line| {
+                    let _ = err_tx.send(Msg::Stderr(line));
+                });
+                let _ = err_done.send(());
+            })
+            .map_err(|e| e.to_string())?;
             2
         } else {
             1
@@ -303,32 +301,33 @@ impl Session {
         // The waiter reaps the process itself rather than after stdout ends:
         // a grandchild that inherited stdout and outlives the agent would
         // otherwise keep the session "live" forever.
+        *session.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
         let wait_tx = tx.clone();
         let exited = Arc::clone(&session.exited);
-        std::thread::Builder::new()
-            .name("mavi-wait".into())
-            .spawn(move || {
-                let exit = match child.wait() {
-                    Ok(status) => (describe_exit(status), status.success()),
-                    Err(e) => (format!("could not be waited on: {e}"), false),
-                };
-                exited.store(true, std::sync::atomic::Ordering::SeqCst);
-                let deadline = std::time::Instant::now() + READER_DRAIN;
-                for _ in 0..readers {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    if done_rx.recv_timeout(left).is_err() {
-                        break;
-                    }
+        let held = Arc::clone(&session.child);
+        let registration = Arc::clone(&session.registration);
+        crate::supervisor::spawn_one_of_many("mavi-wait", SUBSYSTEM, move || {
+            let exit = match reap(&held, &registration) {
+                Ok(status) => (describe_exit(status), status.success()),
+                Err(e) => (format!("could not be waited on: {e}"), false),
+            };
+            exited.store(true, std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + READER_DRAIN;
+            for _ in 0..readers {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if done_rx.recv_timeout(left).is_err() {
+                    break;
                 }
-                let _ = wait_tx.send(Msg::Exit(exit));
-            })
-            .map_err(|e| e.to_string())?;
+            }
+            let _ = wait_tx.send(Msg::Exit(exit));
+        })
+        .map_err(|e| e.to_string())?;
         drop(tx);
         let processor = Arc::clone(&session);
-        std::thread::Builder::new()
-            .name("mavi-events".into())
-            .spawn(move || processor.process(rx))
-            .map_err(|e| e.to_string())?;
+        crate::supervisor::spawn_one_of_many("mavi-events", SUBSYSTEM, move || {
+            processor.process(rx)
+        })
+        .map_err(|e| e.to_string())?;
         Ok(session)
     }
 
@@ -574,26 +573,40 @@ impl Session {
         Ok(())
     }
 
-    /// Ends the agent: closes its input, then terminates its process group,
-    /// then kills it if it is still there after [`STOP_GRACE`].
-    pub(crate) fn stop(&self) {
+    /// Ends the agent: closes its input, asks its process group to stop,
+    /// then kills the group if it is still there after [`STOP_GRACE`].
+    pub(crate) fn stop(self: &Arc<Self>) {
         self.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
-        // A reaped pid may already name another process group.
         if self.has_exited() {
             return;
         }
         self.core.lock().unwrap_or_else(|p| p.into_inner()).stopped = true;
-        terminate_group(self.pid, false);
-        let pid = self.pid;
-        let exited = Arc::clone(&self.exited);
-        let _ = std::thread::Builder::new()
-            .name("mavi-stop".into())
-            .spawn(move || {
-                std::thread::sleep(STOP_GRACE);
-                if !exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    terminate_group(pid, true);
+        self.ask_to_stop();
+        let me = Arc::clone(self);
+        let _ = crate::supervisor::spawn_one_of_many("mavi-stop", SUBSYSTEM, move || {
+            std::thread::sleep(STOP_GRACE);
+            me.kill_now();
+        });
+    }
+
+    /// SIGTERM to the agent's group while it is unreaped, through the guarded
+    /// primitive (`procguard::signal`). Windows has no polite ask for a
+    /// console process; closing its input is the ask there.
+    fn ask_to_stop(&self) {
+        #[cfg(unix)]
+        {
+            let held = self.child.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(child) = held.as_ref() {
+                if let Ok(pgid) = i32::try_from(child.id()) {
+                    let _ = crate::procguard::signal::signal_group(
+                        pgid,
+                        libc::SIGTERM,
+                        crate::procguard::signal::Basis::Spawned,
+                        "mavi agent",
+                    );
                 }
-            });
+            }
+        }
     }
 
     /// Whether the process has been reaped.
@@ -604,8 +617,9 @@ impl Session {
     /// Kills the process group now, unless the process has been reaped. For
     /// the app's exit, which cannot wait for [`Session::stop`]'s grace thread.
     pub(crate) fn kill_now(&self) {
-        if !self.has_exited() {
-            terminate_group(self.pid, true);
+        let mut held = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(child) = held.as_mut() {
+            self.registration.kill_tree(child);
         }
     }
 
@@ -886,7 +900,7 @@ impl Session {
         };
         let root = PathBuf::from(root);
         let me = Arc::clone(self);
-        let _ = std::thread::Builder::new().name("mavi-turn".into()).spawn(move || {
+        let _ = crate::supervisor::spawn_one_of_many("mavi-turn", SUBSYSTEM, move || {
             match worktree::fingerprint(&root) {
                 Ok(after) => {
                     let moved = worktree::moved(&baseline, &after);
@@ -896,7 +910,10 @@ impl Session {
                     );
                 }
                 Err(reason) => {
-                    me.note("mavi_turn_files", json!({"turn": turn, "available": false, "reason": reason}));
+                    me.note(
+                        "mavi_turn_files",
+                        json!({"turn": turn, "available": false, "reason": reason}),
+                    );
                 }
             }
             me.core.lock().unwrap_or_else(|p| p.into_inner()).finishing = false;
@@ -967,41 +984,39 @@ fn describe_exit(status: std::process::ExitStatus) -> String {
     "ended".into()
 }
 
-fn terminate_group(pid: u32, kill: bool) {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = i32::try_from(pid) else { return };
-        if pid <= 1 {
-            return;
+/// Waits for the agent to exit, polling so a stop or a kill can reach it in
+/// the meantime. The reap goes through its registration, which forgets the pid
+/// at the moment it stops being ours.
+fn reap(
+    held: &Mutex<Option<Child>>,
+    registration: &crate::procguard::Registration,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        {
+            let mut guard = held.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(child) = guard.as_mut() else {
+                return Err(std::io::Error::other("the agent was already reaped"));
+            };
+            match registration.poll(|| child.try_wait()) {
+                Ok(Some(status)) => {
+                    guard.take();
+                    return Ok(status);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    guard.take();
+                    return Err(e);
+                }
+            }
         }
-        let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
-        // SAFETY: `kill` with a negative pid signals the process group the
-        // agent was started in (`process_group(0)` makes its pgid its pid).
-        unsafe {
-            libc::kill(-pid, signal);
-        }
-    }
-    #[cfg(windows)]
-    {
-        if kill {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status_locked();
-        } else {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status_locked();
-        }
+        std::thread::sleep(WAIT_POLL);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     // The process-level tests below drive a shell-script fake agent, so they
     // and their helpers are Unix-only; on Windows the helpers would be dead
     // code, which `-D warnings` rejects.
@@ -1026,14 +1041,10 @@ mod tests {
         seen: &Arc<Mutex<Vec<(&'static str, Value)>>>,
         what: impl Fn(&[(&'static str, Value)]) -> bool,
     ) {
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(10) {
-            if what(&seen.lock().unwrap()) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("timed out; saw {:?}", seen.lock().unwrap());
+        let reached = crate::test_support::wait_until(Duration::from_secs(10), || {
+            what(&seen.lock().unwrap())
+        });
+        assert!(reached, "timed out; saw {:?}", seen.lock().unwrap());
     }
 
     #[cfg(unix)]
@@ -1082,6 +1093,8 @@ mod tests {
                 .success())
         };
         git(&["init", "-q"]);
+        // The agent and its turn reads start through the trust-admitting seam.
+        crate::test_support::trust_repo(root);
         std::fs::write(root.join("a.txt"), "a\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
@@ -1222,6 +1235,8 @@ read never
                 .success())
         };
         git(&["init", "-q"]);
+        // The agent and its turn reads start through the trust-admitting seam.
+        crate::test_support::trust_repo(&root);
         std::fs::write(root.join("a.txt"), "hello\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
@@ -1255,7 +1270,7 @@ read never
         let started = Instant::now();
         loop {
             assert!(
-                started.elapsed() < Duration::from_secs(180),
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(180)),
                 "timed out: {:?}",
                 session.summary()
             );
@@ -1275,7 +1290,7 @@ read never
             .any(|l| l["type"] == "mavi_turn_files")
         {
             assert!(
-                started.elapsed() < Duration::from_secs(180),
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(180)),
                 "no turn end: {:?}",
                 session.summary()
             );
@@ -1336,6 +1351,7 @@ mod live_resume {
             return;
         };
         let root = std::fs::canonicalize(&dir).unwrap();
+        crate::test_support::trust_repo(&root);
         // Tests run under a hermetic HOME and CLAUDE_CONFIG_DIR; the saved
         // conversation lives under the real one (the test harness keeps it in
         // GITPULSE_TEST_REAL_HOME). Copy it to where both the locator and
@@ -1414,7 +1430,10 @@ mod live_resume {
             .unwrap();
         let started = Instant::now();
         let answer = loop {
-            assert!(started.elapsed() < Duration::from_secs(120), "no answer");
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(120)),
+                "no answer"
+            );
             let lines = seen.lock().unwrap().clone();
             if lines.iter().any(|l| l["type"] == "result") {
                 break lines
