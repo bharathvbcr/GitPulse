@@ -7,7 +7,7 @@
    * lane at laptop widths. The changes column opens by itself the first time
    * a thread changes a file, and from any file chip or turn footer.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { PanelLeftClose, PanelLeftOpen, PanelRightOpen, Server, Laptop, Play, Square, RotateCcw, SquareTerminal, ArrowRightLeft } from "@lucide/svelte";
   import { bringBackToMavi, canContinueInTerminal, continueInTerminal, openShellHere, terminalHolding } from "../../mavi/handoff";
   import { focusTerminalSession } from "../../terminal/sessionFocus";
@@ -16,7 +16,7 @@
   import { maviStore } from "../../mavi/store.svelte";
   import { MAVI_MODES } from "../../mavi/client";
   import { openApprovals } from "../../mavi/reduce";
-  import { collectChanges } from "../../mavi/changes";
+  import { hasAnyChange } from "../../mavi/changes";
   import { STATUS_LABEL, targetLabel } from "../../mavi/threads";
   import MaviRail from "./MaviRail.svelte";
   import MaviTimeline from "./MaviTimeline.svelte";
@@ -86,6 +86,8 @@
 
   async function moveToTerminal() {
     if (!record || moving) return;
+    // The thread is fixed now: the open one can change while the dialog is up.
+    const key = record.key;
     const bypass = record.mode === "bypass";
     const ok = await askConfirm({
       title: "Continue in a terminal",
@@ -99,7 +101,7 @@
     if (!ok) return;
     moving = true;
     try {
-      const result = await continueInTerminal(record.key);
+      const result = await continueInTerminal(key);
       if (!result.ok) toastStore.warning(result.reason);
       else if (result.note) toastStore.info(result.note);
     } finally {
@@ -142,17 +144,55 @@
   let approvals = $derived(thread ? openApprovals(thread) : []);
   let status = $derived(record ? maviStore.status(record) : null);
   let modeLabel = $derived(MAVI_MODES.find((m) => m.id === record?.mode)?.label ?? record?.mode ?? "");
-  let hasChanges = $derived(thread ? collectChanges(thread, root, { kind: "thread" }).length > 0 : false);
+  let hasChanges = $derived(thread ? hasAnyChange(thread) : false);
   let showNew = $derived(composing || maviStore.records.length === 0 || !record);
 
-  // The changes column opens itself the first time a thread changes a file.
+  // The changes column opens itself the first time a thread changes a file,
+  // unless the reader closed it this run: then it stays closed.
   let announced = new Set<string>();
+  let hiddenByReader = false;
   $effect(() => {
     if (record && hasChanges && !announced.has(record.key)) {
       announced.add(record.key);
-      changesOpen = true;
+      if (!hiddenByReader) changesOpen = true;
     }
   });
+
+  function hideChanges() {
+    hiddenByReader = true;
+    changesOpen = false;
+  }
+
+  // Which open requests are on screen. The composer's "waiting for your
+  // answer" bar points only at those that are not, so it never covers or
+  // repeats a card the reader can already see.
+  let onScreen = $state<ReadonlySet<string>>(new Set());
+  let requestIds = $derived(approvals.map((a) => a.approval?.requestId ?? "").join(","));
+  $effect(() => {
+    void requestIds;
+    if (typeof IntersectionObserver === "undefined") return;
+    const seen = new Set<string>();
+    let observer: IntersectionObserver | null = null;
+    let cancelled = false;
+    void tick().then(() => {
+      if (cancelled) return;
+      observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.request ?? "";
+          if (entry.isIntersecting) seen.add(id);
+          else seen.delete(id);
+        }
+        onScreen = new Set(seen);
+      });
+      for (const el of document.querySelectorAll<HTMLElement>(".mavi-approval[data-request]")) observer.observe(el);
+    });
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+      onScreen = new Set();
+    };
+  });
+  let offScreenApprovals = $derived(approvals.filter((a) => !onScreen.has(a.approval?.requestId ?? "")).length);
 
   $effect(() => writeFlag(RAIL_KEY, railOpen));
   $effect(() => writeFlag(CHANGES_KEY, changesOpen));
@@ -176,9 +216,32 @@
     changesOpen = true;
   }
 
+  /** Brings the first request off screen into view. Focus lands on the card, which answers nothing by itself. */
   function reviewApproval() {
-    document.querySelector<HTMLElement>(".mavi-approval")?.focus();
-    document.querySelector<HTMLElement>(".mavi-approval")?.scrollIntoView({ block: "center", behavior: "smooth" });
+    const target =
+      [...document.querySelectorAll<HTMLElement>(".mavi-approval[data-request]")].find((el) => !onScreen.has(el.dataset.request ?? "")) ??
+      document.querySelector<HTMLElement>(".mavi-approval");
+    target?.scrollIntoView({ block: "center", behavior: "smooth" });
+    target?.focus({ preventScroll: true });
+  }
+
+  async function endAgent() {
+    if (!record) return;
+    const key = record.key;
+    if (working) {
+      const ok = await askConfirm({
+        title: "End this thread's agent",
+        message:
+          "A turn is running. Ending the agent stops it and closes its process; the conversation is kept and can be resumed. To stop only this turn, use Stop beside the message box.",
+        confirmLabel: "End agent",
+      });
+      if (!ok) return;
+    }
+    try {
+      await maviStore.stop(key);
+    } catch (e) {
+      toastStore.warning(`Couldn't end the agent: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   async function resume() {
@@ -222,9 +285,9 @@
       {#if record && !showNew}
         <div class="min-w-0 flex-1">
           <div class="text-xs font-medium text-textPrimary truncate">{record.title}</div>
-          <div class="flex items-center gap-1.5 text-micro text-textMuted min-w-0">
+          <div class="mavi-meta flex items-center gap-1.5 text-micro text-textMuted min-w-0 whitespace-nowrap overflow-hidden">
             {#if record.target.kind === "ssh"}<Server size={10} aria-hidden="true" />{:else}<Laptop size={10} aria-hidden="true" />{/if}
-            <span class="truncate font-mono" title={record.target.kind === "ssh" ? `${record.target.host}:${record.target.dir}` : record.target.root}>{targetLabel(record.target)}</span>
+            <span class="truncate font-mono min-w-0" title={record.target.kind === "ssh" ? `${record.target.host}:${record.target.dir}` : record.target.root}>{targetLabel(record.target)}</span>
             {#if thread?.model}<span>· {thread.model}</span>{/if}
             {#if summary && summary.cost_usd > 0}<span>· ${summary.cost_usd.toFixed(2)}</span>{/if}
             {#if status}<span>· {STATUS_LABEL[status]}</span>{/if}
@@ -247,8 +310,8 @@
           {/if}
         {/if}
         {#if running}
-          <button class="gp-btn" data-variant="ghost" title="End this thread's agent" onclick={() => record && maviStore.stop(record.key)}>
-            <Square size={11} aria-hidden="true" /> End
+          <button class="gp-btn" data-variant="ghost" title="End this thread's agent process; the conversation can be resumed" onclick={endAgent}>
+            <Square size={11} aria-hidden="true" /> End agent
           </button>
         {/if}
       {:else}
@@ -281,29 +344,37 @@
           {/key}
         </div>
       </div>
+    {:else if record && !thread}
+      <p class="flex-1 text-xs text-textMuted text-center py-8" role="status">Loading the conversation…</p>
     {:else if record && thread}
-      <MaviTimeline
-        {thread}
-        {root}
-        {working}
-        onAnswer={(requestId, decision, message) => maviStore.answer(record.key, requestId, decision, message)}
-        onShowTurn={showTurn}
-        onOpenFile={showFile}
-      />
+      {#key record.key}
+        <MaviTimeline
+          {thread}
+          {root}
+          {working}
+          onAnswer={(requestId, decision, message) => maviStore.answer(record.key, requestId, decision, message)}
+          onShowTurn={showTurn}
+          onOpenFile={showFile}
+        />
+      {/key}
       {#if maviStore.errors[record.key]}
         <p class="gp-notice gp-notice-error text-meta" role="alert">{maviStore.errors[record.key]}</p>
       {/if}
       {#if running}
-        <MaviComposer
-          {working}
-          queue={maviStore.queues[record.key] ?? []}
-          pendingApprovals={approvals.length}
-          {modeLabel}
-          onSend={(text) => maviStore.send(record.key, text)}
-          onStop={() => maviStore.interrupt(record.key)}
-          onUnqueue={(i) => maviStore.unqueue(record.key, i)}
-          onReviewApproval={reviewApproval}
-        />
+        {#key record.key}
+          <MaviComposer
+            {working}
+            queue={maviStore.queues[record.key] ?? []}
+            pendingApprovals={offScreenApprovals}
+            draft={maviStore.drafts[record.key] ?? ""}
+            onDraft={(text) => (maviStore.drafts[record.key] = text)}
+            {modeLabel}
+            onSend={(text) => maviStore.send(record.key, text)}
+            onStop={() => maviStore.interrupt(record.key)}
+            onUnqueue={(i) => maviStore.unqueue(record.key, i)}
+            onReviewApproval={reviewApproval}
+          />
+        {/key}
       {:else if moved}
         <div class="mavi-resume flex flex-wrap items-center gap-2 justify-center text-xs text-textMuted">
           <span>This conversation continues in a terminal tab.</span>
@@ -337,14 +408,16 @@
 
   {#if changesOpen && record && thread && !showNew}
     <div class="mavi-changes-col">
-      <MaviChanges
-        {thread}
-        {root}
-        sessionId={record.sessionId}
-        bind:focus={focusPath}
-        bind:turn={focusTurn}
-        onHide={() => (changesOpen = false)}
-      />
+      {#key record.key}
+        <MaviChanges
+          {thread}
+          {root}
+          sessionId={record.sessionId}
+          bind:focus={focusPath}
+          bind:turn={focusTurn}
+          onHide={hideChanges}
+        />
+      {/key}
     </div>
   {/if}
 </div>

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { applyAll, applyLine, emptyThread, openApprovals } from "./reduce";
+import { applyAll, applyLine, continueInNewSession, emptyThread, MAX_ITEMS, openApprovals } from "./reduce";
 import { toRows, summarize } from "./rows";
 import { collectChanges, hunksFromInput, turnTotals, describeCode } from "./changes";
 import type { ThreadState, ToolItem } from "./types";
@@ -127,8 +127,53 @@ describe("approvals and live changes", () => {
     const rows = toRows(state.items, "/repo");
     expect(rows.map((r) => r.kind)).toEqual(["item", "approval"]);
     const [change] = collectChanges(state, "/repo", { kind: "turn", turn: 1 });
-    expect(change).toMatchObject({ path: "src/a.ts", latestState: "proposed", added: 1, removed: 1 });
+    // Shown in full, but a proposal has changed nothing yet, so it counts no lines.
+    expect(change).toMatchObject({ path: "src/a.ts", latestState: "proposed", added: 0, removed: 0 });
+    expect(change!.edits[0]!.hunks.length).toBeGreaterThan(0);
     expect(change!.edits[0]!.fromInput).toBe(true);
+    expect(turnTotals(state, "/repo", 1)).toEqual({ files: 0, added: 0, removed: 0 });
+  });
+
+  it("shows a subagent's open request in the main flow, never under a hidden row", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "go", turn: 1 }));
+    applyLine(state, JSON.stringify({
+      type: "assistant",
+      parent_tool_use_id: "task1",
+      message: { id: "m2", content: [{ type: "tool_use", id: "sub1", name: "Bash", input: { command: "ls" } }] },
+    }));
+    applyLine(state, JSON.stringify({
+      type: "control_request",
+      request_id: "r9",
+      request: { subtype: "can_use_tool", tool_name: "Bash", tool_use_id: "sub1", input: { command: "ls" } },
+    }));
+    const rows = toRows(state.items, "/repo");
+    expect(rows.filter((r) => r.kind === "approval")).toHaveLength(1);
+  });
+
+  it("voids a request once its tool has a result, or the agent cancels it", () => {
+    const state = withOpenEdit();
+    applyLine(state, JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+    }));
+    expect(openApprovals(state)).toHaveLength(0);
+    const cancelled = withOpenEdit();
+    applyLine(cancelled, JSON.stringify({ type: "control_cancel_request", request_id: "r1" }));
+    expect(openApprovals(cancelled)).toHaveLength(0);
+  });
+
+  it("marks a request whose input the host withheld, without inventing one", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "go", turn: 1 }));
+    applyLine(state, JSON.stringify({
+      type: "control_request",
+      request_id: "r2",
+      request: { subtype: "can_use_tool", tool_name: "Write", tool_use_id: "w1", input: { mavi_input_hidden: "too_large", bytes: 900000 } },
+    }));
+    const [open] = openApprovals(state);
+    expect(open!.approval).toMatchObject({ requestId: "r2", hiddenBytes: 900000 });
+    expect(open!.input).toEqual({});
   });
 
   it("voids open approvals on interrupt and on exit", () => {
@@ -277,5 +322,24 @@ describe("history from a real transcript", () => {
   it("continues turn numbering after the history", () => {
     applyLine(state, JSON.stringify({ type: "mavi_user", text: "next", turn: 4 }));
     expect(state.items.at(-1)).toMatchObject({ kind: "user", turn: 4 });
+  });
+});
+
+describe("ids and restarts", () => {
+  it("never repeats an item id once old items are dropped", () => {
+    const state = emptyThread();
+    for (let i = 0; i < MAX_ITEMS + 50; i++) applyLine(state, JSON.stringify({ type: "mavi_redacted" }));
+    const ids = state.items.map((item) => item.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(state.items.length).toBeLessThanOrEqual(MAX_ITEMS);
+  });
+
+  it("numbers a new session's turns after the ones already shown", () => {
+    const state = emptyThread();
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "one", turn: 1 }), 1);
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "two", turn: 2 }), 2);
+    continueInNewSession(state);
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "three", turn: 1 }), 1);
+    expect(state.items.filter((i) => i.kind === "user").map((i) => i.turn)).toEqual([1, 2, 3]);
   });
 });

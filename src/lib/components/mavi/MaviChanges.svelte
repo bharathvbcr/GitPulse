@@ -50,7 +50,10 @@
   let turnFiles = $derived(wholeThread ? null : thread.turnFiles[shownTurn] ?? null);
   let liveTurn = $derived(!wholeThread && shownTurn === thread.turn && !thread.items.some((i) => i.kind === "turn_end" && i.turn === thread.turn));
 
-  /** Patches of unattributed files, read on demand. */
+  /**
+   * Patches of unattributed files, read on demand. Keyed by session, path and
+   * the last turn that moved the file, so a later turn reads it again.
+   */
   let fetched = $state<Record<string, { hunks: MaviHunk[]; binary: boolean; truncated: boolean } | { error: string } | "loading">>({});
 
   $effect(() => {
@@ -63,22 +66,34 @@
     });
   });
 
-  async function loadPatch(path: string) {
-    if (!sessionId || fetched[path] === "loading") return;
-    fetched[path] = "loading";
+  function patchKey(change: FileChange): string {
+    return `${sessionId ?? ""}:${change.path}:${change.turns[change.turns.length - 1] ?? 0}`;
+  }
+
+  async function loadPatch(change: FileChange) {
+    const key = patchKey(change);
+    if (!sessionId || fetched[key] !== undefined) return;
+    fetched[key] = "loading";
     try {
-      const diff = await maviClient.fileDiff(sessionId, path);
+      const diff = await maviClient.fileDiff(sessionId, change.path);
       const parsed = parsePatch(diff.patch);
-      fetched[path] = { ...parsed, truncated: diff.truncated };
+      fetched[key] = { ...parsed, truncated: diff.truncated };
     } catch (e) {
-      fetched[path] = { error: e instanceof Error ? e.message : String(e) };
+      fetched[key] = { error: e instanceof Error ? e.message : String(e) };
     }
   }
 
   function toggle(change: FileChange) {
     focus = focus === change.path ? null : change.path;
-    if (focus && !change.attributed && !fetched[change.path]) void loadPatch(change.path);
   }
+
+  // An unattributed file opened from anywhere (a click, the timeline) reads its patch.
+  $effect(() => {
+    const target = focus;
+    if (!target) return;
+    const change = changes.find((c) => c.path === target);
+    if (change && !change.attributed) untrack(() => void loadPatch(change));
+  });
 
   function split(path: string): { dir: string; name: string } {
     const at = path.lastIndexOf("/");
@@ -109,7 +124,9 @@
   <header class="mavi-changes-head flex items-center gap-2">
     <span class="text-xs font-medium text-textPrimary">Changes</span>
     {#if changes.length}
-      <span class="text-meta"><span class="text-ok">+{totals.added}</span> <span class="text-danger">−{totals.removed}</span></span>
+      {#if totals.added || totals.removed}
+        <span class="text-meta">{#if totals.added}<span class="text-ok">+{totals.added}</span>{/if} {#if totals.removed}<span class="text-danger">−{totals.removed}</span>{/if}</span>
+      {/if}
     {/if}
     <span class="ml-auto"></span>
     <div class="gp-segmented" role="group" aria-label="Scope">
@@ -175,7 +192,9 @@
               <span class="text-micro shrink-0" class:text-warn={change.latestState === "proposed"} class:text-textMuted={change.latestState !== "proposed"}>{STATE_LABEL[change.latestState]}</span>
             {/if}
             {#if change.attributed}
-              <span class="text-meta shrink-0"><span class="text-ok">+{change.added}</span> <span class="text-danger">−{change.removed}</span></span>
+              {#if change.added || change.removed}
+                <span class="text-meta shrink-0">{#if change.added}<span class="text-ok">+{change.added}</span>{/if} {#if change.removed}<span class="text-danger">−{change.removed}</span>{/if}</span>
+              {/if}
             {:else}
               <span class="gp-chip shrink-0" data-tone="unknown" title="Changed during this turn, but no agent edit names it">Other · {describeCode(change.code)}</span>
             {/if}
@@ -196,7 +215,7 @@
                   {/if}
                 {/each}
               {:else}
-                {@const patch = fetched[change.path]}
+                {@const patch = fetched[patchKey(change)]}
                 <p class="text-micro text-textMuted mt-2 mb-1">Changed during this turn outside the agent's edit tools: a command it ran, a formatter, or another program. Shown against HEAD.</p>
                 {#if patch === "loading" || patch === undefined}
                   <p class="text-meta text-textMuted">Reading the change…</p>

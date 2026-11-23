@@ -138,7 +138,7 @@ pub(crate) fn remote_diff_command(dir: &str, path: &str) -> String {
     let p = quote(path);
     let flags = "--no-ext-diff --no-textconv --no-color --no-renames";
     in_sh(&format!(
-        r#"cd {} || exit 97; out=$(git --no-optional-locks diff HEAD {flags} -- {p}); if [ -z "$out" ] && [ -f {p} ]; then git --no-optional-locks diff --no-index {flags} -- /dev/null {p}; else printf '%s\n' "$out"; fi"#,
+        r#"cd {} || exit 97; out=$(git --no-optional-locks diff HEAD {flags} -- {p}); if [ -z "$out" ] && [ -f {p} ] && ! git ls-files --error-unmatch -- {p} >/dev/null 2>&1; then git --no-optional-locks diff --no-index {flags} -- /dev/null {p}; else printf '%s\n' "$out"; fi"#,
         quoted_dir(dir)
     ))
 }

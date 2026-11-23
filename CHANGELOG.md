@@ -43,6 +43,16 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 - **The Agents window lists Mavi threads**, under the plane's rows and in its
   columns, counted in the headline, and following its filter and repository
   scope, with Open and End.
+- **Mavi audit pass.** Permission requests: no single-key Allow, a subagent's
+  request is always shown, withheld inputs are labelled, and a request closes
+  when its tool finishes or is cancelled; the "waiting for you" bar appears only
+  when the card is off screen. Per-thread drafts; queued messages survive a
+  refused send and return to the composer when the agent ends; threads can be
+  renamed, and removing one asks first. Turn footers and the Changes column no
+  longer count proposed edits or show zero counts, and turn totals are computed
+  in one pass. The host refuses SSH diffs of absolute paths, never shows a
+  tracked unchanged file as new, keeps oversized permission requests
+  answerable, and reserves a worktree and conversation while a thread starts.
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.

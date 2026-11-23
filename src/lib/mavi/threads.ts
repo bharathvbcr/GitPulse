@@ -8,7 +8,7 @@
  * agent's view of the person's files, and Claude Code keeps the real
  * transcript. A resumed thread says so instead of pretending to remember.
  */
-import type { MaviPhase, MaviSummary, MaviTarget, ThreadState } from "./types";
+import type { MaviPhase, MaviSummary, MaviTarget, ThreadState, TimelineItem } from "./types";
 
 export const THREADS_STORAGE_KEY = "gitpulse.mavi.threads.v1";
 export const MAX_THREAD_RECORDS = 60;
@@ -155,7 +155,16 @@ export function threadStatus(
   if (phase === "ended") {
     return !summary.exit_ok && unseen ? "failed" : "not_running";
   }
-  const lastEnd = state ? [...state.items].reverse().find((i) => i.kind === "turn_end") : undefined;
+  let lastEnd: TimelineItem | undefined;
+  if (state) {
+    // Backward by index: copying the proxied list would subscribe to all of it.
+    for (let i = state.items.length - 1; i >= 0; i--) {
+      if (state.items[i]!.kind === "turn_end") {
+        lastEnd = state.items[i];
+        break;
+      }
+    }
+  }
   if (unseen && lastEnd && lastEnd.kind === "turn_end") {
     if (!lastEnd.ok && !lastEnd.interrupted) return "failed";
     if (lastEnd.summary?.category === "review_ready" || lastEnd.summary?.needsAction) return "review";

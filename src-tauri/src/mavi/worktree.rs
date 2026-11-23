@@ -210,6 +210,25 @@ pub(crate) fn safe_relative(path: &str) -> bool {
 
 /// The patch of one path against `HEAD` (or, for an untracked file, against
 /// nothing), bounded and redacted. Returns `(patch, truncated)`.
+/// Whether Git tracks `path` (in the index), so an empty diff means "unchanged".
+fn tracked(root: &Path, path: &str) -> bool {
+    run_capped(
+        "git",
+        &[
+            "--no-optional-locks",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            path,
+        ],
+        root,
+        STATUS_DEADLINE,
+        4096,
+    )
+    .map(|(ok, _, _)| ok)
+    .unwrap_or(false)
+}
+
 pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), String> {
     if !safe_relative(path) {
         return Err("That path is not inside this worktree.".into());
@@ -224,9 +243,10 @@ pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), Strin
     args.extend(flags);
     args.extend(["--", path]);
     let (_, mut bytes, mut cut) = run_capped("git", &args, root, STATUS_DEADLINE, MAX_DIFF_BYTES)?;
-    if bytes.is_empty() && root.join(path).is_file() {
+    if bytes.is_empty() && root.join(path).is_file() && !tracked(root, path) {
         // Untracked: `diff --no-index` exits 1 when the files differ, which is
-        // the answer, not a failure.
+        // the answer, not a failure. A tracked file with no diff is unchanged
+        // and must not be shown as wholly new.
         let mut args = vec!["--no-optional-locks", "diff", "--no-index"];
         args.extend(flags);
         args.extend(["--", "/dev/null", path]);
@@ -269,6 +289,19 @@ mod tests {
                 ("??".to_string(), "x".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn an_unchanged_tracked_file_has_no_diff_and_an_untracked_one_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("same.txt"), "a\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("new.txt"), "n\n").unwrap();
+        assert_eq!(file_diff(root, "same.txt").unwrap().0, "");
+        assert!(file_diff(root, "new.txt").unwrap().0.contains("+n"));
     }
 
     #[test]

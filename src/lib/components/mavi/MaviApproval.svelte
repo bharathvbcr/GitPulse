@@ -5,8 +5,10 @@
    * the change itself (built from the request's own input). The host echoes
    * that same input back when allowed, so what is shown is what runs.
    *
-   * Keys work only while this card has focus (A allows, D opens deny), never
-   * from the composer, where typing a word must not answer a request.
+   * Answers are buttons only, with no single-key shortcut: a reader who lands
+   * on the card and starts typing must never allow a command by accident.
+   * The card can take focus (the composer's "Review" moves it here) so a
+   * screen reader starts at the request, but focus alone answers nothing.
    */
   import { ShieldQuestion, Check, X } from "@lucide/svelte";
   import type { ToolItem } from "../../mavi/types";
@@ -51,26 +53,13 @@
     }
   }
 
-  function onKeydown(event: KeyboardEvent) {
-    if (event.target instanceof HTMLTextAreaElement || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (event.key === "a" || event.key === "A") {
-      event.preventDefault();
-      void answer("allow");
-    } else if (event.key === "d" || event.key === "D") {
-      event.preventDefault();
-      denying = true;
-    }
-  }
 </script>
 
-<!-- Justified: the card takes focus so its A/D keys apply only while it is
-     focused; both answers are also real buttons inside it. -->
-<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
 <section
   class="mavi-approval gp-card"
   aria-label="Permission request: {tool.name}"
-  tabindex="0"
-  onkeydown={onKeydown}
+  data-request={tool.approval?.requestId}
+  tabindex="-1"
 >
   <header class="flex items-center gap-2 text-xs">
     <ShieldQuestion size={14} class="text-warn shrink-0" aria-hidden="true" />
@@ -80,7 +69,14 @@
     {/if}
   </header>
 
-  {#if command}
+  {#if tool.parentId}
+    <p class="text-meta text-textMuted mt-1">Asked by a subagent the agent started.</p>
+  {/if}
+  {#if tool.approval?.hiddenBytes !== undefined}
+    <p class="text-meta text-warn mt-1">
+      This request's input ({tool.approval.hiddenBytes.toLocaleString()} bytes) was too large to show safely. Allowing runs it exactly as the agent sent it; deny it if you can't tell what it does.
+    </p>
+  {:else if command}
     {#if why}<p class="text-meta text-textMuted mt-1">{why}</p>{/if}
     <pre class="mavi-command font-mono text-meta select-text">{command}</pre>
   {:else if hunks.length}
@@ -111,11 +107,9 @@
       <button class="gp-btn" data-variant="ghost" disabled={busy} onclick={() => (denying = false)}>Back</button>
     {:else}
       <button class="gp-btn" data-variant="primary" disabled={busy} onclick={() => answer("allow")}>
-        <Check size={12} aria-hidden="true" /> Allow <span class="gp-keycap">A</span>
+        <Check size={12} aria-hidden="true" /> Allow
       </button>
-      <button class="gp-btn" disabled={busy} onclick={() => (denying = true)}>
-        Deny <span class="gp-keycap">D</span>
-      </button>
+      <button class="gp-btn" disabled={busy} onclick={() => (denying = true)}>Deny</button>
     {/if}
     {#if error}<span class="text-meta text-danger" role="alert">{error}</span>{/if}
   </footer>
@@ -126,7 +120,7 @@
     padding: 10px 12px;
     border-color: rgb(var(--c-warn) / 0.65);
   }
-  .mavi-approval:focus-visible {
+  .mavi-approval:focus {
     outline: 2px solid rgb(var(--c-accent));
     outline-offset: 2px;
   }

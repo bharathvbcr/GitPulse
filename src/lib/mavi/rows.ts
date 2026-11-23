@@ -137,6 +137,14 @@ export function describeTool(tool: ToolItem, root: string | null): string {
 }
 
 /** Items → rows. Thinking with no visible text folds into its neighbours' flow as its own small row. */
+function lastRunning(tools: readonly ToolItem[]): ToolItem | null {
+  for (let i = tools.length - 1; i >= 0; i--) {
+    const tool = tools[i]!;
+    if (tool.status === "running" && !tool.background) return tool;
+  }
+  return null;
+}
+
 export function toRows(items: readonly TimelineItem[], root: string | null): Row[] {
   const rows: Row[] = [];
   let group: ToolItem[] = [];
@@ -157,20 +165,22 @@ export function toRows(items: readonly TimelineItem[], root: string | null): Row
       tools,
       summary: summarize(tools),
       failed: tools.filter((t) => t.status === "error" || t.status === "denied").length,
-      running: [...tools].reverse().find((t) => t.status === "running" && !t.background) ?? null,
+      running: lastRunning(tools),
       editedFiles: edited,
     });
     group = [];
   };
   for (const item of items) {
     if (item.kind === "tool") {
-      // Subagent calls belong to their Task row, not the main flow.
-      if (item.parentId) continue;
+      // An open request is always shown, a subagent's too: hiding it would
+      // leave the agent waiting on an answer nobody can give.
       if (item.approval?.state === "open") {
         close();
         rows.push({ kind: "approval", key: `a:${item.id}`, tool: item });
         continue;
       }
+      // Other subagent calls belong to their Task row, not the main flow.
+      if (item.parentId) continue;
       group.push(item);
       continue;
     }

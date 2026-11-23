@@ -3,8 +3,13 @@
    * Threads, grouped by where they run, each with one status. The most urgent
    * status sorts first within a group ("Needs you" above "Working" above
    * finished work not yet looked at), then the most recent.
+   *
+   * Each thread can be renamed in place (the pencil, or a double-click on its
+   * title) and removed after a confirmation that says what removal ends.
    */
-  import { Plus, Server, Laptop, Trash2 } from "@lucide/svelte";
+  import { tick } from "svelte";
+  import { Plus, Server, Laptop, Trash2, Pencil } from "@lucide/svelte";
+  import { askConfirm } from "../../stores/modalStore";
   import { maviStore } from "../../mavi/store.svelte";
   import { STATUS_LABEL, STATUS_PRIORITY, statusTone, targetLabel, type ThreadRecord } from "../../mavi/threads";
   import { formatAge } from "../../storage/format";
@@ -25,15 +30,44 @@
       group.records.push(record);
       byTarget.set(key, group);
     }
+    // Each status once, not once per comparison.
+    const rank = new Map(maviStore.records.map((r) => [r.key, STATUS_PRIORITY.indexOf(maviStore.status(r))]));
     for (const group of byTarget.values()) {
-      group.records.sort((a, b) => {
-        const pa = STATUS_PRIORITY.indexOf(maviStore.status(a));
-        const pb = STATUS_PRIORITY.indexOf(maviStore.status(b));
-        return pa - pb || b.lastActivityAt - a.lastActivityAt;
-      });
+      group.records.sort((a, b) => rank.get(a.key)! - rank.get(b.key)! || b.lastActivityAt - a.lastActivityAt);
     }
     return [...byTarget.values()];
   });
+
+  let renaming = $state<string | null>(null);
+  let draftTitle = $state("");
+  let renameField: HTMLInputElement | undefined = $state();
+
+  async function startRename(record: ThreadRecord) {
+    renaming = record.key;
+    draftTitle = record.title;
+    await tick();
+    renameField?.select();
+  }
+
+  function finishRename(save: boolean) {
+    if (renaming && save) maviStore.rename(renaming, draftTitle);
+    renaming = null;
+  }
+
+  async function remove(record: ThreadRecord) {
+    const summary = maviStore.summaryOf(record);
+    const live = !!summary && summary.phase !== "ended";
+    const ok = await askConfirm({
+      title: "Remove this thread",
+      message:
+        `Removes “${record.title}” from Mavi's list` +
+        (live ? " and ends its agent" : "") +
+        ". Claude Code keeps the conversation's transcript" +
+        (record.conversationId ? `, so it can still be resumed in a terminal with its id ${record.conversationId}.` : "."),
+      confirmLabel: "Remove",
+    });
+    if (ok) maviStore.forget(record.key);
+  }
 
   function age(ms: number): string {
     void now;
@@ -62,7 +96,36 @@
           {@const status = maviStore.status(record)}
           {@const tone = statusTone(status)}
           <li class="mavi-thread" class:mavi-thread-open={maviStore.openKey === record.key}>
-            <button class="mavi-thread-row flex items-start gap-2 w-full text-left" onclick={() => onOpen(record.key)}>
+            {#if renaming === record.key}
+              <form
+                class="mavi-thread-row flex items-center gap-2"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  finishRename(true);
+                }}
+              >
+                <input
+                  bind:this={renameField}
+                  bind:value={draftTitle}
+                  class="gp-field w-full text-xs"
+                  aria-label="Thread name"
+                  maxlength="200"
+                  onblur={() => finishRename(true)}
+                  onkeydown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      finishRename(false);
+                    }
+                  }}
+                />
+              </form>
+            {:else}
+            <button
+              class="mavi-thread-row flex items-start gap-2 w-full text-left"
+              aria-current={maviStore.openKey === record.key ? "true" : undefined}
+              onclick={() => onOpen(record.key)}
+              ondblclick={() => void startRename(record)}
+            >
               <span class="mavi-dot mt-1.5" class:animate-pulse={tone === "accent"} data-tone={tone} aria-hidden="true"></span>
               <span class="min-w-0 flex-1">
                 <span class="block truncate text-xs text-textPrimary">{record.title}</span>
@@ -71,15 +134,27 @@
                 </span>
               </span>
             </button>
-            <button
-              class="mavi-thread-remove gp-icon-btn"
-              data-size="sm"
-              aria-label="Remove {record.title} from the list"
-              title="Remove from the list (stops its agent)"
-              onclick={() => maviStore.forget(record.key)}
-            >
-              <Trash2 size={11} aria-hidden="true" />
-            </button>
+            <span class="mavi-thread-actions flex items-center">
+              <button
+                class="gp-icon-btn"
+                data-size="sm"
+                aria-label="Rename {record.title}"
+                title="Rename"
+                onclick={() => void startRename(record)}
+              >
+                <Pencil size={11} aria-hidden="true" />
+              </button>
+              <button
+                class="gp-icon-btn"
+                data-size="sm"
+                aria-label="Remove {record.title} from the list"
+                title="Remove from the list (ends its agent)"
+                onclick={() => void remove(record)}
+              >
+                <Trash2 size={11} aria-hidden="true" />
+              </button>
+            </span>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -102,7 +177,7 @@
     position: relative;
   }
   .mavi-thread-row {
-    padding: 6px 30px 6px 12px;
+    padding: 6px 52px 6px 12px;
   }
   .mavi-thread-row:hover,
   .mavi-thread-open .mavi-thread-row {
@@ -111,14 +186,14 @@
   .mavi-thread-open .mavi-thread-row {
     box-shadow: inset 2px 0 0 rgb(var(--c-accent));
   }
-  .mavi-thread-remove {
+  .mavi-thread-actions {
     position: absolute;
     right: 6px;
     top: 6px;
     opacity: 0;
   }
-  .mavi-thread:hover .mavi-thread-remove,
-  .mavi-thread-remove:focus-visible {
+  .mavi-thread:hover .mavi-thread-actions,
+  .mavi-thread-actions:focus-within {
     opacity: 1;
   }
   .mavi-dot {

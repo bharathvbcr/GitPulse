@@ -91,7 +91,7 @@
           </td>
         {/if}
         {#if columnVisible("parallel")}
-          <td class="px-3 py-2 align-top tabular-nums" title="One Mavi thread works in a worktree at a time">1</td>
+          <td class="px-3 py-2 align-top text-textMuted" title="Mavi runs one thread per worktree, so a thread never shares its checkout">—</td>
         {/if}
         {#if columnVisible("changes")}
           <td class="px-3 py-2 align-top tabular-nums" title="Files the agent edited with its own tools">

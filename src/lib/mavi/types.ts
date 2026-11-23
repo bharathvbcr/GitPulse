@@ -149,7 +149,13 @@ export interface ToolItem {
   patch: MaviHunk[] | null;
   /** Subagent tool calls name the tool call they belong to. */
   parentId: string | null;
-  approval: { requestId: string; state: ApprovalState; reason: string | null } | null;
+  approval: {
+    requestId: string;
+    state: ApprovalState;
+    reason: string | null;
+    /** Set when the host withheld the request's input (its size in bytes). */
+    hiddenBytes?: number;
+  } | null;
   /** Running in the background after its call returned. */
   background: boolean;
 }

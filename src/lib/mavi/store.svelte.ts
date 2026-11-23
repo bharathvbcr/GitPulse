@@ -7,7 +7,7 @@
  * summary (`mavi-status`), so the rail never has to replay a thread it is not
  * showing.
  */
-import { applyLine, emptyThread } from "./reduce";
+import { applyLine, continueInNewSession, emptyThread } from "./reduce";
 import { changedPaths } from "./files";
 import { maviClient, onMaviEvents, onMaviStatus, type MaviModeId, type StartRequest } from "./client";
 import {
@@ -50,6 +50,8 @@ class MaviStore {
   timelines = $state<Record<string, ThreadState>>({});
   /** Messages written while a turn runs, sent in order when it ends. */
   queues = $state<Record<string, string[]>>({});
+  /** Unsent composer text per thread, so switching threads never moves it. */
+  drafts = $state<Record<string, string>>({});
   openKey = $state<string | null>(null);
   /**
    * The Mavi view is on screen (mounted, and the window visible). Only then
@@ -64,25 +66,37 @@ class MaviStore {
   #buffer = new Map<string, MaviEntry[]>();
   #loading = new Set<string>();
   #flushing = new Set<string>();
+  #loads = new Map<string, Promise<void>>();
+  #init: Promise<void> | null = null;
 
-  /** Starts listening and reads what the host already runs. Idempotent. */
-  async init(): Promise<void> {
-    if (this.#started) return;
-    this.#started = true;
-    this.records = readThreadRecords(storage());
-    await onMaviEvents((id, entries) => this.#onEntries(id, entries));
-    await onMaviStatus((summary) => this.#onSummary(summary));
-    try {
-      const live = await maviClient.list();
-      const known = new Set(live.map((s) => s.id));
-      for (const record of this.records) {
-        if (record.sessionId && !known.has(record.sessionId)) record.sessionId = null;
-      }
-      for (const summary of live) this.#onSummary(summary);
-      this.#persist();
-    } catch {
-      for (const record of this.records) record.sessionId = null;
+  /**
+   * Starts listening and reads what the host already runs. Idempotent; a
+   * failed start can be tried again, and every caller sees its error.
+   */
+  init(): Promise<void> {
+    this.#init ??= this.#start().catch((error) => {
+      this.#init = null;
+      throw error;
+    });
+    return this.#init;
+  }
+
+  async #start(): Promise<void> {
+    if (!this.#started) {
+      this.records = readThreadRecords(storage());
+      await onMaviEvents((id, entries) => this.#onEntries(id, entries));
+      await onMaviStatus((summary) => this.#onSummary(summary));
+      this.#started = true;
     }
+    // When the host cannot be asked, sessions are left as they were: calling
+    // them "not running" would invite a second agent on a live conversation.
+    const live = await maviClient.list();
+    const known = new Set(live.map((s) => s.id));
+    for (const record of this.records) {
+      if (record.sessionId && !known.has(record.sessionId)) record.sessionId = null;
+    }
+    for (const summary of live) this.#onSummary(summary);
+    this.#persist();
   }
 
   recordFor(sessionId: string): ThreadRecord | undefined {
@@ -109,14 +123,37 @@ class MaviStore {
     this.summaries[summary.id] = summary;
     const record = this.recordFor(summary.id);
     if (record) {
-      record.lastActivityAt = Math.max(record.lastActivityAt, summary.last_activity_ms);
+      let changed = false;
+      if (summary.last_activity_ms > record.lastActivityAt) {
+        record.lastActivityAt = summary.last_activity_ms;
+        changed = true;
+      }
       if (summary.conversation_id && record.conversationId !== summary.conversation_id) {
         record.conversationId = summary.conversation_id;
+        changed = true;
       }
-      if (this.viewing && this.openKey === record.key) record.seenAt = Date.now();
-      this.#persist();
+      if (this.viewing && this.openKey === record.key) {
+        record.seenAt = Date.now();
+        changed = true;
+      }
+      // Status lines arrive often; storage is written only when a record moved.
+      if (changed) this.#persist();
       if (summary.phase === "idle" || summary.phase === "ready") void this.#flushQueue(record.key);
+      if (summary.phase === "ended") this.#returnQueue(record.key);
     }
+  }
+
+  /**
+   * The agent ended with messages still queued: they go back to the composer
+   * as a draft, where the person sees them, instead of being sent by surprise
+   * after a resume.
+   */
+  #returnQueue(key: string): void {
+    const queue = this.queues[key];
+    if (!queue?.length) return;
+    const draft = this.drafts[key]?.trim();
+    this.drafts[key] = [...queue, ...(draft ? [draft] : [])].join("\n\n");
+    delete this.queues[key];
   }
 
   #fileListeners = new Set<(record: ThreadRecord, path: string) => void>();
@@ -158,8 +195,10 @@ class MaviStore {
     this.openKey = key;
     const record = this.record(key);
     if (!record) return;
-    record.seenAt = Date.now();
-    this.#persist();
+    if (this.viewing) {
+      record.seenAt = Date.now();
+      this.#persist();
+    }
     if (this.timelines[key] || !record.sessionId) {
       if (!this.timelines[key]) this.timelines[key] = emptyThread();
       return;
@@ -167,17 +206,29 @@ class MaviStore {
     await this.#load(record);
   }
 
-  async #load(record: ThreadRecord): Promise<void> {
+  /** Replays a thread's session once at a time: a second caller joins the first. */
+  #load(record: ThreadRecord): Promise<void> {
+    const running = this.#loads.get(record.key);
+    if (running) return running;
+    const load = this.#replay(record).finally(() => this.#loads.delete(record.key));
+    this.#loads.set(record.key, load);
+    return load;
+  }
+
+  async #replay(record: ThreadRecord): Promise<void> {
     if (!record.sessionId) return;
     this.#loading.add(record.key);
     const timeline = this.timelines[record.key] ?? emptyThread();
     try {
       const replay = await maviClient.events(record.sessionId, timeline.lastSeq);
+      // Forgotten while the replay was on its way: nothing to fill.
+      if (!this.record(record.key)) return;
       this.timelines[record.key] = timeline;
       const live = this.timelines[record.key]!;
       for (const entry of replay.entries) applyLine(live, entry.line, entry.seq);
       this.#onSummary(replay.summary);
     } catch (error) {
+      if (!this.record(record.key)) return;
       this.timelines[record.key] = timeline;
       this.errors[record.key] = error instanceof Error ? error.message : String(error);
     } finally {
@@ -219,7 +270,15 @@ class MaviStore {
     this.openKey = record.key;
     // Anything the agent printed before the record existed (a startup hook).
     await this.#load(record);
-    await this.send(record.key, options.firstMessage);
+    try {
+      await this.send(record.key, options.firstMessage);
+    } catch (error) {
+      // The thread exists either way: a retry from the form would start a
+      // second agent (and, with a new worktree, a second worktree). The
+      // message waits in the thread's composer with the reason beside it.
+      this.drafts[record.key] = options.firstMessage;
+      this.errors[record.key] = error instanceof Error ? error.message : String(error);
+    }
     return record.key;
   }
 
@@ -245,10 +304,11 @@ class MaviStore {
       this.timelines[key] = emptyThread();
       await this.#load(record);
     } else {
-      const timeline = this.timelines[key] ?? emptyThread();
-      // Sequence numbers restart with the new host session.
-      timeline.lastSeq = 0;
-      timeline.ended = null;
+      if (!this.timelines[key]) this.timelines[key] = emptyThread();
+      const timeline = this.timelines[key]!;
+      // Sequence numbers, turns and cost restart with the new host session;
+      // this run's turns stay above it.
+      continueInNewSession(timeline);
       timeline.items.push({
         kind: "notice",
         id: `resume:${summary.id}`,
@@ -256,7 +316,8 @@ class MaviStore {
         tone: "info",
         text: "Started a new agent for this thread.",
       });
-      this.timelines[key] = timeline;
+      // What it printed before this record pointed at it (a startup hook).
+      await this.#load(record);
     }
     this.#persist();
   }
@@ -285,6 +346,7 @@ class MaviStore {
     );
     const now = Date.now();
     let record: ThreadRecord;
+    let key: string;
     if (existing) {
       // The conversation was a Mavi thread before it moved to the terminal.
       record = existing;
@@ -292,9 +354,11 @@ class MaviStore {
       record.mode = options.mode;
       record.movedToTerminalAt = null;
       record.lastActivityAt = now;
+      key = record.key;
     } else {
+      key = newKey();
       record = {
-        key: newKey(),
+        key,
         sessionId: summary.id,
         title: options.title?.trim() || "Continued from a terminal",
         target: summary.target,
@@ -309,16 +373,19 @@ class MaviStore {
       this.records = [record, ...this.records];
     }
     this.summaries[summary.id] = summary;
-    this.timelines[record.key] = emptyThread();
-    this.openKey = record.key;
-    await this.#load(record);
+    this.timelines[key] = emptyThread();
+    this.openKey = key;
+    await this.#load(this.record(key) ?? record);
     // A thread adopted under a placeholder title takes its first prompt's.
-    if (!existing && !options.title?.trim()) {
-      const first = this.timelines[record.key]?.items.find((i) => i.kind === "user");
-      if (first && first.kind === "user") record.title = titleFrom(first.text);
+    // Written through the store's own copy: a write to the object passed in
+    // would not reach the page.
+    const stored = this.record(key);
+    if (stored && !existing && !options.title?.trim()) {
+      const first = this.timelines[key]?.items.find((i) => i.kind === "user");
+      if (first && first.kind === "user") stored.title = titleFrom(first.text);
     }
     this.#persist();
-    return record.key;
+    return key;
   }
 
   /** Sends now when the agent is between turns, otherwise queues. */
@@ -350,7 +417,11 @@ class MaviStore {
       const text = queue.join("\n\n");
       this.queues[key] = [];
       await maviClient.send(record.sessionId, text);
+      delete this.errors[key];
     } catch (error) {
+      // Not sent (a turn the agent started itself, say): the messages go back
+      // to the front of the queue, ahead of anything written since.
+      this.queues[key] = [...queue, ...(this.queues[key] ?? [])];
       this.errors[key] = error instanceof Error ? error.message : String(error);
     } finally {
       this.#flushing.delete(key);
@@ -379,6 +450,10 @@ class MaviStore {
     this.records = this.records.filter((r) => r.key !== key);
     delete this.timelines[key];
     delete this.queues[key];
+    delete this.drafts[key];
+    delete this.errors[key];
+    this.#buffer.delete(key);
+    if (record?.sessionId) delete this.summaries[record.sessionId];
     if (this.openKey === key) this.openKey = null;
     this.#persist();
   }
@@ -387,8 +462,19 @@ class MaviStore {
   markMoved(key: string, moved: boolean): void {
     const record = this.record(key);
     if (!record) return;
+    if (!!record.movedToTerminalAt === moved) return;
     record.movedToTerminalAt = moved ? Date.now() : null;
     this.#persist();
+    // Said in the conversation too, so the agent's exit that follows reads
+    // as the hand-off it is, not as a failure.
+    const timeline = this.timelines[key];
+    timeline?.items.push({
+      kind: "notice",
+      id: `moved:${record.movedToTerminalAt ?? Date.now()}:${moved ? 1 : 0}`,
+      turn: timeline.turn,
+      tone: "info",
+      text: moved ? "Moved to a Claude Code tab in the terminal dock; the agent here ends." : "The move to the terminal did not happen; the conversation stays here.",
+    });
   }
 
   /** Waits until the host says the thread's agent has exited, up to `ms`. */

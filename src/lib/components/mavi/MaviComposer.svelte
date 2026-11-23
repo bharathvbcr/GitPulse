@@ -5,6 +5,9 @@
    * turn when the agent is free; nothing is pasted into a busy agent. Stop
    * interrupts the turn; Esc does too, but only from an empty composer, so
    * dismissing a menu never stops an agent.
+   *
+   * The text is the thread's draft, held by the store, so switching threads
+   * neither carries it to another thread nor loses it.
    */
   import { ArrowUp, Square, X, ShieldAlert } from "@lucide/svelte";
 
@@ -13,6 +16,8 @@
     working,
     queue,
     pendingApprovals,
+    draft = "",
+    onDraft,
     modeLabel,
     placeholder = "Ask for a change, or say what to look at",
     onSend,
@@ -23,7 +28,10 @@
     disabled?: boolean;
     working: boolean;
     queue: readonly string[];
+    /** Open requests not on screen now; the bar points at them. */
     pendingApprovals: number;
+    draft?: string;
+    onDraft?: (text: string) => void;
     modeLabel: string;
     placeholder?: string;
     onSend: (text: string) => Promise<void>;
@@ -32,7 +40,10 @@
     onReviewApproval: () => void;
   } = $props();
 
-  let text = $state("");
+  // Justified: the draft is read once; this composer is keyed by thread, so a
+  // new thread mounts a new composer with its own draft.
+  // svelte-ignore state_referenced_locally
+  let text = $state(draft);
   let error = $state<string | null>(null);
   let sending = $state(false);
   let field: HTMLTextAreaElement | undefined = $state();
@@ -51,7 +62,9 @@
     error = null;
     try {
       await onSend(value);
-      text = "";
+      // Only what was sent is cleared: words typed while it went stay.
+      if (text.trim() === value) text = "";
+      onDraft?.(text);
       queueMicrotask(fit);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -70,7 +83,8 @@
   }
 
   function onKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    // keyCode 229 is the Enter that confirms an IME composition in WebKit.
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
       event.preventDefault();
       void send();
     } else if (event.key === "Escape" && working && !text) {
@@ -118,7 +132,10 @@
         aria-label="Message to the agent"
         {disabled}
         onkeydown={onKeydown}
-        oninput={fit}
+        oninput={() => {
+          fit();
+          onDraft?.(text);
+        }}
       ></textarea>
       <div class="flex items-center gap-2">
         <span class="gp-chip" data-kind="label" title="Permission mode, chosen when the thread started">{modeLabel}</span>

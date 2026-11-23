@@ -180,15 +180,36 @@ impl Pending {
 
     /// The `control_response` line for an answer. The request is then closed.
     /// An unknown id is an error, never a guess.
+    #[cfg(test)]
     pub(crate) fn answer(
         &mut self,
         request_id: &str,
         decision: Decision,
         message: Option<&str>,
     ) -> Result<String, String> {
-        let Some(input) = self.open.remove(request_id) else {
+        let Some(input) = self.take(request_id) else {
             return Err("That request is no longer waiting for an answer.".into());
         };
+        Ok(Self::response(request_id, &input, decision, message))
+    }
+
+    /// Closes a request, returning the input the agent sent with it.
+    pub(crate) fn take(&mut self, request_id: &str) -> Option<Value> {
+        self.open.remove(request_id)
+    }
+
+    /// Reopens a request whose answer could not be delivered.
+    pub(crate) fn restore(&mut self, request_id: &str, input: Value) {
+        self.open.insert(request_id.to_owned(), input);
+    }
+
+    /// The `control_response` line answering `request_id`.
+    pub(crate) fn response(
+        request_id: &str,
+        input: &Value,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> String {
         let response = match decision {
             Decision::Allow => json!({"behavior":"allow","updatedInput":input}),
             Decision::Deny => {
@@ -200,11 +221,11 @@ impl Pending {
                 json!({"behavior":"deny","message":text})
             }
         };
-        Ok(json!({
+        json!({
             "type":"control_response",
             "response":{"subtype":"success","request_id":request_id,"response":response}
         })
-        .to_string())
+        .to_string()
     }
 }
 
@@ -328,6 +349,25 @@ pub(crate) struct Prepared {
     /// so a page that replays sees every finished block once.
     pub keep: bool,
     pub value: Option<Value>,
+    /// For a permission request only: the line as the agent sent it, before
+    /// slimming and redaction. Its input is what an Allow echoes back, so the
+    /// tool runs exactly what the agent asked for, never a page copy with a
+    /// `[REDACTED]` marker or a trimmed body in it.
+    pub raw: Option<Value>,
+}
+
+/// The page copy of a permission request whose input is too large or could
+/// not be redacted cleanly: everything but the input, which is described.
+/// The request stays answerable; the host keeps the real input.
+fn request_without_input(value: &Value, why: &str, bytes: usize) -> String {
+    let mut copy = value.clone();
+    if let Some(request) = copy.get_mut("request").and_then(Value::as_object_mut) {
+        request.insert(
+            "input".into(),
+            json!({"mavi_input_hidden": why, "bytes": bytes}),
+        );
+    }
+    dc_redact::redact_secrets(&copy.to_string())
 }
 
 /// Classifies, slims and redacts one line. Credential shapes are redacted with
@@ -338,11 +378,13 @@ pub(crate) struct Prepared {
 pub(crate) fn prepare(line: String) -> Prepared {
     let (signal, value) = classify(&line);
     let Some(mut value) = value else {
+        // Plain text (a banner, a hook's output) is redacted like the rest.
         return Prepared {
             signal,
-            text: capped(line),
+            text: capped(dc_redact::redact_secrets(&line)),
             keep: true,
             value: None,
+            raw: None,
         };
     };
     if value.get("type").and_then(Value::as_str) == Some("stream_event") {
@@ -351,17 +393,42 @@ pub(crate) fn prepare(line: String) -> Prepared {
             text: capped(line),
             keep: false,
             value: Some(value),
+            raw: None,
         };
     }
+    let raw = matches!(signal, Signal::PermissionRequest { .. }).then(|| value.clone());
     slim(&mut value);
     let text = value.to_string();
+    if raw.is_some() && text.len() > MAX_LINE_BYTES {
+        let page = request_without_input(&value, "too_large", text.len());
+        let value = serde_json::from_str(&page).ok();
+        return Prepared {
+            signal,
+            text: page,
+            keep: true,
+            value,
+            raw,
+        };
+    }
     let redacted = dc_redact::redact_secrets(&text);
     let (text, value) = if redacted == text {
         (text, value)
     } else {
         match serde_json::from_str::<Value>(&redacted) {
             Ok(clean) => (redacted, clean),
-            // A redaction that broke the JSON is never passed on raw.
+            // A redaction that broke the JSON is never passed on raw. A
+            // permission request keeps its id, so it can still be answered.
+            Err(_) if raw.is_some() => {
+                let page = request_without_input(&value, "redacted", text.len());
+                let value = serde_json::from_str(&page).ok();
+                return Prepared {
+                    signal,
+                    text: page,
+                    keep: true,
+                    value,
+                    raw,
+                };
+            }
             Err(_) => {
                 let marker =
                     synthetic("mavi_redacted", json!({"original_type": value.get("type")}));
@@ -371,6 +438,7 @@ pub(crate) fn prepare(line: String) -> Prepared {
                     text: marker,
                     keep: true,
                     value: parsed,
+                    raw: None,
                 };
             }
         }
@@ -380,6 +448,7 @@ pub(crate) fn prepare(line: String) -> Prepared {
         text: capped(text),
         keep: true,
         value: Some(value),
+        raw,
     }
 }
 
@@ -555,5 +624,26 @@ mod tests {
         let out = prepare(line);
         assert!(!out.text.contains(&token), "{}", out.text);
         assert!(out.value.is_some());
+    }
+
+    #[test]
+    fn an_oversized_request_stays_answerable_and_allow_echoes_the_real_input() {
+        let body = "x".repeat(MAX_LINE_BYTES + 10);
+        let line = json!({"type":"control_request","request_id":"r-big","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a","content":body}}}).to_string();
+        let out = prepare(line);
+        let page: Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(page["request_id"], "r-big");
+        assert_eq!(page["request"]["input"]["mavi_input_hidden"], "too_large");
+        let raw = out.raw.expect("raw request kept for the answer");
+        let mut pending = Pending::default();
+        assert!(pending.record("r-big", &raw));
+        let answer: Value =
+            serde_json::from_str(&pending.answer("r-big", Decision::Allow, None).unwrap()).unwrap();
+        assert_eq!(
+            answer["response"]["response"]["updatedInput"]["content"]
+                .as_str()
+                .map(str::len),
+            Some(MAX_LINE_BYTES + 10)
+        );
     }
 }

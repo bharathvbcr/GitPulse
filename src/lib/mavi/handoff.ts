@@ -100,6 +100,15 @@ export async function continueInTerminal(key: string): Promise<HandoffResult> {
   }
   const holder = terminalHolding(conversationId);
   if (holder) {
+    // Both sides must never run it: a Mavi agent still on it ends first.
+    const live = maviStore.summaryOf(record);
+    if (live && live.phase !== "ended") {
+      await maviStore.stop(key);
+      if (!(await maviStore.waitForEnd(key))) {
+        return { ok: false, reason: "The Mavi agent did not stop in time. Nothing was moved." };
+      }
+    }
+    maviStore.markMoved(key, true);
     await focusTerminalSession(holder);
     return { ok: true, note: "This conversation was already open in a terminal tab; showing it." };
   }
@@ -109,11 +118,15 @@ export async function continueInTerminal(key: string): Promise<HandoffResult> {
   const tabPath = await openTab(root);
   if (!tabPath) return { ok: false, reason: "Couldn't open this repository as a tab. Nothing was moved." };
 
-  // From here the Mavi side ends first, then the terminal starts.
+  // From here the Mavi side ends first, then the terminal starts. The thread
+  // reads as moved for the whole launch, so its Resume is not offered while
+  // the tab starts; a failed launch takes that back.
+  maviStore.markMoved(key, true);
   const summary = maviStore.summaryOf(record);
   if (summary && summary.phase !== "ended") {
     await maviStore.stop(key);
     if (!(await maviStore.waitForEnd(key))) {
+      maviStore.markMoved(key, false);
       return { ok: false, reason: "The Mavi agent did not stop in time. Nothing was moved." };
     }
   }
@@ -126,10 +139,10 @@ export async function continueInTerminal(key: string): Promise<HandoffResult> {
     repoStore.setTerminalOpen(true);
     await launched;
   } catch (error) {
+    maviStore.markMoved(key, false);
     const why = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: `Couldn't start it in the terminal: ${why} The conversation is intact; resume it here.` };
   }
-  maviStore.markMoved(key, true);
   return { ok: true };
 }
 
@@ -262,7 +275,11 @@ export async function continueInMavi(
     return { ok: false, reason: `Couldn't end the terminal session: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (!(await waitForTabEnd(tabKey, found.conversationId))) {
-    return { ok: false, reason: "The terminal session did not end in time. Nothing was moved; try again." };
+    return {
+      ok: false,
+      reason:
+        "The terminal session was asked to end but has not yet. Once its tab closes, resume the conversation from the tab's history or start it again here.",
+    };
   }
   try {
     const key = await maviStore.adopt({

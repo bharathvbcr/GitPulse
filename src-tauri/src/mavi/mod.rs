@@ -64,6 +64,24 @@ const CLAUDE_STRUCTURED: [&str; 9] = [
 pub struct MaviState {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     counter: Arc<AtomicU64>,
+    /// Worktrees and conversations a start in progress has claimed, so two
+    /// quick starts (a double click) cannot both pass the checks.
+    starting: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Releases a start's claims however the start ends.
+struct Claim {
+    set: Arc<Mutex<std::collections::HashSet<String>>>,
+    keys: Vec<String>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        for key in &self.keys {
+            set.remove(key);
+        }
+    }
 }
 
 impl MaviState {
@@ -86,10 +104,24 @@ impl MaviState {
     }
 }
 
-/// Stops every agent. Called when the app exits, so no agent outlives it.
+/// Stops every agent. Called when the app exits, so no agent outlives it:
+/// the grace period is waited here (a detached thread would not outlive the
+/// app), then whatever is left is killed.
 pub fn stop_all(state: &MaviState) {
-    for session in state.all() {
+    let live: Vec<Arc<Session>> = state
+        .all()
+        .into_iter()
+        .filter(|s| !s.has_exited())
+        .collect();
+    for session in &live {
         session.stop();
+    }
+    let deadline = std::time::Instant::now() + session::STOP_GRACE;
+    while std::time::Instant::now() < deadline && live.iter().any(|s| !s.has_exited()) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for session in &live {
+        session.kill_now();
     }
 }
 
@@ -214,14 +246,6 @@ fn start(
             let root = worktree_root(repo)?;
             crate::repository_trust::require(&root)?;
             let root_text = root.to_string_lossy().into_owned();
-            let busy = state.all().into_iter().any(|s| {
-                s.is_live() && matches!(&s.target, MaviTarget::Local { root } if *root == root_text)
-            });
-            if busy {
-                return Err(CommandError::plain(
-                    "A Mavi thread is already working in this worktree. Stop it, or start this one in another worktree.",
-                ));
-            }
             let (program, path) = resolve("claude")?;
             let mut command = command_for(&program, path);
             command.args(&args).current_dir(&root);
@@ -259,22 +283,52 @@ fn start(
             ))
         }
     };
-    {
+    let resume_id = request
+        .resume
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let mut keys = Vec::new();
+    if let MaviTarget::Local { root } = &target {
+        keys.push(format!("root:{root}"));
+    }
+    if let Some(id) = &resume_id {
+        keys.push(format!("conv:{id}"));
+    }
+    // The checks and the claim happen under one lock, and the claim is held
+    // until the session is registered, so two quick starts cannot both pass.
+    let _claim = {
         let sessions = state.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let mut starting = state.starting.lock().unwrap_or_else(|p| p.into_inner());
+        if keys.iter().any(|key| starting.contains(key)) {
+            return Err(CommandError::plain(
+                "A thread is already starting for this worktree or conversation.",
+            ));
+        }
+        if let MaviTarget::Local { root } = &target {
+            let busy = sessions.values().any(|s| {
+                s.is_live()
+                    && matches!(&s.target, MaviTarget::Local { root: other } if other == root)
+            });
+            if busy {
+                return Err(CommandError::plain(
+                    "A Mavi thread is already working in this worktree. Stop it, or start this one in another worktree.",
+                ));
+            }
+        }
         // One process per conversation: two would append to one transcript.
-        if let Some(resume) = request
-            .resume
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        // A session that has not printed its `init` yet is matched by the id
+        // it was started to resume.
+        if let Some(resume) = &resume_id {
             let open_here = sessions.values().any(|s| {
                 let summary = s.summary();
                 summary.phase != session::MaviPhase::Ended
-                    && summary
+                    && (summary
                         .conversation_id
                         .as_deref()
                         .is_some_and(|id| id.eq_ignore_ascii_case(resume))
+                        || s.resumed.as_deref() == Some(resume.as_str()))
             });
             if open_here {
                 return Err(CommandError::plain(
@@ -282,19 +336,27 @@ fn start(
                 ));
             }
         }
-        if sessions.values().filter(|s| s.is_live()).count() >= MAX_LIVE {
+        if sessions.values().filter(|s| s.is_live()).count() + starting.len() >= MAX_LIVE {
             return Err(CommandError::plain(format!(
                 "{MAX_LIVE} Mavi threads are already running. Stop one first."
             )));
         }
-    }
+        for key in &keys {
+            starting.insert(key.clone());
+        }
+        Claim {
+            set: Arc::clone(&state.starting),
+            keys,
+        }
+    };
     let id = format!(
         "mavi-{}-{}",
         session::now_ms(),
         state.counter.fetch_add(1, Ordering::Relaxed)
     );
     let model = request.model.clone().filter(|m| !m.trim().is_empty());
-    let history = earlier_turns(&request, &target)?;
+    let mut history = earlier_turns(&request, &target)?;
+    history.resumed = resume_id;
     let session = Session::spawn(
         id.clone(),
         target,
@@ -504,7 +566,9 @@ pub async fn cmd_mavi_file_diff(
                 Ok(MaviFileDiff { patch, truncated })
             }
             MaviTarget::Ssh { host, dir } => {
-                if !worktree::safe_relative(&path) && !path.starts_with('/') {
+                // Relative to the thread's directory only: an absolute path
+                // would let a diff request read any file on the host.
+                if !worktree::safe_relative(&path) {
                     return Err(CommandError::plain(
                         "That path is not inside the remote directory.",
                     ));
@@ -516,13 +580,18 @@ pub async fn cmd_mavi_file_diff(
                 let args = ssh::ssh_args(host, &ssh::remote_diff_command(dir, &path));
                 let refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let _ = env_path;
-                let (_, bytes, truncated) = worktree::run_capped(
+                let (ok, bytes, truncated) = worktree::run_capped(
                     &program,
                     &refs,
                     Path::new("/"),
                     Duration::from_secs(30),
                     worktree::MAX_DIFF_BYTES,
                 )?;
+                if !ok && bytes.is_empty() {
+                    return Err(CommandError::plain(
+                        "Couldn't read that file's diff from the host.",
+                    ));
+                }
                 let patch = dc_redact::redact_secrets(&String::from_utf8_lossy(&bytes));
                 Ok(MaviFileDiff { patch, truncated })
             }

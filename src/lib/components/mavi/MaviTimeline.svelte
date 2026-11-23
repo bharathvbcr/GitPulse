@@ -3,8 +3,8 @@
    * The conversation. Follows new output while the reader is at the bottom,
    * and lets go the moment they scroll up: streaming text must never drag a
    * reader away from what they are reading. A "Latest" pill brings them
-   * back. Scrolls this component makes are fenced so they are not mistaken
-   * for the reader's.
+   * back. A smooth jump to the latest line is not mistaken for the reader
+   * scrolling up while it is under way.
    *
    * Assistant prose streams as plain text and is rendered as Markdown once
    * its block is complete: rendering crosses IPC, and doing it per delta
@@ -16,7 +16,7 @@
   import MaviToolGroup from "./MaviToolGroup.svelte";
   import MaviApproval from "./MaviApproval.svelte";
   import { toRows } from "../../mavi/rows";
-  import { turnTotals } from "../../mavi/changes";
+  import { allTurnTotals } from "../../mavi/changes";
   import type { ThreadState, TurnEndItem } from "../../mavi/types";
 
   let {
@@ -37,9 +37,12 @@
 
   let scroller: HTMLDivElement | undefined = $state();
   let pinned = $state(true);
-  let fence = 0;
+  /** A smooth scroll to the bottom is under way; its steps are not the reader's. */
+  let jumping = false;
 
   let rows = $derived(toRows(thread.items, root));
+  /** Every turn's footer totals, in one pass. */
+  let totals = $derived(allTurnTotals(thread, root));
   /** Changes whenever the visible tail grows: a new row or more streamed text. */
   let tailKey = $derived.by(() => {
     const last = thread.items[thread.items.length - 1];
@@ -53,10 +56,12 @@
 
   function onScroll() {
     if (!scroller) return;
-    if (fence > 0) {
-      fence -= 1;
+    if (jumping) {
+      if (atBottom(scroller)) jumping = false;
       return;
     }
+    // Scrolls this component makes land at the bottom, so they read as
+    // pinned; any other position is the reader's, however they got there.
     pinned = atBottom(scroller);
   }
 
@@ -64,12 +69,14 @@
     // Any upward intent releases at once, before the scroll event lands.
     if (event instanceof WheelEvent && event.deltaY < 0) pinned = false;
     if (event instanceof KeyboardEvent && ["PageUp", "ArrowUp", "Home"].includes(event.key)) pinned = false;
+    // A grab of the scrollbar or a touch ends a jump that is under way.
+    if (event instanceof PointerEvent) jumping = false;
   }
 
   async function toBottom(smooth = false) {
     await tick();
     if (!scroller) return;
-    fence += 1;
+    if (smooth) jumping = true;
     scroller.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? "smooth" : "auto" });
   }
 
@@ -121,6 +128,7 @@
     onscroll={onScroll}
     onwheel={onUserIntent}
     onkeydown={onUserIntent}
+    onpointerdown={onUserIntent}
     role="log"
     aria-live="off"
     aria-label="Conversation"
@@ -185,7 +193,7 @@
           </div>
         {:else if row.item.kind === "turn_end"}
           {@const end = row.item}
-          {@const totals = turnTotals(thread, root, end.turn)}
+          {@const turnTotal = totals.get(end.turn)}
           {@const files = thread.turnFiles[end.turn]}
           <div class="mavi-row mavi-turn-end flex flex-wrap items-center gap-2 text-meta text-textMuted">
             {#if end.interrupted}
@@ -198,11 +206,11 @@
             <span>{endLabel(end)}</span>
             {#if end.durationMs !== null}<span>· {formatDuration(end.durationMs)}</span>{/if}
             {#if end.costUsd !== null && end.costUsd > 0}<span>· ${end.costUsd.toFixed(2)}</span>{/if}
-            {#if totals.files > 0}
+            {#if turnTotal && turnTotal.files > 0}
               <button class="gp-chip" data-tone="accent" onclick={() => onShowTurn(end.turn)} title="Review what this turn changed">
-                {totals.files} {totals.files === 1 ? "file" : "files"}
-                <span class="text-ok">+{totals.added}</span>
-                <span class="text-danger">−{totals.removed}</span>
+                {turnTotal.files} {turnTotal.files === 1 ? "file" : "files"}
+                {#if turnTotal.added > 0}<span class="text-ok">+{turnTotal.added}</span>{/if}
+                {#if turnTotal.removed > 0}<span class="text-danger">−{turnTotal.removed}</span>{/if}
               </button>
             {:else if files && !files.available}
               <span>· changes outside edit tools not tracked</span>

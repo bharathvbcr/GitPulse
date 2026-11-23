@@ -149,6 +149,14 @@ export type ChangeScope = { readonly kind: "turn"; readonly turn: number } | { r
  * other moved paths (alphabetical). Denied and failed edits are listed so a
  * refused change is visible, but they do not count toward +/−.
  */
+/**
+ * Whether an edit's lines count toward +/−: only what was or is being
+ * written. A proposed edit waits for an answer, so it has changed nothing.
+ */
+function counts(edit: ChangeEdit): boolean {
+  return edit.state === "applied" || edit.state === "applying";
+}
+
 export function collectChanges(state: ThreadState, root: string | null, scope: ChangeScope): FileChange[] {
   const inScope = (turn: number) => scope.kind === "thread" || turn === scope.turn;
   const byPath = new Map<string, { edits: ChangeEdit[]; turns: Set<number> }>();
@@ -170,7 +178,7 @@ export function collectChanges(state: ThreadState, root: string | null, scope: C
     for (const moved of files.moved) codes.set(moved.path, moved.code);
   }
   for (const [path, entry] of byPath) {
-    const counted = entry.edits.filter((e) => e.state !== "denied" && e.state !== "failed" && e.state !== "not_applied");
+    const counted = entry.edits.filter(counts);
     const { added, removed } = countLines(counted.flatMap((e) => e.hunks));
     out.push({
       path,
@@ -217,14 +225,63 @@ export function changedTurns(state: ThreadState): number[] {
   return [...turns].sort((a, b) => b - a);
 }
 
+export interface TurnTotals {
+  files: number;
+  added: number;
+  removed: number;
+}
+
 /** Totals for a turn's footer chip. */
-export function turnTotals(state: ThreadState, root: string | null, turn: number): { files: number; added: number; removed: number } {
-  const changes = collectChanges(state, root, { kind: "turn", turn });
-  return {
-    files: changes.length,
-    added: changes.reduce((n, c) => n + c.added, 0),
-    removed: changes.reduce((n, c) => n + c.removed, 0),
+export function turnTotals(state: ThreadState, root: string | null, turn: number): TurnTotals {
+  return allTurnTotals(state, root).get(turn) ?? { files: 0, added: 0, removed: 0 };
+}
+
+/**
+ * Every turn's footer totals in one pass over the thread, instead of one
+ * pass per turn. A file counts once it was written (or moved outside the
+ * edit tools); one only proposed, refused or failed does not.
+ */
+export function allTurnTotals(state: ThreadState, root: string | null): Map<number, TurnTotals> {
+  const files = new Map<number, Set<string>>();
+  const totals = new Map<number, TurnTotals>();
+  const of = (turn: number) => {
+    let t = totals.get(turn);
+    if (!t) {
+      t = { files: 0, added: 0, removed: 0 };
+      totals.set(turn, t);
+      files.set(turn, new Set());
+    }
+    return t;
   };
+  for (const item of state.items) {
+    if (item.kind !== "tool") continue;
+    const edit = editOf(item);
+    const path = edit && toolPath(item);
+    if (!edit || !path || !counts(edit)) continue;
+    const t = of(item.turn);
+    files.get(item.turn)!.add(shortPath(path, root));
+    const { added, removed } = countLines(edit.hunks);
+    t.added += added;
+    t.removed += removed;
+  }
+  for (const [turnText, moved] of Object.entries(state.turnFiles)) {
+    const turn = Number(turnText);
+    if (!moved.moved.length) continue;
+    of(turn);
+    for (const m of moved.moved) files.get(turn)!.add(m.path);
+  }
+  for (const [turn, set] of files) totals.get(turn)!.files = set.size;
+  return totals;
+}
+
+/** Whether the thread changed any file; stops at the first. */
+export function hasAnyChange(state: ThreadState): boolean {
+  for (const files of Object.values(state.turnFiles)) if (files.moved.length) return true;
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const item = state.items[i]!;
+    if (item.kind === "tool" && isEditTool(item.name) && toolPath(item)) return true;
+  }
+  return false;
 }
 
 /** A porcelain code as a word. */

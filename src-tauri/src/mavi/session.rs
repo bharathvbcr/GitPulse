@@ -43,7 +43,12 @@ const MAX_READ_LINE: usize = 32 * 1024 * 1024;
 const MAX_STDERR_LINES: usize = 200;
 const MAX_TOUCHED: usize = 500;
 /// How long a stopped agent gets to exit before its process group is killed.
-const STOP_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(3);
+/// The longest a new turn waits for the previous turn's closing fingerprint.
+const FINISH_WAIT: Duration = Duration::from_secs(25);
+/// How long the exit waits for the output pipes to drain after the process
+/// has been reaped.
+const READER_DRAIN: Duration = Duration::from_millis(1500);
 
 /// Something that delivers an event to the page. Tauri's `emit` in the app; a
 /// collector in tests.
@@ -126,6 +131,9 @@ struct Core {
     exit_ok: bool,
     /// An interrupt was sent during the running turn.
     interrupting: bool,
+    /// The turn-end fingerprint is being taken; a new turn waits for it, so
+    /// none of its edits are counted in the turn that just ended.
+    finishing: bool,
     last_turn: Option<String>,
 }
 
@@ -136,6 +144,13 @@ pub(crate) struct Session {
     pub model: Option<String>,
     pub started_at_ms: u64,
     pid: u32,
+    /// Set once the process has been reaped: after that its pid (and so its
+    /// process group id) can belong to someone else, and is never signalled.
+    exited: Arc<std::sync::atomic::AtomicBool>,
+    /// The conversation this session was started to resume, for the
+    /// one-process-per-conversation check before its `init` line arrives.
+    pub resumed: Option<String>,
+    events: Mutex<Option<mpsc::Sender<Msg>>>,
     stdin: Mutex<Option<mpsc::Sender<String>>>,
     core: Mutex<Core>,
     emit: Emit,
@@ -144,6 +159,9 @@ pub(crate) struct Session {
 enum Msg {
     Line(String),
     Stderr(String),
+    /// A host line (`mavi_*`), sent through the processor so its sequence
+    /// number is never ahead of lines still waiting in a batch.
+    Note(String),
     /// How the process ended, and whether it exited with code 0.
     Exit((String, bool)),
 }
@@ -166,6 +184,7 @@ impl Session {
         emit: Emit,
         history: super::history::History,
     ) -> Result<Arc<Session>, String> {
+        let resumed = history.resumed.clone();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -192,6 +211,9 @@ impl Session {
             model,
             started_at_ms: now,
             pid: child.id(),
+            exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resumed,
+            events: Mutex::new(None),
             stdin: Mutex::new(Some(stdin_tx)),
             core: Mutex::new(Core {
                 ring: VecDeque::new(),
@@ -212,6 +234,7 @@ impl Session {
                 stopped: false,
                 exit_ok: false,
                 interrupting: false,
+                finishing: false,
                 last_turn: None,
             }),
             emit,
@@ -244,32 +267,62 @@ impl Session {
             .map_err(|e| e.to_string())?;
 
         let (tx, rx) = mpsc::channel::<Msg>();
-        // Stdout, then the exit.
+        *session.events.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx.clone());
+        // Each reader says when its pipe has closed, so the exit is sent after
+        // the last stdout and stderr lines (the stderr tail is usually the
+        // reason a process failed).
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let out_tx = tx.clone();
+        let out_done = done_tx.clone();
         std::thread::Builder::new()
             .name("mavi-stdout".into())
             .spawn(move || {
                 read_lines(stdout, |line| {
                     let _ = out_tx.send(Msg::Line(line));
                 });
-                let exit = match child.wait() {
-                    Ok(status) => (describe_exit(status), status.success()),
-                    Err(e) => (format!("could not be waited on: {e}"), false),
-                };
-                let _ = out_tx.send(Msg::Exit(exit));
+                let _ = out_done.send(());
             })
             .map_err(|e| e.to_string())?;
-        if let Some(stderr) = stderr {
+        let readers = if let Some(stderr) = stderr {
             let err_tx = tx.clone();
+            let err_done = done_tx.clone();
             std::thread::Builder::new()
                 .name("mavi-stderr".into())
                 .spawn(move || {
                     read_lines(stderr, |line| {
                         let _ = err_tx.send(Msg::Stderr(line));
-                    })
+                    });
+                    let _ = err_done.send(());
                 })
                 .map_err(|e| e.to_string())?;
-        }
+            2
+        } else {
+            1
+        };
+        drop(done_tx);
+        // The waiter reaps the process itself rather than after stdout ends:
+        // a grandchild that inherited stdout and outlives the agent would
+        // otherwise keep the session "live" forever.
+        let wait_tx = tx.clone();
+        let exited = Arc::clone(&session.exited);
+        std::thread::Builder::new()
+            .name("mavi-wait".into())
+            .spawn(move || {
+                let exit = match child.wait() {
+                    Ok(status) => (describe_exit(status), status.success()),
+                    Err(e) => (format!("could not be waited on: {e}"), false),
+                };
+                exited.store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + READER_DRAIN;
+                for _ in 0..readers {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if done_rx.recv_timeout(left).is_err() {
+                        break;
+                    }
+                }
+                let _ = wait_tx.send(Msg::Exit(exit));
+            })
+            .map_err(|e| e.to_string())?;
         drop(tx);
         let processor = Arc::clone(&session);
         std::thread::Builder::new()
@@ -353,15 +406,30 @@ impl Session {
         );
     }
 
-    /// Adds a host line (a `mavi_*` marker) and emits it at once.
-    fn note(&self, kind: &str, fields: Value) -> u64 {
+    /// Adds a host line (a `mavi_*` marker). It goes through the processor,
+    /// so it is numbered and emitted after every agent line received before
+    /// it; once the processor has stopped (after the exit) it is pushed and
+    /// emitted here.
+    fn note(&self, kind: &str, fields: Value) {
+        let line = wire::synthetic(kind, fields);
+        let sender = self
+            .events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let line = match sender {
+            Some(tx) => match tx.send(Msg::Note(line)) {
+                Ok(()) => return,
+                Err(mpsc::SendError(Msg::Note(line))) => line,
+                Err(_) => return,
+            },
+            None => line,
+        };
         let entry = {
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            Self::push(&mut core, wire::synthetic(kind, fields), true)
+            Self::push(&mut core, line, true)
         };
-        let seq = entry.seq;
         self.emit_entries(vec![entry]);
-        seq
     }
 
     fn write(&self, line: String) -> Result<(), String> {
@@ -378,17 +446,25 @@ impl Session {
     /// it describes the worktree before the agent could touch it.
     pub(crate) fn send(&self, text: &str) -> Result<u64, String> {
         let line = wire::user_message(text)?;
-        {
+        let started = std::time::Instant::now();
+        loop {
             let core = self.core.lock().unwrap_or_else(|p| p.into_inner());
             match core.phase {
                 MaviPhase::Ended => {
                     return Err("The agent has ended. Start or resume the thread.".into())
                 }
                 MaviPhase::Working | MaviPhase::Approval => {
-                    return Err("A turn is still running. The message waits in the queue.".into())
+                    return Err("A turn is still running; send this when it ends.".into())
                 }
                 MaviPhase::Ready | MaviPhase::Idle => {}
             }
+            // The last turn's closing fingerprint first, so this turn's edits
+            // are never counted in it.
+            if !core.finishing || started.elapsed() > FINISH_WAIT {
+                break;
+            }
+            drop(core);
+            std::thread::sleep(Duration::from_millis(50));
         }
         let (baseline, baseline_note) = match &self.target {
             MaviTarget::Local { root } => match worktree::fingerprint(&PathBuf::from(root)) {
@@ -400,7 +476,7 @@ impl Session {
             },
             MaviTarget::Ssh { .. } => (None, Some("remote")),
         };
-        let entry = {
+        let turn = {
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(
                 core.phase,
@@ -411,28 +487,27 @@ impl Session {
             core.turns += 1;
             core.phase = MaviPhase::Working;
             core.baseline = baseline;
+            core.interrupting = false;
             core.last_activity_ms = now_ms();
-            let turn = core.turns;
-            Self::push(
-                &mut core,
-                wire::synthetic(
-                    "mavi_user",
-                    json!({"text": text.trim_end(), "turn": turn, "at": now_ms(), "baseline": baseline_note}),
-                ),
-                true,
-            )
+            core.turns
         };
-        let seq = entry.seq;
-        self.emit_entries(vec![entry]);
+        self.note(
+            "mavi_user",
+            json!({"text": text.trim_end(), "turn": turn, "at": now_ms(), "baseline": baseline_note}),
+        );
         if let Err(e) = self.write(line) {
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            core.phase = MaviPhase::Idle;
+            // Only a turn this call started goes back to idle; an exit that
+            // landed meanwhile stays ended.
+            if core.phase == MaviPhase::Working {
+                core.phase = MaviPhase::Idle;
+            }
             drop(core);
             self.emit_status();
             return Err(e);
         }
         self.emit_status();
-        Ok(seq)
+        Ok(u64::from(turn))
     }
 
     /// Answers one open permission request.
@@ -442,15 +517,27 @@ impl Session {
         decision: wire::Decision,
         message: Option<&str>,
     ) -> Result<(), String> {
-        let line = {
+        let (line, input) = {
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            let line = core.pending.answer(request_id, decision, message)?;
+            let input = core
+                .pending
+                .take(request_id)
+                .ok_or("That request is no longer waiting for an answer.")?;
+            let line = wire::Pending::response(request_id, &input, decision, message);
             if core.pending.len() == 0 && core.phase == MaviPhase::Approval {
                 core.phase = MaviPhase::Working;
             }
-            line
+            (line, input)
         };
-        self.write(line)?;
+        if let Err(e) = self.write(line) {
+            // Not delivered: the request is still open, and still answerable.
+            let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+            core.pending.restore(request_id, input);
+            if core.phase == MaviPhase::Working {
+                core.phase = MaviPhase::Approval;
+            }
+            return Err(e);
+        }
         let decision = match decision {
             wire::Decision::Allow => "allow",
             wire::Decision::Deny => "deny",
@@ -476,7 +563,13 @@ impl Session {
             core.pending.clear();
             format!("mavi-interrupt-{}", core.interrupts)
         };
-        self.write(wire::interrupt(&request_id))?;
+        if let Err(e) = self.write(wire::interrupt(&request_id)) {
+            self.core
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupting = false;
+            return Err(e);
+        }
         self.note("mavi_interrupt", json!({"request_id": request_id}));
         Ok(())
     }
@@ -484,16 +577,36 @@ impl Session {
     /// Ends the agent: closes its input, then terminates its process group,
     /// then kills it if it is still there after [`STOP_GRACE`].
     pub(crate) fn stop(&self) {
-        self.core.lock().unwrap_or_else(|p| p.into_inner()).stopped = true;
         self.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
+        // A reaped pid may already name another process group.
+        if self.has_exited() {
+            return;
+        }
+        self.core.lock().unwrap_or_else(|p| p.into_inner()).stopped = true;
         terminate_group(self.pid, false);
         let pid = self.pid;
+        let exited = Arc::clone(&self.exited);
         let _ = std::thread::Builder::new()
             .name("mavi-stop".into())
             .spawn(move || {
                 std::thread::sleep(STOP_GRACE);
-                terminate_group(pid, true);
+                if !exited.load(std::sync::atomic::Ordering::SeqCst) {
+                    terminate_group(pid, true);
+                }
             });
+    }
+
+    /// Whether the process has been reaped.
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exited.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Kills the process group now, unless the process has been reaped. For
+    /// the app's exit, which cannot wait for [`Session::stop`]'s grace thread.
+    pub(crate) fn kill_now(&self) {
+        if !self.has_exited() {
+            terminate_group(self.pid, true);
+        }
     }
 
     fn process(self: Arc<Self>, rx: mpsc::Receiver<Msg>) {
@@ -510,13 +623,24 @@ impl Session {
             let window_closed = msg.is_none();
             match msg {
                 Some(Msg::Line(line)) => {
-                    let (entry, dirty, turn_ended) = self.take_line(line);
+                    let (entry, dirty, ended) = self.take_line(line);
                     batch.push(entry);
                     status_dirty |= dirty;
-                    if turn_ended {
+                    if let Some((baseline, turn)) = ended {
                         self.flush(&mut batch, &mut status_dirty);
-                        self.finish_turn();
+                        self.finish_turn(baseline, turn);
                     }
+                }
+                Some(Msg::Note(line)) => {
+                    let entry = {
+                        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+                        Self::push(&mut core, line, true)
+                    };
+                    batch.push(entry);
+                    // A note answers something the person did: shown at once.
+                    self.flush(&mut batch, &mut status_dirty);
+                    window_opened = None;
+                    continue;
                 }
                 Some(Msg::Stderr(line)) => {
                     let entry = {
@@ -538,14 +662,20 @@ impl Session {
                     batch.push(entry);
                 }
                 Some(Msg::Exit((exit, success))) => {
-                    let was_working = {
-                        let core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-                        matches!(core.phase, MaviPhase::Working | MaviPhase::Approval)
+                    let unfinished = {
+                        let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
+                        if matches!(core.phase, MaviPhase::Working | MaviPhase::Approval) {
+                            let baseline = core.baseline.take();
+                            core.finishing = baseline.is_some();
+                            Some((baseline, core.turns))
+                        } else {
+                            None
+                        }
                     };
                     self.flush(&mut batch, &mut status_dirty);
                     // A turn the process did not finish still changed files.
-                    if was_working {
-                        self.finish_turn();
+                    if let Some((baseline, turn)) = unfinished {
+                        self.finish_turn(baseline, turn);
                     }
                     let entry = {
                         let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
@@ -574,6 +704,11 @@ impl Session {
                     batch.push(entry);
                     status_dirty = true;
                     self.stdin.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    // Nothing follows an exit: later notes (the unfinished
+                    // turn's files) are pushed and emitted by their sender.
+                    self.events.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    self.flush(&mut batch, &mut status_dirty);
+                    break;
                 }
                 None => {}
             }
@@ -601,15 +736,19 @@ impl Session {
 
     /// Takes one stdout line into the session. Returns the entry, whether the
     /// summary changed, and whether a turn just ended.
-    fn take_line(&self, line: String) -> (MaviEntry, bool, bool) {
+    #[allow(clippy::type_complexity)]
+    fn take_line(&self, line: String) -> (MaviEntry, bool, Option<(Option<Fingerprint>, u32)>) {
         let prepared = wire::prepare(line);
         let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
         core.last_activity_ms = now_ms();
         let mut dirty = false;
-        let mut turn_ended = false;
+        let mut turn_ended = None;
         match &prepared.signal {
             Signal::PermissionRequest { request_id } => {
-                if let Some(value) = &prepared.value {
+                // The input is recorded as the agent sent it, before the page
+                // copy was slimmed or redacted: Allow echoes what the agent
+                // asked to run, never a copy with `[REDACTED]` in it.
+                if let Some(value) = prepared.raw.as_ref().or(prepared.value.as_ref()) {
                     core.pending.record(request_id, value);
                 }
                 if core.phase != MaviPhase::Ended {
@@ -640,6 +779,11 @@ impl Session {
                     .to_owned(),
                 );
                 core.interrupting = false;
+                // The baseline leaves with the phase change, in one step, so a
+                // turn sent right after cannot replace it first.
+                let baseline = core.baseline.take();
+                core.finishing = baseline.is_some();
+                turn_ended = Some((baseline, core.turns));
                 if let Some(cost) = prepared
                     .value
                     .as_ref()
@@ -649,7 +793,6 @@ impl Session {
                     core.cost_usd = cost;
                 }
                 dirty = true;
-                turn_ended = true;
             }
             Signal::Init { session_id } => {
                 if core.conversation_id.as_deref() != Some(session_id) {
@@ -737,13 +880,9 @@ impl Session {
 
     /// Fingerprints the worktree again and records what moved during the turn,
     /// off the processor thread (git status can take seconds).
-    fn finish_turn(self: &Arc<Self>) {
+    fn finish_turn(self: &Arc<Self>, baseline: Option<Fingerprint>, turn: u32) {
         let MaviTarget::Local { root } = &self.target else {
             return;
-        };
-        let (baseline, turn) = {
-            let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            (core.baseline.take(), core.turns)
         };
         let Some(baseline) = baseline else {
             self.note("mavi_turn_files", json!({"turn": turn, "available": false}));
@@ -764,6 +903,7 @@ impl Session {
                     me.note("mavi_turn_files", json!({"turn": turn, "available": false, "reason": reason}));
                 }
             }
+            me.core.lock().unwrap_or_else(|p| p.into_inner()).finishing = false;
         });
     }
 }

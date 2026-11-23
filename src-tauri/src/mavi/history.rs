@@ -42,6 +42,8 @@ pub(crate) struct History {
     pub lines: Vec<String>,
     /// Prompts seen, so the next turn continues the numbering.
     pub turns: u32,
+    /// The conversation being resumed, when this is a resume.
+    pub resumed: Option<String>,
 }
 
 /// Where a conversation's transcript is, relative to a checkout.
@@ -138,7 +140,9 @@ fn read_tail(path: &Path, max: u64) -> std::io::Result<(String, bool)> {
 
 /// The prompt text of a `user` entry, or None when it is not a prompt.
 fn prompt_text(entry: &Value) -> Option<String> {
-    if entry.get("isMeta").and_then(Value::as_bool) == Some(true) {
+    if entry.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || entry.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
         return None;
     }
     let content = entry.pointer("/message/content")?;
@@ -169,6 +173,7 @@ fn prompt_text(entry: &Value) -> Option<String> {
     if trimmed.is_empty()
         || trimmed.starts_with("<command-")
         || trimmed.starts_with("<local-command")
+        || trimmed.starts_with("<bash-")
         || trimmed.starts_with("Caveat:")
         || trimmed.starts_with("[Request interrupted")
     {
@@ -283,7 +288,11 @@ pub(crate) fn convert(text: &str, cut: bool) -> History {
     ));
     lines.extend(out.into_iter().map(|line| wire::prepare(line).text));
     lines.push(wire::synthetic("mavi_history_end", json!({"turns": turns})));
-    History { lines, turns }
+    History {
+        lines,
+        turns,
+        resumed: None,
+    }
 }
 
 /// The marker a resume seeds when no history could be read.
@@ -294,6 +303,7 @@ pub(crate) fn unavailable(reason: &str) -> History {
             json!({"available": false, "reason": reason}),
         )],
         turns: 0,
+        resumed: None,
     }
 }
 

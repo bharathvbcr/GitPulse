@@ -74,6 +74,13 @@ interface Scratch {
   summary: TurnSummary | null;
   /** The cumulative cost at the end of the previous turn. */
   costBefore: number;
+  /** Next item id number: ids never repeat, even once old items are dropped. */
+  nextId: number;
+  /**
+   * Turns of earlier host sessions of this thread. A new session numbers its
+   * turns from 1 again; this keeps them after the ones already shown.
+   */
+  turnBase: number;
 }
 
 const scratch = new WeakMap<ThreadState, Scratch>();
@@ -81,15 +88,41 @@ const scratch = new WeakMap<ThreadState, Scratch>();
 function scratchOf(state: ThreadState): Scratch {
   let s = scratch.get(state);
   if (!s) {
-    s = { messageId: null, blocks: new Map(), summary: null, costBefore: state.costUsd };
+    s = { messageId: null, blocks: new Map(), summary: null, costBefore: state.costUsd, nextId: state.items.length, turnBase: 0 };
     scratch.set(state, s);
   }
   return s;
 }
 
+/** Items dropped at once past the cap, so a long thread does not reindex per line. */
+const TRIM_CHUNK = 200;
+
 function push(state: ThreadState, item: TimelineItem): void {
   state.items.push(item);
-  if (state.items.length > MAX_ITEMS) state.items.splice(0, state.items.length - MAX_ITEMS);
+  if (state.items.length > MAX_ITEMS) state.items.splice(0, state.items.length - MAX_ITEMS + TRIM_CHUNK);
+}
+
+/** A number for an item id that is unique within the thread. */
+function uid(state: ThreadState): number {
+  const s = scratchOf(state);
+  s.nextId += 1;
+  return s.nextId;
+}
+
+/**
+ * The thread will be followed from a new host session (a restart without a
+ * saved conversation): its turn numbers and cost restart, so this run's turns
+ * are kept and the new ones are numbered after them.
+ */
+export function continueInNewSession(state: ThreadState): void {
+  const s = scratchOf(state);
+  s.turnBase = state.turn;
+  s.costBefore = 0;
+  s.messageId = null;
+  s.blocks.clear();
+  s.summary = null;
+  state.lastSeq = 0;
+  state.ended = null;
 }
 
 function find<T extends TimelineItem["kind"]>(
@@ -155,12 +188,17 @@ function unfinished<K extends "assistant" | "thinking">(
   kind: K,
   messageId: string,
 ): Extract<TimelineItem, { kind: K }> | undefined {
-  for (const item of state.items) {
+  // Backward over the current turn only, keeping the earliest match: a
+  // message's blocks finish in the order they started.
+  let found: Extract<TimelineItem, { kind: K }> | undefined;
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const item = state.items[i]!;
+    if (item.turn < state.turn) break;
     if (item.kind === kind && (item as AssistantItem | ThinkingItem).messageId === messageId && !(item as AssistantItem).final) {
-      return item as Extract<TimelineItem, { kind: K }>;
+      found = item as Extract<TimelineItem, { kind: K }>;
     }
   }
-  return undefined;
+  return found;
 }
 
 function onStreamEvent(state: ThreadState, line: Json, s: Scratch): void {
@@ -169,7 +207,7 @@ function onStreamEvent(state: ThreadState, line: Json, s: Scratch): void {
   const parent = str(line.parent_tool_use_id);
   switch (event.type) {
     case "message_start": {
-      s.messageId = str(obj(event.message)?.id) ?? `m${state.items.length}`;
+      s.messageId = str(obj(event.message)?.id) ?? `m${uid(state)}`;
       s.blocks.clear();
       break;
     }
@@ -223,7 +261,7 @@ function onStreamEvent(state: ThreadState, line: Json, s: Scratch): void {
 function onAssistant(state: ThreadState, line: Json): void {
   const message = obj(line.message);
   if (!message) return;
-  const messageId = str(message.id) ?? `m${state.items.length}`;
+  const messageId = str(message.id) ?? `m${uid(state)}`;
   const parent = str(line.parent_tool_use_id);
   for (const raw of arr(message.content)) {
     const block = obj(raw);
@@ -236,7 +274,7 @@ function onAssistant(state: ThreadState, line: Json): void {
         open.streaming = false;
         open.final = true;
       } else if (text.trim()) {
-        push(state, { kind: "assistant", id: `${messageId}:t${state.items.length}`, turn: state.turn, messageId, text, streaming: false, final: true });
+        push(state, { kind: "assistant", id: `${messageId}:t${uid(state)}`, turn: state.turn, messageId, text, streaming: false, final: true });
       }
     } else if (block.type === "thinking" || block.type === "redacted_thinking") {
       const text = str(block.thinking) ?? "";
@@ -246,7 +284,7 @@ function onAssistant(state: ThreadState, line: Json): void {
         open.streaming = false;
         open.final = true;
       } else {
-        push(state, { kind: "thinking", id: `${messageId}:h${state.items.length}`, turn: state.turn, messageId, text, streaming: false, final: true });
+        push(state, { kind: "thinking", id: `${messageId}:h${uid(state)}`, turn: state.turn, messageId, text, streaming: false, final: true });
       }
     } else if (block.type === "tool_use") {
       const id = str(block.id);
@@ -277,6 +315,8 @@ function onUser(state: ThreadState, line: Json): void {
       else if (tool.approval?.state === "denied") tool.status = "denied";
       else if (/interrupted/i.test(text) && text.length < 200) tool.status = "interrupted";
       else tool.status = "error";
+      // A tool that already ran (or was refused elsewhere) asks nothing more.
+      if (tool.approval?.state === "open") tool.approval.state = "void";
       if (meta) {
         const patch = hunks(meta.structuredPatch);
         if (patch) tool.patch = patch;
@@ -285,7 +325,7 @@ function onUser(state: ThreadState, line: Json): void {
     } else if (block.type === "text") {
       const text = str(block.text) ?? "";
       if (/^\[Request interrupted/.test(text)) {
-        push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "info", text: "You stopped this turn." });
+        push(state, { kind: "notice", id: `n${uid(state)}`, turn: state.turn, tone: "info", text: "You stopped this turn." });
       }
     }
   }
@@ -296,10 +336,31 @@ function onControlRequest(state: ThreadState, line: Json): void {
   const requestId = str(line.request_id);
   if (!request || request.subtype !== "can_use_tool" || !requestId) return;
   const toolId = str(request.tool_use_id) ?? `req:${requestId}`;
-  const input = obj(request.input) ?? {};
+  const sent = obj(request.input) ?? {};
+  // The host withholds an input too large (or unsafe) to show; it still
+  // answers with the agent's real input.
+  const hidden = typeof sent.mavi_input_hidden === "string";
+  const input = hidden ? {} : sent;
   const tool = toolById(state, toolId) ?? newTool(state, toolId, str(request.tool_name) ?? "tool", input, null);
   if (Object.keys(tool.input).length === 0) tool.input = input;
-  tool.approval = { requestId, state: "open", reason: str(request.description) ?? str(request.decision_reason) };
+  tool.approval = {
+    requestId,
+    state: "open",
+    reason: str(request.description) ?? str(request.decision_reason),
+    ...(hidden ? { hiddenBytes: num(sent.bytes) ?? 0 } : {}),
+  };
+}
+
+function onControlCancel(state: ThreadState, line: Json): void {
+  const requestId = str(line.request_id);
+  if (!requestId) return;
+  for (let i = state.items.length - 1; i >= 0; i--) {
+    const item = state.items[i]!;
+    if (item.kind === "tool" && item.approval?.requestId === requestId && item.approval.state === "open") {
+      item.approval.state = "void";
+      return;
+    }
+  }
 }
 
 function onResult(state: ThreadState, line: Json, s: Scratch): void {
@@ -322,7 +383,7 @@ function onResult(state: ThreadState, line: Json, s: Scratch): void {
   }
   const end: TurnEndItem = {
     kind: "turn_end",
-    id: `end:${state.turn}:${state.items.length}`,
+    id: `end:${state.turn}:${uid(state)}`,
     turn: state.turn,
     subtype,
     ok: subtype === "success" && line.is_error !== true,
@@ -370,7 +431,7 @@ function onSystem(state: ThreadState, line: Json, s: Scratch): void {
       if (line.outcome && line.outcome !== "success") {
         push(state, {
           kind: "notice",
-          id: `n${state.items.length}`,
+          id: `n${uid(state)}`,
           turn: state.turn,
           tone: "warn",
           text: `Hook ${str(line.hook_name) ?? ""} did not succeed${str(line.stderr) ? `: ${str(line.stderr)!.slice(0, 300)}` : "."}`,
@@ -378,7 +439,7 @@ function onSystem(state: ThreadState, line: Json, s: Scratch): void {
       }
       break;
     case "compact_boundary":
-      push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "info", text: "The agent compacted its context." });
+      push(state, { kind: "notice", id: `n${uid(state)}`, turn: state.turn, tone: "info", text: "The agent compacted its context." });
       break;
     default:
       break;
@@ -388,17 +449,18 @@ function onSystem(state: ThreadState, line: Json, s: Scratch): void {
 function onMavi(state: ThreadState, line: Json): void {
   switch (line.type) {
     case "mavi_user": {
-      const turn = num(line.turn) ?? state.turn + 1;
+      const sent = num(line.turn);
+      const turn = sent === null ? state.turn + 1 : sent + scratchOf(state).turnBase;
       state.turn = Math.max(state.turn, turn);
       if (line.automatic === true) {
         // A turn Claude Code started itself (a background task reporting
         // back): not the person's words, so not a message bubble.
-        push(state, { kind: "notice", id: `auto:${turn}:${state.items.length}`, turn, tone: "info", text: "A background task reported back, and the agent continued." });
+        push(state, { kind: "notice", id: `auto:${turn}:${uid(state)}`, turn, tone: "info", text: "A background task reported back, and the agent continued." });
         break;
       }
-      push(state, { kind: "user", id: `u${turn}:${state.items.length}`, turn, text: str(line.text) ?? "", at: num(line.at) });
+      push(state, { kind: "user", id: `u${turn}:${uid(state)}`, turn, text: str(line.text) ?? "", at: num(line.at) });
       if (line.baseline === "unavailable") {
-        push(state, { kind: "notice", id: `n${state.items.length}`, turn, tone: "warn", text: "Couldn't read the worktree's state before this turn, so changes made outside the agent's edit tools will not be listed." });
+        push(state, { kind: "notice", id: `n${uid(state)}`, turn, tone: "warn", text: "Couldn't read the worktree's state before this turn, so changes made outside the agent's edit tools will not be listed." });
       }
       break;
     }
@@ -417,7 +479,7 @@ function onMavi(state: ThreadState, line: Json): void {
       }
       break;
     case "mavi_turn_files":
-      state.turnFiles[num(line.turn) ?? state.turn] = {
+      state.turnFiles[num(line.turn) === null ? state.turn : num(line.turn)! + scratchOf(state).turnBase] = {
         available: line.available === true,
         partial: line.partial === true,
         moved: arr(line.moved)
@@ -447,7 +509,7 @@ function onMavi(state: ThreadState, line: Json): void {
       const tail = arr(line.stderr).filter((l): l is string => typeof l === "string").join("\n");
       push(state, {
         kind: "notice",
-        id: `n${state.items.length}`,
+        id: `n${uid(state)}`,
         turn: state.turn,
         tone: clean ? "info" : "error",
         text: clean ? "The agent ended." : `The agent ${state.ended}.${tail ? `\n${tail}` : ""}`,
@@ -460,7 +522,7 @@ function onMavi(state: ThreadState, line: Json): void {
         if (turns > 0) {
           push(state, {
             kind: "notice",
-            id: `history:${state.items.length}`,
+            id: `history:${uid(state)}`,
             turn: 0,
             tone: "info",
             text: `Earlier in this conversation: ${turns === 1 ? "1 turn" : `${turns} turns`} from Claude Code's transcript${line.truncated === true ? ", the oldest not shown" : ""}.`,
@@ -469,7 +531,7 @@ function onMavi(state: ThreadState, line: Json): void {
       } else {
         push(state, {
           kind: "notice",
-          id: `history:${state.items.length}`,
+          id: `history:${uid(state)}`,
           turn: state.turn,
           tone: "info",
           text: `Earlier messages are not shown here. ${str(line.reason) ?? ""}`.trim(),
@@ -479,14 +541,14 @@ function onMavi(state: ThreadState, line: Json): void {
     }
     case "mavi_history_end":
       if ((num(line.turns) ?? 0) > 0) {
-        push(state, { kind: "notice", id: `history-end:${state.items.length}`, turn: state.turn, tone: "info", text: "Continues in Mavi from here." });
+        push(state, { kind: "notice", id: `history-end:${uid(state)}`, turn: state.turn, tone: "info", text: "Continues in Mavi from here." });
       }
       break;
     case "mavi_truncated":
-      push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "warn", text: `A ${num(line.bytes) ?? "very large"}-byte line from the agent was too long to show.` });
+      push(state, { kind: "notice", id: `n${uid(state)}`, turn: state.turn, tone: "warn", text: `A ${num(line.bytes) ?? "very large"}-byte line from the agent was too long to show.` });
       break;
     case "mavi_redacted":
-      push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "info", text: "A line held a credential and was withheld." });
+      push(state, { kind: "notice", id: `n${uid(state)}`, turn: state.turn, tone: "info", text: "A line held a credential and was withheld." });
       break;
     default:
       break;
@@ -522,6 +584,8 @@ export function applyLine(state: ThreadState, line: string, seq = 0): void {
       return onUser(state, json);
     case "control_request":
       return onControlRequest(state, json);
+    case "control_cancel_request":
+      return onControlCancel(state, json);
     case "result":
       return onResult(state, json, s);
     case "system":
@@ -529,7 +593,7 @@ export function applyLine(state: ThreadState, line: string, seq = 0): void {
     case "rate_limit_event": {
       const status = str(obj(json.rate_limit_info)?.status);
       if (status && status !== "allowed" && status !== "allowed_warning") {
-        push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "warn", text: "The agent hit a usage limit." });
+        push(state, { kind: "notice", id: `n${uid(state)}`, turn: state.turn, tone: "warn", text: "The agent hit a usage limit." });
       }
       return;
     }

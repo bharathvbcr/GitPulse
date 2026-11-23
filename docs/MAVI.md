@@ -23,12 +23,26 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   shown as chips. The call running now is shown live.
 - **Permission requests** appear where they happen, with what the agent wants
   to run: the command, or for an edit the change itself, built from the
-  request. **Allow** (A) or **Deny** (D, with an optional note for the agent).
-  The keys work only while the card has focus. When the card is off screen, a
-  bar above the composer says the agent is waiting.
+  request. **Allow** or **Deny** (with an optional note for the agent). There is
+  no single-key shortcut: someone who lands on the card and starts typing must
+  never allow a command by accident. A subagent's request is shown in the main
+  flow, marked as a subagent's, never folded away under its Task row. A request
+  whose input the host withheld (too large to show safely) says so, with its
+  size; Allow still runs exactly what the agent sent. A request whose tool has
+  already finished, or that the agent cancels, closes by itself. Only when a
+  card is off screen does a bar above the composer say the agent is waiting;
+  **Review** scrolls to the card.
 - **The composer**: Enter sends, Shift+Enter is a new line. While a turn runs,
   what you send waits in a visible queue and goes as one turn when the agent is
-  free. **Stop** (or Esc from an empty composer) interrupts the turn.
+  free. A queued turn the host could not take goes back to the front of the
+  queue, and messages still queued when the agent ends come back to the
+  composer as a draft instead of being sent after a resume. Each thread keeps
+  its own unsent draft. **Stop** (or Esc from an empty composer) interrupts the
+  turn; **End agent** in the header ends the agent's process (asking first
+  while a turn runs), and the conversation can be resumed.
+- **Threads** can be renamed in place (the pencil, or a double-click on the
+  title). Removing one asks first, says that its agent ends, and gives the
+  conversation id that still resumes it in a terminal.
 - **Changes** (right column): what the selected turn, or the whole thread,
   changed, file by file. See below.
 - **Resume**: quitting GitPulse ends every agent. A thread keeps the
@@ -114,7 +128,7 @@ runs), in the same columns, and counted in the headline ("3 Mavi threads, 2
 running, 1 waiting for you"). They follow the window's filter and repository
 scope: **Needs action** keeps threads waiting for an answer, failed, or ready
 for review; **Live** keeps threads whose agent is running; **Parallel** never
-lists one (a worktree holds one live thread). Each row says where it runs
+lists one (a worktree holds one live thread), and its column reads "—". Each row says where it runs
 (the repository or the SSH host), its presence (Working, Waiting for you,
 Running idle, In a terminal tab, Not running), what it asks of you, and how
 many files the agent edited, with **Open** and, while it runs, **End**.
@@ -196,7 +210,14 @@ Mavi view (Svelte)                       Rust host (src-tauri/src/mavi)
   mode.
 - **Repository trust** is required for a local thread. **One live local thread
   per worktree**: two agents in one checkout would make every "what this turn
-  changed" answer a mix of both; use a worktree.
+  changed" answer a mix of both; use a worktree. The host checks this, the
+  one-process-per-conversation rule and the live-thread limit under one lock
+  and holds a claim until the new thread is registered, so two quick starts
+  cannot both pass.
+- **An SSH thread's file diff** reads only paths relative to the thread's
+  directory; an absolute path is refused, so a diff request cannot read other
+  files on the host. A tracked file with no difference reads as unchanged,
+  never as a wholly new file.
 - **Process lifetime.** Each agent runs in its own process group; ending a
   thread (or quitting) terminates the group, then kills it after 3 s.
 
