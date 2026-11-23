@@ -1016,10 +1016,11 @@ fn reap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::procguard::LockedSpawn;
     // The process-level tests below drive a shell-script fake agent, so they
     // and their helpers are Unix-only; on Windows the helpers would be dead
     // code, which `-D warnings` rejects.
+    #[cfg(unix)]
+    use crate::procguard::LockedSpawn;
     #[cfg(unix)]
     use std::time::Instant;
 

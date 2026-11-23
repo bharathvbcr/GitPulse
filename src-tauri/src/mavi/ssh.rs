@@ -393,7 +393,10 @@ pub(crate) fn probe(host: &str, dir: &str) -> MaviProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the local `sh -c` round trips use these, and they run on Unix.
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
+    #[cfg(unix)]
     use std::process::Command;
 
     #[test]
