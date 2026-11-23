@@ -545,7 +545,12 @@ mod move_path_folder_attacks {
             std::fs::write(&lock, "").unwrap();
             Ok(())
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !wrote.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         handle.join().unwrap();
         std::fs::remove_file(&lock).ok();

@@ -495,7 +495,9 @@ fn docs_rename_benchmark() {
     ] {
         let mut edits = Vec::new();
         let plan_ms = min_ms(RUNS, || {
-            edits = super::rename::plan_edits(&repo, &built.vault, from, to).unwrap();
+            edits = super::rename::plan_edits(&repo, &built.vault, from, to)
+                .unwrap()
+                .0;
         });
         let precheck_ms = min_ms(RUNS, || {
             super::rename::links_the_rename_breaks(&repo, &built.vault, from, to, &edits);
@@ -2396,5 +2398,15 @@ fn a_refused_symlink_asset_link_is_reported_not_silently_left() {
     assert!(
         !outcome.left_broken.is_empty() || !outcome.complete,
         "FINDING: a link the move broke and the code refused to rewrite is reported nowhere: {outcome:?}"
+    );
+}
+
+#[test]
+fn reference_definitions_in_code_or_paragraph_text_and_footnotes_are_not_rewritten() {
+    let body = "```\n[r]: pic.png\n```\n\ntext\n[p]: pic.png\n\n[^1]: pic.png\n\n[q]: pic.png?raw=1 \"t\"\n";
+    let (_d, t, _) = move_with(body, PIC, "notes/A.md");
+    assert_eq!(
+        t,
+        "```\n[r]: pic.png\n```\n\ntext\n[p]: pic.png\n\n[^1]: pic.png\n\n[q]: ../docs/pic.png?raw=1 \"t\"\n"
     );
 }
