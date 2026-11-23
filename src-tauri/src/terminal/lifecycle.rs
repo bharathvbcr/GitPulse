@@ -95,8 +95,11 @@ impl std::fmt::Display for KillOrigin {
 
 /// What a close did: it ran, or it was refused because the session is
 /// protected from this route. A refusal is not an error: the caller reports
-/// the session as skipped and says why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the session as skipped and says why. `cmd_terminal_kill` returns it to the
+/// frontend as `"killed"` or `"skipped_protected"`, so nothing reads an error's
+/// text to learn a session was spared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KillOutcome {
     Killed,
     SkippedProtected,

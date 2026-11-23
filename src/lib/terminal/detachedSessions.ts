@@ -24,6 +24,7 @@ import { get, writable, type Readable } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
+import { settleKill, type KillOutcome } from "./killOrigin";
 import { FAMILY_LOOKUP_MS, terminalDeadline } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
 import { hostedClaude, settleConversation, type createHostedClaudeStore, type ExitFacts } from "./hostedClaude";
@@ -199,7 +200,7 @@ function listDetached(
     sessionId: listing.id,
     async close(origin) {
       // Stop in the Sessions list unless a tab's close (a restored tab not yet shown) says otherwise.
-      await invoke("cmd_terminal_kill", { sessionId: listing.id, origin: origin ?? "sessions_list_stop" });
+      settleKill(listing.id, await invoke<KillOutcome>("cmd_terminal_kill", { sessionId: listing.id, origin: origin ?? "sessions_list_stop" }));
       settle("closed");
       drop();
     },

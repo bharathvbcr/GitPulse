@@ -308,15 +308,15 @@ pub async fn cmd_terminal_detach(
 /// `origin` says which route asked (`terminal::KillOrigin`); a caller that
 /// does not say is `unspecified` and treated as a direct close. A session that
 /// is protected from a batch route (`batch_close`, `stop_children`) is left
-/// running and the call answers an error naming it, so a batch can report
-/// what it skipped.
+/// running and the call answers `skipped_protected`, so a batch can report
+/// what it skipped without reading an error's text.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(
     app: AppHandle,
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     origin: Option<crate::terminal::KillOrigin>,
-) -> Result<(), String> {
+) -> Result<crate::terminal::KillOutcome, String> {
     let origin = origin.unwrap_or_default();
     let ledger = state.session_ledger().clone();
     let kill_id = session_id.clone();
@@ -324,17 +324,10 @@ pub async fn cmd_terminal_kill(
         crate::terminal::kill_session(state, &kill_id, origin)
     })
     .await?;
-    match outcome {
-        crate::terminal::KillOutcome::Killed => {
-            if ledger.mark_user_closed(&session_id) {
-                ledger.emit_view(&app);
-            }
-            Ok(())
-        }
-        crate::terminal::KillOutcome::SkippedProtected => Err(
-            crate::terminal::lifecycle::skipped_protected_message(&session_id, origin),
-        ),
+    if outcome == crate::terminal::KillOutcome::Killed && ledger.mark_user_closed(&session_id) {
+        ledger.emit_view(&app);
     }
+    Ok(outcome)
 }
 
 /// Terminal hosts left running by an earlier GitPulse version (an older

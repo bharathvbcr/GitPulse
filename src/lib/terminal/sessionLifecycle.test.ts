@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { createSessionLifecycle, type SessionTransport } from "./sessionLifecycle";
+import { ProtectedSkip } from "./killOrigin";
 import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
@@ -761,7 +762,7 @@ describe("the route a close came by", () => {
   });
 
   it("keeps a protected session usable when a batch route is refused", async () => {
-    const refusal = "session native-a is protected and was not closed by batch_close; close its tab directly to stop it";
+    const refusal = new ProtectedSkip("native-a");
     const kill = vi.fn<() => Promise<void>>(async () => { throw refusal; });
     const f = fixture({ kill });
     await f.owner.start();

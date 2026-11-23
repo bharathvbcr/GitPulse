@@ -137,6 +137,7 @@
   import { themeStore } from "../stores/themeStore";
   import { describeError } from "../ui/copy/describeFailure";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
+  import { settleKill, type KillOutcome } from "../terminal/killOrigin";
   import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
   import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
@@ -1361,7 +1362,7 @@
         },
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
-        kill: (sessionId, origin) => invoke("cmd_terminal_kill", origin ? { sessionId, origin } : { sessionId }),
+        kill: async (sessionId, origin) => settleKill(sessionId, await invoke<KillOutcome>("cmd_terminal_kill", origin ? { sessionId, origin } : { sessionId })),
         detach: (sessionId) => invoke<boolean>("cmd_terminal_detach", { sessionId }),
       },
       // Only a plain shell positively at its prompt may end with its view.
