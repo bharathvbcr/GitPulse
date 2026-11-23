@@ -1,0 +1,43 @@
+name: Stale issues and pull requests
+
+# Closes issues and pull requests that have gone quiet, after a warning, so the
+# backlog reflects live work. Anything a maintainer labelled as kept is exempt.
+# It only edits issues and PRs through the API and never checks out code.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Fail closed: the job gets only what it writes below.
+permissions: {}
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 45
+          days-before-pr-close: 14
+          stale-issue-label: stale
+          stale-pr-label: stale
+          stale-issue-message: >
+            This issue has had no activity for 60 days, so it is marked stale.
+            Comment or add new information to keep it open; otherwise it closes in 14 days.
+          close-issue-message: >
+            Closed for inactivity. Reopen it, or open a new issue that links this one, if it still applies.
+          stale-pr-message: >
+            This pull request has had no activity for 45 days, so it is marked stale.
+            Push a change or comment to keep it open; otherwise it closes in 14 days.
+          close-pr-message: >
+            Closed for inactivity. The branch is untouched; reopen the pull request when you are ready to continue.
+          exempt-issue-labels: security,pinned,good first issue,help wanted,blocked,needs-triage
+          exempt-pr-labels: security,pinned,blocked
+          exempt-all-milestones: true
+          operations-per-run: 200

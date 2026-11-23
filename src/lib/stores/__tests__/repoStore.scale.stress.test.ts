@@ -21,6 +21,13 @@
  * samples are interleaved with the minimum kept so a GC pause in one run does
  * not decide the ratio. The bound, 8, sits between linear (4-5 measured at load ~170) and
  * quadratic (10.8-12 for a deliberately mild injected O(n^2) pass, a per-open copy of the sessions map, that adds only ~40 ms; real regressions cost seconds).
+ *
+ * The CPU clock is coarse on Windows: `process.cpuUsage` advances in ticks of
+ * about 15.6 ms, so a single 250-tab restore (~5 ms) read 0 there and the ratio
+ * came out Infinity. Each sample therefore times `BATCH` restores, each on its
+ * own store, and reports the mean, so the small size spans several ticks; the
+ * denominator is also floored at one tick's share of a batch, so a sample the
+ * clock could not resolve can never divide by zero.
  */
 import { describe, expect, it } from "vitest";
 import { get, writable } from "svelte/store";
@@ -49,6 +56,11 @@ const invoke: InvokeFn = async (cmd, args) => {
   }
 };
 
+/** Restores timed together per sample; see the header for why. */
+const BATCH = 8;
+/** The coarsest CPU-clock step seen on a supported host (Windows), in ms. */
+const CPU_TICK_MS = 15.625;
+
 /** CPU milliseconds (user + system) the process spent during `work`. */
 async function cpuMs(work: () => Promise<void>): Promise<number> {
   const before = process.cpuUsage();
@@ -57,7 +69,7 @@ async function cpuMs(work: () => Promise<void>): Promise<number> {
   return (used.user + used.system) / 1000;
 }
 
-async function restoreMs(count: number): Promise<number> {
+function storeWith(count: number) {
   const storage = memoryStorage();
   savePersistedWorkspace(storage, {
     version: WORKSPACE_VERSION,
@@ -68,16 +80,24 @@ async function restoreMs(count: number): Promise<number> {
     recents: [],
     lastClosed: [],
   });
-  const store = createRepoStore({
+  return createRepoStore({
     invoke,
     storage,
     caseInsensitive: true,
     graph: { showRepo: () => {}, loadGraph: async () => {}, evict: () => {} },
     filter: { subscribe: writable({ searchQuery: "", selectedBranch: null }).subscribe, setSearch: () => {}, selectBranch: () => {}, clear: () => {} },
   });
-  const elapsed = await cpuMs(() => store.restoreWorkspace());
-  expect(get(store).openTabs).toHaveLength(count);
-  return elapsed;
+}
+
+/** Mean CPU ms of one restore of `count` tabs, over a batch of `BATCH` fresh stores. */
+async function restoreMs(count: number): Promise<number> {
+  // Built before the clock starts: only the restores are timed.
+  const stores = Array.from({ length: BATCH }, () => storeWith(count));
+  const elapsed = await cpuMs(async () => {
+    for (const store of stores) await store.restoreWorkspace();
+  });
+  for (const store of stores) expect(get(store).openTabs).toHaveLength(count);
+  return elapsed / BATCH;
 }
 
 describe("restore at scale", () => {
@@ -91,7 +111,9 @@ describe("restore at scale", () => {
       small = Math.min(small, await restoreMs(250));
       large = Math.min(large, await restoreMs(1000));
     }
-    const ratio = large / small;
+    // A batch the clock could not resolve reads 0; one tick's share is the
+    // smallest honest figure for it (header).
+    const ratio = large / Math.max(small, CPU_TICK_MS / BATCH);
     if (process.env.GITPULSE_PERF_REPORT) {
       // eslint-disable-next-line no-console
       console.log(`PERF restore 250=${small.toFixed(1)}ms 1000=${large.toFixed(1)}ms ratio=${ratio.toFixed(2)}`);
