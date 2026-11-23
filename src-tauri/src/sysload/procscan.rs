@@ -2367,15 +2367,18 @@ pub(crate) fn parse_status_caps(status: &str, field: &str) -> Option<u64> {
 }
 
 /// Whether a process on the reader's own uid holds capabilities the reader
-/// lacks: its permitted set is not inside the reader's. Linux's
-/// `cap_ptrace_access_check` then keeps the process's memory and working
-/// directory from the reader unless the reader has `CAP_SYS_PTRACE` in the
-/// process's user namespace. Asked only after a read was refused, so a reader
-/// that had that privilege would not be asking: the process cannot be
-/// inspected without privilege, as another user's cannot.
+/// cannot use: its permitted set is not inside the reader's effective set.
+/// Reads of `/proc/<pid>/environ` and `/proc/<pid>/cwd` are
+/// `PTRACE_MODE_READ_FSCREDS` checks, for which Linux's
+/// `cap_ptrace_access_check` compares against the caller's *effective* set,
+/// and then keeps the process's memory and working directory from the reader
+/// unless the reader has `CAP_SYS_PTRACE` in the process's user namespace.
+/// Asked only after a read was refused, so a reader that had that privilege
+/// would not be asking: the process cannot be inspected without privilege, as
+/// another user's cannot.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn outranks_reader(target_permitted: u64, own_permitted: u64) -> bool {
-    target_permitted & !own_permitted != 0
+pub(crate) fn outranks_reader(target_permitted: u64, own_effective: u64) -> bool {
+    target_permitted & !own_effective != 0
 }
 
 /// `PF_KTHREAD` in the flags field of `/proc/<pid>/stat`: a kernel thread,
@@ -3366,17 +3369,17 @@ mod os {
     /// ([`super::outranks_reader`]). `false` when either status cannot be
     /// read: an unexplained refusal stays one.
     fn outranks_this_process(pid: i32) -> bool {
-        let caps = |path: &str| -> Option<u64> {
+        let caps = |path: &str, field: &str| -> Option<u64> {
             let raw = read_bounded(path, 8192).ok()?;
-            super::parse_status_caps(&String::from_utf8_lossy(&raw), "CapPrm:")
+            super::parse_status_caps(&String::from_utf8_lossy(&raw), field)
         };
-        let (Some(target_permitted), Some(own_permitted)) = (
-            caps(&format!("/proc/{pid}/status")),
-            caps("/proc/self/status"),
+        let (Some(target_permitted), Some(own_effective)) = (
+            caps(&format!("/proc/{pid}/status"), "CapPrm:"),
+            caps("/proc/self/status", "CapEff:"),
         ) else {
             return false;
         };
-        super::outranks_reader(target_permitted, own_permitted)
+        super::outranks_reader(target_permitted, own_effective)
     }
 
     fn read_identity(pid: i32, name: String, ours: bool) -> Identity {
@@ -4115,9 +4118,11 @@ pub(crate) mod tests {
         assert_eq!(parse_status_caps(status, "CapEff:"), Some(0x1ff_feff_ffff));
         assert_eq!(parse_status_caps(status, "CapBnd:"), None);
         assert_eq!(parse_status_caps("CapPrm:\tzz\n", "CapPrm:"), None);
-        // A process with a capability the reader's permitted set lacks
+        // A process with a capability the reader's effective set lacks
         // outranks it (measured: a container's init holding CAP_SYS_RESOURCE,
-        // bit 24, which the reader had dropped).
+        // bit 24, which the reader had dropped). A capability the reader only
+        // holds as permitted, not effective, does not count for the
+        // FSCREDS reads of /proc.
         assert!(outranks_reader(0x1ff_ffff_ffff, 0x1ff_feff_ffff));
         assert!(outranks_reader(1 << 24, 0));
         assert!(!outranks_reader(1 << 24, 1 << 24));
