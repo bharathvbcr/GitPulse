@@ -613,7 +613,13 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ## 7. Submitting a Pull Request
 
-1. Branch from `main`.
+By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). For where to
+ask a question, see [SUPPORT.md](SUPPORT.md); for how decisions are made,
+[GOVERNANCE.md](GOVERNANCE.md).
+
+1. Branch from `main`, with a type prefix: `feat/`, `fix/`, `docs/`, `test/`,
+   `perf/` or `chore/`, then a short kebab-case description
+   (`fix/blame-empty-file`). Fork the repository if you do not have write access.
 2. Make the change, with tests.
 3. Run `bun run ci:local` until it is green.
 4. Open the PR and fill in
@@ -622,7 +628,25 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 5. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
    subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). GitPulse parses
    these in its own commit filter, so the repository holds itself to them.
-6. Sign off every commit (`git commit -s`). See "Licence of contributions" below.
+6. Sign off every commit (`git commit -s`). This is required: see "Licence of
+   contributions" below.
+
+### Review and required checks
+
+`main` is protected, so nothing is pushed to it directly. A pull request is merged
+when:
+
+- the required status checks pass;
+- one code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) has approved it;
+- every review conversation is resolved;
+- every commit carries a sign-off.
+
+Force-pushes to and deletion of `main` are blocked, and so are deletion and
+rewriting of release tags (`v*`). Pull requests also run a dependency review, which
+fails on a newly added dependency with a known high-severity advisory (for the
+manifests GitHub's dependency graph reads; `bun.lock` is covered by the
+dependency audit workflow), and are labelled by the paths they touch. Keep each pull request to one concern so it
+can be reviewed in one sitting.
 
 ### Licence of contributions
 
@@ -661,4 +685,7 @@ yourself), comment on any issue or PR:
 ## 8. Reporting Security Issues
 
 Do **not** open a public issue for a security vulnerability. Follow
-**[docs/SECURITY.md](docs/SECURITY.md)**.
+**[docs/SECURITY.md](docs/SECURITY.md)** and report it privately through a
+[GitHub security advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new).
+
+For conduct problems, see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
