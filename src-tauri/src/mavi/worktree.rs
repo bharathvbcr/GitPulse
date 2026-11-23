@@ -208,8 +208,6 @@ pub(crate) fn safe_relative(path: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// The patch of one path against `HEAD` (or, for an untracked file, against
-/// nothing), bounded and redacted. Returns `(patch, truncated)`.
 /// Whether Git tracks `path` (in the index), so an empty diff means "unchanged".
 fn tracked(root: &Path, path: &str) -> bool {
     run_capped(
@@ -252,6 +250,8 @@ pub(crate) fn relative_text(root: &str, path: &str) -> Option<String> {
     (same && !rest.is_empty()).then(|| rest.to_owned())
 }
 
+/// The patch of one path against `HEAD` (or, for an untracked file, against
+/// nothing), bounded and redacted. Returns `(patch, truncated)`.
 pub(crate) fn file_diff(root: &Path, path: &str) -> Result<(String, bool), String> {
     if !safe_relative(path) {
         return Err("That path is not inside this worktree.".into());

@@ -1002,10 +1002,16 @@ fn terminate_group(pid: u32, kill: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The process-level tests below drive a shell-script fake agent, so they
+    // and their helpers are Unix-only; on Windows the helpers would be dead
+    // code, which `-D warnings` rejects.
+    #[cfg(unix)]
     use std::time::Instant;
 
+    #[cfg(unix)]
     type Seen = Arc<Mutex<Vec<(&'static str, Value)>>>;
 
+    #[cfg(unix)]
     fn collector() -> (Emit, Seen) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
@@ -1015,6 +1021,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn wait_for(
         seen: &Arc<Mutex<Vec<(&'static str, Value)>>>,
         what: impl Fn(&[(&'static str, Value)]) -> bool,
@@ -1029,6 +1036,7 @@ mod tests {
         panic!("timed out; saw {:?}", seen.lock().unwrap());
     }
 
+    #[cfg(unix)]
     fn lines_of(seen: &[(&'static str, Value)]) -> Vec<Value> {
         seen.iter()
             .filter(|(name, _)| *name == EVENT)
@@ -1307,7 +1315,9 @@ read never
     }
 }
 
-#[cfg(test)]
+// Unix-only like its one test, which runs the agent through the same
+// process plumbing as the tests above.
+#[cfg(all(test, unix))]
 mod live_resume {
     use super::*;
     use std::time::Instant;

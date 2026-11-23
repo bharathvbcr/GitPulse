@@ -465,11 +465,16 @@ mod tests {
             "{cmd}"
         );
         // And `sh` itself round-trips it: the script runs, not its quotes.
-        let out = Command::new("sh")
-            .args(["-c", &in_sh("printf '%s' \"it's ok\"")])
-            .output_locked()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "it's ok");
+        // A remote host is always a POSIX shell; locally that check needs one,
+        // so it runs where `sh` is the system shell.
+        #[cfg(unix)]
+        {
+            let out = Command::new("sh")
+                .args(["-c", &in_sh("printf '%s' \"it's ok\"")])
+                .output_locked()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "it's ok");
+        }
     }
 
     /// What ssh hands the remote login shell, run by a local shell: the
