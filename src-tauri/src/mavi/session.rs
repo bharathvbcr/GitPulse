@@ -164,6 +164,7 @@ impl Session {
         model: Option<String>,
         mut command: Command,
         emit: Emit,
+        history: super::history::History,
     ) -> Result<Arc<Session>, String> {
         command
             .stdin(Stdio::piped())
@@ -215,6 +216,16 @@ impl Session {
             }),
             emit,
         });
+        // Earlier turns of a resumed conversation go first in the ring, so a
+        // page replays them like any other lines, and the next turn continues
+        // their numbering.
+        {
+            let mut core = session.core.lock().unwrap_or_else(|p| p.into_inner());
+            core.turns = history.turns;
+            for line in history.lines {
+                Self::push(&mut core, line, true);
+            }
+        }
 
         // Writer.
         std::thread::Builder::new()
@@ -958,6 +969,7 @@ read never
             None,
             command,
             emit,
+            super::super::history::History::default(),
         )
         .unwrap();
         assert_eq!(session.summary().phase, MaviPhase::Ready);
@@ -1092,6 +1104,7 @@ read never
             None,
             command,
             emit,
+            super::super::history::History::default(),
         )
         .unwrap();
         session.send("Use the Edit tool to append the line world to a.txt. Do nothing else, then reply done.").unwrap();
@@ -1154,6 +1167,141 @@ read never
         let summary = session.summary();
         assert_eq!(summary.touched, vec!["a.txt"]);
         assert!(summary.conversation_id.is_some());
+        session.stop();
+    }
+}
+
+#[cfg(test)]
+mod live_resume {
+    use super::*;
+    use std::time::Instant;
+
+    /// Resumes a real saved conversation through the host with its history
+    /// seeded from the transcript, and asks the agent about it. Opt-in:
+    /// `MAVI_LIVE_RESUME_DIR=<checkout> MAVI_LIVE_RESUME_ID=<uuid> cargo test --lib -- --ignored mavi_live_resume`
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn mavi_live_resume_with_history() {
+        let (Ok(dir), Ok(id)) = (
+            std::env::var("MAVI_LIVE_RESUME_DIR"),
+            std::env::var("MAVI_LIVE_RESUME_ID"),
+        ) else {
+            return;
+        };
+        let root = std::fs::canonicalize(&dir).unwrap();
+        // Tests run under a hermetic HOME and CLAUDE_CONFIG_DIR; the saved
+        // conversation lives under the real one (the test harness keeps it in
+        // GITPULSE_TEST_REAL_HOME). Copy it to where both the locator and
+        // `claude --resume` look in this process.
+        let real_home =
+            std::path::PathBuf::from(std::env::var_os("GITPULSE_TEST_REAL_HOME").unwrap());
+        let project = crate::workbench::conversation::claude_project_dir_name(&root);
+        let file = format!("{id}.jsonl");
+        let source = real_home
+            .join(".claude")
+            .join("projects")
+            .join(&project)
+            .join(&file);
+        let config = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap());
+        let target = config.join("projects").join(&project);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::copy(&source, target.join(&file)).expect("the real transcript exists");
+        let history = super::super::history::load(&root, &id)
+            .expect("the transcript is found for this checkout");
+        assert!(history.turns >= 1, "history has turns");
+        let seeded = history.lines.len();
+        let mut args: Vec<String> = super::super::CLAUDE_STRUCTURED
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        args.extend(
+            crate::workbench::terminal_command::resume("claude", &id, std::path::Path::new(""))
+                .unwrap(),
+        );
+        let args = crate::workbench::terminal_command::apply_permission_mode(
+            Some("claude"),
+            Some("ask"),
+            false,
+            Some(args),
+        )
+        .unwrap()
+        .unwrap();
+        let mut command = Command::new("claude");
+        command.args(&args).current_dir(&root);
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&seen);
+        let emit: Emit = Arc::new(move |name, value| {
+            if name == EVENT {
+                for entry in value["entries"].as_array().cloned().unwrap_or_default() {
+                    if let Some(line) = entry["line"]
+                        .as_str()
+                        .and_then(|l| serde_json::from_str(l).ok())
+                    {
+                        sink.lock().unwrap().push(line);
+                    }
+                }
+            }
+        });
+        let turns = history.turns;
+        let session = Session::spawn(
+            "resume".into(),
+            MaviTarget::Local {
+                root: root.to_string_lossy().into_owned(),
+            },
+            "ask".into(),
+            None,
+            command,
+            emit,
+            history,
+        )
+        .unwrap();
+        let (replay, _) = session.replay(0);
+        assert_eq!(
+            replay.len(),
+            seeded,
+            "the history is the first thing a page replays"
+        );
+        assert!(replay[0].line.contains("mavi_history"));
+        session
+            .send("In one short sentence: what file did you edit earlier in this conversation?")
+            .unwrap();
+        let started = Instant::now();
+        let answer = loop {
+            assert!(started.elapsed() < Duration::from_secs(120), "no answer");
+            let lines = seen.lock().unwrap().clone();
+            if lines.iter().any(|l| l["type"] == "result") {
+                break lines
+                    .iter()
+                    .filter(|l| l["type"] == "assistant")
+                    .flat_map(|l| {
+                        l["message"]["content"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .filter_map(|b| b["text"].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let user_turn = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l["type"] == "mavi_user")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            user_turn["turn"],
+            turns + 1,
+            "numbering continues after the history"
+        );
+        assert!(
+            answer.contains("a.txt"),
+            "the resumed agent remembers the conversation: {answer}"
+        );
         session.stop();
     }
 }

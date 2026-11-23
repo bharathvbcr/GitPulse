@@ -53,3 +53,31 @@ describe("canContinueInTerminal", () => {
     expect(canContinueInTerminal(record({ movedToTerminalAt: 1 })).ok).toBe(false);
   });
 });
+
+describe("terminalConversation", () => {
+  const hosted = (startDir: string | null, mode: "ask" | "edit" | "bypass" | null = "edit") => () => ({ sessionId: UUID.toUpperCase(), repoPath: "/r", startDir, mode });
+
+  it("reads the conversation, where it ran, and its mode before anything ends", async () => {
+    const { terminalConversation } = await import("./handoff");
+    expect(terminalConversation("a", [tab("a", { title: "Fix CI" })], hosted(null))).toEqual({
+      tabKey: "a",
+      conversationId: UUID,
+      cwd: "/r",
+      mode: "edit",
+      title: "Fix CI",
+    });
+    expect(terminalConversation("a", [tab("a")], hosted("pkg/web"))).toMatchObject({ cwd: "/r/pkg/web" });
+  });
+
+  it("refuses shells, unknown tabs and unidentified conversations", async () => {
+    const { terminalConversation } = await import("./handoff");
+    expect(terminalConversation("x", [tab("a")], hosted(null))).toHaveProperty("reason");
+    expect(terminalConversation("a", [tab("a", { launcher: "shell" })], hosted(null))).toHaveProperty("reason");
+    expect(terminalConversation("a", [tab("a")], () => undefined)).toHaveProperty("reason");
+  });
+
+  it("does not count an ended tab as holding the conversation", () => {
+    const map = new Map([["pty-a", { sessionId: UUID }]]);
+    expect(terminalHolding(UUID, [tab("a", { status: "exited" })], (id) => map.get(id))).toBeNull();
+  });
+});

@@ -330,6 +330,7 @@ function onResult(state: ThreadState, line: Json, s: Scratch): void {
     durationMs: num(line.duration_ms),
     costUsd: cost,
     summary: s.summary,
+    history: line.mavi_history === true,
   };
   s.summary = null;
   state.activity = null;
@@ -389,6 +390,12 @@ function onMavi(state: ThreadState, line: Json): void {
     case "mavi_user": {
       const turn = num(line.turn) ?? state.turn + 1;
       state.turn = Math.max(state.turn, turn);
+      if (line.automatic === true) {
+        // A turn Claude Code started itself (a background task reporting
+        // back): not the person's words, so not a message bubble.
+        push(state, { kind: "notice", id: `auto:${turn}:${state.items.length}`, turn, tone: "info", text: "A background task reported back, and the agent continued." });
+        break;
+      }
       push(state, { kind: "user", id: `u${turn}:${state.items.length}`, turn, text: str(line.text) ?? "", at: num(line.at) });
       if (line.baseline === "unavailable") {
         push(state, { kind: "notice", id: `n${state.items.length}`, turn, tone: "warn", text: "Couldn't read the worktree's state before this turn, so changes made outside the agent's edit tools will not be listed." });
@@ -447,6 +454,34 @@ function onMavi(state: ThreadState, line: Json): void {
       });
       break;
     }
+    case "mavi_history": {
+      if (line.available === true) {
+        const turns = num(line.turns) ?? 0;
+        if (turns > 0) {
+          push(state, {
+            kind: "notice",
+            id: `history:${state.items.length}`,
+            turn: 0,
+            tone: "info",
+            text: `Earlier in this conversation: ${turns === 1 ? "1 turn" : `${turns} turns`} from Claude Code's transcript${line.truncated === true ? ", the oldest not shown" : ""}.`,
+          });
+        }
+      } else {
+        push(state, {
+          kind: "notice",
+          id: `history:${state.items.length}`,
+          turn: state.turn,
+          tone: "info",
+          text: `Earlier messages are not shown here. ${str(line.reason) ?? ""}`.trim(),
+        });
+      }
+      break;
+    }
+    case "mavi_history_end":
+      if ((num(line.turns) ?? 0) > 0) {
+        push(state, { kind: "notice", id: `history-end:${state.items.length}`, turn: state.turn, tone: "info", text: "Continues in Mavi from here." });
+      }
+      break;
     case "mavi_truncated":
       push(state, { kind: "notice", id: `n${state.items.length}`, turn: state.turn, tone: "warn", text: `A ${num(line.bytes) ?? "very large"}-byte line from the agent was too long to show.` });
       break;

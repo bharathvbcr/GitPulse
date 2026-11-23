@@ -348,8 +348,10 @@ describe("annotated but unregistered commands", () => {
     // cmd_terminal_set_title (a renamed terminal keeps its title across
     // reloads and restarts), from the terminal landing in e8f7bad9c. 346 with
     // the ten cmd_mavi_* handlers (Mavi: agent conversations over Claude
-    // Code's stream-json, locally or through ssh).
-    expect(found.size).toBe(346);
+    // Code's stream-json, locally or through ssh). 347 with
+    // cmd_mavi_conversation_check (whether a terminal tab's conversation can
+    // continue in Mavi, asked before the tab is ended).
+    expect(found.size).toBe(347);
     expect(found.has("cmd_mavi_start")).toBe(true);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     expect(found.has("cmd_manvi_use")).toBe(true);

@@ -4,7 +4,15 @@
  */
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
-import type { MaviEntry, MaviEventPayload, MaviFileDiff, MaviProbe, MaviReplay, MaviSummary } from "./types";
+import type {
+  MaviConversationCheck,
+  MaviEntry,
+  MaviEventPayload,
+  MaviFileDiff,
+  MaviProbe,
+  MaviReplay,
+  MaviSummary,
+} from "./types";
 
 export const MAVI_EVENT = "mavi-event";
 export const MAVI_STATUS_EVENT = "mavi-status";
@@ -45,6 +53,8 @@ export const maviClient = {
   fileDiff: (id: string, path: string) => invoke<MaviFileDiff>("cmd_mavi_file_diff", { id, path }),
   sshHosts: () => invoke<string[]>("cmd_mavi_ssh_hosts"),
   sshProbe: (host: string, dir: string) => invoke<MaviProbe>("cmd_mavi_ssh_probe", { host, dir }),
+  conversationCheck: (repoPath: string, conversationId: string) =>
+    invoke<MaviConversationCheck>("cmd_mavi_conversation_check", { repoPath, conversationId }),
 };
 
 export function onMaviEvents(handler: (id: string, entries: MaviEntry[]) => void): Promise<UnlistenFn> {

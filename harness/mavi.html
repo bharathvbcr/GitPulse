@@ -7,6 +7,7 @@
   import { mount } from "svelte";
   import MaviView from "../src/lib/components/mavi/MaviView.svelte";
   import { mainLines, doneLines, summary, MAIN_SESSION, DONE_SESSION, SNAPSHOT_PATCH } from "./maviFixture.ts";
+  import historyText from "../src/lib/mavi/__fixtures__/history-allow-edit.jsonl?raw";
 
   // Disposable fixture: the host is simulated. What is real is the view, the
   // store, the reducer, the rows, the changes model and every component.
@@ -37,6 +38,10 @@
       case "cmd_mavi_list":
         return scenario === "empty" ? [] : [summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}), summary(DONE_SESSION, "idle", { touched: [], cost_usd: 0.08 })];
       case "cmd_mavi_events":
+        if (args.id === MAIN_SESSION && scenario === "history") {
+          const history = historyText.split("\n").filter(Boolean);
+          return { entries: entries(history), next_seq: 999, summary: summary(MAIN_SESSION, "ready", { touched: [] }) };
+        }
         if (args.id === MAIN_SESSION) return { entries: entries(scenario === "moved" ? [...mainLines(), JSON.stringify({ type: "mavi_exit", exit: "stopped by signal 15", ok: true, stderr: [] })] : mainLines()), next_seq: 999, summary: summary(MAIN_SESSION, scenario === "moved" ? "ended" : "approval", scenario === "moved" ? { exit_ok: true } : {}) };
         return { entries: entries(doneLines()), next_seq: 99, summary: summary(DONE_SESSION, "idle", { touched: [] }) };
       case "cmd_mavi_ssh_hosts":

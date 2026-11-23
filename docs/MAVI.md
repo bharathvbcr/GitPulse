@@ -33,8 +33,8 @@ Open **Mavi** in the header (⌥⌘4 on macOS, Ctrl+Shift+4 elsewhere).
   changed, file by file. See below.
 - **Resume**: quitting GitPulse ends every agent. A thread keeps the
   conversation id, and **Resume** continues the conversation with
-  `--resume`. The earlier timeline is not restored (it is not persisted; the
-  agent's own transcript holds the conversation) and the view says so.
+  `--resume`, and shows the earlier turns read from Claude Code's transcript (see
+  below).
 
 ## The live changes view
 
@@ -103,12 +103,37 @@ same conversation would both write to one Claude Code transcript. So:
 - Mavi refuses to resume a conversation a terminal tab is still running (and shows that tab), and the host refuses to start a second Mavi thread on a conversation another thread already runs;
 - the moved state is saved with the thread, so a reload still shows "This conversation continues in a terminal tab".
 
-Not yet: **Continue in Mavi** from a terminal tab. Mavi does not yet render a
-conversation's earlier history from the transcript, so an adopted conversation
-would arrive as an empty timeline; that direction waits for history rendering.
+- **Continue in Mavi** (a Claude Code tab's menu in the dock): moves the tab's conversation into a Mavi thread, with its earlier turns. Before the tab's session ends it checks that the conversation is saved for this checkout (not a subdirectory or another worktree, where Claude Code alone can resume it), that no Mavi thread already works in that worktree, and that Mavi has room; then it asks (Bypass is named in the question), ends the tab's process, waits until it has exited, and only then starts the Mavi agent. A conversation that was a Mavi thread before it moved goes back to that thread.
+
 SSH threads cannot move to the local dock, and the Agents window does not list
 Mavi threads yet (its rows come from terminals, worktrees and task runs), so it
 undercounts running agents while Mavi threads run.
+
+### Earlier turns, from the transcript
+
+Whenever Mavi resumes a conversation (Resume after a quit, Bring back to Mavi,
+Continue in Mavi) the host reads Claude Code's own transcript for it and seeds
+the thread with the earlier turns, so they render exactly like live ones: your
+prompts, the agent's prose and thinking, tool rows, edits with their exact
+hunks (the Changes column's Thread scope includes them), interruptions, and a
+note where a background task reported back. A marker says how many turns came
+from the transcript and where Mavi takes over. What a transcript does not
+record per turn (duration, cost, the turn-end summary) is not invented: those
+turns read "Earlier turn".
+
+- Read from `<config>/projects/<encoded cwd>/<id>.jsonl`, found by the same
+  locator GitPulse uses for terminal resumes, across every Claude Code config
+  directory it knows.
+- Bounded: the last 16 MiB of the file and the last 4,000 timeline lines; a
+  cut is announced.
+- Each line is slimmed and redacted exactly as a live line is.
+- Dropped: subagent side-chains, attachments, queue and cost bookkeeping,
+  slash-command plumbing. A turn Claude Code started itself (a background task
+  reporting back) is shown as a note, not as your message.
+- A conversation saved for another directory is refused rather than resumed
+  empty: Claude Code resumes a conversation only from where it was saved.
+- On an SSH host the transcript stays on the host; the thread says so and
+  starts at the resume.
 
 ## How it works
 
@@ -189,8 +214,7 @@ exercised against a live sshd in CI.
 ## Not yet
 
 Codex (`codex app-server`), image attachments, restoring files to a turn,
-a remote daemon that keeps the agent alive across disconnects, and persisting
-the timeline across app restarts.
+and a remote daemon that keeps the agent alive across disconnects.
 
 ## Design sources
 

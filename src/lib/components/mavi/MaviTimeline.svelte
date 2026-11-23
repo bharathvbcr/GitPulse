@@ -104,6 +104,8 @@
 
   function endLabel(end: TurnEndItem): string {
     if (end.interrupted) return "Stopped";
+    // From the transcript: it finished, but when and at what cost is not recorded per turn.
+    if (end.history) return "Earlier turn";
     if (!end.ok) return end.subtype === "error_max_turns" ? "Hit the turn limit" : "Ended with an error";
     return end.summary?.category === "review_ready" ? "Ready for review" : end.summary?.category === "blocked" ? "Blocked" : "Done";
   }

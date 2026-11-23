@@ -25,7 +25,11 @@ import { focusTerminalSession } from "../terminal/sessionFocus";
 import { isPermissionMode, type PermissionMode } from "../terminal/agentDefaults";
 import { repoStore } from "../stores/repoStore";
 import { maviStore } from "./store.svelte";
+import { maviClient, type MaviModeId } from "./client";
 import type { ThreadRecord } from "./threads";
+
+/** The host's own bound on live threads (`MAX_LIVE` in src-tauri/src/mavi/mod.rs). */
+export const MAX_LIVE_THREADS = 12;
 
 export type HandoffResult = { ok: true; note?: string } | { ok: false; reason: string };
 
@@ -38,6 +42,8 @@ export function terminalHolding(
   const id = conversationId.toLowerCase();
   for (const record of runningAgents(records)) {
     if (record.launcher !== "claude" || !record.sessionId) continue;
+    // An ended tab keeps its record (and session id) until it is closed.
+    if (record.status === "exited" || record.status === "error") continue;
     if (byTerminal(record.sessionId)?.sessionId?.toLowerCase() === id) return record;
   }
   return null;
@@ -158,5 +164,120 @@ export async function openShellHere(key: string): Promise<HandoffResult> {
     return { ok: true };
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** What "Continue in Mavi" needs from a terminal tab, read before anything ends. */
+export interface TerminalConversation {
+  readonly tabKey: string;
+  readonly conversationId: string;
+  /** Where the agent ran: the checkout, or the subdirectory it started in. */
+  readonly cwd: string;
+  /** The tab's permission mode; null when it ran with the CLI's own default. */
+  readonly mode: PermissionMode | null;
+  readonly title: string;
+}
+
+/** The conversation a Claude Code tab is running, or why it cannot be moved. */
+export function terminalConversation(
+  tabKey: string,
+  records: readonly TerminalSessionRecord[] = get(terminalSessions),
+  byTerminal: (ptyId: string) => { sessionId: string; repoPath: string; startDir: string | null; mode: PermissionMode | null } | undefined = (id) =>
+    hostedClaude.byTerminal(id),
+): TerminalConversation | { reason: string } {
+  const record = records.find((r) => r.key === tabKey);
+  if (!record) return { reason: "That terminal tab is gone." };
+  if (record.launcher !== "claude") return { reason: "Only a Claude Code tab's conversation can move to Mavi." };
+  const hosted = record.sessionId ? byTerminal(record.sessionId) : undefined;
+  if (!hosted) return { reason: "GitPulse cannot tell which Claude Code conversation this tab is running." };
+  const sub = hosted.startDir?.trim();
+  const cwd = !sub || sub === "." ? hosted.repoPath : sub.startsWith("/") || /^[A-Za-z]:[\\/]/.test(sub) ? sub : `${hosted.repoPath}/${sub}`;
+  return {
+    tabKey,
+    conversationId: hosted.sessionId.toLowerCase(),
+    cwd,
+    mode: hosted.mode,
+    title: record.title?.trim() || "Continued from a terminal",
+  };
+}
+
+/** Waits until the tab's process has ended, up to `ms`. */
+async function waitForTabEnd(tabKey: string, conversationId: string, ms = 5000): Promise<boolean> {
+  const started = Date.now();
+  for (;;) {
+    const record = get(terminalSessions).find((r) => r.key === tabKey);
+    const ended = !record || record.status === "exited" || record.status === "error";
+    if (ended && !terminalHolding(conversationId)) return true;
+    if (Date.now() - started > ms) return false;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * Moves a Claude Code tab's conversation into a Mavi thread, with its earlier
+ * turns read from the transcript. Everything refusable is checked before the
+ * tab ends: the conversation is saved for this checkout (not a subdirectory or
+ * another worktree, where Claude Code alone can resume it), no Mavi thread
+ * already works in that worktree, and Mavi has room for another agent. Then
+ * `confirm` asks the person (who also acknowledges Bypass there), the tab's
+ * process ends, and only once it has exited does the Mavi agent start.
+ */
+export async function continueInMavi(
+  tabKey: string,
+  confirm: (move: TerminalConversation & { root: string; mode: MaviModeId }) => Promise<boolean>,
+): Promise<HandoffResult & { key?: string }> {
+  const found = terminalConversation(tabKey);
+  if ("reason" in found) return { ok: false, reason: found.reason };
+  const check = await maviClient.conversationCheck(found.cwd, found.conversationId).catch((error: unknown) => ({
+    state: "unknown" as const,
+    reason: error instanceof Error ? error.message : String(error),
+    root: null,
+  }));
+  if (check.state !== "found" || !check.root) {
+    const why =
+      check.state === "elsewhere"
+        ? "Claude Code saved this conversation for a subdirectory or another worktree, and resumes it only there. Keep it in the terminal."
+        : check.reason ?? "Couldn't find the conversation.";
+    return { ok: false, reason: `${why} Nothing was moved.` };
+  }
+  const root = check.root;
+  const busy = maviStore.records.some((r) => {
+    const phase = maviStore.summaryOf(r)?.phase;
+    return r.target.kind === "local" && r.target.root === root && !!phase && phase !== "ended";
+  });
+  if (busy) {
+    return { ok: false, reason: "A Mavi thread is already working in this worktree. End it first; nothing was moved." };
+  }
+  const live = Object.values(maviStore.summaries).filter((s) => s.phase !== "ended").length;
+  if (live >= MAX_LIVE_THREADS) {
+    return { ok: false, reason: `${MAX_LIVE_THREADS} Mavi threads are already running. End one first; nothing was moved.` };
+  }
+  const mode: MaviModeId = found.mode ?? "ask";
+  if (!(await confirm({ ...found, root, mode }))) return { ok: false, reason: "" };
+
+  const record = get(terminalSessions).find((r) => r.key === tabKey);
+  try {
+    await record?.close();
+  } catch (error) {
+    return { ok: false, reason: `Couldn't end the terminal session: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!(await waitForTabEnd(tabKey, found.conversationId))) {
+    return { ok: false, reason: "The terminal session did not end in time. Nothing was moved; try again." };
+  }
+  try {
+    const key = await maviStore.adopt({
+      root,
+      conversationId: found.conversationId,
+      mode,
+      acknowledged: mode === "bypass",
+      title: found.title === "Continued from a terminal" ? undefined : found.title,
+    });
+    return { ok: true, key };
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      reason: `Couldn't start it in Mavi: ${why} The conversation is intact; resume it in a Claude Code tab with its id ${found.conversationId}.`,
+    };
   }
 }

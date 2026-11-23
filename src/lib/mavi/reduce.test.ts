@@ -245,3 +245,37 @@ describe("an edit the agent never got to apply", () => {
     expect(change).toMatchObject({ latestState: "not_applied", added: 0, removed: 0 });
   });
 });
+
+describe("history from a real transcript", () => {
+  const state = applyAll(emptyThread(), fixture("history-allow-edit.jsonl"));
+
+  it("renders earlier turns as a live run would, between two markers", () => {
+    expect(state.items[0]).toMatchObject({ kind: "notice", text: expect.stringContaining("3 turns from Claude Code's transcript") });
+    expect(state.items.at(-1)).toMatchObject({ kind: "notice", text: "Continues in Mavi from here." });
+    expect(state.items.filter((i) => i.kind === "user").map((i) => (i.kind === "user" ? i.text : ""))).toEqual([
+      "Use the Edit tool to append a line 'world' to a.txt, then reply done.",
+      "Now run `sleep 30` with Bash.",
+    ]);
+    expect(state.items.some((i) => i.kind === "notice" && i.text.startsWith("A background task reported back"))).toBe(true);
+    expect(state.turn).toBe(3);
+  });
+
+  it("keeps the edit's exact hunks, so the Changes column covers earlier turns", () => {
+    const edit = tools(state).find((t) => t.name === "Edit")!;
+    expect(edit.status).toBe("ok");
+    expect(edit.patch?.[0]?.lines).toContain("+world");
+    const [change] = collectChanges(state, "/repo", { kind: "thread" });
+    expect(change).toMatchObject({ path: "a.txt", latestState: "applied", added: 1 });
+  });
+
+  it("marks history turn ends, which know no duration or cost", () => {
+    const ends = state.items.filter((i) => i.kind === "turn_end");
+    expect(ends).toHaveLength(3);
+    expect(ends.every((e) => e.kind === "turn_end" && e.history && e.costUsd === null && e.durationMs === null)).toBe(true);
+  });
+
+  it("continues turn numbering after the history", () => {
+    applyLine(state, JSON.stringify({ type: "mavi_user", text: "next", turn: 4 }));
+    expect(state.items.at(-1)).toMatchObject({ kind: "user", turn: 4 });
+  });
+});

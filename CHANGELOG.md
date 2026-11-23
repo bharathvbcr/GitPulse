@@ -34,6 +34,12 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   **Continue in terminal / Bring back to Mavi**, which moves a conversation
   between Mavi and a Claude Code tab without ever running it twice. Running
   Mavi threads are named in the quit question.
+- **Continue in Mavi, with the conversation's history.** A Claude Code tab's
+  menu moves its conversation into a Mavi thread, checked before the tab ends
+  and started only after it has exited. Every resume (after a quit, Bring back
+  to Mavi, Continue in Mavi) now shows the earlier turns, read from Claude
+  Code's own transcript and rendered like live ones, edits and their hunks
+  included, instead of an empty timeline.
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.

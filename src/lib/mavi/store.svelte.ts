@@ -238,21 +238,87 @@ class MaviStore {
     const summary = await maviClient.start(base);
     record.sessionId = summary.id;
     this.summaries[summary.id] = summary;
-    const timeline = this.timelines[key] ?? emptyThread();
-    // Sequence numbers restart with the new host session.
-    timeline.lastSeq = 0;
-    timeline.ended = null;
-    timeline.items.push({
-      kind: "notice",
-      id: `resume:${summary.id}`,
-      turn: timeline.turn,
-      tone: "info",
-      text: record.conversationId
-        ? "Resumed the conversation. Earlier messages are in the agent's own transcript; this view continues from here."
-        : "Started a new agent for this thread.",
-    });
-    this.timelines[key] = timeline;
+    if (record.conversationId) {
+      // The host seeds the conversation's earlier turns from Claude Code's
+      // transcript into the new session, so the timeline is rebuilt from that
+      // replay instead of keeping this run's partial copy beside it.
+      this.timelines[key] = emptyThread();
+      await this.#load(record);
+    } else {
+      const timeline = this.timelines[key] ?? emptyThread();
+      // Sequence numbers restart with the new host session.
+      timeline.lastSeq = 0;
+      timeline.ended = null;
+      timeline.items.push({
+        kind: "notice",
+        id: `resume:${summary.id}`,
+        turn: timeline.turn,
+        tone: "info",
+        text: "Started a new agent for this thread.",
+      });
+      this.timelines[key] = timeline;
+    }
     this.#persist();
+  }
+
+  /**
+   * Takes over a conversation that ran elsewhere (a terminal tab): starts an
+   * agent resuming it in `root`, with its earlier turns read from the
+   * transcript, and opens the thread. The caller has ended the other side.
+   */
+  async adopt(options: {
+    root: string;
+    conversationId: string;
+    mode: MaviModeId;
+    acknowledged?: boolean;
+    title?: string;
+  }): Promise<string> {
+    const request: StartRequest = { repoPath: options.root, mode: options.mode, resume: options.conversationId };
+    if (options.acknowledged) request.acknowledged = true;
+    const summary = await maviClient.start(request);
+    const startedIn = summary.target.kind === "local" ? summary.target.root : null;
+    const existing = this.records.find(
+      (r) =>
+        r.conversationId?.toLowerCase() === options.conversationId.toLowerCase() &&
+        r.target.kind === "local" &&
+        r.target.root === startedIn,
+    );
+    const now = Date.now();
+    let record: ThreadRecord;
+    if (existing) {
+      // The conversation was a Mavi thread before it moved to the terminal.
+      record = existing;
+      record.sessionId = summary.id;
+      record.mode = options.mode;
+      record.movedToTerminalAt = null;
+      record.lastActivityAt = now;
+    } else {
+      record = {
+        key: newKey(),
+        sessionId: summary.id,
+        title: options.title?.trim() || "Continued from a terminal",
+        target: summary.target,
+        mode: options.mode,
+        model: null,
+        conversationId: options.conversationId.toLowerCase(),
+        createdAt: now,
+        lastActivityAt: now,
+        seenAt: now,
+        movedToTerminalAt: null,
+      };
+      this.records = [record, ...this.records];
+    }
+    this.summaries[summary.id] = summary;
+    this.timelines[record.key] = emptyThread();
+    this.openKey = record.key;
+    await this.#load(record);
+    // A thread adopted under a placeholder title takes its first prompt's.
+    if (!existing && !options.title?.trim()) {
+      const first = this.timelines[record.key]?.items.find((i) => i.kind === "user");
+      if (first && first.kind === "user") record.title = titleFrom(first.text);
+    }
+    this.#persist();
+    return record.key;
   }
 
   /** Sends now when the agent is between turns, otherwise queues. */

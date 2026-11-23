@@ -25,6 +25,7 @@
 //! make every "what this turn changed" answer a mix of both. A second thread
 //! for the same worktree is refused until the first ends; use a worktree.
 
+pub mod history;
 pub mod session;
 pub mod ssh;
 pub(crate) mod wire;
@@ -293,6 +294,7 @@ fn start(
         state.counter.fetch_add(1, Ordering::Relaxed)
     );
     let model = request.model.clone().filter(|m| !m.trim().is_empty());
+    let history = earlier_turns(&request, &target)?;
     let session = Session::spawn(
         id.clone(),
         target,
@@ -300,6 +302,7 @@ fn start(
         model,
         command,
         emit,
+        history,
     )?;
     let summary = session.summary();
     let mut sessions = state.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -317,6 +320,45 @@ fn start(
         }
     }
     Ok(summary)
+}
+
+/// A resumed conversation's earlier turns, from Claude Code's transcript.
+///
+/// Refuses a local resume whose transcript was saved for another directory:
+/// Claude Code resumes a conversation only from where it was saved, so the
+/// agent would start without it and the thread would quietly be a new one.
+fn earlier_turns(
+    request: &StartRequest,
+    target: &MaviTarget,
+) -> Result<history::History, CommandError> {
+    let Some(id) = request
+        .resume
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(history::History::default());
+    };
+    let id = id.to_ascii_lowercase();
+    match target {
+        MaviTarget::Local { root } => {
+            let root = Path::new(root);
+            let found = history::check(root, &id);
+            match found.state {
+                history::MaviTranscriptState::Found => Ok(history::load(root, &id)
+                    .unwrap_or_else(|reason| history::unavailable(&reason))),
+                history::MaviTranscriptState::Elsewhere => Err(CommandError::plain(
+                    found.reason.unwrap_or_else(|| "This conversation belongs to another directory.".into()),
+                )),
+                _ => Ok(history::unavailable(
+                    found.reason.as_deref().unwrap_or("The transcript could not be found."),
+                )),
+            }
+        }
+        MaviTarget::Ssh { .. } => Ok(history::unavailable(
+            "The earlier messages of a conversation on an SSH host stay on that host; this view starts here.",
+        )),
+    }
 }
 
 fn tauri_emit(app: tauri::AppHandle) -> session::Emit {
@@ -499,6 +541,27 @@ fn relative_to(root: &Path, path: &str) -> String {
         }
     }
     path.to_owned()
+}
+
+/// Whether a conversation can be resumed in `repo_path`: its transcript is
+/// saved for that checkout, for another directory, or not at all. Asked before
+/// a terminal tab is ended to move its conversation here.
+#[tauri::command(async)]
+pub async fn cmd_mavi_conversation_check(
+    repo_path: String,
+    conversation_id: String,
+) -> Result<history::MaviConversationCheck, IpcError> {
+    off_thread(move || {
+        if !ssh::is_uuid(conversation_id.trim()) {
+            return Err(CommandError::plain("A conversation id is a UUID."));
+        }
+        let root = worktree_root(&repo_path)?;
+        Ok(history::check(
+            &root,
+            &conversation_id.trim().to_ascii_lowercase(),
+        ))
+    })
+    .await
 }
 
 /// The concrete hosts in `~/.ssh/config`.

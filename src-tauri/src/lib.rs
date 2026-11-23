@@ -449,6 +449,7 @@ pub fn run() {
             mavi::cmd_mavi_file_diff,
             mavi::cmd_mavi_ssh_hosts,
             mavi::cmd_mavi_ssh_probe,
+            mavi::cmd_mavi_conversation_check,
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
             workbench::cmd_workbench_relink_repository,

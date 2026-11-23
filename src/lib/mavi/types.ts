@@ -72,6 +72,17 @@ export interface MaviProbe {
   readonly millis: number;
 }
 
+/** `MaviTranscriptState` in src-tauri/src/mavi/history.rs. */
+export type MaviTranscriptState = "found" | "elsewhere" | "absent" | "unknown";
+
+/** `MaviConversationCheck` in history.rs (`cmd_mavi_conversation_check`). */
+export interface MaviConversationCheck {
+  readonly state: MaviTranscriptState;
+  readonly reason: string | null;
+  /** The canonical worktree root it would resume in, when found there. */
+  readonly root: string | null;
+}
+
 /** The `mavi-event` payload: a batch of one thread's lines. */
 export interface MaviEventPayload {
   readonly id: string;
@@ -170,6 +181,8 @@ export interface TurnEndItem {
   /** This turn's cost: the cumulative total minus the previous total. */
   readonly costUsd: number | null;
   summary: TurnSummary | null;
+  /** An earlier turn read from the transcript: no duration or cost is known. */
+  readonly history: boolean;
 }
 
 export type TimelineItem = UserItem | AssistantItem | ThinkingItem | ToolItem | NoticeItem | TurnEndItem;
