@@ -43,17 +43,26 @@ who are inactive for a long period are moved to emeritus status.
 
 ## Branches and merging
 
-- **`main` is protected.** Changes reach it through a pull request.
-  A ruleset requires:
-  - a pull request for contributors, with one approving review from a code owner
+- **`main` is protected by a ruleset** ("main: pull requests and checks").
+  Contributors' changes land through pull requests, and the ruleset requires:
+  - a pull request with one approving review, and review from a code owner
     (see [`.github/CODEOWNERS`](.github/CODEOWNERS));
+  - stale approvals dismissed when new commits are pushed;
   - all review conversations resolved;
-  - the required status checks passing;
+  - the required status checks: Rust Lint (ubuntu, macOS and Windows), Frontend
+    (Windows), Gusset engine (Linux), and "No commit authored as a test fixture";
   - no force-push and no deletion of `main`.
-- **Release tags (`v*`) are protected** against deletion and rewriting.
+  Merge, squash and rebase merges are all allowed.
+- **The repository admin can bypass the ruleset.** The maintainer may push to
+  `main` directly as repository admin, which is used for releases, for landing
+  trains of merged work, and for automation. Everything else, including every
+  contributor's change, is subject to the ruleset.
+- **Release tags (`v*`) are protected:** they cannot be deleted, force-updated or moved.
 - **Branch names** use a type prefix (`feat/`, `fix/`, `docs/`, `chore/`, ...).
 - **Commits** use Conventional Commit subjects and carry a DCO sign-off
-  (`git commit -s`). Both are explained in [CONTRIBUTING.md](CONTRIBUTING.md).
+  (`git commit -s`). Sign-off is required by project policy and checked in
+  review; GitHub does not enforce it automatically for commits made outside
+  the web UI. Both are explained in [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Merge policy.** The maintainer merges once the checks are green and the
   review is approved. Pull requests are atomic: one coherent concern each.
   Because the maintainer is the only code owner, the ruleset's pull-request and

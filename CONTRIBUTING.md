@@ -633,16 +633,23 @@ ask a question, see [SUPPORT.md](SUPPORT.md); for how decisions are made,
 
 ### Review and required checks
 
-`main` is protected, so nothing is pushed to it directly. A pull request is merged
-when:
+`main` is protected by a ruleset. Contributors' changes land through pull
+requests; the maintainer can push directly as repository admin (for releases,
+landing trains and automation), and everything else is subject to the ruleset. A
+pull request is merged when:
 
-- the required status checks pass;
-- one code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) has approved it;
+- the required status checks pass (Rust Lint on ubuntu, macOS and Windows,
+  Frontend on Windows, Gusset engine on Linux, and "No commit authored as a test
+  fixture");
+- a code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) has approved it
+  (pushing new commits dismisses an earlier approval);
 - every review conversation is resolved;
-- every commit carries a sign-off.
+- every commit carries a sign-off. This is a project requirement checked in
+  review, not something GitHub enforces automatically for commits made outside the
+  web UI.
 
-Force-pushes to and deletion of `main` are blocked, and so are deletion and
-rewriting of release tags (`v*`). Pull requests also run a dependency review, which
+Force-pushes to and deletion of `main` are blocked, and release tags (`v*`)
+cannot be deleted, force-updated or moved. Pull requests also run a dependency review, which
 fails on a newly added dependency with a known high-severity advisory (for the
 manifests GitHub's dependency graph reads; `bun.lock` is covered by the
 dependency audit workflow), and are labelled by the paths they touch. Keep each pull request to one concern so it
