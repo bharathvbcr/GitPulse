@@ -607,11 +607,12 @@ impl RealHost {
             server::serve_for_unit_test(config, crate::terminal::Engine::default())
         });
         let socket = dir.path().join(super::super::socket_name(proto::PROTOCOL));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Stream::connect(&socket).is_err() {
-            assert!(Instant::now() < deadline, "the test host never listened");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            crate::test_support::wait_until(Duration::from_secs(10), || {
+                Stream::connect(&socket).is_ok()
+            }),
+            "the test host never listened"
+        );
         Self {
             dir,
             sessions: Vec::new(),
@@ -728,17 +729,21 @@ fn a_real_v4_host_is_discovered_read_and_stopped_by_an_app_of_a_later_protocol()
     let mut legacy = LegacyHost::connect(host.dir.path(), 4).unwrap();
     // The saved output is read while the session lives, polled for because the
     // host records it asynchronously.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let tail = loop {
+    let mut recorded = None;
+    let mut last = String::from("never read");
+    crate::test_support::wait_until(Duration::from_secs(15), || {
         match legacy.transcript_tail("term-77-1", 4096, false).unwrap() {
-            crate::terminal::TranscriptRead::Found(tail) if tail.bytes > 0 => break tail,
-            other => assert!(
-                Instant::now() < deadline,
-                "no output was recorded: {other:?}"
-            ),
+            crate::terminal::TranscriptRead::Found(tail) if tail.bytes > 0 => {
+                recorded = Some(tail);
+                true
+            }
+            other => {
+                last = format!("{other:?}");
+                false
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    });
+    let tail = recorded.unwrap_or_else(|| panic!("no output was recorded: {last}"));
     assert!(tail.live);
     use base64::Engine as _;
     let text = base64::engine::general_purpose::STANDARD
