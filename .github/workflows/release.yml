@@ -258,6 +258,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/release-state.mjs check
 
+      # A beta (X.Y.Z-beta.N) ships no .rpm: RPM forbids `-` in a version, and
+      # Tauri has no rpm-only version setting, so its bundler fails on one. The
+      # Linux legs then bundle the deb and AppImage only. The rule lives in
+      # scripts/check-release-assets.mjs, beside the manifest finalize checks.
+      - name: Bundle Targets For This Version
+        id: bundle_args
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          args="$(node scripts/check-release-assets.mjs --bundle-args "$PLATFORM")"
+          echo "Extra tauri build args for $PLATFORM: ${args:-(none)}"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
       - name: Build Tauri Desktop Application
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
@@ -290,7 +305,7 @@ jobs:
           retryAttempts: 3
           # `--` hands the rest to cargo: the shipping build resolves exactly
           # the committed Cargo.lock, not whatever it would resolve today.
-          args: ${{ matrix.args }} -- --locked
+          args: ${{ matrix.args }} ${{ steps.bundle_args.outputs.args }} -- --locked
 
   # Every installer is on the draft. Add the SHA-256 manifest and the two
   # SBOMs, checked against GitHub's own asset digests, before finalize demands
@@ -436,10 +451,18 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/release-state.mjs finalize
+          # A beta ships no rpm (see "Bundle Targets For This Version").
+          if [[ "$RELEASE_TAG" == *-beta.* ]]; then
+            installers="All ten installers (a beta ships no .rpm)"
+            unopened="The dmg and both AppImages are not opened."
+          else
+            installers="All twelve installers"
+            unopened="The dmg, both rpms and both AppImages are not opened."
+          fi
           {
             echo "### Release $RELEASE_TAG — draft verified"
             echo
-            echo "All twelve installers, both SBOMs and the SHA-256 manifest have uploaded with matching SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
-            echo "Seven installers were downloaded, matched to GitHub's SHA-256 and opened: the macOS app archive, both debs, both MSIs and both NSIS installers each hold every [[bin]] in src-tauri/Cargo.toml for their architecture and carry no source maps. The dmg, both rpms and both AppImages are not opened."
+            echo "$installers, both SBOMs and the SHA-256 manifest have uploaded with matching SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
+            echo "Seven installers were downloaded, matched to GitHub's SHA-256 and opened: the macOS app archive, both debs, both MSIs and both NSIS installers each hold every [[bin]] in src-tauri/Cargo.toml for their architecture and carry no source maps. $unopened"
             echo "The release remains a **draft** for manual publication."
           } >> "$GITHUB_STEP_SUMMARY"
