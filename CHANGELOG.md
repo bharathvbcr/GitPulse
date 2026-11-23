@@ -11,6 +11,16 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ## [Unreleased]
 
+### Fixed
+
+- File claims are no longer lost when several hooks compact or repair the claim
+  store at once. A compaction recognised the file it had read by its device and
+  inode number, and once that file was replaced the number could be reused by a
+  newer one; the stale compaction then took the newer file for its own and
+  renamed its older rows over it, dropping every claim appended in between,
+  each of them having been reported as written. A compaction now keeps the file
+  it read open until it is done, so the number cannot be reused meanwhile.
+
 ## [0.2.0-beta.1] - 2026-11-18
 
 The first beta of GitPulse 0.2.0 (see [GitPulse 0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md)),
