@@ -2192,3 +2192,209 @@ fn adversarial_a_rename_that_differs_from_its_folder_only_in_case_keeps_links() 
         outcome.expect("rename");
     }
 }
+
+// ---- adversarial: asset links of a moved note (ft-e023906b) ----
+
+/// Renames docs/A.md -> `to` with `body` as the note and `assets` beside it.
+fn move_with(
+    body: &str,
+    assets: &[(&str, &str)],
+    to: &str,
+) -> (tempfile::TempDir, String, RenameOutcomeProbe) {
+    let mut files: Vec<(&str, &str)> = vec![("docs/A.md", body)];
+    files.extend_from_slice(assets);
+    let dir = repo_with(&files);
+    let path = dir.path().to_str().unwrap().to_string();
+    let outcome = rename_doc(&path, "docs/A.md", to, |_| Ok(())).expect("rename");
+    let text = read(&dir, to);
+    println!(
+        "PROBE {body:?} -> {text:?} left_broken={:?} complete={}",
+        outcome.left_broken, outcome.complete
+    );
+    (
+        dir,
+        text,
+        RenameOutcomeProbe {
+            left_broken: outcome.left_broken.len(),
+            complete: outcome.complete,
+        },
+    )
+}
+
+struct RenameOutcomeProbe {
+    left_broken: usize,
+    complete: bool,
+}
+
+const PIC: &[(&str, &str)] = &[("docs/pic.png", "png")];
+
+#[test]
+fn asset_link_plain_image_is_re_expressed() {
+    let (_d, t, _) = move_with("![](pic.png)\n", PIC, "notes/A.md");
+    assert_eq!(t, "![](../docs/pic.png)\n");
+}
+
+#[test]
+fn asset_link_with_title_keeps_the_title() {
+    let (_d, t, _) = move_with("[x](pic.png \"title\")\n", PIC, "notes/A.md");
+    assert_eq!(t, "[x](../docs/pic.png \"title\")\n");
+}
+
+#[test]
+fn asset_link_with_fragment_still_resolves() {
+    let (_d, t, _) = move_with("[x](pic.png#frag)\n", PIC, "notes/A.md");
+    assert_eq!(t, "[x](../docs/pic.png#frag)\n");
+}
+
+#[test]
+fn asset_link_with_query_resolves_or_is_left_byte_identical() {
+    let (_d, t, _) = move_with("[x](pic.png?raw=1)\n", PIC, "notes/A.md");
+    assert!(
+        t == "[x](../docs/pic.png?raw=1)\n",
+        "a query-string asset link stays pointing at notes/pic.png, which does not exist: {t:?}"
+    );
+}
+
+#[test]
+fn asset_reference_definition_is_re_expressed() {
+    let (_d, t, _) = move_with("[x][r]\n\n[r]: pic.png\n", PIC, "notes/A.md");
+    assert_eq!(t, "[x][r]\n\n[r]: ../docs/pic.png\n");
+}
+
+#[test]
+fn asset_bare_autolink_is_untouched() {
+    let (_d, t, _) = move_with("<pic.png>\n", PIC, "notes/A.md");
+    assert_eq!(t, "<pic.png>\n");
+}
+
+#[test]
+fn asset_links_in_fences_and_inline_code_are_not_rewritten() {
+    let body = "```md\n![](pic.png)\n```\n\n`[x](pic.png)` and ``![](pic.png)``\n";
+    let (_d, t, _) = move_with(body, PIC, "notes/A.md");
+    assert_eq!(t, body);
+}
+
+#[test]
+fn asset_html_img_src_is_re_expressed_or_reported() {
+    let body = "<img src=\"pic.png\">\n";
+    let (_d, t, p) = move_with(body, PIC, "notes/A.md");
+    assert!(
+        t == "<img src=\"../docs/pic.png\">\n" || p.left_broken > 0 || !p.complete,
+        "BREAK: html img left dangling and unreported: {t:?}"
+    );
+}
+
+#[test]
+fn asset_name_with_spaces_in_angle_brackets() {
+    let (_d, t, _) = move_with(
+        "[s](<my pic.png>)\n",
+        &[("docs/my pic.png", "p")],
+        "notes/A.md",
+    );
+    assert_eq!(t, "[s](<../docs/my pic.png>)\n");
+}
+
+#[test]
+fn asset_percent_20_name_stays_escaped() {
+    let (_d, t, _) = move_with(
+        "[s](my%20pic.png)\n",
+        &[("docs/my pic.png", "p")],
+        "notes/A.md",
+    );
+    assert_eq!(t, "[s](../docs/my%20pic.png)\n");
+}
+
+#[test]
+fn asset_percent_encoded_dot_dot_traversal_never_leaves_the_repo() {
+    let body = "[a](%2e%2e/%2e%2e/etc/passwd) [b](%2e%2e/%2e%2e/%2e%2e/etc/passwd) [c](%252e%252e/pic.png)\n";
+    let (_d, t, _) = move_with(body, PIC, "a/b/A.md");
+    assert_eq!(t, body);
+}
+
+#[test]
+fn asset_percent_encoded_dot_dot_inside_the_repo_resolves() {
+    let body = "[a](%2e%2e/root.txt)\n";
+    let dir = repo_with(&[("docs/A.md", body), ("root.txt", "r")]);
+    let path = dir.path().to_str().unwrap();
+    rename_doc(path, "docs/A.md", "a/b/A.md", |_| Ok(())).expect("rename");
+    let t = read(&dir, "a/b/A.md");
+    let dest = t.trim().trim_start_matches("[a](").trim_end_matches(')');
+    assert!(
+        dir.path().join("a/b").join(dest).exists(),
+        "rewritten to a dangling path: {t:?}"
+    );
+}
+
+#[test]
+fn asset_nfd_spelled_link_still_resolves_after_the_move() {
+    let nfc = "caf\u{e9}.png";
+    let nfd = "cafe\u{301}.png";
+    let body = format!("[x]({nfd})\n");
+    let dir = repo_with(&[("docs/A.md", body.as_str()), (&format!("docs/{nfc}"), "p")]);
+    let path = dir.path().to_str().unwrap();
+    rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
+    let t = read(&dir, "notes/A.md");
+    let dest = t.trim().trim_start_matches("[x](").trim_end_matches(')');
+    assert!(
+        dir.path().join("notes").join(dest).exists(),
+        "dangling after rewrite: {t:?}"
+    );
+}
+
+#[test]
+fn asset_case_mismatched_link_resolves_or_is_untouched() {
+    let dir = repo_with(&[("docs/A.md", "[x](PIC.png)\n"), ("docs/pic.png", "p")]);
+    let insensitive = dir.path().join("docs/PIC.png").exists();
+    let path = dir.path().to_str().unwrap();
+    rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
+    let t = read(&dir, "notes/A.md");
+    println!("PROBE case insensitive={insensitive} -> {t:?}");
+    if insensitive {
+        assert_eq!(t, "[x](../docs/PIC.png)\n");
+    } else {
+        assert_eq!(t, "[x](PIC.png)\n");
+    }
+}
+
+#[test]
+fn asset_link_into_dot_git_is_refused() {
+    let body = "[c](../.git/config) [h](../.git/HEAD)\n";
+    let (_d, t, _) = move_with(body, &[], "a/b/A.md");
+    assert_eq!(t, body, "a link into .git/ was re-expressed");
+}
+
+#[test]
+fn same_folder_rename_leaves_every_asset_link_byte_identical() {
+    let body = "![](pic.png) [x](pic.png \"t\") [y](./pic.png#f) [z](<my pic.png>) [w](my%20pic.png) [r][q]\n\n[q]: pic.png\n<img src=\"pic.png\">\n";
+    let (_d, t, _) = move_with(
+        body,
+        &[("docs/pic.png", "p"), ("docs/my pic.png", "p")],
+        "docs/B.md",
+    );
+    assert_eq!(t, body);
+}
+
+#[test]
+fn rewritten_asset_links_are_not_counted_left_broken() {
+    let (_d, _t, p) = move_with("![](pic.png) [d](./pic.png)\n", PIC, "notes/A.md");
+    assert_eq!(p.left_broken, 0);
+    assert!(p.complete);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_symlink_asset_link_is_reported_not_silently_left() {
+    let dir = repo_with(&[("docs/A.md", "[l](link.png)\n"), ("docs/real.png", "p")]);
+    std::os::unix::fs::symlink(
+        dir.path().join("docs/real.png"),
+        dir.path().join("docs/link.png"),
+    )
+    .unwrap();
+    let path = dir.path().to_str().unwrap();
+    let outcome = rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
+    assert_eq!(read(&dir, "notes/A.md"), "[l](link.png)\n");
+    assert!(
+        !outcome.left_broken.is_empty() || !outcome.complete,
+        "FINDING: a link the move broke and the code refused to rewrite is reported nowhere: {outcome:?}"
+    );
+}
