@@ -1543,6 +1543,9 @@
           }
           check("closing the session keeps the oversized-chunk notice", () =>
             closedStatus.includes("exceeded its limit") && !closedStatus.includes("This session ended."));
+          // Leave the list as the steps after this expect it: closed. (It sits
+          // above the grid, so an open list would shrink every pane below.)
+          if (label("Sessions across repositories")) await dockMenu("terminal-session-count");
           earlyLoss = true;
           button("New Shell session").click();
           const earlyDeadline = performance.now() + 2000;
