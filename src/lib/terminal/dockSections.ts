@@ -36,19 +36,23 @@ export function normalizeDockSection(raw: unknown): DockSection {
 }
 
 /**
- * The section chord: ⌥⌘1–4 on macOS, Ctrl+Alt+1–4 elsewhere. ⌘1–9 (and
- * Ctrl+1–9) already switch repository tabs, so the chord adds Alt. Matched on
- * `event.code` because Alt rewrites `event.key` on macOS (⌥1 is "¡").
- * Returns null for anything else, including AltGr-style Ctrl+Alt on a mac.
+ * The section chord: ⌥⇧⌘1–4 on macOS, Ctrl+Alt+Shift+1–4 elsewhere.
+ *
+ * Every lighter digit chord already has an owner: ⌘/Ctrl+digit pick
+ * repository tabs, ⌥⌘digit (macOS) / Ctrl+Shift+digit pick views, ⌥digit
+ * picks a view's section, and ⌥⌘digit / Ctrl+Alt+digit jump between split
+ * panes inside the dock (`terminalSplitChord`). Adding Shift to the split
+ * chord is the one free combination, and it keeps the dock's chords together.
+ * Matched on `event.code` because Shift and Alt rewrite `event.key`.
  */
 export function dockSectionForChord(
-  event: Pick<KeyboardEvent, "code" | "key" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey">,
+  event: Pick<KeyboardEvent, "code" | "altKey" | "ctrlKey" | "metaKey" | "shiftKey"> & { key?: string },
   os: string,
 ): DockSection | null {
-  if (!event.altKey || event.shiftKey) return null;
+  if (!event.altKey || !event.shiftKey) return null;
   const mac = os === "macos";
   if (mac ? !event.metaKey || event.ctrlKey : !event.ctrlKey || event.metaKey) return null;
-  const digit = /^Digit([1-4])$/.exec(event.code ?? "")?.[1] ?? /^[1-4]$/.exec(event.key ?? "")?.[0];
+  const digit = /^Digit([1-4])$/.exec(event.code ?? "")?.[1];
   if (!digit) return null;
   return DOCK_SECTIONS[Number(digit) - 1]?.id ?? null;
 }
@@ -56,7 +60,7 @@ export function dockSectionForChord(
 /** The chord a section answers to, for tooltips and the shortcut guide. */
 export function dockSectionChordLabel(section: DockSection, os: string): string {
   const index = DOCK_SECTIONS.findIndex((entry) => entry.id === section) + 1;
-  return os === "macos" ? `⌥⌘${index}` : `Ctrl+Alt+${index}`;
+  return os === "macos" ? `⌥⇧⌘${index}` : `Ctrl+Alt+Shift+${index}`;
 }
 
 interface StorageLike {

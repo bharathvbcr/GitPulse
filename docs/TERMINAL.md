@@ -2,11 +2,27 @@
 
 The **Dock** is the panel beneath the active view. It has four sections: **Shell**,
 **Agents**, **Files** and **Console**. Toggle it with **Ctrl+`** (⌃` on macOS) and
-switch sections with **⌥⌘1–4** (**Ctrl+Alt+1–4** on Windows and Linux). Each
+switch sections with **⌥⇧⌘1–4** (**Ctrl+Alt+Shift+1–4** on Windows and Linux). Each
 session inside the Dock is a terminal, and the rest of this page is about those.
 
-Open the dock with **Ctrl+`**. It stays below the current view; **Expand terminal**
-gives it as much of the window as will fit (up to 2400px) and **Restore terminal
+Open the dock with **Ctrl+`**. Its header is one row: the section switcher and
+the checkout on the left (with a single status chip when the checkout has
+conflicts or cross-worktree collisions), and **Find**, **⋯ Dock options**,
+**Expand** and **Hide** on the right. Less frequent actions — clear scrollback,
+all sessions, float or dock, tab options, find a session — live under **⋯**.
+
+- **Shell** — the workspace: every tab (shells, agents, browser and file tabs) and
+  every split.
+- **Agents** — agent sessions here and in other repositories, launchers for new
+  agents and *Follow edits*. Picking one opens it in Shell.
+- **Files** — the Explorer beside your sessions; clicked files open as a tab, a
+  split, or in the Code view.
+- **Console** — single commands with capped output and per-run policy verdicts.
+
+The dock remembers the last section you used.
+
+The dock stays below the current view; **Expand the dock**
+gives it as much of the window as will fit (up to 2400px) and **Restore dock
 size** returns to its previous height. When expanded, the dock hides and marks `inert`
 the underlying view, ensuring focus remains strictly inside the terminal and preventing
 accidental background mouse or keyboard interactions. Dragging the splitter can also grow past

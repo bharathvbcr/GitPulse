@@ -41,6 +41,7 @@ export function terminalGuideShortcuts(os: HostOS): GuideShortcut[] {
     { keys: mac ? [cmd, opt, shift, "[ / ]"] : ["Ctrl", opt, "Shift", "[ / ]"], description: "Previous / next terminal pair" },
     { keys: mac ? [cmd, opt, "1–8"] : ["Ctrl", opt, "1–8"], description: "Jump directly to split pane 1–8" },
     { keys: mac ? [cmd, opt, "0"] : ["Ctrl", opt, "0"], description: "Close split view and keep active session" },
+    { keys: mac ? [cmd, opt, shift, "1–4"] : ["Ctrl", opt, "Shift", "1–4"], description: "Dock: Shell/Agents/Files/Console" },
     { keys: [cmd, "1–9"], description: "Jump to a repository tab, from the terminal too; 9 is the last" },
     { keys: mac ? [cmd, "F"] : ["Ctrl", "Shift", "F"], description: "Find in the terminal" },
     { keys: ["Enter"], description: "Next match" },
