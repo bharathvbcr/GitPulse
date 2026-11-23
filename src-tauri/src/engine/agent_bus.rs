@@ -43,6 +43,11 @@ pub const MAX_CLAIMED_ITEMS: usize = 128;
 pub const MAX_BUS_MESSAGES: usize = 256;
 pub const MAX_PINNED_OPEN_ASKS: usize = 64;
 pub const MAX_MESSAGE_BODY_BYTES: usize = 16 * 1024;
+/// Most unread direct messages kept past the row cap for one recipient, so one chatty
+/// pair cannot push a quiet peer's message out.
+pub const MAX_PINNED_UNREAD_PER_RECIPIENT: usize = 8;
+/// Most unread direct messages kept past the row cap across all recipients.
+pub const MAX_PINNED_UNREAD_DIRECT: usize = 64;
 pub const MAX_READ_BY_ENTRIES: usize = 64;
 pub const DEFAULT_MAX_HOPS: u32 = 6;
 pub const MAX_ODB_RADAR_PAIRS: usize = 32;
@@ -51,6 +56,11 @@ pub const MAX_RADAR_CONFLICTS_PER_LAYER: usize = 128;
 const LANES_SUBDIR: &str = "gitpulse/lanes";
 const CLAIMS_FILE: &str = "claims.json";
 const MESSAGES_FILE: &str = "messages.json";
+/// Largest `messages.json` any write leaves behind and any read accepts.
+const MESSAGES_FILE_CAP: u64 = 8 * 1024 * 1024;
+/// Largest `messages.json` a write will load so an over-cap file (written by an older build
+/// that counted body bytes, not stored bytes) can be compacted instead of failing forever.
+const MESSAGES_WRITE_CEILING: u64 = 4 * MESSAGES_FILE_CAP;
 const PEERS_FILE: &str = "peers.json";
 
 /// Registration and intent-claim record for one parallel agent lane.
@@ -523,6 +533,16 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
     path: &Path,
     cap_bytes: u64,
 ) -> Result<T, CommandError> {
+    read_json_bounded_hint(path, cap_bytes, "")
+}
+
+/// [`read_json_bounded`] whose over-cap error ends with `hint`, so a reader that cannot
+/// repair the file can say who will.
+fn read_json_bounded_hint<T: for<'de> Deserialize<'de> + Default>(
+    path: &Path,
+    cap_bytes: u64,
+    hint: &str,
+) -> Result<T, CommandError> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
@@ -539,7 +559,7 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
         .map_err(|e| CommandError::from(format!("cannot read {}: {e}", path.display())))?;
     if buf.len() as u64 > cap_bytes {
         return Err(CommandError::from(format!(
-            "coordination state {} exceeds {} byte cap",
+            "coordination state {} exceeds {} byte cap{hint}",
             path.display(),
             cap_bytes
         )));
@@ -1008,9 +1028,21 @@ pub fn post_peer_message(
     if trimmed_body.is_empty() || trimmed_body.contains('\0') {
         return Err(CommandError::from("message body must not be empty"));
     }
-    if trimmed_body.len() > MAX_MESSAGE_BODY_BYTES {
+    if crate::agent_mailbox::has_disallowed_control(trimmed_body) {
+        return Err(CommandError::from(
+            "message body cannot contain control characters other than line breaks and tabs",
+        ));
+    }
+    // The file stores the body JSON-escaped (a quote or backslash is two bytes), so the cap
+    // counts the stored form: counting raw bytes let a quote-heavy body double its footprint.
+    let stored_len = serde_json::to_string(trimmed_body)
+        .map_err(|e| CommandError::from(format!("cannot encode message body: {e}")))?
+        .len()
+        .saturating_sub(2);
+    if stored_len > MAX_MESSAGE_BODY_BYTES {
         return Err(CommandError::from(format!(
-            "message body exceeds maximum of {MAX_MESSAGE_BODY_BYTES} bytes"
+            "message body exceeds maximum of {MAX_MESSAGE_BODY_BYTES} bytes: {} bytes raw, {stored_len} bytes as stored (JSON-escaped)",
+            trimmed_body.len()
         )));
     }
     let msg_branch = match branch.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1033,7 +1065,7 @@ pub fn post_peer_message(
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, true, || {
         let messages_path = lanes_dir.join(MESSAGES_FILE);
-        let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
+        let mut state: MessagesState = read_json_bounded(&messages_path, MESSAGES_WRITE_CEILING)?;
 
         if let Some(ref want_id) = caller_msg_id {
             if let Some(existing) = state
@@ -1090,44 +1122,7 @@ pub fn post_peer_message(
             max_hops: Some(effective_max_hops),
         };
         state.messages.push(msg.clone());
-        if state.messages.len() > MAX_BUS_MESSAGES {
-            let mut open_ask_seq_by_thread: HashMap<String, u64> = HashMap::new();
-            for existing in &state.messages {
-                let key = existing
-                    .thread_key
-                    .clone()
-                    .unwrap_or_else(|| format!("msg-{}", existing.seq));
-                if existing.kind == "ask" {
-                    open_ask_seq_by_thread.insert(key, existing.seq);
-                } else if matches!(
-                    existing.kind.as_str(),
-                    "reply" | "answer" | "withdraw" | "withdrawn"
-                ) {
-                    open_ask_seq_by_thread.remove(&key);
-                }
-            }
-            let mut pinned_vec: Vec<u64> = open_ask_seq_by_thread.into_values().collect();
-            pinned_vec.sort_unstable();
-            let pinned_seqs: BTreeSet<u64> = pinned_vec
-                .into_iter()
-                .rev()
-                .take(MAX_PINNED_OPEN_ASKS)
-                .collect();
-
-            while state.messages.len() > MAX_BUS_MESSAGES {
-                let evict_idx = state
-                    .messages
-                    .iter()
-                    .position(|m| !pinned_seqs.contains(&m.seq))
-                    .unwrap_or(0);
-                let dropped = state.messages.remove(evict_idx);
-                state.dropped_before_seq =
-                    state.dropped_before_seq.max(dropped.seq.saturating_add(1));
-            }
-        }
-
-        let bytes = serde_json::to_vec_pretty(&state)
-            .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+        let bytes = compact_messages_for_write(&mut state, &messages_path)?;
         devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
             CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
         })?;
@@ -1142,6 +1137,150 @@ pub fn post_peer_message(
     })
 }
 
+/// Reads `messages.json` for a path that cannot repair it. An over-cap file is refused, and
+/// the error says the next write (a post or an ack) compacts it.
+fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
+    read_json_bounded_hint(
+        path,
+        MESSAGES_FILE_CAP,
+        "; the next post or ack compacts it",
+    )
+}
+
+/// Seqs of the rows an eviction must keep while it can: open asks (newest
+/// `MAX_PINNED_OPEN_ASKS`) and unread direct messages younger than the mailbox's pending
+/// TTL (newest `MAX_PINNED_UNREAD_PER_RECIPIENT` per recipient, newest
+/// `MAX_PINNED_UNREAD_DIRECT` overall).
+fn pinned_message_seqs(messages: &[AgentBusMessage], now_ms: u64) -> BTreeSet<u64> {
+    let mut open_ask_seq_by_thread: HashMap<String, u64> = HashMap::new();
+    for existing in messages {
+        let key = existing
+            .thread_key
+            .clone()
+            .unwrap_or_else(|| format!("msg-{}", existing.seq));
+        if existing.kind == "ask" {
+            open_ask_seq_by_thread.insert(key, existing.seq);
+        } else if matches!(
+            existing.kind.as_str(),
+            "reply" | "answer" | "withdraw" | "withdrawn"
+        ) {
+            open_ask_seq_by_thread.remove(&key);
+        }
+    }
+    let mut open_asks: Vec<u64> = open_ask_seq_by_thread.into_values().collect();
+    open_asks.sort_unstable();
+    let mut pinned: BTreeSet<u64> = open_asks
+        .into_iter()
+        .rev()
+        .take(MAX_PINNED_OPEN_ASKS)
+        .collect();
+
+    let ttl_ms = u64::try_from(crate::agent_mailbox::PENDING_TTL.as_millis()).unwrap_or(u64::MAX);
+    let mut per_recipient: HashMap<&str, usize> = HashMap::new();
+    let mut unread: Vec<u64> = Vec::new();
+    for msg in messages.iter().rev() {
+        let Some(to) = msg.to_agent.as_deref() else {
+            continue;
+        };
+        if !msg.read_by.is_empty() || now_ms.saturating_sub(msg.created_at_ms) >= ttl_ms {
+            continue;
+        }
+        let taken = per_recipient.entry(to).or_insert(0);
+        if *taken < MAX_PINNED_UNREAD_PER_RECIPIENT {
+            *taken += 1;
+            unread.push(msg.seq);
+        }
+    }
+    // `unread` is newest first, so the overall cap keeps the newest.
+    pinned.extend(unread.into_iter().take(MAX_PINNED_UNREAD_DIRECT));
+    pinned
+}
+
+/// Seqs in the order rows are given up: every unpinned row oldest first, then pinned rows
+/// oldest first, so a pinned row only goes once nothing unpinned is left.
+fn eviction_order(messages: &[AgentBusMessage], now_ms: u64) -> Vec<u64> {
+    let pinned = pinned_message_seqs(messages, now_ms);
+    let (mut order, held): (Vec<u64>, Vec<u64>) = messages
+        .iter()
+        .map(|m| m.seq)
+        .partition(|seq| !pinned.contains(seq));
+    order.extend(held);
+    order
+}
+
+/// Removes the rows with these seqs and raises `dropped_before_seq` past each. `next_seq`
+/// is never touched, so a dropped seq is never reused.
+fn drop_message_seqs(state: &mut MessagesState, seqs: &[u64]) {
+    let gone: BTreeSet<u64> = seqs.iter().copied().collect();
+    state.messages.retain(|m| {
+        if gone.contains(&m.seq) {
+            state.dropped_before_seq = state.dropped_before_seq.max(m.seq.saturating_add(1));
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Trims `state` to the row cap, then to the file cap, and returns the bytes to write, so no
+/// write ever leaves `messages.json` over what a reader accepts. A file an older build left
+/// over the cap is healed here by dropping rows in eviction order.
+fn compact_messages_for_write(
+    state: &mut MessagesState,
+    messages_path: &Path,
+) -> Result<Vec<u8>, CommandError> {
+    let now_ms = now_epoch_ms();
+    if state.messages.len() > MAX_BUS_MESSAGES {
+        let excess = state.messages.len() - MAX_BUS_MESSAGES;
+        let order = eviction_order(&state.messages, now_ms);
+        drop_message_seqs(state, &order[..excess]);
+    }
+    let serialize = |state: &MessagesState| {
+        serde_json::to_vec_pretty(state)
+            .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))
+    };
+    let mut bytes = serialize(state)?;
+    if bytes.len() as u64 <= MESSAGES_FILE_CAP {
+        return Ok(bytes);
+    }
+
+    let rows_before = state.messages.len();
+    let order = eviction_order(&state.messages, now_ms);
+    let row_bytes: HashMap<u64, usize> = state
+        .messages
+        .iter()
+        .map(|m| {
+            let len = serde_json::to_string_pretty(m).map_or(0, |s| s.len());
+            (m.seq, len)
+        })
+        .collect();
+    let mut next = 0usize;
+    while bytes.len() as u64 > MESSAGES_FILE_CAP {
+        let excess = bytes.len() - MESSAGES_FILE_CAP as usize;
+        let start = next;
+        let mut freed = 0usize;
+        while freed < excess && next < order.len() {
+            freed += row_bytes.get(&order[next]).copied().unwrap_or(0).max(1);
+            next += 1;
+        }
+        if next == start {
+            return Err(CommandError::from(format!(
+                "cannot compact {} under its {MESSAGES_FILE_CAP} byte cap",
+                messages_path.display()
+            )));
+        }
+        drop_message_seqs(state, &order[start..next]);
+        bytes = serialize(state)?;
+    }
+    log::warn!(
+        target: "agent_bus",
+        "dropped {} of {rows_before} rows from {} to bring it under its {MESSAGES_FILE_CAP} byte cap",
+        rows_before - state.messages.len(),
+        messages_path.display()
+    );
+    Ok(bytes)
+}
+
 /// Looks up one message by `msg_id` (used to hydrate `> 6 KiB` mailbox pointer envelopes).
 pub fn get_message_by_id(
     repo_path: &str,
@@ -1150,8 +1289,7 @@ pub fn get_message_by_id(
     let clean_id = sanitize_token("msg_id", msg_id, 64)?;
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         Ok(state
             .messages
             .into_iter()
@@ -1183,7 +1321,7 @@ pub fn ack_messages(
         if !messages_path.is_file() {
             return Ok(0);
         }
-        let mut state: MessagesState = read_json_bounded(&messages_path, 8 * 1024 * 1024)?;
+        let mut state: MessagesState = read_json_bounded(&messages_path, MESSAGES_WRITE_CEILING)?;
         let mut updated = 0usize;
         for msg in &mut state.messages {
             let eff_id = msg
@@ -1198,9 +1336,9 @@ pub fn ack_messages(
                 updated += 1;
             }
         }
-        if updated > 0 {
-            let bytes = serde_json::to_vec_pretty(&state)
-                .map_err(|e| CommandError::from(format!("cannot serialize messages: {e}")))?;
+        let rows_before = state.messages.len();
+        let bytes = compact_messages_for_write(&mut state, &messages_path)?;
+        if updated > 0 || state.messages.len() != rows_before {
             devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
                 CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
             })?;
@@ -1246,8 +1384,7 @@ pub fn read_messages_for_peer(
     let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
         let filtered = state
             .messages
@@ -1935,8 +2072,7 @@ pub fn read_thread_messages(
     let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
         let filtered = state
             .messages
@@ -2036,8 +2172,7 @@ pub fn list_inbox_threads(
         .filter(|s| !s.is_empty() && *s != "all");
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState =
-            read_json_bounded(&lanes_dir.join(MESSAGES_FILE), 8 * 1024 * 1024)?;
+        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
 
         let mut thread_map: HashMap<String, Vec<AgentBusMessage>> = HashMap::new();
         for msg in state.messages {
@@ -3913,5 +4048,221 @@ mod tests {
             spoof_err.contains("Manvi system steward"),
             "unexpected error: {spoof_err}"
         );
+    }
+
+    fn bus_row(seq: u64, to: Option<&str>, created_at_ms: u64, body: String) -> AgentBusMessage {
+        AgentBusMessage {
+            seq,
+            from_agent: "agy:filler".to_string(),
+            to_agent: to.map(str::to_string),
+            kind: "note".to_string(),
+            body,
+            branch: None,
+            created_at_ms,
+            thread_key: None,
+            msg_id: Some(format!("seed-{seq}")),
+            read_by: Vec::new(),
+            hop: Some(1),
+            max_hops: Some(6),
+        }
+    }
+
+    /// A trusted repo whose `messages.json` already holds `rows`, as an older build or a busy
+    /// bus would have left it.
+    fn repo_with_seeded_bus(rows: Vec<AgentBusMessage>) -> tempfile::TempDir {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir.path().to_str().unwrap();
+        let state = MessagesState {
+            next_seq: rows.iter().map(|m| m.seq).max().unwrap_or(0),
+            dropped_before_seq: 0,
+            messages: rows,
+        };
+        fs::write(
+            lanes_messages_path(repo, true).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Posts one broadcast so the write path runs its eviction, and returns what is stored.
+    fn post_then_stored(dir: &tempfile::TempDir) -> MessagesState {
+        let repo = dir.path().to_str().unwrap();
+        post_thread_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:lead",
+            None,
+            None,
+            "note",
+            "trigger",
+            None,
+        )
+        .unwrap();
+        read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap()
+    }
+
+    fn stored_seqs(state: &MessagesState) -> BTreeSet<u64> {
+        state.messages.iter().map(|m| m.seq).collect()
+    }
+
+    /// `count` broadcast rows numbered from `first_seq`; broadcasts are never pinned.
+    fn broadcasts(first_seq: u64, count: u64, now: u64) -> Vec<AgentBusMessage> {
+        (first_seq..first_seq + count)
+            .map(|seq| bus_row(seq, None, now, "filler".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_chatty_recipient_keeps_only_its_newest_eight_unread_pinned_and_a_quiet_one_survives() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "quiet".into())];
+        rows.extend((2..=10).map(|seq| bus_row(seq, Some("claude:chatty"), now, "chatty".into())));
+        rows.extend(broadcasts(11, 250, now));
+        let state = post_then_stored(&repo_with_seeded_bus(rows));
+        let kept = stored_seqs(&state);
+
+        assert_eq!(state.messages.len(), MAX_BUS_MESSAGES);
+        assert!(
+            kept.contains(&1),
+            "the quiet peer's only unread message must survive"
+        );
+        assert!(
+            (3..=10).all(|seq| kept.contains(&seq)),
+            "newest 8 of the chatty recipient are pinned"
+        );
+        assert!(
+            !kept.contains(&2),
+            "the ninth-newest unread is an ordinary row and goes first"
+        );
+    }
+
+    #[test]
+    fn at_most_sixty_four_unread_direct_messages_are_pinned_across_recipients() {
+        let now = now_epoch_ms();
+        // Nine recipients with eight unread messages each: 72 candidates for 64 pins.
+        let mut rows: Vec<AgentBusMessage> = (1..=72u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, "unread".into())
+            })
+            .collect();
+        rows.extend(broadcasts(73, 300, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            (9..=72).all(|seq| kept.contains(&seq)),
+            "the newest 64 are pinned"
+        );
+        assert!(
+            (1..=8).all(|seq| !kept.contains(&seq)),
+            "the oldest beyond the cap are evicted"
+        );
+    }
+
+    #[test]
+    fn an_unread_direct_message_older_than_the_pending_ttl_is_not_pinned() {
+        let now = now_epoch_ms();
+        let stale =
+            now - u64::try_from(crate::agent_mailbox::PENDING_TTL.as_millis()).unwrap() - 1_000;
+        let mut rows = vec![
+            bus_row(1, Some("claude:late"), stale, "stale".into()),
+            bus_row(2, Some("claude:late"), now, "fresh".into()),
+        ];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(
+            !kept.contains(&1),
+            "an expired unread message is the oldest ordinary row"
+        );
+        assert!(kept.contains(&2), "a fresh unread message is pinned");
+        assert!(
+            !kept.contains(&3),
+            "the next oldest ordinary row goes after it"
+        );
+        assert!(kept.contains(&4));
+    }
+
+    #[test]
+    fn a_direct_message_somebody_has_read_is_not_pinned() {
+        let now = now_epoch_ms();
+        let mut read = bus_row(1, Some("claude:late"), now, "read".into());
+        read.read_by.push("claude:late".to_string());
+        let mut rows = vec![read, bus_row(2, Some("claude:late"), now, "unread".into())];
+        rows.extend(broadcasts(3, 255, now));
+        let kept = stored_seqs(&post_then_stored(&repo_with_seeded_bus(rows)));
+
+        assert!(!kept.contains(&1), "a read message is an ordinary row");
+        assert!(kept.contains(&2), "the unread one beside it is pinned");
+        assert!(!kept.contains(&3));
+    }
+
+    #[test]
+    fn size_healing_keeps_pinned_rows_while_unpinned_rows_can_pay_and_never_moves_next_seq() {
+        let now = now_epoch_ms();
+        // 256 rows of 40 KB is over the 8 MiB cap, as an older build could leave it.
+        let big = || "x".repeat(40_000);
+        let mut rows = vec![
+            bus_row(1, Some("claude:quiet"), now, big()),
+            bus_row(2, Some("claude:quiet"), now, big()),
+        ];
+        rows.extend((3..=256).map(|seq| bus_row(seq, None, now, big())));
+        let dir = repo_with_seeded_bus(rows);
+        let path = lanes_messages_path(dir.path().to_str().unwrap(), false).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MESSAGES_FILE_CAP);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(fs::metadata(&path).unwrap().len() <= MESSAGES_FILE_CAP);
+        assert!(
+            kept.contains(&1) && kept.contains(&2),
+            "pinned rows outlast unpinned ones"
+        );
+        assert_eq!(state.next_seq, 257, "healing never moves next_seq");
+        assert!(state.dropped_before_seq > 3);
+        assert!(kept.contains(&257), "the new post is kept");
+    }
+
+    #[test]
+    fn size_healing_evicts_every_unpinned_row_before_any_pinned_one() {
+        let now = now_epoch_ms();
+        let big = || "x".repeat(72_000);
+        // 64 unread directs and 64 open asks, each large enough that together they alone
+        // exceed the cap, then 128 tiny ordinary rows.
+        let mut rows: Vec<AgentBusMessage> = (1..=64u64)
+            .map(|seq| {
+                let to = format!("claude:peer-{}", (seq - 1) / 8);
+                bus_row(seq, Some(&to), now, big())
+            })
+            .collect();
+        rows.extend((65..=128u64).map(|seq| {
+            let mut ask = bus_row(seq, None, now, big());
+            ask.kind = "ask".to_string();
+            ask.thread_key = Some(format!("ask-{seq}"));
+            ask
+        }));
+        rows.extend(broadcasts(129, 128, now));
+        let dir = repo_with_seeded_bus(rows);
+        let state = post_then_stored(&dir);
+        let kept = stored_seqs(&state);
+
+        assert!(
+            (129..=256).all(|seq| !kept.contains(&seq)),
+            "every ordinary row goes before a pinned one is touched"
+        );
+        let survivors: Vec<u64> = (1..=128).filter(|seq| kept.contains(seq)).collect();
+        assert!(
+            survivors.len() < 128,
+            "pinned rows are the last resort and were needed"
+        );
+        let first = survivors[0];
+        assert!(first > 1, "the oldest pinned row goes first");
+        assert!(
+            survivors.iter().copied().eq(first..=128),
+            "pinned rows go oldest first"
+        );
+        assert_eq!(state.next_seq, 257);
     }
 }
