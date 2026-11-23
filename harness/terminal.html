@@ -605,11 +605,15 @@
             const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
-            // The WebGL addon's canvases live in xterm's screen element: its GL
-            // canvas and a 2D link layer (`xterm-link-layer`). xterm's DOM
-            // renderer may add a hidden 2D canvas of its own at the terminal's
-            // root, which holds no WebGL context, so a session's GPU state is
-            // read from the screen element only, never from every canvas.
+            // The WebGL addon draws with two canvases in xterm's screen element:
+            // its GL canvas and a 2D link layer (`xterm-link-layer`). It also
+            // shares one glyph atlas between terminals with the same font,
+            // colours and size, and rasterises new glyphs on a hidden 2D scratch
+            // canvas (`TextureAtlas._drawToCache`: 32x24, `display: none`, no
+            // class) that it parks at the root of whichever terminal drew last,
+            // where it stays after that terminal's renderer is released. That
+            // canvas holds no WebGL context, so a session's GPU state is read
+            // from the screen element only, never from every canvas.
             const screenCanvases = (el) => [...el.querySelectorAll(".xterm-screen canvas")];
             const holdsGpu = (el) => screenCanvases(el).length > 0;
             const glCanvas = (el) => screenCanvases(el).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
@@ -706,8 +710,13 @@
             // -- The hold ends: the context is freed on purpose, not left for the collector.
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
+            // The canvas this session holds while it is on screen, read before
+            // it is hidden: its release detaches it and loses its context.
+            const otherCanvas = glCanvas(other);
+            const otherGl = otherCanvas?.getContext("webgl2");
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
-            const otherReleased = () => other.dataset.renderer === "dom" && !holdsGpu(other);
+            const otherReleased = () => other.dataset.renderer === "dom" && !holdsGpu(other)
+              && !!otherCanvas && !otherCanvas.isConnected && !!otherGl && otherGl.isContextLost();
             await settles(otherReleased);
             check("a session that stays hidden past the hold gives its context up", otherReleased);
             button("Hide the terminal dock").click();
