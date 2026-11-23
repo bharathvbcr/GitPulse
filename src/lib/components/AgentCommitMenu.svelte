@@ -493,7 +493,7 @@
     <!-- Notice / Error banners -->
     {#if launching}
       <div role="status" class="gp-notice" data-tone="info">
-        <span>Opening session in terminal dock…</span>
+        <span>Opening session in the dock…</span>
       </div>
     {/if}
 
