@@ -8,10 +8,19 @@
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
-  import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import { claimedFileOpen, claimedReference, isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
+  import {
+    forgetRecipients,
+    pickRecipient,
+    publishRecipients,
+    recipientChoice,
+    type RecipientCandidate,
+  } from "../terminal/recipient";
+  import { clearTray, contextTrays, trayBytes, trayProblem, trayText } from "../terminal/contextTray";
   import { requestPin } from "../files/pinRequests";
   import { opensExplorerPage } from "../files/explorerPageGesture";
-  import { doubleClickFollows } from "../sidebar/layoutStore";
+  import { resolveFileOpen, sidebarNavStore, type ResolvedFileOpen, type SidebarFileOpenTarget } from "../sidebar/layoutStore";
+  import { lastSurface } from "../ui/lastSurface";
   import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
@@ -53,6 +62,8 @@
     ChevronsUpDown,
     Eye,
     RotateCw,
+    Sparkles,
+    ListPlus,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -65,12 +76,10 @@
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import {
     clampExplorerSidebarWidth,
-    resolveExplorerFileAction,
     TERMINAL_EXPLORER_WIDTH_DEFAULT,
     TERMINAL_EXPLORER_WIDTH_MAX,
     TERMINAL_EXPLORER_WIDTH_MIN,
     terminalExplorerSidebar,
-    type ExplorerOpenTarget,
   } from "../terminal/explorerSidebar";
   import {
     NO_FOLLOW_TARGET,
@@ -378,6 +387,10 @@
   });
 
   onMount(() => {
+    // A store listens only while someone is subscribed. The sidebar explorer
+    // mounts lazily, after the user may already have typed here, so the dock
+    // holds the subscription that records "the terminal was last used".
+    const releaseLastSurface = lastSurface.subscribe(() => {});
     inputEl?.focus();
     // The session limit is an agent default; read it before the first
     // session so the panel stops where the backend does.
@@ -398,6 +411,7 @@
     return () => {
       window.removeEventListener("pagehide", flushPendingSplitPersist);
       flushPendingSplitPersist();
+      releaseLastSurface();
       unsubAgentPanel();
       unsubSessionLedger();
       if (adoptionFallbackTimer !== null) clearTimeout(adoptionFallbackTimer);
@@ -485,7 +499,8 @@
   let groupContextMenu = $state<{ groupId: string; x: number; y: number } | null>(null);
   let groupContextMenuOpener: HTMLElement | null = null;
   const explorerSidebarOpen = $derived($terminalExplorerSidebar.open);
-  const explorerOpenTarget = $derived<ExplorerOpenTarget>($terminalExplorerSidebar.target);
+  /** The app-wide open target, one setting for this explorer and the sidebar's (`resolveFileOpen`). */
+  const explorerOpenTarget = $derived<SidebarFileOpenTarget>($sidebarNavStore.openTarget);
   const explorerSidebarWidth = $derived($terminalExplorerSidebar.width);
   let explorerResizing = $state(false);
   let selectedExplorerFile = $state<string | null>(null);
@@ -493,7 +508,7 @@
   /** Where the docked explorer's last click sent a file, for its double-click. */
   let lastExplorerOpen: {
     path: string;
-    action: ReturnType<typeof resolveExplorerFileAction>;
+    action: ResolvedFileOpen;
     at: number;
   } | null = null;
   let inlineRenameTabId = $state<string | null>(null);
@@ -2109,22 +2124,29 @@
       const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
       mode = "shell";
+      // Text for a session, not a session to open: branch before anything that opens a tab.
+      if (claimed.launcher === "reference") {
+        const reference = claimedReference(claimed);
+        claimed.complete(reference ? sendReferenceToAgent(reference.text, reference.checkout || undefined) : "There is nothing to send.");
+        return;
+      }
       if (claimed.launcher === "browser") {
         claimed.complete(openBrowserFor(claimed.url));
         return;
       }
       if (claimed.launcher === "file") {
-        const err =
-          claimed.fileOpenMode === "tab"
-            ? openFileTabFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-                focus: claimed.fileFocus ?? true,
-              })
-            : openFileSplitFor(claimed.filePath, claimed.line ?? null, claimed.column ?? null, {
-                focus: claimed.fileFocus ?? false,
-              });
-        if (!err && claimed.fileKeep && claimed.filePath) {
-          keepFileShown(claimed.filePath, activeTab?.checkout);
+        const plan = claimedFileOpen(claimed);
+        if (!plan) {
+          claimed.complete("A file request needs a repository-relative path");
+          return;
         }
+        // One checkout for the open and the keep: the panel's own (see
+        // `ClaimedFileOpen.checkout`), not whichever tab happens to be active.
+        const err =
+          plan.mode === "tab"
+            ? openFileTabFor(plan.filePath, plan.line, plan.column, { focus: plan.focus, checkout: plan.checkout })
+            : openFileSplitFor(plan.filePath, plan.line, plan.column, { focus: plan.focus, checkout: plan.checkout });
+        if (!err && plan.keep) keepFileShown(plan.filePath, plan.checkout);
         claimed.complete(err);
         return;
       }
@@ -2152,7 +2174,41 @@
     });
   });
 
+  // Publishes the sessions text can go to, for the Send label in file viewers
+  // outside this panel (`recipient.ts`). Liveness comes from `tabStatuses`,
+  // which is reactive; `sendReferenceToAgent` asks the session itself.
+  let publishedRecipientsFor: string | null = null;
+  $effect(() => {
+    const here = repoPath;
+    const rows: RecipientCandidate[] = tabState.tabs.map((tab) => ({
+      id: tab.id,
+      launcher: tab.launcher,
+      checkout: tab.checkout ?? here ?? "",
+      live: tabStatuses[tab.id] !== "exited" && tabStatuses[tab.id] !== "error",
+      visible: visibleIds.includes(tab.id),
+      name: tabLabel(tab),
+    }));
+    untrack(() => {
+      if (publishedRecipientsFor && publishedRecipientsFor !== here) forgetRecipients(publishedRecipientsFor);
+      publishedRecipientsFor = here || null;
+      if (here) publishRecipients(here, rows);
+    });
+  });
+
+  const trayEntries = $derived(repoPath ? ($contextTrays[repoPath] ?? []) : []);
+
+  /** Types every reference in the context tray into the recipient session, unsubmitted, and keeps the tray. */
+  function insertContextTray() {
+    const problem = trayProblem(trayEntries);
+    if (problem) {
+      sessionError = problem;
+      return;
+    }
+    sendReferenceToAgent(trayText(trayEntries));
+  }
+
   onDestroy(() => {
+    if (publishedRecipientsFor) forgetRecipients(publishedRecipientsFor);
     flushPendingSplitPersist();
     for (const tab of tabState.tabs) {
       terminalLaunchRequests.forget(tab.id);
@@ -2772,11 +2828,11 @@
     filePath?: string,
     line: number | null = null,
     column: number | null = null,
-    options?: { focus?: boolean },
+    options?: { focus?: boolean; checkout?: string },
   ): string | undefined {
     if (!repoPath) return "Open a repository first";
     const shouldFocus = options?.focus ?? true;
-    const checkout = activeTab?.checkout;
+    const checkout = options?.checkout;
     // A kept pane keeps its file: the new one opens in a tab of its own.
     const visibleFile =
       tabState.tabs.find(
@@ -2824,8 +2880,8 @@
     }
   }
 
-  function setExplorerOpenTarget(target: ExplorerOpenTarget) {
-    terminalExplorerSidebar.setTarget(target);
+  function setExplorerOpenTarget(target: SidebarFileOpenTarget) {
+    sidebarNavStore.setOpenTarget(target);
   }
 
   function dockFileTabToSidebar(id: string) {
@@ -2897,27 +2953,29 @@
     lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
     selectedExplorerFile = filePath;
     const checkout = activeTab?.checkout;
-    // A double-click (`keep`) follows where its own clicks sent the file: they
-    // already used and cleared the modifier keys (`doubleClickFollows`).
+    // The click is inside the dock, so the terminal is the active surface: under
+    // "auto" this explorer opens a split. A double-click (`keep`) follows where
+    // its own clicks sent the file (`resolveFileOpen`).
     const now = Date.now();
-    const action =
-      keep && lastExplorerOpen && doubleClickFollows(lastExplorerOpen, filePath, now)
-        ? lastExplorerOpen.action
-        : resolveExplorerFileAction({
-            defaultTarget: explorerOpenTarget,
-            altKey: mods.altKey,
-            metaOrCtrlKey: mods.metaOrCtrlKey,
-            hasVisibleFilePane,
-          });
+    const action = resolveFileOpen({
+      path: filePath,
+      pin: keep,
+      lastOpen: lastExplorerOpen,
+      now,
+      defaultTarget: explorerOpenTarget,
+      terminalActive: true,
+      altKey: mods.altKey,
+      metaOrCtrlKey: mods.metaOrCtrlKey,
+    });
     lastExplorerOpen = { path: filePath, action, at: now };
 
-    if (action === "open-code" && onOpenInCodeView) {
+    if (action === "code" && onOpenInCodeView) {
       // Code owns its tabs: ask it to keep this one rather than preview it.
       if (keep) requestPin(repoPath, filePath);
       onOpenInCodeView(filePath, line);
       return;
     }
-    if (action === "open-split") {
+    if (action === "split") {
       const err = openFileSplitFor(filePath, line, column, {
         focus: false,
         checkout,
@@ -2926,9 +2984,10 @@
       else if (keep) keepFileShown(filePath, checkout);
       return;
     }
-    if (action === "update-visible-pane") {
-      // A kept pane is never repointed at another file; the file then opens
-      // in a tab of its own below.
+    if (action === "tab") {
+      // A tab retargets a file pane already on screen rather than opening
+      // another. A kept pane is never repointed at another file; the file then
+      // opens in a tab of its own below.
       const visibleFile =
         tabState.tabs.find(
           (tab) =>
@@ -3043,27 +3102,47 @@
     );
   }
 
-  function preferredRecipientSessionTab() {
-    const liveCandidates = tabState.tabs.filter(
-      (tab) => tab.launcher !== "browser" && tab.launcher !== "file" && sessions[tab.id]?.isLive(),
-    );
-    return (
-      liveCandidates.find((tab) => visibleIds.includes(tab.id) && isPromptLauncher(tab.launcher)) ??
-      liveCandidates.find((tab) => isPromptLauncher(tab.launcher)) ??
-      liveCandidates.find((tab) => visibleIds.includes(tab.id)) ??
-      liveCandidates[0]
-    );
+  /** Every tab as a send candidate: liveness asked of the session itself, which is the truth at the moment of sending. */
+  function recipientCandidates(): RecipientCandidate[] {
+    return tabState.tabs.map((tab) => ({
+      id: tab.id,
+      launcher: tab.launcher,
+      checkout: tab.checkout ?? repoPath ?? "",
+      live: Boolean(sessions[tab.id]?.isLive()),
+      visible: visibleIds.includes(tab.id),
+    }));
   }
 
-  /** Routes `@file#Lstart-Lend` or `@snapshot.png` attachments to the best live agent/shell session. */
-  function sendReferenceToAgent(reference: string) {
-    const preferred = preferredRecipientSessionTab();
-    if (!preferred) {
-      sessionError = "Open an agent or shell session first to send a reference.";
-      return;
-    }
-    selectTab(preferred.id);
-    sessions[preferred.id]?.insertText(reference, { focus: true });
+  /**
+   * The session text goes to: the person's pick for this repository while it
+   * lives, else one in `checkout` (the file's own), else any — the one rule in
+   * `recipient.ts`, which the file viewers' Send label applies too.
+   */
+  function preferredRecipientSessionTab(checkout: string | null = null) {
+    const picked = pickRecipient(recipientCandidates(), {
+      checkout,
+      stickyId: (repoPath ? $recipientChoice[repoPath] : null) ?? null,
+    });
+    return picked ? tabState.tabs.find((tab) => tab.id === picked.id) : undefined;
+  }
+
+  /**
+   * Routes `@file#Lstart-Lend`, a composed code block or `@snapshot.png` to the
+   * best live agent/shell session, unsubmitted. `checkout` is the checkout of
+   * the file it is about. Returns why nothing was sent, or undefined; the same
+   * reason is shown in the panel, and a caller outside it (the Code page)
+   * reports it itself.
+   */
+  function sendReferenceToAgent(reference: string, checkout?: string): string | undefined {
+    const preferred = preferredRecipientSessionTab(checkout ?? null);
+    if (preferred) selectTab(preferred.id);
+    // null is success; undefined is a tab whose session is not mounted.
+    const outcome = preferred
+      ? sessions[preferred.id]?.insertChecked(reference, { focus: true })
+      : "Open an agent or shell session first to send a reference.";
+    const refusal = outcome === undefined ? "That session is not ready for input yet." : outcome;
+    if (refusal !== null) sessionError = refusal;
+    return refusal ?? undefined;
   }
 
   /** Formats dropped/pasted paths for the actual recipient session (`@path` for agents, shell-escaped for shells). */
@@ -4136,6 +4215,19 @@
             {/if}
             <span class="text-accent shrink-0">→ Shell</span>
           </button>
+        {/if}
+        {#if trayEntries.length > 0}
+          <span
+            class="gp-chip shrink-0 tabular-nums inline-flex items-center gap-1"
+            data-tone="accent"
+            data-testid="terminal-context-tray"
+            title="File ranges set aside in this repository. Kept in memory only: they are gone after a restart."
+          >
+            <ListPlus size={10} class="shrink-0" />
+            {trayEntries.length} {trayEntries.length === 1 ? "reference" : "references"} · {trayBytes(trayEntries)} B
+            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-insert" onclick={insertContextTray}>Insert all</button>
+            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-clear" onclick={() => repoPath && clearTray(repoPath)}>Clear</button>
+          </span>
         {/if}
         {#if mode === "shell" && splitRoot && allSplitLeafIds.length > 1}
           <span
@@ -6364,6 +6456,17 @@
               >
                 <button
                   type="button"
+                  data-testid="terminal-explorer-target-auto"
+                  aria-pressed={explorerOpenTarget === "auto"}
+                  aria-label="Auto"
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'auto' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  title="Auto: files clicked here open beside the terminal; from the sidebar they follow the last surface you used. The setting is shared with the sidebar Explorer"
+                  onclick={() => setExplorerOpenTarget("auto")}
+                >
+                  <Sparkles size={10} class="shrink-0" />
+                </button>
+                <button
+                  type="button"
                   data-testid="terminal-explorer-target-tab"
                   aria-pressed={explorerOpenTarget === "tab"}
                   class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'tab' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
@@ -6887,6 +6990,7 @@
               onOpenExplorerPage={onOpenExplorerPage}
               onDockToSidebar={explorerSidebarOpen ? undefined : () => dockFileTabToSidebar(tab.id)}
               onSendToAgent={sendReferenceToAgent}
+              agentRepoPath={repoPath}
             />
             {:else}
             <TerminalSession

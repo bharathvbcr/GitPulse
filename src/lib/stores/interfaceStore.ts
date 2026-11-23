@@ -100,6 +100,7 @@ import {
 } from "../ui/taskBoardViews";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
 import type { CodePercentageMode } from "../language/barStats";
+import { DEFAULT_EDITOR_CHOICE, isEditorChoice, type EditorChoice } from "../desktop/editorChoice";
 
 export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
@@ -456,6 +457,12 @@ export interface InterfacePrefs extends AppearancePrefs {
    * (`repoStore` subscribes).
    */
   watchScope: WatchScope;
+  /**
+   * The external editor "Open in editor" hands a file to. `auto` takes the
+   * first installed of VS Code, Antigravity IDE, Cursor and Zed; an unknown stored value reads
+   * as `auto`, so a preference can never become something Rust has not named.
+   */
+  preferredEditor: EditorChoice;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -579,6 +586,7 @@ const DEFAULTS: InterfacePrefs = {
   bellAsksForReader: false,
   bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
   watchScope: "narrow",
+  preferredEditor: DEFAULT_EDITOR_CHOICE,
 };
 
 /**
@@ -795,6 +803,9 @@ function readPrefs(): InterfacePrefs {
       ),
       bellAsksForReaderRev: BELL_ASKS_FOR_READER_REV,
       watchScope: isWatchScope(parsed.watchScope) ? parsed.watchScope : DEFAULTS.watchScope,
+      preferredEditor: isEditorChoice(parsed.preferredEditor)
+        ? parsed.preferredEditor
+        : DEFAULTS.preferredEditor,
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -1140,6 +1151,8 @@ function createInterfaceStore() {
     resetCoachMarks: () => patch({ seenCoachMarks: {} }),
     setBellAsksForReader: (on: boolean) => patch({ bellAsksForReader: on }),
     setWatchScope: (scope: WatchScope) => patch({ watchScope: isWatchScope(scope) ? scope : "narrow" }),
+    setPreferredEditor: (editor: EditorChoice) =>
+      patch({ preferredEditor: isEditorChoice(editor) ? editor : DEFAULT_EDITOR_CHOICE }),
     reset: () => commit(freshDefaults()),
   };
 }

@@ -26,7 +26,7 @@
   }: {
     repoPath?: string | null;
     selectedFile?: string | null;
-    revealRequest?: { path: string; nonce: number } | null;
+    revealRequest?: { path: string; nonce: number; at?: number } | null;
     onSelectFile?: (path: string) => void;
     onPinFile?: (path: string) => void;
     onSelectMatch?: (path: string, line: number | null, column: number | null) => void;

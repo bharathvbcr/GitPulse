@@ -124,3 +124,42 @@ export function goToLineTarget(value: unknown, lineCount: number): number | null
 export function clearReveal(): void {
   pending.set(null);
 }
+
+/**
+ * A request to show a path in the file tree: expand down to it, then scroll it
+ * into view. Separate from the line request above, which lands inside a
+ * viewer; this one is for the tree, whichever trees are mounted (the Code
+ * page's and the sidebar's).
+ *
+ * `nonce` is a sequence number. A tree acts on a nonce it has not seen, so
+ * asking again for the path that was just revealed is a new request, which a
+ * bare path (or a selection that did not change) could not express. `at` lets
+ * a tree that mounts later ignore a request nobody was there to see.
+ */
+export interface TreeRevealRequest {
+  path: string;
+  nonce: number;
+  at: number;
+}
+
+let treeNonce = 0;
+const treePending = writable<TreeRevealRequest | null>(null);
+
+/** Subscribe-only view, for the components that hand it to a tree. */
+export const treeRevealRequest = { subscribe: treePending.subscribe };
+
+/**
+ * Asks the file trees to show `path`. Returns false for an unusable path, the
+ * same bound `requestReveal` applies.
+ */
+export function requestTreeReveal(path: string, now: number = Date.now()): boolean {
+  if (!path || path.length > MAX_REVEAL_PATH) return false;
+  treeNonce += 1;
+  treePending.set({ path, nonce: treeNonce, at: now });
+  return true;
+}
+
+/** Drops the pending tree request. For tests. */
+export function clearTreeReveal(): void {
+  treePending.set(null);
+}

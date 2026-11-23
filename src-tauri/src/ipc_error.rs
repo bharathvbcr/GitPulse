@@ -14,8 +14,9 @@
 //!
 //! * the spawn gate's deferral (`git_cli::refusal_message_at`), the repository
 //!   trust refusal (`repository_trust`), the missing commit identity
-//!   (`git_writer`), the stale stash refusal (`engine::stash`) and the
-//!   unconfirmed AI endpoint (`ai`) each build a typed [`CommandError`];
+//!   (`git_writer`), the stale stash refusal (`engine::stash`), the
+//!   unconfirmed AI endpoint (`ai`) and the missing editor
+//!   (`desktop::editor`) each build a typed [`CommandError`];
 //! * `From<LedgerError>` maps the ledger's own `code`;
 //! * a plain `String` or `&str` is [`IpcErrorKind::Unclassified`], which the
 //!   frontend treats as opaque: it shows the message and never matches text
@@ -85,12 +86,16 @@ pub enum IpcErrorKind {
     /// (never the value) and each skipped file; the commit view offers a person
     /// "commit anyway".
     SecretScanBlocked,
+    /// "Open in editor" found no installed editor: the one the user chose, or
+    /// none of the supported ones for `Auto`. `detail.editor` is the choice
+    /// that was asked for; the frontend points at the editor setting.
+    EditorNotFound,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -101,6 +106,7 @@ impl IpcErrorKind {
         Self::AiEndpointUnconfirmed,
         Self::ReadCancelled,
         Self::SecretScanBlocked,
+        Self::EditorNotFound,
     ];
 }
 

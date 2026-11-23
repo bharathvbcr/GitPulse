@@ -4,29 +4,20 @@
  *
  * Kept separate from `splitTree.ts` on purpose: toggling the terminal's File
  * Explorer sidebar docks an explorer rail beside the pane canvas without
- * adding a 3rd split leaf or closing tabs, and clicking a file follows the
- * user's chosen open target (`tab` | `split` | `code`) rather than guessing.
+ * adding a 3rd split leaf or closing tabs. Where a clicked file opens is not
+ * stored here: it is the app-wide setting (`sidebarNavStore.openTarget`),
+ * decided by `resolveFileOpen`, so both explorers answer to one choice.
  */
 
 import { writable, type Readable } from "svelte/store";
-import { resolveSidebarFileAction } from "../sidebar/layoutStore";
 
 export const TERMINAL_EXPLORER_WIDTH_DEFAULT = 248;
 export const TERMINAL_EXPLORER_WIDTH_MIN = 180;
 export const TERMINAL_EXPLORER_WIDTH_MAX = 420;
 export const EXPLORER_SIDEBAR_STORAGE_KEY = "gitpulse.terminal.explorerSidebar";
 
-export type ExplorerOpenTarget = "tab" | "split" | "code";
-
-export type ResolvedExplorerFileAction =
-  | "update-visible-pane"
-  | "open-tab"
-  | "open-split"
-  | "open-code";
-
 export interface ExplorerSidebarPrefs {
   readonly open: boolean;
-  readonly target: ExplorerOpenTarget;
   readonly width: number;
 }
 
@@ -43,42 +34,11 @@ export function clampExplorerSidebarWidth(width: number): number {
   );
 }
 
-export function normalizeExplorerOpenTarget(raw: unknown): ExplorerOpenTarget {
-  if (raw === "split" || raw === "code" || raw === "tab") return raw;
-  return "tab";
-}
-
-/**
- * Resolves what clicking a file in the terminal's docked File Explorer sidebar
- * should do. Which surface opens is the app sidebar explorer's rule
- * (`resolveSidebarFileAction`: `Alt+Click` -> split, `⌘/Ctrl+Click` -> the
- * surface the default is not, else the user's target), so a modifier click
- * means the same thing in both explorers. This adds only the terminal's own
- * step: a tab-target click retargets a file pane already on screen rather
- * than opening another.
- */
-export function resolveExplorerFileAction(options: {
-  defaultTarget: ExplorerOpenTarget;
-  altKey?: boolean;
-  metaOrCtrlKey?: boolean;
-  hasVisibleFilePane: boolean;
-}): ResolvedExplorerFileAction {
-  const target = resolveSidebarFileAction({
-    defaultTarget: options.defaultTarget,
-    altKey: options.altKey,
-    metaOrCtrlKey: options.metaOrCtrlKey,
-  });
-  if (target === "code") return "open-code";
-  if (target === "split") return "open-split";
-  return options.hasVisibleFilePane ? "update-visible-pane" : "open-tab";
-}
-
 export function readExplorerSidebarPrefs(
   storage: Pick<StorageLike, "getItem"> | null | undefined = globalThis.localStorage,
 ): ExplorerSidebarPrefs {
   const defaults: ExplorerSidebarPrefs = {
     open: false,
-    target: "tab",
     width: TERMINAL_EXPLORER_WIDTH_DEFAULT,
   };
   if (!storage || typeof storage.getItem !== "function") return defaults;
@@ -92,7 +52,6 @@ export function readExplorerSidebarPrefs(
     const rec = parsed as Record<string, unknown>;
     return {
       open: rec.open === true,
-      target: normalizeExplorerOpenTarget(rec.target),
       width:
         typeof rec.width === "number"
           ? clampExplorerSidebarWidth(rec.width)
@@ -111,7 +70,6 @@ export function writeExplorerSidebarPrefs(
   try {
     const sanitized: ExplorerSidebarPrefs = {
       open: Boolean(prefs.open),
-      target: normalizeExplorerOpenTarget(prefs.target),
       width: clampExplorerSidebarWidth(prefs.width),
     };
     storage.setItem(EXPLORER_SIDEBAR_STORAGE_KEY, JSON.stringify(sanitized));
@@ -123,7 +81,6 @@ export function writeExplorerSidebarPrefs(
 export interface TerminalExplorerSidebarStore extends Readable<ExplorerSidebarPrefs> {
   setOpen(open: boolean): void;
   toggle(): void;
-  setTarget(target: ExplorerOpenTarget): void;
   setWidthLive(width: number): void;
   setWidth(width: number): void;
 }
@@ -146,11 +103,6 @@ export function createTerminalExplorerSidebarStore(
         return current.open === nextOpen ? current : commit({ ...current, open: nextOpen });
       }),
     toggle: () => update((current) => commit({ ...current, open: !current.open })),
-    setTarget: (target) =>
-      update((current) => {
-        const nextTarget = normalizeExplorerOpenTarget(target);
-        return current.target === nextTarget ? current : commit({ ...current, target: nextTarget });
-      }),
     setWidthLive: (width) =>
       update((current) => ({ ...current, width: clampExplorerSidebarWidth(width) })),
     setWidth: (width) =>

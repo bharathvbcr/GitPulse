@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  editorDraft,
-  emptyEditorTabs,
-  hasDirtyEditorTabs,
-  openPreview,
-  updateEditorDraft,
-  type EditorTabState,
-} from "../files/editorTabs";
+import { emptyEditorTabs, openPreview, type EditorTabState } from "../files/editorTabs";
+import { clearOpenDocumentsForTests, draftPaths, editDocument } from "../files/openDocuments";
 import { createRepoPanelCache } from "./repoPanelCache";
 
 describe("repoPanelCache", () => {
@@ -99,24 +93,23 @@ describe("repoPanelCache", () => {
     expect(cache.size).toBe(2);
   });
 
-  it("round-trips independent same-path drafts across repository switches and remounts", () => {
+  it("keeps the tabs of a repository whose draft the open-file store holds, per checkout", () => {
+    clearOpenDocumentsForTests();
+    // The Code page's own rule: drafts are the store's, so the cache asks it.
     const cache = createRepoPanelCache<EditorTabState>({
-      canEvict: (state) => !hasDirtyEditorTabs(state),
+      maxRepos: 1,
+      canEvict: (_state, repo) => draftPaths(repo).length === 0,
     });
-    const stateFor = (draft: string) => {
-      let state = openPreview(emptyEditorTabs(), "src/shared.ts");
-      state = updateEditorDraft(state, "src/shared.ts", draft, "disk");
-      return state;
-    };
-    cache.set("/repo/a", stateFor("repo a draft"));
-    cache.set("/repo/b", stateFor("repo b draft"));
+    const tabsFor = () => openPreview(emptyEditorTabs(), "src/shared.ts");
+    // The same path is a different document in each checkout.
+    editDocument("/repo/a", "src/shared.ts", "repo a draft", "disk");
+    cache.set("/repo/a", tabsFor());
+    cache.set("/repo/b", tabsFor());
+    cache.set("/repo/c", tabsFor());
 
-    const repoA = cache.get("/repo/a");
-    const repoB = cache.get("/repo/b");
-    expect(repoA).toBeDefined();
-    expect(repoB).toBeDefined();
-    if (!repoA || !repoB) throw new Error("draft cache entry unexpectedly missing");
-    expect(editorDraft(repoA, "src/shared.ts")?.content).toBe("repo a draft");
-    expect(editorDraft(repoB, "src/shared.ts")?.content).toBe("repo b draft");
+    expect(cache.get("/repo/a")?.tabs.map((tab) => tab.path)).toEqual(["src/shared.ts"]);
+    expect(draftPaths("/repo/b")).toEqual([]);
+    expect(cache.get("/repo/b")).toBeUndefined();
+    clearOpenDocumentsForTests();
   });
 });
