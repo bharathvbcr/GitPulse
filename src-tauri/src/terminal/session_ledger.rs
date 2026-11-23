@@ -1851,7 +1851,10 @@ mod tests {
         // first real-app reload test.
         let record: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(record["app_pid"], u64::from(std::process::id()), "{record}");
-        assert!(record.get("pid").is_none(), "no ambiguous bare pid: {record}");
+        assert!(
+            record.get("pid").is_none(),
+            "no ambiguous bare pid: {record}"
+        );
         ledger.record_lifecycle(
             "protection",
             serde_json::json!({ "session_id": "x".repeat(100_000) }),
