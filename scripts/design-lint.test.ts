@@ -21,6 +21,9 @@ import {
   type Violation,
 } from "./design-lint.mjs";
 
+/** For a test that lints the whole tree; see "passes the strict gate on this tree". */
+const WHOLE_TREE_TIMEOUT = 30_000;
+
 const FIXTURES = fileURLToPath(new URL("./fixtures/design-lint/", import.meta.url));
 
 function fixture(name: string): string {
@@ -923,7 +926,11 @@ describe("the committed gate config", () => {
     ]);
   });
 
-  it("passes the strict gate on this tree", () => {
+  // Lints the whole tree (~1.8k files), so it scales with the repository, not
+  // with this test: under coverage instrumentation and a full parallel run it
+  // outgrew vitest's default 5 s. Same budget as the other whole-repo scan
+  // (check-ipc-contract.test.ts).
+  it("passes the strict gate on this tree", { timeout: WHOLE_TREE_TIMEOUT }, () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
     try {
@@ -948,7 +955,7 @@ describe("the committed baseline", () => {
     expect(baseline.retake).toContain("BASE_SHA");
   });
 
-  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", () => {
+  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", { timeout: WHOLE_TREE_TIMEOUT }, () => {
     const fresh = countViolations(lintRepo({ root: repoRoot }).violations);
     const cmp = compareToBaseline(fresh, baseline);
     expect(cmp.increases).toEqual([]);
