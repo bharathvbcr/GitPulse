@@ -673,11 +673,43 @@ nothing typed there reaches GitPulse.
 
 ## 2. Reporting a Vulnerability
 
-If you discover a security vulnerability in GitPulse, please report it via GitHub Security Advisories rather than filing a public issue:
+Do **not** report a security vulnerability in a public issue, pull request or
+discussion. Report it privately through GitHub's private vulnerability reporting:
 
-👉 **[Open a Security Advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new)**
+👉 **[Open a private Security Advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new)**
 
-We take security issues seriously and will respond promptly to investigate and patch confirmed vulnerabilities.
+This is the only reporting channel. GitPulse does not publish a security email
+address. Include the version (or commit), the platform, what you expected, what
+happened, and the smallest steps that reproduce it. If you cannot use GitHub's
+form, say so in a private message to the maintainer, [@bharathvbcr](https://github.com/bharathvbcr),
+through the contact options on their GitHub profile. Do not put details in the
+message; ask for a private channel.
+
+### Supported versions
+
+Security fixes are made against the **latest published release** (the newest
+tag on the [Releases page](https://github.com/bharathvbcr/GitPulse/releases),
+beta or stable) and against `main`. Older releases are not patched; the fix is
+to update to the latest release. The opt-in release check (see *Opt-In Release
+Checks* above) announces a new version once its checksums are published.
+
+### What to expect
+
+GitPulse is maintained by one person, so these are targets, not guarantees:
+
+- **Acknowledgement** within 5 business days of your report.
+- **Assessment** (accepted, needs more information, or not a vulnerability) within
+  14 days of the acknowledgement, with the reason.
+- **Fix and disclosure.** For a confirmed issue, the maintainer works with you on
+  a fix and a disclosure date, and publishes the advisory (with a CVE where one
+  applies) when a patched release is available. Please give a reasonable window,
+  by default up to 90 days from the report, before disclosing details yourself.
+  You are credited in the advisory unless you ask not to be.
+
+Reports about the trust model described in this document (a way to run commands
+or write files without the repository trust, policy gate or confirmation the
+document promises) are in scope. Findings that need a machine you already
+control, or that only restate an accepted limit documented here, are usually not.
 
 ## 3. Dependency Advisory Status
 

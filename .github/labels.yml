@@ -48,6 +48,10 @@
   color: "5319e7"
   description: "Language, coverage runner, or dependency-ecosystem support"
 
+- name: "dependencies"
+  color: "0366d6"
+  description: "Dependency updates (Dependabot and manual)"
+
 # --- Area -----------------------------------------------------------------
 - name: "area: graph"
   color: "c5def5"
@@ -89,6 +93,14 @@
 - name: "blocked"
   color: "ededed"
   description: "Waiting on an upstream fix or another issue"
+
+- name: "pinned"
+  color: "ededed"
+  description: "Exempt from the stale bot"
+
+- name: "stale"
+  color: "ededed"
+  description: "No recent activity; closes automatically unless updated"
 
 - name: "wontfix"
   color: "ffffff"

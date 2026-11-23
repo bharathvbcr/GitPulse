@@ -1,0 +1,4 @@
+# The maintainer reviews every path. The branch ruleset on `main` requires an
+# approving review from a code owner, and this file is what makes that rule apply.
+# GitHub uses the last matching pattern, so a finer entry goes below `*`.
+*   @bharathvbcr
