@@ -63,7 +63,7 @@ use NamedSleepers as Sleepers;
 
 /// Sleepers whose kernel name is their marker: each is this test binary run
 /// through a symlink named by the marker, with the marker as `argv[0]` too,
-/// running only [`named_sleeper_body`]. The marker is at most 15 bytes so
+/// running only [`named_sleeper_600_body`]. The marker is at most 15 bytes so
 /// `comm` is not cut.
 ///
 /// They were `/bin/sleep` through that symlink. On the CI runner's image
@@ -99,7 +99,11 @@ impl NamedSleepers {
             .map(|_| {
                 Command::new(&link)
                     .arg0(&marker)
-                    .args(["--exact", "named_sleeper_body", "--test-threads=1"])
+                    // The command line is exactly `<marker> 600`, as it was
+                    // for `sleep 600`: the `-f` cases match on it. To libtest
+                    // `600` is a name filter, which selects only
+                    // `named_sleeper_600_body`.
+                    .arg("600")
                     .env(NAMED_SLEEPER, "1")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
@@ -132,6 +136,14 @@ impl NamedSleepers {
                 child.id()
             );
         }
+        // The `-f` cases match the full command line, so it must be what they
+        // name, or they compare two empty answers and test nothing.
+        let full = format!("{} 600", sleepers.marker);
+        assert_eq!(
+            pgrep(&["-fx", &full]).len(),
+            count,
+            "the named sleepers' command line is not `{full}`"
+        );
         sleepers
     }
 
@@ -164,7 +176,7 @@ const NAMED_SLEEPER: &str = "GITPULSE_TEST_NAMED_SLEEPER";
 
 #[cfg(target_os = "linux")]
 #[test]
-fn named_sleeper_body() {
+fn named_sleeper_600_body() {
     if std::env::var_os(NAMED_SLEEPER).is_none() {
         return;
     }
