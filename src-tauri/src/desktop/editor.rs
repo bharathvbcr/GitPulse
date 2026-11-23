@@ -265,6 +265,10 @@ enum Launch {
     TimedOut,
 }
 
+/// Runs a launcher with its arguments: [`run_launcher`] in production, a fake
+/// in tests.
+type RunLauncher<'a> = dyn Fn(&Path, &[String]) -> Result<Launch, CommandError> + 'a;
+
 /// The whole operation with every outside effect injected.
 #[allow(clippy::too_many_arguments)]
 fn open_with(
@@ -276,7 +280,7 @@ fn open_with(
     macos: bool,
     find_in_dir: &dyn Fn(&str, &Path) -> Option<PathBuf>,
     find_on_path: &dyn Fn(&str) -> Option<String>,
-    run: &dyn Fn(&Path, &[String]) -> Result<Launch, CommandError>,
+    run: &RunLauncher<'_>,
 ) -> Result<(), CommandError> {
     let (editor, launcher) = resolve_editor(choice, macos, find_in_dir, find_on_path)?;
     check_position(editor, target, line, column)?;
@@ -421,7 +425,7 @@ mod tests {
         line: Option<u32>,
         column: Option<u32>,
         macos: bool,
-        run: &dyn Fn(&Path, &[String]) -> Result<Launch, CommandError>,
+        run: &RunLauncher<'_>,
     ) -> Result<(), CommandError> {
         open_with(
             target,
@@ -440,17 +444,19 @@ mod tests {
             &|name| {
                 installed
                     .on_path
-                    .iter()
-                    .any(|found| *found == name)
+                    .contains(&name)
                     .then(|| format!("/fake/bin/{name}"))
             },
             run,
         )
     }
 
+    /// Every launcher `run` was asked to execute, with its arguments.
+    type Calls = Rc<RefCell<Vec<(PathBuf, Vec<String>)>>>;
+
     /// What `run` was asked to execute.
     fn recording() -> (
-        Rc<RefCell<Vec<(PathBuf, Vec<String>)>>>,
+        Calls,
         impl Fn(&Path, &[String]) -> Result<Launch, CommandError>,
     ) {
         let calls = Rc::new(RefCell::new(Vec::new()));
