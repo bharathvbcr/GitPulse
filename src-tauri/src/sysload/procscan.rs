@@ -2386,6 +2386,33 @@ pub(crate) fn parse_status_caps(status: &str, field: &str) -> Option<u64> {
     u64::from_str_radix(value.trim(), 16).ok()
 }
 
+/// The four ids of a `Uid:` or `Gid:` line of `/proc/<pid>/status`: real,
+/// effective, saved and filesystem. `None` when the line is absent or short.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_status_ids(status: &str, field: &str) -> Option<[u32; 4]> {
+    let line = status.lines().find_map(|l| l.strip_prefix(field))?;
+    let mut ids = line.split_whitespace().map(|v| v.parse::<u32>().ok());
+    Some([ids.next()??, ids.next()??, ids.next()??, ids.next()??])
+}
+
+/// Whether Linux's `__ptrace_may_access` lets a reader whose filesystem ids
+/// are `reader_fsuid` / `reader_fsgid` inspect a process with these ids
+/// without privilege: the reader's fsuid must equal the target's real,
+/// effective and saved uid, and its fsgid the target's real, effective and
+/// saved gid. A process that kept another id in any of those slots, such as
+/// systemd's `(sd-pam)`, which holds on to root to close its PAM session, is
+/// not the reader's to inspect, whatever user `/proc/<pid>` is owned by.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn ids_admit_reader(
+    target_uids: [u32; 4],
+    target_gids: [u32; 4],
+    reader_fsuid: u32,
+    reader_fsgid: u32,
+) -> bool {
+    target_uids[..3].iter().all(|id| *id == reader_fsuid)
+        && target_gids[..3].iter().all(|id| *id == reader_fsgid)
+}
+
 /// Whether a process on the reader's own uid holds capabilities the reader
 /// cannot use: its permitted set is not inside the reader's effective set.
 /// Reads of `/proc/<pid>/environ` and `/proc/<pid>/cwd` are
@@ -3399,22 +3426,52 @@ mod os {
             .map(|m| m.uid())
     }
 
-    /// Whether `pid` holds capabilities this process lacks, so the kernel
-    /// keeps its memory and working directory from it
-    /// ([`super::outranks_reader`]). `false` when either status cannot be
-    /// read: an unexplained refusal stays one.
-    fn outranks_this_process(pid: i32) -> bool {
-        let caps = |path: &str, field: &str| -> Option<u64> {
+    /// `uid r/e/s/fs gid r/e/s/fs` of `pid`, from its status file.
+    fn credentials_note(pid: i32) -> Option<String> {
+        let raw = read_bounded(&format!("/proc/{pid}/status"), 8192).ok()?;
+        let status = String::from_utf8_lossy(&raw);
+        let join = |ids: [u32; 4]| ids.map(|id| id.to_string()).join("/");
+        let uids = super::parse_status_ids(&status, "Uid:")?;
+        let gids = super::parse_status_ids(&status, "Gid:")?;
+        Some(format!("uid {} gid {}", join(uids), join(gids)))
+    }
+
+    /// Whether the kernel keeps `pid`'s memory and working directory from this
+    /// process without privilege: its credentials are not all this process's
+    /// ([`super::ids_admit_reader`]), or it holds capabilities this process
+    /// lacks ([`super::outranks_reader`]). `false` when either status cannot
+    /// be read: an unexplained refusal stays one.
+    fn withheld_by_kernel(pid: i32) -> bool {
+        let status = |path: &str| -> Option<String> {
             let raw = read_bounded(path, 8192).ok()?;
-            super::parse_status_caps(&String::from_utf8_lossy(&raw), field)
+            Some(String::from_utf8_lossy(&raw).into_owned())
         };
-        let (Some(target_permitted), Some(own_effective)) = (
-            caps(&format!("/proc/{pid}/status"), "CapPrm:"),
-            caps("/proc/self/status", "CapEff:"),
+        let (Some(target), Some(own)) = (
+            status(&format!("/proc/{pid}/status")),
+            status("/proc/self/status"),
         ) else {
             return false;
         };
-        super::outranks_reader(target_permitted, own_effective)
+        let ids = (
+            super::parse_status_ids(&target, "Uid:"),
+            super::parse_status_ids(&target, "Gid:"),
+            super::parse_status_ids(&own, "Uid:"),
+            super::parse_status_ids(&own, "Gid:"),
+        );
+        if let (Some(uids), Some(gids), Some(own_uids), Some(own_gids)) = ids {
+            if !super::ids_admit_reader(uids, gids, own_uids[3], own_gids[3]) {
+                return true;
+            }
+        }
+        match (
+            super::parse_status_caps(&target, "CapPrm:"),
+            super::parse_status_caps(&own, "CapEff:"),
+        ) {
+            (Some(target_permitted), Some(own_effective)) => {
+                super::outranks_reader(target_permitted, own_effective)
+            }
+            _ => false,
+        }
     }
 
     /// Whether the kernel keeps `pid`'s memory and working directory from its
@@ -3430,6 +3487,11 @@ mod os {
     /// from it and never asks. A process in another user namespace has its
     /// files given to that namespace's root instead, which is not 0 here, so
     /// it is not explained by this and stays unproven.
+    ///
+    /// This is separate from [`withheld_by_kernel`]: a process whose ids are
+    /// all the user's and that holds no capability the reader lacks is still
+    /// withheld when it is not dumpable, which neither the id nor the
+    /// capability rule sees.
     fn withheld_from_its_user(pid: i32) -> bool {
         use std::os::unix::fs::MetadataExt;
         let me = uid();
@@ -3681,16 +3743,27 @@ mod os {
             return None;
         }
         // On the user's own uid, a read the kernel refused because the process
-        // holds capabilities this one lacks (a helper given file capabilities,
-        // an agent a supervisor started privileged), or because the process
-        // is not dumpable and the kernel has given its /proc files to root
-        // (`(sd-pam)`, `ssh-agent`, a set-id program), is not a failure to
-        // look: the process cannot be inspected without privilege, as another
-        // user's cannot, and is counted as one. A refusal with no such cause
-        // stays unproven.
+        // is not wholly the user's (it kept root as its saved or real id, or
+        // runs with another group), holds capabilities this one lacks (a
+        // helper given file capabilities, an agent a supervisor started
+        // privileged), or is not dumpable so the kernel has given its /proc
+        // files to root (`(sd-pam)` after PAM drops it to the user,
+        // `ssh-agent`, a set-id program) is not a failure to look: the process
+        // cannot be inspected without privilege, as another user's cannot, and
+        // is counted as one. A refusal with no such cause stays unproven.
         let refused = argv.is_none() || env.is_none() || cwd.is_none();
-        let mine = !(refused && (outranks_this_process(pid) || withheld_from_its_user(pid)));
-        let detail = refused.then(|| format!("{pid} {}: {}", info.name, failed.join(", ")));
+        let mine = !(refused && (withheld_by_kernel(pid) || withheld_from_its_user(pid)));
+        let detail = refused.then(|| {
+            let mut note = format!("{pid} {}: {}", info.name, failed.join(", "));
+            // An unexplained refusal names the process's credentials, so the
+            // next reader of the kept reason can see what the kernel compared.
+            if mine {
+                if let Some(ids) = credentials_note(pid) {
+                    note.push_str(&format!(" ({ids})"));
+                }
+            }
+            note
+        });
         Some(super::ProcessUse {
             pid,
             mine,
@@ -4219,6 +4292,32 @@ pub(crate) mod tests {
         // No capabilities at all, the common case: nothing outranks anything.
         assert!(!outranks_reader(0, 0));
         assert!(!outranks_reader(0, 1 << 3));
+    }
+
+    #[test]
+    fn a_process_that_kept_another_id_is_not_the_readers_to_inspect() {
+        let status = "Name:\t(sd-pam)\nUid:\t1001\t1001\t0\t1001\nGid:\t1001\t1001\t1001\t1001\n";
+        let uids = parse_status_ids(status, "Uid:").expect("uids");
+        let gids = parse_status_ids(status, "Gid:").expect("gids");
+        assert_eq!(uids, [1001, 1001, 0, 1001]);
+        // On the GitHub ubuntu runner, `(sd-pam)` refused its environment and
+        // working directory to the runner's own test process (EACCES on
+        // environ), with no capability to explain it. `(sd-pam)` is forked by
+        // root's PAM stack before it drops to the user, so a kept root id is
+        // the likely cause; this row is that shape, not a capture of it.
+        // Linux requires each of real, effective and saved to match the
+        // reader's filesystem id.
+        assert!(!ids_admit_reader(uids, gids, 1001, 1001));
+        assert!(ids_admit_reader([1001; 4], [1001; 4], 1001, 1001));
+        assert!(!ids_admit_reader(
+            [1001; 4],
+            [1001, 27, 1001, 1001],
+            1001,
+            1001
+        ));
+        // The filesystem id is the reader's, not the target's.
+        assert!(ids_admit_reader([1001, 1001, 1001, 0], [5; 4], 1001, 5));
+        assert_eq!(parse_status_ids("Uid:\t1\t2\n", "Uid:"), None);
     }
 
     /// A kernel thread is never a row of the use table: it has no user memory
