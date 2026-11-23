@@ -56,7 +56,7 @@ const UNGUARDED_QUIT_WAIT: Duration = Duration::from_secs(3);
 /// run outside its bundle (`tauri dev`, `target/*/gitpulse`) has no identifier
 /// of its own, yet the copy it must not double is the one LaunchServices knows
 /// by this one.
-const SHIPPED_IDENTIFIER: &str = "com.gitpulse.desktop";
+const SHIPPED_IDENTIFIER: &str = "dev.vbcr.gitpulse";
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -94,6 +94,14 @@ pub fn establish() -> Launch {
             // taking its mailbox with it.
             let launch = unless_already_running();
             if let Launch::Proceed = launch {
+                // Owner of the profile, and no other GitPulse is running: the
+                // only moment the previous identifier's WebKit store is safe
+                // to copy, and before Tauri opens the webview on the new one.
+                // A failed copy never blocks startup.
+                let own = objc2_foundation::NSBundle::mainBundle()
+                    .bundleIdentifier()
+                    .map(|identifier| identifier.to_string());
+                super::identity_migration::run(own.as_deref(), SHIPPED_IDENTIFIER);
                 // Agent hooks' command verdicts, answered here instead of by a
                 // `manvi serve` each hook would start.
                 primary.attach_gate(std::sync::Arc::new(|cwd, command| {
@@ -371,9 +379,16 @@ fn unless_already_running() -> Launch {
 }
 
 /// Whose running copies count as GitPulse for this launch: its own bundle's,
-/// or the shipped app's when it was started outside a bundle.
-fn watched_identifier(own: Option<String>) -> String {
-    own.unwrap_or_else(|| SHIPPED_IDENTIFIER.to_owned())
+/// or the shipped app's when it was started outside a bundle. The shipped app
+/// also answers to the identifier it had before the VBCR Dev rename: that copy
+/// shares this profile and its WebKit store, and must not run beside this one.
+fn watched_identifiers(own: Option<String>) -> Vec<String> {
+    let own = own.unwrap_or_else(|| SHIPPED_IDENTIFIER.to_owned());
+    if own == SHIPPED_IDENTIFIER {
+        vec![own, super::identity_migration::LEGACY_IDENTIFIER.to_owned()]
+    } else {
+        vec![own]
+    }
 }
 
 /// Another process that LaunchServices knows as GitPulse and that is not this
@@ -383,7 +398,10 @@ fn unguarded_instance() -> Option<i32> {
     let own_identifier = objc2_foundation::NSBundle::mainBundle()
         .bundleIdentifier()
         .map(|identifier| identifier.to_string());
-    let identifier = NSString::from_str(&watched_identifier(own_identifier));
+    let identifiers: Vec<_> = watched_identifiers(own_identifier)
+        .iter()
+        .map(|identifier| NSString::from_str(identifier))
+        .collect();
     let own = std::process::id() as i32;
     let started = Instant::now();
     loop {
@@ -391,16 +409,18 @@ fn unguarded_instance() -> Option<i32> {
             // SAFETY: class methods and properties of NSRunningApplication;
             // the array holds NSRunningApplication instances.
             unsafe {
-                let apps: Retained<NSArray<AnyObject>> = msg_send![
-                    class!(NSRunningApplication),
-                    runningApplicationsWithBundleIdentifier: &*identifier
-                ];
-                apps.iter().find_map(|app| {
-                    let pid: i32 = msg_send![&*app, processIdentifier];
-                    let terminated: Bool = msg_send![&*app, isTerminated];
-                    let policy: isize = msg_send![&*app, activationPolicy];
-                    (pid != own && !terminated.as_bool() && policy != POLICY_PROHIBITED)
-                        .then_some(pid)
+                identifiers.iter().find_map(|identifier| {
+                    let apps: Retained<NSArray<AnyObject>> = msg_send![
+                        class!(NSRunningApplication),
+                        runningApplicationsWithBundleIdentifier: &**identifier
+                    ];
+                    apps.iter().find_map(|app| {
+                        let pid: i32 = msg_send![&*app, processIdentifier];
+                        let terminated: Bool = msg_send![&*app, isTerminated];
+                        let policy: isize = msg_send![&*app, activationPolicy];
+                        (pid != own && !terminated.as_bool() && policy != POLICY_PROHIBITED)
+                            .then_some(pid)
+                    })
                 })
             }
         });
@@ -537,13 +557,25 @@ mod tests {
     fn a_launch_outside_a_bundle_still_looks_for_the_shipped_app() {
         // Before this, a `tauri dev` or `target/*/gitpulse` launch had no
         // identifier to look under and started beside the installed app.
-        assert_eq!(watched_identifier(None), SHIPPED_IDENTIFIER);
+        assert_eq!(watched_identifiers(None)[0], SHIPPED_IDENTIFIER);
         // A bundle's own identifier wins, so a test copy under another
         // identifier only defers to copies of itself.
         assert_eq!(
-            watched_identifier(Some("com.gitpulse.desktop.e2e".into())),
-            "com.gitpulse.desktop.e2e"
+            watched_identifiers(Some("dev.vbcr.gitpulse.e2e".into())),
+            ["dev.vbcr.gitpulse.e2e"]
         );
+    }
+
+    #[test]
+    fn the_shipped_app_also_defers_to_a_copy_under_the_pre_rename_identifier() {
+        // An upgrade can start the new build while the old one still runs on
+        // the same profile; LaunchServices tells them apart only by identifier.
+        for own in [None, Some(SHIPPED_IDENTIFIER.to_owned())] {
+            assert_eq!(
+                watched_identifiers(own),
+                [SHIPPED_IDENTIFIER, "com.gitpulse.desktop"]
+            );
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
   "productName": "GitPulse",
   "version": "0.2.0-beta.1",
   "mainBinaryName": "gitpulse",
-  "identifier": "com.gitpulse.desktop",
+  "identifier": "dev.vbcr.gitpulse",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
