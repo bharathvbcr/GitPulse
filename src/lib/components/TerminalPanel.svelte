@@ -84,6 +84,7 @@
   } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { stopChildrenQuestion } from "../terminal/stopChildren";
+  import LegacySessions from "./LegacySessions.svelte";
   import { protectedSkipOf, type KillOrigin } from "../terminal/killOrigin";
   import { noteProtection, partitionByProtection, protectedSessions, setSessionProtected, sparedNotice } from "../terminal/protection";
   import { askConfirm, askText } from "../stores/modalStore";
@@ -4610,6 +4611,7 @@
             </div>
         {/each}
       {/each}
+      <LegacySessions open={sessionListOpen} />
     </div>
   {/if}
   {#if waitingForCapacity && mode === "shell"}

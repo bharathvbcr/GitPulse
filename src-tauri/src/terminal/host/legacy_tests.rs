@@ -775,3 +775,31 @@ fn a_real_v4_host_whose_own_app_is_still_connected_refuses_the_legacy_client() {
     assert!(matches!(status, LegacyStatus::Refused { .. }), "{status:?}");
     drop(app);
 }
+
+/// Before: a host that exited with its last session read, on the next ask, as a
+/// host that "could not be listed", and a failure had no rule against reading
+/// as an empty host.
+#[test]
+fn a_listed_host_that_is_gone_leaves_the_record_but_a_failure_stays_one() {
+    let listed = LegacyStatus::Listed {
+        info: LegacyHostInfo {
+            protocol: 4,
+            build: "1.0".into(),
+            pid: 9,
+            sessions: 1,
+        },
+        sessions: Vec::new(),
+    };
+    let gone = LegacyStatus::Unreachable {
+        reason: "no host".into(),
+    };
+    assert_eq!(listed.after_rescan(gone.clone()), None);
+    // A host that was never listed and still is not stays reported, so the
+    // user keeps being told it could not be listed.
+    assert_eq!(gone.after_rescan(gone.clone()), Some(gone.clone()));
+    let failed = LegacyStatus::Failed {
+        reason: "slow".into(),
+    };
+    assert_eq!(listed.after_rescan(failed.clone()), Some(failed));
+    assert_eq!(listed.after_rescan(listed.clone()), Some(listed));
+}

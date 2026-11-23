@@ -337,6 +337,60 @@ pub async fn cmd_terminal_kill(
     }
 }
 
+/// Terminal hosts left running by an earlier GitPulse version (an older
+/// protocol) that still hold sessions, asked again now: each with its sessions,
+/// or why they could not be listed. Empty when there are none. Their sessions
+/// are not this app's: they can be stopped and their output read
+/// (`cmd_terminal_legacy_kill`, `cmd_terminal_legacy_transcript`), never
+/// attached or typed into.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_hosts(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<Vec<crate::terminal::LegacyHostReport>, String> {
+    crate::terminal::control_async(&state, "terminal_legacy_hosts", |state| {
+        Ok(state.legacy_hosts())
+    })
+    .await
+}
+
+/// Stops one session on an earlier version's terminal host. A separate path
+/// from `cmd_terminal_kill`: terminal ids repeat across hosts, so the id is
+/// never looked up among this app's sessions or marked on its ledger. Recorded
+/// in the lifecycle log as `legacy_kill` with the `sessions_list_stop` origin.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_kill(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    protocol: u32,
+    session_id: String,
+) -> Result<(), String> {
+    crate::terminal::control_async(&state, "terminal_legacy_kill", move |state| {
+        state.legacy_kill(protocol, &session_id)
+    })
+    .await
+}
+
+/// The newest `max_bytes` (default and ceiling: `MAX_TRANSCRIPT_TAIL_BYTES`)
+/// of a session's saved output on an earlier version's terminal host.
+/// Read-only: it never attaches. `redact` masks secrets in that host.
+#[tauri::command(async)]
+pub async fn cmd_terminal_legacy_transcript(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    protocol: u32,
+    session_id: String,
+    max_bytes: Option<usize>,
+    redact: Option<bool>,
+) -> Result<crate::terminal::TranscriptRead, String> {
+    crate::terminal::control_async(&state, "terminal_legacy_transcript", move |state| {
+        state.legacy_transcript(
+            protocol,
+            &session_id,
+            max_bytes.unwrap_or(crate::terminal::MAX_TRANSCRIPT_TAIL_BYTES),
+            redact.unwrap_or(false),
+        )
+    })
+    .await
+}
+
 /// Mass external-signal deaths recorded this run, newest first and bounded.
 ///
 /// Inline on purpose: one short mutex around an in-memory list, no I/O.
@@ -596,9 +650,10 @@ pub async fn cmd_terminal_set_title(
             // session the ledger has no row for. Only the first is a success:
             // a lock shown for a flag that was never stored would be a lie.
             if state.session_ledger().is_protected(&session_id) != protected {
-                return Err(IpcError::from(
-                    "That session is not recorded in the session ledger, so its protection could not be changed.",
-                ));
+                return Err(
+                    "That session is not recorded in the session ledger, so its protection could not be changed."
+                        .into(),
+                );
             }
             if title.is_none() {
                 return Ok(flag_changed);

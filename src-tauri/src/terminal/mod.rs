@@ -39,6 +39,8 @@ mod transcript;
 pub use events::{AppEvents, SessionEnded, SessionEvents};
 use executor::Executor;
 use flow::{OutputFlow, Route};
+#[cfg(unix)]
+pub use host::legacy::LegacyHostReport;
 pub use ipc::{control_async, deliver_peer_wake_async, resize_async, write_async};
 pub use lifecycle::{KillOrigin, KillOutcome};
 pub use ring::RING_BYTES;
@@ -501,6 +503,14 @@ fn clock_ms() -> u64 {
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// An earlier terminal host's report. Only Unix has terminal hosts; here the
+/// list is always empty, so this carries nothing.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Serialize)]
+pub struct LegacyHostReport {
+    pub protocol: u32,
+}
+
 /// Which backend holds the terminals, as Settings and the quit dialog read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalBackendStatus {
@@ -938,6 +948,46 @@ impl TerminalSessions {
         self.host.trouble()
     }
 
+    /// Hosts of an earlier protocol that still run sessions, asked again now
+    /// (`HostClient::legacy_rescan`): each with its sessions, or why they
+    /// could not be listed. Their ids are their own host's, never this one's.
+    pub fn legacy_hosts(&self) -> Vec<LegacyHostReport> {
+        self.host.legacy_rescan()
+    }
+
+    /// Stops `session` on the earlier host of `protocol`. It never touches this
+    /// host's sessions, the ledger or the by-id marks: ids repeat across hosts.
+    /// The stop is recorded in the lifecycle log, which the host's own close
+    /// would have been.
+    pub fn legacy_kill(&self, protocol: u32, session: &str) -> Result<(), String> {
+        let result = self.host.legacy_kill(protocol, session);
+        self.session_ledger().record_lifecycle(
+            "legacy_kill",
+            serde_json::json!({
+                "protocol": protocol,
+                "session_id": session,
+                "origin": KillOrigin::SessionsListStop.as_str(),
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(ToString::to_string),
+            }),
+        );
+        result.map_err(|error| error.to_string())
+    }
+
+    /// The newest `max_bytes` of `session`'s saved output on the earlier host
+    /// of `protocol`, read-only.
+    pub fn legacy_transcript(
+        &self,
+        protocol: u32,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+    ) -> Result<TranscriptRead, String> {
+        self.host
+            .legacy_transcript(protocol, session, max_bytes, redact)
+            .map_err(|error| error.to_string())
+    }
+
     /// Whether this app's exit leaves the host's sessions running.
     pub fn leaves_sessions_running(&self) -> bool {
         self.leave_running.load(Ordering::Acquire)
@@ -1067,6 +1117,25 @@ impl TerminalSessions {
 
     pub fn host_trouble(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// No terminal host here, so no earlier one to list.
+    pub fn legacy_hosts(&self) -> Vec<LegacyHostReport> {
+        Vec::new()
+    }
+
+    pub fn legacy_kill(&self, _protocol: u32, _session: &str) -> Result<(), String> {
+        Err("There is no earlier terminal host on this platform.".into())
+    }
+
+    pub fn legacy_transcript(
+        &self,
+        _protocol: u32,
+        _session: &str,
+        _max_bytes: usize,
+        _redact: bool,
+    ) -> Result<TranscriptRead, String> {
+        Err("There is no earlier terminal host on this platform.".into())
     }
 
     pub fn leaves_sessions_running(&self) -> bool {

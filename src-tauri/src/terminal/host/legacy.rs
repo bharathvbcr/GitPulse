@@ -183,6 +183,20 @@ impl From<LegacyError> for LegacyStatus {
     }
 }
 
+impl LegacyStatus {
+    /// What a host's status becomes when it is asked again after an earlier
+    /// answer: `None` when it has gone. A host that was listed and now has
+    /// nothing behind its socket exited when its last session was stopped, so
+    /// it is not a host that "could not be listed"; every other change is kept
+    /// as the answer, because a failure must never read as an empty host.
+    pub fn after_rescan(&self, now: LegacyStatus) -> Option<LegacyStatus> {
+        match (self, &now) {
+            (Self::Listed { .. }, Self::Unreachable { .. }) => None,
+            _ => Some(now),
+        }
+    }
+}
+
 /// One other-protocol host found in the host directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LegacyHostReport {

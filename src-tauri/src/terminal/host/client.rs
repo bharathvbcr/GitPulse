@@ -606,6 +606,26 @@ impl HostClient {
         lock(&self.inner.legacy).clone()
     }
 
+    /// `legacy_hosts()` asked again: every recorded host is re-inspected, so a
+    /// session stopped since the last probe is no longer listed. A host that
+    /// exited with its last session leaves the record (`after_rescan`). The
+    /// sockets are asked without the record locked.
+    pub fn legacy_rescan(&self) -> Vec<super::legacy::LegacyHostReport> {
+        let before = self.legacy_hosts();
+        let after: Vec<_> = before
+            .into_iter()
+            .filter_map(|report| {
+                let status = report.status.after_rescan(super::legacy::inspect(
+                    &self.inner.config.dir,
+                    report.protocol,
+                ))?;
+                Some(super::legacy::LegacyHostReport { status, ..report })
+            })
+            .collect();
+        *lock(&self.inner.legacy) = after.clone();
+        after
+    }
+
     /// Stops `session` on the host of the earlier `protocol`, then drops the
     /// connection (so that host's own app can return). Opens its own
     /// connection: it does not touch this app's host connection.
@@ -2088,11 +2108,15 @@ impl Inner {
             }
             let path = entry.path();
             let mut holds = |hello_build: &str, pid: u32, sessions: usize| {
-                self.note_trouble(skew(current, protocol, hello_build, pid, sessions));
+                // Asked first: what the message promises depends on whether
+                // the sessions could be listed (and so are in Sessions).
+                let status = super::legacy::inspect(&self.config.dir, protocol);
+                let listed = matches!(status, super::legacy::LegacyStatus::Listed { .. });
+                self.note_trouble(skew(current, protocol, hello_build, pid, sessions, listed));
                 legacy.push(super::legacy::LegacyHostReport {
                     protocol,
                     socket: path.clone(),
-                    status: super::legacy::inspect(&self.config.dir, protocol),
+                    status,
                 });
             };
             match probe(
@@ -2129,10 +2153,26 @@ impl Inner {
     }
 }
 
-fn skew(current: u32, protocol: u32, build: &str, pid: u32, sessions: usize) -> String {
-    format!(
-        "A terminal host from another GitPulse version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {current} and cannot show them; they keep running until they end or that host is stopped."
-    )
+fn skew(
+    current: u32,
+    protocol: u32,
+    build: &str,
+    pid: u32,
+    sessions: usize,
+    listed: bool,
+) -> String {
+    let head = format!(
+        "A terminal host from another GitPulse version (protocol {protocol}, build {build}, pid {pid}) is still running {sessions} session(s). This version speaks protocol {current}"
+    );
+    if listed {
+        format!(
+            "{head}: they are listed under Sessions, where they can be stopped or their output read, but cannot be typed into or shown in a tab. They keep running until they end or you stop them."
+        )
+    } else {
+        format!(
+            "{head} and could not list them, so they cannot be shown; they keep running until they end or that host is stopped."
+        )
+    }
 }
 
 /// One request on a connection of its own, for a host this app will not use.

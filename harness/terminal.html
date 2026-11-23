@@ -57,6 +57,7 @@
       // differs between Chromium and WebKit is explained in the verdict's
       // diagnostics rather than by a silently missing row.
       const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [], skipped: [] };
+      let legacySessions = [];
       /** Every `cmd_terminal_resize`: which session was told which grid, in order. */
       const resizeLog = [];
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
@@ -157,6 +158,16 @@
             const now = Math.floor(Date.now() / 1000);
             return JSON.stringify({ ok: true, item: { kind: "external_terminal", id: "fixture-run", revision: 2, updated_at: 1, task_id: "fixture-task", source_revision: 1, task_title: "Fix the flaky test", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "running", cwd: "/fixture/GitPulse", created_at: now, expires_at: now + 300, session_id: "fixture-task-session", exit_code: null, reason: "", outcome_uncertain: false } });
           }
+          // Sessions an earlier GitPulse version's host still runs: listed, stoppable, readable; never attachable.
+          case "cmd_terminal_legacy_hosts":
+            return legacySessions.length === 0 ? [] : [{ protocol: 4, socket: "/fixture/ptyd-4.sock", status: { state: "listed", info: { protocol: 4, build: "0.9.0", pid: 4242, sessions: legacySessions.length }, sessions: legacySessions } }];
+          case "cmd_terminal_legacy_kill":
+            (report.legacyKills ??= []).push({ protocol: args.protocol, sessionId: args.sessionId });
+            legacySessions = legacySessions.filter((row) => row.id !== args.sessionId);
+            return null;
+          case "cmd_terminal_legacy_transcript":
+            (report.legacyReads ??= []).push({ protocol: args.protocol, sessionId: args.sessionId, redact: args.redact });
+            return { state: "found", data_b64: btoa("legacy output marker\n"), bytes: 21, retained: 21, truncated: false, rotated: false, clipped: false, gap_markers: 0, unrecorded_bytes: 0, redacted: true, live: true, settled: true, recording_error: null, run_id: null };
           case "cmd_terminal_sessions":
             // The host's own sessions as it lists them, plus one a reload left.
             return [
@@ -1400,6 +1411,28 @@
             while (performance.now() < listedDeadline && !kept()) await wait(20);
             check("the kept session is listed under Sessions, where it can be shown or stopped", kept);
             contextBusy = false;
+            {
+              // An earlier version's host still runs a session: shown apart, stopped and read through its own commands.
+              legacySessions = [{ id: "term-9-z", program: "/bin/zsh", cwd: "/fixture/Old", repo: "/fixture/Old", launcher: null, run_id: null, title: "old build", parent_session_id: null, detached: true, ending: false, quiet_ms: 5 }];
+              const killsBeforeLegacy = report.killOrigins.length;
+              button("All terminal sessions").click(); await wait(80);
+              button("All terminal sessions").click();
+              const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
+              check("a session in the previous version's host is listed apart, as not shown here", () =>
+                Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
+              legacyRegion.querySelector('[data-testid="legacy-session-output"]')?.click();
+              await waitFor(() => visible('[data-testid="legacy-session-output-view"]')[0]);
+              check("Show output reads it through the legacy command, masked, and shows the text", () =>
+                report.legacyReads?.[0]?.protocol === 4 && report.legacyReads[0].redact === true && visible('[data-testid="legacy-session-output-view"]')[0].textContent.includes("legacy output marker"));
+              legacyRegion.querySelector('[data-testid="legacy-session-stop"]')?.click();
+              const stopAsked = await waitFor(() => get(promptState));
+              check("Stop asks first, naming the previous host", () => stopAsked?.options.message.includes("previous GitPulse version's terminal host"));
+              completePrompt(true);
+              await waitFor(() => visible('[data-testid="legacy-sessions"]').length === 0);
+              check("Stop goes through the legacy kill with its protocol, and never through cmd_terminal_kill", () =>
+                report.legacyKills?.length === 1 && report.legacyKills[0].protocol === 4 && report.legacyKills[0].sessionId === "term-9-z" && report.killOrigins.length === killsBeforeLegacy);
+              check("a stopped legacy session leaves the list", () => visible('[data-testid="legacy-sessions"]').length === 0);
+            }
           }
           check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {

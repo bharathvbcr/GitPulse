@@ -556,6 +556,23 @@ fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
         client.trouble()
     );
 
+    // The skew message no longer says they cannot be shown: they are listed.
+    assert!(
+        client
+            .trouble()
+            .iter()
+            .any(|t| t.contains("listed under Sessions") && !t.contains("cannot show them")),
+        "{:?}",
+        client.trouble()
+    );
+    // Asked again, the record is the same host with the same session.
+    let rescanned = client.legacy_rescan();
+    assert_eq!(rescanned.len(), 1);
+    assert!(matches!(
+        &rescanned[0].status,
+        LegacyStatus::Listed { sessions, .. } if sessions.len() == 1
+    ));
+
     client.legacy_kill(PROTOCOL, "term-live").unwrap();
     assert!(matches!(
         client.legacy_kill(3, "term-live"),
