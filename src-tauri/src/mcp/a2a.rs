@@ -586,8 +586,10 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     notify_in_process_waiters();
 
     // The mailbox is all the push paths read, so a message that never reached it can only
-    // be surfaced by an inbox or wait call. An answer from the desktop deliver path still
-    // wins, because that path surfaced the message by another route.
+    // be surfaced by an inbox or wait call. A desktop answer wins only when the desktop used
+    // a channel independent of the mailbox ("managed" run delivery or the "banner" event);
+    // its "mailbox" outcomes, and replies from an older desktop with no channel, describe
+    // the mailbox and say nothing when the deposit failed.
     let desktop_outcome = if hop < max_hops && target.liveness == "live" {
         match reach_desktop_agent_deliver(
             &root_repo,
@@ -599,12 +601,15 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
             None,
             None,
         ) {
-            Some(Ok(reply)) => Some(
-                reply["delivery_outcome"]
-                    .as_str()
-                    .unwrap_or("queued_for_hook_boundary")
-                    .to_string(),
-            ),
+            Some(Ok(reply)) => {
+                let independent = matches!(reply["channel"].as_str(), Some("managed" | "banner"));
+                (independent || deposited).then(|| {
+                    reply["delivery_outcome"]
+                        .as_str()
+                        .unwrap_or("queued_for_hook_boundary")
+                        .to_string()
+                })
+            }
             _ => None,
         }
     } else {

@@ -1482,3 +1482,73 @@ fn a_wait_reports_has_more_and_dropped_before_seq_like_the_inbox() {
     assert!(whole["dropped_before_seq"].is_u64(), "{whole}");
     assert_eq!(whole["ack_error"], serde_json::Value::Null);
 }
+
+/// Fills the target's mailbox, then sends once more while a fake desktop owner answers
+/// `reply`, and returns that last send's result.
+#[cfg(target_os = "macos")]
+fn send_into_full_mailbox_with_desktop_reply(
+    sid: &str,
+    reply: serde_json::Value,
+) -> serde_json::Value {
+    use crate::desktop::instance::{claim, Claim};
+    let (_dir, repo) = trusted_git_repo();
+    register_inbox_peer(&repo, sid, "desktop-target");
+    for i in 0..8 {
+        send_to_role(&repo, "desktop-target", &format!("filler {i}"));
+    }
+    let profile = tempfile::Builder::new()
+        .prefix("gpdk")
+        .tempdir()
+        .expect("short socket tempdir");
+    crate::browser::TEST_PROFILE
+        .with(|slot| *slot.borrow_mut() = Some(profile.path().to_path_buf()));
+    let owner = match claim(profile.path(), Duration::from_secs(2)) {
+        Claim::Primary(owner) => owner,
+        _ => panic!("test must claim primary socket"),
+    };
+    owner.attach_agent_deliver(std::sync::Arc::new(move |_| Ok(reply.clone())));
+    let sent = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "agy:lead",
+            "to_peer": "desktop-target",
+            "body": "one more than the mailbox holds",
+        }),
+    )
+    .expect("send");
+    drop(owner);
+    crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+    assert_eq!(sent["mailbox"]["deposited"], false, "{sent}");
+    sent
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_that_rests_on_the_mailbox_cannot_hide_a_failed_deposit() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888811",
+        json!({"ok": true, "delivery_outcome": "queued_for_hook_boundary", "channel": "mailbox"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "bus_only", "{sent}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_through_a_managed_run_stands_when_the_mailbox_is_full() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888812",
+        json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "managed"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "woken_immediately", "{sent}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_desktop_answer_with_no_channel_is_treated_as_resting_on_the_mailbox() {
+    let sent = send_into_full_mailbox_with_desktop_reply(
+        "88888888-8888-4888-8888-888888888813",
+        json!({"ok": true, "delivery_outcome": "woken_immediately"}),
+    );
+    assert_eq!(sent["delivery_outcome"], "bus_only", "{sent}");
+}
