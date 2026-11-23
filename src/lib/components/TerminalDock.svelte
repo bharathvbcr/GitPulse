@@ -25,7 +25,7 @@
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { requestReveal } from "../files/revealRequests";
   import { observeResize } from "../dom/observeResize";
-  import { motionExitMs } from "../motion/tokens";
+  import { motionMs } from "../motion/tokens";
   import { nudgedPaneHeight, startPaneDrag } from "../ui/paneHeight";
   import { panelModes } from "../ui/panelMode";
   import { LAYERS } from "../ui/layers";
@@ -120,12 +120,17 @@
   }
 
   /*
-   * Docked or overlay (panelMode.ts). Docked, the dock owns a row under the
-   * view, settles in, and leaves in the same exit (transform and opacity, the
-   * row collapsing once it is gone). Overlay, it floats over the bottom of the view
-   * and slides on transform; the view keeps the full column. The dock is
-   * never unmounted: hiding is display:none, so an overlay holds the element
-   * for its exit and only then hides it.
+   * Docked or overlay (panelMode.ts). Either way the dock is a sheet that
+   * slides: up out of the bottom edge when it opens, back down when it
+   * closes. Docked, its row takes the final height at once and the sheet
+   * rises inside it, clipped by the row; the row collapses only after the
+   * sheet has gone. Overlay, it floats over the bottom of the view and the
+   * view keeps the full column.
+   *
+   * Transform only: the sheet never changes size while it moves, so no
+   * shell is re-fitted (and no PTY told a new size) by the motion. The dock
+   * is never unmounted: hiding is display:none, so it is held for its exit
+   * and only then hidden.
    */
   let overlay = $derived($panelModes.dock === "overlay");
   let leaving = $state(false);
@@ -135,9 +140,15 @@
   // rendered, so capturing the initial one is the intent.
   let wasOpen = open;
   // Read when the dock closes, not memoized: the reduced-motion preference is
-  // not reactive state, and a stale 70 would hold an exit the reader refused.
-  let exitMs = $state(motionExitMs("slow"));
-  const phase = $derived(leaving ? "slide-out" : overlay ? "slide-in" : "in");
+  // not reactive state, and a stale value would hold an exit the reader refused.
+  //
+  // The `fast` duration, not the shared exit token: exits are capped at 70 ms
+  // so a closing dialog's blurred backdrop never stacks under the next one.
+  // The dock has no backdrop, and a full-height sheet sliding down in 70 ms
+  // reads as a blink, not a slide. 140 ms on the exit curve still yields
+  // faster than the 320 ms entrance.
+  let exitMs = $state(motionMs("fast"));
+  const phase = $derived(leaving ? "slide-out" : "slide-in");
 
   $effect(() => {
     const isOpen = open;
@@ -146,7 +157,7 @@
       wasOpen = isOpen;
       if (leaveTimer) clearTimeout(leaveTimer);
       leaveTimer = null;
-      exitMs = motionExitMs("slow");
+      exitMs = motionMs("fast");
       if (isOpen || exitMs === 0) {
         leaving = false;
         return;
@@ -321,14 +332,23 @@
 
 {#if mounted}
   <!-- Hidden, never unmounted: display:none pauses rendering, not the shell. -->
+  <!-- The row (or, floating, the frame) holds the dock's height; the sheet
+       inside carries the surface and does the sliding. The row does not clip:
+       the workspace column around it already does (App.svelte), so the
+       floating sheet keeps its shadow while the slide still ends at the
+       column's bottom edge rather than over the status bar. -->
   <div
     bind:this={host}
     use:popover={dockDismissOptions}
-    class="gp-dock-motion flex flex-col overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
+    class="flex flex-col {overlay ? 'absolute inset-x-0 bottom-0' : 'shrink-0'}"
     class:hidden={!open && !leaving}
     style="height: {height}px; --gp-dock-exit-ms: {exitMs}ms;{overlay ? ` z-index: ${LAYERS.STICKY};` : ''}"
     data-terminal-dock
     data-dock-mode={overlay ? "overlay" : "docked"}
+  >
+  <div
+    class="gp-dock-motion flex flex-col flex-1 min-h-0 overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'shadow-float' : ''}"
+    data-dock-sheet
     data-phase={phase}
   >
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -402,5 +422,6 @@
         </div>
       {/each}
     </div>
+  </div>
   </div>
 {/if}
