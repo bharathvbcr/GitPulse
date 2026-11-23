@@ -5,7 +5,20 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import AgentsView from "./AgentsView.svelte";
 
-const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "AgentsView.svelte"), "utf8");
+const here = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(here, "AgentsView.svelte"), "utf8");
+// Row actions (which exist, their labels and targets) are decided in one
+// module since 897d520; the view only renders them and runs them.
+const rowActionsSource = readFileSync(join(here, "..", "agents", "rowActions.ts"), "utf8");
+
+/** The text of one `function name(` in the view's script, up to the next function. */
+function functionBody(name: string): string {
+  const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
+  expect(start, `function ${name}`).toBeGreaterThan(-1);
+  const rest = source.slice(start + 1);
+  const next = rest.search(/\n  (?:async )?function /);
+  return next < 0 ? rest : rest.slice(0, next);
+}
 
 describe("AgentsView", () => {
   it("does not call an unread task board an empty workspace", () => {
@@ -30,17 +43,27 @@ describe("AgentsView", () => {
     // focusTerminalSession owns surface → hosting tab → dock → reveal. A
     // hand-rolled reveal after opening the row's directory skipped the dock
     // and opened the cwd, which is not the tab the terminal lives in.
-    expect(source).toContain("focusTerminalSession(record)");
-    expect(source).toContain("showTaskTerminal(run)");
+    const show = functionBody("showTerminal");
+    expect(show).toContain("focusTerminalSession(record)");
+    expect(show).toContain("showTaskTerminal(run)");
+    // Showing never opens a directory: the terminal's tab is the focus
+    // owner's to find. (`onReady` belongs to startIn, which opens a checkout
+    // to launch an agent there, and is not a way of showing one.)
+    expect(show).not.toContain("openRepo");
+    expect(show).not.toContain("onReady");
     expect(source).not.toContain("reveal?.()");
-    expect(source).not.toContain("onReady");
   });
 
   it("gives each row explicit, labelled actions", () => {
-    expect(source).toContain('aria-label="Show terminal for {row.session}"');
-    expect(source).toContain('aria-label="Open task for {row.session}"');
-    expect(source).toContain("openTaskForRun(row.taskRunId)");
-    expect(source).toContain("repoStore.openRepo(row.checkoutPath)");
+    // Every action button carries the label its module gives it.
+    expect(source).toContain("agentRowActions(");
+    expect(source).toContain("aria-label={action.ariaLabel}");
+    expect(rowActionsSource).toContain("ariaLabel: `Show terminal for ${row.session}`");
+    expect(rowActionsSource).toContain("ariaLabel: `Open task for ${row.session}`");
+    // And each kind runs what it names.
+    expect(functionBody("runAction")).toMatch(/case "terminal":[\s\S]*showTerminal\(row\)[\s\S]*case "task":[\s\S]*openTask\(row\)/);
+    expect(functionBody("openTask")).toContain("openTaskForRun(row.taskRunId)");
+    expect(functionBody("openCheckout")).toContain("repoStore.openRepo(row.checkoutPath)");
     expect(source).toContain("agentKindLabel(row.kind)");
   });
 
