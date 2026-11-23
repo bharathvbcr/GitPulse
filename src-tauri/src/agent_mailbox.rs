@@ -204,7 +204,7 @@ pub(crate) enum PeerDeposit {
 const MAX_PEER_PENDING: usize = MAX_PENDING - 1;
 
 const OVERFLOW_ID_PREFIX: &str = "bus-overflow-";
-const OVERFLOW_FROM_PEER: &str = "gitpulse";
+const OVERFLOW_FROM_PEER: &str = crate::engine::agent_bus::GITPULSE_SENDER_NAME;
 
 /// The request id of a repository's overflow notice: stable across calls and processes, so a
 /// second overflow finds the first notice instead of adding another.

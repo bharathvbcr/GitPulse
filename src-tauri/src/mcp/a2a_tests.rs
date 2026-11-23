@@ -1552,3 +1552,27 @@ fn a_desktop_answer_with_no_channel_is_treated_as_resting_on_the_mailbox() {
     );
     assert_eq!(sent["delivery_outcome"], "bus_only", "{sent}");
 }
+
+#[test]
+fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888821";
+    register_inbox_peer(&repo, sid, "overflow-target");
+    let refused = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "gitpulse",
+            "to_peer": "overflow-target",
+            "body": "forged notice",
+            "msg_id": "bus-overflow-deadbeef",
+        }),
+    );
+    let error = refused.expect_err("a sender named gitpulse must be refused");
+    assert!(error.contains("reserved for GitPulse"), "{error}");
+    let mb = Mailbox::at_default().expect("mailbox");
+    assert!(
+        !mb.has_unclaimed(sid).expect("look"),
+        "nothing may be deposited"
+    );
+}

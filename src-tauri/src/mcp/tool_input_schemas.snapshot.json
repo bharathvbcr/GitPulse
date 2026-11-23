@@ -670,7 +670,7 @@
     "additionalProperties": false,
     "properties": {
       "ack": {
-        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default false: a read only peeks, so reading never consumes the owner's messages)",
         "type": "boolean"
       },
       "for_peer": {
@@ -932,7 +932,7 @@
     "additionalProperties": false,
     "properties": {
       "ack": {
-        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass since_seq to wait without consuming)",
         "type": "boolean"
       },
       "for_peer": {

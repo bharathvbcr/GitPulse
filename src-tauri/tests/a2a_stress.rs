@@ -111,15 +111,17 @@ fn pending_in_mailbox(sid: &str) -> usize {
 fn mailbox_text(sid: &str) -> String {
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let mut out = String::new();
-    let mut stack = vec![home];
-    while let Some(d) = stack.pop() {
+    let mut stack = vec![(home, 0usize)];
+    while let Some((d, depth)) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
             continue;
         };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
-                stack.push(p);
+                if depth < 8 {
+                    stack.push((p, depth + 1));
+                }
             } else if p
                 .parent()
                 .and_then(|x| x.file_name())

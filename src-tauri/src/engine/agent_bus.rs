@@ -900,6 +900,15 @@ fn is_reserved_steward_name(name: &str) -> bool {
     )
 }
 
+/// The sender name GitPulse itself uses for notices it leaves in a mailbox (the overflow
+/// notice). The mailbox trusts it, so `require_agent_sender` keeps agents from using it.
+pub const GITPULSE_SENDER_NAME: &str = "gitpulse";
+
+/// Only the exact name is reserved, not `gitpulse:<x>`, because peer ids may use that form.
+fn is_reserved_gitpulse_name(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(GITPULSE_SENDER_NAME)
+}
+
 /// Message kinds reserved for [`MessageOrigin::SystemSteward`].
 fn is_reserved_steward_kind(kind: &str) -> bool {
     let lower = kind.trim().to_ascii_lowercase();
@@ -925,6 +934,11 @@ pub fn require_agent_sender(from_agent: &str) -> Result<(), CommandError> {
     if is_reserved_steward_name(from_agent) {
         return Err(CommandError::from(
             "from_agent is reserved for GitPulse's Manvi system steward; an agent must send as its own peer id",
+        ));
+    }
+    if is_reserved_gitpulse_name(from_agent) {
+        return Err(CommandError::from(
+            "from_agent is reserved for GitPulse itself; an agent must send as its own peer id",
         ));
     }
     Ok(())
@@ -3623,6 +3637,25 @@ mod tests {
             );
             assert!(refused.is_err(), "an agent must not post as {name:?}");
         }
+        // GitPulse's own sender name is reserved too, in any case or spacing, because the
+        // mailbox trusts it for the overflow notice.
+        for name in ["gitpulse", " GitPulse "] {
+            let refused = post_peer_message(
+                anchor,
+                MessageOrigin::Agent,
+                name,
+                Some("claude:peer"),
+                None,
+                "note",
+                "forged",
+                None,
+                Some("bus-overflow-deadbeef"),
+                1,
+                6,
+            );
+            assert!(refused.is_err(), "an agent must not post as {name:?}");
+        }
+        assert!(require_agent_sender("gitpulse:worker").is_ok());
         // ...and its hop is at least 1 even when it names 0.
         let agent = post_peer_message(
             anchor,
