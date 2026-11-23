@@ -568,6 +568,24 @@ fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, CommandEr
     Ok(paths)
 }
 
+/// Creates each folder in `levels` (shallowest first) and records the ones this
+/// call made. A level that appeared since the caller looked (a neighbour made
+/// it) is not ours: it is neither recorded, so a failure never removes it, nor
+/// an error, as `create_dir_all` also tolerated it.
+fn create_levels(
+    levels: &[&std::path::Path],
+    created: &mut Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    for dir in levels {
+        match std::fs::create_dir(dir) {
+            Ok(()) => created.push(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// What [`GitWriter::move_path`] decided to run, handed to its gate before
 /// anything moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -994,11 +1012,8 @@ impl GitWriter {
                     .take_while(|dir| std::fs::symlink_metadata(dir).is_err())
                     .collect();
                 missing.reverse();
-                for dir in missing {
-                    std::fs::create_dir(dir)
-                        .map_err(|e| format!("Failed to create destination parent: {e}"))?;
-                    created.push(dir.to_path_buf());
-                }
+                create_levels(&missing, &mut created)
+                    .map_err(|e| format!("Failed to create destination parent: {e}"))?;
             }
             match &plan {
                 MovePlan::Git { argv } => {
@@ -10440,6 +10455,18 @@ mod move_path_leftovers {
             std::fs::read_to_string(dir.path().join("a/b/keep.txt")).unwrap(),
             "k"
         );
+    }
+
+    #[test]
+    fn a_level_a_neighbour_created_first_is_not_recorded_as_ours() {
+        let dir = repo();
+        let a = dir.path().join("a");
+        let ab = a.join("b");
+        std::fs::create_dir(&a).unwrap();
+        let mut created = Vec::new();
+        create_levels(&[a.as_path(), ab.as_path()], &mut created).expect("create");
+        assert_eq!(created, vec![ab]);
+        assert!(a.is_dir());
     }
 
     #[test]
