@@ -1075,7 +1075,7 @@
                     />
                     <p class="text-textMuted text-micro mt-1.5">
                       Where Open in editor sends a file, at the selected line when there is
-                      one. Auto takes the first installed of VS Code, Cursor and Zed; a
+                      one. Auto takes the first installed of VS Code, Antigravity IDE, Cursor and Zed; a
                       named editor that is not installed is an error, never a substitute.
                     </p>
                   </div>

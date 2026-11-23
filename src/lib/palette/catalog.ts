@@ -121,9 +121,9 @@ function agentSendCommands(state: RepoState, unavailable: string | undefined, ch
     {
       id: "file-open-in-editor", label: "Open active file in editor — your external editor, at the selected line",
       description: file
-        ? `Opens ${file}${lineInEditor(file) ? ` at line ${lineInEditor(file)}` : ""} in the editor chosen in Settings (VS Code, Cursor or Zed).`
+        ? `Opens ${file}${lineInEditor(file) ? ` at line ${lineInEditor(file)}` : ""} in the editor chosen in Settings (VS Code, Antigravity IDE, Cursor or Zed).`
         : "Opens the file Explorer has open in the external editor chosen in Settings, at the selected line when the viewer has one.",
-      keywords: "file open external editor ide vscode vs code cursor zed line goto launch", category: "Workspace", icon: SquareArrowOutUpRight,
+      keywords: "file open external editor ide vscode vs code antigravity cursor zed line goto launch", category: "Workspace", icon: SquareArrowOutUpRight,
       disabledReason: unavailable ?? (file ? undefined : noFile),
       action: async () => {
         checkOrigin();

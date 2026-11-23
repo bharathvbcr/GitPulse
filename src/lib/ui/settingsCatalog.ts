@@ -380,7 +380,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     id: "preferred-editor",
     section: "diff",
     label: "External editor",
-    keywords: "open in editor external ide vs code vscode cursor zed line goto launch preferred default auto",
+    keywords: "open in editor external ide vs code vscode antigravity cursor zed line goto launch preferred default auto",
   },
   {
     id: "auto-github-alerts",

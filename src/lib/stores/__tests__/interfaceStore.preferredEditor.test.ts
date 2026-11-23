@@ -33,7 +33,7 @@ describe("interfaceStore preferredEditor", () => {
     for (const bad of ["code", "vim", "/usr/bin/vim", "", 1, null, true, ["zed"], "VSCODE"]) {
       expect(get((await load({ preferredEditor: bad })).interfaceStore).preferredEditor).toBe("auto");
     }
-    for (const good of ["auto", "vscode", "cursor", "zed"]) {
+    for (const good of ["auto", "vscode", "antigravity", "cursor", "zed"]) {
       expect(get((await load({ preferredEditor: good })).interfaceStore).preferredEditor).toBe(good);
     }
   });

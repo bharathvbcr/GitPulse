@@ -3,7 +3,7 @@
 //! GitPulse cannot host editor extensions, so it hands the file to the editor
 //! the user already has. The webview picks from a **closed** set
 //! ([`EditorChoice`]); the program names and flags in here are constants, so
-//! the page can never name a program to run, only which of three to prefer.
+//! the page can never name a program to run, only which of four to prefer.
 //!
 //! The path is validated by the same gate "open with the default app" uses
 //! ([`super::shell::resolve_trusted`]): repository root and relative path
@@ -31,16 +31,18 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// How much of a failing launcher's stderr is shown.
 const STDERR_TAIL_BYTES: usize = 2048;
 
-/// Which editor to hand a file to. Spelled `auto`, `vscode`, `cursor`, `zed`
-/// on the wire; `src/lib/desktop/openInEditor.ts` mirrors it and
-/// `scripts/enum-variant-contract.test.ts` pins the two together.
+/// Which editor to hand a file to. Spelled `auto`, `vscode`, `antigravity`,
+/// `cursor`, `zed` on the wire; `src/lib/desktop/editorChoice.ts` mirrors it.
+/// `antigravity` is the Antigravity IDE (a VS Code fork), not the separate
+/// Antigravity agent app, which has no file-open launcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EditorChoice {
-    /// The first installed of VS Code, Cursor, Zed, in that order.
+    /// The first installed of VS Code, Antigravity IDE, Cursor, Zed, in that order.
     #[default]
     Auto,
     Vscode,
+    Antigravity,
     Cursor,
     Zed,
 }
@@ -49,18 +51,25 @@ pub enum EditorChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Editor {
     VsCode,
+    Antigravity,
     Cursor,
     Zed,
 }
 
 /// What `Auto` tries, in order.
-const AUTO_ORDER: [Editor; 3] = [Editor::VsCode, Editor::Cursor, Editor::Zed];
+const AUTO_ORDER: [Editor; 4] = [
+    Editor::VsCode,
+    Editor::Antigravity,
+    Editor::Cursor,
+    Editor::Zed,
+];
 
 impl Editor {
     fn from_choice(choice: EditorChoice) -> Option<Self> {
         match choice {
             EditorChoice::Auto => None,
             EditorChoice::Vscode => Some(Self::VsCode),
+            EditorChoice::Antigravity => Some(Self::Antigravity),
             EditorChoice::Cursor => Some(Self::Cursor),
             EditorChoice::Zed => Some(Self::Zed),
         }
@@ -69,6 +78,7 @@ impl Editor {
     fn label(self) -> &'static str {
         match self {
             Self::VsCode => "VS Code",
+            Self::Antigravity => "Antigravity IDE",
             Self::Cursor => "Cursor",
             Self::Zed => "Zed",
         }
@@ -78,6 +88,7 @@ impl Editor {
     fn program(self) -> &'static str {
         match self {
             Self::VsCode => "code",
+            Self::Antigravity => "antigravity-ide",
             Self::Cursor => "cursor",
             Self::Zed => "zed",
         }
@@ -92,6 +103,10 @@ impl Editor {
                 "/Applications/Visual Studio Code.app/Contents/Resources/app/bin",
                 "code",
             ),
+            Self::Antigravity => (
+                "/Applications/Antigravity IDE.app/Contents/Resources/app/bin",
+                "antigravity-ide",
+            ),
             Self::Cursor => (
                 "/Applications/Cursor.app/Contents/Resources/app/bin",
                 "cursor",
@@ -101,7 +116,8 @@ impl Editor {
     }
 
     /// The arguments that open `target` (an absolute path), at `line` and
-    /// `column` when given. VS Code and Cursor take `-g path:line[:col]`; Zed
+    /// `column` when given. VS Code, Antigravity IDE and Cursor take
+    /// `-g path:line[:col]`; Zed
     /// takes the bare `path:line[:col]`. No line is a plain path.
     fn args(self, target: &str, line: Option<u32>, column: Option<u32>) -> Vec<String> {
         let Some(line) = line else {
@@ -112,14 +128,14 @@ impl Editor {
             None => format!("{target}:{line}"),
         };
         match self {
-            Self::VsCode | Self::Cursor => vec!["-g".to_string(), spec],
+            Self::VsCode | Self::Antigravity | Self::Cursor => vec!["-g".to_string(), spec],
             Self::Zed => vec![spec],
         }
     }
 
     /// Whether this editor would read a trailing `:<digits>` of a plain path
-    /// as a position. Zed's bare path form does; `-g` is the only form VS Code
-    /// and Cursor read it from.
+    /// as a position. Zed's bare path form does; `-g` is the only form VS Code,
+    /// Antigravity IDE and Cursor read it from.
     fn reads_position_from_bare_path(self) -> bool {
         matches!(self, Self::Zed)
     }
@@ -183,8 +199,8 @@ fn resolve_editor(
         .ok_or_else(|| {
             not_found(
                 choice,
-                "No supported editor was found: looked for VS Code (`code`), Cursor (`cursor`) \
-                 and Zed (`zed`). Install one, or open the file another way."
+                "No supported editor was found: looked for VS Code (`code`), Antigravity IDE \
+                 (`antigravity-ide`), Cursor (`cursor`) and Zed (`zed`). Install one, or open the file another way."
                     .to_string(),
             )
         })
@@ -452,8 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn code_and_cursor_take_g_with_the_position_and_zed_takes_it_bare() {
-        for editor in [Editor::VsCode, Editor::Cursor] {
+    fn code_antigravity_and_cursor_take_g_with_the_position_and_zed_takes_it_bare() {
+        for editor in [Editor::VsCode, Editor::Antigravity, Editor::Cursor] {
             assert_eq!(
                 editor.args("/r/a.rs", Some(12), None),
                 ["-g", "/r/a.rs:12"],
@@ -488,6 +504,7 @@ mod tests {
         for (text, choice) in [
             ("auto", EditorChoice::Auto),
             ("vscode", EditorChoice::Vscode),
+            ("antigravity", EditorChoice::Antigravity),
             ("cursor", EditorChoice::Cursor),
             ("zed", EditorChoice::Zed),
         ] {
@@ -571,6 +588,55 @@ mod tests {
     }
 
     #[test]
+    fn auto_picks_antigravity_ide_over_cursor_when_vs_code_is_absent() {
+        let bundle_antigravity =
+            "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide";
+        let bundle_cursor = "/Applications/Cursor.app/Contents/Resources/app/bin/cursor";
+        let (_dir, target) = file_in_temp("a.rs");
+
+        // Both installed as bundles, VS Code not: Antigravity IDE is earlier in the order.
+        let (calls, run) = recording();
+        open(
+            &Installed {
+                bundles: vec![bundle_cursor, bundle_antigravity],
+                on_path: vec![],
+            },
+            &target,
+            EditorChoice::Auto,
+            Some(9),
+            None,
+            true,
+            &run,
+        )
+        .expect("opens");
+        assert_eq!(calls.borrow()[0].0, PathBuf::from(bundle_antigravity));
+        assert_eq!(
+            calls.borrow()[0].1,
+            ["-g".to_string(), format!("{}:9", target.display())]
+        );
+
+        // Found on PATH instead of a bundle: the program is `antigravity-ide`.
+        let (calls, run) = recording();
+        open(
+            &Installed {
+                bundles: vec![],
+                on_path: vec!["cursor", "antigravity-ide"],
+            },
+            &target,
+            EditorChoice::Auto,
+            None,
+            None,
+            true,
+            &run,
+        )
+        .expect("opens");
+        assert_eq!(
+            calls.borrow()[0].0,
+            PathBuf::from("/fake/bin/antigravity-ide")
+        );
+    }
+
+    #[test]
     fn a_bundle_is_only_looked_at_on_macos() {
         let bundle_code = "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code";
         let (_dir, target) = file_in_temp("a.rs");
@@ -633,7 +699,7 @@ mod tests {
         )
         .expect_err("nothing installed");
         assert_eq!(err.kind(), IpcErrorKind::EditorNotFound);
-        for name in ["VS Code", "Cursor", "Zed"] {
+        for name in ["VS Code", "Antigravity IDE", "Cursor", "Zed"] {
             assert!(err.message().contains(name), "{}", err.message());
         }
     }

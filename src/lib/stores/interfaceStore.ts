@@ -459,7 +459,7 @@ export interface InterfacePrefs extends AppearancePrefs {
   watchScope: WatchScope;
   /**
    * The external editor "Open in editor" hands a file to. `auto` takes the
-   * first installed of VS Code, Cursor and Zed; an unknown stored value reads
+   * first installed of VS Code, Antigravity IDE, Cursor and Zed; an unknown stored value reads
    * as `auto`, so a preference can never become something Rust has not named.
    */
   preferredEditor: EditorChoice;

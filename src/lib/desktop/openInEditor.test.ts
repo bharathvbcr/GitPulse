@@ -49,7 +49,7 @@ describe("openInEditor (the invoke wrapper)", () => {
 
 describe("the editor choice", () => {
   it("is exactly the four names Rust accepts, and nothing else parses", () => {
-    expect(EDITOR_CHOICES.map((choice) => choice.value)).toEqual(["auto", "vscode", "cursor", "zed"]);
+    expect(EDITOR_CHOICES.map((choice) => choice.value)).toEqual(["auto", "vscode", "antigravity", "cursor", "zed"]);
     expect(isEditorChoice(DEFAULT_EDITOR_CHOICE)).toBe(true);
     for (const other of ["code", "/usr/bin/vim", "VSCODE", "", null, undefined, 1, ["zed"]]) {
       expect(isEditorChoice(other), String(other)).toBe(false);
