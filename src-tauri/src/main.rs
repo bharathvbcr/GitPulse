@@ -30,15 +30,16 @@ fn write_usage(out: &mut impl std::io::Write, text: &str) {
 }
 
 fn main() {
+    // The app spends the per-user spawn budget its agent servers and hooks
+    // share. First, ahead of the headless cleanup branch below, which spawns
+    // git too and never reaches `run()`. Opting in spawns nothing, so
+    // `--help` below can still answer without ever starting the app.
+    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some((text, code)) = early_exit(&args) {
         write_usage(&mut std::io::stdout().lock(), &text);
         std::process::exit(code);
     }
-    // The app spends the per-user spawn budget its agent servers and hooks
-    // share. First, ahead of the headless cleanup branch below, which spawns
-    // git too and never reaches `run()`.
-    gitpulse_lib::engine::process::run_process_with_shared_spawn_budget();
     if std::env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--cleaner-due")
