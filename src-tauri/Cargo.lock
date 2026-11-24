@@ -777,6 +777,7 @@ dependencies = [
 name = "dc-store"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
  "rusqlite",
 ]
 

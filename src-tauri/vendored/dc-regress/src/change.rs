@@ -119,6 +119,38 @@ impl ChangeRefusal {
     }
 }
 
+/// The end line that means "to the end of the file".
+///
+/// What a bare `--at <path>` location carries in memory, so every comparison
+/// and clamp over line ranges keeps working on a plain `u32`. It is never
+/// written out as a number: see [`whole_file_end`].
+pub const WHOLE_FILE_END_LINE: u32 = u32::MAX;
+
+/// Serde adapter for an `end_line` that can be [`WHOLE_FILE_END_LINE`].
+///
+/// Serializes the sentinel as `null` and reads `null` back as the sentinel, so
+/// the in-memory value round-trips while no serializer (CLI, daemon, MCP)
+/// prints 4294967295 as if it were a line number. Every other value is
+/// written and read unchanged. A `null` end line therefore means "through the
+/// end of the file"; there is no separate `whole_file` marker, because adding
+/// one would change the struct's shape.
+pub mod whole_file_end {
+    use super::WHOLE_FILE_END_LINE;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(end_line: &u32, serializer: S) -> Result<S::Ok, S::Error> {
+        if *end_line == WHOLE_FILE_END_LINE {
+            serializer.serialize_none()
+        } else {
+            Some(*end_line).serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+        Ok(Option::<u32>::deserialize(deserializer)?.unwrap_or(WHOLE_FILE_END_LINE))
+    }
+}
+
 /// A contiguous run of post-image lines a change touched.
 ///
 /// One-based and inclusive, matching [`crate::join`] and `git blame`, so the
@@ -126,6 +158,11 @@ impl ChangeRefusal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedRange {
     pub start_line: u32,
+    /// One-based inclusive. `null` in JSON means "the whole file was
+    /// requested" (a bare `--at <path>`): `changed_files` keeps `null` even
+    /// when the length is known, while `unattributed` entries carry the real
+    /// length once the file could be read.
+    #[serde(with = "whole_file_end")]
     pub end_line: u32,
     /// True when the hunk removed lines and added none, so this range is the
     /// *boundary* the removal left behind rather than surviving changed
@@ -241,7 +278,7 @@ pub fn parse_location(at: &str) -> Result<(String, u32, u32), String> {
         return Err("a location needs a path, optionally followed by `:start-end`".to_string());
     }
     let Some((path, range)) = at.rsplit_once(':') else {
-        return Ok((at.to_string(), 1, u32::MAX));
+        return Ok((at.to_string(), 1, WHOLE_FILE_END_LINE));
     };
     let parse_line = |field: &str| -> Result<u32, String> {
         let value: u32 = field.trim().parse().map_err(|_| {
@@ -769,6 +806,49 @@ fn merge_ranges(mut ranges: Vec<ChangedRange>) -> Vec<ChangedRange> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_whole_file_sentinel_serializes_as_null_and_round_trips() {
+        let whole = ChangedRange {
+            start_line: 1,
+            end_line: WHOLE_FILE_END_LINE,
+            deletion_only: false,
+        };
+        let json = serde_json::to_value(&whole).unwrap();
+        assert!(json["end_line"].is_null(), "{json}");
+        assert!(!json.to_string().contains("4294967295"), "{json}");
+        let back: ChangedRange = serde_json::from_value(json).unwrap();
+        assert_eq!(back, whole, "null reads back as the in-memory sentinel");
+    }
+
+    #[test]
+    fn an_ordinary_end_line_is_written_and_read_unchanged() {
+        for end in [0, 1, 3, u32::MAX - 1] {
+            let range = ChangedRange {
+                start_line: 1,
+                end_line: end,
+                deletion_only: false,
+            };
+            let json = serde_json::to_value(&range).unwrap();
+            assert_eq!(json["end_line"], serde_json::json!(end));
+            let back: ChangedRange = serde_json::from_value(json).unwrap();
+            assert_eq!(back, range);
+        }
+    }
+
+    #[test]
+    fn an_unattributed_whole_file_range_serializes_as_null_too() {
+        let change = crate::blast::UnattributedChange {
+            path: "a.rs".to_string(),
+            start_line: 1,
+            end_line: WHOLE_FILE_END_LINE,
+            reason: crate::blast::UnattributedReason::FileNotIndexed,
+        };
+        let json = serde_json::to_value(&change).unwrap();
+        assert!(json["end_line"].is_null(), "{json}");
+        let back: crate::blast::UnattributedChange = serde_json::from_value(json).unwrap();
+        assert_eq!(back, change);
+    }
+
     use super::*;
 
     #[test]

@@ -1535,6 +1535,9 @@ pub(super) fn ts_ambient_exemptions(
     if !whole_file {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            if walk_deadline_passed() {
+                break;
+            }
             if node.kind() == "ambient_declaration" {
                 ambient.push((node.start_byte(), node.end_byte()));
                 continue;
@@ -1587,6 +1590,9 @@ pub(super) fn rust_crate_private_scopes(
     let mut restricted: HashSet<usize> = HashSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            break;
+        }
         let mut cursor = node.walk();
         if node.children(&mut cursor).any(|child| {
             child.kind() == "visibility_modifier"

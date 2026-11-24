@@ -46,9 +46,10 @@ use devmap_resolve::model::LangFamily;
 use devmap_store::delta::{DeltaEdgeRecord, DeltaStore};
 use devmap_store::schema::CURRENT_SCHEMA_VERSION;
 use devmap_store::seed::{
-    clone_or_copy_file, discard_staged, prepare_immutable_snapshot,
-    promote_immutable_base_to_store, read_file_at, seed_artifact, seed_directory_cow,
-    set_file_readonly, set_file_writable, stage_seed_healing_wal,
+    clone_or_copy_file, copy_donor_csr_checked, csr_generation_of_open_file, discard_staged,
+    prepare_immutable_snapshot, promote_immutable_base_to_store, read_file_at,
+    remove_file_if_present, seed_artifact, seed_reuse_directory, set_file_readonly,
+    set_file_writable, sidecar, stage_seed_healing_wal, DonorCsr, SQLITE_SIDECARS, STORE_SIDECARS,
 };
 use devmap_store::{
     CallersPage, DeadPage, FileEdges, GenerationEdges, SearchNarrowing, SearchPage, Store,
@@ -520,11 +521,16 @@ fn publish_base_snapshot_with(source_root: &Path, reuse: bool) -> Result<(PathBu
 
         let src_csr = csr_path_for_store(&source_db);
         let staged_csr = csr_path_for_store(&staged_sqlite);
-        let csr_sha256 = if src_csr.is_file() && seed_artifact(&src_csr, &staged_csr)?.is_some() {
-            set_file_readonly(&staged_csr)?;
-            Some(sha256_file_hex(&staged_csr)?)
-        } else {
-            None
+        // The donor's CSR is a base's too only if it is stamped with this
+        // generation: a sidecar left by an earlier store at the donor's path
+        // would be served as the base's graph. The sealed base is never
+        // repaired, so one that fails the check leaves the base without a CSR.
+        let csr_sha256 = match copy_donor_csr_checked(&src_csr, &staged_csr, key.generation_id)? {
+            DonorCsr::Kept => {
+                set_file_readonly(&staged_csr)?;
+                Some(sha256_file_hex(&staged_csr)?)
+            }
+            DonorCsr::Absent | DonorCsr::Rejected { .. } => None,
         };
 
         let manifest = BaseManifest {
@@ -1037,7 +1043,7 @@ fn admit_published_base(
     let dir = PinnedDir::open(entry, false)
         .with_context(|| format!("cannot pin published base {}", entry.display()))?;
     let what = format!("published base {}", entry.display());
-    for suffix in ["-wal", "-shm", "-journal"] {
+    for suffix in SQLITE_SIDECARS {
         require_child_absent(&dir, &format!("{BASE_SQLITE}{suffix}"), &what)?;
     }
     let open_entry = |name: &str| open_sealed_child(&dir, name, &format!("published {name}"), None);
@@ -1480,7 +1486,7 @@ pub fn seed_derived_artifacts_and_reuse_caches(
             let name = entry.file_name();
             if let Some(s) = name.to_str() {
                 if s.starts_with("resolution-reuse-") && entry.path().is_dir() {
-                    let _ = seed_directory_cow(&entry.path(), &dst_state.join(s))?;
+                    let _ = seed_reuse_directory(&entry.path(), &dst_state.join(s))?;
                 }
             }
         }
@@ -2258,8 +2264,11 @@ impl StackedStore {
     ///
     /// Clones the base this store admitted (the held descriptor, a clone of a
     /// clone), places `devmap.sqlite` by atomic rename and only then retires the
-    /// lease: a store beside a lease means the lease is stale. A failure before
-    /// the store is placed leaves the lane exactly as the call found it.
+    /// lease: a store beside a lease means the lease is stale. Before placing it,
+    /// sweeps the SQLite (`-wal`, `-shm`, `-journal`) and store sidecars an earlier
+    /// store left at the target path, as `place_staged` does. A failure leaves
+    /// the lease, the base and any store that was there untouched; only those
+    /// orphaned sidecars (which describe no store) may already be gone.
     pub fn materialize_seeded_store_waiting(&self, wait: std::time::Duration) -> Result<PathBuf> {
         let target_db = store_path(&self.worktree_root);
         if let Some(parent) = target_db.parent() {
@@ -2286,9 +2295,29 @@ impl StackedStore {
         if let (Some(file), Some(record)) = (&self.csr_file, &self.lease.csr) {
             check_identity(file, record, "CSR sidecar", &lease_path)?;
             verify_csr_content(file, record)?;
+            // Readers take a CSR on its generation alone, and the placed store
+            // keeps this base's generation: a CSR stamped for another one would
+            // be served as the store's graph. The base is sealed, so refuse
+            // rather than repair.
+            let stamped = csr_generation_of_open_file(file)?;
+            if stamped != u64::from(self.lease.generation_id) {
+                bail!(
+                    "the lane's CSR sidecar is stamped for generation {stamped} but its base store is generation {}; \
+                     refusing to place a store beside it. {}",
+                    self.lease.generation_id,
+                    restack_hint(&lease_path)
+                );
+            }
         }
         let dst_csr = csr_path_for_store(&target_db);
         let placed = (|| -> Result<()> {
+            // The placement is a rename, so `Store::open`'s creation-time sweep
+            // never runs: a sidecar an earlier store left at this path would sit
+            // beside the placed one. Swept as `place_staged` sweeps; a symlink is
+            // unlinked, not followed.
+            for suffix in SQLITE_SIDECARS.into_iter().chain(STORE_SIDECARS) {
+                remove_file_if_present(&sidecar(&target_db, suffix))?;
+            }
             promote_immutable_base_to_store(&self.base_file, &target_db, &self.worktree_root)?;
             if let Some(csr_file) = &self.csr_file {
                 clone_or_copy_file(csr_file, &dst_csr)?;
@@ -2301,7 +2330,7 @@ impl StackedStore {
             let _ = fs::remove_file(&dst_csr);
             discard_staged(&target_db);
             return Err(err.context(format!(
-                "materialize failed and changed nothing; {}",
+                "materialize failed: no store was placed and the lease is intact (stale sidecars at the target path may have been removed); {}",
                 restack_hint(&lease_path)
             )));
         }
@@ -2602,6 +2631,12 @@ impl StackedStore {
         let Some((gen_id, _root, base_files)) = self.base.latest_scope_inputs()? else {
             return Ok(None);
         };
+        Ok(Some(self.merge_indexed_files(gen_id, base_files)))
+    }
+
+    /// The base generation's file list with the overlay applied: tombstoned and
+    /// modified files out, added files in, rooted at the worktree.
+    fn merge_indexed_files(&self, gen_id: u32, base_files: Vec<(String, String)>) -> ScopeInputs {
         let mut by_path: std::collections::BTreeMap<String, String> = base_files
             .into_iter()
             .filter(|(p, _)| {
@@ -2614,13 +2649,34 @@ impl StackedStore {
             by_path.insert(path.clone(), ext.language.clone());
         }
         let wt_root = Some(self.worktree_root.to_string_lossy().into_owned());
-        Ok(Some((gen_id, wt_root, by_path.into_iter().collect())))
+        (gen_id, wt_root, by_path.into_iter().collect())
     }
 
     pub fn all_merged_symbols(&self) -> Result<Option<SearchPage>> {
-        let Some(mut page) = self.base.all_symbols_page()? else {
+        let Some(page) = self.base.all_symbols_page()? else {
             return Ok(None);
         };
+        Ok(Some(self.merge_symbols(page)))
+    }
+
+    /// The merged symbols and the merged file list, both read from one base
+    /// snapshot.
+    ///
+    /// Two reads — one for the rows, one for the files — each resolved "the
+    /// latest generation" for itself, so a commit landing between them left
+    /// rows from one generation beside a file list from another. A scope
+    /// resolved against the second then admitted or refused paths the first
+    /// does not hold. `Store::all_symbols_page_with_files` reads both inside one
+    /// deferred transaction.
+    pub(crate) fn merged_corpus(&self) -> Result<Option<(SearchPage, ScopeInputs)>> {
+        let Some((page, base_files)) = self.base.all_symbols_page_with_files()? else {
+            return Ok(None);
+        };
+        let files = self.merge_indexed_files(page.generation, base_files);
+        Ok(Some((self.merge_symbols(page), files)))
+    }
+
+    fn merge_symbols(&self, mut page: SearchPage) -> SearchPage {
         page.rows.retain(|sym| {
             let p = Path::new(&sym.path);
             !self.overlay.is_file_tombstoned(p)
@@ -2647,7 +2703,7 @@ impl StackedStore {
         }
         page.total = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
         page.repo_root = Some(self.worktree_root.to_string_lossy().into_owned());
-        Ok(Some(page))
+        page
     }
 
     pub fn keyword_page(
@@ -2656,10 +2712,7 @@ impl StackedStore {
         pool: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> Result<Option<SearchPage>> {
-        let Some(mut page) = self.all_merged_symbols()? else {
-            return Ok(None);
-        };
-        let Some((_, root, all_files)) = self.all_indexed_files()? else {
+        let Some((mut page, (_, root, all_files))) = self.merged_corpus()? else {
             return Ok(None);
         };
         let corpus_files = u32::try_from(all_files.len()).unwrap_or(u32::MAX);
@@ -2749,13 +2802,10 @@ impl StackedStore {
         &self,
         scope: Option<&crate::scope::SymbolScope>,
     ) -> Result<Option<(SearchPage, Option<crate::scope::ResolvedScope>)>> {
-        let Some(mut page) = self.all_merged_symbols()? else {
-            return Ok(None);
-        };
         let Some(scope) = scope else {
-            return Ok(Some((page, None)));
+            return Ok(self.all_merged_symbols()?.map(|page| (page, None)));
         };
-        let Some((_, root, files)) = self.all_indexed_files()? else {
+        let Some((mut page, (_, root, files))) = self.merged_corpus()? else {
             return Ok(None);
         };
         let mut resolved = scope.resolve(&files, root.as_deref())?;
@@ -3925,6 +3975,152 @@ mod tests {
     }
 
     #[cfg(feature = "parse")]
+    thread_local! {
+        static SNAPSHOT_PAUSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(feature = "parse")]
+    fn count_snapshot_pause() {
+        SNAPSHOT_PAUSES.with(|fires| fires.set(fires.get() + 1));
+    }
+
+    /// Counts the base reads that pin a snapshot (the ft-9450b451 seam fires
+    /// once per pinned snapshot) until dropped.
+    #[cfg(feature = "parse")]
+    struct SnapshotPauseCount;
+
+    #[cfg(feature = "parse")]
+    impl SnapshotPauseCount {
+        fn install() -> Self {
+            SNAPSHOT_PAUSES.with(|fires| fires.set(0));
+            devmap_store::db::set_generation_read_pause(Some(count_snapshot_pause));
+            Self
+        }
+
+        fn fires(&self) -> u32 {
+            SNAPSHOT_PAUSES.with(std::cell::Cell::get)
+        }
+    }
+
+    #[cfg(feature = "parse")]
+    impl Drop for SnapshotPauseCount {
+        fn drop(&mut self) {
+            devmap_store::db::set_generation_read_pause(None);
+        }
+    }
+
+    /// A lane with one dirty file, so reads take the merged (stacked) path.
+    #[cfg(feature = "parse")]
+    fn dirty_stacked_lane(tag: &str) -> (PathBuf, StackedStore) {
+        let root = temp_repo_dir(tag);
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = root.join("lane-1");
+        run_git_ok(
+            &anchor,
+            &["worktree", "add", "-b", "lane-1", lane.to_str().unwrap()],
+        );
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        fs::write(
+            lane.join("src/svc.go"),
+            "package svc\n\ntype Server struct{}\n\nfunc (s *Server) Handle() int { return 99 }\n",
+        )
+        .unwrap();
+        let mut stacked = StackedStore::open(&lane).unwrap();
+        stacked.sync_worktree().unwrap();
+        assert!(stacked.has_delta_changes());
+        (root, stacked)
+    }
+
+    /// The keyword page over a stacked store paired two independent
+    /// "latest generation" reads: the rows, then the file list the scope is
+    /// resolved against. A commit between them left rows from one generation
+    /// beside files from another. One read of the base is one snapshot, so the
+    /// seam sees exactly one pin.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn keyword_page_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("keyword-one-snapshot");
+        let filter = crate::scope::NameQueryFilter::new(&["src".to_string()], &[], &[]).unwrap();
+
+        let pauses = SnapshotPauseCount::install();
+        let page = stacked
+            .keyword_page("Handle", 10, filter.as_ref())
+            .unwrap()
+            .expect("the base holds a generation");
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        assert!(page.rows.iter().any(|row| row.name == "Handle"));
+        assert_eq!(
+            page.narrowing.as_ref().map(|n| n.corpus_files),
+            Some(3),
+            "the scope was resolved against a different file list than the rows"
+        );
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `doc_drift_report_with_stacked` paired the same two reads over a dirty
+    /// worktree: the merged rows, then the merged file list.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn doc_drift_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("docdrift-one-snapshot");
+        let options = crate::doc_drift::DocDriftOptions {
+            paths: &[],
+            exclude: &[],
+            token_budget: 8_000,
+            default_excludes: true,
+            limits: crate::doc_drift::Limits::default(),
+        };
+
+        let pauses = SnapshotPauseCount::install();
+        let report = crate::doc_drift::doc_drift_report_with_stacked(
+            &stacked.base,
+            Some(&stacked),
+            &crate::cancel::Cancel::default(),
+            &options,
+        )
+        .unwrap();
+        assert!(report.available, "{:?}", report.walk_incomplete);
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// `ranking_corpus` pairs the same two reads when it is scoped.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn a_scoped_ranking_corpus_reads_its_rows_and_its_files_from_one_snapshot() {
+        let (root, stacked) = dirty_stacked_lane("ranking-one-snapshot");
+        let scope = crate::scope::SymbolScope::new(&["src".to_string()], &[])
+            .unwrap()
+            .expect("a path scope");
+
+        let pauses = SnapshotPauseCount::install();
+        let (page, resolved) = stacked
+            .ranking_corpus(Some(&scope))
+            .unwrap()
+            .expect("the base holds a generation");
+        assert_eq!(
+            pauses.fires(),
+            1,
+            "the rows and the files were read from separate snapshots"
+        );
+        assert!(resolved.is_some());
+        assert!(!page.rows.is_empty());
+        drop(pauses);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
     #[test]
     fn stacked_store_preserves_go_receiver_ts_const_and_rust_const_edits_and_refuses_writable_base()
     {
@@ -4583,6 +4779,88 @@ mod tests {
             served.is_err(),
             "a csr from another repository (len {tampered_len} vs {honest_len}) was mapped and served: {served:?}"
         );
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A CSR of generation `generation` with one node, written over `path`.
+    #[cfg(all(feature = "parse", unix))]
+    fn write_csr_stamped(path: &Path, generation: u64) {
+        let mut writer = devmap_store::csr::CsrGraphWriter::new(generation);
+        writer.add_node(devmap_store::csr::CsrNodeRecord::default());
+        writer.write_to_file(path).unwrap();
+    }
+
+    /// C-1: a donor's CSR left by an earlier store at its path, stamped for a
+    /// generation the donor's store is not at, must not become the base's CSR.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn provision_does_not_admit_a_donor_csr_stamped_for_another_generation() {
+        let root = temp_repo_dir("c1-orphan-csr");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let donor_csr = csr_path_for_store(store_path(&anchor));
+        let donor_generation = devmap_store::csr::CsrGraphReader::open_mmap(&donor_csr)
+            .unwrap()
+            .generation();
+        write_csr_stamped(&donor_csr, donor_generation + 7);
+
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+
+        assert!(
+            lease.csr.is_none(),
+            "the orphan CSR was admitted into the lease: {:?}",
+            lease.csr
+        );
+        assert!(
+            !csr_path_for_store(lease.base_dir().join("base.sqlite")).exists(),
+            "the orphan CSR was copied into the lane's base"
+        );
+        StackedStore::open(&lane).expect("a base without a CSR is served from its store");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// C-1: materialize refuses a CSR whose generation is not the base's, and
+    /// changes nothing. The lease is rewritten to admit the swapped file, so
+    /// only the generation check can catch it.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn materialize_refuses_a_csr_stamped_for_another_generation_and_changes_nothing() {
+        let root = temp_repo_dir("c1-materialize-gen");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let mut lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        let canon = lane.canonicalize().unwrap();
+        let base_dir = lease.base_dir();
+        let csr = csr_path_for_store(base_dir.join("base.sqlite"));
+        // Only the directory entry for the CSR is opened up: chmod-ing the base
+        // itself would change the identity the lease recorded for it.
+        set_dir_mode(&base_dir, 0o755).unwrap();
+        set_file_writable(&csr).unwrap();
+        fs::remove_file(&csr).unwrap();
+        write_csr_stamped(&csr, u64::from(lease.generation_id) + 7);
+        set_file_readonly(&csr).unwrap();
+        set_dir_mode(&base_dir, 0o555).unwrap();
+        lease.csr =
+            Some(file_record(&File::open(&csr).unwrap(), sha256_file_hex(&csr).unwrap()).unwrap());
+        fs::write(
+            stack_lease_path(&canon),
+            serde_json::to_vec_pretty(&lease).unwrap(),
+        )
+        .unwrap();
+
+        let stacked = StackedStore::open(&lane).expect("the swapped CSR is admitted by its lease");
+        let err = format!(
+            "{:#}",
+            stacked
+                .materialize_seeded_store()
+                .expect_err("a CSR of another generation must not be copied into a store")
+        );
+        assert!(err.contains("generation"), "unexpected error: {err}");
+        assert!(!store_path(&canon).exists(), "no store may be placed");
+        assert!(stack_lease_path(&canon).is_file(), "the lease must remain");
+        drop(stacked);
         let _ = remove_readonly_tree(&root);
     }
 
@@ -6036,6 +6314,63 @@ mod tests {
         let head = s.latest_generation_head_sha().unwrap();
         let honest_head = stacked.base_store().latest_generation_head_sha().unwrap();
         assert_eq!(head, honest_head, "materialized store holds the impostor's graph (head {head:?}) not the opened base's ({honest_head:?})");
+        let _ = remove_readonly_tree(&root);
+    }
+
+    /// A lease with no CSR places a store by rename, which never runs the
+    /// creation-time sidecar sweep: a `.csr` or `.artifacts.json` an earlier
+    /// store left at the lane's path would be served beside the placed one.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn materializing_a_lease_without_a_csr_sweeps_the_stale_sidecars_at_the_lane_path() {
+        let root = temp_repo_dir("materialize-sweeps-sidecars");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        let _ = fs::remove_file(csr_path_for_store(store_path(&anchor)));
+        let lease = provision_stacked_worktree(&anchor, &lane).unwrap();
+        assert!(
+            lease.csr.is_none(),
+            "fixture: a donor without a CSR sidecar"
+        );
+        let target = store_path(lane.canonicalize().unwrap());
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let stale_csr = csr_path_for_store(&target);
+        fs::write(&stale_csr, b"a CSR an earlier store left").unwrap();
+        // A symlinked sidecar is unlinked, never followed.
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"not the lane's").unwrap();
+        let stale_artifacts = devmap_store::seed::sidecar(&target, ".artifacts.json");
+        std::os::unix::fs::symlink(&outside, &stale_artifacts).unwrap();
+        // SQLite would replay a stale log into the placed store on first open.
+        let stale_wal = devmap_store::seed::sidecar(&target, "-wal");
+        fs::write(&stale_wal, b"a log an earlier store left").unwrap();
+        let stale_journal = devmap_store::seed::sidecar(&target, "-journal");
+        fs::write(&stale_journal, b"a journal an earlier store left").unwrap();
+        let outside_shm = root.join("outside-shm");
+        fs::write(&outside_shm, b"not the lane's either").unwrap();
+        let stale_shm = devmap_store::seed::sidecar(&target, "-shm");
+        std::os::unix::fs::symlink(&outside_shm, &stale_shm).unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+        let placed = stacked.materialize_seeded_store().unwrap();
+        assert_eq!(placed, target);
+        for stale in [&stale_wal, &stale_journal, &stale_shm] {
+            assert!(
+                fs::symlink_metadata(stale).is_err(),
+                "{} survived beside the placed store",
+                stale.display()
+            );
+        }
+        assert_eq!(fs::read(&outside_shm).unwrap(), b"not the lane's either");
+        assert!(
+            fs::symlink_metadata(&stale_csr).is_err(),
+            "the stale CSR survived beside the placed store"
+        );
+        assert!(
+            fs::symlink_metadata(&stale_artifacts).is_err(),
+            "the stale artifacts stamp survived beside the placed store"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"not the lane's");
         let _ = remove_readonly_tree(&root);
     }
 

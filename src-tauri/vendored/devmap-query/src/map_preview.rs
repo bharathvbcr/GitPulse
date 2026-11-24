@@ -36,7 +36,73 @@ const SUBSYSTEM_LANG_CAP: usize = 8;
 const REPO_LANG_CAP: usize = 32;
 /// Unplaceable handoff texts listed in the payload, across every subsystem.
 /// The total and the per-subsystem counts are never capped.
-const UNRESOLVED_HANDOFF_CAP: usize = 100;
+pub(crate) const UNRESOLVED_HANDOFF_CAP: usize = 100;
+
+pub(crate) struct UnresolvedHandoffSummary {
+    pub listed: Vec<Value>,
+    pub total: usize,
+    pub by_subsystem: Map<String, Value>,
+}
+
+pub(crate) fn summarize_unresolved_handoffs(
+    mut unresolved: Vec<Value>,
+) -> UnresolvedHandoffSummary {
+    // Counted before the list is cut: a capped list with no total lets the
+    // majority case read as a handful. Per subsystem too, so a detail pane can
+    // say "3 of 12" even when the global cap left it none to list.
+    let total = unresolved.len();
+    let mut by_subsystem_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (index, row) in unresolved.iter().enumerate() {
+        let from = row["from"].as_str().unwrap_or_default().to_string();
+        let counts = by_subsystem_counts.entry(from).or_default();
+        counts.0 += 1;
+        if index < UNRESOLVED_HANDOFF_CAP {
+            counts.1 += 1;
+        }
+    }
+    unresolved.truncate(UNRESOLVED_HANDOFF_CAP);
+    let by_subsystem: Map<String, Value> = by_subsystem_counts
+        .into_iter()
+        .map(|(area, (total, listed))| (area, json!({"total": total, "listed": listed})))
+        .collect();
+    UnresolvedHandoffSummary {
+        listed: unresolved,
+        total,
+        by_subsystem,
+    }
+}
+
+fn fmt_grouped_usize(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+pub(crate) fn format_unplaced_note(total: usize, listed: usize) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let base = format!(
+        "{} handoff{} unplaced",
+        fmt_grouped_usize(total),
+        if total == 1 { "" } else { "s" }
+    );
+    if listed < total {
+        format!(
+            "{base} ({} of {} listed)",
+            fmt_grouped_usize(listed),
+            fmt_grouped_usize(total)
+        )
+    } else {
+        base
+    }
+}
 
 fn as_str(value: &Value, key: &str) -> String {
     value
@@ -46,7 +112,7 @@ fn as_str(value: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn normalize(path: &str) -> String {
+pub(crate) fn normalize(path: &str) -> String {
     path.replace('\\', "/")
 }
 
@@ -440,24 +506,7 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
             );
         }
     }
-    // Counted before the list is cut: a capped list with no total lets the
-    // majority case read as a handful. Per subsystem too, so a detail pane can
-    // say "3 of 12" even when the global cap left it none to list.
-    let unresolved_total = unresolved.len();
-    let mut unresolved_by_subsystem: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for (index, row) in unresolved.iter().enumerate() {
-        let from = row["from"].as_str().unwrap_or_default().to_string();
-        let counts = unresolved_by_subsystem.entry(from).or_default();
-        counts.0 += 1;
-        if index < UNRESOLVED_HANDOFF_CAP {
-            counts.1 += 1;
-        }
-    }
-    unresolved.truncate(UNRESOLVED_HANDOFF_CAP);
-    let unresolved_by_subsystem: Map<String, Value> = unresolved_by_subsystem
-        .into_iter()
-        .map(|(area, (total, listed))| (area, json!({"total": total, "listed": listed})))
-        .collect();
+    let unresolved = summarize_unresolved_handoffs(unresolved);
 
     let repo_ranked = rank(&files.repo_languages, REPO_LANG_CAP);
     let palette_ids: Vec<&str> = files.repo_languages.keys().map(String::as_str).collect();
@@ -505,9 +554,9 @@ pub fn build_preview_payload(repo_map: &Value) -> Value {
         "nodes": nodes,
         "links": links,
         "subsystems": subsystems.into_iter().map(Value::Object).collect::<Vec<_>>(),
-        "unresolved_handoffs": unresolved,
-        "unresolved_handoffs_total": unresolved_total,
-        "unresolved_handoffs_by_subsystem": unresolved_by_subsystem,
+        "unresolved_handoffs": unresolved.listed,
+        "unresolved_handoffs_total": unresolved.total,
+        "unresolved_handoffs_by_subsystem": unresolved.by_subsystem,
         "liveness": {
             "counts": {
                 "entry_roots": liveness_count("entry_roots", "entry_roots"),

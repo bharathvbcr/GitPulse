@@ -330,7 +330,9 @@ mod tests {
 
     #[test]
     fn a_character_reference_is_named_and_a_bare_ampersand_is_not() {
-        for named in ["&amp;", "&lt;", "&frac12;", "&#38;", "&#x26;", "&#X26;", "&copy; x"] {
+        for named in [
+            "&amp;", "&lt;", "&frac12;", "&#38;", "&#x26;", "&#X26;", "&copy; x",
+        ] {
             assert!(is_character_reference(named.as_bytes()), "{named}");
         }
         for bare in [

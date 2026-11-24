@@ -111,3 +111,51 @@ pub use scope::{
     missing_kind_message, NameQueryFilter, ResolvedScope, ScopeReport, SymbolScope,
     MAX_SCOPE_KINDS, MAX_SCOPE_LANGUAGES, MAX_SCOPE_PATHS,
 };
+
+/// Human-readable JSON type label (`"null"`, `"boolean"`, `"number"`, `"string"`,
+/// `"array"`, `"object"`) for diagnostic messages.
+pub fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Indefinite-article form of [`json_value_kind`] (`"null"`, `"a boolean"`,
+/// `"a number"`, `"a string"`, `"an array"`, `"an object"`).
+pub fn json_value_kind_article(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::{json_value_kind, json_value_kind_article};
+    use serde_json::json;
+
+    #[test]
+    fn json_value_kind_covers_every_variant() {
+        let cases = [
+            (json!(null), "null", "null"),
+            (json!(true), "boolean", "a boolean"),
+            (json!(42), "number", "a number"),
+            (json!("hi"), "string", "a string"),
+            (json!([1]), "array", "an array"),
+            (json!({"a": 1}), "object", "an object"),
+        ];
+        for (value, bare, article) in cases {
+            assert_eq!(json_value_kind(&value), bare);
+            assert_eq!(json_value_kind_article(&value), article);
+        }
+    }
+}

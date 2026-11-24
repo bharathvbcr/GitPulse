@@ -1765,10 +1765,12 @@ mod tests {
             !cat_rep.is_sound_tcb(),
             "declare_syntax_cat must convict as MetaprogrammingEscape"
         );
-        assert!(cat_rep
-            .holes
-            .iter()
-            .any(|h| h.kind == LeanTcbHoleKind::MetaprogrammingEscape));
+        assert!(
+            cat_rep
+                .holes
+                .iter()
+                .any(|h| h.kind == LeanTcbHoleKind::MetaprogrammingEscape)
+        );
 
         let scoped_src = "namespace Outer\ndef _root_.GlobalPkg.fn : Nat := 1\ndef «Sub».«val» : Nat := 2\ndef «mutual» : Nat := 3\nend Outer\n";
         let scoped_rep = analyze_lean_tcb(scoped_src);
@@ -1786,7 +1788,10 @@ mod tests {
             render_lean_axiom_driver("DcVerifyTargetSpec", scoped_src, &scoped_rep.declarations);
         assert!(driver.contains("#print axioms GlobalPkg.fn\n"), "{driver}");
         assert!(driver.contains("#print axioms Outer.Sub.val\n"), "{driver}");
-        assert!(driver.contains("#print axioms Outer.«mutual»\n"), "{driver}");
+        assert!(
+            driver.contains("#print axioms Outer.«mutual»\n"),
+            "{driver}"
+        );
         assert_eq!(
             expected,
             vec![

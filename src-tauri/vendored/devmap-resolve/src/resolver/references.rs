@@ -285,8 +285,7 @@ impl Resolver {
         // rung below, for the opposite one — `self.run` cannot mean an imported
         // free function in any language here, so the import rung is refused for
         // an implicit receiver outright.
-        let implicit =
-            Self::receiver_is_self(receiver) && !Self::rust_module_self_path(receiver);
+        let implicit = Self::receiver_is_self(receiver) && !Self::rust_module_self_path(receiver);
         if implicit {
             let answer = reference.enclosing_symbol.as_deref().and_then(|caller| {
                 Self::read_members(family, name)
@@ -793,7 +792,12 @@ impl Resolver {
         // evidence about it. This replaced a JS/TS-only import test and a
         // nine-name Python list.
         if bound_by_unfollowable_import
-            || self.bare_name_has_other_evidence(&ext.file_path, family, name)
+            || self.bare_name_has_other_evidence(
+                &ext.file_path,
+                family,
+                name,
+                reference.enclosing_symbol.as_deref(),
+            )
         {
             return None;
         }

@@ -28,29 +28,19 @@
 //! struct shape on a boundary this small, and the store deliberately carries
 //! only rusqlite.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 
+use dc_proc::cli::{collect_args_with_note, is_version_arg, quote, wants_version};
 use dc_store::{AcquireRequest, Lease, LeaseCode, ReadyMode, ScopeWrite, Store, StoreError};
 
-// A disconnected consumer is a transport failure, not a Rust panic. Keep
-// diagnostics off this JSON protocol, including the error response path.
-macro_rules! respond {
-    ($($argument:tt)*) => {{
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
-            .and_then(|()| out.flush()).is_err() {
-            return ExitCode::FAILURE;
-        }
-    }};
-}
-
 fn main() -> ExitCode {
-    let args = match collect_args() {
+    let args = match collect_args_with_note(
+        "; the store cannot parse a request it cannot read, and its value is withheld here because one argument is a lease token",
+    ) {
         Ok(args) => args,
         Err(message) => {
-            respond!("{}", fatal_object(&message));
+            dc_proc::respond!("{}", fatal_object(&message));
             return ExitCode::from(2);
         }
     };
@@ -66,52 +56,20 @@ fn main() -> ExitCode {
     }
     match run(&args) {
         Ok(json) => {
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Conflict(json)) => {
             // Contention is an outcome, not a fault: exit 0 so a caller that
             // does check the exit code does not treat a busy task as an outage.
-            respond!("{json}");
+            dc_proc::respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(Failure::Fatal(message)) => {
-            respond!("{}", fatal_object(&message));
+            dc_proc::respond!("{}", fatal_object(&message));
             ExitCode::from(2)
         }
     }
-}
-
-/// Collects the command line, refusing an argument that is not valid Unicode
-/// rather than dying on it.
-///
-/// `std::env::args()` panics on such an argument, and a panic here breaks the
-/// one property this boundary rests on and this file's own header states: every
-/// outcome is JSON on stdout. What it produced instead was exit 101, a Rust
-/// backtrace on stderr, and an empty stdout — which the Go client can only
-/// report as "failed: exit status 101", handing an operator a panic dump in
-/// place of a diagnosis. Argument vectors on Unix are bytes, and the values
-/// crossing this boundary include branch names and identifiers that reach the
-/// harness from the environment, so bytes that are not UTF-8 are reachable
-/// input, not a hypothetical.
-///
-/// The offending value is named by position and never by content: one of the
-/// arguments carries a lease token, and an error message that echoed it would
-/// copy a credential into the caller's logs.
-fn collect_args() -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    for (index, arg) in std::env::args_os().skip(1).enumerate() {
-        match arg.into_string() {
-            Ok(value) => args.push(value),
-            Err(_) => {
-                return Err(format!(
-                    "argument {index} is not valid UTF-8; the store cannot parse a request it \
-                     cannot read, and its value is withheld here because one argument is a lease token"
-                ));
-            }
-        }
-    }
-    Ok(args)
 }
 
 /// Flags this binary accepts. Kept beside the parser so adding a flag without
@@ -190,34 +148,25 @@ const KNOWN_FLAGS: &[&str] = &[
 const STORE_IDENTITY: &str = "dc-store";
 const COMPONENT_ID: &str = "dcstore";
 
-fn is_version_arg(arg: &str) -> bool {
-    matches!(arg, "--version" | "-V" | "-v" | "version")
-}
-
 /// What `--version` answers.
 ///
 /// `CARGO_PKG_VERSION` and never a literal: every crate in this workspace takes
 /// `version.workspace = true`, so the one number in `rust/Cargo.toml` is what
-/// reaches here, and there is no second place for a release to forget. Before
-/// this existed the binary answered `--version` with `unknown flag --version`,
-/// which is the reason a deployed `dcstore` could not be told apart from one
-/// three releases old: the package was 0.2.3 and the program could not say so.
-///
-/// JSON rather than a bare string because this boundary's contract is that
-/// every outcome is a JSON object on stdout — a caller that parses each line
-/// must not have to special-case this one.
+/// reaches here, and there is no second place for a release to forget.
 ///
 /// `workbench_schema` is the profile version this build opens, and the only
 /// field that tells a schema 10 build from a schema 11 one: both are 0.2.4.
 /// A host that hands its profile to whatever `dcstore` is on PATH checks it
 /// first, rather than learning from `schema_unsupported` on every request.
 fn version_object() -> String {
-    format!(
-        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{},\"workbench_schema\":{}}}",
-        quote(COMPONENT_ID),
-        quote(STORE_IDENTITY),
-        quote(env!("CARGO_PKG_VERSION")),
-        dc_store::workbench::WORKBENCH_SCHEMA
+    dc_proc::cli::version_object(
+        COMPONENT_ID,
+        STORE_IDENTITY,
+        env!("CARGO_PKG_VERSION"),
+        &[(
+            "workbench_schema",
+            &dc_store::workbench::WORKBENCH_SCHEMA.to_string(),
+        )],
     )
 }
 
@@ -302,17 +251,17 @@ fn parse(args: &[String]) -> Result<Parsed, Failure> {
 /// "healthy, zero leases" from a private empty database nobody else was
 /// using, which is exactly the confident zero Available() promises never to
 /// report. A store that is not there is now an answer, not a side effect.
-fn open_for(command: &str, db: &str) -> Result<Store, Failure> {
-    if command == "health" {
-        Store::open_existing(db)
-    } else {
-        Store::open(db)
+fn open_for(command: &str, db: &str, for_serve: bool) -> Result<Store, Failure> {
+    match command {
+        "runs" | "run-get" | "handoff-get" if !for_serve => Store::open_readonly(db),
+        "health" | "runs" | "run-get" | "handoff-get" => Store::open_existing(db),
+        _ => Store::open(db),
     }
     .map_err(|e| Failure::Fatal(e.to_string()))
 }
 
 fn run(args: &[String]) -> Result<String, Failure> {
-    if args.iter().any(|arg| is_version_arg(arg)) {
+    if wants_version(args) {
         return Ok(version_object());
     }
     let parsed = parse(args)?;
@@ -322,7 +271,7 @@ fn run(args: &[String]) -> Result<String, Failure> {
     let command = parsed
         .command
         .ok_or_else(|| Failure::Fatal("a command is required".into()))?;
-    let store = open_for(&command, &db)?;
+    let store = open_for(&command, &db, false)?;
 
     dispatch(&store, &command, &parsed.flags)
 }
@@ -1082,10 +1031,100 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        "runs" => {
+            let (rows, truncated) = store
+                .runs_list(flag("task"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows.iter().map(run_json).collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("runs", &format!("[{}]", items.join(","))),
+                ("shown", &rows.len().to_string()),
+                ("truncated", &json_bool(truncated)),
+            ]))
+        }
+
+        "run-get" => {
+            let id = required("id")?;
+            if id.trim().is_empty() {
+                return Err(Failure::Fatal("--id must not be blank".into()));
+            }
+            match store
+                .run_get(id)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                Some(run) => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(true)),
+                    ("run", &run_json(&run)),
+                ])),
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(false)),
+                    ("run", &"null".to_string()),
+                ])),
+            }
+        }
+
+        "handoff-get" => {
+            let id = required("id")?;
+            if id.trim().is_empty() {
+                return Err(Failure::Fatal("--id must not be blank".into()));
+            }
+            match store
+                .handoff_get(id)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                Some(handoff) => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(true)),
+                    ("handoff", &handoff_json(&handoff)),
+                ])),
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("found", &json_bool(false)),
+                    ("handoff", &"null".to_string()),
+                ])),
+            }
+        }
+
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, runs, run-get, handoff, handoff-get, work)"
         ))),
     }
+}
+
+fn opt_json_str(value: Option<&str>) -> String {
+    match value {
+        Some(v) => quote(v),
+        None => "null".to_string(),
+    }
+}
+
+fn run_json(run: &dc_store::records::VerificationRun) -> String {
+    object(&[
+        ("id", &quote(&run.id)),
+        ("task_id", &quote(&run.task_id)),
+        ("sandbox", &quote(&run.sandbox)),
+        ("environment_json", &quote(&run.environment_json)),
+        ("commands_json", &quote(&run.commands_json)),
+        ("status", &quote(&run.status)),
+        ("started_at", &quote(&run.started_at)),
+        ("finished_at", &opt_json_str(run.finished_at.as_deref())),
+    ])
+}
+
+fn handoff_json(handoff: &dc_store::records::AgentHandoff) -> String {
+    object(&[
+        ("id", &quote(&handoff.id)),
+        ("task_id", &quote(&handoff.task_id)),
+        ("from_agent", &quote(&handoff.from_agent)),
+        ("to_agent", &quote(&handoff.to_agent)),
+        ("run_id", &quote(&handoff.run_id)),
+        ("manifest_path", &quote(&handoff.manifest_path)),
+        ("status", &quote(&handoff.status)),
+        ("created_at", &quote(&handoff.created_at)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1157,14 @@ const MAX_SERVE_ARGS: usize = 64;
 /// scope — and two different caps on one payload would mean a request the
 /// sender considered legal and the receiver did not.
 const MAX_SERVE_ARG_BYTES: usize = 8 << 20;
+
+/// How many bytes one request may declare across all of its arguments, summed
+/// as each length header arrives and checked before that argument's body is
+/// read. The per-argument cap alone would let 64 arguments of 8 MiB each
+/// through. Two arguments' worth is the most the Go host sends: every request
+/// it builds carries at most one large value (an appended scope, a record, a
+/// verification wire) beside short ids and tokens.
+const MAX_SERVE_REQUEST_BYTES: usize = 2 * MAX_SERVE_ARG_BYTES;
 
 /// How many bytes a length header may run to before it is refused. Lengths are
 /// short decimal numbers; anything longer is a peer that will never send the
@@ -1190,13 +1237,32 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<Vec<String>>, String
         return Ok(None);
     };
     let mut args = Vec::with_capacity(count);
+    let mut declared_total = 0usize;
     for index in 0..count {
         let len = read_bounded_len(reader, MAX_SERVE_ARG_BYTES, &format!("argument {index}"))?
             .ok_or_else(|| format!("stream ended before argument {index}"))?;
-        let mut buf = vec![0u8; len];
+        declared_total = declared_total
+            .checked_add(len)
+            .filter(|total| *total <= MAX_SERVE_REQUEST_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "argument {index} takes the request past the {MAX_SERVE_REQUEST_BYTES} byte cap"
+                )
+            })?;
+        // Memory follows the bytes that arrive, not the length that was
+        // declared: a peer that declares 8 MiB and sends nothing costs nothing.
+        let mut buf = Vec::new();
         reader
-            .read_exact(&mut buf)
+            .by_ref()
+            .take(len as u64)
+            .read_to_end(&mut buf)
             .map_err(|e| format!("reading argument {index}: {e}"))?;
+        if buf.len() != len {
+            return Err(format!(
+                "reading argument {index}: stream ended after {} of {len} bytes",
+                buf.len()
+            ));
+        }
         // Named by position and never by content: one of these arguments
         // carries a lease token, and an error echoing it would copy a
         // credential into the caller's logs. Same rule as collect_args.
@@ -1261,7 +1327,7 @@ fn serve_one(store: &mut Option<Store>, db: &str, args: &[String]) -> (&'static 
         return ("err", fatal_object("serve cannot be nested"));
     }
     if store.is_none() {
-        match open_for(&command, db) {
+        match open_for(&command, db, true) {
             Ok(opened) => *store = Some(opened),
             Err(failure) => return failure_reply(failure),
         }
@@ -1276,7 +1342,7 @@ fn serve_one(store: &mut Option<Store>, db: &str, args: &[String]) -> (&'static 
 /// Answers framed requests on stdin until the caller closes it.
 fn serve(parsed: &Parsed) -> ExitCode {
     let Some(db) = parsed.db.as_deref() else {
-        respond!("{}", fatal_object("--db is required"));
+        dc_proc::respond!("{}", fatal_object("--db is required"));
         return ExitCode::from(2);
     };
     let stdin = std::io::stdin();
@@ -1429,23 +1495,373 @@ fn json_bool(v: bool) -> String {
     if v { "true".into() } else { "false".into() }
 }
 
-/// Escapes a string per RFC 8259. Control characters must be escaped or the
-/// output is not parseable JSON — a task title with a newline in it would
-/// otherwise produce a payload the Go side rejects.
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+#[cfg(test)]
+mod serve_frame_tests {
+    use super::*;
+
+    /// One stretch of a scripted request stream.
+    enum Seg {
+        Bytes(Vec<u8>),
+        /// `n` zero bytes, produced on demand so a declared-but-large body
+        /// costs the test nothing until the code under test asks for it.
+        Zeros(usize),
+        /// Reading this far is the failure: the code under test went past a
+        /// point where it had already been obliged to refuse.
+        Tripwire,
+    }
+
+    struct Scripted {
+        segs: std::collections::VecDeque<Seg>,
+        consumed: usize,
+        max_read_request: usize,
+    }
+
+    impl Scripted {
+        fn new(segs: Vec<Seg>) -> Self {
+            Scripted {
+                segs: segs.into(),
+                consumed: 0,
+                max_read_request: 0,
+            }
         }
     }
-    out.push('"');
-    out
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.max_read_request = self.max_read_request.max(buf.len());
+            let Some(seg) = self.segs.front_mut() else {
+                return Ok(0);
+            };
+            let n = match seg {
+                Seg::Tripwire => {
+                    panic!("the request was read past the point it should have been refused")
+                }
+                Seg::Bytes(bytes) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    bytes.drain(..n);
+                    if bytes.is_empty() {
+                        self.segs.pop_front();
+                    }
+                    n
+                }
+                Seg::Zeros(left) => {
+                    let n = (*left).min(buf.len());
+                    buf[..n].fill(0);
+                    *left -= n;
+                    if *left == 0 {
+                        self.segs.pop_front();
+                    }
+                    n
+                }
+            };
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Scripted {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other(
+                "read_request reads through Read only",
+            ))
+        }
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    fn header(n: usize) -> Seg {
+        Seg::Bytes(format!("{n}\n").into_bytes())
+    }
+
+    #[test]
+    fn total_over_the_cap_is_refused_before_that_body_is_read() {
+        let mut reader = Scripted::new(vec![
+            header(3),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(1),
+            Seg::Tripwire,
+        ]);
+        let err =
+            read_request(&mut reader).expect_err("a third argument pushes the total over the cap");
+        assert!(
+            err.contains("takes the request past the") && err.contains("byte cap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn many_arguments_each_under_the_cap_are_refused_in_total() {
+        let mut segs = vec![header(MAX_SERVE_ARGS)];
+        for _ in 0..MAX_SERVE_ARGS {
+            segs.push(header(1 << 20));
+            segs.push(Seg::Zeros(1 << 20));
+        }
+        let mut reader = Scripted::new(segs);
+        let err = read_request(&mut reader).expect_err("64 MiB declared across a request");
+        assert!(
+            err.contains("takes the request past the") && err.contains("byte cap"),
+            "{err}"
+        );
+        assert!(
+            reader.consumed <= MAX_SERVE_REQUEST_BYTES + 1024,
+            "read {} bytes of a request refused at {}",
+            reader.consumed,
+            MAX_SERVE_REQUEST_BYTES
+        );
+    }
+
+    #[test]
+    fn a_declared_length_is_not_allocated_ahead_of_the_bytes() {
+        let mut reader = Scripted::new(vec![
+            header(1),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Bytes(b"abc".to_vec()),
+        ]);
+        let err =
+            read_request(&mut reader).expect_err("the stream ends 3 bytes into an 8 MiB argument");
+        assert!(
+            err.contains("argument 0") && err.contains("stream ended after 3 of"),
+            "{err}"
+        );
+        // The invariant is that no read is sized to the declared length; how
+        // much smaller each read is belongs to std and is not asserted.
+        assert!(
+            reader.max_read_request < MAX_SERVE_ARG_BYTES,
+            "a read asked for {} bytes against 3 sent",
+            reader.max_read_request
+        );
+    }
+
+    #[test]
+    fn an_eight_mib_scope_append_still_passes() {
+        let mut reader = Scripted::new(vec![
+            header(2),
+            header(12),
+            Seg::Bytes(b"scope-append".to_vec()),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+        ]);
+        let args = read_request(&mut reader)
+            .expect("an 8 MiB argument is legal")
+            .expect("a request, not end of stream");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "scope-append");
+        assert_eq!(args[1].len(), MAX_SERVE_ARG_BYTES);
+    }
+
+    fn run(segs: Vec<Seg>) -> Result<Option<Vec<String>>, String> {
+        read_request(&mut Scripted::new(segs))
+    }
+
+    fn raw(s: &str) -> Seg {
+        Seg::Bytes(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn adversarial_total_exactly_at_the_cap_passes_and_one_over_is_refused() {
+        let args = run(vec![
+            header(2),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+        ])
+        .expect("exactly 16 MiB is legal")
+        .expect("a request");
+        assert_eq!(
+            args.iter().map(String::len).sum::<usize>(),
+            MAX_SERVE_REQUEST_BYTES
+        );
+
+        let err = run(vec![
+            header(3),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(MAX_SERVE_ARG_BYTES),
+            Seg::Zeros(MAX_SERVE_ARG_BYTES),
+            header(1),
+            Seg::Tripwire,
+        ])
+        .expect_err("16 MiB + 1 is over");
+        assert!(
+            err.contains("argument 2 takes the request past the"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn adversarial_zero_length_arguments_at_the_count_cap_pass() {
+        let mut segs = vec![header(MAX_SERVE_ARGS)];
+        segs.extend((0..MAX_SERVE_ARGS).map(|_| header(0)));
+        let args = run(segs).expect("64 empty arguments").expect("a request");
+        assert_eq!(args.len(), MAX_SERVE_ARGS);
+        assert!(args.iter().all(String::is_empty));
+        let empty = run(vec![header(0)])
+            .expect("zero arguments")
+            .expect("a request");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn adversarial_huge_argument_count_is_refused_before_any_allocation_or_read() {
+        for count in [
+            "1000000000",
+            "65",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            let err =
+                run(vec![raw(&format!("{count}\n")), header(0), Seg::Tripwire]).expect_err(count);
+            assert!(err.contains("argument count"), "{count}: {err}");
+        }
+    }
+
+    #[test]
+    fn adversarial_argument_over_the_per_argument_cap_is_refused_first() {
+        for len in [MAX_SERVE_ARG_BYTES + 1, usize::MAX, usize::MAX - 1] {
+            let err = run(vec![header(1), header(len), Seg::Tripwire]).expect_err("over the cap");
+            assert!(
+                err.contains("argument 0 declares") && err.contains("cap"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("request past"),
+                "per-argument cap comes first: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_malformed_lengths_are_refused() {
+        for bad in [
+            "-1",
+            "0x10",
+            "1e3",
+            "5 5",
+            "",
+            "   ",
+            "1.0",
+            "18446744073709551616",
+            "99999999999999999999999",
+            "\u{0661}",
+            "\0",
+        ] {
+            let err = run(vec![header(1), raw(&format!("{bad}\n")), Seg::Tripwire]).expect_err(bad);
+            assert!(err.contains("is not a number"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn adversarial_lenient_length_spellings_are_accepted_and_still_bounded() {
+        // Pinned current behaviour: leading zeros, a plus sign, padding and CRLF
+        // all parse to the same number, so none of them can smuggle a larger
+        // value past the caps.
+        for spelling in [
+            "00000000000000000000000000000003",
+            "+3",
+            "  3 ",
+            "3\r",
+            "\t3",
+        ] {
+            let args = run(vec![raw("1\n"), raw(&format!("{spelling}\n")), raw("abc")])
+                .unwrap_or_else(|e| panic!("{spelling:?}: {e}"))
+                .expect("a request");
+            assert_eq!(args, vec!["abc".to_string()], "{spelling:?}");
+        }
+        let err = run(vec![header(1), raw("+16777217\n"), Seg::Tripwire]).expect_err("over cap");
+        assert!(err.contains("over the"), "{err}");
+    }
+
+    #[test]
+    fn adversarial_crlf_framing_keeps_body_bytes_verbatim() {
+        let args = run(vec![
+            raw("2\r\n4\r\n"),
+            raw("a\r\nb"),
+            raw("1\r\n"),
+            raw("x"),
+        ])
+        .expect("CRLF headers")
+        .expect("a request");
+        assert_eq!(args, vec!["a\r\nb".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn adversarial_header_line_is_bounded_without_a_newline() {
+        let at = "0".repeat(MAX_SERVE_HEADER_BYTES);
+        assert!(
+            run(vec![raw(&format!("{at}\n"))])
+                .expect("32 bytes is the limit")
+                .is_some()
+        );
+        let over = "0".repeat(MAX_SERVE_HEADER_BYTES + 1);
+        let err = run(vec![raw(&over), Seg::Tripwire]).expect_err("33 bytes, no newline");
+        assert!(err.contains("without a newline"), "{err}");
+        let err = run(vec![header(1), raw(&over), Seg::Tripwire]).expect_err("same on an argument");
+        assert!(err.contains("without a newline"), "{err}");
+    }
+
+    #[test]
+    fn adversarial_end_of_stream_in_each_position() {
+        assert_eq!(run(vec![]).expect("clean end between requests"), None);
+        let err = run(vec![raw("2")]).expect_err("EOF inside the count header");
+        assert!(err.contains("part way through a header"), "{err}");
+        let err = run(vec![header(2)]).expect_err("EOF before argument 0");
+        assert!(err.contains("stream ended before argument 0"), "{err}");
+        let err = run(vec![header(1), raw("4")]).expect_err("EOF inside an argument header");
+        assert!(err.contains("part way through a header"), "{err}");
+        let err = run(vec![header(2), header(1), raw("a")]).expect_err("EOF before argument 1");
+        assert!(err.contains("stream ended before argument 1"), "{err}");
+        let err = run(vec![header(1), header(5), raw("ab")]).expect_err("EOF inside a body");
+        assert!(err.contains("stream ended after 2 of 5 bytes"), "{err}");
+    }
+
+    #[test]
+    fn adversarial_invalid_utf8_is_a_clean_error_that_does_not_echo_the_bytes() {
+        let err = run(vec![
+            header(2),
+            header(1),
+            raw("a"),
+            header(4),
+            Seg::Bytes(vec![b'T', 0xff, 0xfe, b'K']),
+        ])
+        .expect_err("invalid UTF-8 body");
+        assert_eq!(err, "argument 1 is not UTF-8");
+        let err = run(vec![Seg::Bytes(vec![b'1', 0xff, b'\n'])]).expect_err("invalid UTF-8 header");
+        assert_eq!(err, "header is not UTF-8");
+    }
+
+    #[test]
+    fn adversarial_a_refusal_leaves_the_stream_mid_frame_so_serve_must_close() {
+        // read_request does not resync: after a refusal the next bytes are
+        // still the refused frame's body. serve() returns on any Err for this
+        // reason; the test pins that the reader is not silently advanced to a
+        // following request.
+        let mut reader = Scripted::new(vec![
+            header(1),
+            header(MAX_SERVE_ARG_BYTES + 1),
+            raw("1\n1\nx"),
+        ]);
+        read_request(&mut reader).expect_err("over the cap");
+        let next = read_request(&mut reader).expect("the leftover parses as a frame");
+        assert_eq!(next, Some(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn adversarial_refusal_reply_keeps_the_serve_error_shape() {
+        let err = run(vec![header(65)]).expect_err("count over cap");
+        let mut out = Vec::new();
+        write_reply(&mut out, "err", &fatal_object(&format!("serve: {err}"))).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let (status, rest) = text.split_once('\n').unwrap();
+        let (len, body) = rest.split_once('\n').unwrap();
+        assert_eq!(status, "err");
+        assert_eq!(len.parse::<usize>().unwrap(), body.len());
+        assert_eq!(
+            body,
+            "{\"ok\":false,\"error\":\"serve: argument count declares 65, over the 64 cap\"}"
+        );
+    }
 }

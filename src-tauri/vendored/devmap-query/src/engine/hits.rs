@@ -94,7 +94,7 @@ pub(super) fn read_verified_source(
     )?;
     #[cfg(test)]
     SOURCE_SPAN_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(source.len() as u64)));
-    if devmap_extract::content_hash(&source) != expected_hash {
+    if devmap_extract::source_identity(&source) != expected_hash {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "source changed since this symbol was indexed",

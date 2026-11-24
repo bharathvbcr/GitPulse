@@ -144,7 +144,7 @@ impl std::fmt::Debug for DeltaStore {
 
 /// The `-journal`, `-wal` and `-shm` beside `db` that are symlinks.
 fn symlinked_sidecars(db: &Path) -> Vec<PathBuf> {
-    ["-journal", "-wal", "-shm"]
+    crate::seed::SQLITE_SIDECARS
         .into_iter()
         .map(|suffix| sidecar(db, suffix))
         .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))

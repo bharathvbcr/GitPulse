@@ -257,6 +257,17 @@ impl Resolver {
             if scoped.is_some() || self.family_of_file(file) != Some(LangFamily::Kotlin) {
                 return scoped;
             }
+            if scope
+                .and_then(|s| self.declaring_type_of(file, s))
+                .is_some()
+                || binding
+                    .scope
+                    .as_deref()
+                    .and_then(|s| self.self_type_at(file, LangFamily::Kotlin, s))
+                    .is_some()
+            {
+                return None;
+            }
             return self
                 .receiver_types
                 .get(&format!("{file}:{name}"))
@@ -305,6 +316,16 @@ impl Resolver {
                 {
                     return Some(typed.clone());
                 }
+            }
+        }
+        if let Some(owner) = scope.and_then(|s| self.declaring_type_of(file, s)) {
+            // A method inside a type scope must never fall back to an owner-less class field
+            // declared by a sibling class, nor should a member of the enclosing type fall back
+            // to file-wide globals.
+            if self.is_sibling_type_field(file, Some(owner), name)
+                || self.has_type_field(file, owner, name)
+            {
+                return None;
             }
         }
         self.receiver_types
@@ -730,12 +751,8 @@ impl Resolver {
             return None;
         }
         let root = Self::path_root(prefix);
-        let base_type = self.receiver_type_for(
-            file,
-            scope,
-            prefix,
-            binding.filter(|b| b.name == root),
-        )?;
+        let base_type =
+            self.receiver_type_for(file, scope, prefix, binding.filter(|b| b.name == root))?;
 
         // 1. Check if member is a declared field on base_type
         if let Some(field_type) = self.field_type_through(file, scope, &base_type, member) {
@@ -764,7 +781,9 @@ impl Resolver {
                 [(target_file, target_sym)] => (target_file.clone(), target_sym.clone()),
                 _ => return None, // ambiguous methods abstain
             }
-        } else if let Some((found_file, found, _)) = self.inherited_method(family, base_type, method) {
+        } else if let Some((found_file, found, _)) =
+            self.inherited_method(family, base_type, method)
+        {
             (found_file, found)
         } else if family == LangFamily::Rust {
             let (target_file, target_sym) = self.rust_blanket_method(method)?;
@@ -773,7 +792,9 @@ impl Resolver {
             return None;
         };
 
-        let written = self.return_types.get(&(callee_file.clone(), callee.clone()))?;
+        let written = self
+            .return_types
+            .get(&(callee_file.clone(), callee.clone()))?;
         let written = written.trim();
 
         // Builder pattern: method returns Self / &mut Self / this
@@ -1202,5 +1223,126 @@ impl Resolver {
         // only statement of the type, the same fallback the implicit-`self`
         // rung takes. A declaration always outranks it.
         .or_else(|| self.field_initializer_type(file, &owner, field))
+    }
+
+    /// Whether `owner` declares `field` as a typed or initialized member.
+    fn has_type_field(&self, file: &str, owner: &str, field: &str) -> bool {
+        [
+            format!("{file}:{file}::{owner}:{field}"),
+            format!("{file}:{owner}:{field}"),
+            format!("{file}:{file}::{owner}:{field}@type"),
+            format!("{file}:{owner}:{field}@type"),
+        ]
+        .iter()
+        .any(|key| {
+            self.scoped_receiver_types.contains_key(key)
+                || self.declared_types.contains_key(key)
+                || self.field_initializers.contains_key(key)
+        })
+    }
+
+    /// Whether any type in `file` other than `except_type` declares `name` as a member or field.
+    fn is_sibling_type_field(&self, file: &str, except_type: Option<&str>, name: &str) -> bool {
+        let prefix = format!("{file}:");
+        let suffix_type = format!(":{name}@type");
+        let suffix_mod = format!(":{name}@mod");
+        let suffix_bare = format!(":{name}");
+
+        let matches_sibling = |key: &str| {
+            if !key.starts_with(&prefix) {
+                return false;
+            }
+            let is_match = key.ends_with(&suffix_type)
+                || key.ends_with(&suffix_mod)
+                || key.ends_with(&suffix_bare);
+            if !is_match {
+                return false;
+            }
+            let without_file = &key[prefix.len()..];
+            let Some((scope_part, _)) = without_file.rsplit_once(':') else {
+                return false; // file-wide key
+            };
+            if scope_part.is_empty() {
+                return false;
+            }
+            let declaring_type = scope_part.rsplit("::").next().unwrap_or(scope_part);
+            if let Some(except) = except_type {
+                declaring_type != except
+            } else {
+                true
+            }
+        };
+
+        self.declared_types
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .any(|(k, _)| matches_sibling(k))
+            || self
+                .scoped_receiver_types
+                .range(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .any(|(k, _)| matches_sibling(k))
+            || self
+                .field_initializers
+                .range(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .any(|(k, _)| matches_sibling(k))
+    }
+
+    /// In Swift, SwiftUI `@Environment(Type.self) private var field` declares an environment property.
+    /// In extraction, this manifests as:
+    /// - Reference to `Environment` (kind Type)
+    /// - Followed by reference to the injected Type `T` (kind Name or Type)
+    /// - Followed by reference to `self` (kind Name)
+    /// - Preceding a Field symbol `field` in the same enclosing struct/class with no intervening symbols.
+    pub(super) fn index_swift_environment_properties(&mut self, ext: &Extraction) {
+        if ext.language != "swift" {
+            return;
+        }
+        for sym in &ext.symbols {
+            if sym.kind != SymbolKind::Field {
+                continue;
+            }
+            let field_start = sym.span.start_byte;
+            let Some(owner) = sym.qualified_name.rsplit_once('.').map(|(o, _)| o) else {
+                continue;
+            };
+            let refs_before: Vec<_> = ext
+                .references
+                .iter()
+                .filter(|r| {
+                    r.enclosing_symbol.as_deref() == Some(owner)
+                        && r.span.end_byte <= field_start
+                        && field_start.saturating_sub(r.span.end_byte) <= 50
+                })
+                .collect();
+            for window in refs_before.windows(3) {
+                if window[0].name == "Environment"
+                    && window[0].kind == ReferenceKind::Type
+                    && window[2].name == "self"
+                    && window[2].kind == ReferenceKind::Name
+                {
+                    let intervening = ext.symbols.iter().any(|s| {
+                        s.span.start_byte >= window[2].span.end_byte
+                            && s.span.end_byte <= field_start
+                    });
+                    if !intervening {
+                        let type_name = &window[1].name;
+                        Self::bind_receiver(
+                            &mut self.scoped_receiver_types,
+                            &mut self.poisoned_receiver_keys,
+                            format!("{}:{}:{}", ext.file_path, owner, sym.name),
+                            type_name,
+                        );
+                        Self::bind_receiver(
+                            &mut self.declared_types,
+                            &mut self.poisoned_receiver_keys,
+                            format!("{}:{}:{}@type", ext.file_path, owner, sym.name),
+                            type_name,
+                        );
+                    }
+                }
+            }
+        }
     }
 }

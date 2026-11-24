@@ -38,6 +38,32 @@ export interface CapCount {
   total: number | null;
 }
 
+export interface UnresolvedHandoffSlice {
+  unresolved: Array<{ from: string; text: string }>;
+  unresolvedTotal: number;
+  unresolvedBySubsystem: Record<string, { total: number; listed: number }>;
+}
+
+/** Narrow the unresolved-handoff list, true total, and per-subsystem counts carried by either payload. */
+export function readUnresolvedHandoffs(
+  rawList: unknown,
+  rawTotal: unknown,
+  rawBySubsystem: unknown,
+): UnresolvedHandoffSlice {
+  const unresolved: Array<{ from: string; text: string }> = [];
+  for (const raw of list(rawList)) {
+    const row = asRecord(raw);
+    if (row) unresolved.push({ from: text(row.from), text: text(row.text) });
+  }
+  const bySubsystem: Record<string, { total: number; listed: number }> = {};
+  for (const [area, raw] of Object.entries(asRecord(rawBySubsystem) ?? {})) {
+    const row = asRecord(raw);
+    if (row) bySubsystem[area] = { total: count(row.total), listed: count(row.listed) };
+  }
+  const unresolvedTotal = rawTotal === undefined && unresolved.length > 0 ? unresolved.length : count(rawTotal);
+  return { unresolved, unresolvedTotal, unresolvedBySubsystem: bySubsystem };
+}
+
 export interface PreviewModel {
   subsystems: PreviewSubsystem[];
   languageTotals: Array<[string, number]>;
@@ -129,16 +155,11 @@ export function readPreview(DATA: Record<string, unknown>): PreviewModel {
   const coverage = asRecord(META.coverage) ?? {};
   const LIVE = asRecord(DATA.liveness) ?? {};
   const counts = asRecord(LIVE.counts) ?? {};
-  const unresolved: Array<{ from: string; text: string }> = [];
-  for (const raw of list(DATA.unresolved_handoffs)) {
-    const row = asRecord(raw);
-    if (row) unresolved.push({ from: text(row.from), text: text(row.text) });
-  }
-  const bySubsystem: Record<string, { total: number; listed: number }> = {};
-  for (const [area, raw] of Object.entries(asRecord(DATA.unresolved_handoffs_by_subsystem) ?? {})) {
-    const row = asRecord(raw);
-    if (row) bySubsystem[area] = { total: count(row.total), listed: count(row.listed) };
-  }
+  const { unresolved, unresolvedTotal, unresolvedBySubsystem: bySubsystem } = readUnresolvedHandoffs(
+    DATA.unresolved_handoffs,
+    DATA.unresolved_handoffs_total,
+    DATA.unresolved_handoffs_by_subsystem,
+  );
   return {
     subsystems,
     languageTotals: pairs(META.language_totals),
@@ -152,7 +173,7 @@ export function readPreview(DATA: Record<string, unknown>): PreviewModel {
     handoffPathsComputed: META.handoff_paths_computed === true,
     roleFilesComputed: META.role_files_computed === true,
     unresolved,
-    unresolvedTotal: count(DATA.unresolved_handoffs_total),
+    unresolvedTotal,
     unresolvedBySubsystem: bySubsystem,
     liveness: {
       entryRoots: capCount(LIVE, counts, "entry_roots"),
@@ -175,9 +196,11 @@ export function capText(cap: CapCount): string {
 }
 
 /** The headline's unplaced-handoff clause; empty when every handoff found an edge. */
-export function unplacedText(total: number): string {
+export function unplacedText(total: number, listed?: number): string {
   if (total <= 0) return "";
-  return `${total.toLocaleString("en-US")} handoff${total === 1 ? "" : "s"} unplaced`;
+  const n = (v: number) => v.toLocaleString("en-US");
+  const base = `${n(total)} handoff${total === 1 ? "" : "s"} unplaced`;
+  return listed !== undefined && listed < total ? `${base} (${n(listed)} of ${n(total)} listed)` : base;
 }
 
 /**

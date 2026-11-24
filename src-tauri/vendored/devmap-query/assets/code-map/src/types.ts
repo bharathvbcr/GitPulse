@@ -77,6 +77,8 @@ export interface GraphVizPayload {
   generation_id?: number | string | null;
   subsystems?: unknown[];
   unresolved_handoffs?: unknown[];
+  unresolved_handoffs_total?: number;
+  unresolved_handoffs_by_subsystem?: Record<string, { total: number; listed: number }>;
   liveness?: unknown;
   meta?: {
     coverage?: { indexed_total?: number; in_subsystems?: number };

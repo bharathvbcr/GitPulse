@@ -266,3 +266,7 @@ required-features = ["parse"]
 [[test]]
 name = "ts_namespace_module_scope_read"
 required-features = ["parse"]
+
+[[test]]
+name = "resolved_edges_survive_a_refused_first_pass"
+required-features = ["parse"]

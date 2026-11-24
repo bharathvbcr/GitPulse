@@ -197,7 +197,8 @@ Migrations are owned by `dc-store`. New columns land in `schema.rs` first.
 ## Workbench profile schema 12: refinement proposals
 
 The workbench profile database (`work_meta.version`, distinct from the
-repository lease store above) reached schema 12 with refinement proposals.
+repository lease store above; currently at `WORKBENCH_SCHEMA = 17` in
+`rust/dc-store/src/workbench/mod.rs`) reached schema 12 with refinement proposals.
 It changes no table. It changes what a host must understand, so it is a hard
 fence: a build that knows only schema 11 compares the stored version with `!=`
 and refuses a 12 profile with `schema_unsupported`. Upgrade every host that
@@ -255,3 +256,17 @@ profile with `schema_unsupported`. Receipts stored in full by schema 12 keep
 replaying as written. Upgrade every host that shares a profile together; the
 upgrade runs only on a write, after the `VACUUM INTO` backup
 (`<profile>.pre-schema-12.bak`).
+
+---
+
+## Workbench profile schemas 14–17: scopes, CI signals, backlog merge, and cross-repo queue
+
+- **Schema 14 (task scope authority):** No table changes. Stored task items (`work_items`) gain a validated `scope` (`planned files`, `forbidden changes`, `allowed commands`, `expected tests`, `requirement links`), acting as the single authority passed to the gate. Older hosts would strip `scope` when rewriting items and therefore refuse schema 14 profiles with `schema_unsupported`.
+- **Schema 15 (CI signal attention rows):** No table changes. `signals.record` writes attention rows of kind `run_ci_passed`, `run_ci_failed`, and `run_ci_cancelled` carrying `body.signal`, judged by branch key rather than revision.
+- **Schema 16 (Inbox merged into Backlog):** No table changes (`status_merge.sql`). The legacy `inbox` task status is retired and existing `inbox` items migrate to `backlog`. Schema 16 builds refuse `inbox` as an active status.
+- **Schema 17 (cross-repo queue, GitHub sync, and durable outbox):** Adds four tables (`queue_outbox.sql`):
+  - `work_queue`: multi-repo execution queues (`concurrency_limit` 2..4, `state` in `queued | leased | verifying | passed | failed | cancelled | timed_out`).
+  - `work_queue_members`: ordered queue entries (`repository_id`, `git_dir`, `base_oid`, `task_id`, `run_id`, `depends_on`, `lease_held`, `verification_json`) with partial unique indexes `work_queue_member_repo_lease` and `work_queue_member_checkout_lease` enforcing one active lease per repository and checkout (`WHERE lease_held = 1`).
+  - `work_issue_sync`: two-way GitHub issue link state keyed per `(repo_slug, issue_number)` and `task_id`.
+  - `work_outbox`: opt-in confirmed (`confirmed = 1`) durable delivery ledger keyed by unique `idempotency_key` with `payload_digest`.
+  Adds `items.readiness`, `queue.*` (`enqueue`, `acquire`, `member.update`, `verify`, `sweep`, `cancel`), `github_sync.*` (`link`, `observe`, `accept`, `dismiss`), and `outbox.*` (`enqueue`, `claim`, `sweep_restart`, `mark_unknown`, `preflight`, `complete`, `fail`, `cancel`) workbench operations. Older schema 16 hosts refuse schema 17 profiles with `schema_unsupported`.

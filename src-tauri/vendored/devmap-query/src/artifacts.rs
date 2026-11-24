@@ -90,7 +90,7 @@ fn write_atomic_once(path: &Path, content: &[u8]) -> std::io::Result<bool> {
                 Ok(false) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted && attempt < 16 => {
-                    continue
+                    continue;
                 }
                 // Another writer is mid-rename onto this name. It failed the
                 // whole emission (concurrent_writers_to_one_artifact_all_succeed
@@ -416,7 +416,7 @@ impl ArtifactRecord {
                     "artifact exceeds the bounded fingerprint read limit",
                 ));
             }
-            Some(devmap_extract::content_hash(&content))
+            Some(devmap_extract::fnv1a64(content.as_bytes()))
         } else {
             None
         };
@@ -705,6 +705,123 @@ pub fn should_regenerate(path: &Path, fp: &ArtifactFingerprint) -> bool {
     let marker = format!("fingerprint:{}", fp.fingerprint);
     let escaped_marker = format!("fingerprint:{}", html_escape(&fp.fingerprint));
     !text.contains(&marker) && !text.contains(&escaped_marker)
+}
+
+/// Directory area label for a repo-relative file path (`"."` at the repository root).
+pub(crate) fn file_area(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .filter(|parent| !parent.is_empty() && *parent != ".")
+        .unwrap_or(".")
+        .replace('\\', "/")
+}
+
+/// Publish `content` atomically to `path` unless a non-`devmap-rust` artifact
+/// already lives there (checked at `engine_pointer`) and `force` is false.
+pub(crate) fn write_consumer_artifact(
+    path: &Path,
+    content: &[u8],
+    force: bool,
+    engine_pointer: &str,
+    artifact_label: &str,
+) -> anyhow::Result<bool> {
+    refuse_foreign_artifact(path, force, engine_pointer, artifact_label)?;
+    Ok(write_atomic(path, content)?)
+}
+
+/// Refuse to overwrite a foreign (e.g. Python-generated) artifact at `path`
+/// unless `force` is set. Identity is read at `engine_pointer` (JSON Pointer).
+pub(crate) fn refuse_foreign_artifact(
+    path: &Path,
+    force: bool,
+    engine_pointer: &str,
+    artifact_label: &str,
+) -> anyhow::Result<()> {
+    if path.exists() && !force && is_foreign_artifact(path, engine_pointer)? {
+        anyhow::bail!(
+            "refuse to overwrite a non-devmap-rust {artifact_label} at {} (pass --force to replace)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn is_foreign_artifact(path: &Path, engine_pointer: &str) -> anyhow::Result<bool> {
+    let existing = fs::read_to_string(path)?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing) else {
+        // A check that could not run must never report the same result as a
+        // check that ran and passed.
+        return Ok(true);
+    };
+    Ok(value
+        .pointer(engine_pointer)
+        .and_then(serde_json::Value::as_str)
+        != Some(CONSUMER_MAP_ENGINE))
+}
+
+#[cfg(all(test, feature = "parse"))]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::model::FreshnessInfo;
+    use devmap_analyze::model::{
+        AnalysisStatus, AnalysisSummary, CommunityReport, DeadSymbolReport,
+    };
+
+    pub(crate) fn freshness() -> FreshnessInfo {
+        FreshnessInfo {
+            head_sha: "abc123".to_string(),
+            generation_id: 1,
+            pending_count: 0,
+            stamped: Default::default(),
+        }
+    }
+
+    pub(crate) fn analysis(
+        dead: Vec<DeadSymbolReport>,
+        communities: Vec<CommunityReport>,
+    ) -> AnalysisSummary {
+        AnalysisSummary {
+            // No discovery step ran over this hand-built corpus, so there is no
+            // refusal count to report. `None` says that; `0` would claim a walk.
+            discovery_refused_files: None,
+            total_files: 0,
+            total_symbols: 0,
+            total_edges: 0,
+            dead_symbols: dead,
+            communities,
+            status: AnalysisStatus::Ok,
+            unresolved_calls: 0,
+            clone_coverage: Default::default(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn empty_analysis() -> AnalysisSummary {
+        analysis(Vec::new(), Vec::new())
+    }
+
+    pub(crate) fn tmp_scratch_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{stamp}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    pub(crate) fn tmp_artifact_file(prefix: &str, filename: &str, contents: &str) -> PathBuf {
+        let dir = tmp_scratch_dir(prefix);
+        let path = dir.join(filename);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1309,65 @@ mod patch_tests {
             })
             .count();
         assert_eq!(leftovers, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_area_normalizes_parents_and_root_files() {
+        assert_eq!(file_area("README.md"), ".");
+        assert_eq!(file_area("./README.md"), ".");
+        assert_eq!(file_area("src/lib.rs"), "src");
+        assert_eq!(
+            file_area("rust/devmap-query/src/lib.rs"),
+            "rust/devmap-query/src"
+        );
+        #[cfg(windows)]
+        assert_eq!(file_area(r"pkg\sub\mod.rs"), "pkg/sub");
+    }
+
+    #[test]
+    fn write_consumer_artifact_checks_json_pointer_engine_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-consumer-art-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let foreign = dir.join("code_graph.json");
+        fs::write(&foreign, r#"{"meta":{"other":"python"}}"#).unwrap();
+        let err = write_consumer_artifact(
+            &foreign,
+            br#"{"meta":{"map_engine":"devmap-rust"}}"#,
+            false,
+            "/meta/map_engine",
+            "code graph",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("non-devmap-rust code graph"),
+            "err={err}"
+        );
+
+        assert!(write_consumer_artifact(
+            &foreign,
+            br#"{"meta":{"map_engine":"devmap-rust"}}"#,
+            true,
+            "/meta/map_engine",
+            "code graph"
+        )
+        .unwrap());
+        assert!(!write_consumer_artifact(
+            &foreign,
+            br#"{"meta":{"map_engine":"devmap-rust"}}"#,
+            false,
+            "/meta/map_engine",
+            "code graph"
+        )
+        .unwrap());
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }
