@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use super::execute_with_profile;
 use super::{
-    cancel, exclusive, execute_with_activity, execute_with_profile, invocation, local_checks,
-    managed_cache_path, plans, prepare_with_activity, providers, tree, HygienePlan, EXECUTION,
-    INVENTORY, MAX_PLANS, PREPARATION, TTL,
+    cancel, exclusive, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
+    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
+    PREPARATION, TTL,
 };
 use crate::ipc_error::CommandError;
 use std::fs::{self, File, FileTimes};

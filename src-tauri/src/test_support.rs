@@ -9,6 +9,7 @@
 
 use crate::procguard::LockedSpawn;
 pub(crate) mod env;
+#[cfg(target_os = "macos")]
 pub(crate) mod fsmonitor;
 
 /// Writes an executable stand-in for `gitpulse-hook` at `path` that answers
@@ -499,7 +500,7 @@ mod pin_adversary_tests;
 #[cfg(test)]
 mod config_value_tests;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod fsmonitor_tests;
 
 #[cfg(test)]

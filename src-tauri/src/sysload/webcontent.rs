@@ -16,23 +16,29 @@
 //! which the dump shows as its own `T-` offsets.
 
 use std::collections::VecDeque;
+#[cfg(target_os = "macos")]
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Executable-path marker of a WebKit content process.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const MARKER: &str = "com.apple.WebKit.WebContent";
 /// Samples kept: 20 x 5 s is the last 100 s.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const RING_TICKS: usize = 20;
 /// Content processes recorded per sample. Every app's are in the table (17
 /// were running on the host this was written on), so the bound sits well above
 /// that; more are counted, not recorded.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const MAX_PROCS: usize = 64;
 /// Gap between samples.
 pub(crate) const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// Lines a dump carries.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const MAX_DUMP_LINES: usize = 40;
 
 /// One content process at one sample. `None` where the OS would not say.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcSample {
     pub pid: i32,
@@ -40,6 +46,7 @@ pub(crate) struct ProcSample {
     pub cpu_ns: Option<u64>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone)]
 struct Tick {
     at: Instant,
@@ -49,6 +56,7 @@ struct Tick {
 }
 
 /// The ring and its health counters.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone)]
 pub(crate) struct Ring {
     ticks: VecDeque<Tick>,
@@ -60,12 +68,14 @@ pub(crate) struct Ring {
 }
 
 /// A formatted dump: lines oldest first, and what to know about them.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Dump {
     pub lines: Vec<String>,
     pub note: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Ring {
     pub(crate) const fn new() -> Self {
         Self {
@@ -180,8 +190,10 @@ impl Ring {
     }
 }
 
+#[cfg(target_os = "macos")]
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
 
+#[cfg(target_os = "macos")]
 fn ring() -> std::sync::MutexGuard<'static, Ring> {
     RING.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -189,12 +201,14 @@ fn ring() -> std::sync::MutexGuard<'static, Ring> {
 
 /// A copy of the ring as it is now, so a dump later still shows what was
 /// there at the moment of interest, not what the next ticks added.
+#[cfg(target_os = "macos")]
 pub(crate) fn snapshot() -> Ring {
     ring().clone()
 }
 
 /// Content processes among `pids`, each read with `usage`. A process `usage`
 /// cannot read is kept as a sample with `None` readings, never dropped.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn collect(
     pids: &[i32],
     path_of: impl Fn(i32) -> Option<String>,

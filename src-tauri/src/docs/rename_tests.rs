@@ -1722,6 +1722,7 @@ fn the_moved_notes_relative_asset_links_still_resolve_after_a_cross_folder_move(
 }
 
 #[test]
+#[cfg(unix)]
 fn asset_links_are_left_alone_when_they_leave_the_repo_or_are_symlinks() {
     let dir = repo_with(&[
         (

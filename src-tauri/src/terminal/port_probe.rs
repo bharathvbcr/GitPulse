@@ -467,7 +467,7 @@ fn collect_socket_inodes_from_dir(
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{MAX_CANDIDATE_PIDS, MAX_FDS_PER_PID};
+    use super::MAX_CANDIDATE_PIDS;
     use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
     use std::fs;
     use std::net::Ipv4Addr;
