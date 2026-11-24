@@ -617,6 +617,41 @@ mod tests {
         assert_eq!(for_launch("agy"), HookInjection::NotApplicable);
     }
 
+    #[test]
+    fn permission_request_carries_both_async_notify_and_sync_permission_bridge() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        let injected =
+            settings_hooks(Path::new("/Applications/Git Pulse.app/gitpulse-hook")).unwrap();
+        for (label, event_val) in [
+            ("manifest", &manifest["hooks"]["PermissionRequest"]),
+            ("injected", &injected["PermissionRequest"]),
+        ] {
+            let handlers: Vec<&Value> = event_val
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .collect();
+            let notify = handlers
+                .iter()
+                .find(|h| h["command"].as_str().unwrap().ends_with("notify permission_request"))
+                .unwrap_or_else(|| panic!("{label}: missing notify permission_request"));
+            assert_eq!(notify["async"], json!(true), "{label}");
+            let bridge = handlers
+                .iter()
+                .find(|h| h["command"].as_str().unwrap().ends_with(" permission-bridge"))
+                .unwrap_or_else(|| panic!("{label}: missing permission-bridge"));
+            assert!(bridge.get("async").is_none(), "{label}");
+            assert!(bridge.get("asyncRewake").is_none(), "{label}");
+            let timeout = bridge["timeout"].as_u64().unwrap();
+            assert!(timeout <= 1800, "{label}: {timeout}");
+            assert!(
+                timeout > crate::hooks::permission_bridge::PERMISSION_BRIDGE_WAIT.as_secs(),
+                "{label}: timeout {timeout} must exceed PERMISSION_BRIDGE_WAIT"
+            );
+        }
+    }
+
     /// Adversary: base 0ea2cc37's Unix renderer, reproduced literally, equals
     /// the new one for awkward paths.
     #[test]

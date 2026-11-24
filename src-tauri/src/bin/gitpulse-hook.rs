@@ -218,6 +218,13 @@ fn decide() -> i32 {
         return finished.exit_code;
     }
 
+    if subcommand == "permission-bridge" {
+        if let Some(json) = hooks::permission_bridge::run(&input) {
+            emit(format!("{json}\n"));
+        }
+        return 0;
+    }
+
     match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
             // GitPulse injects the PreToolUse gates into every session it
