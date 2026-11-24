@@ -1,0 +1,22 @@
+{
+  "approval_signing_preimage_hex": "67697470756c73652d617070726f76616c2f76310a7b226465636973696f6e223a22616c6c6f775f6f6e6365222c22657870697265735f6174223a313830303030303132302c22686f73745f6964223a226465765f686f73745f3031222c22696e7075745f736861323536223a2230366335353734313336323861346339656332623064333638646630343162326335323634653132376366666338326131643636383636316337623539616234222c226973737565645f6174223a313830303030303030302c226e6f6e6365223a226e6f6e63655f6b61745f3031222c227469636b65745f6964223a22746b745f31303031227d",
+  "approval_signing_preimage_utf8": "gitpulse-approval/v1\n{\"decision\":\"allow_once\",\"expires_at\":1800000120,\"host_id\":\"dev_host_01\",\"input_sha256\":\"06c557413628a4c9ec2b0d368df041b2c5264e127cffc82a1d668661c7b59ab4\",\"issued_at\":1800000000,\"nonce\":\"nonce_kat_01\",\"ticket_id\":\"tkt_1001\"}",
+  "canonical_tool_input_utf8": "{\"cwd\":\"/repo\",\"tool_input\":{\"cmd\":\"ls -la\"},\"tool_name\":\"Bash\"}",
+  "cwd": "/repo",
+  "decision": "allow_once",
+  "device_id": "dev_mobile_01",
+  "expires_at": 1800000120,
+  "host_id": "dev_host_01",
+  "input_sha256": "06c557413628a4c9ec2b0d368df041b2c5264e127cffc82a1d668661c7b59ab4",
+  "issued_at": 1800000000,
+  "nonce": "nonce_kat_01",
+  "p256_pub_sec1_b64": "Awu7xei8hL0z0dPOA/+smnR/TBmT/dsuyTpBFqhvAip3",
+  "p256_secret_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+  "schema": "gitpulse-approval/v1",
+  "sig_p256_der_b64": "MEUCIDVLYEa/0cWp0xiRqfep2vdooHitC6YeHzuqhcENPRc3AiEA8O3m+BDx0Z7JODwTm10cMgW8H10C7viNYQeWFP/6OAQ=",
+  "ticket_id": "tkt_1001",
+  "tool_input": {
+    "cmd": "ls -la"
+  },
+  "tool_name": "Bash"
+}

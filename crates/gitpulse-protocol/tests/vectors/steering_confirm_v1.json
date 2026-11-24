@@ -1,0 +1,21 @@
+{
+  "p256_pub_sec1_b64": "Awu7xei8hL0z0dPOA/+smnR/TBmT/dsuyTpBFqhvAip3",
+  "p256_secret_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+  "schema": "gitpulse-steering/v1",
+  "signed": {
+    "device_id": "dev_mobile_01",
+    "expect_route": "peer_inbox",
+    "expires_at": 1800000120,
+    "host_id": "dev_host_01",
+    "issued_at": 1800000000,
+    "nonce": "steer_nonce_01",
+    "request_id": "steer_req_01",
+    "session_key": "sess_claude_01",
+    "sig_p256_der_b64": "MEUCIQDdCE177ngXrg7PrLId/h/QFP0bSN9oJwcNzFeoDWWnZAIgDG2i9pQ89jUVjT+pDkH2Gs09TQaaObYBZbUa3IBJHSM=",
+    "text_sha256": "d32bec0fd5fb02096c8199849c1b886cd7bcc610abe6f1404e57501e17e7db91"
+  },
+  "steering_signing_preimage_hex": "67697470756c73652d7374656572696e672f76310a7b226578706563745f726f757465223a22706565725f696e626f78222c22657870697265735f6174223a313830303030303132302c22686f73745f6964223a226465765f686f73745f3031222c226973737565645f6174223a313830303030303030302c226e6f6e6365223a2273746565725f6e6f6e63655f3031222c22726571756573745f6964223a2273746565725f7265715f3031222c2273657373696f6e5f6b6579223a22736573735f636c617564655f3031222c22746578745f736861323536223a2264333262656330666435666230323039366338313939383439633162383836636437626363363130616265366631343034653537353031653137653764623931227d",
+  "steering_signing_preimage_utf8": "gitpulse-steering/v1\n{\"expect_route\":\"peer_inbox\",\"expires_at\":1800000120,\"host_id\":\"dev_host_01\",\"issued_at\":1800000000,\"nonce\":\"steer_nonce_01\",\"request_id\":\"steer_req_01\",\"session_key\":\"sess_claude_01\",\"text_sha256\":\"d32bec0fd5fb02096c8199849c1b886cd7bcc610abe6f1404e57501e17e7db91\"}",
+  "text": "Re-run cargo test and report any failing cases.",
+  "text_sha256": "d32bec0fd5fb02096c8199849c1b886cd7bcc610abe6f1404e57501e17e7db91"
+}
