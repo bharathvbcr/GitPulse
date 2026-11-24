@@ -836,11 +836,13 @@ EXIT STATUS (call, read):
     2  the command line was wrong: unknown command, tool, option, key or
        resource, or a write without --write
     3  the answer says it is incomplete: ok: false, <facet>_ok: false,
-       deferred: true, truncated: true, deadline_expired: true or a
-       walk_incomplete reason on any object in it (including objects inside
-       lists, where a row's own ok: false is data and is not read), the
+       available: false, a non-empty error string, deferred: true,
+       truncated: true, deadline_expired: true or a walk_incomplete reason
+       on any object in it (including objects inside lists, where a row's
+       own ok: false, available: false or error is data and is not read), the
        result budget cut it, or a resource was cut at its size
-       cap. The partial result is still printed; stderr names where
+       cap. A component that reports itself unavailable (health's
+       harness) counts too. The partial result is still printed; stderr names where
        (worktrees.ok, agents.live.ok, items[2].truncated, ...)
     4  no answer within --timeout-ms, which also bounds reading --json from
        stdin or a file (default: GITPULSE_MCP_CALL_TIMEOUT_MS, 60000, for a
@@ -1673,7 +1675,8 @@ fn payload_outcome(text: &str, compact: bool, command: &str) -> CliOutput {
 
 /// Where a result says it is not whole, as paths (`agents.live.ok`,
 /// `items[2].truncated`): `ok: false` or a `<facet>_ok: false`
-/// (`sessions_ok`), `deferred: true`, `truncated: true` or
+/// (`sessions_ok`), `available: false` (DevMap's "could not look"), a
+/// non-empty string `error`, `deferred: true`, `truncated: true` or
 /// `deadline_expired: true`, a `walk_incomplete` that is `true` or a
 /// non-empty reason (DevMap's is a string), and the result budget's own cut
 /// marker ([`resources::RESULT_TRUNCATION_KEY`]), on the result or on any
@@ -1695,6 +1698,12 @@ fn incomplete_parts(payload: &Value) -> Vec<String> {
             resources::RESULT_TRUNCATION_KEY => !field.is_null(),
             "walk_incomplete" => *field == true || field.as_str().is_some_and(|s| !s.is_empty()),
             "ok" => !in_row && *field == false,
+            // A tool that could not look says so in words: DevMap's
+            // `available: false` (with a `reason`) and a tool's own non-empty
+            // `error`. `error: ""` is the success form of some tools and
+            // `null` is none, so only a non-empty string counts.
+            "available" => !in_row && *field == false,
+            "error" => !in_row && field.as_str().is_some_and(|s| !s.is_empty()),
             other => !in_row && other.ends_with("_ok") && *field == false,
         }
     }
@@ -2474,6 +2483,28 @@ mod cli_tests {
                 json!({ resources::RESULT_TRUNCATION_KEY: { "arrays": [] } }),
                 resources::RESULT_TRUNCATION_KEY,
             ),
+            // A tool that could not look says so in words, not only in `ok`.
+            (
+                json!({ "available": false, "reason": "REPOSITORY_TRUST_REQUIRED: x" }),
+                "available",
+            ),
+            (json!({ "a": { "available": false } }), "a.available"),
+            (json!({ "error": "REPOSITORY_TRUST_REQUIRED: x" }), "error"),
+            // `read gitpulse://server/health` on a host without `manvi`: the
+            // command gate cannot run, so the component reports itself
+            // unavailable and the read is not a clean one.
+            (
+                json!({
+                    "version": "x",
+                    "harness": { "available": false, "error": "no manvi" },
+                    "commandGate": "absent: no manvi",
+                }),
+                "harness.available",
+            ),
+            (
+                json!({ "ledger": { "catch_up": { "error": "unreadable" } } }),
+                "ledger.catch_up.error",
+            ),
         ] {
             let outcome = call_outcome(&text_result(&payload), true);
             assert_eq!(
@@ -2494,6 +2525,11 @@ mod cli_tests {
             json!({ "ok": true, "walk_incomplete": "", "deadline_expired": false }),
             json!({ "walk_incomplete": false, "items": [{ "ok": true, "truncated": false }] }),
             json!({ "items": [1, "ok", null, { "ok": false, "sessions_ok": false }] }),
+            // `error: ""` is the success form of some tools; `null` is none.
+            json!({ "ok": true, "error": "", "available": true }),
+            json!({ "error": null, "merged": { "error": null } }),
+            // A row's own `available` / `error` is that row's verdict.
+            json!({ "items": [{ "available": false }, { "error": "this row failed" }] }),
         ] {
             let outcome = call_outcome(&text_result(&payload), true);
             assert_eq!(outcome.code, exit_status::OK, "{payload}: {outcome:?}");

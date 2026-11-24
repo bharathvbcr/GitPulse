@@ -514,6 +514,44 @@ fn a_one_shot_write_is_held_to_repository_trust() {
     assert!(stderr.contains("untrusted_repository"), "{stderr}");
 }
 
+/// A read that could not look must not exit like one that looked and found
+/// nothing. On an untrusted repository the DevMap tools answer
+/// `available: false` (exit 3), and `gitpulse_provenance` is a tool error
+/// (exit 1) rather than an all-null "unexamined" record under exit 0.
+#[test]
+fn a_one_shot_read_on_an_untrusted_repository_is_not_exit_zero() {
+    let repo = tempfile::tempdir().expect("repo");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(repo.path())
+        .status_locked()
+        .expect("git init")
+        .success());
+    let path = format!("repo_path={}", repo.path().to_str().expect("utf-8 path"));
+
+    let (code, stdout, stderr) = run_one_shot(&["call", "devmap_status", &path]);
+    assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("REPOSITORY_TRUST_REQUIRED"), "{stdout}");
+    assert!(stderr.contains("available"), "{stderr}");
+
+    let (code, stdout, stderr) = run_one_shot(&[
+        "call",
+        "gitpulse_provenance",
+        &path,
+        "commit_sha=0000000000000000000000000000000000000000",
+    ]);
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("REPOSITORY_TRUST_REQUIRED"), "{stderr}");
+
+    // `gitpulse_landed` refuses the same way: a tool error, not an answer
+    // whose only sign of refusal is a top-level `error`.
+    let (code, stdout, stderr) = run_one_shot(&["call", "gitpulse_landed", &path, "commit=HEAD"]);
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("REPOSITORY_TRUST_REQUIRED"), "{stderr}");
+}
+
 // ---------------------------------------------------------------------------
 // Adversarial wire tests for typed tool arguments.
 // ---------------------------------------------------------------------------
