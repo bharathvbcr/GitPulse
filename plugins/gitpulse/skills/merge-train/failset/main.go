@@ -10,8 +10,9 @@
 // two is the set of individual failures: test ids where the gate prints them,
 // and the gate itself where it prints nothing finer.
 //
-// It reads four gate formats: the ci-local.mjs summary (GitPulse, DevCouncil),
-// Manvi's verify.sh, and ScholarLM's local-ci.js. Inside any of them it
+// It reads four gate formats: a ci-local.mjs summary block, a ci-local.mjs
+// that prints "== step ==" headers, a verify.sh that prints "==> step", and a
+// local-ci.js step table. Inside any of them it
 // recognises nextest, libtest, vitest, `go test`, pytest, Playwright and the
 // GitPulse browser harness.
 //
@@ -79,21 +80,21 @@ type Comparison struct {
 const (
 	FormatCILocal   = "ci-local"
 	FormatVerifySh  = "verify-sh"
-	FormatDCLocal   = "devcouncil-ci-local"
-	FormatScholarLM = "scholarlm-local-ci"
+	FormatStepLocal = "ci-local-steps"
+	FormatLocalCIJS = "local-ci-js"
 	FormatUnknown   = "unknown"
 )
 
 var (
 	ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
 
-	// GitPulse ci-local.mjs
+	// ci-local.mjs with "▶ gate" headers
 	ciGate = regexp.MustCompile(`^▶ (.+)$`)
 
-	// The summary block a runner prints last: GitPulse's ci-local.mjs
-	// ("── ci:local ───"), and DevCouncil's ci-local.mjs in --continue and
-	// --only ("── DevCouncil ci:local ───"). DevCouncil's rust/verify.sh
-	// --nested prints its own block inside its parent step's output, indented
+	// The summary block a runner prints last: a ci-local.mjs
+	// ("── ci:local ───"), and the step-header ci-local.mjs in --continue and
+	// --only ("── <Repo> ci:local ───"). A nested verify.sh (--nested)
+	// prints its own block inside its parent step's output, indented
 	// two more spaces and with no totals line; only the outermost runner
 	// prints totals, so only they make a log complete.
 	//
@@ -107,14 +108,14 @@ var (
 	sumIdleRow = regexp.MustCompile(`^ +(SKIP|N/A)\s+(.+?)\s{2,}\(.*\)$`)
 	sumTotals  = regexp.MustCompile(`^\s+\d+ passed · \d+ failed · \d+ skipped(?: · \d+ not applicable)? of \d+ (?:gates|steps)`)
 
-	// Manvi verify.sh
+	// verify.sh with "==> step" headers
 	vsGate       = regexp.MustCompile(`^==> (.+)$`)
 	vsFail       = regexp.MustCompile(`^FAIL (.+)$`)
 	vsIncomplete = regexp.MustCompile(`^INCOMPLETE verify\.sh exited`)
 	vsPass       = regexp.MustCompile(`^PASS (all gates|with gates that did not run)`)
 
-	// DevCouncil scripts/ci-local.mjs, and the rust/verify.sh it runs last.
-	// Both stop at the first failing step.
+	// A ci-local.mjs with "== step ==" headers, and the nested verify.sh it
+	// runs last. Both stop at the first failing step without --continue.
 	dcGate        = regexp.MustCompile(`^== (.+) ==$`)
 	dcFail        = regexp.MustCompile(`^FAIL: (.+)$`)
 	dcExit        = regexp.MustCompile(` \(exit \d+\)$`)
@@ -122,7 +123,7 @@ var (
 	dcCouldNotRun = regexp.MustCompile(`could not run|expects a .* checkout|is missing after`)
 	dcOK          = regexp.MustCompile(`^OK: ci:local`)
 
-	// ScholarLM local-ci.js
+	// local-ci.js step table
 	slGate   = regexp.MustCompile(`^ STEP: .* \(([^()]+)\)$`)
 	slRow    = regexp.MustCompile(`^\| (\S+)\s+\|.*\| (PASSED\*?|FAILED|CRASHED|SKIPPED)\s*\|`)
 	slBanner = regexp.MustCompile(`^\s*(SUCCESS: All executed|PARTIAL SUCCESS:|FAILURE: Some local CI checks failed|REFUSED:)`)
@@ -271,14 +272,14 @@ func (p *parser) enter(format, gate string) {
 	if p.format == FormatUnknown {
 		p.format = format
 	}
-	// verify.sh and DevCouncil's runner print nothing when a step passes and
+	// verify.sh and the step-header runner print nothing when a step passes and
 	// stop at a failure, so reaching the next step is the pass.
-	if (format == FormatVerifySh || format == FormatDCLocal) && p.status[p.gate] == "ran" {
+	if (format == FormatVerifySh || format == FormatStepLocal) && p.status[p.gate] == "ran" {
 		p.status[p.gate] = "passed"
 	}
 	// A runner that goes on after a failed step (a --continue mode) did not
 	// stop there, and has not reached a verdict until it prints one.
-	if format == FormatDCLocal && p.stoppedAt != "" {
+	if format == FormatStepLocal && p.stoppedAt != "" {
 		p.stoppedAt = ""
 		p.complete = false
 	}
@@ -371,13 +372,13 @@ func (p *parser) line(raw string) {
 			return
 		}
 	}
-	if p.format == FormatUnknown || p.format == FormatDCLocal {
+	if p.format == FormatUnknown || p.format == FormatStepLocal {
 		if m := dcGate.FindStringSubmatch(l); m != nil {
-			p.enter(FormatDCLocal, strings.TrimSpace(m[1]))
+			p.enter(FormatStepLocal, strings.TrimSpace(m[1]))
 			return
 		}
 	}
-	if p.format == FormatDCLocal {
+	if p.format == FormatStepLocal {
 		if m := dcFail.FindStringSubmatch(l); m != nil {
 			p.flushGo("?")
 			// A step a summary row already gave a status keeps it: in a
@@ -425,10 +426,10 @@ func (p *parser) line(raw string) {
 		}
 	}
 	if m := slGate.FindStringSubmatch(l); m != nil {
-		p.enter(FormatScholarLM, strings.TrimSpace(m[1]))
+		p.enter(FormatLocalCIJS, strings.TrimSpace(m[1]))
 		return
 	}
-	if p.format == FormatScholarLM {
+	if p.format == FormatLocalCIJS {
 		if m := slRow.FindStringSubmatch(l); m != nil {
 			name := m[1]
 			p.see(name)
@@ -555,7 +556,7 @@ func (p *parser) report() Report {
 	r := Report{Format: p.format, Complete: p.complete, Reason: p.reason, StoppedAt: p.stoppedAt, Incomplete: []string{}, Gates: []Gate{}, Failures: []string{}}
 	if p.format == FormatUnknown {
 		r.Complete = false
-		r.Reason = "no gate runner this tool reads (GitPulse or DevCouncil ci-local.mjs, Manvi verify.sh, ScholarLM local-ci.js) was found in the log"
+		r.Reason = "no gate runner this tool reads (a ci-local.mjs summary or step headers, a verify.sh, a local-ci.js step table) was found in the log"
 	} else if !r.Complete && r.Reason == "" {
 		r.Reason = "the log ends before the runner's verdict: killed, out of disk, or still running"
 	}
