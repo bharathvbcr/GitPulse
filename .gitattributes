@@ -22,6 +22,7 @@
 *.ico binary
 *.icns binary
 *.pdf binary
+*.mp4 binary
 *.woff binary
 *.woff2 binary
 *.dmg binary

@@ -345,6 +345,10 @@
         while (performance.now() < end) { if (predicate()) return true; await wait(20); }
         return predicate();
       };
+      // True once nothing under `root` is still animating (bounded, so an animation
+      // that never ends is reported by the caller, not waited on forever).
+      const animationsEnded = (root, ms = 5000) =>
+        sleepUntil(() => root.getAnimations({ subtree: true }).every((animation) => animation.playState === "finished"), ms);
 
       // ---- where things are -----------------------------------------------------
       const sidebar = () => $("aside.gp-sidebar");
@@ -606,11 +610,19 @@
           // null" outside any check, so the run died with no row naming the step.
           // `need` waits (bounded) for the element and records the wait as a check,
           // so a control that never comes is a named failure, not a crash.
-          const need = async (label, find, ms = 15000) => {
+          const need = async (label, find, ms = 15000, why = () => "") => {
             await sleepUntil(() => !!find(), ms);
             let found = null;
-            hardCheck(`${label} is on screen`, () => (found = find()));
+            hardCheck(`${label} is on screen${find() ? "" : ` (${why()})`}`, () => (found = find()));
             return found;
+          };
+          // What the Create menu looked like when its item never appeared: a menu
+          // that never opened and one that opened and closed again read the same
+          // without this.
+          const createMenuState = () => {
+            const trigger = $("button[data-branch-create-trigger]");
+            const menu = $("#branch-create-menu");
+            return `trigger expanded=${trigger?.getAttribute("aria-expanded")}, menu ${menu ? "present: " + menu.outerHTML.slice(0, 160) : "absent"}, active ${document.activeElement?.tagName}, hasFocus ${document.hasFocus()}`;
           };
           // The scroller must also be tall enough to scroll: its rows arrive with
           // the repository's data.
@@ -623,9 +635,22 @@
           type(await need("the file filter", fileFilter), "src/alpha");
           type(await need("the branch filter", branchFilter), "feat");
           chip("Local")?.click();
-          (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
-          await settle();
-          (await need("the Create menu's Branch item", () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]'))).click();
+          // The Local chip's filter lands a render or more later, and a click that
+          // arrives while the branch section is being rebuilt can open a menu on a
+          // trigger that is replaced under it (on the runner with window focus, the
+          // menu was absent and the trigger not expanded in 2 of 7 pages). A closed
+          // menu after a click is therefore clicked again, at most three times, and
+          // the attempt that opened it is named in the check; a menu that never opens
+          // fails as before, with its state.
+          const branchItem = () => $('#branch-create-menu [role="menuitem"][aria-label="Create branch"]');
+          let createAttempts = 0;
+          while (createAttempts < 3 && !branchItem()) {
+            createAttempts++;
+            (await need("the create-branch button", () => $("button[data-branch-create-trigger]"))).click();
+            await settle();
+            await sleepUntil(branchItem, createAttempts < 3 ? 3000 : 15000);
+          }
+          (await need(`the Create menu's Branch item (attempt ${createAttempts})`, branchItem, 1000, createMenuState)).click();
           await settle();
           type(await need("the new-branch name input", createInput), "feat/half-typed");
           (await need("the create-worktree button", worktreeAdd)).click();
@@ -820,6 +845,10 @@
             body.scrollTop = 0; await settle();
             const fadeAtTop = body.dataset.gpFade ?? "";
             body.scrollTop = body.scrollHeight; await settle(); await wait(120);
+            // The edge mask follows the scroll through ScrollCue, a frame or more
+            // after it; at the end it must be gone. Wait for that (bounded) and then
+            // read it, so a mask that stays is still a failure.
+            await sleepUntil(() => body.scrollHeight <= body.clientHeight + 1 || !(body.dataset.gpFade ?? "").includes("end"), 3000);
             const box = body.getBoundingClientRect();
             const rows = [...body.querySelectorAll("*")].filter((el) => el.getClientRects().length && el.children.length === 0 && !el.closest("[hidden]"));
             const last = rows.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)[0];
@@ -1103,7 +1132,13 @@
                 for (const view of ["work", "code", "history"]) {
                   repoStore.setActiveTab(view);
                   await settle();
-                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}`;
+                  // A view change plays the selection pill's crossfade (280 ms,
+                  // ViewTabBar) and the section strip's: until they end, the strip
+                  // that is leaving is still in the switcher beside the one that
+                  // arrived, so its width is the sum of two views', not a view's.
+                  // Measure the settled switcher, bounded, and say if it never was.
+                  const quiet = await animationsEnded(switcherScroller);
+                  const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}: switcher ${switcherScroller.clientWidth}/${switcherScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}${quiet ? "" : ", still animating"}`;
                   measured.push(row);
                   if (switcherScroller.scrollWidth > switcherScroller.clientWidth + 1) squeezed.push(row);
                 }
@@ -1343,10 +1378,13 @@
                   for (const view of ["work", "code", "history"]) {
                     repoStore.setActiveTab(view);
                     await settle();
+                    // As in the search sweep above: measure once the view change's
+                    // crossfades have ended, not while two views' strips are in the row.
+                    const quiet = await animationsEnded(glanceScroller);
                     const pill = !!$('[data-testid="viewbar-agents"]', row2);
                     const { shown, torn } = glanceShown();
                     const prefix = shown.every((name, i) => name === GLANCE_ORDER[i]);
-                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}`;
+                    const row = `${view}@${Math.round(row2.getBoundingClientRect().width)}${pill ? " with Agents pill" : ""}: switcher ${glanceScroller.clientWidth}/${glanceScroller.scrollWidth}, field ${Math.round(field().getBoundingClientRect().width)}, shown ${shown.join("+") || "none"}${torn.length ? ", torn " + torn.join("+") : ""}${quiet ? "" : ", still animating"}`;
                     glanceMeasured.push(row);
                     // With no pill, Code and History leave room for every chip at 1400px.
                     const roomy = agentsOk && width === 1400 && view !== "work";

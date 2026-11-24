@@ -21,6 +21,16 @@ guard let deadline = requestedDeadline, deadline.isFinite, deadline >= 1, deadli
     exit(2)
 }
 
+// With Reduce Motion on, WKWebView matches `prefers-reduced-motion: reduce`
+// and the app draws no transitions, so every check that measures one fails
+// with "0 animate calls" and the run says nothing about the product. The
+// macos-26 GitHub runner image ships with it on (ci.yml turns it off first).
+// Refuse such a host with the reason rather than report those as failures.
+if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+    fputs("This Mac has Reduce Motion on, so WebKit reports prefers-reduced-motion: reduce and the pages animate nothing to measure. Turn it off (System Settings > Accessibility > Display, or `defaults write com.apple.universalaccess reduceMotion -bool false`) to run the WebKit regressions.\n", stderr)
+    exit(3)
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let config = WKWebViewConfiguration()
@@ -84,6 +94,15 @@ window.alphaValue = 0
 window.ignoresMouseEvents = true
 window.collectionBehavior = [.transient, .ignoresCycle]
 window.orderFrontRegardless()
+// WebKit matches `:focus` only in a key window, so the focus-style checks need
+// one. An unattended runner has no person to take focus from, and there a
+// window that is never activated never becomes key (probed on the macos-26
+// runner: passive gave hasFocus false and no `:focus` match; activating gave
+// both). CI asks for it; a run on a developer's Mac stays passive.
+if ProcessInfo.processInfo.environment["GITPULSE_WEBKIT_TAKE_FOCUS"] == "1" {
+    app.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+}
 webview.load(URLRequest(url: url))
 Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { _ in
     fputs("WebKit regression deadline expired\n", stderr)

@@ -162,16 +162,32 @@
     const KEYFRAME_META = new Set(["offset", "easing", "composite", "computedOffset"]);
     const slideProps = () => [...new Set(sidebar().getAnimations().flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k))))].filter((k) => !KEYFRAME_META.has(k));
     const openWidth = Math.round(width(sidebar()));
+    // Sampling alone can miss a slide: on a loaded runner one frame can outlast
+    // the whole animation, so it starts and ends between two samples and the
+    // trace then says nothing moved. Every animate() call on the sidebar is also
+    // recorded as it is made, and what those animations animate counts as seen.
     async function traceToggle() {
       const samples = [];
-      const end = performance.now() + 2500;
-      let seen = false;
-      do {
-        const n = sidebar().getAnimations().length;
-        seen ||= n > 0;
-        samples.push({ w: Math.round(width(pane())), sw: Math.round(width(sidebar())), n, props: slideProps() });
-        await frame();
-      } while (performance.now() < end && (sidebar().getAnimations().length || !seen));
+      const recorded = [];
+      const nativeAnimate = Element.prototype.animate;
+      Element.prototype.animate = function (keyframes, options) {
+        const animation = nativeAnimate.call(this, keyframes, options);
+        if (this === sidebar()) recorded.push(animation);
+        return animation;
+      };
+      try {
+        const end = performance.now() + 2500;
+        let seen = false;
+        do {
+          const n = sidebar().getAnimations().length;
+          seen ||= n > 0 || recorded.length > 0;
+          samples.push({ w: Math.round(width(pane())), sw: Math.round(width(sidebar())), n, props: slideProps() });
+          await frame();
+        } while (performance.now() < end && (sidebar().getAnimations().length || !seen));
+      } finally {
+        Element.prototype.animate = nativeAnimate;
+      }
+      samples[0].props = [...new Set([...samples[0].props, ...recorded.flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k)))])].filter((k) => !KEYFRAME_META.has(k));
       return samples;
     }
     const jumps = (samples) => samples.filter((s, i) => i && Math.abs(s.w - samples[i - 1].w) > 2).length;

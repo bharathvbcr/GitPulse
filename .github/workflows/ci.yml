@@ -133,8 +133,23 @@ jobs:
         if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: bun run test:browser:all
 
+      # The macos-26 runner image ships with Reduce Motion and Reduce
+      # Transparency on (probed 2026-11-18: NSWorkspace true, WKWebView matched
+      # prefers-reduced-motion). Every animation check then saw no animation.
+      # Turn both off as a developer's Mac has them; the WebKit runner refuses
+      # to run if Reduce Motion is still on.
+      - name: Show motion and transparency to WebKit as a default Mac does
+        if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        run: |
+          defaults write com.apple.universalaccess reduceMotion -bool false
+          defaults write com.apple.universalaccess reduceTransparency -bool false
+
       - name: Native Renderer Regressions (WKWebView)
         if: ${{ !cancelled() && matrix.os == 'macos-latest' }}
+        # Unattended: the runner may make its window key, which WebKit needs
+        # before it matches `:focus` (scripts/webkit-regressions.swift).
+        env:
+          GITPULSE_WEBKIT_TAKE_FOCUS: "1"
         run: bun run test:webkit:all
 
       - name: Frontend Vite Build
