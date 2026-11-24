@@ -1147,6 +1147,14 @@ mod tests {
         git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
         let repo = tempfile::tempdir().expect("local repo");
         git(repo.path(), &["init", "-b", "main"]);
+        // `create_tag` writes an annotated tag with the product's own git,
+        // which reads the repository's identity, not this helper's
+        // environment; a CI runner has no global one.
+        git(repo.path(), &["config", "user.name", "GitPulse Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "gitpulse@example.test"],
+        );
         commit_file(repo.path(), "app.txt", "ready", "feat: ready release #1");
         git(
             repo.path(),

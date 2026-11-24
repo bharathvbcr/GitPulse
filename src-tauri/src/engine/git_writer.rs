@@ -5496,6 +5496,11 @@ mod tests {
             git_ok(dir.path(), &full);
         };
         git(&["init", "-q", "-b", "main"]);
+        // In the repository, not only on these commands: the merge each test
+        // then runs, and the rollback, need an identity too, and a CI runner
+        // has no global one (a merge without it fails before it conflicts).
+        git(&["config", "user.name", "Ada"]);
+        git(&["config", "user.email", "ada@gitpulse.dev"]);
         std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-qm", "base"]);
