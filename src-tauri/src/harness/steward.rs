@@ -494,7 +494,7 @@ pub(crate) fn detect_steward_claude_credential_cached(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn detect_steward_claude_credential_with(
     detect_account: impl FnOnce() -> Result<
         crate::harness::anthropic_account::Detection,
@@ -2293,7 +2293,7 @@ fn deterministic_directive(
 /// finished system-temp session scratchpads and trusted repositories). Never
 /// enables or mutates saved Global Cleaner schedules, and skips overlapping
 /// runs if the Global Cleaner is currently active.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_critical_hygiene_pass(
     trusted_cleanable_repos: &[String],
     clean_shared_caches: bool,
@@ -2515,7 +2515,7 @@ fn path_matches_exclusions(candidate: &Path, exclusions: &[PathBuf]) -> bool {
     exclusions.iter().any(|excl| resolved.starts_with(excl))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_critical_hygiene_pass_with(
     trusted_cleanable_repos: &[String],
     trusted_anchor_repo: Option<&str>,
@@ -2535,7 +2535,7 @@ pub(crate) fn run_critical_hygiene_pass_with(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_critical_hygiene_pass_full(
     trusted_cleanable_repos: &[String],
@@ -3579,7 +3579,7 @@ fn execute_agent_scratch_candidate(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clean_session_agent_scratchpads(
     session_tmp_root: &Path,
     retention_days: u32,

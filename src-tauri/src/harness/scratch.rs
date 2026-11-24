@@ -231,13 +231,17 @@ mod tests {
             .expect("test root")
     }
 
+    // Only the Unix sweep test reads these.
+    #[cfg(unix)]
     const DEAD: u32 = 4_000_001;
+    #[cfg(unix)]
     const LIVE: u32 = 777;
 
     fn name(pid: u32) -> String {
         format!("{SCRATCH_PREFIX}{pid}-0123456789abcdef")
     }
 
+    #[cfg(unix)]
     fn alive_only_live(pid: u32) -> bool {
         pid == LIVE
     }
