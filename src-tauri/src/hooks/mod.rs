@@ -11308,11 +11308,34 @@ done
 
         /// A case-variant spelling of a file in a sibling that holds it dirty
         /// (APFS is case-insensitive).
+        ///
+        /// The case is a property of the filesystem, not the platform: on a
+        /// case-sensitive one (ext4 on the Linux runners) `SEED.TXT` is another
+        /// file than the dirty `seed.txt`, so there is no spelling to judge and
+        /// the guard rightly says nothing. There the test holds the premise
+        /// instead, that the two spellings really are different files, which
+        /// is what made the old unconditional assertion fail on every Linux run.
         #[test]
         fn case_variant_spelling_of_a_sibling_file_is_still_judged() {
             let farm = farm_bound(true, false, 2);
             let (a, b) = (&farm.sibling_dirs[0], &farm.sibling_dirs[1]);
             let upper = format!("{}/SEED.TXT", b.display());
+            let one_file = Path::new(&upper).exists();
+            assert!(
+                b.join("seed.txt").exists(),
+                "the fixture's dirty file is missing"
+            );
+            if !one_file {
+                // Case-sensitive: the spellings name two files, and only the
+                // lower-case one is dirty in the sibling.
+                assert!(
+                    std::fs::read_dir(b)
+                        .unwrap()
+                        .any(|entry| entry.unwrap().file_name() == "seed.txt"),
+                    "the sibling lists seed.txt under its own spelling"
+                );
+                return;
+            }
             let output = guard_here(&edit_call(a.to_str().unwrap(), &upper));
             assert!(asks(&output), "{}", rendered(&output));
         }

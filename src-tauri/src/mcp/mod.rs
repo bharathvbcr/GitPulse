@@ -4756,11 +4756,14 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_browser_open" => {
             let a: BrowserOpenArgs = parse(name, arguments)?;
+            // Trust first, as every other write tool does: an untrusted
+            // repository gets the trust refusal on every platform, and only a
+            // trusted one learns that browser sessions are macOS-only.
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
             if !crate::browser::SUPPORTED {
                 return Err(crate::browser::UNSUPPORTED.to_string());
             }
-            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
-                .map_err(CommandError::into_message)?;
             let root = crate::engine::git_cli::find_git_root(std::path::Path::new(&a.repo_path))
                 .ok_or_else(|| format!("{} is not inside a git repository", a.repo_path))?;
             let repo = root.to_string_lossy().into_owned();
@@ -7215,6 +7218,32 @@ mod tests {
         ("devmap_preview", "one preview verdict, no list"),
     ];
 
+    /// Tools this test can only drive on macOS: the browser session and the
+    /// terminal orchestrator both answer through the desktop mailbox, which
+    /// elsewhere refuses ("available on macOS only for now"; see
+    /// `ask_app_to_orchestrate` and `crate::browser::UNSUPPORTED`), so the block
+    /// that calls them is `#[cfg(target_os = "macos")]`. Off macOS they are left
+    /// out of the probe and validation checks below, which failed on every
+    /// Linux runner for tools that were never called there. On macOS nothing
+    /// here is exempt: each must be probed and validated as before.
+    const EXERCISED_ON_MACOS_ONLY: &[&str] = &[
+        "gitpulse_browser_open",
+        "gitpulse_terminal_close",
+        "gitpulse_terminal_exec",
+        "gitpulse_terminal_list",
+        "gitpulse_terminal_open_file",
+        "gitpulse_terminal_read",
+        "gitpulse_terminal_send",
+        "gitpulse_terminal_spawn",
+        "gitpulse_terminal_wait",
+    ];
+
+    /// Whether `name` is one of [`EXERCISED_ON_MACOS_ONLY`] on a platform that
+    /// cannot drive it.
+    fn not_exercised_here(name: &str) -> bool {
+        cfg!(not(target_os = "macos")) && EXERCISED_ON_MACOS_ONLY.contains(&name)
+    }
+
     /// Tools whose `outputSchema` declares an array that is empty in every
     /// payload the fixtures reach (no ledger events, no tasks on the board that
     /// the call lists, no dead symbols, no collisions): the probe needs a
@@ -8064,6 +8093,9 @@ mod tests {
                 let in_list =
                     |list: &[(&str, &str)]| list.iter().any(|(exempt, _)| *exempt == name);
                 let has_array = schema_declares_array(&tool["outputSchema"]);
+                if not_exercised_here(name) {
+                    return None;
+                }
                 let listed = in_list(NO_ARRAY_IN_SCHEMA) || in_list(EMPTY_ON_FIXTURES);
                 // The reasons are checked, not just stated: a tool listed as
                 // having no array must declare none, and one listed as empty
@@ -8100,9 +8132,17 @@ mod tests {
 
         // Every advertised tool is validated or explicitly exempt. A tool whose
         // every call errored was never checked, and says why.
+        // The macOS-only list names advertised tools, so a rename cannot leave
+        // an entry that exempts nothing and says nothing.
+        for name in EXERCISED_ON_MACOS_ONLY {
+            assert!(
+                tools().iter().any(|tool| tool["name"] == *name),
+                "EXERCISED_ON_MACOS_ONLY names {name}, which is not an advertised tool"
+            );
+        }
         for tool in tools() {
             let name = tool["name"].as_str().expect("name");
-            if is_object_only_exempt(name) {
+            if is_object_only_exempt(name) || not_exercised_here(name) {
                 continue;
             }
             assert!(

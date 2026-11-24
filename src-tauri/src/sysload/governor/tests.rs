@@ -496,9 +496,20 @@ fn an_ungoverned_process_platform_or_switch_admits_without_shedding() {
     );
     assert!(seen.verdict.admit && seen.verdict.reason == Reason::SensorUnavailable);
 
-    // No sample yet: fail open, with a warning.
+    // No sample yet: fail open. Where the governor governs (macOS), it warns
+    // that the sensor is not running. Where it only advises (Linux, Windows),
+    // `availability` answers NotGoverned before the sensor is consulted, so
+    // there is nothing to warn about; asserting the warning there failed the
+    // test on every Linux runner.
     let v = Governor::default().verdict(Instant::now());
-    assert!(v.admit && !v.warnings.is_empty());
+    assert!(v.admit, "{v:?}");
+    if Platform::current() == Platform::Governed {
+        assert_eq!(v.reason, Reason::SensorUnavailable, "{v:?}");
+        assert!(!v.warnings.is_empty(), "{v:?}");
+    } else {
+        assert_eq!(v.reason, Reason::NotGoverned, "{v:?}");
+        assert!(v.warnings.is_empty(), "{v:?}");
+    }
     // This test process runs no governor at all.
     assert_eq!(report().verdict.reason, Reason::NotGoverned);
     assert_eq!(shed(), Shed::default());
