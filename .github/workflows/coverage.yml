@@ -18,6 +18,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The DevCouncil commit `devmap` is built from: the same pin as ci.yml's
+  # (store schema 29). scripts/devmap-pin-contract.test.ts fails when the two
+  # disagree, so a re-vendor that moves one moves both.
+  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+
 jobs:
   coverage:
     name: Generate Code Coverage Reports
@@ -98,6 +104,39 @@ jobs:
           name: frontend-lcov
           path: coverage/lcov.info
           if-no-files-found: error
+
+      # The worktree-overlay and agent-bus radar tests drive the real `devmap`
+      # CLI. Without it eight of them fail here with "devmap is not installed",
+      # as they did in ci.yml before it installed the CLI. Same steps as ci.yml's
+      # rust-test job, on the same cache key, so a build either workflow verified
+      # is reused by the other.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      # Saved as soon as the schema check passes: `actions/cache` saves only
+      # when the whole job succeeds, which a red coverage run never does.
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       - name: Generate Rust Coverage (LCOV + summary)
         run: |
