@@ -606,12 +606,36 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     // An envelope already at its hop limit is paused: the bus row is the record, and nothing is
     // put where a hook or banner would push it to the recipient.
     let at_limit = hop >= max_hops;
+    //
+    // A retry of a row that was already delivered is decided before anything is deposited: the
+    // recipient's claimed copy expires after ten minutes, so a deposit here would hand it the
+    // same message a second time.
+    let delivery_key = (
+        root_repo.clone(),
+        target.peer_id.clone(),
+        msg_id.clone(),
+        message.seq,
+    );
+    let cached_outcome = if at_limit {
+        None
+    } else {
+        delivered_outcome(&delivery_key)
+    };
+    let already_read = !at_limit && message.read_by.contains(&target.peer_id);
     let mailbox = if at_limit {
         json!({
             "deposited": false,
             "reason": "hop_limit",
             "detail": "The message is at its hop limit, so it is recorded on the bus only and not deposited in the recipient's mailbox; the recipient can still read it with gitpulse_agent_inbox.",
             "duplicate": false,
+            "overflow_notice": false,
+        })
+    } else if cached_outcome.is_some() || already_read {
+        json!({
+            "deposited": false,
+            "reason": "already_delivered",
+            "detail": "An earlier delivery of this exact message succeeded (or its recipient has read it), so a retry does not deposit it again.",
+            "duplicate": true,
             "overflow_notice": false,
         })
     } else {
@@ -637,22 +661,16 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     // the old one was evicted or repaired away never replays the old row's outcome.
     let mut replayed = false;
     let mut already_delivered = false;
-    let desktop_outcome = if !at_limit && target.liveness == "live" {
-        let key = (
-            root_repo.clone(),
-            target.peer_id.clone(),
-            msg_id.clone(),
-            message.seq,
-        );
-        if let Some(prior) = delivered_outcome(&key) {
-            replayed = true;
-            Some(prior)
-        } else if message.read_by.contains(&target.peer_id) {
-            // Acknowledged by the target already (a managed delivery does that): delivered
-            // before, with no stored outcome to replay, so the result says only that.
-            already_delivered = true;
-            None
-        } else {
+    let desktop_outcome = if let Some(prior) = cached_outcome {
+        replayed = true;
+        Some(prior)
+    } else if already_read {
+        // Acknowledged by the target already (a managed delivery does that): delivered
+        // before, with no stored outcome to replay, so the result says only that.
+        already_delivered = true;
+        None
+    } else if !at_limit && target.liveness == "live" {
+        {
             let outcome = match reach_desktop_agent_deliver(
                 &root_repo,
                 &target.peer_id,
@@ -676,7 +694,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
                 _ => None,
             };
             if let Some(ref done) = outcome {
-                remember_delivered(key, done.clone());
+                remember_delivered(delivery_key.clone(), done.clone());
             }
             outcome
         }
@@ -1041,6 +1059,16 @@ fn collect_deduped_peer_inbox(
     }
 
     let since_mailbox_floor = since_mailbox_ms.unwrap_or(0);
+    // Rows the bus holds come first in seq order, then the envelopes it does not hold. A
+    // mailbox envelope whose bus row was outside the bus read is appended after rows with a
+    // higher seq, so without the sort a cut could leave it behind them and pull
+    // `next_since_seq` below rows already returned.
+    let is_bus_row = |m: &AgentBusMessage| {
+        !m.msg_id
+            .as_ref()
+            .is_some_and(|id| mailbox_only_ms.contains_key(id))
+    };
+    combined.sort_by_key(|m| if is_bus_row(m) { (0, m.seq) } else { (1, 0) });
     let has_more = combined.len() > limit;
     let cut: Vec<AgentBusMessage> = if has_more {
         combined.split_off(limit)
@@ -1051,13 +1079,13 @@ fn collect_deduped_peer_inbox(
         // Resume just before the first cut row of each kind, never behind where the caller was.
         let returned_seq = combined
             .iter()
-            .filter(|m| on_bus.contains(&m.seq))
+            .filter(|m| is_bus_row(m))
             .map(|m| m.seq)
             .max()
             .unwrap_or(since_seq);
         let seq = cut
             .iter()
-            .filter(|m| on_bus.contains(&m.seq))
+            .filter(|m| is_bus_row(m))
             .map(|m| m.seq.saturating_sub(1))
             .fold(returned_seq, u64::min)
             .max(since_seq);

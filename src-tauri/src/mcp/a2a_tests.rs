@@ -2192,3 +2192,102 @@ fn an_evicted_steward_envelope_cut_from_a_page_is_still_reachable_by_the_cursors
         "{first} / {second}"
     );
 }
+
+#[test]
+fn a_retry_after_the_claimed_copy_expired_deposits_nothing_and_says_already_delivered() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0c";
+    register_inbox_peer(&repo, sid, "expiry-target");
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "expiry-target",
+                       "body": "delivered once", "msg_id": "expiry-retry-1" });
+    send_json(&repo, args.clone()).expect("first send");
+    handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "expiry-target", "ack": true }),
+    )
+    .expect("target reads and acknowledges");
+    // The claimed copy outlives its ten minutes and is gone.
+    let mb = Mailbox::at_default().expect("mailbox");
+    let dir = mb.session_path(sid).expect("session dir");
+    for entry in std::fs::read_dir(&dir).expect("session files").flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".msg") {
+            std::fs::remove_file(entry.path()).expect("expire claimed copy");
+        }
+    }
+    let retry = send_json(&repo, args).expect("exact retry");
+    assert_eq!(retry["delivery_outcome"], "already_delivered", "{retry}");
+    assert_eq!(retry["mailbox"]["deposited"], false, "{retry}");
+    assert_eq!(retry["mailbox"]["reason"], "already_delivered", "{retry}");
+    assert!(
+        mb.peek_pending(sid, 16, SystemTime::now())
+            .expect("peek mailbox")
+            .is_empty(),
+        "a retry must not hand the recipient the message a second time"
+    );
+}
+
+#[test]
+fn paging_terminates_when_a_mailbox_envelope_names_a_bus_row_outside_the_page_read() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0d";
+    register_inbox_peer(&repo, sid, "paging-owner");
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let row = |seq: u64, to: &str, id: &str| {
+        json!({ "seq": seq, "from_agent": "agy:filler", "to_agent": to, "kind": "note",
+                "body": id, "created_at_ms": now_ms, "msg_id": id })
+    };
+    let state = json!({ "next_seq": 11, "dropped_before_seq": 0, "messages": [
+        row(3, "someone-else", "x-3"), row(10, "paging-owner", "seed-10"),
+        row(11, "paging-owner", "seed-11") ] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    // The mailbox holds an envelope for row 3, which the bus read for this peer does not return.
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit_with_provenance(
+            sid,
+            "x-3",
+            "x-3",
+            crate::agent_mailbox::EnvelopeProvenance::PeerAgent {
+                msg_id: "x-3".into(),
+                from_peer: "agy:filler".into(),
+                provider: "agy".into(),
+                branch: String::new(),
+                thread_key: String::new(),
+                hop: 1,
+                max_hops: 6,
+                truncated_in_bus: false,
+                repo_root: repo.clone(),
+            },
+            SystemTime::now(),
+        )
+        .expect("deposit envelope");
+
+    let mut seen: Vec<String> = Vec::new();
+    let (mut seq, mut cursor) = (json!(0), json!(0));
+    for _ in 0..6 {
+        let page = wait_peek(
+            &repo,
+            "paging-owner",
+            json!({ "limit": 1, "since_seq": seq, "since_mailbox_ms": cursor }),
+        );
+        seen.extend(
+            page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["msg_id"].as_str().unwrap().to_string()),
+        );
+        if page["has_more"] == false {
+            break;
+        }
+        seq = page["next_since_seq"].clone();
+        cursor = page["mailbox_cursor_ms"].clone();
+    }
+    assert_eq!(seen, ["x-3", "seed-10", "seed-11"]);
+}
