@@ -2,7 +2,7 @@
   import { onDestroy, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
-  import { ChevronDown, SquareTerminal } from "@lucide/svelte";
+  import { ChevronDown, PanelBottom } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { repoStore } from "../stores/repoStore";
   import type { MutationTarget } from "../repos/storeTypes";
@@ -25,7 +25,7 @@
   import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { requestReveal } from "../files/revealRequests";
   import { observeResize } from "../dom/observeResize";
-  import { motionExitMs } from "../motion/tokens";
+  import { motionMs } from "../motion/tokens";
   import { nudgedPaneHeight, startPaneDrag } from "../ui/paneHeight";
   import { panelModes } from "../ui/panelMode";
   import { LAYERS } from "../ui/layers";
@@ -33,7 +33,7 @@
   import { popover, type PopoverOptions } from "../ui/popover";
 
   /**
-   * The terminal, docked beneath the active view.
+   * The dock, docked beneath the active view: shell, agents, files and console.
    *
    * Two things this shape gets right that a view could not. A PTY has to
    * outlive a view switch, so the pane was already mounted once and hidden
@@ -120,12 +120,17 @@
   }
 
   /*
-   * Docked or overlay (panelMode.ts). Docked, the dock owns a row under the
-   * view, settles in, and leaves in the same exit (transform and opacity, the
-   * row collapsing once it is gone). Overlay, it floats over the bottom of the view
-   * and slides on transform; the view keeps the full column. The dock is
-   * never unmounted: hiding is display:none, so an overlay holds the element
-   * for its exit and only then hides it.
+   * Docked or overlay (panelMode.ts). Either way the dock is a sheet that
+   * slides: up out of the bottom edge when it opens, back down when it
+   * closes. Docked, its row takes the final height at once and the sheet
+   * rises inside it, clipped by the row; the row collapses only after the
+   * sheet has gone. Overlay, it floats over the bottom of the view and the
+   * view keeps the full column.
+   *
+   * Transform only: the sheet never changes size while it moves, so no
+   * shell is re-fitted (and no PTY told a new size) by the motion. The dock
+   * is never unmounted: hiding is display:none, so it is held for its exit
+   * and only then hidden.
    */
   let overlay = $derived($panelModes.dock === "overlay");
   let leaving = $state(false);
@@ -135,18 +140,84 @@
   // rendered, so capturing the initial one is the intent.
   let wasOpen = open;
   // Read when the dock closes, not memoized: the reduced-motion preference is
-  // not reactive state, and a stale 70 would hold an exit the reader refused.
-  let exitMs = $state(motionExitMs("slow"));
-  const phase = $derived(leaving ? "slide-out" : overlay ? "slide-in" : "in");
+  // not reactive state, and a stale value would hold an exit the reader refused.
+  //
+  // The `fast` duration, not the shared exit token: exits are capped at 70 ms
+  // so a closing dialog's blurred backdrop never stacks under the next one.
+  // The dock has no backdrop, and a full-height sheet sliding down in 70 ms
+  // reads as a blink, not a slide. 140 ms on the exit curve still yields
+  // faster than the 320 ms entrance.
+  let exitMs = $state(motionMs("fast"));
+  const phase = $derived(leaving ? "slide-out" : "slide-in");
+
+  let sheet: HTMLDivElement | undefined = $state();
+  /**
+   * Where an interrupted slide resumes from. Toggling the dock mid-slide
+   * (⌃` twice, or Hide while it is still rising) swaps the animation, which
+   * would restart from its keyframe's own start: a fully hidden sheet
+   * snapping back into view, or a rising one snapping open before it sinks.
+   * Instead the next slide starts where the sheet is (`--gp-dock-from`).
+   */
+  let slideFrom = $state<number | null>(null);
+  let pendingSlideFrom: number | null = null;
+
+  /** The sheet's offset while a slide is in flight, or null when it is at rest. */
+  function inFlightOffset(): number | null {
+    const el = sheet;
+    if (!el || !el.getClientRects().length) return null;
+    if (!el.getAnimations().some((animation) => animation.playState === "running")) return null;
+    const y = new DOMMatrixReadOnly(getComputedStyle(el).transform).m42;
+    return y > 0.5 && y < el.offsetHeight - 0.5 ? Math.round(y) : null;
+  }
+
+  /**
+   * Focus the dock took is given back when it closes. Hidden is display:none,
+   * so focus left on the shell (or the Hide button) would sit in an invisible
+   * subtree: the browser drops it to <body> and the reader loses their place.
+   * The status-bar pill is never the target: focusing it opens its menu.
+   */
+  let returnFocusTo: HTMLElement | null = null;
+  // svelte-ignore state_referenced_locally
+  // Justified: like `wasOpen`, only ever compared with the next value.
+  let preWasOpen = open;
+
+  // Before the DOM changes: once `open` flips the sheet may already be
+  // display:none, with no position left to read and focus already dropped.
+  $effect.pre(() => {
+    const isOpen = open;
+    untrack(() => {
+      if (isOpen === preWasOpen) return;
+      preWasOpen = isOpen;
+      pendingSlideFrom = inFlightOffset();
+      const active = document.activeElement;
+      if (isOpen) {
+        returnFocusTo =
+          active instanceof HTMLElement && active !== document.body && !host?.contains(active) && !active.closest(DOCK_TRIGGER)
+            ? active
+            : null;
+        return;
+      }
+      if (!(active instanceof HTMLElement) || !host?.contains(active)) return;
+      const target = returnFocusTo;
+      returnFocusTo = null;
+      if (target?.isConnected && target.getClientRects().length && !target.closest(DOCK_TRIGGER)) {
+        target.focus({ preventScroll: true });
+      } else {
+        active.blur();
+      }
+    });
+  });
 
   $effect(() => {
     const isOpen = open;
     untrack(() => {
       if (isOpen === wasOpen) return;
       wasOpen = isOpen;
+      slideFrom = pendingSlideFrom;
+      pendingSlideFrom = null;
       if (leaveTimer) clearTimeout(leaveTimer);
       leaveTimer = null;
-      exitMs = motionExitMs("slow");
+      exitMs = motionMs("fast");
       if (isOpen || exitMs === 0) {
         leaving = false;
         return;
@@ -326,14 +397,25 @@
 
 {#if mounted}
   <!-- Hidden, never unmounted: display:none pauses rendering, not the shell. -->
+  <!-- The row (or, floating, the frame) holds the dock's height; the sheet
+       inside carries the surface and does the sliding. The row does not clip:
+       the workspace column around it already does (App.svelte), so the
+       floating sheet keeps its shadow while the slide still ends at the
+       column's bottom edge rather than over the status bar. -->
   <div
     bind:this={host}
     use:popover={dockDismissOptions}
-    class="gp-dock-motion flex flex-col overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'absolute inset-x-0 bottom-0 shadow-float' : 'shrink-0'}"
+    class="flex flex-col {overlay ? 'absolute inset-x-0 bottom-0' : 'shrink-0'}"
     class:hidden={!open && !leaving}
     style="height: {height}px; --gp-dock-exit-ms: {exitMs}ms;{overlay ? ` z-index: ${LAYERS.STICKY};` : ''}"
     data-terminal-dock
     data-dock-mode={overlay ? "overlay" : "docked"}
+  >
+  <div
+    bind:this={sheet}
+    class="gp-dock-motion flex flex-col flex-1 min-h-0 overflow-hidden rounded-t-lg bg-surfaceHover {overlay ? 'shadow-float' : ''}"
+    style:--gp-dock-from={slideFrom === null ? undefined : `${slideFrom}px`}
+    data-dock-sheet
     data-phase={phase}
   >
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -346,7 +428,7 @@
     <div
       role="separator"
       aria-orientation="horizontal"
-      aria-label="Resize the terminal dock"
+      aria-label="Resize the dock"
       aria-valuenow={height}
       aria-valuemin={TERMINAL_DOCK_MIN_HEIGHT}
       aria-valuemax={heightCeiling}
@@ -361,15 +443,15 @@
 
     {#if hostedTabs.length === 0}
     <div class="h-7 shrink-0 px-2.5 flex items-center gap-2 select-none">
-      <SquareTerminal size={12} class="text-accent shrink-0" />
-      <span class="text-meta font-medium text-textPrimary">Terminal</span>
+      <PanelBottom size={12} class="text-accent shrink-0" />
+      <span class="text-meta font-medium text-textPrimary">Dock</span>
       <div class="flex-1"></div>
       <button
         type="button"
         onclick={onClose}
         class="gp-icon-btn" data-size="sm"
-        title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — the session keeps running"
-        aria-label="Hide the terminal dock"
+        title="Hide the dock ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — sessions keep running"
+        aria-label="Hide the dock"
       >
         <ChevronDown size={13} />
       </button>
@@ -408,5 +490,6 @@
         </div>
       {/each}
     </div>
+  </div>
   </div>
 {/if}

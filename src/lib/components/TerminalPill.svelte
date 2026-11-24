@@ -4,7 +4,7 @@
   import { describeError } from "../ui/copy/describeFailure";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { LAYERS } from "../ui/layers";
-  import { Eye, EyeOff, Plus, SquareTerminal } from "@lucide/svelte";
+  import { ChevronDown, ChevronUp, PanelBottom, Plus, SquareTerminal } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { onDestroy, tick, untrack } from "svelte";
   import { portal } from "../dom/portal";
@@ -84,7 +84,7 @@
   );
   let pillLabel = $derived.by(() => {
     const count = terminalPill.alive > 1 ? `, ${terminalPill.alive} sessions` : "";
-    return terminalPill.summary ? `Terminal, ${terminalPill.summary}${count}` : `Terminal${count}`;
+    return terminalPill.summary ? `Dock, ${terminalPill.summary}${count}` : `Dock${count}`;
   });
   let activityKey = $derived(
     menuOpen
@@ -327,18 +327,17 @@
       data-testid="terminal-pill"
       aria-pressed={$repoStore.terminalOpen}
       aria-expanded={menuOpen}
-      aria-haspopup="menu"
       aria-controls="terminal-pill-menu"
       aria-label={pillLabel}
       onclick={toggleDock}
       onkeydown={onPillKeydown}
-      title="Toggle the terminal dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"
+      title="Toggle the dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"
       class="inline-flex h-6 max-w-[16rem] shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2 text-meta font-medium leading-none transition-colors {$repoStore.terminalOpen
         ? 'border-accent bg-accent/10 text-accent'
         : 'border-edge bg-surfaceHover text-textPrimary hover:border-edgeStrong hover:bg-accent/10'}"
     >
-      <SquareTerminal size={12} class="shrink-0" />
-      <span>Terminal</span>
+      <PanelBottom size={12} class="shrink-0" />
+      <span>Dock</span>
       {#if terminalPill.summary}
         {#if terminalPill.highlightedLauncher}
           <LauncherIcon kind={terminalPill.highlightedLauncher} size={11} class="shrink-0" />
@@ -364,7 +363,7 @@
       data-testid="terminal-pill-menu"
       data-terminal-pill-menu
       role="group"
-      aria-label="Terminal options"
+      aria-label="Dock sessions"
       use:portal={"body"}
       use:popover={menuPopover} out:popoverExit
       onpointerenter={showMenu}
@@ -442,8 +441,8 @@
         data-testid="terminal-pill-toggle"
         onclick={() => { toggleDock(); closeMenu(); }}
       >
-        {#if $repoStore.terminalOpen}<EyeOff size={13} class="shrink-0 text-textMuted" />{:else}<Eye size={13} class="shrink-0 text-textMuted" />{/if}
-        <span>{$repoStore.terminalOpen ? "Hide terminal" : "Show terminal"}</span>
+        {#if $repoStore.terminalOpen}<ChevronDown size={13} class="shrink-0 text-textMuted" />{:else}<ChevronUp size={13} class="shrink-0 text-textMuted" />{/if}
+        <span>{$repoStore.terminalOpen ? "Hide dock" : "Show dock"}</span>
       </button>
       {#if terminalPill.focusKey}
         <button

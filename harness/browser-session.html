@@ -100,7 +100,12 @@
       check("+ opens a browser tab, labelled Browser, and starts no process", () => byText("[role=tab]", "Browser") && spawns.length === spawnsBefore);
       check("Nothing is opened before an address is given", () => of("cmd_browser_open").length === 0);
       check("The address bar offers a local default", () => byLabel("Address").value === "http://localhost:3000/");
-      check("Find and Clear scrollback are off on a browser tab", () => byLabel("Find in terminal").disabled && byLabel("Clear scrollback").disabled);
+      [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click();
+      await wait(() => document.querySelector('[data-testid="dock-menu-clear-scrollback"]'), "the dock menu");
+      const menuClearDisabled = document.querySelector('[data-testid="dock-menu-clear-scrollback"]').disabled;
+      [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click();
+      await wait(() => !document.querySelector('[data-testid="dock-overflow-menu"]'), "the dock menu to close");
+      check("Find and Clear scrollback are off on a browser tab", () => byLabel("Find in terminal").disabled && menuClearDisabled);
 
       // ---- opening ----------------------------------------------------------
       await type("5173");
@@ -188,10 +193,10 @@
         await wait(() => lastVisible() === true, `the page to return after ${what}`);
       }
 
-      byText("button", "Console").click();
+      [...document.querySelectorAll('[data-testid="dock-section-console"]')].find((el) => el.getClientRects().length).click();
       await wait(() => lastVisible() === false, "the page to hide in Console");
       check("Console mode hides it", () => lastVisible() === false);
-      byText("button", "Shell").click();
+      [...document.querySelectorAll('[data-testid="dock-section-shell"]')].find((el) => el.getClientRects().length).click();
       await wait(() => lastVisible() === true, "the page to return in Shell");
       check("Shell mode shows it again", () => lastVisible() === true);
 

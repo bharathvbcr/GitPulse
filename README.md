@@ -159,7 +159,7 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 
 Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected
 file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (up to 1,000 open repository tabs, with at most 24 repositories watched at once and 24 recent repositories remembered),
-**Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
+**Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **Dock** stays available across views.
 
 ## From a change to the next step
 
@@ -190,7 +190,7 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   redacted secrets scanning (in-process by default, Kingfisher as the deep scan) that locates each finding against Git, storage
   cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
   Capped results identify their limits.
-- **Work from the desktop.** Native menus, a command palette (`⌘K`), a docked PTY terminal
+- **Work from the desktop.** Native menus, a command palette (`⌘K`), the Dock (shell, agents, files and console)
   with expanded view isolation, WebGL context caching, DEC 2026 frame synchronization, and configurable bell prompts that reports what each session is running, reflog recovery (`reset --keep`), GitHub pull
   request actions (review, comment, approve, merge pinned to viewed commit), colour-coded repository
   tabs and collapsible inactive groups that survive a restart, and an optional macOS menu-bar status popover keep
@@ -210,7 +210,7 @@ tracks remaining platform, provider, and performance checks.
 | Blast radius | Local CI on affected tests |
 | ![Diff view with the blast radius of a change](docs/assets/blast-radius.webp) | ![CI:local report running only the one affected test file](docs/assets/ci-local-affected.webp) |
 | Conflict editor | Terminal splits |
-| ![Three-way conflict editor resolving a README merge conflict](docs/assets/conflicts.webp) | ![Terminal dock split into three shells](docs/assets/terminal-splits.webp) |
+| ![Three-way conflict editor resolving a README merge conflict](docs/assets/conflicts.webp) | ![Dock split into three terminals](docs/assets/terminal-splits.webp) |
 
 Screenshots are captures from the macOS app; appearance varies by release and platform. Names of
 private repositories are blurred.
@@ -251,7 +251,7 @@ flowchart TB
         direction LR
         Views["4 Views · 11 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
-        TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
+        TerminalDock["PTY Dock<br/>(portable-pty)"]
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]

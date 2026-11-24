@@ -26,7 +26,7 @@ describe("TerminalDock", () => {
       props: { open: true, onClose: () => {}, load: loader },
     }).body;
     expect(body).toContain("data-terminal-dock");
-    expect(body).toContain("Terminal");
+    expect(body).toContain("Dock");
     expect(body).toContain("rounded-t-lg");
     expect(body).not.toContain("rounded-b-lg");
   });
@@ -109,24 +109,52 @@ describe("TerminalDock", () => {
 });
 
 describe("TerminalDock modes", () => {
-  it("renders docked by default, in its own row, settling in once", () => {
+  it("renders docked by default, in its own row, with a sheet that slides up inside it", () => {
     const body = render(TerminalDock, {
       props: { open: true, onClose: () => {}, load: loader },
     }).body;
     expect(body).toContain('data-dock-mode="docked"');
-    expect(body).toContain('data-phase="in"');
-    expect(body).toContain("gp-dock-motion");
     expect(body).toContain("shrink-0");
     expect(body).not.toContain("absolute inset-x-0 bottom-0");
+    // The motion lives on the inner sheet, not the row that holds the height.
+    const sheet = body.slice(body.lastIndexOf("<", body.indexOf("data-dock-sheet")), body.indexOf(">", body.indexOf("data-dock-sheet")) + 1);
+    expect(sheet).toContain("gp-dock-motion");
+    expect(sheet).toContain('data-phase="slide-in"');
+    expect(sheet).toContain("bg-surfaceHover");
+    const row = body.slice(body.lastIndexOf("<", body.indexOf("data-terminal-dock")), body.indexOf(">", body.indexOf("data-terminal-dock")) + 1);
+    expect(row).not.toContain("gp-dock-motion");
+    expect(row).not.toContain("data-phase");
   });
 
   it("floats over the view in overlay mode, held for its exit and then hidden", () => {
-    expect(source).toContain("absolute inset-x-0 bottom-0 shadow-float");
-    expect(source).toContain('const phase = $derived(leaving ? "slide-out" : overlay ? "slide-in" : "in");');
+    expect(source).toContain("{overlay ? 'absolute inset-x-0 bottom-0' : 'shrink-0'}");
+    expect(source).toContain('const phase = $derived(leaving ? "slide-out" : "slide-in");');
     expect(source).toContain("class:hidden={!open && !leaving}");
-    expect(source).toContain('motionExitMs("slow")');
+    // The dock's exit is the `fast` duration, not the 70 ms backdrop-safe exit cap.
+    expect(source).toContain('motionMs("fast")');
+    expect(source).not.toContain("motionExitMs(");
+    // Floating, the shadow is the sheet's, and nothing clips it.
+    expect(source).toContain("{overlay ? 'shadow-float' : ''}");
+    expect(source).not.toMatch(/data-terminal-dock[\s\S]{0,40}overflow-hidden/);
     // Never unmounted: hiding is display:none, so the PTY survives the exit.
     expect(source).toContain("{#if mounted}");
+  });
+
+  it("resumes an interrupted slide from where the sheet is, read before the DOM changes", () => {
+    // $effect.pre: once `open` flips, the sheet can already be display:none.
+    const pre = source.slice(source.indexOf("$effect.pre("), source.indexOf("$effect(() => {\n    const isOpen = open;"));
+    expect(pre).toContain("pendingSlideFrom = inFlightOffset();");
+    expect(source).toContain('animation.playState === "running"');
+    expect(source).toContain("slideFrom = pendingSlideFrom;");
+    expect(source).toContain("style:--gp-dock-from={slideFrom === null ? undefined : `${slideFrom}px`}");
+    expect(source).toContain("bind:this={sheet}");
+  });
+
+  it("gives focus back when it closes, never to its own pill, and never leaves it in the hidden dock", () => {
+    const pre = source.slice(source.indexOf("$effect.pre("), source.indexOf("$effect(() => {\n    const isOpen = open;"));
+    expect(pre).toContain("!host?.contains(active) && !active.closest(DOCK_TRIGGER)");
+    expect(pre).toContain("target.focus({ preventScroll: true });");
+    expect(pre).toContain("active.blur();");
   });
 
   it("leaves with the exit token when docked too, not only when floating", () => {
@@ -144,7 +172,7 @@ describe("TerminalDock modes", () => {
 
   it("hands the panel the mode and a toggle, and keeps its separator and testids", () => {
     expect(source).toContain('onToggleDockMode: () => panelModes.toggle("dock")');
-    expect(source).toContain('aria-label="Resize the terminal dock"');
+    expect(source).toContain('aria-label="Resize the dock"');
     expect(source).toContain("data-terminal-host={tab.id}");
     expect(source).toContain("data-terminal-dock");
   });
