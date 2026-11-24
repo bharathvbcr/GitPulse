@@ -133,7 +133,9 @@ asks and each recipient's unread direct messages from the last 2 hours (up to 8 
 all) are kept for as long as anything else can go instead. A body may hold line breaks and tabs but no
 other control characters, and the 16 KiB limit counts the body as stored, where a quote or backslash
 takes two bytes. If the bus file ever outgrows its 8 MiB limit, the next post or acknowledgement drops
-the oldest rows to bring it back under, logs a warning, and never reuses a sequence number.
+the oldest rows to bring it back under, logs a warning, and never reuses a sequence number. Because the kept rows can be older than rows that were dropped, an inbox or
+wait response lists them in `pinned_below_dropped_before_seq`: `dropped_before_seq` still means no dropped
+row has a sequence at or above it, and those listed rows are the exceptions below it.
 
 ![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 

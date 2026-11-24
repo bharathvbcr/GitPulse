@@ -663,6 +663,7 @@ struct DedupedInboxResult {
     messages: Vec<AgentBusMessage>,
     latest_seq: u64,
     dropped_before_seq: u64,
+    pinned_below_dropped_before_seq: Vec<u64>,
     has_more: bool,
     acked_count: usize,
     /// Why acknowledging failed, when it did. The messages were already collected, so a failed
@@ -984,6 +985,7 @@ fn collect_deduped_peer_inbox(
             messages: combined,
             latest_seq: bus_page.latest_seq,
             dropped_before_seq: bus_page.dropped_before_seq,
+            pinned_below_dropped_before_seq: bus_page.pinned_below_dropped_before_seq,
             has_more,
             acked_count,
             ack_error: (!ack_errors.is_empty()).then(|| ack_errors.join("; ")),
@@ -1018,6 +1020,7 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
         "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
         "messages": res.messages,
     }))
@@ -1222,6 +1225,7 @@ fn wait_response(
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
         "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
         "messages": res.messages,
     })

@@ -222,6 +222,20 @@ pub struct AgentInboxPage {
     pub messages: Vec<AgentBusMessage>,
     pub latest_seq: u64,
     pub dropped_before_seq: u64,
+    /// Seqs of the rows in this page that sit below `dropped_before_seq`. Eviction spares
+    /// pinned rows (open asks, unread direct messages), so one can outlive later evictions;
+    /// this names them so "everything below `dropped_before_seq` was dropped" is never read
+    /// as covering a row the reader was just handed. Bounded by the pin caps.
+    #[serde(default)]
+    pub pinned_below_dropped_before_seq: Vec<u64>,
+}
+
+/// Seqs of the retained `rows` that are below `dropped_before_seq`, oldest first.
+fn seqs_below_dropped(rows: &[AgentBusMessage], dropped_before_seq: u64) -> Vec<u64> {
+    rows.iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < dropped_before_seq)
+        .collect()
 }
 
 /// Grouped conversation thread and structured ask status modeled on Vespin.
@@ -1157,7 +1171,7 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
     read_json_bounded_hint(
         path,
         MESSAGES_FILE_CAP,
-        "; the next post or ack compacts it",
+        "; the next post or ack compacts it: any gitpulse_agent_send, or an acknowledging inbox read, in this repository repairs it",
     )
 }
 
@@ -1321,7 +1335,11 @@ pub fn get_message_by_id(
         Ok(state
             .messages
             .into_iter()
-            .find(|m| m.msg_id.as_deref() == Some(clean_id.as_str())))
+            .find(|m| match m.msg_id.as_deref() {
+                Some(id) => id == clean_id,
+                // A legacy row has no msg_id; the rest of the code names it `msg-<seq>`.
+                None => clean_id == format!("msg-{}", m.seq),
+            }))
     })
 }
 
@@ -1349,6 +1367,11 @@ pub fn ack_messages(
         if !messages_path.is_file() {
             return Ok(0);
         }
+        let file_len = fs::metadata(&messages_path)
+            .map_err(|e| {
+                CommandError::from(format!("cannot stat {}: {e}", messages_path.display()))
+            })?
+            .len();
         let mut state: MessagesState = read_json_bounded(&messages_path, MESSAGES_WRITE_CEILING)?;
         let mut updated = 0usize;
         for msg in &mut state.messages {
@@ -1363,6 +1386,12 @@ pub fn ack_messages(
                 msg.read_by.push(reader.clone());
                 updated += 1;
             }
+        }
+        // Nothing acknowledged and nothing over a cap: serializing and rewriting the whole
+        // file would only burn I/O, so leave it alone. An over-cap file still heals below.
+        if updated == 0 && state.messages.len() <= MAX_BUS_MESSAGES && file_len <= MESSAGES_FILE_CAP
+        {
+            return Ok(0);
         }
         let rows_before = state.messages.len();
         let bytes = compact_messages_for_write(&mut state, &messages_path, None)?;
@@ -1414,7 +1443,7 @@ pub fn read_messages_for_peer(
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -1435,6 +1464,10 @@ pub fn read_messages_for_peer(
             })
             .collect();
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -2121,7 +2154,7 @@ pub fn read_thread_messages(
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -2137,6 +2170,10 @@ pub fn read_thread_messages(
             .collect();
 
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -4380,5 +4417,108 @@ mod tests {
             "pinned rows go oldest first"
         );
         assert_eq!(state.next_seq, 257);
+    }
+
+    #[test]
+    fn a_pinned_row_below_dropped_before_seq_is_listed_for_the_reader() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "pinned".into())];
+        rows.extend(broadcasts(2, 300, now));
+        let dir = repo_with_seeded_bus(rows);
+        let stored = post_then_stored(&dir);
+        assert!(
+            stored_seqs(&stored).contains(&1),
+            "the unread direct row is pinned"
+        );
+        assert!(
+            stored.dropped_before_seq > 1,
+            "later rows were evicted past the pinned one"
+        );
+
+        let repo = dir.path().to_str().unwrap();
+        let page = read_messages(repo, Some("claude:quiet"), 0).unwrap();
+        assert!(page.messages.iter().any(|m| m.seq == 1));
+        assert_eq!(
+            page.pinned_below_dropped_before_seq,
+            vec![1],
+            "the reader is told which retained row sits below dropped_before_seq"
+        );
+        let past = read_messages(repo, Some("claude:quiet"), 1).unwrap();
+        assert!(past.pinned_below_dropped_before_seq.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_row_without_msg_id_resolves_by_its_effective_id() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(3, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let found = get_message_by_id(repo, "msg-3")
+            .unwrap()
+            .expect("msg-3 resolves");
+        assert_eq!(found.seq, 3);
+        assert!(get_message_by_id(repo, "msg-4").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_leaves_a_within_cap_file_untouched() {
+        let now = now_epoch_ms();
+        let dir = repo_with_seeded_bus(broadcasts(1, 5, now));
+        let repo = dir.path().to_str().unwrap();
+        let path = lanes_messages_path(repo, false).unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap();
+        assert_eq!(acked, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_still_heals_an_over_cap_file() {
+        let now = now_epoch_ms();
+        let mut rows = broadcasts(1, 300, now);
+        rows.push(bus_row(301, None, now, "x".repeat(16)));
+        let dir = repo_with_seeded_bus(rows);
+        let repo = dir.path().to_str().unwrap();
+
+        assert_eq!(
+            ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap(),
+            0
+        );
+        let healed = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(healed.messages.len(), MAX_BUS_MESSAGES);
+    }
+
+    #[test]
+    fn the_over_cap_read_error_says_how_a_reader_repairs_it() {
+        let dir = repo_with_seeded_bus(Vec::new());
+        let repo = dir.path().to_str().unwrap();
+        let big = bus_row(
+            1,
+            None,
+            now_epoch_ms(),
+            "x".repeat(usize::try_from(MESSAGES_FILE_CAP).unwrap()),
+        );
+        let state = MessagesState {
+            next_seq: 1,
+            dropped_before_seq: 0,
+            messages: vec![big],
+        };
+        fs::write(
+            lanes_messages_path(repo, true).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        let err = read_messages(repo, None, 0)
+            .expect_err("over-cap file is refused")
+            .into_message();
+        assert!(err.contains("gitpulse_agent_send"), "{err}");
+        assert!(err.contains("acknowledging inbox read"), "{err}");
     }
 }

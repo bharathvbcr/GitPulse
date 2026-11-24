@@ -1576,3 +1576,51 @@ fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
         "nothing may be deposited"
     );
 }
+
+#[test]
+fn an_inbox_and_a_wait_carry_the_pinned_below_dropped_before_seq_list() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888806";
+    register_inbox_peer(&repo, sid, "pin-owner");
+    send_to_role(&repo, "pin-owner", "hello");
+
+    let inbox = super::a2a::handle_agent_inbox(super::AgentInboxArgs {
+        repo_path: repo.clone(),
+        for_peer: "pin-owner".into(),
+        provider_session_id: Some(sid.into()),
+        since_seq: None,
+        thread_key: None,
+        include_broadcasts: None,
+        ack: Some(false),
+        limit: None,
+    })
+    .expect("inbox");
+    assert_eq!(
+        inbox["pinned_below_dropped_before_seq"],
+        serde_json::json!([]),
+        "{inbox}"
+    );
+
+    let counter = AtomicUsize::new(0);
+    let wait = handle_agent_wait_with_counter(
+        AgentWaitArgs {
+            repo_path: repo.clone(),
+            for_peer: "pin-owner".into(),
+            provider_session_id: Some(sid.into()),
+            since_seq: None,
+            thread_key: None,
+            include_broadcasts: None,
+            timeout_ms: Some(0),
+            ack: Some(false),
+            limit: None,
+        },
+        &counter,
+        60_000,
+    )
+    .expect("wait");
+    assert_eq!(
+        wait["pinned_below_dropped_before_seq"],
+        serde_json::json!([]),
+        "{wait}"
+    );
+}
