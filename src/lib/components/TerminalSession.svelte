@@ -2256,7 +2256,14 @@
             // The addon exposes no canvas; its WebGL one is the only canvas
             // on the screen without a `-layer` class (the link layer has one).
             // The renderer loses its context on release (xterm.js #6068).
-            const canvas = [...(t.element?.querySelectorAll("canvas") ?? [])].find(
+            // Only the screen: the addon's glyph atlas, shared by terminals
+            // with the same config, parks its hidden 2D scratch canvas
+            // (`TextureAtlas._tmpCanvas`, also classless) on the root of
+            // whichever terminal last rasterized a glyph. Searched from the
+            // root, the WebGL canvas is found first only by document order;
+            // were that to change, release would lose nothing and the
+            // context would wait for the collector.
+            const canvas = [...(t.screenElement?.querySelectorAll("canvas") ?? [])].find(
               (node) => ![...node.classList].some((name) => name.endsWith("-layer")),
             );
             return {

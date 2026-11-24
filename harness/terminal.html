@@ -623,8 +623,17 @@
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
             // The addon also adds a 2D link layer (`xterm-link-layer`); the
-            // WebGL canvas is the one without a layer class.
-            const glCanvas = (el) => paneCanvases(el).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            // WebGL canvas is the one in the screen without a layer class.
+            // Not any canvas under the session: addon-webgl shares one glyph
+            // atlas between terminals with the same config, and the atlas parks
+            // its hidden 2D scratch canvas (`TextureAtlas._tmpCanvas`) on the
+            // root of whichever terminal last rasterized a new glyph, outside
+            // the screen, until the last terminal using it lets go. Which one
+            // that is depends on paint timing, and it is the atlas's canvas,
+            // not a context the session holds.
+            // Presence checks below use `paneCanvases`, which also leaves that
+            // scratch canvas out but counts every other canvas in the pane.
+            const glCanvas = (el) => [...el.querySelectorAll(".xterm-screen canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
             const frames = (count = 2) => new Promise((resolve) => {
               let left = count;
               const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
@@ -694,45 +703,58 @@
               () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const other = shown()[0];
+            const otherCanvas = glCanvas(other);
+            const otherGl = otherCanvas?.getContext("webgl2");
             check("switching tabs gives the other session its own context while this one is held",
               () => other !== target && other.dataset.renderer === "webgl" && target.dataset.renderer === "webgl"
                 && glCanvas(other) !== glCanvas(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(80);
             check("switching back inside the hold reuses this session's canvas, and the other is held, within the cap",
               () => shown()[0] === target && glCanvas(target) === firstCanvas && !firstGl.isContextLost()
-                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2);
+                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2
+                && sessionsAll().filter((el) => glCanvas(el)).length <= 2);
 
             // -- The hold ends: the context is freed on purpose, not left for the collector.
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
-            const otherCanvas = glCanvas(other);
+            // The canvas the other session draws to once shown again inside the
+            // hold: the held one, if the hold kept it (`otherCanvas`, above).
+            const reshownCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
             await wait(900);
+            // The hold's timer was armed at the keydown, so it is due ~750 ms
+            // before these waits end and fires first: timers run in order.
             // Given up means: back on the DOM renderer, the WebGL canvas it held
             // detached with its context lost, and no drawing canvas left. The
             // shared glyph atlas's scratch canvas may still sit here (see
             // `paneCanvases`); counting it failed this on the Ubuntu runner.
             // On failure each canvas still in the pane is listed.
+            const releasedCanvas = (node) => !!node && !other.contains(node) && !node.isConnected && !!node.getContext("webgl2")?.isContextLost();
             check("a session that stays hidden past the hold gives its context up",
-              () => (other.dataset.renderer === "dom" && !paneCanvases(other).length
-                && !!otherCanvas && !otherCanvas.isConnected && !!otherCanvas.getContext("webgl2")?.isContextLost()) || (() => {
+              () => (other.dataset.renderer === "dom" && !paneCanvases(other).length && !glCanvas(other)
+                && !!otherGl && otherGl.isContextLost() && releasedCanvas(otherCanvas) && releasedCanvas(reshownCanvas)) || (() => {
                 throw new Error(JSON.stringify({
                   renderer: other.dataset.renderer, canvases: paneCanvases(other).length,
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
                   msSinceHidden: Math.round(performance.now() - hiddenAt),
                   survivors: [...other.querySelectorAll("canvas")].map((node) => ({
-                    held: node === otherCanvas, className: node.className, parent: node.parentElement?.className ?? null,
+                    held: node === otherCanvas, reshown: node === reshownCanvas, className: node.className, parent: node.parentElement?.className ?? null,
                     size: `${node.width}x${node.height}`,
                   })),
                   heldCanvasConnected: otherCanvas?.isConnected ?? null,
+                  reshownSameCanvas: reshownCanvas === otherCanvas,
+                  reshownCanvasConnected: reshownCanvas?.isConnected ?? null,
+                  heldContextLost: otherGl?.isContextLost() ?? null,
                 }));
               })());
             button("Hide the dock").click(); await wait(900);
+            // Strictly no canvas: with every session released the shared atlas has
+            // no owner left, is disposed, and its scratch canvas goes with it.
             check("hiding the dock past the hold releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length));
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length && !el.querySelector("canvas")));
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
               () => firstGl.isContextLost());
             await showAndProbe();
@@ -778,7 +800,8 @@
             } else {
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
-            check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1);
+            check("only the session on screen holds a canvas",
+              () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1 && sessionsAll().filter((el) => glCanvas(el)).length === 1);
 
             // -- The resource profile's cap budgets hidden contexts, never a pane on
             // screen: on the compact budget (two) three more panes beside an anchor
@@ -3049,11 +3072,26 @@
        *
        * A paint is any `onRender`; at each one every row is read back and must
        * carry the same frame number, or a half-drawn frame was shown.
+       *
+       * How many paints "the render rate" is depends on the machine, not on the
+       * writer: software WebGL on a loaded runner draws ~15 frames a second
+       * where the DOM draws 60. So the run also counts the frames it owes:
+       * every animation frame that follows a write xterm has parsed. xterm's
+       * render debouncer paints once in each of those frames unless mode 2026
+       * is on when the frame fires, which is the bug; through the writer every
+       * owed frame must be painted and show a new frame. Direct writes owe as
+       * many frames and paint almost none.
        */
       const SYNC_ROWS = 24;
       const SYNC_COLS = 100;
       const SYNC_FPS = 120;
       const SYNC_MS = 2000;
+      /**
+       * Owed frames a run needs before its paints can tell the writer from the
+       * bug: xterm's own 1000 ms timeout paints about twice in SYNC_MS, so
+       * five times that is a rate the bug cannot reach.
+       */
+      const SYNC_MIN_OWED = 5 * Math.ceil(SYNC_MS / 1000);
       /** The options of TerminalSession's own xterm that could touch painting. */
       const SESSION_LIKE = { lineHeight: 1.15, cursorBlink: true, allowTransparency: true, convertEol: false, allowProposedApi: true };
       const frameText = (id, rows, width) => {
@@ -3119,20 +3157,42 @@
           if (seen.some((id) => id !== seen[0])) partial++; else ids.add(seen[0]);
         };
         let acked = 0, received = 0, writes = 0, endedInsideBlock = 0;
+        // Frames owed: a write's parse asks xterm's debouncer for the next
+        // animation frame, so each frame that follows one or more parsed writes
+        // is one xterm will paint, unless mode 2026 is on when it fires. A
+        // parse runs in a task, never between two frame callbacks, so this
+        // loop and xterm's debouncer agree on which frame a write precedes.
+        let frames = 0, owed = 0, parsedSinceFrame = false, counting = true;
+        const countFrame = () => {
+          if (!counting) return;
+          frames++;
+          if (parsedSinceFrame) { owed++; parsedSinceFrame = false; }
+          requestAnimationFrame(countFrame);
+        };
         // xterm's own parser, not this harness's model of it: is mode 2026 on
         // when a write has been parsed? That is the state its animation frame meets.
         const modes = term._core?.coreService?.decPrivateModes;
         if (typeof modes?.synchronizedOutput !== "boolean") throw new Error("xterm's synchronized-output flag is not where this harness looks for it");
-        const write = (bytes, written) => term.write(bytes, () => { writes++; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
+        const write = (bytes, written) => term.write(bytes, () => { writes++; parsedSinceFrame = true; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
         const writer = createSyncFrameWriter({ write });
         await new Promise((resolve) => requestAnimationFrame(() => resolve()));
         const base = paints;
+        requestAnimationFrame(countFrame);
         const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
           received += chunk.length;
           const done = () => { acked += chunk.length; };
           if (viaWriter) writer.push(chunk, done); else write(chunk, done);
         });
-        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
+        // The last chunks may still be queued in xterm's write buffer: wait
+        // for every write callback, then for the frame that follows the last
+        // parse (its callbacks, ours and xterm's paint, all run before this
+        // timeout), so the tail is counted on both sides. A backlog that never
+        // drains is the ack check's to report.
+        for (const until = performance.now() + 5000; acked < received && performance.now() < until;) await wait(5);
+        await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+        // Read in the task the loop stops in: no frame runs in between.
+        counting = false;
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, frames, owed, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
         await wait(1300);
         out.paintsAfterAnother1p3s = paints - base;
         out.partialPaints = partial;
@@ -3216,7 +3276,12 @@
             // The direct arm's count (0 on Chrome, 0 to 10 on WebKit, against ~120)
             // is reported in the verdict's diagnostics, not asserted: it is
             // xterm's bug, and a fixed xterm would make it converge on this one.
-            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames)`, () => after.paints >= 40 && after.distinctFrames >= 40);
+            // The premise: the run gave xterm enough frames to paint that the
+            // bug's ~1 paint a second cannot pass for the writer's.
+            check(`${tag}: the run owed xterm enough frames to tell the writer from the bug (${after.owed} owed of ${after.frames} frames; at least ${SYNC_MIN_OWED})`, () => after.owed >= SYNC_MIN_OWED);
+            // The render rate is the browser's: every frame that followed a
+            // parsed write is painted, and shows a frame newer than the last.
+            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames, ${after.owed} frames owed; written directly: ${before.paints} paints of ${before.owed} owed)`, () => after.paints >= after.owed && after.distinctFrames >= after.owed);
             check(`${tag}: no write through the writer ends with mode 2026 on in xterm's own parser (${after.endedInsideBlock}/${after.writes}; written directly: ${before.endedInsideBlock}/${before.writes})`, () => after.writes > 0 && after.endedInsideBlock === 0);
             check(`${tag}: no half-drawn frame is ever painted (${before.partialPaints} direct, ${after.partialPaints} through the writer)`, () => before.partialPaints === 0 && after.partialPaints === 0);
             check(`${tag}: every byte received is acknowledged`, () => after.acked === after.received && before.acked === before.received);
