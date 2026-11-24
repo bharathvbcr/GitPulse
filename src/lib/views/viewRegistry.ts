@@ -107,6 +107,15 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
       },
     ],
   },
+  mavi: {
+    id: "mavi",
+    label: "Mavi",
+    summary:
+      "Coding agents as conversations: what the agent read, ran and edited, permission requests with the change they propose, and what each turn changed. Runs here or on an SSH host.",
+    paletteCommand: "Open Mavi — agent conversations and their live changes",
+    // One pane, no sections: the thread rail, the conversation and the
+    // changes column are one subject (a thread) read three ways.
+  },
   code: {
     id: "code",
     label: "Code",

@@ -38,7 +38,7 @@ describe("visibleViewNav", () => {
 
   it("drops the hidden ones, keeping registry order for the rest", () => {
     const shown = shownTabs(["code", "insights"], "history");
-    expect(shown).toEqual(["work", "history"]);
+    expect(shown).toEqual(["work", "mavi", "history"]);
   });
 
   it("keeps showing the active view even when it is hidden", () => {

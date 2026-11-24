@@ -23,9 +23,9 @@ export const WORKSPACE_VERSION = 1 as const;
 import { normalizeGroupName, MAX_COLLAPSED_GROUPS } from "./tabGroups";
 import { normalizeTabColor, type GroupColor, type TabColor } from "./tabColors";
 
-export type ViewTab = "work" | "code" | "history" | "insights";
+export type ViewTab = "work" | "mavi" | "code" | "history" | "insights";
 
-export const VIEW_TABS: readonly ViewTab[] = ["work", "code", "history", "insights"];
+export const VIEW_TABS: readonly ViewTab[] = ["work", "mavi", "code", "history", "insights"];
 
 export interface PersistedTab {
   path: string;

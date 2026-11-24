@@ -251,6 +251,30 @@ describe("check:workflows", () => {
     expect(coverage).toMatch(/toolchain:\s*nightly-\d{4}-\d{2}-\d{2}/);
   });
 
+  it("names the tool on every taiki-e/install-action step, so a re-pinned ref still installs it", () => {
+    // A per-tool ref (`@cargo-llvm-cov`) carries the tool in its name; a pinned
+    // v2 commit installs only what `tool:` lists. #28 re-pinned coverage's step
+    // from the one to the other with no `tool:`, and `cargo llvm-cov` then
+    // failed with "no such command" on every run.
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    let steps = 0;
+    for (const name of workflowFiles(dir)) {
+      const lines = readFileSync(`${dir}/${name}`, "utf8").split("\n");
+      lines.forEach((line, index) => {
+        if (!/^\s*uses:\s*taiki-e\/install-action@/.test(line)) return;
+        steps += 1;
+        const indent = line.search(/\S/);
+        const block: string[] = [];
+        for (const next of lines.slice(index + 1)) {
+          if (next.trim() !== "" && next.search(/\S/) <= indent - 2) break;
+          block.push(next);
+        }
+        expect(block.join("\n"), `${name}:${index + 1}`).toMatch(/^\s*with:\s*\n\s*tool:\s*\S+@\S+/m);
+      });
+    }
+    expect(steps).toBeGreaterThan(0);
+  });
+
   it("keeps the serial gate and also runs the suite in parallel, in its own workflow", () => {
     const read = (name: string) =>
       readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");

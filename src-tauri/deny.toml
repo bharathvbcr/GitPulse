@@ -33,6 +33,14 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; upstream tauri plugins require zbus 5" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; upstream tauri plugins require zbus 5" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; upstream tauri plugins require zbus 5" },
+  # Repeating nonces for *private* (encrypted) cookies after fork(). cookie
+  # compiles that code only with its `private` feature, and this graph enables
+  # none of cookie's features (Tauri depends on it for the `Cookie` type alone),
+  # so the affected code is not in the binary. The fix, 0.18.3, was published
+  # 2026-11-23 and is held back by the 3-day publish cooldown in
+  # .cargo/config.toml until 2026-11-26. Remove this entry and run
+  # `cargo update -p cookie` then.
+  { id = "RUSTSEC-2026-0594", reason = "private-cookie code not compiled (no cookie features enabled); fixed 0.18.3 is inside the publish cooldown until 2026-11-26" },
 ]
 
 [licenses]

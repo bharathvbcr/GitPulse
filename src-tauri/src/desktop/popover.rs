@@ -412,6 +412,7 @@ fn is_status_allowed(id: &str) -> bool {
                     | NativeAction::TabHistory
                     | NativeAction::TabCode
                     | NativeAction::TabInsights
+                    | NativeAction::TabMavi
                     | NativeAction::Fleet
                     | NativeAction::Agents
                     | NativeAction::TerminalDock
