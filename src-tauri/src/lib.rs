@@ -518,6 +518,8 @@ pub fn run() {
             cmd_get_bezier_connector,
             cmd_list_tags,
             cmd_get_reflog,
+            cmd_list_turn_checkpoints,
+            cmd_diff_turn_checkpoint,
             cmd_reset_preview,
             cmd_search_content,
             cmd_get_language_stats,

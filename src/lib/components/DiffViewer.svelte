@@ -102,6 +102,7 @@
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
   const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
+  const loadTurnCheckpointsPanel = () => import("./TurnCheckpointsPanel.svelte");
   import EmptyState from "./EmptyState.svelte";
   import Checkbox from "./Checkbox.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -2010,6 +2011,13 @@
             onCompare={compareCommits}
             onExitCompare={exitCompare}
             onPickWorkingTree={pickWorkingTree}
+          />
+        {/snippet}
+        {#snippet turns()}
+          <LazyMount
+            load={loadTurnCheckpointsPanel}
+            name="Agent turn checkpoints"
+            props={{ repoPath: $repoStore.currentPath }}
           />
         {/snippet}
       </DiffFileRail>
