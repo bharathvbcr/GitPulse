@@ -21,11 +21,12 @@ import {
 import { MAX_NAME_LENGTH, validateTheme } from "./themeSchema";
 import type { ThemeImport } from "./themeFile";
 
-export const MAX_VSCODE_JSON_BYTES = 256 * 1024;
+export const MAX_VSCODE_JSON_BYTES = 512 * 1024;
 export const MAX_VSIX_BYTES = 2 * 1024 * 1024;
 export const MAX_VSIX_ENTRIES = 256;
 export const MAX_VSIX_ENTRY_BYTES = 512 * 1024;
 export const MAX_VSCODE_COLOR_KEYS = 3000;
+export const MAX_INCLUDE_DEPTH = 4;
 export const MIN_STATUS_ACCENT_SEPARATION = 30;
 
 const ZIP_EOCD_SIG = 0x06054b50;
@@ -276,7 +277,22 @@ function clearAndFitStatusColor(
       h: safeHue,
     }),
   );
-  return formatHex(fitReadableColor(clearedRgb, base, appearance));
+  let fitted = fitReadableColor(clearedRgb, base, appearance);
+  if (accent.c >= ACHROMATIC_ACCENT_CHROMA) {
+    const fittedDelta = signedHueDistance(accent.h, rgbToOklch(fitted).h);
+    if (Math.abs(fittedDelta) < MIN_STATUS_ACCENT_SEPARATION) {
+      const nudge = signedHueDistance(accent.h, safeHue) >= 0 ? 4 : -4;
+      const nudgedRgb = oklchToRgb(
+        clampToGamut({
+          l: sourceLch.l,
+          c: Math.max(sourceLch.c, 0.11),
+          h: normalizeHue(safeHue + nudge),
+        }),
+      );
+      fitted = fitReadableColor(nudgedRgb, base, appearance);
+    }
+  }
+  return formatHex(fitted);
 }
 
 function extractThemeNameFromFileName(fileName?: string): string | undefined {
@@ -315,6 +331,20 @@ export function importVsCodeThemeText(text: string, hints: VsCodeThemeHints = {}
   if (!isPlainRecord(parsed) || !isPlainRecord(parsed.colors)) {
     return { ok: false, reason: "The theme file has no VS Code `colors` object.", errors: [] };
   }
+  return importVsCodeThemeObject(parsed, hints);
+}
+
+/**
+ * Converts an already-parsed VS Code theme object into a validated
+ * `gitpulse-theme/1` palette with OKLCH accent-status hue clearance (`>= 30 deg`).
+ */
+export function importVsCodeThemeObject(
+  parsed: Record<string, unknown>,
+  hints: VsCodeThemeHints = {},
+): ThemeImport {
+  if (!isPlainRecord(parsed.colors)) {
+    return { ok: false, reason: "The theme file has no VS Code `colors` object.", errors: [] };
+  }
   const colorEntries = Object.keys(parsed.colors);
   if (colorEntries.length > MAX_VSCODE_COLOR_KEYS) {
     return {
@@ -324,7 +354,11 @@ export function importVsCodeThemeText(text: string, hints: VsCodeThemeHints = {}
     };
   }
 
-  const initialBackdrop = hints.appearanceHint === "light" ? DEFAULT_LIGHT_BASE : DEFAULT_DARK_BASE;
+  const initialIsLight =
+    parsed.type === "light" ||
+    parsed.type === "hcLight" ||
+    (parsed.type !== "dark" && parsed.type !== "hcDark" && hints.appearanceHint === "light");
+  const initialBackdrop = initialIsLight ? DEFAULT_LIGHT_BASE : DEFAULT_DARK_BASE;
   const baseRaw = pickColor(
     parsed.colors,
     ["editor.background", "sideBar.background", "panel.background", "workbench.background"],
@@ -409,22 +443,33 @@ export function importVsCodeThemeText(text: string, hints: VsCodeThemeHints = {}
     validated.theme.appearance,
   );
   if (!derived.ok) {
-    // Fall back to canonical contrast-safe base + accent if the imported base made surfaces uncontrastable.
+    // Recompute accent & status colors against canonical contrast-safe base if the imported base failed deriveTokens.
+    const safeBaseHex = SHIPPED_BASE_HEX[appearance];
+    const safeBaseRgb = parseHexWithAlpha(safeBaseHex, initialBackdrop) ?? initialBackdrop;
+    const safeAccentFit = fitReadableColor(accentRaw, safeBaseRgb, appearance);
+    const safeAccentOklch = rgbToOklch(safeAccentFit);
     const safeCandidate = {
       ...validated.theme,
       colors: {
-        base: SHIPPED_BASE_HEX[appearance],
-        accent: formatHex(accentFit),
+        base: safeBaseHex,
+        accent: formatHex(safeAccentFit),
         contrast: SHIPPED_CONTRAST,
-        ok: validated.theme.colors.ok,
-        warn: validated.theme.colors.warn,
-        danger: validated.theme.colors.danger,
-        info: validated.theme.colors.info,
+        ok: clearAndFitStatusColor(okRaw, STATUS_HUES.ok, safeAccentOklch, safeBaseRgb, appearance),
+        warn: clearAndFitStatusColor(warnRaw, STATUS_HUES.warn, safeAccentOklch, safeBaseRgb, appearance),
+        danger: clearAndFitStatusColor(dangerRaw, STATUS_HUES.danger, safeAccentOklch, safeBaseRgb, appearance),
+        info: clearAndFitStatusColor(infoRaw, STATUS_HUES.info, safeAccentOklch, safeBaseRgb, appearance),
       },
     };
     const rechecked = validateTheme(safeCandidate);
     if (!rechecked.ok) {
       return { ok: false, reason: "The VS Code theme colors couldn't pass contrast checks.", errors: rechecked.errors };
+    }
+    const rederived = deriveTokens(
+      { ...rechecked.theme.colors, contrast: rechecked.theme.colors.contrast ?? SHIPPED_CONTRAST },
+      rechecked.theme.appearance,
+    );
+    if (!rederived.ok) {
+      return { ok: false, reason: "The VS Code theme colors couldn't pass contrast checks.", errors: [] };
     }
     return { ok: true, theme: rechecked.theme, ignoredKeys: [] };
   }
@@ -446,10 +491,13 @@ function isSafeArchivePath(name: string): boolean {
 }
 
 function findEocdOffset(bytes: Uint8Array): number {
+  if (bytes.length < 22) return -1;
   const minOffset = Math.max(0, bytes.length - 22 - 65_535);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let offset = bytes.length - 22; offset >= minOffset; offset -= 1) {
-    if (view.getUint32(offset, true) === ZIP_EOCD_SIG) return offset;
+    if (view.getUint32(offset, true) !== ZIP_EOCD_SIG) continue;
+    const commentLen = view.getUint16(offset + 20, true);
+    if (offset + 22 + commentLen === bytes.length) return offset;
   }
   return -1;
 }
@@ -469,7 +517,7 @@ function readZipCentralDirectory(bytes: Uint8Array): ZipEntry[] {
   }
   const cdOffset = view.getUint32(eocdOffset + 16, true);
   const cdSize = view.getUint32(eocdOffset + 12, true);
-  if (cdOffset + cdSize > bytes.length) {
+  if (cdOffset + cdSize > eocdOffset) {
     throw new Error("The .vsix archive directory is truncated.");
   }
 
@@ -477,8 +525,12 @@ function readZipCentralDirectory(bytes: Uint8Array): ZipEntry[] {
   const entries: ZipEntry[] = [];
   let cursor = cdOffset;
   for (let idx = 0; idx < entryCount; idx += 1) {
-    if (cursor + 46 > bytes.length || view.getUint32(cursor, true) !== ZIP_CD_SIG) {
+    if (cursor + 46 > eocdOffset || view.getUint32(cursor, true) !== ZIP_CD_SIG) {
       throw new Error("The .vsix archive directory is malformed.");
+    }
+    const flags = view.getUint16(cursor + 8, true);
+    if ((flags & 0x1) !== 0) {
+      throw new Error("Encrypted .vsix archives aren't supported.");
     }
     const method = view.getUint16(cursor + 10, true);
     const compressedSize = view.getUint32(cursor + 20, true);
@@ -487,8 +539,18 @@ function readZipCentralDirectory(bytes: Uint8Array): ZipEntry[] {
     const extraLen = view.getUint16(cursor + 30, true);
     const commentLen = view.getUint16(cursor + 32, true);
     const localHeaderOffset = view.getUint32(cursor + 42, true);
+    if (
+      compressedSize === 0xffffffff ||
+      uncompressedSize === 0xffffffff ||
+      localHeaderOffset === 0xffffffff
+    ) {
+      throw new Error("ZIP64 .vsix archives are not supported.");
+    }
+    if (compressedSize > MAX_VSIX_BYTES) {
+      throw new Error("A compressed .vsix entry exceeds the archive size limit.");
+    }
     const nameEnd = cursor + 46 + nameLen;
-    if (nameEnd > bytes.length) {
+    if (nameEnd > eocdOffset) {
       throw new Error("The .vsix entry name extends past EOF.");
     }
     const name = decoder.decode(bytes.subarray(cursor + 46, nameEnd));
@@ -512,15 +574,18 @@ async function inflateBounded(compressed: Uint8Array, maxBytes: number): Promise
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel();
-      throw new Error(`Archive entry exceeds ${maxBytes / 1024} KB uncompressed limit.`);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(`Archive entry exceeds ${maxBytes / 1024} KB uncompressed limit.`);
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } finally {
+    await reader.cancel().catch(() => {});
   }
   const out = new Uint8Array(total);
   let offset = 0;
@@ -578,10 +643,70 @@ function uiThemeToAppearance(uiTheme: unknown): Appearance | undefined {
   return undefined;
 }
 
+function lookupZipEntry(
+  byName: ReadonlyMap<string, ZipEntry>,
+  byLowerName: ReadonlyMap<string, ZipEntry>,
+  targetPath: string,
+): ZipEntry | undefined {
+  return byName.get(targetPath) ?? byLowerName.get(targetPath.toLowerCase());
+}
+
+async function loadVsixThemeWithIncludes(
+  bytes: Uint8Array,
+  byName: ReadonlyMap<string, ZipEntry>,
+  byLowerName: ReadonlyMap<string, ZipEntry>,
+  entryPath: string,
+  visited: Set<string>,
+  depth = 0,
+): Promise<Record<string, unknown>> {
+  const visitKey = entryPath.toLowerCase();
+  if (visited.has(visitKey)) {
+    throw new Error("Circular .vsix theme include detected.");
+  }
+  if (depth > MAX_INCLUDE_DEPTH) {
+    throw new Error("Nested .vsix theme includes exceed the depth limit.");
+  }
+  visited.add(visitKey);
+  const entry = lookupZipEntry(byName, byLowerName, entryPath);
+  if (!entry) {
+    throw new Error(`Missing included .vsix theme "${entryPath}".`);
+  }
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const rawText = decoder.decode(await readZipEntryBytes(bytes, entry));
+  const parsed = JSON.parse(stripJsonc(rawText)) as unknown;
+  if (!isPlainRecord(parsed)) {
+    throw new Error("The VS Code theme file is not a JSON object.");
+  }
+  if (typeof parsed.include !== "string" || !parsed.include.trim()) {
+    return parsed;
+  }
+  const basePath = resolveArchiveRelativePath(entry.name, parsed.include);
+  const baseObj = await loadVsixThemeWithIncludes(bytes, byName, byLowerName, basePath, visited, depth + 1);
+  const mergedColors = {
+    ...(isPlainRecord(baseObj.colors) ? baseObj.colors : {}),
+    ...(isPlainRecord(parsed.colors) ? parsed.colors : {}),
+  };
+  if (Object.keys(mergedColors).length > MAX_VSCODE_COLOR_KEYS) {
+    throw new Error(`Merged VS Code theme exceeds ${MAX_VSCODE_COLOR_KEYS} color keys.`);
+  }
+  return {
+    ...baseObj,
+    ...parsed,
+    name: parsed.name ?? baseObj.name,
+    type: parsed.type ?? baseObj.type,
+    colors: mergedColors,
+  };
+}
+
 /**
- * Extracts and converts the primary theme from a VS Code `.vsix` extension archive.
+ * Extracts and converts a matching theme from a VS Code `.vsix` extension archive,
+ * preferring `preferredAppearance` when the extension contributes multiple themes.
  */
-export async function importVsixBytes(bytes: Uint8Array, fileName?: string): Promise<ThemeImport> {
+export async function importVsixBytes(
+  bytes: Uint8Array,
+  fileName?: string,
+  preferredAppearance?: Appearance,
+): Promise<ThemeImport> {
   if (bytes.byteLength > MAX_VSIX_BYTES) {
     return {
       ok: false,
@@ -592,9 +717,10 @@ export async function importVsixBytes(bytes: Uint8Array, fileName?: string): Pro
   try {
     const entries = readZipCentralDirectory(bytes);
     const byName = new Map(entries.map((entry) => [entry.name, entry]));
+    const byLowerName = new Map(entries.map((entry) => [entry.name.toLowerCase(), entry]));
     const manifestEntry =
-      byName.get("extension/package.json") ??
-      entries.find((entry) => /^[^/]+\/package\.json$/.test(entry.name));
+      lookupZipEntry(byName, byLowerName, "extension/package.json") ??
+      entries.find((entry) => /^[^/]+\/package\.json$/i.test(entry.name));
     if (!manifestEntry) {
       return { ok: false, reason: "The .vsix archive has no extension/package.json manifest.", errors: [] };
     }
@@ -611,21 +737,41 @@ export async function importVsixBytes(bytes: Uint8Array, fileName?: string): Pro
         ? manifest.displayName
         : extractThemeNameFromFileName(fileName);
 
-    for (const item of themes) {
+    const orderedThemes = preferredAppearance
+      ? [
+          ...themes.filter((item) => isPlainRecord(item) && uiThemeToAppearance(item.uiTheme) === preferredAppearance),
+          ...themes.filter((item) => !isPlainRecord(item) || uiThemeToAppearance(item.uiTheme) !== preferredAppearance),
+        ]
+      : themes;
+
+    let lastFailure: ThemeImport | null = null;
+    for (const item of orderedThemes) {
       if (!isPlainRecord(item) || typeof item.path !== "string") continue;
       const targetPath = resolveArchiveRelativePath(manifestEntry.name, item.path);
-      const targetEntry = byName.get(targetPath);
-      if (!targetEntry) continue;
-      const themeText = decoder.decode(await readZipEntryBytes(bytes, targetEntry));
+      if (!lookupZipEntry(byName, byLowerName, targetPath)) continue;
+      const themeObj = await loadVsixThemeWithIncludes(
+        bytes,
+        byName,
+        byLowerName,
+        targetPath,
+        new Set<string>(),
+      );
       const label = typeof item.label === "string" ? item.label : manifestDisplayName;
-      const result = importVsCodeThemeText(themeText, {
+      const result = importVsCodeThemeObject(themeObj, {
         fallbackName: label,
         appearanceHint: uiThemeToAppearance(item.uiTheme),
       });
       if (result.ok) return result;
+      lastFailure = result;
     }
 
-    return { ok: false, reason: "No usable VS Code theme JSON was found inside the .vsix archive.", errors: [] };
+    return (
+      lastFailure ?? {
+        ok: false,
+        reason: "No usable VS Code theme JSON was found inside the .vsix archive.",
+        errors: [],
+      }
+    );
   } catch (error) {
     return {
       ok: false,

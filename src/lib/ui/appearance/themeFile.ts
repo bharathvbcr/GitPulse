@@ -31,7 +31,7 @@ import {
 import {
   MAX_VSCODE_JSON_BYTES,
   MAX_VSIX_BYTES,
-  importVsCodeThemeText,
+  importVsCodeThemeObject,
   importVsixBytes,
   isVsCodeThemeObject,
   stripJsonc,
@@ -85,7 +85,7 @@ export function importThemeText(text: string): ThemeImport {
     }
   }
   if (isVsCodeThemeObject(parsed)) {
-    return importVsCodeThemeText(text);
+    return importVsCodeThemeObject(parsed);
   }
   if (byteLength > MAX_THEME_FILE_BYTES) {
     return {
@@ -109,7 +109,10 @@ export function importThemeText(text: string): ThemeImport {
 }
 
 /** Imports a user-picked `.gitpulse-theme.json`, VS Code `.json`/`.jsonc`, or `.vsix` file. */
-export async function importThemeFile(file: File): Promise<ThemeImport> {
+export async function importThemeFile(
+  file: File,
+  options?: { preferredAppearance?: Appearance },
+): Promise<ThemeImport> {
   if (/\.vsix$/i.test(file.name)) {
     if (file.size > MAX_VSIX_BYTES) {
       return {
@@ -119,7 +122,7 @@ export async function importThemeFile(file: File): Promise<ThemeImport> {
       };
     }
     const bytes = new Uint8Array(await file.arrayBuffer());
-    return importVsixBytes(bytes, file.name);
+    return importVsixBytes(bytes, file.name, options?.preferredAppearance);
   }
   if (file.size > MAX_VSCODE_JSON_BYTES) {
     return {

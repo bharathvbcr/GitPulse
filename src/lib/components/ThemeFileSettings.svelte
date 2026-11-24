@@ -91,7 +91,7 @@
     }
     let result;
     try {
-      result = await importThemeFile(file);
+      result = await importThemeFile(file, { preferredAppearance: theme });
     } catch (error) {
       failure = describeFailure({ verb: "read", object: "the file" }, error);
       return;
@@ -101,6 +101,7 @@
       return;
     }
     interfaceStore.patchAppearance(themeToPatch(result.theme));
+    themeStore.setTheme(result.theme.appearance);
     // Kept on the shelf too, so it can be switched back to after trying another.
     const shelved = interfaceStore.saveTheme(result.theme);
     name = result.theme.name;

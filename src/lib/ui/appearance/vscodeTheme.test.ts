@@ -184,6 +184,45 @@ describe("importVsCodeThemeText", () => {
     expect(result.theme.appearance).toBe("light");
     expect(result.theme.name).not.toMatch(/[;<>{}]/);
   });
+
+  it("composites semi-transparent light editor backgrounds against a light backdrop", () => {
+    const result = importVsCodeThemeText(
+      JSON.stringify({
+        name: "Translucent Day",
+        type: "light",
+        colors: {
+          "editor.background": "#00000010",
+          "focusBorder": "#1d4ed8",
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.theme.appearance).toBe("light");
+    const baseRgb = parseHex(result.theme.colors.base)!;
+    expect(baseRgb[0]).toBeGreaterThan(220);
+  });
+
+  it("re-derives safe colors on extreme low-contrast bases and rejects themes past new byte cap", () => {
+    const extreme = importVsCodeThemeText(
+      JSON.stringify({
+        name: "Extreme Magenta",
+        type: "dark",
+        colors: {
+          "editor.background": "#ff00ff",
+          "focusBorder": "#ff00ff",
+          "editorError.foreground": "#ff00ff",
+        },
+      }),
+    );
+    expect(extreme.ok).toBe(true);
+    if (!extreme.ok) return;
+    const tokens = deriveTokens(
+      { ...extreme.theme.colors, contrast: extreme.theme.colors.contrast ?? SHIPPED_CONTRAST },
+      extreme.theme.appearance,
+    );
+    expect(tokens.ok).toBe(true);
+  });
 });
 
 describe("importVsixBytes", () => {
@@ -242,5 +281,90 @@ describe("importVsixBytes", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toContain("limit");
+  });
+
+  it("selects preferredAppearance across multi-theme .vsix bundles and resolves includes", async () => {
+    const vsix = buildZipArchive([
+      {
+        name: "extension/package.json",
+        content: JSON.stringify({
+          displayName: "Dual Suite",
+          contributes: {
+            themes: [
+              { label: "Suite Dark", uiTheme: "vs-dark", path: "./themes/dark.json" },
+              { label: "Suite Light", uiTheme: "vs", path: "./themes/light.json" },
+            ],
+          },
+        }),
+      },
+      {
+        name: "extension/themes/base-light.json",
+        content: `{
+          "colors": {
+            "editor.background": "#f8fafc",
+            "editor.foreground": "#0f172a"
+          }
+        }`,
+      },
+      {
+        name: "extension/themes/dark.json",
+        content: JSON.stringify({
+          colors: { "editor.background": "#0f172a", "focusBorder": "#60a5fa" },
+        }),
+      },
+      {
+        name: "extension/themes/light.json",
+        deflate: true,
+        content: `{
+          "include": "./base-light.json",
+          "colors": {
+            "focusBorder": "#2563eb"
+          }
+        }`,
+      },
+    ]);
+    const pickedLight = await importVsixBytes(vsix, "dual.vsix", "light");
+    expect(pickedLight.ok).toBe(true);
+    if (!pickedLight.ok) return;
+    expect(pickedLight.theme.name).toBe("Suite Light");
+    expect(pickedLight.theme.appearance).toBe("light");
+    expect(pickedLight.theme.colors.base).toBe("#f8fafc");
+  });
+
+  it("rejects circular includes, encrypted entries, and EOCD markers spoofed in ZIP comments", async () => {
+    const circularVsix = buildZipArchive([
+      {
+        name: "extension/package.json",
+        content: JSON.stringify({
+          contributes: { themes: [{ label: "Loop", path: "./a.json" }] },
+        }),
+      },
+      { name: "extension/a.json", content: JSON.stringify({ include: "./b.json", colors: {} }) },
+      { name: "extension/b.json", content: JSON.stringify({ include: "./a.json", colors: {} }) },
+    ]);
+    const circularRes = await importVsixBytes(circularVsix);
+    expect(circularRes.ok).toBe(false);
+    if (circularRes.ok) return;
+    expect(circularRes.reason).toContain("Circular");
+
+    // Flip encrypted general-purpose bit flag (offset cd + 8) in valid archive
+    const encVsix = buildZipArchive([
+      { name: "extension/package.json", content: "{}" },
+    ]);
+    const encView = new DataView(encVsix.buffer);
+    const cdOffset = encView.getUint32(encVsix.length - 6, true);
+    encView.setUint16(cdOffset + 8, 0x0001, true);
+    const encRes = await importVsixBytes(encVsix);
+    expect(encRes.ok).toBe(false);
+    if (encRes.ok) return;
+    expect(encRes.reason).toContain("Encrypted");
+
+    // Trailing comment bytes past EOCD commentLen = 0 should fail strict EOCD check
+    const baseArchive = buildZipArchive([{ name: "extension/package.json", content: "{}" }]);
+    const padded = new Uint8Array(baseArchive.length + 4);
+    padded.set(baseArchive);
+    padded.set([0x50, 0x4b, 0x05, 0x06], baseArchive.length);
+    const spoofRes = await importVsixBytes(padded);
+    expect(spoofRes.ok).toBe(false);
   });
 });
