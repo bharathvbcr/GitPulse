@@ -115,6 +115,22 @@ export function checkoutsPersistingCredentials(yaml) {
 }
 
 /**
+ * Indexes (0-based, in file order) of `taiki-e/install-action` steps whose own
+ * `with:` names no `tool:`. Pinned to a commit of the action itself (a `# v2`
+ * pin) the action installs nothing without one and still succeeds; only its
+ * per-tool tags carry a default. A version bump that moves such a pin from a
+ * tool tag to a release commit therefore empties the step silently, and the
+ * job fails later on a missing command.
+ *
+ * @param {string} yaml
+ * @returns {number[]}
+ */
+export function installActionsWithoutTool(yaml) {
+  const steps = yaml.split(/\n(?=[ \t]*- )/).filter((step) => /^\s*(?:- )?uses:\s+taiki-e\/install-action@/m.test(step));
+  return steps.flatMap((step, index) => (/^\s+tool:\s*\S/m.test(step) ? [] : [index]));
+}
+
+/**
  * @typedef {{ text: string, subs: string[] }} ShellWord  a word, and the source of each `$(...)`, `<(...)` or backtick inside it
  * @typedef {ShellWord[]} ShellStage  one command of a pipeline
  */
@@ -367,6 +383,9 @@ export function workflowPolicyFindings(dir) {
       ...unpinnedActions(text).map((ref) => `${name}: ${ref} is not pinned to a 40-character commit SHA`),
       ...checkoutsPersistingCredentials(text).map(
         (index) => `${name}: checkout #${index + 1} does not set persist-credentials: false`,
+      ),
+      ...installActionsWithoutTool(text).map(
+        (index) => `${name}: taiki-e/install-action #${index + 1} names no tool, so it installs nothing`,
       ),
     ];
   });

@@ -58,8 +58,13 @@ jobs:
           toolchain: nightly-2026-10-05
           components: llvm-tools-preview
 
+      # The tool is named here: pinned to an install-action release commit,
+      # the action installs nothing without `tool:` (its per-tool tags carry
+      # that default, and a version bump moved this pin off one).
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Key the Rust cache to this runner image
         shell: bash

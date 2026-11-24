@@ -8,6 +8,7 @@ import { GATES } from "./ci-local.mjs";
 import {
   INSTALL_HINT,
   checkoutsPersistingCredentials,
+  installActionsWithoutTool,
   hasWorkflowLevelPermissions,
   interpret,
   pipedDownloads,
@@ -93,6 +94,27 @@ describe("check:workflows", () => {
       "dtolnay/rust-toolchain@stable",
       "owner/short@3d3c42e",
     ]);
+  });
+
+  it("refuses an install-action step that names no tool", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: Bare release pin",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "      - name: Named",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "        with:",
+      "          tool: cargo-nextest@0.9.150",
+      "      - name: Empty tool",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "        with:",
+      "          tool:",
+      "      - run: echo tool: cargo-llvm-cov",
+    ].join("\n");
+    // A `tool:` in another step, or one with no value, names nothing for this one.
+    expect(installActionsWithoutTool(yaml)).toEqual([0, 2]);
   });
 
   it("refuses a checkout that leaves the token in .git/config", () => {
