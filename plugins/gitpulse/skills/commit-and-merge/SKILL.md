@@ -1,6 +1,6 @@
 ---
 name: commit-and-merge
-description: Commit the finished work in a repository's worktrees and merge the verified branches into its default branch, while keeping every locked-in branch in place. Locked-in means a locked worktree, a branch a live agent holds, a protected or archive name, or the repository's own list (git config gitpulse.lockedBranch, such as labs/*). A locked-in branch may be merged once it verifies, but is never deleted, rewritten or committed into. Use when asked to "commit and merge the branches", "merge everything into main", "land the lanes", or "merge but keep my locked branches". It never pushes and never deletes a remote branch.
+description: Commit the finished work in a repository's worktrees and merge the verified branches into its default branch, while keeping every locked-in branch in place. Locked-in means a locked worktree, a branch a live agent holds, a protected or archive name, or the repository's own list (git config gitpulse.lockedBranch, such as labs/**). A locked-in branch may be merged once it verifies, but is never deleted, rewritten or committed into. Use when asked to "commit and merge the branches", "merge everything into main", "land the lanes", or "merge but keep my locked branches". It never pushes and never deletes a remote branch.
 license: MIT
 compatibility: git 2.43+ (merge-tree --write-tree, merge-file --object-id), gitpulse-mcp on PATH, a repository trusted in GitPulse, and the repository's own gate toolchain.
 metadata:
@@ -29,7 +29,7 @@ Settings live in the repository's local git config. Every worktree of the clone 
 
 | Key | Meaning | Default |
 |---|---|---|
-| `gitpulse.lockedBranch` | Multi-valued. Each value is a branch name or a glob under `refs/heads/`, such as `labs/*` or `release/2026-*`. | none |
+| `gitpulse.lockedBranch` | Multi-valued. Each value is a branch name or a pattern under `refs/heads/`, such as `labs`, `labs/**` or `release/2026-*` (matching below). | none |
 | `gitpulse.gate` | The full gate command, run from the root of the worktree under test. | discovered (below) |
 | `gitpulse.trainWorktree` | Path of the persistent integration worktree. A sibling path when the gate needs sibling checkouts beside it. | `<repo>/.worktrees/merge-train` |
 | `gitpulse.gateDiskGb` | Free disk, in GiB, a full gate run needs. | 30 |
@@ -64,9 +64,9 @@ A branch is **locked-in** when any of these is true:
    - an `in_progress` card on `gitpulse_list_tasks` names it;
    - `lsof -d cwd` shows a process whose working directory is inside its worktree. Agents' build and test children count.
 3. **Protected name.**
-   - The default branch, plus `main`, `master`, `develop`, `staging`, `production`, `trunk` and `release/*`.
-   - GitPulse's work-in-progress patterns: `wip/*`, `draft/*`, `*/wip` and `*/draft`.
-   - `archive/*`.
+   - The default branch, plus `main`, `master`, `develop`, `staging`, `production`, `trunk` and `release/**`.
+   - GitPulse's work-in-progress patterns: `wip/**`, `draft/**`, `**/wip` and `**/draft`.
+   - `archive/**`.
 4. **The repository's list:** every `gitpulse.lockedBranch` value.
 
 **Expanding patterns.** Expand the protected names and the repository's values the same way, with git's own matching. Never hand-roll a glob.
@@ -75,7 +75,12 @@ A branch is **locked-in** when any of these is true:
    ```sh
    git for-each-ref --format='%(refname:short)' "refs/heads/<value>"
    ```
-   That matches with fnmatch, where `*` also crosses `/`. Run it once per pattern.
+   Run it once per pattern. The matching rules:
+   - `*` stays inside one path segment: `labs/*` matches `labs/geek` but **not** `labs/geek/v2`.
+   - `**` crosses `/`: `labs/**` matches both, and `**/wip` matches `wip` at any depth.
+   - A value with no wildcard matches that branch **and everything under `<value>/`**: `labs` matches `labs/geek` and `labs/geek/v2`.
+
+   So write a whole family as `labs` or `labs/**`, never `labs/*`.
 3. For remote branches (pull request heads), expand the same values under `refs/remotes/origin/<value>` after `git fetch origin`.
 
 **A repository value that matches nothing** may be a typo, and then a branch the owner meant to keep has no protection. Report it, and delete nothing in this run until the owner answers. Merging may go on.

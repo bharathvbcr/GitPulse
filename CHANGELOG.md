@@ -17,7 +17,7 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   and `gitpulse:wrap-up`.**
   - `commit-and-merge` commits finished worktrees and merges the verified
     branches into the default branch. It keeps every locked-in branch: locked
-    worktrees, branches a live agent holds, protected and `archive/*` names,
+    worktrees, branches a live agent holds, protected and `archive/**` names,
     and the repository's own list in `git config gitpulse.lockedBranch`.
     A locked-in branch may merge once it verifies, and is never deleted,
     rewritten or committed into.

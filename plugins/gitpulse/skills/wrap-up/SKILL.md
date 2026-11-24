@@ -90,9 +90,9 @@ Follow `gitpulse:commit-and-merge` steps 1 and 2: the inventory (with its unstar
 - board cards with critical severity;
 - `in_progress` cards whose sessions stopped mid-task.
 
-If the owner asked for pull requests too, run `gitpulse:merge-prs` now, before anything lands locally.
-- Then `git fetch origin`, and fast-forward the local default branch to `origin/<default>`. It has no local-only commits yet.
-- The train then builds on the merged remote, and merge-prs never meets a diverged local branch.
+If the owner asked for pull requests too, run `gitpulse:merge-prs` now, before anything lands locally. Then `git fetch origin`.
+- **The local default branch has no local-only commits** (`git rev-list --count origin/<default>..<default>` is 0): fast-forward it to `origin/<default>`.
+- **It has unpushed commits:** don't move it. Make the train's base a merge of `origin/<default>` into the local default, built in the integration worktree, and put that merge first in the plan. Then everything this run verifies already contains the merged pull requests.
 
 ## 3. Plan, then get one yes
 
