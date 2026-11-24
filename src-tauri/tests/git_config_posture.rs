@@ -230,6 +230,89 @@ fn tuning_violations(production: &str) -> Vec<String> {
     found
 }
 
+/// Files that name `core.fsmonitor` with a `true` that is not a git call a test
+/// makes: the apply's own argv (covered by `tuning_violations`), a table of
+/// fixture config entries, and this file's scanner samples.
+const FSMONITOR_TRUE_NOT_A_GIT_CALL: [&str; 3] = [
+    TUNING_ARGV_FILE,
+    "storage/repo_tuning/detector_tests.rs",
+    "git_config_posture.rs",
+];
+
+/// The guard that owns the built-in daemon's lifetime for a test repository.
+const FSMONITOR_GUARD: &str = "FsmonitorDaemon";
+
+/// Whether `text` turns the built-in fsmonitor daemon on and does not own it.
+///
+/// `core.fsmonitor=true` starts a detached `git fsmonitor--daemon` the first
+/// time git reads the repository, and it outlives the test and its tempdir
+/// (two orphans ran for hours and one held the cargo build-slot lock). A test
+/// that enables it takes `FsmonitorDaemon`, which turns the setting back off
+/// and stops the daemon; a bare `fsmonitor--daemon stop` is not enough, because
+/// a read still in flight starts another one after it.
+fn enables_the_daemon_without_owning_it(text: &str) -> bool {
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let enables = code.match_indices("core.fsmonitor").any(|(at, key)| {
+        let rest = &code[at + key.len()..];
+        let window: String = rest.chars().take(40).take_while(|c| *c != ';').collect();
+        window.contains("true")
+    });
+    enables && !code.contains(FSMONITOR_GUARD)
+}
+
+#[test]
+fn every_test_that_enables_the_fsmonitor_daemon_owns_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("tests"), &mut files);
+    assert!(files.len() > 100, "found only {} sources", files.len());
+    let mut unowned = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let rel = rel.strip_prefix("src/").unwrap_or(&rel);
+        if FSMONITOR_TRUE_NOT_A_GIT_CALL.contains(&rel) || rel.ends_with("git_config_posture.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source");
+        if enables_the_daemon_without_owning_it(&text) {
+            unowned.push(rel.to_string());
+        }
+    }
+    assert!(
+        unowned.is_empty(),
+        "these sources set core.fsmonitor to true without `{FSMONITOR_GUARD}` \
+         (test_support::fsmonitor), so the daemon they start outlives the test:\n{}",
+        unowned.join("\n")
+    );
+}
+
+#[test]
+fn the_daemon_ownership_scan_flags_a_test_that_only_stops_it_once() {
+    let bare_stop = r#"
+        git(&root, &["config", "core.fsmonitor", "true"]);
+        let _stop = DropGuard::new(root, |r| git(&r, &["fsmonitor--daemon", "stop"]));
+    "#;
+    assert!(enables_the_daemon_without_owning_it(bare_stop));
+    let owned = format!("{bare_stop}\nlet _d = {FSMONITOR_GUARD}::new(&root);");
+    assert!(!enables_the_daemon_without_owning_it(&owned));
+    // A hook path or `false` starts no daemon, and a comment is not a call.
+    assert!(!enables_the_daemon_without_owning_it(
+        r#"git(&["config", "core.fsmonitor", "false"]);"#
+    ));
+    assert!(!enables_the_daemon_without_owning_it(
+        "// `core.fsmonitor=true` starts a daemon"
+    ));
+}
+
 #[test]
 fn no_production_code_writes_repo_config_outside_the_tuning_apply() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
