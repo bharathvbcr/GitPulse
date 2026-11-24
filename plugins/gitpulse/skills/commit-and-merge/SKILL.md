@@ -207,7 +207,7 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
       - an overlapping path has staged changes (`git diff --cached --no-renames --name-only -z`);
       - the landing adds, deletes or changes the type or mode of an overlapping path;
       - either side of an overlap is a symlink or a submodule (mode `120000` or `160000`);
-      - a path the landing adds already exists on disk as a file or a directory, even an ignored one (`test -e`);
+      - a path the landing adds already exists on disk as a file, a directory or a symlink, even an ignored or dangling one (`test -e <path> || test -L <path>`);
       - a dirty path and a landed path differ but one is a directory prefix of the other (`foo` and `foo/bar`).
    3. **Save every dirty file** as a blob with `git hash-object -w -- <path>`, and keep the list. It proves later that nothing else changed, and it is what you restore from.
    4. **Merge each overlapping file** into a temporary file. Never merge in place, because a conflict writes markers into the holder's file:
