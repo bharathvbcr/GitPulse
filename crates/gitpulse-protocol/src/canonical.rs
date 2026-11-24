@@ -2,6 +2,17 @@
 //!
 //! All platforms (Rust desktop/daemon, Go relay, iOS Swift/UniFFI, Android Kotlin/UniFFI)
 //! compute identical byte sequences for `input_sha256` and approval signing payloads.
+//!
+//! Canonicalization rules:
+//! - Object keys are sorted lexicographically by UTF-8 bytes (self-consistent across
+//!   all GitPulse components; note this is UTF-8 byte order, NOT RFC 8785 JCS UTF-16
+//!   code-unit order).
+//! - Zero insignificant whitespace.
+//! - Numbers that cannot be represented losslessly (integers outside `i64`/`u64`,
+//!   non-round-trippable floats, `-0.0`, integer-valued floats like `1.0`, `NaN`/`Infinity`)
+//!   fail closed with [`ProtocolError::NonCanonicalNumber`] so the approval ticket
+//!   falls back to "approve at desk only" rather than rendering a different value on
+//!   mobile than the harness executes.
 
 use crate::error::{ProtocolError, Result};
 use crate::wire::ApprovalDecisionKind;
@@ -15,11 +26,31 @@ pub const APPROVAL_SIGNING_DOMAIN: &[u8] = b"gitpulse-approval/v1\n";
 /// Maximum nesting depth accepted during canonicalization to prevent stack abuse.
 const MAX_JSON_DEPTH: usize = 64;
 
-/// Serializes any `serde_json::Value` to deterministic canonical JSON UTF-8 bytes:
-/// - Object keys sorted lexicographically by UTF-8 byte order (matching UTF-16 for BMP/ASCII).
+/// Parses a raw JSON text string, rejects any lossy/non-canonical number literals
+/// BEFORE `serde_json::Value` parsing can silently coerce them into `f64`, and
+/// returns the parsed [`Value`].
+pub fn parse_canonical_json_value(raw_json: &str) -> Result<Value> {
+    validate_raw_json_numbers(raw_json)?;
+    let value: Value =
+        serde_json::from_str(raw_json).map_err(|e| ProtocolError::Json(e.to_string()))?;
+    // Verify canonical serialization succeeds as well (catches depth/number invariants).
+    let _ = canonical_json_bytes(&value)?;
+    Ok(value)
+}
+
+/// Parses and canonicalizes a raw JSON string to deterministic UTF-8 bytes, failing
+/// closed with [`ProtocolError::NonCanonicalNumber`] on any lossy number literal.
+pub fn canonical_json_from_str(raw_json: &str) -> Result<Vec<u8>> {
+    let value = parse_canonical_json_value(raw_json)?;
+    canonical_json_bytes(&value)
+}
+
+/// Serializes a `serde_json::Value` to deterministic canonical JSON UTF-8 bytes:
+/// - Object keys sorted lexicographically by UTF-8 byte order.
 /// - Zero insignificant whitespace.
-/// - Rejects non-finite floating-point values (`NaN`, `Infinity`) and excessive depth.
-/// - Normalizes `-0.0` to `0`.
+/// - Rejects non-finite floats, `-0.0`, integer-valued floats (which include integers
+///   above `u64::MAX` or below `i64::MIN` coerced to `f64` by `serde_json`), and
+///   excessive nesting depth.
 pub fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(256);
     write_canonical(value, &mut out, 0)?;
@@ -49,21 +80,39 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>, depth: usize) -> Result<()>
                 out.extend_from_slice(u.to_string().as_bytes());
             } else if let Some(f) = num.as_f64() {
                 if !f.is_finite() {
-                    return Err(ProtocolError::InvalidInput(
-                        "non-finite float in canonical JSON".to_string(),
+                    return Err(ProtocolError::NonCanonicalNumber(
+                        "non-finite float".to_string(),
                     ));
                 }
-                if f == 0.0 {
-                    out.push(b'0');
-                } else {
-                    let s = serde_json::to_string(&f)
-                        .map_err(|e| ProtocolError::Json(e.to_string()))?;
-                    out.extend_from_slice(s.as_bytes());
+                if f == 0.0 && f.is_sign_negative() {
+                    return Err(ProtocolError::NonCanonicalNumber(
+                        "negative zero float".to_string(),
+                    ));
                 }
+                // Any integer outside i64/u64 is coerced to f64 with fract() == 0.0,
+                // and float-formatted integers like `1.0` are ambiguous across JSON engines.
+                if f.fract() == 0.0 {
+                    return Err(ProtocolError::NonCanonicalNumber(format!(
+                        "integer-valued or out-of-range float: {num}"
+                    )));
+                }
+                let formatted =
+                    serde_json::to_string(&f).map_err(|e| ProtocolError::Json(e.to_string()))?;
+                let reparsed: f64 = formatted.parse().map_err(|_| {
+                    ProtocolError::NonCanonicalNumber(format!(
+                        "float failed round-trip parse: {num}"
+                    ))
+                })?;
+                if reparsed.to_bits() != f.to_bits() {
+                    return Err(ProtocolError::NonCanonicalNumber(format!(
+                        "non-round-trippable float: {num}"
+                    )));
+                }
+                out.extend_from_slice(formatted.as_bytes());
             } else {
-                return Err(ProtocolError::InvalidInput(
-                    "unsupported JSON number".to_string(),
-                ));
+                return Err(ProtocolError::NonCanonicalNumber(format!(
+                    "unsupported JSON number: {num}"
+                )));
             }
         }
         Value::String(s) => write_json_string(s, out),
@@ -95,7 +144,106 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>, depth: usize) -> Result<()>
     Ok(())
 }
 
-/// Writes a JSON string using minimal RFC 8259 / RFC 8785 escaping.
+/// Scans raw JSON text and rejects any number token that would lose precision or
+/// change representation when parsed into `serde_json::Value`:
+/// - Integers outside `i64`/`u64` (e.g. `18446744073709551616`, `-9223372036854775809`).
+/// - Negative zero (`-0`, `-0.0`).
+/// - Floats whose parsed `f64` does not serialize identically back to the input token
+///   (catches excessive decimal digits like `0.10000000000000000555`, exponent overflow,
+///   and `1.0`-style integer-valued floats).
+fn validate_raw_json_numbers(raw: &str) -> Result<()> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // Skip string literal respecting escapes.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    i += 1;
+                }
+                let token = &raw[start..i];
+                validate_number_token(token)?;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_number_token(token: &str) -> Result<()> {
+    if token == "-0"
+        || token.starts_with("-0.")
+        || token.starts_with("-0e")
+        || token.starts_with("-0E")
+    {
+        // Distinguish `-0.5` (valid negative non-zero float) from `-0` / `-0.0`.
+        if let Ok(f) = token.parse::<f64>() {
+            if f == 0.0 {
+                return Err(ProtocolError::NonCanonicalNumber(format!(
+                    "negative zero: {token}"
+                )));
+            }
+        }
+    }
+
+    let is_float_syntax = token.contains('.') || token.contains('e') || token.contains('E');
+    if !is_float_syntax {
+        if token.starts_with('-') {
+            if token.parse::<i64>().is_err() {
+                return Err(ProtocolError::NonCanonicalNumber(format!(
+                    "signed integer out of i64 range: {token}"
+                )));
+            }
+        } else if token.parse::<u64>().is_err() {
+            return Err(ProtocolError::NonCanonicalNumber(format!(
+                "unsigned integer out of u64 range: {token}"
+            )));
+        }
+        return Ok(());
+    }
+
+    let f: f64 = token
+        .parse()
+        .map_err(|_| ProtocolError::NonCanonicalNumber(format!("invalid float: {token}")))?;
+    if !f.is_finite() {
+        return Err(ProtocolError::NonCanonicalNumber(format!(
+            "non-finite float: {token}"
+        )));
+    }
+    if f.fract() == 0.0 {
+        return Err(ProtocolError::NonCanonicalNumber(format!(
+            "integer-valued float is non-canonical: {token}"
+        )));
+    }
+    let formatted = serde_json::to_string(&f).map_err(|e| ProtocolError::Json(e.to_string()))?;
+    if formatted != token {
+        return Err(ProtocolError::NonCanonicalNumber(format!(
+            "float does not round-trip losslessly: input={token}, canonical={formatted}"
+        )));
+    }
+    Ok(())
+}
+
+/// Writes a JSON string using minimal RFC 8259 escaping.
 fn write_json_string(s: &str, out: &mut Vec<u8>) {
     out.push(b'"');
     for ch in s.chars() {

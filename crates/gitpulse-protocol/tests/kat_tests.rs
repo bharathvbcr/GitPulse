@@ -7,23 +7,28 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use gitpulse_protocol::canonical::{
-    approval_signing_bytes, canonical_json_string, canonical_tool_input_bytes, hex_encode,
-    input_sha256_hex,
+    approval_signing_bytes, canonical_json_from_str, canonical_json_string,
+    canonical_tool_input_bytes, hex_decode, hex_encode, input_sha256_hex,
 };
 use gitpulse_protocol::crypto::{
     ed25519_public_from_secret, issue_device_certificate, issue_revocation_list, open_preview,
-    seal_preview_with_ephemeral, sign_approval_decision_software, sign_relay_request,
-    verify_approval_decision, verify_device_certificate, verify_relay_request,
-    verify_revocation_list, x25519_public_from_secret, NoiseHandshake,
+    relay_signing_message, revocation_signing_bytes, seal_preview_with_ephemeral,
+    sign_approval_decision_software, sign_relay_request, verify_approval_decision,
+    verify_device_certificate, verify_relay_request, verify_revocation_list,
+    x25519_public_from_secret, EpochHandshakeReplayGuard, NoiseHandshake, RevocationPolicy,
+    REPLAY_WINDOW_SIZE,
 };
 use gitpulse_protocol::uniffi_api;
 use gitpulse_protocol::wire::{
-    ApprovalDecisionKind, DeviceKind, FrameClass, OuterFrame, SignedApprovalDecision, GPTF_VERSION,
-    MAX_CERT_TTL_SECS, MAX_PREVIEW_CT_BYTES,
+    ApprovalChannel, ApprovalDecisionKind, ApprovalOutcome, ApprovalResolvedEvent, ApprovalTicket,
+    CapabilitySet, ControlPlaneEvent, DeviceKind, FrameClass, OuterFrame, SessionSnapshot,
+    SignedApprovalDecision, SignedRevocationList, SteeringConfirmReq, SteeringConfirmResp,
+    SteeringDeliveryMode, SteeringPreviewReq, SteeringPreviewResp, SteeringStatus, SubagentSummary,
+    WakePushFrame, WakePushKind, GPTF_VERSION, MAX_CERT_TTL_SECS, MAX_PREVIEW_CT_BYTES,
 };
 use gitpulse_protocol::ProtocolError;
 use p256::ecdsa::SigningKey as P256SigningKey;
-use serde_json::json;
+use serde_json::{json, Value};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -108,19 +113,62 @@ fn kat_canonical_json_and_input_sha256_are_deterministic_and_key_order_independe
     assert_eq!(hash_a, hash_b);
     assert_eq!(hash_a.len(), 64);
 
-    // UniFFI surface produces identical hash.
     let ffi_hash =
         uniffi_api::hash_canonical("Bash", &input_b.to_string(), "/Users/dev/repo").expect("ffi");
     assert_eq!(hash_a, ffi_hash);
 
-    // Any change to cwd or tool_name alters the digest.
     let diff_cwd = input_sha256_hex("Bash", &input_a, "/Users/dev/other").expect("diff_cwd");
     assert_ne!(hash_a, diff_cwd);
 }
 
 #[test]
+fn kat_canonical_rejects_non_canonical_numbers_fail_closed() {
+    // Integers outside u64/i64 range fail closed with NonCanonicalNumber (approve at desk only).
+    for bad in [
+        r#"{"n":18446744073709551616}"#,
+        r#"{"n":99999999999999999999999999}"#,
+        r#"{"n":-9223372036854775809}"#,
+        r#"{"n":0.10000000000000000555}"#,
+        r#"{"n":1.0}"#,
+        r#"{"n":-0}"#,
+        r#"{"n":-0.0}"#,
+        r#"{"n":1e309}"#,
+    ] {
+        assert!(
+            matches!(
+                canonical_json_from_str(bad),
+                Err(ProtocolError::NonCanonicalNumber(_))
+            ),
+            "expected NonCanonicalNumber for {bad}"
+        );
+        assert!(
+            matches!(
+                uniffi_api::hash_canonical("Bash", bad, "/repo"),
+                Err(ProtocolError::NonCanonicalNumber(_))
+            ),
+            "expected UniFFI NonCanonicalNumber for {bad}"
+        );
+    }
+
+    // Valid exact integers (including i64/u64 extremes) and lossless finite floats succeed.
+    for good in [
+        r#"{"n":0}"#,
+        r#"{"n":-9223372036854775808}"#,
+        r#"{"n":18446744073709551615}"#,
+        r#"{"n":0.5}"#,
+        r#"{"n":-12.25}"#,
+        // Numbers inside strings are NOT JSON numbers and must remain untouched.
+        r#"{"cmd":"echo 99999999999999999999999999 1.0 -0.0"}"#,
+    ] {
+        assert!(
+            canonical_json_from_str(good).is_ok(),
+            "unexpected rejection for {good}"
+        );
+    }
+}
+
+#[test]
 fn kat_approval_decision_rejects_updated_input_and_updated_permissions() {
-    // Opus P0-4: updatedInput / updatedPermissions MUST fail closed at deserialization.
     let smuggled_updated_input = json!({
         "host_id": "dev_host_01",
         "ticket_id": "tkt_01",
@@ -149,13 +197,12 @@ fn kat_approval_decision_rejects_updated_input_and_updated_permissions() {
     });
     assert!(serde_json::from_value::<SignedApprovalDecision>(smuggled_updated_perms).is_err());
 
-    // Invalid decision enum value (e.g. allow_always) is rejected.
     let bad_kind = json!("allow_always");
     assert!(serde_json::from_value::<ApprovalDecisionKind>(bad_kind).is_err());
 }
 
 #[test]
-fn kat_p256_approval_verify_and_tamper_rejection() {
+fn kat_p256_approval_verify_mandatory_revocation_and_tamper_rejection() {
     let (identity_pub, _host_cert, mobile_cert) = fixture_certs();
     let input_hash = input_sha256_hex(
         "Bash",
@@ -164,7 +211,6 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
     )
     .expect("input hash");
 
-    // Verify exact signing preimage format.
     let signing_bytes = approval_signing_bytes(
         "dev_host_01",
         "tkt_1001",
@@ -193,7 +239,7 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
     let rev_list = issue_revocation_list(&IDENTITY_SEED, 1, NOW - 30, NOW + 3600, vec![])
         .expect("revocation list");
 
-    // Valid decision verifies through both Rust and UniFFI APIs.
+    // Valid decision verifies with mandatory RevocationPolicy::Enforced.
     let verdict = verify_approval_decision(
         &decision,
         &mobile_cert,
@@ -201,26 +247,77 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
         "dev_host_01",
         "tkt_1001",
         &input_hash,
-        Some(&rev_list),
-        1,
+        RevocationPolicy::Enforced {
+            list: &rev_list,
+            min_version: 1,
+        },
         NOW,
     )
     .expect("valid approval");
     assert_eq!(verdict, ApprovalDecisionKind::AllowOnce);
 
+    // UniFFI requires revocations_json as non-optional &str; empty/invalid fails closed.
+    let decision_json = serde_json::to_string(&decision).unwrap();
+    let mobile_cert_json = serde_json::to_string(&mobile_cert).unwrap();
+    let rev_json = serde_json::to_string(&rev_list).unwrap();
     let ffi_verdict = uniffi_api::verify_approval_decision(
-        &serde_json::to_string(&decision).expect("decision json"),
-        &serde_json::to_string(&mobile_cert).expect("cert json"),
+        &decision_json,
+        &mobile_cert_json,
         &identity_pub,
         "dev_host_01",
         "tkt_1001",
         &input_hash,
-        Some(&serde_json::to_string(&rev_list).expect("rev json")),
+        &rev_json,
         1,
         NOW,
     )
     .expect("ffi verify");
     assert_eq!(ffi_verdict, ApprovalDecisionKind::AllowOnce);
+
+    assert!(matches!(
+        uniffi_api::verify_approval_decision(
+            &decision_json,
+            &mobile_cert_json,
+            &identity_pub,
+            "dev_host_01",
+            "tkt_1001",
+            &input_hash,
+            "",
+            1,
+            NOW,
+        ),
+        Err(ProtocolError::Json(_))
+    ));
+
+    // Deliberate NeverIssued { min_version: 0 } succeeds ONLY when min_version == 0;
+    // NeverIssued { min_version: 1 } fails closed with RevocationRollback!
+    assert_eq!(
+        verify_approval_decision(
+            &decision,
+            &mobile_cert,
+            &identity_pub,
+            "dev_host_01",
+            "tkt_1001",
+            &input_hash,
+            RevocationPolicy::NeverIssued { min_version: 0 },
+            NOW,
+        )
+        .unwrap(),
+        ApprovalDecisionKind::AllowOnce
+    );
+    assert_eq!(
+        verify_approval_decision(
+            &decision,
+            &mobile_cert,
+            &identity_pub,
+            "dev_host_01",
+            "tkt_1001",
+            &input_hash,
+            RevocationPolicy::NeverIssued { min_version: 1 },
+            NOW,
+        ),
+        Err(ProtocolError::RevocationRollback { got: 0, min: 1 })
+    );
 
     // Tamper 1: change decision from AllowOnce to DenyAndInterrupt -> BadSignature.
     let mut tampered_decision = decision.clone();
@@ -233,8 +330,10 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
             "dev_host_01",
             "tkt_1001",
             &input_hash,
-            Some(&rev_list),
-            1,
+            RevocationPolicy::Enforced {
+                list: &rev_list,
+                min_version: 1,
+            },
             NOW,
         ),
         Err(ProtocolError::BadSignature(_))
@@ -250,8 +349,10 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
             "dev_host_01",
             "tkt_1001",
             &other_hash,
-            Some(&rev_list),
-            1,
+            RevocationPolicy::Enforced {
+                list: &rev_list,
+                min_version: 1,
+            },
             NOW,
         ),
         Err(ProtocolError::BindingMismatch(_))
@@ -266,8 +367,10 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
             "dev_host_01",
             "tkt_1001",
             &input_hash,
-            Some(&rev_list),
-            1,
+            RevocationPolicy::Enforced {
+                list: &rev_list,
+                min_version: 1,
+            },
             NOW + 120,
         ),
         Err(ProtocolError::Expired(_))
@@ -290,14 +393,16 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
             "dev_host_01",
             "tkt_1001",
             &input_hash,
-            Some(&revoked_list),
-            2,
+            RevocationPolicy::Enforced {
+                list: &revoked_list,
+                min_version: 2,
+            },
             NOW,
         ),
         Err(ProtocolError::Revoked(_))
     ));
 
-    // Tamper 5: untrusted/forged IdentityKey -> BadSignature on DeviceCertificate.
+    // Tamper 5: untrusted/forged IdentityKey -> BadSignature.
     let stranger_pub = ed25519_public_from_secret(&[0x99; 32]);
     assert!(matches!(
         verify_approval_decision(
@@ -307,8 +412,7 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
             "dev_host_01",
             "tkt_1001",
             &input_hash,
-            None,
-            0,
+            RevocationPolicy::NeverIssued { min_version: 0 },
             NOW,
         ),
         Err(ProtocolError::BadSignature(_))
@@ -319,7 +423,6 @@ fn kat_p256_approval_verify_and_tamper_rejection() {
 fn kat_device_certificate_enforces_30_day_ttl_and_revocation_list_monotonicity() {
     let (identity_pub, _host_cert, mobile_cert) = fixture_certs();
 
-    // Cert TTL > 30 days refused at issue.
     let over_ttl = issue_device_certificate(
         &IDENTITY_SEED,
         "dev_over_ttl",
@@ -333,7 +436,6 @@ fn kat_device_certificate_enforces_30_day_ttl_and_revocation_list_monotonicity()
     );
     assert_eq!(over_ttl, Err(ProtocolError::CertTtlExceeded));
 
-    // Exactly 30 days succeeds.
     let exact_30d = issue_device_certificate(
         &IDENTITY_SEED,
         "dev_exact_30d",
@@ -346,9 +448,14 @@ fn kat_device_certificate_enforces_30_day_ttl_and_revocation_list_monotonicity()
         NOW + MAX_CERT_TTL_SECS,
     )
     .expect("30d cert");
-    verify_device_certificate(&exact_30d, &identity_pub, None, 0, NOW).expect("valid 30d");
+    verify_device_certificate(
+        &exact_30d,
+        &identity_pub,
+        RevocationPolicy::NeverIssued { min_version: 0 },
+        NOW,
+    )
+    .expect("valid 30d");
 
-    // Revocation list rollback rejected (Opus R3).
     let list_v2 = issue_revocation_list(&IDENTITY_SEED, 2, NOW - 10, NOW + 600, vec![]).unwrap();
     verify_revocation_list(&list_v2, &identity_pub, 2, NOW).expect("v2 valid");
     assert_eq!(
@@ -356,13 +463,11 @@ fn kat_device_certificate_enforces_30_day_ttl_and_revocation_list_monotonicity()
         Err(ProtocolError::RevocationRollback { got: 2, min: 3 })
     );
 
-    // Expired revocation list rejected so host fails closed.
     assert!(matches!(
         verify_revocation_list(&list_v2, &identity_pub, 2, NOW + 600),
         Err(ProtocolError::Expired(_))
     ));
 
-    // Tampered revocation list rejected.
     let mut forged = list_v2.clone();
     forged.revoked_device_ids.push("dev_fake".to_string());
     assert!(matches!(
@@ -370,13 +475,21 @@ fn kat_device_certificate_enforces_30_day_ttl_and_revocation_list_monotonicity()
         Err(ProtocolError::BadSignature(_))
     ));
 
-    // Valid mobile cert passes when revocation list is fresh and does not name it.
-    verify_device_certificate(&mobile_cert, &identity_pub, Some(&list_v2), 2, NOW)
-        .expect("mobile cert valid");
+    verify_device_certificate(
+        &mobile_cert,
+        &identity_pub,
+        RevocationPolicy::Enforced {
+            list: &list_v2,
+            min_version: 2,
+        },
+        NOW,
+    )
+    .expect("mobile cert valid");
 }
 
 #[test]
-fn kat_noise_ik_handshake_transport_and_replay_reorder_rejection() {
+fn kat_noise_ik_sliding_replay_window_accepts_in_window_reorder_and_rejects_duplicates_and_below_window(
+) {
     let (identity_pub, host_cert, mobile_cert) = fixture_certs();
     let stream_id = "dev_host_01:42";
     let host_epoch = 42u64;
@@ -385,8 +498,7 @@ fn kat_noise_ik_handshake_transport_and_replay_reorder_rejection() {
         &MOBILE_X_SECRET,
         &host_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         stream_id,
         host_epoch,
@@ -396,73 +508,139 @@ fn kat_noise_ik_handshake_transport_and_replay_reorder_rejection() {
         &HOST_X_SECRET,
         &mobile_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         stream_id,
         host_epoch,
     )
     .expect("responder");
 
-    // Message 1: Initiator -> Responder (-> e, es, s, ss)
-    let m1 = initiator.write_message(b"hello-host").expect("m1");
-    let p1 = responder.read_message(&m1).expect("read m1");
-    assert_eq!(p1, b"hello-host");
+    // Non-empty handshake payload MUST be rejected (Opus review #20 item 5).
+    assert!(matches!(
+        initiator.write_message(b"secret-in-msg1"),
+        Err(ProtocolError::InvalidInput(_))
+    ));
 
-    // Message 2: Responder -> Initiator (<- e, ee, se)
-    let m2 = responder.write_message(b"hello-mobile").expect("m2");
+    // Empty handshake messages succeed, and EpochHandshakeReplayGuard drops duplicate msg1.
+    let mut epoch_guard = EpochHandshakeReplayGuard::new(host_epoch, 64);
+    let m1 = initiator.write_message(&[]).expect("m1");
+    let p1 = responder
+        .read_message_guarded(&m1, &mut epoch_guard)
+        .expect("read m1");
+    assert!(p1.is_empty());
+
+    // Replaying identical msg1 in the same epoch is cheaply dropped before DH.
+    let mut responder_replay = NoiseHandshake::new_responder(
+        &HOST_X_SECRET,
+        &mobile_cert,
+        &identity_pub,
+        RevocationPolicy::NeverIssued { min_version: 0 },
+        NOW,
+        stream_id,
+        host_epoch,
+    )
+    .expect("responder_replay");
+    assert!(matches!(
+        responder_replay.read_message_guarded(&m1, &mut epoch_guard),
+        Err(ProtocolError::ReplayDetected { .. })
+    ));
+
+    let m2 = responder.write_message(&[]).expect("m2");
     let p2 = initiator.read_message(&m2).expect("read m2");
-    assert_eq!(p2, b"hello-mobile");
-
-    assert!(initiator.is_handshake_finished());
-    assert!(responder.is_handshake_finished());
+    assert!(p2.is_empty());
 
     let mut client = initiator.into_transport().expect("client transport");
     let mut host = responder.into_transport().expect("host transport");
     assert_eq!(client.handshake_hash(), host.handshake_hash());
 
-    // Transport round-trip both directions.
-    let ct1 = client.encrypt(b"approval-req-1").expect("ct1");
-    let ct2 = client.encrypt(b"approval-req-2").expect("ct2");
-    let ct3 = client.encrypt(b"approval-req-3").expect("ct3");
+    // Generate 1026 frames (seq 1..=1026).
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(1026);
+    for seq in 1..=1026u64 {
+        frames.push(client.encrypt(format!("msg-{seq}").as_bytes()).unwrap());
+    }
 
-    // Deliver frame 1 then frame 3 (gap allowed, advances high-water to 3).
-    assert_eq!(&*host.decrypt(&ct1).expect("dec1"), b"approval-req-1");
-    assert_eq!(host.recv_high_water(), 1);
-    assert_eq!(&*host.decrypt(&ct3).expect("dec3"), b"approval-req-3");
-    assert_eq!(host.recv_high_water(), 3);
+    // Cross-class reorder scenario from review #20: PTY frame seq 11 arrives BEFORE
+    // approval frame seq 10 -> BOTH must be accepted once!
+    assert_eq!(&*host.decrypt(&frames[10]).expect("seq 11"), b"msg-11");
+    assert_eq!(host.recv_high_water(), 11);
+    assert_eq!(&*host.decrypt(&frames[9]).expect("seq 10"), b"msg-10");
+    assert_eq!(host.recv_high_water(), 11);
 
-    // Reordered frame 2 (seq 2 <= high-water 3) MUST be rejected!
+    // Replaying either seq 10 or seq 11 MUST be rejected as duplicate!
     assert_eq!(
-        host.decrypt(&ct2),
+        host.decrypt(&frames[9]),
+        Err(ProtocolError::ReplayDetected {
+            got: 10,
+            high_water: 11
+        })
+    );
+    assert_eq!(
+        host.decrypt(&frames[10]),
+        Err(ProtocolError::ReplayDetected {
+            got: 11,
+            high_water: 11
+        })
+    );
+
+    // Forged ciphertext claiming high seq 5000 MUST fail AEAD and MUST NOT advance window!
+    let mut forged = frames[10].clone();
+    forged[..8].copy_from_slice(&5000u64.to_be_bytes());
+    assert!(matches!(host.decrypt(&forged), Err(ProtocolError::Aead(_))));
+    assert_eq!(host.recv_high_water(), 11);
+
+    // Advance high-water to seq 1024 (index 1023).
+    assert_eq!(
+        &*host.decrypt(&frames[1023]).expect("seq 1024"),
+        b"msg-1024"
+    );
+    assert_eq!(host.recv_high_water(), 1024);
+
+    // Exact lower edge of 1024-frame window: seq 1 (delta = 1024 - 1 = 1023 < 1024) ACCEPTED!
+    assert_eq!(REPLAY_WINDOW_SIZE, 1024);
+    assert_eq!(
+        &*host.decrypt(&frames[0]).expect("seq 1 in window"),
+        b"msg-1"
+    );
+    // Duplicate of seq 1 at lower edge REJECTED!
+    assert_eq!(
+        host.decrypt(&frames[0]),
+        Err(ProtocolError::ReplayDetected {
+            got: 1,
+            high_water: 1024
+        })
+    );
+
+    // Advance high-water to seq 1026 (index 1025). Now seq 2 (delta = 1024 >= 1024) is BELOW window!
+    assert_eq!(
+        &*host.decrypt(&frames[1025]).expect("seq 1026"),
+        b"msg-1026"
+    );
+    assert_eq!(
+        host.decrypt(&frames[1]),
         Err(ProtocolError::ReplayDetected {
             got: 2,
-            high_water: 3
+            high_water: 1026
         })
     );
-
-    // Replayed frame 3 MUST be rejected!
+    // While seq 3 (delta = 1023 < 1024) is STILL inside the window and accepted once!
     assert_eq!(
-        host.decrypt(&ct3),
+        &*host.decrypt(&frames[2]).expect("seq 3 in window"),
+        b"msg-3"
+    );
+    assert_eq!(
+        host.decrypt(&frames[2]),
         Err(ProtocolError::ReplayDetected {
             got: 3,
-            high_water: 3
+            high_water: 1026
         })
     );
 
-    // Tampered seq prefix with higher seq fails AEAD and MUST NOT advance high-water!
-    let mut forged = ct3.clone();
-    forged[..8].copy_from_slice(&99u64.to_be_bytes());
-    assert!(matches!(host.decrypt(&forged), Err(ProtocolError::Aead(_))));
-    assert_eq!(host.recv_high_water(), 3);
-
-    // Host -> Client direction has independent monotonic counter.
+    // Reverse direction (host -> client) has independent window.
     let reply = host.encrypt(b"inbox-snapshot").expect("reply");
     assert_eq!(
         &*client.decrypt(&reply).expect("dec reply"),
         b"inbox-snapshot"
     );
-    assert_eq!(client.recv_high_water(), 1);
     assert_eq!(
         client.decrypt(&reply),
         Err(ProtocolError::ReplayDetected {
@@ -476,13 +654,11 @@ fn kat_noise_ik_handshake_transport_and_replay_reorder_rejection() {
 fn kat_noise_ik_rejects_mismatched_host_epoch_and_unpinned_peer() {
     let (identity_pub, host_cert, mobile_cert) = fixture_certs();
 
-    // Epoch mismatch (42 vs 43) fails Noise handshake via prologue binding.
     let mut init = NoiseHandshake::new_initiator(
         &MOBILE_X_SECRET,
         &host_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         "dev_host_01:42",
         42,
@@ -492,24 +668,21 @@ fn kat_noise_ik_rejects_mismatched_host_epoch_and_unpinned_peer() {
         &HOST_X_SECRET,
         &mobile_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         "dev_host_01:43",
         43,
     )
     .unwrap();
-    let m1 = init.write_message(b"").unwrap();
+    let m1 = init.write_message(&[]).unwrap();
     assert!(resp.read_message(&m1).is_err());
 
-    // Rogue initiator using unpinned X25519 key is rejected by responder.
     let rogue_x_secret = [0xAA; 32];
     let mut rogue_init = NoiseHandshake::new_initiator(
         &rogue_x_secret,
         &host_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         "dev_host_01:42",
         42,
@@ -519,14 +692,13 @@ fn kat_noise_ik_rejects_mismatched_host_epoch_and_unpinned_peer() {
         &HOST_X_SECRET,
         &mobile_cert,
         &identity_pub,
-        None,
-        0,
+        RevocationPolicy::NeverIssued { min_version: 0 },
         NOW,
         "dev_host_01:42",
         42,
     )
     .unwrap();
-    let rogue_m1 = rogue_init.write_message(b"").unwrap();
+    let rogue_m1 = rogue_init.write_message(&[]).unwrap();
     assert!(matches!(
         resp_pinned.read_message(&rogue_m1),
         Err(ProtocolError::BadSignature(_))
@@ -559,7 +731,6 @@ fn kat_preview_ct_seal_open_deterministic_and_bounded() {
     assert!(sealed_a.len() <= MAX_PREVIEW_CT_BYTES);
     assert_eq!(&sealed_a[..4], b"GPPV");
 
-    // Opens cleanly via Rust and UniFFI API.
     let opened =
         open_preview(&sealed_a, &MOBILE_X_SECRET, &host_ed_pub, "dev_host_01").expect("opened");
     assert_eq!(&*opened, plaintext);
@@ -569,7 +740,6 @@ fn kat_preview_ct_seal_open_deterministic_and_bounded() {
             .expect("ffi opened");
     assert_eq!(ffi_opened, plaintext);
 
-    // Every single bit flip is rejected.
     for byte_idx in [0, 4, 6, 40, sealed_a.len() - 70, sealed_a.len() - 1] {
         let mut mutated = sealed_a.clone();
         mutated[byte_idx] ^= 0x01;
@@ -579,13 +749,11 @@ fn kat_preview_ct_seal_open_deterministic_and_bounded() {
         );
     }
 
-    // Wrong expected sender device id rejected.
     assert!(matches!(
         open_preview(&sealed_a, &MOBILE_X_SECRET, &host_ed_pub, "dev_other"),
         Err(ProtocolError::BindingMismatch(_))
     ));
 
-    // Oversized preview (> 2 KiB total) rejected.
     let oversized = vec![b'A'; MAX_PREVIEW_CT_BYTES];
     assert!(matches!(
         seal_preview_with_ephemeral(
@@ -607,7 +775,6 @@ fn kat_relay_http_ws_request_signing() {
     let headers = sign_relay_request("dev_host_01", &HOST_ED_SEED, "GET", uri, ts_ms, b"")
         .expect("sign_relay_request");
 
-    // Deterministic signature matches UniFFI wrapper.
     let ffi_headers =
         uniffi_api::sign_relay_request("dev_host_01", &HOST_ED_SEED, "GET", uri, ts_ms, b"")
             .expect("ffi sign");
@@ -616,7 +783,6 @@ fn kat_relay_http_ws_request_signing() {
     verify_relay_request(&host_ed_pub, "GET", uri, ts_ms, b"", &headers.signature_b64)
         .expect("verify relay request");
 
-    // URI query tamper fails verification.
     assert!(verify_relay_request(
         &host_ed_pub,
         "GET",
@@ -627,7 +793,6 @@ fn kat_relay_http_ws_request_signing() {
     )
     .is_err());
 
-    // GPTF OuterFrame round-trip JSON contract check.
     let frame = OuterFrame {
         v: GPTF_VERSION,
         frame_id: "frm_01".to_string(),
@@ -647,15 +812,6 @@ fn kat_relay_http_ws_request_signing() {
 
 #[test]
 fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
-    use gitpulse_protocol::wire::{
-        ApprovalChannel, ApprovalOutcome, ApprovalResolvedEvent, ApprovalTicket, CapabilitySet,
-        ControlPlaneEvent, SessionSnapshot, SteeringConfirmReq, SteeringConfirmResp,
-        SteeringDeliveryMode, SteeringPreviewReq, SteeringPreviewResp, SteeringStatus,
-        SubagentSummary, WakePushFrame, WakePushKind,
-    };
-
-    // Frozen golden SHA-256 of canonical {"cwd":"/repo","tool_input":{"cmd":"ls -la"},"tool_name":"Bash"}.
-    // Computed independently with SHA-256 to guard against cross-platform drift.
     let digest = uniffi_api::hash_canonical("Bash", r#"{"cmd":"ls -la"}"#, "/repo").unwrap();
     let rendered =
         uniffi_api::render_canonical_tool_input("Bash", r#"{"cmd":"ls -la"}"#, "/repo").unwrap();
@@ -668,7 +824,6 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
         "06c557413628a4c9ec2b0d368df041b2c5264e127cffc82a1d668661c7b59ab4"
     );
 
-    // Cert without P-256 key (desktop cert) MUST NOT be allowed to verify an approval decision.
     let (identity_pub, host_cert, mobile_cert) = fixture_certs();
     let decision = sign_approval_decision_software(
         &MOBILE_P256_SECRET,
@@ -690,14 +845,12 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
             "dev_host_01",
             "tkt_2",
             &digest,
-            None,
-            0,
+            RevocationPolicy::NeverIssued { min_version: 0 },
             NOW,
         ),
         Err(ProtocolError::BindingMismatch(_))
     ));
 
-    // Full UniFFI Noise IK handshake + tunnel_encrypt / tunnel_decrypt.
     let host_cert_json = serde_json::to_string(&host_cert).unwrap();
     let mobile_cert_json = serde_json::to_string(&mobile_cert).unwrap();
     let mut init = uniffi_api::tunnel_initiator_new(
@@ -722,14 +875,13 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
         9,
     )
     .unwrap();
-    let m1 = init.write_message(b"").unwrap();
+    let m1 = init.write_message(&[]).unwrap();
     resp.read_message(&m1).unwrap();
-    let m2 = resp.write_message(b"").unwrap();
+    let m2 = resp.write_message(&[]).unwrap();
     init.read_message(&m2).unwrap();
     let mut client = init.into_transport().unwrap();
     let mut host = resp.into_transport().unwrap();
 
-    // Serialize every key ControlPlaneEvent variant through Noise IK transport.
     let events = vec![
         ControlPlaneEvent::InboxSnapshot {
             host_id: "dev_host_01".to_string(),
@@ -852,7 +1004,6 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
         assert_eq!(decoded, event);
     }
 
-    // WakePushFrame wire shape check.
     let wake = WakePushFrame {
         v: GPTF_VERSION,
         kind: WakePushKind::Approval,
@@ -865,4 +1016,137 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
     assert_eq!(wake_val["v"], 1);
     assert_eq!(wake_val["kind"], "approval");
     assert!(wake_val.get("preview_ct_b64").is_none());
+}
+
+#[test]
+fn kat_cross_language_vector_files_match_byte_for_byte() {
+    // 1. SignedRevocationList vector (consumed by Go gitpulse-relay & mobile).
+    let rev_raw = include_str!("vectors/revocation_list_v1.json");
+    let rev_vec: Value = serde_json::from_str(rev_raw).expect("revocation vector json");
+    let id_seed: [u8; 32] = hex_decode(rev_vec["identity_seed_hex"].as_str().unwrap()).unwrap();
+    let id_pub: [u8; 32] = hex_decode(rev_vec["identity_pub_hex"].as_str().unwrap()).unwrap();
+    assert_eq!(ed25519_public_from_secret(&id_seed), id_pub);
+
+    let list: SignedRevocationList =
+        serde_json::from_value(rev_vec["list"].clone()).expect("SignedRevocationList");
+    let expected_preimage_hex = rev_vec["preimage_hex"].as_str().unwrap();
+    let actual_preimage = revocation_signing_bytes(&list).unwrap();
+    assert_eq!(hex_encode(&actual_preimage), expected_preimage_hex);
+
+    let reissued = issue_revocation_list(
+        &id_seed,
+        list.version,
+        list.issued_at,
+        list.expires_at,
+        list.revoked_device_ids.clone(),
+    )
+    .unwrap();
+    assert_eq!(reissued, list);
+
+    let valid_at = rev_vec["valid_at_sec"].as_i64().unwrap();
+    verify_revocation_list(&list, &id_pub, list.version, valid_at).expect("vector rev valid");
+
+    // 2. Relay HTTP/WS Ed25519 request-signing vector (consumed by Go gitpulse-relay & mobile).
+    let req_raw = include_str!("vectors/relay_request_signing_v1.json");
+    let req_vec: Value = serde_json::from_str(req_raw).expect("relay req vector json");
+    let dev_seed: [u8; 32] = hex_decode(req_vec["ed25519_seed_hex"].as_str().unwrap()).unwrap();
+    let dev_pub: [u8; 32] = hex_decode(req_vec["ed25519_pub_hex"].as_str().unwrap()).unwrap();
+    assert_eq!(ed25519_public_from_secret(&dev_seed), dev_pub);
+
+    let device_id = req_vec["device_id"].as_str().unwrap();
+    let method = req_vec["method"].as_str().unwrap();
+    let request_uri = req_vec["request_uri"].as_str().unwrap();
+    let timestamp_ms = req_vec["timestamp_ms"].as_i64().unwrap();
+    let body = req_vec["body_utf8"].as_str().unwrap().as_bytes();
+
+    let preimage = relay_signing_message(method, request_uri, timestamp_ms, body).unwrap();
+    assert_eq!(
+        String::from_utf8(preimage.clone()).unwrap(),
+        req_vec["preimage_utf8"].as_str().unwrap()
+    );
+    assert_eq!(
+        hex_encode(&preimage),
+        req_vec["preimage_hex"].as_str().unwrap()
+    );
+
+    let signed = sign_relay_request(
+        device_id,
+        &dev_seed,
+        method,
+        request_uri,
+        timestamp_ms,
+        body,
+    )
+    .unwrap();
+    assert_eq!(
+        signed.signature_b64,
+        req_vec["signature_b64"].as_str().unwrap()
+    );
+    verify_relay_request(
+        &dev_pub,
+        method,
+        request_uri,
+        timestamp_ms,
+        body,
+        &signed.signature_b64,
+    )
+    .expect("relay req vector verify");
+
+    // 3. Approval canonicalization & P-256 signing vector (consumed by mobile & daemon).
+    let app_raw = include_str!("vectors/approval_canonical_v1.json");
+    let app_vec: Value = serde_json::from_str(app_raw).expect("approval vector json");
+    let tool_name = app_vec["tool_name"].as_str().unwrap();
+    let tool_input = &app_vec["tool_input"];
+    let cwd = app_vec["cwd"].as_str().unwrap();
+    let canon_bytes = canonical_tool_input_bytes(tool_name, tool_input, cwd).unwrap();
+    assert_eq!(
+        String::from_utf8(canon_bytes).unwrap(),
+        app_vec["canonical_tool_input_utf8"].as_str().unwrap()
+    );
+    let digest = input_sha256_hex(tool_name, tool_input, cwd).unwrap();
+    assert_eq!(digest, app_vec["input_sha256"].as_str().unwrap());
+
+    let decision_kind: ApprovalDecisionKind =
+        serde_json::from_value(app_vec["decision"].clone()).unwrap();
+    let signing_bytes = approval_signing_bytes(
+        app_vec["host_id"].as_str().unwrap(),
+        app_vec["ticket_id"].as_str().unwrap(),
+        &digest,
+        decision_kind,
+        app_vec["nonce"].as_str().unwrap(),
+        app_vec["issued_at"].as_i64().unwrap(),
+        app_vec["expires_at"].as_i64().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(signing_bytes.clone()).unwrap(),
+        app_vec["approval_signing_preimage_utf8"].as_str().unwrap()
+    );
+    assert_eq!(
+        hex_encode(&signing_bytes),
+        app_vec["approval_signing_preimage_hex"].as_str().unwrap()
+    );
+
+    let p256_secret: [u8; 32] = hex_decode(app_vec["p256_secret_hex"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        STANDARD.encode(p256_compressed_pub(&p256_secret)),
+        app_vec["p256_pub_sec1_b64"].as_str().unwrap()
+    );
+    let signed_dec = sign_approval_decision_software(
+        &p256_secret,
+        app_vec["device_id"].as_str().unwrap(),
+        app_vec["host_id"].as_str().unwrap(),
+        app_vec["ticket_id"].as_str().unwrap(),
+        &digest,
+        decision_kind,
+        app_vec["nonce"].as_str().unwrap(),
+        app_vec["issued_at"].as_i64().unwrap(),
+        app_vec["expires_at"].as_i64().unwrap(),
+    )
+    .unwrap();
+    // RFC 6979 deterministic ECDSA-P256 matches vector signature byte-for-byte.
+    assert_eq!(
+        signed_dec.sig_p256_der_b64,
+        app_vec["sig_p256_der_b64"].as_str().unwrap()
+    );
 }

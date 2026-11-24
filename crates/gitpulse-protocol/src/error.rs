@@ -81,6 +81,12 @@ pub enum ProtocolError {
     /// JSON serialization or deserialization failed.
     #[error("json error: {0}")]
     Json(String),
+
+    /// JSON contains a number that cannot be represented canonically without
+    /// precision loss (e.g., integer outside `i64`/`u64`, non-round-trippable
+    /// float, or ambiguous integer-valued float). Ticket must be approved at desk.
+    #[error("non-canonical number (approve at desk only): {0}")]
+    NonCanonicalNumber(String),
 }
 
 /// Convenience result alias for `gitpulse-protocol`.

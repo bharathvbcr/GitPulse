@@ -5,26 +5,31 @@
 //! (for the iOS Notification Service Extension), Kotlin/JNI, or a hand-written
 //! C ABI with zero complex generics or lifetimes crossing the boundary.
 //!
-//! Security boundary (Opus M2, M3, #15):
+//! Security boundaries (Opus M2, M3, #15, #20):
 //! - Raw key material is passed in by the native module (from Keychain / Keystore)
 //!   for the duration of the call and never returned to JS.
 //! - Hardware P-256 approval keys never enter Rust in private form: native code
 //!   calls [`build_approval_signing_bytes`] and signs the returned bytes inside
 //!   iOS Secure Enclave or Android StrongBox.
+//! - [`verify_approval_decision`] REQUIRES a non-empty, fresh [`SignedRevocationList`]
+//!   JSON (`revocations_json: &str`); missing or stale lists fail closed rather than
+//!   silently bypassing revocation checks.
 
-use crate::canonical::{approval_signing_bytes, canonical_tool_input_bytes, input_sha256_hex};
-use crate::crypto::{self, NoiseHandshake, RelayAuthHeaders, TunnelSession};
+use crate::canonical::{
+    approval_signing_bytes, canonical_tool_input_bytes, input_sha256_hex,
+    parse_canonical_json_value,
+};
+use crate::crypto::{self, NoiseHandshake, RelayAuthHeaders, RevocationPolicy, TunnelSession};
 use crate::error::{ProtocolError, Result};
 use crate::wire::{
     ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision, SignedRevocationList,
 };
-use serde_json::Value;
 
 /// Computes lowercase hex `input_sha256` from `tool_name`, JSON-encoded `tool_input_json`,
-/// and `cwd`.
+/// and `cwd`. Fails closed with [`ProtocolError::NonCanonicalNumber`] if `tool_input_json`
+/// contains a number that cannot be represented losslessly.
 pub fn hash_canonical(tool_name: &str, tool_input_json: &str, cwd: &str) -> Result<String> {
-    let tool_input: Value = serde_json::from_str(tool_input_json)
-        .map_err(|e| ProtocolError::Json(format!("tool_input_json: {e}")))?;
+    let tool_input = parse_canonical_json_value(tool_input_json)?;
     input_sha256_hex(tool_name, &tool_input, cwd)
 }
 
@@ -35,8 +40,7 @@ pub fn render_canonical_tool_input(
     tool_input_json: &str,
     cwd: &str,
 ) -> Result<String> {
-    let tool_input: Value = serde_json::from_str(tool_input_json)
-        .map_err(|e| ProtocolError::Json(format!("tool_input_json: {e}")))?;
+    let tool_input = parse_canonical_json_value(tool_input_json)?;
     let bytes = canonical_tool_input_bytes(tool_name, &tool_input, cwd)?;
     String::from_utf8(bytes).map_err(|e| ProtocolError::Json(e.to_string()))
 }
@@ -66,8 +70,11 @@ pub fn build_approval_signing_bytes(
 
 /// Verifies a JSON-encoded [`SignedApprovalDecision`] against a JSON-encoded
 /// [`DeviceCertificate`], a Keychain-pinned 32-byte Account `IdentityKey` Ed25519
-/// public key, expected ticket binding tuple, optional JSON-encoded
+/// public key, expected ticket binding tuple, a **mandatory** JSON-encoded
 /// [`SignedRevocationList`], minimum revocation list version, and `now_sec`.
+///
+/// Fails closed if `revocations_json` is missing, malformed, expired, forged, or
+/// rolled back (Opus review #20).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_approval_decision(
     decision_json: &str,
@@ -76,7 +83,7 @@ pub fn verify_approval_decision(
     expected_host_id: &str,
     expected_ticket_id: &str,
     expected_input_sha256: &str,
-    revocations_json: Option<&str>,
+    revocations_json: &str,
     min_revocation_version: u64,
     now_sec: i64,
 ) -> Result<ApprovalDecisionKind> {
@@ -84,13 +91,8 @@ pub fn verify_approval_decision(
         .map_err(|e| ProtocolError::Json(format!("decision_json: {e}")))?;
     let cert: DeviceCertificate = serde_json::from_str(cert_json)
         .map_err(|e| ProtocolError::Json(format!("cert_json: {e}")))?;
-    let revocations: Option<SignedRevocationList> = match revocations_json {
-        Some(raw) => Some(
-            serde_json::from_str(raw)
-                .map_err(|e| ProtocolError::Json(format!("revocations_json: {e}")))?,
-        ),
-        None => None,
-    };
+    let revocations: SignedRevocationList = serde_json::from_str(revocations_json)
+        .map_err(|e| ProtocolError::Json(format!("revocations_json: {e}")))?;
     let identity_pub = slice_to_array32(identity_pub_ed25519, "identity_pub_ed25519")?;
     crypto::verify_approval_decision(
         &decision,
@@ -99,8 +101,10 @@ pub fn verify_approval_decision(
         expected_host_id,
         expected_ticket_id,
         expected_input_sha256,
-        revocations.as_ref(),
-        min_revocation_version,
+        RevocationPolicy::Enforced {
+            list: &revocations,
+            min_version: min_revocation_version,
+        },
         now_sec,
     )
 }
@@ -148,7 +152,9 @@ pub fn sign_relay_request(
     crypto::sign_relay_request(device_id, &seed, method, request_uri, timestamp_ms, body)
 }
 
-/// Starts a Noise `IK` initiator handshake pinned to the verified responder `DeviceCertificate`.
+/// Starts a Noise `IK` initiator handshake pinned to the verified responder `DeviceCertificate`
+/// and a mandatory [`SignedRevocationList`] (pass `revocations_json = None` only when
+/// `min_revocation_version == 0` during initial account bootstrap).
 #[allow(clippy::too_many_arguments)]
 pub fn tunnel_initiator_new(
     local_x25519_secret: &[u8],
@@ -171,12 +177,20 @@ pub fn tunnel_initiator_new(
         ),
         None => None,
     };
+    let policy = match revocations.as_ref() {
+        Some(list) => RevocationPolicy::Enforced {
+            list,
+            min_version: min_revocation_version,
+        },
+        None => RevocationPolicy::NeverIssued {
+            min_version: min_revocation_version,
+        },
+    };
     NoiseHandshake::new_initiator(
         &secret,
         &cert,
         &identity_pub,
-        revocations.as_ref(),
-        min_revocation_version,
+        policy,
         now_sec,
         stream_id,
         host_epoch,
@@ -206,12 +220,20 @@ pub fn tunnel_responder_new(
         ),
         None => None,
     };
+    let policy = match revocations.as_ref() {
+        Some(list) => RevocationPolicy::Enforced {
+            list,
+            min_version: min_revocation_version,
+        },
+        None => RevocationPolicy::NeverIssued {
+            min_version: min_revocation_version,
+        },
+    };
     NoiseHandshake::new_responder(
         &secret,
         &cert,
         &identity_pub,
-        revocations.as_ref(),
-        min_revocation_version,
+        policy,
         now_sec,
         stream_id,
         host_epoch,
@@ -224,7 +246,7 @@ pub fn tunnel_encrypt(session: &mut TunnelSession, plaintext: &[u8]) -> Result<V
 }
 
 /// Decrypts a framed ciphertext payload on an established Noise `IK` [`TunnelSession`],
-/// enforcing strict per-direction high-water replay and reorder rejection.
+/// enforcing the 1024-bit sliding replay window.
 pub fn tunnel_decrypt(session: &mut TunnelSession, ciphertext: &[u8]) -> Result<Vec<u8>> {
     let plain = session.decrypt(ciphertext)?;
     Ok(plain.to_vec())

@@ -1,12 +1,17 @@
 //! Cryptographic primitives for `gitpulse-protocol`:
 //! - **Noise `IK`** (`Noise_IK_25519_ChaChaPoly_SHA256`) authenticated E2EE tunnel
 //!   with `DeviceCertificate` static X25519 key pinning, `host_epoch` prologue binding,
-//!   per-direction monotonic high-water replay/reorder rejection, and `zeroize` on drop (Opus R1).
+//!   empty handshake payloads (msg1 has weak forward secrecy and is replayable),
+//!   per-epoch msg1 replay guard, WireGuard/IPsec-style 1024-bit sliding replay window
+//!   (tolerates cross-class reorder between `pty` and `control`/`approval` while rejecting
+//!   duplicates and below-window replays), and `zeroize` on drop (Opus R1 + review #20).
 //! - **DeviceCertificate** (≤30-day TTL, binding Ed25519, X25519, and optional hardware P-256
 //!   approval public key) and **SignedRevocationList** (monotonic version, IdentityKey Ed25519
 //!   signature, Opus M2 & R3).
+//! - **Mandatory [`RevocationPolicy`]** on approval verification so a missing or stale
+//!   revocation list fails closed rather than silently skipping revocation checks (review #20).
 //! - **P-256 ECDSA** approval signature verification (DER-encoded, hardware Secure Enclave /
-//!   StrongBox compatible, Opus P0-5/R2/M2) with full certificate chain + revocation checks.
+//!   StrongBox compatible, Opus P0-5/R2/M2).
 //!   **Caller trust boundary (Opus #15):** `identity_pub_ed25519` MUST be loaded from a
 //!   tamper-resistant OS Keychain / Secret Service (never an agent-writable file).
 //! - **Ed25519 relay HTTP/WS request signing & verification** matching `gitpulse-relay`
@@ -33,6 +38,7 @@ use hkdf::Hkdf;
 use p256::ecdsa::{DerSignature, VerifyingKey as P256VerifyingKey};
 use sha2::{Digest, Sha256};
 use snow::{Builder, HandshakeState, StatelessTransportState};
+use std::collections::{HashSet, VecDeque};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 use zeroize::Zeroizing;
 
@@ -46,7 +52,7 @@ const DOMAIN_TUNNEL_PROLOGUE: &[u8] = b"gitpulse-tunnel/v1\0";
 const DOMAIN_DEVICE_CERT_V2: &[u8] = b"gitpulse-protocol/v2/device-cert\0";
 
 /// Domain prefix for `SignedRevocationList` IdentityKey signatures.
-const DOMAIN_REVOCATION_LIST: &[u8] = b"gitpulse-protocol/v1/revocation-list\0";
+pub const DOMAIN_REVOCATION_LIST: &[u8] = b"gitpulse-protocol/v1/revocation-list\0";
 
 /// Domain prefix + magic for `<= 2 KiB` NSE wake `preview_ct` blobs.
 const PREVIEW_MAGIC: &[u8; 4] = b"GPPV";
@@ -64,12 +70,38 @@ pub const MAX_TUNNEL_PLAINTEXT_BYTES: usize = 65_500;
 /// Maximum frames encrypted per direction under a single Noise handshake before rekey.
 pub const MAX_FRAMES_PER_SESSION: u64 = 100_000;
 
+/// WireGuard/IPsec-style sliding replay window width in frames (`16 * 64 = 1024`).
+pub const REPLAY_WINDOW_SIZE: u64 = 1024;
+const REPLAY_WINDOW_WORDS: usize = 16;
+
 /// Relay HTTP/WS authentication header names (matching `gitpulse-relay`).
 pub const DEVICE_HEADER: &str = "X-GitPulse-Device";
 /// Relay request timestamp header (unix milliseconds).
 pub const TIMESTAMP_HEADER: &str = "X-GitPulse-Timestamp";
 /// Relay request Ed25519 signature header (standard base64).
 pub const SIGNATURE_HEADER: &str = "X-GitPulse-Signature";
+
+/// Explicit revocation-check policy required by certificate and approval verifiers.
+///
+/// Prevents callers from accidentally passing `None` and silently skipping
+/// revocation checks on paths that authorize `allow_once` (Opus review #20).
+#[derive(Debug, Clone, Copy)]
+pub enum RevocationPolicy<'a> {
+    /// Enforce a fresh Account IdentityKey-signed [`SignedRevocationList`] with
+    /// strictly monotonic `version >= min_version`.
+    Enforced {
+        /// Signed revocation list fetched from relay / cache.
+        list: &'a SignedRevocationList,
+        /// Highest previously observed revocation list version.
+        min_version: u64,
+    },
+    /// Deliberate opt-in for an account that has never yet published a revocation list.
+    /// Fails closed with [`ProtocolError::RevocationRollback`] if `min_version != 0`.
+    NeverIssued {
+        /// Must be `0`; any non-zero value means a list was previously seen and cannot be skipped.
+        min_version: u64,
+    },
+}
 
 /// Relay HTTP/WS authentication headers produced by [`sign_relay_request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,15 +310,14 @@ pub fn issue_device_certificate(
 }
 
 /// Verifies a [`DeviceCertificate`] against a Keychain-pinned Account `IdentityKey` Ed25519
-/// public key, current unix timestamp `now_sec`, and an optional verified [`SignedRevocationList`].
+/// public key, current unix timestamp `now_sec`, and an explicit [`RevocationPolicy`].
 ///
 /// Checks signature first (so forged certificates always report `BadSignature`), then
-/// enforces `<= 30 day` TTL, expiry, clock skew, and revocation status.
+/// enforces `<= 30 day` TTL, revocation policy, expiry, and clock skew.
 pub fn verify_device_certificate(
     cert: &DeviceCertificate,
     identity_pub_ed25519: &[u8; 32],
-    revocations: Option<&SignedRevocationList>,
-    min_revocation_version: u64,
+    revocation_policy: RevocationPolicy<'_>,
     now_sec: i64,
 ) -> Result<()> {
     if cert.version != DEVICE_CERT_VERSION {
@@ -310,14 +341,24 @@ pub fn verify_device_certificate(
         return Err(ProtocolError::CertTtlExceeded);
     }
 
-    if let Some(list) = revocations {
-        verify_revocation_list(list, identity_pub_ed25519, min_revocation_version, now_sec)?;
-        if list
-            .revoked_device_ids
-            .iter()
-            .any(|id| id == &cert.device_id)
-        {
-            return Err(ProtocolError::Revoked(cert.device_id.clone()));
+    match revocation_policy {
+        RevocationPolicy::Enforced { list, min_version } => {
+            verify_revocation_list(list, identity_pub_ed25519, min_version, now_sec)?;
+            if list
+                .revoked_device_ids
+                .iter()
+                .any(|id| id == &cert.device_id)
+            {
+                return Err(ProtocolError::Revoked(cert.device_id.clone()));
+            }
+        }
+        RevocationPolicy::NeverIssued { min_version } => {
+            if min_version != 0 {
+                return Err(ProtocolError::RevocationRollback {
+                    got: 0,
+                    min: min_version,
+                });
+            }
         }
     }
 
@@ -330,7 +371,12 @@ pub fn verify_device_certificate(
     Ok(())
 }
 
-fn revocation_signed_bytes(list: &SignedRevocationList) -> Result<Vec<u8>> {
+/// Computes the exact byte preimage signed by the Account `IdentityKey` Ed25519 key
+/// for a [`SignedRevocationList`].
+///
+/// Format:
+/// `b"gitpulse-protocol/v1/revocation-list\0" || version(u64 BE) || issued_at(i64 BE) || expires_at(i64 BE) || count(u32 BE) || (len(u16 BE) || utf8(device_id))*`
+pub fn revocation_signing_bytes(list: &SignedRevocationList) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(128 + list.revoked_device_ids.len() * 32);
     out.extend_from_slice(DOMAIN_REVOCATION_LIST);
     out.extend_from_slice(&list.version.to_be_bytes());
@@ -372,7 +418,7 @@ pub fn issue_revocation_list(
         revoked_device_ids,
         identity_sig_b64: String::new(),
     };
-    let msg = revocation_signed_bytes(&list)?;
+    let msg = revocation_signing_bytes(&list)?;
     let signing = EdSigningKey::from_bytes(identity_ed25519_seed);
     list.identity_sig_b64 = STANDARD.encode(signing.sign(&msg).to_bytes());
     Ok(list)
@@ -389,7 +435,7 @@ pub fn verify_revocation_list(
     let identity_vk = EdVerifyingKey::from_bytes(identity_pub_ed25519)
         .map_err(|_| ProtocolError::InvalidInput("invalid identity Ed25519 key".to_string()))?;
     let sig_bytes = decode_fixed_b64::<64>(&list.identity_sig_b64, "identity_sig_b64")?;
-    let msg = revocation_signed_bytes(list)?;
+    let msg = revocation_signing_bytes(list)?;
     identity_vk
         .verify_strict(&msg, &EdSignature::from_bytes(&sig_bytes))
         .map_err(|_| ProtocolError::BadSignature("revocation list".to_string()))?;
@@ -414,8 +460,9 @@ pub fn verify_revocation_list(
 // ---------------------------------------------------------------------------
 
 /// Verifies a [`SignedApprovalDecision`] end-to-end:
-/// 1. Verifies `signer_cert` chains to the Keychain-pinned `identity_pub_ed25519` and is
-///    unexpired, within `<= 30 day` TTL, and not revoked by `revocations` (Opus R3, #15).
+/// 1. Verifies `signer_cert` chains to the Keychain-pinned `identity_pub_ed25519`, is
+///    unexpired, within `<= 30 day` TTL, and satisfies `revocation_policy` (mandatory —
+///    no silent `Option::None` bypass).
 /// 2. Checks `signer_cert.device_id == decision.device_id` and extracts `approval_pub_p256`.
 /// 3. Verifies exact binding to `(expected_host_id, expected_ticket_id, expected_input_sha256)`.
 /// 4. Enforces `decision` time validity (`issued_at <= now + skew`, `now < expires_at`).
@@ -428,15 +475,13 @@ pub fn verify_approval_decision(
     expected_host_id: &str,
     expected_ticket_id: &str,
     expected_input_sha256: &str,
-    revocations: Option<&SignedRevocationList>,
-    min_revocation_version: u64,
+    revocation_policy: RevocationPolicy<'_>,
     now_sec: i64,
 ) -> Result<ApprovalDecisionKind> {
     verify_device_certificate(
         signer_cert,
         identity_pub_ed25519,
-        revocations,
-        min_revocation_version,
+        revocation_policy,
         now_sec,
     )?;
 
@@ -655,7 +700,6 @@ pub fn open_preview(
             "preview_ct exceeds {MAX_PREVIEW_CT_BYTES} bytes"
         )));
     }
-    // Minimum size: 4 magic + 1 ver + 1 id_len + 1 id + 32 eph + 2 ct_len + 16 tag + 64 sig = 121
     if sealed_bytes.len() < 4 + 1 + 1 + 1 + 32 + 2 + 16 + 64 {
         return Err(ProtocolError::Malformed("preview_ct truncated".to_string()));
     }
@@ -762,8 +806,143 @@ fn preview_aad(
 }
 
 // ---------------------------------------------------------------------------
-// Noise `IK` Authenticated E2EE Tunnel (Opus R1)
+// Noise `IK` Authenticated E2EE Tunnel + Sliding Replay Window (Opus R1, #20)
 // ---------------------------------------------------------------------------
+
+/// Cheap per-epoch responder replay guard for Noise `IK` message 1.
+///
+/// Noise `IK` msg1 has weak forward secrecy and can be replayed by a malicious relay
+/// within the same `host_epoch`. Responders check incoming msg1 hashes through this
+/// bounded guard before spending X25519 DH / responder handshake work.
+pub struct EpochHandshakeReplayGuard {
+    host_epoch: u64,
+    capacity: usize,
+    seen: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl EpochHandshakeReplayGuard {
+    /// Creates a bounded msg1 replay guard for `host_epoch` (default capacity: `1024`).
+    pub fn new(host_epoch: u64, capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            host_epoch,
+            capacity: cap,
+            seen: HashSet::with_capacity(cap.min(1024)),
+            order: VecDeque::with_capacity(cap.min(1024)),
+        }
+    }
+
+    /// Epoch bound to this guard.
+    pub fn host_epoch(&self) -> u64 {
+        self.host_epoch
+    }
+
+    /// Rejects duplicate msg1 bytes within the same `host_epoch` with
+    /// [`ProtocolError::ReplayDetected`] before running DH; records fresh hashes
+    /// with bounded FIFO eviction.
+    pub fn check_and_record(&mut self, host_epoch: u64, msg1: &[u8]) -> Result<()> {
+        if host_epoch != self.host_epoch {
+            return Err(ProtocolError::InvalidInput(format!(
+                "handshake replay guard epoch mismatch: expected {}, got {host_epoch}",
+                self.host_epoch
+            )));
+        }
+        let digest: [u8; 32] = Sha256::digest(msg1).into();
+        if self.seen.contains(&digest) {
+            return Err(ProtocolError::ReplayDetected {
+                got: 0,
+                high_water: 0,
+            });
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(digest);
+        self.order.push_back(digest);
+        Ok(())
+    }
+}
+
+/// WireGuard / RFC 6479-style 1024-bit sliding replay window.
+///
+/// Bit `delta` (`0 <= delta < 1024`) records whether `high_water - delta` has already
+/// been authenticated. Advances ONLY via [`Self::mark_accepted`] after AEAD passes.
+#[derive(Debug, Clone)]
+struct ReplayWindow {
+    high_water: u64,
+    bitmap: [u64; REPLAY_WINDOW_WORDS],
+}
+
+impl ReplayWindow {
+    const fn new() -> Self {
+        Self {
+            high_water: 0,
+            bitmap: [0u64; REPLAY_WINDOW_WORDS],
+        }
+    }
+
+    fn check(&self, seq: u64) -> Result<()> {
+        if seq == 0 {
+            return Err(ProtocolError::ReplayDetected {
+                got: 0,
+                high_water: self.high_water,
+            });
+        }
+        if seq > self.high_water {
+            return Ok(());
+        }
+        let delta = self.high_water - seq;
+        if delta >= REPLAY_WINDOW_SIZE {
+            return Err(ProtocolError::ReplayDetected {
+                got: seq,
+                high_water: self.high_water,
+            });
+        }
+        let word = (delta / 64) as usize;
+        let bit = delta % 64;
+        if (self.bitmap[word] & (1u64 << bit)) != 0 {
+            return Err(ProtocolError::ReplayDetected {
+                got: seq,
+                high_water: self.high_water,
+            });
+        }
+        Ok(())
+    }
+
+    fn mark_accepted(&mut self, seq: u64) {
+        if seq > self.high_water {
+            let shift = seq - self.high_water;
+            if shift >= REPLAY_WINDOW_SIZE {
+                self.bitmap = [0u64; REPLAY_WINDOW_WORDS];
+            } else {
+                let word_shift = (shift / 64) as usize;
+                let bit_shift = (shift % 64) as u32;
+                let mut next = [0u64; REPLAY_WINDOW_WORDS];
+                for i in (word_shift..REPLAY_WINDOW_WORDS).rev() {
+                    let src = i - word_shift;
+                    let mut val = self.bitmap[src] << bit_shift;
+                    if bit_shift > 0 && src > 0 {
+                        val |= self.bitmap[src - 1] >> (64 - bit_shift);
+                    }
+                    next[i] = val;
+                }
+                self.bitmap = next;
+            }
+            self.bitmap[0] |= 1u64;
+            self.high_water = seq;
+        } else {
+            let delta = self.high_water - seq;
+            if delta < REPLAY_WINDOW_SIZE {
+                let word = (delta / 64) as usize;
+                let bit = delta % 64;
+                self.bitmap[word] |= 1u64 << bit;
+            }
+        }
+    }
+}
 
 fn tunnel_prologue(stream_id: &str, host_epoch: u64) -> Result<Vec<u8>> {
     validate_non_empty_id(stream_id, "stream_id", 128)?;
@@ -777,9 +956,13 @@ fn tunnel_prologue(stream_id: &str, host_epoch: u64) -> Result<Vec<u8>> {
 
 /// Noise `IK` handshake state for either initiator (mobile client) or responder (host daemon).
 ///
-/// Pins the peer's static X25519 key from a verified [`DeviceCertificate`] and binds
-/// `(stream_id, host_epoch)` in the Noise prologue so each `host_epoch` requires a fresh
-/// authenticated handshake (Opus R1).
+/// Security invariants:
+/// - Pins the peer's static X25519 key from a verified [`DeviceCertificate`].
+/// - Binds `(stream_id, host_epoch)` in the Noise prologue so each `host_epoch` requires a
+///   fresh authenticated handshake (Opus R1).
+/// - Enforces **empty handshake payloads** (`write_message(&[])`) because Noise `IK` msg1
+///   provides weak forward secrecy and is replayable; application data/secrets travel ONLY
+///   after [`Self::into_transport`] (Opus review #20).
 pub struct NoiseHandshake {
     state: HandshakeState,
     expected_remote_static: Zeroizing<[u8; 32]>,
@@ -795,8 +978,7 @@ impl NoiseHandshake {
         local_x25519_secret: &[u8; 32],
         remote_cert: &DeviceCertificate,
         identity_pub_ed25519: &[u8; 32],
-        revocations: Option<&SignedRevocationList>,
-        min_revocation_version: u64,
+        revocation_policy: RevocationPolicy<'_>,
         now_sec: i64,
         stream_id: &str,
         host_epoch: u64,
@@ -804,8 +986,7 @@ impl NoiseHandshake {
         verify_device_certificate(
             remote_cert,
             identity_pub_ed25519,
-            revocations,
-            min_revocation_version,
+            revocation_policy,
             now_sec,
         )?;
         let remote_x25519 = decode_fixed_b64::<32>(&remote_cert.x25519_pub_b64, "x25519_pub_b64")?;
@@ -847,8 +1028,7 @@ impl NoiseHandshake {
         local_x25519_secret: &[u8; 32],
         expected_initiator_cert: &DeviceCertificate,
         identity_pub_ed25519: &[u8; 32],
-        revocations: Option<&SignedRevocationList>,
-        min_revocation_version: u64,
+        revocation_policy: RevocationPolicy<'_>,
         now_sec: i64,
         stream_id: &str,
         host_epoch: u64,
@@ -856,8 +1036,7 @@ impl NoiseHandshake {
         verify_device_certificate(
             expected_initiator_cert,
             identity_pub_ed25519,
-            revocations,
-            min_revocation_version,
+            revocation_policy,
             now_sec,
         )?;
         let remote_x25519 =
@@ -894,27 +1073,31 @@ impl NoiseHandshake {
 
     /// Writes the next Noise `IK` handshake message (`-> e, es, s, ss` for initiator;
     /// `<- e, ee, se` for responder).
+    ///
+    /// Enforces `payload.is_empty()`: Noise `IK` msg1 has weak forward secrecy and is
+    /// replayable, so zero application data or secrets may be placed in handshake messages.
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        if payload.len() > 1024 {
-            return Err(ProtocolError::TooLarge(
-                "handshake payload exceeds 1024 bytes".to_string(),
+        if !payload.is_empty() {
+            return Err(ProtocolError::InvalidInput(
+                "Noise IK handshake payloads must be empty (send application data only after into_transport)"
+                    .to_string(),
             ));
         }
-        let mut out = vec![0u8; payload.len() + 256];
+        let mut out = vec![0u8; 256];
         let n = self
             .state
-            .write_message(payload, &mut out)
+            .write_message(&[], &mut out)
             .map_err(|e| ProtocolError::Noise(e.to_string()))?;
         out.truncate(n);
         Ok(out)
     }
 
-    /// Reads an incoming Noise `IK` handshake message and verifies the remote static key
-    /// pin as soon as it becomes available.
+    /// Reads an incoming Noise `IK` handshake message, enforces an empty handshake payload,
+    /// and verifies the remote static key pin as soon as it becomes available.
     pub fn read_message(&mut self, message: &[u8]) -> Result<Vec<u8>> {
-        if message.len() > 2048 {
+        if message.len() > 256 {
             return Err(ProtocolError::TooLarge(
-                "handshake message exceeds 2048 bytes".to_string(),
+                "Noise IK empty-payload handshake message exceeds 256 bytes".to_string(),
             ));
         }
         let mut out = vec![0u8; message.len()];
@@ -923,6 +1106,12 @@ impl NoiseHandshake {
             .read_message(message, &mut out)
             .map_err(|e| ProtocolError::Noise(e.to_string()))?;
         out.truncate(n);
+
+        if !out.is_empty() {
+            return Err(ProtocolError::Malformed(
+                "unexpected non-empty Noise IK handshake payload".to_string(),
+            ));
+        }
 
         if let Some(remote_static) = self.state.get_remote_static() {
             if remote_static != *self.expected_remote_static {
@@ -935,13 +1124,24 @@ impl NoiseHandshake {
         Ok(out)
     }
 
+    /// Responder convenience helper that checks [`EpochHandshakeReplayGuard`] before
+    /// spending DH work on [`Self::read_message`].
+    pub fn read_message_guarded(
+        &mut self,
+        message: &[u8],
+        guard: &mut EpochHandshakeReplayGuard,
+    ) -> Result<Vec<u8>> {
+        guard.check_and_record(self.host_epoch, message)?;
+        self.read_message(message)
+    }
+
     /// True once both Noise `IK` messages have been exchanged.
     pub fn is_handshake_finished(&self) -> bool {
         self.state.is_handshake_finished()
     }
 
     /// Transitions a completed handshake into an authenticated [`TunnelSession`] with
-    /// per-direction strict monotonic counters and replay/reorder rejection.
+    /// per-direction monotonic send counters and a 1024-bit sliding replay window.
     pub fn into_transport(self) -> Result<TunnelSession> {
         if !self.state.is_handshake_finished() {
             return Err(ProtocolError::Noise(
@@ -967,26 +1167,29 @@ impl NoiseHandshake {
             host_epoch: self.host_epoch,
             is_initiator: self.is_initiator,
             send_seq: 0,
-            recv_high_water: 0,
+            recv_window: ReplayWindow::new(),
             handshake_hash,
         })
     }
 }
 
 /// Authenticated Noise `IK` transport session with strict monotonic send counters
-/// and receive-side high-water replay/reorder rejection (Opus R1).
+/// and a WireGuard/IPsec-style 1024-bit sliding replay window (Opus R1, review #20).
 ///
 /// Wire ciphertext layout: `seq (8-byte BE u64, starting at 1) || Noise AEAD ciphertext`.
-/// Because `StatelessTransportState` uses `seq` as the ChaCha20-Poly1305 nonce, any
-/// tampering with the 8-byte `seq` prefix fails Poly1305 verification without advancing
-/// `recv_high_water`.
+/// - Out-of-order frames within `[high_water - 1023, high_water]` (e.g. an `approval`
+///   frame replayed after a live `pty` frame) are accepted once and recorded in the bitmap.
+/// - Duplicate frames and frames older than `REPLAY_WINDOW_SIZE` (`1024`) are rejected
+///   with [`ProtocolError::ReplayDetected`] before AEAD work.
+/// - Tampering with the 8-byte `seq` prefix fails Poly1305 verification without
+///   advancing or polluting the replay window.
 pub struct TunnelSession {
     transport: StatelessTransportState,
     stream_id: String,
     host_epoch: u64,
     is_initiator: bool,
     send_seq: u64,
-    recv_high_water: u64,
+    recv_window: ReplayWindow,
     handshake_hash: Zeroizing<Vec<u8>>,
 }
 
@@ -1013,7 +1216,7 @@ impl TunnelSession {
 
     /// Highest authenticated sequence number received so far (`0` before first frame).
     pub fn recv_high_water(&self) -> u64 {
-        self.recv_high_water
+        self.recv_window.high_water
     }
 
     /// Noise handshake hash `h` (32 bytes for SHA-256), usable as a channel binding token.
@@ -1051,12 +1254,11 @@ impl TunnelSession {
         Ok(out)
     }
 
-    /// Decrypts a framed ciphertext and enforces strict monotonic `seq > recv_high_water`.
+    /// Decrypts a framed ciphertext using the 1024-bit sliding replay window.
     ///
-    /// Rejects replays, duplicates, and reordered frames BEFORE AEAD decryption, and
-    /// advances `recv_high_water` ONLY after Poly1305 authentication succeeds.
+    /// Rejects duplicates and below-window frames BEFORE AEAD decryption, and
+    /// marks `seq` accepted in the bitmap ONLY after Poly1305 authentication succeeds.
     pub fn decrypt(&mut self, framed_ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        // 8-byte seq + 16-byte Poly1305 tag minimum.
         if framed_ciphertext.len() < 8 + 16 {
             return Err(ProtocolError::Malformed(
                 "tunnel ciphertext shorter than header + tag".to_string(),
@@ -1072,12 +1274,7 @@ impl TunnelSession {
                 .try_into()
                 .map_err(|_| ProtocolError::Malformed("tunnel seq prefix".to_string()))?,
         );
-        if seq == 0 || seq <= self.recv_high_water {
-            return Err(ProtocolError::ReplayDetected {
-                got: seq,
-                high_water: self.recv_high_water,
-            });
-        }
+        self.recv_window.check(seq)?;
         if seq > MAX_FRAMES_PER_SESSION {
             return Err(ProtocolError::RekeyRequired {
                 limit: MAX_FRAMES_PER_SESSION,
@@ -1090,7 +1287,7 @@ impl TunnelSession {
             .read_message(seq, &framed_ciphertext[8..], &mut plain)
             .map_err(|_| ProtocolError::Aead("tunnel frame authentication failed".to_string()))?;
         plain.truncate(n);
-        self.recv_high_water = seq;
+        self.recv_window.mark_accepted(seq);
         Ok(plain)
     }
 }
