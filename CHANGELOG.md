@@ -63,8 +63,48 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 - **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.
+- **Skills for landing work: `gitpulse:commit-and-merge`, `gitpulse:merge-prs`
+  and `gitpulse:wrap-up`.**
+  - `commit-and-merge` commits finished worktrees and merges the verified
+    branches into the default branch. It keeps every locked-in branch: locked
+    worktrees, branches a live agent holds, protected and `archive/**` names,
+    and the repository's own list in `git config gitpulse.lockedBranch`.
+    A locked-in branch may merge once it verifies, and is never deleted,
+    rewritten or committed into.
+  - `merge-prs` merges open pull requests with `gh`. Each merge is pinned to
+    the head commit that was checked, and none happens without the owner's yes
+    on the list.
+  - `wrap-up` lets running agents finish, fixes the critical bugs found,
+    reviews every branch with the strongest model, then merges, prunes stale
+    and regressed branches behind backup refs, and updates the task board.
+
+  A repository can store its gate, integration worktree and disk floor in
+  `gitpulse.*` git config, so no skill carries any one repository's names or
+  paths.
+
+- **The managed Antigravity plugin installs `gitpulse-merge-train`**, with its
+  `failset` helper, beside `gitpulse-commit-and-merge`, `gitpulse-merge-prs` and
+  `gitpulse-wrap-up`, so the landing skills' references to it resolve there too.
 
 ### Changed
+
+- **GitPulse's branch cleanup keeps locked-in branches.** The dead-branch scan
+  marks every branch under a `git config gitpulse.lockedBranch` value or under
+  `archive/` as protected, a clean refuses to delete one, the Ops cleanup plan
+  never proposes one, and `gitpulse_worktree_prune` skips its worktree even with
+  `force`. Values match as `git for-each-ref` matches them, the same as the
+  landing skills. A config GitPulse cannot read refuses the delete.
+
+- **The plugin manifests no longer say GitPulse "never writes git".** Its
+  worktree tools and landing skills do write; the description now says it never
+  runs `git push`, and that the skills that change the default branch or the
+  remote act only after you approve their plan.
+
+- **`gitpulse:merge-train` no longer names particular repositories or paths.**
+  It reads each repository's gate from its settings or its own instructions.
+  Logs and reports now go under `<git-common-dir>/gitpulse/`, which no
+  repository tracks. `failset` reports the two step-header runner formats as
+  `ci-local-steps` and `local-ci-js`.
 
 - **Plugin skills drop the repeated `gitpulse-` prefix.** Hosts already put the
   plugin's name in front of its skills, so they showed as

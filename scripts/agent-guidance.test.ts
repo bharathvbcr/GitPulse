@@ -114,11 +114,18 @@ const bundledSkills = [...skillNames(".agents/skills"), ...pluginSkills];
  * external clipboard copies (`dc-store`'s vendored `agent_guidance.md`).
  * Until `dc-store` names them directly, the terminal launch lane
  * (`terminal_command.rs`) must name every one of them explicitly.
- * `load` and `merge-train` are here for the second reason,
+ * `load`, `merge-train`, `commit-and-merge`, `merge-prs` and `wrap-up` are here for the second reason,
  * not the first: `dc-store`'s brief is owned there, and a launched agent still
  * has to be told the skill exists.
  */
-const TERMINAL_HOST_SKILLS = new Set(["terminal", "load", "merge-train"]);
+const TERMINAL_HOST_SKILLS = new Set([
+  "terminal",
+  "load",
+  "merge-train",
+  "commit-and-merge",
+  "merge-prs",
+  "wrap-up",
+]);
 const terminalLaunchSource = readFileSync(
   new URL("../src-tauri/src/workbench/terminal_command.rs", import.meta.url),
   "utf8",
