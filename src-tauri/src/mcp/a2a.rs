@@ -556,6 +556,13 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         max_hops,
     )
     .map_err(CommandError::into_message)?;
+    // An exact retry returns the stored row, and a threaded retry recomputed a hop one past
+    // that row (the thread's last message is now the original). The stored row is the truth for
+    // the response, the mailbox provenance and the hop-limit decision; the mailbox refuses the
+    // same request id under different provenance, so a recomputed hop reported a delivered
+    // message as bus-only.
+    let hop = message.hop.unwrap_or(hop);
+    let max_hops = message.max_hops.unwrap_or(max_hops);
     let msg_id = message
         .msg_id
         .clone()
@@ -663,6 +670,7 @@ struct DedupedInboxResult {
     messages: Vec<AgentBusMessage>,
     latest_seq: u64,
     dropped_before_seq: u64,
+    pinned_below_dropped_before_seq: Vec<u64>,
     has_more: bool,
     acked_count: usize,
     /// Why acknowledging failed, when it did. The messages were already collected, so a failed
@@ -759,6 +767,10 @@ fn collect_deduped_peer_inbox(
     )
     .map_err(CommandError::into_message)?;
 
+    // Seqs of returned rows that really are on the bus. A row rebuilt from a mailbox envelope
+    // (its bus row evicted) keeps its old seq, which can sit below `dropped_before_seq` without
+    // being a retained row, so only bus-backed rows may appear in the pinned list.
+    let mut on_bus: BTreeSet<u64> = bus_page.messages.iter().map(|m| m.seq).collect();
     let mut seen_ids = BTreeSet::new();
     let mut combined = Vec::new();
     for msg in bus_page.messages {
@@ -909,6 +921,12 @@ fn collect_deduped_peer_inbox(
                         false,
                     ),
                 };
+                // A legacy bus row has no msg_id; give it the effective id the bus rows above carry,
+                // so the ack and claim below can name it.
+                let mut synthesized = synthesized;
+                if synthesized.msg_id.is_none() {
+                    synthesized.msg_id = Some(env_id.clone());
+                }
                 if from_bus && synthesized.read_by.iter().any(|r| aliases.contains(r)) {
                     if ack {
                         if let Err(e) = mb.mark_claimed_by_id(sid, &env.claim.request_id, now) {
@@ -925,6 +943,9 @@ fn collect_deduped_peer_inbox(
                         continue;
                     }
                 }
+                if from_bus {
+                    on_bus.insert(synthesized.seq);
+                }
                 mailbox_req_by_msg_id.insert(env_id.clone(), env.claim.request_id);
                 seen_ids.insert(env_id);
                 combined.push(synthesized);
@@ -938,6 +959,13 @@ fn collect_deduped_peer_inbox(
     if has_more {
         combined.truncate(limit);
     }
+
+    // Listed from what is actually returned, so the list never names a row the page lacks.
+    let pinned_below_dropped_before_seq: Vec<u64> = combined
+        .iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < bus_page.dropped_before_seq && on_bus.contains(seq))
+        .collect();
 
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
@@ -984,6 +1012,7 @@ fn collect_deduped_peer_inbox(
             messages: combined,
             latest_seq: bus_page.latest_seq,
             dropped_before_seq: bus_page.dropped_before_seq,
+            pinned_below_dropped_before_seq,
             has_more,
             acked_count,
             ack_error: (!ack_errors.is_empty()).then(|| ack_errors.join("; ")),
@@ -1018,6 +1047,7 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
         "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
         "messages": res.messages,
     }))
@@ -1222,6 +1252,7 @@ fn wait_response(
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
         "dropped_before_seq": res.dropped_before_seq,
+        "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
         "messages": res.messages,
     })

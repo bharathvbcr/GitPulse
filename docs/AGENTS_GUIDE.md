@@ -126,14 +126,16 @@ GitPulse shows a preview and waits for your confirmation before delivering it.
 
 The `gitpulse_agent_send` result has a `mailbox` object saying whether the recipient's mailbox took the message (`deposited`, with a `reason` of `full`, `refused`, `no_session` or `unavailable` when it did not). A peer may hold at most 7 pending messages per session; the last slot carries one notice per repository pointing the recipient at `gitpulse_agent_inbox`. A `delivery_outcome` of `bus_only` means the message is on the bus but not in the mailbox, so only an inbox or wait call will show it.
 
-To answer a message, pass its `msg_id` as `in_reply_to`. The message must still be on the bus, or the send is refused. The reply joins the answered message's thread when you name none, and its hop is the answered hop plus one. The hop count never goes down: it is the highest of an explicit `hop`, the `in_reply_to` hop plus one, the thread's last hop plus one, and 1, so a chain of replies reaches the hop limit even without a shared `thread_key`. A sender that never registered as a peer can still be answered: when `to_peer` exactly matches the `from_peer` of a message on the bus and no peer matches, the reply goes to the bus only (`liveness` `unregistered`, `delivery_outcome` `bus_only`, mailbox `reason` `no_session`). A prefix or a different case does not match.
+To answer a message, pass its `msg_id` as `in_reply_to`. The message must still be on the bus, or the send is refused. A delivered message's header tells the reader to reply with `in_reply_to` set to its `msg_id`, so the reply carries the hop count even without a thread. An exact retry (same `msg_id`, same payload) reports the stored message's hop and mailbox outcome rather than recomputing them. The reply joins the answered message's thread when you name none, and its hop is the answered hop plus one. The hop count never goes down: it is the highest of an explicit `hop`, the `in_reply_to` hop plus one, the thread's last hop plus one, and 1, so a chain of replies reaches the hop limit even without a shared `thread_key`. A sender that never registered as a peer can still be answered: when `to_peer` exactly matches the `from_peer` of a message on the bus and no peer matches, the reply goes to the bus only (`liveness` `unregistered`, `delivery_outcome` `bus_only`, mailbox `reason` `no_session`). A prefix or a different case does not match.
 
 The bus keeps the newest 256 messages. When it is full, the oldest message goes first, except that open
 asks and each recipient's unread direct messages from the last 2 hours (up to 8 per recipient, 64 in
 all) are kept for as long as anything else can go instead. A body may hold line breaks and tabs but no
 other control characters, and the 16 KiB limit counts the body as stored, where a quote or backslash
 takes two bytes. If the bus file ever outgrows its 8 MiB limit, the next post or acknowledgement drops
-the oldest rows to bring it back under, logs a warning, and never reuses a sequence number.
+the oldest rows to bring it back under, logs a warning, and never reuses a sequence number. Because the kept rows can be older than rows that were dropped, an inbox or
+wait response lists them in `pinned_below_dropped_before_seq`: `dropped_before_seq` still means no dropped
+row has a sequence at or above it, and those listed rows are the exceptions below it.
 
 ![The Agents inbox with an overlap notice from one agent session to another](assets/agent-inbox.webp)
 
