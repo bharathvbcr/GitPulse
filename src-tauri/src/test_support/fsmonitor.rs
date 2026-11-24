@@ -56,6 +56,9 @@ fn running(root: &Path) -> bool {
 /// could not run or did not finish.
 fn git(root: &Path, args: &[&str]) -> Option<bool> {
     let mut command = Command::new("git");
+    // Pinned so an inherited GIT_DIR or GIT_WORK_TREE cannot aim the stop at
+    // another repository than `root`.
+    crate::test_support::pin_git(&mut command);
     command.args(args).current_dir(root);
     let label = format!("git {}", args.join(" "));
     crate::engine::process::run_bounded(

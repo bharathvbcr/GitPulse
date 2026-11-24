@@ -6799,10 +6799,20 @@ mod tests {
                 "1-hour-old scratch build must be offered when disk_critical=true in cloud mode",
             );
         assert_eq!(recent_entry["recent_below_retention"], true);
-        assert!(
-            recent_entry["private_bytes"].is_u64(),
-            "cloud inventory must measure private_bytes on scratch targets: {recent_entry:?}"
-        );
+        // Clone-private bytes come from APFS (`storage::clone_size`, macOS
+        // only). Elsewhere the inventory must say they were not measured, not
+        // offer a number it never read.
+        if cfg!(target_os = "macos") {
+            assert!(
+                recent_entry["private_bytes"].is_u64(),
+                "cloud inventory must measure private_bytes on scratch targets: {recent_entry:?}"
+            );
+        } else {
+            assert!(
+                recent_entry["private_bytes"].is_null(),
+                "private_bytes is only measured on APFS, so it must be absent here: {recent_entry:?}"
+            );
+        }
         let recent_sess_entry = prompt_cands
             .iter()
             .find(|c| {
