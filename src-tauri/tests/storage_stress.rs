@@ -737,8 +737,16 @@ fn ignore(repo: &TempRepo, body: &str) {
     fs::write(repo.root.join(".gitignore"), body).unwrap();
 }
 
-/// A build directory with nothing committed in it is measured, safe, and
-/// counted toward the headline.
+/// Whether a build directory's size is exact on this platform. On Linux
+/// GitPulse makes reflink clones (`FICLONE`) and nothing reads how much of a
+/// tree they share, so its logical length is only an upper bound: the audit
+/// labels it `Estimated` and keeps it out of the headline
+/// (`ReclaimSizing::MayShare`). Elsewhere a fully walked tree is `Measured`.
+const SIZES_ARE_EXACT: bool = !cfg!(target_os = "linux");
+
+/// A build directory with nothing committed in it is safe, and counted toward
+/// the headline where its size is exact; where it is only an upper bound
+/// (Linux) it is counted as estimated instead, never as reclaimable.
 #[test]
 fn reclaim_counts_a_clean_build_directory_as_recoverable() {
     let repo = TempRepo::new();
@@ -753,22 +761,42 @@ fn reclaim_counts_a_clean_build_directory_as_recoverable() {
         .iter()
         .find(|i| i.label.starts_with("target"))
         .expect("the build directory must appear in the audit");
-    assert_eq!(item.confidence, ReclaimConfidence::Measured);
     assert_eq!(item.safety, ReclaimSafety::Safe);
     assert!(item.bytes >= 200_000, "bytes = {}", item.bytes);
     assert!(item.blocked_reason.is_none());
-    assert!(
-        report.reclaim_summary.reclaimable_bytes >= 200_000,
-        "a measured, safe item must reach the headline: {:?}",
-        report.reclaim_summary
-    );
+    if SIZES_ARE_EXACT {
+        assert_eq!(item.confidence, ReclaimConfidence::Measured);
+        assert!(
+            report.reclaim_summary.reclaimable_bytes >= 200_000,
+            "a measured, safe item must reach the headline: {:?}",
+            report.reclaim_summary
+        );
+    } else {
+        assert_eq!(item.confidence, ReclaimConfidence::Estimated);
+        assert!(
+            item.detail.contains("upper bound"),
+            "an estimate must say it is an upper bound: {}",
+            item.detail
+        );
+        assert_eq!(
+            report.reclaim_summary.reclaimable_bytes, 0,
+            "an upper bound is never promised as free space: {:?}",
+            report.reclaim_summary
+        );
+        assert!(
+            report.reclaim_summary.estimated_bytes >= 200_000,
+            "a safe item sized as an upper bound is counted as estimated: {:?}",
+            report.reclaim_summary
+        );
+    }
 }
 
 /// THE ACCOUNTING RULE: the headline counts measured *and* safe bytes only.
 ///
-/// Committed build output is measured but not safe — deleting it is a commit.
-/// Folding it into "reclaimable" would promise space the user can only have by
-/// losing tracked content.
+/// Committed build output is not safe — deleting it is a commit. Folding it
+/// into "reclaimable" would promise space the user can only have by losing
+/// tracked content. Where its size is exact it is counted as needing review;
+/// where it is an upper bound (Linux) it is counted as estimated.
 #[test]
 fn committed_build_output_is_not_counted_as_reclaimable() {
     let repo = TempRepo::new();
@@ -790,7 +818,16 @@ fn committed_build_output_is_not_counted_as_reclaimable() {
         report.reclaim_summary.reclaimable_bytes, 0,
         "tracked content must never be promised as free space"
     );
-    assert!(report.reclaim_summary.needs_review_bytes >= 150_000);
+    let counted = if SIZES_ARE_EXACT {
+        report.reclaim_summary.needs_review_bytes
+    } else {
+        report.reclaim_summary.estimated_bytes
+    };
+    assert!(
+        counted >= 150_000,
+        "committed build output must still be counted somewhere: {:?}",
+        report.reclaim_summary
+    );
 }
 
 /// Every item lands in exactly one bucket of the summary.

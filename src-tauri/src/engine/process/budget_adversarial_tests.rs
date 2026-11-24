@@ -63,6 +63,17 @@ fn take_always_writing(
     }
 }
 
+/// Leaves `path` holding exactly `blob`, as `std::fs::write` would, without
+/// truncating it to nothing first. Truncating to zero drops the cached page, so
+/// every blob dirtied a fresh 4 KiB block: the ~180 000 blobs of the model
+/// check wrote 1.3 GiB, most of the lib suite's disk-write budget. Overwriting
+/// in place and then cutting to length lands the same bytes on the record.
+fn overwrite_in_place(path: &Path, blob: &[u8]) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all(blob).unwrap();
+    file.set_len(blob.len() as u64).unwrap();
+}
+
 struct ModelResult {
     lane: u64,
     oracle: u64,
@@ -117,8 +128,8 @@ fn model(seed: u64, burst: u32, per_sec: u32, steps: u64) -> ModelResult {
                     }
                     _ => vec![0xFF; RECORD_LEN],
                 };
-                std::fs::write(dir.path().join("lane"), &blob).unwrap();
-                std::fs::write(dir.path().join("oracle"), &blob).unwrap();
+                overwrite_in_place(&dir.path().join("lane"), &blob);
+                overwrite_in_place(&dir.path().join("oracle"), &blob);
             }
         }
     }
