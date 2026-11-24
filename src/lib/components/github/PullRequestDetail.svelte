@@ -22,8 +22,9 @@
     openPullRequestWorktree,
     withVerdict,
   } from "../../github/prActions";
-  import type { PrMergeMethod, PrReviewVerdict, PullRequestDetail } from "../../github/types";
+  import type { PrMergeMethod, PrReviewVerdict, PullRequestDetail, PullRequestDiff } from "../../github/types";
   import { shortHash } from "../../format";
+  import UnifiedPatchView from "../UnifiedPatchView.svelte";
 
   let {
     repoPath,
@@ -156,6 +157,48 @@
       `Merged #${number}.`,
     );
   }
+  let activeTab = $state<"overview" | "files">("overview");
+  let diff = $state<PullRequestDiff | null>(null);
+  let diffLoading = $state(false);
+  let diffError = $state<string | null>(null);
+  let diffGuard: AsyncGuard | null = null;
+  let loadedDiffKey = "";
+
+  async function loadDiff(force = false) {
+    const key = `${repoPath}:${number}`;
+    if (!force && loadedDiffKey === key && diff !== null) return;
+    diffGuard?.cancel();
+    const guard = createAsyncGuard();
+    diffGuard = guard;
+    diffLoading = true;
+    diffError = null;
+    try {
+      const next = await invoke<PullRequestDiff>("cmd_github_pr_diff", { repoPath, number });
+      if (guard.isLive()) {
+        diff = next;
+        loadedDiffKey = key;
+      }
+    } catch (error) {
+      if (guard.isLive()) diffError = failure("load", `#${number} files`, error);
+    } finally {
+      if (guard.isLive()) diffLoading = false;
+    }
+  }
+
+  function selectTab(tab: "overview" | "files") {
+    activeTab = tab;
+    if (tab === "files") void loadDiff();
+  }
+
+  $effect(() => {
+    void `${repoPath}:${number}`;
+    diffGuard?.cancel();
+    activeTab = "overview";
+    diff = null;
+    diffLoading = false;
+    diffError = null;
+    loadedDiffKey = "";
+  });
 </script>
 
 <div data-pr-detail={number} class="mt-2 p-3 rounded-xl border border-edge bg-background/60 text-xs space-y-3">
@@ -176,7 +219,45 @@
       {#if detail.review_decision}<span>{detail.review_decision.toLowerCase().replace("_", " ")}</span>{/if}
       {#if !open}<span class="gp-chip" data-tone="neutral">{detail.state.toLowerCase()}</span>{/if}
     </div>
-    {#if detail.body.trim()}
+    <div class="gp-segmented my-2 inline-flex p-0.5!" role="tablist" aria-label="Pull request view">
+      <button
+        type="button"
+        role="tab"
+        class="gp-seg-btn px-2! text-micro"
+        aria-selected={activeTab === "overview"}
+        data-active={activeTab === "overview" ? "true" : "false"}
+        onclick={() => selectTab("overview")}
+      >
+        Overview
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="gp-seg-btn px-2! text-micro"
+        aria-selected={activeTab === "files"}
+        data-active={activeTab === "files" ? "true" : "false"}
+        onclick={() => selectTab("files")}
+      >
+        Files ({detail.changed_files})
+      </button>
+    </div>
+    {#if activeTab === "files"}
+      {#if diffLoading && !diff}
+        <Skeleton variant="text" count={4} />
+      {:else if diffError}
+        <div class="gp-notice flex items-center justify-between gap-2" data-tone="danger" role="alert">
+          <span>{diffError}</span>
+          <button type="button" class="gp-btn shrink-0" data-size="sm" onclick={() => void loadDiff(true)}>Try again</button>
+        </div>
+      {:else if diff}
+        <UnifiedPatchView
+          patch={diff.patch}
+          truncated={diff.truncated}
+          emptyMessage="No textual file changes in this pull request."
+        />
+      {/if}
+    {:else}
+      {#if detail.body.trim()}
       <div class="max-h-48 overflow-auto whitespace-pre-wrap text-textPrimary/90 font-sans leading-relaxed">{detail.body}</div>
       {#if detail.body_truncated}
         <div class="text-meta text-warn">The description is longer than shown here; open it on GitHub for the rest.</div>
@@ -240,6 +321,7 @@
           onclick={merge}
         >Merge…</button>
       </div>
+    {/if}
     {/if}
   {/if}
   {#if actionError}<div class="gp-notice" data-tone="danger" role="alert">{actionError}</div>{/if}

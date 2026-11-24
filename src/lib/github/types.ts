@@ -227,6 +227,14 @@ export interface PullRequestDetail {
   ci_status: string;
 }
 
+/** Mirrors `PullRequestDiff` in src-tauri/src/github/mod.rs (`gh pr diff`). */
+export interface PullRequestDiff {
+  number: number;
+  patch: string;
+  truncated: boolean;
+  total_bytes: number;
+}
+
 export type PrReviewVerdict = "approve" | "request_changes" | "comment";
 export type PrMergeMethod = "merge" | "squash" | "rebase";
 
