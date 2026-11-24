@@ -547,15 +547,17 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
     path: &Path,
     cap_bytes: u64,
 ) -> Result<T, CommandError> {
-    read_json_bounded_hint(path, cap_bytes, "")
+    read_json_bounded_hint(path, cap_bytes, "", "")
 }
 
-/// [`read_json_bounded`] whose over-cap and corrupt errors end with `hint`, so a reader that
-/// cannot repair the file can say who will.
+/// [`read_json_bounded`] whose over-cap and damaged-JSON errors end with `hint` and whose
+/// valid-JSON-of-another-shape error ends with `shape_hint`, so a reader that cannot repair
+/// the file can say who will, and not promise a repair that a write refuses.
 fn read_json_bounded_hint<T: for<'de> Deserialize<'de> + Default>(
     path: &Path,
     cap_bytes: u64,
     hint: &str,
+    shape_hint: &str,
 ) -> Result<T, CommandError> {
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -582,6 +584,12 @@ fn read_json_bounded_hint<T: for<'de> Deserialize<'de> + Default>(
         return Ok(T::default());
     }
     serde_json::from_slice(&buf).map_err(|e| {
+        if matches!(e.classify(), serde_json::error::Category::Data) {
+            return CommandError::from(format!(
+                "coordination state {} is valid JSON in a shape this build cannot read: {e}{shape_hint}",
+                path.display()
+            ));
+        }
         CommandError::from(format!(
             "corrupt coordination state {}: {e}{hint}",
             path.display()
@@ -1276,6 +1284,12 @@ fn post_message_locked(
         };
 
         let seq = state.next_seq.saturating_add(1);
+        if seq > MAX_JSON_SAFE_SEQ {
+            return Err(CommandError::from(format!(
+                "the message sequence in {} is exhausted (it would pass {MAX_JSON_SAFE_SEQ}, the largest integer readers keep exactly); move messages.json aside by hand to start a fresh bus",
+                messages_path.display()
+            )));
+        }
         state.next_seq = seq;
         let created_at_ms = now_epoch_ms();
         let msg_id = caller_msg_id.unwrap_or_else(|| format!("msg-{seq}-{created_at_ms}"));
@@ -1317,6 +1331,7 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
         path,
         MESSAGES_FILE_CAP,
         "; the next write repairs it (a post, or an acknowledgement that names a message): it moves it aside as messages.json.oversized-<unix> or messages.json.corrupt-<unix> (the two newest are kept, so up to twice the old file's size stays on disk) and starts a fresh bus whose seq continues above the old one, but the unread messages in the old file are not carried over. A read is not a write: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository",
+        "; it was written by a different GitPulse version and no write will repair it. Upgrade or reinstall the GitPulse binaries so every one on this machine is the same version, or move messages.json aside by hand (its unread messages are lost)",
     )
 }
 
@@ -1325,10 +1340,14 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
 const MESSAGES_SEQ_PROBE_BYTES: usize = 4096;
 /// Most `messages.json.oversized-*` / `messages.json.corrupt-*` files left beside the bus.
 const MESSAGES_ASIDE_KEEP: usize = 2;
+const MESSAGES_REPAIR_TMP_PREFIX: &str = "messages.json.repair-";
 const MESSAGES_ASIDE_PREFIXES: [&str; 2] = ["messages.json.oversized-", "messages.json.corrupt-"];
 
-/// Largest seq recovered from a damaged file: 2^53 - 1, the largest integer JSON readers keep.
+/// Largest seq the bus issues: 2^53 - 1, the largest integer JSON readers keep exactly.
 const MAX_JSON_SAFE_SEQ: u64 = (1 << 53) - 1;
+/// Headroom left under [`MAX_JSON_SAFE_SEQ`] when a seq is recovered from a damaged file, so the
+/// fresh bus can still issue about a million messages.
+const SEQ_RECOVERY_CEILING: u64 = MAX_JSON_SAFE_SEQ - (1 << 20);
 
 /// `next_seq` from the head of a `messages.json` that cannot be parsed, or `None`. Only the
 /// first key of the top-level object counts (that is where [`MessagesState`] writes it), and a
@@ -1347,7 +1366,7 @@ fn prefix_next_seq(head: &[u8]) -> Option<u64> {
     Some(
         rest[..digits]
             .parse()
-            .map_or(MAX_JSON_SAFE_SEQ, |n: u64| n.min(MAX_JSON_SAFE_SEQ)),
+            .map_or(SEQ_RECOVERY_CEILING, |n: u64| n.min(SEQ_RECOVERY_CEILING)),
     )
 }
 
@@ -1389,6 +1408,19 @@ fn prune_messages_aside(lanes_dir: &Path) {
     let excess = asides.len().saturating_sub(MESSAGES_ASIDE_KEEP);
     for (_, path) in asides.into_iter().take(excess) {
         let _ = fs::remove_file(path);
+    }
+    // Every repair holds the bus lock and renames its temp file away before it prunes, so a
+    // `messages.json.repair-*` file seen here was left by a repair that died.
+    if let Ok(entries) = fs::read_dir(lanes_dir) {
+        for entry in entries.filter_map(Result::ok).take(4096) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(MESSAGES_REPAIR_TMP_PREFIX)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -1497,6 +1529,8 @@ fn load_messages_for_write(
     // write repairs again, or the new one, so the seq cannot restart at 1.
     if fs::hard_link(messages_path, &aside).is_err() {
         fs::copy(messages_path, &aside).map_err(|e| {
+            // A partial copy is not a usable aside file, and would be counted as one.
+            let _ = fs::remove_file(&aside);
             CommandError::from(format!(
                 "cannot keep {} as {}: {e}",
                 messages_path.display(),
@@ -1504,7 +1538,10 @@ fn load_messages_for_write(
             ))
         })?;
     }
-    let tmp = lanes_dir.join(format!("messages.json.repair-{}", std::process::id()));
+    let tmp = lanes_dir.join(format!(
+        "{MESSAGES_REPAIR_TMP_PREFIX}{}",
+        std::process::id()
+    ));
     let written = (|| -> std::io::Result<()> {
         use std::io::Write;
         let mut opts = fs::OpenOptions::new();
@@ -5358,6 +5395,22 @@ mod tests {
         names
     }
 
+    fn post_one_result(anchor: &str, id: &str) -> Result<AgentBusMessage, CommandError> {
+        post_peer_message(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            None,
+            "note",
+            &format!("body {id}"),
+            None,
+            Some(id),
+            1,
+            6,
+        )
+    }
+
     fn post_one(anchor: &str, id: &str) -> AgentBusMessage {
         post_agent(anchor, None, id, None, 1, 6)
     }
@@ -5452,8 +5505,13 @@ mod tests {
         .unwrap();
         let msg = post_one(anchor, "after-huge");
         assert!(
-            msg.seq <= 1 << 53,
+            msg.seq < 1 << 53,
             "seq {} is not a JSON-safe integer",
+            msg.seq
+        );
+        assert!(
+            msg.seq <= SEQ_RECOVERY_CEILING + 1,
+            "a recovered seq must leave headroom, got {}",
             msg.seq
         );
     }
@@ -5596,5 +5654,59 @@ mod tests {
         assert!(!peers
             .iter()
             .any(|p| p.provider_session_id.as_deref() == Some(S_B)));
+    }
+
+    #[test]
+    fn the_reader_hint_for_a_wrong_typed_file_does_not_promise_a_write_repairs_it() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        fs::write(
+            &path,
+            "{\"next_seq\":\"x\",\"dropped_before_seq\":0,\"messages\":[]}",
+        )
+        .unwrap();
+        let err = read_messages(anchor, None, 0).unwrap_err().into_message();
+        assert!(!err.contains("next write repairs"), "{err}");
+        assert!(err.contains("different GitPulse version"), "{err}");
+        fs::write(&path, "{\"next_seq\": 4, \"dropp").unwrap();
+        let err = read_messages(anchor, None, 0).unwrap_err().into_message();
+        assert!(err.contains("next write repairs"), "{err}");
+    }
+
+    #[test]
+    fn the_bus_never_issues_a_seq_above_two_to_the_53_minus_one() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let limit: u64 = (1 << 53) - 1;
+        let at_limit = format!("{{\"next_seq\":{limit},\"dropped_before_seq\":0,\"messages\":[]}}");
+        fs::write(&path, &at_limit).unwrap();
+        assert!(
+            post_one_result(anchor, "at-limit").is_err(),
+            "a post past the limit must be refused"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), at_limit);
+        let below = format!(
+            "{{\"next_seq\":{},\"dropped_before_seq\":0,\"messages\":[]}}",
+            limit - 1
+        );
+        fs::write(&path, below).unwrap();
+        assert_eq!(post_one(anchor, "last-one").seq, limit);
+    }
+
+    #[test]
+    fn a_repair_removes_repair_temp_files_a_dead_repair_left() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let path = lanes_messages_path(anchor, true).unwrap();
+        let stale = path.with_file_name("messages.json.repair-99999");
+        fs::write(&stale, "half").unwrap();
+        fs::write(&path, "not json at all").unwrap();
+        post_one(anchor, "after-garbage");
+        assert!(!stale.exists(), "stale repair file survived");
     }
 }
