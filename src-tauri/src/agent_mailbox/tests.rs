@@ -1532,3 +1532,168 @@ fn a_waiter_keeps_waiting_while_only_refused_envelopes_are_pending() {
     );
     assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
 }
+
+#[test]
+fn stamps_follow_publish_order_even_when_the_callers_clocks_do_not() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    // The first publisher's clock reads later than the second's, as when one process stamped
+    // before waiting on the lock, or the clock stepped back.
+    let first = mailbox
+        .deposit(
+            SESSION,
+            "req-late-clock",
+            "published first",
+            t0 + Duration::from_millis(5_000),
+        )
+        .unwrap();
+    let second = mailbox
+        .deposit(SESSION, "req-early-clock", "published second", t0)
+        .unwrap();
+    assert!(
+        second.created_at_ms > first.created_at_ms,
+        "a reader that saw {} must not find a later publish at {}",
+        first.created_at_ms,
+        second.created_at_ms
+    );
+    // Even after the first is claimed away, the next stamp still climbs.
+    mailbox.claim_next(SESSION, t0).unwrap();
+    let third = mailbox.deposit(SESSION, "req-third", "third", t0).unwrap();
+    assert!(third.created_at_ms > second.created_at_ms);
+}
+
+#[test]
+fn the_high_water_mark_survives_every_file_being_gone() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    let first = mailbox
+        .deposit(SESSION, "hw-a", "a", t0 + Duration::from_millis(9_000))
+        .unwrap();
+    for name in names(&mailbox, SESSION) {
+        std::fs::remove_file(mailbox.root.join(SESSION).join(name)).unwrap();
+    }
+    assert!(names(&mailbox, SESSION).is_empty());
+    let next = mailbox.deposit(SESSION, "hw-b", "b", t0).unwrap();
+    assert!(
+        next.created_at_ms > first.created_at_ms,
+        "{} must be above {}",
+        next.created_at_ms,
+        first.created_at_ms
+    );
+}
+
+#[test]
+fn a_corrupt_high_water_mark_falls_back_to_the_stamps_present_never_to_zero() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    let first = mailbox
+        .deposit(SESSION, "hw-c", "c", t0 + Duration::from_millis(9_000))
+        .unwrap();
+    std::fs::write(mailbox.root.join(".hw").join(SESSION), b"not a number").unwrap();
+    let next = mailbox.deposit(SESSION, "hw-d", "d", t0).unwrap();
+    assert!(next.created_at_ms > first.created_at_ms);
+    // The mark was rewritten, so it now holds a number again.
+    let healed = std::fs::read_to_string(mailbox.root.join(".hw").join(SESSION)).unwrap();
+    assert_eq!(healed.trim().parse::<u64>().unwrap(), next.created_at_ms);
+}
+
+#[test]
+fn a_stamp_that_would_not_fit_a_file_name_is_refused_not_minted() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-e", "e", SystemTime::now())
+        .unwrap();
+    std::fs::write(
+        mailbox.root.join(".hw").join(SESSION),
+        MAX_STAMP.to_string(),
+    )
+    .unwrap();
+    let refused = mailbox.deposit(SESSION, "hw-f", "f", SystemTime::now());
+    assert!(
+        matches!(refused, Err(MailboxError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert!(
+        names(&mailbox, SESSION).iter().all(|n| !n.contains("hw-f")),
+        "no file may be published for a refused stamp"
+    );
+}
+
+#[test]
+fn a_symlinked_high_water_mark_is_refused() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-g", "g", SystemTime::now())
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let mark = mailbox.root.join(".hw").join(SESSION);
+        let decoy = mailbox.root.join("decoy");
+        std::fs::write(&decoy, "1").unwrap();
+        std::fs::remove_file(&mark).unwrap();
+        std::os::unix::fs::symlink(&decoy, &mark).unwrap();
+        assert!(mailbox
+            .deposit(SESSION, "hw-h", "h", SystemTime::now())
+            .is_err());
+    }
+}
+
+#[test]
+fn pruning_removes_stale_counter_temporaries_but_not_fresh_ones() {
+    let (_dir, mailbox) = mailbox();
+    mailbox
+        .deposit(SESSION, "hw-i", "i", SystemTime::now())
+        .unwrap();
+    let hw = mailbox.root.join(".hw");
+    let stale = hw.join(".tmp-1-00000001");
+    let fresh = hw.join(".tmp-2-00000002");
+    std::fs::write(&stale, "1").unwrap();
+    std::fs::write(&fresh, "1").unwrap();
+    restamp(&stale, SystemTime::now() - Duration::from_secs(3_600));
+    mailbox.prune_sessions(SystemTime::now());
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
+fn the_overflow_notice_names_the_paging_arguments_that_lose_nothing() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    let peer = |id: &str| EnvelopeProvenance::PeerAgent {
+        msg_id: id.to_string(),
+        from_peer: "claude:a".into(),
+        provider: "claude".into(),
+        branch: String::new(),
+        thread_key: String::new(),
+        hop: 1,
+        max_hops: DEFAULT_MAX_HOPS,
+        truncated_in_bus: false,
+        repo_root: "/repo".into(),
+    };
+    for i in 0..MAX_PEER_PENDING {
+        let id = format!("peer-{i}");
+        mailbox
+            .deposit_peer_or_overflow(SESSION, &id, "hello", peer(&id), now)
+            .unwrap();
+    }
+    let over = mailbox
+        .deposit_peer_or_overflow(SESSION, "peer-over", "hello", peer("peer-over"), now)
+        .unwrap();
+    assert!(matches!(over, PeerDeposit::Overflowed { .. }));
+    let notice = mailbox
+        .peek_pending(SESSION, MAX_PENDING, now)
+        .unwrap()
+        .into_iter()
+        .find(|env| env.claim.text.contains("More peer messages"))
+        .expect("an overflow notice");
+    assert!(
+        notice.claim.text.contains("next_since_seq"),
+        "{}",
+        notice.claim.text
+    );
+    assert!(
+        notice.claim.text.contains("since_mailbox_ms"),
+        "{}",
+        notice.claim.text
+    );
+}

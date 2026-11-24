@@ -1048,7 +1048,8 @@ pub fn post_peer_message(
 /// retained row of `thread_key`, one past the `in_reply_to` row, and 1. The stored `max_hops`
 /// is the request (clamped to 1..=32) lowered to the smallest ceiling any of those rows carries,
 /// so a reply can lower a thread's ceiling but never raise it. An exact retry still returns the
-/// stored row unchanged.
+/// stored row unchanged. An `in_reply_to` that names no retained row is refused under the lock
+/// (a row evicted after the caller read it must not silently restart the hop count).
 #[allow(clippy::too_many_arguments)]
 pub fn post_peer_message_in_reply_to(
     repo_path: &str,
@@ -1252,13 +1253,15 @@ fn post_message_locked(
                 ceiling = ceiling.min(row_max.max(1));
             }
         };
-        if let Some(row) = reply_to_id
-            .as_deref()
-            .filter(|_| derive_hops)
-            .and_then(|id| message_index_by_id(&state.messages, id))
-            .map(|idx| &state.messages[idx])
-        {
-            inherit(row);
+        if let Some(id) = reply_to_id.as_deref().filter(|_| derive_hops) {
+            // Checked here, under the lock: a row evicted since the caller looked it up would
+            // otherwise be skipped silently and the reply would restart the hop count at 1.
+            let Some(idx) = message_index_by_id(&state.messages, id) else {
+                return Err(CommandError::from(format!(
+                    "in_reply_to '{id}' names no message on the bus; it may have been evicted, so send without in_reply_to or name a retained msg_id"
+                )));
+            };
+            inherit(&state.messages[idx]);
         }
         if let Some(tk) = t_key.as_ref().filter(|_| derive_hops) {
             // Rows are in seq order, so the last one is where the thread stands; every row's
@@ -5311,6 +5314,30 @@ mod tests {
             post_agent(anchor, Some("t-fresh"), "m-fresh", None, 1, 500).max_hops,
             Some(32)
         );
+    }
+
+    #[test]
+    fn a_reply_naming_no_retained_row_is_refused_under_the_lock() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path().to_str().unwrap();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let err = post_peer_message_in_reply_to(
+            anchor,
+            MessageOrigin::Agent,
+            "claude:aaaaaaaa-1111-4222-8333-444444444444",
+            Some("claude:bbbbbbbb-1111-4222-8333-444444444444"),
+            None,
+            "note",
+            "answer to a row that is gone",
+            None,
+            Some("m-orphan"),
+            Some("m-evicted"),
+            1,
+            6,
+        )
+        .expect_err("a reply to a row the bus no longer holds must not be stored at hop 1");
+        assert!(err.into_message().contains("names no message on the bus"));
+        assert!(get_message_by_id(anchor, "m-orphan").unwrap().is_none());
     }
 
     #[test]

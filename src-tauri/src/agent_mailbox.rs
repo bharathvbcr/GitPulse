@@ -6,6 +6,7 @@
 //! <GitPulse config dir>/agent-mailbox/            0700
 //!   .lock                                         0600, advisory flock for root dir mutations
 //!   .locks/<session uuid>.lock                    0600, advisory flock per session
+//!   .hw/<session uuid>                            0600, highest envelope stamp issued (stamps only climb)
 //!   .meta/<session uuid>/<request id>.json        0600, EnvelopeProvenance sidecar
 //!   .epochs/<session uuid>                        0600, monotonic turn_epoch counter
 //!   .continuations/<session uuid>                 0600, per-turn continuation counter
@@ -58,6 +59,8 @@ pub(crate) const MAX_PENDING: usize = 8;
 pub(crate) const MAX_SESSIONS: usize = 256;
 /// How long a message waits for a hook to take it.
 pub(crate) const PENDING_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// The largest envelope stamp: stamps are 13 digits in a message file name.
+const MAX_STAMP: u64 = 9_999_999_999_999;
 /// How long a claimed message is kept, so the sender can see that it was.
 pub(crate) const CLAIMED_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long an unfinished write is left alone.
@@ -656,9 +659,30 @@ impl Mailbox {
             .collect()
     }
 
+    /// Removes the `.tmp-*` files a crashed counter write left behind, once they are a minute
+    /// old (a live write finishes in milliseconds).
+    fn remove_stale_counter_temps(&self, now: SystemTime) {
+        for subdir in [".hw", ".epochs", ".continuations", ".stop_continued"] {
+            let Ok(entries) = std::fs::read_dir(self.root.join(subdir)) else {
+                continue;
+            };
+            for entry in entries.take(SCAN_LIMIT).flatten() {
+                let stale = entry.file_name().to_string_lossy().starts_with(".tmp-")
+                    && entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .is_ok_and(|modified| age(now, modified) > Duration::from_secs(60));
+                if stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// Removes expired files from every session and empty sessions that have
     /// sat unused. Best effort: a stale file costs bytes, not correctness.
     fn prune_sessions(&self, now: SystemTime) {
+        self.remove_stale_counter_temps(now);
         for name in self.session_names() {
             let dir = self.root.join(&name);
             // Under the session's lock, like every other path that removes a message and its
@@ -678,6 +702,7 @@ impl Mailbox {
                 .is_ok_and(|m| age(now, m) > EMPTY_SESSION_TTL);
             if empty && old && std::fs::remove_dir(&dir).is_ok() {
                 let _ = std::fs::remove_file(self.root.join(".locks").join(format!("{name}.lock")));
+                let _ = std::fs::remove_file(self.root.join(".hw").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".epochs").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".continuations").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".stop_continued").join(&name));
@@ -706,6 +731,45 @@ impl Mailbox {
                 }
             }
         }
+    }
+
+    /// The creation stamp for the next envelope of a session: the caller's clock, but strictly
+    /// above every stamp this session has issued or holds (a persisted high-water mark and the
+    /// files present). Callers stamp before they wait for the lock, and a clock can step back, so
+    /// the raw clock does not follow publish order; a reader that has seen stamp T must never
+    /// find a later publish below it. Must be called with the session lock held.
+    ///
+    /// The mark is read through the counter reader (no symlinks, a private file of this user; only
+    /// a missing file means none yet). An unparseable mark falls back to the stamps of the files
+    /// present, never to zero, and is rewritten. A stamp is 13 digits in a file name, so one past
+    /// [`MAX_STAMP`] is refused rather than minting a name that cannot be parsed back.
+    fn next_stamp(
+        &self,
+        session_key: &str,
+        files: &[(String, SystemTime)],
+        now: SystemTime,
+    ) -> Result<u64, MailboxError> {
+        let persisted = match self.read_counter_text(".hw", session_key)? {
+            None => 0,
+            Some(text) => text.trim().parse::<u64>().unwrap_or_else(|_| {
+                log::warn!(target: "mailbox", "unreadable stamp high-water mark for a session; using the stamps of its files");
+                0
+            }),
+        };
+        let held = files
+            .iter()
+            .filter_map(|(name, _)| parse_message_name(name).map(|(_, stamp, _)| stamp))
+            .max()
+            .unwrap_or(0);
+        let stamp = millis(now).max(persisted.max(held).saturating_add(1));
+        if stamp > MAX_STAMP {
+            return Err(MailboxError::Invalid(
+                "This session's mailbox stamps are exhausted, so it cannot take another message."
+                    .into(),
+            ));
+        }
+        self.write_u64_counter(".hw", session_key, stamp, now)?;
+        Ok(stamp)
     }
 
     /// Puts one human-confirmed message in a session's mailbox.
@@ -836,8 +900,10 @@ impl Mailbox {
                 "This session already has {MAX_PENDING} messages waiting for it."
             )));
         }
+        // Assigned here, under the session lock, so the stamp order is the publish order a
+        // cursor-reading peeker sees (see `next_stamp`).
+        let created = self.next_stamp(&key, &files, now)?;
         self.write_provenance(&key, request_id, &provenance, now)?;
-        let created = millis(now);
         let temp = dir.join(format!(".tmp-{}-{:08x}", std::process::id(), nonce(now)));
         if let Err(err) = write_private(&temp, normalized.as_bytes()) {
             self.remove_provenance(&key, request_id);
@@ -891,7 +957,7 @@ impl Mailbox {
         let notice_text = format!(
             "More peer messages are waiting on the GitPulse agent bus for this session in {repo_root}. \
              Call gitpulse_agent_inbox with repo_path={repo_root} and for_peer={for_peer} to read them; \
-             pass ack=true to mark what it reads as read, or since_seq to page."
+             pass ack=true to mark what it reads as read, or page with next_since_seq (as since_seq) and mailbox_cursor_ms (as since_mailbox_ms)."
         );
         let notice_id = overflow_notice_id(&repo_root);
         let notice = EnvelopeProvenance::PeerAgent {
@@ -1228,6 +1294,19 @@ impl Mailbox {
     }
 
     fn read_u64_counter(&self, subdir: &str, session_uuid: &str) -> Result<u64, MailboxError> {
+        Ok(self
+            .read_counter_text(subdir, session_uuid)?
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// The text of a counter file: `None` only when it does not exist. Opened without following
+    /// symlinks and checked to be a regular file private to this user.
+    fn read_counter_text(
+        &self,
+        subdir: &str,
+        session_uuid: &str,
+    ) -> Result<Option<String>, MailboxError> {
         let path = self.root.join(subdir).join(session_uuid);
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1238,7 +1317,7 @@ impl Mailbox {
         }
         let file = match options.open(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io("could not open mailbox counter", &e)),
         };
         let meta = file
@@ -1254,7 +1333,7 @@ impl Mailbox {
         file.take(64)
             .read_to_string(&mut buf)
             .map_err(|e| io("could not read mailbox counter", &e))?;
-        Ok(buf.trim().parse::<u64>().unwrap_or(0))
+        Ok(Some(buf))
     }
 
     fn write_u64_counter(

@@ -1531,7 +1531,12 @@ tool_args! {
             64,
         ),
         since_seq: Option<u64> = Spec::int(
-            "Return bus messages strictly after this sequence number (default 0)",
+            "Return bus messages strictly after this sequence number (default 0). To page, pass the previous result's next_since_seq, not latest_seq",
+            0,
+            MAX_REVISION,
+        ),
+        since_mailbox_ms: Option<u64> = Spec::int(
+            "Skip mailbox-only envelopes (a person's message, or a peer/steward message whose bus row was evicted; they have no bus seq) created at or before this Unix time in milliseconds (default 0, skip none). Pass the previous result's mailbox_cursor_ms",
             0,
             MAX_REVISION,
         ),
@@ -1564,7 +1569,12 @@ tool_args! {
             64,
         ),
         since_seq: Option<u64> = Spec::int(
-            "Wait for bus messages strictly after this sequence number (default 0)",
+            "Wait for bus messages strictly after this sequence number (default 0). To wait without consuming, pass ack=false with the previous result's next_since_seq and mailbox_cursor_ms",
+            0,
+            MAX_REVISION,
+        ),
+        since_mailbox_ms: Option<u64> = Spec::int(
+            "Ignore mailbox-only envelopes (a person's message, or a peer/steward message whose bus row was evicted; they have no bus seq) created at or before this Unix time in milliseconds (default 0, ignore none). Pass the previous result's mailbox_cursor_ms",
             0,
             MAX_REVISION,
         ),
@@ -1582,7 +1592,7 @@ tool_args! {
             60_000,
         ),
         ack: Option<bool> = Spec::flag(
-            "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass since_seq to wait without consuming)",
+            "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass ack=false with since_seq and since_mailbox_ms to wait without consuming)",
         ),
         limit: Option<u32> = Spec::int("Maximum messages to return on wake (default 20)", 1, 256),
     }
@@ -2881,6 +2891,16 @@ fn build_tools() -> Vec<Value> {
                         }
                     },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
                     "has_more": { "type": "boolean" }
                 },
@@ -3066,7 +3086,18 @@ fn build_tools() -> Vec<Value> {
                     "msg_id": { "type": "string" },
                     "to_peer": { "type": "string" },
                     "liveness": { "type": "string" },
-                    "delivery_outcome": { "type": "string" },
+                    "delivery_outcome": {
+                        "type": "string",
+                        "description": "What happened to the wake: paused_hop_limit, woken_immediately, queued_for_hook_boundary, requires_resume, bus_only, or already_delivered (an exact retry of a message its recipient has already read, so no second delivery was attempted)"
+                    },
+                    "replayed": {
+                        "type": "boolean",
+                        "description": "True when an exact retry did not deliver again and delivery_outcome is the stored outcome of this process's earlier successful delivery of the same row"
+                    },
+                    "mailbox": {
+                        "type": "object",
+                        "description": "Whether the envelope was deposited in the recipient's mailbox. reason is null when deposited, else one of no_session, unavailable, full, refused, hop_limit (the message is at its hop limit: bus row only, nothing deposited)"
+                    },
                     "hop": { "type": "integer", "minimum": 0 },
                     "max_hops": { "type": "integer", "minimum": 1 },
                     "truncated_in_mailbox": { "type": "boolean" },
@@ -3074,7 +3105,7 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": [
                     "ok", "repo_path", "msg_id", "to_peer", "liveness",
-                    "delivery_outcome", "hop", "max_hops", "truncated_in_mailbox", "message"
+                    "delivery_outcome", "replayed", "hop", "max_hops", "truncated_in_mailbox", "message"
                 ]
             }),
             false,
@@ -3095,6 +3126,16 @@ fn build_tools() -> Vec<Value> {
                     "acked_count": { "type": "integer", "minimum": 0 },
                     "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
                     "pinned_below_dropped_before_seq": {
                         "type": "array",
@@ -3129,6 +3170,16 @@ fn build_tools() -> Vec<Value> {
                     "acked_count": { "type": "integer", "minimum": 0 },
                     "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
+                    "next_since_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_seq to continue: the last bus seq returned when the page was cut (has_more), else latest_seq"
+                    },
+                    "mailbox_cursor_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Pass as since_mailbox_ms to continue past the mailbox-only envelopes already returned"
+                    },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
                     "pinned_below_dropped_before_seq": {
                         "type": "array",
