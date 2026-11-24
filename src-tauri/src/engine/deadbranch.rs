@@ -1901,7 +1901,6 @@ mod tests {
         assert!(result.failed[0].1.contains("quoting"), "{result:?}");
     }
 
-    /// A refused clean deletes nothing, so it journals no deletion.
     #[test]
     fn locked_in_branches_are_marked_protected_and_a_clean_refuses_them() {
         let (_dir, repo) = seeded_repo();
@@ -1912,8 +1911,24 @@ mod tests {
             "archive/old",
             "keep",
             "feature/done",
+            "team/a",
+            "team/b/c",
+            "frozen",
+            "x/frozen",
         ] {
             git_in(&repo, &["branch", name]);
+        }
+        for value in ["team/*", "**/frozen"] {
+            git_in(
+                &repo,
+                &[
+                    "config",
+                    "--local",
+                    "--add",
+                    LOCKED_BRANCH_CONFIG_KEY,
+                    value,
+                ],
+            );
         }
         git_in(
             &repo,
@@ -1954,10 +1969,19 @@ mod tests {
                 .is_protected
         };
         // A bare value covers its whole subtree, as `git for-each-ref` reads it.
-        for kept in ["labs/geek", "labs/team/v2", "archive/old", "keep"] {
+        // `*` stays inside one segment; `**` crosses `/` and matches at the top.
+        for kept in [
+            "labs/geek",
+            "labs/team/v2",
+            "archive/old",
+            "keep",
+            "team/a",
+            "frozen",
+            "x/frozen",
+        ] {
             assert!(protected(kept), "{kept} should be locked-in");
         }
-        for free in ["labs-other", "feature/done"] {
+        for free in ["labs-other", "feature/done", "team/b/c"] {
             assert!(!protected(free), "{free} should not be locked-in");
         }
 
@@ -1979,6 +2003,41 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_in_remote_branch_is_marked_and_its_remote_delete_refused() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "archive/old");
+        let repo_path = repo.to_str().unwrap();
+        let scan = scan_stale_branches(
+            repo_path,
+            &DeadbranchConfig {
+                include_remote: true,
+                merged_only: false,
+                days_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = scan
+            .branches
+            .iter()
+            .find(|b| b.full_ref == "refs/remotes/origin/archive/old")
+            .unwrap_or_else(|| panic!("remote row not scanned: {:?}", scan.branches));
+        assert!(row.is_protected, "{row:?}");
+
+        let err = clean_branches(
+            repo_path,
+            &["refs/remotes/origin/archive/old".to_string()],
+            true,
+            false,
+        )
+        .expect_err("a locked-in remote branch is refused");
+        assert!(err.message().contains("locked-in"), "{}", err.message());
+        assert!(
+            rev(bare.path(), "refs/heads/archive/old").is_some(),
+            "the remote's branch was deleted"
+        );
+    }
+
+    #[test]
     fn locked_values_read_an_unset_key_as_empty_and_any_other_failure_as_an_error() {
         let run =
             |success: bool, status_code: i32, stdout: &str| crate::engine::process::BoundedRun {
@@ -1996,8 +2055,9 @@ mod tests {
             vec!["labs".to_string(), "keep".to_string(), "x/y".to_string()]
         );
         assert!(locked_values(&run(false, 1, "")).unwrap().is_empty());
-        // A malformed config exits 3: that is not "nothing is locked".
-        let err = locked_values(&run(false, 3, "")).unwrap_err();
+        // A malformed config exits 128 (`fatal: bad config line`): that is
+        // not "nothing is locked".
+        let err = locked_values(&run(false, 128, "")).unwrap_err();
         assert!(
             err.message().contains(LOCKED_BRANCH_CONFIG_KEY),
             "{}",
@@ -2006,6 +2066,7 @@ mod tests {
         assert!(locked_values(&run(false, 1, "labs\n")).is_err());
     }
 
+    /// A refused clean deletes nothing, so it journals no deletion.
     #[test]
     fn a_refused_clean_journals_no_deletes() {
         let _store = BackupStore::new();
