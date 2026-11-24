@@ -359,8 +359,10 @@ describe("annotated but unregistered commands", () => {
     // Claude Code's stream-json, locally or through ssh) and
     // cmd_mavi_conversation_check (whether a terminal tab's conversation can
     // continue in Mavi, asked before the tab is ended): 344 + the eleven Mavi
-    // handlers. 361 with both: 344 + 6 idle + 11 Mavi.
-    expect(found.size).toBe(361);
+    // handlers. 361 with both: 344 + 6 idle + 11 Mavi. 365 with
+    // cmd_browser_discover_local_servers, cmd_list_turn_checkpoints,
+    // cmd_diff_turn_checkpoint and cmd_github_pr_diff.
+    expect(found.size).toBe(365);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }
