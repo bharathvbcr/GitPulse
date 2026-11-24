@@ -265,6 +265,20 @@ impl Drop for EnvBinding<'_> {
 /// [`hermetic::pinned_git_config`].
 pub(crate) const GIT_MAINTENANCE_PIN: &str = "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n";
 
+/// The identity the hermetic git configs give git, the one the fixtures
+/// already commit as (`git_in` passes it with `-c`).
+///
+/// Without it, a commit the application makes itself (a rebase step, a merge,
+/// a release tag) takes git's identity from the account it runs as. On a
+/// developer's machine that has a full name; GitHub's Linux runner account has
+/// none, so those commits fail there with `fatal: empty ident name`, and a
+/// container that runs as root fails with "unable to auto-detect email
+/// address". The suite then passes or fails on the machine, which is what the
+/// hermetic environment exists to rule out. The address is a fixture one, so
+/// this checkout's commit hooks refuse it if it ever leaks into a real commit.
+pub(crate) const GIT_IDENTITY_PIN: &str =
+    "[user]\n\tname = GitPulse\n\temail = gitpulse@test.local\n";
+
 /// Writes `path` as a git config holding [`GIT_MAINTENANCE_PIN`] followed by
 /// `extra` (more git config text, or empty).
 pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::Result<()> {
@@ -602,12 +616,12 @@ pub(crate) mod hermetic {
                 .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", dir.display()));
         }
         let gitconfig = root.join("gitconfig");
-        super::write_git_config(&gitconfig, "")
+        super::write_git_config(&gitconfig, super::GIT_IDENTITY_PIN)
             .unwrap_or_else(|error| panic!("hermetic gitconfig {}: {error}", gitconfig.display()));
         // The application's own git runs with `GIT_CONFIG_GLOBAL` stripped and
-        // reads `$HOME/.gitconfig` instead, so the pin has to be there too.
+        // reads `$HOME/.gitconfig` instead, so the pins have to be there too.
         let home_config = home.join(".gitconfig");
-        super::write_git_config(&home_config, "").unwrap_or_else(|error| {
+        super::write_git_config(&home_config, super::GIT_IDENTITY_PIN).unwrap_or_else(|error| {
             panic!("hermetic gitconfig {}: {error}", home_config.display())
         });
 

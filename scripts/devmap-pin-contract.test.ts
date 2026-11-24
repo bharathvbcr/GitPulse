@@ -25,7 +25,7 @@ export function devmapPinProblems(ci: string): string[] {
   const problems: string[] = [];
 
   const pins = [...ci.matchAll(/^ {2}DEVMAP_REV: (\S+)\s*$/gm)].map((m) => m[1]);
-  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in ci.yml, found ${pins.length}`);
+  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in the workflow, found ${pins.length}`);
   else if (!/^[0-9a-f]{40}$/.test(pins[0])) problems.push(`DEVMAP_REV ${pins[0]} is not a full 40-character commit SHA`);
 
   for (const line of ci.split("\n").filter((l) => l.includes("cargo install --git"))) {
@@ -60,11 +60,23 @@ export function devmapPinProblems(ci: string): string[] {
   return problems;
 }
 
+/** The workflow's one `DEVMAP_REV`, or undefined. */
+export function devmapPin(workflow: string): string | undefined {
+  return /^ {2}DEVMAP_REV: (\S+)\s*$/m.exec(workflow)?.[1];
+}
+
 describe("devmap pin contract", () => {
   const ci = read(".github/workflows/ci.yml");
+  // The coverage workflow runs the same lib suite, so it installs the same CLI.
+  const coverage = read(".github/workflows/coverage.yml");
 
   it("pins devmap to one full commit, installs it from that pin, and checks it against the vendored schema", () => {
     expect(devmapPinProblems(ci)).toEqual([]);
+  });
+
+  it("holds the coverage workflow to the same rules and the same pin as ci.yml", () => {
+    expect(devmapPinProblems(coverage)).toEqual([]);
+    expect(devmapPin(coverage), "coverage.yml builds devmap from another commit than ci.yml").toBe(devmapPin(ci));
   });
 
   it("builds from the commit the vendored devmap-store schema number comes from", () => {
