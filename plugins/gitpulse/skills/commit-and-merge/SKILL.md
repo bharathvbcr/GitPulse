@@ -217,7 +217,10 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
       A non-zero exit is a conflict: delete the temp files and stop.
    5. **Check, then write.** Each overlapping file must still hash to its saved blob. Then copy each temp file into it with `cat <tmp> > <path>`, which keeps the file's mode, and delete the temp file.
    6. **Write the other landed paths** with `git --literal-pathspecs restore --source=<new> --worktree -- <paths>`. It creates added files, removes deleted ones, and sets modes and symlinks, none of which `git show` does.
-   7. **Move the ref last,** with the compare-and-swap. If it fails, someone else moved the branch. Put every file back and stop: the merged files with `git cat-file blob <saved blob> > <path>`, the others with `git --literal-pathspecs restore --source=<old> --worktree -- <paths>`.
+   7. **Move the ref last,** with the compare-and-swap. If it fails, someone else moved the branch. Put every file back and stop:
+      - the merged files with `git cat-file blob <saved blob> > <path>`;
+      - the paths the landing added, which `<old>` does not have, with `git --literal-pathspecs clean -f -- <paths>` (`restore` refuses a path missing from its source, and then restores nothing);
+      - the rest with `git --literal-pathspecs restore --source=<old> --worktree -- <paths>`.
    8. **Line up the index** with `git --literal-pathspecs reset -q -- <every landed path>`. Otherwise the holder's next commit would revert the landing.
    9. **Prove it.** Every dirty file outside the landing still hashes to its saved blob, and `git status` lists only the holder's own changes.
 
