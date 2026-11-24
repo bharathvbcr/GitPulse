@@ -443,6 +443,32 @@ fn deposit_into_mailbox(
     }
 }
 
+type DeliveryKey = (String, String, String);
+
+/// Upper bound on remembered deliveries; the oldest knowledge is dropped wholesale past it, which
+/// only means a retry of a long-past send may wake its recipient once more.
+const MAX_REMEMBERED_DELIVERIES: usize = 1024;
+
+fn delivered_cache() -> &'static Mutex<std::collections::HashMap<DeliveryKey, String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<DeliveryKey, String>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The outcome of an earlier successful desktop delivery of (repo, peer, msg_id), if this
+/// process made one.
+fn delivered_outcome(key: &DeliveryKey) -> Option<String> {
+    delivered_cache().lock().ok()?.get(key).cloned()
+}
+
+fn remember_delivered(key: DeliveryKey, outcome: String) {
+    if let Ok(mut cache) = delivered_cache().lock() {
+        if cache.len() >= MAX_REMEMBERED_DELIVERIES {
+            cache.clear();
+        }
+        cache.insert(key, outcome);
+    }
+}
+
 /// Where a send goes: a registered peer, or the identity of an unregistered sender being
 /// answered, which has no session and so no mailbox.
 struct SendTarget {
@@ -520,29 +546,17 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     // An MCP caller is always an agent: it is never the person using GitPulse, whatever
     // `from_peer` says. `post_peer_message` refuses the names reserved for a person.
     let origin = agent_bus::MessageOrigin::Agent;
-    // The count only climbs: an explicit hop can raise it but never lower what the answered
-    // message or the thread already reached, or a caller could restart the loop guard.
-    let mut requested_hop = a.hop.unwrap_or(1).max(1);
-    if let Some(m) = &answered {
-        requested_hop = requested_hop.max(m.hop.unwrap_or(0).saturating_add(1));
-    }
-    if let Some(tk) = &thread_key {
-        // A failed read must fail the send: guessing hop 1 would reset the ping-pong count.
-        let last = agent_bus::read_thread_messages(&a.repo_path, Some(tk), None, 0)
-            .map_err(CommandError::into_message)?
-            .messages
-            .last()
-            .map(|m| m.hop.unwrap_or(0).saturating_add(1));
-        requested_hop = requested_hop.max(last.unwrap_or(1));
-    }
-    let hop = origin.effective_hop(requested_hop);
+    // The request only: the bus derives the stored hop and ceiling under its own lock from the
+    // thread and the answered row, so an explicit hop can raise the count but never lower it,
+    // and a reply can lower a ceiling but never raise it.
+    let hop = origin.effective_hop(a.hop.unwrap_or(1).max(1));
     let max_hops = a.max_hops.unwrap_or(agent_bus::DEFAULT_MAX_HOPS);
 
     let root_repo = crate::engine::git_cli::find_git_root(Path::new(&a.repo_path))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| a.repo_path.clone());
 
-    let message = agent_bus::post_peer_message(
+    let message = agent_bus::post_peer_message_in_reply_to(
         &a.repo_path,
         origin,
         &a.from_peer,
@@ -552,6 +566,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         &a.body,
         target.branch.as_deref(),
         a.msg_id.as_deref(),
+        a.in_reply_to.as_deref(),
         hop,
         max_hops,
     )
@@ -587,7 +602,20 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         truncated_in_bus: truncated_in_mailbox,
         repo_root: root_repo.clone(),
     };
-    let mailbox = deposit_into_mailbox(target.session_id.as_deref(), &msg_id, &preview, provenance);
+    // An envelope already at its hop limit is paused: the bus row is the record, and nothing is
+    // put where a hook or banner would push it to the recipient.
+    let at_limit = hop >= max_hops;
+    let mailbox = if at_limit {
+        json!({
+            "deposited": false,
+            "reason": "hop_limit",
+            "detail": "The message is at its hop limit, so it is recorded on the bus only and not deposited in the recipient's mailbox; the recipient can still read it with gitpulse_agent_inbox.",
+            "duplicate": false,
+            "overflow_notice": false,
+        })
+    } else {
+        deposit_into_mailbox(target.session_id.as_deref(), &msg_id, &preview, provenance)
+    };
     let deposited = mailbox["deposited"].as_bool().unwrap_or(false);
 
     notify_in_process_waiters();
@@ -597,32 +625,50 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     // a channel independent of the mailbox ("managed" run delivery or the "banner" event);
     // its "mailbox" outcomes, and replies from an older desktop with no channel, describe
     // the mailbox and say nothing when the deposit failed.
-    let desktop_outcome = if hop < max_hops && target.liveness == "live" {
-        match reach_desktop_agent_deliver(
-            &root_repo,
-            &target.peer_id,
-            &msg_id,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ) {
-            Some(Ok(reply)) => {
-                let independent = matches!(reply["channel"].as_str(), Some("managed" | "banner"));
-                (independent || deposited).then(|| {
-                    reply["delivery_outcome"]
-                        .as_str()
-                        .unwrap_or("queued_for_hook_boundary")
-                        .to_string()
-                })
+    //
+    // An exact retry must not wake the recipient twice. The desktop is skipped only on recorded
+    // evidence that an earlier delivery of this very message succeeded: the bus row already
+    // lists the target as a reader (a managed delivery acknowledges it), or this process
+    // remembers the outcome of a successful delivery. A failed, timed-out or offline first
+    // attempt records nothing, so its retry still delivers.
+    let desktop_outcome = if !at_limit && target.liveness == "live" {
+        let key = (root_repo.clone(), target.peer_id.clone(), msg_id.clone());
+        if let Some(prior) = delivered_outcome(&key) {
+            Some(prior)
+        } else if message.read_by.contains(&target.peer_id) {
+            None
+        } else {
+            let outcome = match reach_desktop_agent_deliver(
+                &root_repo,
+                &target.peer_id,
+                &msg_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Some(Ok(reply)) => {
+                    let independent =
+                        matches!(reply["channel"].as_str(), Some("managed" | "banner"));
+                    (independent || deposited).then(|| {
+                        reply["delivery_outcome"]
+                            .as_str()
+                            .unwrap_or("queued_for_hook_boundary")
+                            .to_string()
+                    })
+                }
+                _ => None,
+            };
+            if let Some(ref done) = outcome {
+                remember_delivered(key, done.clone());
             }
-            _ => None,
+            outcome
         }
     } else {
         None
     };
-    let delivery_outcome = if hop >= max_hops {
+    let delivery_outcome = if at_limit {
         "paused_hop_limit".to_string()
     } else if let Some(outcome) = desktop_outcome {
         outcome
@@ -669,6 +715,13 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
 struct DedupedInboxResult {
     messages: Vec<AgentBusMessage>,
     latest_seq: u64,
+    /// Where to resume by sequence number: the last bus seq this page returned when the page was
+    /// cut (`has_more`), else `latest_seq`. Paging by `latest_seq` would skip the cut rows.
+    next_since_seq: u64,
+    /// Where to resume among mailbox-only envelopes (a person's message, an evicted peer or
+    /// steward row), which carry no bus seq: the newest creation time this page returned,
+    /// never past an envelope the page cut.
+    mailbox_cursor_ms: u64,
     dropped_before_seq: u64,
     pinned_below_dropped_before_seq: Vec<u64>,
     has_more: bool,
@@ -684,6 +737,7 @@ fn collect_deduped_peer_inbox(
     for_peer: &str,
     explicit_session_id: Option<&str>,
     since_seq: u64,
+    since_mailbox_ms: u64,
     thread_key: Option<&str>,
     include_broadcasts: bool,
     ack: bool,
@@ -794,6 +848,8 @@ fn collect_deduped_peer_inbox(
     let t_filter = thread_key.map(str::trim).filter(|s| !s.is_empty());
     let caller_common = crate::harness::steward::canonical_common_dir(repo_path);
     let mut mailbox_req_by_msg_id = std::collections::HashMap::<String, String>::new();
+    // Creation time of each returned-or-cut row that has no bus seq to page by.
+    let mut mailbox_only_ms = std::collections::HashMap::<String, u64>::new();
     let mut ack_errors: Vec<String> = Vec::new();
     if let Some(ref sid) = resolved_session_id {
         let mb = Mailbox::at_default().map_err(|e| format!("mailbox_unavailable: {e}"))?;
@@ -938,6 +994,17 @@ fn collect_deduped_peer_inbox(
                 if (from_bus || has_bus_seq) && synthesized.seq <= since_seq {
                     continue;
                 }
+                // A row with no bus seq pages by creation time instead, so a non-acking wait
+                // can resume past it.
+                if !(from_bus || has_bus_seq)
+                    && since_mailbox_ms > 0
+                    && env_created_ms <= since_mailbox_ms
+                {
+                    continue;
+                }
+                if !(from_bus || has_bus_seq) {
+                    mailbox_only_ms.insert(env_id.clone(), env_created_ms);
+                }
                 if let Some(tk) = t_filter {
                     if synthesized.thread_key.as_deref() != Some(tk) {
                         continue;
@@ -956,9 +1023,51 @@ fn collect_deduped_peer_inbox(
     }
 
     let has_more = combined.len() > limit;
-    if has_more {
-        combined.truncate(limit);
-    }
+    let cut: Vec<AgentBusMessage> = if has_more {
+        combined.split_off(limit)
+    } else {
+        Vec::new()
+    };
+    let (next_since_seq, mailbox_cursor_ms) = if has_more {
+        // Resume just before the first cut row of each kind, never behind where the caller was.
+        let returned_seq = combined
+            .iter()
+            .filter(|m| on_bus.contains(&m.seq))
+            .map(|m| m.seq)
+            .max()
+            .unwrap_or(since_seq);
+        let seq = cut
+            .iter()
+            .filter(|m| on_bus.contains(&m.seq))
+            .map(|m| m.seq.saturating_sub(1))
+            .fold(returned_seq, u64::min)
+            .max(since_seq);
+        let ms_of = |m: &AgentBusMessage| m.msg_id.as_ref().and_then(|id| mailbox_only_ms.get(id));
+        let returned_ms = combined
+            .iter()
+            .filter_map(ms_of)
+            .copied()
+            .max()
+            .unwrap_or(since_mailbox_ms);
+        let ms = cut
+            .iter()
+            .filter_map(ms_of)
+            .map(|t| t.saturating_sub(1))
+            .fold(returned_ms, u64::min)
+            .max(since_mailbox_ms);
+        (seq, ms)
+    } else {
+        let returned_ms = combined
+            .iter()
+            .filter_map(|m| m.msg_id.as_ref().and_then(|id| mailbox_only_ms.get(id)))
+            .copied()
+            .max()
+            .unwrap_or(since_mailbox_ms);
+        (
+            bus_page.latest_seq.max(since_seq),
+            returned_ms.max(since_mailbox_ms),
+        )
+    };
 
     // Listed from what is actually returned, so the list never names a row the page lacks.
     let pinned_below_dropped_before_seq: Vec<u64> = combined
@@ -1011,6 +1120,8 @@ fn collect_deduped_peer_inbox(
         DedupedInboxResult {
             messages: combined,
             latest_seq: bus_page.latest_seq,
+            next_since_seq,
+            mailbox_cursor_ms,
             dropped_before_seq: bus_page.dropped_before_seq,
             pinned_below_dropped_before_seq,
             has_more,
@@ -1033,6 +1144,7 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         &a.for_peer,
         a.provider_session_id.as_deref(),
         a.since_seq.unwrap_or(0),
+        a.since_mailbox_ms.unwrap_or(0),
         a.thread_key.as_deref(),
         a.include_broadcasts.unwrap_or(false),
         ack,
@@ -1046,6 +1158,8 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         "acked_count": res.acked_count,
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
+        "next_since_seq": res.next_since_seq,
+        "mailbox_cursor_ms": res.mailbox_cursor_ms,
         "dropped_before_seq": res.dropped_before_seq,
         "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,
@@ -1069,6 +1183,7 @@ pub(crate) fn handle_agent_wait_with_counter(
     let ack = a.ack.unwrap_or(true);
     let limit = a.limit.map(|l| l as usize).unwrap_or(20);
     let since_seq = a.since_seq.unwrap_or(0);
+    let since_mailbox_ms = a.since_mailbox_ms.unwrap_or(0);
     let include_broadcasts = a.include_broadcasts.unwrap_or(false);
     let started = Instant::now();
 
@@ -1077,6 +1192,7 @@ pub(crate) fn handle_agent_wait_with_counter(
         &a.for_peer,
         a.provider_session_id.as_deref(),
         since_seq,
+        since_mailbox_ms,
         a.thread_key.as_deref(),
         include_broadcasts,
         ack,
@@ -1135,6 +1251,7 @@ pub(crate) fn handle_agent_wait_with_counter(
         &a.for_peer,
         a.provider_session_id.as_deref(),
         since_seq,
+        since_mailbox_ms,
         a.thread_key.as_deref(),
         include_broadcasts,
         ack,
@@ -1201,6 +1318,7 @@ pub(crate) fn handle_agent_wait_with_counter(
             &a.for_peer,
             a.provider_session_id.as_deref(),
             since_seq,
+            since_mailbox_ms,
             a.thread_key.as_deref(),
             include_broadcasts,
             ack,
@@ -1251,6 +1369,8 @@ fn wait_response(
         "acked_count": res.acked_count,
         "ack_error": res.ack_error,
         "latest_seq": res.latest_seq,
+        "next_since_seq": res.next_since_seq,
+        "mailbox_cursor_ms": res.mailbox_cursor_ms,
         "dropped_before_seq": res.dropped_before_seq,
         "pinned_below_dropped_before_seq": res.pinned_below_dropped_before_seq,
         "has_more": res.has_more,

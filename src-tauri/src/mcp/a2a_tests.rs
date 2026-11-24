@@ -337,6 +337,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "p".into(),
             provider_session_id: None,
             since_seq: None,
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: None,
             timeout_ms: Some(100),
@@ -368,6 +369,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "waiter-target".into(),
             provider_session_id: Some(sid.into()),
             since_seq: None,
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: None,
             timeout_ms: Some(500),
@@ -418,6 +420,7 @@ fn wait_clamps_timeout_wakes_on_filesystem_write_and_enforces_slot_ceiling() {
             for_peer: "waiter-target".into(),
             provider_session_id: Some(sid.into()),
             since_seq: Some(0),
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: Some(false),
             timeout_ms: Some(5_000),
@@ -830,7 +833,27 @@ fn an_mcp_send_is_always_a_peer_message_at_a_non_zero_hop_that_the_limit_pauses(
     assert_eq!(sent["hop"], 1);
     assert_eq!(sent["delivery_outcome"], "paused_hop_limit");
 
+    // At its limit the envelope is not deposited: the bus row is the record.
     let mb = Mailbox::at_default().expect("mailbox");
+    assert!(mb
+        .peek_pending(sid, 16, SystemTime::now())
+        .expect("peek mailbox")
+        .is_empty());
+
+    // Under the limit the same caller's message is deposited with peer provenance.
+    let sent = handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({
+            "repo_path": repo,
+            "from_peer": "claude:coder",
+            "to_peer": "hop-victim",
+            "body": "claims to be hop zero, with room",
+            "hop": 0,
+            "max_hops": 8,
+        }),
+    )
+    .expect("send as a peer under the limit");
+    assert_eq!(sent["hop"], 1);
     let pending = mb
         .peek_pending(sid, 16, SystemTime::now())
         .expect("peek mailbox");
@@ -1460,6 +1483,7 @@ fn a_wait_reports_has_more_and_dropped_before_seq_like_the_inbox() {
                 for_peer: "wait-owner".into(),
                 provider_session_id: Some(sid.into()),
                 since_seq: None,
+                since_mailbox_ms: None,
                 thread_key: None,
                 include_broadcasts: None,
                 timeout_ms: Some(timeout_ms),
@@ -1625,6 +1649,7 @@ fn an_inbox_and_a_wait_list_only_the_returned_rows_below_dropped_before_seq() {
             for_peer: "pin-owner".into(),
             provider_session_id: Some(sid.into()),
             since_seq: None,
+            since_mailbox_ms: None,
             thread_key: None,
             include_broadcasts: None,
             timeout_ms: Some(0),
@@ -1801,4 +1826,188 @@ fn an_exact_retry_of_a_threaded_send_keeps_the_stored_hop_and_the_mailbox_deposi
     assert_eq!(retry["mailbox"]["deposited"], true, "{retry}");
     assert_eq!(retry["mailbox"]["duplicate"], true, "{retry}");
     assert_eq!(retry["delivery_outcome"], first["delivery_outcome"]);
+}
+
+fn wait_peek(repo: &str, role: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut args = json!({ "repo_path": repo, "for_peer": role, "ack": false, "timeout_ms": 300 });
+    args.as_object_mut()
+        .expect("args object")
+        .extend(extra.as_object().expect("extra object").clone());
+    handle_tool_call("gitpulse_agent_wait", &args).expect("wait")
+}
+
+#[test]
+fn a_non_acking_wait_resumes_past_a_pending_human_envelope_with_the_returned_cursors() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01";
+    register_inbox_peer(&repo, sid, "peekwait-human");
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit(sid, "human-peek-1", "from the person", SystemTime::now())
+        .expect("deposit human envelope");
+
+    let first = wait_peek(&repo, "peekwait-human", json!({}));
+    assert_eq!(first["timed_out"], false, "{first}");
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    let seq = first["next_since_seq"].as_u64().expect("next_since_seq");
+    let cursor = first["mailbox_cursor_ms"]
+        .as_u64()
+        .expect("mailbox_cursor_ms");
+
+    let second = wait_peek(
+        &repo,
+        "peekwait-human",
+        json!({ "since_seq": seq, "since_mailbox_ms": cursor }),
+    );
+    assert_eq!(second["timed_out"], true, "{second}");
+    assert!(
+        second["messages"].as_array().unwrap().is_empty(),
+        "{second}"
+    );
+
+    // The envelope was never acknowledged, so a plain read still sees it.
+    let plain = wait_peek(&repo, "peekwait-human", json!({}));
+    assert_eq!(plain["messages"].as_array().unwrap().len(), 1, "{plain}");
+}
+
+#[test]
+fn paging_an_inbox_by_next_since_seq_returns_every_bus_row_when_the_page_is_cut() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa02";
+    register_inbox_peer(&repo, sid, "page-owner");
+    send_to_role(&repo, "page-owner", "page one");
+    send_to_role(&repo, "page-owner", "page two");
+
+    let read = |since: u64| {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "page-owner", "limit": 1, "since_seq": since }),
+        )
+        .expect("inbox read")
+    };
+    let first = read(0);
+    assert_eq!(first["has_more"], true, "{first}");
+    let next = first["next_since_seq"].as_u64().expect("next_since_seq");
+    assert!(next < first["latest_seq"].as_u64().unwrap(), "{first}");
+    let second = read(next);
+    assert_eq!(second["has_more"], false, "{second}");
+    let bodies: Vec<String> = [&first, &second]
+        .iter()
+        .flat_map(|page| page["messages"].as_array().unwrap().iter())
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(bodies, ["page one", "page two"]);
+    assert_eq!(second["next_since_seq"], second["latest_seq"], "{second}");
+}
+
+#[test]
+fn a_send_at_its_hop_limit_is_not_deposited_and_says_why() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa03";
+    register_inbox_peer(&repo, sid, "limit-target");
+    let sent = send_json(
+        &repo,
+        json!({ "from_peer": "claude:a", "to_peer": "limit-target", "body": "last hop", "max_hops": 1 }),
+    )
+    .expect("send at the limit");
+    assert_eq!(sent["delivery_outcome"], "paused_hop_limit", "{sent}");
+    assert_eq!(sent["mailbox"]["deposited"], false, "{sent}");
+    assert_eq!(sent["mailbox"]["reason"], "hop_limit", "{sent}");
+    let pending = Mailbox::at_default()
+        .expect("mailbox")
+        .peek_pending(sid, 16, SystemTime::now())
+        .expect("peek mailbox");
+    assert!(
+        pending.is_empty(),
+        "the mailbox must stay empty: {pending:?}"
+    );
+}
+
+#[test]
+fn a_reply_through_in_reply_to_cannot_raise_the_ceiling_of_an_unthreaded_row() {
+    let (_dir, repo) = trusted_git_repo();
+    register_forgery_target(
+        &repo,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa04",
+        "ceiling-target",
+    );
+    send_json(
+        &repo,
+        json!({ "from_peer": "claude:a", "to_peer": "ceiling-target", "body": "root",
+                "msg_id": "ceiling-root", "max_hops": 2 }),
+    )
+    .expect("root send");
+    let reply = send_json(
+        &repo,
+        json!({ "from_peer": "claude:b", "to_peer": "ceiling-target", "body": "answer",
+                "msg_id": "ceiling-reply", "in_reply_to": "ceiling-root", "max_hops": 32 }),
+    )
+    .expect("reply");
+    assert_eq!(reply["message"]["max_hops"], 2, "{reply}");
+    assert_eq!(reply["max_hops"], 2, "{reply}");
+    assert_eq!(reply["hop"], 2, "{reply}");
+    assert_eq!(reply["delivery_outcome"], "paused_hop_limit", "{reply}");
+}
+
+/// Sends the same message twice while a fake desktop owner answers `reply` and counts its
+/// calls. Returns (calls, first send, retry).
+#[cfg(target_os = "macos")]
+fn retry_under_fake_desktop(
+    sid: &str,
+    reply: Result<serde_json::Value, String>,
+) -> (usize, serde_json::Value, serde_json::Value) {
+    use crate::desktop::instance::{claim, Claim};
+    let (_dir, repo) = trusted_git_repo();
+    register_inbox_peer(&repo, sid, "retry-desk");
+    let profile = tempfile::Builder::new()
+        .prefix("gpdk")
+        .tempdir()
+        .expect("short socket tempdir");
+    crate::browser::TEST_PROFILE
+        .with(|slot| *slot.borrow_mut() = Some(profile.path().to_path_buf()));
+    let owner = match claim(profile.path(), Duration::from_secs(2)) {
+        Claim::Primary(owner) => owner,
+        _ => panic!("test must claim primary socket"),
+    };
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    owner.attach_agent_deliver(std::sync::Arc::new(move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        reply.clone()
+    }));
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "retry-desk",
+                       "body": "deliver me once", "msg_id": "desk-retry-1" });
+    let first = send_json(&repo, args.clone()).expect("first send");
+    let retry = send_json(&repo, args).expect("exact retry");
+    drop(owner);
+    crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
+    (
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        first,
+        retry,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exact_retry_after_a_successful_desktop_delivery_does_not_deliver_again() {
+    let (calls, first, retry) = retry_under_fake_desktop(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa05",
+        Ok(json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "banner"})),
+    );
+    assert_eq!(calls, 1, "{first} / {retry}");
+    assert_eq!(
+        retry["delivery_outcome"], first["delivery_outcome"],
+        "{retry}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exact_retry_after_a_failed_desktop_delivery_delivers_again() {
+    let (calls, _first, _retry) = retry_under_fake_desktop(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa06",
+        Err("owner timed out".to_string()),
+    );
+    assert_eq!(calls, 2);
 }
