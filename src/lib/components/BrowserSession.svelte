@@ -25,12 +25,13 @@
    */
   import { onDestroy, onMount, tick } from "svelte";
   import { get } from "svelte/store";
-  import { AlertCircle, ArrowLeft, ArrowRight, Camera, Crosshair, ExternalLink, Globe, LoaderCircle, RotateCw } from "@lucide/svelte";
+  import { AlertCircle, ArrowLeft, ArrowRight, Camera, Crosshair, ExternalLink, FileCode2, Globe, LoaderCircle, RefreshCw, RotateCw, Server } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
   import { invoke } from "../ipc/invoke";
   import { pageZoom } from "../ui/uiScale";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { describeError } from "../ui/copy/describeFailure";
+  import { currentRepoPath } from "../stores/repoStore";
   import { CONTEXT_UNKNOWN, type ContextRead } from "../terminal/sessionContext";
   import {
     browserIpc,
@@ -48,6 +49,7 @@
     toWindowPoints,
     type BrowserSnapshotPreview,
     type HistoryStep,
+    type LocalServerDiscovery,
     type PageEvent,
     type PaneBounds,
   } from "../browser/browserSession";
@@ -207,6 +209,36 @@
     void send(() => browserIpc.setVisible(tabId, visible));
   });
 
+  let terminated = $state(false);
+  let discoveringServers = $state(false);
+  let serverDiscovery = $state<LocalServerDiscovery | null>(null);
+  let discoverySeq = 0;
+
+  async function refreshLocalServers() {
+    const seq = ++discoverySeq;
+    discoveringServers = true;
+    try {
+      const result = await browserIpc.discoverLocalServers($currentRepoPath);
+      if (!disposed && seq === discoverySeq) {
+        serverDiscovery = result;
+      }
+    } catch {
+      if (!disposed && seq === discoverySeq) {
+        serverDiscovery = null;
+      }
+    } finally {
+      if (!disposed && seq === discoverySeq) {
+        discoveringServers = false;
+      }
+    }
+  }
+
+  function openServerUrl(url: string) {
+    address = url;
+    terminated = false;
+    void submit();
+  }
+
   $effect(() => {
     onPageState?.({ loading, error });
   });
@@ -214,12 +246,14 @@
   function onPage(event: PageEvent) {
     switch (event.kind) {
       case "loading":
+        terminated = false;
         loading = true;
         error = null;
         if (!editing) address = event.url;
         if (event.url !== "about:blank") onUrl?.(event.url);
         break;
       case "loaded":
+        terminated = false;
         loading = false;
         if (!editing) address = event.url;
         if (event.url !== "about:blank") {
@@ -234,6 +268,16 @@
         loading = false;
         error = `Blocked ${event.url.slice(0, 200)}: browser sessions open local development servers only.`;
         break;
+      case "terminated":
+        loading = false;
+        terminated = true;
+        error = "The browser page process stopped unexpectedly. Reload to restart it.";
+        cancelPickElement();
+        if (opened) {
+          opened = false;
+          void send(() => browserIpc.close(tabId).catch(() => {}));
+        }
+        break;
     }
   }
 
@@ -243,6 +287,8 @@
       address = initialUrl;
       // Once laid out, so the page opens where the tab is.
       void tick().then(() => submit());
+    } else {
+      void refreshLocalServers();
     }
     return stop;
   });
@@ -252,6 +298,7 @@
     const url = normalizeAddress(address);
     if (!url) return;
     error = null;
+    terminated = false;
     editing = false;
     cancelPickElement();
     addressInput?.blur();
@@ -283,6 +330,10 @@
 
   function step(to: HistoryStep) {
     cancelPickElement();
+    if (to === "reload" && !opened && terminated) {
+      void submit();
+      return;
+    }
     if (opened) void send(() => browserIpc.go(tabId, to));
   }
 
@@ -445,7 +496,7 @@
   <form class="shrink-0 flex items-center gap-1 px-2 h-8" onsubmit={submit}>
     <button type="button" class="gp-icon-btn" aria-label="Back" title="Back" disabled={!opened} onclick={() => step("back")}><ArrowLeft size={13} /></button>
     <button type="button" class="gp-icon-btn" aria-label="Forward" title="Forward" disabled={!opened} onclick={() => step("forward")}><ArrowRight size={13} /></button>
-    <button type="button" class="gp-icon-btn" aria-label="Reload" title="Reload" disabled={!opened} onclick={() => step("reload")}>
+    <button type="button" class="gp-icon-btn" aria-label="Reload" title="Reload" disabled={!opened && !terminated} onclick={() => step("reload")}>
       {#if loading}<LoaderCircle size={13} class="animate-spin" />{:else}<RotateCw size={13} />{/if}
     </button>
     <input
@@ -497,10 +548,90 @@
   {/if}
   <div bind:this={host} class="relative flex-1 min-h-0" data-browser-host>
     {#if !opened}
-      <div class="h-full flex flex-col items-center justify-center gap-2 p-4 text-center text-textMuted text-xs">
-        <Globe size={18} />
-        <span>Open a local development server, like <code>localhost:3000</code> or just <code>5173</code>.</span>
-        <span class="text-micro max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
+      <div class="h-full flex flex-col items-center justify-center gap-3 p-4 text-center text-textMuted text-xs overflow-auto">
+        {#if terminated}
+          <AlertCircle size={18} class="text-danger" />
+          <span class="text-text">The browser page stopped unexpectedly.</span>
+          <div class="flex items-center gap-2">
+            <button type="button" class="gp-btn" data-size="sm" onclick={() => submit()}>
+              <RotateCw size={12} />
+              <span>Reload page</span>
+            </button>
+            <button type="button" class="gp-btn" data-size="sm" onclick={refreshLocalServers}>
+              <span>Scan servers</span>
+            </button>
+          </div>
+        {:else}
+          <Globe size={18} />
+          <span>Open a local development server, like <code>localhost:3000</code> or just <code>5173</code>.</span>
+          <span class="text-micro max-w-sm">The page runs in its own browser with no access to GitPulse and its own storage. Only localhost addresses open; sessions close when the window reloads.</span>
+        {/if}
+
+        {#if (serverDiscovery?.servers.length ?? 0) > 0 || serverDiscovery?.run_script}
+          <div class="w-full max-w-md border border-border rounded bg-background/60 p-2.5 text-left space-y-2">
+            <div class="flex items-center justify-between gap-2 gp-label">
+              <span class="flex items-center gap-1"><Server size={11} /> Local servers</span>
+              <button
+                type="button"
+                class="gp-icon-btn"
+                aria-label="Refresh local servers"
+                title="Refresh local servers"
+                disabled={discoveringServers}
+                onclick={refreshLocalServers}
+              >
+                <RefreshCw size={11} class={discoveringServers ? "animate-spin" : ""} />
+              </button>
+            </div>
+            {#if (serverDiscovery?.servers.length ?? 0) > 0}
+              <div class="flex flex-wrap gap-1.5">
+                {#each serverDiscovery?.servers ?? [] as srv (`${srv.source}:${srv.port}:${srv.url}`)}
+                  <button
+                    type="button"
+                    class="gp-btn font-mono text-micro!"
+                    data-size="sm"
+                    title="{srv.url} ({srv.source})"
+                    onclick={() => openServerUrl(srv.url)}
+                  >
+                    <span>:{srv.port}</span>
+                    <span class="text-textMuted truncate max-w-[160px]">{srv.hostname ?? srv.process ?? srv.label}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+            {#if serverDiscovery?.run_script}
+              <div class="flex items-center justify-between gap-2 pt-1.5 text-micro">
+                <span class="flex items-center gap-1 font-mono text-textMuted truncate">
+                  <FileCode2 size={11} />
+                  <span>{serverDiscovery.run_script.path}</span>
+                </span>
+                {#if serverDiscovery.run_script.preview_url}
+                  {@const previewUrl = serverDiscovery.run_script.preview_url}
+                  <button
+                    type="button"
+                    class="gp-btn font-mono text-micro!"
+                    data-size="sm"
+                    onclick={() => openServerUrl(previewUrl)}
+                  >
+                    Open {previewUrl}
+                  </button>
+                {:else}
+                  <span class="text-textMuted">Add <code># gitpulse-preview: http://localhost:PORT</code></span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {:else if !terminated}
+          <button
+            type="button"
+            class="gp-btn text-micro!"
+            data-size="sm"
+            disabled={discoveringServers}
+            onclick={refreshLocalServers}
+          >
+            <RefreshCw size={11} class={discoveringServers ? "animate-spin" : ""} />
+            <span>{discoveringServers ? "Scanning ports…" : "Detect local servers"}</span>
+          </button>
+        {/if}
       </div>
     {:else if picking && pickPreview}
       <button

@@ -54,6 +54,7 @@
 //! session type is not offered.
 
 pub mod commands;
+pub mod local_servers;
 pub mod policy;
 
 #[cfg(target_os = "macos")]
@@ -424,6 +425,8 @@ pub enum PageEvent {
     Title { title: String },
     /// A navigation (of the page or one of its frames) was refused by policy.
     Refused { url: String },
+    /// The OS web content process crashed or was terminated.
+    Terminated,
 }
 
 /// A [`PageEvent`] and the pane it came from.

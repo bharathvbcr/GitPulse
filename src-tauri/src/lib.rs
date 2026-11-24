@@ -462,6 +462,7 @@ pub fn run() {
             browser::commands::cmd_browser_snapshot,
             browser::commands::cmd_browser_snapshot_preview,
             browser::commands::cmd_browser_inspect_point,
+            browser::commands::cmd_browser_discover_local_servers,
             cmd_pick_folder,
             cmd_list_branches,
             cmd_branch_stats,

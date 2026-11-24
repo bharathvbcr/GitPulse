@@ -44,6 +44,7 @@
     "allow-cmd-branch-cleanup-plan",
     "allow-cmd-branch-stats",
     "allow-cmd-browser-close",
+    "allow-cmd-browser-discover-local-servers",
     "allow-cmd-browser-go",
     "allow-cmd-browser-inspect-point",
     "allow-cmd-browser-navigate",
