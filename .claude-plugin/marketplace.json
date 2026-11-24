@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "description": "GitPulse control-plane plugins: repository, worktree, collision, ledger, and code-intelligence tools for agents, plus task-board writes. It never pushes, and the skills that merge branches or pull requests act only after you approve their plan.",
+  "description": "GitPulse control-plane plugins: repository, worktree, collision, ledger, and code-intelligence tools for agents, plus task-board writes. It never runs git push, and the skills that change the default branch or the remote act only after you approve their plan.",
   "owner": {
     "name": "GitPulse Team",
     "url": "https://gitpulse.vbcr.dev"
@@ -9,7 +9,7 @@
     {
       "name": "gitpulse",
       "source": "./plugins/gitpulse",
-      "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never pushes, and the skills that merge branches or pull requests act only after you approve their plan.",
+      "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never runs git push, and the skills that change the default branch or the remote act only after you approve their plan.",
       "category": "development",
       "author": {
         "name": "GitPulse Team",

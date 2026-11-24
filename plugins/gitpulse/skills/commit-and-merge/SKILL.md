@@ -201,21 +201,25 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
    - **In a worktree with uncommitted work:** `git merge --ff-only <new>` still works when none of the dirty files are in the landed change, and git refuses when one is.
 3. **If git refuses** because dirty files overlap the landing, stop. Show the owner the overlapping paths and whose session holds them. Land only after the holder commits, or after the owner approves a three-way landing of those files.
 
-   **The three-way landing.** Run it in the checkout that has the default branch, with `<old>` as its current tip:
-   1. List the dirty paths with `git status --porcelain=v1 -z -uall`, which includes untracked files, and the landed paths with `git diff --no-renames --name-status -z <old> <new>`. Refuse if:
-      - any overlapping path has staged changes (`git diff --cached --name-only`);
-      - an overlapping path is one the landing adds or deletes. Only a file modified on both sides can be merged; an untracked file where the landing adds one is an overlap too.
-   2. Hash every dirty file in that checkout.
-   3. Merge each overlapping file into a temporary file. Never merge in place, because a conflict writes markers into the holder's file:
+   **The three-way landing.** Run it in the checkout that has the default branch, with `<old>` as its current tip. Give git every path with `--literal-pathspecs`, so a name like `docs/[x].md` cannot also match `docs/x.md`.
+   1. **List both sides.** The dirty paths: `git status --porcelain=v1 -z -uall --no-renames`, which includes untracked files. The landed paths: `git diff --no-renames --raw -z <old> <new>`, which also gives each path's old and new mode.
+   2. **Refuse** unless every overlap is a regular file that both sides modified and nothing staged. Refuse if:
+      - an overlapping path has staged changes (`git diff --cached --no-renames --name-only -z`);
+      - the landing adds, deletes or changes the type or mode of an overlapping path;
+      - either side of an overlap is a symlink or a submodule (mode `120000` or `160000`);
+      - a path the landing adds already exists on disk as a file or a directory, even an ignored one (`test -e`);
+      - a dirty path and a landed path differ but one is a directory prefix of the other (`foo` and `foo/bar`).
+   3. **Save every dirty file** as a blob with `git hash-object -w -- <path>`, and keep the list. It proves later that nothing else changed, and it is what you restore from.
+   4. **Merge each overlapping file** into a temporary file. Never merge in place, because a conflict writes markers into the holder's file:
       ```sh
-      git merge-file -p --object-id <working-file-blob> <old>:<path> <new>:<path> > <tmp>
+      git merge-file -p --object-id <saved blob> <old>:<path> <new>:<path> > <tmp>
       ```
-      Get the working file's blob with `git hash-object -w <path>`. A non-zero exit is a conflict: delete the temp files and stop.
-   4. Check that each working file still has the hash from step 2, then move each temp file over it.
-   5. Write every landed path that is not dirty with `git restore --source=<new> --worktree -- <paths>`. It creates added files, removes deleted ones and keeps the executable bit; `git show` does none of the last two.
-   6. Move the ref last, with the compare-and-swap.
-   7. Run `git reset -q -- <landed paths>` over every landed path, merged or written, so the index follows the new tip. Otherwise the holder's next commit would revert the landing. Afterwards `git status` must list only the holder's own changes.
-   8. Hash every other dirty file again. All of them must be unchanged.
+      A non-zero exit is a conflict: delete the temp files and stop.
+   5. **Check, then write.** Each overlapping file must still hash to its saved blob. Then copy each temp file into it with `cat <tmp> > <path>`, which keeps the file's mode, and delete the temp file.
+   6. **Write the other landed paths** with `git --literal-pathspecs restore --source=<new> --worktree -- <paths>`. It creates added files, removes deleted ones, and sets modes and symlinks, none of which `git show` does.
+   7. **Move the ref last,** with the compare-and-swap. If it fails, someone else moved the branch. Put every file back and stop: the merged files with `git cat-file blob <saved blob> > <path>`, the others with `git --literal-pathspecs restore --source=<old> --worktree -- <paths>`.
+   8. **Line up the index** with `git --literal-pathspecs reset -q -- <every landed path>`. Otherwise the holder's next commit would revert the landing.
+   9. **Prove it.** Every dirty file outside the landing still hashes to its saved blob, and `git status` lists only the holder's own changes.
 
    This is the one place this skill moves a ref that another worktree has checked out. It needs the owner's yes every time.
 4. **Never push.** Say that the default branch moved locally, and by how many commits.

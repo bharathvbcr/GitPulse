@@ -2,7 +2,7 @@
   "name": "gitpulse",
   "displayName": "GitPulse",
   "version": "0.2.0-beta.1",
-  "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never pushes, and the skills that merge branches or pull requests act only after you approve their plan.",
+  "description": "GitPulse control plane for agents: worktrees, collisions, ledger, provenance, in-process code intelligence, and the task board. It never runs git push, and the skills that change the default branch or the remote act only after you approve their plan.",
   "author": {
     "name": "GitPulse Team",
     "url": "https://gitpulse.vbcr.dev"

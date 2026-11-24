@@ -40,7 +40,8 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 - **The plugin manifests no longer say GitPulse "never writes git".** Its
   worktree tools and landing skills do write; the description now says it never
-  pushes, and that the skills that merge act only after you approve their plan.
+  runs `git push`, and that the skills that change the default branch or the
+  remote act only after you approve their plan.
 
 - **`gitpulse:merge-train` no longer names particular repositories or paths.**
   It reads each repository's gate from its settings or its own instructions.
