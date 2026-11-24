@@ -97,7 +97,6 @@ tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 http = "1"
 url = "2"
-gitpulse-protocol = { path = "../crates/gitpulse-protocol" }
 ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
 zeroize = "1"
 notify = "8.2"
