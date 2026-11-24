@@ -1705,10 +1705,18 @@ pub(crate) struct AgentThrottleCandidate {
     /// directory under the Cargo registry, outside every repository; the
     /// `cargo` that started it is where the work belongs.
     pub lineage_cwds: Vec<String>,
+    /// Process ids of this process's ancestors, nearest first, up to and
+    /// including the session root (at most `MAX_ANCESTOR_PIDS`). The steward
+    /// uses them to tell a child that inherited background priority from a
+    /// process it throttled apart from one someone else backgrounded.
+    pub ancestor_pids: Vec<i32>,
 }
 
 /// Most ancestor working directories one candidate carries.
 const MAX_LINEAGE_CWDS: usize = 8;
+
+/// Most ancestor process ids one candidate carries.
+const MAX_ANCESTOR_PIDS: usize = 8;
 
 /// Returns live current-user worker processes belonging to active agent session
 /// trees (`Claude`, `Codex`, `Antigravity`, `DevCouncil`), excluding GitPulse
@@ -1804,6 +1812,7 @@ impl Scanner {
                 .map(|p| p.to_string_lossy().into_owned());
             let effective_cwd = own_cwd.or_else(|| session_cwds.get(s_idx).cloned().flatten());
             let lineage_cwds = self.lineage_cwds(i, root_i, &mut ancestor_cwds);
+            let ancestor_pids = self.ancestor_pids(i, root_i);
             out.push(AgentThrottleCandidate {
                 pid: f.pid,
                 start_us: f.start_us,
@@ -1813,6 +1822,7 @@ impl Scanner {
                 session_cwd: effective_cwd,
                 is_session_root: false,
                 lineage_cwds,
+                ancestor_pids,
             });
         }
         Ok(out)
@@ -1848,6 +1858,22 @@ impl Scanner {
                     }
                 }
             }
+            if p == root_i {
+                break;
+            }
+            at = self.parent_of(p);
+        }
+        out
+    }
+
+    /// Process ids of `i`'s ancestors, nearest first, through the session
+    /// root `root_i`, bounded by `MAX_ANCESTOR_PIDS`.
+    fn ancestor_pids(&self, i: usize, root_i: usize) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH.min(MAX_ANCESTOR_PIDS) {
+            let Some(p) = at else { break };
+            out.push(self.facts[p].pid);
             if p == root_i {
                 break;
             }

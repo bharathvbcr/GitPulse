@@ -4273,15 +4273,22 @@ pub(crate) fn evaluate_tick_with(
                         }
                         // Already in the background. Seen on the episode's first
                         // tick, it was put there by someone else and is left
-                        // alone. Seen later, it was started by a process this
-                        // episode throttled and inherited the priority, so it is
-                        // tracked and restored with the rest.
-                        Ok(false) if episode_started => {
-                            already_background.insert((cand.pid, cand.start_us));
-                        }
+                        // alone. Seen later, it is ours only when its
+                        // backgrounding is attributable to this episode: an
+                        // ancestor (within the scan's bound) is a process this
+                        // episode throttled, so it inherited the priority.
+                        // Any other (the person or another supervisor
+                        // backgrounded it) is recorded and left alone, since
+                        // restoring it would overwrite their choice.
                         Ok(false) => {
-                            if !already_background.contains(&(cand.pid, cand.start_us)) {
+                            let key = (cand.pid, cand.start_us);
+                            let inherited = !episode_started
+                                && !already_background.contains(&key)
+                                && cand.ancestor_pids.iter().any(|a| desired.contains_key(a));
+                            if inherited {
                                 desired.insert(cand.pid, (cand.start_us, common));
+                            } else {
+                                already_background.insert(key);
                             }
                         }
                         Err(err) => refused
@@ -5043,6 +5050,7 @@ mod tests {
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
             lineage_cwds: Vec::new(),
+            ancestor_pids: Vec::new(),
         }];
         let acted = evaluate_tick_with(&rt, "critical_wake", None, &deps);
         assert_eq!(acted.outcome, "acted");
@@ -5140,6 +5148,7 @@ mod tests {
                 session_cwd: Some("/trusted/a".into()),
                 is_session_root: false,
                 lineage_cwds: Vec::new(),
+                ancestor_pids: Vec::new(),
             },
             AgentThrottleCandidate {
                 pid: 5100,
@@ -5150,6 +5159,7 @@ mod tests {
                 session_cwd: Some("/opted_out/c".into()),
                 is_session_root: false,
                 lineage_cwds: Vec::new(),
+                ancestor_pids: Vec::new(),
             },
         ];
         deps.common_dirs
@@ -5208,6 +5218,7 @@ mod tests {
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
             lineage_cwds: Vec::new(),
+            ancestor_pids: Vec::new(),
         }];
         // Simulate the user switching `slow_critical = false` mid-tick while the
         // candidate scan is in flight, before `active.json` is written.
@@ -5931,6 +5942,7 @@ mod tests {
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
             lineage_cwds: Vec::new(),
+            ancestor_pids: Vec::new(),
         }];
 
         // Case 1: Pulse wakes on `PressureInput::Critical` while `verdict.tier` is
@@ -7298,6 +7310,7 @@ Trailing note {done}."#;
             session_cwd: Some("/trusted/a".into()),
             is_session_root: false,
             lineage_cwds: Vec::new(),
+            ancestor_pids: Vec::new(),
         }
     }
 
@@ -7334,7 +7347,10 @@ Trailing note {done}."#;
         assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
 
         // A child of the throttled 4100 starts and inherits background priority.
-        deps.candidates.push(agent_worker(4300));
+        deps.candidates.push(AgentThrottleCandidate {
+            ancestor_pids: vec![4100, 4000],
+            ..agent_worker(4300)
+        });
         deps.already_background.borrow_mut().insert(4300);
         deps.now_ms += 60_000;
         let second = evaluate_tick_with(&rt, "scheduled", None, &deps);
@@ -7360,6 +7376,48 @@ Trailing note {done}."#;
         assert!(ops.contains(&(4300, false)), "{ops:?}");
         assert!(!ops.contains(&(4200, false)), "{ops:?}");
         assert_eq!(journal_entries(tmp.path()), None);
+    }
+
+    /// Runs a throttle episode where 4100 is throttled on the first tick and
+    /// 4300 (already in the background) first shows up on a later tick under
+    /// `ancestors`, then recovers. Returns the throttle ops.
+    fn later_tick_background_candidate(ancestors: Vec<i32>) -> Vec<(i32, bool)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = StewardRuntime::default();
+        let mut deps = base_deps(tmp.path());
+        deps.load = critical_memory();
+        deps.candidates = vec![agent_worker(4100)];
+        evaluate_tick_with(&rt, "critical_wake", None, &deps);
+
+        deps.candidates.push(AgentThrottleCandidate {
+            ancestor_pids: ancestors,
+            ..agent_worker(4300)
+        });
+        deps.already_background.borrow_mut().insert(4300);
+        deps.now_ms += 60_000;
+        evaluate_tick_with(&rt, "scheduled", None, &deps);
+
+        deps.load = make_load(SensorState::Fresh, Tier::Clear, None, true);
+        deps.now_ms += 60_000;
+        evaluate_tick_with(&rt, "scheduled", None, &deps);
+        let ops = deps.throttle_ops.borrow().clone();
+        ops
+    }
+
+    #[test]
+    fn a_later_background_candidate_under_a_throttled_parent_is_restored() {
+        let ops = later_tick_background_candidate(vec![4400, 4100, 4000]);
+        assert!(ops.contains(&(4300, false)), "{ops:?}");
+        assert!(ops.contains(&(4100, false)), "{ops:?}");
+    }
+
+    #[test]
+    fn a_later_background_candidate_with_an_unrelated_parent_is_left_alone() {
+        // Backgrounded by the person or another supervisor: its parent was
+        // never throttled by this episode, so recovery must not reset it.
+        let ops = later_tick_background_candidate(vec![4900, 4000]);
+        assert!(!ops.contains(&(4300, false)), "{ops:?}");
+        assert!(ops.contains(&(4100, false)), "{ops:?}");
     }
 
     #[test]
@@ -7574,6 +7632,7 @@ Trailing note {done}."#;
         let registry = "/home/dev/.cargo/registry/src/index/serde-1.0.0";
         let under = |pid: i32, session_repo: &str| AgentThrottleCandidate {
             lineage_cwds: vec![registry.into(), session_repo.into()],
+            ancestor_pids: Vec::new(),
             ..in_repo(pid, Some(registry))
         };
         deps.candidates = vec![
