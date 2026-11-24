@@ -20,6 +20,12 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   renamed its older rows over it, dropping every claim appended in between,
   each of them having been reported as written. A compaction now keeps the file
   it read open until it is done, so the number cannot be reused meanwhile.
+- **Linux bundling of a beta.** A beta's version (`X.Y.Z-beta.N`) is not a legal
+  RPM version, and Tauri takes the rpm's version straight from the app version, so
+  bundling failed at the `.rpm` (`invalid version "0.2.0-beta.1": contains invalid
+  character`) on the release's Linux legs and CI's ARM Bundle job. A beta's Linux
+  legs now bundle the `.deb` and the AppImage only, and the release manifest expects
+  ten installers for a beta; a stable release still ships both rpms (twelve).
 
 ## [0.2.0-beta.1] - 2026-11-18
 

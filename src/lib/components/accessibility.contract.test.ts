@@ -46,12 +46,15 @@ describe("segmented-control semantics", () => {
     expect(markdev).toContain('aria-pressed={viewMode === "raw"}');
   });
 
-  it("announces terminal modes as a pressed-button group", () => {
-    const text = source("TerminalPanel.svelte");
-    expect(text).toContain('class="gp-segmented" role="group" aria-label="Terminal mode"');
-    expect(text).toContain('aria-pressed={mode === "shell"}');
-    expect(text).toContain('aria-pressed={mode === "console"}');
-    expect(text).not.toContain('role="tablist" aria-label="Terminal mode"');
+  it("announces dock sections as a pressed-button group", () => {
+    // The Dock's section switcher (Shell / Agents / Files / Console) replaced
+    // the two-mode switcher. Still a pressed-button group, never a tablist:
+    // the session strip below it is already the tablist.
+    const text = source("DockHeader.svelte");
+    expect(text).toContain('class="gp-segmented shrink-0" role="group" aria-label="Dock section"');
+    expect(text).toContain("aria-pressed={section === entry.id}");
+    expect(text).not.toContain('role="tablist"');
+    expect(source("TerminalPanel.svelte")).not.toContain('role="tablist" aria-label="Dock section"');
   });
 
   it("announces image comparison modes as a pressed-button group", () => {

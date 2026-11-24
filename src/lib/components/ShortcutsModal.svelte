@@ -68,7 +68,7 @@
         ...sectionShortcutRows(),
         { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
         { keys: ["⌘", "⇧", "A"], description: "Open the Agents plane" },
-        { keys: ["Ctrl", "`"], description: "Toggle the terminal dock" },
+        { keys: ["Ctrl", "`"], description: "Toggle the dock" },
         { keys: ["⌘", "F"], description: "Search commits (switches to History). In Code it searches the open file; in History → Diff, the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },
         { keys: ["⌘", "+"], description: "Zoom in — scales the whole interface" },

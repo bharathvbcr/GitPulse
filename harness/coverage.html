@@ -246,7 +246,7 @@
             /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(claudeSpawn.sessionId ?? "")
               && !claudeSpawn.args.includes("--session-id")
               && JSON.stringify(claudeSpawn.args) === JSON.stringify(expectedArgv("claude", expectedPrompt)));
-          button("Hide the terminal dock").click(); await tick();
+          button("Hide the dock").click(); await tick();
           button("View agent session").click(); await tick();
           check("view agent reopens existing tab without spawning", spawned.length === 2 && visible('[role="tab"][aria-selected="true"]').some(node => node.textContent.includes("Claude")));
           const claude = spawned.find(row => row.program === "claude");
@@ -382,7 +382,7 @@
             check, wait, until, button, byText, region, card, runs, aiCalls, ipcLog, knobs,
             setMode: next => { mode = next; }, setRunDelay: ms => { runDelay = ms; }, scans: () => scans,
           });
-          button("Hide the terminal dock").click();
+          button("Hide the dock").click();
           button("Toggle narrow layout").click(); button("Toggle theme").click(); await wait();
           const section = document.querySelector('section[aria-label="Generate coverage with a coding agent"]');
           check("narrow prompt controls stay inside panel", section.scrollWidth <= section.clientWidth + 1);
