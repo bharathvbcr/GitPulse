@@ -6485,8 +6485,7 @@ mod tests {
         );
         assert!(
             via_key.detail.contains("Keychain key"),
-            "unexpected detail: {}",
-            via_key.detail
+            "the detail does not say the Keychain key was used"
         );
 
         // 3. Broken ~/.anthropic-accounts MUST NOT silently fall back to Keychain key,
@@ -6500,8 +6499,7 @@ mod tests {
         assert!(broken.typed.is_none());
         assert!(
             broken.detail.contains(".anthropic-accounts"),
-            "unexpected detail: {}",
-            broken.detail
+            "the detail does not point at ~/.anthropic-accounts"
         );
 
         // 3b. Corrupted Keychain item (when ~/.anthropic-accounts is absent) also reports `failed`.
@@ -6570,8 +6568,7 @@ mod tests {
         );
         assert!(
             via_acct.detail.contains("account `main`"),
-            "unexpected detail: {}",
-            via_acct.detail
+            "the detail does not name the chosen account entry"
         );
 
         // 5. DeferredUnderLoad from credential check bubbles up so `probe_live_manvi` preserves cached state.
@@ -7486,8 +7483,7 @@ Trailing note {done}."#;
         assert_eq!(unchecked.outcome, "failed");
         assert!(
             unchecked.summary.contains("Couldn't ask Manvi"),
-            "{}",
-            unchecked.summary
+            "the tick summary does not say Manvi could not be asked"
         );
         assert!(deps.throttle_ops.borrow().is_empty());
         assert!(crate::supervisor::lock_or_recover(&rt.inner)

@@ -3895,7 +3895,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert!(
             ninth_err.contains("already has 8 active child sessions (limit 8)"),
-            "unexpected error: {ninth_err}"
+            "the ninth child was not refused for the 8-session limit"
         );
 
         // Option A: Parent B cannot close Parent A's child, and Parent A cannot close user_shell or itself.
