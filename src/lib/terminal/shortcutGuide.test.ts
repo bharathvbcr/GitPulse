@@ -55,6 +55,14 @@ describe("terminal guide shortcuts", () => {
     }
   });
 
+  it("lists the dock section chords for every host", () => {
+    const row = (os: "macos" | "windows" | "linux") =>
+      terminalGuideShortcuts(os).find((entry) => entry.description === "Switch the Dock to Shell, Agents, Files or Console");
+    expect(row("macos")?.keys).toEqual(["⌘", "⌥", "⇧", "1–4"]);
+    expect(row("windows")?.keys).toEqual(["Ctrl", "Alt", "Shift", "1–4"]);
+    expect(row("linux")?.keys).toEqual(["Ctrl", "Alt", "Shift", "1–4"]);
+  });
+
   it("keeps macOS line editing off other hosts", () => {
     expect(terminalGuideShortcuts("macos").some((row) => row.description === "Start of the line")).toBe(true);
     expect(terminalGuideShortcuts("linux").some((row) => row.description === "Start of the line")).toBe(false);
