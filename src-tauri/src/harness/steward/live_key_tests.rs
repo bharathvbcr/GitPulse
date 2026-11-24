@@ -86,10 +86,11 @@ fn a_refused_key_reads_rejected_everywhere_and_a_fixed_account_recovers_live() {
         "set {OPT_IN}=1 to run this live test"
     );
     let manvi = in_real_home(|| read_steward_manvi(&mut false)).expect("read `manvi use`");
+    // The detail can name the signed-in account, so the message says what to
+    // check rather than echoing it into the test log.
     assert_eq!(
         manvi.state, "ready",
-        "Manvi is not usable: {}",
-        manvi.detail
+        "Manvi is not usable; run `manvi use` to see why"
     );
     assert_eq!(manvi.mode, "cloud", "run `manvi use cloud` first");
     let selection = manvi.typed.clone().expect("a cloud model selection");
@@ -164,7 +165,10 @@ fn a_refused_key_reads_rejected_everywhere_and_a_fixed_account_recovers_live() {
     assert_eq!(error.message(), crate::ai::REJECTED_KEY_MESSAGE);
     assert_eq!(recorded_rejection().as_deref(), Some(model.as_str()));
     let shown = status();
-    assert_eq!(shown.manvi_state, "rejected", "{}", shown.manvi_detail);
+    assert_eq!(
+        shown.manvi_state, "rejected",
+        "the steward did not report the refused key"
+    );
     assert_eq!(shown.manvi_detail, crate::ai::REJECTED_KEY_MESSAGE);
 
     // The steward's directive call reads the same code.
@@ -218,7 +222,10 @@ fn a_refused_key_reads_rejected_everywhere_and_a_fixed_account_recovers_live() {
         "a working call did not clear the rejection"
     );
     let shown = status();
-    assert_eq!(shown.manvi_state, "ready", "{}", shown.manvi_detail);
+    assert_eq!(
+        shown.manvi_state, "ready",
+        "a working call did not return the steward to ready"
+    );
 
     worker_running(&host, &selection);
     deps.manvi_complete(&selection, SYSTEM, USER, 16)

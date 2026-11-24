@@ -71,7 +71,10 @@
   import { agentKindLabel } from "../work/agentWorktree";
   import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
   import { inboxFocusRequest, takeInboxFocus } from "../agents/inboxFocus";
-  import { displayName } from "../repos/paths";
+  import { displayName, sameRepo } from "../repos/paths";
+  import { maviStore } from "../mavi/store.svelte";
+  import { maviAgentRows, maviHeadline } from "../mavi/agentsRows";
+  import MaviAgentsTable from "./mavi/MaviAgentsTable.svelte";
   import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
@@ -160,7 +163,19 @@
   /** Every drawn row by id, so a child process's actions can name its parent. */
   const rowsById = $derived(new Map(entries.map((entry) => [entry.row.id, entry.row])));
   const scopeLabel = $derived($agentsRepositoryScope ? displayName($agentsRepositoryScope) : "");
-  const headline = $derived(planeHeadline(plane, countAgentRows(visible)));
+  // Mavi threads are agents too: listed under the plane's rows, in its
+  // columns, under the same filter and scope, and counted in the headline.
+  const maviRows = $derived(
+    maviAgentRows(maviStore.records, (record) => maviStore.summaryOf(record), (record) => maviStore.status(record), {
+      filter,
+      scope: $agentsRepositoryScope || null,
+      sameRepo: (a, b) => sameRepo(a, b, pathOpts),
+    }),
+  );
+  const maviClause = $derived(maviHeadline(maviRows));
+  const headline = $derived(
+    maviClause ? `${planeHeadline(plane, countAgentRows(visible))} · ${maviClause}` : planeHeadline(plane, countAgentRows(visible)),
+  );
   // Exactly one row is in the tab order (a roving tabindex), and it is the one
   // last focused while that row is still drawn.
   const activeId = $derived(
@@ -672,7 +687,15 @@
     {/if}
 
   <div class="gp-page">
-    {#if visible.length === 0}
+    {#if visible.length === 0 && maviRows.length > 0}
+      <!-- Mavi threads below are agent work, so no "nothing here" state; an
+           unread or failed plane still says so rather than looking quiet. -->
+      {#if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
+        <div class="gp-page-body"><div class="gp-notice" data-tone="unknown" role="status">Sessions couldn't be read. The notes above are the reason, not an empty workspace.</div></div>
+      {:else if plane.gaps.length > 0 || scanning}
+        <div class="gp-page-body"><div class="gp-notice" data-tone="unknown" role="status">Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.</div></div>
+      {/if}
+    {:else if visible.length === 0}
       <div class="gp-page-body" data-testid="agents-empty">
         {#if scopeLabel && plane.rows.length > 0 && scoped.length === 0}
           <EmptyState compact icon={Bot} title="No agent work in {scopeLabel}" hint="No agent checkouts, terminals or task runs here. Other repositories have {plural(plane.rows.length, "row", "rows")}; clear the scope to see them." />
@@ -686,7 +709,7 @@
           <EmptyState compact icon={Bot} title="No agent work yet" hint="No agent checkouts, terminals or task runs in the open repositories. A checkout appears when its path is an agent worktree. A terminal appears when this window started it." />
         {/if}
       </div>
-    {:else}
+    {:else if visible.length > 0}
       <!-- A table whose rows nest is a treegrid (ARIA authoring practices); the
            rows carry their level and open state, and the arrow keys move through
            them (harness/agents.html drives them). -->
@@ -884,6 +907,9 @@
           {/each}
         </tbody>
       </table>
+    {/if}
+    {#if maviRows.length > 0}
+      <MaviAgentsTable rows={maviRows} {compact} {columnVisible} />
     {/if}
   </div>
   {/if}

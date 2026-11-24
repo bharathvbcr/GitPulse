@@ -8,6 +8,7 @@ import { GATES } from "./ci-local.mjs";
 import {
   INSTALL_HINT,
   checkoutsPersistingCredentials,
+  installActionsWithoutTool,
   hasWorkflowLevelPermissions,
   interpret,
   pipedDownloads,
@@ -93,6 +94,27 @@ describe("check:workflows", () => {
       "dtolnay/rust-toolchain@stable",
       "owner/short@3d3c42e",
     ]);
+  });
+
+  it("refuses an install-action step that names no tool", () => {
+    const yaml = [
+      "jobs:",
+      "  a:",
+      "    steps:",
+      "      - name: Bare release pin",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "      - name: Named",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "        with:",
+      "          tool: cargo-nextest@0.9.150",
+      "      - name: Empty tool",
+      "        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+      "        with:",
+      "          tool:",
+      "      - run: echo tool: cargo-llvm-cov",
+    ].join("\n");
+    // A `tool:` in another step, or one with no value, names nothing for this one.
+    expect(installActionsWithoutTool(yaml)).toEqual([0, 2]);
   });
 
   it("refuses a checkout that leaves the token in .git/config", () => {
@@ -442,6 +464,30 @@ describe("check:workflows", () => {
       expect(majors.length, `${wfName} setup-node`).toBeGreaterThan(0);
       expect([...new Set([...majors, cfNodeMajor!])]).toHaveLength(1);
     }
+  });
+
+  it("names the tool on every taiki-e/install-action step, so a re-pinned ref still installs it", () => {
+    // A per-tool ref (`@cargo-llvm-cov`) carries the tool in its name; a pinned
+    // v2 commit installs only what `tool:` lists. #28 re-pinned coverage's step
+    // from the one to the other with no `tool:`, and `cargo llvm-cov` then
+    // failed with "no such command" on every run.
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    let steps = 0;
+    for (const name of workflowFiles(dir)) {
+      const lines = readFileSync(`${dir}/${name}`, "utf8").split("\n");
+      lines.forEach((line, index) => {
+        if (!/^\s*uses:\s*taiki-e\/install-action@/.test(line)) return;
+        steps += 1;
+        const indent = line.search(/\S/);
+        const block: string[] = [];
+        for (const next of lines.slice(index + 1)) {
+          if (next.trim() !== "" && next.search(/\S/) <= indent - 2) break;
+          block.push(next);
+        }
+        expect(block.join("\n"), `${name}:${index + 1}`).toMatch(/^\s*with:\s*\n\s*tool:\s*\S+@\S+/m);
+      });
+    }
+    expect(steps).toBeGreaterThan(0);
   });
 
   it("keeps the serial gate and also runs the suite in parallel, in its own workflow", () => {

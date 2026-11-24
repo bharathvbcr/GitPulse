@@ -231,6 +231,7 @@ mod tests {
             .expect("test root")
     }
 
+    // Only the Unix sweep test reads these.
     #[cfg(unix)]
     const DEAD: u32 = 4_000_001;
     #[cfg(unix)]

@@ -2,7 +2,8 @@
 <html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Browser session verification</title></head>
 <body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;top:600px;left:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
 <script type="module">
-  import { mockIPCWithEvents, adoptOutput } from "./tauriMocks";
+  import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput } from "./tauriMocks";
   import "../src/app.css";
   import { createChecks } from "./checks.ts";
 
@@ -20,7 +21,7 @@
   addEventListener("unhandledrejection", e => { errors.push(String(e.reason)); show(); });
   try { localStorage.removeItem("gitpulse.browser.lastAddress"); } catch {}
 
-  mockIPCWithEvents(async (cmd, args) => {
+  mockIPC(async (cmd, args) => {
     if (cmd.startsWith("cmd_browser_")) {
       calls.push({ cmd, args: structuredClone(args) }); show();
       if (cmd === "cmd_browser_open" && openFails) { const why = openFails; openFails = null; throw why; }
@@ -41,7 +42,7 @@
       case "cmd_agent_defaults": throw new Error("Unimplemented fixture: cmd_agent_defaults");
       default: throw new Error(`Unimplemented fixture: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
 
   const { mount, tick } = await import("svelte");
   const { emit } = await import("@tauri-apps/api/event");
@@ -100,7 +101,12 @@
       check("+ opens a browser tab, labelled Browser, and starts no process", () => byText("[role=tab]", "Browser") && spawns.length === spawnsBefore);
       check("Nothing is opened before an address is given", () => of("cmd_browser_open").length === 0);
       check("The address bar offers a local default", () => byLabel("Address").value === "http://localhost:3000/");
-      check("Find and Clear scrollback are off on a browser tab", () => byLabel("Find in terminal").disabled && byLabel("Clear scrollback").disabled);
+      [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click();
+      await wait(() => document.querySelector('[data-testid="dock-menu-clear-scrollback"]'), "the dock menu");
+      const menuClearDisabled = document.querySelector('[data-testid="dock-menu-clear-scrollback"]').disabled;
+      [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click();
+      await wait(() => !document.querySelector('[data-testid="dock-overflow-menu"]'), "the dock menu to close");
+      check("Find and Clear scrollback are off on a browser tab", () => byLabel("Find in terminal").disabled && menuClearDisabled);
 
       // ---- opening ----------------------------------------------------------
       await type("5173");
@@ -188,10 +194,10 @@
         await wait(() => lastVisible() === true, `the page to return after ${what}`);
       }
 
-      byText("button", "Console").click();
+      [...document.querySelectorAll('[data-testid="dock-section-console"]')].find((el) => el.getClientRects().length).click();
       await wait(() => lastVisible() === false, "the page to hide in Console");
       check("Console mode hides it", () => lastVisible() === false);
-      byText("button", "Shell").click();
+      [...document.querySelectorAll('[data-testid="dock-section-shell"]')].find((el) => el.getClientRects().length).click();
       await wait(() => lastVisible() === true, "the page to return in Shell");
       check("Shell mode shows it again", () => lastVisible() === true);
 

@@ -14,7 +14,7 @@
  * agent that rewrites the file while the editor is open. Nothing executes git.
  */
 import "../src/app.css";
-import { mockIPCWithEvents } from "./tauriMocks";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { createChecks } from "./checks.ts";
 
 const errors = [];
@@ -47,8 +47,10 @@ const graphReads = [], fileDiffReads = [];
 let historyFails = false;
 const splitBlob = () => ({ path: splitFile, is_binary: false, is_image: false, mime: "application/octet-stream", text: splitDisk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: splitDisk.base });
 const blob = () => ({ path: file, is_binary: false, is_image: false, mime: "application/octet-stream", text: disk.text, base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: disk.base });
-mockIPCWithEvents((cmd, args) => {
+mockIPC((cmd, args) => {
   switch (cmd) {
+    // Mavi's store asks the host which agent threads run (Live pulse mounts it); none here.
+    case "cmd_mavi_list": return [];
     case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
     case "cmd_list_repo_files": return listing;
     case "cmd_get_status": return statuses;
@@ -90,7 +92,7 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_get_file_coverage": return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [], totals: { lines_found: 0, lines_hit: 0, percentage: 0 }, truncated: false, lines_truncated: false };
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
-});
+}, { shouldMockEvents: true });
 // Live pulse visibility is remembered; start each run from the default (shown).
 localStorage.removeItem("gitpulse.explorer.livePulse");
 // The sidebar explorer's open target is remembered too; its default is Auto,

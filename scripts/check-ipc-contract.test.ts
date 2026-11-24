@@ -355,7 +355,12 @@ describe("annotated but unregistered commands", () => {
     // (cmd_webview_idle_hint, cmd_main_hibernate, cmd_main_ready,
     // cmd_idle_memory_status, cmd_idle_memory_settings,
     // cmd_idle_memory_settings_save).
-    expect(found.size).toBe(350);
+    // 355 with the ten cmd_mavi_* handlers (Mavi: agent conversations over
+    // Claude Code's stream-json, locally or through ssh) and
+    // cmd_mavi_conversation_check (whether a terminal tab's conversation can
+    // continue in Mavi, asked before the tab is ended): 344 + the eleven Mavi
+    // handlers. 361 with both: 344 + 6 idle + 11 Mavi.
+    expect(found.size).toBe(361);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }
@@ -369,6 +374,7 @@ describe("annotated but unregistered commands", () => {
     ]) {
       expect(found.has(idleCmd)).toBe(true);
     }
+    expect(found.has("cmd_mavi_start")).toBe(true);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     for (const steward of ["status", "save", "set_repo", "run_now"]) {
       expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);

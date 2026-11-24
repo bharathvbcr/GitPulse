@@ -47,6 +47,7 @@ pub mod local_socket;
 pub mod logging;
 pub mod lru_map;
 pub mod markdown;
+pub mod mavi;
 pub mod mcp;
 pub mod native_rendering;
 pub mod ndjson;
@@ -215,6 +216,7 @@ pub fn run() {
         .manage(crate::terminal::TerminalSessions::from_settings())
         .manage(desktop::DesktopState::default())
         .manage(workbench::WorkbenchState::default())
+        .manage(mavi::MaviState::default())
         .setup(|app| {
             // A signal exit stops what procguard does not own; the normal exit
             // reaches the same teardown from `RunEvent::Exit`.
@@ -468,6 +470,17 @@ pub fn run() {
         // page's script runs, so nothing it spawns is caught up in it.
         .on_page_load(desktop::handle_page_load)
         .invoke_handler(tauri::generate_handler![
+            mavi::cmd_mavi_start,
+            mavi::cmd_mavi_send,
+            mavi::cmd_mavi_answer,
+            mavi::cmd_mavi_interrupt,
+            mavi::cmd_mavi_stop,
+            mavi::cmd_mavi_list,
+            mavi::cmd_mavi_events,
+            mavi::cmd_mavi_file_diff,
+            mavi::cmd_mavi_ssh_hosts,
+            mavi::cmd_mavi_ssh_probe,
+            mavi::cmd_mavi_conversation_check,
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
             workbench::cmd_workbench_relink_repository,
@@ -825,6 +838,8 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
                 teardown::run(&app.state::<terminal::TerminalSessions>());
+                // No Mavi agent outlives the app that shows it.
+                mavi::stop_all(&app.state::<mavi::MaviState>());
             }
             desktop::handle_run_event(app, &event);
         });

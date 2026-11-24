@@ -11,6 +11,9 @@ import { afterAll, describe, expect, it } from "vitest";
  * The things worth pinning: the hook is silent off-cloud, says "unavailable"
  * rather than nothing when devmap is missing, and setup.sh never reports
  * AVAILABLE for an install that did not happen.
+ *
+ * Skipped on Windows: both scripts are bash for Linux cloud and SSH hosts, and
+ * the stubs are `#!/bin/bash` files the sandbox's system PATH cannot run there.
  */
 const root = path.resolve(__dirname, "..");
 const hook = path.join(root, "scripts/cloud/session-start.sh");
@@ -67,10 +70,11 @@ function context(stdout: string): string {
   }
 }
 
-describe("scripts/cloud/session-start.sh", () => {
+describe.skipIf(process.platform === "win32")("scripts/cloud/session-start.sh", () => {
   it("is silent and exits 0 when CLAUDE_CODE_REMOTE is not true", () => {
     const s = sandbox();
-    for (const env of [{}, { CLAUDE_CODE_REMOTE: "false" }, { CLAUDE_CODE_REMOTE: "1" }] as Record<string, string>[]) {
+    const envs: Record<string, string>[] = [{}, { CLAUDE_CODE_REMOTE: "false" }, { CLAUDE_CODE_REMOTE: "1" }];
+    for (const env of envs) {
       const r = s.run(hook, [], env);
       expect(r.status).toBe(0);
       expect(r.stdout).toBe("");
@@ -174,7 +178,7 @@ describe("scripts/cloud/session-start.sh", () => {
   });
 });
 
-describe("scripts/cloud/setup.sh", () => {
+describe.skipIf(process.platform === "win32")("scripts/cloud/setup.sh", () => {
   const pin = /^ {2}DEVMAP_REV: ([0-9a-f]{40})$/m.exec(readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8"))?.[1];
 
   it("finds the pin in ci.yml", () => expect(pin).toBeDefined());

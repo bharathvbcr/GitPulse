@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { composeMaviThread, showMaviThread } from "../mavi/navigate";
+  import { continueInMavi } from "../mavi/handoff";
+  import { MAVI_MODES } from "../mavi/client";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
@@ -26,6 +29,7 @@
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
+  import { dockSection, dockSectionForChord, dockStatus, type DockSection } from "../terminal/dockSections";
   import { invoke } from "../ipc/invoke";
   import {
     Terminal,
@@ -38,7 +42,6 @@
     Shield,
     Clock,
     SquareTerminal,
-    ListChecks,
     X,
     Plus,
     Search,
@@ -50,16 +53,16 @@
     Columns2,
     Rows2,
     FolderTree,
+    MessagesSquare,
+    PanelLeft,
     PanelLeftClose,
     FileText,
     ExternalLink,
     Send,
     GitBranch,
     Pencil,
-    Settings2,
     ChevronLeft,
     ChevronRight,
-    ChevronsUpDown,
     Eye,
     RotateCw,
     Sparkles,
@@ -76,6 +79,8 @@
   import BrowserSession from "./BrowserSession.svelte";
   import TerminalFilePane from "./TerminalFilePane.svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
+  import DockHeader from "./DockHeader.svelte";
+  import DockAgentsSection, { type DockAgentRow } from "./DockAgentsSection.svelte";
   import {
     clampExplorerSidebarWidth,
     TERMINAL_EXPLORER_WIDTH_DEFAULT,
@@ -216,6 +221,7 @@
     cycleTab,
     initialState,
     launcherLabel,
+    isHandoffCapableLauncher,
     openAttachedChildTab,
     openCheckoutTab,
     openTab,
@@ -264,6 +270,7 @@
     stepSearchIndex,
   } from "../terminal/tabSearch";
   import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
+  import { observeResize } from "../dom/observeResize";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo, popoverExit } from "../ui/popover";
@@ -455,7 +462,27 @@
   /** The repository store's checkout identity rule, for every path compared here. */
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   type PtyMode = "shell" | "console";
-  let mode = $state<PtyMode>("shell");
+  /**
+   * Which dock section is showing. Shell and Files keep the tab strip and the
+   * pane canvas on screen; Agents and Console hide them (never unmount: a
+   * hidden xterm keeps its PTY) and draw their own lens instead.
+   */
+  let section = $state<DockSection>(get(dockSection));
+  /**
+   * "shell" while the pane canvas is on screen (Shell and Files sections),
+   * "console" while it is not (Console, and the Agents lens, which treats the
+   * panes as off-screen exactly as the Console does). Every on-screen check
+   * below reads this, so xterm fit and GPU slots follow the section.
+   */
+  const mode = $derived<PtyMode>(section === "shell" || section === "files" ? "shell" : "console");
+  function setSection(next: DockSection) {
+    section = next;
+    dockSection.set(next);
+  }
+  /** Bring the panes back on screen without leaving Files for Shell. */
+  function showShell() {
+    if (section === "agents" || section === "console") setSection("shell");
+  }
   /** Whether a queued launch or task request will open this panel's first tab itself. */
   function requestWillOpenFirstTab(): boolean {
     const launch = get(terminalLaunchRequests);
@@ -542,11 +569,56 @@
   let splitContextMenuOpener: HTMLElement | null = null;
   let groupContextMenu = $state<{ groupId: string; x: number; y: number } | null>(null);
   let groupContextMenuOpener: HTMLElement | null = null;
-  const explorerSidebarOpen = $derived($terminalExplorerSidebar.open);
+  /** The stored preference; the Files section shows the explorer regardless (see `explorerVisible`). */
+  const explorerPreferenceOpen = $derived($terminalExplorerSidebar.open);
+  /** On screen: the reader's saved choice, or the Files section peeking at it without writing the choice. */
+  const explorerSidebarOpen = $derived(Boolean(repoPath) && (explorerPreferenceOpen || section === "files"));
   /** The app-wide open target, one setting for this explorer and the sidebar's (`resolveFileOpen`). */
   const explorerOpenTarget = $derived<SidebarFileOpenTarget>($sidebarNavStore.openTarget);
   const explorerSidebarWidth = $derived($terminalExplorerSidebar.width);
   let explorerResizing = $state(false);
+  let explorerAsideEl = $state<HTMLElement | null>(null);
+  /**
+   * Entering Files from a dock that had the explorer closed puts focus on the
+   * rail, so the section answers the keyboard the way it answers the mouse.
+   * Keyed on the section alone: nothing the rail does may pull focus again.
+   */
+  let filesFocusReady = false;
+  /** The rail is owed focus, but a pane reveal is still in flight. */
+  let filesFocusOwed = false;
+  /**
+   * Set while the pane-reveal effect below has a reveal scheduled. Entering
+   * Files from Agents or Console brings the panes back on screen too, and
+   * that reveal focuses the active pane after a tick: run first, the rail's
+   * focus would be taken straight back. So the rail waits for the reveal and
+   * takes focus after it (`settleFilesFocus`).
+   */
+  let paneRevealPending = false;
+  function focusExplorerRail() {
+    explorerAsideEl
+      ?.querySelector<HTMLElement>('[role="tree"], [role="treeitem"], input, button:not(:disabled)')
+      ?.focus({ preventScroll: true });
+  }
+  /** Called by the pane reveal once it has run: the rail takes the focus it was owed. */
+  function settleFilesFocus() {
+    if (!filesFocusOwed) return;
+    filesFocusOwed = false;
+    if (section === "files") focusExplorerRail();
+  }
+  $effect(() => {
+    const entering = section === "files";
+    const was = untrack(() => filesFocusReady);
+    filesFocusReady = entering;
+    if (!entering) filesFocusOwed = false;
+    if (!entering || was || !visible) return;
+    if (untrack(() => explorerPreferenceOpen)) return;
+    filesFocusOwed = true;
+    void tick().then(() => {
+      // A reveal is in flight: it hands focus back through settleFilesFocus.
+      if (paneRevealPending) return;
+      settleFilesFocus();
+    });
+  });
   let selectedExplorerFile = $state<string | null>(null);
   let lastExplorerMod = { altKey: false, metaOrCtrlKey: false };
   /** Where the docked explorer's last click sent a file, for its double-click. */
@@ -1281,6 +1353,121 @@
   );
   const pairHandoffTarget = $derived(pairHandoffTargets[0] ?? null);
   let collisionSummary = $state<CollisionRisk | null>(null);
+  /** The header's ⋯ menu; the header owns drawing it, the panel closes it with the other chrome. */
+  let dockMenuOpen = $state(false);
+  const dockStatusSummary = $derived(
+    dockStatus({ conflictedCount: checkoutInfo?.conflictedCount ?? 0, collision: collisionSummary }),
+  );
+  const statusDetail = $derived.by(() => {
+    const kind = dockStatusSummary.primary?.kind;
+    if (kind === "unverified") return collisionSummary?.error || "Cross-worktree collision check unavailable";
+    if (kind === "collision") {
+      return (
+        collisionSummary?.items.slice(0, 6).map((item) => item.path).join(", ") ||
+        "Concurrent dirty files across worktrees or live sessions"
+      );
+    }
+    return null;
+  });
+  const contextTitle = $derived.by(() => {
+    if (!repoPath) return "No repository";
+    if (!checkoutInfo) return repoPath;
+    const { label, currentBranch } = checkoutInfo;
+    return `Checkout: ${label.repository}${label.checkout ? ` · ${label.checkout}` : ""}${currentBranch ? ` (${currentBranch})` : ""}\n${repoPath}`;
+  });
+
+  // The Agents lens. Agents are a view over the same tabs the strip shows —
+  // never a second list of sessions — so a row here selects a strip tab.
+  const agentRowsHere = $derived.by<DockAgentRow[]>(() =>
+    tabState.tabs
+      .filter((tab) => isHandoffCapableLauncher(tab.launcher))
+      .map((tab) => {
+        const display = tabDisplayTitle(tab, effectiveAgentStatuses[tab.id], tabBrowserStates[tab.id]);
+        const backendId = backendSessionIdByTabId[tab.id];
+        const attention =
+          tabStatuses[tab.id] === "error"
+            ? "Failed"
+            : backendId
+              ? activityAttentionLabel($sessionActivity.get(backendId))
+              : null;
+        return {
+          id: tab.id,
+          launcher: tab.launcher,
+          title: display.primary,
+          detail: display.secondary ?? null,
+          status: tabStatuses[tab.id] === "exited" ? { label: "Ended", cls: "text-textMuted" } : oscStatusBadge(effectiveAgentStatuses[tab.id]),
+          attention,
+          active: tab.id === activeId,
+          unread: unread.has(tab.id),
+        };
+      }),
+  );
+  const agentSessionsElsewhere = $derived(
+    $terminalSessions.filter(
+      (session) =>
+        session.launcher !== undefined &&
+        isHandoffCapableLauncher(session.launcher) &&
+        !sessionRow(session, repoPath, checkouts, pathOpts).here,
+    ),
+  );
+  const agentRowsElsewhere = $derived.by<DockAgentRow[]>(() =>
+    agentSessionsElsewhere.map((session) => {
+      const info = sessionRow(session, repoPath, checkouts, pathOpts);
+      const live = session.sessionId ? $sessionActivity.get(session.sessionId) : undefined;
+      const cleaned = (raw: string | null | undefined) =>
+        raw ? stripTitleSpinner(raw).replace(/^[✳✦★•]+\s+/u, "").trim() : "";
+      const launcher = session.launcher ?? "claude";
+      const own = cleaned(session.title);
+      const liveTitle = cleaned(live?.title);
+      const title =
+        (own && !isGenericLauncherTitle(own, launcher) ? own : "") ||
+        (liveTitle && !isGenericLauncherTitle(liveTitle, launcher) ? liveTitle : "") ||
+        session.label.trim() ||
+        launcherLabel(launcher);
+      return {
+        id: session.key,
+        launcher,
+        title,
+        detail: `${info.repository}${info.checkout ? ` · ${info.checkout}` : ""}`,
+        status: { label: sessionStatusLabel(session.status), cls: "text-textMuted" },
+        attention: session.attention ?? (session.sessionId ? activityAttentionLabel(live) : null),
+        disabled: !session.reveal,
+      };
+    }),
+  );
+  const agentLaunchers = $derived(
+    sessionTypes
+      .filter((type) => isHandoffCapableLauncher(type.kind))
+      .map((type) => ({
+        kind: type.kind,
+        label: type.label,
+        disabled: !repoPath || !canCreateKind(type.kind),
+        title: capacityTitleFor(type.kind),
+      })),
+  );
+  /** Agents here that want the reader: the dot on the header's Agents button. */
+  const agentAttention = $derived(
+    agentRowsHere.filter((row) => row.attention || row.unread).length +
+      agentRowsElsewhere.filter((row) => row.attention).length,
+  );
+  /** The active tab is an agent, so the Agents list already highlights it. */
+  const activeSessionListed = $derived(agentRowsHere.some((row) => row.active));
+
+  function selectAgentRow(id: string) {
+    selectTab(id);
+    setSection("shell");
+    void tick().then(() => revealTab(id));
+  }
+  function launchAgent(kind: SessionKind) {
+    const created = newTab(kind);
+    if (!created) return;
+    setSection("shell");
+    void tick().then(() => revealTab(created));
+  }
+  function goToAgentSession(key: string) {
+    const session = $terminalSessions.find((candidate) => candidate.key === key);
+    if (session) void goToSession(session);
+  }
 
   $effect(() => {
     const here = repoPath;
@@ -1338,7 +1525,7 @@
   const canCreate = $derived(!stripFull && $terminalSessions.length < $terminalSessionLimit);
   const capacityTitle = $derived(canCreate ? "New terminal session" : stripFull
     ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
-    : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
+    : `All ${$terminalSessionLimit} terminal sessions are open — close one under ⋯ → All sessions, or raise the limit in Settings → Agents`);
   /**
    * A browser session holds a tab but no process slot, so only the strip
    * bounds it here; the backend caps open pages (`browser::MAX_PANES`) and
@@ -1584,6 +1771,7 @@
   }
 
   function closeChrome() {
+    dockMenuOpen = false;
     tabOptions = false;
     sessionListOpen = false;
     sessionSearchOpen = false;
@@ -1681,7 +1869,7 @@
       sessionError = capacityTitleFor("shell");
       return;
     }
-    mode = "shell";
+    showShell();
     const dir = activeTab?.launcher === "shell" ? (activeTab.startDir ?? null) : null;
     const afterFirst = openTab(tabState, "shell");
     const firstId = afterFirst.activeId;
@@ -1711,7 +1899,7 @@
       sessionError = capacityTitleFor(agentKind);
       return;
     }
-    mode = "shell";
+    showShell();
     const dir = activeTab?.launcher === "shell" ? (activeTab.startDir ?? null) : null;
     const afterAgent = openTab(tabState, agentKind);
     const agentId = afterAgent.activeId;
@@ -1739,7 +1927,7 @@
       sessionError = capacityTitleFor(agentKind);
       return;
     }
-    mode = "shell";
+    showShell();
     const afterAgent = openTab(tabState, agentKind);
     const agentId = afterAgent.activeId;
     if (!agentId) return;
@@ -1766,7 +1954,7 @@
       sessionError = capacityTitleFor("claude");
       return;
     }
-    mode = "shell";
+    showShell();
     const afterFirst = openTab(tabState, "claude");
     const firstId = afterFirst.activeId;
     const afterSecond = openTab(afterFirst, "agy");
@@ -1794,7 +1982,7 @@
       sessionError = capacityTitleFor(agentKind);
       return;
     }
-    mode = "shell";
+    showShell();
     const afterAgent = openTab(tabState, agentKind);
     const agentId = afterAgent.activeId;
     const afterShell = openTab(afterAgent, "shell");
@@ -1818,6 +2006,29 @@
   }
 
   let creatingWorktreePreset = $state(false);
+
+  /**
+   * "Continue in Mavi": the conversation moves to a Mavi thread, which shows
+   * its earlier turns from the transcript. The checks run before this tab's
+   * session ends; this tab's process ends before Mavi's agent starts.
+   */
+  async function moveTabToMavi(tabId: string) {
+    const result = await continueInMavi(tabId, (move) =>
+      askConfirm({
+        title: "Continue in Mavi",
+        message:
+          `Moves this conversation to a Mavi thread in ${move.root}, with its earlier turns. ` +
+          "This tab's session ends first, then Mavi resumes the same conversation " +
+          (move.mode === "bypass"
+            ? "in Bypass: the agent will run everything without asking."
+            : `with the permission mode ${MAVI_MODES.find((m) => m.id === move.mode)?.label ?? move.mode}.`),
+        confirmLabel: move.mode === "bypass" ? "Move and run in Bypass" : "Move to Mavi",
+        destructive: move.mode === "bypass",
+      }),
+    );
+    if (result.ok && result.key) await showMaviThread(result.key);
+    else if (!result.ok && result.reason) toastStore.warning(result.reason);
+  }
 
   async function openWorktreeAgentPreset() {
     launcherMenuOpen = false;
@@ -1875,7 +2086,7 @@
       if (!repoPath || !sameRepo(repoPath, baseRepo, pathOpts)) return;
 
       const checkoutPath = outcome.path;
-      mode = "shell";
+      showShell();
       const openedAgent = openCheckoutTab(tabState, agentKind, {
         checkout: checkoutPath,
         name: `${launcherLabel(agentKind)} · ${slug}`,
@@ -2071,7 +2282,7 @@
         if (tab) {
           // Already this panel's: bring it forward, as a reveal asks.
           tabState = openTab(tabState, request.provider, request);
-          mode = "shell";
+          showShell();
           consumeTaskTerminalRequest(request);
           continue;
         }
@@ -2081,7 +2292,7 @@
         if (!opened) break;
         if (!holdTaskTerminal(request, holder)) continue;
         tabState = next;
-        mode = "shell";
+        showShell();
         admitting.add(opened.id);
         room -= 1;
       }
@@ -2120,7 +2331,7 @@
     untrack(() => {
       const claimed = consumeConsoleLaunch();
       if (!claimed) return;
-      mode = "console";
+      setSection("console");
       void execute(claimed.command, claimed.timeoutSecs ?? 1200);
     });
   });
@@ -2325,7 +2536,7 @@
     untrack(() => {
       const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
-      mode = "shell";
+      showShell();
       // Text for a session, not a session to open: branch before anything that opens a tab.
       if (claimed.launcher === "reference") {
         const reference = claimedReference(claimed);
@@ -2367,7 +2578,7 @@
       if (createdId && agent && (claimed.prompt !== undefined || claimed.resume !== undefined)) terminalLaunchRequests.remember({
         id: createdId, repoPath: claimed.repoPath, launcher: agent, status: "starting",
         reveal() {
-          mode = "shell";
+          showShell();
           selectTab(createdId);
           void tick().then(() => revealTab(createdId));
         },
@@ -2754,7 +2965,7 @@
       return;
     }
     focusTabStrip = false;
-    mode = "shell";
+    showShell();
     const parentGroup = parentTabId ? findGroupForPane(splitGroups, parentTabId) : null;
     const parentTree = parentGroup?.tree ?? null;
     if (payload.split && parentTabId && parentTabId !== result.id && !hasPane(parentTree, result.id)) {
@@ -2830,7 +3041,7 @@
   function handleAgentOpenFile(payload: TerminalOpenFileRequestPayload) {
     if (!repoPath || !sameRepo(payload.repo_path, repoPath, pathOpts)) return;
     const anchorId = tabIdForBackendSession(payload.caller_session_id) ?? tabState.activeId ?? undefined;
-    mode = "shell";
+    showShell();
     const err = openFileSplitFor(payload.path, payload.line, payload.column, {
       focus: false,
       anchorId,
@@ -3081,6 +3292,12 @@
   }
 
   function toggleExplorerSidebar() {
+    // In the Files section the explorer is the section itself: closing it
+    // hands back to Shell, where the saved choice applies again.
+    if (section === "files") {
+      setSection("shell");
+      return;
+    }
     terminalExplorerSidebar.toggle();
     if (activeId) {
       void tick().then(() => revealTab(activeId));
@@ -3373,7 +3590,23 @@
     (sessions[id] ?? browsers[id] ?? filePanes[id])?.reveal();
   }
 
+  /**
+   * ⌥⇧⌘1–4 / Ctrl+Alt+Shift+1–4 switch dock sections. Checked from both the
+   * panel's keydown and the xterm hook (`onChord`), so a chord typed with a
+   * shell focused switches the section without the shell receiving the bytes.
+   */
+  function handleSectionChord(event: KeyboardEvent): boolean {
+    if (!visible || event.defaultPrevented) return false;
+    const target = dockSectionForChord(event, $hostPlatform.os);
+    if (!target) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    setSection(target);
+    return true;
+  }
+
   function handleChord(event: KeyboardEvent): boolean {
+    if (handleSectionChord(event)) return true;
     if (mode !== "shell") return false;
     if (!visible || event.defaultPrevented) return false;
     const splitAction = terminalSplitChord(event, $hostPlatform.os);
@@ -3446,7 +3679,7 @@
     if (
       event.key === "Escape" &&
       !isImeComposition(event) &&
-      (tabOptions || sessionListOpen || sessionSearchOpen || launcherMenuOpen || tabContextMenu || splitContextMenu || groupContextMenu)
+      (dockMenuOpen || tabOptions || sessionListOpen || sessionSearchOpen || launcherMenuOpen || tabContextMenu || splitContextMenu || groupContextMenu)
     ) {
       const sessionsWereOpen = sessionListOpen;
       closeChrome();
@@ -3455,6 +3688,7 @@
       else if (activeId) revealTab(activeId);
       return;
     }
+    if (handleSectionChord(event)) return;
     if (handleChord(event)) return;
     if (mode === "shell" && activeId) {
       (sessions[activeId] ?? filePanes[activeId])?.handleViewChord(event);
@@ -3506,11 +3740,18 @@
     untrack(() => {
       if (unread.has(id)) unread = new Set([...unread].filter((key) => key !== id));
     });
+    paneRevealPending = true;
     void tick().then(() => {
-      if (!visible || mode !== "shell" || activeId !== id) return;
+      paneRevealPending = false;
+      if (!visible || mode !== "shell" || activeId !== id) {
+        settleFilesFocus();
+        return;
+      }
       // Looked up once the tab has mounted, outside the effect's tracking.
       revealTab(id);
       if (focusTabStrip) tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
+      // Entering Files with the reveal: the rail, not the pane, ends with focus.
+      settleFilesFocus();
     });
   });
 
@@ -3535,11 +3776,29 @@
     });
   });
 
+  /**
+   * The tab strip's width. Narrowing the dock (or the window) can push the
+   * active tab past the strip's edge with nothing else changing, so the
+   * reveal below listens to this too.
+   */
+  let tabStripWidth = $state(0);
+  $effect(() => {
+    const scroller = tabScroller;
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    return observeResize(scroller, ([entry]) => {
+      tabStripWidth = Math.round(entry.contentRect.width);
+    });
+  });
+
+  /** Clear room at a scrollable edge for the strip's ScrollCue button (20px plus its margin). */
+  const TAB_STRIP_CUE_INSET_PX = 28;
+
   // OSC titles can widen a tab after it is selected. Keep its entire control
   // (including Close) visible without refocusing the shell on every title.
   $effect(() => {
     const activeScrollLabel = activeTab ? tabLabel(activeTab) : "";
     void activeScrollLabel;
+    void tabStripWidth;
     if (!visible || mode !== "shell") return;
     const id = activeId;
     const scroller = tabScroller;
@@ -3549,10 +3808,11 @@
       if (scroller && node instanceof HTMLElement) {
         const strip = scroller.getBoundingClientRect();
         const tab = node.getBoundingClientRect();
-        scroller.scrollLeft = scrollChildIntoHorizontalView(scroller, {
-          offsetLeft: tab.left - strip.left + scroller.scrollLeft,
-          offsetWidth: tab.width,
-        });
+        scroller.scrollLeft = scrollChildIntoHorizontalView(
+          scroller,
+          { offsetLeft: tab.left - strip.left + scroller.scrollLeft, offsetWidth: tab.width },
+          TAB_STRIP_CUE_INSET_PX,
+        );
       }
     });
   });
@@ -3866,7 +4126,7 @@
         ? group.activePaneId
         : leafPaneIds(group.tree)[0]);
     if (!targetId) return;
-    mode = "shell";
+    showShell();
     zoomedPaneId = null;
     selectTab(targetId);
     void tick().then(() => revealTab(targetId));
@@ -4278,7 +4538,7 @@
     } finally {
       running = false;
       trimExecutions();
-      if (consoleFollowing && visible && mode === "console") void scrollToBottom();
+      if (consoleFollowing && visible && section === "console") void scrollToBottom();
     }
   }
 
@@ -4344,238 +4604,74 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <!-- Justified: keyboard events bubble from the region's interactive controls; the region itself is not a focus stop. -->
-<div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Terminal" onkeydown={handlePanelKey}>
-  <!-- Header Bar -->
-  <div class="px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0">
-    <div class="flex flex-1 items-center gap-2 min-w-0">
-      <Terminal size={14} class="text-accent shrink-0" />
-      <span class="font-semibold text-textPrimary">Terminal</span>
-      <span class="text-textMuted font-mono truncate text-micro" title={repoPath ?? "No repository"}>
-        {repoPath?.split(/[\\/]/).pop() ?? "No repository"}
+<div class="relative flex-1 flex flex-col bg-background h-full min-w-0 text-xs font-sans overflow-hidden" role="region" aria-label="Dock" onkeydown={handlePanelKey}>
+  <DockHeader
+    {section}
+    onSection={setSection}
+    os={$hostPlatform.os}
+    {agentAttention}
+    {activeSessionListed}
+    repoName={repoPath?.split(/[\\/]/).pop() ?? null}
+    {repoPath}
+    {contextTitle}
+    checkoutLabel={checkoutInfo?.label.checkout ?? null}
+    branch={checkoutInfo?.currentBranch ?? null}
+    status={dockStatusSummary}
+    {statusDetail}
+    activeSession={activeTab && activeDisplay
+      ? {
+          launcher: activeTab.launcher,
+          launcherLabel: launcherLabel(activeTab.launcher),
+          primary: activeDisplay.primary,
+          secondary: activeDisplay.secondary,
+          fullTitle: activeDisplay.fullTitle,
+          badge: oscStatusBadge(effectiveAgentStatuses[activeTab.id]),
+        }
+      : null}
+    onReturnToShell={() => {
+      setSection("shell");
+      if (activeId) void tick().then(() => revealTab(activeId));
+    }}
+    findDisabled={!activeId || !repoPath || activeIsNonTerminal}
+    onFind={() => activeId && sessions[activeId]?.openFind()}
+    canClearScrollback={Boolean(activeId && repoPath && !activeIsNonTerminal)}
+    onClearScrollback={() => activeId && sessions[activeId]?.clearScrollback()}
+    canClearOutput={executions.length > 0}
+    onClearOutput={clearOutput}
+    sessionCountLabel={sessionCountLabel($terminalSessions.length, $terminalSessionLimit)}
+    sessionsAtLimit={$terminalSessions.length >= $terminalSessionLimit}
+    {sessionListOpen}
+    onToggleSessionList={toggleSessionList}
+    {dockMode}
+    onToggleDockMode={onToggleDockMode}
+    canTabOptions={Boolean(activeId) && section === "shell"}
+    tabOptionsOpen={tabOptions}
+    onTabOptions={showTabOptions}
+    canFindSession={tabState.tabs.length > 0 && section === "shell"}
+    onFindSession={() => (sessionSearchOpen ? closeChrome() : openSessionSearch())}
+    {expanded}
+    {onToggleExpanded}
+    {onClose}
+    bind:overflowEl={sessionListTrigger}
+    bind:menuOpen={dockMenuOpen}
+  />
+  {#if trayEntries.length > 0}
+    <!-- Context tray: file ranges set aside from the Code page. A row of its own under the header,
+         so it shows in every section and the header stays one calm row. -->
+    <div class="px-3 pb-1 flex items-center shrink-0">
+      <span
+        class="gp-chip shrink-0 tabular-nums inline-flex items-center gap-1"
+        data-tone="accent"
+        data-testid="terminal-context-tray"
+        title="File ranges set aside in this repository. Kept in memory only: they are gone after a restart."
+      >
+        <ListPlus size={10} class="shrink-0" />
+        {trayEntries.length} {trayEntries.length === 1 ? "reference" : "references"} · {trayBytes(trayEntries)} B
+        <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-insert" onclick={insertContextTray}>Insert all</button>
+        <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-clear" onclick={() => repoPath && clearTray(repoPath)}>Clear</button>
       </span>
-      {#if checkoutInfo && (checkoutInfo.currentBranch || checkoutInfo.label.checkout)}
-        <span
-          class="px-1.5 py-0.5 rounded border border-border/65 bg-surface font-mono text-micro text-textMuted truncate max-w-44"
-          data-testid="terminal-checkout-pill"
-          title={`Checkout: ${checkoutInfo.label.repository}${checkoutInfo.label.checkout ? ` · ${checkoutInfo.label.checkout}` : ""}${checkoutInfo.currentBranch ? ` (${checkoutInfo.currentBranch})` : ""}`}
-        >
-          {#if checkoutInfo.label.checkout}{checkoutInfo.label.checkout}{#if checkoutInfo.currentBranch} · {/if}{/if}{#if checkoutInfo.currentBranch}{checkoutInfo.currentBranch}{/if}
-        </span>
-      {/if}
-      {#if checkoutInfo && checkoutInfo.conflictedCount > 0}
-        <span
-          class="px-1.5 py-0.5 rounded border border-danger/35 bg-danger/10 text-danger text-micro shrink-0"
-          data-testid="terminal-conflict-pill"
-        >
-          {checkoutInfo.conflictedCount} {checkoutInfo.conflictedCount === 1 ? "conflict" : "conflicts"}
-        </span>
-      {/if}
-      {#if collisionSummary}
-        {#if !collisionSummary.ok}
-          <span
-            class="px-1.5 py-0.5 rounded border border-border/65 bg-surface text-textMuted text-micro shrink-0"
-            data-testid="terminal-collision-unverified"
-            title={collisionSummary.error || "Cross-worktree collision check unavailable"}
-          >
-            Collisions unverified
-          </span>
-        {:else if collisionSummary.overlapping_files > 0 || collisionSummary.shared_worktree_files > 0}
-          <span
-            class="px-1.5 py-0.5 rounded border border-warn/35 bg-warn/10 text-warn text-micro shrink-0"
-            data-testid="terminal-collision-pill"
-            title={collisionSummary.items.slice(0, 6).map((item) => item.path).join(", ") || "Concurrent dirty files across worktrees or live sessions"}
-          >
-            {#if collisionSummary.overlapping_files > 0}
-              {collisionSummary.overlapping_files} cross-worktree {collisionSummary.overlapping_files === 1 ? "collision" : "collisions"}
-            {:else}
-              {collisionSummary.shared_worktree_files} shared dirty {collisionSummary.shared_worktree_files === 1 ? "file" : "files"}
-            {/if}
-          </span>
-        {/if}
-      {/if}
-      {#if activeTab && activeDisplay}
-        {@const activeOscBadge = oscStatusBadge(effectiveAgentStatuses[activeTab.id])}
-        {#if mode === "shell"}
-          <span
-            class="inline-flex items-center gap-1.5 min-w-0 max-w-72 px-2 py-0.5 rounded border border-border/65 bg-surface text-micro text-textPrimary"
-            data-testid="terminal-active-session-summary"
-            title={`${launcherLabel(activeTab.launcher)} — ${activeDisplay.fullTitle}`}
-          >
-            <LauncherIcon kind={activeTab.launcher} size={11} class="shrink-0" />
-            <span class="font-medium truncate">{activeDisplay.primary}</span>
-            {#if activeDisplay.secondary}
-              <span class="text-textMuted truncate max-w-28">· {activeDisplay.secondary}</span>
-            {/if}
-            {#if activeOscBadge}
-              <span class="shrink-0 {activeOscBadge.cls}">· {activeOscBadge.label}</span>
-            {/if}
-          </span>
-        {:else}
-          <button
-            type="button"
-            class="inline-flex items-center gap-1.5 min-w-0 max-w-72 px-2 py-0.5 rounded border border-border/65 bg-surface hover:bg-surfaceHover text-micro text-textPrimary cursor-pointer transition-colors"
-            data-testid="terminal-active-session-summary"
-            title={`Show active ${launcherLabel(activeTab.launcher)} session — ${activeDisplay.fullTitle}`}
-            onclick={() => {
-              mode = "shell";
-              if (activeId) void tick().then(() => revealTab(activeId));
-            }}
-          >
-            <LauncherIcon kind={activeTab.launcher} size={11} class="shrink-0" />
-            <span class="font-medium truncate">{activeDisplay.primary}</span>
-            {#if activeDisplay.secondary}
-              <span class="text-textMuted truncate max-w-28">· {activeDisplay.secondary}</span>
-            {/if}
-            {#if activeOscBadge}
-              <span class="shrink-0 {activeOscBadge.cls}">· {activeOscBadge.label}</span>
-            {/if}
-            <span class="text-accent shrink-0">→ Shell</span>
-          </button>
-        {/if}
-        {#if trayEntries.length > 0}
-          <span
-            class="gp-chip shrink-0 tabular-nums inline-flex items-center gap-1"
-            data-tone="accent"
-            data-testid="terminal-context-tray"
-            title="File ranges set aside in this repository. Kept in memory only: they are gone after a restart."
-          >
-            <ListPlus size={10} class="shrink-0" />
-            {trayEntries.length} {trayEntries.length === 1 ? "reference" : "references"} · {trayBytes(trayEntries)} B
-            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-insert" onclick={insertContextTray}>Insert all</button>
-            <button type="button" class="underline cursor-pointer" data-testid="terminal-context-tray-clear" onclick={() => repoPath && clearTray(repoPath)}>Clear</button>
-          </span>
-        {/if}
-        {#if mode === "shell" && splitRoot && allSplitLeafIds.length > 1}
-          <span
-            class="gp-chip shrink-0 tabular-nums"
-            data-tone="accent"
-            data-testid="terminal-header-split-indicator"
-            title={zoomedPaneId ? "Split pane zoomed — other split panes stay warm" : `${allSplitLeafIds.length} split panes visible`}
-          >
-            {#if activeGroup && (splitGroups.length > 1 || activeGroup.name)}
-              {activeGroupLabel} · 
-            {/if}
-            {#if activeSplitSlot}
-              Pane {activeSplitSlot} of {allSplitLeafIds.length}{#if zoomedPaneId} · Zoomed{/if}
-            {:else}
-              {allSplitLeafIds.length} split panes
-            {/if}
-          </span>
-          {#if hiddenSplitSummary.badgeLabel}
-            <button
-              type="button"
-              class="gp-chip shrink-0 cursor-pointer"
-              data-tone={hiddenSplitSummary.tone ?? "accent"}
-              data-testid="terminal-hidden-split-alert"
-              title="Hidden split pane activity while zoomed — click to restore split panes and show"
-              onclick={revealHiddenSplitUrgent}
-            >
-              Hidden: {hiddenSplitSummary.badgeLabel}
-            </button>
-          {/if}
-        {/if}
-        {#if mode === "shell" && splitGroups.length > 0 && (splitGroups.length > 1 || !activeGroup)}
-          <div
-            class="inline-flex items-center gap-1 shrink-0"
-            role="group"
-            aria-label="Terminal pairs"
-            data-testid="terminal-pair-switcher"
-          >
-            {#each splitGroups as grp, grpIdx (grp.id)}
-              {@const isGrpActive = activeGroup?.id === grp.id}
-              {@const grpLabel = splitGroupDisplayLabel(grp, grpIdx, splitGroups.length)}
-              {@const att = groupAttentions[grp.id]}
-              <button
-                type="button"
-                class="gp-chip shrink-0 cursor-pointer tabular-nums"
-                data-tone={isGrpActive ? "accent" : (att?.tone ?? "neutral")}
-                data-testid="terminal-pair-switcher-btn"
-                data-group-id={grp.id}
-                data-group-attention={att?.tone ?? "none"}
-                aria-pressed={isGrpActive}
-                title={!isGrpActive && att?.badgeLabel ? `${grpLabel} — ${att.badgeLabel} · Right-click for pair options` : `Switch to ${grpLabel} · Right-click for pair options`}
-                onclick={() => activateSplitGroup(grp.id)}
-                oncontextmenu={(event) => {
-                  openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
-                }}
-                onkeydown={(event) => {
-                  if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
-                    openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
-                  }
-                }}
-              >
-                <Columns2 size={10} class="shrink-0" aria-hidden="true" />
-                {grpLabel}{#if !isGrpActive && att?.badgeLabel}<span class="ml-0.5">●</span>{/if}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      {/if}
     </div>
-    <div class="flex items-center gap-1 shrink-0">
-      <div class="gp-segmented" role="group" aria-label="Terminal mode">
-        <button
-          type="button"
-          aria-pressed={mode === "shell"}
-          data-active={mode === "shell" ? "true" : "false"}
-          class="gp-seg-btn text-meta!"
-          onclick={() => (mode = "shell")}
-          title="A real interactive shell in this repository"
-        >
-          <SquareTerminal size={11} class="inline mr-1 -mt-0.5" />Shell
-        </button>
-        <button
-          type="button"
-          aria-pressed={mode === "console"}
-          data-active={mode === "console" ? "true" : "false"}
-          class="gp-seg-btn text-meta!"
-          onclick={() => (mode = "console")}
-          title="Run single commands with capped output and per-run policy verdicts"
-        >
-          <ListChecks size={11} class="inline mr-1 -mt-0.5" />Console
-        </button>
-      </div>
-      {#if mode === "shell"}
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsNonTerminal} aria-label="Find in terminal" title="Find in terminal ({platformChord('⌘F', 'Ctrl+Shift+F', $hostPlatform.os)})" onclick={() => activeId && sessions[activeId]?.openFind()}><Search size={13} /></button>
-        <button type="button" class="gp-icon-btn" disabled={!activeId || !repoPath || activeIsNonTerminal} aria-label="Clear scrollback" title="Clear scrollback; keep the current prompt and session" onclick={() => activeId && sessions[activeId]?.clearScrollback()}><Trash2 size={13} /></button>
-      {/if}
-      {#if mode === "console" && executions.length > 0}
-        <button
-          type="button"
-          onclick={clearOutput}
-          class="gp-btn" data-size="sm"
-          title="Clear terminal output"
-        >
-          <Trash2 size={12} />
-          <span>Clear</span>
-        </button>
-      {/if}
-      <button
-        bind:this={sessionListTrigger}
-        type="button"
-        class="gp-icon-btn px-2! gap-1 text-micro! tabular-nums whitespace-nowrap"
-        aria-label="All terminal sessions"
-        aria-expanded={sessionListOpen}
-        aria-controls="terminal-session-list"
-        title="Sessions across repositories"
-        data-testid="terminal-session-count"
-        onclick={toggleSessionList}
-      >{sessionCountLabel($terminalSessions.length, $terminalSessionLimit)}</button>
-      {#if onToggleExpanded}
-        <button type="button" class="gp-icon-btn" aria-label={expanded ? "Restore terminal size" : "Expand terminal"} title={expanded ? "Restore terminal size" : "Expand terminal"} onclick={onToggleExpanded}>
-          {#if expanded}<Minimize2 size={13} />{:else}<Maximize2 size={13} />{/if}
-        </button>
-      {/if}
-      {#if onToggleDockMode}
-        <button type="button" class="gp-icon-btn" aria-label="Float terminal over the view" aria-pressed={dockMode === "overlay"} data-terminal-dock-mode-toggle title={dockMode === "overlay" ? "Dock the terminal under the view" : "Float the terminal over the view"} onclick={onToggleDockMode}>
-          {#if dockMode === "overlay"}<PinOff size={13} />{:else}<Pin size={13} />{/if}
-        </button>
-      {/if}
-      {#if onClose}
-        <button type="button" class="gp-icon-btn" aria-label="Hide the terminal dock" title="Hide the terminal ({shortcutTextLabel('⌃`', $hostPlatform.os)}) — sessions keep running" onclick={onClose}><ChevronDown size={14} /></button>
-      {/if}
-    </div>
-  </div>
+  {/if}
 
   {#if sessionListOpen}
     <div
@@ -4841,16 +4937,87 @@
           aria-label={explorerSidebarOpen ? "Hide file explorer sidebar" : "Show file explorer sidebar"}
           aria-pressed={explorerSidebarOpen}
           disabled={!repoPath}
-          title={explorerSidebarOpen ? "Hide docked Explorer sidebar" : "Dock Explorer sidebar beside terminal (never forces a 3rd split pane)"}
+          title={explorerSidebarOpen ? "Hide the files sidebar" : "Show files beside your sessions"}
           onclick={toggleExplorerSidebar}
         >
           {#if explorerSidebarOpen}
             <PanelLeftClose size={13} />
           {:else}
-            <FolderTree size={13} />
+            <PanelLeft size={13} />
           {/if}
         </button>
       </div>
+      {#if activeTab && activeDisplay}
+        <!-- Pair switcher and split indicator: tab context, so they sit with the
+             tabs rather than in the dock header. -->
+        <div class="flex items-center gap-1 shrink-0 self-center">
+          {#if mode === "shell" && splitRoot && allSplitLeafIds.length > 1}
+            <span
+              class="gp-chip shrink-0 tabular-nums"
+              data-tone="accent"
+              data-testid="terminal-header-split-indicator"
+              title={zoomedPaneId ? "Split pane zoomed — other split panes stay warm" : `${allSplitLeafIds.length} split panes visible`}
+            >
+              {#if activeGroup && (splitGroups.length > 1 || activeGroup.name)}
+                {activeGroupLabel} · 
+              {/if}
+              {#if activeSplitSlot}
+                Pane {activeSplitSlot} of {allSplitLeafIds.length}{#if zoomedPaneId} · Zoomed{/if}
+              {:else}
+                {allSplitLeafIds.length} split panes
+              {/if}
+            </span>
+            {#if hiddenSplitSummary.badgeLabel}
+              <button
+                type="button"
+                class="gp-chip shrink-0 cursor-pointer"
+                data-tone={hiddenSplitSummary.tone ?? "accent"}
+                data-testid="terminal-hidden-split-alert"
+                title="Hidden split pane activity while zoomed — click to restore split panes and show"
+                onclick={revealHiddenSplitUrgent}
+              >
+                Hidden: {hiddenSplitSummary.badgeLabel}
+              </button>
+            {/if}
+          {/if}
+          {#if mode === "shell" && splitGroups.length > 0 && (splitGroups.length > 1 || !activeGroup)}
+            <div
+              class="inline-flex items-center gap-1 shrink-0"
+              role="group"
+              aria-label="Terminal pairs"
+              data-testid="terminal-pair-switcher"
+            >
+              {#each splitGroups as grp, grpIdx (grp.id)}
+                {@const isGrpActive = activeGroup?.id === grp.id}
+                {@const grpLabel = splitGroupDisplayLabel(grp, grpIdx, splitGroups.length)}
+                {@const att = groupAttentions[grp.id]}
+                <button
+                  type="button"
+                  class="gp-chip shrink-0 cursor-pointer tabular-nums"
+                  data-tone={isGrpActive ? "accent" : (att?.tone ?? "neutral")}
+                  data-testid="terminal-pair-switcher-btn"
+                  data-group-id={grp.id}
+                  data-group-attention={att?.tone ?? "none"}
+                  aria-pressed={isGrpActive}
+                  title={!isGrpActive && att?.badgeLabel ? `${grpLabel} — ${att.badgeLabel} · Right-click for pair options` : `Switch to ${grpLabel} · Right-click for pair options`}
+                  onclick={() => activateSplitGroup(grp.id)}
+                  oncontextmenu={(event) => {
+                    openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
+                  }}
+                  onkeydown={(event) => {
+                    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+                      openGroupContextMenu(grp.id, event, event.currentTarget as HTMLElement);
+                    }
+                  }}
+                >
+                  <Columns2 size={10} class="shrink-0" aria-hidden="true" />
+                  {grpLabel}{#if !isGrpActive && att?.badgeLabel}<span class="ml-0.5">●</span>{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
       <!-- Only the tabs scroll. The launcher group sat inside the scroller
            behind an `ml-auto`, so past a handful of tabs the way to open one
            more scrolled off the right edge. -->
@@ -5044,7 +5211,7 @@
           {#if canOpenInSplit}
             <button
               type="button"
-              class="gp-icon-btn opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-accent"
+              class="terminal-tab-open-split gp-icon-btn opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-accent"
               data-size="sm"
               data-testid="terminal-tab-open-in-split"
               onclick={(event) => {
@@ -5406,10 +5573,9 @@
             onclick={() => handOffToPairPartner(target)}
           ><LauncherIcon kind={target.launcher} size={11} class="shrink-0" />Hand off → {target.label}</button>
         {/each}
-        <button type="button" class="gp-icon-btn" aria-label="Find terminal session" aria-expanded={sessionSearchOpen} disabled={!tabState.tabs.length} title="Find a session in this repository" onclick={() => sessionSearchOpen ? closeChrome() : openSessionSearch()}><ChevronsUpDown size={13} /></button>
         <button
           type="button"
-          class="gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
+          class="terminal-follow-agent gp-icon-btn {followAgent ? 'text-accent bg-accent/15' : ''}"
           aria-label={followAgent ? "Stop following agent edits" : "Follow agent file edits in split"}
           aria-pressed={followAgent}
           disabled={!repoPath}
@@ -5510,7 +5676,6 @@
             }}
           >1×</button>
         {/if}
-        <button type="button" class="gp-icon-btn" aria-label="Terminal tab options" aria-expanded={tabOptions} disabled={!activeId} onclick={showTabOptions}><Settings2 size={13} /></button>
         <div class="relative shrink-0" data-terminal-launcher>
           <button
             bind:this={launcherTriggerEl}
@@ -5622,6 +5787,24 @@
           {:else}
             <span class="block px-2.5 py-1.5 text-textMuted">No session types match.</span>
           {/each}
+        </div>
+        <div class="gp-menu-sep my-1"></div>
+        <!-- Mavi is a view, not a session kind: this starts no process here. -->
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Mavi">
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-launcher-new-mavi"
+            disabled={!repoPath}
+            title="Start a conversation with an agent in Mavi, the chat view for agents"
+            onclick={() => {
+              launcherMenuOpen = false;
+              composeMaviThread();
+            }}
+          >
+            <MessagesSquare size={13} class="text-accent shrink-0" />
+            <span class="truncate">New Mavi Thread</span>
+          </button>
         </div>
         <div class="gp-menu-sep my-1"></div>
         <div class="flex flex-col gap-0.5" role="group" aria-label="Sidebar and file explorer">
@@ -6002,6 +6185,23 @@
             <Plus size={13} class="shrink-0" />
             <span class="truncate">New {ctxKindLabel} Tab</span>
           </button>
+          {#if ctxTab.launcher === "claude"}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-continue-in-mavi"
+              title="Move this conversation to Mavi, with its earlier turns, and end this tab's session"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                void moveTabToMavi(targetId);
+              }}
+            >
+              <MessagesSquare size={13} class="shrink-0" />
+              <span class="truncate">Continue in Mavi</span>
+            </button>
+          {/if}
           <button
             type="button"
             role="menuitem"
@@ -6680,6 +6880,7 @@
     <div class="flex-1 min-h-0 min-w-0 flex overflow-hidden" class:hidden={mode !== "shell"}>
       {#if explorerSidebarOpen && repoPath}
         <aside
+          bind:this={explorerAsideEl}
           data-testid="terminal-explorer-sidebar"
           aria-label="Terminal file explorer sidebar"
           style:width={`${explorerSidebarWidth}px`}
@@ -6691,17 +6892,12 @@
             lastExplorerMod = { altKey: event.altKey, metaOrCtrlKey: event.metaKey || event.ctrlKey };
           }}
         >
-          <div class="h-8 shrink-0 px-2 bg-surface/80 flex items-center justify-between gap-1 select-none">
-            <div class="flex items-center gap-1.5 min-w-0 text-micro font-medium text-textPrimary">
-              <FolderTree size={12} class="text-accent shrink-0" />
-              <span class="truncate">Explorer</span>
-            </div>
-            <div class="flex items-center gap-0.5 shrink-0">
-              <div
-                class="inline-flex items-center gap-0.5 p-0.5 rounded-md bg-background/80 border border-border/65"
-                role="group"
-                aria-label="Open files in"
-              >
+          <!-- The rail below carries its own "Explorer" heading and the dock
+               section is called Files, so this row is only where clicks go. -->
+          <div class="@container h-8 shrink-0 px-2 bg-surface/80 flex items-center justify-between gap-1 select-none">
+            <div class="flex items-center gap-1.5 min-w-0">
+              <span class="text-micro text-textMuted shrink-0 @max-[13rem]:hidden" aria-hidden="true">Open in</span>
+              <div class="gp-segmented min-w-0" data-size="sm" role="group" aria-label="Open files in">
                 <button
                   type="button"
                   data-testid="terminal-explorer-target-auto"
@@ -6717,38 +6913,43 @@
                   type="button"
                   data-testid="terminal-explorer-target-tab"
                   aria-pressed={explorerOpenTarget === "tab"}
-                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'tab' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  data-active={explorerOpenTarget === "tab" ? "true" : "false"}
+                  class="gp-seg-btn inline-flex items-center gap-1"
                   title={`Open clicked files in a Files tab (or update an already-visible file pane) without adding a 3rd split pane · Alt+Click splits · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("tab")}
                 >
-                  <FileText size={10} class="shrink-0" />
-                  <span>Tab</span>
+                  <FileText size={11} class="shrink-0" aria-hidden="true" />
+                  <span class="@max-2xs:sr-only">Tab</span>
                 </button>
                 <button
                   type="button"
                   data-testid="terminal-explorer-target-split"
                   aria-pressed={explorerOpenTarget === "split"}
-                  class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'split' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                  data-active={explorerOpenTarget === "split" ? "true" : "false"}
+                  class="gp-seg-btn inline-flex items-center gap-1"
                   title={`Open clicked files side-by-side in split view · ${codeViewClick} opens in Code view`}
                   onclick={() => setExplorerOpenTarget("split")}
                 >
-                  <Columns2 size={10} class="shrink-0" />
-                  <span>Split</span>
+                  <Columns2 size={11} class="shrink-0" aria-hidden="true" />
+                  <span class="@max-2xs:sr-only">Split</span>
                 </button>
                 {#if onOpenInCodeView}
                   <button
                     type="button"
                     data-testid="terminal-explorer-target-code"
                     aria-pressed={explorerOpenTarget === "code"}
-                    class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-micro transition-colors {explorerOpenTarget === 'code' ? 'bg-accent/15 text-accent font-medium' : 'text-textMuted hover:text-textPrimary'}"
+                    data-active={explorerOpenTarget === "code" ? "true" : "false"}
+                    class="gp-seg-btn inline-flex items-center gap-1"
                     title={`Open clicked files in the full Code view · ${codeViewClick} opens a Files tab · Alt+Click splits`}
                     onclick={() => setExplorerOpenTarget("code")}
                   >
-                    <ExternalLink size={10} class="shrink-0" />
-                    <span>Code</span>
+                    <ExternalLink size={11} class="shrink-0" aria-hidden="true" />
+                    <span class="@max-2xs:sr-only">Code</span>
                   </button>
                 {/if}
               </div>
+            </div>
+            <div class="flex items-center gap-0.5 shrink-0">
               {#if activeExplorerFile}
                 <button
                   type="button"
@@ -7266,7 +7467,7 @@
               onSendToAgent={sendReferenceToAgent}
               onRunInNewShell={(cmd, sub) => void runCommandInNewSplitShell(tab.id, cmd, sub)}
               onAgentStatus={(st) => { tabAgentStatuses = { ...tabAgentStatuses, [tab.id]: st }; }}
-              revealSelf={() => { mode = "shell"; selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
+              revealSelf={() => { showShell(); selectTab(tab.id); void tick().then(() => revealTab(tab.id)); }}
               confirmCloseSelf={() => confirmClose(tab.id)}
               title={effectiveSessionTitle(tab, effectiveAgentStatuses[tab.id])}
               userNamed={Boolean(tab.userNamed)}
@@ -7371,7 +7572,23 @@
     </div>
     </div>
 
-  {#if mode === "console"}
+  {#if section === "agents"}
+    <div class="flex-1 min-h-0 min-w-0 overflow-hidden" data-testid="dock-agents-lens">
+      <DockAgentsSection
+        here={agentRowsHere}
+        elsewhere={agentRowsElsewhere}
+        launchers={agentLaunchers}
+        {followAgent}
+        canFollow={Boolean(repoPath)}
+        onSelect={selectAgentRow}
+        onGoTo={goToAgentSession}
+        onLaunch={launchAgent}
+        onToggleFollow={() => { if (followAgent) stopFollowing(); else startFollowing(); }}
+      />
+    </div>
+  {/if}
+
+  {#if section === "console"}
   <div class="px-3 h-7 shrink-0 flex items-center gap-1.5 text-micro text-textMuted"><Shield size={11} />Direct & bounded · git commands Manvi-gated</div>
   <!-- Output Area -->
   <div
@@ -7386,7 +7603,7 @@
           <Terminal size={28} />
         </div>
           <div>
-            <h3 class="font-semibold text-textPrimary text-sm">Direct repository terminal</h3>
+            <h3 class="font-semibold text-textPrimary text-sm">Run one command, directly</h3>
             <p class="text-xs text-textMuted mt-1">
               Execute commands directly in your repository — no shell in between, so arguments stay
               literal. Git commands are judged by the Manvi gate before they run; other tools run
@@ -7616,6 +7833,16 @@
     }
     .terminal-tab-scroller[data-crowded="true"] .terminal-tab-label {
       max-width: 4rem;
+    }
+    /* Room for the tabs themselves. Each tab's inline "open in split" is an
+       invisible 24px slot until hover; Alt+Click and the tab's context menu
+       do the same. The Follow toggle is the Agents section's Follow edits.
+       Both split buttons stay: a narrow dock stacks panes with Split down,
+       and still splits right on purpose. */
+    .terminal-tab-label { max-width: 7rem; }
+    .terminal-tab-open-split,
+    .terminal-follow-agent:not([aria-pressed="true"]) {
+      display: none;
     }
   }
   .terminal-panes { container-type: inline-size; overflow: auto; }

@@ -483,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn targets_that_are_not_a_plain_backup_file_are_refused() {
         let _serial = crate::storage::hygiene::tests::serial();
         let (_keep, dir) = profile_dir();
@@ -570,6 +571,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_directory_a_fifo_and_a_symlink_named_like_a_backup_are_refused_and_untouched() {
         let (_keep, dir) = profile_dir();
         let profile = dir.join("workbench.sqlite");
@@ -638,6 +640,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_backup_swapped_for_a_symlink_to_the_live_profile_between_preview_and_execute_is_refused() {
         let _serial = crate::storage::hygiene::tests::serial();
         let (_keep, dir) = profile_dir();
@@ -674,6 +677,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_swap_to_a_symlink_inside_the_policy_gate_never_reaches_the_live_profile() {
         let _serial = crate::storage::hygiene::tests::serial();
         let (_keep, dir) = profile_dir();
@@ -710,6 +714,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn remove_refuses_a_symlink_and_never_touches_the_file_it_points_at() {
         let (_keep, dir) = profile_dir();
         let profile = dir.join("workbench.sqlite");
@@ -754,6 +759,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn an_unreadable_profile_directory_is_an_error_row_and_a_missing_one_is_empty() {
         use std::os::unix::fs::PermissionsExt;
         let (_keep, dir) = profile_dir();
@@ -779,6 +785,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_profile_directory_reached_through_a_symlink_lists_and_still_refuses_traversal() {
         let (_keep, dir) = profile_dir();
         let holder = tempfile::tempdir().unwrap();
@@ -913,6 +920,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn adv_confirm_open_then_swapped_for_symlink_to_live_profile_is_refused() {
         let _serial = crate::storage::hygiene::tests::serial();
         let (text, _exists, live) = accept_after(|backup, profile| {

@@ -1,4 +1,4 @@
-import { mockIPCWithEvents } from "./tauriMocks";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   DevmapCliStatus,
   RepoMapCapMeta,
@@ -165,7 +165,7 @@ export const panel = {
  * `panel.unexpected` and refused.
  */
 export function installPanelIpc(): void {
-  mockIPCWithEvents((cmd, args) => {
+  mockIPC((cmd, args) => {
     const arg = (name: string): string => {
       const value: unknown = args && typeof args === "object" ? Reflect.get(args, name) : undefined;
       return typeof value === "string" ? value : "";
@@ -213,5 +213,5 @@ export function installPanelIpc(): void {
         panel.unexpected.add(cmd);
         throw new Error(`Unconfigured harness command: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
 }

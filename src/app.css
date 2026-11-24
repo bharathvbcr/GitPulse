@@ -2670,32 +2670,31 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
 }
 
 /*
- * The terminal dock's slide (DESIGN_LANGUAGE §8.5). One class, three phases
- * through `data-phase`, so the reduced-motion lists name a single selector:
+ * The dock's slide (DESIGN_LANGUAGE §8.5). The dock is a sheet that rises out
+ * of the bottom edge of the workspace column and sinks back into it, docked
+ * or floating alike. One class on the sheet, two phases through `data-phase`,
+ * so the reduced-motion lists name a single selector:
  *
- *   in          docked: the dock has just been shown; it settles up 8 px and
- *               fades in once. The layout itself does not animate.
- *   slide-in    overlay: it rises from the bottom edge of the column.
- *   slide-out   either mode: it leaves in an exit, opacity and transform only.
- *               The host holds the element for the exit, then hides it.
+ *   slide-in    the dock has just been shown: the sheet rises its own full
+ *               height on the spatial spring. Docked, its row has already
+ *               taken the final height, so the view above settles once and
+ *               the sheet fills the space it left.
+ *   slide-out   the sheet sinks its full height, accelerating away on the
+ *               exit curve. The host holds the element for the exit, then
+ *               hides it (and, docked, the row collapses).
  *
- * transform and opacity only. `--gp-dock-exit-ms` is set by the host from the
- * exit token (EXIT_MS.slow), so no duration literal lives in a component.
+ * Transform only, never size: the sheet keeps its height while it moves, so
+ * no terminal is re-fitted and no PTY told a new size by the motion. The
+ * workspace column clips the sheet below its bottom edge. A slide that
+ * interrupts another starts where the sheet is, through `--gp-dock-from`
+ * (set by the host), instead of jumping to its keyframe's start.
+ * `--gp-dock-exit-ms`
+ * is set by the host from the `fast` token, so no duration literal lives in
+ * a component.
  */
-@keyframes gp-dock-in {
-  from {
-    opacity: 0;
-    transform: translate3d(0, 8px, 0);
-  }
-  to {
-    opacity: 1;
-    transform: translate3d(0, 0, 0);
-  }
-}
-
 @keyframes gp-dock-slide-in {
   from {
-    transform: translate3d(0, 100%, 0);
+    transform: translate3d(0, var(--gp-dock-from, 100%), 0);
   }
   to {
     transform: translate3d(0, 0, 0);
@@ -2704,20 +2703,14 @@ html.macos[data-motion="reduced"] :is(.gp-btn, .gp-btn-primary, .gp-btn-danger, 
 
 @keyframes gp-dock-slide-out {
   from {
-    opacity: 1;
-    transform: translate3d(0, 0, 0);
+    transform: translate3d(0, var(--gp-dock-from, 0px), 0);
   }
   to {
-    opacity: 0;
-    transform: translate3d(0, 24px, 0);
+    transform: translate3d(0, 100%, 0);
   }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="in"] {
-    animation: gp-dock-in var(--gp-dur-base) var(--gp-ease-spatial) both;
-  }
-
   html:not([data-motion="reduced"]) .gp-dock-motion[data-phase="slide-in"] {
     animation: gp-dock-slide-in var(--gp-dur-slow) var(--gp-ease-spatial) backwards;
   }

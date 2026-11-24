@@ -4,10 +4,28 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import TerminalPanel from "./TerminalPanel.svelte";
+import DockHeader from "./DockHeader.svelte";
 import { stripMarkupTags } from "../dom/markupText";
+import { sessionCountLabel } from "../terminal/sessionList";
+
+const headerProps = {
+  section: "shell" as const,
+  onSection: () => {},
+  os: "linux" as const,
+  repoName: "repo",
+  repoPath: "/repo",
+  sessionCountLabel: "",
+  onToggleSessionList: () => {},
+};
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "TerminalPanel.svelte"),
+  "utf8",
+);
+// The dock's header row moved out of the panel into DockHeader.svelte; the
+// assertions that used to read its markup from the panel read it from here.
+const headerSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "DockHeader.svelte"),
   "utf8",
 );
 
@@ -162,22 +180,123 @@ describe("TerminalPanel session ownership", () => {
 
 });
 
+describe("TerminalPanel dock sections", () => {
+  it("derives the pane mode from the section, so Agents and Console both take the panes off screen", () => {
+    expect(source).toContain("let section = $state<DockSection>(get(dockSection));");
+    expect(source).toContain('const mode = $derived<PtyMode>(section === "shell" || section === "files" ? "shell" : "console");');
+    expect(source).not.toMatch(/\bmode = "(shell|console)"/);
+    expect(source).toContain("dockSection.set(next);");
+  });
+
+  it("hides the strip and the pane canvas in the lenses instead of unmounting them", () => {
+    expect(source).toContain('class:hidden={mode !== "shell"}');
+    expect(source).not.toMatch(/\{#if (section|mode) === "shell"\}\s*<div class="terminal-strip-row/);
+    expect(source).toContain("<DockAgentsSection");
+    expect(source).toContain('{#if section === "agents"}');
+  });
+
+  it("keeps the explorer's open-target row to the house segmented control, without a second Explorer title", () => {
+    const aside = source.slice(source.indexOf('data-testid="terminal-explorer-sidebar"'), source.indexOf('data-testid="terminal-explorer-send-file"'));
+    expect(aside).toContain('class="gp-segmented min-w-0" data-size="sm" role="group" aria-label="Open files in"');
+    expect(aside.match(/class="gp-seg-btn/g)?.length).toBe(3);
+    expect(aside).not.toContain('<span class="truncate">Explorer</span>');
+    // Narrow asides keep icons with an accessible name rather than clipping labels.
+    expect(aside).toContain('<span class="@max-2xs:sr-only">Split</span>');
+  });
+
+  it("gives the sidebar toggle its own icon, distinct from the Files section", () => {
+    const toggle = source.slice(source.indexOf('data-testid="terminal-explorer-sidebar-toggle"'), source.indexOf("</button>", source.indexOf('data-testid="terminal-explorer-sidebar-toggle"')));
+    expect(toggle).toContain("<PanelLeft size={13} />");
+    expect(toggle).not.toContain("FolderTree");
+    expect(toggle).not.toContain("3rd split pane");
+  });
+
+  it("counts agents elsewhere that need the reader in the Agents dot, and tells the header when the active tab is listed", () => {
+    const attention = source.slice(source.indexOf("const agentAttention"), source.indexOf("function selectAgentRow"));
+    expect(attention).toContain("agentRowsElsewhere.filter((row) => row.attention)");
+    expect(attention).toContain("const activeSessionListed");
+    expect(source).toContain("{activeSessionListed}");
+  });
+
+  it("gives a narrow tab strip's room to the tabs and keeps the active tab in view", () => {
+    const narrow = source.slice(source.indexOf("@container terminal-strip (max-width: 520px)"));
+    // The Follow toggle (also in Agents) gives way unless it is on; both split buttons stay.
+    expect(narrow).toMatch(/\.terminal-tab-open-split,\s*\.terminal-follow-agent:not\(\[aria-pressed="true"\]\) \{\s*display: none;/);
+    expect(source).toContain('class="terminal-tab-open-split gp-icon-btn');
+    expect(source).toContain('class="terminal-follow-agent gp-icon-btn');
+    expect(source).not.toMatch(/terminal-split-(right|down)/);
+    // Resizing the strip re-runs the reveal, which keeps clear of the scroll cue.
+    const reveal = source.slice(source.indexOf("let tabStripWidth"), source.indexOf("async function splitActive"));
+    expect(reveal).toContain("observeResize(scroller");
+    expect(reveal).toContain("void tabStripWidth;");
+    expect(reveal).toContain("TAB_STRIP_CUE_INSET_PX,");
+  });
+
+  it("lets the Files rail keep focus when entering Files also reveals the panes", () => {
+    // Agents/Console -> Files flips `mode` back to shell, so the pane-reveal
+    // effect focuses the active pane after a tick. The rail must win.
+    const files = source.slice(source.indexOf("let filesFocusReady"), source.indexOf("let selectedExplorerFile"));
+    expect(files).toContain("if (paneRevealPending) return;");
+    expect(files).toContain("filesFocusOwed = true;");
+    const reveal = source.slice(source.indexOf("const revealedId = $derived"), source.indexOf("// Any split sibling brought on screen"));
+    expect(reveal).toContain("paneRevealPending = true;");
+    // The rail takes its owed focus only after the pane has been revealed.
+    expect(reveal.indexOf("settleFilesFocus();", reveal.indexOf("revealTab(id);"))).toBeGreaterThan(reveal.indexOf("revealTab(id);"));
+  });
+
+  it("shows the explorer in Files without writing the saved preference", () => {
+    expect(source).toContain('(explorerPreferenceOpen || section === "files")');
+    expect(source).toContain("explorerPreferenceOpen");
+  });
+
+  it("takes the section chords before the tab and split chords, from the panel and from xterm", () => {
+    const sectionChord = source.slice(source.indexOf("function handleSectionChord"), source.indexOf("function handleChord"));
+    expect(sectionChord).toContain("dockSectionForChord(event, $hostPlatform.os)");
+    expect(sectionChord).toContain("event.preventDefault();");
+    // xterm asks `onChord` (handleChord) before it sends a key to the PTY, so
+    // the section chord must be answered there or a focused shell receives it.
+    const chords = source.slice(source.indexOf("function handleChord"));
+    expect(chords.indexOf("handleSectionChord(event)")).toBeGreaterThan(-1);
+    expect(chords.indexOf("handleSectionChord(event)")).toBeLessThan(chords.indexOf('if (mode !== "shell") return false;'));
+    const keys = source.slice(source.indexOf("function handlePanelKey"));
+    expect(keys.indexOf("handleSectionChord(event)")).toBeLessThan(keys.indexOf("handleChord(event)"));
+    expect(source).toContain("onChord={handleChord}");
+  });
+
+  it("moves the pair switcher and split indicator into the strip row, and the strip's session search and tab options into the dock menu", () => {
+    const strip = source.slice(source.indexOf('class="terminal-strip-row'), source.indexOf("Only the tabs scroll"));
+    expect(strip).toContain('data-testid="terminal-pair-switcher"');
+    expect(strip).toContain('data-testid="terminal-header-split-indicator"');
+    expect(strip).toContain('data-testid="terminal-hidden-split-alert"');
+    expect(source).not.toContain('aria-label="Find terminal session" aria-expanded');
+    expect(source).not.toContain('aria-label="Terminal tab options"');
+    expect(headerSource).toContain('data-testid="dock-menu-find-session"');
+    expect(headerSource).toContain('data-testid="dock-menu-tab-options"');
+  });
+});
+
 describe("TerminalPanel rendering", () => {
-  it("renders the header with mode switcher", () => {
+  it("renders the header with the section switcher", () => {
     const { body } = render(TerminalPanel);
-    expect(body).toContain("Terminal");
+    expect(body).toContain('aria-label="Dock"');
     expect(body).toContain("Shell");
+    expect(body).toContain("Agents");
+    expect(body).toContain("Files");
     expect(body).toContain("Console");
   });
 
   it("labels the session count as open sessions against the limit", () => {
-    const { body } = render(TerminalPanel);
+    // The count lives in the header's ⋯ menu now, so the menu is rendered open.
+    const { body } = render(DockHeader, {
+      props: { ...headerProps, sessionCountLabel: sessionCountLabel(3, 32), menuOpen: true },
+    });
     const match = body.match(/data-testid="terminal-session-count"[^>]*>([\s\S]*?)<\/button>/);
     expect(match).not.toBeNull();
     const text = stripMarkupTags(match?.[1] ?? "").replace(/\s+/g, " ").trim();
     // The old control was an unlabeled `0/32` icon button.
-    expect(text).toMatch(/^\d+ open \/ \d+ limit$/);
+    expect(text).toMatch(/^All sessions \d+ open \/ \d+ limit$/);
     expect(text).not.toBe("0/32");
+    expect(headerSource).toContain('aria-controls="terminal-session-list"');
     expect(source).toContain('data-testid="session-group"');
     expect(source).toContain("sessionListNotice");
     expect(source).not.toContain('aria-label="Terminal shortcuts"');
@@ -283,7 +402,7 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     // failed Go to / Close in Shell mode showed nothing at all.
     const strip = source.indexOf('data-testid="terminal-session-error"');
     expect(strip).toBeGreaterThan(-1);
-    expect(strip).toBeLessThan(source.indexOf('{#if mode === "console"}'));
+    expect(strip).toBeLessThan(source.indexOf('{#if section === "console"}'));
     expect(source).toContain('role="alert"');
     expect(source).toContain('aria-label="Dismiss"');
   });
@@ -402,7 +521,7 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
   });
 
   it("surfaces the active session summary, 3-tier split tab strip markers, constant-height split pane headers, and live session retitling", () => {
-    expect(source).toContain('data-testid="terminal-active-session-summary"');
+    expect(headerSource).toContain('data-testid="terminal-active-session-summary"');
     expect(source).toContain('data-testid="terminal-header-split-indicator"');
     expect(source).toContain('data-active={isActiveTab ? "true" : "false"}');
     expect(source).toContain('data-in-split={inVisibleSplit ? "true" : "false"}');
@@ -440,7 +559,7 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     // P1.8: @container split-pane narrow header responsiveness + inline rename + Console active summary return
     expect(source).toContain("@container split-pane");
     expect(source).toContain('data-testid="terminal-inline-rename-input"');
-    expect(source).toContain("→ Shell");
+    expect(headerSource).toContain("→ Shell");
 
     // P2.9: multi-agent pair handoff targets + Sessions across repositories Active & Split #slot badges
     expect(source).toContain("resolvePairHandoffTargets(");

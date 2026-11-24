@@ -420,8 +420,13 @@
     check("Auto brings it back", () => motionStatus() === "playing" && layer() !== null);
 
     // --- a video wallpaper, end to end ---------------------------------------
-    // A real clip, recorded here from a canvas (red ground, a green bar moving),
-    // through the real file input, the real decoder and IndexedDB.
+    // A real clip (red ground, a green bar moving) through the real file input,
+    // the real decoder and IndexedDB. Where this engine plays MP4 the clip is
+    // harness/fixtures/wallpaper-loop.mp4 (H.264 Constrained Baseline, 320x200,
+    // 2 s, made with ffmpeg's lavfi color + drawbox), because WKWebView's
+    // MediaRecorder gave the same canvas recording a clip on one CI run and an
+    // empty one on the next (53 frames painted, one dataavailable event, no
+    // bytes). Elsewhere it is recorded here from a canvas, as before.
     const wait = async (ok, ms = 8000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); await settle(); return ok(); };
     let clipWhy = "";
     // Real 1.5 s 64x48 10 fps VP8 WebM (red #d02020 ground, green #20d020 box at
@@ -429,6 +434,12 @@
     // natively (e.g. Linux WebKitGTK 2.50.4) but does not implement MediaRecorder.
     const FALLBACK_VP8_WEBM_B64 =
       "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAPUEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEyTbuMU6uEHFO7a1OsggO+7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjMuMS4xMDJXQYxMYXZmNjMuMS4xMDJEiYhAl3AAAAAAABZUrmvXrgEAAAAAAABO14EBc8WIXVwFx/waGfmcgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QF9eEA4JCwgUC6gTCagQJVsIRVuYEBVe6BAOwBAAAAAAAAAgAAElTDZ/pzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYzLjEuMTAyc3PVY8CLY8WIXVwFx/waGflnyKBFo4dFTkNPREVSRIeTTGF2YzYzLjEuMTAyIGxpYnZweGfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDEuNTAwMDAwMDAwAB9DtnVCB+eBAKNAsoEAAIAQCACdASpAADAAAEcIhYWIhYSIAgICdbokwb4D+Ff6zcwzoL2a/VXEBfgP4gV3/0f/oZ/wHeAf6T1AIjQ1wBZE4LhNFq3tJjfgAP7+zN5/xILb/3w4DP69I/hAiP/4hPGmPe2vfw//Lehj/vpHkD0ddSC4Cas//fuIZ/24QqD9/yv7XPx7XDex2vjMQIX7Bt/30jvGMh75gLLPQQw5v44VY/5tU/Y/0QIJiAgmEwCjloEAZADRAQABEBAAGAAYWC/0AAiMAACjloEAyADRAQABEBAAGAAYWC/0AAiMAACjloEBLADRAQABEBAAGAAYWC/0AAiMAACjloEBkADRAQABEBAAGAAYWC/0AAiMAACjloEB9ADRAQABEBAAGAAYWC/0AAiMAACjloECWADRAQABEBAAGAAYWC/0AAiMAACjlYECvACxAQABEBAUYABhYL/QACIwAKOWgQMgANEBAAEQEAAYABhYL/QACIwAAKOWgQOEANEBAAEQEAAYABhYL/QACIwAAKOWgQPoANEBAAEQEAAYABhYL/QACIwAAKOWgQRMANEBAAEQEAAYABhYL/QACIwAAKOWgQSwANEBAAEQEAAYABhYL/QACIwAAKOWgQUUANEBAAEQEAAYABhYL/QACIwAAKOWgQV4ANEBAAEQEAAYABhYL/QACIwAABxTu2uRu4+zgQC3iveBAfGCAbHwgQM=";
+    const fixtureClip = async () => {
+      if (document.createElement("video").canPlayType("video/mp4") === "") return null;
+      const response = await fetch(new URL("./fixtures/wallpaper-loop.mp4", location.href));
+      if (!response.ok) { clipWhy = `fixture: HTTP ${response.status}`; return null; }
+      return new File([await response.blob()], "harness-loop.mp4", { type: "video/mp4" });
+    };
     const recordClip = async () => {
       const player = document.createElement("video");
       const fallbackWebm = () => {
@@ -443,34 +454,51 @@
         clipWhy = "MediaRecorder is undefined";
         return null;
       }
+      // The canvas is put on the page while it records: WebKit captures a canvas
+      // frame only when it prepares that canvas's display buffer, which it does
+      // only for a canvas that is rendered, so a detached canvas (fine in Chrome)
+      // gave WebKit's MediaRecorder no frames and an empty clip.
       const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 200 });
+      canvas.setAttribute("aria-hidden", "true");
+      Object.assign(canvas.style, { position: "fixed", right: "0", bottom: "0", width: "320px", height: "200px", pointerEvents: "none", zIndex: "2147483647" });
+      document.body.append(canvas);
       const ctx = canvas.getContext("2d");
       const stream = canvas.captureStream?.(30);
       // Record a type this engine can also play back: WebKit records WebM it cannot decode.
       const type = ["video/mp4", "video/webm"].find((t) => MediaRecorder.isTypeSupported?.(t) && player.canPlayType(t) !== "");
       if (!stream || !type) {
+        canvas.remove();
         const fb = fallbackWebm();
         if (fb) return fb;
         clipWhy = `MediaRecorder ${typeof MediaRecorder}, captureStream ${typeof canvas.captureStream}, stream ${!!stream}; ${["video/mp4", "video/webm"].map((t) => `${t}: record ${MediaRecorder.isTypeSupported?.(t)}, play "${player.canPlayType(t)}"`).join("; ")}`;
         return null;
       }
       let frame = 0;
-      const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); };
+      const [track] = stream.getVideoTracks();
+      const paint = () => { ctx.fillStyle = "#d02020"; ctx.fillRect(0, 0, 320, 200); ctx.fillStyle = "#20d020"; ctx.fillRect((frame++ * 8) % 280, 20, 30, 40); track?.requestFrame?.(); };
       paint();
       const painter = setInterval(paint, 33);
       const recorder = new MediaRecorder(stream, { mimeType: type });
       const chunks = [];
-      recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+      let events = 0;
+      let recorderError = "";
+      recorder.ondataavailable = (event) => { events++; if (event.data.size > 0) chunks.push(event.data); };
+      recorder.onerror = (event) => { recorderError = event.error?.name ?? event.error?.message ?? "error"; };
       const stopped = new Promise((resolve) => (recorder.onstop = resolve));
       recorder.start(100);
       await new Promise((r) => setTimeout(r, 1500));
+      const trackState = `track ${track?.readyState ?? "none"}, muted ${track?.muted}`;
       recorder.stop(); await stopped; clearInterval(painter);
-      for (const track of stream.getTracks()) track.stop();
-      return new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
+      for (const t of stream.getTracks()) t.stop();
+      canvas.remove();
+      const file = new File(chunks, type === "video/mp4" ? "harness-loop.mp4" : "harness-loop.webm", { type });
+      if (file.size === 0) clipWhy = `empty: ${frame} frames painted, ${events} dataavailable events, ${trackState}${recorderError ? `, recorder error ${recorderError}` : ""}`;
+      return file;
     };
-    const clip = await recordClip();
-    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clip ? "" : ` (${clipWhy})`}`, () => clip !== null && clip.size > 0);
-    if (clip) {
+    const fixture = await fixtureClip();
+    const clip = fixture ?? (await recordClip());
+    check(`this runner has a ${clip?.type ?? "(no)"} clip, ${fixture ? "the fixture" : "recorded here"}, to test the video path with${clipWhy ? ` (${clipWhy})` : ""}`, () => clip !== null && clip.size > 0);
+    if (clip?.size) {
       const input = $("[data-wallpaper-input]");
       const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;
       input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -478,18 +506,22 @@
       const refusal = $("[data-wallpaper-failure]")?.textContent.trim() ?? "";
       check(`the clip is accepted as a video wallpaper and chosen${refusal ? ` (refused: ${refusal})` : ""}`, () =>
         $("[data-custom-video-badge]") !== null && get(interfaceStore).backdrop === "custom" && !$("[data-wallpaper-failure]"));
-      await wait(() => {
-        const img = $('[data-backdrop-option="custom"] img');
-        return !!img?.complete && img.naturalWidth > 0;
-      }, 5000);
-      check("its still is the clip's first frame, not a blank one", () => {
-        const img = $('[data-backdrop-option="custom"] img');
-        if (!img?.complete || img.naturalWidth === 0) return false;
+      // The still is an <img> the browser decodes on its own time; with a 2 KB
+      // fixture the badge can land before it has, so wait for it to load.
+      const stillImage = () => $('[data-backdrop-option="custom"] img');
+      await wait(() => { const img = stillImage(); return !!img?.complete && img.naturalWidth > 0; }, 5000);
+      let stillWhy = "";
+      const stillIsFirstFrame = (() => {
+        const img = stillImage();
+        if (!img) { stillWhy = "no still image"; return false; }
+        if (!img.complete || img.naturalWidth === 0) { stillWhy = `still not loaded: complete ${img.complete}, ${img.naturalWidth}x${img.naturalHeight}`; return false; }
         const probe = Object.assign(document.createElement("canvas"), { width: img.naturalWidth, height: img.naturalHeight });
         const g = probe.getContext("2d"); g.drawImage(img, 0, 0);
-        const [r, gr] = g.getImageData(Math.floor(img.naturalWidth * 0.8), Math.floor(img.naturalHeight * 0.8), 1, 1).data;
+        const [r, gr, b] = g.getImageData(Math.floor(img.naturalWidth * 0.8), Math.floor(img.naturalHeight * 0.8), 1, 1).data;
+        stillWhy = `${img.naturalWidth}x${img.naturalHeight}, rgb(${r}, ${gr}, ${b}) at 80%/80%`;
         return r > 150 && gr < 100;
-      });
+      })();
+      check(`its still is the clip's first frame, not a blank one${stillIsFirstFrame ? "" : ` (${stillWhy})`}`, () => stillIsFirstFrame);
       const video = () => layer()?.querySelector("video") ?? null;
       check("plugged in and quiet, the layer plays it muted, looping, with the still as its poster", () =>
         video() !== null && video().muted && video().loop && !video().controls && video().poster.startsWith("blob:"));

@@ -81,7 +81,7 @@ const STATUS_SHORTCUTS: StatusShortcut[] = [
   { id: "section:insights:pulse", label: "Pulse", group: "go" },
   { id: "fleet", label: "Fleet", group: "go" },
   { id: "agents", label: "Agents", group: "go" },
-  { id: "terminal-dock", label: "Terminal", group: "go" },
+  { id: "terminal-dock", label: "Dock", group: "go" },
   { id: "copy-branch", label: "Copy branch", group: "tool" },
   { id: "reveal-repo", label: "Reveal", group: "tool" },
   { id: "open-remote", label: "Remote", group: "tool" },
@@ -580,9 +580,9 @@ export function buildMenuState(
   }
   // The dock belongs to the active repository tab, so the menu reads the repo
   // state rather than a workspace preference: switching to a repository whose
-  // terminal is closed must say "Show Terminal", not keep offering to hide a
+  // terminal is closed must say "Show Dock", not keep offering to hide a
   // dock that is not on screen.
-  label("terminal-dock", repo.terminalOpen ? "Hide Terminal" : "Show Terminal");
+  label("terminal-dock", repo.terminalOpen ? "Hide Dock" : "Show Dock");
   label("copy-commit", repo.selectedCommitId ? "Copy Selected Commit SHA" : "Copy HEAD SHA");
   if (repo.terminalOpen && hasRepo) checked.add("terminal-dock");
   if (prefs.globalSurface === "fleet") checked.add("fleet");

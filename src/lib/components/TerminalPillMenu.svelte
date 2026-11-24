@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { maviStore } from "../mavi/store.svelte";
+  import { showMaviThread } from "../mavi/navigate";
+  import { STATUS_LABEL, STATUS_PRIORITY } from "../mavi/threads";
   import { repoStore } from "../stores/repoStore";
   import { hostPlatform } from "../stores/platformStore";
   import { describeError } from "../ui/copy/describeFailure";
   import { shortcutTextLabel } from "../ui/platformCopy";
   import { LAYERS } from "../ui/layers";
-  import { Eye, EyeOff, Plus, Search, SquareTerminal, X } from "@lucide/svelte";
+  import { ChevronDown, ChevronUp, MessagesSquare, Plus, Search, SquareTerminal, X } from "@lucide/svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { onDestroy, tick } from "svelte";
   import { portal } from "../dom/portal";
@@ -447,6 +450,18 @@
   onDestroy(() => {
     onLaunchingChange(false);
   });
+
+  /** Mavi threads with a running agent, most urgent first: the pill lists every agent, not only terminals. */
+  let maviLive = $derived(
+    maviStore.records
+      .filter((record) => {
+        const phase = maviStore.summaryOf(record)?.phase;
+        return !!phase && phase !== "ended";
+      })
+      .map((record) => ({ key: record.key, title: record.title, status: maviStore.status(record) }))
+      .sort((a, b) => STATUS_PRIORITY.indexOf(a.status) - STATUS_PRIORITY.indexOf(b.status))
+      .slice(0, 6),
+  );
 </script>
 
 <!-- Justified: pointer enter/leave keep the portaled menu open across
@@ -459,7 +474,7 @@
   data-testid="terminal-pill-menu"
   data-terminal-pill-menu
   role="group"
-  aria-label="Terminal options"
+  aria-label="Dock sessions"
   use:portal={"body"}
   use:popover={menuPopover} out:popoverExit
   onpointerenter={onPointerEnter}
@@ -761,6 +776,24 @@
         {/each}
       </div>
     </div>
+    {#if maviLive.length > 0}
+      <div class="gp-menu-sep" role="separator"></div>
+      <div class="flex flex-col gap-0.5 py-0.5" role="group" aria-label="Mavi threads" data-testid="terminal-pill-mavi">
+        <span class="gp-label px-2.5 py-0.5">Mavi</span>
+        {#each maviLive as thread (thread.key)}
+          <button
+            type="button"
+            class="gp-menu-item text-meta"
+            title="Open this conversation in Mavi"
+            onclick={() => { closeMenu(); void showMaviThread(thread.key); }}
+          >
+            <MessagesSquare size={13} class="shrink-0 {thread.status === 'needs_you' ? 'text-warn' : 'text-accent'}" />
+            <span class="min-w-0 flex-1 truncate">{thread.title}</span>
+            <span class="gp-chip shrink-0" data-tone={thread.status === "needs_you" ? "warn" : thread.status === "failed" ? "danger" : "neutral"}>{STATUS_LABEL[thread.status]}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
     <div class="gp-menu-sep" role="separator"></div>
     <button
       type="button"
@@ -768,8 +801,8 @@
       data-testid="terminal-pill-toggle"
       onclick={() => { onToggleDock(); closeMenu(); }}
     >
-      {#if $repoStore.terminalOpen}<EyeOff size={13} class="shrink-0 text-textMuted" />{:else}<Eye size={13} class="shrink-0 text-textMuted" />{/if}
-      <span>{$repoStore.terminalOpen ? "Hide terminal" : "Show terminal"}</span>
+      {#if $repoStore.terminalOpen}<ChevronDown size={13} class="shrink-0 text-textMuted" />{:else}<ChevronUp size={13} class="shrink-0 text-textMuted" />{/if}
+      <span>{$repoStore.terminalOpen ? "Hide dock" : "Show dock"}</span>
     </button>
     {#if terminalPill.focusKey}
       <button

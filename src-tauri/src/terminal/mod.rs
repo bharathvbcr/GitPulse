@@ -3605,6 +3605,8 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
     // own and is not gated.
     if launcher_kind(&resolved).is_some() {
         let existing = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+        // The lease-bin links are shell wrappers (`hooks::lease_wrapper`,
+        // Unix only), so elsewhere nothing is injected.
         #[cfg(unix)]
         let enabled = {
             let steward_settings = crate::tool_config::manvi_steward_settings();
@@ -3614,7 +3616,8 @@ fn start_session_with<O: SessionObserver + ?Sized + 'static>(
                     .as_deref(),
             );
             // The steward can only slow builds when Manvi is configured, so a
-            // user without Manvi keeps exactly the PATH their lease setting gives.
+            // user without Manvi keeps exactly the PATH their lease setting
+            // gives.
             crate::hooks::lease_wrapper::should_inject_lease_bin(
                 crate::tool_config::host_load_leases().mode,
                 crate::harness::steward::any_slow_policy_enabled(&steward_settings, steward_forced)

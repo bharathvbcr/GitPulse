@@ -22,8 +22,29 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
- * These are the twelve installers emitted by the current five-runner matrix:
- * macOS universal DMG and app archive; Linux RPM/AppImage/deb on x86_64 and
+ * The Linux `.rpm`, which a beta does not ship.
+ *
+ * RPM forbids `-` in a version, and a beta's version is `X.Y.Z-beta.N`. Tauri
+ * takes the rpm version verbatim from `tauri.conf.json > version`, which must
+ * be semver (so it cannot be spelled `X.Y.Z~beta.N`), and has no rpm-only
+ * version setting like `bundle > windows > wix > version` for the MSI. The
+ * bundler therefore fails on a beta's rpm (`invalid version "0.2.0-beta.1":
+ * contains invalid character`), so a beta's Linux legs bundle the deb and the
+ * AppImage only ({@link bundleArgs}) and its manifest omits the rpm. A stable
+ * release ships it.
+ *
+ * @param {string} version
+ * @param {string} rpm
+ * @returns {string[]}
+ */
+function rpmFor(version, rpm) {
+  return isPrerelease(version) ? [] : [rpm];
+}
+
+/**
+ * These are the installers emitted by the current five-runner matrix: twelve
+ * for a stable release, ten for a beta (no rpm, see {@link rpmFor}). macOS
+ * universal DMG and app archive; Linux RPM/AppImage/deb on x86_64 and
  * aarch64; and Windows MSI/NSIS on x64 and arm64. The ARM names are the Tauri
  * bundler's own arch spellings (deb/NSIS/MSI `arm64`, RPM/AppImage
  * `aarch64`), not a convention chosen here.
@@ -41,18 +62,31 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 export const PLATFORM_INSTALLERS = Object.freeze({
   "macos-latest": (version) => [`GitPulse_${version}_universal.dmg`, `GitPulse_${version}_universal.app.tar.gz`],
   "ubuntu-22.04": (version) => [
-    ...(isPrerelease(version) ? [] : [`GitPulse-${version}-1.x86_64.rpm`]),
-    `GitPulse_${version}_amd64.AppImage`,
-    `GitPulse_${version}_amd64.deb`,
+    ...rpmFor(version, `GitPulse-${version}-1.x86_64.rpm`), `GitPulse_${version}_amd64.AppImage`, `GitPulse_${version}_amd64.deb`,
   ],
   "ubuntu-22.04-arm": (version) => [
-    ...(isPrerelease(version) ? [] : [`GitPulse-${version}-1.aarch64.rpm`]),
-    `GitPulse_${version}_aarch64.AppImage`,
-    `GitPulse_${version}_arm64.deb`,
+    ...rpmFor(version, `GitPulse-${version}-1.aarch64.rpm`), `GitPulse_${version}_aarch64.AppImage`, `GitPulse_${version}_arm64.deb`,
   ],
   "windows-latest": (version) => [`GitPulse_${version}_x64-setup.exe`, `GitPulse_${version}_x64_en-US.msi`],
   "windows-11-arm": (version) => [`GitPulse_${version}_arm64-setup.exe`, `GitPulse_${version}_arm64_en-US.msi`],
 });
+
+/**
+ * Extra `tauri build` arguments for one release runner at `version`: on a
+ * Linux leg building a beta, `--bundles deb,appimage`, so the bundler skips
+ * the rpm it cannot build (see {@link rpmFor}); otherwise none, and
+ * `bundle > targets: "all"` applies. release.yml and ci.yml's arm-bundle job
+ * read this through `--bundle-args`, so the targets bundled and the names
+ * {@link PLATFORM_INSTALLERS} expects come from one rule.
+ *
+ * @param {string} platform
+ * @param {string} version
+ * @returns {string[]}
+ */
+export function bundleArgs(platform, version) {
+  if (!Object.hasOwn(PLATFORM_INSTALLERS, platform)) throw new Error(`unknown release platform ${JSON.stringify(platform)}`);
+  return platform.startsWith("ubuntu-") && isPrerelease(version) ? ["--bundles", "deb,appimage"] : [];
+}
 
 /**
  * @param {string} version
@@ -1087,8 +1121,8 @@ export function inspectAppBundle({ appPath, binaries, universal = false, maxUnpa
 
 /** @param {string[]} argv */
 function parseArgs(argv) {
-  /** @type {{ tag: string | null, jsonPath: string | null, bundles: string | null, platform: string | null, contents: string | null, app: string | null, universal: boolean }} */
-  const options = { tag: null, jsonPath: null, bundles: null, platform: null, contents: null, app: null, universal: false };
+  /** @type {{ tag: string | null, jsonPath: string | null, bundles: string | null, platform: string | null, contents: string | null, app: string | null, universal: boolean, bundleArgs: string | null }} */
+  const options = { tag: null, jsonPath: null, bundles: null, platform: null, contents: null, app: null, universal: false, bundleArgs: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--universal") {
@@ -1103,8 +1137,15 @@ function parseArgs(argv) {
     else if (flag === "--platform") options.platform = value;
     else if (flag === "--contents") options.contents = path.resolve(value);
     else if (flag === "--app") options.app = path.resolve(value);
+    else if (flag === "--bundle-args") options.bundleArgs = value;
     else throw new Error(`unknown option ${flag}`);
     index += 1;
+  }
+  if (options.bundleArgs !== null) {
+    if (options.tag || options.jsonPath || options.bundles || options.platform || options.contents || options.app || options.universal) {
+      throw new Error("--bundle-args cannot be combined with another option");
+    }
+    return options;
   }
   if (options.app !== null) {
     if (options.tag || options.jsonPath || options.bundles || options.platform || options.contents) {
@@ -1130,6 +1171,13 @@ function parseArgs(argv) {
 
 /** @param {string[]} [argv] */
 
+/** The version `tauri build` bundles: `src-tauri/tauri.conf.json > version`. */
+function tauriConfVersion() {
+  const config = JSON.parse(readFileSync(path.join(REPO_ROOT, "src-tauri", "tauri.conf.json"), "utf8"));
+  if (typeof config.version !== "string" || !config.version) throw new Error("tauri.conf.json has no version");
+  return config.version;
+}
+
 /** Backlog A2: asking for help is not an error, so this exits 0. */
 export function usage() {
   return formatUsage({
@@ -1141,6 +1189,7 @@ export function usage() {
       { flag: "--bundles <json> --platform <label>", description: "instead: check one runner's tauri-action artifactPaths against the installers it must upload, at the src-tauri/tauri.conf.json version" },
       { flag: "--contents <dir> --tag <tag>", description: "instead: open the macOS archive, debs, MSIs and NSIS installers in <dir> and require every src-tauri/Cargo.toml [[bin]] inside with no source maps (needs 7z; the dmg, rpm and AppImage are not opened)" },
       { flag: "--app <path> [--universal]", description: "instead: inspect a built macOS .app bundle directory on disk for every src-tauri/Cargo.toml [[bin]] and no source maps" },
+      { flag: "--bundle-args <label>", description: "instead: print the extra `tauri build` arguments that release runner needs at the src-tauri/tauri.conf.json version (`--bundles deb,appimage` on a Linux leg building a beta, which ships no rpm; otherwise nothing)" },
       { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
     ],
     exits: "0 every expected asset is present · 1 one is missing, lacks a binary or ships source maps · 2 the check could not run",
@@ -1154,6 +1203,10 @@ export function main(argv = process.argv.slice(2)) {
   }
   try {
     const options = parseArgs(argv);
+    if (options.bundleArgs !== null) {
+      console.log(bundleArgs(options.bundleArgs, tauriConfVersion()).join(" "));
+      return 0;
+    }
     if (options.app) {
       const cargo = readFileSync(path.join(REPO_ROOT, "src-tauri", "Cargo.toml"), "utf8");
       const result = inspectAppBundle({ appPath: options.app, binaries: declaredBinaryNames(cargo), universal: options.universal });
@@ -1180,9 +1233,7 @@ export function main(argv = process.argv.slice(2)) {
       return 0;
     }
     if (options.bundles && options.platform) {
-      const config = JSON.parse(readFileSync(path.join(REPO_ROOT, "src-tauri", "tauri.conf.json"), "utf8"));
-      if (typeof config.version !== "string" || !config.version) throw new Error("tauri.conf.json has no version");
-      const result = inspectBundles({ platform: options.platform, version: config.version, paths: JSON.parse(options.bundles) });
+      const result = inspectBundles({ platform: options.platform, version: tauriConfVersion(), paths: JSON.parse(options.bundles) });
       for (const name of result.actual) console.log(`  ${name}`);
       if (!result.ok) {
         for (const violation of result.violations) console.error(`FAIL: ${options.platform} bundle ${violation}`);

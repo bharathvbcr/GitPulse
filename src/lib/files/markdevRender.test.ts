@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestCpuPerCall, fastestOf } from "../__tests__/perfBudget";
+import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestCpuOf, fastestOf } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
   EMPTY_RENDER,
@@ -73,8 +73,16 @@ describe("markdevRender IPC", () => {
   });
 });
 
-/** Linear is 4 for a 4x input; measured 3.8-4.4 under load. 5.5 leaves a third. */
-const LINEAR_RATIO_LIMIT = 5.5;
+/** How many times longer the large input is than the small one. */
+const SIZE_FACTOR = 8;
+
+/**
+ * The large input's CPU time over the same number of characters in small
+ * calls (`SIZE_FACTOR` of them). Linear reads 1: measured 1.00-1.13, with and
+ * without coverage. A quadratic term worth +50% at the small size reads
+ * (8 + 32) / 12 = 3.3: measured 3.1-3.5. 2 sits well clear of both.
+ */
+const EQUAL_WORK_RATIO_LIMIT = 2;
 
 describe("markdevRender — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
@@ -85,19 +93,22 @@ describe("markdevRender — document stats stay linear", () => {
     // minimum is the sample least disturbed by other load, and a genuine
     // regression still slows it.
     const small = "[".repeat(80000);
-    const large = "[".repeat(320000);
+    const large = "[".repeat(80000 * SIZE_FACTOR);
     expectWithinBudget(
       fastestOf(3, () => void calculateDocumentStats(small)),
       400,
       "stats on unmatched brackets",
     );
-    // 4x the input must not cost much more than 4x. Both sizes are large
-    // because a quadratic term only shows where it dominates: with a term worth
-    // +50% at 80k chars (inside the wall budget above) the 4x ratio reads
-    // 7.2-8.7 against a linear 3.8-4.4, while at 20k-vs-80k it read 5.2-7.4
-    // against a noisy linear 3.9-5.4, which no limit separated. The small
-    // sizes were the noise: CPU time at 5-20k chars varied by a third between
-    // runs, at 80k+ by a tenth.
+    // 8x the input must cost about what 8 calls on the small input cost. Both
+    // sizes are large because a quadratic term only shows where it dominates,
+    // and the small input is timed as a batch of `SIZE_FACTOR` calls so the two
+    // samples are the same amount of work. That is what the CPU clock needs:
+    // Windows advances process.cpuUsage in 15.6 ms ticks, and a single 60 ms
+    // small call could read a tick either side, which pushed the old 4x
+    // single-call ratio (linear ~4, limit 5.5) to 5.63 on Windows CI. Each
+    // sample is now ~500 ms, about 30 ticks. The 8x size also widens the gap
+    // between linear (1) and the quadratic term this guards against (3.3);
+    // at 4x it was 4 against 8.
     // The ratio is taken over CPU time, not wall time: at host load 70 a
     // wall ratio of this linear pass read 2x its true value in 4 of 20 runs,
     // because the two sizes waited for the CPU for different lengths of time.
@@ -105,18 +116,18 @@ describe("markdevRender — document stats stay linear", () => {
     // not be seen; this is a synchronous pure function. Rounds alternate the
     // sizes so a drift in clock speed lands on both, and the minimum of each is
     // what the ratio is taken of.
-    // Each reading spans >= 250 ms of CPU (`fastestCpuPerCall`): Windows
-    // accounts CPU time in 15.6 ms ticks, so single ~60 ms readings of the
-    // small size came out up to a quarter low, their minimum lower still, and
-    // the Windows runner read 5.81 against a linear 4. Batches make the tick a
-    // few percent of either reading.
-    let cpuSmall = Number.POSITIVE_INFINITY;
+    let cpuSmallBatch = Number.POSITIVE_INFINITY;
     let cpuLarge = Number.POSITIVE_INFINITY;
     for (let round = 0; round < 5; round += 1) {
-      cpuSmall = Math.min(cpuSmall, fastestCpuPerCall(1, () => void calculateDocumentStats(small)));
-      cpuLarge = Math.min(cpuLarge, fastestCpuPerCall(1, () => void calculateDocumentStats(large)));
+      cpuSmallBatch = Math.min(
+        cpuSmallBatch,
+        fastestCpuOf(1, () => {
+          for (let call = 0; call < SIZE_FACTOR; call += 1) void calculateDocumentStats(small);
+        }),
+      );
+      cpuLarge = Math.min(cpuLarge, fastestCpuOf(1, () => void calculateDocumentStats(large)));
     }
-    expect(cpuLarge / cpuSmall).toBeLessThan(LINEAR_RATIO_LIMIT);
+    expect(cpuLarge / cpuSmallBatch).toBeLessThan(EQUAL_WORK_RATIO_LIMIT);
   }, STRESS_TIMEOUT_MS);
 });
 

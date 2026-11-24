@@ -1,7 +1,7 @@
 # GitPulse documentation
 
 GitPulse brings Git, code exploration, tasks, and repository insights into one
-local-first desktop workspace with 11 specialized sections across 4 views. This is the index for maintained documentation.
+local-first desktop workspace with 11 specialized sections across 5 views. This is the index for maintained documentation.
 
 [Download the 0.2.0 beta](https://github.com/bharathvbcr/GitPulse/releases/tag/v0.2.0-beta.1) ·
 [Website](https://gitpulse.vbcr.dev/) · [Project overview](../README.md) ·
@@ -27,6 +27,7 @@ local-first desktop workspace with 11 specialized sections across 4 views. This 
 | --- | --- |
 | [Tasks and workspaces](TASKS_AND_WORKSPACES.md) | Quick add, boards, saved workspaces, drafting, archive, agent handoff |
 | [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse `--cone` checkouts, zero-copy DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
+| [Mavi](MAVI.md) | Agent conversations: the timeline, approvals, live per-turn changes, SSH hosts, and how it is kept safe |
 | [Terminal](TERMINAL.md) · [Terminal host](TERMINAL_HOST.md) | Sessions, split panes, search, export, `gitpulse-ptyd` host & crash survival |
 | [Coverage](COVERAGE.md) | Report formats, generation, missing toolchains, diagnostics |
 | [Cloud, SSH and Remote Control sessions](CLOUD_SESSIONS.md) | What works off-Mac, DevMap setup script, what is unavailable |

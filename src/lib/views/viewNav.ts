@@ -8,7 +8,7 @@ export interface ViewNavItem {
 
 /**
  * Header view catalog, derived from the view registry — a flat list, because
- * there are four views and every one of them is a tab.
+ * there are five views and every one of them is a tab.
  *
  * It used to be groups: a "Work" strip of tabs plus "Inspect" and "More"
  * dropdowns, because fifteen views could not fit a title bar and something
@@ -16,7 +16,7 @@ export interface ViewNavItem {
  * it — a new panel is a *section* of the view that owns its subject now, not
  * a fifth top-level entry — so the grouping layer had one group left and the
  * dropdown branch had become unreachable. Both are gone: the header is the
- * four views, in registry order.
+ * five views, in registry order.
  */
 export const VIEW_NAV: readonly ViewNavItem[] = REGISTERED_VIEWS.map((view) => ({
   id: view.id,

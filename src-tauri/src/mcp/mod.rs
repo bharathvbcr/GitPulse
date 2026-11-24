@@ -5266,6 +5266,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_provenance" => {
             let a: ProvenanceArgs = parse(name, arguments)?;
+            // A repository that cannot be examined (untrusted, not a Git
+            // repository) is a tool error. `compute_freshness` would answer it
+            // with an all-null "unexamined" record, which a caller reads as
+            // "looked and found nothing".
+            crate::engine::git_cli::validate_repo(&a.repo_path)
+                .map_err(CommandError::into_message)?;
             Ok(json!(crate::engine::provenance::compute_freshness(
                 &a.repo_path,
                 &a.commit_sha,
@@ -5274,6 +5280,10 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "gitpulse_landed" => {
             let a: LandedArgs = parse(name, arguments)?;
+            // Same refusal as provenance: an unexaminable repository is a
+            // tool error, not an answer whose only sign of it is `error`.
+            crate::engine::git_cli::validate_repo(&a.repo_path)
+                .map_err(CommandError::into_message)?;
             Ok(json!(crate::engine::provenance::landed(
                 &a.repo_path,
                 &a.commit,
@@ -8741,6 +8751,41 @@ mod tests {
         let is_error = res["isError"].as_bool().unwrap_or(false);
         let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
         (is_error, body)
+    }
+
+    /// A repository the provenance or landed read may not examine (here:
+    /// untrusted) is a tool error naming why, not an all-null "unexamined"
+    /// record or an answer whose only sign of refusal is an `error` field.
+    #[test]
+    fn provenance_and_landed_on_an_untrusted_repository_are_tool_errors() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status_locked()
+            .unwrap()
+            .success());
+        for (tool, arguments) in [
+            (
+                "gitpulse_provenance",
+                json!({
+                    "repo_path": repo.path().to_str().unwrap(),
+                    "commit_sha": "0000000000000000000000000000000000000000",
+                }),
+            ),
+            (
+                "gitpulse_landed",
+                json!({ "repo_path": repo.path().to_str().unwrap(), "commit": "HEAD" }),
+            ),
+        ] {
+            let (is_error, body) = tool_json(tool, arguments);
+            assert!(is_error, "{tool}: {body}");
+            assert!(
+                body.as_str()
+                    .is_some_and(|m| m.contains("REPOSITORY_TRUST_REQUIRED")),
+                "{tool}: {body}"
+            );
+        }
     }
 
     fn task_fixture() -> (tempfile::TempDir, tempfile::TempDir, String) {

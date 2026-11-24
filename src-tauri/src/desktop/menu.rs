@@ -46,16 +46,17 @@ const REPO_TAB_BINDINGS: &[(&str, &str, &str)] = &[
 ];
 const _: () = assert!(REPO_TAB_BINDINGS.len() == 9);
 
-/// View-menu digit shortcuts on macOS: ⌥⌘1–3. Never ⌘⇧3, ⌘⇧4 or ⌘⇧5, which
+/// View-menu digit shortcuts on macOS: ⌥⌘1–4. Never ⌘⇧3, ⌘⇧4 or ⌘⇧5, which
 /// are the system screenshot shortcuts, and never plain ⌥1–3, which are the
 /// section chords the webview owns.
 const VIEW_TAB_BINDINGS_MACOS: &[(&str, &str, &str)] = &[
     (actions::TAB_CODE, "Code", "CmdOrCtrl+Alt+1"),
     (actions::TAB_HISTORY, "History", "CmdOrCtrl+Alt+2"),
     (actions::TAB_INSIGHTS, "Insights", "CmdOrCtrl+Alt+3"),
+    (actions::TAB_MAVI, "Mavi", "CmdOrCtrl+Alt+4"),
 ];
 
-/// View-menu digit shortcuts on Windows and Linux: Ctrl+Shift+1–3. Not
+/// View-menu digit shortcuts on Windows and Linux: Ctrl+Shift+1–4. Not
 /// Ctrl+Alt+digit, which is AltGr on many keyboard layouts and so types a
 /// character instead of reaching the menu; not Alt+digit, which the webview
 /// owns for sections. Ctrl+Shift is also the off-macOS convention the
@@ -64,6 +65,7 @@ const VIEW_TAB_BINDINGS_OTHER: &[(&str, &str, &str)] = &[
     (actions::TAB_CODE, "Code", "Ctrl+Shift+1"),
     (actions::TAB_HISTORY, "History", "Ctrl+Shift+2"),
     (actions::TAB_INSIGHTS, "Insights", "Ctrl+Shift+3"),
+    (actions::TAB_MAVI, "Mavi", "Ctrl+Shift+4"),
 ];
 
 /// Nine digits are available; consolidation frees them as views merge, and
@@ -323,7 +325,7 @@ pub fn build_native_menu<R: Runtime>(
     let sep_one = PredefinedMenuItem::separator(app)?;
     let fleet_item = item(app, actions::FLEET, "Fleet", Some(FLEET_ACCEL))?;
     let agents_item = item(app, actions::AGENTS, "Agents", Some(AGENTS_ACCEL))?;
-    let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
+    let terminal_item = item(app, actions::TERMINAL_DOCK, "Dock", Some("Ctrl+`"))?;
     let sep_two = PredefinedMenuItem::separator(app)?;
     let search_item = item(
         app,

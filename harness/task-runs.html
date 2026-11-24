@@ -2,7 +2,8 @@
 <html class="dark"><head><meta charset="utf-8" /><title>Task terminal handoff verification</title></head>
 <body style="margin:0"><div id="app"></div><button id="check" style="position:fixed;top:8px;right:8px;z-index:100">Run handoff checks</button><pre id="result" style="position:fixed;top:42px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:650px;white-space:pre-wrap"></pre>
 <script type="module">
-  import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
+  import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput, pushOutput, emitExit } from "./tauriMocks";
   import { emit } from "@tauri-apps/api/event";
   import "../src/app.css";
   import { describeForeground, focusChanges, holdForeground } from "./foreground";
@@ -41,7 +42,7 @@
   addEventListener("error", event => { report.errors.push(event.message); show(); });
   addEventListener("unhandledrejection", event => { report.errors.push(String(event.reason)); show(); });
   const record = item => JSON.stringify({ok:true,item});
-  mockIPCWithEvents(async (cmd, args) => {
+  mockIPC(async (cmd, args) => {
     if (cmd === "cmd_pick_folder") return "/fixture/GitPulse";
     if (cmd === "cmd_workbench_request") {
       const input = JSON.parse(args.input);
@@ -171,7 +172,7 @@
       case "cmd_repo_operation":return null;
       default:throw new Error(`Unconfigured native command: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
   const {mount}=await import("svelte");
   const {interfaceStore}=await import("../src/lib/stores/interfaceStore");
   const {repoStore}=await import("../src/lib/stores/repoStore");
@@ -193,6 +194,7 @@
     }
     iterations++;await new Promise(r=>setTimeout(r,25));}};
   const pause=ms=>new Promise(r=>setTimeout(r,ms));
+  const dockMenu=async testid=>{[...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click();await pause(250);document.querySelector(`[data-testid="${testid}"]`).click();await pause(250);};
   // How much `count` grew over `ms` in which the window's focus held still. A
   // focus change wakes the pane, which rightly refreshes at once; that is not
   // polling, so a disturbed window is measured again. Three in a row fail
@@ -428,7 +430,7 @@
           get(promptState).options.mode==="confirm"&&get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);
         check("Declining keeps the agent running and its tab open",report.kills===0&&document.querySelector('textarea[aria-label="Terminal input"]'));
-        document.querySelector('[aria-label="All terminal sessions"]').click();
+        await dockMenu("terminal-session-count");
         const listed=await (async()=>{let row=null;await wait(()=>{row=[...(document.querySelector('[aria-label="Sessions across repositories"]')?.children??[])].find(el=>el.textContent.includes(task.title));return row;});return row;})();
         check("The Sessions list names the task a session is working on",listed.textContent.includes("task run"));
         [...listed.querySelectorAll("button")].find(el=>el.textContent.trim()==="Close session").click();
@@ -436,7 +438,7 @@
         check("Closing it from the Sessions list asks the same question",get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);
         check("Declining there stops nothing",report.kills===0);
-        document.querySelector('[aria-label="All terminal sessions"]').click();await pause(50);
+        await dockMenu("terminal-session-count");await pause(50);
         button("Stop agent").click();await wait(()=>get(promptState));
         check("Stop agent in the task's pane asks the same question first",get(promptState).options.message.includes("ends this run")&&report.kills===0);
         completePrompt(false);await pause(150);

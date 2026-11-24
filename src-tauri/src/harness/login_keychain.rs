@@ -98,8 +98,16 @@ mod tests {
     fn the_hermetic_test_home_is_refused() {
         let account = account_home().expect("the password database names this user's home");
         let why = refusal().expect("the hermetic HOME must not reach the login Keychain");
-        assert!(why.contains("not the account's home"), "{why}");
-        assert!(why.contains(&account.display().to_string()), "{why}");
+        // The messages name what is missing without echoing `why`, which
+        // carries the account's home path, into the test log.
+        assert!(
+            why.contains("not the account's home"),
+            "the refusal does not say the HOME is not the account's home"
+        );
+        assert!(
+            why.contains(&account.display().to_string()),
+            "the refusal does not name the account's home"
+        );
     }
 
     #[test]

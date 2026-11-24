@@ -9,6 +9,8 @@
 
 use crate::procguard::LockedSpawn;
 pub(crate) mod env;
+#[cfg(target_os = "macos")]
+pub(crate) mod fsmonitor;
 
 /// Converts a filesystem path to forward-slash POSIX notation so Git hooks and
 /// `diff.<driver>.textconv` scripts execute identically on Unix and Git for
@@ -572,6 +574,9 @@ mod pin_adversary_tests;
 
 #[cfg(test)]
 mod config_value_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+mod fsmonitor_tests;
 
 #[cfg(test)]
 mod fs_time_tests;
@@ -1559,6 +1564,35 @@ mod diskio_guard {
     }
 
     #[test]
+    fn the_measured_suite_total_stays_under_the_budget() {
+        // The whole lib suite is one process. Measured 2026-11-23: about
+        // 10.2 GiB for the coverage suite (scaled from where runs 45268885253
+        // and 45270424352 crossed the old 8 GiB), 9623 MiB for its tests
+        // measured alone, and over 8196 MiB for the Ubuntu suite (run
+        // 45266451066). Each must fit, written slowly enough that only the
+        // total is judged; twice the coverage suite must still abort.
+        let limits = diskio::limits(None).expect("the guard is on by default");
+        for (what, mib) in [
+            ("the coverage suite", 10_445),
+            ("the tests measured alone", 9_623),
+            ("the Ubuntu suite at its old abort", 8_196),
+        ] {
+            let healthy = [at(0, 0), at(2_400, mib)];
+            assert!(
+                diskio::verdict(&healthy, &limits).is_none(),
+                "{what}'s {mib} MiB was treated as a runaway"
+            );
+        }
+        let twice = [at(0, 0), at(4_800, 2 * 10_445)];
+        let why = diskio::verdict(&twice, &limits).expect("twice the suite aborts");
+        assert!(why.contains("budget"), "{why}");
+        assert!(
+            !why.contains("MiB/s"),
+            "the total, not the rate, aborts it: {why}"
+        );
+    }
+
+    #[test]
     fn the_budget_setting_can_tighten_or_disable_but_never_silently_disable() {
         assert!(diskio::limits(None).is_some());
         assert_eq!(diskio::limits(Some("0")), None);
@@ -1613,6 +1647,21 @@ mod diskio_guard {
             "a child's 128 MiB was charged to this process: the counter moved {} bytes",
             after.saturating_sub(before)
         );
+    }
+
+    /// The running total is printed once per 512 MiB passed, at the multiple
+    /// reached, and never for a sample that passed none.
+    #[test]
+    fn milestones_are_printed_once_per_multiple_passed() {
+        let step = diskio::MILESTONE_EVERY;
+        assert_eq!(diskio::milestone_passed(0, step - 1), None);
+        assert_eq!(diskio::milestone_passed(0, step), Some(step));
+        assert_eq!(diskio::milestone_passed(step, step + MIB), None);
+        assert_eq!(
+            diskio::milestone_passed(step + MIB, 3 * step + 1),
+            Some(3 * step)
+        );
+        assert_eq!(diskio::milestone_passed(3 * step, 2 * step), None);
     }
 
     /// Runs only as the child of the test below: writes until something stops it.

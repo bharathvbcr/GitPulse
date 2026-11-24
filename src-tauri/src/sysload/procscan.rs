@@ -1705,10 +1705,18 @@ pub(crate) struct AgentThrottleCandidate {
     /// directory under the Cargo registry, outside every repository; the
     /// `cargo` that started it is where the work belongs.
     pub lineage_cwds: Vec<String>,
+    /// Process ids of this process's ancestors, nearest first, up to and
+    /// including the session root (at most `MAX_ANCESTOR_PIDS`). The steward
+    /// uses them to tell a child that inherited background priority from a
+    /// process it throttled apart from one someone else backgrounded.
+    pub ancestor_pids: Vec<i32>,
 }
 
 /// Most ancestor working directories one candidate carries.
 const MAX_LINEAGE_CWDS: usize = 8;
+
+/// Most ancestor process ids one candidate carries.
+const MAX_ANCESTOR_PIDS: usize = 8;
 
 /// Returns live current-user worker processes belonging to active agent session
 /// trees (`Claude`, `Codex`, `Antigravity`, `DevCouncil`), excluding GitPulse
@@ -1804,6 +1812,7 @@ impl Scanner {
                 .map(|p| p.to_string_lossy().into_owned());
             let effective_cwd = own_cwd.or_else(|| session_cwds.get(s_idx).cloned().flatten());
             let lineage_cwds = self.lineage_cwds(i, root_i, &mut ancestor_cwds);
+            let ancestor_pids = self.ancestor_pids(i, root_i);
             out.push(AgentThrottleCandidate {
                 pid: f.pid,
                 start_us: f.start_us,
@@ -1813,6 +1822,7 @@ impl Scanner {
                 session_cwd: effective_cwd,
                 is_session_root: false,
                 lineage_cwds,
+                ancestor_pids,
             });
         }
         Ok(out)
@@ -1848,6 +1858,22 @@ impl Scanner {
                     }
                 }
             }
+            if p == root_i {
+                break;
+            }
+            at = self.parent_of(p);
+        }
+        out
+    }
+
+    /// Process ids of `i`'s ancestors, nearest first, through the session
+    /// root `root_i`, bounded by `MAX_ANCESTOR_PIDS`.
+    fn ancestor_pids(&self, i: usize, root_i: usize) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = self.parent_of(i);
+        for _ in 0..MAX_DEPTH.min(MAX_ANCESTOR_PIDS) {
+            let Some(p) = at else { break };
+            out.push(self.facts[p].pid);
             if p == root_i {
                 break;
             }
@@ -2321,6 +2347,11 @@ pub(crate) struct ProcessUse {
     pub exe: Option<String>,
     pub argv: Option<Vec<String>>,
     pub env: Option<Vec<String>>,
+    /// What the process is and which reads failed, when one did ("1412
+    /// systemd: environ EACCES, cwd"). Said in a refusal so a person can tell
+    /// which process holds the directory. `None` where the OS reader does not
+    /// say.
+    pub detail: Option<String>,
 }
 
 impl ProcessUse {
@@ -2339,6 +2370,9 @@ pub(crate) struct DirUse {
     /// The user's own processes whose arguments or environment could not be
     /// read, so they cannot be shown not to use the directory.
     pub unreadable: Vec<i32>,
+    /// For each of `unreadable`, in order, what was read of it: its pid, and
+    /// its name and the reads that failed where the OS reader said.
+    pub unreadable_notes: Vec<String>,
     /// Other users' processes, which are not inspected.
     pub other_users: usize,
 }
@@ -2366,9 +2400,25 @@ impl DirUse {
             ));
         }
         (!self.unreadable.is_empty()).then(|| {
+            const NAMED: usize = 8;
+            let shown: Vec<String> = self
+                .unreadable
+                .iter()
+                .enumerate()
+                .take(NAMED)
+                .map(|(at, pid)| {
+                    self.unreadable_notes
+                        .get(at)
+                        .cloned()
+                        .unwrap_or_else(|| pid.to_string())
+                })
+                .collect();
+            let more = self.unreadable.len().saturating_sub(NAMED);
             format!(
-                "{} of your processes could not be read, so none of them can be shown not to use it",
-                self.unreadable.len()
+                "{} of your processes could not be read, so none of them can be shown not to use it (pids {}{})",
+                self.unreadable.len(),
+                shown.join(", "),
+                if more > 0 { format!(" and {more} more") } else { String::new() }
             )
         })
     }
@@ -2576,6 +2626,12 @@ pub(crate) fn dir_use_in(dir: &Path, table: &[ProcessUse], me: i32) -> DirUse {
             // for a directory removed under a process, so that case reads as a
             // user of that path; a failed lookup is what lands here.)
             out.unreadable.push(process.pid);
+            out.unreadable_notes.push(
+                process
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| process.pid.to_string()),
+            );
         }
     }
     out
@@ -2769,6 +2825,61 @@ pub(crate) fn parse_status_uids(status: &str) -> Option<Creds> {
         saved: ids.next()??,
     })
 }
+
+/// A capability set line of `/proc/<pid>/status` (`CapPrm:`, `CapEff:`), a
+/// 64-bit hexadecimal mask. `None` when the line is absent or malformed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_status_caps(status: &str, field: &str) -> Option<u64> {
+    let value = status.lines().find_map(|l| l.strip_prefix(field))?;
+    u64::from_str_radix(value.trim(), 16).ok()
+}
+
+/// The four ids of a `Uid:` or `Gid:` line of `/proc/<pid>/status`: real,
+/// effective, saved and filesystem. `None` when the line is absent or short.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_status_ids(status: &str, field: &str) -> Option<[u32; 4]> {
+    let line = status.lines().find_map(|l| l.strip_prefix(field))?;
+    let mut ids = line.split_whitespace().map(|v| v.parse::<u32>().ok());
+    Some([ids.next()??, ids.next()??, ids.next()??, ids.next()??])
+}
+
+/// Whether Linux's `__ptrace_may_access` lets a reader whose filesystem ids
+/// are `reader_fsuid` / `reader_fsgid` inspect a process with these ids
+/// without privilege: the reader's fsuid must equal the target's real,
+/// effective and saved uid, and its fsgid the target's real, effective and
+/// saved gid. A process that kept another id in any of those slots, such as
+/// systemd's `(sd-pam)`, which holds on to root to close its PAM session, is
+/// not the reader's to inspect, whatever user `/proc/<pid>` is owned by.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn ids_admit_reader(
+    target_uids: [u32; 4],
+    target_gids: [u32; 4],
+    reader_fsuid: u32,
+    reader_fsgid: u32,
+) -> bool {
+    target_uids[..3].iter().all(|id| *id == reader_fsuid)
+        && target_gids[..3].iter().all(|id| *id == reader_fsgid)
+}
+
+/// Whether a process on the reader's own uid holds capabilities the reader
+/// cannot use: its permitted set is not inside the reader's effective set.
+/// Reads of `/proc/<pid>/environ` and `/proc/<pid>/cwd` are
+/// `PTRACE_MODE_READ_FSCREDS` checks, for which Linux's
+/// `cap_ptrace_access_check` compares against the caller's *effective* set,
+/// and then keeps the process's memory and working directory from the reader
+/// unless the reader has `CAP_SYS_PTRACE` in the process's user namespace.
+/// Asked only after a read was refused, so a reader that had that privilege
+/// would not be asking: the process cannot be inspected without privilege, as
+/// another user's cannot.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn outranks_reader(target_permitted: u64, own_effective: u64) -> bool {
+    target_permitted & !own_effective != 0
+}
+
+/// `PF_KTHREAD` in the flags field of `/proc/<pid>/stat`: a kernel thread,
+/// which has no user memory, arguments or environment of its own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const PF_KTHREAD: u64 = 0x0020_0000;
 
 /// Whether `path` is a dynamic loader (`ld-linux-aarch64.so.1`, `ld.so`,
 /// `ld-2.31.so`): a program run as `ld.so PROGRAM` has the loader as its
@@ -3431,6 +3542,7 @@ mod os {
                 exe: Some(exe),
                 argv: Some(argv),
                 env: Some(env),
+                detail: None,
             }),
             // The kernel refused the argument block. A process that is
             // exiting refuses it too, so ask once more and look at the
@@ -3445,6 +3557,7 @@ mod os {
                     exe: Some(exe),
                     argv: Some(argv),
                     env: Some(env),
+                    detail: None,
                 }),
                 None => basic(pid)
                     .is_some_and(|now| !now.zombie && super::process_exists(pid))
@@ -3639,6 +3752,19 @@ mod os {
 
     pub(super) const SUPPORTED: bool = true;
 
+    /// `EACCES`, `EPERM`, `ESRCH`... for an I/O error from `/proc`, or its
+    /// kind when it carries no errno.
+    fn errno_name(error: &std::io::Error) -> String {
+        match error.raw_os_error() {
+            Some(libc::EACCES) => "EACCES".to_string(),
+            Some(libc::EPERM) => "EPERM".to_string(),
+            Some(libc::ESRCH) => "ESRCH".to_string(),
+            Some(libc::ENOENT) => "ENOENT".to_string(),
+            Some(code) => format!("errno {code}"),
+            None => format!("{:?}", error.kind()),
+        }
+    }
+
     fn read_bounded(path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
         use std::io::Read;
         let mut out = Vec::new();
@@ -3723,6 +3849,8 @@ mod os {
         cpu_ticks: u64,
         start_ticks: u64,
         zombie: bool,
+        /// `PF_KTHREAD` is set: a kernel thread, not a user process.
+        kernel_thread: bool,
     }
 
     fn stat(pid: i32) -> Option<Stat> {
@@ -3736,6 +3864,7 @@ mod os {
         Some(Stat {
             name,
             zombie: fields.first() == Some(&"Z"),
+            kernel_thread: field(6).is_some_and(|flags| flags & super::PF_KTHREAD != 0),
             ppid: field(1).and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             cpu_ticks: field(11)?.saturating_add(field(12)?),
             start_ticks: field(19)?,
@@ -3770,6 +3899,87 @@ mod os {
         std::fs::metadata(format!("/proc/{pid}"))
             .ok()
             .map(|m| m.uid())
+    }
+
+    /// `uid r/e/s/fs gid r/e/s/fs` of `pid`, from its status file.
+    fn credentials_note(pid: i32) -> Option<String> {
+        let raw = read_bounded(&format!("/proc/{pid}/status"), 8192).ok()?;
+        let status = String::from_utf8_lossy(&raw);
+        let join = |ids: [u32; 4]| ids.map(|id| id.to_string()).join("/");
+        let uids = super::parse_status_ids(&status, "Uid:")?;
+        let gids = super::parse_status_ids(&status, "Gid:")?;
+        Some(format!("uid {} gid {}", join(uids), join(gids)))
+    }
+
+    /// Whether the kernel keeps `pid`'s memory and working directory from this
+    /// process without privilege: its credentials are not all this process's
+    /// ([`super::ids_admit_reader`]), or it holds capabilities this process
+    /// lacks ([`super::outranks_reader`]). `false` when either status cannot
+    /// be read: an unexplained refusal stays one.
+    fn withheld_by_kernel(pid: i32) -> bool {
+        let status = |path: &str| -> Option<String> {
+            let raw = read_bounded(path, 8192).ok()?;
+            Some(String::from_utf8_lossy(&raw).into_owned())
+        };
+        let (Some(target), Some(own)) = (
+            status(&format!("/proc/{pid}/status")),
+            status("/proc/self/status"),
+        ) else {
+            return false;
+        };
+        let ids = (
+            super::parse_status_ids(&target, "Uid:"),
+            super::parse_status_ids(&target, "Gid:"),
+            super::parse_status_ids(&own, "Uid:"),
+            super::parse_status_ids(&own, "Gid:"),
+        );
+        if let (Some(uids), Some(gids), Some(own_uids), Some(own_gids)) = ids {
+            if !super::ids_admit_reader(uids, gids, own_uids[3], own_gids[3]) {
+                return true;
+            }
+        }
+        match (
+            super::parse_status_caps(&target, "CapPrm:"),
+            super::parse_status_caps(&own, "CapEff:"),
+        ) {
+            (Some(target_permitted), Some(own_effective)) => {
+                super::outranks_reader(target_permitted, own_effective)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the kernel keeps `pid`'s memory and working directory from its
+    /// own user because `pid` is not dumpable: it changed credentials without
+    /// exec'ing (PAM's `(sd-pam)`, forked by systemd as root and dropped to
+    /// the user), it marked itself so (`ssh-agent`, `gpg-agent`,
+    /// `prctl(PR_SET_DUMPABLE, 0)`), or it runs a set-id program.
+    ///
+    /// The kernel says so in `/proc` itself: `task_dump_owner` gives such a
+    /// process's files (`environ`, `status`, ...) to root while `/proc/<pid>`
+    /// stays the user's. That is the case asked here: `/proc/<pid>` ours,
+    /// `/proc/<pid>/environ` root's. A reader that is root learns nothing
+    /// from it and never asks. A process in another user namespace has its
+    /// files given to that namespace's root instead, which is not 0 here, so
+    /// it is not explained by this and stays unproven.
+    ///
+    /// This is separate from [`withheld_by_kernel`]: a process whose ids are
+    /// all the user's and that holds no capability the reader lacks is still
+    /// withheld when it is not dumpable, which neither the id nor the
+    /// capability rule sees.
+    fn withheld_from_its_user(pid: i32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let me = uid();
+        if me == 0 {
+            return false;
+        }
+        let (Ok(dir), Ok(environ)) = (
+            std::fs::symlink_metadata(format!("/proc/{pid}")),
+            std::fs::symlink_metadata(format!("/proc/{pid}/environ")),
+        ) else {
+            return false;
+        };
+        dir.uid() == me && environ.uid() == 0
     }
 
     fn read_identity(pid: i32, name: String, ours: bool) -> Identity {
@@ -3968,7 +4178,11 @@ mod os {
     /// `None` in the row, never an empty list.
     pub(crate) fn read_use(pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {
         let info = stat(pid)?;
-        if info.zombie {
+        // A kernel thread has no user memory, arguments or environment, and
+        // stands in no directory a person made: it uses nothing. Read as one
+        // of the user's own (running as root) its unreadable environment made
+        // every teardown refuse.
+        if info.zombie || info.kernel_thread {
             return None;
         }
         let cwd = cwd(pid);
@@ -3986,23 +4200,53 @@ mod os {
                 .map(|item| String::from_utf8_lossy(item).into_owned())
                 .collect()
         };
-        let argv = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20)
-            .ok()
-            .map(split);
-        let env = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20)
-            .ok()
-            .map(split);
+        let argv_read = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20);
+        let env_read = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20);
+        let failed: Vec<String> = [("cmdline", &argv_read), ("environ", &env_read)]
+            .into_iter()
+            .filter_map(|(what, read)| {
+                read.as_ref()
+                    .err()
+                    .map(|e| format!("{what} {}", errno_name(e)))
+            })
+            .chain(cwd.is_none().then(|| "cwd".to_string()))
+            .collect();
+        let argv = argv_read.ok().map(split);
+        let env = env_read.ok().map(split);
         // A process that exited while it was read holds nothing to read.
         if (argv.is_none() || env.is_none()) && stat(pid).is_none_or(|now| now.zombie) {
             return None;
         }
+        // On the user's own uid, a read the kernel refused because the process
+        // is not wholly the user's (it kept root as its saved or real id, or
+        // runs with another group), holds capabilities this one lacks (a
+        // helper given file capabilities, an agent a supervisor started
+        // privileged), or is not dumpable so the kernel has given its /proc
+        // files to root (`(sd-pam)` after PAM drops it to the user,
+        // `ssh-agent`, a set-id program) is not a failure to look: the process
+        // cannot be inspected without privilege, as another user's cannot, and
+        // is counted as one. A refusal with no such cause stays unproven.
+        let refused = argv.is_none() || env.is_none() || cwd.is_none();
+        let mine = !(refused && (withheld_by_kernel(pid) || withheld_from_its_user(pid)));
+        let detail = refused.then(|| {
+            let mut note = format!("{pid} {}: {}", info.name, failed.join(", "));
+            // An unexplained refusal names the process's credentials, so the
+            // next reader of the kept reason can see what the kernel compared.
+            if mine {
+                if let Some(ids) = credentials_note(pid) {
+                    note.push_str(&format!(" ({ids})"));
+                }
+            }
+            note
+        });
         Some(super::ProcessUse {
             pid,
-            mine: true,
+            mine,
             cwd,
             exe: exe_path(pid),
             argv,
             env,
+            detail,
         })
     }
 
@@ -4282,6 +4526,7 @@ pub(crate) mod tests {
             exe: Some(exe.into()),
             argv: Some(argv.iter().map(|a| (*a).into()).collect()),
             env: Some(env.iter().map(|e| (*e).into()).collect()),
+            detail: None,
         }
     }
 
@@ -4465,6 +4710,114 @@ pub(crate) mod tests {
         assert_eq!(dir_use_in(dir, &[half], 1).unreadable, vec![7]);
     }
 
+    #[test]
+    fn a_kept_directory_names_the_unreadable_pids() {
+        let dir = Path::new("/work/x");
+        let table: Vec<ProcessUse> = (10..22)
+            .map(|pid| ProcessUse {
+                pid,
+                mine: true,
+                ..Default::default()
+            })
+            .collect();
+        let why = dir_use_in(dir, &table, 1).why_kept().expect("kept");
+        assert!(
+            why.starts_with("12 of your processes could not be read"),
+            "{why}"
+        );
+        assert!(
+            why.ends_with("(pids 10, 11, 12, 13, 14, 15, 16, 17 and 4 more)"),
+            "{why}"
+        );
+        let one = dir_use_in(dir, &table[..1], 1).why_kept().expect("kept");
+        assert!(one.ends_with("(pids 10)"), "{one}");
+        // Where the OS reader said what it is and which reads failed, that is
+        // what the refusal names.
+        let described = ProcessUse {
+            pid: 1412,
+            mine: true,
+            detail: Some("1412 systemd: environ EACCES, cwd".into()),
+            ..Default::default()
+        };
+        let reading = dir_use_in(dir, &[described, table[0].clone()], 1);
+        assert_eq!(reading.unreadable, vec![1412, 10]);
+        let why = reading.why_kept().expect("kept");
+        assert!(
+            why.ends_with("(pids 1412 systemd: environ EACCES, cwd, 10)"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn status_capability_sets_parse_and_compare_as_the_kernel_does() {
+        let status = "Name:\tx\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\n\
+                      CapEff:\t000001fffeffffff\n";
+        assert_eq!(parse_status_caps(status, "CapPrm:"), Some(0x1ff_ffff_ffff));
+        assert_eq!(parse_status_caps(status, "CapEff:"), Some(0x1ff_feff_ffff));
+        assert_eq!(parse_status_caps(status, "CapBnd:"), None);
+        assert_eq!(parse_status_caps("CapPrm:\tzz\n", "CapPrm:"), None);
+        // A process with a capability the reader's effective set lacks
+        // outranks it (measured: a container's init holding CAP_SYS_RESOURCE,
+        // bit 24, which the reader had dropped). A capability the reader only
+        // holds as permitted, not effective, does not count for the
+        // FSCREDS reads of /proc.
+        assert!(outranks_reader(0x1ff_ffff_ffff, 0x1ff_feff_ffff));
+        assert!(outranks_reader(1 << 24, 0));
+        assert!(!outranks_reader(1 << 24, 1 << 24));
+        // No capabilities at all, the common case: nothing outranks anything.
+        assert!(!outranks_reader(0, 0));
+        assert!(!outranks_reader(0, 1 << 3));
+    }
+
+    #[test]
+    fn a_process_that_kept_another_id_is_not_the_readers_to_inspect() {
+        let status = "Name:\t(sd-pam)\nUid:\t1001\t1001\t0\t1001\nGid:\t1001\t1001\t1001\t1001\n";
+        let uids = parse_status_ids(status, "Uid:").expect("uids");
+        let gids = parse_status_ids(status, "Gid:").expect("gids");
+        assert_eq!(uids, [1001, 1001, 0, 1001]);
+        // A process that kept root as its saved uid (a set-id program midway
+        // through dropping privilege). Linux requires each of real, effective
+        // and saved to match the reader's filesystem id. (The runner's
+        // `(sd-pam)` is not this case: CI printed its ids as all 1001; it is
+        // refused because it is not dumpable, which `withheld_from_its_user`
+        // reads off its /proc files' owner.)
+        assert!(!ids_admit_reader(uids, gids, 1001, 1001));
+        assert!(ids_admit_reader([1001; 4], [1001; 4], 1001, 1001));
+        assert!(!ids_admit_reader(
+            [1001; 4],
+            [1001, 27, 1001, 1001],
+            1001,
+            1001
+        ));
+        // The filesystem id is the reader's, not the target's.
+        assert!(ids_admit_reader([1001, 1001, 1001, 0], [5; 4], 1001, 5));
+        assert_eq!(parse_status_ids("Uid:\t1\t2\n", "Uid:"), None);
+    }
+
+    /// A kernel thread is never a row of the use table: it has no user memory
+    /// to read and stands in no directory. Read as the user's own (as root),
+    /// it made every teardown refuse with "N of your processes could not be
+    /// read". `kthreadd` is pid 2 wherever kernel threads are visible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_thread_is_not_read_as_a_process_that_could_use_a_directory() {
+        let flags = std::fs::read_to_string("/proc/2/stat").ok().and_then(|s| {
+            let rest = s.get(s.rfind(')')? + 1..)?.to_string();
+            rest.split_whitespace().nth(6)?.parse::<u64>().ok()
+        });
+        if !flags.is_some_and(|f| f & PF_KTHREAD != 0) {
+            eprintln!("skipped: pid 2 is not a visible kernel thread here");
+            return;
+        }
+        let mut buf = Vec::new();
+        assert!(os::read_use(2, &mut buf).is_none());
+        let table = read_use_table().expect("table");
+        assert!(
+            table.iter().all(|row| row.pid != 2),
+            "kthreadd in the use table"
+        );
+    }
+
     fn unreadable_row(pid: i32) -> ProcessUse {
         ProcessUse {
             pid,
@@ -4481,6 +4834,7 @@ pub(crate) mod tests {
             exe: Some("/bin/tool".into()),
             argv: Some(vec!["tool".into()]),
             env: Some(Vec::new()),
+            detail: None,
         }
     }
 
@@ -4693,6 +5047,7 @@ pub(crate) mod tests {
             exe: Some("/bin/tool".into()),
             argv: Some(vec!["t".into()]),
             env: Some(vec![]),
+            detail: None,
         };
         let reading = dir_use_in(dir, std::slice::from_ref(&hidden), 1);
         assert_eq!(reading.unreadable, vec![7]);
@@ -4830,6 +5185,100 @@ pub(crate) mod tests {
             command.env("CARGO_TARGET_DIR", scratch);
         }
         command.spawn_locked().expect("spawn")
+    }
+
+    /// The child for the test below: marks itself not dumpable, as
+    /// `ssh-agent` does and as `(sd-pam)` is after PAM drops it to the user,
+    /// then holds still until its stdin closes. Only with
+    /// `GITPULSE_NOT_DUMPABLE_CHILD` set; as an ordinary test it does nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn not_dumpable_child_holds_still_until_stdin_closes() {
+        if std::env::var_os("GITPULSE_NOT_DUMPABLE_CHILD").is_none() {
+            return;
+        }
+        // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` takes no pointers and changes
+        // only this process's dumpable flag.
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0)");
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+    }
+
+    /// A process of the user's own uid that the kernel will not let its user
+    /// inspect, because it is not dumpable, is counted like another user's
+    /// process, not left unproven: on GitHub's ubuntu runner `(sd-pam)` is one,
+    /// and it held every worktree teardown ("1 of your processes could not be
+    /// read"). The same child left dumpable is still read in full.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_the_kernel_withholds_from_its_own_user_is_counted_not_unproven() {
+        use crate::procguard::LockedSpawn;
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root can read a process that is not dumpable");
+            return;
+        }
+        let spawn = |not_dumpable: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    if not_dumpable {
+                        "sysload::procscan::tests::not_dumpable_child_holds_still_until_stdin_closes"
+                    } else {
+                        "sysload::procscan::tests::directory_use_child_holds_still_until_stdin_closes"
+                    },
+                    "--nocapture",
+                ])
+                .env(
+                    if not_dumpable { "GITPULSE_NOT_DUMPABLE_CHILD" } else { "GITPULSE_DIR_USE_CHILD" },
+                    "1",
+                )
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn_locked().expect("spawn")
+        };
+        let mut withheld = spawn(true);
+        let mut plain = spawn(false);
+        let (withheld_pid, plain_pid) = (
+            i32::try_from(withheld.id()).unwrap(),
+            i32::try_from(plain.id()).unwrap(),
+        );
+        // The child is withheld once its own environment is closed to us.
+        let closed =
+            crate::test_support::env::wait_until(std::time::Duration::from_secs(20), || {
+                std::fs::read(format!("/proc/{withheld_pid}/environ"))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            });
+        let mut buf = Vec::new();
+        let withheld_row = os::read_use(withheld_pid, &mut buf);
+        let plain_row = os::read_use(plain_pid, &mut buf);
+        let reading = dir_use(Path::new("/nonexistent-gitpulse-test-dir")).expect("scan");
+        for child in [&mut withheld, &mut plain] {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(closed, "the child never became not dumpable");
+        let withheld_row = withheld_row.expect("the not-dumpable child is a row");
+        assert!(withheld_row.env.is_none(), "{withheld_row:?}");
+        assert!(
+            !withheld_row.mine && !withheld_row.unproven(),
+            "counted like another user's process, not unproven: {withheld_row:?}"
+        );
+        assert!(
+            !reading.unreadable.contains(&withheld_pid),
+            "{:?}",
+            reading.unreadable_notes
+        );
+        let plain_row = plain_row.expect("the plain child is a row");
+        assert!(plain_row.mine && !plain_row.unproven(), "{plain_row:?}");
+        assert!(
+            plain_row.env.is_some(),
+            "a dumpable child is still read in full"
+        );
     }
 
     /// The same shape against real processes: neither child stands in the

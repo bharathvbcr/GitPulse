@@ -3895,7 +3895,7 @@ pub(crate) mod tests {
         .unwrap_err();
         assert!(
             ninth_err.contains("already has 8 active child sessions (limit 8)"),
-            "unexpected error: {ninth_err}"
+            "the ninth child was not refused for the 8-session limit"
         );
 
         // Option A: Parent B cannot close Parent A's child, and Parent A cannot close user_shell or itself.
@@ -4043,9 +4043,11 @@ pub(crate) mod tests {
             )
         };
         let refusal = close().unwrap_err();
+        // The message says what is missing; the refusal names the repository
+        // path and the session, which stay out of the test log.
         assert!(
             refusal.contains("is protected") && refusal.contains(&child),
-            "{refusal}"
+            "the refusal does not say the child session is protected"
         );
         assert!(
             ui.closed.lock().unwrap().is_empty(),

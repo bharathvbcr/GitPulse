@@ -16,7 +16,7 @@
  * Nothing here executes git.
  */
 import "../src/app.css";
-import { mockIPCWithEvents } from "./tauriMocks";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { createChecks } from "./checks.ts";
 
 const errors = [];
@@ -41,7 +41,7 @@ const guarded = output => ({ policy: null, output });
 let reviewStatus = "unreviewed", ancestry = true, rangeTruncated = false;
 const rangeCalls = [];
 const reviewRecord = () => ({ run_id: "att", branch: "gitpulse/att", base_oid: "a".repeat(40), head_oid: "c".repeat(40), files_changed: 2, ended: true, review: reviewStatus === "approved" ? { status: "approved", note: null } : { status: "unreviewed" }, gate_on: true, gate_error: null });
-mockIPCWithEvents(async (cmd, args) => {
+mockIPC(async (cmd, args) => {
   switch (cmd) {
     case "cmd_resolve_repo": return { path: args.repoPath ?? args.path, name: "repo", is_bare: false, common_dir: String(args.repoPath ?? args.path).endsWith("/att") ? `${A}/.git` : undefined };
     case "cmd_repository_trust": await parkIfHeld("trust"); if (failNext.trust) { delete failNext.trust; throw new Error("trust check refused by fixture"); } return { path: args.repoPath, git_dir: `${args.repoPath}/.git`, common_dir: `${args.repoPath}/.git`, identity: "fixture", scope: "repository", worktrees: 3 };
@@ -84,7 +84,7 @@ mockIPCWithEvents(async (cmd, args) => {
     case "cmd_deadbranch_list_backups": await parkIfHeld(`backups:${args.repoPath}`); return backupsFor(args.repoPath);
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
-});
+}, { shouldMockEvents: true });
 const { mount, tick } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");

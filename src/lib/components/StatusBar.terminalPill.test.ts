@@ -103,7 +103,7 @@ describe("terminal pill", () => {
     expect(tag).not.toContain("text-[10px]");
     expect(tag).toContain('aria-pressed="false"');
     expect(source).toContain("onclick={toggleDock}");
-    expect(body).toContain(">Terminal<");
+    expect(body).toContain(">Dock<");
     expect(body).not.toContain("No shell");
     expect(body).not.toMatch(/bun|npm test|zsh/);
     expect(handler("toggleDock")).toContain("repoStore.toggleTerminal()");
@@ -149,8 +149,8 @@ describe("terminal pill", () => {
       menuSource.indexOf('data-testid="terminal-pill-menu"'),
       menuSource.length,
     );
-    expect(menu).toContain("Show terminal");
-    expect(menu).toContain("Hide terminal");
+    expect(menu).toContain("Show dock");
+    expect(menu).toContain("Hide dock");
     expect(menu).toContain("Focus session");
     expect(menu).toContain("Switch to ");
     expect(menu).toContain("New {launcherLabel($interfaceStore.terminalLauncher)} session");

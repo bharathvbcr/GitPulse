@@ -1,0 +1,26 @@
+name: Labeler
+
+# Labels a pull request by the paths it changes, from .github/labeler.yml.
+# pull_request_target runs with a write token even for forks, so this job never
+# checks out or runs the pull request's code: actions/labeler reads the changed
+# file list through the API and takes labeler.yml from the base branch.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+# Fail closed: the job gets only what it writes below.
+permissions:
+  contents: read
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          # Do not strip a label a maintainer applied by hand.
+          sync-labels: false

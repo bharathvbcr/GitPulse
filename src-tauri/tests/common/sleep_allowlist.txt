@@ -528,7 +528,7 @@ site | tests/terminal_ipc_latency.rs | writes_queued_or_in_flight_when_a_session
 # tests/terminal_output_emits.rs
 site | tests/terminal_output_emits.rs | Viewer::new | 0 | unbounded-poll
 site | tests/terminal_output_emits.rs | a_one_megabyte_burst_is_byte_exact_in_few_events_with_exact_credit | 0 | bounded-poll
-site | tests/terminal_output_emits.rs | coalesced_late_acknowledgements_across_a_shed_keep_credit_exact | 1 | unbounded-poll
+site | tests/terminal_output_emits.rs | coalesced_late_acknowledgements_across_a_shed_keep_credit_exact | 0 | unbounded-poll
 site | tests/terminal_output_emits.rs | echo_latencies | 0 | spacing
 site | tests/terminal_output_emits.rs | wait_for | 0 | bounded-poll
 

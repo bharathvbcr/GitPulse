@@ -7,7 +7,8 @@
     <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
     <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
     <script type="module">
-      import { mockIPCWithEvents, adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
       import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
@@ -75,7 +76,7 @@
        * openable URL with a query, a repository file with line and column, a
        * refused scheme, and a path that climbs out of the repository. */
       const LINK_LINE = "Links: https://example.com/a?b=1 src/lib/terminal/links.ts:240:5 file:///etc/passwd ../../etc/passwd:1";
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "plugin:opener|open_url": opened.push(args.url ?? args.path); return null;
@@ -228,7 +229,7 @@
             return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      });
+      }, { shouldMockEvents: true });
 
       const { mount } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");
@@ -260,6 +261,10 @@
         const el = label(name) ?? visible("button").find((node) => node.textContent.trim() === name);
         if (!el) throw new Error(`missing control: ${name}`);
         return el;
+      };
+      const dockMenu = async (testid) => {
+        [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click(); await wait();
+        document.querySelector(`[data-testid="${testid}"]`).click(); await wait();
       };
 
       /**
@@ -652,7 +657,7 @@
           await press(document.activeElement, "ArrowRight");
           check("ArrowRight selects next tab and keeps strip focus", () => document.activeElement === visible('[role="tab"]')[1]);
           const beforeHide = report.spawned;
-          button("Hide the terminal dock").click(); await wait();
+          button("Hide the dock").click(); await wait();
           button("Show terminal").click(); await wait();
           check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
           // A double-click on the page hides the dock (the shell keeps running);
@@ -717,15 +722,39 @@
             const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
-            // The addon also adds a 2D link layer (`xterm-link-layer`); the
-            // WebGL canvas is the one without a layer class.
-            const glCanvas = (el) => paneCanvases(el).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            // The WebGL addon draws with two canvases in xterm's screen element:
+            // its GL canvas and a 2D link layer (`xterm-link-layer`); the WebGL
+            // canvas is the one in the screen without a layer class. The shared
+            // glyph atlas's hidden 2D scratch canvas (`TextureAtlas._tmpCanvas`,
+            // drawn in `_drawToCache`; see `paneCanvases`) sits at the root of
+            // whichever terminal last rasterised a new glyph, outside the screen,
+            // until the last terminal using the atlas lets go. It is the atlas's,
+            // not a context the session holds. `paneCanvases` counts every canvas
+            // in the pane but that one, so it includes the screen's: absence is
+            // checked with `paneCanvases` (no drawing canvas left anywhere in the
+            // pane), presence with `holdsGpu` (a canvas in the screen itself).
+            const screenCanvases = (el) => [...el.querySelectorAll(".xterm-screen canvas")];
+            const holdsGpu = (el) => screenCanvases(el).length > 0;
+            const glCanvas = (el) => screenCanvases(el).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
             const frames = (count = 2) => new Promise((resolve) => {
               let left = count;
               const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
               requestAnimationFrame(tick);
             });
             const gpuNote = () => visible("[data-terminal-gpu-note]")[0]?.textContent ?? "";
+            // Waits for a state reached by a timer (the hold's release), up to
+            // `ms`, instead of sleeping a fixed span and looking once: a loaded
+            // runner fires the timer late, and a fixed sleep then reads the
+            // state before it was reached. The deadline is generous; the state
+            // is still required, only its arrival time is not guessed.
+            const settles = async (predicate, ms = 5000) => {
+              const until = performance.now() + ms;
+              while (!predicate()) {
+                if (performance.now() > until) return false;
+                await wait(40);
+              }
+              return true;
+            };
             // A context created before any session's is the oldest one on the
             // page, which is the one a browser force-loses first when the page
             // passes its cap (16 in Chromium and in WebKit). It is never drawn
@@ -766,7 +795,7 @@
             check("the session on screen draws through WebGL", () => {
               const [el] = shown();
               if (shown().length !== 1) throw new Error(`${shown().length} sessions on screen`);
-              return el.dataset.renderer === "webgl" && paneCanvases(el).length > 0;
+              return el.dataset.renderer === "webgl" && holdsGpu(el);
             });
             check("sessions that are not on screen hold no WebGL context", () => {
               const rows = hidden().map((el) => `${el.dataset.renderer}/${paneCanvases(el).length}`);
@@ -779,7 +808,7 @@
             check("the on-screen session's canvas holds a live WebGL2 context", () => !!firstGl && !firstGl.isContextLost());
 
             // -- A tab flick inside the hold keeps the warm context.
-            button("Hide the terminal dock").click(); await wait(150);
+            button("Hide the dock").click(); await wait(150);
             check("hiding the dock keeps the session's context through the hold: same canvas, live, still webgl",
               () => target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
             await showAndProbe();
@@ -789,45 +818,62 @@
               () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const other = shown()[0];
+            const otherCanvas = glCanvas(other);
+            const otherGl = otherCanvas?.getContext("webgl2");
             check("switching tabs gives the other session its own context while this one is held",
               () => other !== target && other.dataset.renderer === "webgl" && target.dataset.renderer === "webgl"
                 && glCanvas(other) !== glCanvas(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(80);
             check("switching back inside the hold reuses this session's canvas, and the other is held, within the cap",
               () => shown()[0] === target && glCanvas(target) === firstCanvas && !firstGl.isContextLost()
-                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2);
+                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2
+                && sessionsAll().filter((el) => glCanvas(el)).length <= 2);
 
             // -- The hold ends: the context is freed on purpose, not left for the collector.
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
-            const otherCanvas = glCanvas(other);
+            // The canvas the other session draws to once shown again inside the
+            // hold, read before it is hidden: the held one, if the hold kept it
+            // (`otherCanvas`, above). Its release detaches it and loses its context.
+            const reshownCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
-            await wait(900);
             // Given up means: back on the DOM renderer, the WebGL canvas it held
             // detached with its context lost, and no drawing canvas left. The
             // shared glyph atlas's scratch canvas may still sit here (see
             // `paneCanvases`); counting it failed this on the Ubuntu runner.
-            // On failure each canvas still in the pane is listed.
+            // The release comes from the hold's timer, which a loaded runner fires
+            // late, so this waits for the state (up to 5 s) instead of sleeping a
+            // fixed span; the state itself is still required. On failure each
+            // canvas still in the pane is listed.
+            const releasedCanvas = (node) => !!node && !other.contains(node) && !node.isConnected && !!node.getContext("webgl2")?.isContextLost();
+            const otherReleased = () => other.dataset.renderer === "dom" && !paneCanvases(other).length && !holdsGpu(other) && !glCanvas(other)
+              && !!otherGl && otherGl.isContextLost() && releasedCanvas(otherCanvas) && releasedCanvas(reshownCanvas);
+            await settles(otherReleased);
             check("a session that stays hidden past the hold gives its context up",
-              () => (other.dataset.renderer === "dom" && !paneCanvases(other).length
-                && !!otherCanvas && !otherCanvas.isConnected && !!otherCanvas.getContext("webgl2")?.isContextLost()) || (() => {
+              () => otherReleased() || (() => {
                 throw new Error(JSON.stringify({
                   renderer: other.dataset.renderer, canvases: paneCanvases(other).length,
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
                   msSinceHidden: Math.round(performance.now() - hiddenAt),
                   survivors: [...other.querySelectorAll("canvas")].map((node) => ({
-                    held: node === otherCanvas, className: node.className, parent: node.parentElement?.className ?? null,
+                    held: node === otherCanvas, reshown: node === reshownCanvas, className: node.className, parent: node.parentElement?.className ?? null,
                     size: `${node.width}x${node.height}`,
                   })),
                   heldCanvasConnected: otherCanvas?.isConnected ?? null,
+                  reshownSameCanvas: reshownCanvas === otherCanvas,
+                  reshownCanvasConnected: reshownCanvas?.isConnected ?? null,
+                  heldContextLost: otherGl?.isContextLost() ?? null,
                 }));
               })());
-            button("Hide the terminal dock").click(); await wait(900);
-            check("hiding the dock past the hold releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length));
+            button("Hide the dock").click();
+            // Strictly no canvas: with every session released the shared atlas has
+            // no owner left, is disposed, and its scratch canvas goes with it.
+            const allReleased = () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length && !el.querySelector("canvas"));
+            await settles(allReleased);
+            check("hiding the dock past the hold releases the on-screen session's context too", allReleased);
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
               () => firstGl.isContextLost());
             await showAndProbe();
@@ -839,7 +885,7 @@
             gpuPolicy.hideGraceMs = 3000;
             const beforeFlicks = glCanvas(target);
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
             }
             await wait(100);
@@ -851,7 +897,7 @@
             gpuPolicy.hideGraceMs = 0;
             const everAttached = [];
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
               const attached = glCanvas(target)?.getContext("webgl2");
               if (attached && !everAttached.includes(attached)) everAttached.push(attached);
@@ -873,7 +919,9 @@
             } else {
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
-            check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1);
+            check("only the session on screen holds a canvas",
+              () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1 && sessionsAll().filter(holdsGpu).length === 1
+                && sessionsAll().filter((el) => glCanvas(el)).length === 1);
 
             // -- The resource profile's cap budgets hidden contexts, never a pane on
             // screen: on the compact budget (two) three more panes beside an anchor
@@ -918,7 +966,7 @@
                     const addon = new WebglAddon();
                     term.loadAddon(addon);
                     churn.created += 1;
-                    pane.canvas = paneCanvases(term.element).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+                    pane.canvas = screenCanvases(term.element).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
                     const gl = pane.canvas.getContext("webgl2");
                     // As TerminalSession.svelte hears it: a loss on this canvas is the session's to count.
                     pane.canvas.addEventListener("webglcontextlost", () => {
@@ -1065,7 +1113,7 @@
               () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost() && gpuNote() === "");
             await loseNow();
             check("the second loss is recoverable too (inside the budget)", () => target.dataset.renderer === "reset");
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !paneCanvases(target).length);
             await showAndProbe(); await wait(100);
             check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
@@ -1073,7 +1121,7 @@
             // session's held one: that ends the hold, it is not a counted loss.
             const graceBefore = gpuPolicy.hideGraceMs;
             gpuPolicy.hideGraceMs = 3000;
-            button("Hide the terminal dock").click(); await wait(100);
+            button("Hide the dock").click(); await wait(100);
             const heldCanvas = glCanvas(target);
             check("a hidden session holds its context through the hold", () => !!heldCanvas && target.dataset.renderer === "webgl");
             heldCanvas.getContext("webgl2").getExtension("WEBGL_lose_context").loseContext();
@@ -1085,7 +1133,7 @@
             await loseNow();
             check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !paneCanvases(target).length && !!domText(target));
             check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             button("Show terminal").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a session past its budget is never re-attached", () => target.dataset.renderer === "lost" && !paneCanvases(target).length && !!domText(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
@@ -1124,12 +1172,12 @@
           }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
-          button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
-          button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          button("Expand the dock").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
+          button("Restore dock size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
           {
             // The resize handle is a WAI-ARIA separator: it reports its value,
             // and the arrow keys nudge the dock without a pointer.
-            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const handle = visible('[role="separator"][aria-label="Resize the dock"]')[0];
             const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
             if (handle) await press(handle, "ArrowUp");
             const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
@@ -1139,10 +1187,10 @@
                 && Math.abs(dock.getBoundingClientRect().height - height) < 1 && Number(handle.getAttribute("aria-valuenow")) === valueBefore);
           }
           button("Toggle narrow layout").click(); await wait();
-          check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
+          check("narrow toolbar stays inside its panel", () => label("Dock").scrollWidth === label("Dock").clientWidth);
           button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
           check("terminal palette follows the completed theme transition", () => getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
-          button("Console").click(); await wait();
+          [...document.querySelectorAll('[data-testid="dock-section-console"]')].find((el) => el.getClientRects().length).click(); await wait();
           check("the console command field has an accessible name", () => !!label("Console command"));
           {
             // Console has no tabs: a tab chord there belongs to the command
@@ -1172,15 +1220,15 @@
             await run("git log");
             check("an incomplete output carries the backend's reason, never an invented cap",
               () => consoleText().includes("[Output is incomplete: the stream was not read to the end]") && !consoleText().includes("exceeded cap") && consoleText().includes("exit 2"));
-            button("Clear")?.click(); await wait();
+            await dockMenu("dock-menu-clear-output");
             check("Clear empties the Console's output", () => !consoleText().includes("On branch main") && !consoleText().includes("the stream was not read"));
           }
-          button("Shell").click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
+          [...document.querySelectorAll('[data-testid="dock-section-shell"]')].find((el) => el.getClientRects().length).click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
           for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
           await wait(); check("font size is bounded", () => button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
           button("Reset terminal text size").click(); await wait();
           const beforeClear = report.spawned;
-          button("Clear scrollback").click(); await wait();
+          await dockMenu("dock-menu-clear-scrollback");
           check("clear keeps the prompt and running session", () => visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
           const aboveGrid = (el) => {
             const chrome = el.getBoundingClientRect();
@@ -1189,12 +1237,12 @@
           };
           check("the dock toolbar has no separate terminal shortcuts button", () => !label("Terminal shortcuts"));
           const beforeOptions = report.spawned;
-          button("Terminal tab options").click(); await wait();
+          await dockMenu("dock-menu-tab-options");
           check("tab options sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal tab name").closest("form")));
           const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
           button("Rename").click(); await wait();
           check("custom tab names survive program titles", () => visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
-          button("Find terminal session").click(); await wait();
+          await dockMenu("dock-menu-find-session");
           check("session search sits above the grid instead of overlapping it", () => aboveGrid(label("Search this repository's terminals")));
           const sessionSearch = label("Search this repository's terminals");
           sessionSearch.value = "Build"; sessionSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
@@ -1229,7 +1277,7 @@
           launcherSearch.value = "shell"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           visible('[aria-label="Session types"] [role="option"]')[0].click(); await wait();
           check("launcher search restores a matching type", () => Boolean(button("New Shell session")));
-          button("Terminal tab options").click(); await wait();
+          await dockMenu("dock-menu-tab-options");
           button("Move terminal tab left").click(); await wait();
           check("tab reorder preserves sessions and selection", () => visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
           await press(label("Terminal tab name"), "Escape");
@@ -1249,7 +1297,7 @@
           button("Close find").click(); interfaceStore.setTerminalDockHeight(400); await wait();
           button("Close split view").click(); await wait();
           check("closing split preserves both sessions", () => visible('[role="tabpanel"]').length === 1 && report.killed === 0);
-          button("All terminal sessions").click(); await wait();
+          await dockMenu("terminal-session-count");
           check("session list sits above the grid instead of overlapping it", () => aboveGrid(label("Sessions across repositories")));
           check("session manager includes both repositories", () => label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
           {
@@ -1300,13 +1348,19 @@
             await wait(40);
           }
           check("global session limit spans both repositories", () => report.spawned === SESSION_LIMIT && button("New Shell session").disabled);
-          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
+          check("the session count names the limit, in the header once every slot is taken",
+            () => visible('[data-testid="dock-session-limit"]')[0]?.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
           // The limit is live: raising it in Settings frees a place at once
           // (a waiting task terminal opens off the same `canCreate`), and
           // lowering it again closes nothing.
           setTerminalSessionLimit(SESSION_LIMIT + 1); await wait();
+          // Below the limit the count is back in the ⋯ menu, not the header.
+          const limitChipGone = !visible('[data-testid="dock-session-limit"]').length;
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
+          const menuCount = document.querySelector('[data-testid="dock-overflow-menu"]')?.textContent ?? "";
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
           check("raising the limit frees a place at once",
-            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
+            () => !button("New Shell session").disabled && limitChipGone && menuCount.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
           setTerminalSessionLimit(undefined); await wait();
           check("lowering it again closes nothing",
             () => button("New Shell session").disabled && report.spawned === SESSION_LIMIT && report.killed === 0);
@@ -1428,7 +1482,7 @@
             const { adoptDetachedSessions, DETACHED_STATUS } = await import("../src/lib/terminal/detachedSessions.ts");
             const adopted = await adoptDetachedSessions();
             check("a session a reload left running is adopted into this page", () => adopted === 1);
-            button("All terminal sessions").click(); await wait();
+            await dockMenu("terminal-session-count");
             const row = [...label("Sessions across repositories").children].find((el) => el.textContent.includes(DETACHED_STATUS));
             check("it is listed as still running", () => Boolean(row));
             const spawnsBeforeAttach = report.spawned;
@@ -1450,7 +1504,7 @@
             const { taskOpenRequest, consumeTaskOpen } = await import("../src/lib/workbench/taskOpen.ts");
             const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
             const handle = terminalSessions.reserve({ key: "fixture-task-tab", repoPath: "/fixture/GitPulse", label: "Claude", title: "Fix the flaky test", taskRunId: "fixture-run", status: "running", close: async () => {} });
-            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            if (!label("Sessions across repositories")) { await dockMenu("terminal-session-count"); }
             const rows = () => [...(label("Sessions across repositories")?.children ?? [])];
             const taskRow = rows().find((el) => el.textContent.includes("Fix the flaky test"));
             const link = taskRow?.querySelector('[data-testid="session-open-task"]');
@@ -1490,7 +1544,7 @@
             while (performance.now() < keptDeadline && (report.detached ?? 0) === detachedBefore) await wait(20);
             check("a busy session in a closed repository tab is detached, never killed",
               () => (report.detached ?? 0) === detachedBefore + 1 && report.killed === killedBefore);
-            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            if (!label("Sessions across repositories")) { await dockMenu("terminal-session-count"); }
             const listedDeadline = performance.now() + 2000;
             const kept = () => [...(label("Sessions across repositories")?.children ?? [])]
               .some((el) => (el.textContent ?? "").includes("not shown in any tab"));
@@ -1501,8 +1555,8 @@
               // An earlier version's host still runs a session: shown apart, stopped and read through its own commands.
               legacySessions = [{ id: "term-9-z", program: "/bin/zsh", cwd: "/fixture/Old", repo: "/fixture/Old", launcher: null, run_id: null, title: "old build", parent_session_id: null, detached: true, ending: false, quiet_ms: 5 }];
               const killsBeforeLegacy = report.killOrigins.length;
-              button("All terminal sessions").click(); await wait(80);
-              button("All terminal sessions").click();
+              await dockMenu("terminal-session-count"); await wait(80);
+              await dockMenu("terminal-session-count");
               const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
               check("a session in the previous version's host is listed apart, as not shown here", () =>
                 Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
@@ -1741,7 +1795,7 @@
           }
           check("a live oversized chunk stays on the status row", () =>
             liveStatus.includes("exceeded its limit") && !liveStatus.includes("This session ended."));
-          button("All terminal sessions").click();
+          if (!label("Sessions across repositories")) await dockMenu("terminal-session-count");
           const listDeadline = performance.now() + 2000;
           let closeSession = null;
           while (performance.now() < listDeadline) {
@@ -1764,6 +1818,9 @@
           }
           check("closing the session keeps the oversized-chunk notice", () =>
             closedStatus.includes("exceeded its limit") && !closedStatus.includes("This session ended."));
+          // Leave the list as the steps after this expect it: closed. (It sits
+          // above the grid, so an open list would shrink every pane below.)
+          if (label("Sessions across repositories")) await dockMenu("terminal-session-count");
           earlyLoss = true;
           button("New Shell session").click();
           const earlyDeadline = performance.now() + 2000;
@@ -1884,13 +1941,13 @@
         await section(async (check) => {
           tabs()[0].click(); await wait(300);
           let mark = resizeLog.length;
-          button("Hide the terminal dock").click(); await wait(400);
+          button("Hide the dock").click(); await wait(400);
           button("Show terminal").click(); await wait(400);
           check(`hiding and showing the dock tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
           check("the grid survives the dock being hidden and shown", () => sameGrid() && shownPanels().every(fitsHeight));
           // Resized while hidden: nothing may be told until it is shown, and
           // then once.
-          button("Hide the terminal dock").click(); await wait(300);
+          button("Hide the dock").click(); await wait(300);
           mark = resizeLog.length;
           await setDockHeight(300);
           check(`a dock resized while hidden tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
@@ -2248,8 +2305,8 @@
             await wait(250);
           }
 
-          const consoleBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
-          const shellModeBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Shell");
+          const consoleBtn = visible('[data-testid="dock-section-console"]')[0];
+          const shellModeBtn = visible('[data-testid="dock-section-shell"]')[0];
           if (
             shellModeBtn &&
             (visible('[data-testid="terminal-active-session-summary"]').length > 0 ||
@@ -2565,7 +2622,7 @@
             );
           });
 
-          const consoleSwitcher = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
+          const consoleSwitcher = visible('[data-testid="dock-section-console"]')[0];
           if (!consoleSwitcher) throw new Error("Missing Console mode toggle button");
           consoleSwitcher.click();
           const summaryBtn = await waitFor(() => visible('button[data-testid="terminal-active-session-summary"]')[0]);
@@ -2666,7 +2723,7 @@
           await wait(120);
 
           const isMacHost = button("Split terminal right").getAttribute("title")?.includes("⌘") ?? true;
-          const panelRegion = visible('[role="region"][aria-label="Terminal"]')[0];
+          const panelRegion = visible('[role="region"][aria-label="Dock"]')[0];
           panelRegion?.dispatchEvent(
             new KeyboardEvent(
               "keydown",
@@ -3323,11 +3380,26 @@
        *
        * A paint is any `onRender`; at each one every row is read back and must
        * carry the same frame number, or a half-drawn frame was shown.
+       *
+       * How many paints "the render rate" is depends on the machine, not on the
+       * writer: software WebGL on a loaded runner draws ~15 frames a second
+       * where the DOM draws 60. So the run also counts the frames it owes:
+       * every animation frame that follows a write xterm has parsed. xterm's
+       * render debouncer paints once in each of those frames unless mode 2026
+       * is on when the frame fires, which is the bug; through the writer every
+       * owed frame must be painted and show a new frame. Direct writes owe as
+       * many frames and paint almost none.
        */
       const SYNC_ROWS = 24;
       const SYNC_COLS = 100;
       const SYNC_FPS = 120;
       const SYNC_MS = 2000;
+      /**
+       * Owed frames a run needs before its paints can tell the writer from the
+       * bug: xterm's own 1000 ms timeout paints about twice in SYNC_MS, so
+       * five times that is a rate the bug cannot reach.
+       */
+      const SYNC_MIN_OWED = 5 * Math.ceil(SYNC_MS / 1000);
       /** The options of TerminalSession's own xterm that could touch painting. */
       const SESSION_LIKE = { lineHeight: 1.15, cursorBlink: true, allowTransparency: true, convertEol: false, allowProposedApi: true };
       const frameText = (id, rows, width) => {
@@ -3376,7 +3448,9 @@
           term.loadAddon(new WebglAddon());
         }
         term.focus();
-        const renderer = paneCanvases(host).length ? "webgl" : "dom";
+        // WebGL only when the screen holds a canvas; DOM only when the pane holds
+        // none at all (the atlas's scratch canvas aside, see `paneCanvases`).
+        const renderer = host.querySelector(".xterm-screen canvas") ? "webgl" : paneCanvases(host).length ? "unknown" : "dom";
         // `onRender` skips redraw-only renders (a blinking cursor asks for them),
         // which still paint whatever a block buffered. What the screen shows is
         // every call into the renderer, so that is what is counted.
@@ -3393,20 +3467,46 @@
           if (seen.some((id) => id !== seen[0])) partial++; else ids.add(seen[0]);
         };
         let acked = 0, received = 0, writes = 0, endedInsideBlock = 0;
+        // Frames owed: a write's parse asks xterm's debouncer for the next
+        // animation frame, so each frame that follows one or more parsed writes
+        // is one xterm will paint, unless mode 2026 is on when it fires. A
+        // parse runs in a task, never between two frame callbacks, so this
+        // loop and xterm's debouncer agree on which frame a write precedes.
+        let frames = 0, owed = 0, parsedSinceFrame = false, counting = true;
+        const countFrame = () => {
+          if (!counting) return;
+          frames++;
+          if (parsedSinceFrame) { owed++; parsedSinceFrame = false; }
+          requestAnimationFrame(countFrame);
+        };
         // xterm's own parser, not this harness's model of it: is mode 2026 on
         // when a write has been parsed? That is the state its animation frame meets.
         const modes = term._core?.coreService?.decPrivateModes;
         if (typeof modes?.synchronizedOutput !== "boolean") throw new Error("xterm's synchronized-output flag is not where this harness looks for it");
-        const write = (bytes, written) => term.write(bytes, () => { writes++; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
+        const write = (bytes, written) => term.write(bytes, () => { writes++; parsedSinceFrame = true; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
         const writer = createSyncFrameWriter({ write });
         await new Promise((resolve) => requestAnimationFrame(() => resolve()));
         const base = paints;
-        const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
+        // `frames` is also the page's own render rate during the run: xterm
+        // paints at most once per animation frame, and a loaded runner on
+        // software WebGL gets far fewer than 60 a second.
+        requestAnimationFrame(countFrame);
+        const framesSent = Math.round(SYNC_FPS * SYNC_MS / 1000);
+        const sent = await deliver(frameStream(framesSent), SYNC_MS, (chunk) => {
           received += chunk.length;
           const done = () => { acked += chunk.length; };
           if (viaWriter) writer.push(chunk, done); else write(chunk, done);
         });
-        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
+        // The last chunks may still be queued in xterm's write buffer: wait
+        // for every write callback, then for the frame that follows the last
+        // parse (its callbacks, ours and xterm's paint, all run before this
+        // timeout), so the tail is counted on both sides. A backlog that never
+        // drains is the ack check's to report.
+        for (const until = performance.now() + 5000; acked < received && performance.now() < until;) await wait(5);
+        await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+        // Read in the task the loop stops in: no frame runs in between.
+        counting = false;
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, frames, owed, framesSent, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
         await wait(1300);
         out.paintsAfterAnother1p3s = paints - base;
         out.partialPaints = partial;
@@ -3490,7 +3590,25 @@
             // The direct arm's count (0 on Chrome, 0 to 10 on WebKit, against ~120)
             // is reported in the verdict's diagnostics, not asserted: it is
             // xterm's bug, and a fixed xterm would make it converge on this one.
-            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames)`, () => after.paints >= 40 && after.distinctFrames >= 40);
+            // The premise: the page drew frames at all, and the run gave xterm
+            // enough frames to paint that the bug's ~1 paint a second cannot
+            // pass for the writer's.
+            check(`${tag}: the page drew frames during the run, so it has a render rate to keep (${after.frames} animation frames)`, () => after.frames >= 10);
+            check(`${tag}: the run owed xterm enough frames to tell the writer from the bug (${after.owed} owed of ${after.frames} frames; at least ${SYNC_MIN_OWED})`, () => after.owed >= SYNC_MIN_OWED);
+            // Against the frames the page could show (the fewer of the animation
+            // frames it got and the frames sent), not a fixed count. Through the
+            // writer the DOM renderer paints about once per animation frame, and
+            // software WebGL (CI, a headless container) about every other one;
+            // the bug this guards paints about once a second, ~2 in the whole
+            // run. A quarter of the showable frames is an order of magnitude
+            // above the bug on any host that drew 10 frames, where a fixed 40
+            // failed a loaded runner that only drew ~70 at all.
+            const showable = Math.min(after.frames, after.framesSent);
+            const floor = Math.ceil(showable / 4);
+            check(`${tag}: through the writer it paints at least a quarter of the frames the page could show (${after.paints} paints, ${after.distinctFrames} distinct frames, of ${showable} showable; at least ${floor})`, () => after.paints >= floor && after.distinctFrames >= floor);
+            // The render rate is the browser's: every frame that followed a
+            // parsed write is painted, and shows a frame newer than the last.
+            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames, ${after.owed} frames owed; written directly: ${before.paints} paints of ${before.owed} owed)`, () => after.paints >= after.owed && after.distinctFrames >= after.owed);
             check(`${tag}: no write through the writer ends with mode 2026 on in xterm's own parser (${after.endedInsideBlock}/${after.writes}; written directly: ${before.endedInsideBlock}/${before.writes})`, () => after.writes > 0 && after.endedInsideBlock === 0);
             check(`${tag}: no half-drawn frame is ever painted (${before.partialPaints} direct, ${after.partialPaints} through the writer)`, () => before.partialPaints === 0 && after.partialPaints === 0);
             check(`${tag}: every byte received is acknowledged`, () => after.acked === after.received && before.acked === before.received);

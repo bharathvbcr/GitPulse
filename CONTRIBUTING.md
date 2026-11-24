@@ -269,7 +269,7 @@ flowchart TD
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 131 contracts (352 structs, 2500 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 135 contracts (357 structs, 2516 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -384,7 +384,9 @@ that one tag (`git push origin vX.Y.Z`; never `--tags`). The workflow builds
 a **draft**. Nothing is public until a person publishes it, after `verify`
 reports the complete asset set and has opened the macOS app archive, both debs,
 both MSIs and both NSIS installers to confirm each holds every `[[bin]]` in
-`src-tauri/Cargo.toml` (the dmg, rpms and AppImages are not opened).
+`src-tauri/Cargo.toml` (the dmg, rpms and AppImages are not opened). A beta
+(`vX.Y.Z-beta.N`) ships no rpm: its Linux legs bundle only the deb and AppImage,
+because RPM forbids the `-` in its version.
 
 The opt-in update check (`src-tauri/src/updates`) announces a version only
 once its `GitPulse_X.Y.Z_SHA256SUMS.txt` asset answers an anonymous request,
@@ -449,7 +451,7 @@ GitPulse/
 │   ├── lib/stores/       Reactive state (repo, graph, filter, theme, toasts, modals)
 │   ├── lib/components/   UI components; one .svelte + one .test.ts each
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
-│   ├── lib/views/        View registry + navigation (routerless, 4 views)
+│   ├── lib/views/        View registry + navigation (routerless, 5 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 ├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
@@ -614,7 +616,13 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ## 7. Submitting a Pull Request
 
-1. Branch from `main`.
+By taking part you agree to the [Code of Conduct](CODE_OF_CONDUCT.md). For where to
+ask a question, see [SUPPORT.md](SUPPORT.md); for how decisions are made,
+[GOVERNANCE.md](GOVERNANCE.md).
+
+1. Branch from `main`, with a type prefix: `feat/`, `fix/`, `docs/`, `test/`,
+   `perf/` or `chore/`, then a short kebab-case description
+   (`fix/blame-empty-file`). Fork the repository if you do not have write access.
 2. Make the change, with tests.
 3. Run `bun run ci:local` until it is green.
 4. Open the PR and fill in
@@ -623,7 +631,32 @@ renderer internals — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 5. Use [Conventional Commits](https://www.conventionalcommits.org/) for commit
    subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `perf:`). GitPulse parses
    these in its own commit filter, so the repository holds itself to them.
-6. Sign off every commit (`git commit -s`). See "Licence of contributions" below.
+6. Sign off every commit (`git commit -s`). This is required: see "Licence of
+   contributions" below.
+
+### Review and required checks
+
+`main` is protected by a ruleset. Contributors' changes land through pull
+requests; the maintainer can push directly as repository admin (for releases,
+landing trains and automation), and everything else is subject to the ruleset. A
+pull request is merged when:
+
+- the required status checks pass (Rust Lint on ubuntu, macOS and Windows,
+  Frontend on Windows, Gusset engine on Linux, and "No commit authored as a test
+  fixture");
+- a code owner (see [`.github/CODEOWNERS`](.github/CODEOWNERS)) has approved it
+  (pushing new commits dismisses an earlier approval);
+- every review conversation is resolved;
+- every commit carries a sign-off. This is a project requirement checked in
+  review, not something GitHub enforces automatically for commits made outside the
+  web UI.
+
+Force-pushes to and deletion of `main` are blocked, and release tags (`v*`)
+cannot be deleted, force-updated or moved. Pull requests also run a dependency review, which
+fails on a newly added dependency with a known high-severity advisory (for the
+manifests GitHub's dependency graph reads; `bun.lock` is covered by the
+dependency audit workflow), and are labelled by the paths they touch. Keep each pull request to one concern so it
+can be reviewed in one sitting.
 
 ### Licence of contributions
 
@@ -672,4 +705,7 @@ yourself), comment on any issue or PR:
 ## 8. Reporting Security Issues
 
 Do **not** open a public issue for a security vulnerability. Follow
-**[docs/SECURITY.md](docs/SECURITY.md)**.
+**[docs/SECURITY.md](docs/SECURITY.md)** and report it privately through a
+[GitHub security advisory](https://github.com/bharathvbcr/GitPulse/security/advisories/new).
+
+For conduct problems, see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

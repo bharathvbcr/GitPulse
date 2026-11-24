@@ -44,17 +44,16 @@ describe("view sections", () => {
     // Not "the first of none": callers branch on null to decide whether to
     // draw a segmented control at all.
     //
-    // Every registered view offers sections today, so this loop has nothing
-    // to run on — and says so rather than passing as if it had checked. The
-    // branch stays because a single-pane registration is legitimate; the day
-    // one is added, this starts covering it without being touched.
+    // Mavi is the single-pane view: its rail, conversation and changes are
+    // one subject, so it offers no lenses. Named here so the loop cannot pass
+    // vacuously if it ever gains sections or is removed.
     const singlePane = REGISTERED_VIEWS.filter((view) => (view.sections ?? []).length === 0);
     for (const view of singlePane) {
       expect(defaultSectionFor(view.id)).toBeNull();
       expect(sectionsFor(view.id)).toEqual([]);
       expect(activeSectionFor(view.id, { [view.id]: "anything" })).toBeNull();
     }
-    expect(singlePane.length, "no section-less view exists to exercise the branch").toBe(0);
+    expect(singlePane.map((view) => view.id)).toEqual(["mavi"]);
   });
 
   it("falls back to the default for a section this build no longer offers", () => {

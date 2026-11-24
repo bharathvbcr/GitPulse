@@ -75,7 +75,7 @@
     // A failed listing is not an empty one: it is tried again (bounded) before the dock gives up on restoring.
     void retryListing(() => adoptDetachedSessions({ familyOf: (path) => repoStore.familyOf(path) })).then(
       (count) => {
-        if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the terminal dock.`, 10000);
+        if (count) say(`${count === 1 ? "A terminal session is" : `${count} terminal sessions are`} still running from before the window reloaded. Find ${count === 1 ? "it" : "them"} under Sessions in the dock.`, 10000);
       },
       (error: unknown) => say(`Terminal sessions left running before the window reloaded couldn't be listed: ${describeError(error, "session-notifications")}`, 15000),
     );

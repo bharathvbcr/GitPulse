@@ -40,6 +40,7 @@ pub const TAB_WORK: &str = "tab-work";
 pub const TAB_HISTORY: &str = "tab-history";
 pub const TAB_CODE: &str = "tab-code";
 pub const TAB_INSIGHTS: &str = "tab-insights";
+pub const TAB_MAVI: &str = "tab-mavi";
 /// Fleet is workspace-scoped, not a repository view, so it is deliberately
 /// NOT a `tab-*` id: those are parsed back into a `ViewTab` and stored on the
 /// active repository's session, which is exactly what Fleet must not be.
@@ -172,6 +173,7 @@ pub enum NativeAction {
     TabHistory,
     TabCode,
     TabInsights,
+    TabMavi,
     Fleet,
     Agents,
     TerminalDock,
@@ -252,6 +254,7 @@ impl NativeAction {
             TAB_HISTORY => Self::TabHistory,
             TAB_CODE => Self::TabCode,
             TAB_INSIGHTS => Self::TabInsights,
+            TAB_MAVI => Self::TabMavi,
             FLEET => Self::Fleet,
             AGENTS => Self::Agents,
             TERMINAL_DOCK => Self::TerminalDock,
@@ -323,6 +326,7 @@ impl NativeAction {
             Self::TabHistory => TAB_HISTORY,
             Self::TabCode => TAB_CODE,
             Self::TabInsights => TAB_INSIGHTS,
+            Self::TabMavi => TAB_MAVI,
             Self::Fleet => FLEET,
             Self::Agents => AGENTS,
             Self::TerminalDock => TERMINAL_DOCK,
@@ -455,6 +459,7 @@ mod tests {
             NativeAction::parse(TAB_INSIGHTS),
             Some(NativeAction::TabInsights)
         );
+        assert_eq!(NativeAction::parse(TAB_MAVI), Some(NativeAction::TabMavi));
         assert_eq!(
             NativeAction::parse(TERMINAL_DOCK),
             Some(NativeAction::TerminalDock)

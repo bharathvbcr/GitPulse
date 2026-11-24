@@ -79,8 +79,10 @@ SUBCOMMANDS:
       (index possibly stale) makes the answer ok:false, names it on stderr and
       exits 3 (done but incomplete, the status gitpulse-mcp uses for an
       incomplete answer); the worktree still exists and its path is in the
-      answer. Exit codes: 0 success, 1 failure (nothing was created), 2 usage
-      error, 3 created but the index is not current.
+      answer. Exit codes: 0 success, 1 failure, 2 usage error, 3 created but
+      the index is not current. Exit 1 means nothing was created, except when
+      the --exec guard or command fails: that runs after the worktree exists,
+      so read the state back (`status`) before retrying the create.
       On a large repository the inline build can run up to 900 s (devmap's
       build deadline), longer than gitpulse-mcp's default 600 s write timeout:
       called through `gitpulse-mcp call --write`, the create can then end with

@@ -182,10 +182,14 @@ fn fuzzed_generation_1_ledgers_migrate_without_changing_any_original_column() {
             let (_dir, repo) = repo_dir();
             let db = old_ledger(&repo);
             {
-                let old = Connection::open(&db).unwrap();
+                // One commit for the case's rows; each row's own commit through
+                // the WAL was most of this test's writes.
+                let mut old = Connection::open(&db).unwrap();
+                let tx = old.transaction().unwrap();
                 for (i, spec) in rows.iter().enumerate() {
-                    insert_fuzz_row(&old, i, *spec);
+                    insert_fuzz_row(&tx, i, *spec);
                 }
+                tx.commit().unwrap();
             }
             let before = {
                 let old = Connection::open(&db).unwrap();
@@ -397,9 +401,20 @@ fn rows_from_env(default: usize) -> usize {
 
 /// A realistic old ledger: 60% reflog rows (a duplicate of the previous
 /// identity every 20th row), the rest tool events.
+///
+/// Built with the journal and syncs off and then put back in WAL, which is
+/// where `old_ledger` leaves it: through the WAL every page was written as a
+/// frame and again by the checkpoint, and this fixture is up to 200 000 rows.
+/// The migration the tests time and kill runs on its own connection, with
+/// the ledger's own settings.
 fn big_old_ledger(repo: &str, rows: usize) -> PathBuf {
     let db = old_ledger(repo);
     let mut conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = OFF", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "off");
     let tx = conn.transaction().unwrap();
     {
         let mut stmt = tx
@@ -441,8 +456,10 @@ fn big_old_ledger(repo: &str, rows: usize) -> PathBuf {
         }
     }
     tx.commit().unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
         .unwrap();
+    assert_eq!(mode, "wal");
     db
 }
 

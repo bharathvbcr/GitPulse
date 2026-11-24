@@ -282,7 +282,9 @@ describe("HealthPanel — verdict first, identifiers truncated", () => {
   it("puts the verdict ahead of the GitHub freshness line once a report is loaded", () => {
     // The freshness disclosure used to open the scroll in every state. With a
     // report it now follows the verdict card; before one exists it still leads.
-    const lead = panel.indexOf("{#if !report}\n      {@render githubFreshness()}");
+    // The branches are gated on `shownReport` (the report of the repository
+    // open now), not on `report`; see its comment in HealthPanel.svelte.
+    const lead = panel.indexOf("{#if !shownReport}\n      {@render githubFreshness()}");
     const verdict = panel.indexOf("<HealthSummaryCard");
     const after = panel.indexOf("{@render githubFreshness()}", verdict);
     expect(lead).toBeGreaterThan(-1);

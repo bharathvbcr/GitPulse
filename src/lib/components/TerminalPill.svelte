@@ -2,7 +2,7 @@
   import { repoStore } from "../stores/repoStore";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutTextLabel } from "../ui/platformCopy";
-  import { SquareTerminal } from "@lucide/svelte";
+  import { PanelBottom } from "@lucide/svelte";
   import { onDestroy, untrack } from "svelte";
   import type { LeaseWaiter } from "../stores/hostLoadStore";
   import type { TerminalContext } from "../terminal/sessionContext";
@@ -90,7 +90,7 @@
   );
   let pillLabel = $derived.by(() => {
     const count = terminalPill.alive > 1 ? `, ${terminalPill.alive} sessions` : "";
-    return terminalPill.summary ? `Terminal, ${terminalPill.summary}${count}` : `Terminal${count}`;
+    return terminalPill.summary ? `Dock, ${terminalPill.summary}${count}` : `Dock${count}`;
   });
 
   /**
@@ -176,6 +176,7 @@
   }
 
   onDestroy(() => clearTimeout(closeTimer));
+
 </script>
 
 <svelte:window onkeydown={onWindowKeydown} />
@@ -201,18 +202,17 @@
       data-testid="terminal-pill"
       aria-pressed={$repoStore.terminalOpen}
       aria-expanded={menuOpen}
-      aria-haspopup="menu"
       aria-controls="terminal-pill-menu"
       aria-label={pillLabel}
       onclick={toggleDock}
       onkeydown={onPillKeydown}
-      title="Toggle the terminal dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"
+      title="Toggle the dock ({shortcutTextLabel('⌃`', $hostPlatform.os)})"
       class="inline-flex h-6 max-w-[16rem] shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2 text-meta font-medium leading-none transition-colors {$repoStore.terminalOpen
         ? 'border-accent bg-accent/10 text-accent'
         : 'border-edge bg-surfaceHover text-textPrimary hover:border-edgeStrong hover:bg-accent/10'}"
     >
-      <SquareTerminal size={12} class="shrink-0" />
-      <span>Terminal</span>
+      <PanelBottom size={12} class="shrink-0" />
+      <span>Dock</span>
       {#if terminalPill.summary}
         {#if terminalPill.highlightedLauncher}
           <LauncherIcon kind={terminalPill.highlightedLauncher} size={11} class="shrink-0" />

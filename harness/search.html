@@ -14,7 +14,7 @@
        * a newer search must retire the older one, and a result must open its
        * file. Nothing here runs git; every answer is a fixture.
        */
-      import { mockIPCWithEvents } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
       import "../src/app.css";
 
       const params = new URLSearchParams(location.search);
@@ -31,7 +31,7 @@
       const held = new Map();
       let mode = "complete";
 
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
           case "cmd_search_content":
@@ -55,7 +55,7 @@
           case "cmd_repo_operation": case "cmd_workspace_sync": return null;
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      });
+      }, { shouldMockEvents: true });
 
       const { mount, tick, unmount } = await import("svelte");
       const { get } = await import("svelte/store");

@@ -1,0 +1,58 @@
+# Path-to-label rules for .github/workflows/labeler.yml (actions/labeler v5+
+# syntax). Every label named here is defined in .github/labels.yml.
+
+"area: frontend":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/**"
+          - "harness/**"
+          - "index.html"
+          - "vite.config.*"
+          - "svelte.config.*"
+
+"area: rust-core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src-tauri/**"
+
+"area: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/actions/**"
+          - ".githooks/**"
+          - "scripts/**"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "*.md"
+
+"test":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.test.ts"
+          - "**/*_tests.rs"
+          - "src-tauri/tests/**"
+
+"area: manvi":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src-tauri/src/harness/**"
+          - "src-tauri/src/workbench/**"
+
+"area: graph":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/lib/graph/**"
+          - "src/lib/components/*Graph*"
+
+"dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "package.json"
+          - "bun.lock"
+          - "src-tauri/Cargo.toml"
+          - "src-tauri/Cargo.lock"
+          - "src-tauri/deny.toml"

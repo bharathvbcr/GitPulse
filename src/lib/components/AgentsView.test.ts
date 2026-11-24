@@ -41,15 +41,30 @@ describe("AgentsView", () => {
     // focusTerminalSession owns surface → hosting tab → dock → reveal. A
     // hand-rolled reveal after opening the row's directory skipped the dock
     // and opened the cwd, which is not the tab the terminal lives in.
-    expect(source).toContain("focusTerminalSession(record)");
-    expect(source).toContain("showTaskTerminal(run)");
+    const show = source.slice(source.indexOf("async function showTerminal"), source.indexOf("async function openTask"));
+    expect(show).toContain("focusTerminalSession(record)");
+    expect(show).toContain("showTaskTerminal(run)");
+    expect(show).not.toContain("onReady");
+    expect(show).not.toContain("openRepo");
     expect(source).not.toContain("reveal?.()");
     expect(source).not.toContain("reveal()");
+    // Starting an agent in a checkout is a launch, not a reveal: like the
+    // Worktrees fork it waits for the opened tab's canonical path (`onReady`)
+    // and hands the launch to that tab's dock.
+    const start = source.slice(source.indexOf("async function startIn"), source.indexOf("async function reviewChanges"));
+    expect(start).toContain("onReady");
+    expect(start).toContain("terminalLaunchRequests.request(at, launcher)");
   });
 
   it("gives each row explicit, labelled actions", () => {
-    expect(source).toContain("agentRowActions(");
+    // The actions and their labels are decided in agents/rowActions.ts
+    // ("Show terminal for …", "Open task for …"; pinned in rowActions.test.ts);
+    // the view renders each with its own label and routes it to its handler.
+    expect(source).toContain("agentRowActions(row, ");
     expect(source).toContain("aria-label={action.ariaLabel}");
+    expect(source).toContain("onclick={() => runAction(action)}");
+    expect(source).toMatch(/case "terminal":\s*return void showTerminal\(row\);/);
+    expect(source).toMatch(/case "task":\s*return void openTask\(row\);/);
     expect(source).toContain("openTaskForRun(row.taskRunId)");
     expect(source).toContain("repoStore.openRepo(row.checkoutPath)");
     expect(source).toContain("agentKindLabel(row.kind)");

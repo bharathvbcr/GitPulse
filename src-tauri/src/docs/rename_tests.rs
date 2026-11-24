@@ -1723,6 +1723,7 @@ fn the_moved_notes_relative_asset_links_still_resolve_after_a_cross_folder_move(
 
 #[cfg(unix)]
 #[test]
+#[cfg(unix)]
 fn asset_links_are_left_alone_when_they_leave_the_repo_or_are_symlinks() {
     let dir = repo_with(&[
         (
@@ -2334,14 +2335,24 @@ fn asset_nfd_spelled_link_still_resolves_after_the_move() {
     let nfd = "cafe\u{301}.png";
     let body = format!("[x]({nfd})\n");
     let dir = repo_with(&[("docs/A.md", body.as_str()), (&format!("docs/{nfc}"), "p")]);
+    // Whether the NFD spelling names the NFC file is the filesystem's call:
+    // APFS and HFS+ normalise names, ext4 and NTFS do not. Where it does not,
+    // the link was dangling before the move, and a link that resolves to
+    // nothing is left as written (as `asset_case_mismatched_link_resolves_or_is_untouched`
+    // holds for case).
+    let normalising = dir.path().join("docs").join(nfd).exists();
     let path = dir.path().to_str().unwrap();
     rename_doc(path, "docs/A.md", "notes/A.md", |_| Ok(())).expect("rename");
     let t = read(&dir, "notes/A.md");
-    let dest = t.trim().trim_start_matches("[x](").trim_end_matches(')');
-    assert!(
-        dir.path().join("notes").join(dest).exists(),
-        "dangling after rewrite: {t:?}"
-    );
+    if normalising {
+        let dest = t.trim().trim_start_matches("[x](").trim_end_matches(')');
+        assert!(
+            dir.path().join("notes").join(dest).exists(),
+            "dangling after rewrite: {t:?}"
+        );
+    } else {
+        assert_eq!(t, body, "a link that resolved to nothing was rewritten");
+    }
 }
 
 #[test]
