@@ -7,7 +7,8 @@
     <button id="checks" disabled style="position:fixed;top:4px;right:4px;z-index:100">Run terminal checks</button>
     <pre id="result" style="position:fixed;bottom:0;right:0;font:11px monospace;z-index:100;background:#141a29;color:#e9edf8;margin:0;padding:4px"></pre>
     <script type="module">
-      import { mockIPCWithEvents, adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
       import { createChecks } from "./checks.ts";
       import "../src/app.css";
 
@@ -75,7 +76,7 @@
        * openable URL with a query, a repository file with line and column, a
        * refused scheme, and a path that climbs out of the repository. */
       const LINK_LINE = "Links: https://example.com/a?b=1 src/lib/terminal/links.ts:240:5 file:///etc/passwd ../../etc/passwd:1";
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "plugin:opener|open_url": opened.push(args.url ?? args.path); return null;
@@ -225,7 +226,7 @@
           case "cmd_get_file_blob": if (String(args?.filePath).endsWith(".png")) return { path: args.filePath, is_binary: true, is_image: true, mime: "image/png", text: null, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", invalid_utf8_bytes: 0 }; return { path: args.filePath, is_binary: false, is_image: false, mime: "text/plain", text: Array.from({ length: 400 }, (_, i) => `line ${i + 1} of the fixture file`).join("\n"), base64: null, invalid_utf8_bytes: 0, eol: "lf", disk_base: "fixture" };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      });
+      }, { shouldMockEvents: true });
 
       const { mount } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");

@@ -18,7 +18,8 @@
       // their requests for good — and a third: a strip bounded by the session
       // limit counted ended tabs, so a repository whose agents had run that many
       // times could start no more.
-      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       import "../src/app.css";
       import { holdForeground } from "./foreground";
       holdForeground();
@@ -65,10 +66,10 @@
           unexpected.push(`workbench:${method}`); return JSON.stringify({ ok: false });
         },
       };
-      mockIPCWithEvents(async (cmd, args) => {
+      mockIPC(async (cmd, args) => {
         if (fixtures[cmd]) return fixtures[cmd](args ?? {});
         unexpected.push(cmd); return null;
-      });
+      }, { shouldMockEvents: true });
 
       const { mount } = await import("svelte");
       const { get } = await import("svelte/store");

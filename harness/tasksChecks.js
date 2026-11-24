@@ -3,7 +3,7 @@ import { mount, tick } from "svelte";
 import { emit } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { promptState } from "../src/lib/stores/modalStore";
-import { mockIPCWithEvents } from "./tauriMocks";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { applyPlatformClass } from "../src/lib/platform";
 import { shortcutTextLabel } from "../src/lib/ui/platformCopy";
 import { hostPlatform } from "../src/lib/stores/platformStore";
@@ -145,7 +145,7 @@ const fixtureRepoCommands = {
   cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
 };
 const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(start, start + limit), total: items.length, shown: items.slice(start, start + limit).length, has_more: start + limit < items.length, next_cursor: start + limit < items.length ? String(start + limit) : null });
-mockIPCWithEvents(async (cmd, args) => {
+mockIPC(async (cmd, args) => {
   if (cmd === "cmd_workbench_register_repository") {
     const known = repos.find(repo => repo.identity_key === `local:${args.repoPath}/.git`);
     if (known) return JSON.stringify({ repository: known });
@@ -515,7 +515,7 @@ mockIPCWithEvents(async (cmd, args) => {
     }
     default: unknown.push(args.method); throw Error(`Unconfigured method: ${args.method}`);
   }
-});
+}, { shouldMockEvents: true });
 applyPlatformClass();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "quick-fixture" });

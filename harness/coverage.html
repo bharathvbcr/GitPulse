@@ -6,7 +6,8 @@
     <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run coverage checks</button>
     <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
     <script type="module">
-      import { mockIPCWithEvents, adoptOutput, pushOutput, emitExit } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput, pushOutput, emitExit } from "./tauriMocks";
       import { agentPromptArgs } from "../src/lib/terminal/launchRequests";
       import "../src/app.css";
       // `?mode=ojas` (or any fixture mode) opens on that fixture, for looking at it.
@@ -67,7 +68,7 @@
       };
       addEventListener("error", event => errors.push(event.message));
       addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         ipcLog.push({ cmd, args });
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
@@ -115,7 +116,7 @@
           case "cmd_repo_operation": case "cmd_workspace_sync": return null;
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      });
+      }, { shouldMockEvents: true });
       const { mount, tick } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");

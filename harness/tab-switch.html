@@ -302,8 +302,8 @@
       // The window is looked at for the whole run (WKWebView reports no focus).
       const { holdForeground } = await import("./foreground.ts");
       holdForeground();
-      const { mockIPCWithEvents } = await import("./tauriMocks.ts");
-      mockIPCWithEvents(handler);
+      const { mockIPC } = await import("@tauri-apps/api/mocks");
+      mockIPC(handler, { shouldMockEvents: true });
       // getCurrentWindow() reads the window label from the host-provided metadata, which
       // the IPC mock does not install; without it the shell's native-drag subscription
       // throws after the menu listeners, so a file drop could never be exercised here.

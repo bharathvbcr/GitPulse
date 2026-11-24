@@ -207,7 +207,7 @@ describe("the stress harness can arm what it claims to stress", () => {
   const terminalPanel = src("../src/lib/components/TerminalPanel.svelte");
 
   it("installs IPC through the shared mock layer, not a hand-rolled one", () => {
-    expect(fixtures).toContain("mockIPCWithEvents");
+    expect(fixtures).toMatch(/mockIPC\([\s\S]*shouldMockEvents: true/);
     expect(fixtures).not.toMatch(/window\.__TAURI_INTERNALS__\s*=/);
   });
 
