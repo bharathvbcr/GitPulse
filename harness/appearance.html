@@ -410,10 +410,21 @@
     check("Auto brings it back", () => motionStatus() === "playing" && layer() !== null);
 
     // --- a video wallpaper, end to end ---------------------------------------
-    // A real clip, recorded here from a canvas (red ground, a green bar moving),
-    // through the real file input, the real decoder and IndexedDB.
+    // A real clip (red ground, a green bar moving) through the real file input,
+    // the real decoder and IndexedDB. Where this engine plays MP4 the clip is
+    // harness/fixtures/wallpaper-loop.mp4 (H.264 Constrained Baseline, 320x200,
+    // 2 s, made with ffmpeg's lavfi color + drawbox), because WKWebView's
+    // MediaRecorder gave the same canvas recording a clip on one CI run and an
+    // empty one on the next (53 frames painted, one dataavailable event, no
+    // bytes). Elsewhere it is recorded here from a canvas, as before.
     const wait = async (ok, ms = 8000) => { const end = Date.now() + ms; while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); await settle(); return ok(); };
     let clipWhy = "";
+    const fixtureClip = async () => {
+      if (document.createElement("video").canPlayType("video/mp4") === "") return null;
+      const response = await fetch(new URL("./fixtures/wallpaper-loop.mp4", location.href));
+      if (!response.ok) { clipWhy = `fixture: HTTP ${response.status}`; return null; }
+      return new File([await response.blob()], "harness-loop.mp4", { type: "video/mp4" });
+    };
     const recordClip = async () => {
       if (typeof MediaRecorder === "undefined") { clipWhy = "MediaRecorder is undefined"; return null; }
       // The canvas is put on the page while it records: WebKit captures a canvas
@@ -456,8 +467,9 @@
       if (file.size === 0) clipWhy = `empty: ${frame} frames painted, ${events} dataavailable events, ${trackState}${recorderError ? `, recorder error ${recorderError}` : ""}`;
       return file;
     };
-    const clip = await recordClip();
-    check(`this runner recorded a ${clip?.type ?? "(no)"} clip to test the video path with${clipWhy ? ` (${clipWhy})` : ""}`, () => clip !== null && clip.size > 0);
+    const fixture = await fixtureClip();
+    const clip = fixture ?? (await recordClip());
+    check(`this runner has a ${clip?.type ?? "(no)"} clip, ${fixture ? "the fixture" : "recorded here"}, to test the video path with${clipWhy ? ` (${clipWhy})` : ""}`, () => clip !== null && clip.size > 0);
     if (clip?.size) {
       const input = $("[data-wallpaper-input]");
       const transfer = new DataTransfer(); transfer.items.add(clip); input.files = transfer.files;
