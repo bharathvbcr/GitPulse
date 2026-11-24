@@ -7692,26 +7692,31 @@ Trailing note {done}."#;
         assert_eq!(journal_entries(tmp.path()), None);
 
         // A journal whose writer is another, still-running process is its own.
-        let parent = std::os::unix::process::parent_id();
-        let Some(parent_start) = crate::sysload::process_start_us(parent) else {
-            return;
-        };
-        let foreign = ThrottleJournal {
-            version: 1,
-            writer_pid: parent,
-            writer_start_us: parent_start,
-            entries: vec![(4100, 7)],
-        };
-        write_private_steward_file(
-            tmp.path(),
-            THROTTLE_JOURNAL_FILE,
-            &serde_json::to_vec(&foreign).unwrap(),
-        )
-        .unwrap();
-        restored.borrow_mut().clear();
-        assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
-        assert!(restored.borrow().is_empty());
-        assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+        // The live writer is this process's parent, which only Unix's std
+        // names.
+        #[cfg(unix)]
+        {
+            let parent = std::os::unix::process::parent_id();
+            let Some(parent_start) = crate::sysload::process_start_us(parent) else {
+                return;
+            };
+            let foreign = ThrottleJournal {
+                version: 1,
+                writer_pid: parent,
+                writer_start_us: parent_start,
+                entries: vec![(4100, 7)],
+            };
+            write_private_steward_file(
+                tmp.path(),
+                THROTTLE_JOURNAL_FILE,
+                &serde_json::to_vec(&foreign).unwrap(),
+            )
+            .unwrap();
+            restored.borrow_mut().clear();
+            assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
+            assert!(restored.borrow().is_empty());
+            assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+        }
     }
 
     #[test]
