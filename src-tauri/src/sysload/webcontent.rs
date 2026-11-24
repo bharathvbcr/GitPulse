@@ -15,10 +15,13 @@
 //! should keep being sampled; a tick that runs late just leaves a longer gap,
 //! which the dump shows as its own `T-` offsets.
 
+#[cfg(any(target_os = "macos", test))]
 use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Instant;
 
 /// Executable-path marker of a WebKit content process.
 #[cfg(any(target_os = "macos", test))]
