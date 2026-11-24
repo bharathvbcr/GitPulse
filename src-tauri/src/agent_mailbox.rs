@@ -429,6 +429,7 @@ impl AdvisoryLock {
         Self::open_locked(path, false)
     }
 
+    #[cfg_attr(not(unix), allow(unused_variables))]
     fn open_locked(path: &Path, wait: bool) -> Result<Option<Self>, MailboxError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);

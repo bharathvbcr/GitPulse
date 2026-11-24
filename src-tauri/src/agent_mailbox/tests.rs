@@ -825,7 +825,7 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
 }
 
 #[test]
-fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_stays_pending() {
+fn a_waiter_claims_through_its_filter_so_a_hop_limited_message_stays_pending() {
     let (_dir, mailbox) = mailbox();
     let now = SystemTime::now();
     let peer = |id: &str, hop: u32| EnvelopeProvenance::PeerAgent {
@@ -839,8 +839,8 @@ fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_st
         truncated_in_bus: false,
         repo_root: "/tmp/repo".into(),
     };
-    // The oldest envelope has lost its sidecar, so the peek lets it through and the claim
-    // drops it; the next one is a peer message at its hop limit.
+    // The oldest envelope has lost its sidecar, so the claim drops it (an unreadable origin is
+    // not a refusal); the next one is a peer message at its hop limit.
     mailbox
         .deposit_with_provenance(SESSION, "lost-2", "no provenance", peer("lost-2", 1), now)
         .unwrap();
@@ -1374,6 +1374,8 @@ fn two_waiters_on_one_session_leave_a_hop_limited_peer_message_pending_and_split
     assert_eq!(mailbox.status(SESSION, "fine"), Delivery::Claimed);
 }
 
+// Needs a real lock: `AdvisoryLock` takes none off Unix.
+#[cfg(unix)]
 #[test]
 fn pruning_skips_a_session_whose_lock_is_held_and_still_expires_the_others() {
     let (_dir, mailbox) = mailbox();
@@ -1514,11 +1516,8 @@ fn a_waiter_keeps_waiting_while_only_refused_envelopes_are_pending() {
             );
             let _ = tx.send(outcome);
         });
-        // Give the waiter a while with only the refused envelope pending, without sleeping.
-        let until = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < until {
-            std::thread::yield_now();
-        }
+        // Give the waiter time to poll with only the refused envelope pending.
+        std::thread::sleep(Duration::from_millis(200));
         mailbox
             .deposit(SESSION, "human", "a person's message", SystemTime::now())
             .unwrap();
