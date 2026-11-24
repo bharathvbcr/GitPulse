@@ -25,6 +25,13 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ### Fixed
 
+- File claims are no longer lost when several hooks compact or repair the claim
+  store at once. A compaction recognised the file it had read by its device and
+  inode number, and once that file was replaced the number could be reused by a
+  newer one; the stale compaction then took the newer file for its own and
+  renamed its older rows over it, dropping every claim appended in between,
+  each of them having been reported as written. A compaction now keeps the file
+  it read open until it is done, so the number cannot be reused meanwhile.
 - **Linux bundling of a beta.** A beta's version (`X.Y.Z-beta.N`) is not a legal
   RPM version, and Tauri takes the rpm's version straight from the app version, so
   bundling failed at the `.rpm` (`invalid version "0.2.0-beta.1": contains invalid

@@ -645,6 +645,8 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             // the screen, until the last terminal using it lets go. Which one
             // that is depends on paint timing, and it is the atlas's canvas,
             // not a context the session holds.
+            // Presence checks below use `paneCanvases`, which also leaves that
+            // scratch canvas out but counts every other canvas in the pane.
             const glCanvas = (el) => [...el.querySelectorAll(".xterm-screen canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
             const frames = (count = 2) => new Promise((resolve) => {
               let left = count;
@@ -723,39 +725,50 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(80);
             check("switching back inside the hold reuses this session's canvas, and the other is held, within the cap",
               () => shown()[0] === target && glCanvas(target) === firstCanvas && !firstGl.isContextLost()
-                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2);
+                && sessionsAll().filter((el) => paneCanvases(el).length).length <= 2
+                && sessionsAll().filter((el) => glCanvas(el)).length <= 2);
 
             // -- The hold ends: the context is freed on purpose, not left for the collector.
             gpuPolicy.hideGraceMs = 400;
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
+            // The canvas the other session draws to once shown again inside the
+            // hold: the held one, if the hold kept it (`otherCanvas`, above).
+            const reshownCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
             await wait(900);
+            // The hold's timer was armed at the keydown, so it is due ~750 ms
+            // before these waits end and fires first: timers run in order.
             // Given up means: back on the DOM renderer, the WebGL canvas it held
             // detached with its context lost, and no drawing canvas left. The
             // shared glyph atlas's scratch canvas may still sit here (see
             // `paneCanvases`); counting it failed this on the Ubuntu runner.
             // On failure each canvas still in the pane is listed.
+            const releasedCanvas = (node) => !!node && !other.contains(node) && !node.isConnected && !!node.getContext("webgl2")?.isContextLost();
             check("a session that stays hidden past the hold gives its context up",
               () => (other.dataset.renderer === "dom" && !paneCanvases(other).length && !glCanvas(other)
-                && !!otherCanvas && !otherCanvas.isConnected && !other.contains(otherCanvas)
-                && !!otherGl && otherGl.isContextLost()) || (() => {
+                && !!otherGl && otherGl.isContextLost() && releasedCanvas(otherCanvas) && releasedCanvas(reshownCanvas)) || (() => {
                 throw new Error(JSON.stringify({
                   renderer: other.dataset.renderer, canvases: paneCanvases(other).length,
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
                   msSinceHidden: Math.round(performance.now() - hiddenAt),
                   survivors: [...other.querySelectorAll("canvas")].map((node) => ({
-                    held: node === otherCanvas, className: node.className, parent: node.parentElement?.className ?? null,
+                    held: node === otherCanvas, reshown: node === reshownCanvas, className: node.className, parent: node.parentElement?.className ?? null,
                     size: `${node.width}x${node.height}`,
                   })),
                   heldCanvasConnected: otherCanvas?.isConnected ?? null,
+                  reshownSameCanvas: reshownCanvas === otherCanvas,
+                  reshownCanvasConnected: reshownCanvas?.isConnected ?? null,
+                  heldContextLost: otherGl?.isContextLost() ?? null,
                 }));
               })());
             button("Hide the dock").click(); await wait(900);
+            // Strictly no canvas: with every session released the shared atlas has
+            // no owner left, is disposed, and its scratch canvas goes with it.
             check("hiding the dock past the hold releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length));
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length && !el.querySelector("canvas")));
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
               () => firstGl.isContextLost());
             await showAndProbe();
@@ -801,7 +814,8 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             } else {
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
-            check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1);
+            check("only the session on screen holds a canvas",
+              () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1 && sessionsAll().filter((el) => glCanvas(el)).length === 1);
 
             // -- The resource profile's cap budgets hidden contexts, never a pane on
             // screen: on the compact budget (two) three more panes beside an anchor

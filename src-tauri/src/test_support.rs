@@ -1434,6 +1434,35 @@ mod diskio_guard {
     }
 
     #[test]
+    fn the_measured_suite_total_stays_under_the_budget() {
+        // The whole lib suite is one process. Measured 2026-11-23: about
+        // 10.2 GiB for the coverage suite (scaled from where runs 45268885253
+        // and 45270424352 crossed the old 8 GiB), 9623 MiB for its tests
+        // measured alone, and over 8196 MiB for the Ubuntu suite (run
+        // 45266451066). Each must fit, written slowly enough that only the
+        // total is judged; twice the coverage suite must still abort.
+        let limits = diskio::limits(None).expect("the guard is on by default");
+        for (what, mib) in [
+            ("the coverage suite", 10_445),
+            ("the tests measured alone", 9_623),
+            ("the Ubuntu suite at its old abort", 8_196),
+        ] {
+            let healthy = [at(0, 0), at(2_400, mib)];
+            assert!(
+                diskio::verdict(&healthy, &limits).is_none(),
+                "{what}'s {mib} MiB was treated as a runaway"
+            );
+        }
+        let twice = [at(0, 0), at(4_800, 2 * 10_445)];
+        let why = diskio::verdict(&twice, &limits).expect("twice the suite aborts");
+        assert!(why.contains("budget"), "{why}");
+        assert!(
+            !why.contains("MiB/s"),
+            "the total, not the rate, aborts it: {why}"
+        );
+    }
+
+    #[test]
     fn the_budget_setting_can_tighten_or_disable_but_never_silently_disable() {
         assert!(diskio::limits(None).is_some());
         assert_eq!(diskio::limits(Some("0")), None);
