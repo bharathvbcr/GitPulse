@@ -917,6 +917,12 @@ fn collect_deduped_peer_inbox(
                         false,
                     ),
                 };
+                // A legacy bus row has no msg_id; give it the effective id the bus rows above carry,
+                // so the ack and claim below can name it.
+                let mut synthesized = synthesized;
+                if synthesized.msg_id.is_none() {
+                    synthesized.msg_id = Some(env_id.clone());
+                }
                 if from_bus && synthesized.read_by.iter().any(|r| aliases.contains(r)) {
                     if ack {
                         if let Err(e) = mb.mark_claimed_by_id(sid, &env.claim.request_id, now) {
@@ -946,6 +952,10 @@ fn collect_deduped_peer_inbox(
     if has_more {
         combined.truncate(limit);
     }
+
+    // Listed from what is actually returned, so the list never names a row the page lacks.
+    let pinned_below_dropped_before_seq =
+        agent_bus::seqs_below_dropped(&combined, bus_page.dropped_before_seq);
 
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
@@ -992,7 +1002,7 @@ fn collect_deduped_peer_inbox(
             messages: combined,
             latest_seq: bus_page.latest_seq,
             dropped_before_seq: bus_page.dropped_before_seq,
-            pinned_below_dropped_before_seq: bus_page.pinned_below_dropped_before_seq,
+            pinned_below_dropped_before_seq,
             has_more,
             acked_count,
             ack_error: (!ack_errors.is_empty()).then(|| ack_errors.join("; ")),

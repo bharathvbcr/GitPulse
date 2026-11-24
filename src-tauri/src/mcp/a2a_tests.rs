@@ -1577,28 +1577,45 @@ fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
     );
 }
 
+/// Writes a bus file with two unread direct rows for `role` and 300 broadcasts, so the next
+/// post evicts past the two pinned rows.
+fn seed_bus_with_two_pinned_rows(repo: &str, role: &str) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let row = |seq: u64, to: Option<&str>| {
+        json!({ "seq": seq, "from_agent": "agy:filler", "to_agent": to, "kind": "note",
+                "body": "filler", "created_at_ms": now, "msg_id": format!("seed-{seq}") })
+    };
+    let mut rows = vec![row(1, Some(role)), row(2, Some(role))];
+    rows.extend((3..=302).map(|seq| row(seq, None)));
+    let state = json!({ "next_seq": 302, "dropped_before_seq": 0, "messages": rows });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+}
+
 #[test]
-fn an_inbox_and_a_wait_carry_the_pinned_below_dropped_before_seq_list() {
+fn an_inbox_and_a_wait_list_only_the_returned_rows_below_dropped_before_seq() {
     let (_dir, repo) = trusted_git_repo();
     let sid = "88888888-8888-4888-8888-888888888806";
     register_inbox_peer(&repo, sid, "pin-owner");
-    send_to_role(&repo, "pin-owner", "hello");
+    seed_bus_with_two_pinned_rows(&repo, "pin-owner");
+    send_to_role(&repo, "pin-owner", "trigger the eviction");
 
-    let inbox = super::a2a::handle_agent_inbox(super::AgentInboxArgs {
-        repo_path: repo.clone(),
-        for_peer: "pin-owner".into(),
-        provider_session_id: Some(sid.into()),
-        since_seq: None,
-        thread_key: None,
-        include_broadcasts: None,
-        ack: Some(false),
-        limit: None,
-    })
+    let inbox = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "pin-owner", "limit": 1 }),
+    )
     .expect("inbox");
+    assert!(inbox["dropped_before_seq"].as_u64().unwrap() > 2, "{inbox}");
+    assert_eq!(inbox["messages"][0]["seq"], 1, "{inbox}");
     assert_eq!(
         inbox["pinned_below_dropped_before_seq"],
-        serde_json::json!([]),
-        "{inbox}"
+        json!([1]),
+        "limit 1 returns one row, so only that row is listed: {inbox}"
     );
 
     let counter = AtomicUsize::new(0);
@@ -1612,7 +1629,7 @@ fn an_inbox_and_a_wait_carry_the_pinned_below_dropped_before_seq_list() {
             include_broadcasts: None,
             timeout_ms: Some(0),
             ack: Some(false),
-            limit: None,
+            limit: Some(10),
         },
         &counter,
         60_000,
@@ -1620,8 +1637,45 @@ fn an_inbox_and_a_wait_carry_the_pinned_below_dropped_before_seq_list() {
     .expect("wait");
     assert_eq!(
         wait["pinned_below_dropped_before_seq"],
-        serde_json::json!([]),
+        json!([1, 2]),
         "{wait}"
+    );
+}
+
+#[test]
+fn following_the_over_cap_hint_literally_repairs_the_bus() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888807";
+    register_inbox_peer(&repo, sid, "cap-owner");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let cap = usize::try_from(8u64 * 1024 * 1024).unwrap();
+    let state = json!({ "next_seq": 1, "dropped_before_seq": 0, "messages": [{
+        "seq": 1, "from_agent": "agy:filler", "to_agent": null, "kind": "note",
+        "body": "x".repeat(cap), "created_at_ms": now, "msg_id": "seed-1" }] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "cap-owner", "ack": true }),
+        )
+    };
+
+    let err = read().expect_err("an over-cap bus is refused");
+    assert!(
+        err.contains("gitpulse_agent_send without thread_key or in_reply_to"),
+        "{err}"
+    );
+    send_to_role(&repo, "cap-owner", "the repairing send");
+    let healed = read().expect("the named send repaired the bus");
+    assert_eq!(
+        healed["messages"][0]["body"], "the repairing send",
+        "{healed}"
     );
 }
 
