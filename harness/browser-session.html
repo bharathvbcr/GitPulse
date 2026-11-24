@@ -2,7 +2,8 @@
 <html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Browser session verification</title></head>
 <body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;top:600px;left:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
 <script type="module">
-  import { mockIPCWithEvents, adoptOutput } from "./tauriMocks";
+  import { mockIPC } from "@tauri-apps/api/mocks";
+import { adoptOutput } from "./tauriMocks";
   import "../src/app.css";
   import { createChecks } from "./checks.ts";
 
@@ -20,7 +21,7 @@
   addEventListener("unhandledrejection", e => { errors.push(String(e.reason)); show(); });
   try { localStorage.removeItem("gitpulse.browser.lastAddress"); } catch {}
 
-  mockIPCWithEvents(async (cmd, args) => {
+  mockIPC(async (cmd, args) => {
     if (cmd.startsWith("cmd_browser_")) {
       calls.push({ cmd, args: structuredClone(args) }); show();
       if (cmd === "cmd_browser_open" && openFails) { const why = openFails; openFails = null; throw why; }
@@ -41,7 +42,7 @@
       case "cmd_agent_defaults": throw new Error("Unimplemented fixture: cmd_agent_defaults");
       default: throw new Error(`Unimplemented fixture: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
 
   const { mount, tick } = await import("svelte");
   const { emit } = await import("@tauri-apps/api/event");

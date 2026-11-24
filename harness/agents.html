@@ -15,7 +15,7 @@
     <pre id="result">Loading…</pre>
     <script type="module">
       import "../src/app.css";
-      import { mockIPCWithEvents } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
 
       const errors = [];
       const unexpected = [];
@@ -192,12 +192,12 @@
         ]));
         fixtures.cmd_mavi_list = () => [summary("mavi-1-0", "approval"), summary("mavi-1-1", "working", { touched: [] })];
       }
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         if (cmd.startsWith("plugin:")) return null;
         if (fixtures[cmd]) return fixtures[cmd](args ?? {});
         unexpected.push(cmd);
         return null;
-      });
+      }, { shouldMockEvents: true });
 
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");

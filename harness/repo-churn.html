@@ -24,7 +24,7 @@
       import { mount, unmount, tick } from "svelte";
       import { get } from "svelte/store";
       import { createChecks } from "./checks";
-      import { mockIPCWithEvents } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
 
       const params = new URLSearchParams(location.search);
       // `?shot=failure&theme=light` stops on the failed CommitDetails read, for looking at it.
@@ -136,12 +136,12 @@
           unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [], shared_worktree_files: 0, sessions_ok: true,
           sessions_error: "", shared_worktrees: [] }),
       };
-      mockIPCWithEvents(async (cmd, args) => {
+      mockIPC(async (cmd, args) => {
         calls.push(cmd);
         if (fixtures[cmd]) return fixtures[cmd](args ?? {});
         unexpected.push(cmd);
         throw new Error(`Unconfigured command: ${cmd}`);
-      });
+      }, { shouldMockEvents: true });
 
       // The app's modules after the mock layer, so nothing they do on import
       // can reach a native call that is not there.

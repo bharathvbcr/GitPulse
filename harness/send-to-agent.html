@@ -2,7 +2,7 @@
 <html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Send to agent verification</title></head>
 <body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
 <script type="module">
-  import { mockIPCWithEvents } from "./tauriMocks";
+  import { mockIPC } from "@tauri-apps/api/mocks";
   import "../src/app.css";
   import { createChecks } from "./checks.ts";
 
@@ -28,7 +28,7 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const preview = () => ({ ok: true, sent: false, route: scenario.route, reason: scenario.reason, ...(scenario.route === "mailbox" ? { listening: scenario.listening, session_id: RUN } : {}), ...(scenario.managedState ? { managed_state: scenario.managedState } : {}) });
 
-  mockIPCWithEvents(async (cmd, args) => {
+  mockIPC(async (cmd, args) => {
     if (cmd === "cmd_workbench_request") {
       const input = JSON.parse(args.input);
       if (args.method === "runs.send_to_agent") {
@@ -61,7 +61,7 @@
       case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_terminal_ack": return null;
       default: throw new Error(`Unconfigured native command: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
 
   const { mount, tick } = await import("svelte");
   const { get } = await import("svelte/store");

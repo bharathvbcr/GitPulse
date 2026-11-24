@@ -17,7 +17,7 @@
  * Nothing here executes git.
  */
 import "../src/app.css";
-import { mockIPCWithEvents } from "./tauriMocks";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { createChecks } from "./checks.ts";
 
 const errors = [];
@@ -44,7 +44,7 @@ let statuses = [
   status("src/lib/b.ts", "M", { additions: 5, deletions: 2, warnings: ["numstat record unreadable"] }),
 ];
 const guarded = { policy: null, output: null };
-mockIPCWithEvents((cmd, args) => {
+mockIPC((cmd, args) => {
   switch (cmd) {
     case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
     case "cmd_list_repo_files": if (listFails) throw new Error("listing refused by fixture"); if (holding.has(cmd)) return park(cmd).then(() => listing); return listing;
@@ -65,7 +65,7 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_delete_path": deletes.push(args); if (holding.has(cmd)) return park(cmd).then(() => ({ policy: null, output: { left_behind: false } })); return { policy: null, output: { left_behind: false } };
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
   }
-});
+}, { shouldMockEvents: true });
 const { mount, tick } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
