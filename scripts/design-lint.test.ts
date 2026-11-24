@@ -933,9 +933,7 @@ describe("the committed gate config", () => {
     ]);
   });
 
-  // Lints the whole tree: 1.2-1.8 s alone, past Vitest's 5 s default inside a
-  // coverage run with every worker busy (coverage run 220 timed out here).
-  it("passes the strict gate on this tree", { timeout: wallClockBudget(10_000) }, () => {
+  it("passes the strict gate on this tree", () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
     try {
@@ -960,7 +958,7 @@ describe("the committed baseline", () => {
     expect(baseline.retake).toContain("BASE_SHA");
   });
 
-  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", { timeout: wallClockBudget(10_000) }, () => {
+  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", () => {
     const fresh = countViolations(lintRepo({ root: repoRoot }).violations);
     const cmp = compareToBaseline(fresh, baseline);
     expect(cmp.increases).toEqual([]);
