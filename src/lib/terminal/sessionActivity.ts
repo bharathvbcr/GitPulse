@@ -253,7 +253,7 @@ export function canAutoWakePeerInbox(facts: AutoWakeFacts): boolean {
   return true;
 }
 
-/** Publish at most this often per session for output and title changes. */
+/** Publish output and title changes at most this often, across all sessions. */
 export const ACTIVITY_PUBLISH_MS = 1000;
 /** Sessions tracked; twice the most that can be open, for ones still closing. */
 export const MAX_TRACKED_ACTIVITY = MAX_TERMINAL_SESSIONS * 2;
@@ -527,7 +527,8 @@ const EMPTY: SessionActivity = Object.freeze({
 
 export function createSessionActivity(clock: () => number = Date.now) {
   const entries = new Map<string, SessionActivity>();
-  const published = new Map<string, number>();
+  /** When the last throttled publish went out, whichever session caused it. */
+  let lastThrottled = -Infinity;
   /** When each session's attention last changed here, for `replay`. */
   const changed = new Map<string, number>();
   const store = writable<ReadonlyMap<string, SessionActivity>>(new Map());
@@ -537,14 +538,18 @@ export function createSessionActivity(clock: () => number = Date.now) {
     if (pending) { clearTimeout(pending); pending = null; }
     store.set(new Map(entries));
   };
-  /** Publishes now, or once the session's throttle window has passed. */
-  const publishThrottled = (session: string, now: number) => {
-    const last = published.get(session) ?? -Infinity;
-    if (now - last >= ACTIVITY_PUBLISH_MS) {
-      published.set(session, now);
+  /**
+   * Publishes now, or once the throttle window has passed. The window is
+   * shared by every session: each publish copies the whole map and re-runs
+   * every subscriber, so a per-session window let N chattering sessions cost
+   * N publishes a second. One trailing publish carries every session's latest.
+   */
+  const publishThrottled = (now: number) => {
+    if (now - lastThrottled >= ACTIVITY_PUBLISH_MS) {
+      lastThrottled = now;
       publish();
     } else if (!pending) {
-      pending = setTimeout(() => { pending = null; published.set(session, clock()); store.set(new Map(entries)); }, ACTIVITY_PUBLISH_MS - (now - last));
+      pending = setTimeout(() => { pending = null; lastThrottled = clock(); store.set(new Map(entries)); }, ACTIVITY_PUBLISH_MS - (now - lastThrottled));
     }
   };
   const update = (session: string, change: (current: SessionActivity) => SessionActivity): boolean => {
@@ -558,7 +563,7 @@ export function createSessionActivity(clock: () => number = Date.now) {
         const at = Math.max(value.lastOutputAt ?? 0, value.lastInputAt ?? 0, value.attention?.at ?? 0);
         if (at < oldestAt) { oldest = key; oldestAt = at; }
       }
-      if (oldest) { entries.delete(oldest); published.delete(oldest); changed.delete(oldest); }
+      if (oldest) { entries.delete(oldest); changed.delete(oldest); }
     }
     entries.set(session, change(current));
     return true;
@@ -569,7 +574,7 @@ export function createSessionActivity(clock: () => number = Date.now) {
     /** The session printed something. */
     output(session: string) {
       const now = clock();
-      if (update(session, (current) => ({ ...current, lastOutputAt: now }))) publishThrottled(session, now);
+      if (update(session, (current) => ({ ...current, lastOutputAt: now }))) publishThrottled(now);
     },
     /** The program renamed itself; a rename is also a sign of life. */
     title(session: string, value: string) {
@@ -580,7 +585,7 @@ export function createSessionActivity(clock: () => number = Date.now) {
       if (existing && existing.title === title && existing.lastOutputAt !== null && now - existing.lastOutputAt < ACTIVITY_PUBLISH_MS) {
         return;
       }
-      if (update(session, (current) => ({ ...current, title, lastOutputAt: now }))) publishThrottled(session, now);
+      if (update(session, (current) => ({ ...current, title, lastOutputAt: now }))) publishThrottled(now);
     },
     /**
      * The reader typed into the session: whatever it asked is answered, and
@@ -742,7 +747,6 @@ export function createSessionActivity(clock: () => number = Date.now) {
     },
     /** The session ended or its tab closed. */
     forget(session: string) {
-      published.delete(session);
       changed.delete(session);
       if (entries.delete(session)) publish();
     },

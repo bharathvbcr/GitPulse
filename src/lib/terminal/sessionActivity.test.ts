@@ -252,6 +252,27 @@ describe("createSessionActivity", () => {
     stop();
   });
 
+  it("publishes output at most once a second across all sessions, and every session's last output still lands", () => {
+    // Each publish copies the whole map and re-runs every subscriber (the menu
+    // state serialises itself on each one), so twenty chattering agents must
+    // not cost twenty publishes a second.
+    const activity = make();
+    let publishes = 0;
+    const stop = activity.subscribe(() => { publishes += 1; });
+    publishes = 0;
+    const sessions = Array.from({ length: 20 }, (_, i) => `term-${i}`);
+    for (let tick = 0; tick < 10; tick += 1) {
+      now += 10;
+      for (const session of sessions) activity.output(session);
+    }
+    expect(publishes).toBe(1);
+    now += ACTIVITY_PUBLISH_MS;
+    vi.advanceTimersByTime(ACTIVITY_PUBLISH_MS);
+    expect(publishes).toBe(2);
+    for (const session of sessions) expect(get(activity).get(session)?.lastOutputAt).toBe(1_000_000 + 100);
+    stop();
+  });
+
   it("treats a title change as a sign of life and keeps the title clean", () => {
     const activity = make();
     activity.title("term-1", "\x1b]0;✳ Fixing the importer\x07");
