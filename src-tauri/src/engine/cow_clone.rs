@@ -951,14 +951,12 @@ fn try_clone_file(src: &Path, dst: &Path) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        if try_linux_ficlone(src, dst).unwrap_or(false) {
-            return true;
-        }
+        let cloned = try_linux_ficlone(src, dst).unwrap_or(false);
         #[cfg(test)]
-        if SIMULATED_CLONE.with(std::cell::Cell::get) {
+        if !cloned && SIMULATED_CLONE.with(std::cell::Cell::get) {
             return fs::copy(src, dst).is_ok();
         }
-        false
+        cloned
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
