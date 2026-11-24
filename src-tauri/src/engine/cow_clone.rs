@@ -1443,37 +1443,52 @@ fn rewrite_out_tree_text_files(
 }
 
 fn replace_path_prefixes(text: &str, replacements: &[(&str, &str)]) -> String {
-    let mut current = text.to_string();
-    for (from, to) in replacements {
-        if !from.is_empty() && from != to && current.contains(from) {
-            current = replace_path_prefix(&current, from, to);
-        }
+    let mut valid: Vec<(&str, &str)> = replacements
+        .iter()
+        .copied()
+        .filter(|(from, to)| !from.is_empty() && from != to)
+        .collect();
+    if valid.is_empty() {
+        return text.to_string();
     }
-    current
+    // Longest prefix first so more specific target paths win ties at identical positions.
+    valid.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let mut best: Option<(usize, &str, &str)> = None;
+        for &(from, to) in &valid {
+            if let Some(rel) = rest.find(from) {
+                if best.is_none_or(|(best_rel, _, _)| rel < best_rel) {
+                    best = Some((rel, from, to));
+                }
+            }
+        }
+        let Some((rel, from, to)) = best else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..rel]);
+        let after = &rest[rel + from.len()..];
+        let continues_component = after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        out.push_str(if continues_component { from } else { to });
+        cursor += rel + from.len();
+    }
+    out
 }
 
 /// `text` with every occurrence of the path `from` that ends at a path-component
 /// boundary replaced by `to`. `/a/target2` and `/w/lane-10` are not inside
 /// `/a/target` or `/w/lane-1`, whereas `/a/target/debug`, `"/a/target"`, and
 /// `DIR=/a/target:more` are rewritten.
+#[cfg(test)]
 fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
-    if from.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(from) {
-        let after = &rest[at + from.len()..];
-        let continues_component = after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-        out.push_str(&rest[..at]);
-        out.push_str(if continues_component { from } else { to });
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+    replace_path_prefixes(text, &[(from, to)])
 }
 
 #[cfg(target_os = "macos")]
@@ -2656,6 +2671,30 @@ mod tests {
             replace_path_prefix("nothing here", from, to),
             "nothing here"
         );
+    }
+
+    #[test]
+    fn nested_worktree_under_anchor_root_does_not_double_rewrite_target_paths() {
+        let replacements = [
+            (
+                "/repo/src-tauri/target",
+                "/repo/.gitpulse/worktrees/wt/src-tauri/target",
+            ),
+            ("/repo", "/repo/.gitpulse/worktrees/wt"),
+        ];
+        let input = concat!(
+            "OUT=/repo/src-tauri/target/debug/build/pkg/out\n",
+            "ROOT=/repo/src-tauri\n",
+            "SIBLING=/repo2/target\n",
+            "BARE=/repo/src-tauri/target\n",
+        );
+        let expected = concat!(
+            "OUT=/repo/.gitpulse/worktrees/wt/src-tauri/target/debug/build/pkg/out\n",
+            "ROOT=/repo/.gitpulse/worktrees/wt/src-tauri\n",
+            "SIBLING=/repo2/target\n",
+            "BARE=/repo/.gitpulse/worktrees/wt/src-tauri/target\n",
+        );
+        assert_eq!(replace_path_prefixes(input, &replacements), expected);
     }
 
     /// target/ passes the same ignore check as every other cache.
