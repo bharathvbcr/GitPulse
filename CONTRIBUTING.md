@@ -384,7 +384,9 @@ that one tag (`git push origin vX.Y.Z`; never `--tags`). The workflow builds
 a **draft**. Nothing is public until a person publishes it, after `verify`
 reports the complete asset set and has opened the macOS app archive, both debs,
 both MSIs and both NSIS installers to confirm each holds every `[[bin]]` in
-`src-tauri/Cargo.toml` (the dmg, rpms and AppImages are not opened).
+`src-tauri/Cargo.toml` (the dmg, rpms and AppImages are not opened). A beta
+(`vX.Y.Z-beta.N`) ships no rpm: its Linux legs bundle only the deb and AppImage,
+because RPM forbids the `-` in its version.
 
 The opt-in update check (`src-tauri/src/updates`) announces a version only
 once its `GitPulse_X.Y.Z_SHA256SUMS.txt` asset answers an anonymous request,

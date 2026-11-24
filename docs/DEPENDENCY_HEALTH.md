@@ -249,7 +249,9 @@ Check a download with `sha256sum -c --ignore-missing GitPulse_<v>_SHA256SUMS.txt
 
 Linux aarch64 (`ubuntu-22.04-arm`, keeping the 22.04 glibc floor) and Windows
 arm64 (`windows-11-arm`, native because `libsqlite3-sys` does not cross-build
-to MSVC) are in the release matrix. That brings the release to twelve installers: the
+to MSVC) are in the release matrix. That brings a stable release to twelve installers
+(a beta has ten: it ships no `.rpm`, whose version cannot contain the beta's `-`;
+see `bundleArgs` in `scripts/check-release-assets.mjs`): the
 ARM legs add `GitPulse-<v>-1.aarch64.rpm`, `GitPulse_<v>_aarch64.AppImage`,
 `GitPulse_<v>_arm64.deb`, `GitPulse_<v>_arm64-setup.exe` and
 `GitPulse_<v>_arm64_en-US.msi` (the Tauri 2.12.1 bundler's own arch names). A
