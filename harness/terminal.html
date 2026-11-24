@@ -1425,8 +1425,8 @@
               // An earlier version's host still runs a session: shown apart, stopped and read through its own commands.
               legacySessions = [{ id: "term-9-z", program: "/bin/zsh", cwd: "/fixture/Old", repo: "/fixture/Old", launcher: null, run_id: null, title: "old build", parent_session_id: null, detached: true, ending: false, quiet_ms: 5 }];
               const killsBeforeLegacy = report.killOrigins.length;
-              button("All terminal sessions").click(); await wait(80);
-              button("All terminal sessions").click();
+              await dockMenu("terminal-session-count"); await wait(80);
+              await dockMenu("terminal-session-count");
               const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
               check("a session in the previous version's host is listed apart, as not shown here", () =>
                 Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
