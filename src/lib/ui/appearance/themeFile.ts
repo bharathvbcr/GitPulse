@@ -28,6 +28,14 @@ import {
   type GitPulseTheme,
   type ThemeError,
 } from "./themeSchema";
+import {
+  MAX_VSCODE_JSON_BYTES,
+  MAX_VSIX_BYTES,
+  importVsCodeThemeText,
+  importVsixBytes,
+  isVsCodeThemeObject,
+  stripJsonc,
+} from "./vscodeTheme";
 
 /** A theme file is a few hundred bytes; 64 KiB is generous and bounds the parse. */
 export const MAX_THEME_FILE_BYTES = 64 * 1024;
@@ -40,9 +48,17 @@ export type ThemeImport =
   | { readonly ok: true; readonly theme: GitPulseTheme; readonly ignoredKeys: readonly string[] }
   | { readonly ok: false; readonly reason: string; readonly errors: readonly ThemeError[] };
 
-/** Parses and validates theme file text. Never throws. */
+/** Parses and validates theme file text (`gitpulse-theme/1` or VS Code JSON/JSONC). Never throws. */
 export function importThemeText(text: string): ThemeImport {
-  if (new TextEncoder().encode(text).length > MAX_THEME_FILE_BYTES) {
+  const byteLength = new TextEncoder().encode(text).length;
+  if (byteLength > MAX_VSCODE_JSON_BYTES) {
+    return {
+      ok: false,
+      reason: `The file is larger than ${MAX_VSCODE_JSON_BYTES / 1024} KB, which is more than a theme needs.`,
+      errors: [],
+    };
+  }
+  if (byteLength > MAX_THEME_FILE_BYTES && !text.includes('"colors"')) {
     return {
       ok: false,
       reason: `The file is larger than ${MAX_THEME_FILE_BYTES / 1024} KB, which is more than a theme needs.`,
@@ -50,9 +66,35 @@ export function importThemeText(text: string): ThemeImport {
     };
   }
   let parsed: unknown;
+  let parsedAsJson = false;
   try {
     parsed = JSON.parse(text);
+    parsedAsJson = true;
   } catch {
+    try {
+      parsed = JSON.parse(stripJsonc(text));
+    } catch {
+      return {
+        ok: false,
+        reason:
+          byteLength > MAX_THEME_FILE_BYTES
+            ? `The file is larger than ${MAX_THEME_FILE_BYTES / 1024} KB, which is more than a theme needs.`
+            : "The file isn't valid JSON.",
+        errors: [],
+      };
+    }
+  }
+  if (isVsCodeThemeObject(parsed)) {
+    return importVsCodeThemeText(text);
+  }
+  if (byteLength > MAX_THEME_FILE_BYTES) {
+    return {
+      ok: false,
+      reason: `The file is larger than ${MAX_THEME_FILE_BYTES / 1024} KB, which is more than a theme needs.`,
+      errors: [],
+    };
+  }
+  if (!parsedAsJson) {
     return { ok: false, reason: "The file isn't valid JSON.", errors: [] };
   }
   const checked = validateTheme(parsed);
@@ -64,6 +106,29 @@ export function importThemeText(text: string): ThemeImport {
     reason: `${first.join("; ")}${more > 0 ? `; and ${more} more` : ""}.`,
     errors: checked.errors,
   };
+}
+
+/** Imports a user-picked `.gitpulse-theme.json`, VS Code `.json`/`.jsonc`, or `.vsix` file. */
+export async function importThemeFile(file: File): Promise<ThemeImport> {
+  if (/\.vsix$/i.test(file.name)) {
+    if (file.size > MAX_VSIX_BYTES) {
+      return {
+        ok: false,
+        reason: `The .vsix file is larger than ${MAX_VSIX_BYTES / (1024 * 1024)} MB.`,
+        errors: [],
+      };
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return importVsixBytes(bytes, file.name);
+  }
+  if (file.size > MAX_VSCODE_JSON_BYTES) {
+    return {
+      ok: false,
+      reason: `The file is larger than ${MAX_VSCODE_JSON_BYTES / 1024} KB, which is more than a theme needs.`,
+      errors: [],
+    };
+  }
+  return importThemeText(await file.text());
 }
 
 /** The preference changes importing `theme` makes. The palette stays in `customTheme`. */
