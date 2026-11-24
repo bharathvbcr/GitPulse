@@ -4043,9 +4043,11 @@ pub(crate) mod tests {
             )
         };
         let refusal = close().unwrap_err();
+        // The message says what is missing; the refusal names the repository
+        // path and the session, which stay out of the test log.
         assert!(
             refusal.contains("is protected") && refusal.contains(&child),
-            "{refusal}"
+            "the refusal does not say the child session is protected"
         );
         assert!(
             ui.closed.lock().unwrap().is_empty(),
