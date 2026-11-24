@@ -162,6 +162,25 @@ public final class GitPulseCryptoModule: Module {
             }
         }
 
+        // Opus #23 P1: Steering confirmation MUST be rendered and P-256 biometric-signed natively
+        // so compromised JS/OTA cannot forge HumanConfirmed mailbox envelopes.
+        AsyncFunction("presentSteeringConfirmSheet") { (request: [String: Any], promise: Promise) in
+            DispatchQueue.main.async {
+                GitPulseSteeringSheetPresenter.shared.present(
+                    request: request,
+                    signer: { signingBytes in
+                        try self.signWithSecureEnclaveP256(signingBytes: signingBytes)
+                    },
+                    deviceIdProvider: {
+                        try self.ensureDeviceId()
+                    },
+                    completion: { outcome in
+                        promise.resolve(outcome)
+                    }
+                )
+            }
+        }
+
         // Opus M1: Notification quick-action signing ONLY supports deny and deny_and_interrupt.
         AsyncFunction("signDenyDecision") { (request: [String: Any]) throws -> [String: Any] in
             guard

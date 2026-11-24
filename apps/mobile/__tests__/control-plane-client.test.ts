@@ -208,6 +208,18 @@ describe("ControlPlaneClient state machine", () => {
       session_key: preview.session_key,
       expect_route: preview.expect_route,
       text: "Check failing test",
+      signed: {
+        host_id: "host-1",
+        session_key: preview.session_key,
+        request_id: preview.request_id,
+        expect_route: preview.expect_route,
+        text_sha256: "e".repeat(64),
+        issued_at: 1_700_000_000,
+        expires_at: 1_700_000_300,
+        nonce: "nonce-agy-1",
+        device_id: "ios-device-1",
+        sig_p256_der_b64: "MEUCIQDagy==",
+      },
     });
     expect(confirm.status).toBe("queued");
     expect(sent).toContainEqual(
@@ -215,8 +227,23 @@ describe("ControlPlaneClient state machine", () => {
         type: "steering_confirm_req",
         request_id: "req-agy-1",
         expect_route: "queued_next_turn",
+        signed: expect.objectContaining({
+          text_sha256: "e".repeat(64),
+          device_id: "ios-device-1",
+        }),
       }),
     );
+
+    // Rejects unsigned or mismatched steering confirm (Opus #23 P1)
+    await expect(
+      client.confirmSteering({
+        request_id: "req-unsigned",
+        session_key: "agy:repo:1",
+        expect_route: "queued_next_turn",
+        text: "Injected text",
+        signed: undefined as unknown as Parameters<ControlPlaneClient["confirmSteering"]>[0]["signed"],
+      }),
+    ).rejects.toThrow(/Opus #23 P1/i);
 
     client.applyEvent({
       type: "steering_expired",

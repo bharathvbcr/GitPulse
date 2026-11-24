@@ -3,6 +3,7 @@ import {
   GitPulseCrypto,
   type DevicePublicKeys,
   type NativeApprovalSheetOutcome,
+  type NativeSteeringSheetOutcome,
 } from "@gitpulse/crypto";
 import {
   ControlPlaneClient,
@@ -11,6 +12,7 @@ import {
 } from "../client/ControlPlaneClient";
 import {
   type ApprovalTicket,
+  type SessionSnapshot,
   type SteeringConfirmReq,
   type SteeringConfirmResp,
   type SteeringPreviewReq,
@@ -30,6 +32,14 @@ export interface ControlPlaneContextValue {
   readonly launchNativeApprovalSheet: (
     ticket: ApprovalTicket,
   ) => Promise<NativeApprovalSheetOutcome>;
+  readonly launchNativeSteeringConfirmSheet: (
+    session: SessionSnapshot,
+    preview: SteeringPreviewResp,
+    text: string,
+  ) => Promise<{
+    sheet: NativeSteeringSheetOutcome;
+    receipt?: SteeringConfirmResp;
+  }>;
   readonly previewSteering: (req: SteeringPreviewReq) => Promise<SteeringPreviewResp>;
   readonly confirmSteering: (req: SteeringConfirmReq) => Promise<SteeringConfirmResp>;
   readonly sendPtyInput: (
@@ -196,6 +206,35 @@ export function ControlPlaneProvider({
           client.submitApprovalDecision(outcome.signed_decision);
         }
         return outcome;
+      },
+      async launchNativeSteeringConfirmSheet(
+        session: SessionSnapshot,
+        preview: SteeringPreviewResp,
+        text: string,
+      ) {
+        const sheet = await GitPulseCrypto.presentSteeringConfirmSheet({
+          host_id: session.host_id ?? "local-host",
+          session_key: preview.session_key,
+          request_id: preview.request_id,
+          expect_route: preview.expect_route,
+          delivery_mode: preview.delivery_mode,
+          text,
+          repo_label: session.repo_label,
+          harness_label: session.harness,
+          warning: preview.warning,
+        });
+        if (sheet.status === "signed" && sheet.signed_confirm) {
+          const receipt = await client.confirmSteering({
+            request_id: preview.request_id,
+            session_key: preview.session_key,
+            expect_route: preview.expect_route,
+            text,
+            confirm_token: preview.confirm_token,
+            signed: sheet.signed_confirm,
+          });
+          return { sheet, receipt };
+        }
+        return { sheet };
       },
       previewSteering: (req) => client.previewSteering(req),
       confirmSteering: (req) => client.confirmSteering(req),

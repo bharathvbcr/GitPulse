@@ -52,6 +52,19 @@ object GitPulseRustBridge {
         expiresAt: Long,
     ): ByteArray
 
+    external fun nativeHashSteeringText(text: String): String
+
+    external fun nativeBuildSteeringSigningBytes(
+        hostId: String,
+        sessionKey: String,
+        requestId: String,
+        expectRoute: String,
+        textSha256: String,
+        nonce: String,
+        issuedAt: Long,
+        expiresAt: Long,
+    ): ByteArray
+
     external fun nativeVerifyApprovalDecision(
         decisionJson: String,
         certJson: String,

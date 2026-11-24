@@ -18,7 +18,7 @@ function makeRequestId(): string {
  * `Queued (next turn)` + 2h TTL alerts for idle Antigravity sessions.
  */
 export function SteeringBar({ session }: { session: SessionSnapshot }) {
-  const { previewSteering, confirmSteering } = useControlPlane();
+  const { previewSteering, launchNativeSteeringConfirmSheet } = useControlPlane();
   const [draft, setDraft] = useState("");
   const [preview, setPreview] = useState<SteeringPreviewResp | null>(null);
   const [receipt, setReceipt] = useState<SteeringConfirmResp | null>(null);
@@ -50,17 +50,23 @@ export function SteeringBar({ session }: { session: SessionSnapshot }) {
     setBusy(true);
     setError(null);
     try {
-      const resp = await confirmSteering({
-        request_id: preview.request_id,
-        session_key: preview.session_key,
-        expect_route: preview.expect_route,
-        text: draft.trim(),
-        confirm_token: preview.confirm_token,
-      });
-      setReceipt(resp);
-      if (resp.status === "delivered" || resp.status === "queued") {
-        setDraft("");
-        setPreview(null);
+      const { sheet, receipt: confirmReceipt } = await launchNativeSteeringConfirmSheet(
+        session,
+        preview,
+        draft.trim(),
+      );
+      if (sheet.status !== "signed") {
+        if (sheet.status !== "cancelled") {
+          setError(sheet.error_message ?? `Native signing failed (${sheet.status}).`);
+        }
+        return;
+      }
+      if (confirmReceipt) {
+        setReceipt(confirmReceipt);
+        if (confirmReceipt.status === "delivered" || confirmReceipt.status === "queued") {
+          setDraft("");
+          setPreview(null);
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -115,7 +121,7 @@ export function SteeringBar({ session }: { session: SessionSnapshot }) {
             </Pressable>
             <Pressable style={styles.confirmBtn} onPress={handleConfirm} disabled={busy}>
               <Text style={styles.btnText}>
-                {busy ? "Sending..." : "Step 2: Confirm & Send"}
+                {busy ? "Signing..." : "Step 2: Biometric Sign & Send"}
               </Text>
             </Pressable>
           </View>

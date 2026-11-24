@@ -95,6 +95,47 @@ export interface DenyOnlySignRequest {
   readonly expires_at: number;
 }
 
+/**
+ * Hardware P-256 signed steering confirmation (Opus #23 P1 steering authenticity).
+ * Domain: `gitpulse-steering/v1\n` + canonical sorted JSON.
+ * Signed exclusively from the native steering sheet after rendering the exact steering text
+ * natively and authenticating with Secure Enclave / StrongBox biometrics.
+ */
+export interface SignedSteeringConfirm {
+  readonly host_id: string;
+  readonly session_key: string;
+  readonly request_id: string;
+  readonly expect_route: string;
+  readonly text_sha256: string;
+  readonly issued_at: number;
+  readonly expires_at: number;
+  readonly nonce: string;
+  readonly device_id: string;
+  readonly sig_p256_der_b64: string;
+}
+
+export interface NativeSteeringSheetRequest {
+  readonly host_id: string;
+  readonly session_key: string;
+  readonly request_id: string;
+  readonly expect_route: string;
+  readonly delivery_mode: string;
+  /** Exact steering text rendered natively and SHA-256 hashed in Rust before P-256 signing. */
+  readonly text: string;
+  readonly repo_label: string;
+  readonly harness_label: string;
+  readonly warning?: string;
+  /** Validity window in seconds for the signed confirmation envelope (default 300s). */
+  readonly ttl_sec?: number;
+}
+
+export interface NativeSteeringSheetOutcome {
+  readonly status: "signed" | "cancelled" | "biometric_failed" | "error";
+  readonly signed_confirm?: SignedSteeringConfirm;
+  readonly computed_text_sha256?: string;
+  readonly error_message?: string;
+}
+
 export interface VerifyApprovalDecisionParams {
   readonly decision_json: string;
   readonly cert_json: string;
@@ -144,6 +185,9 @@ export interface NativeGitPulseCryptoBinding {
   tunnelDecrypt(sessionId: string, ciphertextB64: string): Promise<string>;
   tunnelClose(sessionId: string): Promise<void>;
   presentApprovalSheet(request: NativeApprovalSheetRequest): Promise<NativeApprovalSheetOutcome>;
+  presentSteeringConfirmSheet(
+    request: NativeSteeringSheetRequest,
+  ): Promise<NativeSteeringSheetOutcome>;
   signDenyDecision(request: DenyOnlySignRequest): Promise<SignedApprovalDecision>;
   verifyApprovalDecision(params: VerifyApprovalDecisionParams): Promise<ApprovalDecisionKind>;
   authenticateBiometricStepUp(reason: string): Promise<BiometricStepUpResult>;
@@ -263,4 +307,69 @@ export function assertValidSignedApprovalDecision(
   }
 
   assertNoRawKeyMaterial(record, "SignedApprovalDecision");
+}
+
+const ALLOWED_SIGNED_STEERING_KEYS = new Set([
+  "host_id",
+  "session_key",
+  "request_id",
+  "expect_route",
+  "text_sha256",
+  "issued_at",
+  "expires_at",
+  "nonce",
+  "device_id",
+  "sig_p256_der_b64",
+]);
+
+/**
+ * Opus #23 P1 guard: Strictly validates a hardware-signed `SignedSteeringConfirm`
+ * (`#[serde(deny_unknown_fields)]` parity) before sending over the tunnel.
+ */
+export function assertValidSignedSteeringConfirm(
+  candidate: unknown,
+): asserts candidate is SignedSteeringConfirm {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error(
+      "SECURITY VIOLATION (Opus #23 P1): SignedSteeringConfirm must be a JSON object.",
+    );
+  }
+  const record = candidate as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!ALLOWED_SIGNED_STEERING_KEYS.has(key)) {
+      throw new Error(
+        `SECURITY VIOLATION (Opus #23 P1): Unknown field "${key}" rejected in SignedSteeringConfirm.`,
+      );
+    }
+  }
+
+  const requiredStringFields = [
+    "host_id",
+    "session_key",
+    "request_id",
+    "expect_route",
+    "text_sha256",
+    "nonce",
+    "device_id",
+    "sig_p256_der_b64",
+  ] as const;
+  for (const field of requiredStringFields) {
+    if (typeof record[field] !== "string" || (record[field] as string).length === 0) {
+      throw new Error(`Invalid SignedSteeringConfirm: missing non-empty "${field}".`);
+    }
+  }
+
+  if (!/^[0-9a-f]{64}$/.test(record.text_sha256 as string)) {
+    throw new Error(
+      "Invalid SignedSteeringConfirm: text_sha256 must be a 64-char lowercase hex SHA-256.",
+    );
+  }
+  if (typeof record.issued_at !== "number" || typeof record.expires_at !== "number") {
+    throw new Error("Invalid SignedSteeringConfirm: issued_at and expires_at must be numbers.");
+  }
+  if (record.expires_at <= record.issued_at) {
+    throw new Error("Invalid SignedSteeringConfirm: expires_at must be after issued_at.");
+  }
+
+  assertNoRawKeyMaterial(record, "SignedSteeringConfirm");
 }

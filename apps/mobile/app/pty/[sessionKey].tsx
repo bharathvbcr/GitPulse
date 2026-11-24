@@ -57,6 +57,9 @@ function encodeUtf8ToBase64(input: string): string {
  *   1. An active, unexpired Desktop-granted time-boxed `PtyConsentGrant` for this session + device.
  *   2. Local hardware biometric step-up (`GitPulseCrypto.authenticateBiometricStepUp`).
  * - Auto-relocks immediately when grant expires or drawer unmounts.
+ * - Accepted residual risk (Opus #23): Individual `pty.input` keystrokes sent within an
+ *   active Desktop-granted time-boxed consent window + biometric step-up are authenticated
+ *   by the Noise IK session and audited under `grant.audit_id`, not signed per keystroke.
  */
 export default function PtyDrawerScreen() {
   const { sessionKey } = useLocalSearchParams<{ sessionKey: string }>();

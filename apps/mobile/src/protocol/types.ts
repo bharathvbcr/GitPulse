@@ -1,15 +1,19 @@
 import {
   assertValidSignedApprovalDecision,
+  assertValidSignedSteeringConfirm,
   type ApprovalDecisionKind,
   type DevicePublicKeys,
   type SignedApprovalDecision,
+  type SignedSteeringConfirm,
 } from "@gitpulse/crypto";
 
 export {
   assertValidSignedApprovalDecision,
+  assertValidSignedSteeringConfirm,
   type ApprovalDecisionKind,
   type DevicePublicKeys,
   type SignedApprovalDecision,
+  type SignedSteeringConfirm,
 };
 
 export type HarnessKind = "claude" | "antigravity" | "codex" | "manvi";
@@ -94,6 +98,7 @@ export interface DiffHunkFile {
 /** Matches `crates/gitpulse-protocol/src/wire.rs` `SessionSnapshot` (board #18). */
 export interface SessionSnapshot {
   readonly session_key: string;
+  readonly host_id?: string;
   readonly repo_path: string;
   readonly repo_label: string;
   readonly worktree_path: string;
@@ -176,12 +181,18 @@ export interface SteeringPreviewResp {
 }
 
 /** Matches `crates/gitpulse-protocol/src/wire.rs` `SteeringConfirmReq/Resp` (board #18). */
+/**
+ * Matches `SteeringConfirmReq` (board #18 + Opus #23 P1 steering authenticity).
+ * Carries a hardware P-256 `SignedSteeringConfirm` signed from the native steering sheet
+ * so the host verifies human confirmation before depositing `HumanConfirmed` into mailbox.
+ */
 export interface SteeringConfirmReq {
   readonly request_id: string;
   readonly session_key: string;
   readonly expect_route: string;
   readonly text: string;
   readonly confirm_token?: string;
+  readonly signed: SignedSteeringConfirm;
 }
 
 export interface SteeringConfirmResp {

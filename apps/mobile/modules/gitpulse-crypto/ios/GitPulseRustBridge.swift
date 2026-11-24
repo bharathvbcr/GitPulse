@@ -74,6 +74,40 @@ final class GitPulseRustBridge {
         #endif
     }
 
+    func hashSteeringText(text: String) throws -> String {
+        #if canImport(GitPulseProtocol)
+        return GitPulseProtocol.hashSteeringText(text: text)
+        #else
+        throw BridgeError.frameworkUnavailable("hash_steering_text")
+        #endif
+    }
+
+    func buildSteeringSigningBytes(
+        hostId: String,
+        sessionKey: String,
+        requestId: String,
+        expectRoute: String,
+        textSha256: String,
+        nonce: String,
+        issuedAt: Int64,
+        expiresAt: Int64
+    ) throws -> Data {
+        #if canImport(GitPulseProtocol)
+        return try GitPulseProtocol.buildSteeringSigningBytes(
+            hostId: hostId,
+            sessionKey: sessionKey,
+            requestId: requestId,
+            expectRoute: expectRoute,
+            textSha256: textSha256,
+            nonce: nonce,
+            issuedAt: issuedAt,
+            expiresAt: expiresAt
+        )
+        #else
+        throw BridgeError.frameworkUnavailable("build_steering_signing_bytes")
+        #endif
+    }
+
     func verifyApprovalDecision(
         decisionJson: String,
         certJson: String,

@@ -1,6 +1,7 @@
 import {
   assertNoRawKeyMaterial,
   assertValidSignedApprovalDecision,
+  assertValidSignedSteeringConfirm,
   type ApprovalDecisionKind,
   type BiometricStepUpResult,
   type DecryptedPushPreview,
@@ -9,6 +10,8 @@ import {
   type NativeApprovalSheetOutcome,
   type NativeApprovalSheetRequest,
   type NativeGitPulseCryptoBinding,
+  type NativeSteeringSheetOutcome,
+  type NativeSteeringSheetRequest,
   type RelayAuthHeaders,
   type SignedApprovalDecision,
   type TunnelInitiatorParams,
@@ -149,6 +152,50 @@ export const GitPulseCrypto = {
       if (outcome.signed_decision.input_sha256 !== request.expected_input_sha256) {
         throw new Error(
           "SECURITY VIOLATION (Opus M1): Signed input_sha256 does not match ticket expected_input_sha256.",
+        );
+      }
+    }
+    return outcome;
+  },
+
+  /**
+   * Presents the native/Rust steering confirmation sheet (Opus #23 P1).
+   * Native UI renders the exact steering text (isolated from compromised JS/OTA),
+   * hashes UTF-8 text via Rust (`text_sha256`), prompts biometrics, and signs
+   * `gitpulse-steering/v1\n` + canonical JSON using the hardware P-256 key.
+   */
+  async presentSteeringConfirmSheet(
+    request: NativeSteeringSheetRequest,
+  ): Promise<NativeSteeringSheetOutcome> {
+    if (!request.text || request.text.trim().length === 0) {
+      return {
+        status: "error",
+        error_message: "Steering text must be non-empty.",
+      };
+    }
+    const outcome = await resolveNativeBinding().presentSteeringConfirmSheet(request);
+    assertNoRawKeyMaterial(outcome, "presentSteeringConfirmSheet");
+    if (outcome.status === "signed") {
+      if (!outcome.signed_confirm) {
+        throw new Error(
+          "Native steering sheet returned status='signed' without signed_confirm.",
+        );
+      }
+      assertValidSignedSteeringConfirm(outcome.signed_confirm);
+      const sc = outcome.signed_confirm;
+      if (
+        sc.host_id !== request.host_id ||
+        sc.session_key !== request.session_key ||
+        sc.request_id !== request.request_id ||
+        sc.expect_route !== request.expect_route
+      ) {
+        throw new Error(
+          "SECURITY VIOLATION (Opus #23 P1): SignedSteeringConfirm metadata does not match requested steering envelope.",
+        );
+      }
+      if (outcome.computed_text_sha256 && sc.text_sha256 !== outcome.computed_text_sha256) {
+        throw new Error(
+          "SECURITY VIOLATION (Opus #23 P1): SignedSteeringConfirm text_sha256 does not match computed hash.",
         );
       }
     }

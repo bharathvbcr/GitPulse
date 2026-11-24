@@ -1,5 +1,6 @@
 import {
   assertValidSignedApprovalDecision,
+  assertValidSignedSteeringConfirm,
   type ApprovalTicket,
   type BannerAlert,
   type ControlPlaneEvent,
@@ -296,6 +297,18 @@ export class ControlPlaneClient {
     if (!req.request_id || req.request_id.trim().length === 0) {
       throw new Error("Steering confirmation requires an idempotent request_id.");
     }
+    // Opus #23 P1: Fail closed unless steering confirm carries a hardware P-256 signature
+    // binding exact text_sha256, session_key, request_id, and expect_route.
+    assertValidSignedSteeringConfirm(req.signed);
+    if (
+      req.signed.request_id !== req.request_id ||
+      req.signed.session_key !== req.session_key ||
+      req.signed.expect_route !== req.expect_route
+    ) {
+      throw new Error(
+        "SECURITY VIOLATION (Opus #23 P1): SteeringConfirmReq fields do not match SignedSteeringConfirm envelope.",
+      );
+    }
     if (this.options.transport.confirmSteering) {
       return this.options.transport.confirmSteering(req);
     }
@@ -312,7 +325,7 @@ export class ControlPlaneClient {
       expires_at: isQueued ? Math.floor(this.now() / 1000) + 7200 : undefined,
       reason: isQueued
         ? "Queued (next turn) — 2h TTL. You will be notified if it expires."
-        : `Delivered via ${req.expect_route}.`,
+        : `Delivered via ${req.expect_route} (hardware P-256 signed).`,
     };
   }
 

@@ -18,9 +18,11 @@ import {
   __setGitPulseCryptoBindingForTests,
   assertNoRawKeyMaterial,
   assertValidSignedApprovalDecision,
+  assertValidSignedSteeringConfirm,
   GitPulseCrypto,
   type NativeGitPulseCryptoBinding,
   type SignedApprovalDecision,
+  type SignedSteeringConfirm,
 } from "../modules/gitpulse-crypto/src/index";
 import {
   ControlPlaneClient,
@@ -102,6 +104,25 @@ function makeMockBinding(
           input_sha256: req.expected_input_sha256,
           decision: "allow_once",
         }),
+      };
+    },
+    async presentSteeringConfirmSheet(req) {
+      const sha = "c".repeat(64);
+      return {
+        status: "signed",
+        computed_text_sha256: sha,
+        signed_confirm: {
+          host_id: req.host_id,
+          session_key: req.session_key,
+          request_id: req.request_id,
+          expect_route: req.expect_route,
+          text_sha256: sha,
+          issued_at: 1_700_000_000,
+          expires_at: 1_700_000_300,
+          nonce: "steer-nonce-1",
+          device_id: "ios-dev-1",
+          sig_p256_der_b64: "MEUCIQDsteeringp256sig==",
+        },
       };
     },
     async signDenyDecision(req) {
@@ -491,5 +512,122 @@ describe("Opus P0-7: PTY input is read-only by default and requires Desktop cons
         nowMs: now,
       }),
     ).toBe(true);
+  });
+});
+
+describe("Opus #23 P1: Steering authenticity via native biometric P-256 SignedSteeringConfirm", () => {
+  function makeValidSignedSteering(
+    overrides: Partial<SignedSteeringConfirm> = {},
+  ): SignedSteeringConfirm {
+    return {
+      host_id: "host-1",
+      session_key: "claude:repo:1",
+      request_id: "req-1",
+      expect_route: "peer_inbox",
+      text_sha256: "d".repeat(64),
+      issued_at: 1_700_000_000,
+      expires_at: 1_700_000_300,
+      nonce: "nonce-steer-1",
+      device_id: "ios-dev-1",
+      sig_p256_der_b64: "MEUCIQDsteering==",
+      ...overrides,
+    };
+  }
+
+  it("validates SignedSteeringConfirm strictly and rejects malformed/unknown/expired fields", () => {
+    expect(() => assertValidSignedSteeringConfirm(makeValidSignedSteering())).not.toThrow();
+
+    expect(() =>
+      assertValidSignedSteeringConfirm({
+        ...makeValidSignedSteering(),
+        text_sha256: "not-a-sha256",
+      }),
+    ).toThrow(/text_sha256/i);
+
+    expect(() =>
+      assertValidSignedSteeringConfirm({
+        ...makeValidSignedSteering(),
+        expires_at: 1_700_000_000,
+      }),
+    ).toThrow(/expires_at/i);
+
+    expect(() =>
+      assertValidSignedSteeringConfirm({
+        ...makeValidSignedSteering(),
+        extra_injected: true,
+      }),
+    ).toThrow(/Unknown field/i);
+  });
+
+  it("presentSteeringConfirmSheet enforces metadata & hash parity and rejects spoofing", async () => {
+    __setGitPulseCryptoBindingForTests(makeMockBinding());
+    const ok = await GitPulseCrypto.presentSteeringConfirmSheet({
+      host_id: "host-1",
+      session_key: "claude:repo:1",
+      request_id: "req-1",
+      expect_route: "peer_inbox",
+      delivery_mode: "immediate",
+      text: "Run cargo test",
+      repo_label: "GitPulse",
+      harness_label: "claude",
+    });
+    expect(ok.status).toBe("signed");
+    expect(ok.signed_confirm?.text_sha256).toBe("c".repeat(64));
+
+    // Spoofed session_key in returned signed_confirm must fail closed
+    __setGitPulseCryptoBindingForTests(
+      makeMockBinding({
+        async presentSteeringConfirmSheet(req) {
+          return {
+            status: "signed",
+            computed_text_sha256: "c".repeat(64),
+            signed_confirm: makeValidSignedSteering({
+              host_id: req.host_id,
+              session_key: "other-session-hijacked",
+              request_id: req.request_id,
+              expect_route: req.expect_route,
+              text_sha256: "c".repeat(64),
+            }),
+          };
+        },
+      }),
+    );
+
+    await expect(
+      GitPulseCrypto.presentSteeringConfirmSheet({
+        host_id: "host-1",
+        session_key: "claude:repo:1",
+        request_id: "req-1",
+        expect_route: "peer_inbox",
+        delivery_mode: "immediate",
+        text: "Run cargo test",
+        repo_label: "GitPulse",
+        harness_label: "claude",
+      }),
+    ).rejects.toThrow(/Opus #23 P1/i);
+  });
+
+  it("native Swift and Kotlin steering sheets render exact text and sign via hardware P-256", () => {
+    const swiftSheet = fs.readFileSync(
+      path.join(MOBILE_ROOT, "modules/gitpulse-crypto/ios/GitPulseSteeringSheetView.swift"),
+      "utf8",
+    );
+    expect(swiftSheet).toContain("hashSteeringText");
+    expect(swiftSheet).toContain("buildSteeringSigningBytes");
+    expect(swiftSheet).toContain("textView.text = exactText");
+    expect(swiftSheet).toContain('"text_sha256": textSha256');
+
+    const kotlinSheet = fs.readFileSync(
+      path.join(
+        MOBILE_ROOT,
+        "modules/gitpulse-crypto/android/src/main/java/com/gitpulse/crypto/GitPulseSteeringSheetView.kt",
+      ),
+      "utf8",
+    );
+    expect(kotlinSheet).toContain("nativeHashSteeringText");
+    expect(kotlinSheet).toContain("nativeBuildSteeringSigningBytes");
+    expect(kotlinSheet).toContain("text = exactText");
+    expect(kotlinSheet).toContain("BiometricPrompt.CryptoObject(signature)");
+    expect(kotlinSheet).toContain('"text_sha256" to textSha256');
   });
 });

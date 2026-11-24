@@ -145,6 +145,30 @@ class GitPulseCryptoModule : Module() {
             }
         }
 
+        // Opus #23 P1: Steering confirmation MUST be rendered and P-256 biometric-signed natively
+        // so compromised JS/OTA cannot forge HumanConfirmed mailbox envelopes.
+        AsyncFunction("presentSteeringConfirmSheet") { request: Map<String, Any?>, promise: Promise ->
+            val activity = appContext.currentActivity as? FragmentActivity
+            if (activity == null) {
+                promise.resolve(
+                    mapOf(
+                        "status" to "cancelled",
+                        "error_message" to "Active FragmentActivity unavailable for native steering sheet",
+                    ),
+                )
+                return@AsyncFunction
+            }
+            activity.runOnUiThread {
+                GitPulseSteeringSheetPresenter.present(
+                    activity = activity,
+                    request = request,
+                    deviceId = ensureDeviceId(),
+                    prepareSignature = { prepareP256Signature() },
+                    onOutcome = { outcome -> promise.resolve(outcome) },
+                )
+            }
+        }
+
         // Opus M1: Notification quick-action signing ONLY permits deny and deny_and_interrupt.
         AsyncFunction("signDenyDecision") { request: Map<String, Any?>, promise: Promise ->
             val decision = request["decision"] as? String
