@@ -116,25 +116,6 @@ const SKILL_SUBFILES: [(&str, &str, &str); 3] = [
 ];
 
 #[cfg(unix)]
-const SKILL_SUBFILES: [(&str, &str, &str); 3] = [
-    (
-        "gitpulse-merge-train",
-        "failset/go.mod",
-        MERGE_TRAIN_FAILSET_GO_MOD,
-    ),
-    (
-        "gitpulse-merge-train",
-        "failset/main.go",
-        MERGE_TRAIN_FAILSET_MAIN,
-    ),
-    (
-        "gitpulse-merge-train",
-        "failset/main_test.go",
-        MERGE_TRAIN_FAILSET_TEST,
-    ),
-];
-
-#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', r"'\''"))
 }
