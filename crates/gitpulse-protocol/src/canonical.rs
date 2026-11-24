@@ -23,6 +23,10 @@ use sha2::{Digest, Sha256};
 /// every `SignedApprovalDecision`.
 pub const APPROVAL_SIGNING_DOMAIN: &[u8] = b"gitpulse-approval/v1\n";
 
+/// Domain prefix prepended to canonical JSON before P-256 signing/verification of
+/// every `SignedSteeringConfirm` (Opus review #23).
+pub const STEERING_SIGNING_DOMAIN: &[u8] = b"gitpulse-steering/v1\n";
+
 /// Maximum nesting depth accepted during canonicalization to prevent stack abuse.
 const MAX_JSON_DEPTH: usize = 64;
 
@@ -357,6 +361,70 @@ pub fn approval_signing_bytes(
     let canonical = canonical_json_bytes(&Value::Object(map))?;
     let mut out = Vec::with_capacity(APPROVAL_SIGNING_DOMAIN.len() + canonical.len());
     out.extend_from_slice(APPROVAL_SIGNING_DOMAIN);
+    out.extend_from_slice(&canonical);
+    Ok(out)
+}
+
+/// Computes lowercase hex `SHA-256(utf8(text))` for binding a steering message
+/// inside [`crate::wire::SignedSteeringConfirm`].
+pub fn steering_text_sha256_hex(text: &str) -> String {
+    hex_encode(&Sha256::digest(text.as_bytes()))
+}
+
+/// Builds the exact domain-separated bytes signed by the mobile hardware P-256 key
+/// for a [`crate::wire::SignedSteeringConfirm`] (Opus review #23):
+///
+/// ```text
+/// gitpulse-steering/v1\n{"expect_route":...,"expires_at":...,"host_id":...,"issued_at":...,"nonce":...,"request_id":...,"session_key":...,"text_sha256":...}
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn steering_signing_bytes(
+    host_id: &str,
+    session_key: &str,
+    request_id: &str,
+    expect_route: &str,
+    text_sha256_hex_str: &str,
+    nonce: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<Vec<u8>> {
+    validate_non_empty_id(host_id, "host_id", 128)?;
+    validate_non_empty_id(session_key, "session_key", 128)?;
+    validate_non_empty_id(request_id, "request_id", 128)?;
+    validate_non_empty_id(expect_route, "expect_route", 128)?;
+    validate_sha256_hex(text_sha256_hex_str)?;
+    validate_non_empty_id(nonce, "nonce", 128)?;
+    if expires_at <= issued_at {
+        return Err(ProtocolError::InvalidInput(
+            "expires_at must be strictly greater than issued_at".to_string(),
+        ));
+    }
+
+    let mut map = serde_json::Map::with_capacity(8);
+    map.insert(
+        "expect_route".to_string(),
+        Value::String(expect_route.to_string()),
+    );
+    map.insert("expires_at".to_string(), Value::from(expires_at));
+    map.insert("host_id".to_string(), Value::String(host_id.to_string()));
+    map.insert("issued_at".to_string(), Value::from(issued_at));
+    map.insert("nonce".to_string(), Value::String(nonce.to_string()));
+    map.insert(
+        "request_id".to_string(),
+        Value::String(request_id.to_string()),
+    );
+    map.insert(
+        "session_key".to_string(),
+        Value::String(session_key.to_string()),
+    );
+    map.insert(
+        "text_sha256".to_string(),
+        Value::String(text_sha256_hex_str.to_string()),
+    );
+
+    let canonical = canonical_json_bytes(&Value::Object(map))?;
+    let mut out = Vec::with_capacity(STEERING_SIGNING_DOMAIN.len() + canonical.len());
+    out.extend_from_slice(STEERING_SIGNING_DOMAIN);
     out.extend_from_slice(&canonical);
     Ok(out)
 }

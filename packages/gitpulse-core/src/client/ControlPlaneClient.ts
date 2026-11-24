@@ -14,6 +14,7 @@
 
 import {
   assertCleanSignedApprovalDecision,
+  assertCleanSignedSteeringConfirm,
   type ApprovalResolvedEvent,
   type ApprovalTicket,
   type ControlPlaneEvent,
@@ -271,6 +272,9 @@ export class ControlPlaneClient {
     }
     if (event.type === "approval_decide") {
       assertCleanSignedApprovalDecision(event.decision);
+    }
+    if (event.type === "steering_confirm_req" && event.req.signed !== undefined) {
+      assertCleanSignedSteeringConfirm(event.req.signed);
     }
     this.ws.send(JSON.stringify(event));
   }

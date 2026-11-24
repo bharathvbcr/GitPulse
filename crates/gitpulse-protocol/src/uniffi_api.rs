@@ -17,12 +17,13 @@
 
 use crate::canonical::{
     approval_signing_bytes, canonical_tool_input_bytes, input_sha256_hex,
-    parse_canonical_json_value,
+    parse_canonical_json_value, steering_signing_bytes, steering_text_sha256_hex,
 };
 use crate::crypto::{self, NoiseHandshake, RelayAuthHeaders, RevocationPolicy, TunnelSession};
 use crate::error::{ProtocolError, Result};
 use crate::wire::{
     ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision, SignedRevocationList,
+    SignedSteeringConfirm,
 };
 
 /// Computes lowercase hex `input_sha256` from `tool_name`, JSON-encoded `tool_input_json`,
@@ -101,6 +102,79 @@ pub fn verify_approval_decision(
         expected_host_id,
         expected_ticket_id,
         expected_input_sha256,
+        RevocationPolicy::Enforced {
+            list: &revocations,
+            min_version: min_revocation_version,
+        },
+        now_sec,
+    )
+}
+
+/// Computes lowercase hex `SHA-256(utf8(text))` for binding steering text in
+/// [`SignedSteeringConfirm`] (Opus review #23).
+pub fn hash_steering_text(text: &str) -> String {
+    steering_text_sha256_hex(text)
+}
+
+/// Builds the exact domain-separated bytes (`gitpulse-steering/v1\n` + canonical JSON)
+/// signed by the mobile hardware P-256 key inside the native steering confirmation sheet.
+#[allow(clippy::too_many_arguments)]
+pub fn build_steering_signing_bytes(
+    host_id: &str,
+    session_key: &str,
+    request_id: &str,
+    expect_route: &str,
+    text_sha256: &str,
+    nonce: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<Vec<u8>> {
+    steering_signing_bytes(
+        host_id,
+        session_key,
+        request_id,
+        expect_route,
+        text_sha256,
+        nonce,
+        issued_at,
+        expires_at,
+    )
+}
+
+/// Verifies a JSON-encoded [`SignedSteeringConfirm`] against `text`, a JSON-encoded
+/// [`DeviceCertificate`], a Keychain-pinned 32-byte Account `IdentityKey` Ed25519 public key,
+/// expected `(host_id, session_key, request_id, expect_route)`, and a **mandatory**
+/// JSON-encoded [`SignedRevocationList`] (Opus review #23).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_steering_confirm(
+    signed_json: &str,
+    text: &str,
+    cert_json: &str,
+    identity_pub_ed25519: &[u8],
+    expected_host_id: &str,
+    expected_session_key: &str,
+    expected_request_id: &str,
+    expected_route: &str,
+    revocations_json: &str,
+    min_revocation_version: u64,
+    now_sec: i64,
+) -> Result<()> {
+    let signed: SignedSteeringConfirm = serde_json::from_str(signed_json)
+        .map_err(|e| ProtocolError::Json(format!("signed_json: {e}")))?;
+    let cert: DeviceCertificate = serde_json::from_str(cert_json)
+        .map_err(|e| ProtocolError::Json(format!("cert_json: {e}")))?;
+    let revocations: SignedRevocationList = serde_json::from_str(revocations_json)
+        .map_err(|e| ProtocolError::Json(format!("revocations_json: {e}")))?;
+    let identity_pub = slice_to_array32(identity_pub_ed25519, "identity_pub_ed25519")?;
+    crypto::verify_steering_confirm(
+        &signed,
+        text,
+        &cert,
+        &identity_pub,
+        expected_host_id,
+        expected_session_key,
+        expected_request_id,
+        expected_route,
         RevocationPolicy::Enforced {
             list: &revocations,
             min_version: min_revocation_version,

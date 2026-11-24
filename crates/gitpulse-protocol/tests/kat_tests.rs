@@ -8,23 +8,25 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use gitpulse_protocol::canonical::{
     approval_signing_bytes, canonical_json_from_str, canonical_json_string,
-    canonical_tool_input_bytes, hex_decode, hex_encode, input_sha256_hex,
+    canonical_tool_input_bytes, hex_decode, hex_encode, input_sha256_hex, steering_signing_bytes,
+    steering_text_sha256_hex,
 };
 use gitpulse_protocol::crypto::{
     ed25519_public_from_secret, issue_device_certificate, issue_revocation_list, open_preview,
     relay_signing_message, revocation_signing_bytes, seal_preview_with_ephemeral,
-    sign_approval_decision_software, sign_relay_request, verify_approval_decision,
-    verify_device_certificate, verify_relay_request, verify_revocation_list,
-    x25519_public_from_secret, EpochHandshakeReplayGuard, NoiseHandshake, RevocationPolicy,
-    REPLAY_WINDOW_SIZE,
+    sign_approval_decision_software, sign_relay_request, sign_steering_confirm_software,
+    verify_approval_decision, verify_device_certificate, verify_relay_request,
+    verify_revocation_list, verify_steering_confirm, x25519_public_from_secret,
+    EpochHandshakeReplayGuard, NoiseHandshake, RevocationPolicy, REPLAY_WINDOW_SIZE,
 };
 use gitpulse_protocol::uniffi_api;
 use gitpulse_protocol::wire::{
     ApprovalChannel, ApprovalDecisionKind, ApprovalOutcome, ApprovalResolvedEvent, ApprovalTicket,
     CapabilitySet, ControlPlaneEvent, DeviceKind, FrameClass, OuterFrame, SessionSnapshot,
-    SignedApprovalDecision, SignedRevocationList, SteeringConfirmReq, SteeringConfirmResp,
-    SteeringDeliveryMode, SteeringPreviewReq, SteeringPreviewResp, SteeringStatus, SubagentSummary,
-    WakePushFrame, WakePushKind, GPTF_VERSION, MAX_CERT_TTL_SECS, MAX_PREVIEW_CT_BYTES,
+    SignedApprovalDecision, SignedRevocationList, SignedSteeringConfirm, SteeringConfirmReq,
+    SteeringConfirmResp, SteeringDeliveryMode, SteeringPreviewReq, SteeringPreviewResp,
+    SteeringStatus, SubagentSummary, WakePushFrame, WakePushKind, GPTF_VERSION, MAX_CERT_TTL_SECS,
+    MAX_PREVIEW_CT_BYTES,
 };
 use gitpulse_protocol::ProtocolError;
 use p256::ecdsa::SigningKey as P256SigningKey;
@@ -977,6 +979,7 @@ fn kat_pinned_golden_digest_and_uniffi_tunnel_roundtrip() {
                 expect_route: "mailbox_queue".to_string(),
                 text: "check tests".to_string(),
                 confirm_token: Some("tok_1".to_string()),
+                signed: None,
             },
         },
         ControlPlaneEvent::SteeringConfirmResp {
@@ -1149,4 +1152,138 @@ fn kat_cross_language_vector_files_match_byte_for_byte() {
         signed_dec.sig_p256_der_b64,
         app_vec["sig_p256_der_b64"].as_str().unwrap()
     );
+
+    // 4. SignedSteeringConfirm vector (Opus review #23).
+    let steer_raw = include_str!("vectors/steering_confirm_v1.json");
+    let steer_vec: Value = serde_json::from_str(steer_raw).expect("steering vector json");
+    let steer_text = steer_vec["text"].as_str().unwrap();
+    let steer_text_hash = steering_text_sha256_hex(steer_text);
+    assert_eq!(steer_text_hash, steer_vec["text_sha256"].as_str().unwrap());
+    assert_eq!(uniffi_api::hash_steering_text(steer_text), steer_text_hash);
+
+    let signed_steer: SignedSteeringConfirm =
+        serde_json::from_value(steer_vec["signed"].clone()).expect("SignedSteeringConfirm");
+    let steer_preimage = steering_signing_bytes(
+        &signed_steer.host_id,
+        &signed_steer.session_key,
+        &signed_steer.request_id,
+        &signed_steer.expect_route,
+        &signed_steer.text_sha256,
+        &signed_steer.nonce,
+        signed_steer.issued_at,
+        signed_steer.expires_at,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(steer_preimage.clone()).unwrap(),
+        steer_vec["steering_signing_preimage_utf8"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(
+        hex_encode(&steer_preimage),
+        steer_vec["steering_signing_preimage_hex"].as_str().unwrap()
+    );
+
+    let (identity_pub, _host_cert, mobile_cert) = fixture_certs();
+    let rev_list = issue_revocation_list(&IDENTITY_SEED, 1, NOW - 30, NOW + 3600, vec![]).unwrap();
+    verify_steering_confirm(
+        &signed_steer,
+        steer_text,
+        &mobile_cert,
+        &identity_pub,
+        &signed_steer.host_id,
+        &signed_steer.session_key,
+        &signed_steer.request_id,
+        &signed_steer.expect_route,
+        RevocationPolicy::Enforced {
+            list: &rev_list,
+            min_version: 1,
+        },
+        NOW,
+    )
+    .expect("steering vector verify");
+
+    // UniFFI verify_steering_confirm matches and enforces mandatory revocation list.
+    let signed_steer_json = serde_json::to_string(&signed_steer).unwrap();
+    let mobile_cert_json = serde_json::to_string(&mobile_cert).unwrap();
+    let rev_json = serde_json::to_string(&rev_list).unwrap();
+    uniffi_api::verify_steering_confirm(
+        &signed_steer_json,
+        steer_text,
+        &mobile_cert_json,
+        &identity_pub,
+        &signed_steer.host_id,
+        &signed_steer.session_key,
+        &signed_steer.request_id,
+        &signed_steer.expect_route,
+        &rev_json,
+        1,
+        NOW,
+    )
+    .expect("ffi steering verify");
+
+    // Text tamper (compromised JS substituting command) fails with BindingMismatch.
+    assert!(matches!(
+        verify_steering_confirm(
+            &signed_steer,
+            "rm -rf / && echo pwned",
+            &mobile_cert,
+            &identity_pub,
+            &signed_steer.host_id,
+            &signed_steer.session_key,
+            &signed_steer.request_id,
+            &signed_steer.expect_route,
+            RevocationPolicy::Enforced {
+                list: &rev_list,
+                min_version: 1,
+            },
+            NOW,
+        ),
+        Err(ProtocolError::BindingMismatch(_))
+    ));
+
+    // Route tamper fails with BindingMismatch.
+    assert!(matches!(
+        verify_steering_confirm(
+            &signed_steer,
+            steer_text,
+            &mobile_cert,
+            &identity_pub,
+            &signed_steer.host_id,
+            &signed_steer.session_key,
+            &signed_steer.request_id,
+            "headless_resume",
+            RevocationPolicy::Enforced {
+                list: &rev_list,
+                min_version: 1,
+            },
+            NOW,
+        ),
+        Err(ProtocolError::BindingMismatch(_))
+    ));
+
+    // Unknown field smuggling fails closed on deserialization.
+    let mut smuggled = steer_vec["signed"].clone();
+    smuggled
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".to_string(), json!(true));
+    assert!(serde_json::from_value::<SignedSteeringConfirm>(smuggled).is_err());
+
+    // Software signer reproduces vector signature byte-for-byte.
+    let re_signed = sign_steering_confirm_software(
+        &MOBILE_P256_SECRET,
+        &signed_steer.device_id,
+        &signed_steer.host_id,
+        &signed_steer.session_key,
+        &signed_steer.request_id,
+        &signed_steer.expect_route,
+        steer_text,
+        &signed_steer.nonce,
+        signed_steer.issued_at,
+        signed_steer.expires_at,
+    )
+    .unwrap();
+    assert_eq!(re_signed, signed_steer);
 }

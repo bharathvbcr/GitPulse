@@ -336,4 +336,61 @@ describe("packages/gitpulse-core ControlPlaneClient", () => {
     } as unknown as SignedApprovalDecision;
     expect(() => client.sendApprovalDecision(poisonedPerms)).toThrow(/Forbidden field/);
   });
+
+  it("validates SignedSteeringConfirm boundary fields before sending (Opus #23)", () => {
+    const ws = new FakeSocket();
+    const client = new ControlPlaneClient({
+      transport: {
+        async fetchJson() {
+          throw new Error("unused");
+        },
+        openWebSocket() {
+          return ws;
+        },
+      },
+    });
+    client.connect();
+    ws.emitOpen();
+
+    client.sendSteeringConfirm({
+      request_id: "steer-1",
+      session_key: "sess-1",
+      expect_route: "peer_inbox",
+      text: "run tests",
+      signed: {
+        host_id: "host-1",
+        session_key: "sess-1",
+        request_id: "steer-1",
+        expect_route: "peer_inbox",
+        text_sha256: "c".repeat(64),
+        issued_at: 1000,
+        expires_at: 1120,
+        nonce: "n-1",
+        device_id: "mob-1",
+        sig_p256_der_b64: "AAAA",
+      },
+    });
+    expect(ws.sent).toHaveLength(1);
+
+    expect(() =>
+      client.sendSteeringConfirm({
+        request_id: "steer-2",
+        session_key: "sess-1",
+        expect_route: "peer_inbox",
+        text: "run tests",
+        signed: {
+          host_id: "host-1",
+          session_key: "sess-1",
+          request_id: "steer-2",
+          expect_route: "peer_inbox",
+          text_sha256: "not-a-hex-digest",
+          issued_at: 1000,
+          expires_at: 1120,
+          nonce: "n-2",
+          device_id: "mob-1",
+          sig_p256_der_b64: "AAAA",
+        },
+      }),
+    ).toThrow(/text_sha256/);
+  });
 });

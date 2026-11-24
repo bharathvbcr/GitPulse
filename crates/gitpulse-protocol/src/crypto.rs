@@ -20,12 +20,14 @@
 //!   ChaCha20-Poly1305 + host Ed25519 signature) for metadata-free APNs/FCM NSE wake pushes.
 
 use crate::canonical::{
-    approval_signing_bytes, hex_encode, validate_non_empty_id, validate_sha256_hex,
+    approval_signing_bytes, hex_encode, steering_signing_bytes, steering_text_sha256_hex,
+    validate_non_empty_id, validate_sha256_hex,
 };
 use crate::error::{ProtocolError, Result};
 use crate::wire::{
     ApprovalDecisionKind, DeviceCertificate, DeviceKind, SignedApprovalDecision,
-    SignedRevocationList, CLOCK_SKEW_SECS, MAX_CERT_TTL_SECS, MAX_PREVIEW_CT_BYTES,
+    SignedRevocationList, SignedSteeringConfirm, CLOCK_SKEW_SECS, MAX_CERT_TTL_SECS,
+    MAX_PREVIEW_CT_BYTES,
 };
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -590,6 +592,165 @@ pub fn sign_approval_decision_software(
         nonce: nonce.to_string(),
         issued_at,
         expires_at,
+        device_id: device_id.to_string(),
+        sig_p256_der_b64: STANDARD.encode(sig.as_bytes()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// P-256 Hardware Steering Confirm Verification (Opus review #23)
+// ---------------------------------------------------------------------------
+
+/// Verifies a [`SignedSteeringConfirm`] end-to-end before a host deposits remote
+/// steering text with `HumanConfirmed` provenance:
+/// 1. Verifies `signer_cert` chains to the Keychain-pinned `identity_pub_ed25519`,
+///    is unexpired, within `<= 30 day` TTL, and satisfies `revocation_policy` (mandatory).
+/// 2. Verifies `signer_cert.device_id == signed.device_id` and extracts `approval_pub_p256`.
+/// 3. Verifies exact binding to `(expected_host_id, expected_session_key,
+///    expected_request_id, expected_route)` and `signed.text_sha256 == hex(sha256(text))`.
+/// 4. Enforces `signed` time validity (`issued_at <= now + skew`, `now < expires_at`).
+/// 5. Verifies the ASN.1 DER ECDSA-P256-SHA256 signature over [`steering_signing_bytes`].
+#[allow(clippy::too_many_arguments)]
+pub fn verify_steering_confirm(
+    signed: &SignedSteeringConfirm,
+    text: &str,
+    signer_cert: &DeviceCertificate,
+    identity_pub_ed25519: &[u8; 32],
+    expected_host_id: &str,
+    expected_session_key: &str,
+    expected_request_id: &str,
+    expected_route: &str,
+    revocation_policy: RevocationPolicy<'_>,
+    now_sec: i64,
+) -> Result<()> {
+    verify_device_certificate(
+        signer_cert,
+        identity_pub_ed25519,
+        revocation_policy,
+        now_sec,
+    )?;
+
+    if signer_cert.device_id != signed.device_id {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.device_id does not match DeviceCertificate.device_id".to_string(),
+        ));
+    }
+    if signed.host_id != expected_host_id {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.host_id mismatch".to_string(),
+        ));
+    }
+    if signed.session_key != expected_session_key {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.session_key mismatch".to_string(),
+        ));
+    }
+    if signed.request_id != expected_request_id {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.request_id mismatch".to_string(),
+        ));
+    }
+    if signed.expect_route != expected_route {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.expect_route mismatch".to_string(),
+        ));
+    }
+
+    let expected_text_sha256 = steering_text_sha256_hex(text);
+    if signed.text_sha256 != expected_text_sha256 {
+        return Err(ProtocolError::BindingMismatch(
+            "steering.text_sha256 does not match text".to_string(),
+        ));
+    }
+    if signed.expires_at <= signed.issued_at || now_sec >= signed.expires_at {
+        return Err(ProtocolError::Expired("steering confirm".to_string()));
+    }
+    if signed.issued_at > now_sec.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(ProtocolError::NotYetValid("steering confirm".to_string()));
+    }
+
+    let p256_b64 = signer_cert
+        .approval_pub_p256_b64
+        .as_deref()
+        .ok_or_else(|| {
+            ProtocolError::BindingMismatch(
+                "signer DeviceCertificate has no enrolled P-256 approval key".to_string(),
+            )
+        })?;
+    let p256_sec1 = STANDARD
+        .decode(p256_b64)
+        .map_err(|_| ProtocolError::Malformed("approval_pub_p256_b64".to_string()))?;
+    let p256_vk = P256VerifyingKey::from_sec1_bytes(&p256_sec1)
+        .map_err(|_| ProtocolError::Malformed("invalid SEC1 P-256 public key".to_string()))?;
+
+    let sig_der_bytes = STANDARD
+        .decode(&signed.sig_p256_der_b64)
+        .map_err(|_| ProtocolError::Malformed("sig_p256_der_b64".to_string()))?;
+    let der_sig = DerSignature::from_bytes(&sig_der_bytes)
+        .map_err(|_| ProtocolError::Malformed("invalid ASN.1 DER P-256 signature".to_string()))?;
+
+    let signing_bytes = steering_signing_bytes(
+        &signed.host_id,
+        &signed.session_key,
+        &signed.request_id,
+        &signed.expect_route,
+        &signed.text_sha256,
+        &signed.nonce,
+        signed.issued_at,
+        signed.expires_at,
+    )?;
+
+    p256_vk
+        .verify(&signing_bytes, &der_sig)
+        .map_err(|_| ProtocolError::BadSignature("P-256 steering confirm".to_string()))?;
+
+    Ok(())
+}
+
+/// Software P-256 signing helper for deterministic steering KAT tests.
+///
+/// Production mobile apps MUST sign inside Secure Enclave / StrongBox from a native
+/// sheet that renders the exact UTF-8 steering text (Opus review #23).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_steering_confirm_software(
+    p256_secret_scalar: &[u8; 32],
+    device_id: &str,
+    host_id: &str,
+    session_key: &str,
+    request_id: &str,
+    expect_route: &str,
+    text: &str,
+    nonce: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<SignedSteeringConfirm> {
+    use p256::ecdsa::signature::Signer as P256Signer;
+    use p256::ecdsa::SigningKey as P256SigningKey;
+
+    validate_non_empty_id(device_id, "device_id", 64)?;
+    let text_sha256 = steering_text_sha256_hex(text);
+    let signing_bytes = steering_signing_bytes(
+        host_id,
+        session_key,
+        request_id,
+        expect_route,
+        &text_sha256,
+        nonce,
+        issued_at,
+        expires_at,
+    )?;
+    let sk = P256SigningKey::from_bytes(p256_secret_scalar.into())
+        .map_err(|_| ProtocolError::InvalidInput("invalid P-256 secret scalar".to_string()))?;
+    let sig: DerSignature = sk.sign(&signing_bytes);
+    Ok(SignedSteeringConfirm {
+        host_id: host_id.to_string(),
+        session_key: session_key.to_string(),
+        request_id: request_id.to_string(),
+        expect_route: expect_route.to_string(),
+        text_sha256,
+        issued_at,
+        expires_at,
+        nonce: nonce.to_string(),
         device_id: device_id.to_string(),
         sig_p256_der_b64: STANDARD.encode(sig.as_bytes()),
     })

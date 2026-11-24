@@ -395,6 +395,40 @@ pub struct SteeringPreviewResp {
     pub warning: Option<String>,
 }
 
+/// Cryptographically signed mobile steering confirmation (Opus review #23).
+///
+/// Prevents a compromised JS/OTA layer from injecting steering text that the host
+/// deposits as `HumanConfirmed` (which equals arbitrary execution in bypass/acceptEdits
+/// modes). Mobile renders the exact UTF-8 steering `text` natively, computes
+/// `text_sha256 = hex(sha256(text))`, prompts biometrics, and signs
+/// `b"gitpulse-steering/v1\n" || canonical_json({expect_route, expires_at, host_id,
+/// issued_at, nonce, request_id, session_key, text_sha256})` using the hardware P-256
+/// approval key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedSteeringConfirm {
+    /// Target host device identifier.
+    pub host_id: String,
+    /// Target session key.
+    pub session_key: String,
+    /// Idempotent request identifier matching [`SteeringConfirmReq::request_id`].
+    pub request_id: String,
+    /// Expected route matching [`SteeringConfirmReq::expect_route`].
+    pub expect_route: String,
+    /// Lowercase 64-char hex SHA-256 of the exact UTF-8 steering `text`.
+    pub text_sha256: String,
+    /// Unix epoch seconds when the confirmation was signed.
+    pub issued_at: i64,
+    /// Unix epoch seconds after which the confirmation expires.
+    pub expires_at: i64,
+    /// Fresh per-confirmation nonce to prevent replay.
+    pub nonce: String,
+    /// Mobile signer device identifier (must match verified [`DeviceCertificate`]).
+    pub device_id: String,
+    /// Standard base64-encoded ASN.1 DER ECDSA-P256-SHA256 signature from hardware key.
+    pub sig_p256_der_b64: String,
+}
+
 /// Step 2 of two-step confirm steering: commit the previewed steering delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SteeringConfirmReq {
@@ -409,6 +443,11 @@ pub struct SteeringConfirmReq {
     /// Optional confirmation token returned by [`SteeringPreviewResp::confirm_token`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_token: Option<String>,
+    /// Hardware P-256 signed steering confirmation required before the host may
+    /// deposit `text` with `HumanConfirmed` provenance (Opus review #23).
+    /// Unverifiable or absent signatures MUST be refused or downgraded to untrusted framing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed: Option<SignedSteeringConfirm>,
 }
 
 /// Delivery status returned by [`SteeringConfirmResp`].
@@ -601,6 +640,10 @@ pub enum ControlPlaneEvent {
         data_b64: String,
     },
     /// Opt-in PTY keyboard input (Opus P0-7: requires Desktop-granted time-boxed consent + step-up).
+    ///
+    /// Accepted residual risk (Opus review #23): individual `pty_input` keystrokes within
+    /// an active Desktop-granted consent window are authenticated by the Noise `IK` tunnel
+    /// rather than signed per keystroke by the hardware P-256 key.
     PtyInput {
         /// Target session key.
         session_key: String,

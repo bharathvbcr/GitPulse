@@ -214,12 +214,64 @@ export interface SteeringPreviewResp {
   warning?: string;
 }
 
+export interface SignedSteeringConfirm {
+  host_id: string;
+  session_key: string;
+  request_id: string;
+  expect_route: string;
+  text_sha256: string;
+  issued_at: number;
+  expires_at: number;
+  nonce: string;
+  device_id: string;
+  sig_p256_der_b64: string;
+}
+
+const ALLOWED_STEERING_SIGN_KEYS = new Set<string>([
+  "host_id",
+  "session_key",
+  "request_id",
+  "expect_route",
+  "text_sha256",
+  "issued_at",
+  "expires_at",
+  "nonce",
+  "device_id",
+  "sig_p256_der_b64",
+]);
+
+/**
+ * Defense-in-depth boundary check rejecting unexpected keys on `SignedSteeringConfirm`
+ * before transmission (Opus review #23).
+ */
+export function assertCleanSignedSteeringConfirm(
+  candidate: unknown,
+): asserts candidate is SignedSteeringConfirm {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    throw new Error("SignedSteeringConfirm must be a plain object");
+  }
+  const obj = candidate as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (!ALLOWED_STEERING_SIGN_KEYS.has(key)) {
+      throw new Error(`Forbidden field on SignedSteeringConfirm: ${key}`);
+    }
+  }
+  if (
+    typeof obj.text_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(obj.text_sha256)
+  ) {
+    throw new Error("SignedSteeringConfirm.text_sha256 must be 64 lowercase hex chars");
+  }
+}
+
 export interface SteeringConfirmReq {
   request_id: string;
   session_key: string;
   expect_route: string;
   text: string;
   confirm_token?: string;
+  /** Hardware P-256 signed steering confirmation required for `HumanConfirmed` provenance. */
+  signed?: SignedSteeringConfirm;
 }
 
 export type SteeringStatus = "delivered" | "queued" | "expired" | "rejected";
