@@ -165,7 +165,7 @@
   let loadedDiffKey = "";
 
   async function loadDiff(force = false) {
-    const key = `${repoPath}:${number}`;
+    const key = `${repoPath}:${number}:${detail?.head_oid ?? ""}`;
     if (!force && loadedDiffKey === key && diff !== null) return;
     diffGuard?.cancel();
     const guard = createAsyncGuard();
@@ -176,7 +176,7 @@
       const next = await invoke<PullRequestDiff>("cmd_github_pr_diff", { repoPath, number });
       if (guard.isLive()) {
         diff = next;
-        loadedDiffKey = key;
+        loadedDiffKey = `${repoPath}:${number}:${detail?.head_oid ?? ""}`;
       }
     } catch (error) {
       if (guard.isLive()) diffError = failure("load", `#${number} files`, error);
@@ -198,6 +198,16 @@
     diffLoading = false;
     diffError = null;
     loadedDiffKey = "";
+    return () => {
+      diffGuard?.cancel();
+    };
+  });
+
+  $effect(() => {
+    const key = `${repoPath}:${number}:${detail?.head_oid ?? ""}`;
+    if (activeTab === "files" && detail && loadedDiffKey !== "" && loadedDiffKey !== key && !diffLoading && !diffError) {
+      void loadDiff();
+    }
   });
 </script>
 
@@ -253,6 +263,7 @@
         <UnifiedPatchView
           patch={diff.patch}
           truncated={diff.truncated}
+          totalBytes={diff.total_bytes}
           emptyMessage="No textual file changes in this pull request."
         />
       {/if}

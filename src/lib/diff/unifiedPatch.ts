@@ -31,16 +31,48 @@ export interface UnifiedPatchFile {
   hunks: UnifiedDiffHunk[];
 }
 
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+
 function unquoteGitPath(raw: string): string {
   const trimmed = raw.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed
-      .slice(1, -1)
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, "\\")
-      .replace(/\\t/g, "\t");
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"') || trimmed.length < 2) {
+    return trimmed;
   }
-  return trimmed;
+  const inner = trimmed.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (ch === "\\" && i + 1 < inner.length) {
+      const next = inner[i + 1];
+      const oct = inner.slice(i + 1, i + 4);
+      if (/^[0-7]{3}$/.test(oct)) {
+        bytes.push(Number.parseInt(oct, 8));
+        i += 3;
+        continue;
+      }
+      const esc: Record<string, number> = {
+        '"': 34,
+        "\\": 92,
+        a: 7,
+        b: 8,
+        f: 12,
+        n: 10,
+        r: 13,
+        t: 9,
+        v: 11,
+      };
+      if (Object.hasOwn(esc, next)) {
+        bytes.push(esc[next]);
+        i += 1;
+        continue;
+      }
+    }
+    for (const byte of utf8Encoder.encode(ch)) {
+      bytes.push(byte);
+    }
+  }
+  return utf8Decoder.decode(new Uint8Array(bytes));
 }
 
 function stripDiffPrefix(raw: string, prefix: "a/" | "b/"): string {
@@ -80,7 +112,7 @@ function parseDiffGitHeader(line: string): { oldPath: string; newPath: string } 
   return null;
 }
 
-const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 /** Splits a git unified patch string into per-file sections with hunks and line numbers. */
 export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
@@ -91,6 +123,8 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
   let currentHunk: UnifiedDiffHunk | null = null;
   let oldCursor = 0;
   let newCursor = 0;
+  let oldRemaining = 0;
+  let newRemaining = 0;
   let sawNewMode = false;
   let sawDeletedMode = false;
   let renameFrom: string | null = null;
@@ -112,6 +146,8 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
     files.push(current);
     current = null;
     currentHunk = null;
+    oldRemaining = 0;
+    newRemaining = 0;
     sawNewMode = false;
     sawDeletedMode = false;
     renameFrom = null;
@@ -133,6 +169,23 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
     return current;
   };
 
+  const applyHunkHeader = (rawLine: string): UnifiedDiffHunk | null => {
+    const match = HUNK_RE.exec(rawLine);
+    if (!match) return null;
+    oldCursor = Number.parseInt(match[1], 10);
+    oldRemaining = match[2] === undefined ? 1 : Number.parseInt(match[2], 10);
+    newCursor = Number.parseInt(match[3], 10);
+    newRemaining = match[4] === undefined ? 1 : Number.parseInt(match[4], 10);
+    const hunk: UnifiedDiffHunk = {
+      header: rawLine,
+      oldStart: oldCursor,
+      newStart: newCursor,
+      lines: [],
+    };
+    ensureFile().hunks.push(hunk);
+    return hunk;
+  };
+
   for (const rawLine of patch.split(/\r?\n/)) {
     if (rawLine.startsWith("diff --git ")) {
       finalizeFile();
@@ -152,56 +205,6 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
     }
 
     if (currentHunk !== null) {
-      if (rawLine.startsWith("@@ ")) {
-        const match = HUNK_RE.exec(rawLine);
-        if (match) {
-          oldCursor = Number.parseInt(match[1], 10);
-          newCursor = Number.parseInt(match[2], 10);
-          currentHunk = {
-            header: rawLine,
-            oldStart: oldCursor,
-            newStart: newCursor,
-            lines: [],
-          };
-          ensureFile().hunks.push(currentHunk);
-          continue;
-        }
-      }
-      if (rawLine.startsWith("+")) {
-        const file = ensureFile();
-        file.additions += 1;
-        currentHunk.lines.push({
-          kind: "add",
-          oldLine: null,
-          newLine: newCursor,
-          text: rawLine.slice(1),
-        });
-        newCursor += 1;
-        continue;
-      }
-      if (rawLine.startsWith("-")) {
-        const file = ensureFile();
-        file.deletions += 1;
-        currentHunk.lines.push({
-          kind: "del",
-          oldLine: oldCursor,
-          newLine: null,
-          text: rawLine.slice(1),
-        });
-        oldCursor += 1;
-        continue;
-      }
-      if (rawLine.startsWith(" ")) {
-        currentHunk.lines.push({
-          kind: "ctx",
-          oldLine: oldCursor,
-          newLine: newCursor,
-          text: rawLine.slice(1),
-        });
-        oldCursor += 1;
-        newCursor += 1;
-        continue;
-      }
       if (rawLine.startsWith("\\")) {
         currentHunk.lines.push({
           kind: "meta",
@@ -211,13 +214,74 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
         });
         continue;
       }
-      if (rawLine.length === 0) {
-        // Trailing newline at end of patch, or blank context line missing leading space.
-        continue;
+      if (oldRemaining === 0 && newRemaining === 0) {
+        currentHunk = null;
+      } else {
+        if (rawLine.startsWith("@@ ")) {
+          const nextHunk = applyHunkHeader(rawLine);
+          if (nextHunk) {
+            currentHunk = nextHunk;
+            continue;
+          }
+        }
+        if (rawLine.startsWith("+")) {
+          const file = ensureFile();
+          file.additions += 1;
+          currentHunk.lines.push({
+            kind: "add",
+            oldLine: null,
+            newLine: newCursor,
+            text: rawLine.slice(1),
+          });
+          newCursor += 1;
+          if (newRemaining > 0) newRemaining -= 1;
+          continue;
+        }
+        if (rawLine.startsWith("-")) {
+          const file = ensureFile();
+          file.deletions += 1;
+          currentHunk.lines.push({
+            kind: "del",
+            oldLine: oldCursor,
+            newLine: null,
+            text: rawLine.slice(1),
+          });
+          oldCursor += 1;
+          if (oldRemaining > 0) oldRemaining -= 1;
+          continue;
+        }
+        if (rawLine.startsWith(" ")) {
+          currentHunk.lines.push({
+            kind: "ctx",
+            oldLine: oldCursor,
+            newLine: newCursor,
+            text: rawLine.slice(1),
+          });
+          oldCursor += 1;
+          newCursor += 1;
+          if (oldRemaining > 0) oldRemaining -= 1;
+          if (newRemaining > 0) newRemaining -= 1;
+          continue;
+        }
+        if (rawLine.length === 0) {
+          // Empty context line inside an active hunk (whitespace-stripped patch).
+          currentHunk.lines.push({
+            kind: "ctx",
+            oldLine: oldCursor,
+            newLine: newCursor,
+            text: "",
+          });
+          oldCursor += 1;
+          newCursor += 1;
+          if (oldRemaining > 0) oldRemaining -= 1;
+          if (newRemaining > 0) newRemaining -= 1;
+          continue;
+        }
+        currentHunk = null;
       }
     }
 
-    // Inside file metadata (before first hunk or between hunks)
+    // Inside file metadata (before first hunk or between files)
     if (rawLine.startsWith("new file mode ")) {
       ensureFile();
       sawNewMode = true;
@@ -243,6 +307,9 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
       continue;
     }
     if (rawLine.startsWith("--- ")) {
+      if (current && current.hunks.length > 0) {
+        finalizeFile();
+      }
       const fromPath = stripDiffPrefix(rawLine.slice(4), "a/");
       if (!current) {
         ensureFile(fromPath === "/dev/null" ? "patch" : fromPath);
@@ -268,18 +335,7 @@ export function splitUnifiedPatch(patch: string): UnifiedPatchFile[] {
       continue;
     }
     if (rawLine.startsWith("@@ ")) {
-      const match = HUNK_RE.exec(rawLine);
-      if (match) {
-        oldCursor = Number.parseInt(match[1], 10);
-        newCursor = Number.parseInt(match[2], 10);
-        currentHunk = {
-          header: rawLine,
-          oldStart: oldCursor,
-          newStart: newCursor,
-          lines: [],
-        };
-        ensureFile().hunks.push(currentHunk);
-      }
+      currentHunk = applyHunkHeader(rawLine);
       continue;
     }
   }

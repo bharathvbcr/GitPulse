@@ -110,4 +110,39 @@ describe("splitUnifiedPatch", () => {
     expect(parsed[0].additions).toBe(1);
     expect(parsed[0].deletions).toBe(1);
   });
+
+  it("preserves stripped blank context lines, bare multi-file headers, zero-count hunks, and octal UTF-8 filenames", () => {
+    const patch = [
+      'diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"',
+      '--- "a/caf\\303\\251.ts"',
+      '+++ "b/caf\\303\\251.ts"',
+      "@@ -1,3 +1,3 @@",
+      " a",
+      "",
+      "-b",
+      "+c",
+      "--- a/plain-one.txt",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-old",
+      "--- /dev/null",
+      "+++ b/plain-two.txt",
+      "@@ -0,0 +1,2 @@",
+      "+first",
+      "+second",
+      "",
+    ].join("\n");
+
+    const parsed = splitUnifiedPatch(patch);
+    expect(parsed).toHaveLength(3);
+    expect(parsed[0].path).toBe("café.ts");
+    expect(parsed[0].hunks[0].lines).toEqual([
+      { kind: "ctx", oldLine: 1, newLine: 1, text: "a" },
+      { kind: "ctx", oldLine: 2, newLine: 2, text: "" },
+      { kind: "del", oldLine: 3, newLine: null, text: "b" },
+      { kind: "add", oldLine: null, newLine: 3, text: "c" },
+    ]);
+    expect(parsed[1]).toMatchObject({ path: "plain-one.txt", status: "deleted", deletions: 1 });
+    expect(parsed[2]).toMatchObject({ path: "plain-two.txt", status: "added", additions: 2 });
+  });
 });

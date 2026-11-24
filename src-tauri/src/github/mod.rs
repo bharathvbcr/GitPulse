@@ -2884,9 +2884,9 @@ pub struct PullRequestDiff {
     pub total_bytes: usize,
 }
 
-/// Pure argv builder for `gh pr diff <number>`.
-pub fn pr_diff_leading_args(number: &str) -> [&str; 3] {
-    ["pr", "diff", number]
+/// Pure argv builder for `gh pr diff <number> --color=never`.
+pub fn pr_diff_leading_args(number: &str) -> [&str; 4] {
+    ["pr", "diff", number, "--color=never"]
 }
 
 /// Parses and safely bounds raw `gh pr diff` output on a UTF-8 line boundary.
@@ -6229,6 +6229,11 @@ mod non_ascii_tail_tests {
 
     #[test]
     fn parse_pr_diff_bounds_oversized_diffs_on_line_boundaries() {
+        assert_eq!(
+            pr_diff_leading_args("42"),
+            ["pr", "diff", "42", "--color=never"]
+        );
+
         let small = "diff --git a/a.rs b/a.rs\n+hello\n";
         let ok = parse_pr_diff(42, small);
         assert_eq!(ok.number, 42);
