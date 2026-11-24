@@ -2399,9 +2399,11 @@ mod tests {
         assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");
         assert_eq!(deletes, BRANCHES);
         // 16 plus the two `git config` reads that tell a partial clone once
-        // for the whole scan (a merge there would make git fetch blobs). The
+        // for the whole scan (a merge there would make git fetch blobs), plus
+        // the locked-in read (`git config --get-all gitpulse.lockedBranch`
+        // and one `for-each-ref` for every pattern) once per clean. The
         // per-branch terms above are exact and unchanged.
-        const CONSTANT: usize = 18;
+        const CONSTANT: usize = 20;
         assert!(
             used.len() <= 2 * BRANCHES + CONSTANT,
             "{} spawns for {BRANCHES} branches: {used:#?}",
