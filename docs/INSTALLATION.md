@@ -210,6 +210,10 @@ have been withdrawn; [CHANGELOG.md](../CHANGELOG.md) keeps their history.
 On Windows, a beta's `.msi` carries the version `X.Y.Z.N`, because the MSI
 format allows only numbers.
 
+On Linux, a beta ships the `.deb` and the AppImage but no `.rpm`: RPM does not
+allow `-` in a version, and the bundler has no way to give the rpm a different
+version than the app. Stable releases also ship the `.rpm`.
+
 ## Updates
 
 Updates are manual downloads. **Settings → Updates** provides:

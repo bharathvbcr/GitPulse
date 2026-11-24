@@ -64,6 +64,15 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   Mavi threads working in the repository, badges and lists first the files they
   touched, and warns before discarding a file an agent is editing right now.
 
+### Fixed
+
+- **Linux bundling of a beta.** A beta's version (`X.Y.Z-beta.N`) is not a legal
+  RPM version, and Tauri takes the rpm's version straight from the app version, so
+  bundling failed at the `.rpm` (`invalid version "0.2.0-beta.1": contains invalid
+  character`) on the release's Linux legs and CI's ARM Bundle job. A beta's Linux
+  legs now bundle the `.deb` and the AppImage only, and the release manifest expects
+  ten installers for a beta; a stable release still ships both rpms (twelve).
+
 ## [0.2.0-beta.1] - 2026-11-18
 
 The first beta of GitPulse 0.2.0 (see [GitPulse 0.2.0 release notes](docs/RELEASE_NOTES_v0.2.0.md)),

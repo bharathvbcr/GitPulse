@@ -719,13 +719,26 @@ jobs:
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 
+      # As release.yml: a beta's Linux leg bundles no .rpm, which the bundler
+      # cannot build for an X.Y.Z-beta.N version.
+      - name: Bundle Targets For This Version
+        id: bundle_args
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          args="$(node scripts/check-release-assets.mjs --bundle-args "$PLATFORM")"
+          echo "Extra tauri build args for $PLATFORM: ${args:-(none)}"
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
       # No release inputs: tauri-action builds and bundles without uploading.
       - name: Build Tauri Bundles
         id: tauri
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         with:
           # As the release build: cargo resolves the committed Cargo.lock.
-          args: -- --locked
+          args: ${{ steps.bundle_args.outputs.args }} -- --locked
 
       - name: Installer Names Match The Release Manifest
         shell: bash
