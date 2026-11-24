@@ -150,7 +150,7 @@ Recompute the locked-in list right before this step. A locked-in branch is never
      1. First file or fold the card from step 8, naming the failing tests and the backup ref.
      2. If its worktree has uncommitted files, or its card is `in_progress`, stop here and only report it.
      3. Otherwise remove its worktree with `git worktree remove <path>`, without `--force`. It refuses a dirty or locked worktree.
-     4. Then delete the branch with `git update-ref -d refs/heads/<branch> <backed-up sha>`.
+     4. Then delete the branch with `git update-ref -d refs/heads/<branch> <backed-up sha>`, after checking that `git worktree list --porcelain` no longer names it. `update-ref -d` would delete a branch that another worktree has checked out.
      5. Never call `gitpulse_worktree_prune` with `force`: it discards uncommitted files.
 
 **Stale branches** (unmerged, no recent commit, no card, no session) and **regressed branches you only reported** are listed for the owner with their ahead count and last commit. They are not deleted.

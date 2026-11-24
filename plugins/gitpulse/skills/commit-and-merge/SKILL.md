@@ -137,7 +137,7 @@ Put each branch in the **first** class that fits:
 | Class | Meaning |
 |---|---|
 | integration | `train/*` and other branches a merge train or integrator built. They are never candidates. Keep the newest per integrator; the rest are listed for the owner. |
-| unstarted | 0 ahead, and no commit was ever made on it: `git reflog show --format=%gs refs/heads/<branch>` holds only its creation line. If there is no reflog at all, it is unknown: keep it. A lane that has not begun is never landed and never pruned. |
+| unstarted | 0 ahead, and no commit was ever made on it: `git reflog show refs/heads/<branch>` has exactly one entry, its creation. Count the entries rather than reading the message: a branch made with `git update-ref` has an empty one. If there is no reflog at all, it is unknown: keep it. A lane that has not begun is never landed and never pruned. |
 | landed | `gitpulse_landed` says `landed: true`, and the branch did carry commits of its own. Nothing to merge. |
 | candidate | Ahead and not deferred. |
 | deferred | A live holder is still working, it conflicts, or it touches files a sibling lane holds (`gitpulse_collision_risk`). Record the reason. |
@@ -202,7 +202,9 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
 3. **If git refuses** because dirty files overlap the landing, stop. Show the owner the overlapping paths and whose session holds them. Land only after the holder commits, or after the owner approves a three-way landing of those files.
 
    **The three-way landing.** Run it in the checkout that has the default branch, with `<old>` as its current tip:
-   1. Refuse if any overlapping path has staged changes: `git diff --cached --name-only`.
+   1. List the dirty paths with `git status --porcelain=v1 -z -uall`, which includes untracked files, and the landed paths with `git diff --no-renames --name-status -z <old> <new>`. Refuse if:
+      - any overlapping path has staged changes (`git diff --cached --name-only`);
+      - an overlapping path is one the landing adds or deletes. Only a file modified on both sides can be merged; an untracked file where the landing adds one is an overlap too.
    2. Hash every dirty file in that checkout.
    3. Merge each overlapping file into a temporary file. Never merge in place, because a conflict writes markers into the holder's file:
       ```sh
@@ -210,9 +212,9 @@ Locked-in candidates get their own group. Wait for the owner's yes, and take the
       ```
       Get the working file's blob with `git hash-object -w <path>`. A non-zero exit is a conflict: delete the temp files and stop.
    4. Check that each working file still has the hash from step 2, then move each temp file over it.
-   5. Write each landed path that is not dirty from `<new>`.
+   5. Write every landed path that is not dirty with `git restore --source=<new> --worktree -- <paths>`. It creates added files, removes deleted ones and keeps the executable bit; `git show` does none of the last two.
    6. Move the ref last, with the compare-and-swap.
-   7. Run `git reset -q -- <landed paths>`, so the index follows the new tip. Otherwise the holder's next commit would revert the landing.
+   7. Run `git reset -q -- <landed paths>` over every landed path, merged or written, so the index follows the new tip. Otherwise the holder's next commit would revert the landing. Afterwards `git status` must list only the holder's own changes.
    8. Hash every other dirty file again. All of them must be unchanged.
 
    This is the one place this skill moves a ref that another worktree has checked out. It needs the owner's yes every time.
@@ -227,7 +229,7 @@ Recompute the locked-in list first. Then, for each branch merged in this run tha
    - The tool skips a worktree with a live process, a lane claim or a live session, and those stay.
    - Never pass `force`. It also discards uncommitted files.
    - If the tool skips a clean worktree only because of its own integration check (a squash or rebase landing that `gitpulse_landed` recognised), `git worktree remove <path>` without `--force` is the fallback. It refuses a dirty or locked worktree.
-4. **If no worktree is left,** delete the branch with `git update-ref -d refs/heads/<branch> <backed-up sha>`. That is a compare-and-swap, so it fails if the branch moved. Do not use `git branch -d`: it checks the branch's upstream rather than the default branch, and refuses squash-landed work.
+4. **If no worktree is left,** delete the branch with `git update-ref -d refs/heads/<branch> <backed-up sha>`. Check first that `git worktree list --porcelain` has no `branch refs/heads/<branch>` line: `update-ref -d` does not look, and deleting a checked-out branch leaves that worktree on an unborn branch. That is a compare-and-swap, so it fails if the branch moved. Do not use `git branch -d`: it checks the branch's upstream rather than the default branch, and refuses squash-landed work.
 
 Locked-in branches stay, merged or not.
 
