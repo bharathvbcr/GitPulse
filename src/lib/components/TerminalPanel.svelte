@@ -64,6 +64,8 @@
     RotateCw,
     Sparkles,
     ListPlus,
+    Lock,
+    LockOpen,
   } from "@lucide/svelte";
   import { tokenizeCommand } from "../terminal/tokenize";
   import type { TerminalRunResult } from "../terminal/runResult";
@@ -90,6 +92,10 @@
     type FollowTarget,
   } from "../terminal/followAgent";
   import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
+  import { stopChildrenQuestion } from "../terminal/stopChildren";
+  import LegacySessions from "./LegacySessions.svelte";
+  import { protectedSkipOf, type KillOrigin } from "../terminal/killOrigin";
+  import { noteProtection, partitionByProtection, protectedSessions, setSessionProtected, sparedNotice } from "../terminal/protection";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { openTaskForRun } from "../workbench/taskOpen";
@@ -99,7 +105,19 @@
   import { panelTabCounts } from "../terminal/panelTabCounts";
   import { activityAttentionLabel, activityToAgentStatus, sessionActivity } from "../terminal/sessionActivity";
   import { scrollbackSnapshots } from "../terminal/scrollbackSnapshot";
-  import { detachedAdoptionSettled, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import { detachedAdoptionFailed, detachedAdoptionSettled, isAdoptedSession, reclaimAdoptedSession } from "../terminal/detachedSessions";
+  import {
+    buildRestoredStrip,
+    buildTabStrip,
+    composeWorkspaceWithStrip,
+    leafMetaForTab,
+    mergeRestoredTabs,
+    restoreStep,
+    parsePersistedTabStrip,
+    planReloadRestore,
+    stripWorthWaitingFor,
+    type AdoptedFact,
+  } from "../terminal/reloadRestore";
   import { isTauri } from "../platform";
   import {
     describeEndState,
@@ -146,7 +164,6 @@
     flipSplitOrientation,
     hasPane,
     leafPaneIds,
-    MAX_PERSISTED_SNIPPET_CHARS,
     MAX_SPLIT_PANES,
     minimumSplitHeight,
     movePaneToSplit,
@@ -439,20 +456,47 @@
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
-  function initialTabs(): TabState {
+  /** Whether a queued launch or task request will open this panel's first tab itself. */
+  function requestWillOpenFirstTab(): boolean {
     const launch = get(terminalLaunchRequests);
     if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) {
       const needsAnchorShell =
         launch.launcher === "file" &&
         launch.fileOpenMode !== "tab" &&
         get(terminalSessions).length < get(terminalSessionLimit);
-      if (!needsAnchorShell) return { tabs: [], activeId: null };
+      if (!needsAnchorShell) return true;
     }
     // A panel mounted for a queued request starts empty: the request opener
     // below opens its tab, through the same admission as every other.
-    if (requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts)) return { tabs: [], activeId: null };
+    return Boolean(requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts));
+  }
+  function initialTabs(): TabState {
+    if (requestWillOpenFirstTab()) return { tabs: [], activeId: null };
+    // A reload leaves this repository's tabs saved by session id. Starting with
+    // a fresh shell would hide them in Sessions; start empty and let the
+    // restore below decide once the host's sessions have been listed.
+    if (stripRestorePending) return { tabs: [], activeId: null };
     return initialState();
   }
+  /** The tab strip a reload left saved for this repository, if the host can still hold its sessions. */
+  function savedStripToRestore() {
+    if (!isTauri()) return null;
+    const key = splitStorageKey(repoPath);
+    if (!key) return null;
+    try {
+      const strip = parsePersistedTabStrip(globalThis.localStorage?.getItem(key));
+      return stripWorthWaitingFor(strip) ? strip : null;
+    } catch {
+      return null;
+    }
+  }
+  let stripRestorePending = $state(untrack(() => savedStripToRestore() !== null));
+  /** Saved tab id to this page's tab id for the restored strip; the split hydration remaps its leaves through it. */
+  let restoredIdMap: ReadonlyMap<string, string> | null = null;
+  /** The shell opened when the host was slow to list its sessions, so the dock was not left empty. */
+  let fallbackShellId: string | null = null;
+  /** Restored background tabs whose session is taken over only when first shown. */
+  let deferredTabs = $state<ReadonlySet<string>>(new Set());
   let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
   let sessions = $state<Record<string, TerminalSession | undefined>>({});
@@ -750,11 +794,121 @@
   }
 
   let hydratedSplitForRepo: string | null = null;
+
+  /**
+   * After a reload: the tabs this repository's dock had, taken over from the
+   * sessions the host kept (`reloadRestore`). Runs once the host's sessions
+   * have been listed, before the split hydration below, which then remaps its
+   * leaves through `restoredIdMap` instead of opening a second set of tabs.
+   * Nothing restorable (every session ended) falls back to today's fresh shell.
+   */
+  $effect(() => {
+    if (!stripRestorePending) return;
+    const key = splitStorageKey(repoPath);
+    if (!key) return;
+    const settled = $detachedAdoptionSettled;
+    const failed = $detachedAdoptionFailed;
+    const timedOut = adoptionTimedOut;
+    const hasTabs = tabState.tabs.length > 0;
+    // The timeout only opens the fallback shell so the dock is not empty; the
+    // restore waits for the listing however long it takes, and the saved strip
+    // is not touched (the persist and hydrate effects wait on the flag) until it ran.
+    const step = untrack(() =>
+      restoreStep({
+        pending: true,
+        settled,
+        failed,
+        timedOut,
+        hasTabs,
+        requestWillOpenFirstTab: requestWillOpenFirstTab(),
+        fallbackOpened: fallbackShellId !== null,
+      }),
+    );
+    if (step === "wait") return;
+    if (step === "open-fallback-shell") {
+      untrack(() => {
+        const shell = initialState();
+        fallbackShellId = shell.activeId;
+        tabState = shell;
+      });
+      return;
+    }
+    untrack(() => {
+      stripRestorePending = false;
+      let restored = false;
+      try {
+        const raw = globalThis.localStorage?.getItem(key);
+        const strip = parsePersistedTabStrip(raw);
+        const available: AdoptedFact[] = [];
+        for (const record of get(terminalSessions)) {
+          if (!isAdoptedSession(record) || !record.sessionId || !record.reveal || record.taskRunId) continue;
+          available.push({
+            sessionId: record.sessionId,
+            repoPath: record.repoPath,
+            launcher: record.launcher as AdoptedFact["launcher"],
+            ...(record.title ? { title: record.title } : {}),
+          });
+        }
+        const split = parsePersistedSplitWorkspace(raw);
+        const plan = planReloadRestore({
+          strip,
+          available,
+          belongsHere: (fact, meta) =>
+            Boolean(repoPath) &&
+            (sameRepo(fact.repoPath, repoPath as string, pathOpts) ||
+              (meta.checkout !== undefined && sameRepo(fact.repoPath, meta.checkout, pathOpts))),
+          splitLeafIds: new Set(split ? split.groups.flatMap((group) => leafPaneIds(group.tree)) : []),
+          maxTabs: MAX_STRIP_TABS,
+        });
+        if (plan.tabs.length > 0) {
+          const built = buildRestoredStrip(plan);
+          let next = built.state;
+          for (const entry of plan.tabs) {
+            const id = built.idMap.get(entry.oldId);
+            if (id) next = applyPersistedLeafMeta(next, id, entry.meta);
+          }
+          // Tabs opened while the host was being listed (a request's, the fallback
+          // shell) stay, after these; a request's tab keeps focus, the saved tab has it otherwise.
+          tabState = mergeRestoredTabs(next, tabState, fallbackShellId, MAX_STRIP_TABS);
+          restoredIdMap = built.idMap;
+          deferredTabs = built.deferred;
+          restored = true;
+        }
+      } catch {
+        /* localStorage unavailable: nothing to restore */
+      }
+      if (!restored && tabState.tabs.length === 0 && !requestWillOpenFirstTab()) tabState = initialState();
+    });
+  });
+
+  /**
+   * A restored background tab takes its session over when it is first shown,
+   * not at reload: every tab attaching at once would put a terminal, a watch
+   * and an output stream for each of 17+ sessions on a page that is still
+   * starting. Until then its session stays listed in Sessions, still
+   * counted against the limit and still watched for its exit.
+   */
+  $effect(() => {
+    if (deferredTabs.size === 0) return;
+    const shown = splitIds ?? (tabState.activeId ? [tabState.activeId] : []);
+    const due = shown.filter((id) => deferredTabs.has(id));
+    if (due.length === 0) return;
+    untrack(() => {
+      for (const id of due) {
+        const attach = tabState.tabs.find((tab) => tab.id === id)?.attachSessionId;
+        if (attach) reclaimAdoptedSession(attach);
+      }
+      const next = new Set(deferredTabs);
+      for (const id of due) next.delete(id);
+      deferredTabs = next;
+    });
+  });
+
   $effect(() => {
     const key = splitStorageKey(repoPath);
     const readyToHydrate = !isTauri() || $detachedAdoptionSettled || adoptionTimedOut;
     const ids = new Set(tabState.tabs.map((tab) => tab.id));
-    if (!key || !readyToHydrate || hydratedSplitForRepo === key || ids.size === 0) return;
+    if (!key || !readyToHydrate || stripRestorePending || hydratedSplitForRepo === key || ids.size === 0) return;
     hydratedSplitForRepo = key;
     untrack(() => {
       if (splitGroups.length > 0) return;
@@ -763,16 +917,21 @@
         const parsed = parsePersistedSplitWorkspace(stored);
         if (!parsed || parsed.groups.length === 0) return;
         const paneIdMap = new Map<string, string>();
-        for (const id of ids) paneIdMap.set(id, id);
+        // After a restore the saved ids belong to the old page; this page's
+        // tab-N ids are fresh, so identity would pair a leaf with whatever
+        // tab happens to carry the same number.
+        if (restoredIdMap) for (const [oldId, newId] of restoredIdMap) paneIdMap.set(oldId, newId);
+        else for (const id of ids) paneIdMap.set(id, id);
         let nextState = tabState;
         const usedCurrentTabs = new Set<string>();
         const allPersistedLeaves = parsed.groups.flatMap((group) => leafPaneIds(group.tree));
         for (const leafId of allPersistedLeaves) {
-          if (usedCurrentTabs.has(leafId)) continue;
+          const mappedId = paneIdMap.get(leafId);
+          if (mappedId !== undefined && usedCurrentTabs.has(mappedId)) continue;
           const meta = parsed.leaves[leafId];
-          if (paneIdMap.has(leafId)) {
-            usedCurrentTabs.add(leafId);
-            nextState = applyPersistedLeafMeta(nextState, leafId, meta);
+          if (mappedId !== undefined) {
+            usedCurrentTabs.add(mappedId);
+            nextState = applyPersistedLeafMeta(nextState, mappedId, meta);
             continue;
           }
           if (!meta) continue;
@@ -843,6 +1002,9 @@
               }
             }
           }
+          // After a restore a session leaf whose session is gone has no tab; pairing
+          // it with any other tab of its launcher would split the wrong session.
+          if (restoredIdMap && meta.backendSessionId) continue;
           const fallbackExisting = nextState.tabs.find(
             (tab) => !usedCurrentTabs.has(tab.id) && tab.launcher === meta.launcher,
           );
@@ -918,6 +1080,15 @@
       flushPendingSplitPersist();
     }
     if (!key || hydratedSplitForRepo !== key) return;
+    // Saved beside the split layout, by backend session id, so a reload can put
+    // every tab back (`reloadRestore`). Read here so the effect follows it.
+    const backendIdOf = (tab: TerminalTab) => backendSessionIdByTabId[tab.id] || tab.attachSessionId;
+    const strip = buildTabStrip(
+      tabState.tabs,
+      tabState.activeId,
+      backendIdOf,
+      (tab) => tabStatuses[tab.id] === "exited",
+    );
     if (currentGroups.length === 0) {
       if (pendingSplitWrite?.key === key) {
         if (splitPersistTimer !== null) {
@@ -926,12 +1097,13 @@
         }
         pendingSplitWrite = null;
       }
+      const stripOnly = composeWorkspaceWithStrip(null, strip);
       if (
         lastPersistedSplitKey !== key ||
-        lastPersistedSplitJson !== null ||
-        lastPersistedStructuralJson !== null
+        lastPersistedSplitJson !== stripOnly ||
+        lastPersistedStructuralJson !== stripOnly
       ) {
-        writeSplitStorage(key, null, null);
+        writeSplitStorage(key, stripOnly, stripOnly);
       }
       return;
     }
@@ -943,39 +1115,21 @@
     const structuralLeaves: Record<string, PersistedSplitLeafMeta> = {};
     currentTabs.forEach((tab, slotIndex) => {
       if (!groupedLeaves.has(tab.id)) return;
-      const backendId = sessions[tab.id]?.backendSessionId?.() || tab.attachSessionId;
-      const structuralMeta: PersistedSplitLeafMeta = {
-        launcher: tab.launcher,
-        slotIndex,
-        ...(tab.name ? { name: tab.name } : {}),
-        ...(tab.launchName ? { launchName: tab.launchName } : {}),
-        ...(tab.userNamed ? { userNamed: true } : {}),
-        ...(tab.pinned ? { pinned: true } : {}),
-        ...(tab.kept ? { kept: true } : {}),
-        ...(backendId ? { backendSessionId: backendId } : {}),
-        ...(tab.parentSessionId ? { parentSessionId: tab.parentSessionId } : {}),
-        ...(tab.filePath ? { filePath: tab.filePath } : {}),
-        ...(tab.revealLine != null ? { revealLine: tab.revealLine } : {}),
-        ...(tab.revealColumn != null ? { revealColumn: tab.revealColumn } : {}),
-        ...(tab.snippet
-          ? {
-              snippet: {
-                title: tab.snippet.title,
-                content: tab.snippet.content.slice(0, MAX_PERSISTED_SNIPPET_CHARS),
-              },
-            }
-          : {}),
-        ...(tab.url ? { url: tab.url } : {}),
-        ...(tab.checkout ? { checkout: tab.checkout } : {}),
-      };
+      const structuralMeta = leafMetaForTab(tab, slotIndex, backendIdOf(tab));
       leaves[tab.id] = tab.title ? { ...structuralMeta, title: tab.title } : structuralMeta;
       if (!draggingSash) structuralLeaves[tab.id] = structuralMeta;
     });
 
-    const serialized = serializeSplitWorkspace(currentGroups, leaves, currentActiveGroupId);
+    const serialized = composeWorkspaceWithStrip(
+      serializeSplitWorkspace(currentGroups, leaves, currentActiveGroupId),
+      strip,
+    );
     const structuralJson = draggingSash
       ? lastPersistedStructuralJson
-      : serializeSplitWorkspace(currentGroups, structuralLeaves, currentActiveGroupId);
+      : composeWorkspaceWithStrip(
+          serializeSplitWorkspace(currentGroups, structuralLeaves, currentActiveGroupId),
+          strip,
+        );
     const latestKey = pendingSplitWrite ? pendingSplitWrite.key : lastPersistedSplitKey;
     const latestSerialized = pendingSplitWrite
       ? pendingSplitWrite.serialized
@@ -2058,7 +2212,7 @@
   /** The Sessions list's close: the panel's question first, then stop the process. */
   async function closeListed(session: TerminalSessionRecord) {
     try {
-      await closeWithConfirmation(session);
+      await closeWithConfirmation(session, "sessions_list_stop");
     } catch (error: unknown) {
       sessionError = describeError(error, "terminal");
     }
@@ -2066,6 +2220,30 @@
 
   /** Ids with a close question already on screen, so a second press does not ask twice. */
   const closing = new Set<string>();
+
+  /** What the last batch close or Stop children left running because it is protected; dismissible. */
+  let protectionNotice = $state<string | null>(null);
+  /** Whether the tab's process is protected from batch closes (a restored tab not yet shown is read by its saved session id). */
+  function isTabProtected(tabId: string): boolean {
+    const backendId = backendSessionIdByTabId[tabId];
+    return Boolean(backendId) && $protectedSessions.has(backendId);
+  }
+  function labelOfTabId(tabId: string): string {
+    const tab = tabState.tabs.find((candidate) => candidate.id === tabId);
+    return tab ? tabLabel(tab) : "";
+  }
+  async function toggleTabProtection(tabId: string) {
+    const backendId = backendSessionIdByTabId[tabId];
+    if (!backendId) {
+      sessionError = "This tab has no running session to protect yet.";
+      return;
+    }
+    try {
+      await setSessionProtected(backendId, !$protectedSessions.has(backendId));
+    } catch (error: unknown) {
+      sessionError = describeError(error, "terminal");
+    }
+  }
 
   /**
    * Close, asking first when a job is running in the foreground or the tab's
@@ -2077,20 +2255,42 @@
    * same question through the registry's `confirmClose`, so a session in
    * another repository's dock asks too.
    */
-  async function requestClose(id: string) {
-    if (closing.has(id)) return;
+  /** The Sessions record still holding a restored tab's process, or null once handed over or ended. */
+  function adoptedRecordFor(tabId: string): TerminalSessionRecord | null {
+    const attach = tabState.tabs.find((tab) => tab.id === tabId)?.attachSessionId;
+    if (!attach) return null;
+    return get(terminalSessions).find((record) => isAdoptedSession(record) && record.sessionId === attach) ?? null;
+  }
+
+  async function requestClose(id: string, origin: KillOrigin = "tab_close"): Promise<"closed" | "declined" | "spared" | "failed"> {
+    if (closing.has(id)) return "declined";
     closing.add(id);
     try {
-      if (!(await confirmClose(id))) return;
+      if (!(await confirmClose(id))) return "declined";
       // Close ends the process here, explicitly. Dropping the tab only
       // unmounts it, and an unmount keeps whatever is still running.
       try {
-        await (sessions[id] ?? browsers[id] ?? filePanes[id])?.close();
+        if (deferredTabs.has(id)) {
+          // Never mounted, so no session to close: the Sessions record that still
+          // holds this process kills it, exactly as Stop in that list does.
+          await adoptedRecordFor(id)?.close(origin);
+        } else {
+          await (sessions[id]?.close(origin) ?? browsers[id]?.close() ?? filePanes[id]?.close());
+        }
       } catch (error: unknown) {
+        // A batch route spared a protected session this page had not learned
+        // was protected: it runs on, which is the flag working, not a failure.
+        const spared = protectedSkipOf(error);
+        if (spared !== null) {
+          noteProtection(spared, true);
+          protectionNotice = sparedNotice([labelOfTabId(id)], "batch close");
+          return "spared";
+        }
         sessionError = describeError(error, "terminal");
-        return;
+        return "failed";
       }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
+      return "closed";
     } finally {
       closing.delete(id);
     }
@@ -2106,7 +2306,9 @@
     const status = tabStatuses[id];
     const agent = tab.launcher === "shell" ? null : {
       name: launcherLabel(tab.launcher),
-      running: status === "starting" || status === "running",
+      // A restored tab not yet shown has no mounted session to report a status,
+      // but its process is running by definition: ask as for a running agent.
+      running: status === "starting" || status === "running" || deferredTabs.has(id),
       taskAttempt: Boolean(tab.taskRunId),
     };
     // A tab with no mounted session to ask is unknown, not idle.
@@ -2579,10 +2781,15 @@
   }
 
   async function stopActiveChildren() {
-    const targets = [...activeChildTabs];
+    const { closable: targets, spared } = partitionByProtection([...activeChildTabs], (child) => isTabProtected(child.id));
+    protectionNotice = sparedNotice(spared.map((child) => tabLabel(child)), "Stop children");
+    if (targets.length === 0) return;
+    // Stopping ends whatever each child is doing and cannot be undone, so it
+    // is asked first, naming what will stop (as closing a running agent's tab does).
+    if (!(await askConfirm({ ...stopChildrenQuestion(targets.map((child) => tabLabel(child))), confirmLabel: "Stop", destructive: true }))) return;
     for (const child of targets) {
       try {
-        await sessions[child.id]?.close();
+        await sessions[child.id]?.close("stop_children");
       } catch (error: unknown) {
         sessionError = describeError(error, "terminal");
         continue;
@@ -3596,11 +3803,20 @@
     }
   }
 
-  async function closeTabsBatch(ids: readonly string[]) {
+  async function closeTabsBatch(allIds: readonly string[]) {
+    // Decided before anything is asked or closed: protected tabs are left
+    // running and named, so a batch never asks about a session it will not close.
+    const { closable: ids, spared } = partitionByProtection(allIds, isTabProtected);
+    protectionNotice = sparedNotice(
+      spared.map((id) => labelOfTabId(id)),
+      "batch close",
+    );
     for (const id of ids) {
       if (!tabState.tabs.some((candidate) => candidate.id === id)) continue;
-      await requestClose(id);
-      if (tabState.tabs.some((candidate) => candidate.id === id)) break;
+      const outcome = await requestClose(id, "batch_close");
+      // A declined question or a failed close stops the batch; a protected
+      // session being spared does not.
+      if (outcome !== "spared" && tabState.tabs.some((candidate) => candidate.id === id)) break;
     }
   }
 
@@ -4487,6 +4703,7 @@
             </div>
         {/each}
       {/each}
+      <LegacySessions open={sessionListOpen} />
     </div>
   {/if}
   {#if waitingForCapacity && mode === "shell"}
@@ -4496,6 +4713,13 @@
       {:else}
         {waitingForCapacity.title} is waiting to open here: all {$terminalSessionLimit} terminal sessions are in use. Close one in Sessions, or raise the limit in Settings → Agents, and it opens.
       {/if}
+    </div>
+  {/if}
+  {#if protectionNotice}
+    <div class="gp-notice flex items-start gap-1.5" data-tone="warn" role="status" data-testid="terminal-protection-notice">
+      <Lock size={13} class="shrink-0 mt-0.5" />
+      <span class="flex-1" style="overflow-wrap:anywhere">{protectionNotice}</span>
+      <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (protectionNotice = null)}>✕</button>
     </div>
   {/if}
   {#if sessionError}
@@ -4815,7 +5039,7 @@
             onkeydown={handleTabKey}
             title={`${launcherLabel(tab.launcher)} — ${display.fullTitle}${groupMeta ? ` (${groupMeta.label} #${groupMeta.slot}${isActiveTab ? ", active" : ""})` : isActiveTab ? " (Active)" : ""}${tab.pinned ? " · Pinned in split" : ""}${canOpenInSplit ? " · Drag to reorder · Alt+Drag or Alt+Click to split · Right-click for options" : " · Drag to reorder · Right-click for options"}`}
           >
-            <LauncherIcon kind={tab.launcher} size={12} class="mr-1 align-[-2px]" />{#if splitSlot}<span aria-hidden="true" data-testid="terminal-tab-split-slot" class="inline-flex items-center justify-center min-w-3.5 h-3.5 px-1 mr-1 rounded text-micro tabular-nums align-[1px] {isActiveTab ? 'bg-accent/15 text-accent border border-accent/65 font-semibold' : 'bg-surfaceHover text-textMuted border border-border/65'}">{splitSlot}</span>{/if}{#if tab.pinned}<span aria-hidden="true" data-testid="terminal-tab-pinned-icon" class="inline-flex mr-1 align-[-1px] text-accent"><Pin size={10} /></span>{/if}{#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(effectiveAgentStatuses[tab.id])}{@const badge = oscStatusBadge(effectiveAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={effectiveAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
+            <LauncherIcon kind={tab.launcher} size={12} class="mr-1 align-[-2px]" />{#if splitSlot}<span aria-hidden="true" data-testid="terminal-tab-split-slot" class="inline-flex items-center justify-center min-w-3.5 h-3.5 px-1 mr-1 rounded text-micro tabular-nums align-[1px] {isActiveTab ? 'bg-accent/15 text-accent border border-accent/65 font-semibold' : 'bg-surfaceHover text-textMuted border border-border/65'}">{splitSlot}</span>{/if}{#if tab.pinned}<span aria-hidden="true" data-testid="terminal-tab-pinned-icon" class="inline-flex mr-1 align-[-1px] text-accent"><Pin size={10} /></span>{/if}{#if isTabProtected(tab.id)}<span data-testid="terminal-tab-protected-icon" class="inline-flex mr-1 align-[-1px] text-textMuted" role="img" aria-label="Protected from batch close" title="Protected from batch close"><Lock size={10} /></span>{/if}{#if unread.has(tab.id)}<span aria-label="Unread output" class="text-accent">● </span>{/if}{#if tab.parentSessionId}<span class="text-accent mr-0.5" data-testid="terminal-tab-child-badge" title="Child session spawned by parent agent">↳</span>{/if}{tabLabel(tab)}{#if tabStatuses[tab.id] === "exited"}<span class="text-textMuted"> · Ended</span>{:else if tabStatuses[tab.id] === "error"}<span class="text-danger"> · Error</span>{:else if oscStatusBadge(effectiveAgentStatuses[tab.id])}{@const badge = oscStatusBadge(effectiveAgentStatuses[tab.id])}{#if badge}<span class={badge.cls} data-testid="terminal-tab-osc-status" title={effectiveAgentStatuses[tab.id]?.detail ?? badge.label}> · {badge.label}</span>{/if}{/if}
           </button>
           {#if canOpenInSplit}
             <button
@@ -5796,6 +6020,30 @@
               <span>Pin Tab</span>
             {/if}
           </button>
+          {#if ctxTab.launcher !== "browser" && ctxTab.launcher !== "file" && backendSessionIdByTabId[ctxTab.id]}
+            {@const ctxProtected = isTabProtected(ctxTab.id)}
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={ctxProtected}
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-protect"
+              title="A protected session is skipped by Close Other Tabs, Close Tabs to the Right, Close Ended Tabs, Stop children and agent closes. Closing its tab directly still stops it."
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                void toggleTabProtection(targetId);
+              }}
+            >
+              {#if ctxProtected}
+                <LockOpen size={13} class="shrink-0" />
+                <span>Remove Protection</span>
+              {:else}
+                <Lock size={13} class="shrink-0" />
+                <span>Protect from Batch Close</span>
+              {/if}
+            </button>
+          {/if}
           <button
             type="button"
             role="menuitem"
@@ -6992,7 +7240,7 @@
               onSendToAgent={sendReferenceToAgent}
               agentRepoPath={repoPath}
             />
-            {:else}
+            {:else if !deferredTabs.has(tab.id)}
             <TerminalSession
               taskRunId={tab.taskRunId}
               resume={tab.resume}

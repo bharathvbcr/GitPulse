@@ -670,7 +670,7 @@
     "additionalProperties": false,
     "properties": {
       "ack": {
-        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default false: a read only peeks, so reading never consumes the owner's messages)",
         "type": "boolean"
       },
       "for_peer": {
@@ -872,10 +872,16 @@
         "type": "string"
       },
       "hop": {
-        "description": "Explicit hop count (defaults to 1, or previous thread hop + 1; an MCP caller is never below 1, and a 0 is raised to 1)",
+        "description": "Explicit hop count. The count is the highest of this, the in_reply_to message's hop + 1, the thread's last hop + 1 and 1, so an explicit hop can raise it but never lower it (a 0 is raised to 1)",
         "maximum": 32,
         "minimum": 0,
         "type": "integer"
+      },
+      "in_reply_to": {
+        "description": "msg_id of the bus message this answers (1-64 ASCII letters, digits, '-' or '_'). It must still be on the bus; it supplies thread_key when none is given and sets the hop to its hop + 1 (at most 64 UTF-8 bytes)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
       },
       "kind": {
         "description": "Message kind ('note', 'ask', 'reply', or 'handoff'; default 'note') (at most 64 UTF-8 bytes)",
@@ -926,7 +932,7 @@
     "additionalProperties": false,
     "properties": {
       "ack": {
-        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true)",
+        "description": "Acknowledge returned messages across agent_bus and agent_mailbox (default true: a wait consumes what it returns, since a non-acking wait would return the same message again; pass since_seq to wait without consuming)",
         "type": "boolean"
       },
       "for_peer": {

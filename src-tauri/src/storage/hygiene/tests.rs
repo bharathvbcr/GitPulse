@@ -1,7 +1,7 @@
 use super::{
-    cancel, exclusive, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
-    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
-    PREPARATION, TTL,
+    cancel, exclusive, execute_with_activity, execute_with_profile, invocation, local_checks,
+    managed_cache_path, plans, prepare_with_activity, providers, tree, HygienePlan, EXECUTION,
+    INVENTORY, MAX_PLANS, PREPARATION, TTL,
 };
 use crate::ipc_error::CommandError;
 use std::fs::{self, File, FileTimes};
@@ -108,6 +108,25 @@ fn age_sets_mtime_on_a_directory_and_a_file() {
 
 fn preview(repo: &Path) -> HygienePlan {
     prepare_with_activity(repo.to_str().unwrap(), "local:target", 30, |_| Ok(())).unwrap()
+}
+
+#[test]
+#[cfg(unix)]
+fn a_repository_target_never_shows_the_profile_backup_confirmation() {
+    let _serial = serial();
+    let (_temp, repo) = fixture();
+    let view = preview(&repo);
+    let (_, outcome) = execute_with_profile(
+        repo.to_str().unwrap(),
+        &view.id,
+        |_, _| Ok(()),
+        |_| Ok(()),
+        || Err("no profile for a repository target".into()),
+        |_, _| panic!("only a profile backup asks the person"),
+    )
+    .unwrap();
+    assert!(outcome.success, "{}", outcome.message);
+    assert!(!repo.join("target").exists());
 }
 
 #[test]

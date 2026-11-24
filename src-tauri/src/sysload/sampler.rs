@@ -236,6 +236,10 @@ pub struct SamplerOptions {
     /// input. Unsupported unless [`start_app`] starts the probe, so a sampler
     /// started by a test or the soak never spawns a child of its own.
     pub exec_latency: Box<dyn Fn() -> Reading<super::exec_probe::ExecLatency> + Send>,
+    /// Whether each tick also feeds the WebContent footprint ring. Only
+    /// [`start_app`] turns it on: the ring is process-wide, so a sampler a
+    /// test starts must not write to it.
+    pub watch_webcontent: bool,
 }
 
 impl SamplerOptions {
@@ -254,6 +258,7 @@ impl SamplerOptions {
             }),
             trace_opener: trace::file_opener(),
             exec_latency: Box::new(Reading::default),
+            watch_webcontent: false,
         }
     }
 }
@@ -345,6 +350,7 @@ pub fn start_app(mut options: SamplerOptions) -> Result<StopHandle, String> {
     // The probe belongs to the app's sampler only: it spawns a child every
     // 15 s, which a sampler started by a test or a second process must not.
     let probe = super::exec_probe::start();
+    options.watch_webcontent = true;
     if let Some(probe) = &probe {
         options.exec_latency = Box::new(probe.reader());
     }
@@ -617,6 +623,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut trace_problem: Option<String> = None;
     let mut drops_seen: u64 = 0;
     let mut last_drop: Option<Instant> = None;
+    let mut last_webcontent: Option<Instant> = None;
     *shared
         .previous_boot
         .lock()
@@ -667,6 +674,15 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             }
         }
         tick_problems.extend(trace_problem.clone());
+        // The content processes' footprints, for the next one that is killed.
+        // Off with host-load sampling, and only in the app's own sampler.
+        if enabled
+            && options.watch_webcontent
+            && last_webcontent.is_none_or(|at| at.elapsed() >= super::webcontent::SAMPLE_EVERY)
+        {
+            last_webcontent = Some(Instant::now());
+            super::webcontent::sample_now();
+        }
         if let Some(at) = last_drop.filter(|at| at.elapsed() < DROP_NOTICE) {
             tick_problems.push(format!(
                 "trace: {drops_seen} reading(s) dropped while the trace write was blocked or failing (last {} s ago); the ring has a gap",

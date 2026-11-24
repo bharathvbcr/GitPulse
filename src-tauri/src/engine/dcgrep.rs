@@ -18,13 +18,11 @@ use crate::engine::content_search::{
     clip_match_text, ContentMatch, ContentSearchOptions, ContentSearchReport, SEARCH_TIMEOUT,
 };
 use crate::engine::git_cli::sandbox_join;
-use crate::engine::git_reader::sanitize_repo_file_entries;
 use crate::engine::process::{self, Incomplete, KeepDeadlinePrefix, OutputStream, ProcessObserver};
 use crate::ipc_error::CommandError;
 use crate::repository_trust::git_directories;
 use crate::storage::repo_tuning::index_file::{
-    index_shape_supported, read_tracked_paths, repo_has_custom_ignore_or_unicode_config,
-    TrackedIndexPaths,
+    index_shape_supported, repo_has_custom_ignore_or_unicode_config,
 };
 use crate::tool_capability::BinaryProbeCache;
 use crate::tool_install::release::app_bin_dir_path;
@@ -40,8 +38,6 @@ const ABSENT_TTL: Duration = Duration::from_secs(60);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_OUTPUT_CAP: usize = 64 * 1024;
 const SEARCH_OUTPUT_CAP: usize = 64 * 1024 * 1024;
-const FILES_TIMEOUT: Duration = Duration::from_secs(30);
-const FILES_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 const DCGREP_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const DCGREP_MAX_LINE_BYTES: usize = 4 * 1024;
 const REGEX_SIZE_LIMIT: usize = 16 * 1024 * 1024;
@@ -150,19 +146,6 @@ struct SearchRequest<'a> {
     max_line_bytes: usize,
 }
 
-#[derive(Serialize)]
-struct FilesRequest {
-    root: String,
-    max_results: usize,
-    include_ignored: bool,
-    include_hidden: bool,
-    include_oversized: bool,
-    include_symlinks: bool,
-    precompose_unicode: bool,
-    include_devcouncil: bool,
-    ignore_dot_ignore: bool,
-}
-
 #[derive(Default, Deserialize)]
 struct SkippedCounts {
     #[serde(default)]
@@ -192,20 +175,6 @@ struct SearchReply {
     count: usize,
     #[serde(default)]
     matches: Vec<SearchHit>,
-    #[serde(default)]
-    truncated: bool,
-    #[serde(default)]
-    skipped: SkippedCounts,
-}
-
-#[derive(Deserialize)]
-struct FilesReply {
-    #[serde(default)]
-    ok: bool,
-    #[serde(default)]
-    count: usize,
-    #[serde(default)]
-    paths: Vec<String>,
     #[serde(default)]
     truncated: bool,
     #[serde(default)]
@@ -612,11 +581,6 @@ fn find_literal_byte_pos(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn over_limit_error(max_files: usize) -> CommandError {
-    format!("File explorer unavailable: this repository contains more than {max_files} files")
-        .into()
-}
-
 fn has_unsupported_repo_layout(repo: &Path) -> Option<(PathBuf, PathBuf)> {
     if !repo.join(".git").exists() || repo.join(".gitmodules").exists() {
         return None;
@@ -863,90 +827,6 @@ fn search_working_tree_inner(
     }))
 }
 
-/// Attempts working-tree file enumeration by unioning `.git/index` tracked
-/// entries (read in-process) with `dcgrep files` untracked entries.
-/// Returns `Ok(None)` to fall back cleanly to `git ls-files`.
-pub(crate) fn list_working_tree_files(
-    repo: &Path,
-    max_files: usize,
-) -> Result<Option<Vec<String>>, CommandError> {
-    let bin = match resolve_usable_binary_with(&|| false)? {
-        UsableBinary::Ready(bin) => bin,
-        UsableBinary::Unavailable | UsableBinary::Cancelled => return Ok(None),
-    };
-    let Some((git_dir, common_dir)) = has_unsupported_repo_layout(repo) else {
-        return Ok(None);
-    };
-
-    let tracked = match read_tracked_paths(&git_dir, &common_dir, max_files) {
-        TrackedIndexPaths::Paths(paths) => paths,
-        TrackedIndexPaths::OverLimit => return Err(over_limit_error(max_files)),
-        TrackedIndexPaths::Unsupported => return Ok(None),
-    };
-
-    let request = FilesRequest {
-        root: process::plain_path_text(&repo.to_string_lossy()),
-        max_results: max_files,
-        include_ignored: false,
-        include_hidden: true,
-        include_oversized: true,
-        include_symlinks: true,
-        precompose_unicode: cfg!(target_os = "macos"),
-        include_devcouncil: true,
-        ignore_dot_ignore: true,
-    };
-    let Ok(body) = serde_json::to_vec(&request) else {
-        return Ok(None);
-    };
-
-    let cmd = process::build_capture_command(&bin, &["files"], Some(repo), &[], None, None);
-    let run = match process::run_bounded_capped(
-        cmd,
-        "dcgrep files",
-        FILES_TIMEOUT,
-        Some(&body),
-        FILES_OUTPUT_CAP,
-    ) {
-        Ok(run) => run,
-        Err(err) => {
-            if is_load_deferral(&err) {
-                return Err(err);
-            }
-            return Ok(None);
-        }
-    };
-
-    if !run.success || run.incomplete.is_some() {
-        return Ok(None);
-    }
-    let Ok(reply) = serde_json::from_slice::<FilesReply>(&run.stdout) else {
-        return Ok(None);
-    };
-    if !reply.ok || reply.count != reply.paths.len() {
-        return Ok(None);
-    }
-    if reply.skipped.too_large > 0
-        || reply.skipped.unreadable > 0
-        || reply.skipped.unrepresentable_name > 0
-    {
-        return Ok(None);
-    }
-    if reply.truncated {
-        return Err(over_limit_error(max_files));
-    }
-
-    let combined = sanitize_repo_file_entries(
-        tracked
-            .iter()
-            .map(String::as_str)
-            .chain(reply.paths.iter().map(String::as_str)),
-    );
-    if combined.len() > max_files {
-        return Err(over_limit_error(max_files));
-    }
-    Ok(Some(combined))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_dcgrep_handles_search_and_list_with_zero_git_execs() {
+    fn installed_dcgrep_handles_search_with_zero_git_grep_and_list_uses_git_ls_files() {
         let _serial = env_serial();
         if resolve_usable_binary().ok().flatten().is_none() {
             return;
@@ -1032,14 +912,20 @@ mod tests {
         assert!(
             !after
                 .iter()
-                .any(|argv| argv.iter().any(|arg| arg == "grep" || arg == "ls-files")),
-            "expected zero git grep / git ls-files spawns when dcgrep handles working tree, got: {after:?}"
+                .any(|argv| argv.iter().any(|arg| arg == "grep")),
+            "expected zero git grep spawns when dcgrep handles content search, got: {after:?}"
         );
         assert!(
             after
                 .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "ls-files")),
+            "expected git ls-files spawn for the listing: {after:?}"
+        );
+        assert!(
+            !after
+                .iter()
                 .any(|argv| argv.first().map(String::as_str) == Some("files")),
-            "expected dcgrep files spawn in log: {after:?}"
+            "listing must not spawn `dcgrep files`: {after:?}"
         );
         assert!(
             after
@@ -1413,6 +1299,32 @@ mod tests {
         assert!(spawns.iter().any(|a| a.iter().any(|s| s == "grep")));
     }
 
+    /// Listing is `git ls-files` because it measured 2.2-2.5x faster than
+    /// `dcgrep files` (scripts/bench-dcgrep.mjs). A healthy dcgrep that would
+    /// answer `files` with a wrong list, and record that it was asked, must be
+    /// neither asked nor believed.
+    #[test]
+    fn list_repo_files_never_asks_dcgrep() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        git_in(dir.path(), &["add", "a.txt"]);
+        git_in(dir.path(), &["commit", "-m", "init"]);
+        let root_str = dir.path().to_string_lossy().into_owned();
+
+        let stub_dir = TempDir::new().unwrap();
+        let marker = stub_dir.path().join("files-asked");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"health\" ]; then\n  echo '{{\"ok\":true,\"id\":\"dcgrep\",\"component\":\"dc-grep\",\"version\":\"0.2.5\",\"searcher\":\"dc-grep\",\"schema_version\":1,\"capabilities\":{{\"fixed_strings\":true,\"include_hidden\":true,\"preserve_whitespace\":true,\"include_oversized\":true,\"include_symlinks\":true,\"precompose_unicode\":true,\"include_devcouncil\":true,\"ignore_dot_ignore\":true,\"include_git_tracked\":true}}}}'\n  exit 0\nfi\ntouch '{}'\necho '{{\"ok\":true,\"count\":1,\"paths\":[\"bogus-from-dcgrep.txt\"],\"truncated\":false,\"skipped\":{{}}}}'\n",
+            marker.display()
+        );
+        let stub = write_exe(stub_dir.path(), "dcgrep", &script);
+        let _binding = TestDcgrepBinding::bind_test_binary(&stub);
+
+        let files = GitReader::list_repo_files(&root_str).expect("list_repo_files");
+        assert!(!marker.exists(), "list_repo_files invoked `dcgrep files`");
+        assert_eq!(files, vec!["a.txt"]);
+    }
+
     #[test]
     fn explicit_gitpulse_dcgrep_bin_fails_closed_when_missing_or_non_executable() {
         let dir = init_repo();
@@ -1426,10 +1338,9 @@ mod tests {
         let _env = bind_env(&serial).set(GITPULSE_DCGREP_ENV, missing.as_os_str());
         invalidate_cache();
 
-        let list_err = GitReader::list_repo_files(&root_str).expect_err("must fail closed");
-        assert!(
-            list_err.message().contains(GITPULSE_DCGREP_ENV),
-            "{list_err:?}"
+        assert_eq!(
+            GitReader::list_repo_files(&root_str).unwrap(),
+            vec!["a.txt"]
         );
 
         let search_err = content_search::search(
@@ -1518,26 +1429,6 @@ mod tests {
         // .gitmodules falls back cleanly to git.
         std::fs::write(root.join(".gitmodules"), "").unwrap();
         assert!(has_unsupported_repo_layout(root).is_none());
-    }
-
-    #[test]
-    fn list_working_tree_files_enforces_max_files_cap_with_exact_error() {
-        let _serial = env_serial();
-        if resolve_usable_binary().ok().flatten().is_none() {
-            return;
-        }
-        let dir = init_repo();
-        let root = dir.path();
-        std::fs::write(root.join("a.txt"), "1\n").unwrap();
-        std::fs::write(root.join("b.txt"), "2\n").unwrap();
-        std::fs::write(root.join("c.txt"), "3\n").unwrap();
-        git_in(root, &["add", "a.txt", "b.txt"]);
-        let err = list_working_tree_files(root, 2).expect_err("must enforce max_files");
-        assert!(
-            err.message()
-                .contains("File explorer unavailable: this repository contains more than 2 files"),
-            "{err:?}"
-        );
     }
 
     #[test]
@@ -1742,11 +1633,11 @@ mod tests {
             Some(bad_exe.to_string_lossy().as_ref())
         );
 
-        // Failing `health` must fail closed naming GITPULSE_DCGREP_BIN in both entry points.
-        let list_err = GitReader::list_repo_files(&root_str).expect_err("must fail closed");
-        assert!(
-            list_err.message().contains(GITPULSE_DCGREP_ENV),
-            "{list_err:?}"
+        // Failing `health` must fail closed naming GITPULSE_DCGREP_BIN in the search entry
+        // point; listing is git's and never consults dcgrep.
+        assert_eq!(
+            GitReader::list_repo_files(&root_str).unwrap(),
+            vec!["a.txt"]
         );
 
         let search_err = content_search::search(

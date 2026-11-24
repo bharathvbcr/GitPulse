@@ -301,7 +301,9 @@ pub(crate) fn git_config_value(text: &str) -> String {
 /// pointed it at.
 const ROOT_MARKER: &str = "GITPULSE_TEST_HERMETIC_ROOT";
 /// The developer's real `HOME`, kept so a canary can prove nothing resolves
-/// under it. Informational only; nothing reads state from it.
+/// under it. The suite reads no state from it; only the opt-in live test
+/// `harness::steward::live_key_tests` binds it, while it starts a Manvi worker
+/// on the developer's own Anthropic account.
 const REAL_HOME_MARKER: &str = "GITPULSE_TEST_REAL_HOME";
 /// The pid whose constructor has already started the disk-write guard.
 const GUARDED_MARKER: &str = "GITPULSE_TEST_GUARDED_PID";
@@ -385,7 +387,96 @@ pub(crate) mod hermetic {
         "CODEX_HOME",
         "ANTIGRAVITY_HOME",
         "GITPULSE_BACKUPS_DIR",
+        // Claude Code exports it into every session; steward's hygiene sweep
+        // (`default_session_tmp_roots`) adds it as a root to clean, so an
+        // inherited value would point a test at the developer's real tmp dir.
+        "CLAUDE_CODE_TMPDIR",
     ];
+
+    /// Name prefixes whose inherited values are removed: every variable a
+    /// GitPulse, Manvi, lappi or portless process could export to override
+    /// where this code reads state or whom it talks to. GitPulse itself injects
+    /// several into every hosted terminal (`GITPULSE_SESSION_ID`,
+    /// `GITPULSE_NOTIFY_SOCKET`, `GITPULSE_AGENT_KIND`, `LAPPI_SOCKET`), so a
+    /// `cargo test` launched from one would otherwise read the host's values.
+    /// A prefix rather than a list so a name added to production tomorrow is
+    /// covered today; the `env_names_read_by_production` contract test in
+    /// `tests/hermetic_contract.rs` pins the names that are *not* covered.
+    const SCRUBBED_PREFIXES: &[&str] = &["GITPULSE_", "MANVI_", "LAPPI_", "PORTLESS_"];
+
+    /// Opt-in test drivers a developer exports on purpose (`GITPULSE_TEST_NPM=1`,
+    /// `GITPULSE_LIVE_AI=1`, a benchmark's repository): they only ever switch a
+    /// test on or point it at an input, and nothing in production reads them.
+    /// Removing them would silently turn those suites off. The four hermetic
+    /// markers are `GITPULSE_TEST_*` and are kept by the first entry. Each entry
+    /// is a prefix and says why it is kept.
+    const KEPT_PREFIXES: &[(&str, &str)] = &[
+        (
+            "GITPULSE_TEST_",
+            "opt-in suite switches and the hermetic markers",
+        ),
+        ("GITPULSE_BENCH_", "benchmark drivers"),
+        ("GITPULSE_LIVE_", "live-service suites, opt-in"),
+        ("GITPULSE_SMOKE_", "smoke-run inputs"),
+        (
+            "GITPULSE_REQUIRE_",
+            "CI strictness switches that fail instead of skip",
+        ),
+        (
+            "GITPULSE_HOST_LOAD_",
+            "host-load bench and soak inputs: `_ONCE` picks the single sample a \
+             sampler asks one bench process for, `_REPO` and `_SOAK_*` size the run",
+        ),
+        (
+            "GITPULSE_MANVI_BIN",
+            "the manvi a developer points `hook_scope_fence` and the real-Manvi \
+             tests at; read by the test itself, not state",
+        ),
+        (
+            "GITPULSE_DEVMAP_BIN",
+            "the devmap build under test (`devmap_embedding`, the `cli_e2e` \
+             zero-copy tests, `worktree_create`); read by the test itself",
+        ),
+        ("GITPULSE_COW_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_WALK_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_DRIVER_MEASURE_", "measurement-run inputs"),
+        ("GITPULSE_FSEVENTSD_", "measurement-run inputs"),
+        ("GITPULSE_WATCH_TIMING_", "measurement-run inputs"),
+        ("GITPULSE_LEDGER_RELIABILITY_", "reliability-run inputs"),
+        ("GITPULSE_LEDGER_FRESHNESS_", "reliability-run inputs"),
+        ("GITPULSE_LEAK_", "leak-corpus run inputs"),
+        ("GITPULSE_AVATAR_LIVE_", "live-repository suite inputs"),
+        ("GITPULSE_ADV_SHAPE_", "adversarial-shape run output"),
+        (
+            "GITPULSE_BLESS_FIXTURES",
+            "regenerates committed fixtures on request",
+        ),
+        ("GITPULSE_VERDICT_BENCH_STORE", "benchmark input"),
+        ("GITPULSE_SCAN_REPO", "scan-benchmark input"),
+        ("GITPULSE_CODEINTEL_TEST_REPO", "code-intel suite input"),
+        ("GITPULSE_PULSE_REPO", "pulse suite input"),
+        ("GITPULSE_HOOK_STRESS_GRANT_REPO", "hook stress suite input"),
+        ("GITPULSE_MCP_BIN", "path of the binary an MCP suite drives"),
+    ];
+
+    /// Whether the constructor removes `name` from the test process. The
+    /// canary and the env-name contract test ask the same question, so there is
+    /// one answer.
+    pub(crate) fn is_scrubbed(name: &str) -> bool {
+        SCRUBBED.contains(&name)
+            || (SCRUBBED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                && !is_kept_test_knob(name))
+    }
+
+    /// Whether `name` is a scoped-prefix name kept on purpose (a hermetic
+    /// marker or an opt-in test driver).
+    pub(crate) fn is_kept_test_knob(name: &str) -> bool {
+        KEPT_PREFIXES
+            .iter()
+            .any(|(prefix, _)| name.starts_with(prefix))
+    }
 
     /// Toolchain homes that default to a directory under `HOME`. The tests
     /// spawn `cargo`, `rustc` and `go` through rustup shims that find their
@@ -417,6 +508,52 @@ pub(crate) mod hermetic {
         }
     }
 
+    /// Where the per-process root lives. The root also becomes `temp_dir()`
+    /// (`TMPDIR`), and a Unix socket path must fit in `sun_path` (104 bytes on
+    /// macOS), which macOS's per-user temp dir (`/private/var/folders/xx/..`,
+    /// ~50 bytes before the root's own name) does not leave room for: every
+    /// socket fixture under `temp_dir()` failed. So Unix uses the short, fixed
+    /// `/tmp` (`/private/tmp` on macOS), kept canonical so no path under it
+    /// crosses a symlink (the storage cleaner refuses a symlinked root:
+    /// "Symlink paths are not eligible"). Elsewhere, and where `/tmp` is not a
+    /// directory, it is the canonical `temp_dir()`.
+    fn root_base() -> PathBuf {
+        let mut base = std::env::temp_dir();
+        if cfg!(unix) && Path::new("/tmp").is_dir() {
+            base = PathBuf::from("/tmp");
+        }
+        std::fs::canonicalize(&base).map_or(base, |canonical| plain_spelling(&canonical))
+    }
+
+    /// Creates the root itself, failing if it already exists. `/tmp` is shared
+    /// and world-writable, so a pre-existing path is another party's, and on
+    /// Unix the root is made `0700` and checked to be ours before anything
+    /// (git config, `HOME`) is placed under it.
+    fn create_private_root(root: &Path) {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(root)
+            .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            extern "C" {
+                fn geteuid() -> u32;
+            }
+            let meta = std::fs::symlink_metadata(root)
+                .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", root.display()));
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            let euid = unsafe { geteuid() };
+            assert!(
+                meta.is_dir() && meta.uid() == euid && meta.mode() & 0o077 == 0,
+                "hermetic test root {} is not a private directory owned by this user",
+                root.display()
+            );
+        }
+    }
+
     pub(super) extern "C" fn install() {
         // Not `static`: a second include of this file in the same crate has its
         // own copy of every static, and the environment is the one thing both
@@ -432,19 +569,16 @@ pub(crate) mod hermetic {
         if std::env::var_os(super::ROOT_MARKER).is_some() {
             return;
         }
-        // Canonical, so no path under it crosses a symlink: macOS's temp dir is
-        // `/var/folders/..`, and `/var` is a link to `/private/var`, which the
-        // storage cleaner refuses as a root ("Symlink paths are not eligible").
-        let temp = std::env::temp_dir();
-        let temp =
-            std::fs::canonicalize(&temp).map_or(temp, |canonical| plain_spelling(&canonical));
-        let root = temp.join(format!(
-            "gitpulse-hermetic-{}-{}",
+        let root = root_base().join(format!(
+            "gph-{}-{:08x}",
             std::process::id(),
+            // The low 32 bits of the clock: the pid already separates live
+            // processes, this separates a reused pid.
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
+                .map_or(0, |elapsed| elapsed.as_nanos() as u32)
         ));
+        create_private_root(&root);
         let home = root.join("home");
         let dirs = [
             home.clone(),
@@ -489,6 +623,7 @@ pub(crate) mod hermetic {
         set("XDG_CONFIG_HOME", &home.join(".config"));
         set("XDG_CACHE_HOME", &home.join(".cache"));
         set("XDG_DATA_HOME", &home.join(".local").join("share"));
+        set("XDG_STATE_HOME", &home.join(".local").join("state"));
         set("CLAUDE_CONFIG_DIR", &home.join(".claude"));
         set("GIT_CONFIG_GLOBAL", &gitconfig);
         // SAFETY: as above.
@@ -496,6 +631,23 @@ pub(crate) mod hermetic {
             std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
             for key in SCRUBBED {
                 std::env::remove_var(key);
+            }
+            let inherited: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| is_scrubbed(name))
+                .collect();
+            for name in inherited {
+                std::env::remove_var(name);
+            }
+            // Point the temp directory inside the root too: `temp_dir()`
+            // callers (hook markers, viz scratch, fixtures) must not write to
+            // the developer's real one, and the root's own removal then
+            // cleans what they leave.
+            let tmp = root.join("tmp");
+            std::fs::create_dir_all(&tmp)
+                .unwrap_or_else(|error| panic!("hermetic tmp {}: {error}", tmp.display()));
+            for key in ["TMPDIR", "TEMP", "TMP"] {
+                std::env::set_var(key, &tmp);
             }
             std::env::set_var(super::OWNER_MARKER, std::process::id().to_string());
             std::env::set_var(super::ROOT_MARKER, &root);
@@ -960,6 +1112,30 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Regression (70 socket fixtures failed): `TMPDIR` points inside the
+    /// hermetic root, and a Unix socket path must fit in `sun_path` (104 bytes
+    /// on macOS, 108 on Linux). The deepest socket fixture under `temp_dir()`
+    /// is a `tempfile` directory (prefix plus 6 random bytes, allowed 24) holding
+    /// a nested profile directory (allowed 24) holding `instance.sock`; the
+    /// temp dir must leave room for all of it.
+    #[cfg(unix)]
+    #[test]
+    fn the_hermetic_temp_dir_leaves_room_for_the_deepest_socket_fixture() {
+        const SUN_PATH_MIN: usize = 104;
+        let temp = std::env::temp_dir();
+        assert!(
+            temp.starts_with(hermetic::root()),
+            "{} is not under the hermetic root",
+            temp.display()
+        );
+        let worst = temp.as_os_str().len() + 1 + 24 + 1 + 24 + 1 + "instance.sock".len();
+        assert!(
+            worst < SUN_PATH_MIN,
+            "a socket fixture under {} can reach {worst} bytes; sun_path holds {SUN_PATH_MIN} including the NUL",
+            temp.display()
+        );
     }
 
     /// Regression (a panic leaks a process-global override): the whole point of

@@ -14,7 +14,8 @@ use base64::Engine;
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, attach_session, detach_session, kill_session, list_sessions,
-    session_transcript, spawn_session, OutputSink, TerminalSessions, TranscriptRead, RING_BYTES,
+    session_transcript, spawn_session, KillOrigin, OutputSink, TerminalSessions, TranscriptRead,
+    RING_BYTES,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -269,7 +270,7 @@ fn a_view_that_stops_acknowledging_does_not_end_the_session() {
         0,
         "with no detach, every acknowledgement is exact"
     );
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     let exit = view.exits.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(exit["id"], id.as_str());
     assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
@@ -332,7 +333,7 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
     assert!(detach_session(&view.state, &id).unwrap());
     assert!(detach_session(&view.state, &id).unwrap());
     assert!(!detach_session(&view.state, "term-missing").unwrap());
-    kill_session(&view.state, &id).unwrap();
+    kill_session(&view.state, &id, KillOrigin::Unspecified).unwrap();
     assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
     assert!(!detach_session(&view.state, &id).unwrap());
 }
@@ -487,7 +488,7 @@ fn detached_non_repainting_output_under_ring_replays_exact_bytes_without_loss() 
     );
     drop(losses);
 
-    kill_session(&view.state, &spawned.id).unwrap();
+    kill_session(&view.state, &spawned.id, KillOrigin::Unspecified).unwrap();
 }
 
 /// S2-11 (past RING_BYTES): when detached output overflows the ring, reattach
@@ -577,5 +578,5 @@ fn detached_non_repainting_output_past_ring_replays_tail_and_emits_loss() {
     assert_eq!(tail, marker);
     assert!(prefix.iter().all(|b| *b == b'x'));
 
-    kill_session(&view.state, &spawned.id).unwrap();
+    kill_session(&view.state, &spawned.id, KillOrigin::Unspecified).unwrap();
 }

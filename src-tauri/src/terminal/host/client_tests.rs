@@ -189,6 +189,7 @@ fn serve(
                             parent_session_id: None,
                             title: None,
                             quiet_ms: None,
+                            protected: false,
                         })
                         .collect();
                     serde_json::to_value(sessions)
@@ -520,4 +521,66 @@ fn rapid_disconnect_and_relaunch_never_refuses_successor_as_duplicate_window() {
             .unwrap_or_else(|e| panic!("round {round}: {e}"));
         next.disconnect();
     }
+}
+
+/// A protocol bump must not orphan the sessions of the host it leaves behind:
+/// an app of a later protocol that finds a host with sessions records them,
+/// can list, read and stop them, and a probe that finds nothing clears the
+/// record. The fake host here is the protocol-4 host; the app is "protocol 5".
+#[test]
+fn a_probe_from_a_later_protocol_records_what_the_older_host_still_holds() {
+    use crate::terminal::host::legacy::{LegacyError, LegacyStatus};
+    let fake = FakeHost::start();
+    let client = HostClient::new(fake.config());
+    assert!(
+        client.legacy_hosts().is_empty(),
+        "nothing is known before a probe"
+    );
+
+    client.inner.probe_other_protocols_for(5);
+    let hosts = client.legacy_hosts();
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    assert_eq!(hosts[0].protocol, PROTOCOL);
+    let LegacyStatus::Listed { info, sessions } = &hosts[0].status else {
+        panic!("not listed: {:?}", hosts[0].status);
+    };
+    assert_eq!(info.sessions, 1);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, "term-live");
+    assert!(
+        client
+            .trouble()
+            .iter()
+            .any(|t| t.contains("speaks protocol 5") && t.contains("1 session(s)")),
+        "the skew is still reported: {:?}",
+        client.trouble()
+    );
+
+    // The skew message no longer says they cannot be shown: they are listed.
+    assert!(
+        client
+            .trouble()
+            .iter()
+            .any(|t| t.contains("listed under Sessions") && !t.contains("cannot show them")),
+        "{:?}",
+        client.trouble()
+    );
+    // Asked again, the record is the same host with the same session.
+    let rescanned = client.legacy_rescan();
+    assert_eq!(rescanned.len(), 1);
+    assert!(matches!(
+        &rescanned[0].status,
+        LegacyStatus::Listed { sessions, .. } if sessions.len() == 1
+    ));
+
+    client.legacy_kill(PROTOCOL, "term-live").unwrap();
+    assert!(matches!(
+        client.legacy_kill(3, "term-live"),
+        Err(LegacyError::NoCompat(3))
+    ));
+
+    // Once the app speaks this host's own protocol it is not another host,
+    // and the earlier record is replaced by the empty one.
+    client.inner.probe_other_protocols_for(PROTOCOL);
+    assert!(client.legacy_hosts().is_empty());
 }

@@ -379,6 +379,65 @@ fn a_busy_manvi_gets_its_own_message() {
     );
 }
 
+/// Every AI feature on the Claude route reports what Manvi's answer said about
+/// the key, so the steward's status is right whichever feature found out.
+#[test]
+fn every_claude_route_call_tells_the_steward_what_it_learned_about_the_key() {
+    use crate::harness::steward::take_key_answers_noted_here;
+    let model = || "claude-sonnet-5-5".to_string();
+    let rejected = ManviError {
+        code: crate::ai::MANVI_PROVIDER_AUTH.into(),
+        message: "assist completion unavailable: anthropic: 401".into(),
+    };
+    take_key_answers_noted_here();
+
+    let (cloud, _calls) = fake_manvi(Value::Null, Some(rejected.clone()), 200_000);
+    run_with(
+        Feature::ExplainCommit,
+        "/repo",
+        Route::Manvi(cloud),
+        turn("d"),
+        no_sweep,
+    )
+    .expect_err("rejected key");
+    // The dry run reaches no provider, so it says nothing; the refusal does.
+    assert_eq!(
+        take_key_answers_noted_here(),
+        vec![(model(), None), (model(), Some(true))]
+    );
+
+    let (cloud, _calls) = fake_manvi(reply("It adds a readme."), None, 200_000);
+    run_with(
+        Feature::ExplainCommit,
+        "/repo",
+        Route::Manvi(cloud),
+        turn("d"),
+        no_sweep,
+    )
+    .expect("answered");
+    assert_eq!(
+        take_key_answers_noted_here(),
+        vec![(model(), None), (model(), Some(false))]
+    );
+
+    // A local model server's answer is not about the Claude key.
+    let (mut cloud, _calls) = fake_manvi(Value::Null, Some(rejected), 200_000);
+    cloud.provider = "local";
+    let _ = run_with(
+        Feature::ExplainCommit,
+        "/repo",
+        Route::Manvi(cloud),
+        turn("d"),
+        no_sweep,
+    );
+    let noted = take_key_answers_noted_here();
+    assert!(!noted.is_empty(), "the local route never reported");
+    assert!(
+        noted.iter().all(|(_, answer)| answer.is_none()),
+        "{noted:?}"
+    );
+}
+
 #[test]
 fn a_key_anthropic_rejected_says_to_replace_the_key_whatever_the_text() {
     // The code decides; text that merely mentions a key does not.

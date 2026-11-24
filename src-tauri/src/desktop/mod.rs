@@ -597,6 +597,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
         return Ok(serde_json::json!({
             "ok": true,
             "delivery_outcome": "queued_for_hook_boundary",
+            "channel": "mailbox",
         }));
     };
 
@@ -610,6 +611,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
         return Ok(serde_json::json!({
             "ok": true,
             "delivery_outcome": "paused_hop_limit",
+            "channel": "mailbox",
         }));
     }
 
@@ -622,6 +624,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
         return Ok(serde_json::json!({
             "ok": true,
             "delivery_outcome": outcome,
+            "channel": "mailbox",
         }));
     }
 
@@ -684,12 +687,14 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
                     return Ok(serde_json::json!({
                         "ok": true,
                         "delivery_outcome": "woken_immediately",
+                        "channel": "managed",
                     }));
                 }
             }
             return Ok(serde_json::json!({
                 "ok": true,
                 "delivery_outcome": "queued_for_hook_boundary",
+                "channel": "mailbox",
             }));
         }
     }
@@ -722,6 +727,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
                 return Ok(serde_json::json!({
                     "ok": true,
                     "delivery_outcome": outcome,
+                    "channel": "banner",
                 }));
             }
         }
@@ -736,6 +742,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
                 return Ok(serde_json::json!({
                     "ok": true,
                     "delivery_outcome": "woken_immediately",
+                    "channel": "mailbox",
                 }));
             }
         }
@@ -744,6 +751,7 @@ pub fn serve_agent_deliver<R: tauri::Runtime>(
     Ok(serde_json::json!({
         "ok": true,
         "delivery_outcome": "queued_for_hook_boundary",
+        "channel": "mailbox",
     }))
 }
 
