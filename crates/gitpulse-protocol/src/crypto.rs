@@ -1,0 +1,1114 @@
+//! Cryptographic primitives for `gitpulse-protocol`:
+//! - **Noise `IK`** (`Noise_IK_25519_ChaChaPoly_SHA256`) authenticated E2EE tunnel
+//!   with `DeviceCertificate` static X25519 key pinning, `host_epoch` prologue binding,
+//!   per-direction monotonic high-water replay/reorder rejection, and `zeroize` on drop (Opus R1).
+//! - **DeviceCertificate** (≤30-day TTL, binding Ed25519, X25519, and optional hardware P-256
+//!   approval public key) and **SignedRevocationList** (monotonic version, IdentityKey Ed25519
+//!   signature, Opus M2 & R3).
+//! - **P-256 ECDSA** approval signature verification (DER-encoded, hardware Secure Enclave /
+//!   StrongBox compatible, Opus P0-5/R2/M2) with full certificate chain + revocation checks.
+//!   **Caller trust boundary (Opus #15):** `identity_pub_ed25519` MUST be loaded from a
+//!   tamper-resistant OS Keychain / Secret Service (never an agent-writable file).
+//! - **Ed25519 relay HTTP/WS request signing & verification** matching `gitpulse-relay`
+//!   `internal/server/deviceauth.go` (`METHOD\nRequestURI\nts\nhex(sha256(body))`).
+//! - **`<= 2 KiB` `preview_ct` sealing/opening** (ephemeral X25519 + HKDF-SHA256 +
+//!   ChaCha20-Poly1305 + host Ed25519 signature) for metadata-free APNs/FCM NSE wake pushes.
+
+use crate::canonical::{
+    approval_signing_bytes, hex_encode, validate_non_empty_id, validate_sha256_hex,
+};
+use crate::error::{ProtocolError, Result};
+use crate::wire::{
+    ApprovalDecisionKind, DeviceCertificate, DeviceKind, SignedApprovalDecision,
+    SignedRevocationList, CLOCK_SKEW_SECS, MAX_CERT_TTL_SECS, MAX_PREVIEW_CT_BYTES,
+};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use ed25519_dalek::{
+    Signature as EdSignature, Signer as EdSigner, SigningKey as EdSigningKey, Verifier,
+    VerifyingKey as EdVerifyingKey,
+};
+use hkdf::Hkdf;
+use p256::ecdsa::{DerSignature, VerifyingKey as P256VerifyingKey};
+use sha2::{Digest, Sha256};
+use snow::{Builder, HandshakeState, StatelessTransportState};
+use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
+use zeroize::Zeroizing;
+
+/// Noise protocol suite used for all host↔mobile E2EE tunnels (Opus R1).
+pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
+
+/// Domain prefix for Noise `IK` handshake prologue binding `(stream_id, host_epoch)`.
+const DOMAIN_TUNNEL_PROLOGUE: &[u8] = b"gitpulse-tunnel/v1\0";
+
+/// Domain prefix for `DeviceCertificate` v2 IdentityKey signatures.
+const DOMAIN_DEVICE_CERT_V2: &[u8] = b"gitpulse-protocol/v2/device-cert\0";
+
+/// Domain prefix for `SignedRevocationList` IdentityKey signatures.
+const DOMAIN_REVOCATION_LIST: &[u8] = b"gitpulse-protocol/v1/revocation-list\0";
+
+/// Domain prefix + magic for `<= 2 KiB` NSE wake `preview_ct` blobs.
+const PREVIEW_MAGIC: &[u8; 4] = b"GPPV";
+const PREVIEW_VERSION: u8 = 1;
+const INFO_PREVIEW_KEY: &[u8] = b"gitpulse-preview/v1/chacha20poly1305";
+const DOMAIN_PREVIEW_SIG: &[u8] = b"gitpulse-preview/v1/sig\0";
+const DOMAIN_PREVIEW_AAD: &[u8] = b"gitpulse-preview/v1/aad\0";
+
+/// Current `DeviceCertificate` schema version (supports optional hardware P-256 key).
+pub const DEVICE_CERT_VERSION: u8 = 2;
+
+/// Maximum Noise transport plaintext per frame (fits inside Noise 65535B limit minus 16B tag).
+pub const MAX_TUNNEL_PLAINTEXT_BYTES: usize = 65_500;
+
+/// Maximum frames encrypted per direction under a single Noise handshake before rekey.
+pub const MAX_FRAMES_PER_SESSION: u64 = 100_000;
+
+/// Relay HTTP/WS authentication header names (matching `gitpulse-relay`).
+pub const DEVICE_HEADER: &str = "X-GitPulse-Device";
+/// Relay request timestamp header (unix milliseconds).
+pub const TIMESTAMP_HEADER: &str = "X-GitPulse-Timestamp";
+/// Relay request Ed25519 signature header (standard base64).
+pub const SIGNATURE_HEADER: &str = "X-GitPulse-Signature";
+
+/// Relay HTTP/WS authentication headers produced by [`sign_relay_request`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAuthHeaders {
+    /// Device identifier (`X-GitPulse-Device`).
+    pub device_id: String,
+    /// Unix milliseconds (`X-GitPulse-Timestamp`).
+    pub timestamp_ms: i64,
+    /// Standard base64-encoded 64-byte Ed25519 signature (`X-GitPulse-Signature`).
+    pub signature_b64: String,
+}
+
+impl RelayAuthHeaders {
+    /// Returns the three HTTP header `(name, value)` pairs ready for HTTP/WS requests.
+    pub fn pairs(&self) -> [(&'static str, String); 3] {
+        [
+            (DEVICE_HEADER, self.device_id.clone()),
+            (TIMESTAMP_HEADER, self.timestamp_ms.to_string()),
+            (SIGNATURE_HEADER, self.signature_b64.clone()),
+        ]
+    }
+}
+
+/// Computes the exact byte payload signed by Ed25519 for relay HTTP and WebSocket upgrades:
+/// `METHOD\nRequestURI\nts\nhex(sha256(body))`.
+pub fn relay_signing_message(
+    method: &str,
+    request_uri: &str,
+    timestamp_ms: i64,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Err(ProtocolError::InvalidInput(
+            "HTTP method must be non-empty ASCII uppercase".to_string(),
+        ));
+    }
+    if !request_uri.starts_with('/') || request_uri.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Err(ProtocolError::InvalidInput(
+            "request_uri must start with '/' and contain no whitespace/control bytes".to_string(),
+        ));
+    }
+    if timestamp_ms < 0 {
+        return Err(ProtocolError::InvalidInput(
+            "timestamp_ms must be non-negative".to_string(),
+        ));
+    }
+    let body_hash = hex_encode(&Sha256::digest(body));
+    Ok(format!("{method}\n{request_uri}\n{timestamp_ms}\n{body_hash}").into_bytes())
+}
+
+/// Signs a relay HTTP or WebSocket upgrade request with a device's 32-byte Ed25519 seed.
+pub fn sign_relay_request(
+    device_id: &str,
+    ed25519_seed: &[u8; 32],
+    method: &str,
+    request_uri: &str,
+    timestamp_ms: i64,
+    body: &[u8],
+) -> Result<RelayAuthHeaders> {
+    validate_non_empty_id(device_id, "device_id", 64)?;
+    let msg = relay_signing_message(method, request_uri, timestamp_ms, body)?;
+    let signing = EdSigningKey::from_bytes(ed25519_seed);
+    let sig = signing.sign(&msg);
+    Ok(RelayAuthHeaders {
+        device_id: device_id.to_string(),
+        timestamp_ms,
+        signature_b64: STANDARD.encode(sig.to_bytes()),
+    })
+}
+
+/// Verifies a relay HTTP or WebSocket upgrade request signature against a device's Ed25519 public key.
+pub fn verify_relay_request(
+    device_ed25519_pub: &[u8; 32],
+    method: &str,
+    request_uri: &str,
+    timestamp_ms: i64,
+    body: &[u8],
+    signature_b64: &str,
+) -> Result<()> {
+    let raw = STANDARD
+        .decode(signature_b64)
+        .map_err(|_| ProtocolError::Malformed("relay request signature base64".to_string()))?;
+    let sig_bytes: [u8; 64] = raw
+        .try_into()
+        .map_err(|_| ProtocolError::Malformed("relay request signature length".to_string()))?;
+    let vk = EdVerifyingKey::from_bytes(device_ed25519_pub)
+        .map_err(|_| ProtocolError::InvalidInput("invalid Ed25519 public key".to_string()))?;
+    let msg = relay_signing_message(method, request_uri, timestamp_ms, body)?;
+    vk.verify_strict(&msg, &EdSignature::from_bytes(&sig_bytes))
+        .map_err(|_| ProtocolError::BadSignature("relay request".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// DeviceCertificate & SignedRevocationList (Opus M2, R3)
+// ---------------------------------------------------------------------------
+
+fn put_u16_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn cert_signed_bytes(cert: &DeviceCertificate) -> Result<Vec<u8>> {
+    let ed_pub = decode_fixed_b64::<32>(&cert.ed25519_pub_b64, "ed25519_pub_b64")?;
+    let x_pub = decode_fixed_b64::<32>(&cert.x25519_pub_b64, "x25519_pub_b64")?;
+    let p256_pub = match &cert.approval_pub_p256_b64 {
+        Some(b64) => {
+            let bytes = STANDARD
+                .decode(b64)
+                .map_err(|_| ProtocolError::Malformed("approval_pub_p256_b64".to_string()))?;
+            if bytes.len() != 33 && bytes.len() != 65 {
+                return Err(ProtocolError::Malformed(
+                    "approval_pub_p256 must be 33-byte compressed or 65-byte uncompressed SEC1"
+                        .to_string(),
+                ));
+            }
+            Some(bytes)
+        }
+        None => None,
+    };
+
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(DOMAIN_DEVICE_CERT_V2);
+    out.push(cert.version);
+    put_u16_bytes(&mut out, cert.device_id.as_bytes());
+    out.push(match cert.kind {
+        DeviceKind::Desktop => 1,
+        DeviceKind::Mobile => 2,
+    });
+    put_u16_bytes(&mut out, cert.name.as_bytes());
+    out.extend_from_slice(&ed_pub);
+    out.extend_from_slice(&x_pub);
+    match p256_pub {
+        Some(bytes) => {
+            out.push(1);
+            put_u16_bytes(&mut out, &bytes);
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&cert.created_at.to_be_bytes());
+    out.extend_from_slice(&cert.expires_at.to_be_bytes());
+    Ok(out)
+}
+
+/// Issues a short-lived (`<= 30 day`) [`DeviceCertificate`] signed by the Account `IdentityKey`.
+#[allow(clippy::too_many_arguments)]
+pub fn issue_device_certificate(
+    identity_ed25519_seed: &[u8; 32],
+    device_id: &str,
+    kind: DeviceKind,
+    name: &str,
+    ed25519_pub: &[u8; 32],
+    x25519_pub: &[u8; 32],
+    approval_pub_p256_sec1: Option<&[u8]>,
+    created_at: i64,
+    expires_at: i64,
+) -> Result<DeviceCertificate> {
+    validate_non_empty_id(device_id, "device_id", 64)?;
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ProtocolError::InvalidInput(
+            "device name must be 1..=128 printable characters".to_string(),
+        ));
+    }
+    if expires_at <= created_at {
+        return Err(ProtocolError::InvalidInput(
+            "certificate expires_at must be > created_at".to_string(),
+        ));
+    }
+    if expires_at.saturating_sub(created_at) > MAX_CERT_TTL_SECS {
+        return Err(ProtocolError::CertTtlExceeded);
+    }
+    EdVerifyingKey::from_bytes(ed25519_pub).map_err(|_| {
+        ProtocolError::InvalidInput("invalid device Ed25519 public key".to_string())
+    })?;
+    if x25519_pub.iter().all(|&b| b == 0) {
+        return Err(ProtocolError::InvalidInput(
+            "all-zero X25519 public key".to_string(),
+        ));
+    }
+    let approval_pub_p256_b64 = match approval_pub_p256_sec1 {
+        Some(sec1) => {
+            P256VerifyingKey::from_sec1_bytes(sec1).map_err(|_| {
+                ProtocolError::InvalidInput("invalid SEC1 P-256 public key".to_string())
+            })?;
+            Some(STANDARD.encode(sec1))
+        }
+        None => None,
+    };
+
+    let mut cert = DeviceCertificate {
+        version: DEVICE_CERT_VERSION,
+        device_id: device_id.to_string(),
+        kind,
+        name: name.to_string(),
+        ed25519_pub_b64: STANDARD.encode(ed25519_pub),
+        x25519_pub_b64: STANDARD.encode(x25519_pub),
+        approval_pub_p256_b64,
+        created_at,
+        expires_at,
+        identity_sig_b64: String::new(),
+    };
+    let signing = EdSigningKey::from_bytes(identity_ed25519_seed);
+    let msg = cert_signed_bytes(&cert)?;
+    cert.identity_sig_b64 = STANDARD.encode(signing.sign(&msg).to_bytes());
+    Ok(cert)
+}
+
+/// Verifies a [`DeviceCertificate`] against a Keychain-pinned Account `IdentityKey` Ed25519
+/// public key, current unix timestamp `now_sec`, and an optional verified [`SignedRevocationList`].
+///
+/// Checks signature first (so forged certificates always report `BadSignature`), then
+/// enforces `<= 30 day` TTL, expiry, clock skew, and revocation status.
+pub fn verify_device_certificate(
+    cert: &DeviceCertificate,
+    identity_pub_ed25519: &[u8; 32],
+    revocations: Option<&SignedRevocationList>,
+    min_revocation_version: u64,
+    now_sec: i64,
+) -> Result<()> {
+    if cert.version != DEVICE_CERT_VERSION {
+        return Err(ProtocolError::Malformed(format!(
+            "unsupported DeviceCertificate version {}",
+            cert.version
+        )));
+    }
+    validate_non_empty_id(&cert.device_id, "device_id", 64)?;
+    let identity_vk = EdVerifyingKey::from_bytes(identity_pub_ed25519)
+        .map_err(|_| ProtocolError::InvalidInput("invalid identity Ed25519 key".to_string()))?;
+    let sig_bytes = decode_fixed_b64::<64>(&cert.identity_sig_b64, "identity_sig_b64")?;
+    let msg = cert_signed_bytes(cert)?;
+    identity_vk
+        .verify_strict(&msg, &EdSignature::from_bytes(&sig_bytes))
+        .map_err(|_| ProtocolError::BadSignature("device certificate".to_string()))?;
+
+    if cert.expires_at <= cert.created_at
+        || cert.expires_at.saturating_sub(cert.created_at) > MAX_CERT_TTL_SECS
+    {
+        return Err(ProtocolError::CertTtlExceeded);
+    }
+
+    if let Some(list) = revocations {
+        verify_revocation_list(list, identity_pub_ed25519, min_revocation_version, now_sec)?;
+        if list
+            .revoked_device_ids
+            .iter()
+            .any(|id| id == &cert.device_id)
+        {
+            return Err(ProtocolError::Revoked(cert.device_id.clone()));
+        }
+    }
+
+    if now_sec >= cert.expires_at {
+        return Err(ProtocolError::Expired("device certificate".to_string()));
+    }
+    if cert.created_at > now_sec.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(ProtocolError::NotYetValid("device certificate".to_string()));
+    }
+    Ok(())
+}
+
+fn revocation_signed_bytes(list: &SignedRevocationList) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(128 + list.revoked_device_ids.len() * 32);
+    out.extend_from_slice(DOMAIN_REVOCATION_LIST);
+    out.extend_from_slice(&list.version.to_be_bytes());
+    out.extend_from_slice(&list.issued_at.to_be_bytes());
+    out.extend_from_slice(&list.expires_at.to_be_bytes());
+    let count = u32::try_from(list.revoked_device_ids.len())
+        .map_err(|_| ProtocolError::TooLarge("revocation list count".to_string()))?;
+    out.extend_from_slice(&count.to_be_bytes());
+    for id in &list.revoked_device_ids {
+        validate_non_empty_id(id, "revoked_device_id", 64)?;
+        put_u16_bytes(&mut out, id.as_bytes());
+    }
+    Ok(out)
+}
+
+/// Issues a monotonic Account IdentityKey-signed [`SignedRevocationList`] (Opus R3).
+pub fn issue_revocation_list(
+    identity_ed25519_seed: &[u8; 32],
+    version: u64,
+    issued_at: i64,
+    expires_at: i64,
+    mut revoked_device_ids: Vec<String>,
+) -> Result<SignedRevocationList> {
+    if expires_at <= issued_at {
+        return Err(ProtocolError::InvalidInput(
+            "revocation list expires_at must be > issued_at".to_string(),
+        ));
+    }
+    revoked_device_ids.sort();
+    revoked_device_ids.dedup();
+    for id in &revoked_device_ids {
+        validate_non_empty_id(id, "revoked_device_id", 64)?;
+    }
+
+    let mut list = SignedRevocationList {
+        version,
+        issued_at,
+        expires_at,
+        revoked_device_ids,
+        identity_sig_b64: String::new(),
+    };
+    let msg = revocation_signed_bytes(&list)?;
+    let signing = EdSigningKey::from_bytes(identity_ed25519_seed);
+    list.identity_sig_b64 = STANDARD.encode(signing.sign(&msg).to_bytes());
+    Ok(list)
+}
+
+/// Verifies a [`SignedRevocationList`] against the Keychain-pinned Account `IdentityKey`,
+/// enforcing monotonic `version >= min_version` and non-expiry at `now_sec` (Opus R3).
+pub fn verify_revocation_list(
+    list: &SignedRevocationList,
+    identity_pub_ed25519: &[u8; 32],
+    min_version: u64,
+    now_sec: i64,
+) -> Result<()> {
+    let identity_vk = EdVerifyingKey::from_bytes(identity_pub_ed25519)
+        .map_err(|_| ProtocolError::InvalidInput("invalid identity Ed25519 key".to_string()))?;
+    let sig_bytes = decode_fixed_b64::<64>(&list.identity_sig_b64, "identity_sig_b64")?;
+    let msg = revocation_signed_bytes(list)?;
+    identity_vk
+        .verify_strict(&msg, &EdSignature::from_bytes(&sig_bytes))
+        .map_err(|_| ProtocolError::BadSignature("revocation list".to_string()))?;
+
+    if list.version < min_version {
+        return Err(ProtocolError::RevocationRollback {
+            got: list.version,
+            min: min_version,
+        });
+    }
+    if list.expires_at <= list.issued_at || now_sec >= list.expires_at {
+        return Err(ProtocolError::Expired("revocation list".to_string()));
+    }
+    if list.issued_at > now_sec.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(ProtocolError::NotYetValid("revocation list".to_string()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P-256 Hardware Approval Decision Verification (Opus P0-4, P0-5, R2, M2, #15)
+// ---------------------------------------------------------------------------
+
+/// Verifies a [`SignedApprovalDecision`] end-to-end:
+/// 1. Verifies `signer_cert` chains to the Keychain-pinned `identity_pub_ed25519` and is
+///    unexpired, within `<= 30 day` TTL, and not revoked by `revocations` (Opus R3, #15).
+/// 2. Checks `signer_cert.device_id == decision.device_id` and extracts `approval_pub_p256`.
+/// 3. Verifies exact binding to `(expected_host_id, expected_ticket_id, expected_input_sha256)`.
+/// 4. Enforces `decision` time validity (`issued_at <= now + skew`, `now < expires_at`).
+/// 5. Verifies the ASN.1 DER ECDSA-P256-SHA256 signature over [`approval_signing_bytes`].
+#[allow(clippy::too_many_arguments)]
+pub fn verify_approval_decision(
+    decision: &SignedApprovalDecision,
+    signer_cert: &DeviceCertificate,
+    identity_pub_ed25519: &[u8; 32],
+    expected_host_id: &str,
+    expected_ticket_id: &str,
+    expected_input_sha256: &str,
+    revocations: Option<&SignedRevocationList>,
+    min_revocation_version: u64,
+    now_sec: i64,
+) -> Result<ApprovalDecisionKind> {
+    verify_device_certificate(
+        signer_cert,
+        identity_pub_ed25519,
+        revocations,
+        min_revocation_version,
+        now_sec,
+    )?;
+
+    if signer_cert.device_id != decision.device_id {
+        return Err(ProtocolError::BindingMismatch(
+            "decision.device_id does not match DeviceCertificate.device_id".to_string(),
+        ));
+    }
+    if decision.host_id != expected_host_id {
+        return Err(ProtocolError::BindingMismatch(
+            "decision.host_id mismatch".to_string(),
+        ));
+    }
+    if decision.ticket_id != expected_ticket_id {
+        return Err(ProtocolError::BindingMismatch(
+            "decision.ticket_id mismatch".to_string(),
+        ));
+    }
+    validate_sha256_hex(expected_input_sha256)?;
+    if decision.input_sha256 != expected_input_sha256 {
+        return Err(ProtocolError::BindingMismatch(
+            "decision.input_sha256 mismatch".to_string(),
+        ));
+    }
+    if decision.expires_at <= decision.issued_at || now_sec >= decision.expires_at {
+        return Err(ProtocolError::Expired("approval decision".to_string()));
+    }
+    if decision.issued_at > now_sec.saturating_add(CLOCK_SKEW_SECS) {
+        return Err(ProtocolError::NotYetValid("approval decision".to_string()));
+    }
+
+    let p256_b64 = signer_cert
+        .approval_pub_p256_b64
+        .as_deref()
+        .ok_or_else(|| {
+            ProtocolError::BindingMismatch(
+                "signer DeviceCertificate has no enrolled P-256 approval key".to_string(),
+            )
+        })?;
+    let p256_sec1 = STANDARD
+        .decode(p256_b64)
+        .map_err(|_| ProtocolError::Malformed("approval_pub_p256_b64".to_string()))?;
+    let p256_vk = P256VerifyingKey::from_sec1_bytes(&p256_sec1)
+        .map_err(|_| ProtocolError::Malformed("invalid SEC1 P-256 public key".to_string()))?;
+
+    let sig_der_bytes = STANDARD
+        .decode(&decision.sig_p256_der_b64)
+        .map_err(|_| ProtocolError::Malformed("sig_p256_der_b64".to_string()))?;
+    let der_sig = DerSignature::from_bytes(&sig_der_bytes)
+        .map_err(|_| ProtocolError::Malformed("invalid ASN.1 DER P-256 signature".to_string()))?;
+
+    let signing_bytes = approval_signing_bytes(
+        &decision.host_id,
+        &decision.ticket_id,
+        &decision.input_sha256,
+        decision.decision,
+        &decision.nonce,
+        decision.issued_at,
+        decision.expires_at,
+    )?;
+
+    p256_vk
+        .verify(&signing_bytes, &der_sig)
+        .map_err(|_| ProtocolError::BadSignature("P-256 approval decision".to_string()))?;
+
+    Ok(decision.decision)
+}
+
+/// Software P-256 signing helper for deterministic tests and non-hardware test harnesses.
+///
+/// Production mobile apps MUST sign inside Secure Enclave / StrongBox using
+/// [`approval_signing_bytes`] and never export raw P-256 private keys (Opus M2).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_approval_decision_software(
+    p256_secret_scalar: &[u8; 32],
+    device_id: &str,
+    host_id: &str,
+    ticket_id: &str,
+    input_sha256: &str,
+    decision: ApprovalDecisionKind,
+    nonce: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<SignedApprovalDecision> {
+    use p256::ecdsa::signature::Signer as P256Signer;
+    use p256::ecdsa::SigningKey as P256SigningKey;
+
+    validate_non_empty_id(device_id, "device_id", 64)?;
+    let signing_bytes = approval_signing_bytes(
+        host_id,
+        ticket_id,
+        input_sha256,
+        decision,
+        nonce,
+        issued_at,
+        expires_at,
+    )?;
+    let sk = P256SigningKey::from_bytes(p256_secret_scalar.into())
+        .map_err(|_| ProtocolError::InvalidInput("invalid P-256 secret scalar".to_string()))?;
+    let sig: DerSignature = sk.sign(&signing_bytes);
+    Ok(SignedApprovalDecision {
+        host_id: host_id.to_string(),
+        ticket_id: ticket_id.to_string(),
+        input_sha256: input_sha256.to_string(),
+        decision,
+        nonce: nonce.to_string(),
+        issued_at,
+        expires_at,
+        device_id: device_id.to_string(),
+        sig_p256_der_b64: STANDARD.encode(sig.as_bytes()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// <= 2 KiB NSE Wake Push `preview_ct` Sealing & Opening (Opus R8)
+// ---------------------------------------------------------------------------
+
+/// Wire format for `preview_ct` (total size strictly `<= 2048` bytes):
+/// ```text
+/// "GPPV" (4B) | version=1 (1B) | sender_id_len (1B) | sender_device_id (<=64B)
+/// | ephemeral_x25519_pub (32B) | ct_len (u16 BE) | ciphertext_with_poly1305_tag
+/// | ed25519_sig (64B over DOMAIN_PREVIEW_SIG || header_and_ciphertext)
+/// ```
+///
+/// Security note (Opus R8): Sealed to the mobile device's static X25519 key (no forward
+/// secrecy for lock-screen preview snippets). Callers MUST never include full commands
+/// and MUST rotate X25519 keys with each `<= 30 day` `DeviceCertificate` renewal.
+pub fn seal_preview(
+    sender_device_id: &str,
+    sender_ed25519_seed: &[u8; 32],
+    recipient_x25519_pub: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let mut ephemeral_secret = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut ephemeral_secret[..]).map_err(|e| ProtocolError::Rng(e.to_string()))?;
+    seal_preview_with_ephemeral(
+        sender_device_id,
+        sender_ed25519_seed,
+        recipient_x25519_pub,
+        &ephemeral_secret,
+        plaintext,
+    )
+}
+
+/// Deterministic variant of [`seal_preview`] accepting an explicit ephemeral X25519 secret
+/// for Known-Answer Tests.
+pub fn seal_preview_with_ephemeral(
+    sender_device_id: &str,
+    sender_ed25519_seed: &[u8; 32],
+    recipient_x25519_pub: &[u8; 32],
+    ephemeral_x25519_secret: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    validate_non_empty_id(sender_device_id, "sender_device_id", 64)?;
+    let header_and_overhead = 4 + 1 + 1 + sender_device_id.len() + 32 + 2 + 16 + 64;
+    if plaintext.len() + header_and_overhead > MAX_PREVIEW_CT_BYTES {
+        return Err(ProtocolError::TooLarge(format!(
+            "preview_ct would exceed {MAX_PREVIEW_CT_BYTES} bytes"
+        )));
+    }
+
+    let ephemeral_pub = x25519(*ephemeral_x25519_secret, X25519_BASEPOINT_BYTES);
+    let shared = Zeroizing::new(x25519(*ephemeral_x25519_secret, *recipient_x25519_pub));
+    if shared.iter().all(|&b| b == 0) {
+        return Err(ProtocolError::InvalidInput(
+            "degenerate X25519 shared secret".to_string(),
+        ));
+    }
+
+    let (key, nonce) = derive_preview_key_nonce(&shared, &ephemeral_pub, recipient_x25519_pub)?;
+    let aad = preview_aad(sender_device_id, &ephemeral_pub, recipient_x25519_pub);
+
+    let mut ct = Zeroizing::new(Vec::with_capacity(plaintext.len() + 16));
+    ct.extend_from_slice(plaintext);
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    cipher
+        .encrypt_in_place(&Nonce::from(nonce), &aad, &mut *ct)
+        .map_err(|_| ProtocolError::Aead("preview encryption failed".to_string()))?;
+
+    let ct_len = u16::try_from(ct.len())
+        .map_err(|_| ProtocolError::TooLarge("preview ciphertext length".to_string()))?;
+
+    let mut out = Vec::with_capacity(header_and_overhead + plaintext.len());
+    out.extend_from_slice(PREVIEW_MAGIC);
+    out.push(PREVIEW_VERSION);
+    out.push(u8::try_from(sender_device_id.len()).unwrap_or(64));
+    out.extend_from_slice(sender_device_id.as_bytes());
+    out.extend_from_slice(&ephemeral_pub);
+    out.extend_from_slice(&ct_len.to_be_bytes());
+    out.extend_from_slice(&ct);
+
+    let mut sig_input = Vec::with_capacity(DOMAIN_PREVIEW_SIG.len() + out.len());
+    sig_input.extend_from_slice(DOMAIN_PREVIEW_SIG);
+    sig_input.extend_from_slice(&out);
+    let signing = EdSigningKey::from_bytes(sender_ed25519_seed);
+    let sig = signing.sign(&sig_input);
+    out.extend_from_slice(&sig.to_bytes());
+
+    if out.len() > MAX_PREVIEW_CT_BYTES {
+        return Err(ProtocolError::TooLarge(format!(
+            "preview_ct exceeded {MAX_PREVIEW_CT_BYTES} bytes"
+        )));
+    }
+    Ok(out)
+}
+
+/// Opens and authenticates a `<= 2 KiB` `preview_ct` blob inside the mobile NSE / FCM service.
+pub fn open_preview(
+    sealed_bytes: &[u8],
+    recipient_x25519_secret: &[u8; 32],
+    sender_ed25519_pub: &[u8; 32],
+    expected_sender_device_id: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if sealed_bytes.len() > MAX_PREVIEW_CT_BYTES {
+        return Err(ProtocolError::TooLarge(format!(
+            "preview_ct exceeds {MAX_PREVIEW_CT_BYTES} bytes"
+        )));
+    }
+    // Minimum size: 4 magic + 1 ver + 1 id_len + 1 id + 32 eph + 2 ct_len + 16 tag + 64 sig = 121
+    if sealed_bytes.len() < 4 + 1 + 1 + 1 + 32 + 2 + 16 + 64 {
+        return Err(ProtocolError::Malformed("preview_ct truncated".to_string()));
+    }
+    if &sealed_bytes[0..4] != PREVIEW_MAGIC {
+        return Err(ProtocolError::Malformed("preview_ct magic".to_string()));
+    }
+    if sealed_bytes[4] != PREVIEW_VERSION {
+        return Err(ProtocolError::Malformed("preview_ct version".to_string()));
+    }
+
+    let signed_portion_len = sealed_bytes.len() - 64;
+    let sig_bytes: [u8; 64] = sealed_bytes[signed_portion_len..]
+        .try_into()
+        .map_err(|_| ProtocolError::Malformed("preview_ct signature".to_string()))?;
+
+    let sender_vk = EdVerifyingKey::from_bytes(sender_ed25519_pub)
+        .map_err(|_| ProtocolError::InvalidInput("invalid sender Ed25519 key".to_string()))?;
+    let mut sig_input = Vec::with_capacity(DOMAIN_PREVIEW_SIG.len() + signed_portion_len);
+    sig_input.extend_from_slice(DOMAIN_PREVIEW_SIG);
+    sig_input.extend_from_slice(&sealed_bytes[..signed_portion_len]);
+    sender_vk
+        .verify_strict(&sig_input, &EdSignature::from_bytes(&sig_bytes))
+        .map_err(|_| ProtocolError::BadSignature("preview_ct".to_string()))?;
+
+    let id_len = usize::from(sealed_bytes[5]);
+    if id_len == 0 || id_len > 64 || 6 + id_len + 32 + 2 > signed_portion_len {
+        return Err(ProtocolError::Malformed(
+            "preview_ct sender_device_id length".to_string(),
+        ));
+    }
+    let sender_id = std::str::from_utf8(&sealed_bytes[6..6 + id_len])
+        .map_err(|_| ProtocolError::Malformed("preview_ct sender_device_id utf8".to_string()))?;
+    if sender_id != expected_sender_device_id {
+        return Err(ProtocolError::BindingMismatch(
+            "preview_ct sender_device_id mismatch".to_string(),
+        ));
+    }
+
+    let eph_start = 6 + id_len;
+    let ephemeral_pub: [u8; 32] = sealed_bytes[eph_start..eph_start + 32]
+        .try_into()
+        .map_err(|_| ProtocolError::Malformed("preview_ct ephemeral key".to_string()))?;
+    let ct_len_start = eph_start + 32;
+    let ct_len = usize::from(u16::from_be_bytes([
+        sealed_bytes[ct_len_start],
+        sealed_bytes[ct_len_start + 1],
+    ]));
+    let ct_start = ct_len_start + 2;
+    if ct_len < 16 || ct_start + ct_len != signed_portion_len {
+        return Err(ProtocolError::Malformed(
+            "preview_ct ciphertext length".to_string(),
+        ));
+    }
+
+    let recipient_pub = x25519(*recipient_x25519_secret, X25519_BASEPOINT_BYTES);
+    let shared = Zeroizing::new(x25519(*recipient_x25519_secret, ephemeral_pub));
+    if shared.iter().all(|&b| b == 0) {
+        return Err(ProtocolError::Aead(
+            "degenerate X25519 shared secret".to_string(),
+        ));
+    }
+
+    let (key, nonce) = derive_preview_key_nonce(&shared, &ephemeral_pub, &recipient_pub)?;
+    let aad = preview_aad(sender_id, &ephemeral_pub, &recipient_pub);
+    let mut buf = Zeroizing::new(sealed_bytes[ct_start..ct_start + ct_len].to_vec());
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    cipher
+        .decrypt_in_place(&Nonce::from(nonce), &aad, &mut *buf)
+        .map_err(|_| ProtocolError::Aead("preview decryption failed".to_string()))?;
+    Ok(buf)
+}
+
+fn derive_preview_key_nonce(
+    shared: &[u8; 32],
+    ephemeral_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 12])> {
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(ephemeral_pub);
+    salt[32..].copy_from_slice(recipient_pub);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), shared);
+    let mut okm = Zeroizing::new([0u8; 44]);
+    hk.expand(INFO_PREVIEW_KEY, &mut okm[..])
+        .map_err(|_| ProtocolError::InvalidInput("hkdf expand length".to_string()))?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&okm[..32]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&okm[32..]);
+    Ok((key, nonce))
+}
+
+fn preview_aad(
+    sender_device_id: &str,
+    ephemeral_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(DOMAIN_PREVIEW_AAD.len() + 1 + sender_device_id.len() + 64);
+    aad.extend_from_slice(DOMAIN_PREVIEW_AAD);
+    aad.push(u8::try_from(sender_device_id.len()).unwrap_or(64));
+    aad.extend_from_slice(sender_device_id.as_bytes());
+    aad.extend_from_slice(ephemeral_pub);
+    aad.extend_from_slice(recipient_pub);
+    aad
+}
+
+// ---------------------------------------------------------------------------
+// Noise `IK` Authenticated E2EE Tunnel (Opus R1)
+// ---------------------------------------------------------------------------
+
+fn tunnel_prologue(stream_id: &str, host_epoch: u64) -> Result<Vec<u8>> {
+    validate_non_empty_id(stream_id, "stream_id", 128)?;
+    let mut out = Vec::with_capacity(DOMAIN_TUNNEL_PROLOGUE.len() + stream_id.len() + 1 + 8);
+    out.extend_from_slice(DOMAIN_TUNNEL_PROLOGUE);
+    out.extend_from_slice(stream_id.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&host_epoch.to_be_bytes());
+    Ok(out)
+}
+
+/// Noise `IK` handshake state for either initiator (mobile client) or responder (host daemon).
+///
+/// Pins the peer's static X25519 key from a verified [`DeviceCertificate`] and binds
+/// `(stream_id, host_epoch)` in the Noise prologue so each `host_epoch` requires a fresh
+/// authenticated handshake (Opus R1).
+pub struct NoiseHandshake {
+    state: HandshakeState,
+    expected_remote_static: Zeroizing<[u8; 32]>,
+    stream_id: String,
+    host_epoch: u64,
+    is_initiator: bool,
+}
+
+impl NoiseHandshake {
+    /// Creates a Noise `IK` initiator pinned to the verified responder `DeviceCertificate`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_initiator(
+        local_x25519_secret: &[u8; 32],
+        remote_cert: &DeviceCertificate,
+        identity_pub_ed25519: &[u8; 32],
+        revocations: Option<&SignedRevocationList>,
+        min_revocation_version: u64,
+        now_sec: i64,
+        stream_id: &str,
+        host_epoch: u64,
+    ) -> Result<Self> {
+        verify_device_certificate(
+            remote_cert,
+            identity_pub_ed25519,
+            revocations,
+            min_revocation_version,
+            now_sec,
+        )?;
+        let remote_x25519 = decode_fixed_b64::<32>(&remote_cert.x25519_pub_b64, "x25519_pub_b64")?;
+        Self::new_initiator_pinned(local_x25519_secret, &remote_x25519, stream_id, host_epoch)
+    }
+
+    /// Creates a Noise `IK` initiator with an already-verified remote static X25519 key.
+    pub fn new_initiator_pinned(
+        local_x25519_secret: &[u8; 32],
+        remote_x25519_pub: &[u8; 32],
+        stream_id: &str,
+        host_epoch: u64,
+    ) -> Result<Self> {
+        let prologue = tunnel_prologue(stream_id, host_epoch)?;
+        let params: snow::params::NoiseParams = NOISE_PARAMS
+            .parse()
+            .map_err(|e: snow::Error| ProtocolError::Noise(e.to_string()))?;
+        let state = Builder::new(params)
+            .local_private_key(local_x25519_secret)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?
+            .remote_public_key(remote_x25519_pub)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?
+            .prologue(&prologue)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?
+            .build_initiator()
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        Ok(Self {
+            state,
+            expected_remote_static: Zeroizing::new(*remote_x25519_pub),
+            stream_id: stream_id.to_string(),
+            host_epoch,
+            is_initiator: true,
+        })
+    }
+
+    /// Creates a Noise `IK` responder pinned to the verified initiator `DeviceCertificate`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_responder(
+        local_x25519_secret: &[u8; 32],
+        expected_initiator_cert: &DeviceCertificate,
+        identity_pub_ed25519: &[u8; 32],
+        revocations: Option<&SignedRevocationList>,
+        min_revocation_version: u64,
+        now_sec: i64,
+        stream_id: &str,
+        host_epoch: u64,
+    ) -> Result<Self> {
+        verify_device_certificate(
+            expected_initiator_cert,
+            identity_pub_ed25519,
+            revocations,
+            min_revocation_version,
+            now_sec,
+        )?;
+        let remote_x25519 =
+            decode_fixed_b64::<32>(&expected_initiator_cert.x25519_pub_b64, "x25519_pub_b64")?;
+        Self::new_responder_pinned(local_x25519_secret, &remote_x25519, stream_id, host_epoch)
+    }
+
+    /// Creates a Noise `IK` responder expecting a specific verified initiator static X25519 key.
+    pub fn new_responder_pinned(
+        local_x25519_secret: &[u8; 32],
+        expected_initiator_x25519_pub: &[u8; 32],
+        stream_id: &str,
+        host_epoch: u64,
+    ) -> Result<Self> {
+        let prologue = tunnel_prologue(stream_id, host_epoch)?;
+        let params: snow::params::NoiseParams = NOISE_PARAMS
+            .parse()
+            .map_err(|e: snow::Error| ProtocolError::Noise(e.to_string()))?;
+        let state = Builder::new(params)
+            .local_private_key(local_x25519_secret)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?
+            .prologue(&prologue)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?
+            .build_responder()
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        Ok(Self {
+            state,
+            expected_remote_static: Zeroizing::new(*expected_initiator_x25519_pub),
+            stream_id: stream_id.to_string(),
+            host_epoch,
+            is_initiator: false,
+        })
+    }
+
+    /// Writes the next Noise `IK` handshake message (`-> e, es, s, ss` for initiator;
+    /// `<- e, ee, se` for responder).
+    pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if payload.len() > 1024 {
+            return Err(ProtocolError::TooLarge(
+                "handshake payload exceeds 1024 bytes".to_string(),
+            ));
+        }
+        let mut out = vec![0u8; payload.len() + 256];
+        let n = self
+            .state
+            .write_message(payload, &mut out)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// Reads an incoming Noise `IK` handshake message and verifies the remote static key
+    /// pin as soon as it becomes available.
+    pub fn read_message(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+        if message.len() > 2048 {
+            return Err(ProtocolError::TooLarge(
+                "handshake message exceeds 2048 bytes".to_string(),
+            ));
+        }
+        let mut out = vec![0u8; message.len()];
+        let n = self
+            .state
+            .read_message(message, &mut out)
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        out.truncate(n);
+
+        if let Some(remote_static) = self.state.get_remote_static() {
+            if remote_static != *self.expected_remote_static {
+                return Err(ProtocolError::BadSignature(
+                    "Noise remote static X25519 key does not match pinned DeviceCertificate"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// True once both Noise `IK` messages have been exchanged.
+    pub fn is_handshake_finished(&self) -> bool {
+        self.state.is_handshake_finished()
+    }
+
+    /// Transitions a completed handshake into an authenticated [`TunnelSession`] with
+    /// per-direction strict monotonic counters and replay/reorder rejection.
+    pub fn into_transport(self) -> Result<TunnelSession> {
+        if !self.state.is_handshake_finished() {
+            return Err(ProtocolError::Noise(
+                "cannot enter transport mode before handshake finishes".to_string(),
+            ));
+        }
+        let remote_static = self.state.get_remote_static().ok_or_else(|| {
+            ProtocolError::Noise("missing remote static key after Noise IK handshake".to_string())
+        })?;
+        if remote_static != *self.expected_remote_static {
+            return Err(ProtocolError::BadSignature(
+                "Noise remote static X25519 key mismatch".to_string(),
+            ));
+        }
+        let handshake_hash = Zeroizing::new(self.state.get_handshake_hash().to_vec());
+        let transport = self
+            .state
+            .into_stateless_transport_mode()
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        Ok(TunnelSession {
+            transport,
+            stream_id: self.stream_id,
+            host_epoch: self.host_epoch,
+            is_initiator: self.is_initiator,
+            send_seq: 0,
+            recv_high_water: 0,
+            handshake_hash,
+        })
+    }
+}
+
+/// Authenticated Noise `IK` transport session with strict monotonic send counters
+/// and receive-side high-water replay/reorder rejection (Opus R1).
+///
+/// Wire ciphertext layout: `seq (8-byte BE u64, starting at 1) || Noise AEAD ciphertext`.
+/// Because `StatelessTransportState` uses `seq` as the ChaCha20-Poly1305 nonce, any
+/// tampering with the 8-byte `seq` prefix fails Poly1305 verification without advancing
+/// `recv_high_water`.
+pub struct TunnelSession {
+    transport: StatelessTransportState,
+    stream_id: String,
+    host_epoch: u64,
+    is_initiator: bool,
+    send_seq: u64,
+    recv_high_water: u64,
+    handshake_hash: Zeroizing<Vec<u8>>,
+}
+
+impl TunnelSession {
+    /// Stream identifier bound in the Noise prologue.
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    /// Host epoch bound in the Noise prologue.
+    pub fn host_epoch(&self) -> u64 {
+        self.host_epoch
+    }
+
+    /// True if this side acted as the Noise `IK` initiator.
+    pub fn is_initiator(&self) -> bool {
+        self.is_initiator
+    }
+
+    /// Highest sequence number transmitted so far (`0` before first frame).
+    pub fn send_seq(&self) -> u64 {
+        self.send_seq
+    }
+
+    /// Highest authenticated sequence number received so far (`0` before first frame).
+    pub fn recv_high_water(&self) -> u64 {
+        self.recv_high_water
+    }
+
+    /// Noise handshake hash `h` (32 bytes for SHA-256), usable as a channel binding token.
+    pub fn handshake_hash(&self) -> &[u8] {
+        &self.handshake_hash
+    }
+
+    /// Encrypts `plaintext` with the next monotonic sequence number (`send_seq + 1`).
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.len() > MAX_TUNNEL_PLAINTEXT_BYTES {
+            return Err(ProtocolError::TooLarge(format!(
+                "tunnel plaintext exceeds {MAX_TUNNEL_PLAINTEXT_BYTES} bytes"
+            )));
+        }
+        let next_seq = self
+            .send_seq
+            .checked_add(1)
+            .ok_or(ProtocolError::RekeyRequired {
+                limit: MAX_FRAMES_PER_SESSION,
+            })?;
+        if next_seq > MAX_FRAMES_PER_SESSION {
+            return Err(ProtocolError::RekeyRequired {
+                limit: MAX_FRAMES_PER_SESSION,
+            });
+        }
+
+        let mut out = vec![0u8; 8 + plaintext.len() + 16];
+        out[..8].copy_from_slice(&next_seq.to_be_bytes());
+        let written = self
+            .transport
+            .write_message(next_seq, plaintext, &mut out[8..])
+            .map_err(|e| ProtocolError::Noise(e.to_string()))?;
+        out.truncate(8 + written);
+        self.send_seq = next_seq;
+        Ok(out)
+    }
+
+    /// Decrypts a framed ciphertext and enforces strict monotonic `seq > recv_high_water`.
+    ///
+    /// Rejects replays, duplicates, and reordered frames BEFORE AEAD decryption, and
+    /// advances `recv_high_water` ONLY after Poly1305 authentication succeeds.
+    pub fn decrypt(&mut self, framed_ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        // 8-byte seq + 16-byte Poly1305 tag minimum.
+        if framed_ciphertext.len() < 8 + 16 {
+            return Err(ProtocolError::Malformed(
+                "tunnel ciphertext shorter than header + tag".to_string(),
+            ));
+        }
+        if framed_ciphertext.len() > 8 + 65_535 {
+            return Err(ProtocolError::TooLarge(
+                "tunnel ciphertext exceeds Noise 65535-byte message limit".to_string(),
+            ));
+        }
+        let seq = u64::from_be_bytes(
+            framed_ciphertext[..8]
+                .try_into()
+                .map_err(|_| ProtocolError::Malformed("tunnel seq prefix".to_string()))?,
+        );
+        if seq == 0 || seq <= self.recv_high_water {
+            return Err(ProtocolError::ReplayDetected {
+                got: seq,
+                high_water: self.recv_high_water,
+            });
+        }
+        if seq > MAX_FRAMES_PER_SESSION {
+            return Err(ProtocolError::RekeyRequired {
+                limit: MAX_FRAMES_PER_SESSION,
+            });
+        }
+
+        let mut plain = Zeroizing::new(vec![0u8; framed_ciphertext.len() - 8]);
+        let n = self
+            .transport
+            .read_message(seq, &framed_ciphertext[8..], &mut plain)
+            .map_err(|_| ProtocolError::Aead("tunnel frame authentication failed".to_string()))?;
+        plain.truncate(n);
+        self.recv_high_water = seq;
+        Ok(plain)
+    }
+}
+
+/// Helper to derive an X25519 public key from a 32-byte secret seed.
+pub fn x25519_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    x25519(*secret, X25519_BASEPOINT_BYTES)
+}
+
+/// Helper to derive an Ed25519 public key from a 32-byte secret seed.
+pub fn ed25519_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    EdSigningKey::from_bytes(secret).verifying_key().to_bytes()
+}
+
+pub(crate) fn decode_fixed_b64<const N: usize>(b64: &str, field: &str) -> Result<[u8; N]> {
+    let raw = STANDARD
+        .decode(b64)
+        .map_err(|_| ProtocolError::Malformed(format!("{field}: invalid base64")))?;
+    raw.try_into()
+        .map_err(|_| ProtocolError::Malformed(format!("{field}: expected {N} bytes")))
+}
