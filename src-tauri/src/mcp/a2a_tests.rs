@@ -1576,3 +1576,229 @@ fn an_agent_cannot_send_as_gitpulse_to_take_the_reserved_overflow_slot() {
         "nothing may be deposited"
     );
 }
+
+/// Writes a bus file with two unread direct rows for `role` and 300 broadcasts, so the next
+/// post evicts past the two pinned rows.
+fn seed_bus_with_two_pinned_rows(repo: &str, role: &str) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let row = |seq: u64, to: Option<&str>| {
+        json!({ "seq": seq, "from_agent": "agy:filler", "to_agent": to, "kind": "note",
+                "body": "filler", "created_at_ms": now, "msg_id": format!("seed-{seq}") })
+    };
+    let mut rows = vec![row(1, Some(role)), row(2, Some(role))];
+    rows.extend((3..=302).map(|seq| row(seq, None)));
+    let state = json!({ "next_seq": 302, "dropped_before_seq": 0, "messages": rows });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+}
+
+#[test]
+fn an_inbox_and_a_wait_list_only_the_returned_rows_below_dropped_before_seq() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888806";
+    register_inbox_peer(&repo, sid, "pin-owner");
+    seed_bus_with_two_pinned_rows(&repo, "pin-owner");
+    send_to_role(&repo, "pin-owner", "trigger the eviction");
+
+    let inbox = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "pin-owner", "limit": 1 }),
+    )
+    .expect("inbox");
+    assert!(inbox["dropped_before_seq"].as_u64().unwrap() > 2, "{inbox}");
+    assert_eq!(inbox["messages"][0]["seq"], 1, "{inbox}");
+    assert_eq!(
+        inbox["pinned_below_dropped_before_seq"],
+        json!([1]),
+        "limit 1 returns one row, so only that row is listed: {inbox}"
+    );
+
+    let counter = AtomicUsize::new(0);
+    let wait = handle_agent_wait_with_counter(
+        AgentWaitArgs {
+            repo_path: repo.clone(),
+            for_peer: "pin-owner".into(),
+            provider_session_id: Some(sid.into()),
+            since_seq: None,
+            thread_key: None,
+            include_broadcasts: None,
+            timeout_ms: Some(0),
+            ack: Some(false),
+            limit: Some(10),
+        },
+        &counter,
+        60_000,
+    )
+    .expect("wait");
+    assert_eq!(
+        wait["pinned_below_dropped_before_seq"],
+        json!([1, 2]),
+        "{wait}"
+    );
+}
+
+#[test]
+fn following_the_over_cap_hint_literally_repairs_the_bus() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888807";
+    register_inbox_peer(&repo, sid, "cap-owner");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let cap = usize::try_from(8u64 * 1024 * 1024).unwrap();
+    let state = json!({ "next_seq": 1, "dropped_before_seq": 0, "messages": [{
+        "seq": 1, "from_agent": "agy:filler", "to_agent": null, "kind": "note",
+        "body": "x".repeat(cap), "created_at_ms": now, "msg_id": "seed-1" }] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "cap-owner", "ack": true }),
+        )
+    };
+
+    let err = read().expect_err("an over-cap bus is refused");
+    assert!(
+        err.contains("gitpulse_agent_send without thread_key or in_reply_to"),
+        "{err}"
+    );
+    send_to_role(&repo, "cap-owner", "the repairing send");
+    let healed = read().expect("the named send repaired the bus");
+    assert_eq!(
+        healed["messages"][0]["body"], "the repairing send",
+        "{healed}"
+    );
+}
+
+#[test]
+fn a_returned_envelope_whose_bus_row_was_evicted_is_not_listed_as_pinned() {
+    let (_dir, repo) = trusted_git_repo();
+    let nonce = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let sid = format!(
+        "88888888-{:04x}-4888-8888-{:012x}",
+        (std::process::id() & 0xffff),
+        (nonce & 0xffff_ffff_ffff)
+    );
+    register_forgery_target(&repo, &sid, "evict-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo,
+        &mb,
+        "steward-evict-1",
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "Directive whose bus row will be evicted",
+    )
+    .expect("deliver directive");
+    for idx in 0..(crate::engine::agent_bus::MAX_BUS_MESSAGES + 4) {
+        crate::engine::agent_bus::post_peer_message(
+            &repo,
+            crate::engine::agent_bus::MessageOrigin::Agent,
+            "claude:chatter",
+            Some("other-peer"),
+            None,
+            "note",
+            &format!("ring rotation filler {idx}"),
+            None,
+            None,
+            1,
+            6,
+        )
+        .expect("post filler");
+    }
+    assert!(
+        crate::engine::agent_bus::get_message_by_id(&repo, "steward-evict-1")
+            .expect("lookup")
+            .is_none(),
+        "the steward row must be evicted from the bus"
+    );
+
+    let page = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "evict-owner", "limit": 50 }),
+    )
+    .expect("inbox");
+    let returned = page["messages"].as_array().unwrap();
+    let steward = returned
+        .iter()
+        .find(|m| m["msg_id"] == "steward-evict-1")
+        .unwrap_or_else(|| panic!("the envelope is still returned: {page}"));
+    let steward_seq = steward["seq"].as_u64().unwrap();
+    assert!(steward_seq < page["dropped_before_seq"].as_u64().unwrap());
+    let listed = page["pinned_below_dropped_before_seq"].as_array().unwrap();
+    assert!(
+        !listed.contains(&json!(steward_seq)),
+        "a row that is not on the bus must not be listed as retained: {page}"
+    );
+}
+
+#[test]
+fn a_legacy_bus_row_hydrated_for_a_mailbox_envelope_is_acked_and_claimed() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888808";
+    register_inbox_peer(&repo, sid, "legacy-owner");
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({ "repo_path": repo, "from_peer": "agy:lead", "to_peer": "legacy-owner",
+                 "body": "legacy row", "msg_id": "msg-1" }),
+    )
+    .expect("send");
+    // Make the bus row a legacy one (no msg_id) that the bus read does not match to the
+    // reader, so only the mailbox envelope leads to it through get_message_by_id.
+    let path = crate::engine::agent_bus::lanes_messages_path(&repo, false).expect("bus path");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read bus")).expect("parse bus");
+    let row = state["messages"][0].as_object_mut().expect("row");
+    assert_eq!(row["seq"], 1);
+    row.remove("msg_id");
+    row.insert("to_agent".into(), json!("somebody-else"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&state).expect("serialize")).expect("write");
+
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "legacy-owner", "ack": true }),
+        )
+        .expect("inbox")
+    };
+    let first = read();
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(first["messages"][0]["msg_id"], "msg-1", "{first}");
+    assert_eq!(first["acked_count"], 1, "{first}");
+    let second = read();
+    assert!(
+        second["messages"].as_array().unwrap().is_empty(),
+        "{second}"
+    );
+}
+
+#[test]
+fn an_exact_retry_of_a_threaded_send_keeps_the_stored_hop_and_the_mailbox_deposit() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "99999999-9999-4999-8999-999999999991";
+    register_forgery_target(&repo, sid, "retry-target");
+    let args = json!({"from_peer": "claude:a", "to_peer": "retry-target", "body": "q",
+                      "thread_key": "retry-thread", "msg_id": "retry-1"});
+
+    let first = send_json(&repo, args.clone()).expect("first send");
+    let retry = send_json(&repo, args).expect("exact retry");
+
+    assert_eq!(retry["hop"], first["hop"], "a retry must not climb a hop");
+    assert_eq!(retry["message"]["seq"], first["message"]["seq"]);
+    assert_eq!(retry["mailbox"]["deposited"], true, "{retry}");
+    assert_eq!(retry["mailbox"]["duplicate"], true, "{retry}");
+    assert_eq!(retry["delivery_outcome"], first["delivery_outcome"]);
+}

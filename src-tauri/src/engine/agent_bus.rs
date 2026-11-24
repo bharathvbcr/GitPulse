@@ -222,6 +222,20 @@ pub struct AgentInboxPage {
     pub messages: Vec<AgentBusMessage>,
     pub latest_seq: u64,
     pub dropped_before_seq: u64,
+    /// Seqs of the rows in this page that sit below `dropped_before_seq`. Eviction spares
+    /// pinned rows (open asks, unread direct messages), so one can outlive later evictions;
+    /// this names them so "everything below `dropped_before_seq` was dropped" is never read
+    /// as covering a row the reader was just handed. Bounded by the pin caps.
+    #[serde(default)]
+    pub pinned_below_dropped_before_seq: Vec<u64>,
+}
+
+/// Seqs of the retained `rows` that are below `dropped_before_seq`, oldest first.
+fn seqs_below_dropped(rows: &[AgentBusMessage], dropped_before_seq: u64) -> Vec<u64> {
+    rows.iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < dropped_before_seq)
+        .collect()
 }
 
 /// Grouped conversation thread and structured ask status modeled on Vespin.
@@ -1116,6 +1130,20 @@ pub fn post_peer_message(
             }
         }
 
+        if let Some(ref want_id) = caller_msg_id {
+            if let Some(legacy) = state
+                .messages
+                .iter()
+                .find(|m| m.msg_id.is_none() && *want_id == format!("msg-{}", m.seq))
+            {
+                return Err(CommandError::from(format!(
+                    "msg_id '{want_id}' is the effective id of a retained legacy message (seq {}); \
+                     reusing it would make acknowledgements and lookups ambiguous, so choose another id",
+                    legacy.seq
+                )));
+            }
+        }
+
         let seq = state.next_seq.saturating_add(1);
         state.next_seq = seq;
         let created_at_ms = now_epoch_ms();
@@ -1157,7 +1185,7 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
     read_json_bounded_hint(
         path,
         MESSAGES_FILE_CAP,
-        "; the next post or ack compacts it",
+        "; only a write repairs it, and an inbox read or acknowledgement is not one: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository",
     )
 }
 
@@ -1309,6 +1337,21 @@ fn compact_messages_for_write(
     Ok(bytes)
 }
 
+/// The one row an id names: the row whose `msg_id` is exactly `id`, else the legacy id-less
+/// row whose effective id `msg-<seq>` is `id`. A caller may choose "msg-5" as a real id, so an
+/// exact match always wins. Lookup and acknowledgement both resolve through here, so they
+/// cannot disagree about which row an id means.
+fn message_index_by_id(messages: &[AgentBusMessage], id: &str) -> Option<usize> {
+    messages
+        .iter()
+        .position(|m| m.msg_id.as_deref() == Some(id))
+        .or_else(|| {
+            messages
+                .iter()
+                .position(|m| m.msg_id.is_none() && id == format!("msg-{}", m.seq))
+        })
+}
+
 /// Looks up one message by `msg_id` (used to hydrate `> 6 KiB` mailbox pointer envelopes).
 pub fn get_message_by_id(
     repo_path: &str,
@@ -1317,11 +1360,8 @@ pub fn get_message_by_id(
     let clean_id = sanitize_token("msg_id", msg_id, 64)?;
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
-        let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
-        Ok(state
-            .messages
-            .into_iter()
-            .find(|m| m.msg_id.as_deref() == Some(clean_id.as_str())))
+        let mut state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
+        Ok(message_index_by_id(&state.messages, &clean_id).map(|i| state.messages.swap_remove(i)))
     })
 }
 
@@ -1349,14 +1389,20 @@ pub fn ack_messages(
         if !messages_path.is_file() {
             return Ok(0);
         }
+        let file_len = fs::metadata(&messages_path)
+            .map_err(|e| {
+                CommandError::from(format!("cannot stat {}: {e}", messages_path.display()))
+            })?
+            .len();
         let mut state: MessagesState = read_json_bounded(&messages_path, MESSAGES_WRITE_CEILING)?;
         let mut updated = 0usize;
-        for msg in &mut state.messages {
-            let eff_id = msg
-                .msg_id
-                .clone()
-                .unwrap_or_else(|| format!("msg-{}", msg.seq));
-            if wanted.contains(&eff_id)
+        // Each id marks exactly the row get_message_by_id returns for it, never two rows.
+        let targets: BTreeSet<usize> = wanted
+            .iter()
+            .filter_map(|id| message_index_by_id(&state.messages, id))
+            .collect();
+        for (idx, msg) in state.messages.iter_mut().enumerate() {
+            if targets.contains(&idx)
                 && !msg.read_by.contains(&reader)
                 && msg.read_by.len() < MAX_READ_BY_ENTRIES
             {
@@ -1364,9 +1410,17 @@ pub fn ack_messages(
                 updated += 1;
             }
         }
+        // Nothing acknowledged and nothing over a cap: serializing and rewriting the whole
+        // file would only burn I/O, so leave it alone. An over-cap file still heals below.
+        if updated == 0 && state.messages.len() <= MAX_BUS_MESSAGES && file_len <= MESSAGES_FILE_CAP
+        {
+            return Ok(0);
+        }
         let rows_before = state.messages.len();
         let bytes = compact_messages_for_write(&mut state, &messages_path, None)?;
-        if updated > 0 || state.messages.len() != rows_before {
+        // A file over the byte cap is unreadable even when it re-serializes under it (padding,
+        // fields serde drops), so it is rewritten whatever else changed.
+        if updated > 0 || state.messages.len() != rows_before || file_len > MESSAGES_FILE_CAP {
             devmap_query::write_atomic(&messages_path, &bytes).map_err(|e| {
                 CommandError::from(format!("cannot write {}: {e}", messages_path.display()))
             })?;
@@ -1414,7 +1468,7 @@ pub fn read_messages_for_peer(
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -1435,6 +1489,10 @@ pub fn read_messages_for_peer(
             })
             .collect();
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -2121,7 +2179,7 @@ pub fn read_thread_messages(
     with_bus_lock(&lanes_dir, false, || {
         let state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
         let latest_seq = state.next_seq;
-        let filtered = state
+        let filtered: Vec<AgentBusMessage> = state
             .messages
             .into_iter()
             .filter(|m| m.seq > since_seq)
@@ -2137,6 +2195,10 @@ pub fn read_thread_messages(
             .collect();
 
         Ok(AgentInboxPage {
+            pinned_below_dropped_before_seq: seqs_below_dropped(
+                &filtered,
+                state.dropped_before_seq,
+            ),
             messages: filtered,
             latest_seq,
             dropped_before_seq: state.dropped_before_seq,
@@ -4380,5 +4442,161 @@ mod tests {
             "pinned rows go oldest first"
         );
         assert_eq!(state.next_seq, 257);
+    }
+
+    #[test]
+    fn a_pinned_row_below_dropped_before_seq_is_listed_for_the_reader() {
+        let now = now_epoch_ms();
+        let mut rows = vec![bus_row(1, Some("claude:quiet"), now, "pinned".into())];
+        rows.extend(broadcasts(2, 300, now));
+        let dir = repo_with_seeded_bus(rows);
+        let stored = post_then_stored(&dir);
+        assert!(
+            stored_seqs(&stored).contains(&1),
+            "the unread direct row is pinned"
+        );
+        assert!(
+            stored.dropped_before_seq > 1,
+            "later rows were evicted past the pinned one"
+        );
+
+        let repo = dir.path().to_str().unwrap();
+        let page = read_messages(repo, Some("claude:quiet"), 0).unwrap();
+        assert!(page.messages.iter().any(|m| m.seq == 1));
+        assert_eq!(
+            page.pinned_below_dropped_before_seq,
+            vec![1],
+            "the reader is told which retained row sits below dropped_before_seq"
+        );
+        let past = read_messages(repo, Some("claude:quiet"), 1).unwrap();
+        assert!(past.pinned_below_dropped_before_seq.is_empty());
+    }
+
+    #[test]
+    fn a_legacy_row_without_msg_id_resolves_by_its_effective_id() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(3, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let found = get_message_by_id(repo, "msg-3")
+            .unwrap()
+            .expect("msg-3 resolves");
+        assert_eq!(found.seq, 3);
+        assert!(get_message_by_id(repo, "msg-4").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_leaves_a_within_cap_file_untouched() {
+        let now = now_epoch_ms();
+        let dir = repo_with_seeded_bus(broadcasts(1, 5, now));
+        let repo = dir.path().to_str().unwrap();
+        let path = lanes_messages_path(repo, false).unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap();
+        assert_eq!(acked, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+    }
+
+    #[test]
+    fn an_ack_that_changes_nothing_still_heals_an_over_cap_file() {
+        let now = now_epoch_ms();
+        let mut rows = broadcasts(1, 300, now);
+        rows.push(bus_row(301, None, now, "x".repeat(16)));
+        let dir = repo_with_seeded_bus(rows);
+        let repo = dir.path().to_str().unwrap();
+
+        assert_eq!(
+            ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap(),
+            0
+        );
+        let healed = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(healed.messages.len(), MAX_BUS_MESSAGES);
+    }
+
+    #[test]
+    fn an_explicit_msg_id_that_looks_like_a_seq_id_wins_over_the_legacy_fallback() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let mut explicit = bus_row(6, Some("claude:quiet"), now, "explicit".into());
+        explicit.msg_id = Some("msg-5".to_string());
+        let dir = repo_with_seeded_bus(vec![legacy, explicit]);
+        let found = get_message_by_id(dir.path().to_str().unwrap(), "msg-5")
+            .unwrap()
+            .expect("msg-5 resolves");
+        assert_eq!(
+            found.seq, 6,
+            "the row that carries the id, not the legacy one"
+        );
+    }
+
+    #[test]
+    fn an_ack_by_id_marks_only_the_row_get_message_by_id_returns() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let mut explicit = bus_row(6, Some("claude:quiet"), now, "explicit".into());
+        explicit.msg_id = Some("msg-5".to_string());
+        let dir = repo_with_seeded_bus(vec![legacy, explicit]);
+        let repo = dir.path().to_str().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["msg-5".to_string()]).unwrap();
+        assert_eq!(acked, 1, "one id marks exactly one row");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        let by_seq = |s: u64| stored.messages.iter().find(|m| m.seq == s).unwrap();
+        assert!(by_seq(5).read_by.is_empty(), "the legacy row stays unread");
+        assert_eq!(by_seq(6).read_by, vec!["claude:reader".to_string()]);
+    }
+
+    #[test]
+    fn an_explicit_msg_id_equal_to_a_retained_legacy_effective_id_is_refused() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let err = post_peer_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            None,
+            "peer_message",
+            "hello",
+            None,
+            Some("msg-5"),
+            1,
+            6,
+        )
+        .expect_err("msg-5 collides with the legacy row's effective id");
+        assert!(format!("{err:?}").contains("legacy"), "{err:?}");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(stored.messages.len(), 1, "nothing was written");
+    }
+
+    #[test]
+    fn an_ack_rewrites_a_file_that_is_over_the_byte_cap_but_serializes_under_it() {
+        let now = now_epoch_ms();
+        let dir = repo_with_seeded_bus(broadcasts(1, 3, now));
+        let repo = dir.path().to_str().unwrap();
+        let path = lanes_messages_path(repo, false).unwrap();
+        let mut padded = fs::read(&path).unwrap();
+        padded.resize(usize::try_from(MESSAGES_FILE_CAP).unwrap() + 1024, b' ');
+        fs::write(&path, &padded).unwrap();
+        read_messages(repo, None, 0).expect_err("the padded file is over the cap");
+
+        assert_eq!(
+            ack_messages(repo, "claude:reader", &["no-such-id".to_string()]).unwrap(),
+            0
+        );
+        assert!(fs::metadata(&path).unwrap().len() <= MESSAGES_FILE_CAP);
+        assert_eq!(read_messages(repo, None, 0).unwrap().messages.len(), 3);
     }
 }
