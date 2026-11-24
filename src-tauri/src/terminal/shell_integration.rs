@@ -161,8 +161,17 @@ if [[ $- == *i* && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" && -z "${__GITPULSE
     __GITPULSE_IN_PROMPT=0
   }
 
+  # The DEBUG trap fires before every simple command, the prompt hook's own
+  # included. `__gitpulse_precmd` runs before it can set __GITPULSE_IN_PROMPT,
+  # so without the name check its own call counted as a user command: the
+  # first prompt, and every empty Enter, emitted a 133;C/133;D pair (bash < 4.4)
+  # or a lone 133;D (bash >= 4.4) for a command nobody ran. A wait for "the
+  # command finished" then answered before the real command had started.
+  # $BASH_COMMAND is passed from the trap string because inside the handler
+  # function it names the handler's own commands instead.
   __gitpulse_preexec() {
     local ret=$?
+    case "$1" in __gitpulse_*) return $ret ;; esac
     if [[ "${__GITPULSE_IN_PROMPT:-0}" == "0" && "${__GITPULSE_CMD_ACTIVE:-0}" == "0" ]]; then
       __GITPULSE_CMD_ACTIVE=1
       printf '\e]133;C\a'
@@ -170,17 +179,20 @@ if [[ $- == *i* && "${GITPULSE_SHELL_INTEGRATION:-1}" != "0" && -z "${__GITPULSE
     return $ret
   }
 
-  if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-    PS0=$'\e]133;C\a'"${PS0:-}"
-    trap '__GITPULSE_CMD_ACTIVE=1' DEBUG
-  else
-    trap '__gitpulse_preexec' DEBUG
-  fi
-
   if [[ -z "${PROMPT_COMMAND:-}" ]]; then
     PROMPT_COMMAND="__gitpulse_precmd;__gitpulse_prompt_end"
   elif [[ "${PROMPT_COMMAND}" != *"__gitpulse_precmd"* ]]; then
     PROMPT_COMMAND="__gitpulse_precmd;${PROMPT_COMMAND};__gitpulse_prompt_end"
+  fi
+
+  # Installed last: once it is set it fires for every simple command, and the
+  # setup commands above would otherwise count as a user command before the
+  # first prompt.
+  if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    PS0=$'\e]133;C\a'"${PS0:-}"
+    trap '[[ "${__GITPULSE_IN_PROMPT:-0}" == "1" || "$BASH_COMMAND" == __gitpulse_* ]] || __GITPULSE_CMD_ACTIVE=1' DEBUG
+  else
+    trap '__gitpulse_preexec "$BASH_COMMAND"' DEBUG
   fi
 fi
 "#;
@@ -491,6 +503,68 @@ mod tests {
         assert!(
             !bash_raw.contains("-%"),
             "bash produced signed-char hex: {bash_raw:?}"
+        );
+    }
+
+    /// The OSC 133 marks an interactive bash with the integration emits, in order:
+    /// `C`, `A`, `D;<code>`.
+    #[cfg(unix)]
+    fn bash_marks(script: &str) -> Vec<String> {
+        use crate::procguard::LockedSpawn;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = ensure_scripts_in(tmp.path()).expect("scripts written");
+        let out = std::process::Command::new("/bin/bash")
+            .env("HOME", tmp.path())
+            .env("BASH_SILENCE_DEPRECATION_WARNING", "1")
+            .args([
+                "-c",
+                // An interactive bash reading its commands from a pipe still
+                // runs PROMPT_COMMAND and the DEBUG trap for each line.
+                r#"printf '%s' "$1" | /bin/bash --rcfile "$0" -i 2>&1"#,
+                &root.join("bash/gitpulse.bash").to_string_lossy(),
+                script,
+            ])
+            .output_locked()
+            .expect("run bash");
+        let raw = String::from_utf8_lossy(&out.stdout);
+        raw.split("\x1b]133;")
+            .skip(1)
+            .filter_map(|rest| rest.split('\x07').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The DEBUG trap fires for the prompt hook's own commands too. Before it
+    /// skipped them, the first prompt and every empty Enter emitted a command
+    /// start and finish (bash < 4.4) or a lone finish (bash >= 4.4) for a command
+    /// nobody ran, and a wait for "the sent command finished" answered with that
+    /// phantom: `sticky_herdr_status_does_not_wake_subsequent_send_and_wait_in_zero_ms`
+    /// failed on macOS CI (bash 3.2) when the first prompt landed after the send.
+    #[cfg(unix)]
+    #[test]
+    fn bash_marks_only_commands_that_ran() {
+        // An empty line, a command that succeeds, a command that fails.
+        let marks = bash_marks("\nprintf hi\nfalse\n");
+        let first_prompt = marks
+            .iter()
+            .position(|mark| mark == "A")
+            .unwrap_or_else(|| panic!("no prompt mark at all: {marks:?}"));
+        assert!(
+            marks[..first_prompt].is_empty(),
+            "a command mark before the first prompt, for no command: {marks:?}"
+        );
+        // These hold whether `C` comes from the DEBUG trap (bash < 4.4) or
+        // from PS0 (bash >= 4.4): one finish per command that ran, none for the
+        // empty line, with each command's own exit status.
+        let finishes: Vec<&str> = marks
+            .iter()
+            .filter(|mark| mark.starts_with('D'))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            finishes,
+            vec!["D;0", "D;1"],
+            "a finish for a command that did not run: {marks:?}"
         );
     }
 }
