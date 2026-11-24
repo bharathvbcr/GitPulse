@@ -1130,6 +1130,20 @@ pub fn post_peer_message(
             }
         }
 
+        if let Some(ref want_id) = caller_msg_id {
+            if let Some(legacy) = state
+                .messages
+                .iter()
+                .find(|m| m.msg_id.is_none() && *want_id == format!("msg-{}", m.seq))
+            {
+                return Err(CommandError::from(format!(
+                    "msg_id '{want_id}' is the effective id of a retained legacy message (seq {}); \
+                     reusing it would make acknowledgements and lookups ambiguous, so choose another id",
+                    legacy.seq
+                )));
+            }
+        }
+
         let seq = state.next_seq.saturating_add(1);
         state.next_seq = seq;
         let created_at_ms = now_epoch_ms();
@@ -1323,6 +1337,21 @@ fn compact_messages_for_write(
     Ok(bytes)
 }
 
+/// The one row an id names: the row whose `msg_id` is exactly `id`, else the legacy id-less
+/// row whose effective id `msg-<seq>` is `id`. A caller may choose "msg-5" as a real id, so an
+/// exact match always wins. Lookup and acknowledgement both resolve through here, so they
+/// cannot disagree about which row an id means.
+fn message_index_by_id(messages: &[AgentBusMessage], id: &str) -> Option<usize> {
+    messages
+        .iter()
+        .position(|m| m.msg_id.as_deref() == Some(id))
+        .or_else(|| {
+            messages
+                .iter()
+                .position(|m| m.msg_id.is_none() && id == format!("msg-{}", m.seq))
+        })
+}
+
 /// Looks up one message by `msg_id` (used to hydrate `> 6 KiB` mailbox pointer envelopes).
 pub fn get_message_by_id(
     repo_path: &str,
@@ -1332,19 +1361,7 @@ pub fn get_message_by_id(
     let (_repo, lanes_dir) = lanes_dir_for_repo(repo_path)?;
     with_bus_lock(&lanes_dir, false, || {
         let mut state: MessagesState = read_messages_readonly(&lanes_dir.join(MESSAGES_FILE))?;
-        let exact = state
-            .messages
-            .iter()
-            .position(|m| m.msg_id.as_deref() == Some(clean_id.as_str()));
-        // A legacy row has no msg_id; the rest of the code names it `msg-<seq>`. A caller may
-        // also choose "msg-5" as a real id, so an exact match always wins over this fallback.
-        let found = exact.or_else(|| {
-            state
-                .messages
-                .iter()
-                .position(|m| m.msg_id.is_none() && clean_id == format!("msg-{}", m.seq))
-        });
-        Ok(found.map(|i| state.messages.swap_remove(i)))
+        Ok(message_index_by_id(&state.messages, &clean_id).map(|i| state.messages.swap_remove(i)))
     })
 }
 
@@ -1379,12 +1396,13 @@ pub fn ack_messages(
             .len();
         let mut state: MessagesState = read_json_bounded(&messages_path, MESSAGES_WRITE_CEILING)?;
         let mut updated = 0usize;
-        for msg in &mut state.messages {
-            let eff_id = msg
-                .msg_id
-                .clone()
-                .unwrap_or_else(|| format!("msg-{}", msg.seq));
-            if wanted.contains(&eff_id)
+        // Each id marks exactly the row get_message_by_id returns for it, never two rows.
+        let targets: BTreeSet<usize> = wanted
+            .iter()
+            .filter_map(|id| message_index_by_id(&state.messages, id))
+            .collect();
+        for (idx, msg) in state.messages.iter_mut().enumerate() {
+            if targets.contains(&idx)
                 && !msg.read_by.contains(&reader)
                 && msg.read_by.len() < MAX_READ_BY_ENTRIES
             {
@@ -4517,6 +4535,50 @@ mod tests {
             found.seq, 6,
             "the row that carries the id, not the legacy one"
         );
+    }
+
+    #[test]
+    fn an_ack_by_id_marks_only_the_row_get_message_by_id_returns() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let mut explicit = bus_row(6, Some("claude:quiet"), now, "explicit".into());
+        explicit.msg_id = Some("msg-5".to_string());
+        let dir = repo_with_seeded_bus(vec![legacy, explicit]);
+        let repo = dir.path().to_str().unwrap();
+
+        let acked = ack_messages(repo, "claude:reader", &["msg-5".to_string()]).unwrap();
+        assert_eq!(acked, 1, "one id marks exactly one row");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        let by_seq = |s: u64| stored.messages.iter().find(|m| m.seq == s).unwrap();
+        assert!(by_seq(5).read_by.is_empty(), "the legacy row stays unread");
+        assert_eq!(by_seq(6).read_by, vec!["claude:reader".to_string()]);
+    }
+
+    #[test]
+    fn an_explicit_msg_id_equal_to_a_retained_legacy_effective_id_is_refused() {
+        let now = now_epoch_ms();
+        let mut legacy = bus_row(5, Some("claude:quiet"), now, "legacy".into());
+        legacy.msg_id = None;
+        let dir = repo_with_seeded_bus(vec![legacy]);
+        let repo = dir.path().to_str().unwrap();
+        let err = post_peer_message(
+            repo,
+            MessageOrigin::Agent,
+            "agy:11111111-2222-4333-8444-555555555555",
+            Some("claude:aaaaaaaa-1111-4222-8333-444444444444"),
+            None,
+            "peer_message",
+            "hello",
+            None,
+            Some("msg-5"),
+            1,
+            6,
+        )
+        .expect_err("msg-5 collides with the legacy row's effective id");
+        assert!(format!("{err:?}").contains("legacy"), "{err:?}");
+        let stored = read_messages_readonly(&lanes_messages_path(repo, false).unwrap()).unwrap();
+        assert_eq!(stored.messages.len(), 1, "nothing was written");
     }
 
     #[test]
