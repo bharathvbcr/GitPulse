@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "gitpulse_protocol"
 path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 base64 = "0.23"

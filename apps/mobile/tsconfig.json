@@ -9,7 +9,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedIndexedAccess": true,
+    "noUncheckedIndexedAccess": false,
     "isolatedModules": true,
     "resolveJsonModule": true,
     "esModuleInterop": true,

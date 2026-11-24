@@ -126,10 +126,10 @@ export function describePushExtensionsPlan(
  * 2. Android FirebaseMessagingService (Kotlin -> libgitpulse_protocol.so, 10s budget, always visible).
  * 3. Lock-screen Deny / Deny & Stop ONLY categories (Opus M1).
  */
-export function withGitPulsePushExtensions(
-  config: ExpoConfig,
+export function withGitPulsePushExtensions<T extends ExpoConfig>(
+  config: T,
   options: WithNsePluginOptions = {},
-): ExpoConfig {
+): T {
   const plan = describePushExtensionsPlan(options);
 
   // Ensure iOS App Group entitlements are set on main target
@@ -269,7 +269,7 @@ export function withGitPulsePushExtensions(
     // @expo/config-plugins is only required during `expo prebuild`; pure config inspection works without it.
   }
 
-  return nextConfig;
+  return nextConfig as T;
 }
 
 export default withGitPulsePushExtensions;

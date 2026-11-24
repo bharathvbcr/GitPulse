@@ -1,4 +1,10 @@
 import {
+  computeReconnectDelayMs as coreComputeReconnectDelayMs,
+  RECONNECT_MAX_MS,
+  RECONNECT_MIN_MS,
+  WS_CLOSE_REVOKED,
+} from "@gitpulse/core/client";
+import {
   assertValidSignedApprovalDecision,
   assertValidSignedSteeringConfirm,
   type ApprovalTicket,
@@ -15,9 +21,8 @@ import {
   type SteeringPreviewResp,
 } from "../protocol/types";
 
-export const RECONNECT_MIN_MS = 250;
-export const RECONNECT_MAX_MS = 15_000;
-export const RELAY_CLOSE_REVOKED_OR_DOWNGRADED = 4003;
+export { RECONNECT_MIN_MS, RECONNECT_MAX_MS };
+export const RELAY_CLOSE_REVOKED_OR_DOWNGRADED = WS_CLOSE_REVOKED;
 
 export type ConnectionState =
   | "disconnected"
@@ -66,16 +71,14 @@ export interface ControlPlaneClientOptions {
 }
 
 /**
- * Bounded exponential jittered reconnect delay (`250ms..15s`, Opus Relay spec).
+ * Bounded exponential jittered reconnect delay (`250ms..15s`, Opus Relay spec),
+ * delegated to `@gitpulse/core/client`.
  */
 export function computeReconnectDelayMs(
   attempt: number,
   randomFn: () => number = Math.random,
 ): number {
-  const safeAttempt = Math.max(0, Math.floor(attempt));
-  const exp = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * Math.pow(2, safeAttempt));
-  const clampedRand = Math.min(1, Math.max(0, randomFn()));
-  return Math.round(RECONNECT_MIN_MS + clampedRand * (exp - RECONNECT_MIN_MS));
+  return coreComputeReconnectDelayMs(attempt, randomFn());
 }
 
 /**

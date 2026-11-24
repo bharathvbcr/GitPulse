@@ -66,7 +66,7 @@ export default function PtyDrawerScreen() {
   const decodedKey = sessionKey ? decodeURIComponent(sessionKey) : "";
   const { state, deviceKeys, client, sendPtyInput } = useControlPlane();
 
-  const webViewRef = useRef<{ injectJavaScript?: (js: string) => void } | null>(null);
+  const webViewRef = useRef<WebView>(null);
   const [biometricAttestedAtMs, setBiometricAttestedAtMs] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [stepUpError, setStepUpError] = useState<string | null>(null);

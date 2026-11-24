@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -13,6 +14,7 @@ import {
   assertNoLockScreenApproveActions,
   describePushExtensionsPlan,
   NOTIFICATION_CATEGORIES,
+  withGitPulsePushExtensions,
 } from "../plugins/with-nse";
 import {
   __setGitPulseCryptoBindingForTests,
@@ -220,6 +222,82 @@ describe("Opus M1: No lock-screen Approve action exists anywhere", () => {
     expect(ktReceiver).toContain("ACTION_DENY");
     expect(ktReceiver).toContain("ACTION_DENY_AND_INTERRUPT");
     expect(ktReceiver).not.toMatch(/allow_once/i);
+  });
+
+  it("withGitPulsePushExtensions executes iOS NSE + Android FCM mods and enforces AndroidManifest hygiene", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gitpulse-nse-test-"));
+    const iosRoot = path.join(tmpRoot, "ios");
+    const androidRoot = path.join(tmpRoot, "android");
+    fs.mkdirSync(iosRoot, { recursive: true });
+    fs.mkdirSync(androidRoot, { recursive: true });
+
+    try {
+      const base = buildMobileAppConfig({});
+      const modded = withGitPulsePushExtensions(base, {
+        appGroup: GITPULSE_IOS_APP_GROUP,
+        nseBundleIdentifier: "com.gitpulse.mobile.NotificationService",
+        androidPackage: "com.gitpulse.mobile",
+      }) as unknown as {
+        mods?: {
+          ios?: {
+            dangerous?: (cfg: {
+              modRequest: { projectRoot: string; platformProjectRoot: string };
+            }) => Promise<unknown>;
+          };
+          android?: {
+            dangerous?: (cfg: {
+              modRequest: { projectRoot: string; platformProjectRoot: string };
+            }) => Promise<unknown>;
+            manifest?: (cfg: {
+              modResults: { manifest: { application: Array<Record<string, unknown>> } };
+            }) => Promise<{
+              modResults: { manifest: { application: Array<Record<string, unknown>> } };
+            }>;
+          };
+        };
+      };
+
+      expect(typeof modded.mods?.ios?.dangerous).toBe("function");
+      expect(typeof modded.mods?.android?.dangerous).toBe("function");
+      expect(typeof modded.mods?.android?.manifest).toBe("function");
+
+      await modded.mods!.ios!.dangerous!({
+        modRequest: { projectRoot: tmpRoot, platformProjectRoot: iosRoot },
+      });
+      const nseDir = path.join(iosRoot, "GitPulseNotificationService");
+      const renderedSwift = fs.readFileSync(path.join(nseDir, "NotificationService.swift"), "utf8");
+      const renderedPlist = fs.readFileSync(path.join(nseDir, "Info.plist"), "utf8");
+      const renderedEntitlements = fs.readFileSync(
+        path.join(nseDir, "GitPulseNotificationService.entitlements"),
+        "utf8",
+      );
+      expect(renderedSwift).toContain(`appGroup = "${GITPULSE_IOS_APP_GROUP}"`);
+      expect(renderedSwift).not.toContain("__APP_GROUP__");
+      expect(renderedPlist).toContain("com.gitpulse.mobile.NotificationService");
+      expect(renderedEntitlements).toContain(GITPULSE_IOS_APP_GROUP);
+
+      await modded.mods!.android!.dangerous!({
+        modRequest: { projectRoot: tmpRoot, platformProjectRoot: androidRoot },
+      });
+      const pushDir = path.join(androidRoot, "app/src/main/java/com/gitpulse/mobile/push");
+      expect(fs.existsSync(path.join(pushDir, "GitPulseMessagingService.kt"))).toBe(true);
+      expect(fs.existsSync(path.join(pushDir, "GitPulseNotificationActionReceiver.kt"))).toBe(true);
+
+      const manifestRes = await modded.mods!.android!.manifest!({
+        modResults: { manifest: { application: [{}] } },
+      });
+      const appNode = manifestRes.modResults.manifest.application[0]!;
+      const services = appNode.service as Array<{ $: Record<string, string> }>;
+      const receivers = appNode.receiver as Array<{ $: Record<string, string> }>;
+      expect(services).toHaveLength(1);
+      expect(services[0]!.$["android:name"]).toBe(".push.GitPulseMessagingService");
+      expect(services[0]!.$["android:exported"]).toBe("false");
+      expect(receivers).toHaveLength(1);
+      expect(receivers[0]!.$["android:name"]).toBe(".push.GitPulseNotificationActionReceiver");
+      expect(receivers[0]!.$["android:exported"]).toBe("false");
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 
