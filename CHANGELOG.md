@@ -38,6 +38,13 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ### Changed
 
+- **GitPulse's branch cleanup keeps locked-in branches.** The dead-branch scan
+  marks every branch under a `git config gitpulse.lockedBranch` value or under
+  `archive/` as protected, a clean refuses to delete one, the Ops cleanup plan
+  never proposes one, and `gitpulse_worktree_prune` skips its worktree even with
+  `force`. Values match as `git for-each-ref` matches them, the same as the
+  landing skills. A config GitPulse cannot read refuses the delete.
+
 - **The plugin manifests no longer say GitPulse "never writes git".** Its
   worktree tools and landing skills do write; the description now says it never
   runs `git push`, and that the skills that change the default branch or the
