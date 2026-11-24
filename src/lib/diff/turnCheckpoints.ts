@@ -87,6 +87,13 @@ export function formatOmissionSummary(omissions: TurnCheckpointOmissions): strin
   if (omissions.wholesale) {
     const detail = omissions.wholesale_detail ? `: ${omissions.wholesale_detail}` : "";
     notes.push(`Skipped untracked snapshot (${omissions.wholesale}${detail})`);
+  } else {
+    const skippedUntracked = Math.max(0, omissions.untracked_found - omissions.untracked_admitted);
+    if (skippedUntracked > 0) {
+      notes.push(
+        `${skippedUntracked} untracked file${skippedUntracked === 1 ? "" : "s"} skipped by cap`,
+      );
+    }
   }
   if (omissions.env_files > 0) {
     notes.push(`${omissions.env_files} .env file${omissions.env_files === 1 ? "" : "s"} excluded`);
@@ -94,6 +101,11 @@ export function formatOmissionSummary(omissions: TurnCheckpointOmissions): strin
   if (omissions.secret_flagged > 0) {
     notes.push(
       `${omissions.secret_flagged} secret-flagged file${omissions.secret_flagged === 1 ? "" : "s"} excluded`,
+    );
+  }
+  if (omissions.unreadable_or_special > 0) {
+    notes.push(
+      `${omissions.unreadable_or_special} unreadable or special file${omissions.unreadable_or_special === 1 ? "" : "s"} skipped`,
     );
   }
   if (omissions.too_large > 0) {

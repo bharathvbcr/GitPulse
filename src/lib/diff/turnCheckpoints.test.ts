@@ -87,6 +87,19 @@ describe("turnCheckpoints helpers", () => {
       "2 secret-flagged files excluded",
       "1 oversized file skipped",
     ]);
+
+    const perFileOmissions = baseOmissions({
+      untracked_found: 4,
+      untracked_admitted: 1,
+      unreadable_or_special: 2,
+      nested_repos: 1,
+    });
+    expect(totalOmittedFiles(perFileOmissions)).toBe(6);
+    expect(formatOmissionSummary(perFileOmissions)).toEqual([
+      "3 untracked files skipped by cap",
+      "2 unreadable or special files skipped",
+      "1 nested repository skipped",
+    ]);
   });
 
   it("filters turns across label, branch, session, id, and commit", () => {

@@ -38,12 +38,14 @@
 
   const filtered = $derived(filterTurnCheckpoints(listData?.entries ?? [], query));
 
-  const previousTurnId = $derived.by(() => {
-    if (!selected || !listData) return null;
-    const idx = listData.entries.findIndex((item) => item.id === selected?.id);
+  function previousIdFor(turnId: string): string | null {
+    if (!listData) return null;
+    const idx = listData.entries.findIndex((item) => item.id === turnId);
     if (idx === -1 || idx + 1 >= listData.entries.length) return null;
     return listData.entries[idx + 1].id;
-  });
+  }
+
+  const previousTurnId = $derived(selected ? previousIdFor(selected.id) : null);
 
   async function refresh() {
     if (!repoPath) {
@@ -73,12 +75,19 @@
 
   async function loadDiffForSelected(comparePrev: boolean) {
     if (!repoPath || !selected) return;
+    const prevId = previousIdFor(selected.id);
+    const against = comparePrev ? prevId : null;
+    if (against === null && selected.parent === null) {
+      diffLoading = false;
+      diffData = null;
+      diffError = null;
+      return;
+    }
     diffGuard?.cancel();
     const guard = createAsyncGuard();
     diffGuard = guard;
     diffLoading = true;
     diffError = null;
-    const against = comparePrev ? previousTurnId : null;
     try {
       const next = await diffTurnCheckpoint(repoPath, selected.id, against);
       if (guard.isLive()) diffData = next;
@@ -91,9 +100,15 @@
 
   function selectTurn(entry: TurnCheckpointSummary) {
     selected = entry;
-    againstPrevious = false;
+    const hasPrev = previousIdFor(entry.id) !== null;
+    againstPrevious = hasPrev;
     diffData = null;
-    void loadDiffForSelected(false);
+    diffError = null;
+    if (!hasPrev && entry.parent === null) {
+      diffLoading = false;
+      return;
+    }
+    void loadDiffForSelected(hasPrev);
   }
 
   function backToList() {
@@ -113,6 +128,23 @@
     backToList();
     listData = null;
     void refresh();
+    return () => {
+      listGuard?.cancel();
+      diffGuard?.cancel();
+    };
+  });
+
+  $effect(() => {
+    if (!selected) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        backToList();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   });
 </script>
 
@@ -125,7 +157,13 @@
         <ArrowLeft size={11} />
         <span>Turns</span>
       </button>
-      <span class="font-mono text-micro text-textMuted truncate">{shortHash(selected.commit)}</span>
+      <span class="font-mono text-micro text-textMuted truncate">
+        {#if diffData}
+          {shortHash(diffData.base_commit)} → {shortHash(diffData.commit)}
+        {:else}
+          {shortHash(selected.commit)}
+        {/if}
+      </span>
     </div>
 
     <div class="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
@@ -135,30 +173,37 @@
           <span>{formatRelativeTurnTime(selected.created_at)}</span>
           {#if selected.branch}<span>{selected.branch}</span>{/if}
           {#if selected.event}<span>{selected.event}</span>{/if}
-          <span>
-            <span class="text-ok">+{selected.additions}</span>
+          {#if selected.session_id}
+            <span class="gp-chip" data-tone="neutral" title="Session {selected.session_id}">
+              {selected.session_id.slice(0, 8)}
+            </span>
+          {/if}
+          <span title={selected.stats_complete ? undefined : "Stats truncated at capture limit"}>
+            {#if !selected.stats_complete}~{/if}<span class="text-ok">+{selected.additions}</span>
             <span class="text-danger">−{selected.deletions}</span>
           </span>
         </div>
       </div>
 
-      {#if previousTurnId}
+      {#if previousTurnId && selected.parent !== null}
         <div class="gp-segmented p-0.5! inline-flex" role="group" aria-label="Diff base">
           <button
             type="button"
             class="gp-seg-btn px-1.5! text-micro"
-            data-active={!againstPrevious ? "true" : "false"}
-            onclick={() => setCompareMode(false)}
-          >
-            Parent commit
-          </button>
-          <button
-            type="button"
-            class="gp-seg-btn px-1.5! text-micro"
+            aria-pressed={againstPrevious}
             data-active={againstPrevious ? "true" : "false"}
             onclick={() => setCompareMode(true)}
           >
             Previous turn
+          </button>
+          <button
+            type="button"
+            class="gp-seg-btn px-1.5! text-micro"
+            aria-pressed={!againstPrevious}
+            data-active={!againstPrevious ? "true" : "false"}
+            onclick={() => setCompareMode(false)}
+          >
+            Since HEAD
           </button>
         </div>
       {/if}
@@ -175,7 +220,11 @@
         </div>
       {/if}
 
-      {#if diffLoading}
+      {#if !previousTurnId && selected.parent === null}
+        <div class="rounded border border-border px-2.5 py-2 text-micro text-textMuted">
+          Initial checkpoint has no parent commit or earlier turn to diff against.
+        </div>
+      {:else if diffLoading}
         <div class="py-3 text-micro text-textMuted">Loading turn diff…</div>
       {:else if diffError}
         <div class="gp-notice space-y-1.5" data-tone="danger" role="alert">
@@ -246,11 +295,11 @@
               <span class="truncate">
                 {entry.files} {entry.files === 1 ? "file" : "files"}{entry.branch ? ` · ${entry.branch}` : ""}
               </span>
-              <span class="shrink-0 flex items-center gap-1.5">
+              <span class="shrink-0 flex items-center gap-1.5" title={entry.stats_complete ? undefined : "Stats truncated at capture limit"}>
                 {#if omitted > 0}
                   <span class="text-warn" title="{omitted} omitted files">!{omitted}</span>
                 {/if}
-                <span class="text-ok">+{entry.additions}</span>
+                {#if !entry.stats_complete}~{/if}<span class="text-ok">+{entry.additions}</span>
                 <span class="text-danger">−{entry.deletions}</span>
               </span>
             </div>

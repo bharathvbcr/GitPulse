@@ -67,7 +67,7 @@
     type RailEntry,
   } from "../diff/fileRail";
   import { createCommitPicker, type CommitFilesRead } from "../diff/commitPick";
-  import { commitLabel, compareLabel, toggleHistoryView, type RailTab } from "../diff/historyRail";
+  import { commitLabel, compareLabel, toggleHistoryView, toggleTurnsView, type RailTab } from "../diff/historyRail";
   import { createCommitHover } from "../diff/commitHover";
   import { shortHash } from "../format";
   import type { CommitBody, CompareFiles, CommitNote } from "../diff/compareTypes";
@@ -91,6 +91,7 @@
     Copy,
     FileCode,
     GitBranch,
+    History,
     AlertTriangle,
     Palette,
     PanelLeftOpen,
@@ -1033,7 +1034,7 @@
     compareBase !== null && currentCommitId ? compareLabel(compareBase, currentCommitId) : null,
   );
 
-  const hasRail = $derived(rail.entries.length > 0 || historyRows.length > 0);
+  const hasRail = $derived(rail.entries.length > 0 || historyRows.length > 0 || $repoStore.currentPath !== null);
 
   // A3: layered blast over the files in this change set (no min_rung).
   let changeSetPathsKey = $derived(
@@ -1147,6 +1148,12 @@
       toggleHistory();
       return;
     }
+    if (event.code === "KeyT" && !event.shiftKey && $repoStore.currentPath !== null) {
+      if (typing) return;
+      event.preventDefault();
+      toggleTurns();
+      return;
+    }
     if (event.key === "PageDown" || event.key === "PageUp") {
       if (typing) return;
       event.preventDefault();
@@ -1182,6 +1189,11 @@
     ({ open: railOpen, tab: railTab } = toggleHistoryView({ open: railOpen, tab: railTab }));
   }
 
+  /** ⌥T and the toolbar's Turns button: one rule, {@link toggleTurnsView}. */
+  function toggleTurns(): void {
+    ({ open: railOpen, tab: railTab } = toggleTurnsView({ open: railOpen, tab: railTab }));
+  }
+
   /** The empty diff's way into History: always lands on it, never toggles away. */
   function showHistory(): void {
     railOpen = true;
@@ -1190,6 +1202,8 @@
 
   /** Whether the History tab is what the rail is showing right now. */
   const historyShowing = $derived(railOpen && hasRail && railTab === "history");
+  /** Whether the Turns tab is what the rail is showing right now. */
+  const turnsShowing = $derived(railOpen && hasRail && railTab === "turns");
 
   /**
    * A diff with nothing in it is where a reader is most likely to be looking
@@ -1796,6 +1810,22 @@
       >
         <GitBranch size={13} />
         <span class="hidden sm:inline">History</span>
+      </button>
+    {/if}
+
+    {#if $repoStore.currentPath !== null}
+      <button
+        type="button"
+        class="gp-btn {turnsShowing ? PRESSED : 'text-textMuted'}"
+        data-size="sm"
+        aria-pressed={turnsShowing}
+        onclick={toggleTurns}
+        aria-label="Turn checkpoints"
+        title="{turnsShowing ? 'Back to the file list' : 'Agent turn checkpoints'} ({shortcutTextLabel('⌥T', $hostPlatform.os)})"
+        data-diff-turns-toggle
+      >
+        <History size={13} />
+        <span class="hidden sm:inline">Turns</span>
       </button>
     {/if}
 
