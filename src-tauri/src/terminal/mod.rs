@@ -24,6 +24,7 @@ mod input;
 mod ipc;
 #[cfg(unix)]
 mod jobs;
+pub mod lifecycle;
 pub mod orchestrate;
 pub mod port_probe;
 #[cfg(unix)]
@@ -38,7 +39,10 @@ mod transcript;
 pub use events::{AppEvents, SessionEnded, SessionEvents};
 use executor::Executor;
 use flow::{OutputFlow, Route};
+#[cfg(unix)]
+pub use host::legacy::LegacyHostReport;
 pub use ipc::{control_async, deliver_peer_wake_async, resize_async, write_async};
+pub use lifecycle::{KillOrigin, KillOutcome};
 pub use ring::RING_BYTES;
 use serde::{Deserialize, Serialize};
 pub use session_ledger::{
@@ -499,6 +503,14 @@ fn clock_ms() -> u64 {
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// An earlier terminal host's report. Only Unix has terminal hosts; here the
+/// list is always empty, so this carries nothing.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Serialize)]
+pub struct LegacyHostReport {
+    pub protocol: u32,
+}
+
 /// Which backend holds the terminals, as Settings and the quit dialog read it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalBackendStatus {
@@ -936,6 +948,46 @@ impl TerminalSessions {
         self.host.trouble()
     }
 
+    /// Hosts of an earlier protocol that still run sessions, asked again now
+    /// (`HostClient::legacy_rescan`): each with its sessions, or why they
+    /// could not be listed. Their ids are their own host's, never this one's.
+    pub fn legacy_hosts(&self) -> Vec<LegacyHostReport> {
+        self.host.legacy_rescan()
+    }
+
+    /// Stops `session` on the earlier host of `protocol`. It never touches this
+    /// host's sessions, the ledger or the by-id marks: ids repeat across hosts.
+    /// The stop is recorded in the lifecycle log, which the host's own close
+    /// would have been.
+    pub fn legacy_kill(&self, protocol: u32, session: &str) -> Result<(), String> {
+        let result = self.host.legacy_kill(protocol, session);
+        self.session_ledger().record_lifecycle(
+            "legacy_kill",
+            serde_json::json!({
+                "protocol": protocol,
+                "session_id": session,
+                "origin": KillOrigin::SessionsListStop.as_str(),
+                "ok": result.is_ok(),
+                "error": result.as_ref().err().map(ToString::to_string),
+            }),
+        );
+        result.map_err(|error| error.to_string())
+    }
+
+    /// The newest `max_bytes` of `session`'s saved output on the earlier host
+    /// of `protocol`, read-only.
+    pub fn legacy_transcript(
+        &self,
+        protocol: u32,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+    ) -> Result<TranscriptRead, String> {
+        self.host
+            .legacy_transcript(protocol, session, max_bytes, redact)
+            .map_err(|error| error.to_string())
+    }
+
     /// Whether this app's exit leaves the host's sessions running.
     pub fn leaves_sessions_running(&self) -> bool {
         self.leave_running.load(Ordering::Acquire)
@@ -1065,6 +1117,25 @@ impl TerminalSessions {
 
     pub fn host_trouble(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// No terminal host here, so no earlier one to list.
+    pub fn legacy_hosts(&self) -> Vec<LegacyHostReport> {
+        Vec::new()
+    }
+
+    pub fn legacy_kill(&self, _protocol: u32, _session: &str) -> Result<(), String> {
+        Err("There is no earlier terminal host on this platform.".into())
+    }
+
+    pub fn legacy_transcript(
+        &self,
+        _protocol: u32,
+        _session: &str,
+        _max_bytes: usize,
+        _redact: bool,
+    ) -> Result<TranscriptRead, String> {
+        Err("There is no earlier terminal host on this platform.".into())
     }
 
     pub fn leaves_sessions_running(&self) -> bool {
@@ -2627,6 +2698,12 @@ pub struct TerminalListing {
     /// "quiet".
     #[serde(default)]
     pub quiet_ms: Option<u64>,
+    /// The session is spared by batch closes, "Stop children", agent closes and
+    /// the load governor. Never set by the host that holds the PTY: the app
+    /// fills it from the session ledger in `list_sessions`, so a reloaded page
+    /// can show the lock. Absent from the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub protected: bool,
 }
 
 /// Every session the terminal host (or non-Unix engine) still owns, live or
@@ -2647,6 +2724,7 @@ pub fn list_sessions(state: &TerminalSessions) -> Result<Vec<TerminalListing>, S
         item.title = state
             .session_ledger()
             .resolved_title_for_terminal(&item.id, item.title.as_deref());
+        item.protected = state.session_ledger().is_protected(&item.id);
     }
     Ok(listed)
 }
@@ -2679,11 +2757,76 @@ pub(in crate::terminal) fn engine_list_sessions(
                 parent_session_id: s.parent_session_id.clone(),
                 title: s.child_title.clone().or(osc_title),
                 quiet_ms: Some(clock_ms().saturating_sub(s.last_output_ms.load(Ordering::Relaxed))),
+                protected: false,
             }
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(listed)
+}
+
+/// The ids of the sessions still running, for a lifecycle record. Empty when
+/// there is no host to ask (the same guard `mark_app_quit_sessions` uses) or it
+/// cannot answer: the record then names no sessions rather than failing.
+fn live_session_ids(state: &TerminalSessions) -> Vec<String> {
+    if cfg!(unix) && state.host_pid().is_none() {
+        return Vec::new();
+    }
+    list_sessions(state)
+        .map(|listed| {
+            listed
+                .into_iter()
+                .filter(|s| !s.ending)
+                .map(|s| s.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A webview's content process died, so its page is about to reload and detach
+/// every session (`detach_all`). Recorded in the lifecycle log with the sessions
+/// that were live, so a blank window and the sessions that outlived it can be
+/// matched afterwards. Best effort: a host that cannot list records none.
+pub fn record_webview_terminated(state: &TerminalSessions, label: &str, crashes: usize) {
+    let ids = live_session_ids(state);
+    state.session_ledger().record_lifecycle(
+        "webview_terminated",
+        serde_json::json!({ "label": label, "crashes_in_window": crashes, "session_ids": ids }),
+    );
+}
+
+/// How many live sessions had a view attached and how many were detached, or
+/// `None` when there is no host to ask or it cannot answer: unknown is not zero.
+pub fn session_attachment_counts(state: &TerminalSessions) -> Option<(usize, usize)> {
+    if cfg!(unix) && state.host_pid().is_none() {
+        return None;
+    }
+    let listed = list_sessions(state).ok()?;
+    let live = listed.iter().filter(|s| !s.ending);
+    let (mut attached, mut detached) = (0, 0);
+    for session in live {
+        if session.detached {
+            detached += 1;
+        } else {
+            attached += 1;
+        }
+    }
+    Some((attached, detached))
+}
+
+/// Adds one evidence record about a webview termination to the lifecycle log
+/// (`event` is `webview_terminated_context` or `webview_terminated_attribution`),
+/// joined to [`record_webview_terminated`]'s by `label`.
+pub fn record_webview_evidence(
+    state: &TerminalSessions,
+    event: &str,
+    label: &str,
+    mut evidence: serde_json::Value,
+) {
+    if let Some(map) = evidence.as_object_mut() {
+        map.insert("label".into(), serde_json::json!(label));
+    }
+    state.session_ledger().record_lifecycle(event, evidence);
 }
 
 /// The page holding every session is being replaced (a webview reload).
@@ -2692,12 +2835,20 @@ pub(in crate::terminal) fn engine_list_sessions(
 pub fn detach_all(state: &TerminalSessions) -> usize {
     #[cfg(unix)]
     {
+        // The ids are read before the detach so the lifecycle log can say
+        // which sessions a page reload left without a view.
+        let ids = live_session_ids(state);
         // A count is all the caller logs; a host that could not be told has
         // already detached every view of an app whose page it cannot reach.
-        state.host.detach_all().unwrap_or_else(|error| {
+        let detached = state.host.detach_all().unwrap_or_else(|error| {
             log::warn!(target: "terminal", "the terminal host could not be told the page reloaded: {error}");
             0
-        })
+        });
+        state.session_ledger().record_lifecycle(
+            "page_reload_detach",
+            serde_json::json!({ "detached": detached, "session_ids": ids }),
+        );
+        detached
     }
     #[cfg(not(unix))]
     {
@@ -2833,7 +2984,12 @@ impl Takeover {
 pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool, String> {
     #[cfg(unix)]
     {
-        state.host.detach(session_id)
+        let detached = state.host.detach(session_id)?;
+        state.session_ledger().record_lifecycle(
+            "detach",
+            serde_json::json!({ "session_id": session_id, "was_live": detached }),
+        );
+        Ok(detached)
     }
     #[cfg(not(unix))]
     {
@@ -2881,6 +3037,14 @@ pub fn attach_session(
         if out.is_ok() {
             state.orchestration.resize(session_id, rows, cols);
         }
+        state.session_ledger().record_lifecycle(
+            "attach",
+            serde_json::json!({
+                "session_id": session_id,
+                "ok": out.is_ok(),
+                "error": out.as_ref().err(),
+            }),
+        );
         out
     }
     #[cfg(not(unix))]
@@ -4559,16 +4723,107 @@ pub(in crate::terminal) fn engine_hold_master(
 /// Signals only the still-owned child and its verified foreground tty group.
 /// Waits for the reader to reap the child and release capacity before success;
 /// a timeout retains ownership so a retry cannot signal an unrelated process.
-pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
+///
+/// Every close names the route it came by (`origin`). It is logged with the
+/// session, its launcher and repository, written to the lifecycle log, and
+/// kept on the session's ledger row (`closed_by`). A protected session is
+/// spared by the routes that respect protection (`KillOrigin::respects_protection`):
+/// nothing is signalled and the answer is [`KillOutcome::SkippedProtected`],
+/// which the caller reports with [`lifecycle::skipped_protected_message`].
+pub fn kill_session(
+    state: &TerminalSessions,
+    session_id: &str,
+    origin: KillOrigin,
+) -> Result<KillOutcome, String> {
+    kill_session_as(state, session_id, origin, None)
+}
+
+/// `id` as a log field: itself when it is one [`next_session_id`] could have
+/// minted, otherwise a fixed word, so an arbitrary IPC string is never logged.
+fn loggable_id(id: &str) -> &str {
+    if is_session_id(id) {
+        id
+    } else {
+        "invalid-id"
+    }
+}
+
+/// A caller as a log field: a session id when it is one, else `external`.
+fn loggable_caller(caller: &str) -> &str {
+    if is_session_id(caller) {
+        caller
+    } else {
+        "external"
+    }
+}
+
+/// [`kill_session`] naming who asked: `caller` is the agent session (or
+/// external caller) behind an agent close, recorded beside the origin.
+pub fn kill_session_as(
+    state: &TerminalSessions,
+    session_id: &str,
+    origin: KillOrigin,
+    caller: Option<&str>,
+) -> Result<KillOutcome, String> {
+    let ledger = state.session_ledger();
+    let brief = ledger.brief(session_id);
+    // A session the ledger never recorded (an orchestrated child) is described
+    // from the host's listing instead, so its close is never anonymous.
+    let (launcher, repo) = match &brief {
+        Some(b) => (b.launcher.clone(), b.repo_path.clone()),
+        None => list_sessions(state)
+            .ok()
+            .and_then(|listed| listed.into_iter().find(|s| s.id == session_id))
+            .map_or_else(
+                || ("unknown".to_owned(), "unknown".to_owned()),
+                |s| (s.launcher.unwrap_or_else(|| "shell".into()), s.repo),
+            ),
+    };
+    // Logged only as a validated id: the argument comes over IPC, and a
+    // string no session could have been named must not reach the log verbatim.
+    let who = loggable_id(session_id);
+    let caller_text = caller.map_or("none", loggable_caller);
+    if origin.respects_protection() && brief.as_ref().is_some_and(|b| b.protected) {
+        log::info!(
+            target: "terminal",
+            "terminal close skipped, session is protected: session={who} origin={origin} caller={caller_text} launcher={launcher} repo={repo}"
+        );
+        ledger.record_lifecycle(
+            "kill_skipped_protected",
+            serde_json::json!({
+                "session_id": who,
+                "origin": origin,
+                "caller": caller_text,
+                "launcher": launcher,
+                "repo": repo,
+            }),
+        );
+        return Ok(KillOutcome::SkippedProtected);
+    }
+    log::info!(
+        target: "terminal",
+        "terminal close requested: session={who} origin={origin} caller={caller_text} launcher={launcher} repo={repo}"
+    );
+    ledger.set_closed_by(session_id, origin);
+    ledger.record_lifecycle(
+        "kill_request",
+        serde_json::json!({
+            "session_id": who,
+            "origin": origin,
+            "caller": caller_text,
+            "launcher": launcher,
+            "repo": repo,
+        }),
+    );
     #[cfg(unix)]
     {
-        log::info!(target: "terminal", "terminal close requested");
-        state.host.kill(session_id)
+        state.host.kill(session_id)?;
     }
     #[cfg(not(unix))]
     {
-        engine_kill_session(&state.engine, session_id)
+        engine_kill_session(&state.engine, session_id)?;
     }
+    Ok(KillOutcome::Killed)
 }
 
 pub(in crate::terminal) fn engine_kill_session(
@@ -4612,7 +4867,23 @@ pub(in crate::terminal) fn engine_kill_session(
 }
 
 /// Application exit closes every owned PTY before the runtime disappears.
+///
+/// Logged and recorded as one [`KillOrigin::QuitStopAll`] request naming the
+/// sessions it could list; it never skips a protected one (quit semantics).
 pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
+    let ledger = state.session_ledger();
+    let ids: Vec<String> = live_session_ids(state);
+    log::info!(
+        target: "terminal",
+        "terminal close requested: origin={} sessions={} ids={ids:?}",
+        KillOrigin::QuitStopAll,
+        ids.len()
+    );
+    ledger.record_lifecycle(
+        "kill_request",
+        serde_json::json!({ "origin": KillOrigin::QuitStopAll, "session_ids": ids }),
+    );
+    ledger.set_closed_by_many(&ids, KillOrigin::QuitStopAll);
     #[cfg(unix)]
     {
         state.host.stop_all()
@@ -6329,7 +6600,7 @@ mod tests {
             None,
         )
         .expect("a plain shell is never refused");
-        kill_session(&state, &shell.id).unwrap();
+        kill_session(&state, &shell.id, KillOrigin::Unspecified).unwrap();
         drop(pressed);
 
         // Pressure cleared: the same launch is admitted and runs.
@@ -6500,7 +6771,7 @@ mod tests {
         assert!(attach_session(&state, &spawned.id, 30, 100, discard()).is_err());
         assert!(attach_session(&state, "term-missing", 30, 100, discard()).is_err());
 
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(list_sessions(&state).unwrap().is_empty());
         assert_eq!(detach_all(&state), 0);
     }
@@ -6569,7 +6840,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle:?} in {replay:?}"))
         };
         assert!(at("before") < at("while-away-1") && at("while-away-1") < at("while-away-2"));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// A sink whose messages are kept, raw, in order.
@@ -6758,7 +7029,7 @@ mod tests {
             !list_sessions(&state).unwrap().is_empty(),
             "the hosted session remains listed after app listener panic"
         );
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(
             wait_until(Duration::from_secs(5), || unsafe { libc::kill(pid, 0) }
                 != 0),
@@ -6799,7 +7070,7 @@ mod tests {
             listed.expect("list_sessions was stuck behind another session's resize"),
             1
         );
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// The defect: a poisoned master lock made every later resize fail with
@@ -6834,7 +7105,7 @@ mod tests {
             .get_size()
             .unwrap();
         assert_eq!((size.rows, size.cols), (40, 120));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// The native smoke test the browser harness cannot be: it executes a real
@@ -6897,7 +7168,7 @@ mod tests {
             wait_until(Duration::from_secs(15), || exited.load(Ordering::SeqCst)),
             "terminal-exit was never emitted after the shell finished"
         );
-        let _ = kill_session(&state, &spawned.id);
+        let _ = kill_session(&state, &spawned.id, KillOrigin::Unspecified);
     }
 
     #[cfg(unix)]
@@ -6973,7 +7244,7 @@ mod tests {
         let before = reader_wakeups(&state, &spawned.id).expect("open session");
         thread::sleep(Duration::from_millis(1500));
         let after = reader_wakeups(&state, &spawned.id).expect("open session");
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(
             after - before <= 1,
             "the reader woke {} times in 1.5 s of idleness",
@@ -7007,8 +7278,8 @@ mod tests {
         assert!(wait_until(Duration::from_secs(2), || !hidden(&a.id) && hidden(&b.id)));
         set_background_sessions(&state, &[]);
         assert!(wait_until(Duration::from_secs(2), || !hidden(&a.id) && !hidden(&b.id)));
-        kill_session(&state, &a.id).unwrap();
-        kill_session(&state, &b.id).unwrap();
+        kill_session(&state, &a.id, KillOrigin::Unspecified).unwrap();
+        kill_session(&state, &b.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// A page that is gone (or whose event loop refused) is the view's trouble:
@@ -7057,7 +7328,7 @@ mod tests {
             "the session kept running"
         );
         assert!(!list_sessions(&state).unwrap()[0].ending);
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// The defect: Close signalled the tty's one foreground group and then the
@@ -7080,7 +7351,7 @@ mod tests {
         let a = read_pid(&dir.path().join("pids.a"));
         let b = read_pid(&dir.path().join("pids.b"));
         assert!(alive(a) && alive(b));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(
             wait_until(Duration::from_secs(3), || !alive(a) && !alive(b)),
             "a background job survived Close (a alive: {}, b alive: {})",
@@ -7104,7 +7375,7 @@ mod tests {
             ),
         );
         let pid = read_pid(&dir.path().join("stubborn"));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
     }
 
@@ -7131,7 +7402,7 @@ mod tests {
             .path()
             .join("ready")
             .exists()));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(
             done.exists(),
             "the job was killed before its cleanup finished"
@@ -7207,7 +7478,7 @@ mod tests {
             libc::getsid(escapee) == escapee
         });
         assert!(escaped, "the test's escapee never left the session");
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         let stopped = wait_until(Duration::from_secs(3), || !alive(member) && !alive(other));
         let escapee_survived = alive(escapee);
         // SAFETY: the test started this process and holds its pid.
@@ -7256,7 +7527,7 @@ mod tests {
             scans <= 4,
             "{scans} reads of the process table for a 0.8 s cleanup"
         );
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// A close that obeys the hangup is not slowed by the way it waits: the
@@ -7295,7 +7566,7 @@ mod tests {
         // The shell reaps them in its own time; until it does they are zombies
         // that still answer a probe.
         assert!(wait_until(Duration::from_secs(2), || !alive(a) && !alive(b)));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// A job that ignores the hangup is escalated at the end of the grace, not
@@ -7328,7 +7599,7 @@ mod tests {
             "{waited:?} for a {grace:?} grace"
         );
         assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// The defect: the child lock was held across the whole grace, so anything
@@ -7376,7 +7647,7 @@ mod tests {
             "a context read waited {answered:?} behind a close"
         );
         assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
     }
 
     /// The process state letter `ps` reports for `pid`, empty when it is gone.
@@ -7463,7 +7734,7 @@ mod tests {
         let closes: Vec<_> = (0..2)
             .map(|_| {
                 let (state, id) = (state.clone(), spawned.id.clone());
-                thread::spawn(move || kill_session(&state, &id))
+                thread::spawn(move || kill_session(&state, &id, KillOrigin::Unspecified))
             })
             .collect();
         for close in closes {
@@ -7496,7 +7767,7 @@ mod tests {
             "the foreground is the shell's own"
         );
         assert_eq!(context.jobs, Some(true));
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(wait_until(Duration::from_secs(3), || !alive(job)));
     }
 
@@ -7523,7 +7794,7 @@ mod tests {
         assert!(
             !acknowledge_output(&state, &spawned.id, 0).is_err_and(|e| e.contains("Lock error"))
         );
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(list_sessions(&state).unwrap().is_empty());
     }
 
@@ -7647,7 +7918,7 @@ mod tests {
         let took = started.elapsed();
         drop(held);
         holder.join().unwrap();
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(
             took < Duration::from_secs(1),
             "spawn waited on the ledger: {took:?}"
@@ -7675,7 +7946,7 @@ mod tests {
         assert_eq!(listed.len(), 1, "an ending session was hidden");
         assert!(listed[0].ending && listed[0].detached);
         // Stop still works on it.
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(list_sessions(&state).unwrap().is_empty());
     }
 
@@ -9631,7 +9902,7 @@ mod tests {
     #[test]
     fn kill_session_of_unknown_id_is_ok_noop() {
         let state = TerminalSessions::default();
-        assert!(kill_session(&state, "term-missing").is_ok());
+        assert!(kill_session(&state, "term-missing", KillOrigin::Unspecified).is_ok());
     }
 
     #[test]
@@ -10380,7 +10651,7 @@ mod tests {
         );
         let facet =
             crate::insights::live_sessions::attribute(&seen, &[repo.to_string_lossy().into()]);
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         assert!(!running.is_empty(), "the terminal claude never started");
         assert_eq!(facet.sessions, 0, "{facet:?}");
     }
@@ -10451,7 +10722,7 @@ mod tests {
             crate::insights::live_sessions::attribute(&seen, &[repo.to_string_lossy().into()]);
         let scanned = crate::sysload::procscan::observe_sessions().unwrap();
         let probed = crate::sysload::procscan::probe_one(pid);
-        kill_session(&state, &spawned.id).unwrap();
+        kill_session(&state, &spawned.id, KillOrigin::Unspecified).unwrap();
         let ours: Vec<_> = facet
             .worktrees
             .iter()
@@ -10683,7 +10954,186 @@ mod tests {
             "wake delivery must leave envelope pending so PreInvocation claims it"
         );
 
-        kill_session(&state, &sh_session.id).unwrap();
-        kill_session(&state, &agy_session.id).unwrap();
+        kill_session(&state, &sh_session.id, KillOrigin::Unspecified).unwrap();
+        kill_session(&state, &agy_session.id, KillOrigin::Unspecified).unwrap();
+    }
+
+    /// A registry whose ledger is a real file in a temp dir, with one running
+    /// `sleep` recorded in it, so kills leave a lifecycle log and a ledger row.
+    #[cfg(unix)]
+    fn recorded_sleeper(
+        dir: &std::path::Path,
+    ) -> (TerminalSessions, Arc<session_ledger::SessionLedger>, String) {
+        let ledger = Arc::new(session_ledger::SessionLedger::open(
+            dir.join("ledger").join(session_ledger::SESSION_LEDGER_FILE),
+        ));
+        let state = TerminalSessions::with_ledger(ledger.clone());
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let spawned = spawn_script(&state, &repo, "sleep 60".into());
+        ledger.record_spawn(session_ledger::NewSessionRow {
+            terminal_id: spawned.id.clone(),
+            launcher: "claude".into(),
+            native_id: None,
+            repo_path: repo.to_string_lossy().into_owned(),
+            start_dir: None,
+            cwd: spawned.cwd.clone(),
+            mode: None,
+            reopen_row_id: None,
+        });
+        (state, ledger, spawned.id)
+    }
+
+    #[cfg(unix)]
+    fn is_listed(state: &TerminalSessions, id: &str) -> bool {
+        list_sessions(state)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == id && !s.ending)
+    }
+
+    /// Before: a close logged "terminal close requested" with no session id and
+    /// no origin, and only a click on a tab left any attribution. Now every
+    /// route leaves a record naming it.
+    #[cfg(unix)]
+    #[test]
+    fn every_kill_origin_is_recorded_with_the_session_id() {
+        for origin in [
+            KillOrigin::TabClose,
+            KillOrigin::SessionsListStop,
+            KillOrigin::AgentExecCleanup,
+            KillOrigin::Unspecified,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (state, ledger, id) = recorded_sleeper(dir.path());
+            assert_eq!(
+                kill_session(&state, &id, origin).unwrap(),
+                KillOutcome::Killed
+            );
+            let lines = ledger.lifecycle_lines();
+            let request = lines
+                .iter()
+                .find(|l| l.contains("\"event\":\"kill_request\""))
+                .unwrap_or_else(|| panic!("no kill_request for {origin}: {lines:?}"));
+            let record: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(record["session_id"], id.as_str());
+            assert_eq!(record["origin"], origin.as_str());
+            assert_eq!(record["launcher"], "claude");
+            assert!(record["repo"].as_str().unwrap().ends_with("repo"));
+            let stored = std::fs::read_to_string(ledger.path().unwrap()).unwrap();
+            assert!(
+                stored.contains(&format!("\"closed_by\":\"{}\"", origin.as_str())),
+                "ledger row lacks closed_by={origin}: {stored}"
+            );
+        }
+    }
+
+    /// Before: nothing spared a session from a batch close, "Stop children",
+    /// an agent close or the governor.
+    #[cfg(unix)]
+    #[test]
+    fn a_protected_session_survives_every_route_that_respects_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ledger, id) = recorded_sleeper(dir.path());
+        assert!(ledger.set_protected(&id, true));
+        for origin in [
+            KillOrigin::BatchClose,
+            KillOrigin::StopChildren,
+            KillOrigin::AgentClose,
+            KillOrigin::LoadGovernor,
+        ] {
+            assert_eq!(
+                kill_session(&state, &id, origin).unwrap(),
+                KillOutcome::SkippedProtected,
+                "{origin}"
+            );
+            assert!(
+                is_listed(&state, &id),
+                "{origin} closed a protected session"
+            );
+        }
+        let skipped = ledger
+            .lifecycle_lines()
+            .iter()
+            .filter(|l| l.contains("kill_skipped_protected"))
+            .count();
+        assert_eq!(skipped, 4, "every skip is recorded");
+        assert!(
+            !std::fs::read_to_string(ledger.path().unwrap())
+                .unwrap()
+                .contains("closed_by"),
+            "a skipped close is not the session's closer"
+        );
+        // A direct close of that one tab still works, and so does quit.
+        assert_eq!(
+            kill_session(&state, &id, KillOrigin::TabClose).unwrap(),
+            KillOutcome::Killed
+        );
+        assert!(wait_until(Duration::from_secs(5), || !is_listed(
+            &state, &id
+        )));
+    }
+
+    /// Before: the flag lived on the ledger row only, so a reloaded page had no
+    /// way to learn which tabs were protected and drew none of them locked.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_listing_says_which_sessions_are_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ledger, id) = recorded_sleeper(dir.path());
+        let listed = |state: &TerminalSessions| {
+            list_sessions(state)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .expect("listed")
+        };
+        assert!(!listed(&state).protected);
+        assert!(!serde_json::to_string(&listed(&state))
+            .unwrap()
+            .contains("protected"));
+        assert!(ledger.set_protected(&id, true));
+        assert!(listed(&state).protected);
+        assert!(ledger.set_protected(&id, false));
+        assert!(!listed(&state).protected);
+        let _ = kill_session(&state, &id, KillOrigin::TabClose);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quit_stop_all_stops_a_protected_session_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ledger, id) = recorded_sleeper(dir.path());
+        assert!(ledger.set_protected(&id, true));
+        shutdown_sessions(&state).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || !is_listed(
+            &state, &id
+        )));
+        let lines = ledger.lifecycle_lines();
+        let request = lines
+            .iter()
+            .find(|l| l.contains("quit_stop_all"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(request.contains(&id), "{request}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_reload_detach_and_attach_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, ledger, id) = recorded_sleeper(dir.path());
+        assert_eq!(detach_all(&state), 1);
+        let lines = ledger.lifecycle_lines();
+        let detach = lines
+            .iter()
+            .find(|l| l.contains("page_reload_detach"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(detach.contains(&id), "{detach}");
+        record_webview_terminated(&state, "main", 3);
+        assert!(ledger
+            .lifecycle_lines()
+            .iter()
+            .any(|l| l.contains("webview_terminated") && l.contains(&id)));
+        kill_session(&state, &id, KillOrigin::TabClose).unwrap();
     }
 }

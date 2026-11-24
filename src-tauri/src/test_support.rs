@@ -1193,6 +1193,33 @@ mod hermetic_canary {
         }
     }
 
+    /// Nothing GitPulse, Manvi, lappi or portless could have exported into the
+    /// developer's shell survives into the test process: `MANVI_STATE_DIR`,
+    /// `GITPULSE_SESSION_ID`, `LAPPI_SOCKET` and the rest are what a GitPulse
+    /// terminal injects, and a test that reads one passes or fails by where it
+    /// was launched. Only the hermetic markers and named opt-in test drivers
+    /// (see `hermetic::is_kept_test_knob`) remain.
+    #[test]
+    fn no_inherited_override_variable_survives_the_constructor() {
+        let _serial = env_serial();
+        let leaked: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| hermetic::is_scrubbed(name))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "these inherited variables reached the test process: {leaked:?}"
+        );
+    }
+
+    /// `temp_dir()` callers write under the hermetic root, not the real temp
+    /// directory.
+    #[test]
+    fn the_temp_directory_is_under_the_per_process_root() {
+        let _serial = env_serial();
+        assert_under_root("std::env::temp_dir", Some(std::env::temp_dir()));
+    }
+
     #[test]
     fn this_process_is_not_running_in_the_developers_home() {
         let _serial = env_serial();

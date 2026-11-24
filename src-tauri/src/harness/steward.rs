@@ -773,10 +773,51 @@ pub(crate) fn key_answer_of(
     }
 }
 
+/// What one steward model call (always on the cloud route when this is asked)
+/// says about the key: a success proves it works, Anthropic's refusal
+/// (`credential_rejected`) says it does not, any other failure says nothing.
+fn key_answer_of_call<T>(answer: &Result<T, ModelCallError>) -> Option<bool> {
+    match answer {
+        Ok(_) => Some(false),
+        Err(failure) if failure.credential_rejected => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// The cleanup selection's model call. It runs on the same key as every other
+/// cloud call, so what its answer says about the key is reported too.
+fn cleanup_evaluator<'a>(
+    model: &'a str,
+    call: impl Fn(&str, &str, i64) -> Result<String, ModelCallError> + 'a,
+) -> impl Fn(&str, &str, i64) -> Result<String, String> + 'a {
+    move |system, user, max_tokens| {
+        let answer = call(system, user, max_tokens);
+        note_cloud_key_answer(model, key_answer_of_call(&answer));
+        answer.map_err(|failure| failure.message)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every [`note_cloud_key_answer`] made on this thread, in order. The
+    /// runtime it writes is process-wide and any parallel test may change it,
+    /// so a test of a call site reads this instead.
+    static KEY_ANSWERS_NOTED: std::cell::RefCell<Vec<(String, Option<bool>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes the answers this thread reported through [`note_cloud_key_answer`].
+#[cfg(test)]
+pub(crate) fn take_key_answers_noted_here() -> Vec<(String, Option<bool>)> {
+    KEY_ANSWERS_NOTED.with(|noted| std::mem::take(&mut *noted.borrow_mut()))
+}
+
 /// Called by every GitPulse call through Manvi's Anthropic route so a key
 /// Anthropic refused shows in the steward's status whichever feature found
 /// out, and a working key clears it.
 pub fn note_cloud_key_answer(model: &str, answer: Option<bool>) {
+    #[cfg(test)]
+    KEY_ANSWERS_NOTED.with(|noted| noted.borrow_mut().push((model.to_string(), answer)));
     let rt = runtime();
     let cached = {
         let mut guard = crate::supervisor::lock_or_recover(&rt.inner);
@@ -1315,8 +1356,11 @@ pub(crate) fn build_status_with_env(
         None
     };
     // A rejected key still passes every local check, so only the provider's
-    // refusal can say it is not usable. Checks keep running (a refused call is
-    // not billed), and the first one that succeeds clears this.
+    // refusal can say it is not usable, and only a call that succeeds clears
+    // this: the steward's own calls, which it makes only under load (a calm,
+    // healthy tick calls no model), or any AI feature's. A fix the app cannot
+    // see (`~/.anthropic-accounts` edited) therefore reads rejected until one of
+    // those calls is made.
     let (manvi_state, manvi_detail) = present_rejected_credential(
         guard.credential_rejected.as_deref(),
         manvi,
@@ -2035,20 +2079,9 @@ impl StewardDeps for LiveDeps<'_> {
             .then_some(req.manvi.typed.as_ref())
             .flatten();
         if let Some(sel) = cloud_selection {
-            let eval = |system: &str, user: &str, max_tokens: i64| {
-                let answer = self.call_manvi_assist_checked(sel, system, user, max_tokens, true);
-                // The cleanup selection runs on the same key, so its answer
-                // counts too (it is only ever a cloud call).
-                note_cloud_key_answer(
-                    &req.manvi.model,
-                    match &answer {
-                        Ok(_) => Some(false),
-                        Err(failure) if failure.credential_rejected => Some(true),
-                        Err(_) => None,
-                    },
-                );
-                answer.map_err(|failure| failure.message)
-            };
+            let eval = cleanup_evaluator(&req.manvi.model, |system, user, max_tokens| {
+                self.call_manvi_assist_checked(sel, system, user, max_tokens, true)
+            });
             run_critical_hygiene_pass_impl(
                 req.trusted_cleanable_repos,
                 req.trusted_anchor_repo,
@@ -2769,6 +2802,11 @@ fn run_critical_hygiene_pass_impl(
                             .is_some_and(crate::engine::process::is_deferred_under_load)
                         {
                             out.deferred_or_busy = true;
+                        }
+                        // Profile backups are the only way back from a schema
+                        // upgrade: a user-confirmed action removes them, never this run.
+                        if entry.confirm_only {
+                            continue;
                         }
                         let Some(bytes) = entry.bytes else {
                             continue;
@@ -3670,6 +3708,18 @@ fn execute_single_hygiene_target(
     policy_still_allows: PreMutationPolicyCheck<'_>,
     out: &mut CleanPassOutcome,
 ) -> bool {
+    if crate::storage::hygiene::requires_user_confirmation(target) {
+        out.items.push(StewardCleanItem {
+            repo_path: repo_root.to_string(),
+            target: display_target.to_string(),
+            status: "skipped".into(),
+            measured_bytes: 0,
+            bytes_after: None,
+            detail: "Removal needs a user-confirmed action; the scheduled steward does not run it."
+                .into(),
+        });
+        return true;
+    }
     let plan = match crate::engine::process::with_disk_relief(|| {
         crate::storage::hygiene::prepare(repo_root, target, retention_days)
     }) {
@@ -4551,15 +4601,10 @@ pub(crate) fn evaluate_tick_with(
         // a rejection, Anthropic's refusal of the key sets it, and any other
         // failure (or a local model's answer) leaves it as it was.
         if manvi.mode == "cloud" {
-            let key_answer = match &answer {
-                Ok(_) => Some(false),
-                Err(err) if err.credential_rejected => Some(true),
-                Err(_) => None,
-            };
             record_cloud_key_answer(
                 &mut crate::supervisor::lock_or_recover(&rt.inner),
                 &manvi.model,
-                key_answer,
+                key_answer_of_call(&answer),
             );
         }
         match answer {
@@ -4675,6 +4720,9 @@ fn store_tick(rt: &StewardRuntime, now_ms: u64, record: StewardTickRecord) {
     guard.history.insert(0, record);
     guard.history.truncate(MAX_HISTORY);
 }
+
+#[cfg(all(test, unix))]
+mod live_key_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7738,6 +7786,35 @@ Trailing note {done}."#;
     }
 
     #[test]
+    fn the_cleanup_selection_tells_the_steward_what_its_answer_says_about_the_key() {
+        take_key_answers_noted_here();
+        let refused = cleanup_evaluator("claude-a", |_, _, _| {
+            Err(ModelCallError {
+                message: "E_PROVIDER_AUTH: anthropic: 401".into(),
+                credential_rejected: true,
+            })
+        });
+        assert_eq!(
+            refused("s", "u", 8),
+            Err("E_PROVIDER_AUTH: anthropic: 401".to_string())
+        );
+        let answered = cleanup_evaluator("claude-a", |_, _, _| Ok("[]".to_string()));
+        assert_eq!(answered("s", "u", 8), Ok("[]".to_string()));
+        let outage = cleanup_evaluator("claude-a", |_, _, _| {
+            Err(ModelCallError::from("E_DEPENDENCY: invalid x-api-key"))
+        });
+        assert!(outage("s", "u", 8).is_err());
+        assert_eq!(
+            take_key_answers_noted_here(),
+            vec![
+                ("claude-a".to_string(), Some(true)),
+                ("claude-a".to_string(), Some(false)),
+                ("claude-a".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
     fn only_a_real_anthropic_call_says_whether_the_key_works() {
         let refused: Result<serde_json::Value, ManviError> = Err(ManviError {
             code: crate::ai::MANVI_PROVIDER_AUTH.into(),
@@ -7815,7 +7892,7 @@ Trailing note {done}."#;
         assert_eq!(rejected.manvi_detail, crate::ai::REJECTED_KEY_MESSAGE);
         assert!(
             rejected.next_check_ms.is_some(),
-            "checks keep running so a replaced key is noticed"
+            "loaded ticks keep checking so a replaced key is noticed"
         );
         // The refusal was about that cloud model's key: a local model chosen
         // since, or another cloud model, does not read rejected.
@@ -7881,5 +7958,40 @@ Trailing note {done}."#;
             recheck_target_policy("/still/on", "cache:cargo-registry", &global_off),
             Err("steward cleanup is off".to_string())
         );
+    }
+
+    #[test]
+    fn the_steward_never_runs_a_user_confirmed_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("workbench.sqlite.pre-schema-11.bak");
+        std::fs::write(&backup, "rollback copy").unwrap();
+        let mut out = CleanPassOutcome::default();
+        let allow = |_: Option<&str>| -> Result<(), String> { Ok(()) };
+
+        let proceed = execute_single_hygiene_target(
+            "/not/a/repo",
+            "backup:workbench.sqlite.pre-schema-11.bak",
+            "backup:workbench.sqlite.pre-schema-11.bak",
+            0,
+            false,
+            None,
+            None,
+            false,
+            "",
+            &[],
+            &allow,
+            &mut out,
+        );
+
+        assert!(proceed);
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].status, "skipped");
+        assert!(
+            out.items[0].detail.contains("user-confirmed"),
+            "{}",
+            out.items[0].detail
+        );
+        assert_eq!(out.reclaimed_bytes, 0);
+        assert!(backup.exists());
     }
 }

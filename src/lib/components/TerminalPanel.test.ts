@@ -645,8 +645,8 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
 
     // 5. Cold-boot file split preserves an anchor shell, folder drops on file panes forward to session, and ledger rows suppress generic startup titles
     const initialTabsBody = source.slice(
+      source.indexOf("function requestWillOpenFirstTab(): boolean"),
       source.indexOf("function initialTabs(): TabState"),
-      source.indexOf("let tabState = $state<TabState>"),
     );
     expect(initialTabsBody).toContain('launch.launcher === "file"');
     expect(initialTabsBody).toContain('launch.fileOpenMode !== "tab"');
@@ -703,5 +703,64 @@ describe("TerminalPanel session failures are visible in Shell mode", () => {
     expect(source).toContain('data-testid="terminal-tab-opt-copy-on-select"');
     expect(source).toContain("initialCommand={tab.initialCommand}");
     expect(source).toContain("onRunInNewShell={(cmd, sub) => void runCommandInNewSplitShell(tab.id, cmd, sub)}");
+  });
+});
+
+describe("TerminalPanel reload restore wiring", () => {
+  // The restore decisions are pure (reloadRestore.test.ts); these pin that the
+  // effects stay thin callers and run in the order the design needs.
+  it("restores the saved strip before the split hydration, which remaps through it", () => {
+    const restore = source.indexOf("if (!stripRestorePending) return;");
+    const hydrate = source.indexOf("stripRestorePending || hydratedSplitForRepo === key");
+    expect(restore).toBeGreaterThan(-1);
+    expect(hydrate).toBeGreaterThan(restore);
+    expect(source).toContain("if (restoredIdMap) for (const [oldId, newId] of restoredIdMap) paneIdMap.set(oldId, newId);");
+    expect(source).toContain("planReloadRestore({");
+    expect(source).toContain("composeWorkspaceWithStrip(");
+  });
+  it("starts empty, not with a fresh shell, while a saved strip awaits the host's session list", () => {
+    const body = source.slice(source.indexOf("function initialTabs(): TabState"), source.indexOf("let tabState = $state<TabState>"));
+    expect(body).toContain("if (stripRestorePending) return { tabs: [], activeId: null };");
+  });
+  it("waits for the settled listing, never the timeout, before restoring", () => {
+    const effect = source.slice(source.indexOf("if (!stripRestorePending) return;"), source.indexOf("planReloadRestore({"));
+    expect(effect).toContain("restoreStep({");
+    expect(effect).not.toContain("|| adoptionTimedOut");
+    expect(effect.indexOf("if (step === \"wait\") return;")).toBeLessThan(effect.indexOf("stripRestorePending = false"));
+  });
+  it("closing a not-yet-shown restored tab asks as for a running agent and kills its session", () => {
+    expect(source).toContain('deferredTabs.has(id),');
+    const body = source.slice(source.indexOf("async function requestClose("), source.indexOf("/** Whether closing this tab may go ahead"));
+    expect(body).toContain("if (deferredTabs.has(id))");
+    expect(body).toContain("await adoptedRecordFor(id)?.close(origin);");
+    expect(body.indexOf("await confirmClose(id)")).toBeLessThan(body.indexOf("adoptedRecordFor(id)?.close(origin)"));
+  });
+  it("mounts a restored background tab's session only when it is first shown", () => {
+    expect(source).toContain("{:else if !deferredTabs.has(tab.id)}");
+    expect(source).toContain("if (attach) reclaimAdoptedSession(attach);");
+  });
+});
+
+describe("TerminalPanel names the route of every close", () => {
+  // The panel's closes run in the Svelte component, which vitest does not
+  // mount; harness/terminal.html asserts the origin each route sends at run time.
+  it("sends tab_close for a single tab, batch_close for the batch routes", () => {
+    expect(source).toContain('async function requestClose(id: string, origin: KillOrigin = "tab_close")');
+    expect(source).toContain('await requestClose(id, "batch_close");');
+    expect(source).toContain('?.close(origin)');
+  });
+  it("sends stop_children from Stop children and sessions_list_stop from the Sessions list", () => {
+    expect(source).toContain('sessions[child.id]?.close("stop_children")');
+    expect(source).toContain('closeWithConfirmation(session, "sessions_list_stop")');
+  });
+});
+
+describe("TerminalPanel reads a failed listing as failed, not empty", () => {
+  it("hands the failed latch to restoreStep, and the bridge retries the listing", () => {
+    const effect = source.slice(source.indexOf("if (!stripRestorePending) return;"), source.indexOf("A restored background tab takes its session over"));
+    expect(effect).toContain("const failed = $detachedAdoptionFailed;");
+    expect(effect).toMatch(/settled,\s+failed,\s+timedOut,/);
+    const bridge = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "SessionNotificationBridge.svelte"), "utf8");
+    expect(bridge).toContain("retryListing(() => adoptDetachedSessions(");
   });
 });

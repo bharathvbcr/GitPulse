@@ -57,6 +57,7 @@
       // differs between Chromium and WebKit is explained in the verdict's
       // diagnostics rather than by a silently missing row.
       const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [], skipped: [] };
+      let legacySessions = [];
       /** Every `cmd_terminal_resize`: which session was told which grid, in order. */
       const resizeLog = [];
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
@@ -118,6 +119,8 @@
             acks.push({ sessionId: args.sessionId, bytes: args.bytes });
             return null;
           case "cmd_terminal_set_title":
+            // A flag-only call (no title) is the protection toggle; the host answers true once it stored it.
+            if (args.protected !== undefined) { (report.protection ??= []).push({ sessionId: args.sessionId, protected: args.protected, titleSent: "title" in args }); return true; }
             return null;
           case "cmd_terminal_session_ledger":
             return { offers: [], reopenable_count: 0, unreadable_count: 0 };
@@ -137,7 +140,7 @@
             resizeLog.push({ id: args.sessionId, rows: args.rows, cols: args.cols });
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
-          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
+          case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; (report.killOrigins ??= []).push({ sessionId: args.sessionId, origin: args.origin ?? null }); showReport(); return null;
           // A tab unmounted without Close: the host keeps the process.
           case "cmd_terminal_detach": {
             const kept = sessions.has(args.sessionId);
@@ -155,6 +158,16 @@
             const now = Math.floor(Date.now() / 1000);
             return JSON.stringify({ ok: true, item: { kind: "external_terminal", id: "fixture-run", revision: 2, updated_at: 1, task_id: "fixture-task", source_revision: 1, task_title: "Fix the flaky test", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "running", cwd: "/fixture/GitPulse", created_at: now, expires_at: now + 300, session_id: "fixture-task-session", exit_code: null, reason: "", outcome_uncertain: false } });
           }
+          // Sessions an earlier GitPulse version's host still runs: listed, stoppable, readable; never attachable.
+          case "cmd_terminal_legacy_hosts":
+            return legacySessions.length === 0 ? [] : [{ protocol: 4, socket: "/fixture/ptyd-4.sock", status: { state: "listed", info: { protocol: 4, build: "0.9.0", pid: 4242, sessions: legacySessions.length }, sessions: legacySessions } }];
+          case "cmd_terminal_legacy_kill":
+            (report.legacyKills ??= []).push({ protocol: args.protocol, sessionId: args.sessionId });
+            legacySessions = legacySessions.filter((row) => row.id !== args.sessionId);
+            return null;
+          case "cmd_terminal_legacy_transcript":
+            (report.legacyReads ??= []).push({ protocol: args.protocol, sessionId: args.sessionId, redact: args.redact });
+            return { state: "found", data_b64: btoa("legacy output marker\n"), bytes: 21, retained: 21, truncated: false, rotated: false, clipped: false, gap_markers: 0, unrecorded_bytes: 0, redacted: true, live: true, settled: true, recording_error: null, run_id: null };
           case "cmd_terminal_sessions":
             // The host's own sessions as it lists them, plus one a reload left.
             return [
@@ -1243,6 +1256,42 @@
           const tabCount = visible('[role="tab"]').length;
           await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
           check("close chord kills only its session", () => visible('[role="tab"]').length === tabCount - 1 && report.killed === 1);
+          check("a single tab's close sends the tab_close origin", () => report.killOrigins.length === 1 && report.killOrigins[0].origin === "tab_close");
+          {
+            // Protection: a protected tab is skipped (named, never killed) by a batch close, and the
+            // same batch with the flag removed closes it with the batch_close origin.
+            const tabCards = () => visible('[role="tab"]').map((el) => el.closest("[data-terminal-tab]"));
+            const openTabMenu = async (card) => {
+              const box = card.getBoundingClientRect();
+              card.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: box.left + 8, clientY: box.bottom - 2 }));
+              return waitFor(() => visible('[data-testid="terminal-tab-context-menu"]')[0]);
+            };
+            const cards = tabCards();
+            const lastCard = cards.at(-1), anchorCard = cards.at(-2);
+            const lastId = lastCard.querySelector('[role="tab"]').id.replace("terminal-tab-", "");
+            const tabsBeforeProtect = cards.length;
+            const killsBeforeProtect = report.killed;
+            let menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            check("Protect from Batch Close sends the flag alone, without touching the title", () =>
+              report.protection?.length === 1 && report.protection[0].protected === true && report.protection[0].titleSent === false);
+            check("a protected tab shows its lock", () => Boolean(lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]')));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            const notice = await waitFor(() => visible('[data-testid="terminal-protection-notice"]')[0]);
+            await wait(200);
+            check("a batch close leaves a protected tab running and names it", () =>
+              report.killed === killsBeforeProtect && visible('[role="tab"]').length === tabsBeforeProtect && Boolean(notice) && notice.textContent.includes("protected from batch close"));
+            menu = await openTabMenu(lastCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-protect"]')?.click();
+            await waitFor(() => !lastCard.querySelector('[data-testid="terminal-tab-protected-icon"]'));
+            menu = await openTabMenu(anchorCard);
+            menu.querySelector('[data-testid="terminal-tab-ctx-close-right"]')?.click();
+            await waitFor(() => visible('[role="tab"]').length === tabsBeforeProtect - 1);
+            check("with the protection removed the same batch closes it, as batch_close", () =>
+              report.killed === killsBeforeProtect + 1 && report.killOrigins.at(-1).origin === "batch_close" && report.killOrigins.at(-1).sessionId !== undefined && lastId !== "");
+          }
           // A shell tab opened beside another starts where that shell is.
           contextDir = "src/lib";
           const spawnsBeforeHere = report.spawned;
@@ -1372,6 +1421,28 @@
             while (performance.now() < listedDeadline && !kept()) await wait(20);
             check("the kept session is listed under Sessions, where it can be shown or stopped", kept);
             contextBusy = false;
+            {
+              // An earlier version's host still runs a session: shown apart, stopped and read through its own commands.
+              legacySessions = [{ id: "term-9-z", program: "/bin/zsh", cwd: "/fixture/Old", repo: "/fixture/Old", launcher: null, run_id: null, title: "old build", parent_session_id: null, detached: true, ending: false, quiet_ms: 5 }];
+              const killsBeforeLegacy = report.killOrigins.length;
+              button("All terminal sessions").click(); await wait(80);
+              button("All terminal sessions").click();
+              const legacyRegion = await waitFor(() => visible('[data-testid="legacy-sessions"]')[0]);
+              check("a session in the previous version's host is listed apart, as not shown here", () =>
+                Boolean(legacyRegion) && legacyRegion.textContent.includes("previous GitPulse version's terminal host") && legacyRegion.textContent.includes("old build"));
+              legacyRegion.querySelector('[data-testid="legacy-session-output"]')?.click();
+              await waitFor(() => visible('[data-testid="legacy-session-output-view"]')[0]);
+              check("Show output reads it through the legacy command, masked, and shows the text", () =>
+                report.legacyReads?.[0]?.protocol === 4 && report.legacyReads[0].redact === true && visible('[data-testid="legacy-session-output-view"]')[0].textContent.includes("legacy output marker"));
+              legacyRegion.querySelector('[data-testid="legacy-session-stop"]')?.click();
+              const stopAsked = await waitFor(() => get(promptState));
+              check("Stop asks first, naming the previous host", () => stopAsked?.options.message.includes("previous GitPulse version's terminal host"));
+              completePrompt(true);
+              await waitFor(() => visible('[data-testid="legacy-sessions"]').length === 0);
+              check("Stop goes through the legacy kill with its protocol, and never through cmd_terminal_kill", () =>
+                report.legacyKills?.length === 1 && report.legacyKills[0].protocol === 4 && report.legacyKills[0].sessionId === "term-9-z" && report.killOrigins.length === killsBeforeLegacy);
+              check("a stopped legacy session leaves the list", () => visible('[data-testid="legacy-sessions"]').length === 0);
+            }
           }
           check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {

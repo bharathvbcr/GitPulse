@@ -24,6 +24,7 @@ import { get, writable, type Readable } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
+import { settleKill, type KillOutcome } from "./killOrigin";
 import { FAMILY_LOOKUP_MS, terminalDeadline } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
 import { hostedClaude, settleConversation, type createHostedClaudeStore, type ExitFacts } from "./hostedClaude";
@@ -31,6 +32,7 @@ import { terminalSessions, type createSessionRegistry, type TerminalSessionRecor
 import { enqueueTaskTerminal } from "./taskLaunches";
 import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
+import { replaceProtection } from "./protection";
 
 export const DETACHED_STATUS = "Still running — not shown in any tab";
 /** A session whose terminal closed but whose process has not exited: stoppable, never shown. */
@@ -41,6 +43,7 @@ type Confirm = (options: { title: string; message: string; confirmLabel: string;
 
 const KEY_PREFIX = "detached:";
 const adoptionSettledStore = writable(false);
+const adoptionFailedStore = writable(false);
 const adoptedDrops = new Map<string, () => void>();
 
 /**
@@ -50,6 +53,16 @@ const adoptedDrops = new Map<string, () => void>();
  */
 export const detachedAdoptionSettled: Readable<boolean> = {
   subscribe: adoptionSettledStore.subscribe,
+};
+
+/**
+ * The latest listing of the host failed. Not the same as settled-and-empty: a
+ * reload restore must keep the saved tab strip and retry, not open a fresh
+ * shell over it (`reloadRestore.restoreStep`). `detachedAdoptionSettled` is set
+ * only by a listing that succeeded.
+ */
+export const detachedAdoptionFailed: Readable<boolean> = {
+  subscribe: adoptionFailedStore.subscribe,
 };
 
 /**
@@ -135,6 +148,7 @@ export function parseListing(raw: unknown): TerminalListing | null {
     ...(row.ending === true ? { ending: true } : {}),
     ...(typeof row.parent_session_id === "string" ? { parent_session_id: row.parent_session_id } : {}),
     ...(parsedTitle ? { title: parsedTitle } : {}),
+    ...(row.protected === true ? { protected: true } : {}),
   };
 }
 
@@ -184,8 +198,9 @@ function listDetached(
     ...(family ? { family } : {}),
     status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
     sessionId: listing.id,
-    async close() {
-      await invoke("cmd_terminal_kill", { sessionId: listing.id });
+    async close(origin) {
+      // Stop in the Sessions list unless a tab's close (a restored tab not yet shown) says otherwise.
+      settleKill(listing.id, await invoke<KillOutcome>("cmd_terminal_kill", { sessionId: listing.id, origin: origin ?? "sessions_list_stop" }));
       settle("closed");
       drop();
     },
@@ -295,7 +310,10 @@ export async function adoptDetachedSessions(deps: {
     const raw = await invoke<unknown>("cmd_terminal_sessions");
     if (!Array.isArray(raw)) throw new Error("The terminal host returned an invalid session list.");
     let adopted = 0;
-    for (const listing of raw.map(parseListing)) {
+    const listings = raw.map(parseListing);
+    // The locks a reload would otherwise forget: protection lives on the ledger.
+    replaceProtection(listings.filter((row): row is TerminalListing => row !== null));
+    for (const listing of listings) {
       if (!listing?.detached) continue;
       // Adopting twice must not list a session twice.
       if (get(registry).some((record) => record.sessionId === listing.id)) continue;
@@ -309,10 +327,13 @@ export async function adoptDetachedSessions(deps: {
       listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
       adopted += 1;
     }
-    return adopted;
-  } finally {
     if (!deps.registry || deps.registry === terminalSessions) {
+      adoptionFailedStore.set(false);
       adoptionSettledStore.set(true);
     }
+    return adopted;
+  } catch (error) {
+    if (!deps.registry || deps.registry === terminalSessions) adoptionFailedStore.set(true);
+    throw error;
   }
 }

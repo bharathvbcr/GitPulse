@@ -68,6 +68,12 @@ describe("docsRenameHonesty", () => {
     expect(line).toContain("3 notes were not scanned");
   });
 
+  it("states that links to notes named with #, ? or % are not checked", () => {
+    const line = docsRenameHonesty({ ...clean, scan: { ...scan, notScanned: 1 } });
+    expect(line).toContain("Not covered");
+    expect(line).toContain("#, ? or %");
+  });
+
   it("names conflicts, failures and links left behind, and says the rename is incomplete", () => {
     const line = docsRenameHonesty({
       ...clean,
@@ -227,5 +233,54 @@ describe("brokenLinksHonesty", () => {
     const { shown, honesty } = brokenLinksHonesty(links, 3);
     expect(shown).toHaveLength(3);
     expect(honesty).toBe("Showing 3 of 5 broken links.");
+  });
+});
+
+describe("docsRenameHonesty escaped-name limit (adversarial)", () => {
+  const scan = { noteCount: 2, truncated: false, skippedOversized: 0, skippedUnreadable: 0, notScanned: 0 };
+  const base: DocRenameOutcome = {
+    from: "a.md",
+    to: "b.md",
+    rewrittenPaths: [],
+    linksRewritten: 0,
+    complete: true,
+    skippedConflict: [],
+    failed: [],
+    leftBroken: [],
+    scan,
+  };
+  const limit = "Not covered: links to notes whose names contain #, ? or % are not checked";
+
+  it("is null, not just the limit, for a clean rename", () => {
+    expect(docsRenameHonesty(base)).toBeNull();
+  });
+
+  it("appears exactly once at the end of every shown line", () => {
+    const variants: DocRenameOutcome[] = [
+      { ...base, scan: { ...scan, truncated: true, notScanned: 1 } },
+      { ...base, scan: { ...scan, notScanned: 2 } },
+      { ...base, leftBroken: [{ source: "x.md", target: "y.md" }] },
+      { ...base, complete: false, failed: [{ path: "x.md", error: "e" }] },
+      { ...base, complete: false, skippedConflict: ["x.md"] },
+    ];
+    for (const outcome of variants) {
+      const line = docsRenameHonesty(outcome) ?? "";
+      expect(line.endsWith(limit), line).toBe(true);
+      expect(line.split(limit).length - 1).toBe(1);
+    }
+  });
+
+  it("stays bounded with the limit appended to the worst case", () => {
+    const names = Array.from({ length: 5000 }, (_, i) => `docs/n${i}.md`);
+    const line =
+      docsRenameHonesty({
+        ...base,
+        complete: false,
+        skippedConflict: names,
+        failed: names.map((path) => ({ path, error: "e".repeat(500) })),
+        leftBroken: names.map((source) => ({ source, target: "old.md" })),
+      }) ?? "";
+    expect(line.length).toBeLessThan(2000);
+    expect(line.endsWith(limit)).toBe(true);
   });
 });

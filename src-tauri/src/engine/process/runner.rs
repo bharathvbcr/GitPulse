@@ -1422,8 +1422,11 @@ fn run_admitted_inner(
     let mut cursors = [0; 2];
     enum Halt {
         Exited(std::process::ExitStatus, bool),
-        /// Runtime deadline. The child has been reaped. `message` is the
-        /// timeout sentence callers that cannot keep a prefix still return.
+        /// Runtime deadline. The child was asked to stop, then killed and
+        /// reaped; if the signal guard refused the kill, it is instead left
+        /// registered with procguard after a bounded wait (REAP_BOUND) and
+        /// is not reaped. `message` is the timeout sentence callers that
+        /// cannot keep a prefix still return.
         Deadline(String),
         Failed(String),
     }
@@ -1507,8 +1510,11 @@ fn run_admitted_inner(
     // `procguard::with_inheritance_lock` — any sibling spawned inside
     // this pipe's pre-`FD_CLOEXEC` window, which on macOS `std` cannot
     // close atomically. Do not read this reason as the first cause
-    // alone. A deadline already reaped the child, so there is no grace
-    // left to spend: the bytes in the buffer are the prefix.
+    // alone. A deadline spends no grace on the pipes, whether the child
+    // was reaped or, after a refused kill, left registered with procguard
+    // after its bounded wait (REAP_BOUND): the finish deadline is zero, so
+    // a still-live child holding the pipes cannot hang the read, and the
+    // bytes in the buffer are the prefix.
     let (mut stdout, mut stderr) = output.finish(
         Instant::now()
             + if cancelled || deadline_message.is_some() {

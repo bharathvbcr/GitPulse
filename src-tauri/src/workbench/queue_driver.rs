@@ -369,7 +369,13 @@ pub(super) fn verify_combined(
                     })?;
                     let (gate, latest_head) = state.with_store(|store| {
                         let memo = verification_gate::Memo::shared();
-                        let gate = verification_gate::check(memo, store, task_id, &repo_identity);
+                        let gate = verification_gate::check(
+                            memo,
+                            store,
+                            task_id,
+                            &repo_identity,
+                            checkout_head.as_deref(),
+                        );
                         let latest_head = memo
                             .latest(store, task_id)
                             .ok()
@@ -385,6 +391,11 @@ pub(super) fn verify_combined(
                                     "verification recorded for {verified} does not match checkout HEAD {current}"
                                 ),
                                 Some(current.clone()),
+                            ),
+                            (None, _) | (_, None) => (
+                                false,
+                                "verification passed but the checkout HEAD or the verified head could not be read, so the verdict cannot be tied to the work".to_owned(),
+                                checkout_head.or(latest_head),
                             ),
                             _ => (true, reason, checkout_head.or(latest_head)),
                         },
@@ -819,6 +830,67 @@ mod tests {
             passed["item"]["verification"]["publication"],
             "manual_per_repository"
         );
+    }
+
+    #[test]
+    fn verify_combined_never_passes_a_member_whose_checkout_head_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        git_init(&repo_a);
+        let head_a = git_commit(&repo_a, "a.txt");
+        let state = host_state(&dir.path().join("profile.sqlite"));
+        register_repo(&state, "repo-a", &repo_a);
+        create_task(&state, "task-a", "repo-a");
+        let queued = state
+            .request(
+                "queue.enqueue_host",
+                &json!({
+                    "id": "q-nohead", "request_id": "req-nh", "expected_revision": 0,
+                    "title": "No checkout", "concurrency_limit": 2,
+                    "members": [{
+                        "member_id": "m-a", "repository_id": "repo-a",
+                        "repo_path": repo_a, "task_id": "task-a",
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let acquired = state
+            .request(
+                "queue.acquire",
+                &json!({
+                    "id": "q-nohead", "request_id": "req-acq-nh",
+                    "expected_revision": queued["item"]["revision"],
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let updated = state
+            .request(
+                "queue.member.update",
+                &json!({
+                    "id": "q-nohead", "request_id": "t1",
+                    "expected_revision": acquired["item"]["revision"],
+                    "member_id": "m-a", "state": "passed",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        record_verification_evidence(&state, "task-a", &repo_a, &head_a, "passed", "A ok");
+        // No checkouts and no run: the member's checkout head is unknown, so a
+        // passed gate cannot be tied to the work.
+        let verdict = state
+            .request(
+                "queue.verify_combined",
+                &json!({
+                    "id": "q-nohead", "request_id": "verify-nh",
+                    "expected_revision": updated["item"]["revision"],
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(verdict["item"]["state"], "failed", "{verdict}");
+        assert_eq!(verdict["item"]["verification"]["ok"], false, "{verdict}");
     }
 
     #[test]

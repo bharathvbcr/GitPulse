@@ -416,3 +416,174 @@ fn a_local_branch_tracking_a_different_remote_is_not_silently_taken_for_the_twin
         "origin/feature was answered by a `feature` that tracks upstream/feature"
     );
 }
+
+/// Attacks on the destination folders `move_path` creates and removes.
+mod move_path_folder_attacks {
+    use super::*;
+
+    fn repo() -> tempfile::TempDir {
+        let dir = git_repo();
+        std::fs::write(dir.path().join("t.txt"), "x\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    fn mv<G: FnOnce(&MovePlan) -> Result<(), CommandError>>(
+        dir: &tempfile::TempDir,
+        to: &str,
+        gate: G,
+    ) -> Result<MovePlan, CommandError> {
+        GitWriter::move_path(dir.path().to_str().unwrap(), "t.txt", to, gate)
+    }
+
+    #[test]
+    fn a_destination_folder_created_by_a_neighbour_after_the_plan_does_not_fail_the_move() {
+        let dir = repo();
+        let a = dir.path().join("a");
+        let result = mv(&dir, "a/t.txt", |_| {
+            std::fs::create_dir(&a).unwrap();
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "old create_dir_all tolerated this: {result:?}"
+        );
+        assert!(dir.path().join("a/t.txt").exists());
+    }
+
+    #[test]
+    fn a_nested_folder_created_by_a_neighbour_after_the_plan_does_not_fail_the_move() {
+        let dir = repo();
+        let ab = dir.path().join("a/b");
+        let result = mv(&dir, "a/b/c/t.txt", |_| {
+            std::fs::create_dir_all(&ab).unwrap();
+            Ok(())
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(dir.path().join("a/b/c/t.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_move_after_a_neighbour_made_the_folder_does_not_remove_it() {
+        let dir = repo();
+        let a = dir.path().join("a");
+        let lock = dir.path().join(".git/index.lock");
+        let result = mv(&dir, "a/t.txt", |_| {
+            std::fs::create_dir(&a).unwrap();
+            std::fs::write(&lock, "").unwrap();
+            Ok(())
+        });
+        std::fs::remove_file(&lock).ok();
+        assert!(result.is_err());
+        assert!(a.is_dir(), "a folder this call did not create was removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_destination_folder_never_creates_or_leaves_anything_outside_the_repo() {
+        let dir = repo();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let result = mv(&dir, "link/b/t.txt", |_| Ok(()));
+        let escaped: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "BREAK: move_path wrote outside the repo through a symlink: {escaped:?}; result {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_move_through_a_symlinked_folder_leaves_the_outside_directory_as_it_was() {
+        let dir = repo();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("keep.txt"), "k").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let lock = dir.path().join(".git/index.lock");
+        let result = mv(&dir, "link/b/t.txt", |_| {
+            std::fs::write(&lock, "").unwrap();
+            Ok(())
+        });
+        std::fs::remove_file(&lock).ok();
+        assert!(result.is_err());
+        let names: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "BREAK: outside dir changed: {names:?}");
+        assert!(std::fs::symlink_metadata(dir.path().join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_folder_that_gains_content_before_the_failure_survives() {
+        let dir = repo();
+        let lock = dir.path().join(".git/index.lock");
+        let watched = dir.path().join("a/b");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let (stop, wrote, watched) = (stop.clone(), wrote.clone(), watched.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::fs::write(watched.join("late.txt"), "late").is_ok() {
+                        wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                }
+            })
+        };
+        let result = mv(&dir, "a/b/t.txt", |_| {
+            std::fs::write(&lock, "").unwrap();
+            Ok(())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !wrote.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.join().unwrap();
+        std::fs::remove_file(&lock).ok();
+        assert!(result.is_err());
+        assert!(
+            wrote.load(std::sync::atomic::Ordering::SeqCst),
+            "inconclusive: the writer never won the race"
+        );
+        let late = std::fs::read_to_string(watched.join("late.txt"));
+        assert_eq!(
+            late.as_deref().ok(),
+            Some("late"),
+            "content written meanwhile was lost"
+        );
+    }
+
+    #[test]
+    fn a_failed_untracked_rename_removes_only_the_folders_it_made() {
+        let dir = repo();
+        std::fs::write(dir.path().join("u.txt"), "u").unwrap();
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        // The destination's folder is a file: creation fails midway.
+        std::fs::write(dir.path().join("a/b"), "file").unwrap();
+        let result =
+            GitWriter::move_path(dir.path().to_str().unwrap(), "u.txt", "a/b/c/u.txt", |_| {
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert!(dir.path().join("a").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b")).unwrap(),
+            "file"
+        );
+        assert!(dir.path().join("u.txt").exists());
+    }
+}

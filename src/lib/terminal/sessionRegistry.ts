@@ -2,6 +2,7 @@ import { writable } from "svelte/store";
 import { currentSessionLimit } from "./sessionLimit";
 import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
 import { cleanTabName, type LauncherKind } from "./tabs";
+import type { KillOrigin } from "./killOrigin";
 
 export interface TerminalSessionRecord {
   key: string;
@@ -55,8 +56,13 @@ export interface TerminalSessionRecord {
    * `taskRunId`, closing it ends no attempt.
    */
   continuesRunId?: string;
-  /** Stops the process without asking; the tab stays, showing that it ended. */
-  close: () => Promise<void>;
+  /**
+   * Stops the process without asking; the tab stays, showing that it ended.
+   * `origin` is the route that asked (`killOrigin.ts`): a protected session
+   * survives the batch routes, so a caller that closes several names its own.
+   * Absent, the close is a direct one.
+   */
+  close: (origin?: KillOrigin) => Promise<void>;
   /**
    * Asks the panel's question — the one the tab's × asks — and resolves to
    * whether to go ahead: true at once when closing would interrupt nothing,
@@ -184,9 +190,10 @@ export function runningAgents<T extends Pick<TerminalSessionRecord, "launcher" |
  */
 export async function closeWithConfirmation(
   record: Pick<TerminalSessionRecord, "close" | "confirmClose">,
+  origin?: KillOrigin,
 ): Promise<boolean> {
   if (!(await (record.confirmClose?.() ?? true))) return false;
-  await record.close();
+  await (origin ? record.close(origin) : record.close());
   return true;
 }
 

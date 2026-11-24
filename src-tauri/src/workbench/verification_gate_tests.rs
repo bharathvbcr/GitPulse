@@ -2,8 +2,8 @@
 //! claim can lack evidence, plus the paths that must keep working.
 
 use super::tests::{filed, git_repo, live, person_edits, profile};
-use super::{complete_task, resend};
-use crate::workbench::verification_gate::{current_head, EVIDENCE_TYPE};
+use super::{complete_task, resend, resolve};
+use crate::workbench::verification_gate::{current_head, landed_on_default, EVIDENCE_TYPE};
 use dc_store::Store;
 use serde_json::{json, Value};
 
@@ -140,6 +140,33 @@ fn a_verification_still_running_is_not_a_verdict() {
 }
 
 #[test]
+fn a_passed_record_for_an_older_head_on_an_unlanded_lane_is_stale() {
+    let (_d, store, repo, id) = setup();
+    // The work is on a lane that has not landed: a head that moved past a
+    // pass on the default branch itself would be landed work.
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "lane"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "lane work"],
+    );
+    verified(&store, &repo, &id);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more work"],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(
+        &store,
+        &id,
+        &response,
+        "the work changed after it was verified",
+    );
+}
+
+/// The main-checkout case: the record is for the default branch's own head M,
+/// new commits land on top, and the claim is made from that checkout. M is an
+/// ancestor of the tip, but the claim is for M2, which was never verified.
+#[test]
 fn a_passed_record_for_an_older_head_is_stale() {
     let (_d, store, repo, id) = setup();
     verified(&store, &repo, &id);
@@ -154,6 +181,28 @@ fn a_passed_record_for_an_older_head_is_stale() {
         &response,
         "the work changed after it was verified",
     );
+}
+
+/// A verified lane landed and was removed, then more commits landed on top: a
+/// claim from the main checkout is for the new tip, not the verified commit.
+#[test]
+fn a_landed_pass_does_not_cover_commits_that_landed_after_it() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    crate::test_support::git_in(
+        repo.path(),
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "unverified follow-up",
+        ],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "the claim is for");
 }
 
 #[test]
@@ -350,4 +399,441 @@ fn a_start_request_cannot_carry_a_command_or_a_bad_identity() {
         get_params(r#"{"id":"item-1"}"#).unwrap(),
         json!({"item_id": "item-1"})
     );
+}
+
+/// A lane worktree with one commit of its own, verified at that commit. Returns
+/// the lane directory (keep it alive), the lane path and the verified commit.
+fn verified_lane(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+) -> (tempfile::TempDir, String, String) {
+    let parent = tempfile::tempdir().unwrap();
+    let lane = parent.path().join("lane").to_str().unwrap().to_owned();
+    crate::test_support::git_in(repo.path(), &["worktree", "add", "-q", "-b", "lane", &lane]);
+    crate::test_support::git_in(
+        std::path::Path::new(&lane),
+        &["commit", "-q", "--allow-empty", "-m", "the work"],
+    );
+    let m = current_head(&lane).unwrap();
+    let mut passed = record(id, "passed", "settled", repo, &m);
+    passed["worktree"] = json!(lane);
+    store_record(store, id, &passed);
+    (parent, lane, m)
+}
+
+fn land(repo: &tempfile::TempDir) {
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "land the lane", "lane"],
+    );
+}
+
+/// Land the lane by fast-forward, so the default branch's tip is the verified
+/// commit itself and a claim made from that checkout is for that commit.
+fn land_ff(repo: &tempfile::TempDir) {
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--ff-only", "lane"]);
+}
+
+fn tear_down(repo: &tempfile::TempDir, lane: &str) {
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", lane]);
+}
+
+#[test]
+fn a_pass_for_a_commit_that_landed_on_the_default_branch_survives_the_lane_being_removed() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land_ff(&repo);
+    tear_down(&repo, &lane);
+    crate::test_support::git_in(repo.path(), &["branch", "-q", "-D", "lane"]);
+    let response = claim(&store, &repo, &id, Some("Landed"));
+    assert_eq!(response["status"], "done", "{response}");
+    assert_eq!(response["held_for_review"], false);
+    assert!(
+        response["verification"]
+            .as_str()
+            .unwrap()
+            .contains("default branch"),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_pass_for_a_landed_commit_passes_while_the_lane_moved_on_past_it() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land_ff(&repo);
+    crate::test_support::git_in(
+        std::path::Path::new(&lane),
+        &["commit", "-q", "--allow-empty", "-m", "unrelated follow-up"],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_eq!(response["status"], "done", "{response}");
+}
+
+#[test]
+fn a_pass_for_a_commit_that_never_landed_stays_held_when_the_lane_is_gone() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+    tear_down(&repo, &lane);
+    // The claim is for the verified commit itself, so the landed check is
+    // reached and says the commit is not on the default branch.
+    crate::test_support::git_in(repo.path(), &["checkout", "-q", "--detach", &m]);
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "not on the default branch");
+}
+
+#[test]
+fn a_lane_that_moved_to_a_commit_without_the_verified_one_stays_held() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    let lane_path = std::path::Path::new(&lane);
+    crate::test_support::git_in(lane_path, &["reset", "-q", "--hard", "HEAD~1"]);
+    crate::test_support::git_in(
+        lane_path,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a different line of work",
+        ],
+    );
+    let response = claim(&store, &repo, &id, None);
+    assert_held(
+        &store,
+        &id,
+        &response,
+        "the work changed after it was verified",
+    );
+}
+
+#[test]
+fn a_record_whose_commit_the_repository_does_not_know_stays_held() {
+    let (_d, store, repo, id) = setup();
+    let gone = tempfile::tempdir().unwrap();
+    let mut passed = record(&id, "passed", "settled", &repo, &"ab".repeat(20));
+    passed["worktree"] = json!(gone.path().join("nowhere").to_str().unwrap());
+    store_record(&store, &id, &passed);
+    let response = claim(&store, &repo, &id, None);
+    assert_held(&store, &id, &response, "could not be resolved");
+    assert_held(&store, &id, &response, "the claim is for");
+}
+
+// ---- Adversarial attacks on the landed-commit relaxation (bl1121w3) ----
+// Each asserts the SAFE outcome: a failure here is a found break.
+
+/// Store a passed record whose worktree is `worktree` and whose head is the
+/// given string, then claim done from the repository checkout.
+fn claim_with_record(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+    worktree: &str,
+    head: &str,
+) -> Value {
+    let mut passed = record(id, "passed", "settled", repo, head);
+    passed["worktree"] = json!(worktree);
+    store_record(store, id, &passed);
+    // The claim is for the commit the checkout is at. Put it at the recorded
+    // head where the repository has that commit, so the landed check itself is
+    // what the attack meets rather than a claim for some other commit.
+    if crate::engine::git_cli::git_text(
+        repo.path(),
+        &["cat-file", "-e", &format!("{head}^{{commit}}")],
+    )
+    .is_ok()
+    {
+        crate::test_support::git_in(repo.path(), &["checkout", "-q", "--detach", head]);
+    }
+    claim(store, repo, id, None)
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    crate::test_support::git_in(repo, args);
+}
+
+fn is_done(response: &Value) -> bool {
+    response["status"] == "done"
+}
+
+#[test]
+fn attack_heads_that_are_not_full_commit_ids_never_pass_even_when_the_commit_landed() {
+    let mut breaks = Vec::new();
+    type Spell = Box<dyn Fn(&str) -> String>;
+    let forms: Vec<(&str, Spell)> = vec![
+        ("HEAD", Box::new(|_| "HEAD".into())),
+        ("HEAD~1", Box::new(|_| "HEAD~1".into())),
+        ("main", Box::new(|_| "main".into())),
+        ("--all", Box::new(|_| "--all".into())),
+        ("-1", Box::new(|_| "-1".into())),
+        ("leading space", Box::new(|m| format!(" {m}"))),
+        ("trailing newline", Box::new(|m| format!("{m}\n"))),
+        ("abbreviated 12", Box::new(|m| m[..12].to_owned())),
+        ("abbreviated 7", Box::new(|m| m[..7].to_owned())),
+        ("uppercase", Box::new(|m| m.to_uppercase())),
+        ("hex-shaped unknown 40", Box::new(|_| "ab".repeat(20))),
+        ("sha256-shaped 64", Box::new(|m| format!("{m}{}", &m[..24]))),
+        ("sha256-shaped zeros", Box::new(|_| "0".repeat(64))),
+        (
+            "hex-named tag on landed commit",
+            Box::new(|_| "cafe123".into()),
+        ),
+        (
+            "hex-named branch on landed commit",
+            Box::new(|_| "beef456".into()),
+        ),
+    ];
+    for (label, make) in &forms {
+        let (_d, store, repo, id) = setup();
+        let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+        land(&repo);
+        git(repo.path(), &["tag", "cafe123", &m]);
+        git(repo.path(), &["branch", "beef456", &m]);
+        tear_down(&repo, &lane);
+        let head = make(&m);
+        let response = claim_with_record(&store, &repo, &id, &lane, &head);
+        if is_done(&response) {
+            breaks.push(format!(
+                "{label}: head {head:?} reached done: {}",
+                response["verification"]
+            ));
+        }
+    }
+    assert!(breaks.is_empty(), "BREAKS:\n{}", breaks.join("\n"));
+}
+
+#[test]
+fn attack_a_head_hex_shaped_that_is_a_tag_on_an_unlanded_commit_stays_held() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+    git(repo.path(), &["tag", "cafe123", &m]);
+    tear_down(&repo, &lane);
+    let response = claim_with_record(&store, &repo, &id, &lane, "cafe123");
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_pass_taken_in_another_clone_is_not_landed_work_here() {
+    let (_d, store, repo, id) = setup();
+    let other = crate::test_support::git_repo();
+    git(
+        other.path(),
+        &["commit", "-q", "--allow-empty", "-m", "elsewhere"],
+    );
+    let m = current_head(other.path().to_str().unwrap()).unwrap();
+    let response = claim_with_record(&store, &repo, &id, other.path().to_str().unwrap(), &m);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_pass_for_a_commit_only_another_clone_has_stays_held_when_that_clone_is_gone() {
+    let (_d, store, repo, id) = setup();
+    let other = crate::test_support::git_repo();
+    git(
+        other.path(),
+        &["commit", "-q", "--allow-empty", "-m", "elsewhere"],
+    );
+    let m = current_head(other.path().to_str().unwrap()).unwrap();
+    let gone = other.path().to_str().unwrap().to_owned();
+    drop(other);
+    let response = claim_with_record(&store, &repo, &id, &gone, &m);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_shared_object_store_sibling_does_not_make_a_commit_landed() {
+    // A clone that borrows this repository's objects, with its own commit on
+    // its own main: the commit is not in the card's repository at all.
+    let (_d, store, repo, id) = setup();
+    let other = crate::test_support::git_repo();
+    let alternates = repo.path().join(".git/objects");
+    std::fs::write(
+        other.path().join(".git/objects/info/alternates"),
+        format!("{}\n", alternates.display()),
+    )
+    .unwrap();
+    git(
+        other.path(),
+        &["commit", "-q", "--allow-empty", "-m", "shared sibling"],
+    );
+    let m = current_head(other.path().to_str().unwrap()).unwrap();
+    let response = claim_with_record(&store, &repo, &id, other.path().to_str().unwrap(), &m);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_local_branch_named_main_is_not_the_default_when_origin_head_names_another() {
+    let (_d, store, repo, id) = setup();
+    let init = head_of(&repo);
+    git(repo.path(), &["branch", "trunk"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", repo.path().to_str().unwrap()],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/trunk", &init],
+    );
+    git(
+        repo.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    );
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo); // lands on the checked-out local branch, which is not trunk
+    tear_down(&repo, &lane);
+    let base = crate::engine::git_reader::default_base(repo.path());
+    let response = claim(&store, &repo, &id, None);
+    assert!(
+        !is_done(&response),
+        "default base read as {:?}; {response}",
+        base.base
+    );
+}
+
+#[test]
+fn attack_the_first_alphabetical_branch_is_not_a_default_when_no_main_exists() {
+    // No main/master/trunk/develop: the lane's own branch sorts first and must
+    // not be taken for the default branch.
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    tear_down(&repo, &lane);
+    git(repo.path(), &["branch", "-m", "lane", "aaa-lane"]);
+    git(repo.path(), &["branch", "-m", "main", "zzz-work"]);
+    let response = claim(&store, &repo, &id, None);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_detached_checkout_with_no_branches_has_no_default_branch() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    git(repo.path(), &["checkout", "-q", "--detach"]);
+    git(repo.path(), &["branch", "-D", "main", "lane"]);
+    let response = claim(&store, &repo, &id, None);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_init_default_branch_naming_a_missing_branch_does_not_promote_unlanded_work() {
+    let (_d, store, repo, id) = setup();
+    git(repo.path(), &["config", "init.defaultBranch", "develop"]);
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    tear_down(&repo, &lane);
+    let response = claim(&store, &repo, &id, None);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_default_branch_reset_past_the_commit_holds_it_though_the_object_remains() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    git(repo.path(), &["reset", "-q", "--hard", "HEAD~1"]);
+    git(repo.path(), &["branch", "-q", "-D", "lane"]);
+    git(repo.path(), &["cat-file", "-e", &m]);
+    let response = claim(&store, &repo, &id, None);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_default_branch_force_moved_to_an_unrelated_root_holds_it() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    git(repo.path(), &["checkout", "-q", "--orphan", "fresh"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "unrelated root"],
+    );
+    git(repo.path(), &["branch", "-q", "-M", "main"]);
+    let response = claim(&store, &repo, &id, None);
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_different_repository_created_at_the_lane_path_is_not_the_lane() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+    tear_down(&repo, &lane);
+    std::fs::create_dir_all(&lane).unwrap();
+    git(std::path::Path::new(&lane), &["init", "-q"]);
+    git(
+        std::path::Path::new(&lane),
+        &["commit", "-q", "--allow-empty", "-m", "squatter"],
+    );
+    let response = claim_with_record(&store, &repo, &id, &lane, &m);
+    assert!(!is_done(&response), "{response}");
+    assert_held(&store, &id, &response, "another repository");
+}
+
+#[test]
+fn attack_a_commit_missing_from_a_shallow_clone_holds() {
+    let origin = crate::test_support::git_repo();
+    let mut first = String::new();
+    for n in 0..3 {
+        git(
+            origin.path(),
+            &["commit", "-q", "--allow-empty", "-m", &format!("c{n}")],
+        );
+        if n == 0 {
+            first = current_head(origin.path().to_str().unwrap()).unwrap();
+        }
+    }
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let shallow = crate::test_support::git_repo();
+    git(
+        shallow.path(),
+        &[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", origin.path().to_str().unwrap()),
+            "main",
+        ],
+    );
+    git(
+        shallow.path(),
+        &["checkout", "-q", "-B", "main", "FETCH_HEAD"],
+    );
+    let id = filed(&store, &shallow, "gp-shallow", "Ship the exporter");
+    let gone = tempfile::tempdir().unwrap();
+    let response = claim_with_record(
+        &store,
+        &shallow,
+        &id,
+        gone.path().join("nowhere").to_str().unwrap(),
+        &first,
+    );
+    assert!(!is_done(&response), "{response}");
+}
+
+#[test]
+fn attack_a_corrupt_default_branch_ref_is_a_read_error_not_a_yes() {
+    let (_d, store, repo, id) = setup();
+    let (_lane_dir, lane, m) = verified_lane(&store, &repo, &id);
+    land(&repo);
+    tear_down(&repo, &lane);
+    let identity = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+    std::fs::write(repo.path().join(".git/refs/heads/main"), "not-a-sha\n").unwrap();
+    let answer = landed_on_default(&identity, &m);
+    assert!(!matches!(answer, Ok(true)), "{answer:?}");
+}
+
+#[test]
+fn attack_a_repository_with_no_checkout_is_a_read_error_not_a_yes() {
+    let answer = landed_on_default("local:/definitely/not/a/dir/.git", &"ab".repeat(20));
+    assert!(answer.is_err(), "{answer:?}");
+    let answer = landed_on_default("https://example.com/r.git", &"ab".repeat(20));
+    assert!(answer.is_err(), "{answer:?}");
 }

@@ -20,7 +20,7 @@
 //! by [`MAX_INDEX_BYTES`]; a larger index is reported as unreadable, never
 //! guessed at. Results are cached by path, size, modification time and inode.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -366,6 +366,9 @@ fn walk_entries(
 }
 
 /// Result of reading tracked paths from `.git/index` without spawning `git`.
+/// Test-only since `GitReader::list_repo_files` moved to `git ls-files`: its
+/// parser and fail-closed tests are kept until the index walker is retired.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TrackedIndexPaths {
     Paths(Vec<String>),
@@ -514,6 +517,7 @@ pub(crate) fn index_shape_supported(git_dir: &Path, common_dir: &Path) -> bool {
 /// Reads unique tracked UTF-8 paths from `git_dir/index` when config and index
 /// shape are standard; otherwise returns `Unsupported` (caller falls back to
 /// `git ls-files`) or `OverLimit` if unique tracked paths exceed `max_unique`.
+#[cfg(test)]
 pub(crate) fn read_tracked_paths(
     git_dir: &Path,
     common_dir: &Path,
@@ -550,7 +554,7 @@ pub(crate) fn read_tracked_paths(
         return TrackedIndexPaths::Unsupported;
     }
 
-    let mut unique: HashSet<String> = HashSet::new();
+    let mut unique: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut over_limit = false;
     let walked = walk_entries(file, meta.len(), header, hash_len, |mode, raw| {
         if (mode & GITLINK_MODE_MASK) == GITLINK_MODE {
