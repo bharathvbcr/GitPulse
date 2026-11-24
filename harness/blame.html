@@ -24,7 +24,7 @@
        *
        * Nothing here executes git. Every IPC answer is a fixture.
        */
-      import { mockIPCWithEvents } from "./tauriMocks";
+      import { mockIPC } from "@tauri-apps/api/mocks";
       import "../src/app.css";
 
       const params = new URLSearchParams(location.search);
@@ -95,7 +95,7 @@
       /** A coverage read that fails, and a blame read that answers late. */
       let coverageRefused = false, blameDelayMs = 0;
 
-      mockIPCWithEvents((cmd, args) => {
+      mockIPC((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "cmd_get_file_blame":
@@ -117,7 +117,7 @@
             return { response: { source_freshness: { fresh: true }, available: true, items: [], total: 0, shown: 0, truncated: false }, scope: { indexed_head: oid("7"), since: args.since, cone_size: 1, blamed_symbols: 1, refusals: [] } };
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      });
+      }, { shouldMockEvents: true });
 
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");

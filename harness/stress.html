@@ -451,8 +451,8 @@
       // and every unlisten on teardown threw reading `unregisterListener` --
       // ManviOpsPanel's chaos remount reported that TypeError as a crash (its
       // listeners and issue poll now live in GitHubPanel, which took its place).
-      const { mockIPCWithEvents } = await import("./tauriMocks.ts");
-      mockIPCWithEvents(async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null));
+      const { mockIPC } = await import("@tauri-apps/api/mocks");
+      mockIPC(async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null), { shouldMockEvents: true });
 
       // ---- loop detection -------------------------------------------------
       const crashes = [];
