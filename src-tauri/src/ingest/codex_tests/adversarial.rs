@@ -74,7 +74,7 @@ fn p02_a_hundred_megabyte_line_is_skipped_in_bounded_memory_and_the_next_line_is
     let path = rollout_path(codex.path(), "BIG");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     {
-        use std::io::Write;
+        use std::io::{Seek, Write};
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{}", session_meta("BIG", w1)).unwrap();
         // One envelope line holding 100 MB of text and the call needle.
@@ -84,10 +84,13 @@ fn p02_a_hundred_megabyte_line_is_skipped_in_bounded_memory_and_the_next_line_is
             stamp(1)
         )
         .unwrap();
+        // Text at both ends and a 98 MiB hole between: the reader still pulls
+        // all 100 MiB through its bounded buffer, but a hole costs no disk
+        // writes (100 MiB of real text was 100 MiB of the suite's write budget).
         let chunk = vec![b'a'; 1 << 20];
-        for _ in 0..100 {
-            f.write_all(&chunk).unwrap();
-        }
+        f.write_all(&chunk).unwrap();
+        f.seek(std::io::SeekFrom::Current(98 << 20)).unwrap();
+        f.write_all(&chunk).unwrap();
         writeln!(f, r#""}}}}"#).unwrap();
         writeln!(f, "{}", run(2, "after-the-big-line", w1)).unwrap();
     }

@@ -163,6 +163,11 @@ it("opens the bundled installers in verify, with the tools the runner image alre
   // One `command -v` per tool: `command -v a b` exits 0 when only one is found.
   expect(verify.slice(0, finalize)).toMatch(/command -v 7z\n\s+command -v gh\n/);
   expect(verify).toContain("The dmg, both rpms and both AppImages are not opened.");
+  // A beta ships no rpm (scripts/check-release-assets.mjs bundleArgs), and the
+  // summary says so rather than claiming twelve installers and two rpms.
+  expect(verify).toContain('if [[ "$RELEASE_TAG" == *-beta.* ]]; then');
+  expect(verify).toContain("All ten installers (a beta ships no .rpm)");
+  expect(verify).toContain("The dmg and both AppImages are not opened.");
   // The names it requires come from Cargo.toml, not from this workflow.
   expect(verify).not.toContain("gitpulse-hook");
   expect(stateScript).toContain("declaredBinaryNames(readFileSync(path.join(\"src-tauri\", \"Cargo.toml\")");
