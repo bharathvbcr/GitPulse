@@ -3774,12 +3774,14 @@ pub(crate) mod tests {
                     entry_wiring_json, grammar_version, analyzer_version)
                  VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
                 // Signed SQLite value emitted by the real devmap writer for
-                // CALLER_SOURCE. The readable-source assertion below pins the
-                // fixture bytes and this identity together.
+                // CALLER_SOURCE: `devmap_extract::source_identity`, FNV-1a 64
+                // with the byte length folded in (extract schema 101). The
+                // readable-source assertion below pins the fixture bytes and
+                // this identity together.
                 (
                     id,
                     if id == 1 {
-                        -477_759_399_776_341_435i64
+                        -2_658_498_691_388_418_655i64
                     } else {
                         id
                     },

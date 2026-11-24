@@ -22,7 +22,7 @@ env:
   # the one the vendored devmap crates were synced to (store schema 29). A new
   # re-vendor moves this with it; `bun run check:vendor-schema` below fails the
   # job when they disagree.
-  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+  DEVMAP_REV: 84b97f0bfd976c9bb437541e6be8ce3f72bbd6b3
 
 jobs:
   # One job per OS used to run everything in a row: the contract checks, the
