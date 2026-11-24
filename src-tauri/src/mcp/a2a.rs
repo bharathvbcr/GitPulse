@@ -443,7 +443,8 @@ fn deposit_into_mailbox(
     }
 }
 
-type DeliveryKey = (String, String, String);
+/// (repo, peer, msg_id, bus seq of the row).
+type DeliveryKey = (String, String, String, u64);
 
 /// Upper bound on remembered deliveries; the oldest knowledge is dropped wholesale past it, which
 /// only means a retry of a long-past send may wake its recipient once more.
@@ -631,11 +632,25 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     // lists the target as a reader (a managed delivery acknowledges it), or this process
     // remembers the outcome of a successful delivery. A failed, timed-out or offline first
     // attempt records nothing, so its retry still delivers.
+    //
+    // The cache key carries the row's seq, so a new row that reuses a caller-chosen msg_id after
+    // the old one was evicted or repaired away never replays the old row's outcome.
+    let mut replayed = false;
+    let mut already_delivered = false;
     let desktop_outcome = if !at_limit && target.liveness == "live" {
-        let key = (root_repo.clone(), target.peer_id.clone(), msg_id.clone());
+        let key = (
+            root_repo.clone(),
+            target.peer_id.clone(),
+            msg_id.clone(),
+            message.seq,
+        );
         if let Some(prior) = delivered_outcome(&key) {
+            replayed = true;
             Some(prior)
         } else if message.read_by.contains(&target.peer_id) {
+            // Acknowledged by the target already (a managed delivery does that): delivered
+            // before, with no stored outcome to replay, so the result says only that.
+            already_delivered = true;
             None
         } else {
             let outcome = match reach_desktop_agent_deliver(
@@ -670,6 +685,8 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
     };
     let delivery_outcome = if at_limit {
         "paused_hop_limit".to_string()
+    } else if already_delivered {
+        "already_delivered".to_string()
     } else if let Some(outcome) = desktop_outcome {
         outcome
     } else if !deposited {
@@ -704,6 +721,7 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         "to_peer": target.peer_id,
         "liveness": target.liveness,
         "delivery_outcome": delivery_outcome,
+        "replayed": replayed,
         "hop": hop,
         "max_hops": max_hops,
         "truncated_in_mailbox": truncated_in_mailbox,
@@ -718,9 +736,9 @@ struct DedupedInboxResult {
     /// Where to resume by sequence number: the last bus seq this page returned when the page was
     /// cut (`has_more`), else `latest_seq`. Paging by `latest_seq` would skip the cut rows.
     next_since_seq: u64,
-    /// Where to resume among mailbox-only envelopes (a person's message, an evicted peer or
-    /// steward row), which carry no bus seq: the newest creation time this page returned,
-    /// never past an envelope the page cut.
+    /// Where to resume among envelopes the bus does not hold (a person's message, an evicted
+    /// peer row, an evicted steward row, which keeps a stale bus_seq that is no cursor): the
+    /// newest creation time this page returned, never past an envelope the page cut.
     mailbox_cursor_ms: u64,
     dropped_before_seq: u64,
     pinned_below_dropped_before_seq: Vec<u64>,
@@ -737,7 +755,7 @@ fn collect_deduped_peer_inbox(
     for_peer: &str,
     explicit_session_id: Option<&str>,
     since_seq: u64,
-    since_mailbox_ms: u64,
+    since_mailbox_ms: Option<u64>,
     thread_key: Option<&str>,
     include_broadcasts: bool,
     ack: bool,
@@ -991,18 +1009,18 @@ fn collect_deduped_peer_inbox(
                     }
                     continue;
                 }
-                if (from_bus || has_bus_seq) && synthesized.seq <= since_seq {
+                // A row that is not on the bus pages by creation time: a person's or an evicted peer
+                // envelope always, and an evicted steward envelope (it keeps a bus_seq, but the
+                // seq is no cursor for a row the bus no longer holds) once the caller passes
+                // since_mailbox_ms. Without that argument it still honors since_seq.
+                let by_ms = !from_bus && (!has_bus_seq || since_mailbox_ms.is_some());
+                if !by_ms && synthesized.seq <= since_seq {
                     continue;
                 }
-                // A row with no bus seq pages by creation time instead, so a non-acking wait
-                // can resume past it.
-                if !(from_bus || has_bus_seq)
-                    && since_mailbox_ms > 0
-                    && env_created_ms <= since_mailbox_ms
-                {
+                if by_ms && since_mailbox_ms.is_some_and(|cursor| env_created_ms <= cursor) {
                     continue;
                 }
-                if !(from_bus || has_bus_seq) {
+                if !from_bus {
                     mailbox_only_ms.insert(env_id.clone(), env_created_ms);
                 }
                 if let Some(tk) = t_filter {
@@ -1022,6 +1040,7 @@ fn collect_deduped_peer_inbox(
         }
     }
 
+    let since_mailbox_floor = since_mailbox_ms.unwrap_or(0);
     let has_more = combined.len() > limit;
     let cut: Vec<AgentBusMessage> = if has_more {
         combined.split_off(limit)
@@ -1048,13 +1067,13 @@ fn collect_deduped_peer_inbox(
             .filter_map(ms_of)
             .copied()
             .max()
-            .unwrap_or(since_mailbox_ms);
+            .unwrap_or(since_mailbox_floor);
         let ms = cut
             .iter()
             .filter_map(ms_of)
             .map(|t| t.saturating_sub(1))
             .fold(returned_ms, u64::min)
-            .max(since_mailbox_ms);
+            .max(since_mailbox_floor);
         (seq, ms)
     } else {
         let returned_ms = combined
@@ -1062,10 +1081,10 @@ fn collect_deduped_peer_inbox(
             .filter_map(|m| m.msg_id.as_ref().and_then(|id| mailbox_only_ms.get(id)))
             .copied()
             .max()
-            .unwrap_or(since_mailbox_ms);
+            .unwrap_or(since_mailbox_floor);
         (
             bus_page.latest_seq.max(since_seq),
-            returned_ms.max(since_mailbox_ms),
+            returned_ms.max(since_mailbox_floor),
         )
     };
 
@@ -1144,7 +1163,7 @@ pub(crate) fn handle_agent_inbox(a: super::AgentInboxArgs) -> Result<Value, Stri
         &a.for_peer,
         a.provider_session_id.as_deref(),
         a.since_seq.unwrap_or(0),
-        a.since_mailbox_ms.unwrap_or(0),
+        a.since_mailbox_ms,
         a.thread_key.as_deref(),
         a.include_broadcasts.unwrap_or(false),
         ack,
@@ -1183,7 +1202,7 @@ pub(crate) fn handle_agent_wait_with_counter(
     let ack = a.ack.unwrap_or(true);
     let limit = a.limit.map(|l| l as usize).unwrap_or(20);
     let since_seq = a.since_seq.unwrap_or(0);
-    let since_mailbox_ms = a.since_mailbox_ms.unwrap_or(0);
+    let since_mailbox_ms = a.since_mailbox_ms;
     let include_broadcasts = a.include_broadcasts.unwrap_or(false);
     let started = Instant::now();
 

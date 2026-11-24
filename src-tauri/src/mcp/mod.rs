@@ -3058,7 +3058,14 @@ fn build_tools() -> Vec<Value> {
                     "msg_id": { "type": "string" },
                     "to_peer": { "type": "string" },
                     "liveness": { "type": "string" },
-                    "delivery_outcome": { "type": "string" },
+                    "delivery_outcome": {
+                        "type": "string",
+                        "description": "What happened to the wake: paused_hop_limit, woken_immediately, queued_for_hook_boundary, requires_resume, bus_only, or already_delivered (an exact retry of a message its recipient has already read, so no second delivery was attempted)"
+                    },
+                    "replayed": {
+                        "type": "boolean",
+                        "description": "True when an exact retry did not deliver again and delivery_outcome is the stored outcome of this process's earlier successful delivery of the same row"
+                    },
                     "mailbox": {
                         "type": "object",
                         "description": "Whether the envelope was deposited in the recipient's mailbox. reason is null when deposited, else one of no_session, unavailable, full, refused, hop_limit (the message is at its hop limit: bus row only, nothing deposited)"
@@ -3070,7 +3077,7 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": [
                     "ok", "repo_path", "msg_id", "to_peer", "liveness",
-                    "delivery_outcome", "hop", "max_hops", "truncated_in_mailbox", "message"
+                    "delivery_outcome", "replayed", "hop", "max_hops", "truncated_in_mailbox", "message"
                 ]
             }),
             false,

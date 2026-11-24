@@ -1956,6 +1956,16 @@ fn retry_under_fake_desktop(
     sid: &str,
     reply: Result<serde_json::Value, String>,
 ) -> (usize, serde_json::Value, serde_json::Value) {
+    retry_under_fake_desktop_between(sid, reply, |_| {})
+}
+
+/// [`retry_under_fake_desktop`] that runs `between` (given the repo path) after the first send.
+#[cfg(target_os = "macos")]
+fn retry_under_fake_desktop_between(
+    sid: &str,
+    reply: Result<serde_json::Value, String>,
+    between: impl Fn(&str),
+) -> (usize, serde_json::Value, serde_json::Value) {
     use crate::desktop::instance::{claim, Claim};
     let (_dir, repo) = trusted_git_repo();
     register_inbox_peer(&repo, sid, "retry-desk");
@@ -1978,6 +1988,7 @@ fn retry_under_fake_desktop(
     let args = json!({ "from_peer": "agy:lead", "to_peer": "retry-desk",
                        "body": "deliver me once", "msg_id": "desk-retry-1" });
     let first = send_json(&repo, args.clone()).expect("first send");
+    between(&repo);
     let retry = send_json(&repo, args).expect("exact retry");
     drop(owner);
     crate::browser::TEST_PROFILE.with(|slot| *slot.borrow_mut() = None);
@@ -2000,6 +2011,31 @@ fn an_exact_retry_after_a_successful_desktop_delivery_does_not_deliver_again() {
         retry["delivery_outcome"], first["delivery_outcome"],
         "{retry}"
     );
+    assert_eq!(first["replayed"], false, "{first}");
+    assert_eq!(retry["replayed"], true, "{retry}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_row_reusing_an_evicted_msg_id_does_not_replay_the_old_rows_delivery() {
+    let (calls, first, retry) = retry_under_fake_desktop_between(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa07",
+        Ok(json!({"ok": true, "delivery_outcome": "woken_immediately", "channel": "banner"})),
+        |repo| {
+            // The first row is gone (evicted or repaired away); the sequence keeps counting.
+            let path = crate::engine::agent_bus::lanes_messages_path(repo, true).expect("bus path");
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read bus")).expect("bus json");
+            state["messages"] = json!([]);
+            std::fs::write(&path, serde_json::to_vec(&state).expect("encode")).expect("write bus");
+        },
+    );
+    assert_ne!(first["message"]["seq"], retry["message"]["seq"], "{retry}");
+    assert_eq!(
+        calls, 2,
+        "a new row must be delivered, not matched to the old one"
+    );
+    assert_eq!(retry["replayed"], false, "{retry}");
 }
 
 #[cfg(target_os = "macos")]
@@ -2010,4 +2046,149 @@ fn an_exact_retry_after_a_failed_desktop_delivery_delivers_again() {
         Err("owner timed out".to_string()),
     );
     assert_eq!(calls, 2);
+}
+
+#[test]
+fn a_retry_of_a_row_the_target_already_read_reports_already_delivered_not_a_new_wake() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa08";
+    register_inbox_peer(&repo, sid, "read-target");
+    let args = json!({ "from_peer": "agy:lead", "to_peer": "read-target",
+                       "body": "read before the retry", "msg_id": "read-retry-1" });
+    let first = send_json(&repo, args.clone()).expect("first send");
+    assert_eq!(first["replayed"], false, "{first}");
+    handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "read-target", "ack": true }),
+    )
+    .expect("target reads and acknowledges");
+    let retry = send_json(&repo, args).expect("exact retry");
+    assert_eq!(retry["delivery_outcome"], "already_delivered", "{retry}");
+    assert_eq!(retry["replayed"], false, "{retry}");
+}
+
+#[test]
+fn a_mailbox_cursor_never_skips_an_envelope_published_after_the_reader_saw_a_later_stamp() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa09";
+    register_inbox_peer(&repo, sid, "cursor-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    let t0 = SystemTime::now();
+    mb.deposit(
+        sid,
+        "cursor-a",
+        "first published",
+        t0 + Duration::from_millis(5_000),
+    )
+    .expect("deposit a");
+    let first = wait_peek(&repo, "cursor-owner", json!({}));
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    let cursor = first["mailbox_cursor_ms"].as_u64().expect("cursor");
+
+    // Published later, but stamped by a clock that reads earlier.
+    mb.deposit(sid, "cursor-b", "published after", t0)
+        .expect("deposit b");
+    let second = wait_peek(
+        &repo,
+        "cursor-owner",
+        json!({ "since_mailbox_ms": cursor, "since_seq": first["next_since_seq"] }),
+    );
+    let bodies: Vec<&str> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(bodies, ["published after"], "{second}");
+}
+
+#[test]
+fn paging_cut_mailbox_only_envelopes_by_cursor_returns_every_one_exactly_once() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0a";
+    register_inbox_peer(&repo, sid, "cut-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    let now = SystemTime::now();
+    for (id, body) in [("cut-1", "one"), ("cut-2", "two"), ("cut-3", "three")] {
+        mb.deposit(sid, id, body, now).expect("deposit");
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let (mut seq, mut cursor) = (json!(0), json!(0));
+    for _ in 0..5 {
+        let page = wait_peek(
+            &repo,
+            "cut-owner",
+            json!({ "limit": 1, "since_seq": seq, "since_mailbox_ms": cursor }),
+        );
+        seen.extend(
+            page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["body"].as_str().unwrap().to_string()),
+        );
+        if page["has_more"] == false {
+            break;
+        }
+        seq = page["next_since_seq"].clone();
+        cursor = page["mailbox_cursor_ms"].clone();
+    }
+    assert_eq!(seen, ["one", "two", "three"]);
+}
+
+#[test]
+fn an_evicted_steward_envelope_cut_from_a_page_is_still_reachable_by_the_cursors() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa0b";
+    register_inbox_peer(&repo, sid, "steward-owner");
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    let live = json!({ "seq": 50, "from_agent": "agy:lead", "to_agent": "steward-owner",
+                       "kind": "note", "body": "live row", "created_at_ms": now_ms,
+                       "msg_id": "seed-50" });
+    let state = json!({ "next_seq": 50, "dropped_before_seq": 0, "messages": [live] });
+    std::fs::write(
+        crate::engine::agent_bus::lanes_messages_path(&repo, true).expect("bus path"),
+        serde_json::to_vec_pretty(&state).expect("serialize"),
+    )
+    .expect("seed bus");
+    // A steward directive whose bus row was evicted: it keeps its old bus_seq (10).
+    Mailbox::at_default()
+        .expect("mailbox")
+        .deposit_with_provenance(
+            sid,
+            "steward-evicted-1",
+            "evicted steward directive",
+            crate::agent_mailbox::EnvelopeProvenance::SystemSteward {
+                msg_id: "steward-evicted-1".into(),
+                model: "m".into(),
+                mode: "advise".into(),
+                tier: "t".into(),
+                binding: "b".into(),
+                repo_root: repo.clone(),
+                bus_seq: 10,
+            },
+            SystemTime::now(),
+        )
+        .expect("deposit steward envelope");
+
+    let first = wait_peek(&repo, "steward-owner", json!({ "limit": 1 }));
+    assert_eq!(first["has_more"], true, "{first}");
+    let second = wait_peek(
+        &repo,
+        "steward-owner",
+        json!({ "limit": 1, "since_seq": first["next_since_seq"],
+                "since_mailbox_ms": first["mailbox_cursor_ms"] }),
+    );
+    let bodies: Vec<&str> = [&first, &second]
+        .iter()
+        .flat_map(|p| p["messages"].as_array().unwrap().iter())
+        .map(|m| m["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["live row", "evicted steward directive"],
+        "{first} / {second}"
+    );
 }
