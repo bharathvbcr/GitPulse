@@ -19,8 +19,8 @@ import { REGISTERED_VIEWS, sectionsFor, type ViewSection } from "./viewRegistry"
  * The plain command digits, ⌘1–⌘9 (Ctrl+1–9 elsewhere), select REPOSITORY
  * tabs, as in a browser. Views therefore take a chord of their own, and it is
  * not the same word on every host:
- *   - macOS: ⌥⌘1–3. Never ⌘⇧3/4/5, which are the system screenshot shortcuts.
- *   - Windows and Linux: Ctrl+Shift+1–3. Ctrl+Alt+digit is AltGr on many
+ *   - macOS: ⌥⌘1–4. Never ⌘⇧3/4/5, which are the system screenshot shortcuts.
+ *   - Windows and Linux: Ctrl+Shift+1–4. Ctrl+Alt+digit is AltGr on many
  *     keyboard layouts, so it types a character instead of reaching the menu,
  *     and plain Alt+digit is the section chord below.
  * `viewChordModifiers` is the structured form; `menu.rs` binds the same chords
@@ -28,7 +28,10 @@ import { REGISTERED_VIEWS, sectionsFor, type ViewSection } from "./viewRegistry"
  */
 
 /** Views the native menu binds to the view chord's digits 1…n, in order. */
-export const VIEW_DIGIT_ORDER: readonly ViewTab[] = ["code", "history", "insights"];
+// Mavi takes the next digit rather than the slot its header position would
+// suggest, so the chords people already know for Code, History and Insights
+// keep their digits.
+export const VIEW_DIGIT_ORDER: readonly ViewTab[] = ["code", "history", "insights", "mavi"];
 
 export type ChordModifier = "ctrl" | "alt" | "shift" | "meta";
 

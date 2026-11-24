@@ -349,10 +349,15 @@ describe("annotated but unregistered commands", () => {
     // reloads and restarts), from the terminal landing in e8f7bad9c. 340 with
     // the Manvi system steward's cmd_manvi_steward_status, _save, _set_repo
     // and _run_now. 341 with cmd_open_in_editor (Open in editor, at a line).
-    // 343 (without it) with cmd_terminal_legacy_hosts, _legacy_kill and
-    // _legacy_transcript (sessions an earlier version's terminal host still runs).
-    // 344 with both (341 + the three legacy-host commands).
-    expect(found.size).toBe(344);
+    // 344 with cmd_terminal_legacy_hosts, _legacy_kill and _legacy_transcript
+    // (sessions an earlier version's terminal host still runs). On main, 346
+    // with the ten cmd_mavi_* handlers (Mavi: agent conversations over Claude
+    // Code's stream-json, locally or through ssh) and 347 with
+    // cmd_mavi_conversation_check (whether a terminal tab's conversation can
+    // continue in Mavi, asked before the tab is ended). 355 with both: 344 +
+    // the eleven Mavi handlers.
+    expect(found.size).toBe(355);
+    expect(found.has("cmd_mavi_start")).toBe(true);
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     for (const steward of ["status", "save", "set_repo", "run_now"]) {
       expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);

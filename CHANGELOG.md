@@ -11,6 +11,59 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
 
 ## [Unreleased]
 
+### Added
+
+- **Mavi**, a chat-first view for coding agents ([docs/MAVI.md](docs/MAVI.md)).
+  Claude Code runs in its structured stream-json mode, here or on an SSH host,
+  and its work reads as a timeline: tool runs collapsed by what they did,
+  permission requests answered in place against the change they propose, a
+  queue for messages written while a turn runs, Stop, and Resume of the
+  conversation after a quit. SSH uses the system `ssh` with `BatchMode` and
+  strict host keys, and checks a host before starting with a typed answer.
+- **Live changes per turn.** Mavi's Changes column shows, per file, the edit an
+  agent is asking to make, the exact hunks of each edit it made, and paths that
+  changed during the turn outside its edit tools ("Other", from a read-only
+  worktree fingerprint at each turn boundary), for one turn or the whole thread.
+- **Mavi is part of the app and the terminal dock.** The Mavi tab carries a
+  count of threads waiting for you; a thread that starts waiting or fails
+  raises a toast with Open; the command palette starts, asks about the open
+  file, and opens threads; new threads take Claude's defaults from Settings →
+  Agents and can start in a new worktree. In the dock: New Mavi thread in the
+  + menu, live threads in the terminal pill's menu, open file panes reload
+  (and Follow agent works) as a Mavi agent edits, Open a terminal here, and
+  **Continue in terminal / Bring back to Mavi**, which moves a conversation
+  between Mavi and a Claude Code tab without ever running it twice. Running
+  Mavi threads are named in the quit question.
+- **Continue in Mavi, with the conversation's history.** A Claude Code tab's
+  menu moves its conversation into a Mavi thread, checked before the tab ends
+  and started only after it has exited. Every resume (after a quit, Bring back
+  to Mavi, Continue in Mavi) now shows the earlier turns, read from Claude
+  Code's own transcript and rendered like live ones, edits and their hunks
+  included, instead of an empty timeline.
+- **The Agents window lists Mavi threads**, under the plane's rows and in its
+  columns, counted in the headline, and following its filter and repository
+  scope, with Open and End.
+- **Mavi audit pass.** Permission requests: no single-key Allow, a subagent's
+  request is always shown, withheld inputs are labelled, and a request closes
+  when its tool finishes or is cancelled; the "waiting for you" bar appears only
+  when the card is off screen. Per-thread drafts; queued messages survive a
+  refused send and return to the composer when the agent ends; threads can be
+  renamed, and removing one asks first. Turn footers and the Changes column no
+  longer count proposed edits or show zero counts, and turn totals are computed
+  in one pass. The host refuses SSH diffs of absolute paths, never shows a
+  tracked unchanged file as new, keeps oversized permission requests
+  answerable, and reserves a worktree and conversation while a thread starts.
+- **Mavi: the rest of the audit.** Windows paths match their worktree (edit
+  chips, the Changes column, file reloads); a thread is not marked seen under
+  an expanded terminal dock; drafts and queued messages survive a quit, and the
+  quit question names queued messages; a subagent's streamed output is kept
+  apart from the main agent's and its prose stays with its Task; one quiet
+  screen-reader announcement per state change; tool groups keep their key (and
+  their expanded state) when an answered request joins them.
+- **Live pulse knows which agent is editing.** Explorer's Live pulse shows the
+  Mavi threads working in the repository, badges and lists first the files they
+  touched, and warns before discarding a file an agent is editing right now.
+
 ### Changed
 
 - **Plugin skills drop the repeated `gitpulse-` prefix.** Hosts already put the

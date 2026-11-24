@@ -20,7 +20,7 @@ describe("viewNav", () => {
     // cause: a new panel is a section of the view that owns its subject, not
     // a fifth top-level entry. So every view is a tab, and the check that
     // matters is the ceiling on how many views there can be at all.
-    expect(viewNavTabs()).toEqual(["work", "code", "history", "insights"]);
+    expect(viewNavTabs()).toEqual(["work", "mavi", "code", "history", "insights"]);
     expect(VIEW_NAV.length).toBe(VIEW_TABS.length);
     // Nine digit accelerators exist and the native menu asserts it too; a
     // header wider than that is the point at which grouping has to come back.
