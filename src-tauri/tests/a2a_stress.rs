@@ -27,6 +27,10 @@ fn repo() -> TempDir {
 fn call(tool: &str, args: &[(&str, String)]) -> (i32, Value, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gitpulse-mcp"));
     cmd.arg("call").arg(tool);
+    // The child logs into the hermetic home this process runs under, not the
+    // user's real log directory (tests/test_log_isolation.rs).
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    cmd.env(gitpulse_lib::logging::LOG_DIR_ENV, home.join("logs"));
     for (k, v) in args {
         cmd.arg(format!("{k}={v}"));
     }
