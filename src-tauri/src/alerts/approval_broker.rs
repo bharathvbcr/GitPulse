@@ -152,6 +152,7 @@ pub fn is_remote_approvable_tool(tool_name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerError {
     TrustAnchorUnconfigured,
+    RevocationListMissingOrStale(String),
     InvalidSignature(String),
     UntrustedDevice(String),
     DeviceRevoked(String),
@@ -167,6 +168,9 @@ impl std::fmt::Display for BrokerError {
         match self {
             Self::TrustAnchorUnconfigured => {
                 f.write_str("approval trust anchor (Account IdentityKey) is not configured")
+            }
+            Self::RevocationListMissingOrStale(m) => {
+                write!(f, "signed revocation list is missing or stale: {m}")
             }
             Self::InvalidSignature(m) => write!(f, "invalid P-256 approval signature: {m}"),
             Self::UntrustedDevice(id) => write!(f, "untrusted mobile approval device: {id}"),
@@ -193,7 +197,11 @@ fn map_protocol_error(err: ProtocolError, device_id: &str) -> BrokerError {
             "revocation list rollback (got v{got}, min v{min})"
         )),
         ProtocolError::Expired(m) | ProtocolError::NotYetValid(m) => {
-            BrokerError::ExpiredOrClockSkew(m)
+            if m.contains("revocation") {
+                BrokerError::RevocationListMissingOrStale(m)
+            } else {
+                BrokerError::ExpiredOrClockSkew(m)
+            }
         }
         ProtocolError::CertTtlExceeded => {
             BrokerError::ExpiredOrClockSkew("device certificate exceeds 30-day TTL".into())
@@ -216,6 +224,11 @@ fn map_protocol_error(err: ProtocolError, device_id: &str) -> BrokerError {
 /// (Account `IdentityKey` Ed25519 public key, enrolled `DeviceCertificate`s,
 /// and strictly monotonic `SignedRevocationList`) — NEVER loaded from an
 /// agent-writable `0600` file (Opus #15, #31).
+///
+/// Always requires a fresh, verified [`SignedRevocationList`]
+/// (`RevocationPolicy::Enforced`) — NEVER silently falls back to
+/// `RevocationPolicy::NeverIssued` when a revocation list is absent or expired
+/// (Opus #39 P1).
 #[derive(Default)]
 pub struct TrustedApprovalKeyStore {
     inner: Mutex<TrustAnchorInner>,
@@ -229,20 +242,55 @@ struct TrustAnchorInner {
     min_revocation_version: u64,
 }
 
+impl TrustAnchorInner {
+    fn enforced_policy(
+        &self,
+        identity_pub: &[u8; 32],
+        now_sec: i64,
+    ) -> Result<RevocationPolicy<'_>, BrokerError> {
+        let list = self.revocation_list.as_ref().ok_or_else(|| {
+            BrokerError::RevocationListMissingOrStale("no signed revocation list installed".into())
+        })?;
+        verify_revocation_list(list, identity_pub, self.min_revocation_version, now_sec)
+            .map_err(|e| map_protocol_error(e, "revocation-list"))?;
+        Ok(RevocationPolicy::Enforced {
+            list,
+            min_version: self.min_revocation_version,
+        })
+    }
+}
+
 impl TrustedApprovalKeyStore {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Configures the Account `IdentityKey` Ed25519 public key in broker memory.
-    /// Until configured, every mobile approval fails closed with
-    /// [`BrokerError::TrustAnchorUnconfigured`].
+    /// Until configured (alongside an unexpired [`SignedRevocationList`]), every
+    /// mobile approval fails closed and away holds bypass immediately.
     pub fn set_identity_pub_ed25519(&self, pubkey: [u8; 32]) {
         let mut guard = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.identity_pub_ed25519 = Some(pubkey);
+    }
+
+    /// Checks whether this broker is cryptographically ready to verify remote
+    /// mobile approvals at `now_sec` (Account `IdentityKey` configured AND an
+    /// unexpired, valid [`SignedRevocationList`] installed).
+    pub fn check_remote_readiness(&self, now_sec: i64) -> Result<(), &'static str> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity_pub = guard
+            .identity_pub_ed25519
+            .ok_or("trust_anchor_unconfigured")?;
+        guard
+            .enforced_policy(&identity_pub, now_sec)
+            .map_err(|_| "revocation_list_missing_or_stale")?;
+        Ok(())
     }
 
     /// Installs a verified Account IdentityKey-signed [`SignedRevocationList`],
@@ -271,7 +319,9 @@ impl TrustedApprovalKeyStore {
     }
 
     /// Verifies and enrolls a mobile [`DeviceCertificate`] chained to the
-    /// Keychain-pinned Account `IdentityKey` and current [`RevocationPolicy`].
+    /// Keychain-pinned Account `IdentityKey` and an enforced, unexpired
+    /// [`SignedRevocationList`]. Fails closed if no valid revocation list is
+    /// installed.
     pub fn enroll_device_cert(
         &self,
         cert: DeviceCertificate,
@@ -284,15 +334,7 @@ impl TrustedApprovalKeyStore {
         let identity_pub = guard
             .identity_pub_ed25519
             .ok_or(BrokerError::TrustAnchorUnconfigured)?;
-        let policy = match guard.revocation_list.as_ref() {
-            Some(list) => RevocationPolicy::Enforced {
-                list,
-                min_version: guard.min_revocation_version,
-            },
-            None => RevocationPolicy::NeverIssued {
-                min_version: guard.min_revocation_version,
-            },
-        };
+        let policy = guard.enforced_policy(&identity_pub, now_sec)?;
         verify_device_certificate(&cert, &identity_pub, policy, now_sec)
             .map_err(|e| map_protocol_error(e, &cert.device_id))?;
         guard.certs.insert(cert.device_id.clone(), cert);
@@ -300,7 +342,9 @@ impl TrustedApprovalKeyStore {
     }
 
     /// Verifies a [`SignedApprovalDecision`] end-to-end through
-    /// `gitpulse_protocol::crypto::verify_approval_decision`.
+    /// `gitpulse_protocol::crypto::verify_approval_decision` with mandatory
+    /// `RevocationPolicy::Enforced` (fails closed when the revocation list is
+    /// missing, expired, or rolled back).
     pub fn verify_decision(
         &self,
         decision: &SignedApprovalDecision,
@@ -316,19 +360,9 @@ impl TrustedApprovalKeyStore {
         let identity_pub = guard
             .identity_pub_ed25519
             .ok_or(BrokerError::TrustAnchorUnconfigured)?;
-        let policy = match guard.revocation_list.as_ref() {
-            Some(list) => RevocationPolicy::Enforced {
-                list,
-                min_version: guard.min_revocation_version,
-            },
-            None => RevocationPolicy::NeverIssued {
-                min_version: guard.min_revocation_version,
-            },
-        };
+        let policy = guard.enforced_policy(&identity_pub, now_sec)?;
         // Check explicit revocation even if the cert was already evicted from `certs`.
-        if let RevocationPolicy::Enforced { list, min_version } = policy {
-            verify_revocation_list(list, &identity_pub, min_version, now_sec)
-                .map_err(|e| map_protocol_error(e, &decision.device_id))?;
+        if let RevocationPolicy::Enforced { list, .. } = policy {
             if list
                 .revoked_device_ids
                 .iter()
@@ -353,6 +387,94 @@ impl TrustedApprovalKeyStore {
         )
         .map_err(|e| map_protocol_error(e, &decision.device_id))
     }
+    /// Test-only helper to seed an already-expired revocation list directly so
+    /// tests verify fail-closed expiry handling deterministically without sleep.
+    #[cfg(test)]
+    fn seed_revocation_list_for_test(&self, list: SignedRevocationList) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.min_revocation_version = guard.min_revocation_version.max(list.version);
+        guard.revocation_list = Some(list);
+    }
+}
+
+/* ── Repository trust check (Opus #39 P1 / A1-8) ─────────────────────────── */
+
+/// Checks whether `cwd` belongs to a GitPulse-trusted Git repository
+/// (`find_git_root` + `repository_trust::require`).
+///
+/// Fails closed (`false`) when `cwd` is empty, outside any Git repository, or
+/// inside an untrusted repository.
+pub fn is_trusted_repo_cwd(cwd: &str) -> bool {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some(root) = crate::engine::git_cli::find_git_root(Path::new(trimmed)) else {
+        return false;
+    };
+    crate::repository_trust::require(&root).is_ok()
+}
+
+/// Pluggable repository trust checker used by [`ApprovalBroker`] as
+/// defense-in-depth alongside `permission_bridge`'s pre-socket trust check.
+/// Production always uses [`RealRepoTrustChecker`].
+pub trait RepoTrustChecker: Send + Sync {
+    fn is_trusted_cwd(&self, cwd: &str) -> bool;
+}
+
+/// Production repository trust checker delegating to [`is_trusted_repo_cwd`].
+pub struct RealRepoTrustChecker;
+
+impl RepoTrustChecker for RealRepoTrustChecker {
+    fn is_trusted_cwd(&self, cwd: &str) -> bool {
+        is_trusted_repo_cwd(cwd)
+    }
+}
+
+/// Test-only mock repository trust checker so unit tests exercise broker
+/// mechanics without mutating global repository trust state.
+#[cfg(test)]
+pub(crate) struct MockRepoTrustChecker {
+    trusted: AtomicBool,
+}
+
+#[cfg(test)]
+impl MockRepoTrustChecker {
+    pub(crate) fn new(trusted: bool) -> Self {
+        Self {
+            trusted: AtomicBool::new(trusted),
+        }
+    }
+}
+
+#[cfg(test)]
+impl RepoTrustChecker for MockRepoTrustChecker {
+    fn is_trusted_cwd(&self, _cwd: &str) -> bool {
+        self.trusted.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only helper that populates a valid Account `IdentityKey` and unexpired
+/// empty `SignedRevocationList` (v1) so tests exercising non-revocation broker
+/// flows satisfy [`TrustedApprovalKeyStore::check_remote_readiness`].
+#[cfg(test)]
+pub(crate) fn configure_test_trust_anchor(keys: &TrustedApprovalKeyStore) {
+    let seed = [0x11u8; 32];
+    keys.set_identity_pub_ed25519(gitpulse_protocol::crypto::ed25519_public_from_secret(&seed));
+    let now = wall_now_secs();
+    let list = gitpulse_protocol::crypto::issue_revocation_list(
+        &seed,
+        1,
+        now - 60,
+        now + 3600,
+        Vec::new(),
+    )
+    .expect("issue empty test revocation list");
+    keys.install_revocation_list(list, now)
+        .expect("install empty test revocation list");
 }
 
 /* ── Presence detection (Opus P0-1) ──────────────────────────────────────── */
@@ -709,6 +831,7 @@ pub struct ApprovalBroker {
     human_ledger: Option<Arc<HumanIssuanceLedger>>,
     presence: Arc<dyn PresenceProvider>,
     keys: Arc<TrustedApprovalKeyStore>,
+    repo_trust: Arc<dyn RepoTrustChecker>,
     remote_approval_active: AtomicBool,
     hold_ceiling: Duration,
     presence_poll_interval: Duration,
@@ -729,12 +852,19 @@ impl ApprovalBroker {
             human_ledger: None,
             presence,
             keys,
+            repo_trust: Arc::new(RealRepoTrustChecker),
             remote_approval_active: AtomicBool::new(false),
             hold_ceiling: DEFAULT_HOLD_CEILING,
             presence_poll_interval: DEFAULT_PRESENCE_POLL,
             book: Mutex::new(TicketBook::default()),
             forbidden_socket_op_rejections: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_repo_trust_checker(mut self, checker: Arc<dyn RepoTrustChecker>) -> Self {
+        self.repo_trust = checker;
+        self
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1036,6 +1166,16 @@ impl ApprovalBroker {
                 reason: "remote_inactive".to_owned(),
             });
         }
+        if let Err(reason) = self.keys.check_remote_readiness(wall_now_secs()) {
+            return Err(HookBrokerReply::Bypass {
+                reason: reason.to_owned(),
+            });
+        }
+        if !self.repo_trust.is_trusted_cwd(&req.cwd) {
+            return Err(HookBrokerReply::Bypass {
+                reason: "untrusted_repository".to_owned(),
+            });
+        }
         match self.presence.current_presence() {
             UserPresence::Present => {
                 return Err(HookBrokerReply::Bypass {
@@ -1158,6 +1298,12 @@ impl ApprovalBroker {
                 self.transition_to_bypass(ticket_id, "remote_disabled");
                 break HookBrokerReply::Bypass {
                     reason: "remote_disabled".to_owned(),
+                };
+            }
+            if let Err(reason) = self.keys.check_remote_readiness(wall_now_secs()) {
+                self.transition_to_bypass(ticket_id, reason);
+                break HookBrokerReply::Bypass {
+                    reason: reason.to_owned(),
                 };
             }
             if self.presence.current_presence() != UserPresence::Away {
@@ -1673,8 +1819,6 @@ mod tests {
     }
 
     fn enroll_test_mobile_device(keys: &TrustedApprovalKeyStore, device_id: &str) {
-        let identity_pub = ed25519_public_from_secret(&TEST_IDENTITY_SEED);
-        keys.set_identity_pub_ed25519(identity_pub);
         let now = wall_now_secs();
         let dev_ed = ed25519_public_from_secret(&[0x22; 32]);
         let dev_x = x25519_public_from_secret(&[0x33; 32]);
@@ -1698,8 +1842,10 @@ mod tests {
         mailbox_root: PathBuf,
     ) -> (Arc<ApprovalBroker>, Arc<TrustedApprovalKeyStore>) {
         let keys = Arc::new(TrustedApprovalKeyStore::new());
+        configure_test_trust_anchor(&keys);
         let broker = Arc::new(
             ApprovalBroker::new("host-dev-1", mailbox_root, presence, keys.clone())
+                .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
                 .with_hold_ceiling(Duration::from_secs(30))
                 .with_presence_poll_interval(Duration::from_millis(10)),
         );
@@ -1894,18 +2040,18 @@ mod tests {
         ));
         let ticket = broker.pending_tickets()[0].clone();
 
-        // Before configuring Account IdentityKey trust anchor, mobile approvals fail closed.
-        let pre_anchor = sign_decision(
+        // Before enrolling `mob-1` device certificate, mobile approvals fail closed.
+        let pre_enroll = sign_decision(
             &TEST_P256_SECRET,
             "host-dev-1",
             &ticket,
             ApprovalDecision::AllowOnce,
-            "nonce-pre-anchor",
+            "nonce-pre-enroll",
             "mob-1",
         );
         assert_eq!(
-            broker.resolve_signed(&pre_anchor),
-            Err(BrokerError::TrustAnchorUnconfigured)
+            broker.resolve_signed(&pre_enroll),
+            Err(BrokerError::UntrustedDevice("mob-1".into()))
         );
 
         // Enroll verified DeviceCertificate chained to Account IdentityKey.
@@ -1973,7 +2119,7 @@ mod tests {
         let now = wall_now_secs();
         let rev_list = issue_revocation_list(
             &TEST_IDENTITY_SEED,
-            1,
+            2,
             now - 10,
             now + 3600,
             vec!["mob-1".to_string()],
@@ -2043,13 +2189,16 @@ mod tests {
         let sock = base.join(SOCKET_NAME);
         let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
         let ledger = Arc::new(HumanIssuanceLedger::new());
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        configure_test_trust_anchor(&keys);
         let broker_arc = Arc::new(
             ApprovalBroker::new(
                 "host-sock-1",
                 base.join("agent-mailbox"),
                 presence,
-                Arc::new(TrustedApprovalKeyStore::new()),
+                keys,
             )
+            .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
             .with_human_ledger(ledger)
             .with_hold_ceiling(Duration::from_secs(30))
             .with_presence_poll_interval(Duration::from_millis(10)),
@@ -2112,5 +2261,124 @@ mod tests {
             "req-1",
             &crate::agent_mailbox::text_sha256_hex("tampered text")
         ));
+    }
+
+    #[test]
+    fn missing_or_expired_revocation_list_fails_closed_in_verify_and_bypasses_in_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        let broker = ApprovalBroker::new("host-rev-1", dir.path().to_path_buf(), presence, keys.clone())
+            .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
+            .with_hold_ceiling(Duration::from_secs(30));
+        broker.set_remote_approval_active(true);
+
+        let now = wall_now_secs();
+        let dummy_hash = input_sha256_hex("Bash", &json!({"command": "ls"}), "/repo").unwrap();
+        let sample_sig = sign_approval_decision_software(
+            &TEST_P256_SECRET,
+            "mob-1",
+            "host-rev-1",
+            "host-rev-1:tkt-1",
+            &dummy_hash,
+            ApprovalDecision::AllowOnce,
+            "nonce-rev-1",
+            now,
+            now + 120,
+        )
+        .unwrap();
+
+        // 1. Unconfigured trust anchor: bypasses immediately AND fails closed in verify_decision.
+        assert_eq!(
+            broker.register_and_wait_in_process(&bash_request("s-rev", "ls"), || false),
+            HookBrokerReply::Bypass {
+                reason: "trust_anchor_unconfigured".into()
+            }
+        );
+        assert_eq!(
+            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            Err(BrokerError::TrustAnchorUnconfigured)
+        );
+
+        // 2. IdentityKey configured WITHOUT a revocation list: MUST fail closed (no NeverIssued fallback!).
+        keys.set_identity_pub_ed25519(ed25519_public_from_secret(&TEST_IDENTITY_SEED));
+        let dev_ed = ed25519_public_from_secret(&[0x22; 32]);
+        let dev_x = x25519_public_from_secret(&[0x33; 32]);
+        let cert = issue_device_certificate(
+            &TEST_IDENTITY_SEED,
+            "mob-1",
+            DeviceKind::Mobile,
+            "Test iPhone",
+            &dev_ed,
+            &dev_x,
+            Some(&test_p256_pub_sec1()),
+            now - 60,
+            now + 7 * 24 * 3600,
+        )
+        .unwrap();
+        assert!(matches!(
+            keys.enroll_device_cert(cert.clone(), now),
+            Err(BrokerError::RevocationListMissingOrStale(_))
+        ));
+        assert!(matches!(
+            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            Err(BrokerError::RevocationListMissingOrStale(_))
+        ));
+        assert_eq!(
+            broker.register_and_wait_in_process(&bash_request("s-rev", "ls"), || false),
+            HookBrokerReply::Bypass {
+                reason: "revocation_list_missing_or_stale".into()
+            }
+        );
+
+        // 3. Install valid list, enroll cert, then let the revocation list expire -> MUST fail closed & bypass.
+        let valid_list =
+            issue_revocation_list(&TEST_IDENTITY_SEED, 1, now - 60, now + 3600, Vec::new()).unwrap();
+        keys.install_revocation_list(valid_list, now).unwrap();
+        keys.enroll_device_cert(cert, now).unwrap();
+
+        let expired_list =
+            issue_revocation_list(&TEST_IDENTITY_SEED, 2, now - 3600, now - 10, Vec::new()).unwrap();
+        keys.seed_revocation_list_for_test(expired_list);
+        assert!(matches!(
+            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            Err(BrokerError::RevocationListMissingOrStale(_))
+        ));
+        assert_eq!(
+            broker.register_and_wait_in_process(&bash_request("s-rev", "ls"), || false),
+            HookBrokerReply::Bypass {
+                reason: "revocation_list_missing_or_stale".into()
+            }
+        );
+    }
+
+    #[test]
+    fn untrusted_repository_bypasses_immediately_even_when_away_and_remote_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let untrusted_repo = dir.path().join("untrusted-repo");
+        std::fs::create_dir_all(untrusted_repo.join(".git")).unwrap();
+
+        let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        configure_test_trust_anchor(&keys);
+
+        // Default `ApprovalBroker::new` uses `RealRepoTrustChecker` (`find_git_root` + `repository_trust::require`).
+        let broker = ApprovalBroker::new("host-trust-1", dir.path().join("mailbox"), presence, keys)
+            .with_hold_ceiling(Duration::from_secs(30));
+        broker.set_remote_approval_active(true);
+
+        let mut req = bash_request("s-untrusted", "rm -rf /tmp/x");
+        req.cwd = untrusted_repo.to_string_lossy().into_owned();
+
+        let t0 = Instant::now();
+        let reply = broker.register_and_wait_in_process(&req, || false);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            reply,
+            HookBrokerReply::Bypass {
+                reason: "untrusted_repository".into()
+            }
+        );
+        assert!(broker.pending_tickets().is_empty());
     }
 }

@@ -495,13 +495,18 @@ mod tests {
 
         let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
         let ledger = Arc::new(HumanIssuanceLedger::new());
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        crate::alerts::approval_broker::configure_test_trust_anchor(&keys);
         let broker = Arc::new(
             ApprovalBroker::new(
                 "host-cp-1",
                 base.join("agent-mailbox"),
                 presence,
-                Arc::new(TrustedApprovalKeyStore::new()),
+                keys,
             )
+            .with_repo_trust_checker(Arc::new(
+                crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
+            ))
             .with_human_ledger(ledger)
             .with_hold_ceiling(Duration::from_secs(30))
             .with_presence_poll_interval(Duration::from_millis(10)),

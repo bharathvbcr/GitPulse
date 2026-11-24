@@ -29,8 +29,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::alerts::approval_broker::{
-    default_socket_path, is_remote_approvable_tool, ApprovalDecision, HookBrokerReply,
-    RegisterApprovalRequest,
+    default_socket_path, is_remote_approvable_tool, is_trusted_repo_cwd, ApprovalDecision,
+    HookBrokerReply, RegisterApprovalRequest,
 };
 
 use super::{HookError, HookInput, HookOutput};
@@ -157,23 +157,42 @@ pub fn build_request(input: &HookInput, wait: Duration) -> Option<RegisterApprov
 }
 
 /// Executes `permission-bridge` against the default `approval-broker.sock`.
-/// Returns `Ok(Some(json))` only for a verified decision, or `Ok(None)` for
-/// immediate bypass (exit `0`, empty stdout).
+/// Returns `Some(json)` only for a verified decision, or `None` for immediate
+/// bypass (exit `0`, empty stdout).
+///
+/// Enforces `find_git_root` + `repository_trust::require` before touching any
+/// socket (Opus A1-8 / #39 P1).
 pub fn run(input: &HookInput) -> Option<String> {
+    if !is_trusted_repo_cwd(&input.cwd) {
+        return None;
+    }
     let wait = wait_limit(std::env::var(WAIT_ENV).ok().as_deref());
     let Some(socket_path) = default_socket_path() else {
         return None;
     };
-    run_against_socket(input, &socket_path, wait)
+    run_against_socket_with_trust_check(input, &socket_path, wait, is_trusted_repo_cwd)
 }
 
-/// Executes `permission-bridge` against an explicit socket path (used by
-/// integration tests). Never blocks or denies when the broker is absent.
+/// Executes `permission-bridge` against an explicit socket path, enforcing
+/// `find_git_root` + `repository_trust::require` before connecting. Never
+/// blocks or denies when the repo is untrusted or the broker is absent.
 pub fn run_against_socket(
     input: &HookInput,
     socket_path: &Path,
     wait: Duration,
 ) -> Option<String> {
+    run_against_socket_with_trust_check(input, socket_path, wait, is_trusted_repo_cwd)
+}
+
+fn run_against_socket_with_trust_check(
+    input: &HookInput,
+    socket_path: &Path,
+    wait: Duration,
+    trust_check: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if !trust_check(&input.cwd) {
+        return None;
+    }
     let request = build_request(input, wait)?;
     #[cfg(unix)]
     {
@@ -326,13 +345,18 @@ mod tests {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let sock = base.join(SOCKET_NAME);
         let presence = Arc::new(MockPresenceProvider::new(UserPresence::Present));
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        crate::alerts::approval_broker::configure_test_trust_anchor(&keys);
         let broker = Arc::new(
             ApprovalBroker::new(
                 "host-pb-1",
                 base.join("agent-mailbox"),
                 presence.clone(),
-                Arc::new(TrustedApprovalKeyStore::new()),
+                keys,
             )
+            .with_repo_trust_checker(Arc::new(
+                crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
+            ))
             .with_hold_ceiling(Duration::from_secs(30))
             .with_presence_poll_interval(Duration::from_millis(10)),
         );
@@ -343,7 +367,7 @@ mod tests {
         let input = sample_bash_input();
         // User present -> immediate bypass (empty stdout).
         assert_eq!(
-            run_against_socket(&input, &sock, Duration::from_secs(5)),
+            run_against_socket_with_trust_check(&input, &sock, Duration::from_secs(5), |_| true),
             None
         );
 
@@ -352,7 +376,9 @@ mod tests {
         let sock_bg = sock.clone();
         let input_bg = input.clone();
         let handle = std::thread::spawn(move || {
-            run_against_socket(&input_bg, &sock_bg, Duration::from_secs(5))
+            run_against_socket_with_trust_check(&input_bg, &sock_bg, Duration::from_secs(5), |_| {
+                true
+            })
         });
 
         assert!(crate::test_support::wait_until(
@@ -376,11 +402,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn untrusted_repository_bypasses_immediately_without_contacting_broker() {
+        let dir = tempfile::Builder::new().prefix("gp-pb-ut-").tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let untrusted_repo = base.join("untrusted-repo");
+        std::fs::create_dir_all(untrusted_repo.join(".git")).unwrap();
+        let sock = base.join(SOCKET_NAME);
+
+        let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
+        let keys = Arc::new(TrustedApprovalKeyStore::new());
+        crate::alerts::approval_broker::configure_test_trust_anchor(&keys);
+        // Even if the broker itself had a permissive checker, `run_against_socket` MUST
+        // bypass locally via real `repository_trust::require` before touching the socket.
+        let broker = Arc::new(
+            ApprovalBroker::new(
+                "host-pb-ut",
+                base.join("agent-mailbox"),
+                presence,
+                keys,
+            )
+            .with_repo_trust_checker(Arc::new(
+                crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
+            ))
+            .with_hold_ceiling(Duration::from_secs(30)),
+        );
+        broker.set_remote_approval_active(true);
+        let _server = ApprovalBrokerServer::bind_and_start(sock.clone(), broker.clone())
+            .expect("bind approval broker");
+
+        let mut input = sample_bash_input();
+        input.cwd = untrusted_repo.to_string_lossy().into_owned();
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(run_against_socket(&input, &sock, Duration::from_secs(5)), None);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(broker.pending_tickets().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_broker_socket_bypasses_cleanly_with_empty_stdout() {
         let dir = tempfile::Builder::new().prefix("gp-pb-none-").tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.sock");
         assert_eq!(
-            run_against_socket(&sample_bash_input(), &missing, Duration::from_secs(1)),
+            run_against_socket_with_trust_check(
+                &sample_bash_input(),
+                &missing,
+                Duration::from_secs(1),
+                |_| true
+            ),
             None
         );
     }
