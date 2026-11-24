@@ -135,39 +135,6 @@ export function fastestCpuOf(samples: number, body: () => void): number {
 }
 
 /**
- * CPU time is only as fine as the OS accounts it. Windows charges it in
- * scheduler ticks of 15.625 ms (`GetProcessTimes`), so a 60 ms sample reads
- * anywhere from 47 to 62 ms, and the minimum of seven such readings is biased
- * low by up to a quarter. A ratio against a larger input, which is quantised
- * far less, then reads high: a linear pass measured 5.8 for a 4x input there.
- */
-export const CPU_TIMER_MIN_SAMPLE_MS = 250;
-
-/**
- * CPU milliseconds per call of `body`, for the fastest of `samples` batches.
- *
- * Like `fastestCpuOf`, but each sample runs `body` enough times to span at least
- * `minSampleMs` of work (sized from one probe call, which also warms the code),
- * so the OS's CPU-time granularity is a few percent of the reading rather than
- * a quarter of it, and the same at every input size. Returns the per-call
- * average of the least disturbed batch.
- */
-export function fastestCpuPerCall(samples: number, body: () => void, minSampleMs = CPU_TIMER_MIN_SAMPLE_MS): number {
-  const probeStart = performance.now();
-  body();
-  const probeMs = Math.max(performance.now() - probeStart, 0.05);
-  const batch = Math.max(1, Math.ceil(minSampleMs / probeMs));
-  let best = Number.POSITIVE_INFINITY;
-  for (let sample = 0; sample < samples; sample += 1) {
-    const before = process.cpuUsage();
-    for (let call = 0; call < batch; call += 1) body();
-    const spent = process.cpuUsage(before);
-    best = Math.min(best, (spent.user + spent.system) / 1000 / batch);
-  }
-  return best;
-}
-
-/**
  * Timeout for stress and fuzz cases whose assertions are invariants, not speed.
  *
  * Vitest's 5s default is an infrastructure limit, not a guard: these cases
