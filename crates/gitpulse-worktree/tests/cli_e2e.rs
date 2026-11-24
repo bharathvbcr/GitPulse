@@ -848,7 +848,10 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
         ],
     );
     assert_eq!(merged["ok"], true);
-    assert_eq!(merged["worktree_removed"], true);
+    assert_eq!(
+        merged["worktree_removed"], true,
+        "merge kept the worktree: {merged}"
+    );
     assert!(!wt_a_target.exists(), "merged worktree must be removed");
     assert!(
         fs::read_to_string(anchor.join("packages/app/main.rs"))
@@ -1089,7 +1092,10 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
             "main",
         ],
     );
-    assert_eq!(merged["worktree_removed"], true);
+    assert_eq!(
+        merged["worktree_removed"], true,
+        "merge kept the worktree: {merged}"
+    );
 
     let post_merge_status = run_cli_json_ok(home.path(), &["status", "--repo", anchor_str]);
     let remaining_agents: Vec<&str> = post_merge_status["active_lanes"]

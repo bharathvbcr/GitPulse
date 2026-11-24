@@ -72,11 +72,15 @@ fn leftovers(dir: &Path) -> usize {
 #[test]
 fn adv2_one_huge_file_is_rechecked_only_after_it_is_fully_written() {
     use std::sync::atomic::AtomicUsize;
+    // 200 MiB against the real 64 MiB interval, scaled to a 1 MiB one: the
+    // sparse source is free, the 64 MiB the copy wrote before stopping was not.
+    const EVERY: u64 = 1 << 20;
+    const HUGE: u64 = 200 * EVERY / 64;
     let parent = tempdir().unwrap();
     let src = parent.path().join("src");
     fs::create_dir_all(&src).unwrap();
     let f = fs::File::create(src.join("huge")).unwrap();
-    f.set_len(200 << 20).unwrap();
+    f.set_len(HUGE).unwrap();
     drop(f);
     let calls = AtomicUsize::new(0);
     let written_at_stop = std::sync::atomic::AtomicU64::new(0);
@@ -92,23 +96,25 @@ fn adv2_one_huge_file_is_rechecked_only_after_it_is_fully_written() {
         written_at_stop.store(written, Ordering::SeqCst);
         Reading::Value(0)
     };
-    let r = with_forced_byte_copy(|| {
-        copy_dir_rechecked(
-            &src,
-            &parent.path().join("dst"),
-            CowCaps::DEFAULT,
-            CopyRules::default(),
-            Some(&recheck),
-        )
+    let r = with_recheck_every(EVERY, || {
+        with_forced_byte_copy(|| {
+            copy_dir_rechecked(
+                &src,
+                &parent.path().join("dst"),
+                CowCaps::DEFAULT,
+                CopyRules::default(),
+                Some(&recheck),
+            )
+        })
     });
     assert!(matches!(r, Err(CopyStop::BelowFloor { free: 0 })), "{r:?}");
     // Re-pointed (round 2, item 4): the check runs between chunks, so the
-    // copy stops mid-file, not after all 200 MiB are written.
+    // copy stops mid-file, not after the whole file is written.
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let at_stop = written_at_stop.load(Ordering::SeqCst);
     assert!(
-        at_stop > 0 && at_stop < (200 << 20),
-        "stopped after {at_stop} bytes of 200 MiB"
+        at_stop > 0 && at_stop < HUGE,
+        "stopped after {at_stop} bytes of {HUGE}"
     );
     assert_eq!(leftovers(parent.path()), 0);
 }
@@ -132,41 +138,35 @@ fn adv2_unreadable_recheck_continues_silently() {
     let worktree = linked.into_iter().next().unwrap();
     let anchor = main.path().canonicalize().unwrap();
     fs::create_dir_all(anchor.join("node_modules")).unwrap();
-    // Sparse sources, and only as much as reaches one re-check: the first
-    // file crosses `RECHECK_EVERY_BYTES` (read again between its chunks), the
-    // second is copied after the unreadable reading. Three dense 70 MiB files
-    // wrote 420 MiB here, which on Linux all counts against the suite's
-    // disk-write budget.
-    let sizes = [
-        crate::engine::cow_clone::RECHECK_EVERY_BYTES + (1 << 20),
-        1 << 20,
-    ];
-    for (i, size) in sizes.iter().enumerate() {
-        fs::File::create(anchor.join(format!("node_modules/f{i}")))
-            .unwrap()
-            .set_len(*size)
-            .unwrap();
-    }
+    // One byte past one re-check interval is the least that reaches a
+    // mid-copy re-check (call 0 is the up-front reading). Three 70 MiB files
+    // at the real 64 MiB interval reached the same one and wrote 420 MiB.
+    const EVERY: u64 = 1 << 20;
+    fs::write(
+        anchor.join("node_modules/f0"),
+        vec![1u8; EVERY as usize + 1],
+    )
+    .unwrap();
     let selection = CacheSelection {
         free_space: readable_once,
         ..CacheSelection::default()
     };
-    let report =
-        with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &selection)).unwrap();
+    let report = with_recheck_every(EVERY, || {
+        with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &selection))
+    })
+    .unwrap();
     assert_eq!(report.copied.len(), 1, "{report:?}");
     assert!(report.low_disk.is_none());
     assert!(report.disk_unknown, "an unreadable re-check was not noted");
     assert!(
         CALLS.load(Ordering::SeqCst) >= 2,
-        "the copy was never read again mid-way"
+        "the copy never re-checked mid-copy"
     );
-    for (i, size) in sizes.iter().enumerate() {
-        assert_eq!(
-            fs::metadata(worktree.join(format!("node_modules/f{i}")))
-                .map(|meta| meta.len())
-                .ok(),
-            Some(*size),
-            "f{i} was not copied whole after the unreadable re-check"
-        );
-    }
+    assert_eq!(
+        fs::metadata(worktree.join("node_modules/f0"))
+            .map(|meta| meta.len())
+            .ok(),
+        Some(EVERY + 1),
+        "f0 was not copied whole after the unreadable re-check"
+    );
 }

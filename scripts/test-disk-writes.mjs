@@ -8,12 +8,14 @@
  * alone, `--exact`, makes the process total the test's own bytes. The counter is
  * read by the test binary itself at exit (`src-tauri/src/test_support/env.rs`,
  * `diskio`): `ri_diskio_byteswritten` from `proc_pid_rusage` on macOS,
- * `write_bytes` from `/proc/self/io` on Linux. This script only sets
+ * `ru_oublock` from `getrusage(RUSAGE_SELF)` on Linux. This script only sets
  * `GITPULSE_TEST_DISKIO_REPORT` and reads the lines back.
  *
  * What it cannot see: a test whose writes depend on state an earlier test left
  * behind. The in-process watchdog in the same module covers that (it aborts a
- * run that averages more than 80 MiB/s over 30 s, or writes more than 8 GiB).
+ * run that averages more than 160 MiB/s over 30 s, or writes more than 8 GiB).
+ * That 8 GiB covers the whole lib suite in one process, so it is the sum of
+ * these per-test figures that must stay under it, not only the largest.
  *
  * Usage: node scripts/test-disk-writes.mjs [--budget-mib N] [--jobs N] [--top N] [--filter TEXT]
  *   --budget-mib  per-test budget; a test writing more fails the run (default 256)
