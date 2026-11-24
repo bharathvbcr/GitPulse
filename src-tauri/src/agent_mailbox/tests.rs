@@ -825,7 +825,7 @@ fn mark_claimed_by_id_and_hop_filter_preserve_exact_delivery_invariants() {
 }
 
 #[test]
-fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_stays_pending() {
+fn a_waiter_claims_through_its_filter_so_a_hop_limited_message_stays_pending() {
     let (_dir, mailbox) = mailbox();
     let now = SystemTime::now();
     let peer = |id: &str, hop: u32| EnvelopeProvenance::PeerAgent {
@@ -839,8 +839,8 @@ fn a_waiter_claims_through_the_filter_it_peeked_with_so_a_hop_limited_message_st
         truncated_in_bus: false,
         repo_root: "/tmp/repo".into(),
     };
-    // The oldest envelope has lost its sidecar, so the peek lets it through and the claim
-    // drops it; the next one is a peer message at its hop limit.
+    // The oldest envelope has lost its sidecar, so the claim drops it (an unreadable origin is
+    // not a refusal); the next one is a peer message at its hop limit.
     mailbox
         .deposit_with_provenance(SESSION, "lost-2", "no provenance", peer("lost-2", 1), now)
         .unwrap();
@@ -1313,4 +1313,222 @@ fn a_claimed_overflow_notice_is_reissued_by_the_next_overflow() {
             .any(|c| c.claim.text.contains("gitpulse_agent_inbox")),
         "the recipient was never told about the second overflow"
     );
+}
+
+fn hop_filter(prov: &EnvelopeProvenance) -> bool {
+    !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
+}
+
+#[test]
+fn two_waiters_on_one_session_leave_a_hop_limited_peer_message_pending_and_split_the_rest() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    // The acceptable message is the older one, so both waiters can reach it; the hop-limited
+    // one behind it must survive whichever waiter wins.
+    mailbox
+        .deposit(SESSION, "fine", "an acceptable message", now)
+        .unwrap();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes: Vec<EnvelopeWait> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    mailbox
+                        .wait_in_pool_filtered(
+                            SESSION,
+                            Duration::from_secs(3),
+                            WaitPool::Hosted,
+                            hop_filter,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let delivered: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            EnvelopeWait::Message(env) => Some(env.claim.request_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["fine"], "outcomes: {outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, EnvelopeWait::Declined(_))),
+        "the other waiter is told the hop-limited message is paused: {outcomes:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    assert_eq!(mailbox.status(SESSION, "fine"), Delivery::Claimed);
+}
+
+// Needs a real lock: `AdvisoryLock` takes none off Unix.
+#[cfg(unix)]
+#[test]
+fn pruning_skips_a_session_whose_lock_is_held_and_still_expires_the_others() {
+    let (_dir, mailbox) = mailbox();
+    let busy = SESSION;
+    let idle = session_n(5);
+    let third = session_n(7);
+    let now = SystemTime::now();
+    mailbox.deposit(busy, "reused", "first life", now).unwrap();
+    mailbox.deposit(&idle, "idle", "never taken", now).unwrap();
+    let late = now + PENDING_TTL + Duration::from_secs(60);
+    // A deposit of the same request id holds the busy session's lock while it publishes.
+    let held = mailbox.lock_session(&session_key(busy).unwrap()).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let finished = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            mailbox.ensure_session(&third, late).unwrap();
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        // Releasing the lock lets a prune that blocked on it finish, so the scope can join.
+        drop(held);
+        finished
+    });
+    assert!(finished, "pruning blocked on a session whose lock was held");
+    assert_eq!(
+        mailbox.status(busy, "reused"),
+        Delivery::Pending,
+        "pruning removed an expired message from a session it could not lock"
+    );
+    let key = session_key(busy).unwrap();
+    assert!(
+        mailbox.read_provenance(&key, "reused").is_ok(),
+        "pruning removed the sidecar of a session it could not lock"
+    );
+    assert_eq!(mailbox.status(&idle, "idle"), Delivery::Absent);
+}
+
+#[test]
+fn a_claimed_file_keeps_its_window_from_the_claim_and_a_retry_does_not_redeliver() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "slow", "pending for a long time", now)
+        .unwrap();
+    // Claimed with a minute of its pending window left.
+    let claimed_at = now + PENDING_TTL - Duration::from_secs(60);
+    let taken = mailbox.claim_next(SESSION, claimed_at).unwrap();
+    assert!(taken.is_some());
+    // Almost the whole claimed window later the claimed file is still there.
+    let retry_at = claimed_at + CLAIMED_TTL - Duration::from_secs(60);
+    assert_eq!(
+        mailbox
+            .deposit(SESSION, "slow", "pending for a long time", retry_at)
+            .map(|d| d.duplicate),
+        Ok(true),
+        "the retry was not recognised as a duplicate of the claimed message"
+    );
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Claimed);
+    assert_eq!(
+        mailbox.claim_next(SESSION, retry_at).unwrap(),
+        None,
+        "a retried request id was delivered a second time"
+    );
+    // And it is forgotten once the window counted from the claim has passed.
+    let after = claimed_at + CLAIMED_TTL + Duration::from_secs(60);
+    assert_eq!(mailbox.claim_next(SESSION, after).unwrap(), None);
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Absent);
+}
+#[test]
+fn a_waiter_looks_past_a_hop_limited_envelope_and_returns_the_first_acceptable_one() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now,
+        )
+        .unwrap();
+    mailbox
+        .deposit(
+            SESSION,
+            "human",
+            "a person's message",
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_secs(2),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, EnvelopeWait::Message(env) if env.claim.request_id == "human"),
+        "the waiter was held up by the hop-limited envelope ahead of it: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    // With nothing acceptable left, the waiter waits out its limit and then reports the
+    // refused envelope as paused.
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_millis(300),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(matches!(outcome, EnvelopeWait::Declined(_)), "{outcome:?}");
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+}
+
+#[test]
+fn a_waiter_keeps_waiting_while_only_refused_envelopes_are_pending() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now,
+        )
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let outcome = mailbox.wait_in_pool_filtered(
+                SESSION,
+                Duration::from_secs(20),
+                WaitPool::Hosted,
+                hop_filter,
+            );
+            let _ = tx.send(outcome);
+        });
+        // Give the waiter time to poll with only the refused envelope pending.
+        std::thread::sleep(Duration::from_millis(200));
+        mailbox
+            .deposit(SESSION, "human", "a person's message", SystemTime::now())
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(15))
+    });
+    let outcome = outcome
+        .expect("the waiter did not return")
+        .expect("the wait failed");
+    assert!(
+        matches!(&outcome, EnvelopeWait::Message(env) if env.claim.request_id == "human"),
+        "the waiter left instead of waiting for an acceptable envelope: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
 }
