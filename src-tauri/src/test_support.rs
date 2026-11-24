@@ -1350,6 +1350,21 @@ mod diskio_guard {
         );
     }
 
+    /// The running total is printed once per 512 MiB passed, at the multiple
+    /// reached, and never for a sample that passed none.
+    #[test]
+    fn milestones_are_printed_once_per_multiple_passed() {
+        let step = diskio::MILESTONE_EVERY;
+        assert_eq!(diskio::milestone_passed(0, step - 1), None);
+        assert_eq!(diskio::milestone_passed(0, step), Some(step));
+        assert_eq!(diskio::milestone_passed(step, step + MIB), None);
+        assert_eq!(
+            diskio::milestone_passed(step + MIB, 3 * step + 1),
+            Some(3 * step)
+        );
+        assert_eq!(diskio::milestone_passed(3 * step, 2 * step), None);
+    }
+
     /// Runs only as the child of the test below: writes until something stops it.
     #[test]
     #[ignore = "child of a_runaway_writer_is_aborted_by_the_watchdog"]

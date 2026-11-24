@@ -10,6 +10,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   BudgetExhausted,
   PLATFORM_INSTALLERS,
+  bundleArgs,
   bundleSpecs,
   checkSevenZipListing,
   createBudget,
@@ -195,6 +196,97 @@ describe("installer manifest follows the release matrix", () => {
     expect(arm).toHaveLength(2);
     expect(legs).toEqual(arm);
     expect(job).toContain("node scripts/check-release-assets.mjs --bundles");
+  });
+
+  it("passes each runner's bundle args to tauri build, in release.yml and in ci.yml's arm-bundle job", () => {
+    // The targets bundled and the names this manifest expects come from one
+    // rule (bundleArgs): a workflow that bundled all targets for a beta would
+    // fail on the rpm, and one that dropped the args would never reach it.
+    const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+    const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+    const jobs = [
+      release.slice(release.indexOf("\n  release:"), release.indexOf("\n  attest:")),
+      ci.slice(ci.indexOf("\n  arm-bundle:"), ci.indexOf("\n  gusset:")),
+    ];
+    for (const job of jobs) {
+      const step = job.indexOf("id: bundle_args");
+      const build = job.indexOf("uses: tauri-apps/tauri-action@");
+      expect(step).toBeGreaterThan(0);
+      expect(build).toBeGreaterThan(step);
+      expect(job).toContain('node scripts/check-release-assets.mjs --bundle-args "$PLATFORM"');
+      expect(job).toContain("PLATFORM: ${{ matrix.platform }}");
+      expect(job.slice(build)).toMatch(/args: [^\n]*\$\{\{ steps\.bundle_args\.outputs\.args \}\} -- --locked/);
+    }
+  });
+});
+
+describe("a beta ships no rpm", () => {
+  // RPM forbids `-` in a version and Tauri has no rpm-only version setting, so
+  // the bundler cannot build an rpm for X.Y.Z-beta.N (CI's ARM Bundle failed
+  // with `invalid version "0.2.0-beta.1": contains invalid character`).
+  const beta = "0.2.0-beta.1";
+  const rpms = (names: string[]) => names.filter((name) => name.endsWith(".rpm"));
+
+  it("expects ten installers and no rpm for a beta, twelve with both rpms for a stable release", () => {
+    expect(expectedInstallerNames(beta)).toHaveLength(10);
+    expect(rpms(expectedInstallerNames(beta))).toEqual([]);
+    expect(expectedInstallerNames("0.2.0")).toHaveLength(12);
+    expect(rpms(expectedInstallerNames("0.2.0"))).toEqual(["GitPulse-0.2.0-1.aarch64.rpm", "GitPulse-0.2.0-1.x86_64.rpm"]);
+    // Only the rpms differ: every other installer is the same set by name.
+    const stableWithoutRpm = expectedInstallerNames("0.2.0").filter((name) => !name.endsWith(".rpm"));
+    expect(expectedInstallerNames(beta)).toEqual(stableWithoutRpm.map((name) => name.replace("0.2.0", beta)).sort());
+  });
+
+  it("accepts a beta's Linux deb and AppImage alone, and refuses an rpm the bundler should not have made", () => {
+    const linux = [`/b/deb/GitPulse_${beta}_arm64.deb`, `/b/appimage/GitPulse_${beta}_aarch64.AppImage`];
+    expect(inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: linux }).ok).toBe(true);
+    const withRpm = inspectBundles({ platform: "ubuntu-22.04-arm", version: beta, paths: [...linux, `/b/rpm/GitPulse-${beta}-1.aarch64.rpm`] });
+    expect(withRpm.ok).toBe(false);
+    expect(withRpm.violations).toEqual([`unexpected: GitPulse-${beta}-1.aarch64.rpm`]);
+  });
+
+  it("verifies a complete beta draft without rpms, and still requires both rpms of a stable one", () => {
+    // Built from the stable set minus its rpms, not from the manifest under
+    // test, so a manifest that still wanted rpms for a beta fails here.
+    const betaDraft = expectedAssetNames("0.2.0").filter((name) => !name.endsWith(".rpm")).map((name) => name.replace("0.2.0", beta));
+    expect(betaDraft).toHaveLength(13);
+    expect(inspectReleaseAssets({ tag: `v${beta}`, json: payload(beta, betaDraft) })).toMatchObject({ ok: true, violations: [] });
+    const stable = expectedAssetNames("0.2.0").filter((name) => !name.endsWith(".rpm"));
+    const result = inspectReleaseAssets({ tag: "v0.2.0", json: payload("0.2.0", stable) });
+    expect(result.ok).toBe(false);
+    expect(result.violations.sort()).toEqual(["missing: GitPulse-0.2.0-1.aarch64.rpm", "missing: GitPulse-0.2.0-1.x86_64.rpm"]);
+  });
+
+  it("bundles a beta's Linux legs as deb and AppImage only, and leaves every other leg and every stable release to the config's targets", () => {
+    for (const platform of ["ubuntu-22.04", "ubuntu-22.04-arm"]) {
+      expect(bundleArgs(platform, beta)).toEqual(["--bundles", "deb,appimage"]);
+      expect(bundleArgs(platform, "0.2.0")).toEqual([]);
+      // The formats selected are exactly the ones the manifest expects.
+      const formats = PLATFORM_INSTALLERS[platform](beta).map((name) => name.slice(name.lastIndexOf(".") + 1).toLowerCase()).sort();
+      expect(formats).toEqual(bundleArgs(platform, beta)[1].split(",").sort());
+    }
+    for (const platform of ["macos-latest", "windows-latest", "windows-11-arm"]) {
+      expect(bundleArgs(platform, beta)).toEqual([]);
+    }
+    expect(() => bundleArgs("solaris", beta)).toThrow(/unknown release platform/);
+  });
+
+  it("opens the same seven installers for a beta and says no rpm was expected", () => {
+    expect(bundleSpecs(beta).map((spec) => spec.asset.replace(beta, "1.2.3")).sort())
+      .toEqual(bundleSpecs("1.2.3").map((spec) => spec.asset).sort());
+    const result = inspectBundleContents({ version: beta, binaries: BINS, files: {} });
+    expect(result.coverage).toBe("opened 0 of 10 installers; AppImage and dmg are not opened");
+  });
+
+  it("prints a runner's bundle args at tauri.conf.json's version from the CLI", async () => {
+    const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8")) as { version: string };
+    for (const platform of ["ubuntu-22.04-arm", "windows-11-arm"]) {
+      const printed = await execFileAsync(process.execPath, [scriptPath, "--bundle-args", platform]);
+      expect(printed.stdout).toBe(`${bundleArgs(platform, config.version).join(" ")}\n`);
+    }
+    await expect(execFileAsync(process.execPath, [scriptPath, "--bundle-args", "solaris"])).rejects.toMatchObject({ code: 2 });
+    await expect(execFileAsync(process.execPath, [scriptPath, "--bundle-args", "ubuntu-22.04", "--tag", "v1.0.0"]))
+      .rejects.toMatchObject({ code: 2 });
   });
 });
 

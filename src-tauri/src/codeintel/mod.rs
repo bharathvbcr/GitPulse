@@ -3952,6 +3952,19 @@ pub(crate) mod tests {
     /// process and each fixture gets a clone of that file (`fs::copy` clones on
     /// APFS, and is a plain copy elsewhere; neither re-runs the migrations).
     fn install_empty_fixture_store(repo: &Path) {
+        close_fixture_store(open_empty_fixture_store(repo));
+    }
+
+    /// [`install_empty_fixture_store`], left open for more fixture rows and
+    /// with the journal off: close it with [`close_fixture_store`].
+    ///
+    /// The clone is a WAL store, and in WAL every commit writes its pages twice,
+    /// once as frames and again at the checkpoint: one transaction of a seeded
+    /// file's rows wrote about 620 KiB. The copy has just dirtied every page of
+    /// the file, so with the journal off those pages are rewritten in the page
+    /// cache before they reach the disk and only pages the rows add are new.
+    /// A fixture needs no crash safety.
+    fn open_empty_fixture_store(repo: &Path) -> rusqlite::Connection {
         static TEMPLATE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         let template = TEMPLATE.get_or_init(|| {
             let dir = crate::test_support::env::hermetic::root().join("devmap-store-template");
@@ -3972,10 +3985,18 @@ pub(crate) mod tests {
         let db = map_path(repo);
         std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir codeintel");
         std::fs::copy(template, &db).expect("clone the template store");
+        let conn = rusqlite::Connection::open(&db).expect("open the cloned store");
+        // No fsync either: a sync cleans the pages, and the next write to one
+        // is counted as a fresh block.
+        conn.pragma_update(None, "synchronous", "OFF")
+            .expect("turn the fixture's syncs off");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = OFF", [], |row| row.get(0))
+            .expect("turn the fixture's journal off");
+        assert_eq!(mode, "off");
         // `pending_state.epoch` is the store's identity, minted by `randomblob`
         // when the schema is created: a clone must not share its template's, or
         // two fixtures would acknowledge each other's claims. Same minting.
-        let conn = rusqlite::Connection::open(&db).expect("open the cloned store");
         let changed = conn
             .execute(
                 "UPDATE pending_state SET epoch = lower(hex(randomblob(16))) WHERE singleton = 1",
@@ -3983,6 +4004,16 @@ pub(crate) mod tests {
             )
             .expect("give the clone its own identity");
         assert_eq!(changed, 1, "the template store has one identity row");
+        conn
+    }
+
+    /// Puts a fixture store back in WAL, the mode the real store keeps, and
+    /// closes it.
+    fn close_fixture_store(conn: rusqlite::Connection) {
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .expect("put the fixture back in WAL");
+        assert_eq!(mode, "wal");
         conn.close().expect("close the cloned store");
     }
 
@@ -4082,8 +4113,8 @@ pub(crate) mod tests {
         };
         let line_start = |line: u32| line_starts[(line - 1) as usize];
 
-        install_empty_fixture_store(repo);
-        let conn = rusqlite::Connection::open(map_path(repo)).expect("open fixture db");
+        let mut db = open_empty_fixture_store(repo);
+        let conn = db.transaction().expect("begin fixture rows");
         conn.execute("INSERT INTO paths (id, path) VALUES (1, ?1)", [file])
             .expect("insert path");
         conn.execute(
@@ -4139,7 +4170,8 @@ pub(crate) mod tests {
             (head_sha, symbols.len() as i64),
         )
         .expect("insert build history");
-        conn.close().expect("close fixture db");
+        conn.commit().expect("commit fixture rows");
+        close_fixture_store(db);
     }
 
     /// Depth and confidence reach the affected-tests walk: the test file is two

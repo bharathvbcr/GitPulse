@@ -322,8 +322,9 @@ fn copy_bounded(
     let permissions = input.metadata().map_err(fail)?.permissions();
     let mut output = fs::File::create_new(dst).map_err(fail)?;
     let mut left = limit;
+    let every = recheck_every_bytes();
     while left > 0 {
-        let chunk = left.min(RECHECK_EVERY_BYTES);
+        let chunk = left.min(every);
         let copied = std::io::copy(&mut (&mut input).take(chunk), &mut output).map_err(fail)?;
         if copied < chunk {
             break;
@@ -696,6 +697,34 @@ fn discard_staging(staging: &Path, error: String) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECHECK_INTERVAL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bytes a byte-copy writes between free-space readings:
+/// [`RECHECK_EVERY_BYTES`], or what a test on this thread set.
+fn recheck_every_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = RECHECK_INTERVAL.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    RECHECK_EVERY_BYTES
+}
+
+/// Runs `body` with free space re-read every `bytes` instead of every
+/// [`RECHECK_EVERY_BYTES`], so a test reaches a mid-copy re-check without
+/// writing 64 MiB (four such tests wrote 390 MiB of the suite's disk-write
+/// budget).
+#[cfg(test)]
+pub(crate) fn with_recheck_every<T>(bytes: u64, body: impl FnOnce() -> T) -> T {
+    let _restore = std::mem::DropGuard::new(
+        RECHECK_INTERVAL.with(|cell| cell.replace(Some(bytes))),
+        |prev| RECHECK_INTERVAL.with(|cell| cell.set(prev)),
+    );
+    body()
+}
+
 /// Why a tree that must be cloned was not copied.
 const NOT_CLONED: &str = "this filesystem could not clone it, and a build directory is never byte-copied, so it was skipped";
 
@@ -998,12 +1027,13 @@ fn walk_copy(
                     })?;
                     // A file past the interval was checked between its
                     // chunks; a small one adds to the run since the last check.
-                    since_check = if cost >= RECHECK_EVERY_BYTES {
+                    let every = recheck_every_bytes();
+                    since_check = if cost >= every {
                         0
                     } else {
                         since_check.saturating_add(cost)
                     };
-                    if since_check >= RECHECK_EVERY_BYTES {
+                    if since_check >= every {
                         since_check = 0;
                         recheck_floor(recheck)?;
                     }
@@ -3149,15 +3179,21 @@ mod tests {
                 Reading::Value(0)
             }
         }
+        // Seventy files of a sixty-fourth of the interval each: the run of
+        // small files reaches a re-check before the last of them, as seventy
+        // 1 MiB files did at the real 64 MiB interval.
+        const EVERY: u64 = 1 << 20;
         let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
         fs::create_dir_all(anchor.join("node_modules/p")).unwrap();
-        let mib = vec![b'x'; 1 << 20];
+        let part = vec![b'x'; (EVERY / 64) as usize];
         for i in 0..70 {
-            fs::write(anchor.join(format!("node_modules/p/f{i}")), &mib).unwrap();
+            fs::write(anchor.join(format!("node_modules/p/f{i}")), &part).unwrap();
         }
-        let report = with_forced_byte_copy(|| {
-            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        let report = with_recheck_every(EVERY, || {
+            with_forced_byte_copy(|| {
+                clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+            })
         })
         .unwrap();
         assert!(
@@ -3287,16 +3323,18 @@ mod tests {
         assert_eq!(other.bytes, 1000);
     }
 
-    /// Sparse source, so the source tree is cheap: the destination is not.
+    /// Sparse source, so the source tree is cheap: the destination is not,
+    /// so the interval is 1 MiB rather than 64.
     #[test]
     fn a_huge_file_is_rechecked_between_chunks() {
         use std::sync::atomic::AtomicU64;
+        const EVERY: u64 = 1 << 20;
         let parent = tempdir().unwrap();
         let src = parent.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::File::create(src.join("huge"))
             .unwrap()
-            .set_len(3 * RECHECK_EVERY_BYTES)
+            .set_len(3 * EVERY)
             .unwrap();
         let dst = parent.path().join("dst");
         let seen = AtomicU64::new(0);
@@ -3311,21 +3349,23 @@ mod tests {
             seen.store(written, Ordering::SeqCst);
             Reading::Value(0)
         };
-        let r = with_forced_byte_copy(|| {
-            copy_dir_rechecked(
-                &src,
-                &dst,
-                CowCaps::DEFAULT,
-                CopyRules::default(),
-                Some(&recheck),
-            )
+        let r = with_recheck_every(EVERY, || {
+            with_forced_byte_copy(|| {
+                copy_dir_rechecked(
+                    &src,
+                    &dst,
+                    CowCaps::DEFAULT,
+                    CopyRules::default(),
+                    Some(&recheck),
+                )
+            })
         });
         assert!(matches!(r, Err(CopyStop::BelowFloor { free: 0 })), "{r:?}");
         let at_stop = seen.load(Ordering::SeqCst);
         assert!(
-            at_stop > 0 && at_stop < 3 * RECHECK_EVERY_BYTES,
+            at_stop > 0 && at_stop < 3 * EVERY,
             "stopped after {at_stop} of {} bytes",
-            3 * RECHECK_EVERY_BYTES
+            3 * EVERY
         );
         assert!(!dst.exists());
         assert!(staging_leftovers(parent.path()).is_empty());
