@@ -9,6 +9,7 @@
 
 use crate::procguard::LockedSpawn;
 pub(crate) mod env;
+pub(crate) mod fsmonitor;
 
 /// Writes an executable stand-in for `gitpulse-hook` at `path` that answers
 /// `--version` the way a build with lease mode does, for tests of the
@@ -497,6 +498,9 @@ mod pin_adversary_tests;
 
 #[cfg(test)]
 mod config_value_tests;
+
+#[cfg(test)]
+mod fsmonitor_tests;
 
 #[cfg(test)]
 mod fs_time_tests;
