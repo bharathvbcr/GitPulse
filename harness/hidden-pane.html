@@ -94,6 +94,8 @@
   const panel = () => $("[data-sidebar-panel]");
   const rail = () => $("[data-sidebar-rail-slot]");
   const dock = () => $("[data-terminal-dock]");
+  // The dock's surface slides as an inner sheet; the row above holds its height.
+  const sheet = () => dock()?.querySelector("[data-dock-sheet]");
   const dockShown = () => !!dock() && getComputedStyle(dock()).display !== "none";
   const scroller = () => {
     let el = $("[data-row]");
@@ -331,7 +333,7 @@
     // The slide-in runs 320 ms; geometry is read once it has landed.
     // The spring overshoots, so crossing the final position is not landing:
     // wait for the animation itself to finish.
-    await until(() => dock().getAnimations().every((animation) => animation.playState === "finished"), "the dock's slide-in finishes");
+    await until(() => dock().getAnimations({ subtree: true }).every((animation) => animation.playState === "finished"), "the dock's slide-in finishes");
     await settle();
     check("an overlay dock floats over the pane's bottom edge", () => {
       const d = dock().getBoundingClientRect(), p = pane().getBoundingClientRect();
@@ -340,10 +342,10 @@
       return ok;
     });
     check("it does not shrink the list under it, which still draws full rows", () => Math.abs(scroller().clientHeight - listHeight) < 2 && full());
-    check("it rises with the slide-in phase", () => dock().dataset.phase === "slide-in");
+    check("it rises with the slide-in phase", () => sheet()?.dataset.phase === "slide-in");
     host.setDockOpen(false);
     await tick();
-    check("it is held for its exit with the slide-out phase", () => dock().dataset.phase === "slide-out" && dockShown());
+    check("it is held for its exit with the slide-out phase", () => sheet()?.dataset.phase === "slide-out" && dockShown());
     await until(() => !dockShown(), "overlay dock hides after its exit");
     check("then hidden, never unmounted, so a shell would survive", () => !!dock() && full());
 

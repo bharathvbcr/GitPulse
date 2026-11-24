@@ -4,6 +4,7 @@
   <a href="https://gitpulse.vbcr.dev/"><img src="https://img.shields.io/badge/website-gitpulse.vbcr.dev-F97316?style=flat&logo=safari&logoColor=white" alt="Website"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml"><img src="https://github.com/bharathvbcr/GitPulse/actions/workflows/coverage.yml/badge.svg" alt="Coverage"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/bharathvbcr/GitPulse"><img src="https://api.scorecard.dev/projects/github.com/bharathvbcr/GitPulse/badge" alt="OpenSSF Scorecard"></a>
   <a href="https://github.com/bharathvbcr/GitPulse/releases"><img src="https://img.shields.io/github/v/release/bharathvbcr/GitPulse?include_prereleases&sort=semver" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/tested%20on-macOS-lightgrey" alt="Tested on macOS; Windows and Linux builds are not yet tested">
@@ -158,7 +159,7 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 
 Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected
 file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (up to 1,000 open repository tabs, with at most 24 repositories watched at once and 24 recent repositories remembered),
-**Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
+**Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **Dock** stays available across views.
 
 ## From a change to the next step
 
@@ -189,7 +190,7 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   redacted secrets scanning (in-process by default, Kingfisher as the deep scan) that locates each finding against Git, storage
   cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
   Capped results identify their limits.
-- **Work from the desktop.** Native menus, a command palette (`⌘K`), a docked PTY terminal
+- **Work from the desktop.** Native menus, a command palette (`⌘K`), the Dock (shell, agents, files and console)
   with expanded view isolation, WebGL context caching, DEC 2026 frame synchronization, and configurable bell prompts that reports what each session is running, reflog recovery (`reset --keep`), GitHub pull
   request actions (review, comment, approve, merge pinned to viewed commit), colour-coded repository
   tabs and collapsible inactive groups that survive a restart, and an optional macOS menu-bar status popover keep
@@ -209,7 +210,7 @@ tracks remaining platform, provider, and performance checks.
 | Blast radius | Local CI on affected tests |
 | ![Diff view with the blast radius of a change](docs/assets/blast-radius.webp) | ![CI:local report running only the one affected test file](docs/assets/ci-local-affected.webp) |
 | Conflict editor | Terminal splits |
-| ![Three-way conflict editor resolving a README merge conflict](docs/assets/conflicts.webp) | ![Terminal dock split into three shells](docs/assets/terminal-splits.webp) |
+| ![Three-way conflict editor resolving a README merge conflict](docs/assets/conflicts.webp) | ![Dock split into three terminals](docs/assets/terminal-splits.webp) |
 
 Screenshots are captures from the macOS app; appearance varies by release and platform. Names of
 private repositories are blurred.
@@ -250,7 +251,7 @@ flowchart TB
         direction LR
         Views["4 Views · 11 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
-        TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
+        TerminalDock["PTY Dock<br/>(portable-pty)"]
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]

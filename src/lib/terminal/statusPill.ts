@@ -71,7 +71,7 @@ export interface PillSessionView extends PillSession {
 
 export interface TerminalPillView {
   /**
-   * Text after the Terminal label. Null when the dock is closed and no
+   * Text after the Dock label. Null when the dock is closed and no
    * session is published — the pill stays a control, not a status fiction.
    */
   summary: string | null;

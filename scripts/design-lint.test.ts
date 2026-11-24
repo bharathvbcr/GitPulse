@@ -898,6 +898,15 @@ describe("design-lint gate (--strict) against a scratch repository", () => {
   });
 });
 
+/**
+ * Linting the whole committed tree is the one heavy thing these tests do:
+ * about 1.3 s on an ordinary run, 2.3-2.5 s under v8 coverage on an idle
+ * host, and past vitest's default 5 s on a loaded coverage runner. The
+ * ordinary-run limit stays the default 5 s; a coverage run scales it the
+ * way every other wall-clock limit does (`wallClock.ts`).
+ */
+const WHOLE_TREE_LINT_MS = wallClockBudget(5_000);
+
 describe("the committed gate config", () => {
   const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   const configFile = path.join(repoRoot, "scripts", "design-lint.config.json");
@@ -935,7 +944,7 @@ describe("the committed gate config", () => {
       spy.mockRestore();
     }
     expect(logs.join("\n")).toContain("allowed (");
-  });
+  }, WHOLE_TREE_LINT_MS);
 });
 
 describe("the committed baseline", () => {
@@ -961,5 +970,5 @@ describe("the committed baseline", () => {
       // so a stale baseline (a rule changed without retaking it) cannot hide a regression.
       expect(cmp.decreases).toEqual([]);
     }
-  });
+  }, WHOLE_TREE_LINT_MS);
 });

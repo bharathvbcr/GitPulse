@@ -25,7 +25,7 @@ GitPulse has 4 application views with 11 specialized sections. Each view keeps r
 | **[History](#3-history-history)** | Follow commits, review changes, find recovery points | Graph (commits, HEAD moves — the reflog — or regression suspects) · Diff |
 | **[Insights](#4-insights-insights)** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Storage |
 
-Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the terminal dock stays available across views.
+Graph's three lists and Diff share the selected commit; Explorer and Blame share the selected file; Overview embeds branch stack hierarchy. Fleet compares repositories across the workspace, Tasks opens global and saved-workspace boards, and the Dock stays available across views.
 
 GitPulse provides 4 application views — **Work**, **Code**, **History** and **Insights** — all four of them header tabs. Each holds the lenses on one subject as sections rather than as separate destinations, and the terminal is a dock beneath whichever view is on screen.
 
@@ -57,7 +57,7 @@ flowchart TD
     end
 
     subgraph NotViews["Not views — available under every view"]
-        Terminal["<b>Terminal dock</b> (<code>⌃`</code>)<br/>Embedded PTY beneath the active view"]
+        Terminal["<b>Dock</b> (<code>⌃`</code>)<br/>Embedded PTY beneath the active view"]
         Tasks["<b>Tasks</b><br/>Global and saved-workspace boards"]
         Fleet["<b>Fleet</b> (<code>⌘⇧F</code>)<br/>Every open and recent repository at once"]
     end
@@ -760,7 +760,7 @@ stop per checkout.
 | **Insights** | `⌥ ⌘ 3` | `Ctrl+Shift+3` |
 | **Fleet** | `⌘ ⇧ F` | `Ctrl+Shift+F` |
 | **Agents plane** | `⌘ ⇧ A` | `Ctrl+Shift+A` |
-| **Terminal dock** | `⌃ \`` | `Ctrl+\`` |
+| **Dock** | `⌃ \`` | `Ctrl+\`` |
 
 Sections within a view — Work's Overview / Remote / Tasks, Code's Explorer / Map, History's Graph /
 Diff, Insights' Pulse / Coverage / Health / Storage — are switched by that

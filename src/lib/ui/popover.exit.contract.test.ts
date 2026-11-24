@@ -64,7 +64,10 @@ describe("every popover the action places leaves with the shared exit", () => {
   /** Elements that carry `use:popover` for dismissal only and own a different exit. Each names the evidence. */
   const OWN_EXIT: Record<string, { tag: RegExp; why: string }> = {
     "lib/components/Sidebar.svelte": { tag: /out:panelOut/, why: "the floating sidebar slides out" },
-    "lib/components/TerminalDock.svelte": { tag: /gp-dock-motion/, why: "the dock exits through gp-dock-slide-out (data-phase)" },
+    "lib/components/TerminalDock.svelte": {
+      tag: /--gp-dock-exit-ms/,
+      why: "the row holds the dock for --gp-dock-exit-ms while its sheet slides out through gp-dock-slide-out (data-phase)",
+    },
     "lib/components/TaskBoard.svelte": { tag: /out:fly/, why: "the scope rail overlay flies out" },
   };
 

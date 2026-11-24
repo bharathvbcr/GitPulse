@@ -1,0 +1,32 @@
+name: Dependency review
+
+# Blocks a pull request that adds or bumps a dependency to a version with a
+# known high-severity advisory, by diffing the dependency graph between the base
+# and the head. It reads the dependency graph through the GitHub API and does
+# not run the pull request's code (the checkout below keeps no token and
+# nothing from it is executed). The dependency graph does not read
+# bun.lock, so JavaScript changes are covered by bun-audit.yml instead; this covers
+# what a change introduces in the manifests GitHub does parse, such as Cargo and
+# the workflows' own actions.
+on:
+  pull_request:
+    branches: [main]
+
+# Fail closed: the review only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No PR comment: a fork's pull_request token is read-only, so a comment
+      # would fail there. The summary is written to the job summary instead.
+      - name: Dependency review
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
