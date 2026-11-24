@@ -62,6 +62,7 @@ export interface LocalServerInfo {
 export interface RunScriptInfo {
   path: string;
   preview_url: string | null;
+  preview_listening: boolean;
 }
 
 export interface LocalServerDiscovery {

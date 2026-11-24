@@ -214,11 +214,11 @@
   let serverDiscovery = $state<LocalServerDiscovery | null>(null);
   let discoverySeq = 0;
 
-  async function refreshLocalServers() {
+  async function refreshLocalServers(repoPath = $currentRepoPath) {
     const seq = ++discoverySeq;
     discoveringServers = true;
     try {
-      const result = await browserIpc.discoverLocalServers($currentRepoPath);
+      const result = await browserIpc.discoverLocalServers(repoPath);
       if (!disposed && seq === discoverySeq) {
         serverDiscovery = result;
       }
@@ -238,6 +238,13 @@
     terminated = false;
     void submit();
   }
+
+  $effect(() => {
+    const repo = $currentRepoPath;
+    if (!opened && onscreen && (!initialUrl || terminated)) {
+      void refreshLocalServers(repo);
+    }
+  });
 
   $effect(() => {
     onPageState?.({ loading, error });
@@ -272,6 +279,8 @@
         loading = false;
         terminated = true;
         error = "The browser page process stopped unexpectedly. Reload to restart it.";
+        sentVisible = false;
+        sentBounds = null;
         cancelPickElement();
         if (opened) {
           opened = false;
@@ -287,8 +296,6 @@
       address = initialUrl;
       // Once laid out, so the page opens where the tab is.
       void tick().then(() => submit());
-    } else {
-      void refreshLocalServers();
     }
     return stop;
   });
@@ -539,7 +546,7 @@
     {/if}
     <button type="button" class="gp-icon-btn" aria-label="Open in your browser" title="Open this address in your system browser" onclick={() => void openOutside()}><ExternalLink size={13} /></button>
   </form>
-  {#if error}
+  {#if error && !terminated}
     <div class="shrink-0 px-3 py-1 bg-danger/10 text-danger text-meta flex items-start gap-1.5" role="alert" data-testid="browser-session-error">
       <AlertCircle size={12} class="shrink-0 mt-0.5" />
       <span class="flex-1" style="overflow-wrap:anywhere">{error}</span>
@@ -550,16 +557,18 @@
     {#if !opened}
       <div class="h-full flex flex-col items-center justify-center gap-3 p-4 text-center text-textMuted text-xs overflow-auto">
         {#if terminated}
-          <AlertCircle size={18} class="text-danger" />
-          <span class="text-text">The browser page stopped unexpectedly.</span>
-          <div class="flex items-center gap-2">
-            <button type="button" class="gp-btn" data-size="sm" onclick={() => submit()}>
-              <RotateCw size={12} />
-              <span>Reload page</span>
-            </button>
-            <button type="button" class="gp-btn" data-size="sm" onclick={refreshLocalServers}>
-              <span>Scan servers</span>
-            </button>
+          <div class="flex flex-col items-center gap-2" role="alert" data-testid="browser-session-terminated">
+            <AlertCircle size={18} class="text-danger" />
+            <span class="text-text">The browser page stopped unexpectedly.</span>
+            <div class="flex items-center gap-2">
+              <button type="button" class="gp-btn" data-size="sm" onclick={() => submit()}>
+                <RotateCw size={12} />
+                <span>Reload page</span>
+              </button>
+              <button type="button" class="gp-btn" data-size="sm" onclick={() => refreshLocalServers()}>
+                <span>Scan servers</span>
+              </button>
+            </div>
           </div>
         {:else}
           <Globe size={18} />
@@ -577,7 +586,7 @@
                 aria-label="Refresh local servers"
                 title="Refresh local servers"
                 disabled={discoveringServers}
-                onclick={refreshLocalServers}
+                onclick={() => refreshLocalServers()}
               >
                 <RefreshCw size={11} class={discoveringServers ? "animate-spin" : ""} />
               </button>
@@ -600,15 +609,20 @@
             {/if}
             {#if serverDiscovery?.run_script}
               <div class="flex items-center justify-between gap-2 pt-1.5 text-micro">
-                <span class="flex items-center gap-1 font-mono text-textMuted truncate">
-                  <FileCode2 size={11} />
-                  <span>{serverDiscovery.run_script.path}</span>
+                <span class="flex items-center gap-1.5 font-mono text-textMuted min-w-0">
+                  <FileCode2 size={11} class="shrink-0" />
+                  <span class="truncate">{serverDiscovery.run_script.path}</span>
+                  {#if serverDiscovery.run_script.preview_url}
+                    <span class="gp-chip shrink-0" data-tone={serverDiscovery.run_script.preview_listening ? "ok" : "neutral"}>
+                      {serverDiscovery.run_script.preview_listening ? "Listening" : "Not listening"}
+                    </span>
+                  {/if}
                 </span>
                 {#if serverDiscovery.run_script.preview_url}
                   {@const previewUrl = serverDiscovery.run_script.preview_url}
                   <button
                     type="button"
-                    class="gp-btn font-mono text-micro!"
+                    class="gp-btn font-mono text-micro! shrink-0"
                     data-size="sm"
                     onclick={() => openServerUrl(previewUrl)}
                   >
@@ -626,7 +640,7 @@
             class="gp-btn text-micro!"
             data-size="sm"
             disabled={discoveringServers}
-            onclick={refreshLocalServers}
+            onclick={() => refreshLocalServers()}
           >
             <RefreshCw size={11} class={discoveringServers ? "animate-spin" : ""} />
             <span>{discoveringServers ? "Scanning ports…" : "Detect local servers"}</span>
