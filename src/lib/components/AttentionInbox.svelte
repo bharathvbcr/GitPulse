@@ -169,7 +169,7 @@
   .peek{position:absolute;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
   .pile + button{margin-top:8px}
   /* The summary takes the slack so the dismiss control sits at the row's end, after Open. */
-  .summary{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0}
+  .summary{flex:1;display:flex;flex-direction:column;gap:2px;min-width:0;overflow-wrap:anywhere}
   .summary strong{font-weight:500}
   .summary span{color:rgb(var(--c-text-muted))}
   details{margin:8px 0}

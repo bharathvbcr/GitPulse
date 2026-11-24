@@ -172,4 +172,26 @@ describe("FileTreePanel source contracts", () => {
     expect(source).not.toContain("if ($currentRepoPath) void loadFiles($currentRepoPath, true)");
     expect(source).not.toContain("copyPath(`${$repoStore.currentPath}/${row.path}`)");
   });
+
+  it("offers Open as Preview and Open Code & Preview in the right-click context menu for HTML files", () => {
+    expect(source).toContain("isHtmlFile(row.path)");
+    expect(source).toContain('data-testid="file-ctx-html-preview"');
+    expect(source).toContain('data-testid="file-ctx-html-split"');
+    expect(source).toContain('data-testid="file-ctx-html-code"');
+    expect(source).toContain("Open as Preview");
+    expect(source).toContain("Open Code &amp; Preview");
+    const helper = functionBody(source, "openHtmlInMode");
+    expect(helper).toContain("requestHtmlViewMode(effectiveRepoPath, path, mode)");
+    expect(helper).toContain("onSelectFile(path)");
+  });
+
+  it("offers Open as Preview and Open Code & Preview in the right-click context menu for SVG files", () => {
+    expect(source).toContain("isSvgFile(row.path)");
+    expect(source).toContain('data-testid="file-ctx-svg-preview"');
+    expect(source).toContain('data-testid="file-ctx-svg-split"');
+    expect(source).toContain('data-testid="file-ctx-svg-code"');
+    const helper = functionBody(source, "openSvgInMode");
+    expect(helper).toContain("requestSvgViewMode(effectiveRepoPath, path, mode)");
+    expect(helper).toContain("onSelectFile(path)");
+  });
 });

@@ -764,6 +764,14 @@ pub(crate) const PINNED_GIT_CONFIG: &[&str] = &[
     // status read, and `normal` collapses a new directory to `dir/`. Both make
     // a file another worktree is holding invisible to a collision check.
     "status.showUntrackedFiles=all",
+    // Apple Git's `fsmonitor--daemon` lacks `pthread_cond_timedwait` and hangs
+    // indefinitely in `_pthread_cond_wait` when FSEvents drops or delays cookie
+    // notifications under memory pressure; any git subcommand (`status`, `diff`,
+    // `ls-files`, `stash`, etc.) attaching to `.git/fsmonitor--daemon.ipc` then
+    // stalls for the full 90s timeout, and fsmonitor cookie files defeat macOS
+    // `PollSkip`. Pinning `core.fsmonitor=false` bypasses the IPC socket on all
+    // spawned git commands.
+    "core.fsmonitor=false",
 ];
 
 /// The one porcelain status read: NUL-separated records, raw UTF-8 paths, and
@@ -874,7 +882,11 @@ fn git_command_with_env(
     // The pinned config goes ahead of the caller's arguments, so a `-c` the
     // caller passes itself still wins; `--no-ext-diff` goes right after the
     // subcommand of a patch-printing command.
+    let is_config_cmd = subcommand_index(args).is_some_and(|at| args[at] == "config");
     for pin in PINNED_GIT_CONFIG {
+        if is_config_cmd && *pin == "core.fsmonitor=false" {
+            continue;
+        }
         cmd.args(["-c", pin]);
     }
     match subcommand_index(args) {

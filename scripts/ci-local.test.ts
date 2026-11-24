@@ -61,7 +61,7 @@ function npmScripts(text: string): Set<string> {
 }
 
 const PUSH_WORKFLOWS = ["ci.yml", "coverage.yml"];
-const ALL_WORKFLOWS = ["ci.yml", "coverage.yml", "release.yml"];
+const ALL_WORKFLOWS = ["ci.yml", "coverage.yml", "release.yml", "e2e-desktop.yml"];
 
 /** Every npm script this runner would invoke, directly or by declared cover. */
 function gateScripts(): Set<string> {
@@ -106,6 +106,19 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(claimed.size).toBeGreaterThan(5);
     const stale = [...claimed].filter((script) => !everywhere.has(script)).sort();
     expect(stale).toEqual([]);
+
+    // Every verbatim command declared in gate.covers (including non-npm commands
+    // such as actionlint, cargo fmt/clippy/nextest/test) must still appear in at
+    // least one tracked workflow so non-npm covers entries cannot silently rot.
+    const allTexts = ALL_WORKFLOWS.map((file) => workflow(file));
+    for (const gate of GATES) {
+      for (const covered of gate.covers ?? []) {
+        expect(
+          allTexts.some((text) => text.includes(covered)),
+          `stale gate cover on ${gate.id}: ${covered}`,
+        ).toBe(true);
+      }
+    }
   });
 
   it("carries the Rust gates ci.yml runs, over the same manifest", () => {
@@ -176,14 +189,19 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(outcomes.filter((o) => o.status === "failed").map((o) => o.gate.id)).toEqual(["design-lint"]);
   });
 
-  it("passes the flags that stop one failing test binary hiding the rest", () => {
+  it("passes the flags that stop one failing test binary hiding the rest and tracks both sharded ci.yml and release.yml", () => {
     // ci.yml spells out why: without --no-fail-fast cargo stops at the first
     // failing test binary, so the rest never run and the job reports one
     // failure when there may be several.
     const rust = GATES.find((gate) => gate.id === "cargo-tests");
     expect(commandLine(rust!)).toContain("--no-fail-fast");
     expect(commandLine(rust!)).toContain("--locked");
-    expect(workflow("ci.yml")).toContain("--no-fail-fast");
+    const ci = workflow("ci.yml");
+    const release = workflow("release.yml");
+    expect(ci).toContain("--no-fail-fast");
+    for (const covered of rust?.covers ?? []) {
+      expect(ci.includes(covered) || release.includes(covered), `stale cargo-tests cover: ${covered}`).toBe(true);
+    }
   });
 });
 
@@ -747,11 +765,12 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
     expect(first(outcomes).status).toBe("refused");
   });
 
-  it("does not delete a directory that contains the repository", () => {
+  it("does not delete a directory that contains the repository, and never locks beside it", () => {
     const parent = join(root, "..");
     const { outcomes } = run([OWNER], { env: { CARGO_LLVM_COV_TARGET_DIR: parent } });
     expect(existsSync(root)).toBe(true);
     expect(first(outcomes).status).toBe("refused");
+    expect(first(outcomes).detail).toMatch(/contains, the repository/);
   });
 
   it("does not delete the repository root itself", () => {
@@ -759,6 +778,8 @@ describe("it refuses rather than delete what it cannot identify, and says so", (
     const { outcomes } = run([OWNER], { env: { CARGO_LLVM_COV_TARGET_DIR: "." } });
     expect(existsSync(join(root, "src", "keep.txt"))).toBe(true);
     expect(first(outcomes).status).toBe("refused");
+    expect(first(outcomes).detail).toMatch(/contains, the repository/);
+    expect(existsSync(`${root}.ci-local.lock`)).toBe(false);
   });
 
   it("does not delete the home directory", () => {

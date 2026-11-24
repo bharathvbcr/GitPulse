@@ -44,4 +44,16 @@ describe("BlameViewer source contracts", () => {
     expect(column).toBeGreaterThan(-1);
     expect(row.indexOf('<LazyView load={loadBlame} name="Blame" />')).toBeGreaterThan(column);
   });
+
+  it("provides inline find, inline match slicing, and unified go-to-line over blame lines", () => {
+    expect(source).toContain('import FindField from "./FindField.svelte"');
+    expect(source).toContain("firstMatchFrom");
+    expect(source).toContain("sliceTokensWithMatches");
+    expect(source).toContain("blameFindFieldRef");
+    expect(source).toContain("handleBlameKeydown");
+    expect(source).toContain("highlightedLineNo");
+    expect(source).toContain("data-blame-target-line");
+    expect(source).toContain("ongotoline={handleBlameGoToLine}");
+    expect(source).toContain('goToShortcut={shortcutTextLabel("⌘G", $hostPlatform.os)}');
+  });
 });

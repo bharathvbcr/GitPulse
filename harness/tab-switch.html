@@ -175,6 +175,9 @@
           settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },
           collect_forced_off: false, socket: null, store: null, transport_supported: false,
         }),
+        cmd_idle_memory_settings: () => ({ mode: "balanced" }),
+        cmd_main_ready: () => ({ wake_from_hibernation: false, snapshot: null, pending_events: [] }),
+        cmd_inbox_read: (a) => ({ ok: true, repo_path: a.repoPath ?? "", threads: [], lanes: [], total: 0 }),
         cmd_host_load_settings: () => ({ enabled: true, govern_launches: false }),
         // Settings -> Agents holds the Claude key row (LocalModelServers): no key saved.
         cmd_claude_key_status: () => ({ key_saved: false, account: null, account_error: null }),

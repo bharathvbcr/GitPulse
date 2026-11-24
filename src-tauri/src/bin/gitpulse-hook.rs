@@ -110,6 +110,19 @@ where
     env_is_agy || args.into_iter().any(|arg| arg.as_ref() == "--host=agy")
 }
 
+fn strip_host_agy_flag(raw_args: &[String]) -> (bool, Vec<String>) {
+    let mut flag_is_agy = false;
+    let mut args = Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        if arg == "--host=agy" {
+            flag_is_agy = true;
+        } else {
+            args.push(arg.clone());
+        }
+    }
+    (flag_is_agy, args)
+}
+
 /// Runs one hook invocation and returns its exit code, which
 /// [`hooks::diagnostic`] fixes at 0 for every outcome it reports.
 fn decide() -> i32 {
@@ -124,10 +137,7 @@ fn decide() -> i32 {
     let _ = gitpulse_lib::procguard::install_signal_handlers();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let (flag_is_agy, args): (bool, &[String]) = match raw_args.first().map(String::as_str) {
-        Some("--host=agy") => (true, &raw_args[1..]),
-        _ => (false, &raw_args[..]),
-    };
+    let (flag_is_agy, args) = strip_host_agy_flag(&raw_args);
 
     let antigravity_env = flag_is_agy || hooks::is_antigravity_env();
 
@@ -1357,6 +1367,22 @@ mod tests {
         assert!(
             !is_agy_invocation_from(["--host=agyx", "notify"], false),
             "only the exact flag counts"
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["--host=agy", "peer-inbox"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox", "--host=agy"])),
+            (true, vec_args(&["peer-inbox"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["notify", "--host=agy", "permission_request"])),
+            (true, vec_args(&["notify", "permission_request"]))
+        );
+        assert_eq!(
+            strip_host_agy_flag(&vec_args(&["peer-inbox"])),
+            (false, vec_args(&["peer-inbox"]))
         );
     }
 }

@@ -422,6 +422,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability reset defaults thresholds command gate hook heavy build test cargo refuse advise enforce",
   },
   {
+    id: "idle-memory",
+    section: "agents",
+    label: "Idle memory efficiency",
+    keywords: "idle memory efficiency shed shedding hibernate hibernation webview gpu webgl ram footprint background balanced aggressive off ptyd wake skeleton",
+  },
+  {
     id: "host-load-swap",
     section: "agents",
     label: "Host load: swap used",

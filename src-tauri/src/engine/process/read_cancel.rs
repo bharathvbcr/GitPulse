@@ -70,6 +70,10 @@ impl ReadCancel {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    pub(crate) fn as_atomic(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
 }
 
 thread_local! {

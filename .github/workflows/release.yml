@@ -30,12 +30,18 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # Keep in lockstep with ci.yml / coverage.yml / test-parallel.yml so preflight
+  # tests the exact devmap and manvi commits CI verifies.
+  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+  MANVI_REV: abb2a72276269c63f6300a59a26e774a0383a8ab
 
 jobs:
   preflight:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The serial Linux Rust suite takes ~63 min unsharded; 40 min previously
+    # cancelled preflight before the matrix could even start.
+    timeout-minutes: 120
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
     steps:
@@ -92,14 +98,18 @@ jobs:
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          cache-on-failure: true
 
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 
-      # Hosted runners build the embedded reader; the optional external CLI
-      # is absent there. Validate the vendored schema and report CLI absence.
+      # Hosted runners build the embedded reader; validate the vendored schema
+      # before building the pinned external devmap CLI below.
       - name: Vendored Schema Gate
         run: bun run check:vendor-schema -- --allow-missing-cli
+
+      - name: Vendored Crates Unedited
+        run: bun run check:vendor-edits
 
       - name: IPC Command Contract Gate
         run: bun run check:ipc
@@ -129,8 +139,83 @@ jobs:
       - name: Frontend Unit Tests (Vitest)
         run: bun run test
 
+      - name: Frontend Timezone & DST Tests (Vitest)
+        run: bun run test:tz
+
       - name: Frontend Vite Build
         run: bun run build
+
+      # The worktree-overlay and agent-bus radar tests drive the real `devmap`
+      # CLI; build from the pinned DEVMAP_REV and verify schema parity before
+      # running the Rust suite.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      # Two lib tests drive a real `manvi` under its default gate; build from
+      # pinned MANVI_REV (reusing ci.yml's cache key) so preflight does not fail
+      # with "No MANVI harness is installed".
+      - name: Check out Manvi at MANVI_REV
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/manvi-src/Manvi"
+          git clone --quiet --filter=blob:none https://github.com/bharathvbcr/Manvi.git "$src"
+          git -C "$src" checkout --quiet "$MANVI_REV"
+
+      - name: Setup Go for Manvi
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ runner.temp }}/manvi-src/Manvi/manvi/go.mod
+          cache: false
+
+      - name: Cache manvi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      - name: Install manvi
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/manvi"
+          exe=manvi
+          if [ ! -x "$root/bin/$exe" ]; then
+            src="$RUNNER_TEMP/manvi-src/Manvi"
+            bash "$src/scripts/fetch-modules.sh"
+            CGO_ENABLED=0 go -C "$src/manvi" build -trimpath -o "$root/bin/$exe" ./cmd/manvi
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/$exe" --version
+
+      - name: Keep the manvi build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
 
       - name: Rust Cargo Format Check
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
@@ -150,7 +235,7 @@ jobs:
     name: Prepare Verified Draft
     needs: [preflight]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: write
       actions: read
@@ -249,6 +334,7 @@ jobs:
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          cache-on-failure: true
 
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile --ignore-scripts
@@ -259,6 +345,7 @@ jobs:
         run: node scripts/release-state.mjs check
 
       - name: Build Tauri Desktop Application
+        id: tauri
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -291,6 +378,38 @@ jobs:
           # `--` hands the rest to cargo: the shipping build resolves exactly
           # the committed Cargo.lock, not whatever it would resolve today.
           args: ${{ matrix.args }} -- --locked
+
+      - name: Installer Names Match The Release Manifest
+        if: ${{ !startsWith(matrix.platform, 'macos-') }}
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: node scripts/check-release-assets.mjs --bundles "$ARTIFACT_PATHS" --platform "${{ matrix.platform }}"
+
+      - name: Inspect macOS Universal App Bundle
+        if: ${{ startsWith(matrix.platform, 'macos-') }}
+        shell: bash
+        run: node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/GitPulse.app --universal
+
+      # Prove LTO did not leak window-runtime symbols (RunObserver, tauri_runtime_wry)
+      # into the release terminal daemon binary on Unix legs.
+      - name: Verify gitpulse-ptyd Release Symbols
+        if: ${{ !startsWith(matrix.platform, 'windows-') }}
+        shell: bash
+        env:
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          if [[ "$MATRIX_PLATFORM" == macos-* ]]; then
+            if [ -f src-tauri/target/universal-apple-darwin/release/gitpulse-ptyd ]; then
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/universal-apple-darwin/release/gitpulse-ptyd
+            else
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/aarch64-apple-darwin/release/gitpulse-ptyd
+              node scripts/check-ptyd-release.mjs --binary src-tauri/target/x86_64-apple-darwin/release/gitpulse-ptyd
+            fi
+          else
+            node scripts/check-ptyd-release.mjs --binary src-tauri/target/release/gitpulse-ptyd
+          fi
 
   # Every installer is on the draft. Add the SHA-256 manifest and the two
   # SBOMs, checked against GitHub's own asset digests, before finalize demands
@@ -394,8 +513,18 @@ jobs:
       - name: Report Build Matrix Outcome
         run: |
           set -euo pipefail
+          echo "preflight job result: ${{ needs.preflight.result }}"
+          echo "prepare job result: ${{ needs.prepare.result }}"
           echo "release job aggregate result: ${{ needs.release.result }}"
           echo "attest job result: ${{ needs.attest.result }}"
+          if [ "${{ needs.preflight.result }}" != "success" ]; then
+            echo "::error::Pre-flight checks concluded ${{ needs.preflight.result }}. No release was built for $RELEASE_TAG — do not publish it."
+            exit 1
+          fi
+          if [ "${{ needs.prepare.result }}" != "success" ]; then
+            echo "::error::Prepare step concluded ${{ needs.prepare.result }} (CI provenance or draft creation failed). The draft release for $RELEASE_TAG is INCOMPLETE — do not publish it."
+            exit 1
+          fi
           if [ "${{ needs.release.result }}" != "success" ]; then
             echo "::error::At least one platform failed to build or upload. The draft release for $RELEASE_TAG is INCOMPLETE — do not publish it."
             exit 1
@@ -439,7 +568,7 @@ jobs:
           {
             echo "### Release $RELEASE_TAG — draft verified"
             echo
-            echo "All twelve installers, both SBOMs and the SHA-256 manifest have uploaded with matching SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
-            echo "Seven installers were downloaded, matched to GitHub's SHA-256 and opened: the macOS app archive, both debs, both MSIs and both NSIS installers each hold every [[bin]] in src-tauri/Cargo.toml for their architecture and carry no source maps. The dmg, both rpms and both AppImages are not opened."
+            echo "All expected installers, both SBOMs and the canonical SHA-256 manifest have uploaded with matching SHA-256 metadata; SHA256SUMS.txt was downloaded and verified against every asset digest, and the tag, commit, draft ID, and changelog notes agree."
+            echo "Seven installers were downloaded, matched to GitHub's SHA-256 and SHA256SUMS.txt, and opened: the macOS app archive, both debs, both MSIs and both NSIS installers each hold every [[bin]] in src-tauri/Cargo.toml for their architecture and carry no source maps. The dmg, both rpms and both AppImages are not opened."
             echo "The release remains a **draft** for manual publication."
           } >> "$GITHUB_STEP_SUMMARY"

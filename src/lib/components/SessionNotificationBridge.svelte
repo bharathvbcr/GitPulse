@@ -12,7 +12,7 @@
    * its place. It is reported quietly rather than silently so "clicking does
    * nothing" has an explanation on screen.
    */
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { describeError } from "../ui/copy/describeFailure";
   import { isTauri } from "../platform";
@@ -27,7 +27,9 @@
   import { LAYERS } from "../ui/layers";
   import Logo from "./Logo.svelte";
 
-  let missed = $state<string | null>(null);
+  let { initialMissed = null }: { initialMissed?: string | null } = $props();
+
+  let missed = $state<string | null>(untrack(() => initialMissed));
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   /**
@@ -42,6 +44,10 @@
     const record = sessionByNativeId($terminalSessions, sessionId);
     const outcome = await focusTerminalSession(record);
     if (outcome.ok) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       missed = null;
       return;
     }
@@ -56,7 +62,10 @@
   function say(message: string, ms: number) {
     missed = message;
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => (missed = null), ms);
+    timer = setTimeout(() => {
+      timer = null;
+      missed = null;
+    }, ms);
   }
 
   onMount(() => {
@@ -117,5 +126,6 @@
   .session-activation-text {
     min-width: 0;
     flex: 1;
+    overflow-wrap: anywhere;
   }
 </style>

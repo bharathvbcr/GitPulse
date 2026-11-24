@@ -258,6 +258,7 @@ fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
     let env = GitEnv {
         version: Some((2, 54, 0)),
         fsmonitor_measured: true,
+        is_apple_git: false,
     };
     assert!(recommend(&report, env)
         .iter()

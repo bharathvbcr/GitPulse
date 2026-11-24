@@ -1184,6 +1184,24 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     /** The repositories whose journals are cached, for tests and diagnostics that watch for growth. */
     cachedRepositories: (): number => ledgerBuckets.size - 1,
 
+    /**
+     * Drops cached in-memory journal buckets for every repository except the
+     * active one (and the unscoped bucket). Disk ledgers stay intact and reload
+     * lazily on repo switch. Returns how many buckets were evicted.
+     */
+    evictInactiveRepositories: (): number => {
+      let evicted = 0;
+      for (const key of [...ledgerBuckets.keys()]) {
+        if (key === UNSCOPED_REPOSITORY || key === activeRepositoryKey) continue;
+        ledgerBuckets.delete(key);
+        for (const [alias, destination] of [...repositoryAliases]) {
+          if (alias === key || destination === key) repositoryAliases.delete(alias);
+        }
+        evicted += 1;
+      }
+      return evicted;
+    },
+
     clearActions: () => {
       // Clears the *view*, never the ledger. The record on disk is what makes
       // the history answerable after a crash; a UI button must not be able to

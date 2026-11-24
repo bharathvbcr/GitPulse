@@ -35,20 +35,30 @@ describe("CodeViewer", () => {
     expect(source).toContain("prevMatch");
   });
 
-  it("supports line numbers, jump to line, and line selection", () => {
+  it("supports line numbers, unified inline go-to-line + find highlights, and line selection", () => {
     expect(source).toContain("selectedLine");
+    expect(source).toContain("selectedColumn");
     expect(source).toContain("handleLineClick");
-    expect(source).toContain("goToLineOpen");
     expect(source).toContain("handleGoToLine");
+    expect(source).toContain("sliceTokensWithMatches");
+    expect(source).toContain("firstMatchFrom");
+    expect(source).toContain("buildMatchTicks");
+    expect(source).toContain("data-find-overview");
+    expect(source).toContain("data-status-goto-line");
+    expect(source).toContain("extractSelectionSeed");
+    expect(source).toContain("ongotoline={handleGoToLine}");
+    expect(source).not.toContain("goToLineOpen");
+    expect(source).not.toContain("targetLineInput");
+    expect(source).not.toContain("goToBar");
   });
 
-  it("reads the go-to-line field through goToLineTarget, never as text", () => {
-    // The field is `type="number"`, so `bind:value` yields a number or null.
-    // Calling `.trim()` on it threw "trim is not a function" on every Go.
-    const handler = source.slice(source.indexOf("function handleGoToLine()"), source.indexOf("function handleLineClick("));
-    expect(handler).toContain("goToLineTarget(targetLineInput, rawLines.length)");
+  it("reads the go-to-line target through goToLineTarget without text-only .trim()", () => {
+    const handler = source.slice(
+      source.indexOf("function handleGoToLine(targetInput: unknown, column?: number | null)"),
+      source.indexOf("function handleLineClick("),
+    );
+    expect(handler).toContain("goToLineTarget(targetInput, rawLines.length)");
     expect(handler).not.toContain(".trim()");
-    expect(source).toContain("let targetLineInput = $state<number | null>(null);");
   });
 
   it("supports inline editing and file saving via cmd_write_file_content", () => {

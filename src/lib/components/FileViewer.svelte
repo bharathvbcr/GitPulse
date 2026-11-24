@@ -77,7 +77,9 @@
   import FileTreeColumn from "./files/FileTreeColumn.svelte";
   import ExplorerRail from "./files/ExplorerRail.svelte";
   import LazyView from "./LazyView.svelte";
-  import { explorerLens, toggleBlameLens } from "../files/explorerLens";
+  import { explorerLens, setEditorLens, toggleBlameLens } from "../files/explorerLens";
+  import { htmlViewModeRequest, matchHtmlViewMode } from "../files/htmlPreview";
+  import { matchSvgViewMode, svgViewModeRequest } from "../files/svgPreview";
   import { sidebarExplorerDocked } from "../sidebar/layoutStore";
   import MediaViewer from "./files/MediaViewer.svelte";
   import { sendToAgentFromPage } from "../terminal/sendFromPage";
@@ -89,6 +91,9 @@
   import { classifyFileChange, statusBadgeClass, statusBadgeLabel } from "../files/fileStatus";
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import { observeResize } from "../dom/observeResize";
+  import { isCommitSearchChord } from "../views/commitFilter";
+  import { isImeComposition } from "../keyboard/imeGuard";
+  import { extractSelectionSeed, triggerFileSearch } from "../files/fileSearchTarget";
   import {
     FILE_DASHBOARD_WIDTH,
     FILE_EDITOR_MIN_WIDTH,
@@ -640,6 +645,43 @@
     });
   });
 
+  // Choosing "Open as Preview" or "Open Code & Preview" on an HTML file exits
+  // Blame lens once per request nonce so switching back to Blame afterwards
+  // isn't snapped back during the request TTL window.
+  let lastHandledHtmlModeNonce = 0;
+  $effect(() => {
+    const req = $htmlViewModeRequest;
+    const repo = hydratedRepo;
+    const path = activeTabPath;
+    if (!req) return;
+    untrack(() => {
+      const matched = matchHtmlViewMode(req, repo, path);
+      if (matched && matched.nonce > lastHandledHtmlModeNonce) {
+        lastHandledHtmlModeNonce = matched.nonce;
+        if ($explorerLens.lens === "blame") {
+          setEditorLens("edit");
+        }
+      }
+    });
+  });
+
+  let lastHandledSvgModeNonce = 0;
+  $effect(() => {
+    const req = $svgViewModeRequest;
+    const repo = hydratedRepo;
+    const path = activeTabPath;
+    if (!req) return;
+    untrack(() => {
+      const matched = matchSvgViewMode(req, repo, path);
+      if (matched && matched.nonce > lastHandledSvgModeNonce) {
+        lastHandledSvgModeNonce = matched.nonce;
+        if ($explorerLens.lens === "blame") {
+          setEditorLens("edit");
+        }
+      }
+    });
+  });
+
   // The open file is held while it is shown, so the store keeps its text
   // loaded and drops it once no host shows it. Declared before the read below,
   // which needs the hold in place.
@@ -700,6 +742,35 @@
   });
 
   onMount(() => {
+    const handleDocumentSearchChords = (e: KeyboardEvent) => {
+      if (
+        e.defaultPrevented ||
+        isImeComposition(e) ||
+        !fileViewRoot ||
+        fileViewRoot.closest("[inert], [hidden], .hidden")
+      ) {
+        return;
+      }
+      const active = document.activeElement;
+      if (
+        active instanceof Element &&
+        active.closest("[data-terminal-dock], [role='dialog'], [data-page-search]")
+      ) {
+        return;
+      }
+      if (isCommitSearchChord(e)) {
+        if (triggerFileSearch(fileViewRoot, "find", extractSelectionSeed(null, fileViewRoot))) {
+          e.preventDefault();
+        }
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "g") {
+        if (triggerFileSearch(fileViewRoot, "line")) {
+          e.preventDefault();
+        }
+      }
+    };
+    document.addEventListener("keydown", handleDocumentSearchChords);
     window.addEventListener("keydown", handleWindowKeydown);
     const stopResize = fileViewRoot
       ? observeResize(fileViewRoot, (entries) => {
@@ -713,6 +784,7 @@
       fileViewWidth = fileViewRoot.clientWidth || 0;
     }
     return () => {
+      document.removeEventListener("keydown", handleDocumentSearchChords);
       window.removeEventListener("keydown", handleWindowKeydown);
       stopResize();
     };

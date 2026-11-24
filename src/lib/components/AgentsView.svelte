@@ -17,12 +17,35 @@
    * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, ChevronDown, LayoutList, ChevronRight, CircleAlert, FileDiff, FolderOpen, Inbox, ListChecks, Play, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import {
+    AlertCircle,
+    Bell,
+    Bot,
+    Check,
+    CheckCircle2,
+    ChevronDown,
+    ChevronRight,
+    CircleAlert,
+    CircleHelp,
+    FileDiff,
+    FolderOpen,
+    Inbox,
+    LayoutList,
+    ListChecks,
+    Play,
+    RefreshCw,
+    Rows3,
+    ShieldAlert,
+    SquareTerminal,
+    X,
+  } from "@lucide/svelte";
   import { agentRowActions, type AgentRowAction } from "../agents/rowActions";
   import { terminalLaunchRequests } from "../terminal/launchRequests";
-  import type { SessionKind } from "../terminal/tabs";
+  import type { SessionKind, TabKind } from "../terminal/tabs";
   import AgentInbox from "./AgentInbox.svelte";
+  import LauncherIcon from "./LauncherIcon.svelte";
   import PageHeader from "./PageHeader.svelte";
+  import { formatAge } from "../storage/format";
   import { tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -47,10 +70,13 @@
   import { gapGroupTitle, gapsBlockReading, groupGaps, type GapNote } from "../agents/gapGroups";
   import { agentKindLabel } from "../work/agentWorktree";
   import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
+  import { inboxFocusRequest, takeInboxFocus } from "../agents/inboxFocus";
   import { displayName } from "../repos/paths";
   import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
+    NOTIFICATION_REASONS,
+    UNREAD_REASONS,
     applyAgentTree,
     countAgentRows,
     flattenAgentTree,
@@ -84,7 +110,19 @@
   const compact = $derived($interfaceStore.agentsCompact);
   const filter = $derived(isAgentFilter($interfaceStore.agentsFilter) ? $interfaceStore.agentsFilter : "all");
   let activeView = $state<"plane" | "inbox">("plane");
+  let focusedInboxThreadKey = $state<string | null>(null);
+  let inboxFocusSeq = $state(0);
   const activeRepoPath = $derived($agentsRepositoryScope || $repoStore.currentPath || "");
+
+  $effect(() => {
+    if (!$inboxFocusRequest) return;
+    const req = takeInboxFocus();
+    if (!req) return;
+    setAgentsRepositoryScope(req.repoPath ?? null);
+    focusedInboxThreadKey = req.threadKey;
+    inboxFocusSeq = req.seq;
+    activeView = "inbox";
+  });
 
   // The one mapping the header shares (`repoAttention.ts`): unknown stays
   // unknown there, and the tab chip counts from this same sweep.
@@ -146,9 +184,86 @@
   const FILTERS: { id: AgentFilter; label: string }[] = [
     { id: "all", label: "All" },
     { id: "attention", label: "Needs action" },
+    { id: "notifications", label: "Notifications" },
+    { id: "gaps", label: "Gaps" },
     { id: "live", label: "Live" },
     { id: "parallel", label: "Parallel" },
   ];
+
+  type ChipTone = "danger" | "warn" | "info" | "unknown" | "ok" | "neutral";
+
+  const BLOCKING_REASONS = new Set<string>([
+    "needs-you",
+    "error",
+    "pending",
+    "blocked",
+    "collision",
+    "disconnected",
+    "unstarted",
+    "signalled",
+  ]);
+
+  function launcherKindFor(kind: string): TabKind {
+    const k = kind.trim().toLowerCase();
+    if (k === "claude" || k === "claude code" || k === "claude-code") return "claude";
+    if (k === "agy" || k === "antigravity") return "agy";
+    if (k === "codex" || k === "grok" || k === "manvi" || k === "shell" || k === "browser" || k === "file") {
+      return k;
+    }
+    return "shell";
+  }
+
+  function attentionTone(row: AgentRow): ChipTone {
+    if (
+      row.attentionUrgency === "error" ||
+      row.attention.includes("error") ||
+      row.attention.includes("blocked") ||
+      row.attention.includes("collision")
+    ) {
+      return "danger";
+    }
+    if (
+      row.attentionUrgency === "blocking" ||
+      row.attention.some((reason) => BLOCKING_REASONS.has(reason))
+    ) {
+      return "warn";
+    }
+    if (row.attention.some((reason) => NOTIFICATION_REASONS.has(reason))) {
+      return "info";
+    }
+    if (row.attention.some((reason) => UNREAD_REASONS.has(reason))) {
+      return "unknown";
+    }
+    return "neutral";
+  }
+
+  function isInformationalRow(row: AgentRow): boolean {
+    if (!row.sessionId) return false;
+    if (row.attentionUrgency === "blocking" || row.attentionUrgency === "error") return false;
+    if (row.attention.some((reason) => BLOCKING_REASONS.has(reason))) return false;
+    return row.attention.some((reason) => NOTIFICATION_REASONS.has(reason));
+  }
+
+  const MAX_DATE_MS = 8.64e15;
+
+  function safeIsoDatetime(atMs: number | null): string | undefined {
+    if (typeof atMs !== "number" || !Number.isFinite(atMs) || Math.abs(atMs) > MAX_DATE_MS) {
+      return undefined;
+    }
+    return new Date(atMs).toISOString();
+  }
+
+  function attentionTimestamp(row: AgentRow): number | null {
+    if (row.attentionAt !== null && row.attentionAt > 0) return row.attentionAt;
+    if (!row.sessionId) return null;
+    const outputAt = $sessionActivity.get(row.sessionId)?.lastOutputAt ?? null;
+    return outputAt !== null && outputAt > 0 ? outputAt : null;
+  }
+
+  function dismissNotice(row: AgentRow) {
+    if (!row.sessionId) return;
+    sessionActivity.dismiss(row.sessionId);
+  }
 
   function columnVisible(key: AgentColumnKey): boolean {
     return !hidden.has(key);
@@ -439,7 +554,7 @@
        Inbox has neither, and showing them there offered controls that did
        nothing. Each group is labelled rather than told apart by a divider. -->
   {#if activeView === "plane"}
-    <div class="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2" data-testid="agents-toolbar">
+    <div class="shrink-0 min-w-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3.5 py-2" data-testid="agents-toolbar">
       {#if scopeLabel}
         <span class="gp-chip" data-tone="accent" data-kind="removable" data-testid="agents-scope">
           <span>Only {scopeLabel}</span>
@@ -456,13 +571,13 @@
         </span>
       {/if}
       <!-- One filter at a time, so a segmented switch, not toggles. -->
-      <div class="flex items-center gap-1.5" role="group" aria-label="Show">
-        <span class="gp-label">Show</span>
-        <div class="gp-segmented" class:gp-liquid-tabs={macos}>
+      <div class="flex min-w-0 max-w-full items-center gap-1.5" role="group" aria-label="Show">
+        <span class="gp-label shrink-0">Show</span>
+        <div class="gp-header-scroll gp-segmented min-w-0 max-w-full flex-nowrap" class:gp-liquid-tabs={macos}>
           {#each FILTERS as item (item.id)}
             <button
               type="button"
-              class="gp-seg-btn text-meta!"
+              class="gp-seg-btn shrink-0 whitespace-nowrap text-meta!"
               data-active={filter === item.id}
               aria-pressed={filter === item.id}
               data-testid="agents-filter-{item.id}"
@@ -507,7 +622,13 @@
   {#if activeView === "inbox"}
     <!-- No inset: the Inbox spans the pane like the Plane's table does. -->
     <div class="flex-1 min-h-0 min-w-0 overflow-hidden flex flex-col" data-testid="agents-inbox-container">
-      <AgentInbox repoPath={activeRepoPath} embedded={true} onopenTask={openInboxTask} />
+      <AgentInbox
+        repoPath={activeRepoPath}
+        embedded={true}
+        focusThreadKey={focusedInboxThreadKey}
+        focusSeq={inboxFocusSeq}
+        onopenTask={openInboxTask}
+      />
     </div>
   {:else}
     {#if noteGroups.length > 0}
@@ -519,7 +640,7 @@
         data-testid="agents-gaps"
         aria-label="What the plane couldn't read"
       >
-        <div class="flex items-center gap-2 px-3 pt-2 pb-1">
+        <div class="flex flex-wrap items-center gap-2 px-3 pt-2 pb-1">
           <CircleAlert size={13} class="shrink-0" style="color: var(--gp-notice-ink)" />
           <span class="text-meta font-semibold text-textPrimary">
             {notesBlock ? "Not everything could be read" : "Some of this is partial"}
@@ -625,6 +746,7 @@
                   {:else if entry.level > 1}
                     <span class="w-4 shrink-0" aria-hidden="true"></span>
                   {/if}
+                  <LauncherIcon kind={launcherKindFor(row.launcher || row.kind)} size={14} class="mt-0.5 shrink-0" />
                   <span class="min-w-0">
                 <span class="block font-medium text-textPrimary">{row.session}</span>
                 <span class="block text-textMuted">{agentKindLabel(row.kind)} · {row.repoLabel}</span>
@@ -663,11 +785,85 @@
                 </td>
               {/if}
               {#if columnVisible("attention")}
-                <td class="px-3 py-2 align-top">
+                {@const attTs = attentionTimestamp(row)}
+                <td class="px-3 py-2 align-top min-w-0">
                   {#if !row.attentionObserved}
-                    <span title="Nothing in this window watches what this process asks for.">Not observed</span>
+                    <span
+                      class="gp-chip font-medium"
+                      data-tone="unknown"
+                      title="Nothing in this window watches what this process asks for."
+                    >
+                      <CircleHelp size={11} />
+                      <span>Not observed</span>
+                    </span>
+                  {:else if row.attention.length > 0 || row.attentionLabel}
+                    {@const tone = attentionTone(row)}
+                    <div class="flex flex-wrap items-center gap-1.5 min-w-0">
+                      <span
+                        class="gp-chip font-medium"
+                        data-tone={tone}
+                        data-urgency={row.attentionUrgency ?? undefined}
+                      >
+                        {#if tone === "danger"}
+                          <AlertCircle size={11} />
+                        {:else if tone === "warn"}
+                          <ShieldAlert size={11} />
+                        {:else if tone === "info"}
+                          <Bell size={11} />
+                        {:else if tone === "unknown"}
+                          <CircleHelp size={11} />
+                        {:else}
+                          <FileDiff size={11} />
+                        {/if}
+                        <span>{row.attentionLabel || "—"}</span>
+                      </span>
+                      {#if attTs !== null}
+                        <time
+                          class="text-micro text-textMuted tabular-nums shrink-0"
+                          datetime={safeIsoDatetime(attTs)}
+                        >
+                          {formatAge(attTs, now)}
+                        </time>
+                      {/if}
+                      {#if isInformationalRow(row)}
+                        <button
+                          type="button"
+                          class="gp-btn"
+                          data-size="sm"
+                          data-action="dismiss"
+                          aria-label="Dismiss notification for {row.session}"
+                          title="Dismiss this notification without stopping the terminal"
+                          onclick={() => dismissNotice(row)}
+                        >
+                          <Check size={11} />
+                          <span>Dismiss</span>
+                        </button>
+                      {/if}
+                    </div>
+                    {#if row.attentionDetail}
+                      <p
+                        class="m-0 mt-1 min-w-0 max-w-[min(28rem,32cqw)] line-clamp-2 wrap-anywhere text-meta text-textMuted"
+                        data-width-cap="truncating attention detail cell"
+                        title={row.attentionDetail}
+                      >{row.attentionDetail}</p>
+                    {/if}
+                  {:else if row.presence === "live"}
+                    <div class="flex flex-wrap items-center gap-1.5 min-w-0">
+                      <span class="gp-chip font-medium" data-tone="ok">
+                        <CheckCircle2 size={11} />
+                        <span>Working</span>
+                      </span>
+                      {#if attTs !== null}
+                        <time
+                          class="text-micro text-textMuted tabular-nums shrink-0"
+                          datetime={safeIsoDatetime(attTs)}
+                        >
+                          {formatAge(attTs, now)}
+                        </time>
+                      {/if}
+                    </div>
                   {:else}
-                    {row.attentionLabel || "—"}
+                    <span class="text-textMuted">—</span>
                   {/if}
                   {#if under.attention}
                     <span class="block text-textMuted" data-testid="agents-row-rollup-attention">{under.attention}</span>

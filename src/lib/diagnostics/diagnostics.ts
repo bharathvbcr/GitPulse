@@ -1009,6 +1009,26 @@ function isRestoredGithubAlertsProductDisabled(entry: DiagnosticEntry): boolean 
   );
 }
 
+/**
+ * Builds before `xtermLogger` was wired into `TerminalSession` let
+ * `@xterm/addon-webgl`'s `createShader`/`createProgram` log
+ * `console.error("xterm.js: null")` whenever `gl.getShaderInfoLog` or
+ * `gl.getProgramInfoLog` returned `null` on a lost WebGL context. Restoring
+ * that historical entry from an earlier build after the logger fix makes a
+ * resolved bug look live. Entries recorded by the currently running build
+ * (and live `console.error` calls) are kept so any regression survives restart.
+ */
+function isRestoredXtermNullConsoleError(entry: DiagnosticEntry, runningBuildId: string): boolean {
+  if (runningBuildId !== "unknown" && entry.buildId === runningBuildId) {
+    return false;
+  }
+  return (
+    entry.severity === "error"
+    && entry.source === "console"
+    && entry.message.trim() === "xterm.js: null"
+  );
+}
+
 function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as Record<string, unknown>;
@@ -1053,7 +1073,7 @@ function sanitizeEntry(raw: unknown): DiagnosticEntry | null {
   };
 }
 
-function loadPersisted(storage: StorageLike | null, development: boolean): {
+function loadPersisted(storage: StorageLike | null, development: boolean, runningBuildId: string): {
   entries: DiagnosticEntry[];
   nextId: number;
   rewritten: boolean;
@@ -1080,6 +1100,7 @@ function loadPersisted(storage: StorageLike | null, development: boolean): {
     .filter((entry) => !isHostRuntimeNoise(entry.message, development))
     .filter((entry) => !isRestoredObserverDump(entry))
     .filter((entry) => !isRestoredGithubAlertsProductDisabled(entry))
+    .filter((entry) => !isRestoredXtermNullConsoleError(entry, runningBuildId))
     // Newest first regardless of how the blob was written.
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_DIAGNOSTIC_ENTRIES);
@@ -1123,7 +1144,7 @@ export function createDiagnostics(deps: { storage?: StorageLike | null; now?: ()
   const storage = deps.storage !== undefined ? deps.storage : browserStorage();
   const now = deps.now ?? (() => Date.now());
   const development = deps.development ?? import.meta.env.DEV;
-  const restored = loadPersisted(storage, development);
+  const restored = loadPersisted(storage, development, buildId);
 
   let entries: DiagnosticEntry[] = restored.entries;
   let nextId = restored.nextId;

@@ -16,7 +16,7 @@
         "url": "https://gitpulse.vbcr.dev"
       },
       "homepage": "https://gitpulse.vbcr.dev",
-      "license": "MIT",
+      "license": "MIT OR Apache-2.0",
       "keywords": [
         "git",
         "mcp",

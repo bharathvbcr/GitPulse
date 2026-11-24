@@ -93,6 +93,7 @@
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
   import HostLoadSetting from "./HostLoadSetting.svelte";
+  import IdleMemorySetting from "./IdleMemorySetting.svelte";
   import HostLoadInputSetting from "./HostLoadInputSetting.svelte";
   import HostLoadDiskGuardSetting from "./HostLoadDiskGuardSetting.svelte";
   import WatchScopeSetting from "./WatchScopeSetting.svelte";
@@ -1224,6 +1225,11 @@
                 <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["host-load"])}>
                   <div data-setting="host-load" hidden={!shown("host-load")}>
                     <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                  </div>
+                </section>
+                <section class="gp-card p-4 flex flex-col gap-3" hidden={!any(["idle-memory"])}>
+                  <div data-setting="idle-memory" hidden={!shown("idle-memory")}>
+                    <IdleMemorySetting active={isOpen && activeSection === "agents"} />
                   </div>
                 </section>
                 <section class="gp-card p-4 flex flex-col gap-4" hidden={!any(HOST_LOAD_INPUT_ROWS)}>

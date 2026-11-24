@@ -110,9 +110,13 @@
         return JSON.stringify({ ok: true, items: [item], total: 1, shown: 1, has_more: false, next_cursor: null });
       }
 
+      let t5InboxHandler = null;
       const fixtures = {
         cmd_resolve_repo: (args) => ({
-          path: args.repoPath, name: "GitPulse", is_bare: false, common_dir: `${MAIN}/.git`,
+          path: args.repoPath,
+          name: args.repoPath === MAIN ? "GitPulse" : (String(args.repoPath).split("/").pop() || "Repo"),
+          is_bare: false,
+          common_dir: `${args.repoPath}/.git`,
         }),
         cmd_list_branches: () => [branch("main")],
         cmd_get_status: () => [],
@@ -157,7 +161,8 @@
         },
         // One settled thread shaped like a real cross-session note: the sender is
         // a bare session uuid and the title is longer than the thread list.
-        cmd_inbox_read: () => {
+        cmd_inbox_read: (args) => {
+          if (t5InboxHandler) return t5InboxHandler.read(args);
           const sender = "08ed0464-1cc2-4f66-a87e-107731d5f268";
           const note = (seq) => ({
             seq, from_agent: sender, to_agent: "claude:52d6abcd-6965-454b-a465-56a4a88526e7", kind: "note",
@@ -172,10 +177,16 @@
           };
           return { ok: true, repo_path: MAIN, threads: [thread], lanes: [], total: 1 };
         },
+        cmd_worktree_send_message: (args) => t5InboxHandler ? t5InboxHandler.send(args) : null,
+        cmd_inbox_withdraw: (args) => t5InboxHandler ? t5InboxHandler.withdraw(args) : null,
+        cmd_inbox_post: (args) => t5InboxHandler ? t5InboxHandler.post(args) : null,
+        cmd_inbox_decompose_task: (args) => t5InboxHandler ? t5InboxHandler.decompose(args) : null,
         cmd_terminal_context: (args) => (
           args.sessionId === "pty-alpha"
             ? { process: "claude", busy: false, cwd: ALPHA, repo_dir: ".claude/worktrees/alpha" }
-            : { process: null, busy: null, cwd: null, repo_dir: null }
+            : args.sessionId === "pty-agy-beta"
+              ? { process: "agy", busy: false, cwd: BETA, repo_dir: ".claude/worktrees/beta" }
+              : { process: null, busy: null, cwd: null, repo_dir: null }
         ),
       };
       mockIPCWithEvents((cmd, args) => {
@@ -185,7 +196,7 @@
         return null;
       });
 
-      const { mount, tick } = await import("svelte");
+      const { mount, tick, unmount } = await import("svelte");
       const { get } = await import("svelte/store");
       const { createChecks } = await import("./checks.ts");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
@@ -207,7 +218,7 @@
       const until = async (test, label) => {
         const end = Date.now() + 8000;
         while (!test() && Date.now() < end) await settle();
-        if (!test()) throw new Error(label || "Timed out");
+        if (!test()) throw new Error((typeof label === "function" ? label() : label) || "Timed out");
       };
       const press = async (name) => { button(name).click(); await settle(); };
       let revealed = 0;
@@ -225,7 +236,7 @@
         noteForegroundFocus(true);
         await repoStore.openRepo(MAIN);
         interfaceStore.setAgentsOpen(true);
-        mount(AgentsView, { target: stage });
+        const mainView = mount(AgentsView, { target: stage });
         await settle();
 
         check("the plane is a labelled region", () => root()?.getAttribute("aria-label") === "Agents");
@@ -279,7 +290,7 @@
         await press("All");
 
         const slot = terminalSessions.reserve({
-          key: "live-alpha", repoPath: MAIN, label: "Claude", title: "alpha", status: "running",
+          key: "live-alpha", repoPath: MAIN, label: "Claude", launcher: "claude", title: "alpha", status: "running",
           sessionId: "pty-alpha", close: async () => {}, reveal: () => { revealed += 1; },
         });
         await until(() => row("alpha").textContent.includes("Live"), "the live terminal did not join its checkout");
@@ -288,7 +299,7 @@
           && presence("alpha").textContent.includes("Live")
           && presence("alpha").getAttribute("title").includes("A process this window started.")
           && presence("beta").textContent.includes("On disk"));
-        terminalSessions.reserve({
+        const shellSlot = terminalSessions.reserve({
           key: "live-shell", repoPath: MAIN, label: "Shell", title: "zsh", status: "running",
           close: async () => {},
         });
@@ -416,6 +427,41 @@
         button("Refresh").click();
         await until(() => button("Refresh") && !button("Refresh").disabled && row("alpha"), "refresh did not finish");
 
+        // Verify F10/F11 Claude blocking vs Antigravity informational separation,
+        // LauncherIcon, detail preview, Notifications filter, and Dismiss.
+        const agySlot = terminalSessions.reserve({
+          key: "live-agy-beta", repoPath: MAIN, label: "Antigravity", launcher: "agy", title: "beta", status: "running",
+          sessionId: "pty-agy-beta", close: async () => {},
+        });
+        sessionActivity.announce({
+          session: "pty-agy-beta",
+          channel: "hook",
+          event: "turn_finished",
+          detail: "Completed plan synthesis",
+        });
+        await until(() => row("beta")?.textContent.includes("Completed plan synthesis"), "Antigravity notice did not reach row");
+        check("LauncherIcon and semantic gp-chip tones distinguish Claude blocking from Antigravity informational", () =>
+          !!row("alpha")?.querySelector('[data-launcher-icon="claude"]')
+          && !!row("beta")?.querySelector('[data-launcher-icon="agy"]')
+          && !!row("alpha")?.querySelector('.gp-chip[data-tone="warn"]')
+          && !!row("beta")?.querySelector('.gp-chip[data-tone="info"]')
+          && !row("alpha")?.querySelector('[data-action="dismiss"]')
+          && !!row("beta")?.querySelector('[data-action="dismiss"]'));
+        await press("Notifications");
+        check("Notifications filter shows only informational notices and excludes blocking rows", () =>
+          !!row("beta") && !row("alpha"));
+        await press("Needs action");
+        check("Needs action filter keeps blocking rows and excludes informational notices", () =>
+          !!row("alpha") && !row("beta"));
+        await press("All");
+        row("beta").querySelector('[data-action="dismiss"]').click();
+        await until(() => !row("beta")?.textContent.includes("Completed plan synthesis"), "dismiss did not clear notification");
+        check("dismissing an informational notice keeps the live terminal row intact", () =>
+          !!row("beta") && presence("beta").textContent.includes("Live"));
+        sessionActivity.forget("pty-agy-beta");
+        agySlot.release();
+        await settle();
+
         mode = "truncated";
         await until(() => button("Refresh")?.disabled === false, "refresh was still running");
         button("Refresh").click();
@@ -513,6 +559,800 @@
           return sender.scrollWidth > sender.clientWidth && summary.getBoundingClientRect().width >= 100;
         });
         sheet.remove();
+        shellSlot.release();
+        sessionActivity.forget("pty-alpha");
+        await unmount(mainView);
+
+        // Tier-5 G2-01..G2-03 real DOM/store integration checks
+        const { agentsRepositoryScope, setAgentsRepositoryScope } = await import("../src/lib/agents/scope.ts");
+        const { requestInboxFocus } = await import("../src/lib/agents/inboxFocus.ts");
+        const { nativeMenuState } = await import("../src/lib/desktop/menuStateStore.ts");
+
+        const makeAskThread = (threadKey, title, askType = "decide") => {
+          const now = Date.now();
+          const body = JSON.stringify(
+            askType === "decide"
+              ? { ask_type: "decide", question: title, options: ["Yes", "No"] }
+              : { ask_type: "answer", question: title }
+          );
+          const msg = {
+            seq: 1, from_agent: "claude-worker", to_agent: "developer", kind: "ask",
+            body, branch: "main", created_at_ms: now, thread_key: threadKey,
+          };
+          return {
+            thread_key: threadKey, title, status: "open", ask_type: askType,
+            from_agent: "claude-worker", to_agent: "developer", updated_at_ms: now,
+            latest_msg: msg, messages: [msg],
+          };
+        };
+
+        const REPO_A = "/repo/A";
+        const REPO_B = "/repo/B";
+        const REPO_ERR = "/repo/Err";
+        const REPO_SLOW = "/repo/SlowA";
+        const repoThreads = new Map([
+          [REPO_A, [makeAskThread("ask-A", "Deploy Repo A", "decide")]],
+          [REPO_B, [makeAskThread("ask-B", "Deploy Repo B", "decide")]],
+          [REPO_SLOW, [makeAskThread("ask-SlowA", "Deploy Slow A", "decide")]],
+        ]);
+        const agentInboxReadCounts = new Map();
+        const sendCalls = [];
+        let failRepoErr = true;
+        let resolveSlowRead = null;
+        let slowReadIssued = false;
+        const heldReads = new Map();
+        const holdReadFor = (rp) => {
+          let resolveFn = null;
+          let issued = false;
+          const promise = new Promise((resolve) => { resolveFn = resolve; });
+          const gate = {
+            promise,
+            resolve: () => resolveFn?.(),
+            markIssued: () => { issued = true; },
+            get issued() { return issued; },
+          };
+          heldReads.set(rp, gate);
+          return gate;
+        };
+        let sendInterceptor = null;
+        let decomposeInterceptor = null;
+
+        t5InboxHandler = {
+          read: async (args) => {
+            const rp = args.repoPath;
+            const fromAgentInbox = args.status === undefined;
+            if (fromAgentInbox) {
+              agentInboxReadCounts.set(rp, (agentInboxReadCounts.get(rp) ?? 0) + 1);
+            }
+            if (rp === REPO_ERR && failRepoErr && fromAgentInbox) {
+              throw new Error("DB offline");
+            }
+            if (rp === REPO_SLOW && fromAgentInbox) {
+              slowReadIssued = true;
+              await new Promise((resolve) => { resolveSlowRead = resolve; });
+            }
+            if (fromAgentInbox && heldReads.has(rp)) {
+              const gate = heldReads.get(rp);
+              heldReads.delete(rp);
+              gate.markIssued();
+              await gate.promise;
+            }
+            const list = (repoThreads.get(rp) ?? []).map((t) => ({ ...t, messages: [...t.messages] }));
+            const filtered = args.status ? list.filter((t) => t.status === args.status) : list;
+            return { ok: true, repo_path: rp, threads: filtered, lanes: [], total: filtered.length };
+          },
+          send: async (args) => {
+            if (sendInterceptor) await sendInterceptor(args);
+            sendCalls.push({ repoPath: args.repoPath, threadKey: args.threadKey, body: args.body });
+            const list = repoThreads.get(args.repoPath) ?? [];
+            const target = list.find((t) => t.thread_key === args.threadKey);
+            const msg = {
+              seq: (target?.latest_msg?.seq ?? 0) + 1,
+              from_agent: args.fromAgent ?? "developer",
+              to_agent: args.toAgent ?? null,
+              kind: args.kind ?? "reply",
+              body: args.body,
+              branch: null,
+              created_at_ms: Date.now(),
+              thread_key: args.threadKey,
+            };
+            if (target) {
+              target.status = "answered";
+              target.updated_at_ms = msg.created_at_ms;
+              target.latest_msg = msg;
+              target.messages = [...target.messages, msg];
+            }
+            return { ok: true, thread_key: args.threadKey, message: msg };
+          },
+          withdraw: (args) => {
+            const list = repoThreads.get(args.repoPath) ?? [];
+            const target = list.find((t) => t.thread_key === args.threadKey);
+            const msg = {
+              seq: (target?.latest_msg?.seq ?? 0) + 1,
+              from_agent: args.fromAgent ?? "developer",
+              to_agent: target?.from_agent ?? null,
+              kind: "withdraw",
+              body: `Ask withdrawn: ${args.reason}`,
+              branch: null,
+              created_at_ms: Date.now(),
+              thread_key: args.threadKey,
+            };
+            if (target) {
+              target.status = "withdrawn";
+              target.updated_at_ms = msg.created_at_ms;
+              target.latest_msg = msg;
+              target.messages = [...target.messages, msg];
+            }
+            return { ok: true, thread_key: args.threadKey, message: msg };
+          },
+          post: (args) => {
+            const list = repoThreads.get(args.repoPath) ?? [];
+            const msg = {
+              seq: 1, from_agent: args.fromAgent ?? "developer", to_agent: args.toAgent ?? null,
+              kind: args.kind ?? "ask", body: args.body, branch: args.branch ?? null,
+              created_at_ms: Date.now(), thread_key: args.threadKey,
+            };
+            list.unshift({
+              thread_key: args.threadKey, title: args.title || "New ask", status: "open",
+              ask_type: "answer", from_agent: args.fromAgent ?? "developer", to_agent: args.toAgent ?? null,
+              updated_at_ms: msg.created_at_ms, latest_msg: msg, messages: [msg],
+            });
+            repoThreads.set(args.repoPath, list);
+            return { ok: true, thread_key: args.threadKey, message: msg };
+          },
+          decompose: async (args) => {
+            if (decomposeInterceptor) await decomposeInterceptor(args);
+            const list = repoThreads.get(args.repoPath) ?? [];
+            const threadKey = `task-gp-${list.length + 1}`;
+            const msg = {
+              seq: 1, from_agent: "developer", to_agent: args.assignAgent ?? null,
+              kind: "ask", body: JSON.stringify({ ask_type: "do", title: args.title, steps: args.subtasks }),
+              branch: args.branch ?? null, created_at_ms: Date.now(), thread_key: threadKey,
+            };
+            list.unshift({
+              thread_key: threadKey, title: `Task Breakdown: ${args.title}`, status: "open",
+              ask_type: "do", from_agent: "developer", to_agent: args.assignAgent ?? null,
+              updated_at_ms: msg.created_at_ms, latest_msg: msg, messages: [msg],
+            });
+            repoThreads.set(args.repoPath, list);
+            return {
+              ok: true, item_id: `gp-${list.length}`, thread_key: threadKey,
+              subtasks: (args.subtasks ?? []).map((s, idx) => ({ item_id: `sub-${idx}`, title: s, status: "ready" })),
+              inbox_message: msg,
+            };
+          },
+        };
+
+        mode = "ready";
+        await repoStore.openRepo(REPO_A);
+        await repoStore.openRepo(REPO_B);
+
+        // G2-03 + G2-01 single mount read:
+        setAgentsRepositoryScope(REPO_A);
+        requestInboxFocus("ask-B", null);
+        const t5View = mount(AgentsView, { target: stage });
+        await until(() => text().includes("Deploy Repo B"), "G2-03: Repo B inbox ask did not render after null-repo focus");
+        check("G2-03: null repoPath on requestInboxFocus clears stale agentsRepositoryScope and falls back to currentPath", () =>
+          get(agentsRepositoryScope) === null && text().includes("Deploy Repo B") && !text().includes("Deploy Repo A"));
+        check("G2-01: AgentInbox issues a single cmd_inbox_read on mount with focusThreadKey", () =>
+          agentInboxReadCounts.get(REPO_B) === 1);
+
+        // G2-01 failed read on switched repo clears prior threads & prevents cross-repo reply:
+        requestInboxFocus("ask-A", REPO_A);
+        await until(() => text().includes("Deploy Repo A"), "Repo A inbox ask did not render");
+        requestInboxFocus("ask-Err", REPO_ERR);
+        await until(() => text().includes("DB offline"), "Repo Err failure notice did not render");
+        check("G2-01: failed cmd_inbox_read on switched repo clears stale threads and disables cross-repo actions", () =>
+          !text().includes("Deploy Repo A")
+          && text().includes("DB offline")
+          && !root().querySelector("[data-testid=confirm-decision-btn]")
+          && !button("Withdraw ask")
+          && sendCalls.every((c) => c.repoPath !== REPO_ERR));
+
+        // G2-01 out-of-order slow response cannot overwrite active repo:
+        requestInboxFocus("ask-SlowA", REPO_SLOW);
+        await until(() => slowReadIssued, "SlowA read was not issued");
+        requestInboxFocus("ask-B", REPO_B);
+        await until(() => text().includes("Deploy Repo B"), "Repo B did not render while SlowA was in flight");
+        resolveSlowRead?.();
+        await settle();
+        await wait(60);
+        check("G2-01: out-of-order slow cmd_inbox_read resolution cannot overwrite active repo threads", () =>
+          text().includes("Deploy Repo B") && !text().includes("Deploy Slow A"));
+
+        // G2-02 end-to-end AgentInbox mutation -> gitpulse:inbox-changed -> nativeMenuState:
+        let inboxChangedEvents = 0;
+        const onInboxEvt = () => { inboxChangedEvents += 1; };
+        window.addEventListener("gitpulse:inbox-changed", onInboxEvt);
+        let menuSnap = null;
+        const unsubMenu = nativeMenuState.subscribe((snap) => { menuSnap = snap; });
+
+        try {
+          // Close extra tabs so only REPO_A is open for clean menu waiting count = 1.
+          for (const tab of [...get(repoStore).openTabs]) {
+            if (tab.path !== REPO_A) await repoStore.closeTab(tab.id);
+          }
+          requestInboxFocus("ask-A", REPO_A);
+          await until(() => text().includes("Deploy Repo A") && root().querySelector("[data-testid=decide-option-Yes]"), "Repo A decision ask did not render");
+          window.dispatchEvent(new CustomEvent("gitpulse:inbox-changed"));
+          await until(
+            () => menuSnap?.agentsWaiting === 1 && menuSnap.agentRequests.some((r) => r.id === "inbox:ask-A"),
+            () => `nativeMenuState did not pick up open ask-A: ${JSON.stringify({ waiting: menuSnap?.agentsWaiting, reqs: menuSnap?.agentRequests, tabs: get(repoStore).openTabs.map((t) => t.path) })}`,
+          );
+
+          const beforeAnsEvents = inboxChangedEvents;
+          root().querySelector("[data-testid=decide-option-Yes]").click();
+          await settle();
+          root().querySelector("[data-testid=confirm-decision-btn]").click();
+          await until(() => menuSnap?.agentsWaiting === 0 && menuSnap.agentRequests.length === 0, "nativeMenuState did not clear after answering ask");
+          check("G2-02: answering an ask in AgentInbox dispatches gitpulse:inbox-changed and clears nativeMenuState waiting count", () =>
+            inboxChangedEvents > beforeAnsEvents && menuSnap.agentsWaiting === 0 && menuSnap.agentRequests.length === 0);
+
+          // Remaining mutations dispatch gitpulse:inbox-changed on success:
+          const setField = async (el, val) => {
+            el.value = val;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            await settle();
+          };
+
+          // 1) handlePostStructuredAsk
+          const beforePost = inboxChangedEvents;
+          root().querySelector("[data-testid=new-ask-btn]").click();
+          await settle();
+          const askSelect = root().querySelector("select[aria-label='Ask type']");
+          askSelect.value = "answer";
+          askSelect.dispatchEvent(new Event("change", { bubbles: true }));
+          await settle();
+          await setField(root().querySelector("input[placeholder='Question or ask title…']"), "Posted question");
+          root().querySelector("[data-testid=submit-new-ask-btn]").click();
+          await until(() => inboxChangedEvents > beforePost && text().includes("Posted question"), "handlePostStructuredAsk did not dispatch gitpulse:inbox-changed");
+
+          // 2) handleWithdraw
+          const beforeWithdraw = inboxChangedEvents;
+          button("Withdraw ask").click();
+          await settle();
+          button("Confirm withdrawal").click();
+          await until(() => inboxChangedEvents > beforeWithdraw && text().includes("Ask withdrawn"), "handleWithdraw did not dispatch gitpulse:inbox-changed");
+
+          // 3) handleBatchResolve & handleBatchWithdraw
+          repoThreads.set(REPO_A, [
+            makeAskThread("batch-1", "Batch One", "answer"),
+            makeAskThread("batch-2", "Batch Two", "answer"),
+          ]);
+          root().querySelector("[aria-label='Refresh inbox']").click();
+          await until(() => text().includes("Batch One") && text().includes("Batch Two"), "batch threads did not load");
+          const beforeBatchResolve = inboxChangedEvents;
+          button("Select visible (2)").click();
+          await settle();
+          await setField(root().querySelector("[aria-label='Batch resolution note']"), "Resolved together");
+          root().querySelector("[data-testid=batch-resolve-btn]").click();
+          await until(() => inboxChangedEvents > beforeBatchResolve, "handleBatchResolve did not dispatch gitpulse:inbox-changed");
+
+          repoThreads.set(REPO_A, [
+            makeAskThread("batch-w1", "Batch Withdraw One", "answer"),
+          ]);
+          root().querySelector("[aria-label='Refresh inbox']").click();
+          await until(() => text().includes("Batch Withdraw One"), "batch withdraw thread did not load");
+          const beforeBatchWithdraw = inboxChangedEvents;
+          button("Select visible (1)").click();
+          await settle();
+          root().querySelector("[data-testid=batch-withdraw-btn]").click();
+          await until(() => inboxChangedEvents > beforeBatchWithdraw, "handleBatchWithdraw did not dispatch gitpulse:inbox-changed");
+
+          // 4) handleDecomposeTask
+          const beforeDecompose = inboxChangedEvents;
+          root().querySelector("[data-testid=decompose-task-btn]").click();
+          await settle();
+          await setField(root().querySelector("input[placeholder='Parent task title…']"), "Parent Task");
+          await setField(root().querySelector("textarea[placeholder='Subtasks, one per line…']"), "Step 1\nStep 2");
+          root().querySelector("[data-testid=submit-decompose-btn]").click();
+          await until(() => inboxChangedEvents > beforeDecompose, "handleDecomposeTask did not dispatch gitpulse:inbox-changed");
+
+          check("G2-02: post, withdraw, batch-resolve, batch-withdraw, and decompose mutations all dispatch gitpulse:inbox-changed", () =>
+            inboxChangedEvents > beforeAnsEvents + 5);
+
+          // GAP-R3-01 Test 1: handleKickOffAgent cross-repo isolation on concurrent repo switch
+          const makeMobileBreakdownThread = (threadKey, title) => {
+            const now = Date.now();
+            const msg = {
+              seq: 1, from_agent: "graft-mobile", to_agent: "developer", kind: "ask",
+              body: JSON.stringify({
+                kind: "decompose",
+                task_id: "ft-mobile-1",
+                title,
+                steps: ["Step A1", "Step A2"],
+              }),
+              branch: "main", created_at_ms: now, thread_key: threadKey,
+            };
+            return {
+              thread_key: threadKey, title, status: "open", ask_type: "do",
+              from_agent: "graft-mobile", to_agent: "developer", updated_at_ms: now,
+              latest_msg: msg, messages: [msg],
+            };
+          };
+
+          repoThreads.set(REPO_A, [makeAskThread("mobile-A", "Kickoff Repo A", "answer")]);
+          repoThreads.set(REPO_B, [makeAskThread("ask-B", "Deploy Repo B", "decide")]);
+          await repoStore.openRepo(REPO_B);
+
+          // 1a) Managed kickoff rejects while Repo B read is in flight
+          requestInboxFocus("mobile-A", REPO_A);
+          await until(() => text().includes("Kickoff Repo A") && root().querySelector("[data-testid=kickoff-agent-btn]") && !root().querySelector("[aria-label='Refresh inbox']").disabled, "Repo A kickoff thread did not render");
+
+          let rejectKickoffDecompose = null;
+          let kickoffDecomposeIssued = false;
+          decomposeInterceptor = () => new Promise((_, reject) => {
+            kickoffDecomposeIssued = true;
+            rejectKickoffDecompose = reject;
+          });
+          root().querySelector("[data-testid=kickoff-agent-btn]").click();
+          await until(() => kickoffDecomposeIssued, "handleKickOffAgent did not invoke cmd_inbox_decompose_task");
+          decomposeInterceptor = null;
+
+          const holdRepoBRead1 = holdReadFor(REPO_B);
+          const readsBeforeKickoffReject = agentInboxReadCounts.get(REPO_B) ?? 0;
+          requestInboxFocus("ask-B", REPO_B);
+          await until(() => holdRepoBRead1.issued && root().querySelector("[aria-label='Refresh inbox']").disabled === true, "Repo B read did not stay pending during kickoff reject test");
+
+          rejectKickoffDecompose?.(new Error("Repo A kickoff failed"));
+          await settle();
+          await wait(40);
+          const kickoffBusyKeptOnReject = root().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          holdRepoBRead1.resolve();
+          await until(() => text().includes("Deploy Repo B") && root().querySelector("[aria-label='Refresh inbox']").disabled === false, "Repo B did not settle after kickoff reject");
+          const alertAfterKickoffReject = root().querySelector("[role='alert']")?.textContent ?? "";
+          const statusAfterKickoffReject = root().querySelector("[role='status']")?.textContent ?? "";
+          check("GAP-R3-01: handleKickOffAgent rejection after repo switch preserves Repo B busy and leaks no alert", () =>
+            kickoffBusyKeptOnReject
+            && !alertAfterKickoffReject.includes("Couldn't kick off")
+            && !statusAfterKickoffReject.includes("Kicked off")
+            && (agentInboxReadCounts.get(REPO_B) ?? 0) === readsBeforeKickoffReject + 1);
+
+          // 1b) Terminal kickoff resolves while Repo B read is in flight
+          requestInboxFocus("mobile-A", REPO_A);
+          await until(() => text().includes("Kickoff Repo A") && !root().querySelector("[aria-label='Refresh inbox']").disabled, "Repo A did not reload for kickoff resolve test");
+          const modeSelect = root().querySelector("select[aria-label='Kickoff session mode']");
+          modeSelect.value = "terminal";
+          modeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+          await settle();
+
+          const { terminalLaunchRequests } = await import("../src/lib/terminal/launchRequests.ts");
+          const unsubLaunch = terminalLaunchRequests.subscribe((req) => {
+            if (req && req.repoPath === REPO_A) {
+              terminalLaunchRequests.take(REPO_A)?.complete();
+            }
+          });
+          let resolveKickoffSend = null;
+          let kickoffSendIssued = false;
+          sendInterceptor = () => new Promise((resolve) => {
+            kickoffSendIssued = true;
+            resolveKickoffSend = resolve;
+          });
+          try {
+            root().querySelector("[data-testid=kickoff-agent-btn]").click();
+            await until(() => kickoffSendIssued, "handleKickOffAgent terminal handoff send was not issued");
+          } finally {
+            sendInterceptor = null;
+            unsubLaunch();
+          }
+
+          const holdRepoBRead2 = holdReadFor(REPO_B);
+          const readsBeforeKickoffResolve = agentInboxReadCounts.get(REPO_B) ?? 0;
+          requestInboxFocus("ask-B", REPO_B);
+          await until(() => holdRepoBRead2.issued && root().querySelector("[aria-label='Refresh inbox']").disabled === true, "Repo B read did not stay pending during kickoff resolve test");
+
+          resolveKickoffSend?.();
+          await settle();
+          await wait(40);
+          const kickoffBusyKeptOnResolve = root().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          holdRepoBRead2.resolve();
+          await until(() => text().includes("Deploy Repo B") && root().querySelector("[aria-label='Refresh inbox']").disabled === false, "Repo B did not settle after kickoff resolve");
+          const statusAfterKickoffResolve = root().querySelector("[role='status']")?.textContent ?? "";
+          check("GAP-R3-01: handleKickOffAgent resolution after repo switch preserves Repo B busy, skips notice, and avoids extra read", () =>
+            kickoffBusyKeptOnResolve
+            && !statusAfterKickoffResolve.includes("Opened interactive")
+            && !statusAfterKickoffResolve.includes("Kicked off")
+            && (agentInboxReadCounts.get(REPO_B) ?? 0) === readsBeforeKickoffResolve + 1);
+
+          // GAP-R3-01 Test 2 (Part B): handleApplyMobileBreakdown immediate inbox-changed & cross-repo isolation
+          repoThreads.set(REPO_A, [makeMobileBreakdownThread("mobile-bd-A", "Mobile Breakdown From A")]);
+          requestInboxFocus("mobile-bd-A", REPO_A);
+          await until(() => root().querySelector("[data-testid=mobile-apply-subtasks-btn]") && !root().querySelector("[aria-label='Refresh inbox']").disabled, "Repo A mobile breakdown thread did not render");
+
+          // 2b-i) Immediate gitpulse:inbox-changed emission on un-switched success (before follow-up refreshInbox completes)
+          const holdFollowUpReadA = holdReadFor(REPO_A);
+          const beforeApplyEvents = inboxChangedEvents;
+          root().querySelector("[data-testid=mobile-apply-subtasks-btn]").click();
+          await until(() => inboxChangedEvents > beforeApplyEvents && holdFollowUpReadA.issued, "handleApplyMobileBreakdown did not emit gitpulse:inbox-changed immediately after decompose IPC");
+          const immediateInboxChanged = inboxChangedEvents > beforeApplyEvents;
+          holdFollowUpReadA.resolve();
+          await until(() => text().includes("Applied 2 subtasks") && root().querySelector("[aria-label='Refresh inbox']").disabled === false, "Repo A did not settle after mobile apply");
+
+          // 2b-ii) Rejection across repo switch (already on REPO_A with mobile-bd-A selected)
+          await until(() => root().querySelector("[data-testid=mobile-apply-subtasks-btn]") && !root().querySelector("[aria-label='Refresh inbox']").disabled, "Repo A mobile breakdown was not ready for reject test");
+
+          let rejectApplyDecompose = null;
+          let applyDecomposeIssued = false;
+          decomposeInterceptor = () => new Promise((_, reject) => {
+            applyDecomposeIssued = true;
+            rejectApplyDecompose = reject;
+          });
+          root().querySelector("[data-testid=mobile-apply-subtasks-btn]").click();
+          await until(() => applyDecomposeIssued, "handleApplyMobileBreakdown did not invoke cmd_inbox_decompose_task");
+          decomposeInterceptor = null;
+
+          const holdRepoBRead3 = holdReadFor(REPO_B);
+          requestInboxFocus("ask-B", REPO_B);
+          await until(() => holdRepoBRead3.issued && root().querySelector("[aria-label='Refresh inbox']").disabled === true, "Repo B read did not stay pending during mobile apply reject");
+
+          rejectApplyDecompose?.(new Error("Repo A mobile apply failed"));
+          await settle();
+          await wait(40);
+          const applyBusyKeptOnReject = root().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          holdRepoBRead3.resolve();
+          await until(() => text().includes("Deploy Repo B") && root().querySelector("[aria-label='Refresh inbox']").disabled === false, "Repo B did not settle after mobile apply reject");
+          const alertAfterApplyReject = root().querySelector("[role='alert']")?.textContent ?? "";
+
+          // 2b-iii) Resolution across repo switch
+          requestInboxFocus("mobile-bd-A", REPO_A);
+          await until(() => text().includes("Mobile Breakdown From A") && root().querySelector("[data-testid=mobile-apply-subtasks-btn]") && !root().querySelector("[aria-label='Refresh inbox']").disabled, "Repo A mobile breakdown did not reload for resolve test");
+
+          let resolveApplyDecompose = null;
+          let applyResolveIssued = false;
+          decomposeInterceptor = () => new Promise((resolve) => {
+            applyResolveIssued = true;
+            resolveApplyDecompose = resolve;
+          });
+          root().querySelector("[data-testid=mobile-apply-subtasks-btn]").click();
+          await until(() => applyResolveIssued, "handleApplyMobileBreakdown resolve test did not invoke cmd_inbox_decompose_task");
+          decomposeInterceptor = null;
+
+          const holdRepoBRead4 = holdReadFor(REPO_B);
+          const readsBeforeApplyResolve = agentInboxReadCounts.get(REPO_B) ?? 0;
+          requestInboxFocus("ask-B", REPO_B);
+          await until(() => holdRepoBRead4.issued && root().querySelector("[aria-label='Refresh inbox']").disabled === true, "Repo B read did not stay pending during mobile apply resolve");
+
+          resolveApplyDecompose?.();
+          await settle();
+          await wait(40);
+          const applyBusyKeptOnResolve = root().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          holdRepoBRead4.resolve();
+          await until(() => text().includes("Deploy Repo B") && root().querySelector("[aria-label='Refresh inbox']").disabled === false, "Repo B did not settle after mobile apply resolve");
+          const statusAfterApplyResolve = root().querySelector("[role='status']")?.textContent ?? "";
+
+          check("GAP-R3-01: handleApplyMobileBreakdown emits gitpulse:inbox-changed immediately and isolates cross-repo reject/resolve", () =>
+            immediateInboxChanged
+            && applyBusyKeptOnReject
+            && !alertAfterApplyReject.includes("Couldn't apply the subtasks")
+            && applyBusyKeptOnResolve
+            && !statusAfterApplyResolve.includes("Applied 2 subtasks")
+            && (agentInboxReadCounts.get(REPO_B) ?? 0) === readsBeforeApplyResolve + 1);
+        } finally {
+          window.removeEventListener("gitpulse:inbox-changed", onInboxEvt);
+          unsubMenu();
+          await unmount(t5View);
+        }
+
+        // GAP-R3-01 Test 2 (Part A): handleApplyMobileBreakdown during async onopenTask suspension
+        const AgentInboxHost = (await import("./AgentInboxHost.svelte")).default;
+        const hostContainer = document.createElement("div");
+        stage.append(hostContainer);
+        let resolveOpenTask = null;
+        let openTaskCalled = false;
+        const decomposeArgsLog = [];
+        decomposeInterceptor = (args) => { decomposeArgsLog.push(args); };
+        const mobileBreakdownNow = Date.now();
+        const mobileBreakdownMsg = {
+          seq: 1, from_agent: "graft-mobile", to_agent: "developer", kind: "ask",
+          body: JSON.stringify({
+            kind: "decompose",
+            task_id: "ft-mobile-1",
+            title: "Mobile Breakdown From A",
+            steps: ["Step A1", "Step A2"],
+          }),
+          branch: "main", created_at_ms: mobileBreakdownNow, thread_key: "mobile-bd-A",
+        };
+        repoThreads.set(REPO_A, [{
+          thread_key: "mobile-bd-A", title: "Mobile Breakdown From A", status: "open", ask_type: "do",
+          from_agent: "graft-mobile", to_agent: "developer", updated_at_ms: mobileBreakdownNow,
+          latest_msg: mobileBreakdownMsg, messages: [mobileBreakdownMsg],
+        }]);
+        const inboxHost = mount(AgentInboxHost, {
+          target: hostContainer,
+          props: {
+            initialRepoPath: REPO_A,
+            focusThreadKey: "mobile-bd-A",
+            focusSeq: 1,
+            onopenTask: async () => {
+              openTaskCalled = true;
+              await new Promise((resolve) => { resolveOpenTask = resolve; });
+            },
+          },
+        });
+        try {
+          const inboxRoot = () => hostContainer.querySelector("[data-testid=agent-inbox]");
+          await until(() => inboxRoot()?.querySelector("[data-testid=mobile-apply-subtasks-btn]") && !inboxRoot().querySelector("[aria-label='Refresh inbox']").disabled, "AgentInboxHost did not load mobile breakdown thread");
+          inboxRoot().querySelector("[data-testid=mobile-apply-subtasks-btn]").click();
+          await until(() => openTaskCalled, "handleApplyMobileBreakdown did not await onopenTask");
+
+          const holdRepoBRead5 = holdReadFor(REPO_B);
+          inboxHost.setRepoPath(REPO_B);
+          await until(() => holdRepoBRead5.issued && inboxRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "Repo B read did not start after host repo switch");
+
+          resolveOpenTask?.();
+          await settle();
+          await wait(40);
+          const busyKeptDuringOpenTask = inboxRoot().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          holdRepoBRead5.resolve();
+          await until(() => (inboxRoot()?.textContent ?? "").includes("Deploy Repo B") && inboxRoot().querySelector("[aria-label='Refresh inbox']").disabled === false, "AgentInboxHost did not settle on Repo B");
+          check("GAP-R3-01: switching repoPath during async onopenTask aborts handleApplyMobileBreakdown without invoking cmd_inbox_decompose_task", () =>
+            busyKeptDuringOpenTask
+            && decomposeArgsLog.length === 0
+            && !(inboxRoot()?.textContent ?? "").includes("Applied 2 subtasks")
+            && !(inboxRoot()?.textContent ?? "").includes("Couldn't apply the subtasks"));
+        } finally {
+          decomposeInterceptor = null;
+          sendInterceptor = null;
+          await unmount(inboxHost);
+          hostContainer.remove();
+        }
+
+        // GAP-R4-01 Test 1: handleDecomposeTask A -> B -> A ABA during post-mutation refreshInbox()
+        const abaHostContainer = document.createElement("div");
+        stage.append(abaHostContainer);
+        repoThreads.set(REPO_A, [makeAskThread("ask-A", "Deploy Repo A", "decide")]);
+        repoThreads.set(REPO_B, [makeAskThread("ask-B", "Deploy Repo B", "decide")]);
+        const abaHost = mount(AgentInboxHost, {
+          target: abaHostContainer,
+          props: { initialRepoPath: REPO_A, focusThreadKey: "ask-A", focusSeq: 1 },
+        });
+        try {
+          const abaRoot = () => abaHostContainer.querySelector("[data-testid=agent-inbox]");
+          const setAbaField = async (el, val) => {
+            el.value = val;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            await settle();
+          };
+          await until(() => (abaRoot()?.textContent ?? "").includes("Deploy Repo A") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: Repo A did not settle before decompose ABA test");
+
+          abaRoot().querySelector("[data-testid=decompose-task-btn]").click();
+          await settle();
+          await setAbaField(abaRoot().querySelector("input[placeholder='Parent task title…']"), "Task 1");
+          await setAbaField(abaRoot().querySelector("textarea[placeholder='Subtasks, one per line…']"), "Step 1");
+
+          const gate0 = holdReadFor(REPO_A);
+          abaRoot().querySelector("[data-testid=submit-decompose-btn]").click();
+          await until(() => gate0.issued, "GAP-R4-01: post-decompose refreshInbox did not issue gate0");
+
+          abaHost.setRepoPath(REPO_B);
+          await until(() => (abaRoot()?.textContent ?? "").includes("Deploy Repo B") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: Repo B did not settle during ABA switch");
+          if (abaRoot().querySelector("[data-testid=decompose-task-drawer]")) {
+            abaRoot().querySelector("[data-testid=decompose-task-btn]").click();
+            await settle();
+          }
+
+          const gate1 = holdReadFor(REPO_A);
+          abaHost.setRepoPath(REPO_A);
+          await until(() => gate1.issued && abaRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R4-01: fresh Repo A read gate1 did not issue");
+
+          if (!abaRoot().querySelector("[data-testid=decompose-task-drawer]")) {
+            abaRoot().querySelector("[data-testid=decompose-task-btn]").click();
+            await settle();
+          }
+          await setAbaField(abaRoot().querySelector("input[placeholder='Parent task title…']"), "WIP Task 2");
+
+          gate0.resolve();
+          await settle();
+          await wait(40);
+
+          const drawerStillOpen = !!abaRoot().querySelector("[data-testid=decompose-task-drawer]");
+          const titleAfterStaleResolve = abaRoot().querySelector("input[placeholder='Parent task title…']")?.value ?? null;
+          const statusWhileGate1Pending = abaRoot().querySelector("[role='status']")?.textContent ?? "";
+          gate1.resolve();
+          await until(() => !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: fresh Repo A read gate1 did not settle");
+
+          check("GAP-R4-01: handleDecomposeTask A->B->A ABA during post-mutation refreshInbox preserves composer drawer and WIP input", () =>
+            drawerStillOpen
+            && titleAfterStaleResolve === "WIP Task 2"
+            && !statusWhileGate1Pending.includes("Filed parent task"));
+
+          // GAP-R4-01 Test 2: handleApplyMobileBreakdown & handleKickOffAgent A -> B -> A ABA suppress stale notice
+          repoThreads.set(REPO_A, [{
+            thread_key: "bd-A", title: "Mobile Breakdown A", status: "open", ask_type: "do",
+            from_agent: "graft-mobile", to_agent: "developer", updated_at_ms: mobileBreakdownNow,
+            latest_msg: mobileBreakdownMsg, messages: [mobileBreakdownMsg],
+          }]);
+          abaHost.setFocus("bd-A", 2);
+          await until(() => abaRoot().querySelector("[data-testid=mobile-apply-subtasks-btn]") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: mobile breakdown did not load");
+
+          const applyGate0 = holdReadFor(REPO_A);
+          abaRoot().querySelector("[data-testid=mobile-apply-subtasks-btn]").click();
+          await until(() => applyGate0.issued, "GAP-R4-01: post-apply refreshInbox did not issue gate0");
+
+          abaHost.setRepoPath(REPO_B);
+          await until(() => (abaRoot()?.textContent ?? "").includes("Deploy Repo B") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: Repo B did not settle during apply ABA");
+
+          const applyGate1 = holdReadFor(REPO_A);
+          abaHost.setRepoPath(REPO_A);
+          await until(() => applyGate1.issued && abaRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R4-01: fresh Repo A read gate1 did not issue for apply ABA");
+
+          applyGate0.resolve();
+          await settle();
+          await wait(40);
+          const applyStatusWhilePending = abaRoot().querySelector("[role='status']")?.textContent ?? "";
+          applyGate1.resolve();
+          await until(() => !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: apply gate1 did not settle");
+
+          // Symmetric check for handleKickOffAgent A -> B -> A (terminal handoff mode)
+          repoThreads.set(REPO_A, [makeAskThread("kick-A", "Kickoff A", "answer")]);
+          abaHost.setFocus("kick-A", 3);
+          await until(() => (abaRoot()?.textContent ?? "").includes("Kickoff A") && abaRoot().querySelector("[data-testid=kickoff-agent-btn]") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: kickoff thread did not load");
+
+          const abaModeSelect = abaRoot().querySelector("select[aria-label='Kickoff session mode']");
+          abaModeSelect.value = "terminal";
+          abaModeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+          await settle();
+
+          const { terminalLaunchRequests: abaLaunchReqs } = await import("../src/lib/terminal/launchRequests.ts");
+          const unsubAbaLaunch = abaLaunchReqs.subscribe((req) => {
+            if (req && req.repoPath === REPO_A) {
+              abaLaunchReqs.take(REPO_A)?.complete();
+            }
+          });
+          const kickGate0 = holdReadFor(REPO_A);
+          try {
+            abaRoot().querySelector("[data-testid=kickoff-agent-btn]").click();
+            await until(() => kickGate0.issued, "GAP-R4-01: post-kickoff refreshInbox did not issue gate0");
+          } finally {
+            unsubAbaLaunch();
+          }
+
+          abaHost.setRepoPath(REPO_B);
+          await until(() => (abaRoot()?.textContent ?? "").includes("Deploy Repo B") && !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: Repo B did not settle during kickoff ABA");
+
+          const kickGate1 = holdReadFor(REPO_A);
+          abaHost.setRepoPath(REPO_A);
+          await until(() => kickGate1.issued && abaRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R4-01: fresh Repo A read gate1 did not issue for kickoff ABA");
+
+          kickGate0.resolve();
+          await settle();
+          await wait(40);
+          const kickStatusWhilePending = abaRoot().querySelector("[role='status']")?.textContent ?? "";
+          kickGate1.resolve();
+          await until(() => !abaRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R4-01: kickoff gate1 did not settle");
+
+          check("GAP-R4-01: handleApplyMobileBreakdown & handleKickOffAgent A->B->A ABA suppress stale notice while fresh read is pending", () =>
+            !applyStatusWhilePending.includes("Applied 2 subtasks")
+            && !kickStatusWhilePending.includes("Opened interactive")
+            && !kickStatusWhilePending.includes("Kicked off"));
+        } finally {
+          decomposeInterceptor = null;
+          sendInterceptor = null;
+          await unmount(abaHost);
+          abaHostContainer.remove();
+        }
+
+        // GAP-R3-01 Test 3: handleLaunchMobileKickoff async onkickoff suspension across A -> B (reject & resolve) and A -> B -> A ABA
+        const kickoffHostContainer = document.createElement("div");
+        stage.append(kickoffHostContainer);
+        let kickoffCallbackHandler = null;
+        const kickoffDecomposeLog = [];
+        decomposeInterceptor = (args) => { kickoffDecomposeLog.push(args); };
+        const mobileKickoffMsg = {
+          seq: 1, from_agent: "graft-mobile", to_agent: "developer", kind: "ask",
+          body: "[KICKOFF provider=claude mode=managed] Launch worker from Graft Mobile",
+          branch: "main", created_at_ms: mobileBreakdownNow, thread_key: "mobile-ko-A",
+        };
+        repoThreads.set(REPO_A, [{
+          thread_key: "mobile-ko-A", title: "Mobile Kickoff A", status: "open", ask_type: "do",
+          from_agent: "graft-mobile", to_agent: "developer", updated_at_ms: mobileBreakdownNow,
+          latest_msg: mobileKickoffMsg, messages: [mobileKickoffMsg],
+        }]);
+        const koHost = mount(AgentInboxHost, {
+          target: kickoffHostContainer,
+          props: {
+            initialRepoPath: REPO_A,
+            focusThreadKey: "mobile-ko-A",
+            focusSeq: 1,
+            onkickoff: (directive, thread) => kickoffCallbackHandler?.(directive, thread),
+          },
+        });
+        try {
+          const koRoot = () => kickoffHostContainer.querySelector("[data-testid=agent-inbox]");
+          await until(() => koRoot()?.querySelector("[data-testid=mobile-launch-session-btn]") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: mobile kickoff thread did not load");
+
+          // 3a) A -> B with onkickoff rejection
+          let rejectKo1 = null;
+          let ko1Called = false;
+          kickoffCallbackHandler = () => new Promise((_, reject) => {
+            ko1Called = true;
+            rejectKo1 = reject;
+          });
+          koRoot().querySelector("[data-testid=mobile-launch-session-btn]").click();
+          await until(() => ko1Called, "GAP-R3-01: onkickoff was not awaited (reject case)");
+
+          const koGateB1 = holdReadFor(REPO_B);
+          koHost.setRepoPath(REPO_B);
+          await until(() => koGateB1.issued && koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R3-01: Repo B read did not stay pending during onkickoff reject");
+
+          rejectKo1?.(new Error("onkickoff failed in A"));
+          await settle();
+          await wait(40);
+          const koBusyOnReject = koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          koGateB1.resolve();
+          await until(() => (koRoot()?.textContent ?? "").includes("Deploy Repo B") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo B did not settle after onkickoff reject");
+          const koAlertAfterReject = koRoot().querySelector("[role='alert']")?.textContent ?? "";
+
+          // 3b) A -> B with onkickoff resolution
+          koHost.setRepoPath(REPO_A);
+          koHost.setFocus("mobile-ko-A", 2);
+          await until(() => koRoot()?.querySelector("[data-testid=mobile-launch-session-btn]") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo A did not reload for onkickoff resolve case");
+
+          let resolveKo2 = null;
+          let ko2Called = false;
+          kickoffCallbackHandler = () => new Promise((resolve) => {
+            ko2Called = true;
+            resolveKo2 = resolve;
+          });
+          koRoot().querySelector("[data-testid=mobile-launch-session-btn]").click();
+          await until(() => ko2Called, "GAP-R3-01: onkickoff was not awaited (resolve case)");
+
+          const koGateB2 = holdReadFor(REPO_B);
+          koHost.setRepoPath(REPO_B);
+          await until(() => koGateB2.issued && koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R3-01: Repo B read did not stay pending during onkickoff resolve");
+
+          resolveKo2?.();
+          await settle();
+          await wait(40);
+          const koBusyOnResolve = koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          koGateB2.resolve();
+          await until(() => (koRoot()?.textContent ?? "").includes("Deploy Repo B") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo B did not settle after onkickoff resolve");
+          const koStatusAfterResolve = koRoot().querySelector("[role='status']")?.textContent ?? "";
+
+          // 3c) A -> B -> A ABA before onkickoff resolves
+          koHost.setRepoPath(REPO_A);
+          koHost.setFocus("mobile-ko-A", 3);
+          await until(() => koRoot()?.querySelector("[data-testid=mobile-launch-session-btn]") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo A did not reload for onkickoff ABA case");
+
+          let resolveKo3 = null;
+          let ko3Called = false;
+          kickoffCallbackHandler = () => new Promise((resolve) => {
+            ko3Called = true;
+            resolveKo3 = resolve;
+          });
+          koRoot().querySelector("[data-testid=mobile-launch-session-btn]").click();
+          await until(() => ko3Called, "GAP-R3-01: onkickoff was not awaited (ABA case)");
+
+          koHost.setRepoPath(REPO_B);
+          await until(() => (koRoot()?.textContent ?? "").includes("Deploy Repo B") && !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo B did not settle in onkickoff ABA");
+          const koGateA3 = holdReadFor(REPO_A);
+          koHost.setRepoPath(REPO_A);
+          await until(() => koGateA3.issued && koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true, "GAP-R3-01: fresh Repo A read did not stay pending in onkickoff ABA");
+
+          resolveKo3?.();
+          await settle();
+          await wait(40);
+          const koBusyOnAba = koRoot().querySelector("[aria-label='Refresh inbox']").disabled === true;
+          koGateA3.resolve();
+          await until(() => !koRoot().querySelector("[aria-label='Refresh inbox']").disabled, "GAP-R3-01: Repo A did not settle after onkickoff ABA");
+          const koStatusAfterAba = koRoot().querySelector("[role='status']")?.textContent ?? "";
+
+          check("GAP-R3-01: handleLaunchMobileKickoff async onkickoff suspension isolates A->B (reject/resolve) and A->B->A ABA", () =>
+            koBusyOnReject
+            && !koAlertAfterReject.includes("Couldn't kick off")
+            && koBusyOnResolve
+            && !koStatusAfterResolve.includes("Kicked off")
+            && koBusyOnAba
+            && !koStatusAfterAba.includes("Kicked off")
+            && kickoffDecomposeLog.length === 0);
+        } finally {
+          decomposeInterceptor = null;
+          sendInterceptor = null;
+          t5InboxHandler = null;
+          await unmount(koHost);
+          kickoffHostContainer.remove();
+        }
+
         check("the run made no unexpected native calls", () => unexpected.length === 0 && errors.length === 0);
         await finish();
       } catch (error) {

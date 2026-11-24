@@ -36,8 +36,11 @@ jobs:
   # `needs` between them run side by side, so a leg takes as long as its slowest
   # job, and a red clippy no longer hides behind a 22-minute WKWebView sweep.
   #
-  # The Rust suite is still `cargo test --test-threads=1`: scripts/
-  # check-workflows.test.ts pins that line, for the fixture timeouts it names.
+  # The Rust suites stay serial (`--profile ci` with `test-threads = 1` for the
+  # sharded nextest jobs, and `cargo test --test-threads=1` for doctests,
+  # worktree crate tests, and the descriptor-inheritance burst):
+  # scripts/check-workflows.test.ts and scripts/ci-shards-contract.test.ts pin
+  # those constraints for the fixture timeouts they prevent.
   frontend:
     name: Frontend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -250,36 +253,33 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: cargo clippy --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --all-targets -- -D warnings
 
-  # Linux and Windows run the suite in one process, one test at a time:
-  # `cargo test --test-threads=1`, the gate scripts/check-workflows.test.ts pins.
-  # macOS cannot: in run 43351016929 it logged 6,623 of the lib suite's 7,474
-  # tests in 52 minutes and hit the job limit. It runs the same suite as three
-  # `cargo nextest` shards instead (`rust-test-macos`), each one bucket of
-  # `--partition hash:M/3`, each serial (`--profile ci`,
-  # src-tauri/.config/nextest.toml), so a leg takes about a third of the suite
-  # rather than the whole of it. `rust-test-complete` then fails unless the three
-  # buckets between them ran every listed test once.
+  # All three OSes run the Rust suite as serial `cargo nextest` shards
+  # (`--partition hash:M/N`, `--profile ci` in src-tauri/.config/nextest.toml):
+  # macOS timed out at 120 minutes unsharded (run 43351016929), Windows hit the
+  # 120-minute cancellation limit unsharded (run 44455349617), and Linux took
+  # 63 minutes unsharded. Linux and macOS run 3 shards (macOS is bounded by its
+  # 5-runner concurrency limit); Windows runs 4 shards so MSVC process-creation
+  # overhead stays well inside the timeout. Each OS has a companion `-extras`
+  # job for doctests, Unix-only worktree crate / descriptor-burst checks, and
+  # the unpartitioned `cargo nextest list` JSON. `rust-test-complete` then fails
+  # unless every OS's shards between them ran every listed test exactly once.
   #
-  # What the shards do not see, ubuntu and windows still do: a test that fails
-  # only beside another in the same process, which nextest's one-process-per-test
-  # cannot show, and which ci-local's `cargo-tests` gate and test-parallel.yml
-  # also run.
+  # In-process multi-test interaction continues to be exercised by
+  # `test-parallel.yml` (8 threads in one process) and `coverage.yml` (serial
+  # in one process) as well as `ci:local`.
   #
   # These are separate jobs, not one matrix with `if: matrix.shard == 1` steps,
   # because the release-gate rule (scripts/check-workflows.mjs) accepts a step
   # condition only as `!cancelled()` or a platform selector over a matrix list:
   # a check that can skip reads as a pass to release-state.mjs.
-  rust-test:
-    name: Rust Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # fec1e008: ubuntu reached the serial 6,099-test lib suite at 39 min and
-    # was cancelled. The same suite took 20 min at eight threads on a macOS
-    # runner, so serial it needs well over that.
+  rust-test-linux:
+    name: Rust Tests (Linux, shard ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        shard: [1, 2, 3]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -287,7 +287,6 @@ jobs:
           persist-credentials: false
 
       - name: Install System Dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
@@ -309,6 +308,11 @@ jobs:
           shared-key: rust-test-${{ runner.os }}
           cache-on-failure: true
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -323,33 +327,19 @@ jobs:
         run: bun install --frozen-lockfile
 
       # tauri.conf.json's frontendDist is ../dist, which the Rust build embeds,
-      # so the bundle has to exist before cargo runs. Every leg builds it from
-      # its own checkout rather than sharing an artifact: a cold build is ~5 s,
-      # an upload and a download are not cheaper, and a shared `dist/` would
-      # make this job wait on another.
+      # so the bundle has to exist before cargo runs.
       - name: Frontend Vite Build
         run: bun run build
 
       # The worktree-overlay and agent-bus radar tests drive the real `devmap`
-      # CLI, which no runner has: eight of them failed on every macOS shard with
-      # "devmap is not installed". It is built from DevCouncil at DEVMAP_REV and
-      # cached on that SHA; the step after it fails the job when the CLI's schema
-      # and the vendored one differ, so a stale pin cannot pass quietly. Not on
-      # Windows, where this leg does not build yet.
-      # Restore and save are separate steps: `actions/cache` saves in a post step
-      # that runs only when the whole job succeeded, and this job's suite is red
-      # on a runner more often than not, so the build would never be kept. It is
-      # saved the moment the schema check passes, whatever the tests do after. Saving over
-      # an existing key is a logged no-op, so no step-level `if` is needed to skip it.
+      # CLI, built from DevCouncil at DEVMAP_REV and cached on that SHA.
       - name: Cache devmap
-        if: ${{ runner.os != 'Windows' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       - name: Install devmap
-        if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -361,25 +351,16 @@ jobs:
           "$root/bin/devmap" --version
 
       - name: Installed devmap matches the vendored schema
-        if: ${{ runner.os != 'Windows' }}
         run: bun run check:vendor-schema
 
       - name: Keep the verified devmap build
-        if: ${{ runner.os != 'Windows' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
-      # Two tests drive a real `manvi` under its default gate, which no runner
-      # has: mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
-      # and hooks::tests::adv_held::a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout
-      # failed with "No MANVI harness is installed". It is built from Manvi at
-      # MANVI_REV with the module pins that commit names (its
-      # scripts/fetch-modules.sh), with cgo off: the Gusset engine is not linked,
-      # as in Manvi's own Windows release, and its policy decisions use Go's
-      # fnmatch either way. Go's version is the one Manvi's go.mod names. Cached
-      # on the SHA and saved as soon as it runs, as devmap is.
+      # Two tests drive a real `manvi` under its default gate, built from
+      # Manvi at MANVI_REV with CGO_ENABLED=0 and cached on that SHA.
       - name: Check out Manvi at MANVI_REV
         shell: bash
         run: |
@@ -406,7 +387,6 @@ jobs:
           set -euo pipefail
           root="$HOME/.cache/gitpulse-ci/manvi"
           exe=manvi
-          if [ "$RUNNER_OS" = Windows ]; then exe=manvi.exe; fi
           if [ ! -x "$root/bin/$exe" ]; then
             src="$RUNNER_TEMP/manvi-src/Manvi"
             bash "$src/scripts/fetch-modules.sh"
@@ -421,44 +401,323 @@ jobs:
           path: ~/.cache/gitpulse-ci/manvi
           key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
 
-      - name: Rust Unit & Integration Tests
+      - name: Rust Unit & Integration Tests (nextest shard)
         if: ${{ !cancelled() }}
-        # --no-fail-fast: without it cargo stops at the first failing test
-        # BINARY, so every later one -- the whole tests/ directory -- is
-        # skipped and the job reports one failure when there may be several.
-        # A suite that never ran must not read like a suite that passed.
-        # --test-threads=1: sidecar hello is a 20s window and shebang/stub
-        # fixtures time out under even four-way contention. GitHub runners
-        # are 2–4 cores; this is slower and deterministic.
+        shell: bash
+        run: xvfb-run -a dbus-run-session -- cargo nextest run --manifest-path src-tauri/Cargo.toml --locked --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
+
+      - name: Upload this shard's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: junit-linux-shard-${{ matrix.shard }}
+          path: src-tauri/target/nextest/ci/junit.xml
+          if-no-files-found: error
+
+  rust-test-linux-extras:
+    name: Rust Tests (Linux, doctests and one-off checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
-          else
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
           fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Rust Doctests
+        run: xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --doc -- --test-threads=1
 
       - name: Worktree Crate Tests
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        if: ${{ !cancelled() }}
         run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
 
       - name: Descriptor inheritance under concurrent spawns
         # The test is #[ignore]d out of the suite above: it is a 12,003-spawn,
-        # 16-thread burst, which loads a developer's machine for no signal in
-        # the common case. It still gates every change here. --ignored selects
-        # only opt-in tests and --exact keeps the run to the one named test,
-        # so a rename fails on the "1 passed" check below instead of quietly
-        # running nothing. The test is #[cfg(unix)], hence no Windows run.
-        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        # 16-thread burst. --ignored --exact keeps the run to this one test so a
+        # rename fails on the "1 passed" check. Unix-only (not run on Windows).
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            out="$(xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
-          else
-            out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
-          fi
+          out="$(xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
           grep -q "test result: ok. 1 passed" <<<"$out"
+
+      - name: List the whole Rust suite
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
+
+      - name: Upload the suite list
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-list-linux
+          path: nextest-list.json
+          if-no-files-found: error
+
+  rust-test-windows:
+    name: Rust Tests (Windows, shard ${{ matrix.shard }}/4)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # The worktree-overlay and agent-bus radar tests drive the real `devmap`
+      # CLI; DevCouncil builds devmap-cli natively on Windows at DEVMAP_REV.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap.exe" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          bin_dir="$(cygpath -w "$root/bin")"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          "$root/bin/devmap.exe" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Check out Manvi at MANVI_REV
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/manvi-src/Manvi"
+          git clone --quiet --filter=blob:none https://github.com/bharathvbcr/Manvi.git "$src"
+          git -C "$src" checkout --quiet "$MANVI_REV"
+
+      - name: Setup Go for Manvi
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ runner.temp }}/manvi-src/Manvi/manvi/go.mod
+          cache: false
+
+      - name: Cache manvi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      - name: Install manvi
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/manvi"
+          exe=manvi.exe
+          if [ ! -x "$root/bin/$exe" ]; then
+            src="$RUNNER_TEMP/manvi-src/Manvi"
+            bash "$src/scripts/fetch-modules.sh"
+            CGO_ENABLED=0 go -C "$src/manvi" build -trimpath -o "$root/bin/$exe" ./cmd/manvi
+          fi
+          bin_dir="$(cygpath -w "$root/bin")"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          "$root/bin/$exe" --version
+
+      - name: Keep the manvi build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/manvi
+          key: manvi-${{ runner.os }}-${{ runner.arch }}-${{ env.MANVI_REV }}
+
+      - name: Rust Unit & Integration Tests (nextest shard)
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --manifest-path src-tauri/Cargo.toml --locked --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/4
+
+      - name: Upload this shard's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: junit-windows-shard-${{ matrix.shard }}
+          path: src-tauri/target/nextest/ci/junit.xml
+          if-no-files-found: error
+
+  rust-test-windows-extras:
+    name: Rust Tests (Windows, doctests and suite list)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          shared-key: rust-test-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
+        with:
+          tool: cargo-nextest@0.9.150
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Frontend Vite Build
+        run: bun run build
+
+      - name: Rust Doctests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --doc -- --test-threads=1
+
+      # shell: bash guarantees plain UTF-8 output (PowerShell redirection adds a UTF-16LE BOM).
+      - name: List the whole Rust suite
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
+
+      - name: Upload the suite list
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-list-windows
+          path: nextest-list.json
+          if-no-files-found: error
 
   # The macOS suite as three serial nextest shards. Three, because the macOS
   # runner allowance is five concurrent jobs and the frontend, lint and extras
@@ -519,11 +778,11 @@ jobs:
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
 
-      # The Rust build embeds ../dist (see rust-test).
+      # The Rust build embeds ../dist (see rust-test-linux).
       - name: Frontend Vite Build
         run: bun run build
 
-      # The CLI the worktree-overlay and radar tests drive, as in rust-test.
+      # The CLI the worktree-overlay and radar tests drive, as in rust-test-linux.
       - name: Cache devmap
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -585,7 +844,6 @@ jobs:
           set -euo pipefail
           root="$HOME/.cache/gitpulse-ci/manvi"
           exe=manvi
-          if [ "$RUNNER_OS" = Windows ]; then exe=manvi.exe; fi
           if [ ! -x "$root/bin/$exe" ]; then
             src="$RUNNER_TEMP/manvi-src/Manvi"
             bash "$src/scripts/fetch-modules.sh"
@@ -612,7 +870,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: junit-shard-${{ matrix.shard }}
+          name: junit-macos-shard-${{ matrix.shard }}
           path: src-tauri/target/nextest/ci/junit.xml
           if-no-files-found: error
 
@@ -668,7 +926,7 @@ jobs:
         run: bun run build
 
       # The worktree crate's `cli_e2e` tests drive the real `devmap`; without it
-      # both fail with "devmap is not installed". Built and kept as in rust-test.
+      # both fail with "devmap is not installed". Built and kept as in rust-test-linux.
       - name: Cache devmap
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -704,8 +962,8 @@ jobs:
         run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
 
       - name: Descriptor inheritance under concurrent spawns
-        # As in rust-test: the #[ignore]d burst, run by name, failing when it
-        # collects nothing.
+        # As in rust-test-linux-extras: the #[ignore]d burst, run by name,
+        # failing when it collects nothing.
         if: ${{ !cancelled() }}
         shell: bash
         run: |
@@ -716,17 +974,18 @@ jobs:
       # Builds nothing new: the test binaries are the ones just built.
       - name: List the whole Rust suite
         if: ${{ !cancelled() }}
+        shell: bash
         run: cargo nextest list --manifest-path src-tauri/Cargo.toml --locked --message-format json > nextest-list.json
 
       - name: Upload the suite list
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-list
+          name: nextest-list-macos
           path: nextest-list.json
           if-no-files-found: error
 
-  # Fails unless the macOS buckets between them ran every test in the suite
+  # Fails unless every OS's buckets between them ran every test in its suite
   # exactly once. A green shard says only that its own bucket passed: a shard
   # whose build broke or whose report is missing leaves the others green and the
   # suite short, and nothing else in the run would say so.
@@ -736,8 +995,8 @@ jobs:
   # failed or was cancelled, and then the run is red anyway; when every shard is
   # green, it always runs.
   rust-test-complete:
-    name: Rust Tests (macOS, every shard ran)
-    needs: [rust-test-macos, rust-test-macos-extras]
+    name: Rust Tests (every OS shard ran)
+    needs: [rust-test-linux, rust-test-linux-extras, rust-test-windows, rust-test-windows-extras, rust-test-macos, rust-test-macos-extras]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -751,23 +1010,44 @@ jobs:
         with:
           node-version: 22
 
-      - name: Download the suite list
+      - name: Download the Linux suite list
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: nextest-list
-          path: shards/list
+          name: nextest-list-linux
+          path: shards/list-linux
 
-      # A shard that uploaded nothing is not an error at this step: the check
-      # below fails on the missing report and names its path, which says which
+      - name: Download the Windows suite list
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nextest-list-windows
+          path: shards/list-windows
+
+      - name: Download the macOS suite list
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: nextest-list-macos
+          path: shards/list-macos
+
+      # A shard that uploaded nothing is not an error at this step: the checks
+      # below fail on the missing report and name its path, which says which
       # shard is short where a failed download would not.
       - name: Download the shard reports
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          pattern: junit-shard-*
+          pattern: junit-*-shard-*
           path: shards
 
-      - name: Every listed test ran in exactly one shard
-        run: node scripts/check-shard-coverage.mjs --list shards/list/nextest-list.json --shards 3 shards/junit-shard-1/junit.xml shards/junit-shard-2/junit.xml shards/junit-shard-3/junit.xml
+      - name: Every listed Linux test ran in exactly one shard
+        if: ${{ !cancelled() }}
+        run: node scripts/check-shard-coverage.mjs --list shards/list-linux/nextest-list.json --shards 3 shards/junit-linux-shard-1/junit.xml shards/junit-linux-shard-2/junit.xml shards/junit-linux-shard-3/junit.xml
+
+      - name: Every listed Windows test ran in exactly one shard
+        if: ${{ !cancelled() }}
+        run: node scripts/check-shard-coverage.mjs --list shards/list-windows/nextest-list.json --shards 4 shards/junit-windows-shard-1/junit.xml shards/junit-windows-shard-2/junit.xml shards/junit-windows-shard-3/junit.xml shards/junit-windows-shard-4/junit.xml
+
+      - name: Every listed macOS test ran in exactly one shard
+        if: ${{ !cancelled() }}
+        run: node scripts/check-shard-coverage.mjs --list shards/list-macos/nextest-list.json --shards 3 shards/junit-macos-shard-1/junit.xml shards/junit-macos-shard-2/junit.xml shards/junit-macos-shard-3/junit.xml
 
   # release.yml builds Linux aarch64 and Windows arm64 only on a tag, so a
   # broken ARM leg would first fail with every other platform already on the
@@ -818,6 +1098,7 @@ jobs:
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+          cache-on-failure: true
 
       - name: Install Frontend Dependencies
         run: bun install --frozen-lockfile
@@ -835,6 +1116,11 @@ jobs:
         env:
           ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
         run: node scripts/check-release-assets.mjs --bundles "$ARTIFACT_PATHS" --platform "${{ matrix.platform }}"
+
+      - name: Verify gitpulse-ptyd Release Symbols
+        if: matrix.platform == 'ubuntu-22.04-arm'
+        shell: bash
+        run: node scripts/check-ptyd-release.mjs --binary src-tauri/target/release/gitpulse-ptyd
 
   # go/ is GitPulse's Go import of the shared Gusset engine. Its go.mod
   # replaces DevCouncil and gusset with ../../DevCouncil and ../../gusset, so

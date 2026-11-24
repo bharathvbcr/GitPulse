@@ -28,11 +28,20 @@ const BARS: ReadonlyArray<readonly [file: string, anchors: readonly string[]]> =
   ["../components/FileViewer.svelte", ["data-file-path-strip"]],
   ["../components/files/CodeViewer.svelte", [
     "relative shrink-0 gp-section-edge select-none",
-    "relative shrink-0 select-none",
     "gp-section-edge text-micro font-mono",
   ]],
   ["../components/files/MediaViewer.svelte", ['relative shrink-0 select-none" data-tip-place']],
   ["../components/files/MarkDevViewer.svelte", ['relative shrink-0 select-none" data-tip-place']],
+  ["../components/files/HtmlPreviewViewer.svelte", [
+    "data-html-toolbar",
+    "data-html-controls-bar",
+    "data-html-mode-row",
+  ]],
+  ["../components/files/SvgPreviewViewer.svelte", [
+    "data-svg-toolbar",
+    "data-svg-controls-bar",
+    "data-svg-mode-row",
+  ]],
   ["../components/RepoMapPanel.svelte", ["gap-x-3 gap-y-1 px-3 py-2 text-meta text-textMuted"]],
   ["../components/TerminalFilePane.svelte", [
     "px-2 h-8 select-none",

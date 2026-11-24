@@ -10,6 +10,81 @@
 use crate::procguard::LockedSpawn;
 pub(crate) mod env;
 
+/// Converts a filesystem path to forward-slash POSIX notation so Git hooks and
+/// `diff.<driver>.textconv` scripts execute identically on Unix and Git for
+/// Windows's bundled MSYS2 `sh`.
+#[cfg(test)]
+pub(crate) fn sh_path(path: &Path) -> String {
+    plain_git_path(path).to_string_lossy().replace('\\', "/")
+}
+
+/// Formats `path` as a single-quoted POSIX shell token (forward slashes,
+/// verbatim Win32 prefixes stripped, embedded `'` escaped as `'\''`) so
+/// spaces and apostrophes in temp paths never break `#!/bin/sh` fixtures.
+#[cfg(test)]
+pub(crate) fn sh_quote(path: &Path) -> String {
+    format!("'{}'", sh_path(path).replace('\'', "'\\''"))
+}
+
+/// Writes an executable POSIX `#!/bin/sh` script at `path` (setting `0o755` on
+/// Unix; Git for Windows invokes `.git/hooks/*` and `textconv` scripts through
+/// its bundled `sh` without requiring a POSIX execute bit).
+#[cfg(test)]
+pub(crate) fn write_git_script(path: &Path, body: &str, executable: bool) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+}
+
+/// Writes an executable PATH stub named `name` inside `bin_dir`: an executable
+/// POSIX shell script on Unix, and a CRLF `.cmd` batch script on Windows (which
+/// `engine::process::env::find_in_dirs` resolves before the bare name).
+#[cfg(test)]
+pub(crate) fn write_path_stub(
+    bin_dir: &Path,
+    name: &str,
+    unix_sh: &str,
+    windows_cmd: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = windows_cmd;
+        let path = bin_dir.join(name);
+        write_git_script(&path, unix_sh, true);
+        path
+    }
+    #[cfg(windows)]
+    {
+        let _ = unix_sh;
+        let path = bin_dir.join(format!("{name}.cmd"));
+        let crlf = windows_cmd.replace("\r\n", "\n").replace('\n', "\r\n");
+        std::fs::write(&path, crlf).unwrap();
+        path
+    }
+}
+
+/// Prepends `dir` to the inherited `PATH` using the OS path separator (`:` on
+/// Unix, `;` on Windows) so tests that inject a fake binary keep `git` and
+/// system utilities reachable on every platform.
+#[cfg(test)]
+pub(crate) fn prepend_path_dir(dir: &Path) -> std::ffi::OsString {
+    let mut entries = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(entries).expect("join PATH entries")
+}
+
 /// Writes an executable stand-in for `gitpulse-hook` at `path` that answers
 /// `--version` the way a build with lease mode does, for tests of the
 /// `lease-bin` links, which only link to a binary that says it is a lease
@@ -554,6 +629,61 @@ mod plain_path_tests {
             plain_git_path(Path::new("/tmp/repo")),
             PathBuf::from("/tmp/repo")
         );
+    }
+
+    #[test]
+    fn sh_path_and_sh_quote_handle_verbatim_unc_spaces_and_apostrophes() {
+        assert_eq!(
+            super::sh_path(Path::new(r"\\?\C:\Users\runner admin\Temp\it's\hook")),
+            "C:/Users/runner admin/Temp/it's/hook"
+        );
+        assert_eq!(
+            super::sh_path(Path::new(r"\\?\UNC\server\share\repo")),
+            "//server/share/repo"
+        );
+        assert_eq!(
+            super::sh_quote(Path::new(r"\\?\C:\Temp\it's a test\out.txt")),
+            r"'C:/Temp/it'\''s a test/out.txt'"
+        );
+    }
+
+    #[test]
+    fn prepend_path_dir_places_dir_first_using_platform_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let joined = super::prepend_path_dir(dir.path());
+        let mut iter = std::env::split_paths(&joined);
+        assert_eq!(iter.next().as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn write_path_stub_writes_expected_platform_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = super::write_path_stub(
+            dir.path(),
+            "demo-tool",
+            "#!/bin/sh\necho ok\n",
+            "@echo off\necho ok\n",
+        );
+        assert!(stub.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(stub.file_name().and_then(|n| n.to_str()), Some("demo-tool"));
+            let mode = std::fs::metadata(&stub).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                stub.file_name().and_then(|n| n.to_str()),
+                Some("demo-tool.cmd")
+            );
+            let body = std::fs::read_to_string(&stub).unwrap();
+            assert!(
+                body.contains("\r\n"),
+                "Windows .cmd must use CRLF: {body:?}"
+            );
+        }
     }
 }
 

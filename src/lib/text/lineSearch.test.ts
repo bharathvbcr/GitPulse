@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildMatchTicks,
   buildMatcher,
   escapeRegExp,
   hasUnboundedNesting,
@@ -7,7 +8,10 @@ import {
   firstMatchFrom,
   matchLabel,
   matchesInLine,
+  sliceTokensWithMatches,
   stepMatch,
+  type LineMatchRange,
+  type MatchTier,
 } from "./lineSearch";
 import { wallClockBudget } from "../testing/wallClock";
 
@@ -337,7 +341,116 @@ describe("matchLabel", () => {
     ).toBe("pattern may not terminate");
   });
 
-  it("says no matches when there are none", () => {
+  it("says no matches when there are none, and labels a truncated zero-match scan partial", () => {
     expect(matchLabel({ matches: [], truncated: false, invalid: false }, 0)).toBe("no matches");
+    expect(matchLabel({ matches: [], truncated: true, invalid: false }, 0)).toBe("no matches (partial)");
+  });
+});
+
+describe("buildMatchTicks", () => {
+  it("returns empty for empty matches, empty files, or non-positive bucket counts", () => {
+    expect(buildMatchTicks([], 100, 0)).toEqual([]);
+    expect(buildMatchTicks([{ lineIndex: 0, colStart: 0, length: 1 }], 0, 0)).toEqual([]);
+    expect(buildMatchTicks([{ lineIndex: 0, colStart: 0, length: 1 }], 10, 0, 0)).toEqual([]);
+  });
+
+  it("buckets dense matches down to maxTicks and preserves active tick status", () => {
+    const matches = Array.from({ length: 500 }, (_, i) => ({
+      lineIndex: i,
+      colStart: 0,
+      length: 2,
+    }));
+    const ticks = buildMatchTicks(matches, 500, 250, 20);
+    expect(ticks.length).toBeLessThanOrEqual(20);
+    expect(ticks.filter((t) => t.active)).toHaveLength(1);
+    expect(ticks.every((t) => t.topPercent >= 0 && t.topPercent <= 100)).toBe(true);
+  });
+});
+
+describe("sliceTokensWithMatches", () => {
+  interface TestToken {
+    text: string;
+    color: string;
+    bold?: boolean;
+  }
+
+  const fallback = (text: string): TestToken => ({ text, color: "plain" });
+
+  it("returns empty array for an empty line", () => {
+    expect(sliceTokensWithMatches("", [], [{ start: 0, end: 1, active: true }], fallback)).toEqual([]);
+  });
+
+  it("tags all tokens with match: 'none' when there are no valid matches", () => {
+    const tokens: TestToken[] = [
+      { text: "const", color: "kw", bold: true },
+      { text: " foo = 1", color: "plain" },
+    ];
+    const invalid: LineMatchRange[] = [
+      { start: 3, end: 3, active: false },
+      { start: Number.NaN, end: 5, active: true },
+    ];
+    const out = sliceTokensWithMatches("const foo = 1", tokens, invalid, fallback);
+    expect(out).toEqual([
+      { text: "const", color: "kw", bold: true, match: "none" satisfies MatchTier },
+      { text: " foo = 1", color: "plain", match: "none" satisfies MatchTier },
+    ]);
+  });
+
+  it("splits syntax tokens around passive and active matches without losing characters or colors", () => {
+    const line = "let alphaBeta = 42;";
+    const tokens: TestToken[] = [
+      { text: "let ", color: "kw", bold: true },
+      { text: "alphaBeta", color: "ident", bold: false },
+      { text: " = 42;", color: "plain" },
+    ];
+    // Passive match covering "et al" across token 0 and token 1, plus active match "Beta" inside token 1.
+    const matches: LineMatchRange[] = [
+      { start: 1, end: 6, active: false },
+      { start: 9, end: 13, active: true },
+    ];
+    const out = sliceTokensWithMatches(line, tokens, matches, fallback);
+    expect(out.map((t) => t.text).join("")).toBe(line);
+    expect(out).toEqual([
+      { text: "l", color: "kw", bold: true, match: "none" },
+      { text: "et ", color: "kw", bold: true, match: "match" },
+      { text: "al", color: "ident", bold: false, match: "match" },
+      { text: "pha", color: "ident", bold: false, match: "none" },
+      { text: "Beta", color: "ident", bold: false, match: "active" },
+      { text: " = 42;", color: "plain", match: "none" },
+    ]);
+  });
+
+  it("prefers active tier when active and passive matches overlap and merges adjacent matching tokens", () => {
+    const line = "abcdef";
+    const tokens: TestToken[] = [
+      { text: "ab", color: "ident" },
+      { text: "cd", color: "ident" },
+      { text: "ef", color: "num" },
+    ];
+    const matches: LineMatchRange[] = [
+      { start: 0, end: 4, active: false },
+      { start: 2, end: 4, active: true },
+    ];
+    const out = sliceTokensWithMatches(line, tokens, matches, fallback);
+    expect(out).toEqual([
+      { text: "ab", color: "ident", match: "match" },
+      { text: "cd", color: "ident", match: "active" },
+      { text: "ef", color: "num", match: "none" },
+    ]);
+  });
+
+  it("falls back to single plain token when token lengths do not sum to line length", () => {
+    const line = "hello world";
+    const brokenTokens: TestToken[] = [{ text: "hello", color: "ident" }];
+    const out = sliceTokensWithMatches(
+      line,
+      brokenTokens,
+      [{ start: 6, end: 11, active: true }],
+      fallback,
+    );
+    expect(out).toEqual([
+      { text: "hello ", color: "plain", match: "none" },
+      { text: "world", color: "plain", match: "active" },
+    ]);
   });
 });

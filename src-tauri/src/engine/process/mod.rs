@@ -66,10 +66,10 @@ pub(crate) use gate::with_disk_only_answer;
 #[cfg(any(not(unix), test))]
 pub(in crate::engine::process) use gate::SpawnPermit;
 pub(crate) use gate::{
-    background_deferral_cause, current_admission, grant_post_action_credit_now,
-    is_deferred_under_load, is_slot_wait_timeout, mark_user_action, production_spawn_rate,
-    run_command_scope, with_admission, with_background_processes, with_disk_relief,
-    with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
+    background_deferral_cause, check_in_process_admission, current_admission,
+    grant_post_action_credit_now, is_deferred_under_load, is_slot_wait_timeout, mark_user_action,
+    production_spawn_rate, run_command_scope, with_admission, with_background_processes,
+    with_disk_relief, with_spawn_source, Admission, SPAWN_QUEUE_BUDGET, TIMEOUT_MARKER,
 };
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]

@@ -3,7 +3,23 @@ import { get } from "svelte/store";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, PEER_QUIESCENCE_MS, asksForReader, bindAttention, canAutoWakePeerInbox, clean, createSessionActivity, isReaderInput, parseAttention, setSignalledAsksForReader } from "./sessionActivity";
+import {
+  ACTIVITY_PUBLISH_MS,
+  ATTENTION_EVENTS,
+  MAX_TRACKED_ACTIVITY,
+  PEER_QUIESCENCE_MS,
+  asksForReader,
+  bindAttention,
+  canAutoWakePeerInbox,
+  classifyAttentionUrgency,
+  clean,
+  createSessionActivity,
+  isBlockingAttention,
+  isInformationalAttention,
+  isReaderInput,
+  parseAttention,
+  setSignalledAsksForReader,
+} from "./sessionActivity";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -13,14 +29,33 @@ describe("the attention vocabulary matches the native notifier's", () => {
     // there fails this test instead of reaching the pane as "Signalled".
     const bridge = readFileSync(join(here, "../../../src-tauri/src/alerts/bridge.rs"), "utf8");
     const table = bridge.slice(bridge.indexOf("pub const EVENTS"), bridge.indexOf("];", bridge.indexOf("pub const EVENTS")));
-    const rows = [...table.matchAll(/name: "([a-z_]+)"[^}]*need: Need::(\w+)/g)].map((match) => [match[1], match[2]] as const);
+    const rows = [
+      ...table.matchAll(/name:\s*"([a-z_]+)"[^}]*need:\s*Need::(\w+)[^}]*urgency:\s*Urgency::(\w+)/g),
+    ].map((match) => ({ name: match[1], need: match[2], urgency: match[3] }));
     expect(rows.length).toBeGreaterThanOrEqual(12);
-    expect(Object.keys(ATTENTION_EVENTS).sort()).toEqual(rows.map(([name]) => name).sort());
-    // And each means here what it means there: a resolving event that read
-    // as a request, or the reverse, would put the board's answer backwards.
-    const KIND = { Ask: "needs-you", Error: "error", Finished: "finished", Clear: "clear" } as const;
-    for (const [name, need] of rows) {
-      expect(ATTENTION_EVENTS[name as keyof typeof ATTENTION_EVENTS].kind, name).toBe(KIND[need as keyof typeof KIND]);
+    expect(Object.keys(ATTENTION_EVENTS).sort()).toEqual(rows.map((r) => r.name).sort());
+    // Urgency drives the frontend kind so `idle_prompt` (Need::Ask +
+    // Urgency::Informational) is never treated as a blocking request by legacy
+    // kind-only surfaces.
+    const URGENCY = {
+      Blocking: "blocking",
+      Error: "error",
+      Informational: "informational",
+      Clear: "clear",
+    } as const;
+    const KIND_BY_URGENCY = {
+      Blocking: "needs-you",
+      Error: "error",
+      Informational: "finished",
+      Clear: "clear",
+    } as const;
+    for (const { name, need, urgency } of rows) {
+      const entry = ATTENTION_EVENTS[name as keyof typeof ATTENTION_EVENTS];
+      expect(entry.urgency, name).toBe(URGENCY[urgency as keyof typeof URGENCY]);
+      expect(entry.kind, name).toBe(KIND_BY_URGENCY[urgency as keyof typeof KIND_BY_URGENCY]);
+      if (name === "idle_prompt") {
+        expect(need).toBe("Ask");
+      }
     }
   });
 
@@ -41,11 +76,27 @@ describe("the attention vocabulary matches the native notifier's", () => {
     };
     expect(parseAttention(wire("WIRE_HOOK"), 1_000)).toEqual({
       session: "term-1",
-      attention: { kind: "needs-you", label: "Needs your permission", detail: "Bash: cargo test", at: 1_000 },
+      attention: {
+        kind: "needs-you",
+        urgency: "blocking",
+        event: "permission_prompt",
+        channel: "hook",
+        label: "Needs your permission",
+        detail: "Bash: cargo test",
+        at: 1_000,
+      },
     });
     expect(parseAttention(wire("WIRE_SIGNAL"), 1_000)).toEqual({
       session: "term-1",
-      attention: { kind: "signalled", label: "Signalled", detail: null, at: 1_000 },
+      attention: {
+        kind: "signalled",
+        urgency: "informational",
+        event: null,
+        channel: "bell",
+        label: "Signalled",
+        detail: null,
+        at: 1_000,
+      },
     });
   });
 
@@ -56,7 +107,13 @@ describe("the attention vocabulary matches the native notifier's", () => {
     const activity = createSessionActivity(() => 60_000);
     expect(activity.replay(JSON.parse(found[1]) as unknown, 0)).toBe(1);
     expect(get(activity).get("term-1")?.attention).toEqual({
-      kind: "needs-you", label: "Needs your permission", detail: "Bash: cargo test", at: 55_000,
+      kind: "needs-you",
+      urgency: "blocking",
+      event: "permission_request",
+      channel: "hook",
+      label: "Needs your permission",
+      detail: "Bash: cargo test",
+      at: 55_000,
     });
   });
 });
@@ -94,13 +151,32 @@ describe("isReaderInput", () => {
 describe("parseAttention", () => {
   it("turns a hook event into what it asks of the reader", () => {
     expect(parseAttention({ session: "term-1-a", channel: "hook", event: "permission_prompt", detail: "Bash: cargo test" }, 5))
-      .toEqual({ session: "term-1-a", attention: { kind: "needs-you", label: "Needs your permission", detail: "Bash: cargo test", at: 5 } });
+      .toEqual({
+        session: "term-1-a",
+        attention: {
+          kind: "needs-you",
+          urgency: "blocking",
+          event: "permission_prompt",
+          channel: "hook",
+          label: "Needs your permission",
+          detail: "Bash: cargo test",
+          at: 5,
+        },
+      });
     expect(parseAttention({ session: "t", channel: "hook", event: "agent_completed" }, 5)?.attention?.kind).toBe("finished");
     expect(parseAttention({ session: "t", channel: "hook", event: "error" }, 5)?.attention?.kind).toBe("error");
   });
 
   it("calls a terminal signal with no event signalled — never needs-you", () => {
-    expect(parseAttention({ session: "t", channel: "bell" }, 5)?.attention).toEqual({ kind: "signalled", label: "Signalled", detail: null, at: 5 });
+    expect(parseAttention({ session: "t", channel: "bell" }, 5)?.attention).toEqual({
+      kind: "signalled",
+      urgency: "informational",
+      event: null,
+      channel: "bell",
+      label: "Signalled",
+      detail: null,
+      at: 5,
+    });
     expect(parseAttention({ session: "t", channel: "bell", event: null }, 5)?.attention?.kind).toBe("signalled");
   });
 
@@ -606,6 +682,265 @@ describe("what answers a request", () => {
       } finally {
         setSignalledAsksForReader(false);
       }
+    });
+  });
+
+  describe("F10 urgency classification, idle_prompt, and dismiss transitions", () => {
+    afterEach(() => setSignalledAsksForReader(false));
+
+    it("treats idle_prompt as informational finished rather than blocking", async () => {
+      const { activityAttentionLabel, activityToAgentStatus } = await import("./sessionActivity");
+      const parsed = parseAttention(
+        { session: "term-idle", channel: "hook", event: "idle_prompt", urgency: "informational", at: 42_000 },
+        99_000,
+      );
+      expect(parsed).toEqual({
+        session: "term-idle",
+        attention: {
+          kind: "finished",
+          urgency: "informational",
+          event: "idle_prompt",
+          channel: "hook",
+          label: "Waiting for you",
+          detail: null,
+          at: 42_000,
+        },
+      });
+      expect(asksForReader(parsed?.attention)).toBe(false);
+      expect(asksForReader(parsed?.attention?.kind)).toBe(false);
+      expect(isBlockingAttention(parsed?.attention)).toBe(false);
+      expect(isInformationalAttention(parsed?.attention)).toBe(true);
+      expect(activityToAgentStatus({ lastOutputAt: null, title: null, attention: parsed!.attention })).toEqual({
+        state: "done",
+        detail: "Waiting for you",
+      });
+      expect(activityAttentionLabel({ lastOutputAt: null, title: null, attention: parsed!.attention })).toBeNull();
+    });
+
+    it("preserves M3a Attention payload fields and handles event-less urgency values", () => {
+      expect(
+        parseAttention(
+          {
+            session: "term-osc",
+            channel: "osc9",
+            event: null,
+            urgency: "informational",
+            detail: "Build finished",
+            at: 12_345,
+          },
+          50_000,
+        ),
+      ).toEqual({
+        session: "term-osc",
+        attention: {
+          kind: "signalled",
+          urgency: "informational",
+          event: null,
+          channel: "osc9",
+          label: "Signalled",
+          detail: "Build finished",
+          at: 12_345,
+        },
+      });
+
+      expect(
+        parseAttention({ session: "term-osc", channel: "osc7501", event: null, urgency: "blocking", detail: "Approve" }, 5_000),
+      ).toEqual({
+        session: "term-osc",
+        attention: {
+          kind: "needs-you",
+          urgency: "blocking",
+          event: null,
+          channel: "osc7501",
+          label: "Needs your input",
+          detail: "Approve",
+          at: 5_000,
+        },
+      });
+
+      expect(
+        parseAttention({ session: "term-osc", channel: "osc7501", event: null, urgency: "error", detail: "Crashed" }, 5_000),
+      ).toEqual({
+        session: "term-osc",
+        attention: {
+          kind: "error",
+          urgency: "error",
+          event: null,
+          channel: "osc7501",
+          label: "Stopped on an error",
+          detail: "Crashed",
+          at: 5_000,
+        },
+      });
+
+      expect(parseAttention({ session: "term-osc", channel: "osc7501", event: null, urgency: "clear" }, 5_000)).toEqual({
+        session: "term-osc",
+        attention: null,
+      });
+
+      // Unknown/malformed urgency with event: null defaults safely to informational signalled.
+      expect(
+        parseAttention({ session: "term-osc", channel: "bell", event: null, urgency: "unknown_future", at: 0 }, 7_777),
+      ).toEqual({
+        session: "term-osc",
+        attention: {
+          kind: "signalled",
+          urgency: "informational",
+          event: null,
+          channel: "bell",
+          label: "Signalled",
+          detail: null,
+          at: 7_777,
+        },
+      });
+    });
+
+    it("hydrates urgency, event, and channel across StandingAttention replay", () => {
+      const activity = createSessionActivity(() => 100_000);
+      const applied = activity.replay(
+        [
+          { session: "s-block", channel: "hook", event: "permission_request", detail: "Bash: rm", age_ms: 1_000 },
+          { session: "s-idle", channel: "hook", event: "idle_prompt", detail: null, age_ms: 2_000 },
+          { session: "s-done", channel: "hook", event: "turn_finished", detail: "Done", age_ms: 3_000 },
+          { session: "s-err", channel: "hook", event: "error", detail: "API 500", age_ms: 4_000 },
+          { session: "s-osc", channel: "osc9", event: null, detail: "Tests green", age_ms: 5_000 },
+        ],
+        0,
+      );
+      expect(applied).toBe(5);
+      const map = get(activity);
+      expect(map.get("s-block")?.attention).toMatchObject({ urgency: "blocking", event: "permission_request", channel: "hook", at: 99_000 });
+      expect(map.get("s-idle")?.attention).toMatchObject({ kind: "finished", urgency: "informational", event: "idle_prompt", channel: "hook", at: 98_000 });
+      expect(map.get("s-done")?.attention).toMatchObject({ kind: "finished", urgency: "informational", event: "turn_finished", channel: "hook", at: 97_000 });
+      expect(map.get("s-err")?.attention).toMatchObject({ kind: "error", urgency: "error", event: "error", channel: "hook", at: 96_000 });
+      expect(map.get("s-osc")?.attention).toMatchObject({ kind: "signalled", urgency: "informational", event: null, channel: "osc9", at: 95_000 });
+    });
+
+    it("provides pure M4 urgency helpers independent of global bell state", () => {
+      setSignalledAsksForReader(false);
+      const bellAttention = {
+        kind: "signalled" as const,
+        urgency: "informational" as const,
+        event: null,
+        channel: "bell",
+        label: "Signalled",
+        detail: null,
+        at: 1,
+      };
+      expect(classifyAttentionUrgency(bellAttention, false)).toBe("informational");
+      expect(classifyAttentionUrgency(bellAttention, true)).toBe("blocking");
+      expect(asksForReader(bellAttention, false)).toBe(false);
+      expect(asksForReader(bellAttention, true)).toBe(true);
+      expect(isBlockingAttention(bellAttention, false)).toBe(false);
+      expect(isBlockingAttention(bellAttention, true)).toBe(true);
+      expect(isInformationalAttention(bellAttention, false)).toBe(true);
+      expect(isInformationalAttention(bellAttention, true)).toBe(false);
+
+      // Explicit global override does not leak into explicit 2-arg calls.
+      setSignalledAsksForReader(true);
+      expect(asksForReader(bellAttention, false)).toBe(false);
+      expect(isInformationalAttention(bellAttention, false)).toBe(true);
+
+      // Error is asksForReader=true, isBlockingAttention=false, isInformationalAttention=false.
+      expect(classifyAttentionUrgency("error")).toBe("error");
+      expect(asksForReader("error")).toBe(true);
+      expect(isBlockingAttention("error")).toBe(false);
+      expect(isInformationalAttention("error")).toBe(false);
+
+      // Legacy fixture without urgency/event/channel falls back cleanly.
+      expect(classifyAttentionUrgency({ kind: "needs-you", label: "Ask", detail: null, at: 1 })).toBe("blocking");
+      expect(classifyAttentionUrgency(null)).toBeNull();
+      expect(isBlockingAttention(undefined)).toBe(false);
+      expect(isInformationalAttention(undefined)).toBe(false);
+    });
+
+    it("dismiss() clears informational notifications while preserving agent state and refusing blocking asks", () => {
+      let now = 20_000;
+      const activity = createSessionActivity(() => now);
+      const convId = "11111111-2222-4333-8444-555555555555";
+
+      // Antigravity turn_finished with fully_idle + dirtyPrompt + title + output
+      activity.output("term-agy");
+      activity.title("term-agy", "Reviewing code");
+      activity.announce({
+        session: "term-agy",
+        channel: "hook",
+        event: "turn_finished",
+        detail: "Plan ready",
+        fully_idle: true,
+        provider_session_id: convId,
+      });
+      now += 100;
+      expect(activity.dismiss("term-agy")).toBe(true);
+      const afterDismiss = get(activity).get("term-agy");
+      expect(afterDismiss?.attention).toBeNull();
+      expect(afterDismiss?.fullyIdle).toBe(true);
+      expect(afterDismiss?.providerSessionId).toBe(convId);
+      expect(afterDismiss?.title).toBe("Reviewing code");
+      expect(afterDismiss?.lastOutputAt).toBe(20_000);
+
+      // Subsequent replay from before dismiss MUST NOT resurrect the dismissed notification.
+      expect(
+        activity.replay(
+          [{ session: "term-agy", channel: "hook", event: "turn_finished", detail: "Plan ready", age_ms: 50 }],
+          20_050,
+        ),
+      ).toBe(0);
+      expect(get(activity).get("term-agy")?.attention).toBeNull();
+
+      // Dismisses idle_prompt, agent_completed, and passive osc9/bell.
+      for (const payload of [
+        { session: "s-idle", channel: "hook", event: "idle_prompt" },
+        { session: "s-done", channel: "hook", event: "agent_completed" },
+        { session: "s-osc9", channel: "osc9", event: null, detail: "Build ok" },
+        { session: "s-bell", channel: "bell", event: null },
+      ]) {
+        activity.announce(payload);
+        expect(activity.dismiss(payload.session), payload.session).toBe(true);
+        expect(get(activity).get(payload.session)?.attention).toBeNull();
+      }
+
+      // Refuses blocking/error asks and invalid/empty sessions.
+      for (const event of ["permission_prompt", "permission_request", "agent_needs_input", "elicitation_dialog", "elicitation_url_dialog", "error"]) {
+        activity.announce({ session: "s-block", channel: "hook", event, detail: "Action needed" });
+        expect(activity.dismiss("s-block"), event).toBe(false);
+        expect(get(activity).get("s-block")?.attention).not.toBeNull();
+      }
+
+      // Refuses signalled when bellAsksForReader is enabled.
+      activity.announce({ session: "s-bell-ask", channel: "bell", event: null });
+      setSignalledAsksForReader(true);
+      expect(activity.dismiss("s-bell-ask")).toBe(false);
+      expect(get(activity).get("s-bell-ask")?.attention?.kind).toBe("signalled");
+
+      expect(activity.dismiss("missing-session")).toBe(false);
+      expect(activity.dismiss("../bad")).toBe(false);
+    });
+
+    it("rejects out-of-range Date timestamps (> 8.64e15) in parseAttention and falls back to clock now", () => {
+      const now = 1_700_000_000_000;
+      const parsed = parseAttention(
+        {
+          session: "s-overflow",
+          channel: "hook",
+          event: "permission_prompt",
+          detail: "Approve",
+          at: 8_700_000_000_000_000,
+        },
+        now,
+      );
+      expect(parsed?.attention?.at).toBe(now);
+      const valid = parseAttention(
+        {
+          session: "s-valid",
+          channel: "hook",
+          event: "permission_prompt",
+          detail: "Approve",
+          at: 1_700_000_000_123,
+        },
+        now,
+      );
+      expect(valid?.attention?.at).toBe(1_700_000_000_123);
     });
   });
 });

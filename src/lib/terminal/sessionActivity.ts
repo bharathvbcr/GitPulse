@@ -42,19 +42,30 @@ export const ATTENTION_EVENT = "gitpulse-session-attention";
  * differs here; `parseAttention` drops an event outside this table.
  */
 export const ATTENTION_EVENTS = {
-  permission_prompt: { kind: "needs-you", label: "Needs your permission" },
-  permission_request: { kind: "needs-you", label: "Needs your permission" },
-  idle_prompt: { kind: "needs-you", label: "Waiting for you" },
-  agent_needs_input: { kind: "needs-you", label: "Needs your input" },
-  elicitation_dialog: { kind: "needs-you", label: "Asking you a question" },
-  elicitation_url_dialog: { kind: "needs-you", label: "Asking you to open a link" },
-  agent_completed: { kind: "finished", label: "Finished its work" },
-  turn_finished: { kind: "finished", label: "Finished its turn" },
-  error: { kind: "error", label: "Stopped on an error" },
-  prompt_submitted: { kind: "clear", label: "Working again" },
-  tool_finished: { kind: "clear", label: "Working again" },
-  session_ended: { kind: "clear", label: "Session ended" },
-} as const satisfies Record<string, { kind: AttentionKind | "clear"; label: string }>;
+  permission_prompt: { kind: "needs-you", urgency: "blocking", label: "Needs your permission" },
+  permission_request: { kind: "needs-you", urgency: "blocking", label: "Needs your permission" },
+  idle_prompt: { kind: "finished", urgency: "informational", label: "Waiting for you" },
+  agent_needs_input: { kind: "needs-you", urgency: "blocking", label: "Needs your input" },
+  elicitation_dialog: { kind: "needs-you", urgency: "blocking", label: "Asking you a question" },
+  elicitation_url_dialog: { kind: "needs-you", urgency: "blocking", label: "Asking you to open a link" },
+  agent_completed: { kind: "finished", urgency: "informational", label: "Finished its work" },
+  turn_finished: { kind: "finished", urgency: "informational", label: "Finished its turn" },
+  error: { kind: "error", urgency: "error", label: "Stopped on an error" },
+  prompt_submitted: { kind: "clear", urgency: "clear", label: "Working again" },
+  tool_finished: { kind: "clear", urgency: "clear", label: "Working again" },
+  session_ended: { kind: "clear", urgency: "clear", label: "Session ended" },
+} as const satisfies Record<string, { kind: AttentionKind | "clear"; urgency: AttentionUrgency; label: string }>;
+
+/**
+ * Semantic urgency of an attention announcement (`alerts::bridge::Urgency`).
+ */
+export type AttentionUrgency = "blocking" | "error" | "informational" | "clear";
+
+/**
+ * Standing attention urgency persisted on `SessionAttention` (never `"clear"`,
+ * since `"clear"` resolves standing attention to `null`).
+ */
+export type SessionAttentionUrgency = Exclude<AttentionUrgency, "clear">;
 
 /**
  * `signalled` is a terminal convention (a bell, an OSC 9 notice) that says
@@ -75,22 +86,92 @@ export function setSignalledAsksForReader(on: boolean): void {
   signalledAsks = on;
 }
 
+const VALID_STANDING_URGENCIES = new Set<string>(["blocking", "error", "informational"]);
+
 /**
- * Whether a kind is the agent waiting on the reader rather than reporting
- * what it did. A bell counts only when the opt-in setting above is turned on:
- * it is how an agent with no hooks says it is blocked, and while off (default)
- * those asks do not count. Finished does not: it is worth showing, not worth
- * chasing. The one rule every surface — the task pane, the board chip, the
- * Agents view, the tray — counts by. The task pane and the board still show a
- * bell while off and only stop counting it; the Agents view also drops the
- * bell as a reason, so a row there no longer shows that one rang.
+ * Classifies a `SessionAttention` object or bare `AttentionKind` into its
+ * effective standing urgency (`"blocking" | "error" | "informational" | null`).
+ *
+ * Explicit `urgency` on `SessionAttention` takes precedence (except opted-in
+ * `"signalled"`, which promotes to `"blocking"` when `bellAsks` is true so
+ * callers see uniform blocking semantics across all surfaces). Falls back to
+ * `ATTENTION_EVENTS[event]` and finally `kind` when `urgency` is omitted by
+ * legacy fixtures.
  */
-export function asksForReader(kind: AttentionKind | null | undefined): boolean {
-  return kind === "needs-you" || kind === "error" || (kind === "signalled" && signalledAsks);
+export function classifyAttentionUrgency(
+  target: SessionAttention | AttentionKind | null | undefined,
+  bellAsks: boolean = signalledAsks,
+): SessionAttentionUrgency | null {
+  if (!target) return null;
+  if (typeof target === "string") {
+    if (target === "needs-you") return "blocking";
+    if (target === "error") return "error";
+    if (target === "finished") return "informational";
+    if (target === "signalled") return bellAsks ? "blocking" : "informational";
+    return null;
+  }
+  if (target.kind === "signalled") {
+    if (target.urgency === "blocking" || target.urgency === "error") return target.urgency;
+    return bellAsks ? "blocking" : "informational";
+  }
+  if (target.urgency && VALID_STANDING_URGENCIES.has(target.urgency)) {
+    return target.urgency;
+  }
+  if (target.event && Object.hasOwn(ATTENTION_EVENTS, target.event)) {
+    const mapped = ATTENTION_EVENTS[target.event as keyof typeof ATTENTION_EVENTS].urgency;
+    return mapped === "clear" ? null : mapped;
+  }
+  return classifyAttentionUrgency(target.kind, bellAsks);
+}
+
+/**
+ * Returns `true` strictly when the attention has `"blocking"` urgency
+ * (human action required, or opted-in `"signalled"` when `bellAsks` is true).
+ * Returns `false` for `"error"`, `"informational"`, and `null`; use
+ * `asksForReader` when checking whether either `"blocking"` or `"error"` needs
+ * the reader.
+ */
+export function isBlockingAttention(
+  target: SessionAttention | AttentionKind | null | undefined,
+  bellAsks: boolean = signalledAsks,
+): boolean {
+  return classifyAttentionUrgency(target, bellAsks) === "blocking";
+}
+
+/**
+ * Returns `true` strictly when the attention is `"informational"` and NOT an
+ * opted-in ask (`!asksForReader`).
+ */
+export function isInformationalAttention(
+  target: SessionAttention | AttentionKind | null | undefined,
+  bellAsks: boolean = signalledAsks,
+): boolean {
+  return classifyAttentionUrgency(target, bellAsks) === "informational";
+}
+
+/**
+ * Whether an attention event or kind is waiting on the reader rather than
+ * reporting an informational notice.
+ *
+ * Returns `true` strictly for `"blocking"` + `"error"` + (`"signalled"` iff
+ * `bellAsks` is true), and `false` for `"informational"` (including
+ * `idle_prompt`, `turn_finished`, `agent_completed`, and passive terminal
+ * signals). Passing `bellAsks` explicitly keeps pure projections (e.g. menu
+ * bar state) decoupled from the module-global flag.
+ */
+export function asksForReader(
+  kindOrAttention: SessionAttention | AttentionKind | null | undefined,
+  bellAsks: boolean = signalledAsks,
+): boolean {
+  const urgency = classifyAttentionUrgency(kindOrAttention, bellAsks);
+  return urgency === "blocking" || urgency === "error";
 }
 
 export interface SessionAttention {
   kind: AttentionKind;
+  urgency?: SessionAttentionUrgency;
+  event?: string | null;
+  channel?: string;
   label: string;
   /** What the agent said, when it said anything. */
   detail: string | null;
@@ -118,12 +199,11 @@ export function activityToAgentStatus(
   const attention = activity?.attention;
   if (!attention) return null;
   const detail = attention.detail ?? (attention.label || null);
-  if (attention.kind === "needs-you") return { state: "blocked", detail };
-  if (attention.kind === "error") return { state: "error", detail };
-  if (attention.kind === "finished") return { state: "done", detail };
-  if (attention.kind === "signalled" && asksForReader("signalled")) {
-    return { state: "blocked", detail };
-  }
+  const urgency = classifyAttentionUrgency(attention);
+  if (urgency === "blocking") return { state: "blocked", detail };
+  if (urgency === "error") return { state: "error", detail };
+  if (attention.kind === "signalled") return null;
+  if (urgency === "informational") return { state: "done", detail };
   return null;
 }
 
@@ -331,25 +411,88 @@ export function parseAttention(raw: unknown, now: number): { session: string; at
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const row = raw as Record<string, unknown>;
   if (typeof row.session !== "string" || !SESSION_ID.test(row.session)) return null;
-  if (typeof row.channel !== "string" || !row.channel) return null;
+  const channel = clean(row.channel, 64);
+  if (!channel) return null;
   const detail = clean(row.detail, MAX_DETAIL);
+  const MAX_DATE_MS = 8.64e15;
+  const at =
+    typeof row.at === "number" && Number.isFinite(row.at) && row.at > 0 && row.at <= MAX_DATE_MS
+      ? row.at
+      : now;
   // No event is a bell or an OSC notice: it says only that the program wanted
   // attention. An event this table does not name is a native side newer than
   // this window; counting it as a bell would put an unknown meaning on the
   // board as a request, so it is no announcement.
+  let rawEvent: string | null = null;
   let event: (typeof ATTENTION_EVENTS)[keyof typeof ATTENTION_EVENTS] | null = null;
   if (row.event !== undefined && row.event !== null) {
     if (typeof row.event !== "string" || !Object.hasOwn(ATTENTION_EVENTS, row.event)) {
       logUnknownEvent(row.event, now);
       return null;
     }
-    event = ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS];
+    rawEvent = row.event;
+    event = ATTENTION_EVENTS[rawEvent as keyof typeof ATTENTION_EVENTS];
   }
-  if (event?.kind === "clear") return { session: row.session, attention: null };
-  const attention: SessionAttention = event
-    ? { kind: event.kind, label: event.label, detail, at: now }
-    : { kind: "signalled", label: "Signalled", detail, at: now };
-  return { session: row.session, attention };
+  if (event?.kind === "clear") {
+    return { session: row.session, attention: null };
+  }
+  if (event) {
+    const urgency: SessionAttentionUrgency = event.urgency;
+    return {
+      session: row.session,
+      attention: {
+        kind: event.kind,
+        urgency,
+        event: rawEvent,
+        channel,
+        label: event.label,
+        detail,
+        at,
+      },
+    };
+  }
+  const rawUrgency = typeof row.urgency === "string" ? row.urgency : null;
+  if (rawUrgency === "clear") return { session: row.session, attention: null };
+  if (rawUrgency === "blocking") {
+    return {
+      session: row.session,
+      attention: {
+        kind: "needs-you",
+        urgency: "blocking",
+        event: null,
+        channel,
+        label: "Needs your input",
+        detail,
+        at,
+      },
+    };
+  }
+  if (rawUrgency === "error") {
+    return {
+      session: row.session,
+      attention: {
+        kind: "error",
+        urgency: "error",
+        event: null,
+        channel,
+        label: "Stopped on an error",
+        detail,
+        at,
+      },
+    };
+  }
+  return {
+    session: row.session,
+    attention: {
+      kind: "signalled",
+      urgency: "informational",
+      event: null,
+      channel,
+      label: "Signalled",
+      detail,
+      at,
+    },
+  };
 }
 
 /**
@@ -573,6 +716,29 @@ export function createSessionActivity(clock: () => number = Date.now) {
       }
       if (applied) publish();
       return applied;
+    },
+    /**
+     * Dismisses a standing informational notification in the UI without clearing
+     * prompt-tracking or idle flags (`dirtyPrompt`, `fullyIdle`,
+     * `lastPromptSubmittedAt`). Refuses blocking or error requests that still
+     * require user action (`asksForReader(current)`).
+     */
+    dismiss(session: string): boolean {
+      if (!SESSION_ID.test(session)) return false;
+      const current = entries.get(session)?.attention ?? null;
+      if (!current || asksForReader(current)) return false;
+      const now = clock();
+      changed.set(session, now);
+      if (
+        update(session, (entry) => ({
+          ...entry,
+          attention: null,
+        }))
+      ) {
+        publish();
+        return true;
+      }
+      return false;
     },
     /** The session ended or its tab closed. */
     forget(session: string) {

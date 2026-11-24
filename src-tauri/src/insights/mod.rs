@@ -52,10 +52,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// How many worktrees collision detection will porcelain-scan.
-const MAX_COLLISION_SCANS: usize = 16;
+/// How many worktrees collision detection will porcelain-scan. Aligned with
+/// [`MAX_SNAPSHOT_WORKTREES`] and `worktree::MAX_DIRTY_SCANS` so multi-agent
+/// repos with several dozen worktrees scan completely without partial tails.
+pub(crate) const MAX_COLLISION_SCANS: usize = 64;
 /// How many overlapping-file rows the payload keeps.
-const MAX_COLLISION_ITEMS: usize = 32;
+pub(crate) const MAX_COLLISION_ITEMS: usize = 256;
 /// The per-worktree path cap must not be the thing that starves the
 /// collision payload: a scanned worktree has to be able to contribute at
 /// least as many paths as the payload keeps rows. Compile-time, so it is
@@ -858,17 +860,24 @@ fn fill_head_divergence(
     items: &mut [WorktreeSummary],
     clock: &worktree::ScanDeadline,
 ) -> bool {
-    let heads: Vec<String> = items
+    let entries: Vec<(String, Option<String>)> = items
         .iter()
         .filter(|item| !item.is_bare)
-        .filter_map(|item| item.head.clone())
+        .filter_map(|item| {
+            item.head
+                .as_ref()
+                .map(|head| (head.clone(), item.branch.clone()))
+        })
         .collect();
-    if heads.is_empty() {
+    if entries.is_empty() {
         return false;
     }
-    let asked: Vec<&str> = heads.iter().map(String::as_str).collect();
+    let asked: Vec<(&str, Option<&str>)> = entries
+        .iter()
+        .map(|(head, branch)| (head.as_str(), branch.as_deref()))
+        .collect();
     let measured = match validate_repo(repo_path) {
-        Ok(repo) => worktree::measure_head_divergence(&repo, &asked, clock),
+        Ok(repo) => worktree::measure_head_divergence_for_worktrees(&repo, &asked, clock),
         Err(error) => worktree::HeadDivergences {
             unread: Some(error.into_message()),
             ..Default::default()
@@ -1168,10 +1177,25 @@ fn snapshot_observed_from(
     observed_ms: Option<u64>,
 ) -> InsightsSnapshot {
     // One clock for the whole pass, handed to every stage that can run long.
+    // Overlap `codeintel::status` (local SQLite / devmap read, zero git
+    // dependency) with the git facets so it finishes in the shadow of the
+    // worktree status scan instead of adding serially to wall time.
     let clock = worktree::ScanDeadline::after(started, deadline);
-    let mut read = read_git_facets(repo_path, &clock, max_worktrees, observation);
+    let caller = CallerScope::capture();
+    let (mut read, precomputed_codeintel) = std::thread::scope(|scope| {
+        let codeintel_handle = scope.spawn(|| {
+            caller.run(|| {
+                let began = Instant::now();
+                let status = codeintel::status(repo_path);
+                (status, elapsed_ms(began))
+            })
+        });
+        let read = read_git_facets(repo_path, &clock, max_worktrees, observation);
+        let precomputed = codeintel_handle.join().ok();
+        (read, precomputed)
+    });
     read.stages.observe = observed_ms;
-    complete_snapshot(repo_path, started, read)
+    complete_snapshot_with_codeintel(repo_path, started, read, precomputed_codeintel)
 }
 
 /// The git half of a snapshot: the three facets that cost `git` children
@@ -1248,31 +1272,72 @@ fn read_listing(
     };
     let mut deadline_expired = false;
 
-    // The main checkout is read here, for the changes facet, and its row below
-    // takes this same read: a pass reads each worktree once.
+    // The main checkout is read first (warming the shared status cell so its
+    // porcelain read and any mid-snapshot probe finish before linked worktrees
+    // begin). Once warmed, `GitReader::get_status_since` only needs `git diff
+    // --numstat` for line stats and can overlap with `worktree::read_dirty`.
     let main_began = Instant::now();
-    let changes = match GitReader::get_status_since(repo_path, clock.started()) {
-        // The facet carries counts, not rows, and the whole status is already
-        // in memory: count every file. Counting only the first
-        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
-        Ok(files) => changes_from_status(&files, false),
-        Err(error) => empty_changes(error.into_message()),
-    };
-    stages.main_status = Some(elapsed_ms(main_began));
+    let main_warmed = listed.is_ok()
+        && validate_repo(repo_path)
+            .ok()
+            .and_then(|repo| worktree::read_status_since(&repo, None, clock.started()).ok())
+            .is_some();
 
-    // The only `git status` of each worktree this snapshot makes, and the last
-    // git read it makes: the rows' dirty counts and the collision scan's paths
-    // come out of it together, so the two facets describe the same moment, and
-    // an edit made before a worktree is read is in both. The read is bounded by
-    // the same clock as everything else; a worktree it did not reach stays
-    // unknown in both facets rather than reading as clean in either.
-    if let Ok(list) = &mut listed {
-        let statuses_began = Instant::now();
-        if worktree::read_dirty(list, clock) > 0 {
+    let changes = if main_warmed {
+        let caller = CallerScope::capture();
+        let (changes, wt_cut, wt_ms) = std::thread::scope(|scope| {
+            let wt_handle = scope.spawn(|| {
+                caller.run(|| {
+                    let statuses_began = Instant::now();
+                    let cut = match &mut listed {
+                        Ok(list) => worktree::read_dirty(list, clock),
+                        Err(_) => 0,
+                    };
+                    (cut, elapsed_ms(statuses_began))
+                })
+            });
+            let changes = match GitReader::get_status_since(repo_path, clock.started()) {
+                // The facet carries counts, not rows, and the whole status is
+                // already in memory: count every file. Counting only the first
+                // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+                Ok(files) => changes_from_status(&files, false),
+                Err(error) => empty_changes(error.into_message()),
+            };
+            stages.main_status = Some(elapsed_ms(main_began));
+            let (cut, wt_ms) = wt_handle.join().unwrap_or((0, 0));
+            (changes, cut, wt_ms)
+        });
+        if wt_cut > 0 {
             deadline_expired = true;
         }
-        stages.worktree_status = Some(elapsed_ms(statuses_began));
-    }
+        stages.worktree_status = Some(wt_ms);
+        changes
+    } else {
+        let changes = match GitReader::get_status_since(repo_path, clock.started()) {
+            // The facet carries counts, not rows, and the whole status is
+            // already in memory: count every file. Counting only the first
+            // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+            Ok(files) => changes_from_status(&files, false),
+            Err(error) => empty_changes(error.into_message()),
+        };
+        stages.main_status = Some(elapsed_ms(main_began));
+
+        // The only `git status` of each worktree this snapshot makes, and the
+        // last git read it makes: the rows' dirty counts and the collision
+        // scan's paths come out of it together, so the two facets describe the
+        // same moment, and an edit made before a worktree is read is in both.
+        // The read is bounded by the same clock as everything else; a worktree
+        // it did not reach stays unknown in both facets rather than reading as
+        // clean in either.
+        if let Ok(list) = &mut listed {
+            let statuses_began = Instant::now();
+            if worktree::read_dirty(list, clock) > 0 {
+                deadline_expired = true;
+            }
+            stages.worktree_status = Some(elapsed_ms(statuses_began));
+        }
+        changes
+    };
     ListingRead {
         listed,
         changes,
@@ -1376,6 +1441,15 @@ fn derive_facets(
 /// The snapshot around `read`: the main worktree's branch and the two local
 /// stores (ledger, code graph), which start no `git` child.
 fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> InsightsSnapshot {
+    complete_snapshot_with_codeintel(repo_path, started, read, None)
+}
+
+fn complete_snapshot_with_codeintel(
+    repo_path: &str,
+    started: Instant,
+    read: GitFacets,
+    precomputed_codeintel: Option<(codeintel::CodeintelStatus, u64)>,
+) -> InsightsSnapshot {
     let GitFacets {
         worktrees,
         agents,
@@ -1390,34 +1464,60 @@ fn complete_snapshot(repo_path: &str, started: Instant, read: GitFacets) -> Insi
     // only when the listing that would have said so actually ran.
     let branch_ok = worktrees.ok && main_worktree.is_some();
 
-    // The read-only variant. A snapshot is a read on every surface that takes
-    // one — the MCP tool annotated `readOnlyHint: true`, and the Work view —
-    // and the creating variant opens the database (which makes it) and runs the
-    // legacy consolidation (which migrates rows). A ledger comes into existence
-    // when the first event is *recorded*, which is the honest moment for it to;
-    // until then `not_initialised` is the true answer rather than one arranged
-    // by writing to the user's repository so that "recording" could be said.
-    let ledger_began = Instant::now();
-    let ledger = match crate::ledger::bindings::repository_status_readonly(repo_path) {
-        Ok(status) => status,
-        Err(error) => crate::ledger::LedgerStatus {
-            recording: false,
-            recording_state: crate::ledger::STATE_UNKNOWN.to_string(),
-            path: String::new(),
-            dropped: 0,
-            dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
-            catch_up_failures: 0,
-            history_only_bindings: 0,
-            history_only_bindings_unknown: false,
-            error: error.to_string(),
-            error_code: error.code.to_string(),
-            freshness: crate::ledger::Freshness::unavailable(error.to_string()),
-        },
+    let read_ledger = || {
+        // The read-only variant. A snapshot is a read on every surface that takes
+        // one — the MCP tool annotated `readOnlyHint: true`, and the Work view —
+        // and the creating variant opens the database (which makes it) and runs the
+        // legacy consolidation (which migrates rows). A ledger comes into existence
+        // when the first event is *recorded*, which is the honest moment for it to;
+        // until then `not_initialised` is the true answer rather than one arranged
+        // by writing to the user's repository so that "recording" could be said.
+        let ledger_began = Instant::now();
+        let ledger = match crate::ledger::bindings::repository_status_readonly(repo_path) {
+            Ok(status) => status,
+            Err(error) => crate::ledger::LedgerStatus {
+                recording: false,
+                recording_state: crate::ledger::STATE_UNKNOWN.to_string(),
+                path: String::new(),
+                dropped: 0,
+                dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
+                catch_up_failures: 0,
+                history_only_bindings: 0,
+                history_only_bindings_unknown: false,
+                error: error.to_string(),
+                error_code: error.code.to_string(),
+                freshness: crate::ledger::Freshness::unavailable(error.to_string()),
+            },
+        };
+        (ledger, elapsed_ms(ledger_began))
     };
-    stages.ledger = Some(elapsed_ms(ledger_began));
-    let codeintel_began = Instant::now();
-    let codeintel = codeintel::status(repo_path);
-    stages.codeintel = Some(elapsed_ms(codeintel_began));
+
+    let (ledger, ledger_ms, codeintel, codeintel_ms) = match precomputed_codeintel {
+        Some((codeintel, codeintel_ms)) => {
+            let (ledger, ledger_ms) = read_ledger();
+            (ledger, ledger_ms, codeintel, codeintel_ms)
+        }
+        None => {
+            let caller = CallerScope::capture();
+            std::thread::scope(|scope| {
+                let codeintel_handle = scope.spawn(|| {
+                    caller.run(|| {
+                        let began = Instant::now();
+                        let status = codeintel::status(repo_path);
+                        (status, elapsed_ms(began))
+                    })
+                });
+                let (ledger, ledger_ms) = read_ledger();
+                let (codeintel, codeintel_ms) = codeintel_handle.join().unwrap_or_else(|_| {
+                    let began = Instant::now();
+                    (codeintel::status(repo_path), elapsed_ms(began))
+                });
+                (ledger, ledger_ms, codeintel, codeintel_ms)
+            })
+        }
+    };
+    stages.ledger = Some(ledger_ms);
+    stages.codeintel = Some(codeintel_ms);
 
     InsightsSnapshot {
         repo_path: repo_path.to_string(),
@@ -2771,8 +2871,8 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
 /// The freshness of the ledger a read of `repo_path` consults: its anchor's,
 /// or unavailable with the reason when the anchor cannot be named.
 pub(crate) fn ledger_freshness(repo_path: &str) -> crate::ledger::Freshness {
-    match crate::ledger::bindings::repository_address_readonly(repo_path) {
-        Ok(address) => crate::ledger::freshness_readonly(&address.anchor),
+    match crate::ledger::bindings::repository_freshness_readonly(repo_path) {
+        Ok(freshness) => freshness,
         Err(error) => crate::ledger::Freshness::unavailable(error.to_string()),
     }
 }
@@ -3957,12 +4057,14 @@ mod tests {
     /// ahead of the alphabet or the fortieth file reads as "no collision".
     #[test]
     fn a_full_list_read_keeps_the_focus_row_past_the_row_cap() {
+        let total = MAX_COLLISION_ITEMS + 8;
+        let last = format!("f{:03}.txt", total - 1);
         let list = vec![
             bare_listing("/gp-test/a", "a"),
             bare_listing("/gp-test/b", "b"),
         ];
         let read = |_: &str, _: Option<&worktree::ScanDeadline>| -> PathsRead {
-            Ok(((0..40).map(|n| format!("f{n:02}.txt")).collect(), false))
+            Ok(((0..total).map(|n| format!("f{n:03}.txt")).collect(), false))
         };
         let live = live_in(&Vec::new(), &list);
         let focused = collision_from_list_reading(
@@ -3971,20 +4073,20 @@ mod tests {
             None,
             &read,
             CollisionScope {
-                focus: Some("f39.txt"),
+                focus: Some(last.as_str()),
                 involving: None,
             },
         );
         assert_eq!(focused.items.len(), MAX_COLLISION_ITEMS);
-        assert_eq!(focused.overlapping_files, 40);
+        assert_eq!(focused.overlapping_files, total as u32);
         assert!(focused.truncated);
         assert!(
-            focused.items.iter().any(|item| item.path == "f39.txt"),
+            focused.items.iter().any(|item| item.path == last),
             "{focused:?}"
         );
         let unfocused =
             collision_from_list_reading(&list, &live, None, &read, CollisionScope::default());
-        assert!(!unfocused.items.iter().any(|item| item.path == "f39.txt"));
+        assert!(!unfocused.items.iter().any(|item| item.path == last));
     }
 
     /// `repo` and one linked worktree of it, both trusted, on a repository
@@ -4090,30 +4192,36 @@ mod tests {
         assert!(gone.truncated, "{gone:?}");
     }
 
-    /// S3-09. Forty files dirty in both worktrees: the row cap is 32, and the
-    /// fortieth must still be found when it is the one being edited.
+    /// S3-09. Files past the row cap (`MAX_COLLISION_ITEMS + 8` dirty in both
+    /// worktrees): the wide scan cuts at `MAX_COLLISION_ITEMS`, and the last
+    /// file must still be found when it is the one being edited.
     #[test]
     fn the_file_being_edited_is_found_past_the_row_cap() {
+        let total = MAX_COLLISION_ITEMS + 8;
+        let last = format!("f{:03}.txt", total - 1);
         let (main, wt) = repo_with_one_worktree("forty");
         let repo = main.path().to_str().unwrap();
-        for n in 0..40 {
-            fs::write(main.path().join(format!("f{n:02}.txt")), "m").unwrap();
-            fs::write(wt.join(format!("f{n:02}.txt")), "w").unwrap();
+        for n in 0..total {
+            fs::write(main.path().join(format!("f{n:03}.txt")), "m").unwrap();
+            fs::write(wt.join(format!("f{n:03}.txt")), "w").unwrap();
         }
         let wide = collision_risk(repo);
         assert_eq!(wide.items.len(), MAX_COLLISION_ITEMS, "{wide:?}");
-        assert!(wide.truncated && wide.overlapping_files == 40, "{wide:?}");
-        assert!(!wide.items.iter().any(|i| i.path == "f39.txt"));
+        assert!(
+            wide.truncated && wide.overlapping_files == total as u32,
+            "{wide:?}"
+        );
+        assert!(!wide.items.iter().any(|i| i.path == last));
 
-        let risk = collision_for_path(repo, "f39.txt", None);
+        let risk = collision_for_path(repo, &last, None);
         assert!(risk.ok, "{risk:?}");
         assert_eq!(risk.items.len(), 1, "{risk:?}");
-        assert_eq!(risk.items[0].path, "f39.txt");
+        assert_eq!(risk.items[0].path, last);
         assert_eq!(risk.items[0].worktrees.len(), 2);
     }
 
     /// The same cap, in a worktree's context: its own rows are chosen before
-    /// the cut, so thirty-two overlaps elsewhere cannot hide its one.
+    /// the cut, so overlaps elsewhere filling the cap cannot hide its one.
     #[test]
     fn a_worktrees_context_keeps_its_own_collision_when_others_fill_the_cap() {
         let (main, wt) = repo_with_one_worktree("busy");
@@ -4128,9 +4236,9 @@ mod tests {
         )
         .expect("add third");
         crate::test_support::trust_repo(&third);
-        for n in 0..40 {
-            fs::write(wt.join(format!("aa{n:02}.txt")), "w").unwrap();
-            fs::write(third.join(format!("aa{n:02}.txt")), "t").unwrap();
+        for n in 0..(MAX_COLLISION_ITEMS + 8) {
+            fs::write(wt.join(format!("aa{n:03}.txt")), "w").unwrap();
+            fs::write(third.join(format!("aa{n:03}.txt")), "t").unwrap();
         }
         fs::write(main.path().join("zz.txt"), "m").unwrap();
         fs::write(wt.join("zz.txt"), "w").unwrap();
@@ -6216,11 +6324,12 @@ mod tests {
             .collect()
     }
 
-    /// One `git status` per worktree, shared by the worktree rows and the
+    /// One status read per worktree, shared by the worktree rows and the
     /// collision scan. The collision scan used to re-run the status the
     /// listing had already read, in every worktree it covered.
     #[test]
     fn a_snapshot_reads_each_worktrees_status_once() {
+        use crate::engine::worktree::status_reads::{self, StatusBackend};
         let (main, _parent, linked) = repo_with_linked_worktrees(17);
         let root = main.path().canonicalize().unwrap();
         // Two worktrees dirty the same file, so the collision scan has a real
@@ -6238,21 +6347,34 @@ mod tests {
         );
 
         for dir in &linked {
+            assert!(
+                status_spawns_in(dir).is_empty(),
+                "{} spawned git status unexpectedly: {:?}",
+                dir.display(),
+                status_spawns_in(dir)
+            );
+            let reads = status_reads::in_dir(dir);
             assert_eq!(
-                status_spawns_in(dir).len(),
+                reads.len(),
                 1,
-                "{} was read more than once",
+                "{} was read more than once: {reads:?}",
                 dir.display()
             );
+            assert_eq!(reads[0].0, StatusBackend::Gix);
         }
         // The main checkout is read by the listing and once more by
         // `get_status`, which needs per-file untracked rows (`-u`) and churn
         // the listing's count does not: the O(1) beside the N statuses.
         assert!(
-            status_spawns_in(&root).len() <= 2,
+            status_spawns_in(&root).is_empty(),
             "{:?}",
             status_spawns_in(&root)
         );
+        let root_reads = status_reads::in_dir(&root);
+        assert!((1..=2).contains(&root_reads.len()), "{root_reads:?}");
+        for (backend, _) in &root_reads {
+            assert_eq!(*backend, StatusBackend::Gix);
+        }
     }
 
     /// The collision scan runs on rayon's pool, whose threads start in the
@@ -6261,6 +6383,7 @@ mod tests {
     #[test]
     fn the_collision_scan_keeps_the_callers_admission_class() {
         use crate::engine::process::{with_admission, Admission};
+        use crate::engine::worktree::status_reads::{self, StatusBackend};
         let (main, _parent, linked) = repo_with_linked_worktrees(10);
         let root = main.path().canonicalize().unwrap();
         let risk = with_admission(Admission::Background, || {
@@ -6272,10 +6395,17 @@ mod tests {
         let mut checked = 0;
         let mut escaped = Vec::new();
         for dir in linked.iter().chain(std::iter::once(&root)) {
-            for (argv, class) in status_spawns_in(dir) {
+            assert!(
+                status_spawns_in(dir).is_empty(),
+                "{} spawned git status unexpectedly: {:?}",
+                dir.display(),
+                status_spawns_in(dir)
+            );
+            for (backend, class) in status_reads::in_dir(dir) {
+                assert_eq!(backend, StatusBackend::Gix);
                 checked += 1;
                 if class != Admission::Background {
-                    escaped.push((dir.clone(), argv, class));
+                    escaped.push((dir.clone(), class));
                 }
             }
         }

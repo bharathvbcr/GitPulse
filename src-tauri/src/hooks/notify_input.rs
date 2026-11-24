@@ -36,7 +36,7 @@
 use super::{within_budget, HookInput, NOTIFY_BUDGET, SESSION_END_NOTIFY_BUDGET};
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{BufReader, Cursor, Read};
 use std::time::Duration;
 
 /// The `timeout` the plugin manifest gives every `notify` hook, in the host's
@@ -83,6 +83,11 @@ pub fn budgets_for(event: &str) -> (Duration, Duration) {
 /// The most of one payload that is read. Four times the limit the other
 /// subcommands hold, because only what `notify` keeps is built.
 pub const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Upper bound when streaming an oversized `stop-or-notify` payload so
+/// `terminationReason` / `error` / `session_id` survive past [`MAX_READ_BYTES`]
+/// without unbounded reads.
+const MAX_STOP_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The top-level fields `HookInput::from_value` reads. A field added there and
 /// not here is read as empty; `the_walk_reads_what_a_whole_parse_reads` fails
@@ -171,26 +176,25 @@ impl<'de> Visitor<'de> for Skipped {
     }
 }
 
-/// The kept fields of one JSON object, in a `Value`.
-struct Kept;
+/// The kept fields of one JSON object, written into an existing map.
+struct KeptInto<'a>(&'a mut serde_json::Map<String, Value>);
 
-impl<'de> Visitor<'de> for Kept {
-    type Value = Value;
+impl<'de> Visitor<'de> for KeptInto<'_> {
+    type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("a JSON object")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut kept = serde_json::Map::new();
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         while let Some(key) = map.next_key::<String>()? {
             if KEPT_FIELDS.contains(&key.as_str()) {
-                kept.insert(key, map.next_value::<Value>()?);
+                self.0.insert(key, map.next_value::<Value>()?);
             } else {
                 map.next_value::<Skipped>()?;
             }
         }
-        Ok(Value::Object(kept))
+        Ok(())
     }
 }
 
@@ -199,11 +203,11 @@ impl<'de> Visitor<'de> for Kept {
 fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("hook stdin is not UTF-8: {e}"))?;
     let mut de = serde_json::Deserializer::from_str(text.trim());
-    let value = de
-        .deserialize_map(Kept)
-        .and_then(|value| de.end().map(|()| value))
+    let mut kept = serde_json::Map::new();
+    de.deserialize_map(KeptInto(&mut kept))
+        .and_then(|()| de.end())
         .map_err(|e| format!("hook stdin is not valid JSON: {e}"))?;
-    Ok(HookInput::from_value(&value))
+    Ok(HookInput::from_value(&Value::Object(kept)))
 }
 
 /// [`read_notify_input_within`] under [`NOTIFY_READ_BUDGET`].
@@ -239,6 +243,52 @@ pub fn read_notify_input_within(
             return Ok(HookInput::default());
         }
         kept_fields(&bytes)
+    })
+    .ok_or_else(|| "hook stdin deadline exceeded or reader could not run; no report".to_string())?
+}
+
+/// Reads `stop-or-notify` fields from `reader` within `budget`.
+///
+/// Fast-paths payloads up to `limit` through [`kept_fields`]. When a payload
+/// exceeds `limit`, streams the remainder (capped at [`MAX_STOP_STREAM_BYTES`])
+/// with `BufReader` + `Skipped` so `terminationReason`, `error`, and session
+/// identity are retained without buffering huge unused fields.
+pub fn read_stop_notify_input_within(
+    reader: impl Read + Send + 'static,
+    limit: u64,
+    budget: Duration,
+) -> Result<HookInput, String> {
+    within_budget(budget, move || {
+        let mut bytes = Vec::new();
+        let mut limited = reader.take(limit.saturating_add(1));
+        limited
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("could not read hook stdin: {e}"))?;
+        if bytes.len() as u64 <= limit {
+            return kept_fields(&bytes);
+        }
+        log::warn!(
+            target: "hook",
+            "stop-or-notify stdin is past {limit} bytes; streaming kept fields"
+        );
+        let rest = limited.into_inner();
+        let extra = MAX_STOP_STREAM_BYTES.saturating_sub(bytes.len() as u64);
+        let chained = Cursor::new(bytes).chain(rest.take(extra));
+        let buffered = BufReader::with_capacity(64 * 1024, chained);
+        let mut de = serde_json::Deserializer::from_reader(buffered);
+        let mut kept = serde_json::Map::new();
+        match de.deserialize_map(KeptInto(&mut kept)).and_then(|()| de.end()) {
+            Ok(()) => Ok(HookInput::from_value(&Value::Object(kept))),
+            Err(err) if err.is_eof() && !kept.is_empty() => {
+                log::warn!(
+                    target: "hook",
+                    "stop-or-notify stdin hit stream cap ({MAX_STOP_STREAM_BYTES} bytes); retaining parsed fields"
+                );
+                Ok(HookInput::from_value(&Value::Object(kept)))
+            }
+            Err(err) if err.is_eof() => Ok(HookInput::default()),
+            Err(err) => Err(format!("hook stdin is not valid JSON: {err}")),
+        }
     })
     .ok_or_else(|| "hook stdin deadline exceeded or reader could not run; no report".to_string())?
 }

@@ -1,51 +1,45 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compile } from "svelte/compiler";
 import { render } from "svelte/server";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import NativeNotificationBridgeView from "./NativeNotificationBridgeView.svelte";
+import type { Attention, NotificationDelivery } from "../workbench/client";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, "..", "..", "..");
 const source = readFileSync(join(here, "NativeNotificationBridgeView.svelte"), "utf8");
 
-const scratch = join(root, "tmp");
-mkdirSync(scratch, { recursive: true });
-const generatedDir = mkdtempSync(join(scratch, "vitest-native-bridge-"));
-const receiptCopyPath = join(generatedDir, "NativeBridgeReceipt.svelte");
-const errorCopyPath = join(generatedDir, "NativeBridgeError.svelte");
+const deliveryFixture = {
+  id: "n1",
+  task_id: "t1",
+  native_id: "gitpulse.x.n1",
+  revision: 1,
+  state: "submitted",
+  created_at: 1,
+  updated_at: 1,
+  activated_at: null,
+  acknowledged_at: null,
+} satisfies NotificationDelivery;
 
-const STATE_LINE =
-  "let current = $state<NotificationDelivery | null>(null), notice = $state<Attention | null>(null), task = $state<Task | null>(null);";
-const ERROR_LINE = 'let error = $state(""), busy = $state(false);';
-
-function rewriteImports(svelte: string): string {
-  return svelte
-    .replace(/from "(\.\.?\/[^"]+)"/g, (_m, spec: string) => `from "${join(here, spec).replaceAll("\\", "/")}"`)
-    .replace(/from "\.\/Logo\.svelte"/g, `from "${join(here, "Logo.svelte").replaceAll("\\", "/")}"`);
-}
-
-beforeAll(() => {
-  expect(source).toContain(STATE_LINE);
-  expect(source).toContain(ERROR_LINE);
-
-  const withReceipt = rewriteImports(
-    source.replace(
-      STATE_LINE,
-      'let current = $state<NotificationDelivery | null>({ id: "n1", task_id: "t1", native_id: "gitpulse.x.n1", revision: 1, state: "submitted", activated_at: null } as unknown as NotificationDelivery), notice = $state<Attention | null>({ id: "n1", task_id: "t1", title: "Coding agent exited", target_status: "task_deleted" } as unknown as Attention), task = $state<Task | null>(null);',
-    ),
-  );
-  writeFileSync(receiptCopyPath, withReceipt);
-
-  const withError = rewriteImports(
-    source.replace(ERROR_LINE, 'let error = $state("Notification activation failed"), busy = $state(false);'),
-  );
-  writeFileSync(errorCopyPath, withError);
-});
-
-afterAll(() => {
-  rmSync(generatedDir, { recursive: true, force: true });
-});
+const noticeFixture = {
+  id: "event-1",
+  revision: 1,
+  updated_at: 1,
+  source_sequence: 1,
+  task_id: "t1",
+  task_revision: 1,
+  target_type: "run",
+  target_id: "r1",
+  target_revision: 1,
+  target_status: "task_deleted",
+  kind: "run_exited",
+  title: "Coding agent exited",
+  created_at: 1,
+  read_at: null,
+  dismissed_at: null,
+  snoozed_until: null,
+} satisfies Attention;
 
 describe("NativeNotificationBridgeView", () => {
   it("compiles cleanly and wraps <Logo in aria-hidden in both receipt and error cards", () => {
@@ -55,23 +49,46 @@ describe("NativeNotificationBridgeView", () => {
     expect(source.match(/aria-hidden="true"[^>]*><Logo\b/g)).toHaveLength(2);
   });
 
-  it("renders .receipt with the current GitPulse badge Logo and Close notification button", async () => {
-    const component = (await import(/* @vite-ignore */ receiptCopyPath)).default;
-    const { body } = render(component);
+  it("renders nothing when no activation or error is present", () => {
+    const { body } = render(NativeNotificationBridgeView);
+    expect(body).not.toContain("native-activation");
+    expect(body).not.toContain("activation-error");
+  });
+
+  it("renders .receipt with the current GitPulse badge Logo and Close notification button", () => {
+    const { body } = render(NativeNotificationBridgeView, {
+      props: { initialCurrent: deliveryFixture, initialNotice: noticeFixture },
+    });
     expect(body).toMatch(/class="receipt\b/);
     expect(body).toContain("Coding agent exited");
     expect(body).toContain("Close notification");
     expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
     expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
   });
 
-  it("renders .activation-error with the current GitPulse badge Logo and Dismiss button", async () => {
-    const component = (await import(/* @vite-ignore */ errorCopyPath)).default;
-    const { body } = render(component);
+  it("falls back to GitPulse activity heading when notice is missing or empty", () => {
+    const missingNotice = render(NativeNotificationBridgeView, {
+      props: { initialCurrent: deliveryFixture },
+    }).body;
+    expect(missingNotice).toMatch(/<strong[^>]*>GitPulse activity<\/strong>/);
+    expect(missingNotice).toContain("Resolving the saved notification");
+
+    const emptyTitle = render(NativeNotificationBridgeView, {
+      props: { initialCurrent: deliveryFixture, initialNotice: { ...noticeFixture, title: "" } },
+    }).body;
+    expect(emptyTitle).toMatch(/<strong[^>]*>GitPulse activity<\/strong>/);
+  });
+
+  it("renders .activation-error with the current GitPulse badge Logo and Dismiss button", () => {
+    const { body } = render(NativeNotificationBridgeView, {
+      props: { initialError: "Notification activation failed" },
+    });
     expect(body).toMatch(/class="activation-error gp-card shadow-float\b/);
     expect(body).toContain("Notification activation failed");
     expect(body).toContain("Dismiss");
     expect(body).toContain("M24.04 9.25A10.5 10.5 0 1 0 26.5 16H22.6L20.2 21L16.8 9.9L14.4 16H11.8");
     expect(body).toMatch(/id="gp-[a-z0-9]+-badge"/);
+    expect(body).toMatch(/<span class="receipt-logo[^"]*" aria-hidden="true">[\s\S]*?<svg[^>]*aria-label="GitPulse"/);
   });
 });

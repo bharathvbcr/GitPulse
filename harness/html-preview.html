@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <title>GitPulse HTML Preview checks</title>
+</head>
+<body>
+<div id="app"></div>
+<pre id="result"></pre>
+<script type="module">
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { createChecks } from "./checks.ts";
+  import { mockIPCWithEvents } from "./tauriMocks";
+  import HtmlPreviewHost from "./HtmlPreviewHost.svelte";
+
+  const { results, check, stopped } = createChecks();
+  const errors = [];
+  const cspViolations = [];
+  const unexpected = new Set();
+  const blobReads = [];
+  addEventListener("error", (e) => errors.push(e.message));
+  addEventListener("unhandledrejection", (e) => errors.push(String(e.reason)));
+  document.addEventListener("securitypolicyviolation", (e) =>
+    cspViolations.push(`${e.violatedDirective}:${e.blockedURI}`),
+  );
+
+  const repo = "/fixture/html-preview";
+  const demoHtml = `<!-- <head> comment mentioning <script> should never truncate or hijack CSP -->
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Live HTML Card</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script>window.__pwned = true;<\/script>
+  </head>
+  <body>
+    <h1 class="hero">Hello Live HTML</h1>
+    <img data-src="./lazy.png" alt="1 > 0" src="./logo.svg">
+    <a href="#details">In-page</a>
+    <a href="https://example.com">External</a>
+    <a href="./other.html" target="_self">Same</a>
+    <a href="./bool.html" target>BoolTarget</a>
+    <a href="./slash.html" target=_self/ >SlashSpace</a>
+    <map name="m"><area shape="rect" coords="0,0,10,10" href="https://example.com/area"></map>
+    <textarea><script>console.log("inert")<\/script></textarea>
+  </body>
+</html>`;
+
+  const secondHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <title>Second <script> Doc</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body><h2>Second Page</h2></body>
+</html>`;
+
+  const identicalCloneHtml = `<!DOCTYPE html><html><head><title>Clone</title></head><body><p>Identical</p></body></html>`;
+
+  const files = {
+    "docs/demo.html": { path: "docs/demo.html", is_binary: false, is_image: false, mime: "text/html", text: demoHtml, base64: null, invalid_utf8_bytes: 0 },
+    "docs/styles.css": { path: "docs/styles.css", is_binary: false, is_image: false, mime: "text/css", text: `.hero { color: rgb(22, 163, 74); background-image: url('./bg.svg'); }`, base64: null, invalid_utf8_bytes: 0 },
+    "docs/logo.svg": { path: "docs/logo.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="green"/></svg>`, base64: null, invalid_utf8_bytes: 0 },
+    "docs/bg.svg": { path: "docs/bg.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: `<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><circle cx="2" cy="2" r="2" fill="blue"/></svg>`, base64: null, invalid_utf8_bytes: 0 },
+    "sub/second.html": { path: "sub/second.html", is_binary: false, is_image: false, mime: "text/html", text: secondHtml, base64: null, invalid_utf8_bytes: 0 },
+    "sub/styles.css": { path: "sub/styles.css", is_binary: false, is_image: false, mime: "text/css", text: `h2 { color: rgb(37, 99, 235); }`, base64: null, invalid_utf8_bytes: 0 },
+    "sub/clone-a.html": { path: "sub/clone-a.html", is_binary: false, is_image: false, mime: "text/html", text: identicalCloneHtml, base64: null, invalid_utf8_bytes: 0 },
+    "sub/clone-b.html": { path: "sub/clone-b.html", is_binary: false, is_image: false, mime: "text/html", text: identicalCloneHtml, base64: null, invalid_utf8_bytes: 0 },
+  };
+
+  mockIPCWithEvents((cmd, args) => {
+    switch (cmd) {
+      case "cmd_resolve_repo": return { path: args.repoPath, name: "html-preview", is_bare: false };
+      case "cmd_list_repo_files": return ["docs/demo.html", "docs/styles.css", "docs/logo.svg", "sub/second.html", "src/app.ts"];
+      case "cmd_get_status": return [];
+      case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
+      case "cmd_list_remotes": case "cmd_list_submodules": return [];
+      case "cmd_stash_list": return { entries: [], truncated: false };
+      case "cmd_list_tags": return { tags: [], truncated: false };
+      case "cmd_branch_stats": return {};
+      case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_watch_repo": case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_last_fetch_at": case "cmd_set_recent_menu": return null;
+      case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
+      case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
+      case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_get_file_blob":
+        blobReads.push(args);
+        if (files[args.filePath]) return files[args.filePath];
+        throw new Error(`Missing fixture file: ${args.filePath}`);
+      default:
+        unexpected.add(cmd);
+        throw new Error(`Unconfigured harness command: ${cmd}`);
+    }
+  });
+
+  const { repoStore } = await import("../src/lib/stores/repoStore");
+  const { triggerFileSearch } = await import("../src/lib/files/fileSearchTarget");
+  const { requestHtmlViewMode } = await import("../src/lib/files/htmlPreview");
+  const { REVEAL_TTL_MS, requestReveal } = await import("../src/lib/files/revealRequests");
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const settle = async (ms = 60) => { await tick(); await sleep(ms); await tick(); };
+  const until = async (fn, ms = 3000) => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      if (fn()) return true;
+      await sleep(25);
+    }
+    return fn();
+  };
+
+  await repoStore.openRepo(repo);
+
+  let host;
+  const selectedFromTree = [];
+  const target = document.getElementById("app");
+  host = mount(HtmlPreviewHost, {
+    target,
+    props: {
+      initial: { repoPath: repo, filePath: "docs/demo.html", text: demoHtml, diskBase: "rev-1" },
+      width: 900,
+      height: 560,
+      onTreeSelect(path) {
+        selectedFromTree.push(path);
+        const blob = files[path];
+        if (blob) {
+          host.updatePrimary({ filePath: path, text: blob.text, draftContent: null });
+          host.updateSecondary({ filePath: path, text: blob.text, draftContent: null });
+        }
+      },
+    },
+  });
+
+  const treeHost = () => target.querySelector('[data-host="tree"]');
+  const primaryHost = () => target.querySelector('[data-host="primary"]');
+  const secondaryHost = () => target.querySelector('[data-host="secondary"]');
+  const primaryIframe = () => primaryHost().querySelector('[data-testid="html-preview-iframe"]');
+  const secondaryIframe = () => secondaryHost().querySelector('[data-testid="html-preview-iframe"]');
+
+  await until(() => Boolean(primaryIframe()) && Boolean(secondaryIframe()));
+  await until(() => primaryIframe()?.getAttribute("srcdoc")?.includes("rgb(22, 163, 74)"));
+  await until(() => [...treeHost().querySelectorAll('[role="treeitem"]')].some((el) => el.textContent.includes("demo.html")));
+
+  try {
+    // 1. Live iframe srcdoc rendering, security sandboxing, and CSS/image inlining
+    const srcdoc = primaryIframe().getAttribute("srcdoc") ?? "";
+    check("preview iframe is strictly sandboxed without scripts or same-origin", () =>
+      primaryIframe().getAttribute("sandbox") === "allow-forms" &&
+      primaryIframe().getAttribute("referrerpolicy") === "no-referrer");
+    check("comment mentioning <script> and <head> never truncates body or neutralizes CSP", () => {
+      const commentEnd = srcdoc.indexOf("-->");
+      const realHead = srcdoc.indexOf("<head>", commentEnd);
+      const cspIdx = srcdoc.indexOf("Content-Security-Policy");
+      return srcdoc.includes("Hello Live HTML") && cspIdx > realHead && !srcdoc.includes("__pwned");
+    });
+    check("local stylesheet, CSS url(...) background image, and <img src> are inlined without clobbering data-src", () =>
+      srcdoc.includes("rgb(22, 163, 74)") &&
+      srcdoc.includes('url("data:image/svg+xml;base64,') &&
+      srcdoc.includes('src="data:image/svg+xml;base64,') &&
+      srcdoc.includes('data-src="./lazy.png"') &&
+      srcdoc.includes('<a href="#details">In-page</a>') &&
+      srcdoc.includes('<a href="https://example.com" target="_blank" rel="noopener noreferrer">External</a>'));
+    check("anchor containment replaces boolean and existing target attrs and always enforces rel=noopener noreferrer", () =>
+      srcdoc.includes('<a href="./other.html" target="_blank" rel="noopener noreferrer">Same</a>') &&
+      srcdoc.includes('<a href="./bool.html" target="_blank" rel="noopener noreferrer">BoolTarget</a>') &&
+      srcdoc.includes('<a href="./slash.html" target="_blank" rel="noopener noreferrer"/ >SlashSpace</a>') &&
+      srcdoc.includes('<area shape="rect" coords="0,0,10,10" href="https://example.com/area" target="_blank" rel="noopener noreferrer">') &&
+      srcdoc.includes('<textarea><script>console.log("inert")<\/script></textarea>') &&
+      !/href="\.\/bool\.html"[^>]*\btarget\b[^>]*\btarget=/i.test(srcdoc));
+    check("local asset reads pass withDigest: false to avoid redundant backend hashing", () =>
+      blobReads.some((r) => r.filePath === "docs/styles.css" && r.withDigest === false));
+    check("secondary host delegates HTML cleanly through MediaViewer LazyMount", () =>
+      Boolean(secondaryHost().querySelector('[data-testid="html-preview-viewer"]')) &&
+      Boolean(secondaryIframe()));
+
+    // 2. Real FileTreePanel right-click menu -> Open Code & Preview across BOTH concurrently mounted hosts!
+    const demoRow = [...treeHost().querySelectorAll('[role="treeitem"]')].find((el) =>
+      el.textContent.includes("demo.html"),
+    );
+    demoRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 80, clientY: 80 }));
+    await until(() => Boolean(document.querySelector('[data-testid="file-ctx-html-split"]')));
+    check("right-clicking an HTML file in FileTreePanel offers Preview, Code & Preview, and Open in editor", () =>
+      Boolean(document.querySelector('[data-testid="file-ctx-html-preview"]')) &&
+      Boolean(document.querySelector('[data-testid="file-ctx-html-split"]')) &&
+      Boolean(document.querySelector('[data-testid="file-ctx-html-code"]')));
+
+    document.querySelector('[data-testid="file-ctx-html-split"]').click();
+    await until(() =>
+      Boolean(primaryHost().querySelector("[data-html-split-code]")) &&
+      Boolean(secondaryHost().querySelector("[data-html-split-code]")),
+    );
+    check("Open Code & Preview switches BOTH concurrently mounted hosts into Split mode without stealing the request", () =>
+      Boolean(primaryHost().querySelector("[data-html-split-code]")) &&
+      Boolean(primaryHost().querySelector("[data-html-split-preview]")) &&
+      Boolean(secondaryHost().querySelector("[data-html-split-code]")) &&
+      Boolean(secondaryHost().querySelector("[data-html-split-preview]")));
+
+    // 3. Stale revealTarget does NOT override explicit right-click "Open as Preview" on a newly mounted host!
+    host.setSecondaryMounted(false);
+    await settle();
+    host.updateSecondary({ revealTarget: { line: 8, column: 1, seq: 1 } });
+    requestHtmlViewMode(repo, "docs/demo.html", "preview");
+    host.setSecondaryMounted(true);
+    await until(() => Boolean(secondaryHost()?.querySelector('[data-testid="html-mode-preview"]')));
+    await settle(80);
+    check("explicit Open as Preview wins over a stale revealTarget on mount", () =>
+      secondaryHost().querySelector('[data-testid="html-mode-preview"]')?.getAttribute("data-active") === "true" &&
+      Boolean(secondaryIframe()));
+
+    // 3b. Expired store revealRequest MUST NOT switch Preview mode to Code mode!
+    requestReveal("docs/demo.html", 4, null, Date.now() - REVEAL_TTL_MS - 1000);
+    await settle(60);
+    check("expired revealRequest in store does not hijack Preview mode into Code mode", () =>
+      secondaryHost().querySelector('[data-testid="html-mode-preview"]')?.getAttribute("data-active") === "true" &&
+      Boolean(secondaryIframe()));
+
+    // 3c. Clicking Refresh reloads the iframe element even when prepared.srcdoc is unchanged!
+    const iframeBeforeRefresh = secondaryIframe();
+    let refreshedFrameLoaded = false;
+    const onRefreshFrameLoad = (event) => {
+      if (event.target instanceof HTMLIFrameElement && event.target !== iframeBeforeRefresh) {
+        refreshedFrameLoaded = true;
+      }
+    };
+    secondaryHost().addEventListener("load", onRefreshFrameLoad, true);
+    secondaryHost().querySelector('[data-testid="html-refresh-btn"]').click();
+    await until(() => refreshedFrameLoaded, 1500);
+    secondaryHost().removeEventListener("load", onRefreshFrameLoad, true);
+    const iframeAfterRefresh = secondaryIframe();
+    check("clicking Refresh remounts and reloads the sandboxed srcdoc iframe even when HTML is unchanged", () =>
+      Boolean(iframeBeforeRefresh) &&
+      Boolean(iframeAfterRefresh) &&
+      iframeAfterRefresh !== iframeBeforeRefresh &&
+      refreshedFrameLoaded);
+
+    // 4. Live editing in Split mode (auto-update + Pause + pending banner + Refresh + Resume)
+    primaryHost().querySelector('[data-testid="html-mode-split"]').click();
+    await settle();
+    const updatedHtml = demoHtml.replace("Hello Live HTML", "Live Edited Heading");
+    host.updatePrimary({ draftContent: updatedHtml });
+    await until(() => primaryIframe()?.getAttribute("srcdoc")?.includes("Live Edited Heading"), 1500);
+    check("editing draftContent live-updates the preview iframe in Split mode", () =>
+      primaryIframe().getAttribute("srcdoc").includes("Live Edited Heading"));
+
+    primaryHost().querySelector('[data-testid="html-live-toggle"]').click();
+    await settle();
+    const pausedHtml = updatedHtml.replace("Live Edited Heading", "Paused Draft Heading");
+    host.updatePrimary({ draftContent: pausedHtml });
+    await settle(260);
+    check("pausing live updates holds the iframe and shows the pending-edit banner", () =>
+      !primaryIframe().getAttribute("srcdoc").includes("Paused Draft Heading") &&
+      Boolean(primaryHost().querySelector('[data-testid="html-paused-banner"]')));
+
+    primaryHost().querySelector('[data-testid="html-paused-refresh"]').click();
+    await until(() => primaryIframe()?.getAttribute("srcdoc")?.includes("Paused Draft Heading"));
+    check("Refresh now reflects paused edits immediately", () =>
+      primaryIframe().getAttribute("srcdoc").includes("Paused Draft Heading") &&
+      !primaryHost().querySelector('[data-testid="html-paused-banner"]'));
+
+    primaryHost().querySelector('[data-testid="html-live-toggle"]').click();
+    await settle();
+
+    // 5. Horizontal pointer sash drag & double-click reset
+    const sash = primaryHost().querySelector('[data-testid="html-split-sash"]');
+    const splitBox = primaryHost().querySelector("[data-html-split]").getBoundingClientRect();
+    const codePane = () => primaryHost().querySelector("[data-html-split-code]");
+    const initialW = codePane().getBoundingClientRect().width;
+    sash.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: splitBox.left + splitBox.width * 0.5 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: splitBox.left + splitBox.width * 0.35 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    await settle();
+    const draggedW = codePane().getBoundingClientRect().width;
+    check("pointer-dragging horizontal split sash resizes code and preview panes", () => draggedW < initialW - 40);
+    sash.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await settle();
+    check("double-clicking split sash resets panes to 50%", () =>
+      Math.abs(codePane().getBoundingClientRect().width - initialW) < 4);
+
+    // 5b. Wide Split mode allows toggling between side-by-side and stacked layout for full-width preview!
+    const orientToggle = primaryHost().querySelector('[data-testid="html-split-orientation-toggle"]');
+    const sideBySidePreviewW = primaryHost().querySelector("[data-html-split-preview]").getBoundingClientRect().width;
+    check("wide Split mode exposes the split orientation toggle button", () =>
+      Boolean(orientToggle) &&
+      primaryHost().querySelector("[data-html-split]")?.getAttribute("data-html-split") === "horizontal");
+    orientToggle.click();
+    await settle();
+    const stackedPreviewW = primaryHost().querySelector("[data-html-split-preview]").getBoundingClientRect().width;
+    check("toggling split orientation stacks code above preview and gives preview full pane width", () =>
+      primaryHost().querySelector("[data-html-split]")?.getAttribute("data-html-split") === "vertical" &&
+      primaryHost().querySelector('[data-testid="html-split-sash"]')?.getAttribute("aria-orientation") === "horizontal" &&
+      stackedPreviewW > sideBySidePreviewW + 150);
+    // Toggle back to horizontal before testing narrow auto-stacking
+    primaryHost().querySelector('[data-testid="html-split-orientation-toggle"]').click();
+    await settle();
+    check("toggling split orientation again restores side-by-side layout", () =>
+      primaryHost().querySelector("[data-html-split]")?.getAttribute("data-html-split") === "horizontal");
+
+    // 6. Narrow pane switches to vertical stacked split with draggable vertical sash and hides orientation toggle!
+    host.resize(480, 560);
+    await until(() => primaryHost().querySelector("[data-html-split]")?.getAttribute("data-html-split") === "vertical");
+    const vSash = primaryHost().querySelector('[data-testid="html-split-sash"]');
+    const vCodeBefore = primaryHost().querySelector("[data-html-split-code]").getBoundingClientRect().height;
+    vSash.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    await settle();
+    const vCodeAfter = primaryHost().querySelector("[data-html-split-code]").getBoundingClientRect().height;
+    check("narrow pane switches to vertical split with keyboard-resizable horizontal sash and hides orientation toggle", () =>
+      vSash.getAttribute("aria-orientation") === "horizontal" &&
+      vCodeAfter > vCodeBefore + 10 &&
+      !primaryHost().querySelector('[data-testid="html-split-orientation-toggle"]'));
+
+    // 7. Wide Desktop preset inside narrow pane MUST NOT clip left edge into negative scroll space!
+    host.resize(620, 560);
+    await settle();
+    primaryHost().querySelector('[data-testid="html-mode-preview"]').click();
+    await settle();
+    primaryHost().querySelector('[data-testid="html-viewport-desktop"]').click();
+    await settle();
+    const stage = primaryHost().querySelector('[data-html-stage="framed"]');
+    const frameCard = primaryHost().querySelector('[data-testid="html-device-frame"]');
+    stage.scrollLeft = 0;
+    const stageRect = stage.getBoundingClientRect();
+    const frameRect = frameCard.getBoundingClientRect();
+    check("Desktop 1280px frame inside 620px pane keeps left edge reachable at scrollLeft=0 (no flex items-center clipping)", () =>
+      frameRect.left >= stageRect.left && stage.scrollWidth > stage.clientWidth);
+
+    // 8. Fit-scale button scales Desktop preset cleanly into pane width
+    const fitScaleBtn = primaryHost().querySelector('[data-testid="html-viewport-fit-scale"]');
+    check("fit-scale control appears when preset exceeds pane width and shrinks zoom cleanly", () => {
+      if (!fitScaleBtn) return false;
+      fitScaleBtn.click();
+      return true;
+    });
+    await settle();
+    check("fit-scale zooms down below 100% and reset returns to 100%", () => {
+      const zoomedText = primaryHost().querySelector('[data-testid="html-zoom-reset"]').textContent;
+      primaryHost().querySelector('[data-testid="html-zoom-reset"]').click();
+      return zoomedText !== "100%";
+    });
+    await settle();
+
+    // 9. Rotate, Canvas surfaces (dark & grid), and Details inspector
+    primaryHost().querySelector('[data-testid="html-viewport-rotate"]').click();
+    await settle();
+    check("rotate toggles Desktop frame to landscape (800 x 1280)", () =>
+      primaryHost().querySelector('[data-testid="html-device-frame"]').textContent.includes("800 × 1280"));
+
+    primaryHost().querySelector('[data-testid="html-canvas-dark"]').click();
+    await settle();
+    check("dark canvas injects color-scheme:dark into preview", () =>
+      primaryIframe().getAttribute("srcdoc").includes("color-scheme:dark") &&
+      primaryIframe().getAttribute("data-canvas") === "dark");
+
+    primaryHost().querySelector('[data-testid="html-canvas-grid"]').click();
+    await settle();
+    check("grid canvas applies html-grid-surface checkerboard with readable light color-scheme", () =>
+      Boolean(primaryHost().querySelector(".html-grid-surface")) &&
+      primaryIframe().getAttribute("data-canvas") === "grid");
+
+    primaryHost().querySelector('[data-testid="html-inspector-toggle"]').click();
+    await settle();
+    const inspectorText = primaryHost().querySelector('[data-testid="html-inspector-panel"]')?.textContent ?? "";
+    check("Details inspector reports inlined CSS, inlined images (including CSS url), and disabled scripts", () =>
+      inspectorText.includes("1 local CSS inlined") &&
+      inspectorText.includes("2 local images inlined") &&
+      inspectorText.includes("1 script disabled"));
+
+    // 10. ⌘F (triggerFileSearch) from Preview mode switches to Split and opens Find!
+    const triggered = triggerFileSearch(primaryHost(), "find", "Hello");
+    await until(() => Boolean(primaryHost().querySelector("[data-html-split-code] input")));
+    check("triggerFileSearch in Preview mode opens Split mode and activates CodeViewer Find", () =>
+      triggered && Boolean(primaryHost().querySelector("[data-html-split-code]")));
+
+    // 11. Cross-file switch clears previous file's inlined CSS immediately (no red/green CSS bleed!)
+    primaryHost().querySelector('[data-testid="html-mode-preview"]').click();
+    await settle();
+    host.updatePrimary({ filePath: "sub/second.html", text: secondHtml, draftContent: null, diskBase: "rev-2" });
+    await until(() => primaryIframe()?.getAttribute("srcdoc")?.includes("rgb(37, 99, 235)"));
+    check("switching to another HTML file with the same ./styles.css href loads its own CSS with zero cross-file bleed and preserves RCDATA <title>", () => {
+      const nextSrcdoc = primaryIframe().getAttribute("srcdoc") ?? "";
+      return (
+        nextSrcdoc.includes("rgb(37, 99, 235)") &&
+        !nextSrcdoc.includes("rgb(22, 163, 74)") &&
+        nextSrcdoc.includes("<h2>Second Page</h2>") &&
+        nextSrcdoc.includes("<title>Second <script> Doc</title>")
+      );
+    });
+
+    // 11b. Switching between two HTML files with identical HTML content still remounts a clean iframe
+    host.updatePrimary({ filePath: "sub/clone-a.html", text: identicalCloneHtml, draftContent: null, diskBase: "rev-3" });
+    await settle();
+    const cloneAFrame = primaryIframe();
+    host.updatePrimary({ filePath: "sub/clone-b.html", text: identicalCloneHtml, draftContent: null, diskBase: "rev-4" });
+    await settle();
+    const cloneBFrame = primaryIframe();
+    check("switching between two files with identical HTML content remounts a fresh iframe", () =>
+      Boolean(cloneAFrame) && Boolean(cloneBFrame) && cloneAFrame !== cloneBFrame);
+
+    // 12. No runtime errors, CSP violations, or unexpected IPC calls
+    check("zero CSP violations across sandboxed srcdoc rendering", () => cspViolations.length === 0);
+    check("zero runtime errors and zero unexpected IPC calls", () => errors.length === 0 && unexpected.size === 0);
+  } catch (err) {
+    errors.push(String(err));
+  } finally {
+    const params = new URLSearchParams(location.search);
+    const verdict = { results, errors, unexpected: [...unexpected], diagnostics: "[]" };
+    document.getElementById("result").textContent = JSON.stringify(verdict, null, 2);
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(verdict));
+    if (params.has("report")) {
+      await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    }
+  }
+</script>
+</body>
+</html>

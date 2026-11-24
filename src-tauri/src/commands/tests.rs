@@ -201,6 +201,7 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
         WatcherState::default(),
         root,
         false,
+        None,
     ))
     .expect_err("the read is shed");
     assert_eq!(

@@ -494,7 +494,7 @@ pub(crate) fn detect_steward_claude_credential_cached(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn detect_steward_claude_credential_with(
     detect_account: impl FnOnce() -> Result<
         crate::harness::anthropic_account::Detection,
@@ -2326,7 +2326,7 @@ fn deterministic_directive(
 /// finished system-temp session scratchpads and trusted repositories). Never
 /// enables or mutates saved Global Cleaner schedules, and skips overlapping
 /// runs if the Global Cleaner is currently active.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_critical_hygiene_pass(
     trusted_cleanable_repos: &[String],
     clean_shared_caches: bool,
@@ -2548,7 +2548,7 @@ fn path_matches_exclusions(candidate: &Path, exclusions: &[PathBuf]) -> bool {
     exclusions.iter().any(|excl| resolved.starts_with(excl))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_critical_hygiene_pass_with(
     trusted_cleanable_repos: &[String],
     trusted_anchor_repo: Option<&str>,
@@ -2568,7 +2568,7 @@ pub(crate) fn run_critical_hygiene_pass_with(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_critical_hygiene_pass_full(
     trusted_cleanable_repos: &[String],
@@ -3617,7 +3617,7 @@ fn execute_agent_scratch_candidate(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clean_session_agent_scratchpads(
     session_tmp_root: &Path,
     retention_days: u32,
@@ -6794,6 +6794,11 @@ mod tests {
             );
         assert_eq!(recent_entry["recent_below_retention"], true);
         assert!(
+            recent_entry["bytes"].is_u64(),
+            "cloud inventory must measure bytes on scratch targets: {recent_entry:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
             recent_entry["private_bytes"].is_u64(),
             "cloud inventory must measure private_bytes on scratch targets: {recent_entry:?}"
         );
@@ -7684,26 +7689,29 @@ Trailing note {done}."#;
         assert_eq!(journal_entries(tmp.path()), None);
 
         // A journal whose writer is another, still-running process is its own.
-        let parent = std::os::unix::process::parent_id();
-        let Some(parent_start) = crate::sysload::process_start_us(parent) else {
-            return;
-        };
-        let foreign = ThrottleJournal {
-            version: 1,
-            writer_pid: parent,
-            writer_start_us: parent_start,
-            entries: vec![(4100, 7)],
-        };
-        write_private_steward_file(
-            tmp.path(),
-            THROTTLE_JOURNAL_FILE,
-            &serde_json::to_vec(&foreign).unwrap(),
-        )
-        .unwrap();
-        restored.borrow_mut().clear();
-        assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
-        assert!(restored.borrow().is_empty());
-        assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+        #[cfg(unix)]
+        {
+            let parent = std::os::unix::process::parent_id();
+            let Some(parent_start) = crate::sysload::process_start_us(parent) else {
+                return;
+            };
+            let foreign = ThrottleJournal {
+                version: 1,
+                writer_pid: parent,
+                writer_start_us: parent_start,
+                entries: vec![(4100, 7)],
+            };
+            write_private_steward_file(
+                tmp.path(),
+                THROTTLE_JOURNAL_FILE,
+                &serde_json::to_vec(&foreign).unwrap(),
+            )
+            .unwrap();
+            restored.borrow_mut().clear();
+            assert_eq!(restore_throttle_journal(tmp.path(), restore), 0);
+            assert!(restored.borrow().is_empty());
+            assert_eq!(journal_entries(tmp.path()), Some(vec![(4100, 7)]));
+        }
     }
 
     #[test]

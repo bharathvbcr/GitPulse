@@ -237,7 +237,17 @@ describe("check:workflows", () => {
     }
     // "0 tests" is a green cargo exit: only the count makes a rename fail.
     expect(ci).toContain('grep -q "test result: ok. 1 passed"');
-    expect(ci).toMatch(/Descriptor inheritance under concurrent spawns[\s\S]*?runner\.os != 'Windows'/);
+    const jobsOf = (text: string) => {
+      const body = text.slice(text.search(/^jobs:\s*$/m));
+      const jobs = new Map<string, string>();
+      const heads = [...body.matchAll(/^ {2}([a-z0-9-]+):\s*$/gm)];
+      heads.forEach((head, i) => jobs.set(head[1], body.slice(head.index, heads[i + 1]?.index ?? body.length)));
+      return jobs;
+    };
+    const jobs = jobsOf(ci);
+    expect(jobs.get("rust-test-linux-extras")).toContain("Descriptor inheritance under concurrent spawns");
+    expect(jobs.get("rust-test-macos-extras")).toContain("Descriptor inheritance under concurrent spawns");
+    expect(jobs.get("rust-test-windows-extras")).not.toContain("Descriptor inheritance under concurrent spawns");
   });
 
   it("measures Rust branch coverage, on a pinned nightly because the flag is unstable", () => {
@@ -264,9 +274,10 @@ describe("check:workflows", () => {
       return jobs;
     };
     const suites: Record<string, { jobs: string[]; testStep: RegExp }> = {
-      "ci.yml": { jobs: ["rust-test", "rust-test-macos"], testStep: /- name: Rust (Unit & Integration Tests|Tests)/ },
+      "ci.yml": { jobs: ["rust-test-linux", "rust-test-windows", "rust-test-macos"], testStep: /- name: Rust (Unit & Integration Tests|Tests)/ },
       "coverage.yml": { jobs: ["coverage"], testStep: /- name: Generate Rust Coverage/ },
       "test-parallel.yml": { jobs: ["rust-parallel"], testStep: /cargo test --manifest-path/ },
+      "release.yml": { jobs: ["preflight"], testStep: /- name: Rust Unit & Integration Tests/ },
     };
     for (const [file, { jobs, testStep }] of Object.entries(suites)) {
       const text = read(file);
@@ -283,8 +294,153 @@ describe("check:workflows", () => {
         expect(test, `${file} ${name} runs its tests after manvi`).toBeGreaterThan(install);
         // The pins Manvi's own commit names, never whatever sibling happens to exist.
         expect(job!.slice(install, test)).toContain('bash "$src/scripts/fetch-modules.sh"');
-        expect(job!.slice(install, test)).toContain('echo "$root/bin" >> "$GITHUB_PATH"');
+        if (name.includes("windows")) {
+          expect(job!.slice(install, test)).toContain('cygpath -w "$root/bin"');
+          expect(job!.slice(install, test)).toContain('>> "$GITHUB_PATH"');
+        } else {
+          expect(job!.slice(install, test)).toContain('echo "$root/bin" >> "$GITHUB_PATH"');
+        }
       }
+    }
+  });
+
+  it("builds the pinned devmap and verifies schema parity on all three OS test jobs, converting Windows PATH via cygpath", () => {
+    const ci = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    const body = ci.slice(ci.search(/^jobs:\s*$/m));
+    const heads = [...body.matchAll(/^ {2}([a-z0-9-]+):\s*$/gm)];
+    const jobs = new Map<string, string>();
+    heads.forEach((head, i) => jobs.set(head[1], body.slice(head.index, heads[i + 1]?.index ?? body.length)));
+    for (const name of ["rust-test-linux", "rust-test-windows", "rust-test-macos"]) {
+      const job = jobs.get(name);
+      expect(job, name).toBeDefined();
+      const install = job!.indexOf("- name: Install devmap");
+      const schema = job!.indexOf("run: bun run check:vendor-schema");
+      const nextest = job!.indexOf("- name: Rust Unit & Integration Tests (nextest shard)");
+      expect(install, `${name} installs devmap`).toBeGreaterThan(-1);
+      expect(schema, `${name} verifies vendored schema after devmap`).toBeGreaterThan(install);
+      expect(nextest, `${name} runs nextest after devmap`).toBeGreaterThan(schema);
+      if (name === "rust-test-windows") {
+        expect(job!.slice(install, schema)).toContain('cygpath -w "$root/bin"');
+      }
+    }
+  });
+
+  it("keeps e2e-desktop.yml safe on Windows (shell: bash, cygpath, WebView2 msedgedriver matching) and Linux (X11 + Wayland)", () => {
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const linux = e2e.slice(e2e.indexOf("\n  e2e-linux:"), e2e.indexOf("\n  e2e-windows:"));
+    const windows = e2e.slice(e2e.indexOf("\n  e2e-windows:"));
+    expect(e2e).toContain("harnesses:");
+    const expectedScope = "HARNESS_SCOPE: ${{ inputs.harnesses || (github.event_name == 'pull_request' && 'smoke' || 'all') }}";
+    expect(linux).toContain(expectedScope);
+    expect(windows).toContain(expectedScope);
+    expect(linux).toContain("GDK_BACKEND=x11");
+    expect(linux).toContain("GDK_BACKEND=wayland");
+    expect(linux).toContain("NO_AT_BRIDGE=1");
+    expect(linux).toContain("unset WAYLAND_DISPLAY");
+    expect(linux).toContain("weston --backend=headless-backend.so");
+    expect(linux).toContain('kill -0 "$wpid"');
+    expect(linux).toContain("weston-gtk.log");
+    expect(linux).toContain("weston-webview.log");
+    expect(linux).toContain("weston.log");
+    expect(linux).toContain("Publish Linux E2E Summary");
+    expect(linux).toContain("if-no-files-found: warn");
+    expect(linux).toContain("retention-days: 14");
+    // Both Native WebKitGTK UI regression steps pair WEBKIT_DISABLE_DMABUF_RENDERER=0 with FORCE_SHM=1 + Skia CPU rendering
+    // to avoid both the WebKitGTK 2.50.4 AcceleratedBackingStore SIGSEGV and headless GBM/Skia stalls.
+    const linuxUi = linux.slice(linux.indexOf("- name: Native WebKitGTK UI Regressions (X11)"), linux.indexOf("- name: Real-Binary tauri-driver E2E Smoke (X11)"));
+    expect(linuxUi.match(/^\s*export WEBKIT_DISABLE_DMABUF_RENDERER=0\b/gm)).toHaveLength(2);
+    expect(linuxUi.match(/^\s*export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1\b/gm)).toHaveLength(2);
+    expect(linuxUi.match(/^\s*export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1\b/gm)).toHaveLength(2);
+    expect(linuxUi).not.toMatch(/^\s*(?:export\s+)?WEBKIT_DISABLE_DMABUF_RENDERER=1\b/m);
+    // Windows multiline cargo build with backslash continuations must run under bash, never pwsh.
+    const winBuild = windows.slice(windows.indexOf("- name: Build Desktop App"), windows.indexOf("- name: Native Windows WebView2 Runtime Smoke"));
+    expect(winBuild).toContain("shell: bash");
+    // Windows matches msedgedriver major version to installed WebView2 Runtime and writes Win32 paths to GITHUB_PATH.
+    expect(windows).toContain("F3017226-FE2A-4295-8BDF-00C3A9A7E4C5");
+    // Disable MSYS2 POSIX path conversion so `/v` is not rewritten to `C:/Program Files/Git/v`.
+    expect(windows).toContain("MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg.exe query");
+    // Resolve explicit `.exe` path so NTFS existsSync/tauri-driver never receive an extensionless path.
+    expect(windows).toContain('driver_bin="$(command -v msedgedriver.exe || command -v msedgedriver || true)"');
+    expect(windows).toContain('driver_bin="${driver_bin}.exe"');
+    expect(windows).toContain('matched_exe="$(cygpath -w "$driver_bin")"');
+    expect(windows).toContain('cygpath -w "$root/bin" >> "$GITHUB_PATH"');
+    expect(windows).toContain('cygpath -u "$EDGEWEBDRIVER"');
+    expect(windows).toContain("LATEST_RELEASE_");
+    expect(windows).toContain("LC_ALL=C tr -d");
+    // Both preinstalled-match and freshly-downloaded msedgedriver branches pin TAURI_NATIVE_DRIVER_BIN.
+    expect(windows.match(/echo "TAURI_NATIVE_DRIVER_BIN=\$matched_exe" >> "\$GITHUB_ENV"/g)).toHaveLength(2);
+    expect(windows).toContain("Publish Windows E2E Summary");
+    expect(windows).toContain("if-no-files-found: warn");
+    expect(windows).toContain("retention-days: 14");
+  });
+
+  it("keeps DEVMAP_REV, MANVI_REV, NEXTEST_VERSION, TAURI_DRIVER_VERSION, BUN_VERSION, and Node major identical across workflows, package.json, and Containerfile.linux-test", () => {
+    const readWf = (name: string) =>
+      readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
+    const containerfile = readFileSync(fileURLToPath(new URL("../Containerfile.linux-test", import.meta.url)), "utf8");
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as {
+      packageManager?: string;
+    };
+
+    const files = ["ci.yml", "coverage.yml", "test-parallel.yml", "release.yml"];
+    const devmapPins = new Set<string>();
+    const manviPins = new Set<string>();
+    for (const file of files) {
+      const text = readWf(file);
+      const devmap = /^ {2}DEVMAP_REV: ([0-9a-f]{40})$/m.exec(text)?.[1];
+      const manvi = /^ {2}MANVI_REV: ([0-9a-f]{40})$/m.exec(text)?.[1];
+      expect(devmap, `${file} missing 40-char DEVMAP_REV`).toBeDefined();
+      expect(manvi, `${file} missing 40-char MANVI_REV`).toBeDefined();
+      devmapPins.add(devmap!);
+      manviPins.add(manvi!);
+    }
+    const cfDevmap = /^ARG DEVMAP_REV=([0-9a-f]{40})$/m.exec(containerfile)?.[1];
+    const cfManvi = /^ARG MANVI_REV=([0-9a-f]{40})$/m.exec(containerfile)?.[1];
+    expect(cfDevmap, "Containerfile.linux-test missing 40-char ARG DEVMAP_REV").toBeDefined();
+    expect(cfManvi, "Containerfile.linux-test missing 40-char ARG MANVI_REV").toBeDefined();
+    devmapPins.add(cfDevmap!);
+    manviPins.add(cfManvi!);
+    expect([...devmapPins]).toHaveLength(1);
+    expect([...manviPins]).toHaveLength(1);
+
+    // cargo-nextest version across all 6 ci.yml install sites and Containerfile.linux-test.
+    const ci = readWf("ci.yml");
+    const ciNextest = [...ci.matchAll(/tool:\s*cargo-nextest@(\d+\.\d+\.\d+)/g)].map((m) => m[1]);
+    expect(ciNextest).toHaveLength(6);
+    const cfNextest = /^ARG NEXTEST_VERSION=(\d+\.\d+\.\d+)$/m.exec(containerfile)?.[1];
+    expect(cfNextest, "Containerfile.linux-test missing ARG NEXTEST_VERSION").toBeDefined();
+    expect([...new Set([...ciNextest, cfNextest!])]).toHaveLength(1);
+
+    // tauri-driver version between e2e-desktop.yml and Containerfile.linux-test.
+    const e2e = readWf("e2e-desktop.yml");
+    const e2eDriver = /^ {2}TAURI_DRIVER_VERSION:\s*"?(\d+\.\d+\.\d+)"?$/m.exec(e2e)?.[1];
+    const cfDriver = /^ARG TAURI_DRIVER_VERSION=(\d+\.\d+\.\d+)$/m.exec(containerfile)?.[1];
+    expect(e2eDriver, "e2e-desktop.yml missing TAURI_DRIVER_VERSION").toBeDefined();
+    expect(cfDriver, "Containerfile.linux-test missing ARG TAURI_DRIVER_VERSION").toBeDefined();
+    expect(cfDriver).toBe(e2eDriver);
+
+    // Bun version between package.json, Containerfile.linux-test, and every workflow using setup-bun.
+    const pkgBun = /^bun@(\d+\.\d+\.\d+)$/.exec(pkg.packageManager ?? "")?.[1];
+    const cfBun = /^ARG BUN_VERSION=(\d+\.\d+\.\d+)$/m.exec(containerfile)?.[1];
+    expect(pkgBun, "package.json missing packageManager bun@x.y.z").toBeDefined();
+    expect(cfBun, "Containerfile.linux-test missing ARG BUN_VERSION").toBeDefined();
+    expect(cfBun).toBe(pkgBun);
+    for (const wfName of workflowFiles(fileURLToPath(new URL("../.github/workflows", import.meta.url)))) {
+      const text = readWf(wfName);
+      const bunSteps = text.split(/\n(?=[ \t]*- )/).filter((step) => step.includes("oven-sh/setup-bun@"));
+      for (const step of bunSteps) {
+        expect(step, `${wfName} setup-bun must pin via package.json`).toContain("bun-version-file: package.json");
+        expect(step, `${wfName} setup-bun must not hardcode bun-version`).not.toMatch(/^\s+bun-version:/m);
+      }
+    }
+
+    // Node major version between Containerfile.linux-test and core workflows.
+    const cfNodeMajor = /^ARG NODE_VERSION=(\d+)\.\d+\.\d+$/m.exec(containerfile)?.[1];
+    expect(cfNodeMajor, "Containerfile.linux-test missing ARG NODE_VERSION").toBeDefined();
+    for (const wfName of ["ci.yml", "release.yml", "e2e-desktop.yml"]) {
+      const majors = [...readWf(wfName).matchAll(/node-version:\s*(\d+)/g)].map((m) => m[1]);
+      expect(majors.length, `${wfName} setup-node`).toBeGreaterThan(0);
+      expect([...new Set([...majors, cfNodeMajor!])]).toHaveLength(1);
     }
   });
 
@@ -306,7 +462,7 @@ describe("check:workflows", () => {
   });
 
   it("scopes rust-cache to the runner image so native artifacts are not reused across MSVC upgrades", () => {
-    for (const name of ["ci.yml", "coverage.yml", "release.yml"]) {
+    for (const name of ["ci.yml", "coverage.yml", "release.yml", "e2e-desktop.yml"]) {
       const source = readFileSync(
         fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)),
         "utf8",

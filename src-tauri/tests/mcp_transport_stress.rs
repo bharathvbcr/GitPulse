@@ -391,13 +391,48 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         .unwrap()
         .to_string_lossy()
         .replace('\'', "'\"'\"'");
-    let monitor = format!("'{executable}' --exact slow_status_fixture --ignored; :");
-    assert!(Command::new("git")
-        .current_dir(&repo)
-        .args(["config", "core.fsmonitor", &monitor])
-        .status_locked()
-        .unwrap()
-        .success());
+    let wrapper_dir = fixture.path().join("bin");
+    std::fs::create_dir_all(&wrapper_dir).unwrap();
+    let orig_path = std::env::var_os("PATH").unwrap_or_default();
+    let real_git = resolve_real_git(&orig_path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real_git_escaped = real_git.to_string_lossy().replace('\'', "'\"'\"'");
+        let wrapper_path = wrapper_dir.join("git");
+        let script = format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               if [ \"$arg\" = \"worktree\" ]; then\n\
+                 '{executable}' --exact slow_status_fixture --ignored >/dev/null 2>&1\n\
+                 break\n\
+               fi\n\
+             done\n\
+             exec '{real_git_escaped}' \"$@\"\n"
+        );
+        std::fs::write(&wrapper_path, script).unwrap();
+        std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let wrapper_path = wrapper_dir.join("git.cmd");
+        let script = format!(
+            "@echo off\r\n\
+             echo %* | findstr /C:\"worktree\" >nul\r\n\
+             if not errorlevel 1 (\r\n\
+               \"{}\" --exact slow_status_fixture --ignored >nul 2>&1\r\n\
+             )\r\n\
+             \"{}\" %*\r\n",
+            std::env::current_exe().unwrap().display(),
+            real_git.display(),
+        );
+        std::fs::write(&wrapper_path, script).unwrap();
+    }
+    let wrapped_path = std::env::join_paths(
+        std::iter::once(wrapper_dir.clone()).chain(std::env::split_paths(&orig_path)),
+    )
+    .unwrap();
+    let wrapped_path_str = wrapped_path.to_str().unwrap();
     process_trust::approve(&repo, &home);
     let home_text = home.to_str().unwrap();
     let config = home.join(".config");
@@ -407,6 +442,7 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         ("HOME", home_text),
         ("XDG_CONFIG_HOME", config.to_str().unwrap()),
         ("APPDATA", appdata.to_str().unwrap()),
+        ("PATH", wrapped_path_str),
     ]);
     let mut reader = BufReader::new(stdout);
 
@@ -1000,6 +1036,40 @@ mod process_trust;
 #[ignore = "bounded subprocess fixture used to make Git status observably slow"]
 fn slow_status_fixture() {
     std::thread::sleep(Duration::from_secs(1));
+}
+
+fn resolve_real_git(orig_path: &std::ffi::OsStr) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in std::env::split_paths(orig_path) {
+            let candidate = dir.join("git");
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    return candidate;
+                }
+            }
+        }
+        for fallback in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+            let candidate = std::path::PathBuf::from(fallback);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        std::path::PathBuf::from("git")
+    }
+    #[cfg(windows)]
+    {
+        for dir in std::env::split_paths(orig_path) {
+            for name in ["git.exe", "git.cmd", "git.bat"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        std::path::PathBuf::from("git")
+    }
 }
 
 /// The kernel's count of interrupt wakeups for `pid` — the figure Activity

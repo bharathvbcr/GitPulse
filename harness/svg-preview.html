@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <title>GitPulse SVG Preview checks</title>
+</head>
+<body>
+<div id="app"></div>
+<pre id="result"></pre>
+<script type="module">
+  import "../src/app.css";
+  import { mount, tick } from "svelte";
+  import { createChecks } from "./checks.ts";
+  import { mockIPCWithEvents } from "./tauriMocks";
+  import SvgPreviewHost from "./SvgPreviewHost.svelte";
+
+  const { results, check } = createChecks();
+  const errors = [];
+  const cspViolations = [];
+  const unexpected = new Set();
+  const blobReads = [];
+  addEventListener("error", (e) => errors.push(e.message));
+  addEventListener("unhandledrejection", (e) => errors.push(String(e.reason)));
+  document.addEventListener("securitypolicyviolation", (e) =>
+    cspViolations.push(`${e.violatedDirective}:${e.blockedURI}`),
+  );
+
+  const repo = "/fixture/svg-preview";
+  const PNG_1X1_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=";
+  const PNG_ALT_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mNk+M9QzwAEjDAGACCKAoG+r5fHAAAAAElFTkSuQmCC";
+
+  const demoSvg = `<!-- <script>comment should stay safe</script> -->
+<svg viewBox="0 0 24 24" onload="window.__svgPwned = true">
+  <title>Pulse Mark</title>
+  <script>window.__svgPwned = true;<\/script>
+  <a href="javascript:window.__svgPwned=true">
+    <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+  </a>
+  <image href="./chip.png" x="8" y="8" width="8" height="8"/>
+</svg>`;
+
+  const secondSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="32" viewBox="0 0 48 32">
+  <title>Second Asset</title>
+  <image href="./chip.png" x="4" y="4" width="16" height="16"/>
+  <rect x="24" y="4" width="16" height="24" fill="currentColor"/>
+</svg>`;
+
+  const cloneSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="green"/></svg>`;
+  const noVbSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#2563eb"/></svg>`;
+  const bareSvg = `<svg><circle cx="150" cy="75" r="50" fill="green"/></svg>`;
+  const bannerSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800"><rect width="1200" height="800" fill="#1d4ed8"/><circle cx="600" cy="400" r="240" fill="#38bdf8"/></svg>`;
+  const childBadgeSvg = `<svg viewBox="0 0 12 12"><path fill="currentColor" d="M1 1h10v10z"/></svg>`;
+  const auditSanitizeSvg = `<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="https://evil.example/sheet.xsl"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title onclick="window.__svgPwned = true">Audit Title</title>
+  <desc onmouseover="window.__svgPwned = true">Audit description line</desc>
+  <style onload="window.__svgPwned = true">@import "https://evil.example/font.css"; .a{background:url(file:///etc/passwd);fill:currentColor}</style>
+  <g>
+    <a href="data:text/html,<script>window.__svgPwned=true<\/script>"><rect width="10" height="10" class="a"/></a>
+    <image href="ftp://mirror.example/pic.png" width="4" height="4"/>
+    <image href="./badge.svg" x="12" y="12" width="12" height="12"/>
+    <set attributeName="href" to="javascript:window.__svgPwned=true"/>
+    <animate attributeName="opacity" from="0" to="1" dur="1s"/>
+  </g>
+</svg>`;
+  const prefixedSvg = `<SVG:svg width="24" height="24"><SVG:rect width="24" height="24" fill="green"/></SVG:svg>`;
+  const wrongCaseSvg = `<svg xmlns="http://www.w3.org/2000/svg" ViewBox="0 0 24 24" Color="#e11d48"><path fill="currentColor" d="M0 0h24v24z"/></svg>`;
+  const hugeArtboardSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100000 100000"><rect width="100000" height="100000" fill="#0ea5e9"/></svg>`;
+  const tinyIconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#22c55e"/></svg>`;
+
+  const files = {
+    "art/demo.svg": { path: "art/demo.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: demoSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/chip.png": { path: "art/chip.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: PNG_1X1_B64, invalid_utf8_bytes: 0 },
+    "art/badge.svg": { path: "art/badge.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: childBadgeSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/no-vb.svg": { path: "art/no-vb.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: noVbSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/bare.svg": { path: "art/bare.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: bareSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/banner.svg": { path: "art/banner.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: bannerSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/audit-sanitize.svg": { path: "art/audit-sanitize.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: auditSanitizeSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/prefixed.svg": { path: "art/prefixed.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: prefixedSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/wrong-case.svg": { path: "art/wrong-case.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: wrongCaseSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/huge-artboard.svg": { path: "art/huge-artboard.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: hugeArtboardSvg, base64: null, invalid_utf8_bytes: 0 },
+    "art/tiny-icon.svg": { path: "art/tiny-icon.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: tinyIconSvg, base64: null, invalid_utf8_bytes: 0 },
+    "sub/second.svg": { path: "sub/second.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: secondSvg, base64: null, invalid_utf8_bytes: 0 },
+    "sub/chip.png": { path: "sub/chip.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: PNG_ALT_B64, invalid_utf8_bytes: 0 },
+    "sub/clone-a.svg": { path: "sub/clone-a.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: cloneSvg, base64: null, invalid_utf8_bytes: 0 },
+    "sub/clone-b.svg": { path: "sub/clone-b.svg", is_binary: false, is_image: true, mime: "image/svg+xml", text: cloneSvg, base64: null, invalid_utf8_bytes: 0 },
+  };
+
+  mockIPCWithEvents((cmd, args) => {
+    switch (cmd) {
+      case "cmd_resolve_repo": return { path: args.repoPath, name: "svg-preview", is_bare: false };
+      case "cmd_list_repo_files": return ["art/demo.svg", "art/chip.png", "sub/second.svg", "sub/chip.png", "src/app.ts"];
+      case "cmd_get_status": return [];
+      case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: "a".repeat(40), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
+      case "cmd_list_remotes": case "cmd_list_submodules": return [];
+      case "cmd_stash_list": return { entries: [], truncated: false };
+      case "cmd_list_tags": return { tags: [], truncated: false };
+      case "cmd_branch_stats": return {};
+      case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_watch_repo": case "cmd_unwatch_repo": case "cmd_note_tab_activated": case "cmd_last_fetch_at": case "cmd_set_recent_menu": return null;
+      case "cmd_devmap_maybe_refresh": return { decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null };
+      case "cmd_devcouncil_init": return { repo: args.repoPath, state_dir: "/fixture/.devmap", exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false };
+      case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_get_file_blob":
+        blobReads.push(args);
+        if (files[args.filePath]) return files[args.filePath];
+        throw new Error(`Missing fixture file: ${args.filePath}`);
+      default:
+        unexpected.add(cmd);
+        throw new Error(`Unconfigured harness command: ${cmd}`);
+    }
+  });
+
+  const { repoStore } = await import("../src/lib/stores/repoStore");
+  const { triggerFileSearch } = await import("../src/lib/files/fileSearchTarget");
+  const { clearSvgPreviewPreferences, requestSvgViewMode, validateSvgXmlInDom } = await import("../src/lib/files/svgPreview");
+  const { REVEAL_TTL_MS, requestReveal } = await import("../src/lib/files/revealRequests");
+  clearSvgPreviewPreferences();
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const settle = async (ms = 60) => { await tick(); await sleep(ms); await tick(); };
+  const until = async (fn, ms = 3000) => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      if (fn()) return true;
+      await sleep(25);
+    }
+    return fn();
+  };
+  const decodeImgSrc = (img) => {
+    const src = img?.getAttribute("src") ?? "";
+    const prefix = "data:image/svg+xml;base64,";
+    if (!src.startsWith(prefix)) return "";
+    const bin = atob(src.slice(prefix.length));
+    return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+  };
+  // WebKitGTK 2.50.4 reports the CSS layout container size on an attached SVG
+  // `<img>` (WebKit's SVGImageForContainer behavior) instead of the SVG root's
+  // intrinsic width/height. Probing an unstyled detached `new Image()` with the
+  // exact same `src` exercises the browser's real SVG decoder and yields the
+  // true intrinsic dimensions across Chrome, macOS WKWebView, and WebKitGTK.
+  const intrinsicSizeCache = new Map();
+  const decodeIntrinsicSize = (img) => {
+    const src = img?.getAttribute("src") ?? "";
+    if (!src) return Promise.resolve({ width: 0, height: 0 });
+    if (intrinsicSizeCache.has(src)) return intrinsicSizeCache.get(src);
+    const pending = new Promise((resolve) => {
+      const probe = new Image();
+      probe.onload = () => resolve({ width: probe.naturalWidth, height: probe.naturalHeight });
+      probe.onerror = () => resolve({ width: 0, height: 0 });
+      probe.src = src;
+    });
+    intrinsicSizeCache.set(src, pending);
+    return pending;
+  };
+  const waitForSvgImg = async (getImg, expectedW, expectedH = null, extra = () => true, ms = 1500) => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      const img = getImg();
+      if (img?.complete && img.naturalWidth > 0 && img.naturalHeight > 0 && extra(img)) {
+        const size = await decodeIntrinsicSize(img);
+        if (size.width === expectedW && (expectedH === null || size.height === expectedH)) return size;
+      }
+      await sleep(25);
+    }
+    const img = getImg();
+    return img?.complete && img.naturalWidth > 0 ? await decodeIntrinsicSize(img) : { width: 0, height: 0 };
+  };
+
+  await repoStore.openRepo(repo);
+
+  const target = document.getElementById("app");
+  const host = mount(SvgPreviewHost, {
+    target,
+    props: {
+      initial: { repoPath: repo, filePath: "art/demo.svg", text: demoSvg, diskBase: "rev-1" },
+      width: 900,
+      height: 560,
+      onTreeSelect(path) {
+        const blob = files[path];
+        if (blob) {
+          host.updatePrimary({ filePath: path, text: blob.text, draftContent: null });
+          host.updateSecondary({ filePath: path, text: blob.text, draftContent: null });
+        }
+      },
+    },
+  });
+
+  const treeHost = () => target.querySelector('[data-host="tree"]');
+  const primaryHost = () => target.querySelector('[data-host="primary"]');
+  const secondaryHost = () => target.querySelector('[data-host="secondary"]');
+  const primaryImg = () => primaryHost().querySelector('[data-testid="svg-preview-img"]');
+  const secondaryImg = () => secondaryHost().querySelector('[data-testid="svg-preview-img"]');
+
+  await until(() =>
+    Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0) &&
+    Boolean(secondaryImg()?.complete && secondaryImg().naturalWidth > 0) &&
+    decodeImgSrc(primaryImg()).includes(PNG_1X1_B64),
+  );
+  await until(() => [...treeHost().querySelectorAll('[role="treeitem"]')].some((el) => el.textContent.includes("demo.svg")));
+
+  try {
+    // 1. Rendered SVG decoding, missing xmlns & viewBox normalization, currentColor, local <image>, and security stripping
+    const decoded = decodeImgSrc(primaryImg());
+    const primaryIntrinsic = await decodeIntrinsicSize(primaryImg());
+    check("SVG without xmlns or explicit width/height normalizes and renders cleanly in browser <img>", () =>
+      primaryImg().complete &&
+      primaryImg().naturalWidth > 0 &&
+      primaryIntrinsic.width === 24 &&
+      primaryIntrinsic.height === 24 &&
+      decoded.includes('xmlns="http://www.w3.org/2000/svg"') &&
+      decoded.includes('width="24"') &&
+      decoded.includes('height="24"'));
+
+    check("viewBox-only 24x24 icon scales up in Fit mode inside preview stage", () =>
+      primaryImg().getBoundingClientRect().width > 24 &&
+      primaryImg().getBoundingClientRect().height > 24);
+
+    check("sanitized preview strips script, onload, and javascript: link while keeping comment safe and executing nothing", () =>
+      !decoded.includes("alert(") &&
+      !decoded.includes("onload=") &&
+      !decoded.includes("javascript:") &&
+      !decoded.includes("__svgPwned=true") &&
+      decoded.includes("<!-- <script>comment should stay safe</script> -->") &&
+      window.__svgPwned === undefined &&
+      Boolean(primaryHost().querySelector('[data-testid="svg-sanitized-badge"]')));
+
+    check("local <image href='./chip.png'> is inlined via base64 using withDigest: false", () =>
+      decoded.includes(`href="data:image/png;base64,${PNG_1X1_B64}"`) &&
+      blobReads.some((r) => r.filePath === "art/chip.png" && r.withDigest === false));
+
+    check("secondary host delegates SVG cleanly through MediaViewer LazyMount", () =>
+      Boolean(secondaryHost().querySelector('[data-testid="svg-preview-viewer"]')) &&
+      Boolean(secondaryImg()?.complete && secondaryImg().naturalWidth > 0));
+
+    // 2. Canvas surfaces (light / dark / grid), bounds, zoom (1:1, +, -, reset, Fit), and Details inspector
+    primaryHost().querySelector('[data-testid="svg-canvas-dark"]').click();
+    await settle();
+    check("dark canvas updates currentColor ink to light foreground inside rendered SVG", () =>
+      primaryHost().querySelector('[data-svg-canvas="dark"]') !== null &&
+      decodeImgSrc(primaryImg()).includes('color="#f1f5f9"'));
+
+    primaryHost().querySelector('[data-testid="svg-canvas-light"]').click();
+    await settle();
+    check("light canvas updates currentColor ink to dark foreground inside rendered SVG", () =>
+      primaryHost().querySelector('[data-svg-canvas="light"]') !== null &&
+      decodeImgSrc(primaryImg()).includes('color="#0f172a"'));
+
+    primaryHost().querySelector('[data-testid="svg-canvas-grid"]').click();
+    await settle();
+    check("grid canvas restores transparency grid surface", () =>
+      Boolean(primaryHost().querySelector(".svg-grid-surface")) &&
+      primaryHost().querySelector('[data-svg-canvas="grid"]') !== null);
+
+    primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').click();
+    await settle();
+    check("Bounds toggle activates artboard outline indicator", () =>
+      primaryHost().querySelector('[data-svg-bounds="true"]') !== null &&
+      primaryHost().querySelector('.svg-artboard-box[data-bounds="true"]') !== null);
+
+    primaryHost().querySelector('[data-testid="svg-zoom-actual"]').click();
+    await settle();
+    check("1:1 actual button renders 24x24 SVG at exact 24px and 100%", () =>
+      Math.round(primaryImg().getBoundingClientRect().width) === 24 &&
+      primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent === "100%");
+
+    primaryHost().querySelector('[data-testid="svg-zoom-in"]').click();
+    await settle();
+    check("Zoom in steps from 100% to 125% and enlarges rendered image", () =>
+      primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent === "125%" &&
+      Math.round(primaryImg().getBoundingClientRect().width) === 30);
+
+    primaryHost().querySelector('[data-testid="svg-zoom-out"]').click();
+    await settle();
+    check("Zoom out returns from 125% to 100%", () =>
+      primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent === "100%");
+
+    primaryHost().querySelector('[data-testid="svg-zoom-fit"]').click();
+    await settle();
+    check("Fit button scales SVG back up to fill available stage", () =>
+      primaryImg().getBoundingClientRect().width > 100);
+
+    primaryHost().querySelector('[data-testid="svg-inspector-toggle"]').click();
+    await settle();
+    const inspectorText = primaryHost().querySelector('[data-testid="svg-inspector-panel"]')?.textContent ?? "";
+    check("Details inspector reports dimensions, viewBox, currentColor, inlined images, and stripped items", () =>
+      inspectorText.includes("24 × 24 px (viewBox)") &&
+      inspectorText.includes("viewBox 0 0 24 24") &&
+      inspectorText.includes("currentColor") &&
+      inspectorText.includes("1 local image inlined") &&
+      inspectorText.includes("1 script") &&
+      inspectorText.includes("1 event handler") &&
+      inspectorText.includes("1 unsafe link"));
+
+    // 3. Real FileTreePanel right-click menu -> Open Code & Preview across BOTH concurrently mounted hosts
+    const demoRow = [...treeHost().querySelectorAll('[role="treeitem"]')].find((el) =>
+      el.textContent.includes("demo.svg"),
+    );
+    demoRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 80, clientY: 80 }));
+    await until(() => Boolean(document.querySelector('[data-testid="file-ctx-svg-split"]')));
+    check("right-clicking an SVG file in FileTreePanel offers Preview, Code & Preview, and Open in editor", () =>
+      Boolean(document.querySelector('[data-testid="file-ctx-svg-preview"]')) &&
+      Boolean(document.querySelector('[data-testid="file-ctx-svg-split"]')) &&
+      Boolean(document.querySelector('[data-testid="file-ctx-svg-code"]')));
+
+    document.querySelector('[data-testid="file-ctx-svg-split"]').click();
+    await until(() =>
+      Boolean(primaryHost().querySelector("[data-svg-split-code]")) &&
+      Boolean(secondaryHost().querySelector("[data-svg-split-code]")),
+    );
+    check("Open Code & Preview switches BOTH concurrently mounted hosts into Split mode without stealing the request", () =>
+      Boolean(primaryHost().querySelector("[data-svg-split-code]")) &&
+      Boolean(primaryHost().querySelector("[data-svg-split-preview]")) &&
+      Boolean(secondaryHost().querySelector("[data-svg-split-code]")) &&
+      Boolean(secondaryHost().querySelector("[data-svg-split-preview]")));
+
+    // 4. Stale revealTarget does NOT override explicit right-click "Open as Preview"; expired reveal does not hijack Preview
+    host.setSecondaryMounted(false);
+    await settle();
+    host.updateSecondary({ revealTarget: { line: 4, column: 1, seq: 1 } });
+    requestSvgViewMode(repo, "art/demo.svg", "preview");
+    host.setSecondaryMounted(true);
+    await until(() => Boolean(secondaryHost()?.querySelector('[data-testid="svg-mode-preview"]')));
+    await settle(80);
+    check("explicit Open as Preview wins over a stale revealTarget on mount", () =>
+      secondaryHost().querySelector('[data-testid="svg-mode-preview"]')?.getAttribute("data-active") === "true" &&
+      Boolean(secondaryImg()));
+
+    requestReveal("art/demo.svg", 2, null, Date.now() - REVEAL_TTL_MS - 1000);
+    await settle(60);
+    check("expired revealRequest does not hijack Preview mode into Code mode", () =>
+      secondaryHost().querySelector('[data-testid="svg-mode-preview"]')?.getAttribute("data-active") === "true" &&
+      Boolean(secondaryImg()));
+
+    // 5. Clicking Refresh remounts & reloads <img> even when SVG markup is unchanged
+    const imgBeforeRefresh = secondaryImg();
+    let refreshedImgLoaded = false;
+    const onRefreshImgLoad = (event) => {
+      if (event.target instanceof HTMLImageElement && event.target !== imgBeforeRefresh) {
+        refreshedImgLoaded = true;
+      }
+    };
+    secondaryHost().addEventListener("load", onRefreshImgLoad, true);
+    secondaryHost().querySelector('[data-testid="svg-refresh-btn"]').click();
+    await until(() => refreshedImgLoaded, 1500);
+    secondaryHost().removeEventListener("load", onRefreshImgLoad, true);
+    const imgAfterRefresh = secondaryImg();
+    check("clicking Refresh remounts and reloads the SVG <img> even when XML is unchanged", () =>
+      Boolean(imgBeforeRefresh) &&
+      Boolean(imgAfterRefresh) &&
+      imgAfterRefresh !== imgBeforeRefresh &&
+      refreshedImgLoaded);
+
+    // 6. Live editing in Split mode, Pause/Resume, and Malformed XML -> Recovery
+    primaryHost().querySelector('[data-testid="svg-mode-split"]').click();
+    await settle();
+    const updatedSvg = demoSvg.replace('r="9"', 'r="11" data-live="yes"');
+    host.updatePrimary({ draftContent: updatedSvg });
+    await until(() => decodeImgSrc(primaryImg()).includes('data-live="yes"'), 1500);
+    check("editing draftContent live-updates the rendered SVG in Split mode", () =>
+      decodeImgSrc(primaryImg()).includes('data-live="yes"'));
+
+    primaryHost().querySelector('[data-testid="svg-live-toggle"]').click();
+    await settle();
+    const pausedSvg = updatedSvg.replace('data-live="yes"', 'data-paused="yes"');
+    host.updatePrimary({ draftContent: pausedSvg });
+    await settle(260);
+    check("pausing live updates holds the SVG preview and shows the pending-edit banner", () =>
+      !decodeImgSrc(primaryImg()).includes('data-paused="yes"') &&
+      Boolean(primaryHost().querySelector('[data-testid="svg-paused-banner"]')));
+
+    primaryHost().querySelector('[data-testid="svg-paused-refresh"]').click();
+    await until(() => decodeImgSrc(primaryImg()).includes('data-paused="yes"'));
+    check("Refresh now reflects paused SVG edits immediately", () =>
+      decodeImgSrc(primaryImg()).includes('data-paused="yes"') &&
+      !primaryHost().querySelector('[data-testid="svg-paused-banner"]'));
+
+    primaryHost().querySelector('[data-testid="svg-live-toggle"]').click();
+    await settle();
+
+    const brokenSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect></svg>';
+    host.updatePrimary({ draftContent: brokenSvg });
+    await until(() => Boolean(primaryHost().querySelector('[data-testid="svg-parse-error"]')), 1500);
+    check("malformed SVG XML shows an inline parse-error banner instead of a silent broken icon", () =>
+      Boolean(primaryHost().querySelector('[data-testid="svg-parse-error"]')) &&
+      !primaryImg());
+
+    host.updatePrimary({ draftContent: demoSvg });
+    await until(() => Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0), 1500);
+    check("fixing malformed SVG XML recovers live rendering automatically", () =>
+      Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0) &&
+      !primaryHost().querySelector('[data-testid="svg-parse-error"]'));
+
+    // 7. Split drag resize, double-click reset, orientation toggle, and narrow auto-stacking
+    const sash = primaryHost().querySelector('[data-testid="svg-split-sash"]');
+    const splitBox = primaryHost().querySelector("[data-svg-split]").getBoundingClientRect();
+    const codePane = () => primaryHost().querySelector("[data-svg-split-code]");
+    const initialW = codePane().getBoundingClientRect().width;
+    sash.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0, clientX: splitBox.left + splitBox.width * 0.5 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: splitBox.left + splitBox.width * 0.35 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    await settle();
+    const draggedW = codePane().getBoundingClientRect().width;
+    check("pointer-dragging horizontal split sash resizes SVG code and preview panes", () => draggedW < initialW - 40);
+    sash.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await settle();
+    check("double-clicking SVG split sash resets panes to 50%", () =>
+      Math.abs(codePane().getBoundingClientRect().width - initialW) < 4);
+
+    const orientToggle = primaryHost().querySelector('[data-testid="svg-split-orientation-toggle"]');
+    const sideBySidePreviewW = primaryHost().querySelector("[data-svg-split-preview]").getBoundingClientRect().width;
+    orientToggle.click();
+    await settle();
+    const stackedPreviewW = primaryHost().querySelector("[data-svg-split-preview]").getBoundingClientRect().width;
+    check("toggling split orientation stacks code above SVG preview and gives preview full pane width", () =>
+      primaryHost().querySelector("[data-svg-split]")?.getAttribute("data-svg-split") === "vertical" &&
+      primaryHost().querySelector('[data-testid="svg-split-sash"]')?.getAttribute("aria-orientation") === "horizontal" &&
+      stackedPreviewW > sideBySidePreviewW + 150);
+
+    primaryHost().querySelector('[data-testid="svg-split-orientation-toggle"]').click();
+    await settle();
+
+    host.resize(480, 560);
+    await until(() => primaryHost().querySelector("[data-svg-split]")?.getAttribute("data-svg-split") === "vertical");
+    const vSash = primaryHost().querySelector('[data-testid="svg-split-sash"]');
+    const vCodeBefore = primaryHost().querySelector("[data-svg-split-code]").getBoundingClientRect().height;
+    vSash.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    await settle();
+    const vCodeAfter = primaryHost().querySelector("[data-svg-split-code]").getBoundingClientRect().height;
+    check("narrow pane switches to vertical split with keyboard-resizable sash and hides orientation toggle", () =>
+      vSash.getAttribute("aria-orientation") === "horizontal" &&
+      vCodeAfter > vCodeBefore + 10 &&
+      !primaryHost().querySelector('[data-testid="svg-split-orientation-toggle"]'));
+
+    // 8. ⌘F (triggerFileSearch) from Preview mode opens Split mode and focuses Find
+    host.resize(900, 560);
+    await settle();
+    primaryHost().querySelector('[data-testid="svg-mode-preview"]').click();
+    await settle();
+    const triggered = triggerFileSearch(primaryHost(), "find", "Pulse");
+    await until(() => Boolean(primaryHost().querySelector("[data-svg-split-code] input")));
+    check("triggerFileSearch in Preview mode opens Split mode and activates CodeViewer Find", () =>
+      triggered && Boolean(primaryHost().querySelector("[data-svg-split-code]")));
+
+    // 9. Cross-file switch clears previous inlined assets (no bleed) and identical-markup switch remounts clean img
+    primaryHost().querySelector('[data-testid="svg-mode-preview"]').click();
+    await settle();
+    host.updatePrimary({ filePath: "sub/second.svg", text: secondSvg, draftContent: null, diskBase: "rev-2" });
+    const secondIntrinsic = await waitForSvgImg(primaryImg, 48, 32, (img) => decodeImgSrc(img).includes(PNG_ALT_B64), 1500);
+    const secondDecoded = decodeImgSrc(primaryImg());
+    check("switching to another SVG with ./chip.png loads its own sibling asset with zero cross-file bleed", () =>
+      secondDecoded.includes(PNG_ALT_B64) &&
+      !secondDecoded.includes(PNG_1X1_B64) &&
+      Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0) &&
+      secondIntrinsic.width === 48 &&
+      secondIntrinsic.height === 32);
+
+    host.updatePrimary({ filePath: "sub/clone-a.svg", text: cloneSvg, draftContent: null, diskBase: "rev-3" });
+    await settle();
+    const cloneAImg = primaryImg();
+    host.updatePrimary({ filePath: "sub/clone-b.svg", text: cloneSvg, draftContent: null, diskBase: "rev-4" });
+    await settle();
+    const cloneBImg = primaryImg();
+    check("switching between two SVG files with identical markup remounts a fresh preview image", () =>
+      Boolean(cloneAImg) && Boolean(cloneBImg) && cloneAImg !== cloneBImg);
+
+    // 10. Non-viewBox Fit/Zoom scaling, Fit zero-overflow, dark checkerboard, extended sanitization & inspector stats
+    host.updatePrimary({ filePath: "art/no-vb.svg", text: noVbSvg, draftContent: null, diskBase: "rev-5" });
+    await waitForSvgImg(primaryImg, 24, 24, (img) => decodeImgSrc(img).includes('viewBox="0 0 24 24"'), 1500);
+    await settle(80);
+    const primaryStage = () => primaryHost().querySelector("[data-svg-stage]");
+    check("SVG with explicit width/height and no viewBox synthesizes viewBox and scales up in Fit mode", () =>
+      decodeImgSrc(primaryImg()).includes('viewBox="0 0 24 24"') &&
+      primaryImg().getBoundingClientRect().width > 100 &&
+      primaryStage().scrollWidth <= primaryStage().clientWidth &&
+      primaryStage().scrollHeight <= primaryStage().clientHeight);
+
+    if (!primaryHost().querySelector('[data-testid="svg-inspector-panel"]')) {
+      primaryHost().querySelector('[data-testid="svg-inspector-toggle"]').click();
+      await settle();
+    }
+    check("inspector shows synthesized viewBox note for non-viewBox SVGs", () =>
+      Boolean(primaryHost().querySelector('[data-testid="svg-inspector-viewbox-note"]')));
+
+    host.updatePrimary({ filePath: "art/bare.svg", text: bareSvg, draftContent: null, diskBase: "rev-6" });
+    const bareIntrinsic = await waitForSvgImg(primaryImg, 300, 150, (img) => decodeImgSrc(img).includes('viewBox="0 0 300 150"'), 1500);
+    await settle(60);
+    check("dimensionless SVG synthesizes default 300x150 viewBox, auto-adds xmlns, and notes both in inspector", () =>
+      Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0 && bareIntrinsic.width === 300) &&
+      Boolean(primaryHost().querySelector('[data-testid="svg-inspector-viewbox-note"]')) &&
+      Boolean(primaryHost().querySelector('[data-testid="svg-inspector-xmlns-note"]')));
+
+    host.updatePrimary({ filePath: "art/banner.svg", text: bannerSvg, draftContent: null, diskBase: "rev-7" });
+    await waitForSvgImg(primaryImg, 1200, 800, () => true, 1500);
+    await settle(80);
+    if (primaryHost().querySelector('[data-testid="svg-bounds-toggle"]')?.getAttribute("aria-pressed") !== "true") {
+      primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').click();
+      await settle();
+    }
+    check("large 1200x800 banner in Fit mode with Bounds active has zero horizontal or vertical stage overflow", () =>
+      primaryStage().scrollWidth <= primaryStage().clientWidth &&
+      primaryStage().scrollHeight <= primaryStage().clientHeight);
+
+    host.updatePrimary({ filePath: "art/huge-artboard.svg", text: hugeArtboardSvg, draftContent: null, diskBase: "rev-7b" });
+    await waitForSvgImg(primaryImg, 100000, 100000, () => true, 1500);
+    await settle(80);
+    check("huge 100000x100000 SVG in Fit mode has zero stage overflow (not clamped at 1%)", () =>
+      primaryStage().scrollWidth <= primaryStage().clientWidth &&
+      primaryStage().scrollHeight <= primaryStage().clientHeight);
+
+    host.updatePrimary({ filePath: "art/tiny-icon.svg", text: tinyIconSvg, draftContent: null, diskBase: "rev-7c" });
+    await waitForSvgImg(primaryImg, 16, 16, () => true, 1500);
+    await settle(80);
+    const tinyFitPct = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    primaryHost().querySelector('[data-testid="svg-zoom-in"]').click();
+    await settle();
+    const tinyAfterPlus = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    primaryHost().querySelector('[data-testid="svg-zoom-out"]').click();
+    await settle();
+    const tinyAfterMinus = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    check("16x16 icon at 1600% Fit does not shrink when clicking + and steps cleanly to 1200% on -", () =>
+      tinyFitPct === "1600%" && tinyAfterPlus === "1600%" && tinyAfterMinus === "1200%");
+    primaryHost().querySelector('[data-testid="svg-zoom-fit"]').click();
+    await settle();
+
+    // 11. Dark checkerboard, child SVG canvas forwarding, and extended sanitization + inspector stats
+    primaryHost().querySelector('[data-testid="svg-canvas-dark-grid"]').click();
+    await settle();
+    check("dark transparency grid canvas switches to dark checkerboard and light currentColor ink", () =>
+      Boolean(primaryHost().querySelector(".svg-grid-dark-surface")) &&
+      primaryHost().querySelector('[data-svg-canvas="dark-grid"]') !== null);
+
+    host.updatePrimary({ filePath: "art/audit-sanitize.svg", text: auditSanitizeSvg, draftContent: null, diskBase: "rev-8" });
+    await until(() => decodeImgSrc(primaryImg()).includes("data:image/svg+xml;base64,"), 1500);
+    await settle(80);
+    const auditXml = decodeImgSrc(primaryImg());
+    const childHrefMatch = /href="(data:image\/svg\+xml;base64,[^"]+)"/.exec(auditXml);
+    const childDecoded = childHrefMatch
+      ? new TextDecoder().decode(Uint8Array.from(atob(childHrefMatch[1].slice("data:image/svg+xml;base64,".length)), (c) => c.charCodeAt(0)))
+      : "";
+    const auditInspectorText = primaryHost().querySelector('[data-testid="svg-inspector-panel"]')?.textContent ?? "";
+    check("extended sanitization strips style/title/desc on*, xml-stylesheet, data:text/html, and unsafe SMIL while forwarding parent canvas to child SVG", () =>
+      !auditXml.includes("onload=") &&
+      !auditXml.includes("onclick=") &&
+      !auditXml.includes("onmouseover=") &&
+      !auditXml.includes("xml-stylesheet") &&
+      !auditXml.includes("data:text/html") &&
+      !auditXml.includes('attributeName="href"') &&
+      auditXml.includes('attributeName="opacity"') &&
+      childDecoded.includes('color="#f1f5f9"') &&
+      window.__svgPwned === undefined);
+
+    check("inspector displays group, image, animation counts, <desc> text, xml-stylesheet, and unsafe animation notices", () =>
+      auditInspectorText.includes("1 group") &&
+      auditInspectorText.includes("2 images") &&
+      auditInspectorText.includes("2 animations") &&
+      auditInspectorText.includes("Audit description line") &&
+      auditInspectorText.includes("unsafe animation target") &&
+      auditInspectorText.includes("xml-stylesheet") &&
+      auditInspectorText.includes("4 external resource references"));
+
+    // Close inspector so stage has full height for pan/zoom tests
+    primaryHost().querySelector('[data-testid="svg-inspector-toggle"]').click();
+    await settle();
+
+    // 12. Non-root <svg>, DOMParser root/namespace check, and XML case-sensitivity (<SVG:svg>, ViewBox, Color)
+    host.updatePrimary({ filePath: "art/bad-root.svg", text: "<div><svg viewBox='0 0 10 10'><rect/></svg></div>", draftContent: null, diskBase: "rev-9" });
+    await until(() => Boolean(primaryHost().querySelector('[data-testid="svg-parse-error"]')), 1500);
+    check("non-root <svg> wrapped in <div> is rejected cleanly and DOMParser rejects wrong root namespace", () =>
+      Boolean(primaryHost().querySelector('[data-testid="svg-parse-error"]')) &&
+      validateSvgXmlInDom('<div><svg xmlns="http://www.w3.org/2000/svg"/></div>') !== null &&
+      validateSvgXmlInDom('<svg xmlns="http://www.w3.org/1999/xhtml"><rect/></svg>') !== null);
+
+    host.updatePrimary({ filePath: "art/prefixed.svg", text: prefixedSvg, draftContent: null, diskBase: "rev-10" });
+    const prefixedIntrinsic = await waitForSvgImg(primaryImg, 24, 24, (img) => decodeImgSrc(img).includes('xmlns:SVG="http://www.w3.org/2000/svg"'), 1500);
+    check("<SVG:svg> preserves uppercase prefix when injecting xmlns:SVG and decodes cleanly in browser <img>", () =>
+      decodeImgSrc(primaryImg()).includes('xmlns:SVG="http://www.w3.org/2000/svg"') &&
+      Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0) &&
+      prefixedIntrinsic.width === 24);
+
+    host.updatePrimary({ filePath: "art/wrong-case.svg", text: wrongCaseSvg, draftContent: null, diskBase: "rev-11" });
+    const wrongCaseIntrinsic = await waitForSvgImg(primaryImg, 300, 150, (img) => decodeImgSrc(img).includes('viewBox="0 0 300 150"'), 1500);
+    check("wrong-case ViewBox and Color attributes do not block lowercase viewBox/color normalization", () =>
+      decodeImgSrc(primaryImg()).includes('viewBox="0 0 300 150"') &&
+      decodeImgSrc(primaryImg()).includes('color="#f1f5f9"') &&
+      Boolean(primaryImg()?.complete && primaryImg().naturalWidth > 0) &&
+      wrongCaseIntrinsic.width === 300);
+
+    // 13. Direct stage manipulation (Ctrl+wheel zoom, click-drag pan, scoped preview keyboard shortcuts)
+    host.updatePrimary({ filePath: "art/banner.svg", text: bannerSvg, draftContent: null, diskBase: "rev-12" });
+    await waitForSvgImg(primaryImg, 1200, 800, () => true, 1500);
+    await settle(80);
+    const stageForInteract = primaryStage();
+    stageForInteract.focus();
+    stageForInteract.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true, cancelable: true }));
+    await settle();
+    const afterKey1 = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    stageForInteract.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true }));
+    await settle();
+    const afterWheelIn = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    stageForInteract.dispatchEvent(new KeyboardEvent("keydown", { key: "-", bubbles: true, cancelable: true }));
+    await settle();
+    const afterKeyMinus = primaryHost().querySelector('[data-testid="svg-zoom-reset"]').textContent;
+    const boundsBeforeKeyB = primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').getAttribute("aria-pressed");
+    stageForInteract.dispatchEvent(new KeyboardEvent("keydown", { key: "b", bubbles: true, cancelable: true }));
+    await settle();
+    const boundsAfterKeyB = primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').getAttribute("aria-pressed");
+    check("scoped keyboard shortcuts (1, -, b) and Ctrl+wheel zoom control preview stage directly", () =>
+      afterKey1 === "100%" &&
+      afterWheelIn === "125%" &&
+      afterKeyMinus === "100%" &&
+      boundsAfterKeyB !== boundsBeforeKeyB);
+
+    // Drag pan while zoomed past viewport (1200x800 at 100% overflows 900x560 stage)
+    stageForInteract.scrollLeft = 0;
+    stageForInteract.scrollTop = 0;
+    const pannableNow = stageForInteract.getAttribute("data-svg-pannable") === "true";
+    const sRect = stageForInteract.getBoundingClientRect();
+    stageForInteract.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, button: 0, clientX: sRect.left + 200, clientY: sRect.top + 200 }));
+    window.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, clientX: sRect.left + 120, clientY: sRect.top + 130 }));
+    window.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    await settle();
+    check("click-drag panning scrolls a zoomed SVG stage past viewport bounds", () =>
+      pannableNow && stageForInteract.scrollLeft >= 60 && stageForInteract.scrollTop >= 50);
+
+    stageForInteract.dispatchEvent(new KeyboardEvent("keydown", { key: "0", bubbles: true, cancelable: true }));
+    await settle();
+    check("pressing 0 returns zoomed SVG stage to Fit mode", () =>
+      primaryHost().querySelector('[data-testid="svg-zoom-fit"]')?.getAttribute("aria-pressed") === "true");
+
+    // Verify shortcuts do NOT hijack keystrokes inside Split CodeViewer
+    primaryHost().querySelector('[data-testid="svg-mode-split"]').click();
+    await settle();
+    const boundsBeforeCodeKey = primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').getAttribute("aria-pressed");
+    const splitCodePane = primaryHost().querySelector("[data-svg-split-code]");
+    splitCodePane.dispatchEvent(new KeyboardEvent("keydown", { key: "b", bubbles: true, cancelable: true }));
+    await settle();
+    check("preview shortcuts ignore keystrokes originating inside Split CodeViewer", () =>
+      primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').getAttribute("aria-pressed") === boundsBeforeCodeKey);
+
+    // 14. Copy Data URI and Copy as PNG rasterization
+    const copiedTexts = [];
+    const copiedItems = [];
+    const origClipboard = navigator.clipboard;
+    const origClipboardItem = window.ClipboardItem;
+    class HarnessClipboardItem {
+      constructor(entries) { this.entries = entries; }
+    }
+    Object.defineProperty(window, "ClipboardItem", { value: HarnessClipboardItem, configurable: true });
+    Object.defineProperty(navigator, "clipboard", {
+      value: {
+        writeText: async (txt) => { copiedTexts.push(txt); },
+        write: async (items) => { copiedItems.push(...items); },
+      },
+      configurable: true,
+    });
+    try {
+      primaryHost().querySelector('[data-testid="svg-copy-data-uri"]').click();
+      await until(() => copiedTexts.length >= 1, 1000);
+      primaryHost().querySelector('[data-testid="svg-copy-png"]').click();
+      await until(() => copiedItems.length >= 1, 1500);
+      const pngEntry = copiedItems[0]?.entries?.["image/png"];
+      const pngBlob = pngEntry instanceof Promise ? await pngEntry : pngEntry;
+      check("Copy Data URI writes sanitized base64 URI and Copy PNG rasterizes a non-empty PNG blob", () =>
+        copiedTexts[0]?.startsWith("data:image/svg+xml;base64,") &&
+        pngBlob instanceof Blob &&
+        pngBlob.type === "image/png" &&
+        pngBlob.size > 0);
+    } finally {
+      Object.defineProperty(navigator, "clipboard", { value: origClipboard, configurable: true });
+      Object.defineProperty(window, "ClipboardItem", { value: origClipboardItem, configurable: true });
+    }
+
+    // 15. Persisted preferences across remount, fromBase64 read-only mode, and hasNul error rendering
+    primaryHost().querySelector('[data-testid="svg-mode-split"]').click();
+    await settle();
+    if (primaryHost().querySelector("[data-svg-split]")?.getAttribute("data-svg-split") !== "vertical") {
+      primaryHost().querySelector('[data-testid="svg-split-orientation-toggle"]').click();
+      await settle();
+    }
+    primaryHost().querySelector('[data-testid="svg-mode-preview"]').click();
+    await settle();
+    if (primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').getAttribute("aria-pressed") !== "true") {
+      primaryHost().querySelector('[data-testid="svg-bounds-toggle"]').click();
+      await settle();
+    }
+    primaryHost().querySelector('[data-testid="svg-canvas-dark-grid"]').click();
+    await settle();
+
+    host.setSecondaryMounted(false);
+    await settle();
+    host.updateSecondary({ filePath: "art/legacy-b64.svg", text: null, base64: btoa(noVbSvg), isBinary: true, draftContent: null, revealTarget: null });
+    host.setSecondaryMounted(true);
+    await waitForSvgImg(secondaryImg, 24, 24, () => true, 1500);
+    await settle();
+    const persistedSurfaceAndBounds =
+      secondaryHost().querySelector('[data-svg-canvas="dark-grid"]') !== null &&
+      secondaryHost().querySelector('[data-svg-bounds="true"]') !== null;
+    secondaryHost().querySelector('[data-testid="svg-mode-split"]').click();
+    await settle();
+    const persistedSplitVertical =
+      secondaryHost().querySelector("[data-svg-split]")?.getAttribute("data-svg-split") === "vertical";
+    check("persisted canvasSurface, showBounds, and preferredSplitDirection preferences survive unmount and remount", () =>
+      persistedSurfaceAndBounds && persistedSplitVertical);
+
+    secondaryHost().querySelector('[data-testid="svg-mode-code"]').click();
+    await settle();
+    const secondaryButtonsText = [...secondaryHost().querySelectorAll("button")].map((b) => b.textContent.trim());
+    check("fromBase64 SVG renders in Preview and stays read-only (no Edit button) in Code mode", () =>
+      !secondaryButtonsText.includes("Edit"));
+
+    secondaryHost().querySelector('[data-testid="svg-mode-preview"]').click();
+    await settle();
+    host.updateSecondary({ filePath: "art/nul-b64.svg", text: null, base64: btoa("<svg>\0</svg>"), isBinary: true, draftContent: null });
+    await until(() => Boolean(secondaryHost().querySelector('[data-testid="svg-parse-error"]')), 1500);
+    check("base64 SVG containing NUL bytes renders parse error instead of empty state", () =>
+      Boolean(secondaryHost().querySelector('[data-testid="svg-parse-error"]')?.textContent?.includes("NUL bytes")) &&
+      !secondaryHost().querySelector('[data-testid="svg-empty-state"]'));
+
+    host.updateSecondary({ filePath: "art/invalid-b64.svg", text: null, base64: "!!!invalid-base64!!!", isBinary: true, draftContent: null });
+    await until(() => Boolean(secondaryHost().querySelector('[data-testid="svg-parse-error"]')?.textContent?.includes("couldn't be decoded")), 1500);
+    check("corrupt base64 SVG renders explicit decode error instead of empty state", () =>
+      Boolean(secondaryHost().querySelector('[data-testid="svg-parse-error"]')?.textContent?.includes("couldn't be decoded")) &&
+      !secondaryHost().querySelector('[data-testid="svg-empty-state"]'));
+
+    // 16. Clean execution guarantees
+    check("zero CSP violations across SVG preview rendering", () => cspViolations.length === 0);
+    check("zero runtime errors and zero unexpected IPC calls", () => errors.length === 0 && unexpected.size === 0);
+  } catch (err) {
+    errors.push(String(err));
+  } finally {
+    const params = new URLSearchParams(location.search);
+    const verdict = { results, errors, unexpected: [...unexpected], diagnostics: "[]" };
+    document.getElementById("result").textContent = JSON.stringify(verdict, null, 2);
+    document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(verdict));
+    if (params.has("report")) {
+      await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    }
+  }
+</script>
+</body>
+</html>

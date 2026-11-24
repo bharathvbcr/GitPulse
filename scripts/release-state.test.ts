@@ -1,16 +1,27 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { bundleSpecs, expectedAssetNames, expectedInstallerNames, supplementNames } from "./check-release-assets.mjs";
-import { runReleaseStage, runCommand, main, resolveReleaseContext, type Runner } from "./release-state.mjs";
+import { compareCodePoints, fetchReleaseAsset, formatChecksumsManifest, isPermanentDownloadFailure, isTransientUploadError, MAX_API_PAGES, parseChecksumsManifest, REQUIRED_WORKFLOW_JOBS, runReleaseStage, runCommand, main, resolveReleaseContext, validateSbomDocuments, verifyChecksumsManifest, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
 const tag = "v1.2.3";
 const options = { stage: "prepare", repo: "owner/repo", tag, commit };
+const checksumsAssetName = supplementNames("1.2.3").checksums;
+const rawStubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+const rawStubDigest = (name: string) => `sha256:${createHash("sha256").update(rawStubBytes(name)).digest("hex")}`;
+const canonicalSumsBytes = Buffer.from(
+  formatChecksumsManifest(
+    expectedAssetNames("1.2.3")
+      .filter((name) => name !== checksumsAssetName)
+      .map((name) => ({ name, digest: rawStubDigest(name) })),
+  ),
+  "utf8",
+);
 /** The bytes the stub download writes for an asset; the draft's size and digest describe exactly these. */
-const stubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+const stubBytes = (name: string) => (name === checksumsAssetName ? canonicalSumsBytes : rawStubBytes(name));
 const stubDigest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
 function draft() {
   return {id: 42, tag_name: tag, name: `GitPulse ${tag}`, target_commitish: commit, draft: true, prerelease: false,
@@ -19,9 +30,20 @@ function draft() {
     assets: expectedAssetNames("1.2.3")
       .map((name, index) => ({id: index + 1, name, size: stubBytes(name).length, state: "uploaded", digest: stubDigest(name)}))};
 }
+function defaultJobsFor(workflow: string) {
+  return (REQUIRED_WORKFLOW_JOBS[workflow] ?? []).map((name, index) => ({
+    id: 5000 + index,
+    name,
+    head_sha: commit,
+    status: "completed",
+    conclusion: "success",
+  }));
+}
 function fixture(change: {
   release?: Record<string, unknown> | null;
   ci?: Record<string, unknown>;
+  ciJobs?: Record<string, { jobs: unknown[]; total_count?: number }>;
+  ciJobPages?: Record<string, Array<{ jobs: unknown[]; total_count?: number }>>;
   remote?: string;
   local?: string;
   fail?: string;
@@ -33,12 +55,20 @@ function fixture(change: {
   downloadDuringFinalize?: boolean;
   crlfNotes?: boolean;
   list?: unknown[];
+  releasePages?: unknown[][];
+  wipeResidualAssets?: unknown[][];
   corruptUpload?: boolean;
+  flakyUploads?: number;
+  uploadStatus?: number;
 } = {}) {
   let release = change.release === undefined ? draft() : change.release;
   const calls: string[][] = [];
   const patches: string[] = [];
+  const uploadedBytes = new Map<string, Buffer>();
+  const residualQueue = [...(change.wipeResidualAssets ?? [])];
   let patched = false;
+  let remainingUploadFailures = change.flakyUploads ?? 0;
+  const runIdToWorkflow = new Map<number, string>([[100, "ci.yml"], [101, "coverage.yml"]]);
   const run: Runner = (program, args, input) => {
     calls.push([program, ...args]);
     if (program === "git") return {status: 0, failed: false, stdout: args[0] === "rev-parse" ? change.local ?? commit : change.remote ?? `${commit}\trefs/tags/${tag}\n`};
@@ -51,7 +81,28 @@ function fixture(change: {
       if (release && release.draft !== true && release.tag_name === wanted) return respond(release);
       return respond({message: "Not Found"}, 404);
     }
-    if (endpoint.includes("actions/workflows/")) return respond({workflow_runs: [change.ci ?? {head_sha: commit, event: "push", status: "completed", conclusion: "success"}]});
+    if (endpoint.includes("actions/workflows/")) {
+      const wfMatch = /actions\/workflows\/([^/]+)\/runs/.exec(endpoint);
+      const wf = wfMatch?.[1] ?? "ci.yml";
+      const runId = wf === "coverage.yml" ? 101 : 100;
+      const runRecord = change.ci ? {id: runId, ...change.ci} : {id: runId, head_sha: commit, event: "push", status: "completed", conclusion: "success"};
+      return respond({workflow_runs: [runRecord]});
+    }
+    if (endpoint.includes("actions/runs/") && endpoint.includes("/jobs")) {
+      const runMatch = /actions\/runs\/(\d+)\/jobs/.exec(endpoint);
+      const wf = runIdToWorkflow.get(Number(runMatch?.[1] ?? 0)) ?? "ci.yml";
+      const pageMatch = /[?&]page=(\d+)/.exec(endpoint);
+      const pageIndex = Math.max(0, Number(pageMatch?.[1] ?? 1) - 1);
+      const paged = change.ciJobPages?.[wf];
+      if (paged) {
+        const page = paged[pageIndex] ?? { jobs: [], total_count: paged[0]?.total_count };
+        return respond({ total_count: page.total_count, jobs: page.jobs });
+      }
+      const override = change.ciJobs?.[wf];
+      const jobs = override ? override.jobs : defaultJobsFor(wf);
+      const total_count = override?.total_count ?? jobs.length;
+      return respond({total_count, jobs});
+    }
     if (args[3] === "DELETE") {
       const assetMatch = /releases\/assets\/(\d+)$/.exec(String(args[4] ?? ""));
       if (assetMatch && release && Array.isArray(release.assets)) {
@@ -62,10 +113,20 @@ function fixture(change: {
     }
     if (args[3] === "POST" && endpoint.startsWith("https://uploads.github.com/")) {
       const name = decodeURIComponent(endpoint.slice(endpoint.indexOf("?name=") + "?name=".length));
-      const hash = createHash("sha256").update(change.corruptUpload ? `${input}!` : input ?? "", "utf8").digest("hex");
+      if (change.uploadStatus) return respond({message: "upload error"}, change.uploadStatus);
+      if (remainingUploadFailures > 0) {
+        remainingUploadFailures -= 1;
+        // Simulate GitHub leaving a partial state="starter" asset with null digest after a 502.
+        const assets = release && Array.isArray(release.assets) ? release.assets : [];
+        release = {...release, assets: [...assets, {id: 1900 + assets.length, name, size: 0, state: "starter", digest: null}]};
+        return respond({message: "Bad Gateway"}, 502);
+      }
+      const payload = input ?? "";
+      const hash = createHash("sha256").update(change.corruptUpload ? `${payload}!` : payload, "utf8").digest("hex");
       const assets = release && Array.isArray(release.assets) ? release.assets : [];
-      const asset = {id: 1000 + assets.length, name, size: Buffer.byteLength(input ?? ""), state: "uploaded", digest: `sha256:${hash}`};
+      const asset = {id: 1000 + assets.length, name, size: Buffer.byteLength(payload), state: "uploaded", digest: `sha256:${hash}`};
       release = {...release, assets: [...assets, asset]};
+      uploadedBytes.set(name, Buffer.from(payload, "utf8"));
       return respond(asset, 201);
     }
     if (args[3] === "POST") { release = {...draft(), ...JSON.parse(input ?? "{}")}; return change.uncertainPost ? {status: null, failed: true, stdout: ""} : respond(release, 201); }
@@ -79,13 +140,21 @@ function fixture(change: {
       return respond(release);
     }
     if (String(args[4] ?? "").includes("releases?per_page=")) {
+      if (change.releasePages) {
+        const pageMatch = /[?&]page=(\d+)/.exec(String(args[4] ?? ""));
+        const pageIndex = Math.max(0, Number(pageMatch?.[1] ?? 1) - 1);
+        return respond(change.releasePages[pageIndex] ?? []);
+      }
       return respond(change.list ?? (release ? [release] : []));
+    }
+    if (release && Array.isArray(release.assets) && release.assets.length === 0 && residualQueue.length > 0 && /\/releases\/\d+$/.test(endpoint)) {
+      release = { ...release, assets: residualQueue.shift() ?? [] };
     }
     if (patched && change.changeAssets && release) release.assets = [];
     if (patched && change.downloadDuringFinalize && release) release.assets = draft().assets.map(asset => ({...asset, download_count: 1})).reverse();
     return release ? respond(release) : respond({message: "Not Found"}, 404);
   };
-  return {run, calls, patches};
+  return {run, calls, patches, uploadedBytes};
 }
 
 const binaries = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"];
@@ -98,7 +167,7 @@ afterAll(() => { for (const dir of scratch) rmSync(dir, {recursive: true, force:
  * exactly one thing. `fetched` and `inspected` record what ran.
  */
 type Verdict = {ok: boolean; invalid: boolean; violations: string[]; opened: string[]; coverage: string};
-function bundleDeps(fault: {corrupt?: string; short?: string; fail?: string; order?: string[]; swapDuringInspect?: boolean; verdict?: Verdict} = {}) {
+function bundleDeps(fault: {corrupt?: string; short?: string; fail?: string; order?: string[]; swapDuringInspect?: boolean; verdict?: Verdict; bytesOverride?: Map<string, Buffer>} = {}) {
   const downloadDir = path.join(mkdtempSync(path.join(tmpdir(), "gitpulse-release-state-")), "bundles");
   scratch.push(path.dirname(downloadDir));
   const fetched: string[] = [];
@@ -108,7 +177,7 @@ function bundleDeps(fault: {corrupt?: string; short?: string; fail?: string; ord
     fetchAsset: ({asset, dest}: {asset: {name: string}; dest: string}) => {
       fetched.push(asset.name);
       if (fault.fail === asset.name) throw new Error("download refused");
-      const bytes = stubBytes(asset.name);
+      const bytes = fault.bytesOverride?.get(asset.name) ?? stubBytes(asset.name);
       writeFileSync(dest, fault.corrupt === asset.name ? Buffer.from(bytes.toString().toUpperCase()) : fault.short === asset.name ? bytes.subarray(1) : bytes);
     },
     inspect: (request: {binaries: string[]; files: Record<string, string | undefined>}) => {
@@ -170,11 +239,30 @@ describe("remote release lifecycle", () => {
     expect(runReleaseStage(options, run).release_id).toBe("42");
     expect(calls.filter(call => call.includes("POST"))).toHaveLength(1);
   });
-  it("refuses a truncated release list rather than posting a duplicate", () => {
-    const list = Array.from({length: 100}, (_, index) => ({...draft(), id: index + 1, name: `Other ${index}`}));
-    const {run, calls} = fixture({apiStatus: 404, release: null, list});
-    expect(() => runReleaseStage(options, run)).toThrow(/capped at 100/);
-    expect(calls.some(call => call.includes("POST"))).toBe(false);
+  it("paginates releases beyond 100 entries and refuses when the page cap is exceeded rather than posting a duplicate", () => {
+    const page1 = Array.from({length: 100}, (_, index) => ({...draft(), id: 1000 + index, name: `Other ${index}`, tag_name: `v0.0.${index}`}));
+    const page2Match = {...draft(), id: 42, tag_name: "untagged-deadbeef02", assets: []};
+    // Finds a matching draft on page 2 without creating a duplicate.
+    const found = fixture({apiStatus: 404, release: page2Match, releasePages: [page1, [page2Match]]});
+    expect(runReleaseStage(options, found.run).release_id).toBe("42");
+    expect(found.calls.some(call => call.includes("POST"))).toBe(false);
+    expect(found.calls.some(call => call.some(arg => arg.includes("releases?per_page=100&page=2")))).toBe(true);
+
+    // Detects duplicate matching drafts even when they appear on different pages.
+    const dupPage1 = [{...draft(), id: 42, name: `GitPulse ${tag}`, tag_name: "untagged-a1"}, ...page1.slice(1)];
+    const dupPage2 = [{...draft(), id: 43, name: `GitPulse ${tag}`, tag_name: "untagged-a2"}];
+    const dups = fixture({apiStatus: 404, release: null, releasePages: [dupPage1, dupPage2]});
+    expect(() => runReleaseStage(options, dups.run)).toThrow(/Multiple matching drafts/);
+    expect(dups.calls.some(call => call.includes("POST"))).toBe(false);
+
+    // Deduplicates a release shifted across page boundaries instead of treating it as two drafts.
+    const shifted = fixture({apiStatus: 404, release: page2Match, releasePages: [[page2Match, ...page1.slice(1)], [page2Match]]});
+    expect(runReleaseStage(options, shifted.run).release_id).toBe("42");
+
+    // Refuses when all MAX_API_PAGES pages are full rather than posting a duplicate.
+    const capped = fixture({apiStatus: 404, release: null, list: page1});
+    expect(() => runReleaseStage(options, capped.run)).toThrow(new RegExp(`capped at ${MAX_API_PAGES * 100}`));
+    expect(capped.calls.some(call => call.includes("POST"))).toBe(false);
   });
   it("refuses multiple drafts that share this release name", () => {
     const {run, calls} = fixture({
@@ -306,6 +394,89 @@ describe("remote release lifecycle", () => {
     expect(() => runReleaseStage(options, empty)).toThrow(/has no push run/);
     expect(calls.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
   });
+  it("refuses a CI run missing a required shard or completeness gate even when run conclusion is success", () => {
+    const missingShard = defaultJobsFor("ci.yml").filter(job => job.name !== "Rust Tests (Windows, shard 4/4)");
+    const {run: runMissing, calls: callsMissing} = fixture({ciJobs: {"ci.yml": {jobs: missingShard}}});
+    expect(() => runReleaseStage(options, runMissing)).toThrow(/missing required job "Rust Tests \(Windows, shard 4\/4\)"/);
+    expect(callsMissing.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
+
+    const skippedComplete = defaultJobsFor("ci.yml").map(job =>
+      job.name === "Rust Tests (every OS shard ran)" ? {...job, conclusion: "skipped"} : job
+    );
+    const {run: runSkipped, calls: callsSkipped} = fixture({ciJobs: {"ci.yml": {jobs: skippedComplete}}});
+    expect(() => runReleaseStage({...options, stage: "ready"}, runSkipped)).toThrow(/required job "Rust Tests \(every OS shard ran\)" did not succeed/);
+    expect(callsSkipped.some(call => call.some(arg => arg.includes("/releases")))).toBe(false);
+  });
+  it("wipes leftover assets across multiple passes when inline asset lists span pages and fails closed if assets persist", () => {
+    const pass1 = {
+      ...draft(),
+      assets: [{id: 11, name: "GitPulse_1.2.3_x64-setup.exe", size: 10, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}],
+    };
+    const pass2 = [{id: 12, name: "GitPulse_1.2.3_x64_en-US.msi", size: 10, state: "uploaded", digest: `sha256:${"c".repeat(64)}`}];
+    const multi = fixture({release: pass1, list: [pass1], wipeResidualAssets: [pass2]});
+    expect(runReleaseStage(options, multi.run).release_id).toBe("42");
+    const deleted = multi.calls.filter(call => call.includes("DELETE")).map(call => call[5]);
+    expect(deleted).toEqual(["repos/owner/repo/releases/assets/11", "repos/owner/repo/releases/assets/12"]);
+
+    const stuck = fixture({release: pass1, list: [pass1], wipeResidualAssets: [pass2, pass2, pass2, pass2, pass2]});
+    expect(() => runReleaseStage(options, stuck.run)).toThrow(/Draft still has installer assets after wipe/);
+  });
+
+  it("refuses a truncated CI job list, missing head_sha, or a job executed against another commit, and paginates >100 jobs", () => {
+    const truncated = fixture({ciJobs: {"ci.yml": {jobs: defaultJobsFor("ci.yml"), total_count: 105}}});
+    expect(() => runReleaseStage(options, truncated.run)).toThrow(/job list was truncated/);
+
+    const missingSha = defaultJobsFor("ci.yml").map(job =>
+      job.name === "Frontend (ubuntu-latest)" ? {...job, head_sha: undefined} : job
+    );
+    expect(() => runReleaseStage(options, fixture({ciJobs: {"ci.yml": {jobs: missingSha}}}).run)).toThrow(/ran against/);
+
+    const wrongSha = defaultJobsFor("ci.yml").map(job =>
+      job.name === "Frontend (ubuntu-latest)" ? {...job, head_sha: "b".repeat(40)} : job
+    );
+    const {run} = fixture({ciJobs: {"ci.yml": {jobs: wrongSha}}});
+    expect(() => runReleaseStage(options, run)).toThrow(/ran against/);
+
+    // Paginate >100 jobs across page 1 + page 2: required job on page 2 passes when green, fails when red.
+    const required = defaultJobsFor("ci.yml");
+    const filler = Array.from({length: 85}, (_, i) => ({
+      id: 8000 + i,
+      name: `Extra Matrix Job ${i}`,
+      head_sha: commit,
+      status: "completed",
+      conclusion: "success",
+    }));
+    const page1 = [...required.slice(0, 15), ...filler]; // 100 jobs
+    const page2 = required.slice(15); // remaining 7 required jobs -> total 107
+    const pagedOk = fixture({
+      release: null,
+      ciJobPages: {"ci.yml": [{jobs: page1, total_count: 107}, {jobs: page2, total_count: 107}]},
+    });
+    expect(runReleaseStage({...options, stage: "ready"}, pagedOk.run).stage).toBe("ready");
+    expect(pagedOk.calls.some(call => call.some(arg => arg.includes("actions/runs/100/jobs?filter=latest&per_page=100&page=2")))).toBe(true);
+
+    const page2Failed = page2.map((job, idx) => (idx === 0 ? {...job, conclusion: "failure"} : job));
+    const pagedFail = fixture({
+      release: null,
+      ciJobPages: {"ci.yml": [{jobs: page1, total_count: 107}, {jobs: page2Failed, total_count: 107}]},
+    });
+    expect(() => runReleaseStage({...options, stage: "ready"}, pagedFail.run)).toThrow(/did not succeed/);
+
+    // Refuse when total_count mutates mid-pagination.
+    const mutated = fixture({
+      release: null,
+      ciJobPages: {"ci.yml": [{jobs: page1, total_count: 107}, {jobs: page2, total_count: 108}]},
+    });
+    expect(() => runReleaseStage({...options, stage: "ready"}, mutated.run)).toThrow(/changed during pagination/);
+
+    // Refuse when pagination exceeds MAX_API_PAGES.
+    const infinitePages = Array.from({length: MAX_API_PAGES + 1}, (_, p) => ({
+      jobs: Array.from({length: 100}, (_, i) => ({id: 10_000 + p * 100 + i, name: `Job ${p}-${i}`, head_sha: commit, status: "completed", conclusion: "success"})),
+      total_count: (MAX_API_PAGES + 1) * 100,
+    }));
+    const overflow = fixture({release: null, ciJobPages: {"ci.yml": infinitePages}});
+    expect(() => runReleaseStage({...options, stage: "ready"}, overflow.run)).toThrow(/job list was truncated/);
+  });
   it("ready checks CI without requiring the tag to already point here or mutating a draft", () => {
     const {run, calls} = fixture();
     expect(runReleaseStage({...options, stage: "ready"}, run)).toEqual({release_id: "", commit, tag, stage: "ready"});
@@ -340,17 +511,36 @@ describe("remote release lifecycle", () => {
   it("round trips large notes without environment variables and leaves a draft", () => {
     expect(runReleaseStage(finalize, fixture().run).stage).toBe("finalize");
   });
-  it("downloads and opens every bundled installer before the notes are written, and reports what was not opened", () => {
+  it("downloads and opens every bundled installer plus SHA256SUMS.txt before the notes are written, and reports what was not opened", () => {
     const order: string[] = [];
     const {run} = fixture();
     const spy: Runner = (program, args, input) => { if (args[3] === "PATCH") order.push("patch"); return run(program, args, input); };
     const deps = bundleDeps({order});
     const result = runReleaseStage({...finalize, ...deps}, spy);
-    expect(deps.fetched.sort()).toEqual(bundleSpecs("1.2.3").map(spec => spec.asset).sort());
+    expect(deps.fetched.sort()).toEqual([...bundleSpecs("1.2.3").map(spec => spec.asset), checksumsAssetName].sort());
     expect(order).toEqual(["inspect", "patch"]);
     expect(deps.inspected[0].binaries).toEqual(binaries);
     expect(result.bundles).toBe("opened 7 of 12 installers; AppImage, dmg and rpm are not opened");
     expect(existsSync(deps.downloadDir) && readdirSync(deps.downloadDir)).toEqual([]);
+  });
+  it("refuses stale or tampered SHA256SUMS.txt metadata before downloading any installer, and refuses corrupted SHA256SUMS.txt bytes on download", () => {
+    // 1. Metadata mismatch (stale SHA256SUMS.txt on draft) fails fast with 0 downloads and 0 patches.
+    const stale = draft();
+    stale.assets = stale.assets.map(asset =>
+      asset.name === checksumsAssetName ? {...asset, digest: `sha256:${"e".repeat(64)}`} : asset
+    );
+    const staleFix = fixture({release: stale});
+    const staleDeps = bundleDeps();
+    expect(() => runReleaseStage({...finalize, ...staleDeps}, staleFix.run)).toThrow(/SHA256SUMS manifest .* does not match the current draft assets/);
+    expect(staleDeps.fetched).toEqual([]);
+    expect(staleFix.patches).toHaveLength(0);
+
+    // 2. Corrupted downloaded SHA256SUMS.txt bytes fail before inspecting bundles or writing notes.
+    const corruptFix = fixture();
+    const corruptDeps = bundleDeps({corrupt: checksumsAssetName});
+    expect(() => runReleaseStage({...finalize, ...corruptDeps}, corruptFix.run)).toThrow(/SHA256SUMS manifest .* does not match GitHub's SHA-256/);
+    expect(corruptDeps.inspected).toHaveLength(0);
+    expect(corruptFix.patches).toHaveLength(0);
   });
   it.each([
     ["a digest that is not GitHub's", {corrupt: "GitPulse_1.2.3_amd64.deb"}, /does not match GitHub's SHA-256/],
@@ -540,6 +730,20 @@ describe("remote release lifecycle", () => {
     expect(resolved.tag).toBe(`v${version}`);
   });
 
+  it("resolves a beta release tag pointing at HEAD instead of falling back to package.json", () => {
+    expect(resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "https://github.com/owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: "untagged-2db6b2cc5c\nv0.2.0-beta.1\n",
+    }))).toEqual({repo: "owner/repo", commit, tag: "v0.2.0-beta.1"});
+    // When both a beta and stable tag sit on HEAD, the stable tag wins.
+    expect(resolveReleaseContext({}, gitRun({
+      [ORIGIN]: "https://github.com/owner/repo.git\n",
+      [HEAD]: `${commit}\n`,
+      [POINTS_AT]: "v0.2.0-beta.1\nv0.2.0\n",
+    })).tag).toBe("v0.2.0");
+  });
+
   it("leaves an unresolvable remote empty rather than guessing a repository", () => {
     expect(resolveReleaseContext({}, gitRun({
       [ORIGIN]: "https://example.invalid/not-github.git\n",
@@ -592,7 +796,61 @@ describe("attest stage", () => {
     expect(lines).toContain(`${sha(sboms.spdx)}  ${names.spdx}`);
     expect(lines).toContain(`${sha(sboms.cargo)}  ${names.cargo}`);
     expect(lines.every(line => /^[a-f0-9]{64} {2}GitPulse[-_]1\.2\.3[-_]/.test(line))).toBe(true);
-    expect([...lines].sort((a, b) => a.slice(66).localeCompare(b.slice(66)))).toEqual(lines);
+    expect([...lines].sort((a, b) => compareCodePoints(a.slice(66), b.slice(66)))).toEqual(lines);
+  });
+
+  it("validates formatChecksumsManifest, parseChecksumsManifest, and verifyChecksumsManifest strictly", () => {
+    const hexA = "a".repeat(64);
+    const hexB = "b".repeat(64);
+    // Code-point sort puts '-' (0x2d) < '.' (0x2e) < '_' (0x5f) deterministically across all locales.
+    const formatted = formatChecksumsManifest([
+      {name: "GitPulse_1.2.3_arm64_en-US.msi", digest: `sha256:${hexB.toUpperCase()}`},
+      {name: "GitPulse_1.2.3_arm64-setup.exe", digest: hexA},
+    ]);
+    expect(formatted).toBe(`${hexA}  GitPulse_1.2.3_arm64-setup.exe\n${hexB}  GitPulse_1.2.3_arm64_en-US.msi\n`);
+    expect(() => formatChecksumsManifest([{name: "a", digest: hexA}, {name: "a", digest: hexB}])).toThrow(/Duplicate/);
+    expect(() => formatChecksumsManifest([{name: "bad name", digest: hexA}])).toThrow(/Invalid checksums manifest filename/);
+    expect(() => parseChecksumsManifest(`${hexA}  a\r\n`)).toThrow(/CR line endings/);
+    expect(() => parseChecksumsManifest(`${hexA}  a`)).toThrow(/end with a newline/);
+    expect(() => parseChecksumsManifest(`${hexA.toUpperCase()}  a\n`)).toThrow(/malformed/);
+    expect(() => parseChecksumsManifest(`${hexA}  a\n${hexB}  a\n`)).toThrow(/duplicate entry/);
+
+    const fullDraft = draft();
+    expect(verifyChecksumsManifest({version: "1.2.3", assets: fullDraft.assets, manifestText: canonicalSumsBytes.toString("utf8")}).size).toBe(14);
+    // Reversed line order fails canonical format check.
+    const reversed = `${canonicalSumsBytes.toString("utf8").trimEnd().split("\n").reverse().join("\n")}\n`;
+    expect(() => verifyChecksumsManifest({version: "1.2.3", assets: fullDraft.assets, manifestText: reversed})).toThrow(/canonical sorted format/);
+    // Self-reference to SHA256SUMS.txt fails exact coverage check.
+    const withSelf = `${canonicalSumsBytes.toString("utf8")}${hexA}  ${checksumsAssetName}\n`;
+    expect(() => verifyChecksumsManifest({version: "1.2.3", assets: fullDraft.assets, manifestText: withSelf})).toThrow(/coverage is not exact/);
+  });
+
+  it("refuses duplicate installer names, zero-byte installers, or non-uploaded installer states before uploading any supplement", () => {
+    const dup = installersOnly();
+    dup.assets = [...dup.assets, {...dup.assets[0], id: 999}];
+    const dupFix = fixture({release: dup});
+    expect(() => runReleaseStage(attest, dupFix.run)).toThrow(/duplicate:/);
+    expect(uploads(dupFix.calls)).toHaveLength(0);
+
+    const zero = installersOnly();
+    zero.assets = zero.assets.map((a, idx) => (idx === 0 ? {...a, size: 0} : a));
+    const zeroFix = fixture({release: zero});
+    expect(() => runReleaseStage(attest, zeroFix.run)).toThrow(/invalid size/);
+    expect(uploads(zeroFix.calls)).toHaveLength(0);
+
+    const starter = installersOnly();
+    starter.assets = starter.assets.map((a, idx) => (idx === 0 ? {...a, state: "starter"} : a));
+    const starterFix = fixture({release: starter});
+    expect(() => runReleaseStage(attest, starterFix.run)).toThrow(/not uploaded/);
+    expect(uploads(starterFix.calls)).toHaveLength(0);
+
+    const overflow = installersOnly();
+    overflow.assets = Array.from({length: 100}, (_, idx) => ({
+      id: 2000 + idx, name: `extra-${idx}.bin`, size: 10, state: "uploaded", digest: `sha256:${"a".repeat(64)}`,
+    }));
+    const overflowFix = fixture({release: overflow});
+    expect(() => runReleaseStage(attest, overflowFix.run)).toThrow(/reached 100 entries and may be truncated/);
+    expect(uploads(overflowFix.calls)).toHaveLength(0);
   });
 
   it("replaces its own earlier uploads on a rerun and never deletes an installer", () => {
@@ -601,6 +859,38 @@ describe("attest stage", () => {
     const deleted = calls.filter(call => call.includes("DELETE")).map(call => call[5]);
     expect(deleted.sort()).toEqual(["repos/owner/repo/releases/assets/900", "repos/owner/repo/releases/assets/901"]);
     expect(uploads(calls)).toHaveLength(3);
+  });
+
+  it("recovers on rerun when an interrupted upload left a starter supplement with null digest", () => {
+    const release = installersOnly();
+    release.assets = [
+      ...release.assets,
+      {id: 902, name: names.spdx, size: 0, state: "starter", digest: null as unknown as string},
+    ];
+    const {run, calls} = fixture({release});
+    expect(runReleaseStage(attest, run).release_id).toBe("42");
+    const deleted = calls.filter(call => call.includes("DELETE")).map(call => call[5]);
+    expect(deleted).toEqual(["repos/owner/repo/releases/assets/902"]);
+    expect(uploads(calls)).toHaveLength(3);
+  });
+
+  it("retries transient 5xx supplement uploads after wiping partial starter leftovers and fails fast on 4xx", () => {
+    expect(isTransientUploadError("GitHub POST upload x: HTTP 502")).toBe(true);
+    expect(isTransientUploadError("GitHub POST upload x: incomplete response")).toBe(true);
+    expect(isTransientUploadError("GitHub POST upload x: HTTP 422")).toBe(false);
+    expect(isTransientUploadError("GitHub POST upload x: HTTP 403")).toBe(false);
+
+    const flaky = fixture({release: installersOnly(), flakyUploads: 2});
+    expect(runReleaseStage(attest, flaky.run).release_id).toBe("42");
+    expect(uploads(flaky.calls)).toHaveLength(5);
+    const deletedIds = flaky.calls.filter(call => call.includes("DELETE")).map(call => call[5]);
+    expect(deletedIds).toHaveLength(2);
+    // Never deleted any installer ID (1..12).
+    for (const del of deletedIds) expect(Number(del.split("/").pop())).toBeGreaterThanOrEqual(1900);
+
+    const perm = fixture({release: installersOnly(), uploadStatus: 422});
+    expect(() => runReleaseStage(attest, perm.run)).toThrow(/HTTP 422/);
+    expect(uploads(perm.calls)).toHaveLength(1);
   });
 
   it("refuses before uploading when a platform's installers are missing", () => {
@@ -635,9 +925,23 @@ describe("attest stage", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it.each([
+    ["non-JSON SPDX", {spdx: "not-json", cargo: sboms.cargo}, /Invalid SPDX SBOM/],
+    ["SPDX missing spdxVersion", {spdx: '{"name":"gitpulse"}', cargo: sboms.cargo}, /spdxVersion/],
+    ["SPDX non-array packages", {spdx: '{"spdxVersion":"SPDX-2.3","packages":"bad"}', cargo: sboms.cargo}, /packages must be an array/],
+    ["non-JSON CycloneDX", {spdx: sboms.spdx, cargo: "<html>502</html>"}, /Invalid CycloneDX SBOM/],
+    ["CycloneDX with wrong bomFormat", {spdx: sboms.spdx, cargo: '{"bomFormat":"SPDX"}'}, /CycloneDX/],
+    ["CycloneDX non-array components", {spdx: sboms.spdx, cargo: '{"bomFormat":"CycloneDX","components":{}}'}, /components must be an array/],
+  ])("refuses structurally invalid SBOM (%s) before reaching GitHub", (_label, badSboms, expected) => {
+    const {run, calls} = fixture({release: installersOnly()});
+    expect(() => validateSbomDocuments(badSboms)).toThrow(expected);
+    expect(() => runReleaseStage({...attest, sboms: badSboms}, run)).toThrow(expected);
+    expect(calls).toHaveLength(0);
+  });
+
   it("leaves finalize an exact inventory of installers plus supplements", () => {
-    const {run} = fixture({release: installersOnly()});
-    const finalizing = {...attest, stage: "finalize", notes: "notes", ...bundleDeps()};
+    const {run, uploadedBytes} = fixture({release: installersOnly()});
+    const finalizing = {...attest, stage: "finalize", notes: "notes", ...bundleDeps({bytesOverride: uploadedBytes})};
     expect(() => runReleaseStage(finalizing, run)).toThrow(/missing: GitPulse_1\.2\.3_SHA256SUMS\.txt/);
     runReleaseStage(attest, run);
     expect(runReleaseStage(finalizing, run).release_id).toBe("42");
@@ -688,5 +992,51 @@ describe.skipIf(process.platform === "win32")("finalize with the real download a
     expect(patches).toHaveLength(0);
     expect(inspected).toHaveLength(0);
     expect(readdirSync(deps.downloadDir)).toEqual([]);
+  });
+
+  it("retries transient 5xx download failures inside the timeout and succeeds once GitHub recovers", () => {
+    expect(isPermanentDownloadFailure("gh: Not Found (HTTP 404)")).toBe(true);
+    expect(isPermanentDownloadFailure("gh: Unauthorized (HTTP 401)")).toBe(true);
+    expect(isPermanentDownloadFailure("spawnSync gh ENOENT", "ENOENT")).toBe(true);
+    expect(isPermanentDownloadFailure("gh: Bad Gateway (HTTP 502)")).toBe(false);
+    expect(isPermanentDownloadFailure("connection reset by peer")).toBe(false);
+
+    const work = mkdtempSync(path.join(tmpdir(), "gitpulse-retry-gh-"));
+    scratch.push(work);
+    const bin = path.join(work, "bin");
+    const counterFile = path.join(work, "attempts.txt");
+    const dest = path.join(work, "asset.bin");
+    writeFileSync(counterFile, "0");
+    const gh = path.join(bin, "gh");
+    // Create bin dir and flaky gh: fails with partial stdout + HTTP 502 on attempt 1, succeeds on attempt 2.
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(gh, [
+      "#!/bin/bash",
+      `count=$(cat "${counterFile}")`,
+      "count=$((count + 1))",
+      `echo "$count" > "${counterFile}"`,
+      'if [ "$count" -eq 1 ]; then',
+      '  printf "partial-junk"',
+      '  echo "gh: Bad Gateway (HTTP 502)" >&2',
+      "  exit 1",
+      "fi",
+      'printf "good-payload"',
+      "",
+    ].join("\n"), { mode: 0o755 });
+
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+    try {
+      fetchReleaseAsset({
+        repo: "owner/repo",
+        asset: { id: 99, name: "GitPulse_1.2.3_amd64.deb", size: 12, digest: `sha256:${"a".repeat(64)}` },
+        dest,
+        timeoutMs: 10_000,
+      });
+      expect(readFileSync(dest, "utf8")).toBe("good-payload");
+      expect(readFileSync(counterFile, "utf8").trim()).toBe("2");
+    } finally {
+      process.env.PATH = prevPath;
+    }
   });
 });

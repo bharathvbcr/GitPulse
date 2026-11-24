@@ -51,9 +51,10 @@
 </script>
 
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import type { FileBlob } from "../files/types";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { themeStore } from "../stores/themeStore";
   import { currentHeadTip } from "../stores/headTip";
   import { graphStore } from "../stores/graphStore";
   import { liveIndex } from "../codeintel/liveIndex";
@@ -88,7 +89,9 @@
     Check,
     ChevronDown,
     ChevronUp,
+    Code,
     Copy,
+    Eye,
     FileCode,
     GitBranch,
     AlertTriangle,
@@ -102,6 +105,7 @@
   // Only an image diff reaches this pane; it does not belong in the chunk
   // every launch parses.
   const loadImageDiffViewer = () => import("./ImageDiffViewer.svelte");
+  import type { ImageDiffCanvas } from "./ImageDiffViewer.svelte";
   import EmptyState from "./EmptyState.svelte";
   import Checkbox from "./Checkbox.svelte";
   import Skeleton from "./Skeleton.svelte";
@@ -116,6 +120,11 @@
     replacementBlock,
     type ReplacementBlock,
   } from "../diff/wordDiff";
+  import {
+    isSvgFile,
+    svgBlobToPreviewResult,
+    type SvgCanvasSurface,
+  } from "../files/svgPreview";
   import {
     buildFilePatchForHunk,
     buildFilePatchFromLines,
@@ -245,13 +254,68 @@
   let railTab = $state<RailTab>("files");
   let wordWrap = $state(diffDefaults.diffWordWrap);
   let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);
-  let oldSrc = $state<string | null>(null);
-  let newSrc = $state<string | null>(null);
-  /** Whether the pictures are in flight, read, or unreadable; never inferred from the sources being null. */
-  let imageStatus = $state<"loading" | "ready" | "failed">("ready");
-  let imageError = $state<string | null>(null);
-  let oldError = $state<string | null>(null);
-  let newError = $state<string | null>(null);
+  interface LoadedImageSide {
+    readonly blob: FileBlob | null;
+    readonly path: string;
+    readonly readError: string | null;
+  }
+
+  let svgDiffView = $state<"visual" | "code">("visual");
+  let imageCanvasOverride = $state<ImageDiffCanvas | null>(null);
+  let oldImageSide = $state<LoadedImageSide | null>(null);
+  let newImageSide = $state<LoadedImageSide | null>(null);
+  /** Whether the pictures are in flight; settled errors/absences are derived from each side. */
+  let imageLoading = $state(false);
+  const effectiveImageCanvas = $derived<ImageDiffCanvas>(
+    imageCanvasOverride ?? ($themeStore === "dark" ? "dark" : "light"),
+  );
+  const effectiveSvgCanvas = $derived<SvgCanvasSurface>(
+    effectiveImageCanvas === "grid"
+      ? $themeStore === "dark"
+        ? "dark-grid"
+        : "grid"
+      : effectiveImageCanvas,
+  );
+
+  function resolveImageSide(
+    side: LoadedImageSide | null,
+    svgCanvas: SvgCanvasSurface,
+  ): { readonly src: string | null; readonly error: string | null } {
+    if (!side) return { src: null, error: null };
+    if (side.readError) return { src: null, error: side.readError };
+    const blob = side.blob;
+    if (!blob) return { src: null, error: null };
+    if (blob.mime === "image/svg+xml" || isSvgFile(side.path)) {
+      const result = svgBlobToPreviewResult(blob, svgCanvas);
+      return { src: result.dataUrl, error: result.error };
+    }
+    if (blob.base64) {
+      return {
+        src: `data:${blob.mime || "image/png"};base64,${blob.base64}`,
+        error: null,
+      };
+    }
+    return { src: null, error: null };
+  }
+
+  const resolvedOldImage = $derived(resolveImageSide(oldImageSide, effectiveSvgCanvas));
+  const resolvedNewImage = $derived(resolveImageSide(newImageSide, effectiveSvgCanvas));
+  const oldSrc = $derived(resolvedOldImage.src);
+  const newSrc = $derived(resolvedNewImage.src);
+  const oldError = $derived(resolvedOldImage.src ? null : resolvedOldImage.error);
+  const newError = $derived(resolvedNewImage.src ? null : resolvedNewImage.error);
+  const imageStatus = $derived<"loading" | "ready" | "failed">(
+    imageLoading
+      ? "loading"
+      : !resolvedOldImage.src && !resolvedNewImage.src && (resolvedNewImage.error || resolvedOldImage.error)
+        ? "failed"
+        : "ready",
+  );
+  const imageError = $derived<string | null>(
+    !imageLoading && !resolvedOldImage.src && !resolvedNewImage.src
+      ? (resolvedNewImage.error ?? resolvedOldImage.error)
+      : null,
+  );
   let selectedLines = $state<Set<number>>(new Set());
   let dragAnchor = $state<number | null>(null);
   let isDragging = $state(false);
@@ -544,8 +608,9 @@
   function openSearch(): void {
     searchOpen = true;
     // Resume from what the reader is looking at, not from the top of a diff
-    // they have already scrolled through.
-    queueMicrotask(() => {
+    // they have already scrolled through. Wait for `tick()` so a conditional
+    // transition (e.g. SVG Visual -> Code) mounts `<FindField>` before focus.
+    void tick().then(() => {
       searchInput?.focus();
       searchInput?.select();
     });
@@ -567,7 +632,12 @@
       label: "Find in this diff",
       placeholder: "Find in this diff…",
       query: () => searchQuery,
-      setQuery: (next) => (searchQuery = next),
+      setQuery: (next) => {
+        searchQuery = next;
+        if (next && showingImage && isTextSvgDiff) {
+          svgDiffView = "code";
+        }
+      },
       caseSensitive: () => searchCase,
       setCaseSensitive: (next) => (searchCase = next),
       regex: () => searchRegex,
@@ -1115,6 +1185,10 @@
 
     // As a page's pane, ⌘F is the view bar field's (App routes it there).
     if (!searchScope && (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
+      if (showingImage) {
+        if (!isTextSvgDiff) return;
+        svgDiffView = "code";
+      }
       event.preventDefault();
       openSearch();
       return;
@@ -1437,9 +1511,19 @@
   /** Wrapping actually in effect — asked for, and permitted. */
   const wrapping = $derived(wordWrap && wrapAvailable);
 
-  let showingImage = $derived(
-    isImagePath(singleSection?.path ?? $repoStore.selectedFilePath) &&
+  const activeImagePath = $derived(singleSection?.path ?? $repoStore.selectedFilePath);
+  const isSingleImageCandidate = $derived(
+    isImagePath(activeImagePath) &&
       (singleSection?.binary === true || lines.length === 0 || outline.files.length <= 1),
+  );
+  const isTextSvgDiff = $derived(
+    isSingleImageCandidate &&
+      isSvgFile(activeImagePath) &&
+      singleSection?.binary !== true &&
+      lines.length > 0,
+  );
+  let showingImage = $derived(
+    isSingleImageCandidate && (!isTextSvgDiff || svgDiffView === "visual"),
   );
 
   /**
@@ -1526,14 +1610,11 @@
     // The previous file's pictures must not sit under the new file's title
     // while the new ones are read, so every side is cleared the moment the
     // selection changes, not when the next read lands.
-    oldSrc = null;
-    newSrc = null;
-    oldError = null;
-    newError = null;
-    imageError = null;
+    oldImageSide = null;
+    newImageSide = null;
     if (!key || !path || !repo) {
       imageRequest = null;
-      imageStatus = "ready";
+      imageLoading = false;
       return;
     }
     const request = { key, repo, path, commitId: commitId || null, baseId };
@@ -1546,7 +1627,7 @@
     repo: string,
     path: string,
     commitId: string | null,
-  ): Promise<{ src: string | null; error: string | null }> {
+  ): Promise<LoadedImageSide> {
     try {
       const blob = await invoke<FileBlob>("cmd_get_file_blob", {
         repoPath: repo,
@@ -1556,11 +1637,12 @@
         withDigest: false,
       });
       return {
-        src: blob?.base64 ? `data:${blob.mime || "image/png"};base64,${blob.base64}` : null,
-        error: null,
+        blob: blob ?? null,
+        path,
+        readError: null,
       };
     } catch (err) {
-      return { src: null, error: formatError(err) };
+      return { blob: null, path, readError: formatError(err) };
     }
   }
 
@@ -1577,8 +1659,7 @@
     commitId: string | null;
     baseId: string | null;
   }): Promise<void> {
-    imageStatus = "loading";
-    imageError = null;
+    imageLoading = true;
     // A comparison's old side is its base; a commit's is its first parent;
     // the working tree's is HEAD.
     const previousRev = request.baseId ?? (request.commitId ? `${request.commitId}^` : "HEAD");
@@ -1587,19 +1668,9 @@
       readImageSide(request.repo, request.path, previousRev),
     ]);
     if (imageBlobKey !== request.key) return;
-    newSrc = current.src;
-    oldSrc = previous.src;
-    newError = current.src ? null : current.error;
-    oldError = previous.src ? null : previous.error;
-    // Failed means nothing could be read at all. A missing side beside a
-    // readable one is a normal added/deleted image; a side that simply has no
-    // picture data is the real empty state.
-    if (current.error && previous.error) {
-      imageStatus = "failed";
-      imageError = current.error;
-    } else {
-      imageStatus = "ready";
-    }
+    newImageSide = current;
+    oldImageSide = previous;
+    imageLoading = false;
   }
 
   function retryImage(): void {
@@ -1798,125 +1869,160 @@
       </button>
     {/if}
 
-    {#if !searchScope}
-    <FindField
-      bind:open={searchOpen}
-      bind:query={searchQuery}
-      bind:caseSensitive={searchCase}
-      bind:regex={searchRegex}
-      bind:input={searchInput}
-      label="Find in this diff"
-      placeholder="Find in this diff…"
-      shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
-      status={matchLabel(search, searchIndex)}
-      invalid={search.invalid}
-      hasMatches={search.matches.length > 0}
-      onstep={stepSearch}
-      onclose={closeSearch}
-    />
-    {/if}
+    {#if !showingImage}
+      {#if !searchScope}
+      <FindField
+        bind:open={searchOpen}
+        bind:query={searchQuery}
+        bind:caseSensitive={searchCase}
+        bind:regex={searchRegex}
+        bind:input={searchInput}
+        label="Find in this diff"
+        placeholder="Find in this diff…"
+        shortcut={shortcutTextLabel("⌘F", $hostPlatform.os)}
+        status={matchLabel(search, searchIndex)}
+        invalid={search.invalid}
+        hasMatches={search.matches.length > 0}
+        onstep={stepSearch}
+        onclose={closeSearch}
+      />
+      {/if}
 
-    <div class="flex items-center gap-1">
-      <button
-        type="button"
-        class="gp-icon-btn"
-        data-size="sm"
-        onclick={() => stepChange(-1)}
-        title="Previous change (Alt+PageUp)"
-        aria-label="Previous change"
-      >
-        <ArrowUpWideNarrow size={13} />
-      </button>
-      <button
-        type="button"
-        class="gp-icon-btn"
-        data-size="sm"
-        onclick={() => stepChange(1)}
-        title="Next change (Alt+PageDown)"
-        aria-label="Next change"
-      >
-        <ArrowDownWideNarrow size={13} />
-      </button>
-    </div>
-
-    <div class="ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
-      <button
-        type="button"
-        class="gp-btn text-textMuted"
-        data-size="sm"
-        onclick={copyPatch}
-        disabled={!$repoStore.selectedDiff}
-        title={cutByBackend
-          ? `Copy the first part of this patch — this diff ${backendCutReason}`
-          : "Copy the whole patch as unified diff text"}
-      >
-        {#if copiedPatch}
-          <Check size={13} class="text-ok" />
-        {:else}
-          <Copy size={13} />
-        {/if}
-        <span class="hidden md:inline">{copiedPatch ? "Copied" : cutByBackend ? "Copy partial patch" : "Copy patch"}</span>
-      </button>
-
-      <button
-        type="button"
-        onclick={() => (syntaxOn = !syntaxOn)}
-        aria-pressed={syntaxActive}
-        disabled={!syntaxAvailable}
-        title={syntaxAvailable
-          ? "Color the code by language"
-          : `Syntax coloring is off above ${SYNTAX_MAX_LINES.toLocaleString()} lines — this diff has ${lines.length.toLocaleString()}.`}
-        class="gp-btn {syntaxActive ? `${PRESSED} font-semibold` : 'text-textMuted'}"
-        data-size="sm"
-        aria-label="Toggle syntax coloring"
-      >
-        <Palette size={13} />
-        <span class="hidden md:inline">Syntax</span>
-      </button>
-
-      <button
-        type="button"
-        onclick={() => (wordWrap = !wordWrap)}
-        aria-pressed={wrapping}
-        disabled={!wrapAvailable}
-        title={wrapAvailable
-          ? "Wrap long lines"
-          : `Wrapping is unavailable above ${WRAP_MAX_LINES.toLocaleString()} lines — this diff has ${renderedRowCount.toLocaleString()}. Wrapped rows vary in height and cannot be windowed, so the whole diff would render at once.`}
-        class="gp-btn {wrapping ? `${PRESSED} font-semibold` : 'text-textMuted'}"
-        data-size="sm"
-        aria-label="Toggle word wrap"
-      >
-        <WrapText size={13} />
-        <span class="hidden md:inline">Wrap</span>
-      </button>
-
-      <label class="flex cursor-pointer items-center gap-1.5 text-meta text-textMuted hover:text-textPrimary">
-        <Checkbox
-          checked={$repoStore.selectedIgnoreWhitespace}
-          onchange={(next) => repoStore.setIgnoreWhitespace(next)}
-          ariaLabel="Ignore whitespace-only changes"
-        />
-        <span class="hidden lg:inline">Ignore whitespace</span>
-      </label>
-
-      <div class="gp-segmented" role="group" aria-label="Diff layout">
+      <div class="flex items-center gap-1">
         <button
-          onclick={() => setViewMode("unified")}
-          aria-pressed={viewMode === "unified"}
-          data-active={viewMode === "unified" ? "true" : "false"}
-          class="gp-seg-btn"
+          type="button"
+          class="gp-icon-btn"
+          data-size="sm"
+          onclick={() => stepChange(-1)}
+          title="Previous change (Alt+PageUp)"
+          aria-label="Previous change"
         >
-          Unified
+          <ArrowUpWideNarrow size={13} />
         </button>
         <button
-          onclick={() => setViewMode("split")}
-          aria-pressed={viewMode === "split"}
-          data-active={viewMode === "split" ? "true" : "false"}
-          class="gp-seg-btn"
+          type="button"
+          class="gp-icon-btn"
+          data-size="sm"
+          onclick={() => stepChange(1)}
+          title="Next change (Alt+PageDown)"
+          aria-label="Next change"
         >
-          Split
+          <ArrowDownWideNarrow size={13} />
         </button>
       </div>
+    {/if}
+
+    <div class="ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+      {#if isTextSvgDiff}
+        <div class="gp-segmented" role="group" aria-label="SVG diff view">
+          <button
+            type="button"
+            onclick={() => (svgDiffView = "visual")}
+            aria-pressed={svgDiffView === "visual"}
+            data-active={svgDiffView === "visual" ? "true" : "false"}
+            data-testid="diff-svg-visual"
+            class="gp-seg-btn flex items-center gap-1"
+            title="Compare rendered SVG artwork"
+          >
+            <Eye size={12} />
+            <span>Visual</span>
+          </button>
+          <button
+            type="button"
+            onclick={() => (svgDiffView = "code")}
+            aria-pressed={svgDiffView === "code"}
+            data-active={svgDiffView === "code" ? "true" : "false"}
+            data-testid="diff-svg-code"
+            class="gp-seg-btn flex items-center gap-1"
+            title="Compare SVG XML diff and stage hunks"
+          >
+            <Code size={12} />
+            <span>Code</span>
+          </button>
+        </div>
+      {/if}
+
+      {#if !showingImage || isTextSvgDiff}
+        <button
+          type="button"
+          class="gp-btn text-textMuted"
+          data-size="sm"
+          onclick={copyPatch}
+          disabled={!$repoStore.selectedDiff}
+          title={cutByBackend
+            ? `Copy the first part of this patch — this diff ${backendCutReason}`
+            : "Copy the whole patch as unified diff text"}
+        >
+          {#if copiedPatch}
+            <Check size={13} class="text-ok" />
+          {:else}
+            <Copy size={13} />
+          {/if}
+          <span class="hidden md:inline">{copiedPatch ? "Copied" : cutByBackend ? "Copy partial patch" : "Copy patch"}</span>
+        </button>
+      {/if}
+
+      {#if !showingImage}
+        <button
+          type="button"
+          onclick={() => (syntaxOn = !syntaxOn)}
+          aria-pressed={syntaxActive}
+          disabled={!syntaxAvailable}
+          title={syntaxAvailable
+            ? "Color the code by language"
+            : `Syntax coloring is off above ${SYNTAX_MAX_LINES.toLocaleString()} lines — this diff has ${lines.length.toLocaleString()}.`}
+          class="gp-btn {syntaxActive ? `${PRESSED} font-semibold` : 'text-textMuted'}"
+          data-size="sm"
+          aria-label="Toggle syntax coloring"
+        >
+          <Palette size={13} />
+          <span class="hidden md:inline">Syntax</span>
+        </button>
+
+        <button
+          type="button"
+          onclick={() => (wordWrap = !wordWrap)}
+          aria-pressed={wrapping}
+          disabled={!wrapAvailable}
+          title={wrapAvailable
+            ? "Wrap long lines"
+            : `Wrapping is unavailable above ${WRAP_MAX_LINES.toLocaleString()} lines — this diff has ${renderedRowCount.toLocaleString()}. Wrapped rows vary in height and cannot be windowed, so the whole diff would render at once.`}
+          class="gp-btn {wrapping ? `${PRESSED} font-semibold` : 'text-textMuted'}"
+          data-size="sm"
+          aria-label="Toggle word wrap"
+        >
+          <WrapText size={13} />
+          <span class="hidden md:inline">Wrap</span>
+        </button>
+
+        <label class="flex cursor-pointer items-center gap-1.5 text-meta text-textMuted hover:text-textPrimary">
+          <Checkbox
+            checked={$repoStore.selectedIgnoreWhitespace}
+            onchange={(next) => repoStore.setIgnoreWhitespace(next)}
+            ariaLabel="Ignore whitespace-only changes"
+          />
+          <span class="hidden lg:inline">Ignore whitespace</span>
+        </label>
+
+        <div class="gp-segmented" role="group" aria-label="Diff layout">
+          <button
+            onclick={() => setViewMode("unified")}
+            aria-pressed={viewMode === "unified"}
+            data-active={viewMode === "unified" ? "true" : "false"}
+            class="gp-seg-btn"
+          >
+            Unified
+          </button>
+          <button
+            onclick={() => setViewMode("split")}
+            aria-pressed={viewMode === "split"}
+            data-active={viewMode === "split" ? "true" : "false"}
+            class="gp-seg-btn"
+          >
+            Split
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -2091,6 +2197,10 @@
               error: imageError,
               oldError,
               newError,
+              canvas: effectiveImageCanvas,
+              onCanvasChange: (next: ImageDiffCanvas) => {
+                imageCanvasOverride = next;
+              },
               onRetry: retryImage,
             }}
           />

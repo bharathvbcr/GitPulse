@@ -1467,10 +1467,10 @@ pub(crate) fn bind_test_binary(
 /// Points scratch directories (and the sweep of them) at `root` for the whole
 /// process, until this is dropped. Needs the serial guard for the reason
 /// [`TestBinaryBinding`] does.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct TestScratchRoot;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn bind_test_scratch_root(
     _serial: &SidecarTestGuard,
     root: impl Into<PathBuf>,
@@ -1481,7 +1481,7 @@ pub(crate) fn bind_test_scratch_root(
     TestScratchRoot
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestScratchRoot {
     fn drop(&mut self) {
         *TEST_SCRATCH_ROOT
@@ -3090,7 +3090,7 @@ impl ProfileConnection {
 
     /// [`Self::call`] with the caller's own timeout, so a test can wedge a call
     /// inside its budget.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn call_fixed(
         &self,
         op: &str,
@@ -3101,7 +3101,7 @@ impl ProfileConnection {
     }
 
     /// The live stdio child's pid, if one is running.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn child_pid(&self) -> Option<u32> {
         let slot = self.slot.lock().unwrap();
         slot.sidecar
@@ -3138,7 +3138,7 @@ impl ProfileConnection {
 
     /// Forgets the respawn backoff a fault armed, so a test can see the next
     /// call start a new child.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn clear_backoff(&self) {
         let mut guard = self.slot.lock().unwrap();
         guard.last_error = None;

@@ -478,6 +478,30 @@ pub(crate) fn responses() -> Result<ResponseTap, String> {
         .map_err(|error| error.message)
 }
 
+fn deliver_notification_activation(opening: &tauri::AppHandle, session: Option<String>) {
+    if let Err(error) = crate::desktop::reveal_main(opening) {
+        log::warn!(target: "workbench", "notification window activation: {error}");
+    }
+    if crate::desktop::is_main_ready(opening) {
+        let emitted = match &session {
+            Some(key) => opening.emit("gitpulse-session-notification-open", key.clone()),
+            None => opening.emit("workbench-notification-open", ()),
+        };
+        if let Err(error) = emitted {
+            log::warn!(target: "workbench", "notification activation wake: {error}");
+        }
+    } else {
+        let (event, payload) = match &session {
+            Some(key) => (
+                "gitpulse-session-notification-open",
+                serde_json::Value::String(key.clone()),
+            ),
+            None => ("workbench-notification-open", serde_json::Value::Null),
+        };
+        crate::desktop::queue_main_event(opening, event, payload);
+    }
+}
+
 fn run(
     host: WorkbenchState,
     app: tauri::AppHandle,
@@ -594,16 +618,13 @@ fn run(
                     }
                 }
                 let opening = app.clone();
-                if let Err(error)=app.run_on_main_thread(move||{
-                    if let Some(window)=opening.get_webview_window("main") {
-                        for result in [window.show(),window.unminimize(),window.set_focus()] {if let Err(error)=result {log::warn!(target:"workbench","notification window activation: {error}");}}
+                if let Err(error) = app.run_on_main_thread(move || {
+                    deliver_notification_activation(&opening, session);
+                }) {
+                    if let Ok(mut current) = status.lock() {
+                        current.error = Some(error.to_string());
                     }
-                    let emitted = match &session {
-                        Some(key) => opening.emit("gitpulse-session-notification-open", key.clone()),
-                        None => opening.emit("workbench-notification-open", ()),
-                    };
-                    if let Err(error)=emitted {log::warn!(target:"workbench","notification activation wake: {error}");}
-                }) {if let Ok(mut current)=status.lock(){current.error=Some(error.to_string());}}
+                }
             }
             Ok(Event::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1709,8 +1730,6 @@ mod tests {
     #[test]
     fn session_host_routes_through_session_category_and_preserves_activity_heading() {
         assert_eq!(ACTIVITY_HEADING, "GitPulse activity");
-        #[cfg(target_os = "macos")]
-        assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(platform::SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(crate::alerts::NATIVE_PREFIX, "gitpulse.session.");
     }

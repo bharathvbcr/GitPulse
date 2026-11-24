@@ -48,22 +48,40 @@ fn farm(count: usize, contended: bool) -> Farm {
     }
 }
 
-fn marks(farm: &Farm) -> Vec<usize> {
-    farm.dirs.iter().map(|dir| spawns_in(dir).len()).collect()
+fn marks(farm: &Farm) -> Vec<(usize, usize)> {
+    use crate::engine::worktree::status_reads;
+    farm.dirs
+        .iter()
+        .map(|dir| (spawns_in(dir).len(), status_reads::in_dir(dir).len()))
+        .collect()
 }
 
-/// `(worktree list, status)` git children started in the farm since `marks`.
-fn spawned(farm: &Farm, marks: &[usize]) -> (usize, usize) {
+/// `(worktree list, status)` reads started in the farm since `marks` —
+/// counting both git CLI spawns and in-process `gix` status reads without
+/// double-counting CLI fallbacks.
+fn spawned(farm: &Farm, marks: &[(usize, usize)]) -> (usize, usize) {
+    use crate::engine::worktree::status_reads::{self, StatusBackend};
     let argvs: Vec<Vec<String>> = farm
         .dirs
         .iter()
         .zip(marks)
-        .flat_map(|(dir, mark)| spawns_in(dir)[*mark..].to_vec())
+        .flat_map(|(dir, (spawn_mark, _))| spawns_in(dir)[*spawn_mark..].to_vec())
         .collect();
+    let gix_statuses: usize = farm
+        .dirs
+        .iter()
+        .zip(marks)
+        .map(|(dir, (_, read_mark))| {
+            status_reads::in_dir(dir)[*read_mark..]
+                .iter()
+                .filter(|(backend, _)| *backend == StatusBackend::Gix)
+                .count()
+        })
+        .sum();
     let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
     (
         argvs.iter().filter(|a| has(a, "worktree")).count(),
-        argvs.iter().filter(|a| has(a, "status")).count(),
+        argvs.iter().filter(|a| has(a, "status")).count() + gix_statuses,
     )
 }
 
@@ -563,13 +581,11 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
     let mark = marks(&farm);
     let answer = serve(&link.to_string_lossy()).expect("trusted through the link");
     assert_eq!(answer.repo, farm.repo);
-    let reads: usize = farm
-        .dirs
-        .iter()
-        .zip(&mark)
-        .map(|(dir, mark)| spawns_in(dir).len() - mark)
-        .sum();
-    assert!(reads > 0, "no read was made in the repository itself");
+    let (listings, statuses) = spawned(&farm, &mark);
+    assert!(
+        listings + statuses > 0,
+        "no read was made in the repository itself"
+    );
 }
 
 /// The app runs an agent's read in the class the agent's own scan runs in
@@ -577,37 +593,76 @@ fn a_repository_asked_for_through_a_link_is_read_at_its_canonical_path() {
 #[test]
 fn the_apps_reads_for_an_mcp_process_run_in_the_background_class() {
     use crate::engine::process::spawn_log::classed_spawns_in;
+    use crate::engine::worktree::status_reads::{self, StatusBackend};
     let farm = farm(2, false);
     let answer = serve(&farm.repo).expect("the app reads");
     assert!(answer.worktrees.is_some());
-    let classes: Vec<_> = farm
+    let worktree_classes: Vec<_> = farm
         .dirs
         .iter()
         .flat_map(|dir| classed_spawns_in(dir))
-        .filter(|(argv, _)| argv.iter().any(|arg| arg == "status" || arg == "worktree"))
+        .filter(|(argv, _)| argv.iter().any(|arg| arg == "worktree"))
         .collect();
-    assert!(!classes.is_empty(), "no read was recorded");
-    for (argv, class) in classes {
+    assert!(
+        !worktree_classes.is_empty(),
+        "no worktree listing was recorded"
+    );
+    for (argv, class) in worktree_classes {
         assert_eq!(
             class,
             crate::engine::process::Admission::Background,
             "{argv:?} ran at the UI's priority"
         );
     }
+    let status_spawns: Vec<_> = farm
+        .dirs
+        .iter()
+        .flat_map(|dir| classed_spawns_in(dir))
+        .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
+        .collect();
+    assert!(
+        status_spawns.is_empty(),
+        "happy path must use in-process gix status: {status_spawns:?}"
+    );
+    let in_process: Vec<_> = farm
+        .dirs
+        .iter()
+        .flat_map(|dir| status_reads::in_dir(dir))
+        .collect();
+    assert!(
+        !in_process.is_empty(),
+        "no in-process status read was recorded"
+    );
+    for (backend, class) in in_process {
+        assert_eq!(backend, StatusBackend::Gix);
+        assert_eq!(
+            class,
+            crate::engine::process::Admission::Background,
+            "in-process status read ran at the UI's priority"
+        );
+    }
 }
 
-/// Status children started anywhere in the farm, on any thread: the spawn log is
-/// process-wide and keyed by directory, unlike a per-thread spawn counter.
-fn statuses_started(farm: &Farm) -> Vec<(std::path::PathBuf, Vec<String>)> {
-    farm.dirs
+/// Status reads (subprocesses or in-process `gix`) started anywhere in the
+/// farm, on any thread: both logs are process-wide and keyed by directory.
+fn statuses_started(farm: &Farm) -> Vec<(std::path::PathBuf, String)> {
+    use crate::engine::worktree::status_reads;
+    let mut started: Vec<(std::path::PathBuf, String)> = farm
+        .dirs
         .iter()
         .flat_map(|dir| {
             spawns_in(dir)
                 .into_iter()
                 .filter(|argv| argv.iter().any(|arg| arg == "status"))
-                .map(|argv| (dir.clone(), argv))
+                .map(|argv| (dir.clone(), format!("cli:{argv:?}")))
         })
-        .collect()
+        .collect();
+    started.extend(farm.dirs.iter().flat_map(|dir| {
+        status_reads::in_dir(dir)
+            .into_iter()
+            .map(|(backend, _)| (dir.clone(), format!("{backend:?}")))
+    }));
+    started
 }
 
 /// Runs `ask` as a request whose asker leaves the moment the first status read

@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
 import { ledgerStatus } from "../ledger/types";
+import { setSignalledAsksForReader } from "../terminal/sessionActivity";
 import {
   MAX_AGENT_ROWS,
   applyAgentFilter,
@@ -335,17 +336,101 @@ describe("projectAgentPlane", () => {
     expect(plane.rows.find((row) => row.liveKey === "ask")?.attention).toContain("needs-you");
   });
 
-  it("shows a live agent that finished as waiting for the reader, below one that is blocked", () => {
+  it("keeps informational finished notices in notifications and out of needing attention", () => {
     const plane = project({
       terminals: [
-        terminal({ key: "done", attention: "finished", label: "Claude", title: "done", cwd: "/tmp/done", repoPath: "/tmp/done" }),
-        terminal({ key: "ask", attention: "needs-you", label: "Claude", title: "asking", cwd: "/tmp/ask", repoPath: "/tmp/ask" }),
+        terminal({
+          key: "done",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "turn_finished",
+          attentionChannel: "hook",
+          attentionLabel: "Finished its turn",
+          attentionDetail: "Tests green",
+          attentionAt: 1000,
+          label: "Antigravity",
+          launcher: "agy",
+          title: "done",
+          cwd: "/tmp/done",
+          repoPath: "/tmp/done",
+        }),
+        terminal({
+          key: "idle",
+          sessionId: "s2",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "idle_prompt",
+          attentionChannel: "hook",
+          attentionLabel: "Waiting for you",
+          label: "Claude",
+          launcher: "claude",
+          title: "idle",
+          cwd: "/tmp/idle",
+          repoPath: "/tmp/idle",
+        }),
+        terminal({
+          key: "ask",
+          sessionId: "s3",
+          attention: "needs-you",
+          attentionUrgency: "blocking",
+          attentionEvent: "permission_prompt",
+          attentionChannel: "hook",
+          attentionLabel: "Needs your permission",
+          attentionDetail: "Bash: cargo test",
+          attentionAt: 2000,
+          label: "Claude",
+          launcher: "claude",
+          title: "asking",
+          cwd: "/tmp/ask",
+          repoPath: "/tmp/ask",
+        }),
       ],
     });
     const done = plane.rows.find((row) => row.liveKey === "done");
+    const idle = plane.rows.find((row) => row.liveKey === "idle");
+    const ask = plane.rows.find((row) => row.liveKey === "ask");
     expect(done?.attention).toEqual(["finished"]);
-    expect(plane.attention.needing).toBe(2);
-    expect(applyAgentFilter(plane.rows, "attention").map((row) => row.liveKey)).toEqual(["ask", "done"]);
+    expect(done?.attentionLabel).toBe("Finished its turn");
+    expect(done?.attentionDetail).toBe("Tests green");
+    expect(done?.launcher).toBe("agy");
+    expect(idle?.attention).toEqual(["idle-waiting"]);
+    expect(idle?.attentionLabel).toBe("Idle, waiting for input");
+    expect(ask?.attentionLabel).toBe("Needs your permission");
+    expect(plane.attention.needing).toBe(1);
+    expect(plane.notifications).toBe(2);
+    expect(applyAgentFilter(plane.rows, "attention").map((row) => row.liveKey)).toEqual(["ask"]);
+    expect(applyAgentFilter(plane.rows, "notifications").map((row) => row.liveKey)).toEqual(["done", "idle"]);
+    expect(planeHeadline(plane, plane.rows.length)).toContain("1 need attention · 2 notifications");
+  });
+
+  it("routes passive OSC notices and legacy informational idle_prompt to notifications", () => {
+    const plane = project({
+      terminals: [
+        terminal({
+          key: "osc",
+          sessionId: "s-osc",
+          attention: "signalled",
+          attentionUrgency: "informational",
+          attentionChannel: "osc9",
+          attentionDetail: "Build complete",
+          cwd: "/tmp/osc",
+          repoPath: "/tmp/osc",
+        }),
+        terminal({
+          key: "legacy-idle",
+          sessionId: "s-idle",
+          attention: "needs-you",
+          attentionUrgency: "informational",
+          attentionEvent: "idle_prompt",
+          cwd: "/tmp/legacy-idle",
+          repoPath: "/tmp/legacy-idle",
+        }),
+      ],
+    });
+    expect(plane.attention.needing).toBe(0);
+    expect(plane.notifications).toBe(2);
+    expect(plane.rows.find((row) => row.liveKey === "osc")?.attention).toEqual(["notice"]);
+    expect(plane.rows.find((row) => row.liveKey === "legacy-idle")?.attention).toEqual(["idle-waiting"]);
   });
 
   it("keeps a shell that is sitting in an agent checkout", () => {
@@ -461,13 +546,31 @@ describe("projectAgentPlane", () => {
 });
 
 describe("filters and the headline", () => {
-  it("accepts only the four filters", () => {
+  it("accepts only the six valid agent filters", () => {
     expect(isAgentFilter("all")).toBe(true);
     expect(isAgentFilter("attention")).toBe(true);
+    expect(isAgentFilter("notifications")).toBe(true);
+    expect(isAgentFilter("gaps")).toBe(true);
     expect(isAgentFilter("parallel")).toBe(true);
     expect(isAgentFilter("live")).toBe(true);
     expect(isAgentFilter("dirty")).toBe(false);
     expect(isAgentFilter("")).toBe(false);
+  });
+
+  it("separates gaps filter for unread measurements while keeping unread in attention filter", () => {
+    const unread = project({
+      probes: [probe({
+        snapshot: snapshot({
+          worktrees: {
+            ok: true, error: "", count: 1, scanned: 1, dirty: 0, dirty_unknown: 1,
+            blocked: 0, blocked_unknown: 0, truncated: false,
+            items: [worktree({ dirty_files: null })],
+          },
+        }),
+      })],
+    });
+    expect(applyAgentFilter(unread.rows, "gaps")).toHaveLength(1);
+    expect(applyAgentFilter(unread.rows, "notifications")).toEqual([]);
   });
 
   it("leaves a dirty checkout out of the attention filter and keeps an unread count in it", () => {
@@ -516,5 +619,197 @@ describe("filters and the headline", () => {
       ],
     });
     expect(planeHeadline(plane, 0)).toContain("2 repositories not read");
+  });
+});
+
+describe("M3b iteration 2 attention projection regressions", () => {
+  afterEach(() => setSignalledAsksForReader(false));
+
+  it("isolates terminal attention across multiple terminals in the same agent checkout", () => {
+    const cleanPlane = project({
+      terminals: [
+        terminal({
+          key: "t1",
+          sessionId: "s1",
+          cwd: "/repo/.claude/worktrees/alpha",
+          title: "first",
+          attention: "needs-you",
+          attentionUrgency: "blocking",
+          attentionEvent: "permission_prompt",
+          attentionChannel: "hook",
+          attentionLabel: "Needs your permission",
+        }),
+        terminal({
+          key: "t2",
+          sessionId: "s2",
+          cwd: "/repo/.claude/worktrees/alpha",
+          title: "second",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "turn_finished",
+          attentionChannel: "hook",
+          attentionLabel: "Finished its turn",
+        }),
+      ],
+    });
+    const r1 = cleanPlane.rows.find((row) => row.liveKey === "t1")!;
+    const r2 = cleanPlane.rows.find((row) => row.liveKey === "t2")!;
+    expect(r1.attention).toEqual(["needs-you"]);
+    expect(r2.attention).toEqual(["finished"]);
+    expect(r2.attentionLabel).toBe("Finished its turn");
+    expect(cleanPlane.attention.needing).toBe(1);
+    expect(cleanPlane.notifications).toBe(1);
+
+    // Checkout-only reasons (like `dirty`) still carry onto cloned terminals without leaking t1's reasons.
+    const dirtyPlane = project({
+      probes: [probe({
+        snapshot: snapshot({
+          worktrees: {
+            ok: true, error: "", count: 1, scanned: 1, dirty: 1, dirty_unknown: 0,
+            blocked: 0, blocked_unknown: 0, truncated: false,
+            items: [worktree({ dirty_files: 2 })],
+          },
+        }),
+      })],
+      terminals: [
+        terminal({
+          key: "t1",
+          sessionId: "s1",
+          cwd: "/repo/.claude/worktrees/alpha",
+          title: "first",
+          attention: "needs-you",
+          attentionUrgency: "blocking",
+          attentionEvent: "permission_prompt",
+          attentionChannel: "hook",
+          attentionLabel: "Needs your permission",
+        }),
+        terminal({
+          key: "t2",
+          sessionId: "s2",
+          cwd: "/repo/.claude/worktrees/alpha",
+          title: "second",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "turn_finished",
+          attentionChannel: "hook",
+          attentionLabel: "Finished its turn",
+        }),
+      ],
+    });
+    const d2 = dirtyPlane.rows.find((row) => row.liveKey === "t2")!;
+    expect(d2.attention).toEqual(["finished", "dirty"]);
+    expect(d2.attentionLabel).toBe("Finished its turn · +1");
+    expect(dirtyPlane.attention.needing).toBe(1);
+    expect(dirtyPlane.notifications).toBe(1);
+  });
+
+  it("does not reuse stale terminal attentionLabel when foldTask elevates a row to a higher-priority reason", () => {
+    const plane = project({
+      terminals: [
+        terminal({
+          key: "t1",
+          sessionId: "s1",
+          taskRunId: "run-1",
+          cwd: "/repo/.claude/worktrees/alpha",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "turn_finished",
+          attentionChannel: "hook",
+          attentionLabel: "Finished its turn",
+        }),
+      ],
+      tasks: tasks({
+        tasks: [task({ runId: "run-1", tone: "needs-you" })],
+      }),
+    });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0].attention).toEqual(["needs-you", "finished"]);
+    expect(plane.rows[0].attentionLabel).toBe("Needs you · +1");
+  });
+
+  it("does not duplicate finished alongside idle-waiting on task-backed live terminals receiving idle_prompt", () => {
+    const plane = project({
+      terminals: [
+        terminal({
+          key: "t1",
+          sessionId: "s-task-idle",
+          taskRunId: "run-idle-1",
+          cwd: "/repo/.claude/worktrees/alpha",
+          attention: "finished",
+          attentionUrgency: "informational",
+          attentionEvent: "idle_prompt",
+          attentionChannel: "hook",
+          attentionLabel: "Waiting for you",
+        }),
+      ],
+      tasks: tasks({
+        tasks: [task({ runId: "run-idle-1", tone: "finished" })],
+      }),
+    });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0].attention).toEqual(["idle-waiting"]);
+    expect(plane.rows[0].attentionLabel).toBe("Idle, waiting for input");
+    expect(plane.notifications).toBe(1);
+  });
+
+  it("suppresses bare BEL attention metadata on a dirty checkout when bell does not ask", () => {
+    setSignalledAsksForReader(false);
+    const plane = project({
+      probes: [probe({
+        snapshot: snapshot({
+          worktrees: {
+            ok: true, error: "", count: 1, scanned: 1, dirty: 1, dirty_unknown: 0,
+            blocked: 0, blocked_unknown: 0, truncated: false,
+            items: [worktree({ dirty_files: 2 })],
+          },
+        }),
+      })],
+      terminals: [
+        terminal({
+          key: "t-bell",
+          sessionId: "s-bell",
+          cwd: "/repo/.claude/worktrees/alpha",
+          attention: "signalled",
+          attentionUrgency: "informational",
+          attentionEvent: null,
+          attentionChannel: "bell",
+          attentionLabel: "Signalled",
+          attentionDetail: null,
+          attentionAt: 1000,
+        }),
+      ],
+    });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0].attention).toEqual(["dirty"]);
+    expect(plane.rows[0].attentionLabel).toBe("Uncommitted changes");
+    expect(plane.rows[0].attentionUrgency).toBeNull();
+    expect(plane.rows[0].attentionChannel).toBeNull();
+    expect(plane.rows[0].attentionAt).toBeNull();
+    expect(plane.notifications).toBe(0);
+    expect(plane.attention.needing).toBe(0);
+  });
+
+  it("derives blocking urgency for opted-in bare BEL when bell asks for reader", () => {
+    setSignalledAsksForReader(true);
+    const plane = project({
+      terminals: [
+        terminal({
+          key: "t-bell",
+          sessionId: "s-bell",
+          cwd: "/repo/.claude/worktrees/alpha",
+          attention: "signalled",
+          attentionUrgency: "informational",
+          attentionEvent: null,
+          attentionChannel: "bell",
+          attentionLabel: "Signalled",
+          attentionDetail: null,
+          attentionAt: 1000,
+        }),
+      ],
+    });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0].attention).toEqual(["signalled"]);
+    expect(plane.rows[0].attentionUrgency).toBe("blocking");
+    expect(plane.attention.needing).toBe(1);
   });
 });

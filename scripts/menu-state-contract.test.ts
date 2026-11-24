@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  FOCUS_AGENT_PREFIX,
   MENU_ACTION_IDS,
   MENU_LIMITS,
   MENU_TONES,
@@ -81,13 +82,27 @@ describe("the frontend mirror matches MenuState::validate", () => {
     expect(agents, "state.rs no longer names MAX_AGENTS_WAITING").not.toBeNull();
     expect(state).toContain("self.agents_waiting > MAX_AGENTS_WAITING");
     expect(MENU_LIMITS.agentsWaiting).toBe(Number((agents as RegExpMatchArray)[1].replace(/_/g, "")));
+
+    const requests = state.match(/pub const MAX_MENU_AGENT_REQUESTS: usize = (\d[\d_]*);/);
+    expect(requests, "state.rs no longer names MAX_MENU_AGENT_REQUESTS").not.toBeNull();
+    expect(state).toContain("self.agent_requests.len() > MAX_MENU_AGENT_REQUESTS");
+    expect(MENU_LIMITS.agentRequests).toBe(Number((requests as RegExpMatchArray)[1].replace(/_/g, "")));
+
+    const idBytes = state.match(/pub const MAX_AGENT_REQUEST_ID_BYTES: usize = (\d[\d_]*);/);
+    expect(idBytes, "state.rs no longer names MAX_AGENT_REQUEST_ID_BYTES").not.toBeNull();
+    expect(state).toContain("req.id.len() > MAX_AGENT_REQUEST_ID_BYTES");
+    expect(MENU_LIMITS.agentRequestIdBytes).toBe(Number((idBytes as RegExpMatchArray)[1].replace(/_/g, "")));
   });
 
-  it("lets an older renderer omit the agent count", () => {
-    // A renderer built before the field existed sends no `agentsWaiting`; serde
-    // must default it rather than refuse the payload and freeze the menu.
+  it("lets an older renderer omit the agent count and request fields", () => {
+    // A renderer built before these fields existed omits them; serde must
+    // default them rather than refuse the payload and freeze the menu.
     const field = state.slice(state.indexOf("pub struct MenuState"), state.indexOf("impl Default for MenuState"));
     expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agents_waiting: u32,/);
+    expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agent_requests: Vec<MenuAgentRequest>,/);
+    expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agent_requests_hidden: u32,/);
+    expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agents_running: u32,/);
+    expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agents_informational: u32,/);
   });
 
   it("agrees on the status-card enums", () => {
@@ -116,6 +131,7 @@ describe("the frontend mirror matches MenuState::validate", () => {
   it("agrees on the path-carrying prefixes", () => {
     expect(REPOSITORY_PREFIX).toBe(constant("REPOSITORY_PREFIX"));
     expect(RECENT_PREFIX).toBe(constant("RECENT_PREFIX"));
+    expect(FOCUS_AGENT_PREFIX).toBe(constant("FOCUS_AGENT_PREFIX"));
   });
 
   it("lists exactly the actions NativeAction::parse resolves without a path", () => {
@@ -133,6 +149,7 @@ describe("the frontend mirror matches MenuState::validate", () => {
     expect(MENU_ACTION_IDS).not.toContain(constant("RECENT_EMPTY"));
     expect(MENU_ACTION_IDS).not.toContain(constant("ACTIVATE_REPO"));
     expect(MENU_ACTION_IDS).not.toContain(constant("OPEN_RECENT"));
+    expect(MENU_ACTION_IDS).not.toContain(constant("FOCUS_AGENT"));
   });
 
   it("agrees on which ids carry a checkmark", () => {
@@ -177,6 +194,10 @@ describe("the frontend mirror matches MenuState::validate", () => {
       traySummary: { id: "open", text: "Open a repository…" },
       trayDetail: "GitPulse",
       agentsWaiting: 0,
+      agentRequests: [],
+      agentRequestsHidden: 0,
+      agentsRunning: 0,
+      agentsInformational: 0,
       status: {
         repository: "GitPulse", branch: "", changed: null, staged: null, conflicts: null,
         ahead: null, behind: null, upstream: null, headline: "Your work, at a glance",
@@ -231,6 +252,42 @@ describe("the frontend mirror matches MenuState::validate", () => {
     );
     expect(broken((draft) => (draft.agentsWaiting = MENU_LIMITS.agentsWaiting + 1))).toBe(
       "Native menu agent count exceeds its limit",
+    );
+    expect(broken((draft) => (draft.agentsRunning = MENU_LIMITS.agentsWaiting + 1))).toBe(
+      "Native menu agent count exceeds its limit",
+    );
+    expect(broken((draft) => (draft.agentsInformational = MENU_LIMITS.agentsWaiting + 1))).toBe(
+      "Native menu agent count exceeds its limit",
+    );
+    expect(broken((draft) => (draft.agentRequestsHidden = 1))).toBe(
+      "Native menu state exceeds its entry limit",
+    );
+    const req = {
+      id: "term:1",
+      source: "terminal" as const,
+      provider: "claude" as const,
+      agentLabel: "Claude",
+      repoLabel: "GitPulse",
+      repoPath: "/r/a",
+      urgency: "blocking" as const,
+      reason: "Needs your permission",
+      detail: null,
+      atMs: 1,
+    };
+    expect(broken((draft) => draft.agentRequests.push({ ...req }, { ...req }))).toBe(
+      "Native menu state contains an invalid agent request",
+    );
+    expect(broken((draft) => draft.agentRequests.push({ ...req, id: "" }))).toBe(
+      "Native menu state contains an invalid agent request",
+    );
+    expect(broken((draft) => draft.agentRequests.push({ ...req, urgency: "action_needed" as never }))).toBe(
+      "Native menu state contains an invalid agent request",
+    );
+    expect(broken((draft) => draft.agentRequests.push({ ...req, detail: "d".repeat(MENU_LIMITS.text + 1) }))).toBe(
+      "Native menu state contains an invalid agent request",
+    );
+    expect(broken((draft) => draft.agentRequests.push({ ...req, repoPath: "p".repeat(MENU_LIMITS.path + 1) }))).toBe(
+      "Native menu state contains an invalid agent request",
     );
     expect(broken((draft) => (draft.status.tone = "excited"))).toBe("Invalid status card presentation");
     expect(broken((draft) => (draft.status.watchStatus = "wedged"))).toBe("Invalid status card presentation");

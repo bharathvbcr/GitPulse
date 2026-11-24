@@ -27,8 +27,66 @@ use super::{Clock, Platform, SensorReport, SensorState, CADENCE_MS};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Relaxed sampling cadence when the main WebView is hibernated, no active
+/// managed runs, builds, or launched agents are running, and the governor
+/// verdict is clear with no active hold. Capped at <= 20 s so snapshot readers
+/// retain ample margin under `STALE_RECENT_MS`.
+pub const HIBERNATED_CADENCE_MS: u64 = 20_000;
+
+static APP_HIBERNATED: AtomicBool = AtomicBool::new(false);
+
+fn wake_signal() -> &'static (Mutex<u64>, Condvar) {
+    static SIGNAL: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    SIGNAL.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn notify_wake() {
+    let (lock, cvar) = wake_signal();
+    let mut gen = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    *gen = gen.wrapping_add(1);
+    cvar.notify_all();
+}
+
+/// Updates whether the main WebView is hibernated. When hibernated and idle,
+/// the sampler releases its `NSProcessInfo` App Nap activity token and relaxes
+/// its cadence to [`HIBERNATED_CADENCE_MS`]; returning `false` wakes it
+/// immediately to restore the activity token and normal cadence.
+pub fn set_app_hibernated(hibernated: bool) {
+    let prev = APP_HIBERNATED.swap(hibernated, Ordering::SeqCst);
+    if prev != hibernated {
+        notify_wake();
+    }
+}
+
+fn active_work_present(dir: &Path, procs: Option<&ProcView>) -> bool {
+    if let Some(view) = procs {
+        if view.claude.launched > 0
+            || view.codex.launched > 0
+            || view.other.launched > 0
+            || !view.trees.is_empty()
+        {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        let lease_root = super::lease::lease_dir(dir);
+        if lease_root.is_dir() {
+            if let Ok(lease_dir) = super::lease::Dir::open(&lease_root) {
+                let board = lease_dir.board(&super::lease::Own::default());
+                if board.occupied() > 0 || !board.waiters.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    false
+}
 
 /// What the background gate (card 1c) consumes: a level when the sensor may
 /// be acted on, otherwise unavailable — never a guessed "normal".
@@ -209,6 +267,13 @@ pub fn pulse_of(status: &HostLoadStatus) -> HostLoadPulse {
     }
 }
 
+/// Predicate checking whether active managed runs, builds, or launched agents are running.
+pub type ActiveWorkCheck = Box<dyn Fn(Option<&ProcView>) -> bool + Send>;
+
+/// Test seam factory supplying a deterministic [`Sensor`].
+#[cfg(test)]
+pub type SensorFactory = Box<dyn Fn(&Path) -> Box<dyn Sensor> + Send>;
+
 /// How to run one sampler.
 pub struct SamplerOptions {
     /// The per-user config directory the snapshot and its lock live in.
@@ -236,6 +301,16 @@ pub struct SamplerOptions {
     /// input. Unsupported unless [`start_app`] starts the probe, so a sampler
     /// started by a test or the soak never spawns a child of its own.
     pub exec_latency: Box<dyn Fn() -> Reading<super::exec_probe::ExecLatency> + Send>,
+    /// Sleep cadence when the app is hibernated and idle.
+    pub hibernated_cadence: Duration,
+    /// Whether the main WebView is hibernated. Defaults to `APP_HIBERNATED`.
+    pub hibernated: Box<dyn Fn() -> bool + Send>,
+    /// Whether active managed runs, builds, or launched agents are running.
+    pub active_work: ActiveWorkCheck,
+    /// Test seam to supply a deterministic [`Sensor`] (e.g. [`super::sensor::ReplaySensor`])
+    /// so hibernation/App Nap tests do not depend on the live host's current VM pressure.
+    #[cfg(test)]
+    pub sensor_factory: Option<SensorFactory>,
     /// Whether each tick also feeds the WebContent footprint ring. Only
     /// [`start_app`] turns it on: the ring is process-wide, so a sampler a
     /// test starts must not write to it.
@@ -244,6 +319,7 @@ pub struct SamplerOptions {
 
 impl SamplerOptions {
     pub fn new(dir: PathBuf) -> Self {
+        let lease_dir = dir.clone();
         Self {
             dir,
             cadence: Duration::from_millis(CADENCE_MS),
@@ -258,6 +334,11 @@ impl SamplerOptions {
             }),
             trace_opener: trace::file_opener(),
             exec_latency: Box::new(Reading::default),
+            hibernated_cadence: Duration::from_millis(HIBERNATED_CADENCE_MS),
+            hibernated: Box::new(|| APP_HIBERNATED.load(Ordering::Acquire)),
+            active_work: Box::new(move |procs| active_work_present(&lease_dir, procs)),
+            #[cfg(test)]
+            sensor_factory: None,
             watch_webcontent: false,
         }
     }
@@ -324,6 +405,7 @@ impl StopHandle {
             probe.stop();
         }
         self.shared.stop.store(true, Ordering::Release);
+        notify_wake();
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
             let _ = thread.join();
@@ -598,6 +680,12 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         problems.push(format!("QoS: {why}"));
     }
     let mut activity = ActivityHold::default();
+    #[cfg(test)]
+    let mut sensor: Box<dyn Sensor> = match &options.sensor_factory {
+        Some(make) => make(&options.dir),
+        None => Box::new(OsSensor::new(&options.dir)),
+    };
+    #[cfg(not(test))]
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
     let mut trend = CompressorTrend::default();
@@ -607,9 +695,12 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let mut writer: Option<Writer> = None;
     let identity = own_identity();
     let cadence = options.cadence.max(Duration::from_millis(10));
-    let origin = Instant::now();
+    let hibernated_cadence = options.hibernated_cadence.max(cadence);
+    let mut origin = Instant::now();
     let cpu_origin = super::probe::thread_cpu_ns();
     let mut slot: u64 = 0;
+    let mut was_hibernated_idle = false;
+    let mut last_governor_clear = true;
     let mut tick = TickStats::default();
     let mut last_sample = None;
     // The governor's held verdict after the last tick's count, for the next
@@ -633,11 +724,16 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         let began = Instant::now();
         let mut tick_problems = problems.clone();
         let enabled = (options.enabled)();
-        tick_problems.extend(
-            activity
-                .follow(enabled, options.begin_activity.as_ref())
-                .map(str::to_string),
-        );
+        let hibernated_requested = (options.hibernated)();
+        let mut activity_checked = false;
+        if !enabled || !hibernated_requested {
+            tick_problems.extend(
+                activity
+                    .follow(enabled, options.begin_activity.as_ref())
+                    .map(str::to_string),
+            );
+            activity_checked = true;
+        }
         if writer.is_none() {
             match Writer::elect(&shared.dir) {
                 Ok(elected) => writer = elected,
@@ -689,12 +785,16 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 at.elapsed().as_secs()
             ));
         }
+        let hibernated_idle;
         let status = match writer.as_mut() {
             Some(w) => {
                 let mut snap = Snapshot::empty(Clock::now(), identity.clone(), enabled);
                 let mut procs = None;
                 if enabled {
                     let view = scanner.scan(&ScanContext::here());
+                    #[cfg(test)]
+                    fill(&mut snap, sensor.as_mut(), &mut trend, &view);
+                    #[cfg(not(test))]
                     fill(&mut snap, &mut sensor, &mut trend, &view);
                     let at_ms = snap.written.mono_ns / 1_000_000;
                     fill_tracker.observe(snap.written.boot_id, at_ms, snap.host.free_disk);
@@ -713,7 +813,26 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                     snap.disk_fill_rate = Reading::Unavailable(Why::Disabled);
                     snap.disk_fill_sustained = Reading::Unavailable(Why::Disabled);
                 }
+                let active_work = (options.active_work)(procs.as_ref());
+                hibernated_idle = hibernated_requested && !active_work;
+                let nap_allowed = hibernated_idle && last_governor_clear;
+                if !activity_checked {
+                    tick_problems.extend(
+                        activity
+                            .follow(enabled && !nap_allowed, options.begin_activity.as_ref())
+                            .map(str::to_string),
+                    );
+                }
                 snap.tick = tick;
+                snap.cadence_ms = u32::try_from(
+                    if nap_allowed {
+                        hibernated_cadence
+                    } else {
+                        cadence
+                    }
+                    .as_millis(),
+                )
+                .unwrap_or(u32::MAX);
                 // The verdict the previous tick's count produced (pending on
                 // the first): the record is published before this tick's
                 // sample is counted.
@@ -737,13 +856,25 @@ fn run(shared: &Shared, options: &SamplerOptions) {
                 status.procs = procs;
                 status
             }
-            None => reader_status(
-                &shared.dir,
-                Role::Reader,
-                tick_problems,
-                tick,
-                (options.profile_choice)(),
-            ),
+            None => {
+                let active_work = (options.active_work)(None);
+                hibernated_idle = hibernated_requested && !active_work;
+                let nap_allowed = hibernated_idle && last_governor_clear;
+                if !activity_checked {
+                    tick_problems.extend(
+                        activity
+                            .follow(enabled && !nap_allowed, options.begin_activity.as_ref())
+                            .map(str::to_string),
+                    );
+                }
+                reader_status(
+                    &shared.dir,
+                    Role::Reader,
+                    tick_problems,
+                    tick,
+                    (options.profile_choice)(),
+                )
+            }
         };
 
         let govern_launches = (options.govern_launches)();
@@ -809,6 +940,11 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         if let (Some(origin), Some(now)) = (cpu_origin, super::probe::thread_cpu_ns()) {
             tick.cpu_ns = now.saturating_sub(origin);
         }
+        let governor_clear = status.governor.verdict.tier == super::governor::Tier::Clear
+            && status.governor.verdict.admit
+            && !status.governor.verdict.shed.background
+            && !status.governor.verdict.shed.reactive;
+        last_governor_clear = governor_clear;
         let pulse = pulse_of(&status);
         *shared
             .status
@@ -822,24 +958,61 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         // supervisor clears its record only when the body returns.
         crate::supervisor::note_recovered(SUBSYSTEM);
 
-        // The next slot on the fixed grid. Waking later than one whole
-        // cadence past it means slots went by with no tick: those are missed.
-        slot += 1;
-        let mut next = origin + cadence * u32::try_from(slot).unwrap_or(u32::MAX);
-        let now = Instant::now();
-        if now > next {
-            let behind = (now - next).as_nanos() / cadence.as_nanos().max(1);
-            let behind = u64::try_from(behind).unwrap_or(u64::MAX);
-            tick.missed = tick.missed.saturating_add(behind);
-            slot = slot.saturating_add(behind);
-            next = origin + cadence * u32::try_from(slot).unwrap_or(u32::MAX);
+        let nap_sleep = hibernated_idle && governor_clear;
+        if !nap_sleep && enabled && !activity.engaged {
+            let _ = activity.follow(true, options.begin_activity.as_ref());
         }
-        while !shared.stop.load(Ordering::Acquire) {
-            let now = Instant::now();
-            if now >= next {
-                break;
+
+        if nap_sleep {
+            was_hibernated_idle = true;
+            let deadline = Instant::now() + hibernated_cadence;
+            let (lock, cvar) = wake_signal();
+            let mut guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while !shared.stop.load(Ordering::Acquire) && (options.hibernated)() {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (next_guard, _) = cvar
+                    .wait_timeout(guard, deadline - now)
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard = next_guard;
             }
-            std::thread::park_timeout(next - now);
+            origin = Instant::now();
+            slot = 0;
+        } else {
+            if was_hibernated_idle {
+                origin = Instant::now();
+                slot = 0;
+                was_hibernated_idle = false;
+            }
+            // The next slot on the fixed grid. Waking later than one whole
+            // cadence past it means slots went by with no tick: those are missed.
+            slot += 1;
+            let mut next = origin + cadence * u32::try_from(slot).unwrap_or(u32::MAX);
+            let now = Instant::now();
+            if now > next {
+                let behind = (now - next).as_nanos() / cadence.as_nanos().max(1);
+                let behind = u64::try_from(behind).unwrap_or(u64::MAX);
+                tick.missed = tick.missed.saturating_add(behind);
+                slot = slot.saturating_add(behind);
+                next = origin + cadence * u32::try_from(slot).unwrap_or(u32::MAX);
+            }
+            let (lock, cvar) = wake_signal();
+            let mut guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while !shared.stop.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if now >= next {
+                    break;
+                }
+                if (options.hibernated)() && !hibernated_idle {
+                    break;
+                }
+                let (next_guard, _) = cvar
+                    .wait_timeout(guard, next - now)
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard = next_guard;
+            }
         }
     }
     // Stopped: close the feed. The thread writes a record still in its slot;
@@ -1811,6 +1984,7 @@ mod tests {
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut options = SamplerOptions::new(dir.path().to_path_buf());
         options.cadence = Duration::from_millis(50);
+        options.hibernated = Box::new(|| false);
         let switch = enabled.clone();
         options.enabled = Box::new(move || switch.load(Ordering::SeqCst));
         options.begin_activity = Box::new(counting_begin(&begun, &live));
@@ -1819,7 +1993,16 @@ mod tests {
         let wait_for = |what: &str, done: &dyn Fn() -> bool| {
             let deadline = Instant::now() + limit;
             while !done() {
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: live={}, status={:?}",
+                    live.load(Ordering::SeqCst),
+                    sampler.status().map(|s| (
+                        s.snapshot.as_ref().map(|sn| (sn.seq, sn.cadence_ms)),
+                        s.governor.verdict.clone(),
+                        s.tick,
+                    ))
+                );
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
@@ -1843,5 +2026,210 @@ mod tests {
         });
         sampler.stop();
         assert_eq!(live.load(Ordering::SeqCst), 0, "stop ends the activity");
+    }
+
+    #[test]
+    fn set_app_hibernated_toggles_global_flag() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_app_hibernated(false);
+            }
+        }
+        let _reset = Reset;
+        assert!(!APP_HIBERNATED.load(Ordering::Acquire));
+        set_app_hibernated(true);
+        assert!(APP_HIBERNATED.load(Ordering::Acquire));
+        set_app_hibernated(false);
+        assert!(!APP_HIBERNATED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn active_work_present_checks_launched_agents_and_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = super::super::procscan::ProcView {
+            ok: true,
+            error: None,
+            processes: 1,
+            other_users: 0,
+            unreadable: 0,
+            claude: Default::default(),
+            codex: Default::default(),
+            other: Default::default(),
+            sessions: Vec::new(),
+            sessions_truncated: false,
+            trees: Vec::new(),
+            launched_footprint: Reading::Unavailable(Why::NotYet),
+            observed_footprint: Reading::Unavailable(Why::NotYet),
+            foreign_top: Vec::new(),
+            largest_foreign: Reading::Unavailable(Why::NotYet),
+            launched_write_rate: Reading::Unavailable(Why::NotYet),
+            max_tree_write_rate: Reading::Unavailable(Why::NotYet),
+            memguard: super::super::procscan::MemguardHealth {
+                present: false,
+                pid: None,
+                start_us: None,
+                exec: None,
+                flags: Vec::new(),
+                log_path: Reading::Unavailable(Why::Unsupported),
+                heartbeat_age_s: Reading::Unavailable(Why::Unsupported),
+                heartbeat_interval_s: None,
+                warn: false,
+                warnings: Vec::new(),
+            },
+            orphans: Vec::new(),
+        };
+        assert!(!active_work_present(dir.path(), Some(&empty)));
+
+        let mut observed_only = empty.clone();
+        observed_only.claude.observed = 2;
+        assert!(
+            !active_work_present(dir.path(), Some(&observed_only)),
+            "external observed agents should not block GitPulse hibernation"
+        );
+
+        let mut launched_agent = empty.clone();
+        launched_agent.claude.launched = 1;
+        assert!(active_work_present(dir.path(), Some(&launched_agent)));
+
+        let mut with_tree = empty;
+        with_tree.trees.push(super::super::procscan::LaunchedTree {
+            tree: "run:1".into(),
+            run_id: Some("1".into()),
+            session_id: None,
+            members: 1,
+            unreadable_members: 0,
+            footprint: Reading::Unavailable(Why::NotYet),
+            write_rate: Reading::Unavailable(Why::NotYet),
+            cpu_rate: Reading::Unavailable(Why::NotYet),
+        });
+        assert!(active_work_present(dir.path(), Some(&with_tree)));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_releases_app_nap_when_hibernated_and_wakes_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let hibernated = Arc::new(AtomicBool::new(false));
+        let active_work = Arc::new(AtomicBool::new(false));
+        let begun = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(250);
+        options.hibernated_cadence = Duration::from_secs(6);
+        options.thresholds = Box::new(|| {
+            use super::super::thresholds::{InputMode, Thresholds};
+            let mut t = Thresholds::default();
+            t.swap.mode = InputMode::Off;
+            t.compressor_segments.mode = InputMode::Off;
+            t.load.mode = InputMode::Off;
+            t.thermal.mode = InputMode::Off;
+            t.battery.mode = InputMode::Off;
+            t.disk.mode = InputMode::Off;
+            t.disk_guard.fill.mode = InputMode::Off;
+            t.disk_guard.coverage.mode = InputMode::Off;
+            t
+        });
+        let hib_read = hibernated.clone();
+        options.hibernated = Box::new(move || hib_read.load(Ordering::Acquire));
+        let active_read = active_work.clone();
+        options.active_work = Box::new(move |_| active_read.load(Ordering::Acquire));
+        options.begin_activity = Box::new(counting_begin(&begun, &live));
+        options.sensor_factory = Some(Box::new(|_| {
+            Box::new(super::super::sensor::ReplaySensor::new(vec![HostSample {
+                pressure: Reading::Value(Level::Normal),
+                ..HostSample::default()
+            }]))
+        }));
+
+        let sampler = start(options).unwrap();
+        let limit = crate::test_support::coverage_relaxed(Duration::from_secs(20));
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + limit;
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: live={}, status={:?}",
+                    live.load(Ordering::SeqCst),
+                    sampler.status().map(|s| (
+                        s.snapshot.as_ref().map(|sn| (sn.seq, sn.cadence_ms)),
+                        s.governor.verdict.clone(),
+                        s.tick,
+                    ))
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        wait_for("initial activity and ticks", &|| {
+            live.load(Ordering::SeqCst) == 1 && sampler.status().is_some_and(|s| s.tick.ticks >= 2)
+        });
+        assert_eq!(
+            sampler
+                .status()
+                .and_then(|s| s.snapshot)
+                .map(|s| s.cadence_ms),
+            Some(250)
+        );
+        let missed_before_hibernate = sampler.status().unwrap().tick.missed;
+
+        // Enter hibernation while idle: App Nap activity token must be released
+        // and the sampler enters the stretched 6 s sleep, publishing its real
+        // cadence_ms in the snapshot.
+        hibernated.store(true, Ordering::Release);
+        notify_wake();
+        wait_for("activity release on hibernation", &|| {
+            live.load(Ordering::SeqCst) == 0
+                && sampler
+                    .status()
+                    .and_then(|s| s.snapshot)
+                    .is_some_and(|s| s.cadence_ms == 6_000)
+        });
+        let ticks_at_hibernate = sampler.status().unwrap().tick.ticks;
+        std::thread::sleep(Duration::from_millis(400));
+        let ticks_while_hibernated = sampler.status().unwrap().tick.ticks;
+        assert!(
+            ticks_while_hibernated <= ticks_at_hibernate + 1,
+            "hibernated sampler kept ticking fast: {ticks_at_hibernate} -> {ticks_while_hibernated}"
+        );
+
+        // Wake from hibernation: must wake immediately (well before 6 s) and
+        // re-acquire the App Nap activity token.
+        let wake_start = Instant::now();
+        hibernated.store(false, Ordering::Release);
+        notify_wake();
+        wait_for("immediate wake and activity restore", &|| {
+            live.load(Ordering::SeqCst) == 1
+                && sampler
+                    .status()
+                    .is_some_and(|s| s.tick.ticks >= ticks_while_hibernated + 2)
+        });
+        assert!(
+            wake_start.elapsed() < Duration::from_secs(2),
+            "wake took {:?} instead of waking immediately",
+            wake_start.elapsed()
+        );
+        assert_eq!(
+            sampler.status().unwrap().tick.missed,
+            missed_before_hibernate,
+            "intentional hibernated sleep must not be counted as missed ticks"
+        );
+
+        // Hibernated flag true while active work is running: must keep App Nap
+        // activity token and stay on fast cadence.
+        active_work.store(true, Ordering::Release);
+        hibernated.store(true, Ordering::Release);
+        notify_wake();
+        let ticks_before_active = sampler.status().unwrap().tick.ticks;
+        wait_for("fast ticks while active work runs", &|| {
+            sampler
+                .status()
+                .is_some_and(|s| s.tick.ticks >= ticks_before_active + 3)
+        });
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+
+        sampler.stop();
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 }

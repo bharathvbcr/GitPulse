@@ -65,6 +65,10 @@ pub struct GitEnv {
     /// Whether `core.fsmonitor`'s built-in daemon was measured on this
     /// platform (macOS; Windows runs the same daemon but was not measured).
     pub fsmonitor_measured: bool,
+    /// Whether the resolved `git` binary identifies as Apple Git, whose
+    /// `fsmonitor--daemon` lacks `pthread_cond_timedwait` and can deadlock
+    /// indefinitely on cookie waits under FSEvents pressure.
+    pub is_apple_git: bool,
 }
 
 impl GitEnv {
@@ -77,6 +81,10 @@ impl GitEnv {
                 .as_deref()
                 .and_then(crate::engine::git_cli::parse_git_version),
             fsmonitor_measured: cfg!(target_os = "macos"),
+            is_apple_git: preflight
+                .version
+                .as_deref()
+                .is_some_and(|v| v.contains("Apple Git")),
         }
     }
 
@@ -225,6 +233,7 @@ fn untracked_cache_offer(report: &RepoTuningReport, env: GitEnv) -> Option<Tunin
 fn fsmonitor_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffer> {
     let entries = report.index.entries?;
     if !env.fsmonitor_measured
+        || env.is_apple_git
         || report.index.state != IndexReadState::Present
         || !report.index.entries_exact
         || entries < FSMONITOR_MIN_TRACKED_FILES
@@ -238,7 +247,9 @@ fn fsmonitor_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOffer
         TuningChange::Fsmonitor,
         format!(
             "{entries} tracked files (offered from {FSMONITOR_MIN_TRACKED_FILES}): git status \
-             measured 20 to 45 percent faster at this size, and slower below about 10,000."
+             measured 20 to 45 percent faster at this size, and slower below about 10,000. \
+             GitPulse bypasses core.fsmonitor on its own reads; on macOS, external Apple Git \
+             (/usr/bin/git) callers can still spawn a deadlocking daemon."
         ),
     ))
 }
@@ -322,6 +333,25 @@ pub fn warnings(report: &RepoTuningReport) -> Vec<String> {
              beside it."
                 .to_string(),
         );
+    }
+    if report.is_true("core.fsmonitor") {
+        if report.index.entries.is_some_and(|n| n < 10_000) {
+            out.push(
+                "core.fsmonitor=true slows git status on repositories under 10,000 tracked \
+                 files, disables macOS idle poll skipping, and risks Apple Git \
+                 fsmonitor--daemon IPC deadlocks for external /usr/bin/git tools (GitPulse \
+                 bypasses it on its own reads; unset it with `git config --local --unset \
+                 core.fsmonitor`)."
+                    .to_string(),
+            );
+        } else {
+            out.push(
+                "core.fsmonitor=true risks Apple Git fsmonitor--daemon IPC deadlocks under \
+                 FSEvents pressure when external /usr/bin/git callers share the repository \
+                 (GitPulse disables core.fsmonitor on its own reads)."
+                    .to_string(),
+            );
+        }
     }
     out
 }
@@ -624,6 +654,14 @@ pub fn plan_apply(
         match change {
             TuningChange::UntrackedCache => would_set.push("core.untrackedcache"),
             TuningChange::Fsmonitor => {
+                if env.is_apple_git {
+                    return Err(
+                        "core.fsmonitor=true is refused on Apple Git: its fsmonitor--daemon \
+                         lacks a cookie-wait timeout and deadlocks indefinitely under FSEvents \
+                         pressure"
+                            .to_string(),
+                    );
+                }
                 if !env.at_least(FSMONITOR_BOOLEAN_MIN_GIT) {
                     return Err(format!(
                         "core.fsmonitor=true needs git {}.{}.{} or newer: older git reads the \

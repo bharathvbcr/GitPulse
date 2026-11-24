@@ -530,6 +530,7 @@ pub(crate) mod hermetic {
     /// Unix the root is made `0700` and checked to be ours before anything
     /// (git config, `HOME`) is placed under it.
     fn create_private_root(root: &Path) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

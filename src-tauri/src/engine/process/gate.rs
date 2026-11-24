@@ -552,6 +552,27 @@ pub(crate) fn background_deferral_cause() -> Option<&'static str> {
     }
 }
 
+/// Applies the spawn gate's host-load shedding verdict to an in-process read
+/// before it starts work, keeping `sysload::shed` single-owned in
+/// [`pressure_refusal`].
+pub(crate) fn check_in_process_admission(label: &str) -> Result<(), CommandError> {
+    #[cfg(test)]
+    if super::runner::forced_deferral_active() {
+        return Err(refusal_message(label, Refusal::Shed));
+    }
+    let class = current_admission();
+    if let Some(refusal) = pressure_refusal(class) {
+        spawn_gate()
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters[class.index()]
+        .count(refusal);
+        return Err(refusal_message_at(label, refusal, None));
+    }
+    Ok(())
+}
+
 /// Applies only inside a synchronous blocking operation.
 pub(crate) fn with_background_processes<T>(body: impl FnOnce() -> T) -> T {
     with_admission(Admission::Background, body)

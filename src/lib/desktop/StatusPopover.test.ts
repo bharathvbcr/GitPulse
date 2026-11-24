@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import StatusPopover from "./StatusPopover.svelte";
+import { sendableMenuState } from "./menuContract";
 import { statusFixture } from "../../../harness/statusFixtures";
 
 const source = readFileSync(
@@ -205,5 +206,126 @@ describe("reduced transparency in the status popover", () => {
 
   it("does not react to the unknown state", () => {
     expect(styles).not.toContain('data-transparency="unknown"');
+  });
+});
+
+describe("status popover logo and agent requests overhaul", () => {
+  it("replaces legacy Activity icons with the current GitPulse Logo badge", () => {
+    expect(source).toContain('import Logo from "../components/Logo.svelte"');
+    expect(source).toContain("<Logo ");
+    expect(source).not.toContain("Activity");
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("changes"), onaction: () => {} } });
+    expect(body).toContain('aria-label="GitPulse"');
+    const empty = render(StatusPopover, { props: { snapshot: null, onaction: () => {} } }).body;
+    expect(empty).toContain('aria-label="GitPulse"');
+  });
+
+  it("renders waiting agent requests above the fold with blocking vs error distinction and overflow link", () => {
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("agents waiting"), onaction: () => {} } });
+    const reqIdx = body.indexOf('data-testid="status-agent-requests"');
+    const metricsIdx = body.indexOf('aria-label="Working tree counts"');
+    expect(reqIdx).toBeGreaterThan(-1);
+    expect(metricsIdx).toBeGreaterThan(reqIdx);
+    expect(body).toContain("5 waiting for action");
+    expect(body).toContain('data-urgency="blocking"');
+    expect(body).toContain('data-urgency="error"');
+    expect(body).toContain('data-tone="warn"');
+    expect(body).toContain('data-tone="danger"');
+    expect(body).toContain('data-launcher-icon="claude"');
+    expect(body).toContain('data-launcher-icon="agy"');
+    expect(body).toContain('data-launcher-icon="codex"');
+    expect(body).toContain("Allow git push to origin/main");
+    expect(body).toContain("<time");
+    expect(body).toContain("+2 more in Agents");
+    expect(body).not.toContain('data-testid="status-agent-quiet"');
+  });
+
+  it("renders the quiet agent strip when running or informational notices exist with zero waiting", () => {
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("agents quiet"), onaction: () => {} } });
+    expect(body).not.toContain('data-testid="status-agent-requests"');
+    expect(body).toContain('data-testid="status-agent-quiet"');
+    expect(body).toContain("1 notice");
+    expect(body).toContain("2 running · none waiting");
+    expect(body).toContain('data-tone="info"');
+  });
+
+  it("surfaces waiting agent requests even when no repository is open", () => {
+    const { body } = render(StatusPopover, { props: { snapshot: statusFixture("agents empty"), onaction: () => {} } });
+    expect(body).toContain('data-testid="status-agent-requests"');
+    expect(body).toContain("Claude Code");
+    expect(body).toContain("Open repository");
+    expect(body).not.toContain('aria-label="Working tree counts"');
+  });
+
+  it("renders <time> safely without throwing RangeError when atMs exceeds Date bounds", () => {
+    const base = statusFixture("agents waiting");
+    const snapshot = {
+      ...base,
+      agentRequests: [
+        {
+          ...base.agentRequests[0],
+          id: "term:huge-at",
+          atMs: 8_700_000_000_000_000,
+        },
+      ],
+    };
+    const { body } = render(StatusPopover, { props: { snapshot, onaction: () => {} } });
+    expect(body).toContain("<time");
+    expect(body).not.toContain('datetime="');
+  });
+
+  it("never renders 'none waiting' or 'No actions waiting' when agentsWaiting > 0 and agentRequests was stripped by repair", () => {
+    const base = statusFixture("agents waiting");
+    const broken = {
+      ...base,
+      agentsWaiting: 2,
+      agentRequests: [
+        {
+          id: "\u0000",
+          source: "terminal" as const,
+          provider: "claude" as const,
+          agentLabel: "Claude",
+          repoLabel: "a",
+          repoPath: "/r/a",
+          urgency: "blocking" as const,
+          reason: "Waiting",
+          detail: null,
+          atMs: 1000,
+        },
+      ],
+      agentRequestsHidden: 0,
+      agentsRunning: 1,
+      agentsInformational: 1,
+    };
+    const { state } = sendableMenuState(broken);
+    const { body } = render(StatusPopover, { props: { snapshot: state, onaction: () => {} } });
+    expect(body).not.toContain("none waiting");
+    expect(body).not.toContain("No actions waiting");
+    expect(body).toContain('data-testid="status-agent-requests"');
+    expect(body).toContain('data-testid="status-agent-fallback"');
+    expect(body).toContain("2 waiting for action");
+  });
+
+  it("renders request rows cleanly when optional repoLabel, atMs, and detail are absent", () => {
+    const base = statusFixture("agents waiting");
+    const snapshot = {
+      ...base,
+      agentsWaiting: 1,
+      agentRequestsHidden: 0,
+      agentRequests: [
+        {
+          ...base.agentRequests[0],
+          id: "term:minimal",
+          repoLabel: "",
+          repoPath: null,
+          atMs: null,
+          detail: null,
+        },
+      ],
+    };
+    const { body } = render(StatusPopover, { props: { snapshot, onaction: () => {} } });
+    expect(body).toContain('data-request-id="term:minimal"');
+    expect(body).not.toContain('class="request-age"');
+    expect(body).not.toContain('class="request-detail"');
   });
 });

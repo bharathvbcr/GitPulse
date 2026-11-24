@@ -488,22 +488,26 @@ mod tests {
         let (_keep, dir) = profile_dir();
         let profile = dir.join("workbench.sqlite");
         let (_repo_keep, repo) = repo();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(
             dir.join("workbench.sqlite"),
             dir.join("workbench.sqlite.link.bak"),
         )
         .unwrap();
         fs::create_dir(dir.join("workbench.sqlite.dir.bak")).unwrap();
-        for target in [
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut targets = vec![
             "backup:workbench.sqlite",
             "backup:other.sqlite.pre-schema-11.bak",
             "backup:workbench.sqlite.pre-schema-12.bak.partial",
             "backup:../workbench.sqlite.pre-schema-11.bak",
-            "backup:workbench.sqlite.link.bak",
             "backup:workbench.sqlite.dir.bak",
             "backup:workbench.sqlite.gone.bak",
             "backup:",
-        ] {
+        ];
+        #[cfg(unix)]
+        targets.push("backup:workbench.sqlite.link.bak");
+        for target in targets {
             assert!(
                 prepare_with_profile(
                     repo.to_str().unwrap(),
@@ -564,6 +568,7 @@ mod tests {
         assert!(dir.join("workbench.sqlite").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_directory_a_fifo_and_a_symlink_named_like_a_backup_are_refused_and_untouched() {
         let (_keep, dir) = profile_dir();
@@ -631,6 +636,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_backup_swapped_for_a_symlink_to_the_live_profile_between_preview_and_execute_is_refused() {
         let _serial = crate::storage::hygiene::tests::serial();
@@ -666,6 +672,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_swap_to_a_symlink_inside_the_policy_gate_never_reaches_the_live_profile() {
         let _serial = crate::storage::hygiene::tests::serial();
@@ -701,6 +708,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&profile).unwrap(), "live profile");
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_refuses_a_symlink_and_never_touches_the_file_it_points_at() {
         let (_keep, dir) = profile_dir();
@@ -744,6 +752,7 @@ mod tests {
             .all(|r| r.error.is_none() && r.confirm_only));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_profile_directory_is_an_error_row_and_a_missing_one_is_empty() {
         use std::os::unix::fs::PermissionsExt;
@@ -768,6 +777,7 @@ mod tests {
         assert!(entries(Ok(&gone)).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_profile_directory_reached_through_a_symlink_lists_and_still_refuses_traversal() {
         let (_keep, dir) = profile_dir();
@@ -901,6 +911,7 @@ mod tests {
         assert!(exists && live, "{text}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn adv_confirm_open_then_swapped_for_symlink_to_live_profile_is_refused() {
         let _serial = crate::storage::hygiene::tests::serial();

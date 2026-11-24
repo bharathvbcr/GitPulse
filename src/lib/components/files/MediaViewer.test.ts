@@ -60,6 +60,58 @@ describe("MediaViewer", () => {
     expect(source).toContain("Decoded ASCII");
   });
 
+  it("delegates HTML files to lazy HtmlPreviewViewer with full draft and reveal props", () => {
+    expect(source).toContain("isHtmlFile");
+    expect(source).toMatch(
+      /const loadHtmlPreviewViewer = \(\) => import\("\.\/HtmlPreviewViewer\.svelte"\)/,
+    );
+    expect(source).toContain("load={loadHtmlPreviewViewer}");
+    const bag = source.slice(source.indexOf("load={loadHtmlPreviewViewer}"));
+    const props = bag.slice(0, bag.indexOf("/>"));
+    for (const prop of [
+      "filePath",
+      "blob",
+      "repoPathOverride: effectiveRepoPath",
+      "draftContent",
+      "dirty",
+      "onSave",
+      "onDraftChange",
+      "onRequestDiscard",
+      "revealTarget",
+      "onSendSelectionToAgent",
+    ]) {
+      expect(props).toContain(prop);
+    }
+  });
+
+  it("delegates SVG files to lazy SvgPreviewViewer before generic raster images with full draft and reveal props", () => {
+    expect(source).toContain("isSvgFile");
+    expect(source).toMatch(
+      /const loadSvgPreviewViewer = \(\) => import\("\.\/SvgPreviewViewer\.svelte"\)/,
+    );
+    expect(source).toContain("load={loadSvgPreviewViewer}");
+    const svgIdx = source.indexOf("{#if isSvg}");
+    const imageIdx = source.indexOf("{:else if blob.is_image}");
+    expect(svgIdx).toBeGreaterThan(-1);
+    expect(imageIdx).toBeGreaterThan(svgIdx);
+    const bag = source.slice(source.indexOf("load={loadSvgPreviewViewer}"));
+    const props = bag.slice(0, bag.indexOf("/>"));
+    for (const prop of [
+      "filePath",
+      "blob",
+      "repoPathOverride: effectiveRepoPath",
+      "draftContent",
+      "dirty",
+      "onSave",
+      "onDraftChange",
+      "onRequestDiscard",
+      "revealTarget",
+      "onSendSelectionToAgent",
+    ]) {
+      expect(props).toContain(prop);
+    }
+  });
+
   it("opens through the validated shell gate, not the opener plugin", () => {
     expect(source).toContain("openInDefaultApp");
     expect(source).not.toContain("@tauri-apps/plugin-opener");

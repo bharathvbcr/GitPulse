@@ -8382,14 +8382,9 @@ mod tests {
     }
 
     /// Installs an executable `name` hook in `dir`'s default hooks directory.
-    #[cfg(unix)]
     fn install_hook(dir: &std::path::Path, name: &str, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        let hooks = dir.join(".git/hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        let path = hooks.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join(".git/hooks").join(name);
+        crate::test_support::write_git_script(&path, &format!("#!/bin/sh\n{body}\n"), true);
     }
 
     fn head_oid(dir: &tempfile::TempDir) -> String {
@@ -8401,7 +8396,6 @@ mod tests {
 
     /// A hook that outlives the hook budget is stopped, and the error names
     /// the hook rather than calling it a git hang.
-    #[cfg(unix)]
     #[test]
     fn a_hook_past_its_budget_is_named_in_the_timeout() {
         let dir = init_repo_with_commit();
@@ -8441,7 +8435,6 @@ mod tests {
 
     /// The user can stop a slow hook from the UI; the commit does not land
     /// and the hook's process goes with git's.
-    #[cfg(unix)]
     #[test]
     fn a_running_hook_is_cancelled_on_request() {
         let dir = init_repo_with_commit();
@@ -8449,7 +8442,7 @@ mod tests {
         install_hook(
             dir.path(),
             "pre-commit",
-            &format!("touch '{}'\nsleep 30", marker.display()),
+            &format!("touch {}\nsleep 30", crate::test_support::sh_quote(&marker)),
         );
         std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
         git_in(dir.path(), &["add", "tracked.txt"]);

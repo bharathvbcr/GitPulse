@@ -1297,3 +1297,601 @@ fn osc7501_idle_and_working_clear_standing_attention() {
         "clear"
     );
 }
+
+#[test]
+fn idle_prompt_never_clobbers_blocking_standing_or_desyncs_pending_banner() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    // Deliver `agent_completed` at t0 to open the 5s COALESCE window, then offer
+    // `permission_prompt` (held in `pending`) followed by `idle_prompt`.
+    driver.tick(
+        Some(hook("term-1", "agent_completed", Some("turn 1"))),
+        start,
+    );
+    driver.tick(
+        Some(hook("term-1", "permission_prompt", Some("Bash: rm -rf"))),
+        start + Duration::from_millis(100),
+    );
+    driver.tick(
+        Some(hook("term-1", "idle_prompt", Some("Waiting for prompt"))),
+        start + Duration::from_millis(200),
+    );
+
+    let standing = driver.tracked["term-1"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.event, Some("permission_prompt"));
+    assert_eq!(standing.attention.urgency, "blocking");
+    assert_eq!(standing.attention.detail.as_deref(), Some("Bash: rm -rf"));
+
+    let hub = driver.tracked["term-1"].hub_state.as_ref().unwrap();
+    assert_eq!(hub.state, "blocked");
+    assert_eq!(hub.event, Some("permission_prompt"));
+
+    let pending = driver.tracked["term-1"].pending.as_ref().unwrap();
+    assert_eq!(pending.event, Some("permission_prompt"));
+    assert_eq!(pending.detail.as_deref(), Some("Bash: rm -rf"));
+
+    // After ANNOUNCE_GAP and COALESCE, both announcement and banner agree.
+    driver.tick(None, start + COALESCE + Duration::from_millis(50));
+    let said = driver.recorder.announcements();
+    assert_eq!(said.len(), 2);
+    assert_eq!(said[1].event, Some("permission_prompt"));
+    assert_eq!(said[1].urgency, "blocking");
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work — turn 1".to_string(),
+            "needs your permission — Bash: rm -rf".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn idle_prompt_never_clobbers_error_standing_and_hub_maps_error_to_blocked() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    driver.tick(Some(hook("term-err", "error", Some("API 500"))), start);
+    driver.tick(
+        Some(hook("term-err", "idle_prompt", Some("Idle"))),
+        start + Duration::from_millis(100),
+    );
+
+    let standing = driver.tracked["term-err"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.event, Some("error"));
+    assert_eq!(standing.attention.urgency, "error");
+    assert_eq!(standing.attention.detail.as_deref(), Some("API 500"));
+
+    let hub = driver.tracked["term-err"].hub_state.as_ref().unwrap();
+    assert_eq!(hub.state, "blocked");
+    assert_eq!(hub.event, Some("error"));
+}
+
+#[test]
+fn osc7501_blocking_is_protected_against_bare_bell_osc9_and_ttl_prune() {
+    for detail in [None, Some("Approve tool")] {
+        let mut driver = Driver::new();
+        let start = Instant::now();
+        let mut blocked = hook("term-osc", scan::HerdrState::Blocked.bridge_event(), detail);
+        blocked.origin = Origin::Terminal;
+        blocked.channel = "osc7501";
+        driver.tick(Some(blocked), start);
+
+        // Bare BEL after `osc7501:Blocked` (both with and without `detail`) restates
+        // without overwriting `osc7501` `agent_needs_input` / `"blocking"`.
+        driver.tick(Some(notice("term-osc")), start + Duration::from_millis(100));
+        let standing = driver.tracked["term-osc"].standing.as_ref().unwrap();
+        assert_eq!(standing.attention.channel, "osc7501");
+        assert_eq!(standing.attention.event, Some("agent_needs_input"));
+        assert_eq!(standing.attention.urgency, "blocking");
+        assert_eq!(standing.attention.detail.as_deref(), detail);
+
+        // Informational `OSC 9` never overwrites `osc7501:Blocked`.
+        driver.tick(
+            Some(osc("term-osc", "osc9", "Tests passed")),
+            start + Duration::from_millis(200),
+        );
+        let standing = driver.tracked["term-osc"].standing.as_ref().unwrap();
+        assert_eq!(standing.attention.channel, "osc7501");
+        assert_eq!(standing.attention.event, Some("agent_needs_input"));
+        assert_eq!(standing.attention.urgency, "blocking");
+        assert_eq!(standing.attention.detail.as_deref(), detail);
+
+        // `osc7501` Blocking standing also survives pruning past TRACK_TTL.
+        driver.tick(None, start + TRACK_TTL * 2);
+        assert!(driver.tracked.contains_key("term-osc"));
+    }
+}
+
+#[test]
+fn mixed_is_agent_osc7501_blocked_and_shell_bell_delivers_blocking_banner() {
+    // Simulates `terminal/mod.rs:1884, 1927`: `OSC 7501` arrives with
+    // `is_agent: true` while a `/bin/zsh` tab's bare `BEL` arrives with
+    // `is_agent: false`.
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    let mut done = hook(
+        "term-mix",
+        scan::HerdrState::Done.bridge_event(),
+        Some("step 1"),
+    );
+    done.origin = Origin::Terminal;
+    done.channel = "osc7501";
+    driver.tick(Some(done), start);
+
+    let mut blocked = hook(
+        "term-mix",
+        scan::HerdrState::Blocked.bridge_event(),
+        Some("Approve"),
+    );
+    blocked.origin = Origin::Terminal;
+    blocked.channel = "osc7501";
+    driver.tick(Some(blocked), start + Duration::from_millis(100));
+
+    let mut shell_bell = notice("term-mix");
+    shell_bell.is_agent = false;
+    driver.tick(Some(shell_bell), start + Duration::from_millis(200));
+
+    let pending = driver.tracked["term-mix"].pending.as_ref().unwrap();
+    assert_eq!(pending.channel, "osc7501");
+    assert_eq!(pending.event, Some("agent_needs_input"));
+
+    let standing = driver.tracked["term-mix"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.channel, "osc7501");
+    assert_eq!(standing.attention.event, Some("agent_needs_input"));
+    assert_eq!(standing.attention.urgency, "blocking");
+    assert_eq!(standing.attention.detail.as_deref(), Some("Approve"));
+
+    driver.tick(None, start + COALESCE + Duration::from_millis(50));
+    let standing = driver.tracked["term-mix"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.channel, "osc7501");
+    assert_eq!(standing.attention.event, Some("agent_needs_input"));
+    assert_eq!(standing.attention.urgency, "blocking");
+    assert_eq!(standing.attention.detail.as_deref(), Some("Approve"));
+    let hub = driver.tracked["term-mix"].hub_state.as_ref().unwrap();
+    assert_eq!(hub.state, "blocked");
+    assert_eq!(hub.event, Some("agent_needs_input"));
+    assert_eq!(driver.counter(Verdict::NotAnAgent), 0);
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work — step 1".to_string(),
+            "needs your input — Approve".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn shell_bell_after_hook_shadow_and_non_agent_osc_preserve_agent_banner() {
+    // 1. Hook `permission_prompt` (`is_agent: true`) followed by shell `BEL`
+    //    (`is_agent: false`) past `HOOK_SHADOW` restates with `is_agent: true`.
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(
+        Some(hook("term-hook", "permission_prompt", Some("Bash: ls"))),
+        start,
+    );
+
+    let mut shell_bell = notice("term-hook");
+    shell_bell.is_agent = false;
+    driver.tick(
+        Some(shell_bell),
+        start + HOOK_SHADOW + Duration::from_secs(1),
+    );
+    driver.tick(
+        None,
+        start + HOOK_SHADOW + Duration::from_secs(1) + HOOK_GRACE + Duration::from_millis(50),
+    );
+    assert_eq!(driver.counter(Verdict::NotAnAgent), 0);
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "needs your permission — Bash: ls".to_string(),
+            "needs your permission — Bash: ls".to_string(),
+        ]
+    );
+
+    // 2. Non-standing `hook-*` pending `is_agent: true` banner cannot be
+    //    displaced by a `!is_agent` terminal signal.
+    let mut ext_driver = Driver::new();
+    ext_driver.tick(
+        Some(hook("hook-claude-ext", "agent_completed", Some("t1"))),
+        start,
+    );
+    ext_driver.tick(
+        Some(hook(
+            "hook-claude-ext",
+            "permission_prompt",
+            Some("Bash: ls"),
+        )),
+        start + Duration::from_millis(100),
+    );
+    let mut non_agent_osc = osc("hook-claude-ext", "osc9", "shell chime");
+    non_agent_osc.is_agent = false;
+    ext_driver.tick(Some(non_agent_osc), start + Duration::from_millis(200));
+    ext_driver.tick(None, start + COALESCE + Duration::from_millis(50));
+    assert_eq!(ext_driver.counter(Verdict::NotAnAgent), 0);
+    assert_eq!(
+        ext_driver.recorder.bodies(),
+        vec![
+            "finished its work — t1".to_string(),
+            "needs your permission — Bash: ls".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn post_session_ended_shell_bell_is_suppressed_and_never_resurrects_hub_state() {
+    let ended = |key: &str| {
+        let mut n = hook(key, "session_ended", None);
+        n.origin = Origin::Terminal;
+        n.channel = "exit";
+        n
+    };
+
+    for (last, detail, expected_initial_banners) in [
+        ("agent_completed", Some("done"), 1usize),
+        ("turn_finished", None, 0usize),
+        ("error", Some("API 500"), 1usize),
+    ] {
+        let mut driver = Driver::new();
+        let start = Instant::now();
+        driver.tick(Some(hook("term-1", last, detail)), start);
+        assert_eq!(driver.recorder.count(), expected_initial_banners, "{last}");
+
+        driver.tick(Some(ended("term-1")), start + Duration::from_secs(1));
+        assert!(
+            driver.tracked["term-1"].hub_state.is_none(),
+            "{last}: session_ended must clear hub_state"
+        );
+
+        // Inside HOOK_SHADOW: coalesced, hub_state remains None.
+        let mut early_bell = notice("term-1");
+        early_bell.is_agent = false;
+        driver.tick(Some(early_bell), start + Duration::from_secs(2));
+        assert!(
+            driver.tracked["term-1"].hub_state.is_none(),
+            "{last}: early shell bell must not resurrect hub_state"
+        );
+
+        // Past HOOK_SHADOW + HOOK_GRACE: suppressed as NotAnAgent, zero banners, hub_state None.
+        let later = start + HOOK_SHADOW + Duration::from_secs(5);
+        let mut shell_bell = notice("term-1");
+        shell_bell.is_agent = false;
+        driver.tick(Some(shell_bell), later);
+        driver.tick(None, later + HOOK_GRACE + Duration::from_millis(50));
+
+        assert_eq!(
+            driver.counter(Verdict::NotAnAgent),
+            1,
+            "{last}: post-session_ended shell BEL must be suppressed as NotAnAgent"
+        );
+        assert_eq!(
+            driver.recorder.count(),
+            expected_initial_banners,
+            "{last}: post-session_ended shell BEL must not deliver a banner"
+        );
+        assert!(
+            driver.tracked["term-1"].hub_state.is_none(),
+            "{last}: post-session_ended shell BEL must not resurrect hub_state"
+        );
+    }
+
+    // Also verify osc7501:Error + session_ended + shell BEL.
+    let mut osc_driver = Driver::new();
+    let start = Instant::now();
+    let mut osc_err = hook(
+        "term-osc-err",
+        scan::HerdrState::Error.bridge_event(),
+        Some("exit 1"),
+    );
+    osc_err.origin = Origin::Terminal;
+    osc_err.channel = "osc7501";
+    osc_driver.tick(Some(osc_err), start);
+    assert_eq!(osc_driver.recorder.count(), 1);
+    osc_driver.tick(Some(ended("term-osc-err")), start + Duration::from_secs(1));
+    assert!(osc_driver.tracked["term-osc-err"].hub_state.is_none());
+
+    let later = start + HOOK_SHADOW + Duration::from_secs(5);
+    let mut shell_bell = notice("term-osc-err");
+    shell_bell.is_agent = false;
+    osc_driver.tick(Some(shell_bell), later);
+    osc_driver.tick(None, later + HOOK_GRACE + Duration::from_millis(50));
+
+    assert_eq!(osc_driver.counter(Verdict::NotAnAgent), 1);
+    assert_eq!(osc_driver.recorder.count(), 1);
+    assert!(osc_driver.tracked["term-osc-err"].hub_state.is_none());
+}
+
+#[test]
+fn post_informational_standing_shell_bell_is_suppressed_as_not_an_agent() {
+    // 1. osc7501:Done followed by shell BEL (`is_agent: false`) past HOOK_SHADOW + HOOK_GRACE.
+    let mut osc_driver = Driver::new();
+    let start = Instant::now();
+    let mut done = hook(
+        "term-osc-done",
+        scan::HerdrState::Done.bridge_event(),
+        Some("step 1"),
+    );
+    done.origin = Origin::Terminal;
+    done.channel = "osc7501";
+    osc_driver.tick(Some(done), start);
+    assert_eq!(osc_driver.recorder.count(), 1);
+
+    let later = start + HOOK_SHADOW + Duration::from_secs(5);
+    let mut shell_bell = notice("term-osc-done");
+    shell_bell.is_agent = false;
+    osc_driver.tick(Some(shell_bell), later);
+    osc_driver.tick(None, later + HOOK_GRACE + Duration::from_millis(50));
+
+    assert_eq!(osc_driver.counter(Verdict::NotAnAgent), 1);
+    assert_eq!(osc_driver.recorder.count(), 1);
+
+    // 2. Hook agent_completed followed by shell BEL (`is_agent: false`) past HOOK_SHADOW + HOOK_GRACE.
+    let mut hook_driver = Driver::new();
+    hook_driver.tick(
+        Some(hook("term-done", "agent_completed", Some("finished"))),
+        start,
+    );
+    assert_eq!(hook_driver.recorder.count(), 1);
+
+    let mut shell_bell = notice("term-done");
+    shell_bell.is_agent = false;
+    hook_driver.tick(Some(shell_bell), later);
+    hook_driver.tick(None, later + HOOK_GRACE + Duration::from_millis(50));
+
+    assert_eq!(hook_driver.counter(Verdict::NotAnAgent), 1);
+    assert_eq!(hook_driver.recorder.count(), 1);
+
+    // 3. Hook turn_finished followed by shell BEL (`is_agent: false`) past HOOK_SHADOW + HOOK_GRACE.
+    let mut turn_driver = Driver::new();
+    turn_driver.tick(Some(hook("term-turn", "turn_finished", None)), start);
+    assert_eq!(turn_driver.recorder.count(), 0);
+
+    let mut shell_bell = notice("term-turn");
+    shell_bell.is_agent = false;
+    turn_driver.tick(Some(shell_bell), later);
+    turn_driver.tick(None, later + HOOK_GRACE + Duration::from_millis(50));
+
+    assert_eq!(turn_driver.counter(Verdict::NotAnAgent), 1);
+    assert_eq!(turn_driver.recorder.count(), 0);
+}
+
+#[test]
+fn shell_bell_after_delivered_osc7501_blocked_restates_blocking_banner() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    let mut blocked = hook(
+        "term-osc-blk",
+        scan::HerdrState::Blocked.bridge_event(),
+        Some("Approve"),
+    );
+    blocked.origin = Origin::Terminal;
+    blocked.channel = "osc7501";
+    driver.tick(Some(blocked), start);
+    assert_eq!(driver.recorder.count(), 1);
+    assert!(driver.tracked["term-osc-blk"].pending.is_none());
+
+    let later = start + COALESCE + Duration::from_secs(1);
+    let mut shell_bell = notice("term-osc-blk");
+    shell_bell.is_agent = false;
+    driver.tick(Some(shell_bell), later);
+    assert_eq!(driver.counter(Verdict::NotAnAgent), 0);
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "needs your input — Approve".to_string(),
+            "needs your input — Approve".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn permission_request_without_plugin_allows_bare_bell_after_hook_grace() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    // Claude injected --settings sends PermissionRequest (Role::State) without
+    // Notification(permission_prompt) when the plugin is disabled.
+    driver.tick(
+        Some(tool("term-1", "permission_request", "Bash:rm", false)),
+        start,
+    );
+    // Claude rings BEL 50 ms later (inside HOOK_SHADOW = 10s).
+    driver.tick(Some(notice("term-1")), start + Duration::from_millis(50));
+
+    // Must wait out HOOK_GRACE (1500ms) for a plugin Notification, then deliver
+    // the restated blocking banner when none arrives.
+    driver.tick(None, start + HOOK_GRACE + Duration::from_millis(100));
+    assert_eq!(
+        driver.recorder.count(),
+        1,
+        "bare BEL after Role::State must deliver a banner"
+    );
+    assert_eq!(driver.standing(), Some("permission_request"));
+}
+
+#[test]
+fn turn_finished_state_does_not_cancel_pending_error_banner_or_overwrite_error_standing() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    // Arm COALESCE window so the subsequent Error notice sits in entry.pending.
+    driver.tick(
+        Some(hook("term-err", "agent_completed", Some("Prior"))),
+        start,
+    );
+    driver.tick(
+        Some(hook("term-err", "error", Some("StopFailure 429"))),
+        start + Duration::from_millis(80),
+    );
+    // Late or concurrent turn_finished arrives while Error is pending/standing.
+    driver.tick(
+        Some(hook("term-err", "turn_finished", Some("Done"))),
+        start + Duration::from_millis(160),
+    );
+    driver.tick(None, start + COALESCE + Duration::from_millis(200));
+
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work — Prior".to_string(),
+            "stopped on an error — StopFailure 429".to_string(),
+        ],
+        "pending Error banner must not be cancelled by Role::State turn_finished"
+    );
+    let standing = driver.tracked["term-err"].standing.as_ref().unwrap();
+    assert_eq!(standing.attention.event, Some("error"));
+    assert_eq!(standing.attention.urgency, "error");
+}
+
+#[test]
+fn subagent_turn_finished_does_not_cancel_pending_blocking_permission_prompt() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    // Arm COALESCE window, then enqueue parent's Blocking permission_prompt.
+    driver.tick(
+        Some(hook("term-1", "agent_completed", Some("Earlier"))),
+        start,
+    );
+    driver.tick(
+        Some(hook(
+            "term-1",
+            "permission_prompt",
+            Some("Allow Bash: rm -rf"),
+        )),
+        start + Duration::from_millis(20),
+    );
+    // Background subagent finishes its turn while parent's Blocking prompt is pending.
+    let mut sub_stop = hook("term-1", "turn_finished", Some("Subagent done"));
+    sub_stop.subagent = true;
+    sub_stop.agent_id = Some("subagent-worker-1".to_string());
+    driver.tick(Some(sub_stop), start + Duration::from_millis(40));
+
+    driver.tick(None, start + COALESCE + Duration::from_millis(100));
+
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work — Earlier".to_string(),
+            "needs your permission — Allow Bash: rm -rf".to_string(),
+        ],
+        "subagent turn_finished must not cancel parent's pending Blocking permission_prompt"
+    );
+    assert_eq!(driver.standing(), Some("permission_prompt"));
+}
+
+#[test]
+fn subagent_turn_finished_does_not_overwrite_standing_blocking_permission_request() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
+    assert_eq!(driver.standing(), Some("permission_request"));
+
+    let mut sub_stop = hook("term-1", "turn_finished", Some("Subagent done"));
+    sub_stop.subagent = true;
+    sub_stop.agent_id = Some("subagent-worker-1".to_string());
+    driver.tick(Some(sub_stop), start + Duration::from_millis(250));
+
+    assert_eq!(
+        driver.standing(),
+        Some("permission_request"),
+        "subagent turn_finished must not overwrite parent's standing Blocking permission_request"
+    );
+    assert_eq!(
+        driver.tracked["term-1"].hub_state.as_ref().map(|h| h.state),
+        Some("blocked")
+    );
+}
+
+#[test]
+fn subagent_agent_completed_does_not_mark_working_parent_finished() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    driver.tick(Some(tool("term-1", "tool_finished", "aa", false)), start);
+    let mut sub_done = hook("term-1", "agent_completed", Some("Subagent done"));
+    sub_done.subagent = true;
+    sub_done.agent_id = Some("subagent-worker-1".to_string());
+    driver.tick(Some(sub_done), start + Duration::from_millis(50));
+
+    driver.tick(None, start + COALESCE + Duration::from_millis(200));
+
+    assert_eq!(driver.recorder.count(), 0);
+    assert_eq!(driver.standing(), None);
+    assert_eq!(
+        driver.tracked["term-1"].hub_state.as_ref().map(|h| h.state),
+        Some("working")
+    );
+}
+
+#[test]
+fn subagent_prompt_submitted_and_session_ended_do_not_clear_parent_blocking_state() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+
+    // Arm COALESCE window so parent's Blocking permission_prompt is held pending & standing.
+    driver.tick(
+        Some(hook("term-1", "agent_completed", Some("Earlier"))),
+        start,
+    );
+    driver.tick(
+        Some(hook(
+            "term-1",
+            "permission_prompt",
+            Some("Allow Bash: deploy"),
+        )),
+        start + Duration::from_millis(20),
+    );
+
+    let mut sub_prompt = hook("term-1", "prompt_submitted", None);
+    sub_prompt.subagent = true;
+    sub_prompt.agent_id = Some("subagent-worker-1".to_string());
+    driver.tick(Some(sub_prompt), start + Duration::from_millis(30));
+
+    let mut sub_end = hook("term-1", "session_ended", None);
+    sub_end.subagent = true;
+    sub_end.agent_id = Some("subagent-worker-1".to_string());
+    driver.tick(Some(sub_end), start + Duration::from_millis(40));
+
+    driver.tick(None, start + COALESCE + Duration::from_millis(100));
+
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work — Earlier".to_string(),
+            "needs your permission — Allow Bash: deploy".to_string(),
+        ]
+    );
+    assert_eq!(driver.standing(), Some("permission_prompt"));
+    assert_eq!(
+        driver.tracked["term-1"].hub_state.as_ref().map(|h| h.state),
+        Some("blocked")
+    );
+
+    // Blocking subagent permission prompts remain admitted and delivered.
+    let mut sub_perm = hook("term-sub-5", "permission_prompt", Some("Allow Read"));
+    sub_perm.subagent = true;
+    sub_perm.agent_id = Some("subagent-worker-2".to_string());
+    driver.tick(
+        Some(sub_perm),
+        start + COALESCE + Duration::from_millis(200),
+    );
+    assert_eq!(
+        driver.recorder.bodies().last().map(String::as_str),
+        Some("needs your permission — Allow Read")
+    );
+    assert_eq!(
+        driver.tracked["term-sub-5"]
+            .hub_state
+            .as_ref()
+            .map(|h| h.state),
+        Some("blocked")
+    );
+}

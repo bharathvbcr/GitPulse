@@ -244,11 +244,58 @@ pub(crate) fn repository_status_readonly(
     repo_path: &str,
 ) -> Result<super::LedgerStatus, LedgerError> {
     let family = resolve_address(repo_path, repo_path)?;
-    Ok(readonly_status_of(&family))
+    Ok(readonly_status_of(&family, Some(repo_path)))
 }
 
-fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
+/// Read-only freshness of `repo_path`'s ledger scoped to the currently active
+/// members of its authenticated worktree family.
+pub(crate) fn repository_freshness_readonly(
+    repo_path: &str,
+) -> Result<super::Freshness, LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    let keys = family_member_keys(&family, Some(repo_path));
+    if keys.is_empty() {
+        Ok(super::freshness_readonly(&family.address.anchor))
+    } else {
+        Ok(super::freshness::freshness_readonly_for_members(
+            &family.address.anchor,
+            &keys,
+        ))
+    }
+}
+
+fn family_member_keys(
+    family: &FamilyAddress,
+    raw_repo_path: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let mut keys: std::collections::HashSet<String> = family
+        .members
+        .iter()
+        .map(|member| super::transcript_key(member))
+        .collect();
+    if !keys.is_empty() {
+        keys.insert(super::transcript_key(std::path::Path::new(
+            &family.address.anchor,
+        )));
+        keys.insert(super::transcript_key(std::path::Path::new(
+            &family.address.worktree,
+        )));
+        if let Some(raw) = raw_repo_path {
+            keys.insert(super::transcript_key(std::path::Path::new(raw)));
+        }
+    }
+    keys
+}
+
+fn readonly_status_of(family: &FamilyAddress, raw_repo_path: Option<&str>) -> super::LedgerStatus {
     let mut status = super::status_readonly(&family.address.anchor);
+    if status.recording_state == super::STATE_READABLE {
+        let keys = family_member_keys(family, raw_repo_path);
+        if !keys.is_empty() {
+            status.freshness =
+                super::freshness::freshness_readonly_for_members(&family.address.anchor, &keys);
+        }
+    }
     // A repository whose siblings still carry pre-consolidation ledgers has
     // rows this read cannot see. Saying so beats silently under-reporting, and
     // beats running the migration from a read to make the number right.

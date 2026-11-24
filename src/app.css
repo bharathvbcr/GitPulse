@@ -3174,12 +3174,14 @@ html.light .gp-markdown {
   --c-pop-text: 32 36 44;
   --c-pop-muted-solid: 99 108 121;
   --c-pop-muted-glass: 66 76 91;
-  --c-pop-blue-solid: 37 99 235;
+  --c-pop-blue-solid: 29 85 220;
   --c-pop-blue-glass: 23 76 176;
-  --c-pop-green-solid: 28 125 78;
+  --c-pop-green-solid: 22 113 69;
   --c-pop-green-glass: 24 91 57;
-  --c-pop-amber-solid: 151 86 0;
+  --c-pop-amber-solid: 145 82 0;
   --c-pop-amber-glass: 114 66 6;
+  --c-pop-red-solid: 157 52 59;
+  --c-pop-red-glass: 138 24 36;
   --c-pop-action: 37 99 235;
   --c-pop-action-hover: 30 85 206;
   --c-pop-on-action: 255 255 255;
@@ -3206,6 +3208,8 @@ html.dark {
   --c-pop-green-glass: 165 238 203;
   --c-pop-amber-solid: 241 187 112;
   --c-pop-amber-glass: 255 229 200;
+  --c-pop-red-solid: 255 148 149;
+  --c-pop-red-glass: 255 216 216;
   --c-pop-action: 50 106 222;
   --c-pop-action-hover: 40 95 207;
   --c-pop-hue-a: 52 78 200;
@@ -3230,6 +3234,8 @@ html.dark {
     --c-pop-green-glass: 165 238 203;
     --c-pop-amber-solid: 241 187 112;
     --c-pop-amber-glass: 255 229 200;
+    --c-pop-red-solid: 255 148 149;
+    --c-pop-red-glass: 255 216 216;
     --c-pop-action: 50 106 222;
     --c-pop-action-hover: 40 95 207;
     --c-pop-hue-a: 52 78 200;

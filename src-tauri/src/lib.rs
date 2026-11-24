@@ -34,6 +34,7 @@ pub mod graph;
 pub mod harness;
 pub mod hooks;
 pub mod host_platform;
+pub mod idle_trim;
 pub mod ingest;
 pub mod insights;
 pub mod ipc_error;
@@ -77,8 +78,9 @@ pub mod workspace_registry;
 use commands::*;
 use desktop::shell::{cmd_open_worktree_path, cmd_reveal_worktree_path};
 use desktop::{
-    cmd_exit_app, cmd_exit_request_answer, cmd_resolve_git_root, cmd_set_exit_guard_ready,
-    cmd_set_recent_menu, cmd_take_pending_open,
+    cmd_exit_app, cmd_exit_request_answer, cmd_idle_memory_status, cmd_main_hibernate,
+    cmd_main_ready, cmd_resolve_git_root, cmd_set_exit_guard_ready, cmd_set_recent_menu,
+    cmd_take_pending_open, cmd_webview_idle_hint,
 };
 use logging::{cmd_diagnostic_log_tail, cmd_diagnostic_persisted_log};
 
@@ -394,28 +396,48 @@ pub fn run() {
             if let Err(error) = desktop::terminate::install(app.handle()) {
                 log::error!(target: "setup", "quit guard not installed; AppKit quits bypass it: {error}");
             }
-            // Unlock 120 Hz ProMotion rendering on macOS WKWebView (guarded by
-            // `objc2::exception::catch` in case a future WebKit drops the KVC key).
+            // Build `"main"` lazily on `--background` when the persisted tray
+            // hint confirms the status icon is enabled, so login launches use
+            // 0 MB WebView RAM until revealed. When `--background` is absent, or
+            // when tray visibility is unknown/disabled, build `"main"` now
+            // (hidden on `--background` so `menuStateStore` can project
+            // `showStatusIcon`).
             {
-                use tauri::Manager as _;
-                if let Some(window) = app.get_webview_window("main") {
-                    desktop::webview_perf::unlock_window_high_refresh_rate(&window);
+                let is_background = std::env::args_os().any(|arg| arg == "--background");
+                let tray_hint = desktop::hibernate::read_boot_tray_hint();
+                let skip_main_on_bg = is_background && matches!(tray_hint, Some((true, _)));
+                if skip_main_on_bg {
+                    let (_, hide_dock) = tray_hint.unwrap_or((true, true));
+                    if let Err(error) =
+                        desktop::apply_background_boot_tray(app.handle(), true, hide_dock)
+                    {
+                        log::warn!(
+                            target: "setup",
+                            "lazy background tray setup failed; building main window: {error}"
+                        );
+                        if let Err(build_err) = desktop::hibernate::build_main_window_with_visibility(
+                            app.handle(),
+                            false,
+                            false,
+                        ) {
+                            log::error!(target: "setup", "main window creation failed: {build_err}");
+                        }
+                    }
+                } else if let Err(error) = desktop::hibernate::build_main_window_with_visibility(
+                    app.handle(),
+                    false,
+                    !is_background,
+                ) {
+                    log::error!(target: "setup", "main window creation failed: {error}");
                 }
-            }
-            // Login-item / LaunchAgent starts with --background: stay in the
-            // menu bar until the frontend projects showStatusIcon. If the icon
-            // is off, menu sync reveals the main window as usual.
-            if std::env::args_os().any(|arg| arg == "--background") {
-                use tauri::Manager;
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                if is_background && !skip_main_on_bg {
                     workbench::external_changes::note_main_window_on_screen(false);
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = app
-                        .handle()
-                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = app
+                            .handle()
+                            .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    }
                 }
             }
             // The cold-start half of the same request the single-instance hook
@@ -684,6 +706,12 @@ pub fn run() {
             cmd_set_exit_guard_ready,
             cmd_exit_app,
             cmd_exit_request_answer,
+            cmd_webview_idle_hint,
+            cmd_main_hibernate,
+            cmd_main_ready,
+            cmd_idle_memory_status,
+            cmd_idle_memory_settings,
+            cmd_idle_memory_settings_save,
             cmd_diagnostic_log_tail,
             cmd_diagnostic_persisted_log,
             cmd_ledger_tail,

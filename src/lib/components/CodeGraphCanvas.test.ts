@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { compile } from "svelte/compiler";
+import { render } from "svelte/server";
+import CodeGraphCanvas from "./CodeGraphCanvas.svelte";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "CodeGraphCanvas.svelte"), "utf8");
@@ -260,9 +262,7 @@ describe("CodeGraphCanvas globe, focus and design-rule pins", () => {
 });
 
 describe("CodeGraphCanvas About hint", () => {
-  it("shows a focusable info hint carrying the view description, and none without one", async () => {
-    const { render } = await import("svelte/server");
-    const { default: CodeGraphCanvas } = await import("./CodeGraphCanvas.svelte");
+  it("shows a focusable info hint carrying the view description, and none without one", () => {
     const about = "Each dot is a file; a line means one file imports another.";
     const withHint = render(CodeGraphCanvas, { props: { load: null, about } }).body;
     const tag = withHint.match(/<button\b[^>]*data-testid="code-graph-about"[^>]*>/)?.[0] ?? "";

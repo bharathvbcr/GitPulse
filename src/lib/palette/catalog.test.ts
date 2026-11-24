@@ -117,6 +117,29 @@ describe("command catalog and context", () => {
     expect(navigate).toHaveBeenLastCalledWith("work", "overview");
   });
 
+  it("gates work:conflicts only when closed, loading, or bare, allowing clean non-bare repos", async () => {
+    const navigate = vi.spyOn(repoStore, "setActiveTab").mockImplementation(() => {});
+    const surface = vi.spyOn(interfaceStore, "setGlobalSurface").mockImplementation(() => {});
+
+    const closed = buildCommands(snapshot({ currentPath: null, isLoading: false, isBare: false }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(closed?.disabledReason).toBe("Open a repository first.");
+
+    const loading = buildCommands(snapshot({ currentPath: "/repo", isLoading: true, isBare: false }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(loading?.disabledReason).toBe("Wait for the repository to finish loading.");
+
+    const bare = buildCommands(snapshot({ currentPath: "/repo.git", isLoading: false, isBare: true }), () => {})
+      .find(command => command.id === "work:conflicts");
+    expect(bare?.disabledReason).toBe("This bare repository has no working tree.");
+
+    const clean = buildCommands(ready(), () => {}).find(command => command.id === "work:conflicts");
+    expect(clean?.disabledReason).toBeUndefined();
+    await clean?.action();
+    expect(surface).toHaveBeenCalledWith("repository");
+    expect(navigate).toHaveBeenLastCalledWith("work", "overview");
+  });
+
   it("does not offer Policy activity when Overview would not render it", () => {
     // Manvi absent and nothing journaled: Overview hides the card, so a door
     // to it would land on nothing. Disabled with the reason instead.

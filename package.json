@@ -2,7 +2,7 @@
   "name": "gitpulse",
   "version": "0.2.0-beta.1",
   "private": true,
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "description": "Fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5",
   "keywords": [
     "git",
@@ -63,7 +63,12 @@
     "test:browser:all": "node scripts/browser-regressions.mjs --all",
     "test:coverage-ui": "node scripts/browser-regressions.mjs --harness coverage",
     "test:webkit": "node scripts/browser-regressions.mjs --webkit",
-    "test:webkit:all": "node scripts/browser-regressions.mjs --webkit --all"
+    "test:webkit:all": "node scripts/browser-regressions.mjs --webkit --all",
+    "test:native": "node scripts/browser-regressions.mjs --native",
+    "test:native:all": "node scripts/browser-regressions.mjs --native --all",
+    "test:e2e:driver": "node scripts/e2e-driver-smoke.mjs",
+    "test:linux:podman": "node scripts/linux-podman.mjs",
+    "check:windows:cross": "node scripts/check-windows-cross.mjs"
   },
   "dependencies": {
     "@lucide/svelte": "^1.67.0",

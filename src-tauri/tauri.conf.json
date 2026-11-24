@@ -15,6 +15,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "GitPulse",
         "width": 1280,
         "height": 850,

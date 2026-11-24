@@ -128,46 +128,100 @@ const type = async value => { const area = textarea(); area.value = value; area.
   check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
   await sendToAgentChecks();
 
-  // Find used to open a second bar under the toolbar, styled unlike the
-  // diff's. It is the same in-place field now: the pill widens where it sat.
+  // Find and Go to line share one inline slot in the file viewer toolbar, with
+  // zero second toolbar row when either opens.
   {
     const trigger = () => host.querySelector("[data-find-trigger]");
+    const goToTrigger = () => host.querySelector("[data-goto-line-trigger]");
     const field = () => host.querySelector("[data-find-field]");
-    check("the file toolbar offers Find as one pill", () => !!trigger() && !field());
+    const findStatus = () => field()?.querySelector("[data-find-status]");
     const slot = trigger().parentElement;
+    const barRow = slot.closest(".gp-section-edge");
+    const closedBarHeight = barRow.getBoundingClientRect().height;
+    check("the file toolbar offers Find and Go to line pills in the same slot", () =>
+      !!trigger() && !!goToTrigger() && goToTrigger().parentElement === slot && !field());
     trigger().click();
-    await until(() => !!field(), "find field");
+    await until(() => field()?.dataset.findMode === "find" && document.activeElement === field()?.querySelector("input"), "find field opens in find mode and focuses input");
     await tick();
-    check("Find opens in place in the toolbar row, focused, with no second bar", () =>
-      field().parentElement === slot && !trigger() && document.activeElement === field().querySelector("input"));
-    const input = field().querySelector("input");
-    input.value = "o";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await until(() => / of /.test(field().querySelector("[data-find-status]")?.textContent ?? ""), "match count");
-    check("a query shows its match count inside the field", () => /^1 of [1-9]/.test(field().querySelector("[data-find-status]").textContent.trim()));
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
-    await until(() => !field(), "find closed");
-    check("Escape folds it back to the Find pill", () => !!trigger() && !field());
+    check("Find opens in place in the toolbar row, focused, with no second toolbar row", () => {
+      const openH = barRow.getBoundingClientRect().height;
+      if (
+        field().parentElement === slot && !trigger() && !goToTrigger() &&
+        document.activeElement === field().querySelector("input") &&
+        openH - closedBarHeight <= 6
+      ) return true;
+      throw new Error(`sameSlot=${field().parentElement === slot} noTriggers=${!trigger() && !goToTrigger()} focused=${document.activeElement === field().querySelector("input")} closedH=${closedBarHeight} openH=${openH}`);
+    });
+    const input = () => field()?.querySelector("input");
+    const setFind = async value => { const el = input(); el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
+    await setFind("o");
+    await until(() => / of /.test(findStatus()?.textContent ?? ""), "match count");
+    check("a query shows its match count, inline highlights, and scrollbar overview ticks", () =>
+      /^1 of [1-9]/.test(findStatus().textContent.trim()) &&
+      Boolean(host.querySelector("span.bg-warn")) &&
+      Boolean(host.querySelector("span.bg-warn\\/30")) &&
+      Boolean(host.querySelector("[data-find-overview]")));
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await tick();
+    check("Enter in the find field steps to the next match", () => /^2 of /.test(findStatus().textContent.trim()));
+
+    host.querySelector("[data-goto-mode-toggle]").click();
+    await until(() => field()?.dataset.findMode === "line", "switches in place to line mode");
+    check("the # toggle switches in place to Go to line without adding a second row", () =>
+      Boolean(host.querySelector("[data-goto-line-input]")) &&
+      field().parentElement === slot &&
+      barRow.getBoundingClientRect().height - closedBarHeight <= 6);
+    host.querySelector("[data-find-mode-toggle]").click();
+    await until(() => field()?.dataset.findMode === "find", "switches back to find mode");
+
+    // Typing `:1:2` in Find mode previews Line 1, Col 2 and Enter jumps there and folds.
+    await setFind(":1:2");
+    await until(() => findStatus()?.textContent.trim() === "Line 1, Col 2", "colon-line:col preview in find mode");
+    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await until(() => !field() && host.textContent.includes("Ln 1, Col 2"), "colon-line:col jump closes find and lands on line 1 col 2");
+
+    // Clicking `Ln X, Col Y` in the status bar opens inline Go to line in place.
+    host.querySelector("[data-status-goto-line]").click();
+    await until(() => field()?.dataset.findMode === "line" && document.activeElement === host.querySelector("[data-goto-line-input]"), "status bar Ln/Col click opens inline go to line");
+    host.querySelector("[data-goto-line-input]").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !field(), "Escape closes status-bar go to line");
+    requestReveal(file, 2, 1);
+    await until(() => host.textContent.includes("Ln 2, Col 1"), "restored to line 2");
   }
 
-  // --- go to line ---------------------------------------------------------------
-  // The field is `type="number"`, so what it binds is a number (or null once
-  // cleared). The handler used to call `.trim()` on it: every Go threw and the
-  // cursor never moved.
+  // --- unified inline go to line ------------------------------------------------
+  // Go to line shares the same inline pill (`data-find-mode="line"`), avoiding any
+  // second bar, accepting numbers or `:line`, and using `goToLineTarget` without `.trim()`.
   {
-    const lineField = () => host.querySelector('input[type="number"][placeholder="Line number"]');
+    const goToTrigger = () => host.querySelector("[data-goto-line-trigger]");
+    const field = () => host.querySelector("[data-find-field]");
+    const lineField = () => host.querySelector("[data-goto-line-input]");
+    const submitBtn = () => host.querySelector("[data-goto-submit]");
+    const lineStatus = () => field()?.querySelector("[data-find-status]");
+    const slot = goToTrigger().parentElement;
+    const barRow = goToTrigger().closest(".gp-section-edge");
+    const closedBarHeight = barRow.getBoundingClientRect().height;
     const setLine = async value => { const input = lineField(); input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
     const enter = async () => { lineField().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await tick(); };
     const errorsBefore = errors.length;
-    button("Go to Line").click();
-    await until(() => !!lineField(), "the go-to-line field");
+    goToTrigger().click();
+    await until(() => field()?.dataset.findMode === "line" && document.activeElement === lineField(), "inline go-to-line opens and focuses input");
+    check("Go to line opens in the same toolbar row with no second bar and focuses the line input", () =>
+      field().parentElement === slot &&
+      document.activeElement === lineField() &&
+      barRow.getBoundingClientRect().height - closedBarHeight <= 6);
     await setLine("");
     await enter();
-    check("Go on a cleared line field does nothing: the field stays open and the cursor stays put", () => !!lineField() && host.textContent.includes("Ln 2, Col 1"));
+    check("Enter on an empty line field keeps it open and leaves the cursor put", () => Boolean(lineField()) && host.textContent.includes("Ln 2, Col 1"));
+    await setLine("0");
+    await until(() => /^1–\d+$/.test(lineStatus()?.textContent.trim() ?? ""), "bounds status on line 0");
+    check("out-of-range line 0 displays bounds and disables Go without closing", () => submitBtn()?.disabled === true);
+    await enter();
+    check("Enter on an out-of-range line leaves the field open on line 2", () => Boolean(lineField()) && host.textContent.includes("Ln 2, Col 1"));
     await setLine("1");
     await enter();
     await until(() => host.textContent.includes("Ln 1, Col 1"), "go to line 1");
-    check("Go to Line moves the cursor to the typed line and closes the field", () => host.textContent.includes("Ln 1, Col 1") && !lineField());
+    check("valid Go to line moves to line 1 and folds the inline pill back", () => host.textContent.includes("Ln 1, Col 1") && !field());
     check("and going to a line throws nothing (no 'trim is not a function')", () => {
       const raised = errors.slice(errorsBefore);
       if (raised.length === 0) return true;
@@ -175,33 +229,40 @@ const type = async value => { const area = textarea(); area.value = value; area.
     });
   }
 
-  // --- find through the view bar ----------------------------------------------
-  // As the Code view's file pane the viewer has no Find of its own: the view
-  // bar's one search field becomes this file's find.
+  // --- Code > Explorer keeps inline file search and chords while PageSearch stays palette ---
   {
     await unmount(app); await tick();
     repoStore.setActiveTab("code", "explorer");
     const ScopedSearchHost = (await import("./ScopedSearchHost.svelte")).default;
     app = mount(ScopedSearchHost, { target: host, props: { scope: "code:explorer", viewer: Viewer } });
-    await until(() => !!host.querySelector("[data-scoped-bar] [data-page-search=find]"), "the scoped file registers its find");
+    await until(() => Boolean(button("Edit")) && Boolean(host.querySelector("[data-scoped-bar] [data-page-search]")), "Code Explorer viewer and view bar mounted");
     const bar = host.querySelector("[data-scoped-bar]");
     const pill = () => bar.querySelector("[data-page-search]");
-    const input = () => bar.querySelector("#gitpulse-page-search");
-    const status = () => bar.querySelector("[data-find-status]")?.textContent.trim() ?? "";
-    await until(() => pill()?.dataset.pageSearch === "find", "the field becomes the file's find");
-    check("as Code's file pane the viewer draws no Find of its own, and the view bar's field is its find", () => {
-      const own = host.querySelectorAll("[data-find-trigger],[data-find-field]").length;
-      if (own === 0 && input().placeholder === "Find in file…") return true;
-      throw new Error(`own find controls ${own}, placeholder ${input()?.placeholder}`);
-    });
-    input().focus(); input().value = "o"; input().dispatchEvent(new Event("input", { bubbles: true }));
-    await until(() => / of /.test(status()), "match count in the field");
-    check("a query typed in the field reaches the file: its match count shows in the field", () => /^1 of [1-9]/.test(status()));
-    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await tick();
-    check("Enter in the field steps to the file's next match", () => /^2 of /.test(status()));
-    input().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await tick();
-    check("Escape clears the file's find and leaves the field", () => input().value === "" && document.activeElement !== input() && !bar.querySelector("[data-find-status]"));
-    // Back to the viewer on its own, on the line the checks below start from.
+    const pageInput = () => bar.querySelector("#gitpulse-page-search");
+    check("in Code > Explorer the file viewer keeps its inline Find + Go to line controls while the view bar stays palette", () =>
+      pill()?.dataset.pageSearch === "palette" &&
+      Boolean(host.querySelector("[data-find-trigger]")) &&
+      Boolean(host.querySelector("[data-goto-line-trigger]")));
+
+    const chordHost = host.querySelector('[role="tab"]') ?? button("Edit");
+    chordHost.focus();
+    const findChord = new KeyboardEvent("keydown", { key: "f", metaKey: true, bubbles: true, cancelable: true });
+    chordHost.dispatchEvent(findChord);
+    await until(() => host.querySelector("[data-find-field]")?.dataset.findMode === "find" && document.activeElement === host.querySelector("[data-find-field] input"), "Cmd+F focuses inline file search");
+    check("Cmd+F outside the editor toolbar opens and focuses the open file's Find box instead of PageSearch", () =>
+      findChord.defaultPrevented &&
+      document.activeElement !== pageInput());
+
+    const findInputEl = document.activeElement;
+    const lineChord = new KeyboardEvent("keydown", { key: "g", metaKey: true, bubbles: true, cancelable: true });
+    findInputEl.dispatchEvent(lineChord);
+    await until(() => host.querySelector("[data-find-field]")?.dataset.findMode === "line" && document.activeElement === host.querySelector("[data-goto-line-input]"), "Cmd+G switches in place to Go to line");
+    check("Cmd+G switches the inline pill to Go to line and focuses the line box", () => lineChord.defaultPrevented);
+
+    host.querySelector("[data-goto-line-input]").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await until(() => !host.querySelector("[data-find-field]") && Boolean(host.querySelector("[data-find-trigger]")), "Escape folds unified pill");
+
+    // Back to the plain viewer on line 2 for downstream checks.
     await unmount(app); await tick();
     app = mount(Viewer, { target: host });
     await until(() => button("Edit"), "the plain viewer is back");
@@ -401,6 +462,24 @@ const type = async value => { const area = textarea(); area.value = value; area.
   check("Blame reads the open file in place of the editor", () =>
     blameReads.at(-1)?.filePath === file && !editorShown() && blameToggle().getAttribute("aria-pressed") === "true");
   check("beside Explorer's tree, with no second tree of its own", () => host.querySelectorAll('[role="tree"]').length === 1);
+  check("Blame's toolbar offers inline Find and Go to line pills in the same slot", () => {
+    const findBtn = host.querySelector("[data-find-trigger]");
+    const lineBtn = host.querySelector("[data-goto-line-trigger]");
+    return Boolean(findBtn && lineBtn && findBtn.parentElement === lineBtn.parentElement);
+  });
+  host.querySelector("[data-goto-line-trigger]").click();
+  await until(() => Boolean(host.querySelector("[data-goto-line-input]")), "Blame go-to-line opens");
+  {
+    const blameLineInput = host.querySelector("[data-goto-line-input]");
+    blameLineInput.value = "2";
+    blameLineInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+    blameLineInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await until(() => Boolean(host.querySelector('[data-blame-line="2"][data-blame-target-line="true"]')), "Blame highlights jumped target line");
+    check("Blame Go to line highlights the jumped row and folds the inline pill", () =>
+      Boolean(host.querySelector('[data-blame-line="2"][data-blame-target-line="true"]')) &&
+      !host.querySelector("[data-find-field]"));
+  }
   blameToggle().click(); await tick();
   await until(() => editorShown(), "the editor returns");
   check("toggling Blame off returns to the editor", () => !host.querySelector("[data-blame-line]") && editorShown());
@@ -840,6 +919,53 @@ const type = async value => { const area = textarea(); area.value = value; area.
     check("and clears the banner in both hosts", () => !banner() && !splitBanner());
 
     await unmount(pane2); splitHost.remove(); await tick();
+  }
+
+  // --- Raster MediaViewer zoomed overflow: top-left reachable without clipping ---
+  {
+    const MediaViewer = (await import("../src/lib/components/files/MediaViewer.svelte")).default;
+    const rasterCanvas = document.createElement("canvas");
+    rasterCanvas.width = 2000;
+    rasterCanvas.height = 2000;
+    const rctx = rasterCanvas.getContext("2d");
+    rctx.fillStyle = "#2563eb";
+    rctx.fillRect(0, 0, 2000, 2000);
+    rctx.fillStyle = "#f97316";
+    rctx.fillRect(0, 0, 120, 120);
+    const bigPngBase64 = rasterCanvas.toDataURL("image/png").split(",")[1];
+    const rasterHost = document.createElement("div");
+    rasterHost.style.cssText = "position:fixed;left:0;top:0;width:520px;height:420px;display:flex;flex-direction:column;background:#0b0f19;z-index:200";
+    document.body.append(rasterHost);
+    const rasterApp = mount(MediaViewer, {
+      target: rasterHost,
+      props: {
+        filePath: "assets/big-2000.png",
+        repoPath: root,
+        blob: { path: "assets/big-2000.png", is_binary: true, is_image: true, mime: "image/png", text: null, base64: bigPngBase64, invalid_utf8_bytes: 0 },
+      },
+    });
+    const rasterImg = () => rasterHost.querySelector("[data-raster-stage] img");
+    await until(() => Boolean(rasterImg()?.complete && rasterImg().naturalWidth === 2000), "2000x2000 raster image loaded");
+    const zoomInBtn = rasterHost.querySelector('button[aria-label="Zoom in"]');
+    const actualBtn = [...rasterHost.querySelectorAll("button")].find(b => b.textContent.trim() === "1:1 actual");
+    actualBtn.click(); await tick();
+    for (let i = 0; i < 4; i++) { zoomInBtn.click(); await tick(); }
+    await wait(60);
+    const stage = rasterHost.querySelector("[data-raster-stage]");
+    stage.scrollLeft = 0;
+    stage.scrollTop = 0;
+    await wait(40);
+    const stageRect = stage.getBoundingClientRect();
+    const imgRect = rasterImg().getBoundingClientRect();
+    check("zoomed 2000x2000 raster PNG at 200% renders full 4000px width and keeps top-left reachable at scroll (0,0)", () =>
+      imgRect.width >= 3990 &&
+      stage.scrollWidth > stage.clientWidth &&
+      stage.scrollHeight > stage.clientHeight &&
+      imgRect.left >= stageRect.left &&
+      imgRect.top >= stageRect.top);
+    await unmount(rasterApp);
+    rasterHost.remove();
+    await tick();
   }
 
   check("No unexpected commands", () => unexpected.length === 0);

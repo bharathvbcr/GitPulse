@@ -1,7 +1,7 @@
 import type { MenuState } from "../src/lib/desktop/menuState";
 
 const NAV = [
-  "open", "clone", "refresh", "palette", "fleet", "terminal-dock", "toggle-theme",
+  "open", "clone", "refresh", "palette", "fleet", "agents", "terminal-dock", "toggle-theme",
   "copy-branch", "copy-repo-path", "copy-commit", "reveal-repo", "open-remote",
   "section:work:overview", "section:history:graph", "section:insights:pulse",
 ];
@@ -17,6 +17,10 @@ export function statusFixture(kind: string): MenuState {
     ],
     repositoriesHidden: 0,
     agentsWaiting: 0,
+    agentRequests: [],
+    agentRequestsHidden: 0,
+    agentsRunning: 0,
+    agentsInformational: 0,
     trayDetail: "GitPulse · feature/status-popover", traySummary: { id: "section:work:overview", text: "12 changed · 4 staged" },
     trayDetails: ["Repository: /Projects/GitPulse", "Branch: feature/status-popover", "12 changed · 4 staged · 0 conflicts", "2 listed stashes", "3 ahead · 1 behind origin/main (fetched 4 min ago)", "Live updates"],
     status: { repository: "GitPulse", branch: "feature/status-popover", changed: 12, staged: 4, conflicts: 0, ahead: 3, behind: 1,
@@ -32,5 +36,81 @@ export function statusFixture(kind: string): MenuState {
   if (kind === "busy") { Object.assign(snapshot.status, { activity: "Fetching…", tone: "busy", headline: "Fetching…", elsewhere: 1, primaryLabel: "Review changes" }); snapshot.traySummary = { id: "section:work:overview", text: "Fetching… · 1 running elsewhere" }; }
   if (kind === "operation") { Object.assign(snapshot.status, { operation: "Merge in progress — on main", tone: "warning", headline: "Merge in progress — on main", primaryLabel: "Review changes" }); }
   if (kind === "never fetched") { snapshot.status.fetchedAt = null; snapshot.trayDetails[4] = "3 ahead · 1 behind origin/main (never fetched)"; }
+  if (kind === "agents waiting") {
+    const now = Date.now();
+    snapshot.agentsWaiting = 5;
+    snapshot.agentRequestsHidden = 2;
+    snapshot.agentsRunning = 3;
+    snapshot.agentsInformational = 1;
+    snapshot.trayTitle = "5 waiting · 12";
+    snapshot.agentRequests = [
+      {
+        id: "term:claude-1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude Code",
+        repoLabel: "GitPulse",
+        repoPath: "/Projects/GitPulse",
+        urgency: "blocking",
+        reason: "Needs your permission",
+        detail: "Allow git push to origin/main",
+        atMs: now - 120_000,
+      },
+      {
+        id: "term:agy-1",
+        source: "terminal",
+        provider: "agy",
+        agentLabel: "Antigravity",
+        repoLabel: "ScholarLM",
+        repoPath: "/Projects/ScholarLM",
+        urgency: "error",
+        reason: "Stopped on an error",
+        detail: "Build command failed with exit code 1",
+        atMs: now - 300_000,
+      },
+      {
+        id: "run:codex-1",
+        source: "managed",
+        provider: "codex",
+        agentLabel: "Codex Task",
+        repoLabel: "GitPulse",
+        repoPath: "/Projects/GitPulse",
+        urgency: "blocking",
+        reason: "Pending decision",
+        detail: "Review generated schema migration",
+        atMs: now - 600_000,
+      },
+    ];
+  }
+  if (kind === "agents quiet") {
+    snapshot.agentsWaiting = 0;
+    snapshot.agentsRunning = 2;
+    snapshot.agentsInformational = 1;
+  }
+  if (kind === "agents empty") {
+    const now = Date.now();
+    snapshot.activePath = null;
+    snapshot.repositories = [];
+    snapshot.status.branch = "";
+    snapshot.enabled = ["open", "clone", "palette", "agents"];
+    snapshot.status.fetchedAt = null;
+    snapshot.agentsWaiting = 1;
+    snapshot.agentsRunning = 1;
+    snapshot.trayTitle = "1 waiting";
+    snapshot.agentRequests = [
+      {
+        id: "term:claude-empty",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "Claude Code",
+        repoLabel: "ScholarLM",
+        repoPath: "/Projects/ScholarLM",
+        urgency: "blocking",
+        reason: "Needs your input",
+        detail: "Confirm whether to apply patch",
+        atMs: now - 60_000,
+      },
+    ];
+  }
   return snapshot;
 }

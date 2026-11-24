@@ -1072,6 +1072,34 @@ pub(crate) fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Best-effort, non-blocking idle trim across already-open repository ledger
+/// connections (`PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);`).
+pub(crate) fn trim_idle() -> usize {
+    let slots: Vec<std::sync::Arc<Slot>> = {
+        let Ok(reg) = registry().try_lock() else {
+            return 0;
+        };
+        reg.values().cloned().collect()
+    };
+    let mut trimmed = 0usize;
+    for slot in slots {
+        let Ok(guard) = slot.conn.try_lock() else {
+            continue;
+        };
+        let Some(live) = guard.as_ref() else {
+            continue;
+        };
+        if live
+            .conn
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
+}
+
 /// Failed appends counted by the canonical database they would have reached.
 ///
 /// Drop accounting is process-local, just as it was when this was one atomic

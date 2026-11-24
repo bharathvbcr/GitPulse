@@ -141,9 +141,24 @@ export function createHydrationController(deps: HydrationDeps) {
   const { invoke: invokeFn, sessionBook } = deps;
   const { familyUnknown, snapshotRuns, statusPollApplied, statsInflight, statsDrained } = sessionBook;
   const now = deps.now ?? (() => Date.now());
+  const statusControllers = new Map<string, AbortController>();
 
-  async function loadFileStatusFacet(path: string): Promise<FileStatusFacetPayload> {
-    const statuses = await invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path });
+  function cancelStatus(id: string): void {
+    const controller = statusControllers.get(id);
+    if (!controller) return;
+    statusControllers.delete(id);
+    controller.abort();
+  }
+
+  async function loadFileStatusFacet(
+    path: string,
+    signal?: AbortSignal,
+  ): Promise<FileStatusFacetPayload> {
+    const statuses = await invokeFn<FileStatus[]>(
+      "cmd_get_status",
+      { repoPath: path },
+      signal ? { signal } : undefined,
+    );
     return {
       statuses,
       statusPollFailures: 0,
@@ -192,9 +207,10 @@ export function createHydrationController(deps: HydrationDeps) {
 
   async function loadSnapshot(
     path: string,
+    statusSignal?: AbortSignal,
   ): Promise<FileStatusFacetPayload & BranchGraphFacetPayload & MetadataFacetPayload> {
     const [fileStatus, branchGraph, metadata] = await Promise.all([
-      loadFileStatusFacet(path),
+      loadFileStatusFacet(path, statusSignal),
       loadBranchGraphFacet(path),
       loadMetadataFacet(path),
     ]);
@@ -565,11 +581,20 @@ export function createHydrationController(deps: HydrationDeps) {
       await learnFamily(id, path, generation);
       if (snapshotRuns.get(id) !== run) return;
     }
+    const previousStatus =
+      facet === "status" || facet === "all" ? statusControllers.get(id) : undefined;
+    const statusController =
+      facet === "status" || facet === "all" ? new AbortController() : undefined;
+    if (statusController) {
+      statusControllers.set(id, statusController);
+    }
     try {
       let patch: Partial<RepoSession> = {};
       let drainVerified = false;
       if (facet === "status") {
-        const statusData = await loadFileStatusFacet(path);
+        const pendingStatus = loadFileStatusFacet(path, statusController?.signal);
+        previousStatus?.abort();
+        const statusData = await pendingStatus;
         if (snapshotRuns.get(id) !== run) return;
         patch = statusData;
       } else if (facet === "branches") {
@@ -588,7 +613,9 @@ export function createHydrationController(deps: HydrationDeps) {
         if (snapshotRuns.get(id) !== run) return;
         patch = metaData;
       } else {
-        const raw = await loadSnapshot(path);
+        const pendingSnapshot = loadSnapshot(path, statusController?.signal);
+        previousStatus?.abort();
+        const raw = await pendingSnapshot;
         if (snapshotRuns.get(id) !== run) return;
         const live = deps.sessionById(id);
         if (live) {
@@ -640,12 +667,19 @@ export function createHydrationController(deps: HydrationDeps) {
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
+      if (statusController?.signal.aborted || ipcErrorKind(err) === "read_cancelled") {
+        return;
+      }
       const message = describeError(err, "repo");
       deps.applyToSession(id, generation, {
         isLoading: false,
         error: message,
         ...(repositoryTrustRefused(err) ? { trustRequired: true } : {}),
       });
+    } finally {
+      if (statusController && statusControllers.get(id) === statusController) {
+        statusControllers.delete(id);
+      }
     }
   }
 
@@ -661,6 +695,7 @@ export function createHydrationController(deps: HydrationDeps) {
   }
 
   return {
+    cancelStatus,
     loadFileStatusFacet,
     loadBranchGraphFacet,
     loadMetadataFacet,

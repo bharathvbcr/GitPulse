@@ -63,9 +63,23 @@ impl Breaker {
 
 static BREAKERS: Mutex<Option<HashMap<String, Breaker>>> = Mutex::new(None);
 
+/// Whether a web content termination for `label` is an intentional hibernation
+/// teardown rather than an unexpected crash.
+pub fn should_suppress_termination(label: &str, state: Option<&super::DesktopState>) -> bool {
+    label == "main" && state.is_some_and(|desktop| desktop.is_hibernating_main())
+}
+
 /// Tauri's `on_web_content_process_terminate` hook.
 pub fn on_terminated<R: Runtime>(webview: &Webview<R>) {
     let label = webview.label().to_string();
+    let desktop = webview.app_handle().try_state::<super::DesktopState>();
+    if should_suppress_termination(&label, desktop.as_deref()) {
+        log::debug!(
+            target: "desktop",
+            "ignoring web content process termination during intentional hibernation of '{label}'"
+        );
+        return;
+    }
     let (count, delay) = {
         let mut breakers = BREAKERS
             .lock()
@@ -132,6 +146,10 @@ pub fn on_terminated<R: Runtime>(webview: &Webview<R>) {
     let spawned =
         crate::supervisor::spawn_once("webview-crash-reload", "webview reload", move || {
             std::thread::sleep(delay);
+            let desktop = later.app_handle().try_state::<super::DesktopState>();
+            if should_suppress_termination(later.label(), desktop.as_deref()) {
+                return;
+            }
             reload(&later);
         });
     if let Err(error) = spawned {
@@ -510,5 +528,35 @@ mod tests {
         }
         assert!(breaker.recent.len() <= 64);
         assert_eq!(last, CAP);
+    }
+
+    #[test]
+    fn intentional_main_hibernation_suppresses_crash_breaker_only_for_main() {
+        let state = super::super::DesktopState::default();
+        assert!(!should_suppress_termination("main", Some(&state)));
+        assert!(!should_suppress_termination("main", None));
+        assert!(!should_suppress_termination(
+            super::super::popover::LABEL,
+            Some(&state)
+        ));
+
+        state
+            .hibernation
+            .set_lifecycle(super::super::hibernate::MainWindowLifecycle::Hibernating);
+        assert!(should_suppress_termination("main", Some(&state)));
+        assert!(!should_suppress_termination(
+            super::super::popover::LABEL,
+            Some(&state)
+        ));
+
+        state
+            .hibernation
+            .set_lifecycle(super::super::hibernate::MainWindowLifecycle::Hibernated);
+        assert!(should_suppress_termination("main", Some(&state)));
+
+        state
+            .hibernation
+            .set_lifecycle(super::super::hibernate::MainWindowLifecycle::Visible);
+        assert!(!should_suppress_termination("main", Some(&state)));
     }
 }

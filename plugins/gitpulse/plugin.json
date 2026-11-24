@@ -9,7 +9,7 @@
   },
   "homepage": "https://gitpulse.vbcr.dev",
   "repository": "https://github.com/bharathvbcr/GitPulse",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "keywords": [
     "git",
     "mcp",

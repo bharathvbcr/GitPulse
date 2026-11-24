@@ -261,9 +261,11 @@ fn is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
+static PINNED_STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+static UNPINNED_STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+
 fn pinned_store() -> &'static Mutex<Store> {
-    static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
-    STORE.get_or_init(|| {
+    PINNED_STORE.get_or_init(|| {
         let store = if PERSIST.load(Ordering::Relaxed) {
             match default_path()
                 .map_err(|e| OpenError::Failed(e.into_message()))
@@ -286,8 +288,28 @@ fn pinned_store() -> &'static Mutex<Store> {
 }
 
 fn unpinned_store() -> &'static Mutex<Store> {
-    static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(Store::memory(MEMORY_ROWS)))
+    UNPINNED_STORE.get_or_init(|| Mutex::new(Store::memory(MEMORY_ROWS)))
+}
+
+/// Best-effort, non-blocking idle trim across already-open churn SQLite stores.
+pub(crate) fn trim_idle() -> usize {
+    let mut trimmed = 0usize;
+    for slot in [&PINNED_STORE, &UNPINNED_STORE] {
+        let Some(mutex) = slot.get() else {
+            continue;
+        };
+        let Ok(store) = mutex.try_lock() else {
+            continue;
+        };
+        if store
+            .conn
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 fn default_path() -> Result<PathBuf, CommandError> {

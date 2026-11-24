@@ -140,7 +140,8 @@ fn mapped_standing_state_separates_error_idle_and_informational_signals_from_blo
     let counters = Counters::default();
     let t0 = Instant::now();
 
-    // Hook `error` maps to `"error"` (not `"blocked"`).
+    // Hook `error` maps to `"blocked"` (valid `gitpulse_sessions` enum) while
+    // keeping `event: Some("error")` to distinguish it from permission prompts.
     let _ = admit_at(
         hook_notice("term-err", Some("error"), None, None),
         t0,
@@ -197,16 +198,22 @@ fn mapped_standing_state_separates_error_idle_and_informational_signals_from_blo
     );
 
     let snap = snapshot_of(&tracked, 42, 100, 22_000);
-    let states: HashMap<&str, &str> = snap
+    let states: HashMap<&str, (&str, Option<&str>)> = snap
         .sessions
         .iter()
-        .map(|s| (s.key.as_str(), s.state.as_str()))
+        .map(|s| (s.key.as_str(), (s.state.as_str(), s.event.as_deref())))
         .collect();
-    assert_eq!(states.get("term-err"), Some(&"error"));
-    assert_eq!(states.get("term-bell"), Some(&"idle"));
-    assert_eq!(states.get("term-osc"), Some(&"idle"));
-    assert_eq!(states.get("term-idle"), Some(&"idle"));
-    assert_eq!(states.get("term-ask"), Some(&"blocked"));
+    assert_eq!(states.get("term-err"), Some(&("blocked", Some("error"))));
+    assert_eq!(states.get("term-bell"), Some(&("idle", None)));
+    assert_eq!(states.get("term-osc"), Some(&("idle", None)));
+    assert_eq!(
+        states.get("term-idle"),
+        Some(&("idle", Some("idle_prompt")))
+    );
+    assert_eq!(
+        states.get("term-ask"),
+        Some(&("blocked", Some("agent_needs_input")))
+    );
 }
 
 #[test]

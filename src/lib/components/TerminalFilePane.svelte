@@ -50,6 +50,11 @@
   import MediaViewer from "./files/MediaViewer.svelte";
   import EditorConflictBanner from "./files/EditorConflictBanner.svelte";
   import LanguageLogo from "./LanguageLogo.svelte";
+  import { isCommitSearchChord } from "../views/commitFilter";
+  import { isImeComposition } from "../keyboard/imeGuard";
+  import { extractSelectionSeed, triggerFileSearch } from "../files/fileSearchTarget";
+  import { htmlViewModeRequest, matchHtmlViewMode } from "../files/htmlPreview";
+  import { matchSvgViewMode, svgViewModeRequest } from "../files/svgPreview";
 
   let {
     tabId,
@@ -300,6 +305,43 @@
     });
   });
 
+  // Choosing "Open as Preview" or "Open Code & Preview" for an HTML file
+  // switches out of Diff view once per request nonce so toggling back to Diff
+  // afterwards isn't snapped back during the request TTL window.
+  let lastHandledHtmlModeNonce = 0;
+  $effect(() => {
+    const req = $htmlViewModeRequest;
+    const target = filePath;
+    const repo = repoPath;
+    if (!req) return;
+    untrack(() => {
+      const matched = matchHtmlViewMode(req, repo, target);
+      if (matched && matched.nonce > lastHandledHtmlModeNonce) {
+        lastHandledHtmlModeNonce = matched.nonce;
+        if (viewMode === "diff") {
+          viewMode = "code";
+        }
+      }
+    });
+  });
+
+  let lastHandledSvgModeNonce = 0;
+  $effect(() => {
+    const req = $svgViewModeRequest;
+    const target = filePath;
+    const repo = repoPath;
+    if (!req) return;
+    untrack(() => {
+      const matched = matchSvgViewMode(req, repo, target);
+      if (matched && matched.nonce > lastHandledSvgModeNonce) {
+        lastHandledSvgModeNonce = matched.nonce;
+        if (viewMode === "diff") {
+          viewMode = "code";
+        }
+      }
+    });
+  });
+
   async function loadQuickLens(
     repo: string,
     targetPath: string | undefined,
@@ -493,9 +535,36 @@
     return Promise.resolve(CONTEXT_UNKNOWN);
   }
 
-  export function handleViewChord(_event: KeyboardEvent): boolean {
+  export function handleViewChord(event: KeyboardEvent): boolean {
+    if (event.defaultPrevented || isImeComposition(event) || !paneRoot) return false;
+    if (isCommitSearchChord(event) && triggerFileSearch(paneRoot, "find", extractSelectionSeed(null, paneRoot))) {
+      event.preventDefault();
+      event.stopPropagation();
+      return true;
+    }
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "g" &&
+      triggerFileSearch(paneRoot, "line")
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      return true;
+    }
     return false;
   }
+
+  $effect(() => {
+    const el = paneRoot;
+    if (!el) return;
+    const onKeydown = (e: KeyboardEvent) => {
+      handleViewChord(e);
+    };
+    el.addEventListener("keydown", onKeydown);
+    return () => el.removeEventListener("keydown", onKeydown);
+  });
 
   onDestroy(() => {
     inflight?.cancel();

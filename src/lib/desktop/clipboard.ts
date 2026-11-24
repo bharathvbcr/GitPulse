@@ -7,7 +7,58 @@
  * it. Dependencies (an injected clipboard/document) keep this unit-testable in
  * a plain Node environment.
  */
-export type WebClipboard = { writeText(text: string): Promise<void> };
+export type WebClipboard = {
+  writeText(text: string): Promise<void>;
+  write?(items: unknown[]): Promise<void>;
+};
+
+/**
+ * Copies a raster image blob (or a gesture-scoped promise resolving to one, so
+ * Safari/WKWebView retains the user activation) to the OS clipboard when the
+ * host supports `navigator.clipboard.write` + `ClipboardItem`.
+ */
+export async function copyImageBlob(
+  blobOrPromise: Blob | Promise<Blob>,
+  mime = "image/png",
+  deps: {
+    clipboard?: { write?(items: unknown[]): Promise<void> } | null;
+    ClipboardItemCtor?: (new (items: Record<string, Blob | PromiseLike<Blob>>) => unknown) | null;
+  } = {},
+): Promise<boolean> {
+  const clipboard =
+    deps.clipboard !== undefined
+      ? deps.clipboard
+      : typeof navigator !== "undefined"
+        ? (navigator.clipboard as { write?(items: unknown[]): Promise<void> } | null)
+        : null;
+  const ItemCtor =
+    deps.ClipboardItemCtor !== undefined
+      ? deps.ClipboardItemCtor
+      : typeof ClipboardItem !== "undefined"
+        ? ClipboardItem
+        : null;
+  if (!clipboard?.write || !ItemCtor) {
+    if (blobOrPromise instanceof Promise) void blobOrPromise.catch(() => {});
+    return false;
+  }
+  const blobPromise = blobOrPromise instanceof Promise ? blobOrPromise : null;
+  if (blobPromise) void blobPromise.catch(() => {});
+  try {
+    const item = new ItemCtor({ [mime]: blobOrPromise });
+    await clipboard.write([item]);
+    return true;
+  } catch {
+    if (!blobPromise) return false;
+    try {
+      const resolved = await blobPromise;
+      const item = new ItemCtor({ [mime]: resolved });
+      await clipboard.write([item]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
 
 /** The slice of the DOM the execCommand fallback needs. */
 export interface ClipboardDocument {

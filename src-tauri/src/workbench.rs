@@ -525,6 +525,21 @@ impl WorkbenchState {
         body(store)
     }
 
+    /// Best-effort, non-blocking idle trim of the already-open workbench SQLite
+    /// connection (`PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);`).
+    pub(crate) fn trim_idle(&self) -> bool {
+        let Ok(guard) = self.0.store.try_lock() else {
+            return false;
+        };
+        let Some(store) = guard.as_ref() else {
+            return false;
+        };
+        store
+            .connection()
+            .execute_batch("PRAGMA shrink_memory; PRAGMA wal_checkpoint(PASSIVE);")
+            .is_ok()
+    }
+
     pub(crate) fn request(&self, method: &str, input: &str) -> Result<Value, WorkbenchError> {
         self.check_open()?;
         if input.len() > MAX_INPUT || method.len() > 64 {

@@ -349,10 +349,26 @@ describe("annotated but unregistered commands", () => {
     // reloads and restarts), from the terminal landing in e8f7bad9c. 340 with
     // the Manvi system steward's cmd_manvi_steward_status, _save, _set_repo
     // and _run_now. 341 with cmd_open_in_editor (Open in editor, at a line).
-    // 343 (without it) with cmd_terminal_legacy_hosts, _legacy_kill and
-    // _legacy_transcript (sessions an earlier version's terminal host still runs).
-    // 344 with both (341 + the three legacy-host commands).
-    expect(found.size).toBe(344);
+    // 344 with cmd_terminal_legacy_hosts, _legacy_kill and _legacy_transcript
+    // (sessions an earlier version's terminal host still runs).
+    // 350 with the idle memory efficiency and main-window hibernation commands
+    // (cmd_webview_idle_hint, cmd_main_hibernate, cmd_main_ready,
+    // cmd_idle_memory_status, cmd_idle_memory_settings,
+    // cmd_idle_memory_settings_save).
+    expect(found.size).toBe(350);
+    for (const legacy of ["hosts", "kill", "transcript"]) {
+      expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
+    }
+    for (const idleCmd of [
+      "cmd_webview_idle_hint",
+      "cmd_main_hibernate",
+      "cmd_main_ready",
+      "cmd_idle_memory_status",
+      "cmd_idle_memory_settings",
+      "cmd_idle_memory_settings_save",
+    ]) {
+      expect(found.has(idleCmd)).toBe(true);
+    }
     expect(found.has("cmd_terminal_set_title")).toBe(true);
     for (const steward of ["status", "save", "set_repo", "run_now"]) {
       expect(found.has(`cmd_manvi_steward_${steward}`)).toBe(true);

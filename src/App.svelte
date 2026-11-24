@@ -32,6 +32,7 @@
   import { activity } from "./lib/diagnostics/activity";
   import { get } from "svelte/store";
   import { requestConflictsFocus } from "./lib/ui/workConflicts";
+  import { requestInboxFocus } from "./lib/agents/inboxFocus";
   import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
     subscribeNativeShell,
@@ -90,6 +91,14 @@
   import { warmLazyChunks } from "./lib/components/lazyLoaders";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
   import Splash from "./lib/components/Splash.svelte";
+  import Skeleton from "./lib/components/Skeleton.svelte";
+  import { clearWakeSkeletonHint, idleStage } from "./lib/runtime/idleShedder";
+  import {
+    startIdleShedder,
+    stopIdleShedder,
+    waitForBootListeners,
+    type MainReadyPayload,
+  } from "./lib/runtime/idleShedderWiring";
 
   // Views the app does not need to start. Each becomes its own chunk, so
   // opening a repository no longer parses the coverage, health, storage,
@@ -173,7 +182,9 @@
   import { installTransparencyPreference } from "./lib/ui/transparencyPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
-  import { terminalSessions } from "./lib/terminal/sessionRegistry";
+  import { sessionByNativeId, terminalSessions } from "./lib/terminal/sessionRegistry";
+  import { focusTerminalSession } from "./lib/terminal/sessionFocus";
+  import { openTaskForRun } from "./lib/workbench/taskOpen";
   import { quitRisks } from "./lib/terminal/quitGuard";
   import { decideQuitManagedRuns, decideQuitTerminals, readTerminalBackend, type QuitTerminals } from "./lib/terminal/quitChoice";
   import { listAllLiveRuns } from "./lib/workbench/client";
@@ -267,14 +278,57 @@
   // repository surface on every toggle, which kills the live terminal
   // PTY it contains and re-hydrates every open tab on the way back.
   const fleetOpen = $derived($interfaceStore.globalSurface === "fleet");
+  const shouldShedInactiveSurfaces = $derived(
+    ($idleStage === "deep_shed" || $idleStage === "hibernating") && !isPromptOpen(),
+  );
   let fleetMounted = $state(false);
   let tasksMounted = $state(false);
   let agentsMounted = $state(false);
-  $effect(() => { if ($interfaceStore.globalSurface === "tasks") tasksMounted = true; });
+  let fleetShed = $state(false);
+  let tasksShed = $state(false);
+  let agentsShed = $state(false);
   $effect(() => {
-    if (fleetOpen) fleetMounted = true;
+    if ($interfaceStore.globalSurface === "tasks") {
+      tasksMounted = true;
+      if (tasksShed) {
+        const frame = requestAnimationFrame(() => {
+          tasksShed = false;
+        });
+        return () => cancelAnimationFrame(frame);
+      }
+    } else if (shouldShedInactiveSurfaces && tasksMounted) {
+      tasksMounted = false;
+      tasksShed = true;
+    }
   });
-  $effect(() => { if ($interfaceStore.globalSurface === "agents") agentsMounted = true; });
+  $effect(() => {
+    if (fleetOpen) {
+      fleetMounted = true;
+      if (fleetShed) {
+        const frame = requestAnimationFrame(() => {
+          fleetShed = false;
+        });
+        return () => cancelAnimationFrame(frame);
+      }
+    } else if (shouldShedInactiveSurfaces && fleetMounted) {
+      fleetMounted = false;
+      fleetShed = true;
+    }
+  });
+  $effect(() => {
+    if ($interfaceStore.globalSurface === "agents") {
+      agentsMounted = true;
+      if (agentsShed) {
+        const frame = requestAnimationFrame(() => {
+          agentsShed = false;
+        });
+        return () => cancelAnimationFrame(frame);
+      }
+    } else if (shouldShedInactiveSurfaces && agentsMounted) {
+      agentsMounted = false;
+      agentsShed = true;
+    }
+  });
 
   // Forward legacy repoStore.error to the centralized toast queue AND to the
   // diagnostics ring.
@@ -528,13 +582,45 @@
 
   onMount(() => {
     applyPlatformClass();
-    // After first paint, fetch the chunks a hover or click would otherwise wait on.
-    warmLazyChunks();
     // HMR/unmount can tear the component down while the async subscription
     // chain is still awaiting; listeners tracked after dispose unlisten
     // immediately instead of leaking past the component.
     const listeners = createListenerTracker();
     const { track } = listeners;
+
+    // When waking from Stage 2 hibernation (?wake=1), defer chunk warming
+    // briefly so the active surface hydrates and paints Frame 1 first.
+    const wakingFromHibernation =
+      typeof window !== "undefined" && window.location.search.includes("wake=1");
+    if (wakingFromHibernation) {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("wake");
+        const cleanUrl = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : "") + url.hash;
+        window.history.replaceState(window.history.state, "", cleanUrl);
+      } catch {
+        // Ignore restricted history state in synthetic test hosts.
+      }
+      const warmTimer = setTimeout(() => {
+        if (!listeners.disposed) warmLazyChunks();
+      }, 650);
+      track(() => clearTimeout(warmTimer));
+    } else {
+      warmLazyChunks();
+    }
+
+    startIdleShedder({
+      hasOpenModal: () =>
+        isRebaseModalOpen ||
+        isCloneModalOpen ||
+        isSettingsModalOpen ||
+        isShortcutsOpen ||
+        isDiagnosticsOpen ||
+        isBranchCleanupOpen ||
+        get(setupWizard).open,
+      onFlushBeforeHibernate: flushBeforeExit,
+    });
+    track(() => stopIdleShedder());
 
     track(installBackgroundScope({
       subscribe: repoStore.subscribe,
@@ -569,7 +655,7 @@
 
     // Arm the native side only after its listener exists. This prevents a
     // startup failure from trapping an exit request with nobody to answer it.
-    void listen<void>("gitpulse-exit-requested", () => {
+    const exitListenReady = listen<void>("gitpulse-exit-requested", () => {
       // Before any await: this is what tells the native side the page lives.
       void invoke("cmd_exit_request_answer", { answer: "seen" }).catch((error) =>
         diagnostics.warn("desktop:exit-seen", error),
@@ -754,6 +840,49 @@
       track(() => sync.dispose());
     }
 
+    async function focusAgentRequest(id: string) {
+      if (id.startsWith("term:")) {
+        const sessionId = id.slice("term:".length);
+        const record = sessionByNativeId(get(terminalSessions), sessionId);
+        if (record) {
+          const outcome = await focusTerminalSession(record);
+          if (outcome.ok) return;
+          if (record.taskRunId) {
+            try {
+              await openTaskForRun(record.taskRunId);
+              return;
+            } catch {
+              // Fall through to Agents surface + toast below.
+            }
+          }
+        }
+        toastStore.info("That agent session is no longer active.");
+        interfaceStore.setAgentsOpen(true);
+        return;
+      }
+      if (id.startsWith("run:")) {
+        const runId = id.slice("run:".length);
+        try {
+          await openTaskForRun(runId);
+          return;
+        } catch {
+          toastStore.info("That agent run is no longer waiting.");
+          interfaceStore.setAgentsOpen(true);
+          return;
+        }
+      }
+      if (id.startsWith("inbox:")) {
+        const threadKey = id.slice("inbox:".length);
+        const targetRepo =
+          get(nativeMenuState).agentRequests.find((req) => req.id === id)?.repoPath ?? null;
+        requestInboxFocus(threadKey, targetRepo);
+        interfaceStore.setAgentsOpen(true);
+        window.dispatchEvent(new CustomEvent("gitpulse:inbox-changed"));
+        return;
+      }
+      interfaceStore.setAgentsOpen(true);
+    }
+
     const shellHandlers: NativeShellHandlers = {
       ...createMenuCommands(),
       checkUpdates: () => void checkUpdatesFromMenu(),
@@ -798,6 +927,7 @@
       resetZoom: () => interfaceStore.resetZoom(),
       fleet: () => interfaceStore.setFleetOpen(true),
       agents: () => interfaceStore.setAgentsOpen(true),
+      focusAgent: (id) => void focusAgentRequest(id),
       terminalDock: () => repoStore.toggleTerminal(),
       rebase: openRebaseDialog,
       palette: () => openCommandPalette(),
@@ -840,7 +970,7 @@
         routeRepoChange(repo, polled, blocked, { ...fileDerivedTargets, repoState: () => {} });
       }),
     );
-    void runBootSequence(
+    const bootPromise = runBootSequence(
       {
         subscribeNativeShell,
         takePendingOpen,
@@ -870,7 +1000,7 @@
 
     // Sessions ended together by one external signal: say what ended them and
     // offer to resume their Claude conversations.
-    void watchIncidents(listen).then(
+    const incidentsListenReady = watchIncidents(listen).then(
       (unlisten) => track(unlisten),
       (error) => diagnostics.warn("boot:terminal-incident", error),
     );
@@ -878,7 +1008,7 @@
     // Build progress. A cold index of a large repository is several minutes of
     // an otherwise empty Map pane, and the kernel already prints the stage it
     // has reached; this is the only thing that carries it to the UI.
-    void listen<DevmapBuildProgress>("devmap-build-progress", (event) => {
+    const devmapListenReady = listen<DevmapBuildProgress>("devmap-build-progress", (event) => {
       const payload = event.payload;
       if (!payload?.repository) return;
       liveIndex.onBuildProgress(payload.repository, payload.stage, payload.total_stages);
@@ -890,7 +1020,7 @@
     // A watched checkout vanished (worktree removed, directory moved). The
     // watcher never announces a dead path as a change, so this is the only
     // way its tab learns it is gone.
-    void listen<RepoGonePayload>("repo-gone", (event) => {
+    const repoGoneListenReady = listen<RepoGonePayload>("repo-gone", (event) => {
       const path = event.payload?.path;
       if (path) repoStore.markRepoGone(path);
     }).then(
@@ -901,7 +1031,7 @@
     // The action journal follows the durable ledger rather than accumulating
     // in memory. Every guarded mutation announces its cursor; the store pages
     // from where it left off, so a missed notification costs nothing.
-    void listen<LedgerAppended>("ledger-appended", (event) => {
+    const ledgerListenReady = listen<LedgerAppended>("ledger-appended", (event) => {
       const path = event.payload?.repo_path;
       if (path) void harnessStore.syncLedger(path);
     }).then(
@@ -911,6 +1041,34 @@
       (unlisten) => track(unlisten),
       (err) => diagnostics.warn("boot:ledger-appended", err),
     );
+
+    // Signal main-window readiness only after every boot/event listener is
+    // attached so Rust's emit_to("main", ...) replay never drops an event.
+    if (isTauri()) {
+      void Promise.allSettled([
+        bootPromise,
+        waitForBootListeners(),
+        exitListenReady,
+        incidentsListenReady,
+        devmapListenReady,
+        repoGoneListenReady,
+        ledgerListenReady,
+        tick(),
+      ])
+        .then(() => {
+          if (listeners.disposed) return;
+          return invoke<MainReadyPayload>("cmd_main_ready");
+        })
+        .then(() => {
+          clearWakeSkeletonHint();
+        })
+        .catch((error) => {
+          clearWakeSkeletonHint();
+          diagnostics.warn("boot:main-ready", error);
+        });
+    } else {
+      clearWakeSkeletonHint();
+    }
 
     // GitHub Dependabot / code scanning at repository open. Detached from
     // boot the same way as the release check: a slow `gh api` must not delay
@@ -1388,7 +1546,11 @@
   {#if tasksMounted}
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("tasks", error)}>
       <div class="gp-workspace flex-1 flex flex-col min-h-0 bg-background gp-pane" class:hidden={$interfaceStore.globalSurface !== "tasks"}>
-        <LazyView load={loadTaskBoard} name="Tasks" props={{ active: $interfaceStore.globalSurface === "tasks", acceptsOpenRequests: true }} />
+        {#if tasksShed}
+          <Skeleton variant="pane-shell" />
+        {:else}
+          <LazyView load={loadTaskBoard} name="Tasks" props={{ active: $interfaceStore.globalSurface === "tasks", acceptsOpenRequests: true }} />
+        {/if}
       </div>
     </svelte:boundary>
   {/if}
@@ -1398,7 +1560,11 @@
          than unmounted for the same reason the terminal is. -->
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
-        <LazyView load={loadFleetView} name="the Fleet dashboard" props={{ active: fleetOpen }} />
+        {#if fleetShed}
+          <Skeleton variant="pane-shell" />
+        {:else}
+          <LazyView load={loadFleetView} name="the Fleet dashboard" props={{ active: fleetOpen }} />
+        {/if}
       </div>
     </svelte:boundary>
   {/if}
@@ -1406,7 +1572,11 @@
   {#if agentsMounted}
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("agents", error)}>
       <div class="gp-workspace flex-1 flex flex-col min-h-0 min-w-0 bg-background gp-pane" class:hidden={$interfaceStore.globalSurface !== "agents"}>
-        <LazyView load={loadAgentsView} name="Agents" />
+        {#if agentsShed}
+          <Skeleton variant="pane-shell" />
+        {:else}
+          <LazyView load={loadAgentsView} name="Agents" />
+        {/if}
       </div>
     </svelte:boundary>
   {/if}

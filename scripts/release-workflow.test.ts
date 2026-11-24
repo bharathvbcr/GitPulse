@@ -6,8 +6,8 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { expectedAssetNames } from "./check-release-assets.mjs";
-import { BUNDLE_CHECK_BUDGET_MS, COMMAND_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS, runReleaseStage, type Runner } from "./release-state.mjs";
+import { expectedAssetNames, supplementNames } from "./check-release-assets.mjs";
+import { BUNDLE_CHECK_BUDGET_MS, COMMAND_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS, formatChecksumsManifest, runReleaseStage, type Runner } from "./release-state.mjs";
 
 const stateScript = readFileSync(new URL("./release-state.mjs", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
@@ -177,7 +177,18 @@ it("opens the bundled installers in verify, with the tools the runner image alre
  */
 function boundedCallsInFinalize(): number {
   const commit = "a".repeat(40);
-  const stubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+  const checksumsName = supplementNames("1.2.3").checksums;
+  const rawBytes = (name: string) => Buffer.from(`bytes:${name}`);
+  const rawDigest = (name: string) => `sha256:${createHash("sha256").update(rawBytes(name)).digest("hex")}`;
+  const sumsBytes = Buffer.from(
+    formatChecksumsManifest(
+      expectedAssetNames("1.2.3")
+        .filter((name) => name !== checksumsName)
+        .map((name) => ({ name, digest: rawDigest(name) })),
+    ),
+    "utf8",
+  );
+  const stubBytes = (name: string) => (name === checksumsName ? sumsBytes : rawBytes(name));
   const digest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
   let release: Record<string, unknown> = {
     id: 42, tag_name: "v1.2.3", name: "GitPulse v1.2.3", target_commitish: commit, draft: true, prerelease: false,
@@ -257,4 +268,38 @@ it("attaches checksums and SBOMs after every installer and before finalize", () 
   const verify = workflow.slice(workflow.indexOf("\n  verify:"));
   expect(verify).toContain("needs: [preflight, prepare, release, attest]");
   expect(verify).toContain('if [ "${{ needs.attest.result }}" != "success" ]; then');
+});
+
+it("gives preflight headroom for the serial Rust suite and installs pinned devmap and manvi", () => {
+  const preflight = workflow.slice(workflow.indexOf("  preflight:"), workflow.indexOf("\n  prepare:"));
+  const timeout = Number(/timeout-minutes:\s*(\d+)/.exec(preflight)?.[1]);
+  expect(timeout).toBeGreaterThanOrEqual(90);
+  expect(preflight).toContain("cache-on-failure: true");
+  expect(preflight).toContain("run: bun run check:vendor-edits");
+  expect(preflight).toContain("run: bun run test:tz");
+  const installDevmap = preflight.indexOf("- name: Install devmap");
+  const strictSchema = preflight.indexOf("run: bun run check:vendor-schema\n");
+  const installManvi = preflight.indexOf("- name: Install manvi");
+  const rustTests = preflight.indexOf("- name: Rust Unit & Integration Tests");
+  expect(installDevmap).toBeGreaterThan(-1);
+  expect(strictSchema).toBeGreaterThan(installDevmap);
+  expect(installManvi).toBeGreaterThan(-1);
+  expect(rustTests).toBeGreaterThan(installDevmap);
+  expect(rustTests).toBeGreaterThan(installManvi);
+});
+
+it("verifies per-leg installer names, macOS app bundle integrity, release gitpulse-ptyd symbols, and preserves Rust cache on failure", () => {
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  release:"));
+  const prepareTimeout = Number(/timeout-minutes:\s*(\d+)/.exec(prepare)?.[1]);
+  expect(prepareTimeout).toBeGreaterThanOrEqual(10);
+  const release = workflow.slice(workflow.indexOf("\n  release:"), workflow.indexOf("\n  attest:"));
+  expect(release).toContain("cache-on-failure: true");
+  expect(release).toContain("node scripts/check-release-assets.mjs --bundles");
+  expect(release).toContain("node scripts/check-release-assets.mjs --app src-tauri/target/universal-apple-darwin/release/bundle/macos/GitPulse.app --universal");
+  expect(release).toContain("node scripts/check-ptyd-release.mjs --binary");
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  expect(verify).toContain("needs.preflight.result");
+  expect(verify).toContain("needs.prepare.result");
+  expect(stateScript).toContain("verifyChecksumsMetadata(release)");
+  expect(stateScript).toContain("verifyChecksumsManifest(");
 });
