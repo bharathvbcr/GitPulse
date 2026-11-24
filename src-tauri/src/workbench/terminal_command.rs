@@ -1548,7 +1548,12 @@ pub(super) fn arguments(
     };
     let skill = |name: &str| super::agy_plugin::skill_reference(provider, name);
     let (terminal, load, merge_train) = (skill("terminal"), skill("load"), skill("merge-train"));
-    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the {terminal} skill covers spawning and orchestrating child terminals or split file panes, the {load} skill covers checking host load before a heavy build or test and what a refusal for load means, and the {merge_train} skill covers verifying several finished branches together with one full gate run. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
+    let (commit_and_merge, merge_prs, wrap_up) = (
+        skill("commit-and-merge"),
+        skill("merge-prs"),
+        skill("wrap-up"),
+    );
+    args.push(format!("Read the UTF-8 task brief at {quoted}. It opens with how to work in this repository (its own instructions, GitPulse, DevMap and DevCouncil, and the verification rules), then the user's saved task and repository references. In this GitPulse terminal, the {terminal} skill covers spawning and orchestrating child terminals or split file panes, the {load} skill covers checking host load before a heavy build or test and what a refusal for load means, and the {merge_train} skill covers verifying several finished branches together with one full gate run. When the user asks you to land work, the {commit_and_merge} skill commits and merges finished branches while keeping locked-in ones, the {merge_prs} skill merges pull requests, and the {wrap_up} skill winds agents down and lands everything; run those three only on the user's request. {scope} Do not publish changes (push, merge, release) on the user's behalf."));
     if args.iter().any(|a| a.len() > 16 * 1024 || a.contains('\0')) {
         return Err(error(
             "invalid_input",
@@ -2568,7 +2573,14 @@ mod tests {
             } else {
                 ("gitpulse:", "gitpulse-")
             };
-            for skill in ["terminal", "load", "merge-train"] {
+            for skill in [
+                "terminal",
+                "load",
+                "merge-train",
+                "commit-and-merge",
+                "merge-prs",
+                "wrap-up",
+            ] {
                 assert!(
                     prompt.contains(&format!("the {want}{skill} skill")),
                     "{provider}: {prompt}"
