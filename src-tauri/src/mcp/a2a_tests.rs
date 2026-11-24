@@ -1680,6 +1680,112 @@ fn following_the_over_cap_hint_literally_repairs_the_bus() {
 }
 
 #[test]
+fn a_returned_envelope_whose_bus_row_was_evicted_is_not_listed_as_pinned() {
+    let (_dir, repo) = trusted_git_repo();
+    let nonce = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    let sid = format!(
+        "88888888-{:04x}-4888-8888-{:012x}",
+        (std::process::id() & 0xffff),
+        (nonce & 0xffff_ffff_ffff)
+    );
+    register_forgery_target(&repo, &sid, "evict-owner");
+    let mb = Mailbox::at_default().expect("mailbox");
+    crate::harness::steward::deliver_directive_to_repo(
+        &repo,
+        &mb,
+        "steward-evict-1",
+        "claude-sonnet-4-6",
+        "cloud",
+        "severe",
+        "swap",
+        "Directive whose bus row will be evicted",
+    )
+    .expect("deliver directive");
+    for idx in 0..(crate::engine::agent_bus::MAX_BUS_MESSAGES + 4) {
+        crate::engine::agent_bus::post_peer_message(
+            &repo,
+            crate::engine::agent_bus::MessageOrigin::Agent,
+            "claude:chatter",
+            Some("other-peer"),
+            None,
+            "note",
+            &format!("ring rotation filler {idx}"),
+            None,
+            None,
+            1,
+            6,
+        )
+        .expect("post filler");
+    }
+    assert!(
+        crate::engine::agent_bus::get_message_by_id(&repo, "steward-evict-1")
+            .expect("lookup")
+            .is_none(),
+        "the steward row must be evicted from the bus"
+    );
+
+    let page = handle_tool_call(
+        "gitpulse_agent_inbox",
+        &json!({ "repo_path": repo, "for_peer": "evict-owner", "limit": 50 }),
+    )
+    .expect("inbox");
+    let returned = page["messages"].as_array().unwrap();
+    let steward = returned
+        .iter()
+        .find(|m| m["msg_id"] == "steward-evict-1")
+        .unwrap_or_else(|| panic!("the envelope is still returned: {page}"));
+    let steward_seq = steward["seq"].as_u64().unwrap();
+    assert!(steward_seq < page["dropped_before_seq"].as_u64().unwrap());
+    let listed = page["pinned_below_dropped_before_seq"].as_array().unwrap();
+    assert!(
+        !listed.contains(&json!(steward_seq)),
+        "a row that is not on the bus must not be listed as retained: {page}"
+    );
+}
+
+#[test]
+fn a_legacy_bus_row_hydrated_for_a_mailbox_envelope_is_acked_and_claimed() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "88888888-8888-4888-8888-888888888808";
+    register_inbox_peer(&repo, sid, "legacy-owner");
+    handle_tool_call(
+        "gitpulse_agent_send",
+        &json!({ "repo_path": repo, "from_peer": "agy:lead", "to_peer": "legacy-owner",
+                 "body": "legacy row", "msg_id": "msg-1" }),
+    )
+    .expect("send");
+    // Make the bus row a legacy one (no msg_id) that the bus read does not match to the
+    // reader, so only the mailbox envelope leads to it through get_message_by_id.
+    let path = crate::engine::agent_bus::lanes_messages_path(&repo, false).expect("bus path");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read bus")).expect("parse bus");
+    let row = state["messages"][0].as_object_mut().expect("row");
+    assert_eq!(row["seq"], 1);
+    row.remove("msg_id");
+    row.insert("to_agent".into(), json!("somebody-else"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&state).expect("serialize")).expect("write");
+
+    let read = || {
+        handle_tool_call(
+            "gitpulse_agent_inbox",
+            &json!({ "repo_path": repo, "for_peer": "legacy-owner", "ack": true }),
+        )
+        .expect("inbox")
+    };
+    let first = read();
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1, "{first}");
+    assert_eq!(first["messages"][0]["msg_id"], "msg-1", "{first}");
+    assert_eq!(first["acked_count"], 1, "{first}");
+    let second = read();
+    assert!(
+        second["messages"].as_array().unwrap().is_empty(),
+        "{second}"
+    );
+}
+
+#[test]
 fn an_exact_retry_of_a_threaded_send_keeps_the_stored_hop_and_the_mailbox_deposit() {
     let (_dir, repo) = trusted_git_repo();
     let sid = "99999999-9999-4999-8999-999999999991";

@@ -231,7 +231,7 @@ pub struct AgentInboxPage {
 }
 
 /// Seqs of the retained `rows` that are below `dropped_before_seq`, oldest first.
-pub(crate) fn seqs_below_dropped(rows: &[AgentBusMessage], dropped_before_seq: u64) -> Vec<u64> {
+fn seqs_below_dropped(rows: &[AgentBusMessage], dropped_before_seq: u64) -> Vec<u64> {
     rows.iter()
         .map(|m| m.seq)
         .filter(|seq| *seq < dropped_before_seq)
@@ -1171,7 +1171,7 @@ fn read_messages_readonly(path: &Path) -> Result<MessagesState, CommandError> {
     read_json_bounded_hint(
         path,
         MESSAGES_FILE_CAP,
-        "; the next post or ack compacts it: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository to repair it",
+        "; only a write repairs it, and an inbox read or acknowledgement is not one: send one gitpulse_agent_send without thread_key or in_reply_to to a registered peer in this repository",
     )
 }
 

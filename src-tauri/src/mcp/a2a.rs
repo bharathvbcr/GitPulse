@@ -767,6 +767,10 @@ fn collect_deduped_peer_inbox(
     )
     .map_err(CommandError::into_message)?;
 
+    // Seqs of returned rows that really are on the bus. A row rebuilt from a mailbox envelope
+    // (its bus row evicted) keeps its old seq, which can sit below `dropped_before_seq` without
+    // being a retained row, so only bus-backed rows may appear in the pinned list.
+    let mut on_bus: BTreeSet<u64> = bus_page.messages.iter().map(|m| m.seq).collect();
     let mut seen_ids = BTreeSet::new();
     let mut combined = Vec::new();
     for msg in bus_page.messages {
@@ -939,6 +943,9 @@ fn collect_deduped_peer_inbox(
                         continue;
                     }
                 }
+                if from_bus {
+                    on_bus.insert(synthesized.seq);
+                }
                 mailbox_req_by_msg_id.insert(env_id.clone(), env.claim.request_id);
                 seen_ids.insert(env_id);
                 combined.push(synthesized);
@@ -954,8 +961,11 @@ fn collect_deduped_peer_inbox(
     }
 
     // Listed from what is actually returned, so the list never names a row the page lacks.
-    let pinned_below_dropped_before_seq =
-        agent_bus::seqs_below_dropped(&combined, bus_page.dropped_before_seq);
+    let pinned_below_dropped_before_seq: Vec<u64> = combined
+        .iter()
+        .map(|m| m.seq)
+        .filter(|seq| *seq < bus_page.dropped_before_seq && on_bus.contains(seq))
+        .collect();
 
     let mut acked_count = 0usize;
     if ack && !combined.is_empty() {
