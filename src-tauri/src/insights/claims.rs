@@ -34,7 +34,8 @@
 //!   stays honestly degraded until the next claim write.
 //! * A compaction reads the store through one handle and takes that handle's
 //!   own device and inode, and its last complete line, as what it was made
-//!   from. The new file is written beside the store before the exclusive lock
+//!   from. It keeps that handle open until it is done, so the inode number
+//!   cannot be given to another file meanwhile. The new file is written beside the store before the exclusive lock
 //!   is asked for; under it the file at the path must still be that file, and
 //!   whatever was appended since is copied on before the rename. If it is not
 //!   that file, nothing is copied and the claim is simply appended.
@@ -487,6 +488,15 @@ struct Prepared {
     end: u64,
     /// The file that was read, when the platform can say which.
     id: Option<(u64, u64)>,
+    /// The handle that read it, held open until the compaction is done. `id` is
+    /// a device and inode number, and a number is reused: once another writer
+    /// renames its compaction over the store, the file this was read from is
+    /// unlinked, and a later compaction's new file can be given the same
+    /// number and be renamed over the store in turn. That file then passed for
+    /// this one, and the rename here put back rows read long before, losing
+    /// every append made to the file in between. An open handle keeps the
+    /// inode, so its number cannot be given to another file while this holds it.
+    _read: Option<fs::File>,
     /// The new file, beside the store.
     tmp: PathBuf,
     committed: bool,
@@ -535,7 +545,13 @@ impl Prepared {
 
     /// Writes `text` to a file of its own beside `store`. The name carries this
     /// process and a counter, so hooks compacting together never share one.
-    fn write(store: &Path, end: u64, id: Option<(u64, u64)>, text: &str) -> Result<Self, String> {
+    fn write(
+        store: &Path,
+        end: u64,
+        id: Option<(u64, u64)>,
+        read: Option<fs::File>,
+        text: &str,
+    ) -> Result<Self, String> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp = store.with_extension(format!(
             "jsonl.{}.{}.tmp",
@@ -549,6 +565,7 @@ impl Prepared {
         let prepared = Prepared {
             end,
             id,
+            _read: read,
             tmp,
             committed: false,
         };
@@ -617,7 +634,7 @@ fn prepare_from_loaded(
         text.push('\n');
     }
     text.push_str(&rows_text);
-    Prepared::write(store, loaded.end, loaded.id, &text)
+    Prepared::write(store, loaded.end, loaded.id, loaded.read, &text)
 }
 
 /// `kept` (oldest first) as store text, with the oldest rows left out until it
@@ -839,7 +856,8 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
         file.seek(SeekFrom::Start(start)).map_err(read_error)?;
     }
     let mut buf = Vec::new();
-    file.take(MAX_STORE_BYTES)
+    Read::by_ref(&mut file)
+        .take(MAX_STORE_BYTES)
         .read_to_end(&mut buf)
         .map_err(read_error)?;
     // The read stops at the last newline it saw. What follows it may be a row
@@ -857,6 +875,9 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
         skipped: parsed.skipped,
         end: start + complete as u64,
         id,
+        // Only where `id` is an inode: elsewhere it is `None`, the handle pins
+        // nothing, and Windows may refuse to rename over a file still open.
+        read: cfg!(unix).then_some(file),
     })
 }
 
@@ -871,6 +892,9 @@ struct Loaded {
     end: u64,
     /// The file that was read, from its own handle, when the platform can say.
     id: Option<(u64, u64)>,
+    /// That handle, still open: a compaction made from this read keeps it so
+    /// `id` cannot be reused by another file meanwhile (see [`Prepared`]).
+    read: Option<fs::File>,
 }
 
 /// A line a compaction writes when it had to drop live claims, so the next read

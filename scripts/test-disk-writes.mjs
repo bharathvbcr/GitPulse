@@ -13,8 +13,8 @@
  *
  * What it cannot see: a test whose writes depend on state an earlier test left
  * behind. The in-process watchdog in the same module covers that (it aborts a
- * run that averages more than 160 MiB/s over 30 s, or writes more than 8 GiB).
- * That 8 GiB covers the whole lib suite in one process, so it is the sum of
+ * run that averages more than 160 MiB/s over 30 s, or writes more than 16 GiB).
+ * That 16 GiB covers the whole lib suite in one process, so it is the sum of
  * these per-test figures that must stay under it, not only the largest.
  *
  * Usage: node scripts/test-disk-writes.mjs [--budget-mib N] [--jobs N] [--top N] [--filter TEXT]
