@@ -8,6 +8,15 @@ updates:
       bun-dependencies:
         patterns:
           - "*"
+    ignore:
+      # 5.58.1's batching rework (sveltejs/svelte#19030) re-runs expressions in
+      # an `{#if x}` branch with `x` already null before tearing the branch
+      # down. The throw abandons the update, so Health's state chain stays on
+      # its old branch after a repository switch (harness/health.html: "rapid A
+      # to B to A scans A once and B never"). Pinned to 5.58.0 in package.json;
+      # later releases are still proposed, and CI tests them.
+      - dependency-name: svelte
+        versions: ["5.58.1", "5.59.0", "5.59.1"]
 
   - package-ecosystem: cargo
     directory: /src-tauri

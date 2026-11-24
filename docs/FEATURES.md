@@ -7,7 +7,7 @@ code on `main` today. For controls, prerequisites and limits of each view, see t
 [view reference](VIEW_REFERENCE.md). GitPulse is tested on macOS. Windows and Linux builds are produced by
 release CI but have not been tested, so some features below may behave differently or be missing there.
 
-GitPulse has 4 views and 11 sections: **Work** (Overview, Remote, Tasks), **Code** (Explorer, Map),
+GitPulse has 5 views and 11 sections: **Work** (Overview, Remote, Tasks), **Mavi** (a single pane: agent conversations and their changes), **Code** (Explorer, Map),
 **History** (Graph, Diff) and **Insights** (Pulse, Coverage, Health, Storage). Fleet, the Agents plane and
 the terminal dock sit beside them. The native layer exposes 330+ commands to the frontend.
 

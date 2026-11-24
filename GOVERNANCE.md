@@ -53,12 +53,34 @@ who are inactive for a long period are moved to emeritus status.
     (Windows), Gusset engine (Linux), and "No commit authored as a test fixture";
   - no force-push and no deletion of `main`.
   Merge, squash and rebase merges are all allowed.
-- **The repository admin can bypass the ruleset.** The maintainer may push to
-  `main` directly as repository admin, which is used for releases, for landing
-  trains of merged work, and for automation. Everything else, including every
-  contributor's change, is subject to the ruleset.
+- **Development split and branch groups are protected by rulesets** (with the
+  same repository-admin bypass):
+  - **`dev`** ("dev: development split") is the long-lived development
+    integration branch alongside `main`. It blocks unauthorized creation,
+    deletion and force-push and requires pull-request review (1 approving
+    review, code-owner review, stale approvals dismissed, all conversations
+    resolved). Required CI status checks remain gated on `main` until CI
+    triggers include `dev`.
+  - **`release/**` and `primary/**`** ("branch groups: release/\*\* and
+    primary/\*\*") reserve release stabilization lines and long-term Primary
+    product tracks with the same creation, deletion, force-push and pull-request
+    review rules.
+  - **`labs/**`** ("labs/\*\*: private-repo guard") blocks non-admin creation,
+    updates, deletion and force-push on this public repository. Private Labs
+    development (`labs/integration`, `primary/byok`, `labs/geek`,
+    `labs/geek-squad`, `labs/enterprise`, plus immutable `archive/**`) lives in
+    the private `GitPulse-labs` repository under matching rulesets.
+  - **`archive/**`** ("archive/\*\*: immutable") cannot be created, updated,
+    force-pushed or deleted by non-admins.
+- **The repository admin can bypass the rulesets.** The maintainer may push to
+  `main` or protected branch groups directly as repository admin, which is used
+  for releases, for landing trains of merged work, and for automation.
+  Everything else, including every contributor's change, is subject to the
+  rulesets.
 - **Release tags (`v*`) are protected:** they cannot be deleted, force-updated or moved.
-- **Branch names** use a type prefix (`feat/`, `fix/`, `docs/`, `chore/`, ...).
+- **Branch names** use a type prefix (`feat/`, `fix/`, `docs/`, `chore/`, ...)
+  for contributor pull requests, or a reserved group prefix (`release/`,
+  `primary/`, `archive/`) managed by maintainers.
 - **Commits** use Conventional Commit subjects and carry a DCO sign-off
   (`git commit -s`). Sign-off is required by project policy and checked in
   review; GitHub does not enforce it automatically for commits made outside

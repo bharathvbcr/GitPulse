@@ -56,11 +56,11 @@ jobs:
           toolchain: nightly-2026-10-05
           components: llvm-tools-preview
 
-      # The tool is named, not implied by the ref. Pinned to the commit behind
-      # install-action's `cargo-llvm-cov` tag, the action installed it with no
-      # input; when Dependabot moved the pin to a plain release commit (b2503f6)
-      # it installed nothing, succeeded, and every run failed later with
-      # "no such command: `llvm-cov`". The version check fails here instead.
+      # The tool is named, not implied by the ref: install-action's per-tool
+      # refs (`@cargo-llvm-cov`) carry the name, but a pinned v2 commit installs
+      # only what `tool:` lists. #28 moved this step from the per-tool ref's
+      # commit to a v2 commit without one, and every coverage run then failed
+      # at `cargo llvm-cov` with "no such command".
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:

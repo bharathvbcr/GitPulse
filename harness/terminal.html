@@ -623,24 +623,39 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
-            // The addon also adds a 2D link layer (`xterm-link-layer`); the
-            // WebGL canvas is the one in the screen without a layer class.
-            // Not any canvas under the session: addon-webgl shares one glyph
-            // atlas between terminals with the same config, and the atlas parks
-            // its hidden 2D scratch canvas (`TextureAtlas._tmpCanvas`) on the
-            // root of whichever terminal last rasterized a new glyph, outside
-            // the screen, until the last terminal using it lets go. Which one
-            // that is depends on paint timing, and it is the atlas's canvas,
-            // not a context the session holds.
-            // Presence checks below use `paneCanvases`, which also leaves that
-            // scratch canvas out but counts every other canvas in the pane.
-            const glCanvas = (el) => [...el.querySelectorAll(".xterm-screen canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            // The WebGL addon draws with two canvases in xterm's screen element:
+            // its GL canvas and a 2D link layer (`xterm-link-layer`); the WebGL
+            // canvas is the one in the screen without a layer class. The shared
+            // glyph atlas's hidden 2D scratch canvas (`TextureAtlas._tmpCanvas`,
+            // drawn in `_drawToCache`; see `paneCanvases`) sits at the root of
+            // whichever terminal last rasterised a new glyph, outside the screen,
+            // until the last terminal using the atlas lets go. It is the atlas's,
+            // not a context the session holds. `paneCanvases` counts every canvas
+            // in the pane but that one, so it includes the screen's: absence is
+            // checked with `paneCanvases` (no drawing canvas left anywhere in the
+            // pane), presence with `holdsGpu` (a canvas in the screen itself).
+            const screenCanvases = (el) => [...el.querySelectorAll(".xterm-screen canvas")];
+            const holdsGpu = (el) => screenCanvases(el).length > 0;
+            const glCanvas = (el) => screenCanvases(el).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
             const frames = (count = 2) => new Promise((resolve) => {
               let left = count;
               const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
               requestAnimationFrame(tick);
             });
             const gpuNote = () => visible("[data-terminal-gpu-note]")[0]?.textContent ?? "";
+            // Waits for a state reached by a timer (the hold's release), up to
+            // `ms`, instead of sleeping a fixed span and looking once: a loaded
+            // runner fires the timer late, and a fixed sleep then reads the
+            // state before it was reached. The deadline is generous; the state
+            // is still required, only its arrival time is not guessed.
+            const settles = async (predicate, ms = 5000) => {
+              const until = performance.now() + ms;
+              while (!predicate()) {
+                if (performance.now() > until) return false;
+                await wait(40);
+              }
+              return true;
+            };
             // A context created before any session's is the oldest one on the
             // page, which is the one a browser force-loses first when the page
             // passes its cap (16 in Chromium and in WebKit). It is never drawn
@@ -681,7 +696,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             check("the session on screen draws through WebGL", () => {
               const [el] = shown();
               if (shown().length !== 1) throw new Error(`${shown().length} sessions on screen`);
-              return el.dataset.renderer === "webgl" && paneCanvases(el).length > 0;
+              return el.dataset.renderer === "webgl" && holdsGpu(el);
             });
             check("sessions that are not on screen hold no WebGL context", () => {
               const rows = hidden().map((el) => `${el.dataset.renderer}/${paneCanvases(el).length}`);
@@ -720,23 +735,26 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
             const reshown = shown()[0] === other;
             // The canvas the other session draws to once shown again inside the
-            // hold: the held one, if the hold kept it (`otherCanvas`, above).
+            // hold, read before it is hidden: the held one, if the hold kept it
+            // (`otherCanvas`, above). Its release detaches it and loses its context.
             const reshownCanvas = glCanvas(other);
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft");
             const hiddenAt = performance.now();
             const backOnTarget = shown()[0] === target;
-            await wait(900);
-            // The hold's timer was armed at the keydown, so it is due ~750 ms
-            // before these waits end and fires first: timers run in order.
             // Given up means: back on the DOM renderer, the WebGL canvas it held
             // detached with its context lost, and no drawing canvas left. The
             // shared glyph atlas's scratch canvas may still sit here (see
             // `paneCanvases`); counting it failed this on the Ubuntu runner.
-            // On failure each canvas still in the pane is listed.
+            // The release comes from the hold's timer, which a loaded runner fires
+            // late, so this waits for the state (up to 5 s) instead of sleeping a
+            // fixed span; the state itself is still required. On failure each
+            // canvas still in the pane is listed.
             const releasedCanvas = (node) => !!node && !other.contains(node) && !node.isConnected && !!node.getContext("webgl2")?.isContextLost();
+            const otherReleased = () => other.dataset.renderer === "dom" && !paneCanvases(other).length && !holdsGpu(other) && !glCanvas(other)
+              && !!otherGl && otherGl.isContextLost() && releasedCanvas(otherCanvas) && releasedCanvas(reshownCanvas);
+            await settles(otherReleased);
             check("a session that stays hidden past the hold gives its context up",
-              () => (other.dataset.renderer === "dom" && !paneCanvases(other).length && !glCanvas(other)
-                && !!otherGl && otherGl.isContextLost() && releasedCanvas(otherCanvas) && releasedCanvas(reshownCanvas)) || (() => {
+              () => otherReleased() || (() => {
                 throw new Error(JSON.stringify({
                   renderer: other.dataset.renderer, canvases: paneCanvases(other).length,
                   hideGraceMs: gpuPolicy.hideGraceMs, reshown, backOnTarget, shownNow: shown().map((el) => el === other ? "other" : el === target ? "target" : "?"),
@@ -751,11 +769,12 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
                   heldContextLost: otherGl?.isContextLost() ?? null,
                 }));
               })());
-            button("Hide the dock").click(); await wait(900);
+            button("Hide the dock").click();
             // Strictly no canvas: with every session released the shared atlas has
             // no owner left, is disposed, and its scratch canvas goes with it.
-            check("hiding the dock past the hold releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length && !el.querySelector("canvas")));
+            const allReleased = () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !paneCanvases(el).length && !el.querySelector("canvas"));
+            await settles(allReleased);
+            check("hiding the dock past the hold releases the on-screen session's context too", allReleased);
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
               () => firstGl.isContextLost());
             await showAndProbe();
@@ -802,7 +821,8 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
               report.skipped.push("the page's oldest context survived (WebKit counts a lost wrapper until it is collected)");
             }
             check("only the session on screen holds a canvas",
-              () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1 && sessionsAll().filter((el) => glCanvas(el)).length === 1);
+              () => sessionsAll().filter((el) => paneCanvases(el).length).length === 1 && sessionsAll().filter(holdsGpu).length === 1
+                && sessionsAll().filter((el) => glCanvas(el)).length === 1);
 
             // -- The resource profile's cap budgets hidden contexts, never a pane on
             // screen: on the compact budget (two) three more panes beside an anchor
@@ -847,7 +867,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
                     const addon = new WebglAddon();
                     term.loadAddon(addon);
                     churn.created += 1;
-                    pane.canvas = paneCanvases(term.element).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+                    pane.canvas = screenCanvases(term.element).find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
                     const gl = pane.canvas.getContext("webgl2");
                     // As TerminalSession.svelte hears it: a loss on this canvas is the session's to count.
                     pane.canvas.addEventListener("webglcontextlost", () => {
@@ -3141,7 +3161,9 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
           term.loadAddon(new WebglAddon());
         }
         term.focus();
-        const renderer = paneCanvases(host).length ? "webgl" : "dom";
+        // WebGL only when the screen holds a canvas; DOM only when the pane holds
+        // none at all (the atlas's scratch canvas aside, see `paneCanvases`).
+        const renderer = host.querySelector(".xterm-screen canvas") ? "webgl" : paneCanvases(host).length ? "unknown" : "dom";
         // `onRender` skips redraw-only renders (a blinking cursor asks for them),
         // which still paint whatever a block buffered. What the screen shows is
         // every call into the renderer, so that is what is counted.
@@ -3178,8 +3200,12 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
         const writer = createSyncFrameWriter({ write });
         await new Promise((resolve) => requestAnimationFrame(() => resolve()));
         const base = paints;
+        // `frames` is also the page's own render rate during the run: xterm
+        // paints at most once per animation frame, and a loaded runner on
+        // software WebGL gets far fewer than 60 a second.
         requestAnimationFrame(countFrame);
-        const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
+        const framesSent = Math.round(SYNC_FPS * SYNC_MS / 1000);
+        const sent = await deliver(frameStream(framesSent), SYNC_MS, (chunk) => {
           received += chunk.length;
           const done = () => { acked += chunk.length; };
           if (viaWriter) writer.push(chunk, done); else write(chunk, done);
@@ -3193,7 +3219,7 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
         await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
         // Read in the task the loop stops in: no frame runs in between.
         counting = false;
-        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, frames, owed, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, frames, owed, framesSent, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
         await wait(1300);
         out.paintsAfterAnother1p3s = paints - base;
         out.partialPaints = partial;
@@ -3277,9 +3303,22 @@ import { adoptOutput, pushOutput, pushedBytes, emitExit } from "./tauriMocks";
             // The direct arm's count (0 on Chrome, 0 to 10 on WebKit, against ~120)
             // is reported in the verdict's diagnostics, not asserted: it is
             // xterm's bug, and a fixed xterm would make it converge on this one.
-            // The premise: the run gave xterm enough frames to paint that the
-            // bug's ~1 paint a second cannot pass for the writer's.
+            // The premise: the page drew frames at all, and the run gave xterm
+            // enough frames to paint that the bug's ~1 paint a second cannot
+            // pass for the writer's.
+            check(`${tag}: the page drew frames during the run, so it has a render rate to keep (${after.frames} animation frames)`, () => after.frames >= 10);
             check(`${tag}: the run owed xterm enough frames to tell the writer from the bug (${after.owed} owed of ${after.frames} frames; at least ${SYNC_MIN_OWED})`, () => after.owed >= SYNC_MIN_OWED);
+            // Against the frames the page could show (the fewer of the animation
+            // frames it got and the frames sent), not a fixed count. Through the
+            // writer the DOM renderer paints about once per animation frame, and
+            // software WebGL (CI, a headless container) about every other one;
+            // the bug this guards paints about once a second, ~2 in the whole
+            // run. A quarter of the showable frames is an order of magnitude
+            // above the bug on any host that drew 10 frames, where a fixed 40
+            // failed a loaded runner that only drew ~70 at all.
+            const showable = Math.min(after.frames, after.framesSent);
+            const floor = Math.ceil(showable / 4);
+            check(`${tag}: through the writer it paints at least a quarter of the frames the page could show (${after.paints} paints, ${after.distinctFrames} distinct frames, of ${showable} showable; at least ${floor})`, () => after.paints >= floor && after.distinctFrames >= floor);
             // The render rate is the browser's: every frame that followed a
             // parsed write is painted, and shows a frame newer than the last.
             check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames, ${after.owed} frames owed; written directly: ${before.paints} paints of ${before.owed} owed)`, () => after.paints >= after.owed && after.distinctFrames >= after.owed);

@@ -76,3 +76,17 @@ describe("viewAttention", () => {
     expect(viewAttention("code", ["explorer", "map"], ctx)).toBeNull();
   });
 });
+
+describe("Mavi attention", () => {
+  const base = { conflictedCount: 0, verdictStatus: null };
+  it("counts threads waiting for an answer, and outranks a failure", () => {
+    expect(viewAttention("mavi", [], { ...base, maviNeedsYou: 2, maviFailed: 1 })).toMatchObject({ tone: "amber", count: 2 });
+  });
+  it("shows a dot for an unseen failure, and nothing when all is quiet", () => {
+    expect(viewAttention("mavi", [], { ...base, maviFailed: 1 })).toMatchObject({ tone: "rose", count: null });
+    expect(viewAttention("mavi", [], base)).toBeNull();
+  });
+  it("never puts Mavi's attention on another view", () => {
+    expect(viewAttention("code", ["explorer"], { ...base, maviNeedsYou: 3 })).toBeNull();
+  });
+});

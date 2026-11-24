@@ -17,6 +17,10 @@ export interface AttentionContext {
   conflictedCount: number;
   /** Status of the last MANVI verdict, or null when none was recorded. */
   verdictStatus: PolicyStatus | null;
+  /** Mavi threads waiting for the person's answer to a permission request. */
+  maviNeedsYou?: number;
+  /** Mavi threads whose last turn or agent failed and that no one has looked at. */
+  maviFailed?: number;
 }
 
 export type AttentionTone = "rose" | "amber";
@@ -53,12 +57,38 @@ export function sectionAttention(
   return null;
 }
 
+/**
+ * Mavi has no sections (its rail, conversation and changes are one pane), so
+ * its pill reads the threads directly. A request waiting for an answer
+ * outranks a failure: the agent is blocked on the reader.
+ */
+export function maviAttention(context: AttentionContext): SectionAttention | null {
+  const waiting = context.maviNeedsYou ?? 0;
+  if (waiting > 0) {
+    return {
+      tone: "amber",
+      count: waiting,
+      reason: waiting === 1 ? "1 Mavi thread is waiting for your answer" : `${waiting} Mavi threads are waiting for your answer`,
+    };
+  }
+  const failed = context.maviFailed ?? 0;
+  if (failed > 0) {
+    return {
+      tone: "rose",
+      count: null,
+      reason: failed === 1 ? "A Mavi thread failed" : `${failed} Mavi threads failed`,
+    };
+  }
+  return null;
+}
+
 /** The most urgent attention among a view's sections, for its collapsed pill. */
 export function viewAttention(
   view: ViewTab,
   sections: readonly string[],
   context: AttentionContext,
 ): SectionAttention | null {
+  if (view === "mavi") return maviAttention(context);
   for (const section of sections) {
     const found = sectionAttention(view, section, context);
     if (found) return found;

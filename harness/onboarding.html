@@ -104,11 +104,11 @@
       check("repository state confirms success", () => text().includes("Repository open."));
       check("picker leaves current step active", () => get(tour).step === 1 && JSON.parse(saved).status === "active");
       await next();
-      check("four live view controls", () => body().querySelectorAll('[aria-pressed]').length === 4);
+      check("five live view controls", () => body().querySelectorAll('[aria-pressed]').length === 5);
       check("mac shortcut", () => text().includes("⌘K"));
       resetHostPlatformForTests({ os: "windows", dock_hiding: false }); await settle();
       check("Windows shortcut", () => text().includes("Ctrl+K"));
-      for (const [label, id] of [["Code", "code"], ["History", "history"], ["Insights", "insights"], ["Work", "work"]]) {
+      for (const [label, id] of [["Mavi", "mavi"], ["Code", "code"], ["History", "history"], ["Insights", "insights"], ["Work", "work"]]) {
         await click(label);
         check(`${label} changes the host view`, () => get(workspace).view === id);
         check(`${label} reports the actual selection`, () => body().querySelector('[aria-pressed="true"]')?.textContent.trim() === label);

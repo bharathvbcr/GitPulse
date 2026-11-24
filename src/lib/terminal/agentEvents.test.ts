@@ -181,3 +181,17 @@ describe("agentEvents", () => {
     expect(harness.has("terminal-child-closed")).toBe(false);
   });
 });
+
+describe("dispatchTouchedFile", () => {
+  it("routes a valid outside event to panel subscribers and refuses an invalid one", async () => {
+    const { createAgentEventBus } = await import("./agentEvents");
+    const bus = createAgentEventBus(() => Promise.resolve(() => {}));
+    const seen: string[] = [];
+    const stop = bus.subscribePanelEvents({ onTouchedFile: (p) => seen.push(`${p.repo_path}:${p.path}`) });
+    expect(bus.dispatchTouchedFile({ id: "mavi:k", repo_path: "/r", path: "src/a.ts", artifact: false })).toBe(true);
+    expect(bus.dispatchTouchedFile({ id: "mavi:k", repo_path: "/r", path: "../etc/passwd", artifact: false })).toBe(false);
+    expect(bus.dispatchTouchedFile({ id: "mavi:k", repo_path: "relative", path: "a", artifact: false })).toBe(false);
+    stop();
+    expect(seen).toEqual(["/r:src/a.ts"]);
+  });
+});
