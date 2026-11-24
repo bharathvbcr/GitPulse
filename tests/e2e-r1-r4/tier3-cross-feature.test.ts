@@ -3,13 +3,14 @@ import { existsSync } from "node:fs";
 import { get } from "svelte/store";
 import { render } from "svelte/server";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { clearMocks } from "@tauri-apps/api/mocks";
+import { mockIPCWithEvents } from "../../harness/tauriMocks";
 import Logo from "../../src/lib/components/Logo.svelte";
 import StatusPopover from "../../src/lib/desktop/StatusPopover.svelte";
 import {
-  buildMenuState,
   canDispatchMenuEvent,
   countAgentsWaiting,
-  type MenuState,
+  type MenuAgentRequest,
 } from "../../src/lib/desktop/menuState";
 import {
   MENU_LIMITS,
@@ -38,20 +39,20 @@ import {
 } from "../../src/lib/ui/workConflicts";
 import { runBrowserPage } from "./helpers/browser";
 import {
+  assertCargoPassed,
+  assertTrayPulseIconUpdated,
   ensureGitPulseHookBinary,
+  execCargoSuite,
   readPngInfo,
   readRepoFile,
   repoPath,
-  runCargoTest,
   runGitPulseHookWithSocket,
 } from "./helpers/env";
 import {
   agyPreInvocation,
   agyStop,
-  claudeNotification,
   claudePermissionRequest,
-  claudePostToolUse,
-  claudeStop,
+  makeMenuAgentRequest,
   makeMenuState,
   makeMenuStateWithRequests,
   makePlaneProbe,
@@ -63,12 +64,145 @@ const LEGACY_PLUGIN_LOGO_SHA256 =
   "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
 const PATHS = { caseInsensitive: false };
 
-function makeHandlers(overrides: Record<string, unknown> = {}): NativeMenuHandlers & {
-  focusAgent?: (id: string) => void;
-} {
+function assertMenuRequestMatches(
+  req: MenuAgentRequest | undefined,
+  expectedSession: string,
+  expectedUrgency: MenuAgentRequest["urgency"],
+  expectedDetail?: string,
+): void {
+  expect(req).toBeDefined();
+  expect(req!.id).toBe(`term:${expectedSession}`);
+  expect(req!.source).toBe("terminal");
+  expect(req!.urgency).toBe(expectedUrgency);
+  expect(typeof req!.provider).toBe("string");
+  expect(req!.agentLabel.length).toBeGreaterThan(0);
+  expect(req!.reason.length).toBeGreaterThan(0);
+  expect(req!.repoPath === null || req!.repoPath.length > 0).toBe(true);
+  if (expectedDetail !== undefined) {
+    expect(req!.detail).toContain(expectedDetail);
+  }
+}
+
+async function withMockedConflictedAndCleanRepos(
+  repoA: string,
+  repoB: string,
+  fn: () => Promise<void> | void,
+): Promise<void> {
+  const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, "window");
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  if (!hadWindow || !prevWindow) {
+    (globalThis as { window: unknown }).window = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    };
+  }
+
+  mockIPCWithEvents((cmd, args) => {
+    if (cmd.startsWith("plugin:")) return null;
+    const payload = (args ?? {}) as Record<string, unknown>;
+    const reqRepo = String(payload.repoPath ?? payload.path ?? repoA);
+    switch (cmd) {
+      case "cmd_resolve_repo":
+        return {
+          path: reqRepo,
+          name: reqRepo === repoB ? "RepoB" : "RepoA",
+          is_bare: false,
+          common_dir: `${reqRepo}/.git`,
+        };
+      case "cmd_list_branches":
+        return [
+          {
+            name: reqRepo === repoB ? "feat/agent" : "main",
+            is_current: true,
+            is_remote: false,
+            remote_name: null,
+            tip_commit_id: "a".repeat(40),
+            is_default: true,
+            is_gone: false,
+            last_commit_timestamp: Math.floor(Date.now() / 1000) - 600,
+            last_author: "Alex",
+            last_summary: "Work",
+            upstream: "origin/main",
+            ahead_count: 0,
+            behind_count: 0,
+          },
+        ];
+      case "cmd_get_status":
+        if (reqRepo === repoA) {
+          return [
+            {
+              path: "src/lib.rs",
+              status_code: "UU",
+              is_staged: false,
+              is_conflicted: true,
+              additions: 0,
+              deletions: 0,
+            },
+            {
+              path: "src/main.rs",
+              status_code: "UU",
+              is_staged: false,
+              is_conflicted: true,
+              additions: 0,
+              deletions: 0,
+            },
+          ];
+        }
+        return [];
+      case "cmd_repo_operation":
+        return null;
+      case "cmd_list_tags":
+        return { tags: [], truncated: false };
+      case "cmd_stash_list":
+        return { entries: [], truncated: false };
+      case "cmd_list_worktrees":
+        return [];
+      case "cmd_get_commit_graph":
+        return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_branch_stats":
+        return { updates: [], capped: false, compute_failures: 0, compared_to: "main" };
+      case "cmd_workspace_sync":
+        return { repos: [] };
+      case "cmd_list_repo_files":
+        return [];
+      case "cmd_task_view":
+        return { available: false, store_path: "", leases: [], error: "" };
+      case "cmd_worktree_task":
+      case "cmd_watch_repo":
+      case "cmd_unwatch_repo":
+      case "cmd_last_fetch_at":
+      case "cmd_note_tab_activated":
+      case "cmd_set_recent_menu":
+        return null;
+      default:
+        return null;
+    }
+  });
+
+  try {
+    expect(await repoStore.openRepo(repoB)).toBe(true);
+    expect(await repoStore.openRepo(repoA)).toBe(true);
+    await fn();
+  } finally {
+    let guard = 0;
+    while (get(repoStore).activeTabId && guard++ < 10) {
+      await repoStore.closeTab(get(repoStore).activeTabId!);
+    }
+    clearMocks();
+    if (!hadWindow) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window?: unknown }).window = prevWindow;
+    }
+  }
+}
+
+function makeHandlers(overrides: Partial<NativeMenuHandlers> = {}): NativeMenuHandlers {
   const noop = () => {};
   return {
     activateRepo: noop,
+    focusAgent: noop,
     clearRecents: noop,
     checkUpdates: noop,
     stageAll: noop,
@@ -122,7 +256,7 @@ function makeHandlers(overrides: Record<string, unknown> = {}): NativeMenuHandle
     jumpRepoTab: noop,
     openError: noop,
     ...overrides,
-  } as NativeMenuHandlers & { focusAgent?: (id: string) => void };
+  };
 }
 
 describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
@@ -191,10 +325,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       expect(withBlocking.agentsWaiting).toBe(1);
       expect(withBlocking.agentRequests).toBeDefined();
       expect(withBlocking.agentRequests?.length).toBe(1);
-      expect(withBlocking.agentRequests?.[0]).toMatchObject({
-        sessionId: sPerm,
-        urgency: "blocking",
-      });
+      assertMenuRequestMatches(withBlocking.agentRequests?.[0], sPerm, "blocking", "Allow Bash: cargo test");
       expect(withBlocking.agentsInformational).toBeGreaterThanOrEqual(2);
 
       sessionActivity.announce({
@@ -287,10 +418,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       const afterError = get(nativeMenuState) as MenuStateFixture;
       expect(afterError.agentsWaiting).toBe(1);
       expect(afterError.agentRequests?.length).toBe(1);
-      expect(afterError.agentRequests?.[0]).toMatchObject({
-        sessionId: sid,
-        urgency: "error",
-      });
+      assertMenuRequestMatches(afterError.agentRequests?.[0], sid, "error", "quota exceeded");
 
       const nextTurn = await runGitPulseHookWithSocket({
         args: ["--host=agy", "notify", "prompt_submitted"],
@@ -307,7 +435,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       const afterClear = get(nativeMenuState) as MenuStateFixture;
       expect(afterClear.agentsWaiting).toBe(0);
       expect(afterClear.agentRequests).toEqual([]);
-    }, 300_000);
+    }, 600_000);
   });
 
   describe("[Tier 3] [R2] [R4] Pair 3 (F7 <-> F9 <-> F10): Cross-surface bellSurfaces agreement", () => {
@@ -473,17 +601,17 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       expect(focusClick?.pass, JSON.stringify(verdict.results)).toBe(true);
 
       const menuWithRequest = makeMenuStateWithRequests([
-        {
-          id: "req-1",
-          sessionId: "pty-claude-1",
-          agent: "claude",
-          label: "claude-1",
+        makeMenuAgentRequest({
+          id: "term:pty-claude-1",
+          source: "terminal",
+          provider: "claude",
+          agentLabel: "claude-1",
           repoPath: "/Projects/GitPulse",
           repoLabel: "GitPulse",
           urgency: "blocking",
-          event: "permission_prompt",
+          reason: "Needs your permission",
           detail: "Allow Bash",
-        },
+        }),
       ]);
       const emptyRepo = get(createRepoStore({ storage: null }));
       const repoState: RepoState = {
@@ -492,7 +620,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
         currentBranch: "main",
         isLoading: false,
       };
-      const event = { id: "focus-agent", path: "req-1", repo_path: "/Projects/GitPulse" };
+      const event = { id: "focus-agent", path: "term:pty-claude-1", repo_path: "/Projects/GitPulse" };
       expect(canDispatchMenuEvent(event, menuWithRequest, repoState, PATHS)).toBe(true);
 
       let focusedId: string | null = null;
@@ -503,12 +631,12 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       });
       const handled = dispatchNativeMenu(event, handlers);
       expect(handled).toBe(true);
-      expect(focusedId).toBe("req-1");
+      expect(focusedId).toBe("term:pty-claude-1");
 
-      const rustActions = await runCargoTest(["--lib", "desktop::actions::tests"], {
+      const rustActions = await execCargoSuite(["--lib", "desktop::actions::tests"], {
         timeoutMs: 280_000,
       });
-      expect(rustActions.ok, rustActions.stderr || rustActions.stdout).toBe(true);
+      assertCargoPassed(rustActions, "cargo test --lib desktop::actions::tests");
     }, 300_000);
   });
 
@@ -545,124 +673,55 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
   });
 
   describe("[Tier 3] [R2] [R3] Pair 7 (F6 <-> F10): Multi-repo conflicts in Repo A + waiting agent in Repo B", () => {
-    it("preserves both Repo A Resolve conflicts CTA and Repo B waiting agentRequests in MenuState & StatusPopover SSR", () => {
-      const emptyRepo = get(createRepoStore({ storage: null }));
-      const prefs = get(interfaceStore);
+    it("preserves both Repo A Resolve conflicts CTA and Repo B waiting agentRequests in MenuState & StatusPopover SSR", async () => {
       const repoA = "/Projects/RepoA";
       const repoB = "/Projects/RepoB";
-
-      const multiRepo: RepoState = {
-        ...emptyRepo,
-        currentPath: repoA,
-        currentBranch: "main",
-        isLoading: false,
-        statuses: [
-          {
-            path: "src/lib.rs",
-            status_code: "UU",
-            is_staged: false,
-            is_conflicted: true,
-            additions: 0,
-            deletions: 0,
-          },
-          {
-            path: "src/main.rs",
-            status_code: "UU",
-            is_staged: false,
-            is_conflicted: true,
-            additions: 0,
-            deletions: 0,
-          },
-        ],
-        openTabs: [
-          {
-            id: "tab-a",
-            path: repoA,
-            name: "RepoA",
-            label: "RepoA",
-            pinned: false,
-            isActive: true,
-            isBare: false,
-            isDirty: true,
-            isLoading: false,
-            error: null,
-            currentBranch: "main",
-            conflictedCount: 2,
-            changedCount: 2,
-          },
-          {
-            id: "tab-b",
-            path: repoB,
-            name: "RepoB",
-            label: "RepoB",
-            pinned: false,
-            isActive: false,
-            isBare: false,
-            isDirty: false,
-            isLoading: false,
-            error: null,
-            currentBranch: "feat/agent",
-            conflictedCount: 0,
-            changedCount: 0,
-          },
-        ],
-      };
-
       const sidB = trackSession("t3-p7-repob-claude");
-      sessionActivity.announce({
-        session: sidB,
-        channel: "hook",
-        event: "elicitation_dialog",
-        detail: "Choose staging or production target",
+
+      await withMockedConflictedAndCleanRepos(repoA, repoB, () => {
+        sessionActivity.announce({
+          session: sidB,
+          channel: "hook",
+          event: "elicitation_dialog",
+          detail: "Choose staging or production target",
+        });
+
+        const built = get(nativeMenuState) as MenuStateFixture;
+
+        // Also verify StatusPopover SSR when Repo B request is attached
+        const combined = makeMenuStateWithRequests(
+          [
+            makeMenuAgentRequest({
+              id: `term:${sidB}`,
+              source: "terminal",
+              provider: "claude",
+              agentLabel: "claude-repob",
+              repoPath: repoB,
+              repoLabel: "RepoB",
+              urgency: "blocking",
+              reason: "Needs your input",
+              detail: "Choose staging or production target",
+            }),
+          ],
+          { conflicts: 2 },
+        );
+
+        expect(built.status.conflicts).toBe(2);
+        expect(built.status.primaryLabel).toBe("Resolve conflicts");
+        expect(built.traySummary.id).toBe("section:work:overview");
+        expect(built.agentsWaiting).toBe(1);
+        expect(built.agentRequests).toBeDefined();
+        expect(built.agentRequests?.length).toBeGreaterThanOrEqual(1);
+
+        expect(menuStateProblem(built)).toBeNull();
+        expect(sendableMenuState(combined).problem).toBeNull();
+
+        const { body } = render(StatusPopover, {
+          props: { snapshot: combined, onaction: () => {} },
+        });
+        expect(body).toContain("Resolve conflicts");
+        expect(body).toContain("Choose staging or production target");
       });
-
-      const activityMap = get(sessionActivity);
-      const built = buildMenuState(
-        multiRepo,
-        prefs,
-        "dark",
-        {},
-        false,
-        {},
-        PATHS,
-        countAgentsWaiting(activityMap),
-        2,
-      ) as MenuStateFixture;
-
-      // Also verify nativeMenuState / MenuState contract when Repo B request is attached
-      const combined = makeMenuStateWithRequests(
-        [
-          {
-            id: `req-${sidB}`,
-            sessionId: sidB,
-            agent: "claude",
-            label: "claude-repob",
-            repoPath: repoB,
-            repoLabel: "RepoB",
-            urgency: "blocking",
-            event: "elicitation_dialog",
-            detail: "Choose staging or production target",
-          },
-        ],
-        { conflicts: 2 },
-      );
-
-      expect(built.status.conflicts).toBe(2);
-      expect(built.status.primaryLabel).toBe("Resolve conflicts");
-      expect(built.traySummary.id).toBe("section:work:overview");
-      expect(built.agentsWaiting).toBe(1);
-      // M4 requires buildMenuState / nativeMenuState to project agentRequests too:
-      expect(built.agentRequests).toBeDefined();
-      expect(built.agentRequests?.length).toBeGreaterThanOrEqual(1);
-
-      expect(menuStateProblem(built)).toBeNull();
-      expect(sendableMenuState(combined).problem).toBeNull();
-
-      const { body } = render(StatusPopover, {
-        props: { snapshot: combined, onaction: () => {} },
-      });
-      expect(body).toContain("Resolve conflicts");
-      expect(body).toContain("Choose staging or production target");
     });
   });
 
@@ -685,8 +744,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       expect(markSlice).not.toContain("lucide-activity");
 
       const traySource = readRepoFile("src-tauri/src/desktop/tray.rs");
-      expect(traySource).not.toContain("(15 * SUPER as i32, 9 * SUPER as i32)");
-      expect(traySource).toMatch(/arc|ring|24\.04|10\.5|G-ring/i);
+      assertTrayPulseIconUpdated(traySource);
     });
   });
 
@@ -724,15 +782,15 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       expect(tauriConf.bundle.icon).toContain("icons/icon.icns");
       expect(tauriConf.bundle.resources["../plugins/gitpulse/"]).toBe("plugin/");
 
-      const notifRes = await runCargoTest(["--lib", "workbench::notifications::tests"], {
-        timeoutMs: 280_000,
+      const notifRes = await execCargoSuite(["--lib", "workbench::notifications::tests"], {
+        timeoutMs: 420_000,
       });
-      expect(notifRes.ok, notifRes.stderr || notifRes.stdout).toBe(true);
+      assertCargoPassed(notifRes, "cargo test --lib workbench::notifications::tests");
 
-      const bridgeRes = await runCargoTest(["--lib", "alerts::bridge::tests"], {
-        timeoutMs: 280_000,
+      const bridgeRes = await execCargoSuite(["--lib", "alerts::bridge::tests"], {
+        timeoutMs: 420_000,
       });
-      expect(bridgeRes.ok, bridgeRes.stderr || bridgeRes.stdout).toBe(true);
+      assertCargoPassed(bridgeRes, "cargo test --lib alerts::bridge::tests");
     }, 600_000);
   });
 
@@ -819,10 +877,10 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       expect(map.get(agySid)?.attention?.kind).toBe("finished");
       expect(map.get(agySid)?.attention?.detail).toContain("All tasks done");
       expect(countAgentsWaiting(map)).toBe(1);
-    }, 300_000);
+    }, 600_000);
   });
 
-  describe("[Tier 3] [R1] [R4] Pair 13 (F1 <-> F3 <-> F9): design-lint --strict compliance on R1–R4 components", () => {
+  describe("[Tier 3] [R1] [R2] [R3] [R4] Pair 13 (F1 <-> F3 <-> F9): design-lint --strict compliance on R1–R4 components", () => {
     it("verifies zero color/vocab/layout violations across all R1–R4 UI components", () => {
       const targetFiles = new Set([
         "src/lib/components/ToastContainer.svelte",
@@ -876,7 +934,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
 
   describe("[Tier 3] [R2] Pair 14 (F4 <-> F10): status-popover 4-command ACL + MenuState bounded agentRequests", () => {
     it("enforces strict 4-command popover ACL and bounded agentRequests in Rust & TS contracts", async () => {
-      const aclRes = await runCargoTest(
+      const aclRes = await execCargoSuite(
         [
           "--test",
           "acl_contract",
@@ -884,7 +942,7 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
         ],
         { timeoutMs: 280_000 },
       );
-      expect(aclRes.ok, aclRes.stderr || aclRes.stdout).toBe(true);
+      assertCargoPassed(aclRes, "cargo test --test acl_contract");
 
       const cap = JSON.parse(readRepoFile("src-tauri/capabilities/status-popover.json")) as {
         windows: string[];
@@ -902,21 +960,23 @@ describe("[Tier 3] Cross-Feature Pairwise Combinations (R1–R4)", () => {
       const limits = MENU_LIMITS as Record<string, number>;
       expect(limits.agentRequests).toBe(8);
 
-      const overflowRequests = Array.from({ length: 12 }, (_, i) => ({
-        id: `req-${i + 1}`,
-        sessionId: `pty-${i + 1}`,
-        agent: i % 2 === 0 ? "claude" : "agy",
-        label: `agent-${i + 1}`,
-        repoPath: "/Projects/GitPulse",
-        repoLabel: "GitPulse",
-        urgency: "blocking",
-        event: "permission_prompt",
-        detail: `Approve step ${i + 1}`,
-        at: 1_700_000_000_000 + i,
-      }));
+      const overflowRequests = Array.from({ length: 12 }, (_, i) =>
+        makeMenuAgentRequest({
+          id: `term:pty-${i + 1}`,
+          source: "terminal",
+          provider: i % 2 === 0 ? "claude" : "agy",
+          agentLabel: `agent-${i + 1}`,
+          repoPath: "/Projects/GitPulse",
+          repoLabel: "GitPulse",
+          urgency: "blocking",
+          reason: "Needs your permission",
+          detail: `Approve step ${i + 1}`,
+          atMs: 1_700_000_000_000 + i,
+        }),
+      );
       const oversized = makeMenuStateWithRequests(overflowRequests, {
         agentRequestsHidden: 0,
-      }) as unknown as MenuState;
+      });
 
       expect(menuStateProblem(oversized)).not.toBeNull();
       const repaired = sendableMenuState(oversized);

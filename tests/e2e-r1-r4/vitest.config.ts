@@ -13,6 +13,7 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: true,
+    fsModuleCache: false,
     fileParallelism: false,
     maxWorkers: 1,
     testTimeout: 90_000,

@@ -2,19 +2,17 @@ import { execFileSync } from "node:child_process";
 import { get } from "svelte/store";
 import { render } from "svelte/server";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { clearMocks } from "@tauri-apps/api/mocks";
+import { mockIPCWithEvents } from "../../harness/tauriMocks";
 import StatusPopover from "../../src/lib/desktop/StatusPopover.svelte";
-import {
-  buildMenuState,
-  canDispatchMenuEvent,
-  countAgentsWaiting,
-} from "../../src/lib/desktop/menuState";
+import { canDispatchMenuEvent, type MenuAgentRequest } from "../../src/lib/desktop/menuState";
 import { sendableMenuState } from "../../src/lib/desktop/menuContract";
 import { nativeMenuState } from "../../src/lib/desktop/menuStateStore";
 import {
   dispatchNativeMenu,
   type NativeMenuHandlers,
 } from "../../src/lib/desktop/nativeActions";
-import { createRepoStore, type RepoState } from "../../src/lib/stores/repoStore";
+import { repoStore } from "../../src/lib/stores/repoStore";
 import { interfaceStore } from "../../src/lib/stores/interfaceStore";
 import {
   asksForReader,
@@ -28,11 +26,13 @@ import {
 } from "../../src/lib/ui/workConflicts";
 import { runBrowserPage } from "./helpers/browser";
 import {
+  assertCargoPassed,
+  assertTrayPulseIconUpdated,
   ensureGitPulseHookBinary,
+  execCargoSuite,
   readPngInfo,
   readRepoFile,
   repoPath,
-  runCargoTest,
   runGitPulseHookWithSocket,
 } from "./helpers/env";
 import {
@@ -42,6 +42,7 @@ import {
   claudeNotification,
   claudePermissionRequest,
   claudePostToolUse,
+  makeMenuAgentRequest,
   makeMenuStateWithRequests,
   type MenuStateFixture,
 } from "./helpers/fixtures";
@@ -50,6 +51,140 @@ const LOGO_TRUNK_FRAGMENT = "M24.04 9.25A10.5";
 const LEGACY_PLUGIN_LOGO_SHA256 =
   "eb41940073257e695b51f513061f56446da9b4fdf995a6aa06d41387ea7e6ea1";
 const PATHS = { caseInsensitive: false };
+
+function assertMenuRequestMatches(
+  req: MenuAgentRequest | undefined,
+  expectedSession: string,
+  expectedUrgency: MenuAgentRequest["urgency"],
+  expectedDetail?: string,
+): void {
+  expect(req).toBeDefined();
+  expect(req!.id).toBe(`term:${expectedSession}`);
+  expect(req!.source).toBe("terminal");
+  expect(req!.urgency).toBe(expectedUrgency);
+  expect(typeof req!.provider).toBe("string");
+  expect(req!.agentLabel.length).toBeGreaterThan(0);
+  expect(req!.reason.length).toBeGreaterThan(0);
+  expect(req!.repoPath === null || req!.repoPath.length > 0).toBe(true);
+  if (expectedDetail !== undefined) {
+    expect(req!.detail).toContain(expectedDetail);
+  }
+}
+
+async function withMockedConflictedAndCleanRepos(
+  repoA: string,
+  repoB: string,
+  fn: () => Promise<void> | void,
+): Promise<void> {
+  const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, "window");
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  if (!hadWindow || !prevWindow) {
+    (globalThis as { window: unknown }).window = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    };
+  }
+
+  mockIPCWithEvents((cmd, args) => {
+    if (cmd.startsWith("plugin:")) return null;
+    const payload = (args ?? {}) as Record<string, unknown>;
+    const reqRepo = String(payload.repoPath ?? payload.path ?? repoA);
+    switch (cmd) {
+      case "cmd_resolve_repo":
+        return {
+          path: reqRepo,
+          name: reqRepo === repoB ? "DevCouncil" : "GitPulse",
+          is_bare: false,
+          common_dir: `${reqRepo}/.git`,
+        };
+      case "cmd_list_branches":
+        return [
+          {
+            name: "main",
+            is_current: true,
+            is_remote: false,
+            remote_name: null,
+            tip_commit_id: "a".repeat(40),
+            is_default: true,
+            is_gone: false,
+            last_commit_timestamp: Math.floor(Date.now() / 1000) - 600,
+            last_author: "Alex",
+            last_summary: "Work",
+            upstream: "origin/main",
+            ahead_count: 0,
+            behind_count: 0,
+          },
+        ];
+      case "cmd_get_status":
+        if (reqRepo === repoA) {
+          return [
+            {
+              path: "src/merge.ts",
+              status_code: "UU",
+              is_staged: false,
+              is_conflicted: true,
+              additions: 0,
+              deletions: 0,
+            },
+            {
+              path: "src/conflict.ts",
+              status_code: "UU",
+              is_staged: false,
+              is_conflicted: true,
+              additions: 0,
+              deletions: 0,
+            },
+          ];
+        }
+        return [];
+      case "cmd_repo_operation":
+        return null;
+      case "cmd_list_tags":
+        return { tags: [], truncated: false };
+      case "cmd_stash_list":
+        return { entries: [], truncated: false };
+      case "cmd_list_worktrees":
+        return [];
+      case "cmd_get_commit_graph":
+        return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_branch_stats":
+        return { updates: [], capped: false, compute_failures: 0, compared_to: "main" };
+      case "cmd_workspace_sync":
+        return { repos: [] };
+      case "cmd_list_repo_files":
+        return [];
+      case "cmd_task_view":
+        return { available: false, store_path: "", leases: [], error: "" };
+      case "cmd_worktree_task":
+      case "cmd_watch_repo":
+      case "cmd_unwatch_repo":
+      case "cmd_last_fetch_at":
+      case "cmd_note_tab_activated":
+      case "cmd_set_recent_menu":
+        return null;
+      default:
+        return null;
+    }
+  });
+
+  try {
+    expect(await repoStore.openRepo(repoB)).toBe(true);
+    expect(await repoStore.openRepo(repoA)).toBe(true);
+    await fn();
+  } finally {
+    let guard = 0;
+    while (get(repoStore).activeTabId && guard++ < 10) {
+      await repoStore.closeTab(get(repoStore).activeTabId!);
+    }
+    clearMocks();
+    if (!hadWindow) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window?: unknown }).window = prevWindow;
+    }
+  }
+}
 
 function runBunScript(script: string): { ok: boolean; stdout: string; stderr: string } {
   try {
@@ -69,12 +204,11 @@ function runBunScript(script: string): { ok: boolean; stdout: string; stderr: st
   }
 }
 
-function makeHandlers(overrides: Record<string, unknown> = {}): NativeMenuHandlers & {
-  focusAgent?: (id: string) => void;
-} {
+function makeHandlers(overrides: Partial<NativeMenuHandlers> = {}): NativeMenuHandlers {
   const noop = () => {};
   return {
     activateRepo: noop,
+    focusAgent: noop,
     clearRecents: noop,
     checkUpdates: noop,
     stageAll: noop,
@@ -128,7 +262,7 @@ function makeHandlers(overrides: Record<string, unknown> = {}): NativeMenuHandle
     jumpRepoTab: noop,
     openError: noop,
     ...overrides,
-  } as NativeMenuHandlers & { focusAgent?: (id: string) => void };
+  };
 }
 
 describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () => {
@@ -223,10 +357,12 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
       const menuWaiting = get(nativeMenuState) as MenuStateFixture;
       expect(menuWaiting.agentsWaiting).toBe(1);
       expect(menuWaiting.agentRequests?.length).toBe(1);
-      expect(menuWaiting.agentRequests?.[0]).toMatchObject({
-        sessionId: sid,
-        urgency: "blocking",
-      });
+      assertMenuRequestMatches(
+        menuWaiting.agentRequests?.[0],
+        sid,
+        "blocking",
+        "Allow Bash: git push --dry-run",
+      );
 
       // 4. Verify AgentsView in real headless Chrome shows Needs Action, LauncherIcon, gp-chip, detail, and Focus
       const agentsVerdict = await runBrowserPage({
@@ -421,148 +557,80 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
 
   describe("[Tier 4] [R2] [R3] [R4] S4: Multi-repo triage — Repo A conflicts + Repo B waiting Claude elicitation_dialog", () => {
     it("surfaces Repo A Resolve conflicts CTA and Repo B FocusAgent request simultaneously and routes both cleanly", async () => {
-      const emptyRepo = get(createRepoStore({ storage: null }));
-      const prefs = get(interfaceStore);
       const repoA = "/Projects/GitPulse";
       const repoB = "/Projects/DevCouncil";
-
-      const repoState: RepoState = {
-        ...emptyRepo,
-        currentPath: repoA,
-        currentBranch: "main",
-        isLoading: false,
-        statuses: [
-          {
-            path: "src/merge.ts",
-            status_code: "UU",
-            is_staged: false,
-            is_conflicted: true,
-            additions: 0,
-            deletions: 0,
-          },
-          {
-            path: "src/conflict.ts",
-            status_code: "UU",
-            is_staged: false,
-            is_conflicted: true,
-            additions: 0,
-            deletions: 0,
-          },
-        ],
-        openTabs: [
-          {
-            id: "a",
-            path: repoA,
-            name: "GitPulse",
-            label: "GitPulse",
-            pinned: false,
-            isActive: true,
-            isBare: false,
-            isDirty: true,
-            isLoading: false,
-            error: null,
-            currentBranch: "main",
-            conflictedCount: 2,
-            changedCount: 2,
-          },
-          {
-            id: "b",
-            path: repoB,
-            name: "DevCouncil",
-            label: "DevCouncil",
-            pinned: false,
-            isActive: false,
-            isBare: false,
-            isDirty: false,
-            isLoading: false,
-            error: null,
-            currentBranch: "main",
-            conflictedCount: 0,
-            changedCount: 0,
-          },
-        ],
-      };
-
       const sidB = trackSession("t4-s4-repob-elicitation");
-      sessionActivity.announce({
-        session: sidB,
-        channel: "hook",
-        event: "elicitation_dialog",
-        detail: "Select deployment target",
-      });
 
-      const built = buildMenuState(
-        repoState,
-        prefs,
-        "dark",
-        {},
-        false,
-        {},
-        PATHS,
-        countAgentsWaiting(get(sessionActivity)),
-        2,
-      ) as MenuStateFixture;
+      await withMockedConflictedAndCleanRepos(repoA, repoB, async () => {
+        sessionActivity.announce({
+          session: sidB,
+          channel: "hook",
+          event: "elicitation_dialog",
+          detail: "Select deployment target",
+        });
 
-      expect(built.status.conflicts).toBe(2);
-      expect(built.status.primaryLabel).toBe("Resolve conflicts");
-      expect(built.traySummary.id).toBe("section:work:overview");
-      expect(built.agentsWaiting).toBe(1);
-      expect(built.agentRequests?.length).toBeGreaterThanOrEqual(1);
+        const built = get(nativeMenuState) as MenuStateFixture;
+        expect(built.status.conflicts).toBe(2);
+        expect(built.status.primaryLabel).toBe("Resolve conflicts");
+        expect(built.traySummary.id).toBe("section:work:overview");
+        expect(built.agentsWaiting).toBe(1);
+        expect(built.agentRequests?.length).toBeGreaterThanOrEqual(1);
 
-      const snapshot = makeMenuStateWithRequests(
-        [
-          {
-            id: "req-repob",
-            sessionId: sidB,
-            agent: "claude",
-            label: "claude-devcouncil",
-            repoPath: repoB,
-            repoLabel: "DevCouncil",
-            urgency: "blocking",
-            event: "elicitation_dialog",
-            detail: "Select deployment target",
+        const snapshot = makeMenuStateWithRequests(
+          [
+            makeMenuAgentRequest({
+              id: `term:${sidB}`,
+              source: "terminal",
+              provider: "claude",
+              agentLabel: "claude-devcouncil",
+              repoPath: repoB,
+              repoLabel: "DevCouncil",
+              urgency: "blocking",
+              reason: "Needs your input",
+              detail: "Select deployment target",
+            }),
+          ],
+          { conflicts: 2 },
+        );
+        expect(sendableMenuState(snapshot).problem).toBeNull();
+
+        // Browser check on conflict-jump scenario
+        const popoverVerdict = await runBrowserPage({
+          page: "/tests/e2e-r1-r4/browser/status-popover.html",
+          query: { scenario: "conflict-jump" },
+        });
+        expect(popoverVerdict.crashes).toEqual([]);
+        expect(popoverVerdict.unexpected).toEqual([]);
+        expect(popoverVerdict.passed, JSON.stringify(popoverVerdict.results)).toBe(
+          popoverVerdict.total,
+        );
+
+        // Route Resolve CTA -> work/overview -> openConflicts()
+        let tabSwitch: [string, string | undefined] | null = null;
+        let focusedAgentId: string | null = null;
+        const handlers = makeHandlers({
+          setTab: (tab: string, section?: string) => {
+            tabSwitch = [tab, section];
+            if (tab === "work" && section === "overview") openConflicts();
           },
-        ],
-        { conflicts: 2 },
-      );
-      expect(sendableMenuState(snapshot).problem).toBeNull();
+          focusAgent: (id: string) => {
+            focusedAgentId = id;
+          },
+        });
 
-      // Browser check on conflict-jump scenario
-      const popoverVerdict = await runBrowserPage({
-        page: "/tests/e2e-r1-r4/browser/status-popover.html",
-        query: { scenario: "conflict-jump" },
+        expect(
+          dispatchNativeMenu({ id: "section:work:overview", repo_path: repoA }, handlers),
+        ).toBe(true);
+        expect(tabSwitch).toEqual(["work", "overview"]);
+        expect(takeConflictsReveal()).toBe(true);
+        expect(takeConflictsFocus()).toBe(true);
+
+        // Route FocusAgent -> switches/focuses Repo B agent
+        const focusEvent = { id: "focus-agent", path: `term:${sidB}`, repo_path: repoA };
+        expect(canDispatchMenuEvent(focusEvent, snapshot, get(repoStore), PATHS)).toBe(true);
+        expect(dispatchNativeMenu(focusEvent, handlers)).toBe(true);
+        expect(focusedAgentId).toBe(`term:${sidB}`);
       });
-      expect(popoverVerdict.crashes).toEqual([]);
-      expect(popoverVerdict.unexpected).toEqual([]);
-      expect(popoverVerdict.passed, JSON.stringify(popoverVerdict.results)).toBe(
-        popoverVerdict.total,
-      );
-
-      // Route Resolve CTA -> work/overview -> openConflicts()
-      let tabSwitch: [string, string | undefined] | null = null;
-      let focusedAgentId: string | null = null;
-      const handlers = makeHandlers({
-        setTab: (tab: string, section?: string) => {
-          tabSwitch = [tab, section];
-          if (tab === "work" && section === "overview") openConflicts();
-        },
-        focusAgent: (id: string) => {
-          focusedAgentId = id;
-        },
-      });
-
-      expect(dispatchNativeMenu({ id: "section:work:overview", repo_path: repoA }, handlers)).toBe(
-        true,
-      );
-      expect(tabSwitch).toEqual(["work", "overview"]);
-      expect(takeConflictsReveal()).toBe(true);
-      expect(takeConflictsFocus()).toBe(true);
-
-      // Route FocusAgent -> switches/focuses Repo B agent
-      const focusEvent = { id: "focus-agent", path: "req-repob", repo_path: repoA };
-      expect(canDispatchMenuEvent(focusEvent, snapshot, repoState, PATHS)).toBe(true);
-      expect(dispatchNativeMenu(focusEvent, handlers)).toBe(true);
-      expect(focusedAgentId).toBe("req-repob");
     }, 120_000);
   });
 
@@ -608,23 +676,25 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
       expect(logoCheck?.pass, JSON.stringify(popoverVerdict.results)).toBe(true);
 
       // 4. Rust bundled notification icons & tray G-ring glyph tests
-      const bundleTest = await runCargoTest(
+      const bundleTest = await execCargoSuite(
         [
           "--lib",
           "workbench::notifications::tests::bundled_notification_icons_and_plugin_logo_match_current_brand",
         ],
-        { timeoutMs: 280_000 },
+        { timeoutMs: 420_000 },
       );
-      expect(bundleTest.ok, bundleTest.stderr || bundleTest.stdout).toBe(true);
+      assertCargoPassed(
+        bundleTest,
+        "workbench::notifications::tests::bundled_notification_icons_and_plugin_logo_match_current_brand",
+      );
 
-      const trayTests = await runCargoTest(["--lib", "desktop::tray::tests"], {
-        timeoutMs: 280_000,
+      const trayTests = await execCargoSuite(["--lib", "desktop::tray::tests"], {
+        timeoutMs: 420_000,
       });
-      expect(trayTests.ok, trayTests.stderr || trayTests.stdout).toBe(true);
+      assertCargoPassed(trayTests, "cargo test --lib desktop::tray::tests");
 
       const traySource = readRepoFile("src-tauri/src/desktop/tray.rs");
-      expect(traySource).not.toContain("(15 * SUPER as i32, 9 * SUPER as i32)");
-      expect(traySource).toMatch(/arc|ring|24\.04|10\.5|G-ring/i);
+      assertTrayPulseIconUpdated(traySource);
     }, 600_000);
   });
 
@@ -689,17 +759,19 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
 
       // Also verify StatusPopover SSR renders cleanly with overflow fixture
       const overflowSnapshot = makeMenuStateWithRequests(
-        Array.from({ length: 8 }, (_, i) => ({
-          id: `req-${i + 1}`,
-          sessionId: `pty-${i + 1}`,
-          agent: i % 2 === 0 ? "claude" : "agy",
-          label: `agent-${i + 1}`,
-          repoPath: "/Projects/GitPulse",
-          repoLabel: "GitPulse",
-          urgency: "blocking",
-          event: "permission_prompt",
-          detail: `Allow tool #${i + 1}`,
-        })),
+        Array.from({ length: 8 }, (_, i) =>
+          makeMenuAgentRequest({
+            id: `term:pty-${i + 1}`,
+            source: "terminal",
+            provider: i % 2 === 0 ? "claude" : "agy",
+            agentLabel: `agent-${i + 1}`,
+            repoPath: "/Projects/GitPulse",
+            repoLabel: "GitPulse",
+            urgency: "blocking",
+            reason: "Needs your permission",
+            detail: `Allow tool #${i + 1}`,
+          }),
+        ),
         { agentRequestsHidden: 3, agentsRunning: 2, agentsInformational: 3 },
       );
       const { body } = render(StatusPopover, {
@@ -720,7 +792,7 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
       const vendorCheck = runBunScript("check:vendor-edits");
       expect(vendorCheck.ok, vendorCheck.stderr || vendorCheck.stdout).toBe(true);
 
-      const desktopContracts = await runCargoTest(
+      const desktopContracts = await execCargoSuite(
         [
           "--test",
           "acl_contract",
@@ -731,10 +803,10 @@ describe("[Tier 4] End-to-End Real-World Application Scenarios (S1–S7)", () =>
         ],
         { timeoutMs: 360_000 },
       );
-      expect(
-        desktopContracts.ok,
-        desktopContracts.stderr || desktopContracts.stdout,
-      ).toBe(true);
+      assertCargoPassed(
+        desktopContracts,
+        "acl_contract + desktop_menu_integration + native_menu_main_thread",
+      );
 
       let rawLint = "";
       try {

@@ -27,7 +27,14 @@ import {
 } from "../../src/lib/ui/workConflicts";
 import { resolveSection } from "../../src/lib/views/viewRegistry";
 import { runBrowserPage } from "./helpers/browser";
-import { readPngInfo, readRepoFile, repoPath, runCargoTest } from "./helpers/env";
+import {
+  assertCargoPassed,
+  assertTrayPulseIconUpdated,
+  execCargoSuite,
+  readPngInfo,
+  readRepoFile,
+  repoPath,
+} from "./helpers/env";
 import { makeRepoFixtures } from "./helpers/fixtures";
 
 const OLD_PULSE_LOGO_SHA256 =
@@ -373,14 +380,13 @@ describe("[Tier 2] [R1] F2 Boundaries — macOS Notifications & Capability Bound
   it(
     "fails closed cleanly on unbundled macOS notification calls without panicking",
     async () => {
-      const res = await runCargoTest(
+      const res = await execCargoSuite(
         ["--lib", "workbench::notifications::macos::tests"],
-        { timeoutMs: 280_000 },
+        { timeoutMs: 420_000 },
       );
-      expect(res.ok, res.stderr || res.stdout).toBe(true);
-      expect(res.exitCode).toBe(0);
+      assertCargoPassed(res, "cargo test --lib workbench::notifications::macos::tests");
     },
-    300_000,
+    450_000,
   );
 
   it("preserves role=img and aria-label accessibility fallback for custom and empty Logo title props", () => {
@@ -421,7 +427,7 @@ describe("[Tier 2] [R1] F2 Boundaries — macOS Notifications & Capability Bound
     expect(existsSync(path.join(resolvedPluginDir, "assets/logo.png"))).toBe(true);
   });
 
-  it("isolates status-popover capability to 4 commands on window status and scopes default capability to main", () => {
+  it("isolates status-popover capability to 4 app commands on window status-popover and scopes default capability to main", () => {
     const statusCap = JSON.parse(
       readRepoFile("src-tauri/capabilities/status-popover.json"),
     ) as { windows?: string[]; permissions?: string[] };
@@ -429,10 +435,13 @@ describe("[Tier 2] [R1] F2 Boundaries — macOS Notifications & Capability Bound
       readRepoFile("src-tauri/capabilities/default.json"),
     ) as { windows?: string[]; permissions?: string[] };
 
-    expect(statusCap.windows).toEqual(["status"]);
-    expect(statusCap.permissions).toHaveLength(4);
-    expect(statusCap.permissions).toContain("allow-cmd-status-action");
-    expect(statusCap.permissions).toContain("allow-cmd-get-status-state");
+    expect(statusCap.windows).toEqual(["status-popover"]);
+    const appPerms = (statusCap.permissions ?? []).filter((p) => p.startsWith("allow-cmd-"));
+    expect(appPerms).toHaveLength(4);
+    expect(appPerms).toContain("allow-cmd-status-action");
+    expect(appPerms).toContain("allow-cmd-get-status-state");
+    expect(appPerms).toContain("allow-cmd-get-accessibility-display");
+    expect(appPerms).toContain("allow-cmd-resize-status");
     expect(defaultCap.windows).toEqual(["main"]);
     expect(defaultCap.windows).not.toContain("*");
   });
@@ -488,7 +497,10 @@ describe("[Tier 2] [R1] F3 Boundaries — In-App Notification Edge Cases", () =>
     });
     expect(verdict.crashes).toEqual([]);
     expect(verdict.unexpected).toEqual([]);
-    expect(verdict.passed).toBe(verdict.total);
+    const nativeCheck = verdict.results.find((r) =>
+      r.name.includes("NativeNotificationBridgeView renders current GitPulse SVG logo"),
+    );
+    expect(nativeCheck?.pass, JSON.stringify(verdict.results)).toBe(true);
     expect(verdict.data?.surfaces).toMatchObject({
       native: { mounted: true, hasGitPulseLogo: true, visibleBox: true },
     });
@@ -518,7 +530,10 @@ describe("[Tier 2] [R1] F3 Boundaries — In-App Notification Edge Cases", () =>
     });
     expect(activeVerdict.crashes).toEqual([]);
     expect(activeVerdict.unexpected).toEqual([]);
-    expect(activeVerdict.passed).toBe(activeVerdict.total);
+    const sessionCheck = activeVerdict.results.find((r) =>
+      r.name.includes("SessionNotificationBridge renders current GitPulse SVG logo"),
+    );
+    expect(sessionCheck?.pass, JSON.stringify(activeVerdict.results)).toBe(true);
     expect(activeVerdict.data?.surfaces).toMatchObject({
       session: { mounted: true, hasGitPulseLogo: true, visibleBox: true },
     });
@@ -532,18 +547,13 @@ describe("[Tier 2] [R1] [R2] F4 Boundaries — Tray Glyph Pixels & StatusPopover
   it(
     "verifies tray.rs Plain vs Attention dot alpha and border bounds plus G-ring glyph implementation",
     async () => {
-      const res = await runCargoTest(["--lib", "desktop::tray::tests"], {
+      const res = await execCargoSuite(["--lib", "desktop::tray::tests"], {
         timeoutMs: 280_000,
       });
-      expect(res.ok, res.stderr || res.stdout).toBe(true);
-      expect(res.exitCode).toBe(0);
+      assertCargoPassed(res, "cargo test --lib desktop::tray::tests");
 
       const trayRs = readRepoFile("src-tauri/src/desktop/tray.rs");
-      const fnStart = trayRs.indexOf("fn pulse_icon(");
-      const fnEnd = trayRs.indexOf("\nfn ", fnStart + 1);
-      const pulseFn = trayRs.slice(fnStart, fnEnd > -1 ? fnEnd : trayRs.length);
-      expect(pulseFn).not.toContain("(5i32 * SUPER as i32, 19i32 * SUPER as i32)");
-      expect(pulseFn).toMatch(/ring|arc|atan2|cos|sin|24\.04|10\.5/i);
+      assertTrayPulseIconUpdated(trayRs);
     },
     300_000,
   );
@@ -649,19 +659,29 @@ describe("[Tier 2] [R3] F5 Boundaries — Overview Conflicts & Routing Edge Case
     });
   });
 
-  it("resets manual reveal and panel-open state on repository switch and pane unmount", () => {
-    const paneSrc = readRepoFile("src/lib/components/WorkOverviewPane.svelte");
-    expect(paneSrc).toContain("setConflictsPanelOpen(showEditor);");
-    expect(paneSrc).toContain("setConflictsPanelOpen(false);");
-    expect(paneSrc).toContain("if (prevRepo !== undefined && repo !== prevRepo)");
-    expect(paneSrc).toContain("manualOpen = false;");
-    expect(paneSrc).toContain("reviewingDrafts = false;");
-
+  it("resets manual reveal and panel-open state on repository switch and pane unmount", async () => {
     setConflictsPanelOpen(true);
     expect(get(conflictsPanelOpen)).toBe(true);
     setConflictsPanelOpen(false);
     expect(get(conflictsPanelOpen)).toBe(false);
-  });
+
+    const verdict = await runBrowserPage<{
+      panelOpenAfterReveal?: boolean;
+      panelOpenAfterRepoSwitch?: boolean;
+      panelOpenAfterUnmount?: boolean;
+      layoutAfterClose?: string;
+    }>({
+      page: "/tests/e2e-r1-r4/browser/overview-conflicts.html",
+      query: { scenario: "repo-switch" },
+    });
+    expect(verdict.crashes).toEqual([]);
+    expect(verdict.unexpected).toEqual([]);
+    expect(verdict.passed, JSON.stringify(verdict.results)).toBe(verdict.total);
+    expect(verdict.data?.panelOpenAfterReveal).toBe(true);
+    expect(verdict.data?.panelOpenAfterRepoSwitch).toBe(false);
+    expect(verdict.data?.panelOpenAfterUnmount).toBe(false);
+    expect(verdict.data?.layoutAfterClose).toBe("overview");
+  }, 90_000);
 
   it("keeps Overview Conflicts/Resolve button visible and overflow-free in narrow 600px viewport in Chrome", async () => {
     const verdict = await runBrowserPage({

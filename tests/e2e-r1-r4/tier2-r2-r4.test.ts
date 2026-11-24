@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { get } from "svelte/store";
@@ -12,16 +12,19 @@ import {
 } from "../../src/lib/agents/plane";
 import AgentsView from "../../src/lib/components/AgentsView.svelte";
 import {
+  MENU_LIMITS,
   byteLength,
   menuStateProblem,
   menuStateWireProblem,
   sendableMenuState,
 } from "../../src/lib/desktop/menuContract";
 import {
+  buildMenuState,
   canDispatchMenuEvent,
   countAgentsWaiting,
+  projectMenuAgentState,
   statusKeyAction,
-  type MenuState,
+  type MenuAgentRequest,
 } from "../../src/lib/desktop/menuState";
 import { interfaceStore } from "../../src/lib/stores/interfaceStore";
 import { createRepoStore, type RepoState } from "../../src/lib/stores/repoStore";
@@ -38,11 +41,13 @@ import { terminalSessions } from "../../src/lib/terminal/sessionRegistry";
 import { runBrowserPage } from "./helpers/browser";
 import {
   TempDirManager,
+  assertCargoPassed,
   buildCargoEnv,
   ensureGitPulseHookBinary,
+  execCargoSuite,
   readRepoFile,
-  runCargoTest,
   runGitPulseHookWithSocket,
+  stripRustCommentsAndStrings,
 } from "./helpers/env";
 import {
   agyNotification,
@@ -52,11 +57,12 @@ import {
   claudeNotification,
   claudePermissionRequest,
   claudePostToolUse,
+  claudeStop,
   claudeStopFailure,
+  makeMenuAgentRequest,
   makeMenuStateWithRequests,
   makePlaneProbe,
   makePlaneTerminal,
-  type MenuAgentRequestFixture,
 } from "./helpers/fixtures";
 
 const PATHS = { caseInsensitive: false };
@@ -89,19 +95,6 @@ function loadedRepo(currentPath = "/Projects/GitPulse"): RepoState {
       },
     ],
   };
-}
-
-function assertCargoPassed(
-  res: { ok: boolean; exitCode: number; stdout: string; stderr: string },
-  label: string,
-): void {
-  expect(res.ok, `${label} failed (exit ${res.exitCode}):\n${res.stdout}\n${res.stderr}`).toBe(true);
-  expect(res.exitCode).toBe(0);
-  const combined = `${res.stdout}\n${res.stderr}`;
-  const passedMatch = /(\d+)\s+passed/.exec(combined);
-  if (passedMatch) {
-    expect(Number(passedMatch[1]), `${label} matched 0 tests`).toBeGreaterThan(0);
-  }
 }
 
 function spawnHook(
@@ -152,14 +145,14 @@ describe("[Tier 2] [R4] F7 — Claude Code Notification Boundaries", () => {
     interfaceStore.setBellAsksForReader(savedBell);
   });
 
-  it("post-HOOK_SHADOW (>10s) bare terminal BEL does NOT overwrite a cleared hook state or resurrect a standing blocking alert", async () => {
-    const res = await runCargoTest(
+  it("post-HOOK_SHADOW (>10s) bare terminal BEL and informational OSC do NOT overwrite standing blocking hook or OSC detail", async () => {
+    const res = await execCargoSuite(
       ["--lib", "alerts::tests::post_hook_shadow_bare_bell"],
       { timeoutMs: 300_000 },
     );
     assertCargoPassed(res, "post_hook_shadow_bare_bell");
 
-    const bellRes = await runCargoTest(
+    const bellRes = await execCargoSuite(
       ["--lib", "alerts::tests::bare_bell_does_not_erase_standing_osc_detail"],
       { timeoutMs: 300_000 },
     );
@@ -167,10 +160,15 @@ describe("[Tier 2] [R4] F7 — Claude Code Notification Boundaries", () => {
   }, 300_000);
 
   it("rapid duplicate twin hooks (<500ms) deduplicate cleanly and stale seq reports are rejected out-of-order", async () => {
-    const intakeRes = await runCargoTest(["--lib", "alerts::intake::tests"], {
+    const intakeRes = await execCargoSuite(["--lib", "alerts::intake_tests::"], {
       timeoutMs: 300_000,
     });
-    assertCargoPassed(intakeRes, "alerts::intake::tests");
+    assertCargoPassed(intakeRes, "alerts::intake_tests::");
+
+    const twinRes = await execCargoSuite(["--lib", "alerts::intake_twin_attack_tests::"], {
+      timeoutMs: 300_000,
+    });
+    assertCargoPassed(twinRes, "alerts::intake_twin_attack_tests::");
 
     // Verify real binary treats app-side `stale` refusal silently with exit 0 and empty stdout.
     const hookRes = await runGitPulseHookWithSocket({
@@ -379,6 +377,32 @@ describe("[Tier 2] [R4] F7 — Claude Code Notification Boundaries", () => {
       }).attention.needing,
     ).toBe(1);
   });
+
+  it("subagent turn_finished / agent_completed emits subagent: true on wire and alerts worker isolates parent Blocking prompts and working state", async () => {
+    const subStop = await runGitPulseHookWithSocket({
+      args: ["notify", "turn_finished"],
+      env: {
+        GITPULSE_SESSION_ID: "term-t2-subagent-parent",
+        GITPULSE_AGENT_KIND: undefined,
+        GITPULSE_HOST: undefined,
+      },
+      stdinJson: claudeStop({ agent_id: "subagent-1", last_assistant_message: "Subagent done" }),
+    });
+    expect(subStop.exitCode).toBe(0);
+    expect(subStop.stdout).toBe("");
+    expect(subStop.receivedJson).toHaveLength(1);
+    expect(subStop.receivedJson[0]).toMatchObject({
+      event: "turn_finished",
+      subagent: true,
+      agent_id: "subagent-1",
+      session: "term-t2-subagent-parent",
+    });
+
+    const subAlerts = await execCargoSuite(["--lib", "alerts::tests::subagent_"], {
+      timeoutMs: 300_000,
+    });
+    assertCargoPassed(subAlerts, "alerts::tests::subagent_");
+  }, 300_000);
 });
 
 describe("[Tier 2] [R4] F8 — Antigravity (agy) Hook Boundaries", () => {
@@ -500,7 +524,7 @@ describe("[Tier 2] [R4] F8 — Antigravity (agy) Hook Boundaries", () => {
     expect(req.receivedJson[0].subject).toBeTruthy();
     expect(otherTool.receivedJson[0].event).toBe("tool_finished");
 
-    const rustCheck = await runCargoTest(
+    const rustCheck = await execCargoSuite(
       ["--lib", "alerts::tests::a_permission_ends_only_on_its_own_tool_call"],
       { timeoutMs: 300_000 },
     );
@@ -534,7 +558,7 @@ describe("[Tier 2] [R4] F8 — Antigravity (agy) Hook Boundaries", () => {
   }, 300_000);
 
   it("workbench::agy_plugin Rust tests verify .gitpulse-managed marker preservation and configure_agents = false cleanup", async () => {
-    const res = await runCargoTest(["--lib", "workbench::agy_plugin"], {
+    const res = await execCargoSuite(["--lib", "workbench::agy_plugin"], {
       timeoutMs: 300_000,
     });
     assertCargoPassed(res, "workbench::agy_plugin");
@@ -553,13 +577,21 @@ describe("[Tier 2] [R4] F9 — Agents Fleet Pane Boundaries", () => {
     expect(bounded).not.toBeNull();
     expect(bounded!.length).toBeLessThanOrEqual(240);
 
-    const verdict = await runBrowserPage<{ overflowX?: boolean }>({
+    const verdict = await runBrowserPage<{
+      overflowX?: boolean;
+      detailLength?: number;
+      narrowDetailRendered?: boolean;
+      narrowDetailBounded?: boolean;
+    }>({
       page: "tests/e2e-r1-r4/browser/agents-fleet.html",
-      query: { scenario: "narrow", width: 640 },
-      windowSize: { width: 640, height: 820 },
+      query: { scenario: "narrow", width: 390 },
+      windowSize: { width: 390, height: 820 },
     });
     expect(verdict.crashes).toEqual([]);
     expect(verdict.unexpected).toEqual([]);
+    expect(verdict.data?.detailLength).toBeGreaterThan(200);
+    expect(verdict.data?.narrowDetailRendered).toBe(true);
+    expect(verdict.data?.narrowDetailBounded).toBe(true);
     expect(verdict.data?.overflowX).toBe(false);
     expect(
       verdict.passed,
@@ -688,31 +720,102 @@ describe("[Tier 2] [R4] F9 — Agents Fleet Pane Boundaries", () => {
 });
 
 describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
-  it("MenuState overflow (> MAX_MENU_AGENT_REQUESTS = 8): sendableMenuState clamps to 8 and sets agentRequestsHidden = total - 8", async () => {
+  it("MenuState overflow (> MAX_MENU_AGENT_REQUESTS = 8): projectMenuAgentState + buildMenuState caps at 8 with agentRequestsHidden = total - 8 and sendableMenuState enforces bounds", async () => {
     const now = Date.now();
-    const eleven: MenuAgentRequestFixture[] = Array.from({ length: 11 }, (_, i) => ({
-      id: `req-ov-${i + 1}`,
+    const activity = new Map<string, SessionActivity>();
+    for (let i = 0; i < 11; i += 1) {
+      activity.set(`pty-${i + 1}`, {
+        lastOutputAt: now - i * 1_000,
+        title: `agent-${i + 1}`,
+        attention: {
+          kind: "needs-you",
+          urgency: "blocking",
+          label: "Needs your permission",
+          detail: `Allow tool #${i + 1}`,
+          at: now - i * 1_000,
+        },
+      });
+    }
+    const records = Array.from({ length: 11 }, (_, i) => ({
       sessionId: `pty-${i + 1}`,
-      agent: i % 2 === 0 ? "claude" : "agy",
-      kind: i % 2 === 0 ? "claude" : "agy",
-      label: `agent-${i + 1}`,
       repoPath: "/Projects/GitPulse",
-      repoLabel: "GitPulse",
-      urgency: "blocking",
-      event: "permission_prompt",
-      detail: `Allow tool #${i + 1}`,
-      at: now - i * 1_000,
+      launcher: (i % 2 === 0 ? "claude" : "agy") as "claude" | "agy",
+      title: `agent-${i + 1}`,
+      label: i % 2 === 0 ? "Claude Code" : "Antigravity",
     }));
-    const raw = makeMenuStateWithRequests(eleven, {
+
+    const projection = projectMenuAgentState(
+      activity,
+      records,
+      undefined,
+      [],
+      [{ path: "/Projects/GitPulse", label: "GitPulse" }],
+      false,
+      PATHS,
+      "/Projects/GitPulse",
+    );
+    expect(projection.agentsWaiting).toBe(11);
+    expect(projection.agentRequests).toHaveLength(MENU_LIMITS.agentRequests);
+    expect(projection.agentRequestsHidden).toBe(3);
+
+    const built = buildMenuState(
+      loadedRepo("/Projects/GitPulse"),
+      get(interfaceStore),
+      "system",
+      {},
+      false,
+      {},
+      PATHS,
+      projection.agentsWaiting,
+      0,
+      projection,
+    );
+    expect(built.agentsWaiting).toBe(11);
+    expect(built.agentRequests).toHaveLength(MENU_LIMITS.agentRequests);
+    expect(built.agentRequestsHidden).toBe(3);
+    expect(menuStateWireProblem(built)).toBeNull();
+    expect(menuStateProblem(built)).toBeNull();
+
+    const { state: validated, problem: validProblem } = sendableMenuState(built);
+    expect(validProblem).toBeNull();
+    expect(validated.agentRequests).toHaveLength(MENU_LIMITS.agentRequests);
+    expect(validated.agentRequestsHidden).toBe(3);
+
+    // Adversarial unsendable > 8 payload: sendableMenuState clamps to 8 and keeps valid state
+    const eleven: MenuAgentRequest[] = Array.from({ length: 11 }, (_, i) =>
+      makeMenuAgentRequest({
+        id: `term:req-ov-${i + 1}`,
+        source: "terminal",
+        provider: i % 2 === 0 ? "claude" : "agy",
+        agentLabel: `agent-${i + 1}`,
+        repoPath: "/Projects/GitPulse",
+        repoLabel: "GitPulse",
+        urgency: "blocking",
+        reason: "Needs your permission",
+        detail: `Allow tool #${i + 1}`,
+        atMs: now - i * 1_000,
+      }),
+    );
+    const oversized = makeMenuStateWithRequests(eleven, {
       agentsRunning: 2,
       agentsInformational: 1,
-    }) as unknown as MenuState;
+      agentRequestsHidden: 3,
+    });
+    expect(menuStateProblem(oversized)).not.toBeNull();
+    const { state: repaired } = sendableMenuState(oversized);
+    expect(repaired.agentRequests).toHaveLength(MENU_LIMITS.agentRequests);
+    expect(repaired.agentRequestsHidden).toBe(3);
+    expect(menuStateWireProblem(repaired)).toBeNull();
+    expect(menuStateProblem(repaired)).toBeNull();
 
-    const { state: repaired } = sendableMenuState(raw);
-    const repObj = repaired as unknown as Record<string, unknown>;
-    expect(Array.isArray(repObj.agentRequests)).toBe(true);
-    expect((repObj.agentRequests as unknown[]).length).toBeLessThanOrEqual(8);
-    expect(repObj.agentRequestsHidden).toBe(3);
+    // Dishonest hidden > 0 when list < 8 is rejected by menuStateProblem and repaired to 0
+    const dishonest = makeMenuStateWithRequests(eleven.slice(0, 3), {
+      agentRequestsHidden: 2,
+    });
+    expect(menuStateProblem(dishonest)).not.toBeNull();
+    const { state: repairedDishonest } = sendableMenuState(dishonest);
+    expect(repairedDishonest.agentRequestsHidden).toBe(0);
+    expect(menuStateProblem(repairedDishonest)).toBeNull();
 
     const verdict = await runBrowserPage<{ shellHeight?: number }>({
       page: "tests/e2e-r1-r4/browser/status-popover.html",
@@ -732,19 +835,18 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
   it("Oversized MenuState strings (>2048B), trayTitle (>24 chars), and agentsWaiting (>999) are repaired by sendableMenuState", () => {
     const oversized = makeMenuStateWithRequests(
       [
-        {
-          id: "req-big",
-          sessionId: "pty-big",
-          agent: "claude",
-          kind: "claude",
-          label: "L".repeat(3000),
+        makeMenuAgentRequest({
+          id: "term:req-big",
+          source: "terminal",
+          provider: "claude",
+          agentLabel: "L".repeat(3000),
           repoPath: "/Projects/GitPulse",
           repoLabel: "GitPulse",
           urgency: "blocking",
-          event: "permission_prompt",
+          reason: "Needs your permission",
           detail: "D".repeat(3000),
-          at: Date.now(),
-        },
+          atMs: Date.now(),
+        }),
       ],
       { agentsRunning: 2 },
     );
@@ -752,13 +854,15 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
     oversized.trayTitle = "T".repeat(40);
     oversized.status.headline = "H".repeat(3000);
 
-    const { state: repaired, problem } = sendableMenuState(oversized as unknown as MenuState);
+    const { state: repaired, problem } = sendableMenuState(oversized);
     expect(problem).not.toBeNull();
     expect(menuStateWireProblem(repaired)).toBeNull();
     expect(menuStateProblem(repaired)).toBeNull();
     expect(repaired.agentsWaiting).toBeLessThanOrEqual(999);
     expect(Array.from(repaired.trayTitle ?? "").length).toBeLessThanOrEqual(24);
     expect(byteLength(repaired.status.headline)).toBeLessThanOrEqual(2048);
+    expect(byteLength(repaired.agentRequests[0]?.agentLabel ?? "")).toBeLessThanOrEqual(2048);
+    expect(byteLength(repaired.agentRequests[0]?.detail ?? "")).toBeLessThanOrEqual(2048);
   });
 
   it("Stale repository mismatch rejects/disables stale action safely without mutating wrong repo", async () => {
@@ -777,7 +881,7 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
         .join("\n")}`,
     ).toBe(verdict.total);
 
-    const state = makeMenuStateWithRequests([], { conflicts: 1 }) as unknown as MenuState;
+    const state = makeMenuStateWithRequests([], { conflicts: 1 });
     const repo = loadedRepo("/Projects/GitPulse");
     expect(
       canDispatchMenuEvent(
@@ -798,7 +902,10 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
   }, 90_000);
 
   it("StatusPopover height stays <= 640px (MAX_HEIGHT) even with max 8 agent requests + metrics", async () => {
-    const verdict = await runBrowserPage<{ shellHeight?: number }>({
+    const verdict = await runBrowserPage<{
+      shellHeight?: number;
+      renderedRequestButtons?: number;
+    }>({
       page: "tests/e2e-r1-r4/browser/status-popover.html",
       query: { scenario: "overflow" },
     });
@@ -806,27 +913,34 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
     expect(verdict.unexpected).toEqual([]);
     expect(verdict.data?.shellHeight).toBeGreaterThan(0);
     expect(verdict.data?.shellHeight).toBeLessThanOrEqual(640);
+    expect(verdict.data?.renderedRequestButtons).toBe(8);
+    expect(
+      verdict.passed,
+      `Failed overflow height checks:\n${verdict.results
+        .filter((r) => !r.pass)
+        .map((r) => `- ${r.name}${r.detail ? `: ${r.detail}` : ""}`)
+        .join("\n")}`,
+    ).toBe(verdict.total);
   }, 90_000);
 
   it("Keyboard navigation in StatusPopover (Escape, R, Enter, 1..4) works alongside agent request rows", async () => {
     const snapshot = makeMenuStateWithRequests(
       [
-        {
-          id: "req-kbd-1",
-          sessionId: "pty-1",
-          agent: "claude",
-          kind: "claude",
-          label: "claude-1",
+        makeMenuAgentRequest({
+          id: "term:req-kbd-1",
+          source: "terminal",
+          provider: "claude",
+          agentLabel: "claude-1",
           repoPath: "/Projects/GitPulse",
           repoLabel: "GitPulse",
           urgency: "blocking",
-          event: "permission_prompt",
+          reason: "Needs your permission",
           detail: "Allow Edit",
-          at: Date.now(),
-        },
+          atMs: Date.now(),
+        }),
       ],
       { conflicts: 2 },
-    ) as unknown as MenuState;
+    );
     snapshot.status.changed = 3;
     snapshot.status.staged = 1;
     snapshot.status.stashes = 2;
@@ -858,24 +972,243 @@ describe("[Tier 2] [R2] F10 — Menu Bar Overhaul Boundaries", () => {
   }, 90_000);
 
   it("MenuState Rust serde backward-compatibility deserializes payloads omitting agentRequests / agentsRunning / agentsInformational", async () => {
-    const res = await runCargoTest(["--lib", "desktop::state::tests"], {
+    const res = await execCargoSuite(["--lib", "desktop::state::tests"], {
       timeoutMs: 300_000,
     });
     assertCargoPassed(res, "desktop::state::tests");
 
     const stateSrc = readRepoFile("src-tauri/src/desktop/state.rs");
+    const stateTestIdx = stateSrc.indexOf("#[cfg(test)]");
+    const stateCode = stripRustCommentsAndStrings(
+      stateTestIdx > -1 ? stateSrc.slice(0, stateTestIdx) : stateSrc,
+    );
     for (const field of [
       "agent_requests",
       "agent_requests_hidden",
       "agents_running",
       "agents_informational",
     ]) {
-      const idx = stateSrc.indexOf(`pub ${field}:`);
+      const idx = stateCode.indexOf(`pub ${field}:`);
       expect(idx, `state.rs missing field ${field}`).toBeGreaterThan(-1);
-      const prefix = stateSrc.slice(Math.max(0, idx - 160), idx);
+      const boundary = Math.max(stateCode.lastIndexOf(",", idx), stateCode.lastIndexOf("{", idx));
+      const prefix = stateCode.slice(boundary + 1, idx);
       expect(prefix, `state.rs field ${field} missing #[serde(default)]`).toContain(
         "#[serde(default)]",
       );
     }
   }, 300_000);
+});
+
+describe("[Tier 2] [R4] Antigravity peer-inbox --host=agy vs GITPULSE_HOST=antigravity parity", () => {
+  it("routes PreInvocation invocationNum 1 (prompt_submitted, fully_idle=false) vs 2 (no-op) identically under --host=agy alone and GITPULSE_HOST=antigravity alone", async () => {
+    await ensureGitPulseHookBinary();
+
+    const matrix = [
+      {
+        label: "flag-only-inv1",
+        args: ["--host=agy", "peer-inbox"],
+        envHost: undefined as string | undefined,
+        invocationNum: 1,
+        expectPromptSubmitted: true,
+      },
+      {
+        label: "flag-only-inv2",
+        args: ["--host=agy", "peer-inbox"],
+        envHost: undefined as string | undefined,
+        invocationNum: 2,
+        expectPromptSubmitted: false,
+      },
+      {
+        label: "env-only-inv1",
+        args: ["peer-inbox"],
+        envHost: "antigravity" as string | undefined,
+        invocationNum: 1,
+        expectPromptSubmitted: true,
+      },
+      {
+        label: "env-only-inv2",
+        args: ["peer-inbox"],
+        envHost: "antigravity" as string | undefined,
+        invocationNum: 2,
+        expectPromptSubmitted: false,
+      },
+    ];
+
+    for (const item of matrix) {
+      const sid = `t5-agy-peer-${item.label}`;
+      const res = await runGitPulseHookWithSocket({
+        args: item.args,
+        env: { GITPULSE_SESSION_ID: sid, GITPULSE_HOST: item.envHost },
+        stdinJson: agyPreInvocation({ invocationNum: item.invocationNum }),
+      });
+
+      expect(res.exitCode, item.label).toBe(0);
+      expect(res.stdout.trim(), item.label).toBe("{}");
+      if (item.expectPromptSubmitted) {
+        expect(res.receivedJson, item.label).toHaveLength(1);
+        expect(res.receivedJson[0], item.label).toMatchObject({
+          agent: "agy",
+          event: "prompt_submitted",
+          fully_idle: false,
+          hook_event: "PreInvocation",
+          session: sid,
+        });
+      } else {
+        expect(res.receivedJson, item.label).toEqual([]);
+      }
+    }
+  }, 60_000);
+});
+
+describe("[Tier 2] [R4] gitpulse-hook adversarial stdin, flag order, oversized Stop & concurrent socket stress", () => {
+  it("keeps Antigravity stdout non-empty '{}' on malformed/empty JSON regardless of --host=agy position, retains oversized stop error, handles hostile control+emoji, and survives 16-way concurrent burst", async () => {
+    await ensureGitPulseHookBinary();
+
+    for (const badPayload of ["{not json", ""]) {
+      for (const variant of [
+        { args: ["--host=agy", "peer-inbox"], envHost: undefined },
+        { args: ["peer-inbox", "--host=agy"], envHost: undefined },
+        { args: ["peer-inbox"], envHost: "antigravity" },
+      ]) {
+        const res = await runGitPulseHookWithSocket({
+          args: variant.args,
+          env: { GITPULSE_SESSION_ID: "t5-bad-json", GITPULSE_HOST: variant.envHost },
+          stdinJson: badPayload,
+        });
+        expect(res.exitCode, `${variant.args.join(" ")}:${badPayload}`).toBe(0);
+        expect(res.stdout.trim(), `${variant.args.join(" ")}:${badPayload}`).toBe("{}");
+        expect(res.receivedJson).toEqual([]);
+      }
+    }
+
+    // Oversized (>16 MiB) Stop payload still preserves terminationReason="ERROR"
+    const oversizedStop = JSON.stringify({
+      hookEventName: "Stop",
+      conversationId: "91a8ef12-3456-4789-abcd-ef0123456789",
+      terminationReason: "ERROR",
+      error: "Oversized stop error preserved",
+      pad: "x".repeat(16 * 1024 * 1024 + 256),
+    });
+    const stopRes = await runGitPulseHookWithSocket({
+      args: ["--host=agy", "stop-or-notify"],
+      env: { GITPULSE_SESSION_ID: "t5-oversized-stop", GITPULSE_HOST: undefined },
+      stdinJson: oversizedStop,
+    });
+    expect(stopRes.exitCode).toBe(0);
+    expect(stopRes.stdout.trim()).toBe("{}");
+    expect(stopRes.receivedJson).toHaveLength(1);
+    expect(stopRes.receivedJson[0]).toMatchObject({
+      agent: "agy",
+      event: "error",
+      session: "t5-oversized-stop",
+    });
+
+    // Hostile bidi + ESC + BEL + 3000 multi-byte emoji stays valid JSON <= 8192B
+    const hostileSid = "t5-hostile-msg";
+    const hostile = await runGitPulseHookWithSocket({
+      args: ["notify", "permission_request"],
+      env: { GITPULSE_SESSION_ID: hostileSid, GITPULSE_HOST: undefined },
+      stdinJson: claudePermissionRequest({
+        message: `\u001b[31m\u202eAllow\u0007\n\r${"🔥".repeat(3000)}`,
+      }),
+    });
+    expect(hostile.exitCode).toBe(0);
+    expect(hostile.receivedJson).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(hostile.receivedJson[0]), "utf8")).toBeLessThanOrEqual(8192);
+
+    // 16-way concurrent burst across Claude & Antigravity routes
+    const burst = await Promise.all(
+      Array.from({ length: 16 }, (_, i) => {
+        const sid = `t5-burst-${i}`;
+        if (i % 4 === 0) {
+          return runGitPulseHookWithSocket({
+            args: ["--host=agy", "peer-inbox"],
+            env: { GITPULSE_SESSION_ID: sid, GITPULSE_HOST: undefined },
+            stdinJson: agyPreInvocation({ invocationNum: 1 }),
+          });
+        }
+        if (i % 4 === 1) {
+          return runGitPulseHookWithSocket({
+            args: ["peer-inbox"],
+            env: { GITPULSE_SESSION_ID: sid, GITPULSE_HOST: "antigravity" },
+            stdinJson: agyPreInvocation({ invocationNum: 2 }),
+          });
+        }
+        if (i % 4 === 2) {
+          return runGitPulseHookWithSocket({
+            args: ["notify", "permission_request"],
+            env: { GITPULSE_SESSION_ID: sid, GITPULSE_HOST: undefined },
+            stdinJson: claudePermissionRequest({ message: `Burst ask ${i}` }),
+          });
+        }
+        return runGitPulseHookWithSocket({
+          args: ["stop-or-notify"],
+          env: { GITPULSE_SESSION_ID: sid, GITPULSE_HOST: "antigravity" },
+          stdinJson: agyStop({ terminationReason: "NO_TOOL_CALL", message: `Done ${i}` }),
+        });
+      }),
+    );
+
+    for (const [i, res] of burst.entries()) {
+      expect(res.exitCode, `burst[${i}]`).toBe(0);
+      if (i % 4 === 1) {
+        expect(res.receivedJson, `burst[${i}] inv=2`).toEqual([]);
+      } else {
+        expect(res.receivedJson, `burst[${i}]`).toHaveLength(1);
+      }
+    }
+  }, 120_000);
+
+  it("gitpulse-worktree.sh fallback extracts top-level name without shadowing by nested objects", async () => {
+    const temps = new TempDirManager();
+    const repoDir = realpathSync(temps.create("gp-wt-nested-"));
+    const runGit = (args: string[], cwd: string) =>
+      new Promise<{ code: number; stderr: string }>((resolve, reject) => {
+        const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+        const err: Buffer[] = [];
+        child.stderr.on("data", (c: Buffer) => err.push(c));
+        child.once("error", reject);
+        child.once("close", (code) => resolve({ code: code ?? 1, stderr: Buffer.concat(err).toString("utf8") }));
+      });
+    try {
+      expect((await runGit(["init", "-b", "main"], repoDir)).code).toBe(0);
+      expect((await runGit(["config", "user.email", "t@example.com"], repoDir)).code).toBe(0);
+      expect((await runGit(["config", "user.name", "Test"], repoDir)).code).toBe(0);
+      expect((await runGit(["commit", "--allow-empty", "-m", "init"], repoDir)).code).toBe(0);
+
+      for (const [idx, payload] of [
+        JSON.stringify({ name: "wt-top-first", cwd: repoDir, nested: { name: "wrong-name" } }),
+        JSON.stringify({ nested: { name: "wrong-name" }, name: "wt-top-second", cwd: repoDir }),
+      ].entries()) {
+        const expectedName = idx === 0 ? "wt-top-first" : "wt-top-second";
+        const res = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+          const child = spawn(
+            "sh",
+            [path.join(process.cwd(), "plugins/gitpulse/hooks/gitpulse-worktree.sh"), "/nonexistent/gitpulse-hook", "worktree-create"],
+            { cwd: repoDir, stdio: ["pipe", "pipe", "pipe"] },
+          );
+          const out: Buffer[] = [];
+          const err: Buffer[] = [];
+          child.stdout.on("data", (c: Buffer) => out.push(c));
+          child.stderr.on("data", (c: Buffer) => err.push(c));
+          child.once("error", reject);
+          child.once("close", (code) =>
+            resolve({
+              code: code ?? 1,
+              stdout: Buffer.concat(out).toString("utf8"),
+              stderr: Buffer.concat(err).toString("utf8"),
+            }),
+          );
+          child.stdin.write(payload);
+          child.stdin.end();
+        });
+        expect(res.code, res.stderr).toBe(0);
+        expect(res.stdout.trim()).toBe(path.join(repoDir, ".claude/worktrees", expectedName));
+        expect(existsSync(path.join(repoDir, ".claude/worktrees", expectedName))).toBe(true);
+        expect(existsSync(path.join(repoDir, ".claude/worktrees/wrong-name"))).toBe(false);
+      }
+    } finally {
+      temps.cleanup();
+    }
+  }, 60_000);
 });

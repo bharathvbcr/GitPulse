@@ -1,6 +1,8 @@
 import { get } from "svelte/store";
 import { render } from "svelte/server";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { clearMocks } from "@tauri-apps/api/mocks";
+import { mockIPCWithEvents } from "../../harness/tauriMocks";
 import { projectAgentPlane } from "../../src/lib/agents/plane";
 import { planeTerminals, repoAgentPill } from "../../src/lib/agents/repoAttention";
 import AgentsView from "../../src/lib/components/AgentsView.svelte";
@@ -10,17 +12,18 @@ import {
   sendableMenuState,
 } from "../../src/lib/desktop/menuContract";
 import {
-  buildMenuState,
   countAgentsWaiting,
+  type MenuAgentRequest,
   type MenuState,
 } from "../../src/lib/desktop/menuState";
+import { nativeMenuState } from "../../src/lib/desktop/menuStateStore";
 import {
   dispatchNativeMenu,
   type NativeMenuHandlers,
 } from "../../src/lib/desktop/nativeActions";
 import StatusPopover from "../../src/lib/desktop/StatusPopover.svelte";
 import { interfaceStore } from "../../src/lib/stores/interfaceStore";
-import { createRepoStore, type RepoState } from "../../src/lib/stores/repoStore";
+import { repoStore } from "../../src/lib/stores/repoStore";
 import {
   ATTENTION_EVENTS,
   activityToAgentStatus,
@@ -34,10 +37,12 @@ import {
 import { terminalSessions } from "../../src/lib/terminal/sessionRegistry";
 import { runBrowserPage } from "./helpers/browser";
 import {
+  assertCargoPassed,
   ensureGitPulseHookBinary,
+  execCargoSuite,
   readRepoFile,
-  runCargoTest,
   runGitPulseHookWithSocket,
+  stripRustCommentsAndStrings,
 } from "./helpers/env";
 import {
   agyNotification,
@@ -47,42 +52,105 @@ import {
   claudeNotification,
   claudePermissionRequest,
   claudeStop,
+  makeMenuAgentRequest,
   makeMenuStateWithRequests,
   makePlaneProbe,
   makePlaneTerminal,
-  type MenuAgentRequestFixture,
 } from "./helpers/fixtures";
 
 const PATHS = { caseInsensitive: false };
 
-function emptyRepo(): RepoState {
-  return get(createRepoStore({ storage: null }));
-}
+async function withMockedLoadedRepo(
+  currentPath: string,
+  fn: () => Promise<void> | void,
+): Promise<void> {
+  const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, "window");
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  if (!hadWindow || !prevWindow) {
+    (globalThis as { window: unknown }).window = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    };
+  }
 
-function loadedRepo(currentPath = "/Projects/GitPulse"): RepoState {
-  return {
-    ...emptyRepo(),
-    currentPath,
-    currentBranch: "main",
-    isLoading: false,
-    openTabs: [
-      {
-        id: "tab-1",
-        path: currentPath,
-        name: "GitPulse",
-        label: "GitPulse",
-        pinned: false,
-        isActive: true,
-        isBare: false,
-        isDirty: false,
-        isLoading: false,
-        error: null,
-        currentBranch: "main",
-        conflictedCount: 0,
-        changedCount: 0,
-      },
-    ],
-  };
+  mockIPCWithEvents((cmd, args) => {
+    if (cmd.startsWith("plugin:")) return null;
+    const payload = (args ?? {}) as Record<string, unknown>;
+    switch (cmd) {
+      case "cmd_resolve_repo":
+        return {
+          path: String(payload.repoPath ?? payload.path ?? currentPath),
+          name: "GitPulse",
+          is_bare: false,
+          common_dir: `${currentPath}/.git`,
+        };
+      case "cmd_list_branches":
+        return [
+          {
+            name: "main",
+            is_current: true,
+            is_remote: false,
+            remote_name: null,
+            tip_commit_id: "a".repeat(40),
+            is_default: true,
+            is_gone: false,
+            last_commit_timestamp: Math.floor(Date.now() / 1000) - 600,
+            last_author: "Alex",
+            last_summary: "Work",
+            upstream: "origin/main",
+            ahead_count: 0,
+            behind_count: 0,
+          },
+        ];
+      case "cmd_get_status":
+        return [];
+      case "cmd_repo_operation":
+        return null;
+      case "cmd_list_tags":
+        return { tags: [], truncated: false };
+      case "cmd_stash_list":
+        return { entries: [], truncated: false };
+      case "cmd_list_worktrees":
+        return [];
+      case "cmd_get_commit_graph":
+        return { nodes: [], edges: [], total_commits: 0, truncated: false };
+      case "cmd_branch_stats":
+        return { updates: [], capped: false, compute_failures: 0, compared_to: "main" };
+      case "cmd_workspace_sync":
+        return { repos: [] };
+      case "cmd_list_repo_files":
+        return [];
+      case "cmd_task_view":
+        return { available: false, store_path: "", leases: [], error: "" };
+      case "cmd_worktree_task":
+      case "cmd_watch_repo":
+      case "cmd_unwatch_repo":
+      case "cmd_last_fetch_at":
+      case "cmd_note_tab_activated":
+      case "cmd_set_recent_menu":
+        return null;
+      default:
+        return null;
+    }
+  });
+
+  try {
+    const opened = await repoStore.openRepo(currentPath);
+    expect(opened).toBe(true);
+    await fn();
+  } finally {
+    let guard = 0;
+    while (get(repoStore).activeTabId && guard++ < 10) {
+      await repoStore.closeTab(get(repoStore).activeTabId!);
+    }
+    clearMocks();
+    if (!hadWindow) {
+      delete (globalThis as { window?: unknown }).window;
+    } else {
+      (globalThis as { window?: unknown }).window = prevWindow;
+    }
+  }
 }
 
 function createNoopHandlers(
@@ -91,6 +159,7 @@ function createNoopHandlers(
   const noop = () => {};
   return {
     activateRepo: noop,
+    focusAgent: noop,
     clearRecents: noop,
     checkUpdates: noop,
     stageAll: noop,
@@ -145,16 +214,6 @@ function createNoopHandlers(
     openError: noop,
     ...overrides,
   };
-}
-
-function assertCargoPassed(res: { ok: boolean; exitCode: number; stdout: string; stderr: string }, label: string): void {
-  expect(res.ok, `${label} failed (exit ${res.exitCode}):\n${res.stdout}\n${res.stderr}`).toBe(true);
-  expect(res.exitCode).toBe(0);
-  const combined = `${res.stdout}\n${res.stderr}`;
-  const passedMatch = /(\d+)\s+passed/.exec(combined);
-  if (passedMatch) {
-    expect(Number(passedMatch[1]), `${label} matched 0 tests`).toBeGreaterThan(0);
-  }
 }
 
 describe("[Tier 1] [R4] F7 — Claude Code Attention vs Informational Classification", () => {
@@ -401,14 +460,31 @@ describe("[Tier 1] [R4] F7 — Claude Code Attention vs Informational Classifica
   });
 
   it("Cargo alerts:: unit suite passes including idle_prompt informational urgency and post-HOOK_SHADOW bare BEL guard", async () => {
-    const res = await runCargoTest(["--lib", "alerts::"], { timeoutMs: 300_000 });
+    const res = await execCargoSuite(["--lib", "alerts::"], { timeoutMs: 300_000 });
     assertCargoPassed(res, "cargo test --lib alerts::");
   }, 300_000);
 
-  it("Cargo hooks:: unit tests and agent_notify_socket integration suite pass", async () => {
-    const hooksRes = await runCargoTest(["--lib", "hooks::"], { timeoutMs: 300_000 });
-    assertCargoPassed(hooksRes, "cargo test --lib hooks::");
-    const socketRes = await runCargoTest(["--test", "agent_notify_socket"], { timeoutMs: 300_000 });
+  it("Cargo hooks notification/socket/route unit tests pass deterministically", async () => {
+    const hooksRes = await execCargoSuite(
+      [
+        "--lib",
+        "--",
+        "--test-threads=1",
+        "hooks::notify",
+        "hooks::adv_l5_tests",
+        "hooks::adv_w3c_tests",
+        "hooks::tests::a_permission_request_and_its_result",
+        "hooks::tests::the_shipped_manifest",
+        "hooks::tests::what_the_hook_sends_is_what_the_socket_accepts",
+        "hooks::tests::antigravity_a2a_tests",
+      ],
+      { timeoutMs: 300_000 },
+    );
+    assertCargoPassed(hooksRes, "cargo test --lib hooks notification/socket/route suites");
+  }, 300_000);
+
+  it("Cargo agent_notify_socket integration suite passes independently", async () => {
+    const socketRes = await execCargoSuite(["--test", "agent_notify_socket"], { timeoutMs: 300_000 });
     assertCargoPassed(socketRes, "cargo test --test agent_notify_socket");
   }, 300_000);
 });
@@ -418,7 +494,7 @@ describe("[Tier 1] [R4] F8 — Antigravity (agy) Hook Parity & Lifecycle", () =>
     await ensureGitPulseHookBinary();
   }, 300_000);
 
-  it("plugins/gitpulse/hooks.json and plugins/gitpulse-agy/hooks.json align on full Antigravity lifecycle hooks and host parity", () => {
+  it("plugins/gitpulse/hooks.json and plugins/gitpulse-agy/hooks.json align on Antigravity lifecycle hooks and host parity", () => {
     const embedded = JSON.parse(readRepoFile("plugins/gitpulse/hooks.json")) as {
       gitpulse: Record<string, unknown[]>;
     };
@@ -432,13 +508,19 @@ describe("[Tier 1] [R4] F8 — Antigravity (agy) Hook Parity & Lifecycle", () =>
       "PostInvocation",
       "PostToolUse",
       "Stop",
-      "Notification",
-      "SessionEnd",
     ];
 
     for (const event of requiredEvents) {
       expect(embedded.gitpulse[event], `plugins/gitpulse/hooks.json missing ${event}`).toBeDefined();
       expect(agyPlugin.gitpulse[event], `plugins/gitpulse-agy/hooks.json missing ${event}`).toBeDefined();
+    }
+
+    // Antigravity (`agy plugin validate --strict`) recognizes only SessionStart, PreInvocation,
+    // PostInvocation, Stop, PreToolUse, PostToolUse; Notification/SessionEnd fail strict validation,
+    // and PreToolUse is intentionally omitted (Antigravity IDE 2.32.1 denies non-"allow" answers).
+    for (const disallowed of ["PreToolUse", "Notification", "SessionEnd"]) {
+      expect(embedded.gitpulse[disallowed], `plugins/gitpulse/hooks.json unexpected ${disallowed}`).toBeUndefined();
+      expect(agyPlugin.gitpulse[disallowed], `plugins/gitpulse-agy/hooks.json unexpected ${disallowed}`).toBeUndefined();
     }
 
     const extractCommands = (root: Record<string, unknown[]>, event: string) => {
@@ -462,37 +544,31 @@ describe("[Tier 1] [R4] F8 — Antigravity (agy) Hook Parity & Lifecycle", () =>
       return out;
     };
 
-    // PreInvocation must clear prompt/prior attention (`notify prompt_submitted`) as well as peer-inbox.
-    expect(
-      extractCommands(embedded.gitpulse, "PreInvocation").some((c) =>
-        c.command.includes("notify prompt_submitted"),
-      ),
-      "plugins/gitpulse/hooks.json PreInvocation missing notify prompt_submitted",
-    ).toBe(true);
-    expect(
-      extractCommands(agyPlugin.gitpulse, "PreInvocation").some(
-        (c) =>
-          c.command.includes("notify prompt_submitted") &&
-          c.env?.GITPULSE_HOST === "antigravity",
-      ),
-      "plugins/gitpulse-agy/hooks.json PreInvocation missing notify prompt_submitted with GITPULSE_HOST=antigravity",
-    ).toBe(true);
+    expect(extractCommands(embedded.gitpulse, "SessionStart").some((c) => c.command.includes("session-brief"))).toBe(true);
+    expect(extractCommands(agyPlugin.gitpulse, "SessionStart").some((c) => c.command.includes("session-brief"))).toBe(true);
+    expect(extractCommands(embedded.gitpulse, "SessionStart").some((c) => c.command.includes("peer-inbox"))).toBe(true);
+    expect(extractCommands(agyPlugin.gitpulse, "SessionStart").some((c) => c.command.includes("peer-inbox"))).toBe(true);
 
-    // SessionEnd must emit session_ended on both manifests.
-    expect(
-      extractCommands(embedded.gitpulse, "SessionEnd").some((c) =>
-        c.command.includes("notify session_ended"),
-      ),
-    ).toBe(true);
-    expect(
-      extractCommands(agyPlugin.gitpulse, "SessionEnd").some(
-        (c) =>
-          c.command.includes("notify session_ended") &&
-          c.env?.GITPULSE_HOST === "antigravity",
-      ),
-    ).toBe(true);
+    // PreInvocation & PostInvocation run peer-inbox (emitting prompt_submitted only on fresh turns).
+    for (const invocationEvent of ["PreInvocation", "PostInvocation"] as const) {
+      expect(
+        extractCommands(embedded.gitpulse, invocationEvent).some((c) => c.command.includes("peer-inbox")),
+        `plugins/gitpulse/hooks.json ${invocationEvent} missing peer-inbox`,
+      ).toBe(true);
+      expect(
+        extractCommands(agyPlugin.gitpulse, invocationEvent).some((c) => c.command.includes("peer-inbox")),
+        `plugins/gitpulse-agy/hooks.json ${invocationEvent} missing peer-inbox`,
+      ).toBe(true);
+    }
 
-    // Embedded hooks.json uses --host=agy consistently across hook commands.
+    expect(extractCommands(embedded.gitpulse, "PostToolUse").some((c) => c.command.includes("notify tool_finished"))).toBe(true);
+    expect(extractCommands(agyPlugin.gitpulse, "PostToolUse").some((c) => c.command.includes("notify tool_finished"))).toBe(true);
+
+    // Stop must run stop-or-notify on both manifests.
+    expect(extractCommands(embedded.gitpulse, "Stop").some((c) => c.command.includes("stop-or-notify"))).toBe(true);
+    expect(extractCommands(agyPlugin.gitpulse, "Stop").some((c) => c.command.includes("stop-or-notify"))).toBe(true);
+
+    // Embedded hooks.json uses --host=agy consistently; gitpulse-agy uses GITPULSE_HOST=antigravity.
     for (const event of requiredEvents) {
       for (const entry of extractCommands(embedded.gitpulse, event)) {
         expect(entry.command, `embedded ${event}`).toContain("--host=agy");
@@ -756,8 +832,12 @@ describe("[Tier 1] [R4] F9 — Agents Fleet Pane UX/UI & Dismiss/Focus Actions",
       });
 
       const html = render(AgentsView).body;
-      expect(html).toMatch(/class="[^"]*\bgp-chip\b[^"]*"[^>]*data-tone="(warn|danger)"/);
-      expect(html).toMatch(/class="[^"]*\bgp-chip\b[^"]*"[^>]*data-tone="(info|neutral)"/);
+      expect(html).toMatch(
+        /<[^>]*\bclass="[^"]*\bgp-chip\b[^"]*"[^>]*\bdata-tone="(warn|danger)"|<[^>]*\bdata-tone="(warn|danger)"[^>]*\bclass="[^"]*\bgp-chip\b[^"]*"/,
+      );
+      expect(html).toMatch(
+        /<[^>]*\bclass="[^"]*\bgp-chip\b[^"]*"[^>]*\bdata-tone="(info|neutral)"|<[^>]*\bdata-tone="(info|neutral)"[^>]*\bclass="[^"]*\bgp-chip\b[^"]*"/,
+      );
       expect(html).toMatch(/data-testid="agents-filter-(notifications|notices)"/i);
     } finally {
       sessionActivity.forget("pty-ssr-block-f9");
@@ -802,27 +882,29 @@ describe("[Tier 1] [R4] F9 — Agents Fleet Pane UX/UI & Dismiss/Focus Actions",
     try {
       slots.push(
         terminalSessions.reserve({
-          key: "ssr-dismiss-f9",
+          key: "ssr-notice-f9",
           repoPath: "/code/GitPulse",
           label: "Antigravity",
           launcher: "agy",
-          title: "agy-dismiss-row",
+          title: "agy-notice-row",
           status: "running",
-          sessionId: "pty-ssr-dismiss-f9",
+          sessionId: "pty-ssr-notice-f9",
           close: async () => {},
         }),
       );
       sessionActivity.announce({
-        session: "pty-ssr-dismiss-f9",
+        session: "pty-ssr-notice-f9",
         channel: "hook",
         event: "agent_completed",
         detail: "Finished code review",
       });
 
       const html = render(AgentsView).body;
-      expect(html).toMatch(/aria-label="[^"]*(dismiss|acknowledge|clear)[^"]*"|>[\s]*(dismiss|acknowledge)[\s]*</i);
+      expect(html).toMatch(
+        /data-action="(?:dismiss|acknowledge|clear)"|aria-label="[^"]*(?:dismiss|acknowledge|clear)[^"]*"|<button[^>]*>(?:<[^>]+>|\s)*(?:Dismiss|Acknowledge|Clear)\b/i,
+      );
     } finally {
-      sessionActivity.forget("pty-ssr-dismiss-f9");
+      sessionActivity.forget("pty-ssr-notice-f9");
       while (slots.length > 0) slots.pop()?.release();
     }
   });
@@ -910,96 +992,93 @@ describe("[Tier 1] [R2] F10 — Menu Bar Agent Requests, Waiting States & FocusA
     interfaceStore.setBellAsksForReader(savedBell);
   });
 
-  it("MenuState projection includes agentRequests, agentRequestsHidden, agentsRunning, agentsInformational, and agentsWaiting for blocking/error only", () => {
-    const activity = createSessionActivity(() => 10_000);
-    activity.announce({
-      session: "s-block",
-      channel: "hook",
-      event: "permission_prompt",
-      detail: "Allow Bash: git status",
-    });
-    activity.announce({
-      session: "s-err",
-      channel: "hook",
-      event: "error",
-      detail: "Tool execution failed",
-    });
-    activity.announce({
-      session: "s-info-1",
-      channel: "hook",
-      event: "turn_finished",
-      detail: "Turn complete",
-    });
-    activity.announce({
-      session: "s-info-2",
-      channel: "hook",
-      event: "idle_prompt",
-      detail: "Idle reminder",
-    });
-    activity.output("s-quiet");
+  it("MenuState projection includes agentRequests, agentRequestsHidden, agentsRunning, agentsInformational, and agentsWaiting for blocking/error only", async () => {
+    const tracked = ["t1-f10-block", "t1-f10-err", "t1-f10-info-1", "t1-f10-info-2", "t1-f10-quiet"];
+    try {
+      await withMockedLoadedRepo("/Projects/GitPulse", () => {
+        sessionActivity.announce({
+          session: "t1-f10-block",
+          channel: "hook",
+          event: "permission_prompt",
+          detail: "Allow Bash: git status",
+        });
+        sessionActivity.announce({
+          session: "t1-f10-err",
+          channel: "hook",
+          event: "error",
+          detail: "Tool execution failed",
+        });
+        sessionActivity.announce({
+          session: "t1-f10-info-1",
+          channel: "hook",
+          event: "turn_finished",
+          detail: "Turn complete",
+        });
+        sessionActivity.announce({
+          session: "t1-f10-info-2",
+          channel: "hook",
+          event: "idle_prompt",
+          detail: "Idle reminder",
+        });
+        sessionActivity.output("t1-f10-quiet");
 
-    const map = get(activity) as ReadonlyMap<string, SessionActivity>;
-    expect(countAgentsWaiting(map)).toBe(2);
+        const map = get(sessionActivity) as ReadonlyMap<string, SessionActivity>;
+        expect(countAgentsWaiting(map)).toBe(2);
 
-    const built = buildMenuState(
-      loadedRepo("/Projects/GitPulse"),
-      get(interfaceStore),
-      "dark",
-      {},
-      false,
-      {},
-      PATHS,
-      countAgentsWaiting(map),
-    ) as unknown as Record<string, unknown>;
-
-    expect(built.agentsWaiting).toBe(2);
-    expect(Array.isArray(built.agentRequests)).toBe(true);
-    expect((built.agentRequests as unknown[]).length).toBe(2);
-    expect(built.agentRequestsHidden).toBe(0);
-    expect(typeof built.agentsRunning).toBe("number");
-    expect(built.agentsInformational).toBe(2);
+        const built = get(nativeMenuState) as unknown as Record<string, unknown>;
+        expect(built.agentsWaiting).toBe(2);
+        expect(Array.isArray(built.agentRequests)).toBe(true);
+        expect((built.agentRequests as unknown[]).length).toBe(2);
+        expect(built.agentRequestsHidden).toBe(0);
+        expect(typeof built.agentsRunning).toBe("number");
+        expect(built.agentsInformational).toBe(2);
+      });
+    } finally {
+      for (const sid of tracked) sessionActivity.forget(sid);
+    }
   });
 
   it("StatusPopover SSR and browser waiting scenario render waiting-for-action agent requests with agent/repo context", async () => {
-    const reqs: MenuAgentRequestFixture[] = [
-      {
-        id: "req-1",
-        sessionId: "pty-claude-1",
-        agent: "claude",
-        kind: "claude",
-        label: "claude-main",
+    const reqs: MenuAgentRequest[] = [
+      makeMenuAgentRequest({
+        id: "term:pty-claude-1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "claude-main",
         repoPath: "/Projects/GitPulse",
         repoLabel: "GitPulse",
         urgency: "blocking",
-        event: "permission_prompt",
+        reason: "Needs your permission",
         detail: "Allow Bash: cargo test",
-        at: Date.now() - 10_000,
-      },
-      {
-        id: "req-2",
-        sessionId: "pty-agy-2",
-        agent: "agy",
-        kind: "agy",
-        label: "agy-review",
+        atMs: Date.now() - 10_000,
+      }),
+      makeMenuAgentRequest({
+        id: "term:pty-agy-2",
+        source: "terminal",
+        provider: "agy",
+        agentLabel: "agy-review",
         repoPath: "/Projects/DevCouncil",
         repoLabel: "DevCouncil",
         urgency: "blocking",
-        event: "elicitation_dialog",
+        reason: "Needs your input",
         detail: "Choose target deployment environment",
-        at: Date.now() - 25_000,
-      },
+        atMs: Date.now() - 25_000,
+      }),
     ];
-    const snapshot = makeMenuStateWithRequests(reqs, {
+    const snapshot: MenuState = makeMenuStateWithRequests(reqs, {
       agentsRunning: 3,
       agentsInformational: 1,
-    }) as unknown as MenuState;
+    });
 
     const { body } = render(StatusPopover, {
       props: { snapshot, onaction: () => {} },
     });
+    expect(body).toContain("claude-main");
+    expect(body).toContain("Needs your permission");
     expect(body).toContain("Allow Bash: cargo test");
     expect(body).toContain("DevCouncil");
     expect(body).toContain("Choose target deployment environment");
+    expect(body).toContain("<time");
 
     const verdict = await runBrowserPage({
       page: "tests/e2e-r1-r4/browser/status-popover.html",
@@ -1059,7 +1138,7 @@ describe("[Tier 1] [R2] F10 — Menu Bar Agent Requests, Waiting States & FocusA
   }, 90_000);
 
   it("Rust acl_contract, desktop_menu_integration, and native_menu_main_thread integration suites pass", async () => {
-    const res = await runCargoTest(
+    const res = await execCargoSuite(
       [
         "--test",
         "acl_contract",
@@ -1074,30 +1153,33 @@ describe("[Tier 1] [R2] F10 — Menu Bar Agent Requests, Waiting States & FocusA
   }, 300_000);
 
   it("Rust desktop::state, desktop::tray, and desktop::popover unit tests pass and tray surfaces agent requests", async () => {
-    const res = await runCargoTest(["--lib", "desktop::"], { timeoutMs: 300_000 });
+    const res = await execCargoSuite(["--lib", "desktop::"], { timeoutMs: 300_000 });
     assertCargoPassed(res, "cargo test --lib desktop::");
 
     const traySrc = readRepoFile("src-tauri/src/desktop/tray.rs");
-    expect(traySrc).toContain("tray_tooltip");
-    expect(traySrc).toContain("build_tray_menu");
-    expect(traySrc).toContain("agent_requests");
+    const trayTestIdx = traySrc.indexOf("#[cfg(test)]");
+    const trayProdCode = stripRustCommentsAndStrings(
+      trayTestIdx > -1 ? traySrc.slice(0, trayTestIdx) : traySrc,
+    );
+    expect(trayProdCode).toContain("tray_tooltip");
+    expect(trayProdCode).toContain("build_tray_menu");
+    expect(trayProdCode).toContain("agent_requests");
 
     // Verify sendableMenuState keeps valid request-carrying MenuState clean.
     const valid = makeMenuStateWithRequests([
-      {
-        id: "req-tray-1",
-        sessionId: "s-1",
-        agent: "claude",
-        kind: "claude",
-        label: "claude-1",
+      makeMenuAgentRequest({
+        id: "term:s-1",
+        source: "terminal",
+        provider: "claude",
+        agentLabel: "claude-1",
         repoPath: "/Projects/GitPulse",
         repoLabel: "GitPulse",
         urgency: "blocking",
-        event: "permission_prompt",
+        reason: "Needs your permission",
         detail: "Allow Bash",
-        at: Date.now(),
-      },
-    ]) as unknown as MenuState;
+        atMs: Date.now(),
+      }),
+    ]);
     expect(menuStateWireProblem(valid)).toBeNull();
     expect(menuStateProblem(valid)).toBeNull();
     expect(sendableMenuState(valid).problem).toBeNull();

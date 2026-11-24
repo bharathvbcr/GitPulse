@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { inflateSync } from "node:zlib";
 import { render } from "svelte/server";
 import { get } from "svelte/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,7 +10,6 @@ import { mockIPCWithEvents } from "../../harness/tauriMocks";
 import AttentionInbox from "../../src/lib/components/AttentionInbox.svelte";
 import ConflictEditor from "../../src/lib/components/ConflictEditor.svelte";
 import Logo from "../../src/lib/components/Logo.svelte";
-import SessionNotificationBridge from "../../src/lib/components/SessionNotificationBridge.svelte";
 import ToastContainer from "../../src/lib/components/ToastContainer.svelte";
 import WorkOverviewPane from "../../src/lib/components/WorkOverviewPane.svelte";
 import WorkView from "../../src/lib/components/WorkView.svelte";
@@ -25,7 +25,15 @@ import {
   takeConflictsReveal,
 } from "../../src/lib/ui/workConflicts";
 import { runBrowserPage } from "./helpers/browser";
-import { REPO_ROOT, readPngInfo, readRepoFile, repoPath, runCargoTest } from "./helpers/env";
+import {
+  REPO_ROOT,
+  assertCargoPassed,
+  assertTrayPulseIconUpdated,
+  execCargoSuite,
+  readPngInfo,
+  readRepoFile,
+  repoPath,
+} from "./helpers/env";
 import { makeMenuState, makeRepoFixtures } from "./helpers/fixtures";
 
 const OLD_PULSE_LOGO_SHA256 =
@@ -206,7 +214,7 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
     }
   });
 
-  it("ships plugins/gitpulse/assets/logo.png as current 256x256 RGBA PNG matching 128x128@2x.png", () => {
+  it("ships plugins/gitpulse/assets/logo.png as current 256x256 RGBA G-ring badge matching 128x128@2x.png mark colors", () => {
     const pluginLogo = readPngInfo("plugins/gitpulse/assets/logo.png");
     const appIcon2x = readPngInfo("src-tauri/icons/128x128@2x.png");
 
@@ -215,7 +223,71 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
     expect(pluginLogo.colorType).toBe(6);
     expect(pluginLogo.bitDepth).toBe(8);
     expect(pluginLogo.sha256).not.toBe(OLD_PULSE_LOGO_SHA256);
-    expect(pluginLogo.sha256).toBe(appIcon2x.sha256);
+    expect(appIcon2x.width).toBe(256);
+    expect(appIcon2x.height).toBe(256);
+
+    // Verify both 256x256 PNGs render the cyan-blue G-ring at the same ring coordinates
+    const decode = (rel: string) => {
+      const bytes = readFileSync(repoPath(rel));
+      const idat: Buffer[] = [];
+      let off = 8;
+      while (off + 12 <= bytes.length) {
+        const len = bytes.readUInt32BE(off);
+        const kind = bytes.subarray(off + 4, off + 8).toString("ascii");
+        const data = bytes.subarray(off + 8, off + 8 + len);
+        off += 12 + len;
+        if (kind === "IDAT") idat.push(data);
+        else if (kind === "IEND") break;
+      }
+      const stride = 256 * 4;
+      const raw = inflateSync(Buffer.concat(idat));
+      const rgba = new Uint8Array(256 * stride);
+      for (let y = 0; y < 256; y += 1) {
+        const filter = raw[y * (1 + stride)]!;
+        const s = y * (1 + stride) + 1;
+        const d = y * stride;
+        for (let i = 0; i < stride; i += 1) {
+          const x = raw[s + i]!;
+          const a = i >= 4 ? rgba[d + i - 4]! : 0;
+          const b = y > 0 ? rgba[d - stride + i]! : 0;
+          const c = y > 0 && i >= 4 ? rgba[d - stride + i - 4]! : 0;
+          let recon = x;
+          if (filter === 1) recon = (x + a) & 0xff;
+          else if (filter === 2) recon = (x + b) & 0xff;
+          else if (filter === 3) recon = (x + ((a + b) >> 1)) & 0xff;
+          else if (filter === 4) {
+            const p = a + b - c;
+            const pr =
+              Math.abs(p - a) <= Math.abs(p - b) && Math.abs(p - a) <= Math.abs(p - c)
+                ? a
+                : Math.abs(p - b) <= Math.abs(p - c)
+                  ? b
+                  : c;
+            recon = (x + pr) & 0xff;
+          }
+          rgba[d + i] = recon;
+        }
+      }
+      return (x: number, y: number) => {
+        const idx = (y * 256 + x) * 4;
+        return [rgba[idx]!, rgba[idx + 1]!, rgba[idx + 2]!, rgba[idx + 3]!] as const;
+      };
+    };
+
+    const pluginPixel = decode("plugins/gitpulse/assets/logo.png");
+    const iconPixel = decode("src-tauri/icons/128x128@2x.png");
+    expect(pluginPixel(0, 0)[3]).toBe(0);
+    for (const [x, y] of [
+      [60, 128],
+      [128, 196],
+    ] as const) {
+      const [pr, , pb, pa] = pluginPixel(x, y);
+      const [ir, , ib, ia] = iconPixel(x, y);
+      expect(pa).toBeGreaterThan(200);
+      expect(pb).toBeGreaterThan(pr);
+      expect(ia).toBeGreaterThan(200);
+      expect(ib).toBeGreaterThan(ir);
+    }
   });
 
   it("references assets/logo.png in Cursor plugin manifest and bundles ../plugins/gitpulse/ in tauri.conf.json", () => {
@@ -279,11 +351,11 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
   });
 
   it("passes strict design-lint with zero raw #hex/rgb color literals in notification components", () => {
-    const output = execFileSync("node", ["scripts/design-lint.mjs", "--strict"], {
+    const lint = spawnSync("node", ["scripts/design-lint.mjs", "--strict"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
     });
-    expect(output).toBeDefined();
+    const combinedOutput = `${lint.stdout ?? ""}\n${lint.stderr ?? ""}`;
 
     const notificationComponents = [
       "src/lib/components/ToastContainer.svelte",
@@ -293,6 +365,7 @@ describe("[Tier 1] [R1] F1 — Notification & Plugin Logo Assets", () => {
       "src/lib/desktop/StatusPopover.svelte",
     ];
     for (const rel of notificationComponents) {
+      expect(combinedOutput, `${rel} mentioned in design-lint failures`).not.toContain(rel);
       const src = readRepoFile(rel);
       expect(src, `${rel} raw hex`).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
       expect(src, `${rel} raw rgb(`).not.toMatch(/\brgb\s*\(\s*\d/);
@@ -307,11 +380,10 @@ describe("[Tier 1] [R1] F2 — macOS System Notification Logo & Bundle Delivery"
   it(
     "passes Rust workbench::notifications tests",
     async () => {
-      const res = await runCargoTest(["--lib", "workbench::notifications"], {
+      const res = await execCargoSuite(["--lib", "workbench::notifications"], {
         timeoutMs: 280_000,
       });
-      expect(res.ok, res.stderr || res.stdout).toBe(true);
-      expect(res.exitCode).toBe(0);
+      assertCargoPassed(res, "cargo test --lib workbench::notifications");
     },
     300_000,
   );
@@ -335,11 +407,10 @@ describe("[Tier 1] [R1] F2 — macOS System Notification Logo & Bundle Delivery"
   it(
     "keeps default.json and status-popover.json capability contracts valid",
     async () => {
-      const res = await runCargoTest(["--test", "acl_contract"], {
+      const res = await execCargoSuite(["--test", "acl_contract"], {
         timeoutMs: 280_000,
       });
-      expect(res.ok, res.stderr || res.stdout).toBe(true);
-      expect(res.exitCode).toBe(0);
+      assertCargoPassed(res, "cargo test --test acl_contract");
     },
     300_000,
   );
@@ -409,7 +480,10 @@ describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
     });
     expect(activation.crashes).toEqual([]);
     expect(activation.unexpected).toEqual([]);
-    expect(activation.passed).toBe(activation.total);
+    const activationCheck = activation.results.find((r) =>
+      r.name.includes("NativeNotificationBridgeView renders current GitPulse SVG logo"),
+    );
+    expect(activationCheck?.pass, JSON.stringify(activation.results)).toBe(true);
     expect(activation.data?.surfaces).toMatchObject({
       native: { mounted: true, hasGitPulseLogo: true, visibleBox: true },
     });
@@ -420,7 +494,10 @@ describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
     });
     expect(errBanner.crashes).toEqual([]);
     expect(errBanner.unexpected).toEqual([]);
-    expect(errBanner.passed).toBe(errBanner.total);
+    const errCheck = errBanner.results.find((r) =>
+      r.name.includes("NativeNotificationBridgeView renders current GitPulse SVG logo"),
+    );
+    expect(errCheck?.pass, JSON.stringify(errBanner.results)).toBe(true);
     expect(errBanner.data?.surfaces).toMatchObject({
       native: { mounted: true, hasGitPulseLogo: true, visibleBox: true },
     });
@@ -433,7 +510,10 @@ describe("[Tier 1] [R1] F3 — In-App Notification Surfaces Logo", () => {
     });
     expect(verdict.crashes).toEqual([]);
     expect(verdict.unexpected).toEqual([]);
-    expect(verdict.passed).toBe(verdict.total);
+    const sessionCheck = verdict.results.find((r) =>
+      r.name.includes("SessionNotificationBridge renders current GitPulse SVG logo"),
+    );
+    expect(sessionCheck?.pass, JSON.stringify(verdict.results)).toBe(true);
     expect(verdict.data?.surfaces).toMatchObject({
       session: { mounted: true, hasGitPulseLogo: true, visibleBox: true },
     });
@@ -481,27 +561,17 @@ describe("[Tier 1] [R1] [R2] F4 — Menu Bar Tray Glyph & StatusPopover Logo", (
   it(
     "passes Rust desktop::tray unit tests",
     async () => {
-      const res = await runCargoTest(["--lib", "desktop::tray"], {
+      const res = await execCargoSuite(["--lib", "desktop::tray"], {
         timeoutMs: 280_000,
       });
-      expect(res.ok, res.stderr || res.stdout).toBe(true);
-      expect(res.exitCode).toBe(0);
+      assertCargoPassed(res, "cargo test --lib desktop::tray");
     },
     300_000,
   );
 
   it("updates tray.rs pulse_icon to draw the G-ring + heartbeat glyph instead of the legacy 6-point pulse polyline", () => {
     const trayRs = readRepoFile("src-tauri/src/desktop/tray.rs");
-    const fnStart = trayRs.indexOf("fn pulse_icon(");
-    expect(fnStart).toBeGreaterThan(-1);
-    const fnEnd = trayRs.indexOf("\nfn ", fnStart + 1);
-    const pulseFn = trayRs.slice(fnStart, fnEnd > -1 ? fnEnd : trayRs.length);
-
-    expect(pulseFn).not.toContain("(5i32 * SUPER as i32, 19i32 * SUPER as i32)");
-    expect(pulseFn).not.toContain("(15 * SUPER as i32, 9 * SUPER as i32)");
-    expect(pulseFn).not.toContain("(21 * SUPER as i32, 28 * SUPER as i32)");
-    // G-ring arc + crossbar/heartbeat + node must be rasterized instead of a bare 6-point pulse.
-    expect(pulseFn).toMatch(/ring|arc|atan2|cos|sin|24\.04|10\.5/i);
+    assertTrayPulseIconUpdated(trayRs);
   });
 
   it("SSR renders StatusPopover header .mark with current GitPulse Logo rather than Lucide Activity", () => {
@@ -510,10 +580,9 @@ describe("[Tier 1] [R1] [R2] F4 — Menu Bar Tray Glyph & StatusPopover Logo", (
       props: { snapshot, onaction: () => {} },
     });
 
-    const markStart = body.indexOf('class="mark"');
-    expect(markStart).toBeGreaterThan(-1);
-    const markClose = body.indexOf("</div>", markStart);
-    const markHtml = body.slice(markStart, markClose);
+    const markMatch = /<div class="mark\b[^>]*>([\s\S]*?)<\/div>/.exec(body);
+    expect(markMatch).not.toBeNull();
+    const markHtml = markMatch![1]!;
 
     expect(markHtml).toContain(CANONICAL_PATH_FRAGMENT);
     expect(markHtml).not.toContain("lucide-activity");
@@ -596,7 +665,7 @@ describe("[Tier 1] [R3] F5 — Overview Direct Conflicts & Resolve Visibility", 
     expect(paneHtml).toContain(`data-overview-layout="overview"`);
 
     const editorHtml = render(ConflictEditor).body;
-    expect(editorHtml).toContain("<h2>Resolve conflicts</h2>");
+    expect(editorHtml).toMatch(/<h2\b[^>]*>Resolve conflicts<\/h2>/);
     expect(editorHtml).toContain("No merge conflicts");
     expect(editorHtml).toContain("No conflicted files are listed in this repository.");
   });

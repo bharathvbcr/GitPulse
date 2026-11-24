@@ -153,7 +153,14 @@ const until = async (pred: () => boolean, label: string) => {
 };
 
 function inspectLogoIn(container: Element | null) {
-  if (!container) return { mounted: false, hasGitPulseLogo: false, visibleBox: false, rects: [] as { w: number; h: number }[] };
+  if (!container) {
+    return {
+      mounted: false,
+      hasGitPulseLogo: false,
+      visibleBox: false,
+      rects: [] as { w: number; h: number; visible: boolean }[],
+    };
+  }
   const svgs = [...container.querySelectorAll("svg")];
   const logoSvgs = svgs.filter((svg) => {
     const html = svg.outerHTML;
@@ -161,12 +168,21 @@ function inspectLogoIn(container: Element | null) {
   });
   const rects = logoSvgs.map((svg) => {
     const r = svg.getBoundingClientRect();
-    return { w: r.width, h: r.height };
+    const style = getComputedStyle(svg);
+    const visible =
+      r.width > 0 &&
+      r.height > 0 &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      Number.parseFloat(style.opacity || "1") > 0;
+    return { w: r.width, h: r.height, visible };
   });
   return {
     mounted: true,
-    hasGitPulseLogo: logoSvgs.some((svg) => svg.outerHTML.includes(LOGO_TRUNK_FRAGMENT)),
-    visibleBox: rects.some((r) => r.w > 0 && r.h > 0),
+    hasGitPulseLogo: logoSvgs.some(
+      (svg, idx) => svg.outerHTML.includes(LOGO_TRUNK_FRAGMENT) && Boolean(rects[idx]?.visible),
+    ),
+    visibleBox: rects.some((r) => r.visible),
     rects,
   };
 }
@@ -263,12 +279,12 @@ try {
     return Boolean(toastEl && alertRegion && statusRegion);
   });
 
-  check("toast action and dismiss buttons remain exposed outside aria-hidden", () => {
-    const buttons = [...toastHost.querySelectorAll(".toast button")];
-    return buttons.length >= 3 && buttons.every((btn) => !btn.closest('[aria-hidden="true"]'));
-  });
-
   if (scenario === "all" || scenario === "toast") {
+    check("toast action and dismiss buttons remain exposed outside aria-hidden", () => {
+      const buttons = [...toastHost.querySelectorAll(".toast button")];
+      return buttons.length >= 3 && buttons.every((btn) => !btn.closest('[aria-hidden="true"]'));
+    });
+
     const info = inspectLogoIn(toastEl);
     check("ToastContainer renders current GitPulse SVG logo with non-zero bounding box", () =>
       info.hasGitPulseLogo && info.visibleBox,

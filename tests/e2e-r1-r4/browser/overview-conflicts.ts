@@ -1,9 +1,10 @@
 import "../../../src/app.css";
 import { mount, tick, unmount } from "svelte";
+import { get } from "svelte/store";
 import { mockIPCWithEvents } from "../../../harness/tauriMocks";
 import { repoStore } from "../../../src/lib/stores/repoStore";
 import { conflictSessions } from "../../../src/lib/diff/conflictSession";
-import { openConflicts } from "../../../src/lib/ui/workConflicts";
+import { conflictsPanelOpen, openConflicts } from "../../../src/lib/ui/workConflicts";
 import ConflictEditor from "../../../src/lib/components/ConflictEditor.svelte";
 import WorkOverviewPane from "../../../src/lib/components/WorkOverviewPane.svelte";
 import { makeRepoFixtures } from "../helpers/fixtures";
@@ -24,6 +25,7 @@ window.addEventListener("error", (event) => crashes.push(event.message));
 window.addEventListener("unhandledrejection", (event) => crashes.push(String(event.reason)));
 
 const REPO = "/workspace/GitPulse";
+const REPO_B = "/workspace/GitPulse-B";
 let activeMode: "clean" | "dirty" | "conflicted" | "parked" =
   scenario === "dirty"
     ? "dirty"
@@ -37,12 +39,13 @@ mockIPCWithEvents((cmd, args) => {
   if (cmd.startsWith("plugin:")) return null;
   const payload = (args ?? {}) as Record<string, unknown>;
   const fx = getFixture();
+  const reqRepo = String(payload.repoPath ?? payload.path ?? REPO);
   const handlers: Record<string, () => unknown> = {
     cmd_resolve_repo: () => ({
-      path: String(payload.repoPath ?? payload.path ?? REPO),
-      name: "GitPulse",
+      path: reqRepo,
+      name: reqRepo === REPO_B ? "GitPulse-B" : "GitPulse",
       is_bare: false,
-      common_dir: `${REPO}/.git`,
+      common_dir: `${reqRepo}/.git`,
     }),
     cmd_list_branches: () => [
       {
@@ -76,7 +79,8 @@ mockIPCWithEvents((cmd, args) => {
     cmd_list_repo_files: () => fx.statuses.map((s) => s.path),
     cmd_task_view: () => ({ available: false, store_path: "", leases: [], error: "" }),
     cmd_worktree_task: () => null,
-    cmd_list_worktrees: () => fx.worktrees,
+    cmd_list_worktrees: () =>
+      reqRepo === REPO_B ? makeRepoFixtures("clean", REPO_B).worktrees : fx.worktrees,
     cmd_github_context: () => ({
       available: false,
       cli_present: false,
@@ -145,10 +149,16 @@ const settle = async (ms = 40) => {
   await tick();
 };
 
+const timedOutWaits: string[] = [];
 const until = async (pred: () => boolean, label: string, timeoutMs = 4000) => {
   const end = Date.now() + timeoutMs;
   while (!pred() && Date.now() < end) await settle(25);
-  return pred();
+  const ok = pred();
+  if (!ok) {
+    timedOutWaits.push(label);
+    dataSummary.timedOutWaitingFor = [...timedOutWaits];
+  }
+  return ok;
 };
 
 const results: { name: string; pass: boolean; detail?: string }[] = [];
@@ -224,6 +234,9 @@ try {
       arrived &&
       stage.querySelector("[data-overview-layout]")?.getAttribute("data-overview-layout") === "with-conflicts",
     );
+    check("conflicted repo omits Hide button so live conflicts cannot be hidden", () =>
+      !findHideConflictsButton(),
+    );
     check("WorkView DOM node identity preserved in conflicted layout", () =>
       stage.querySelector(".work-overview") === initialWorkView,
     );
@@ -261,39 +274,82 @@ try {
       stage.querySelector(".work-overview") === initialWorkView,
     );
 
-    const hideBtn = findHideConflictsButton();
-    dataSummary.hasHideButton = Boolean(hideBtn);
-    if (hideBtn) {
-      hideBtn.click();
-      await until(() => !stage.querySelector("#work-conflicts"), "close #work-conflicts", 1500);
-    }
-    dataSummary.layoutAfterClose =
-      stage.querySelector("[data-overview-layout]")?.getAttribute("data-overview-layout") ?? null;
-
-    check("closing clean #work-conflicts returns to overview layout without unmounting WorkView", () =>
-      Boolean(hideBtn) &&
-      !stage.querySelector("#work-conflicts") &&
-      stage.querySelector(".work-overview") === initialWorkView,
-    );
-
-    if (scenario === "transition") {
-      activeMode = "conflicted";
-      await repoStore.refresh();
-      const liveArrived = await until(
-        () => Boolean(stage.querySelector("#work-conflicts .resolve-page")),
-        "live conflict arrival",
-        3000,
-      );
-      check("live conflict transition reveals #work-conflicts without remounting WorkView", () =>
-        liveArrived && stage.querySelector(".work-overview") === initialWorkView,
+    if (scenario === "repo-switch") {
+      dataSummary.panelOpenAfterReveal = get(conflictsPanelOpen);
+      check("conflictsPanelOpen becomes true while #work-conflicts is open", () =>
+        get(conflictsPanelOpen) === true,
       );
 
-      activeMode = "clean";
-      await repoStore.refresh();
-      const cleared = await until(() => !stage.querySelector("#work-conflicts"), "live conflict cleared", 3000);
-      check("resolving live conflict restores overview without remounting WorkView", () =>
-        cleared && stage.querySelector(".work-overview") === initialWorkView,
+      await repoStore.openRepo(REPO_B);
+      repoStore.setActiveTab("work", "overview");
+      const closedOnSwitch = await until(
+        () => !stage.querySelector("#work-conflicts"),
+        "close #work-conflicts on repo switch",
+        2000,
       );
+      await settle(40);
+      dataSummary.panelOpenAfterRepoSwitch = get(conflictsPanelOpen);
+      dataSummary.layoutAfterClose =
+        stage.querySelector("[data-overview-layout]")?.getAttribute("data-overview-layout") ?? null;
+      check("switching repository closes manual #work-conflicts and resets conflictsPanelOpen", () =>
+        closedOnSwitch &&
+        stage.querySelector("[data-overview-layout]")?.getAttribute("data-overview-layout") === "overview" &&
+        get(conflictsPanelOpen) === false,
+      );
+
+      if (conflictsBtn) {
+        const secondBtn = findOverviewConflictsButton();
+        secondBtn?.click();
+      } else {
+        openConflicts();
+      }
+      await until(() => Boolean(stage.querySelector("#work-conflicts")), "re-open #work-conflicts", 1500);
+      await settle(40);
+      check("conflictsPanelOpen is true before unmount", () => get(conflictsPanelOpen) === true);
+      if (pane) {
+        await unmount(pane);
+        pane = undefined;
+      }
+      await settle(20);
+      dataSummary.panelOpenAfterUnmount = get(conflictsPanelOpen);
+      check("unmounting WorkOverviewPane resets conflictsPanelOpen to false", () =>
+        get(conflictsPanelOpen) === false,
+      );
+    } else {
+      const hideBtn = findHideConflictsButton();
+      dataSummary.hasHideButton = Boolean(hideBtn);
+      if (hideBtn) {
+        hideBtn.click();
+        await until(() => !stage.querySelector("#work-conflicts"), "close #work-conflicts", 1500);
+      }
+      dataSummary.layoutAfterClose =
+        stage.querySelector("[data-overview-layout]")?.getAttribute("data-overview-layout") ?? null;
+
+      check("closing clean #work-conflicts returns to overview layout without unmounting WorkView", () =>
+        Boolean(hideBtn) &&
+        !stage.querySelector("#work-conflicts") &&
+        stage.querySelector(".work-overview") === initialWorkView,
+      );
+
+      if (scenario === "transition") {
+        activeMode = "conflicted";
+        await repoStore.refresh();
+        const liveArrived = await until(
+          () => Boolean(stage.querySelector("#work-conflicts .resolve-page")),
+          "live conflict arrival",
+          3000,
+        );
+        check("live conflict transition reveals #work-conflicts without remounting WorkView", () =>
+          liveArrived && stage.querySelector(".work-overview") === initialWorkView,
+        );
+
+        activeMode = "clean";
+        await repoStore.refresh();
+        const cleared = await until(() => !stage.querySelector("#work-conflicts"), "live conflict cleared", 3000);
+        check("resolving live conflict restores overview without remounting WorkView", () =>
+          cleared && stage.querySelector(".work-overview") === initialWorkView,
+        );
+      }
     }
   }
 
