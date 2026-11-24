@@ -561,6 +561,32 @@ export interface DevmapCliStatus {
   lookup?: DevmapLookup | null;
   reason?: string | null;
   status?: DevmapStatusPayload | null;
+  /**
+   * Set when the backend's spawn gate declined to start the probe under load:
+   * nothing was examined, so the status is unknown, not unavailable. Typed so
+   * the panel never infers "tool missing" from `available: false` alone.
+   */
+  deferral?: CliDeferral | null;
+}
+
+/** What a deferred `devmap status` still knows (`Deferral` in devmap/cli.rs). */
+export interface CliDeferral {
+  /** The last good reading this app took of the repository, or null for none. */
+  last_good: LastGoodIndex | null;
+}
+
+/** The last good `devmap status` reading and its age (`LastGoodIndex` in devmap/cli.rs). */
+export interface LastGoodIndex {
+  generation_id: number | null;
+  /** Milliseconds between that reading and the deferred answer. */
+  age_ms: number;
+  /**
+   * Whether the index matches the tree now: true, false or null (not known),
+   * the three readings of DevMap's own `source_freshness`. The backend never
+   * sends true here, because nothing was re-examined.
+   */
+  fresh: boolean | null;
+  fresh_reason: string;
 }
 
 /** Fields the Map freshness strip reads from `devmap status --json`. */

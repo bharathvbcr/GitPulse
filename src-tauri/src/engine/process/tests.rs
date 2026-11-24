@@ -5644,3 +5644,78 @@ fn the_observer_is_told_when_the_runner_itself_stopped_the_child() {
     );
     assert_eq!(facts.raw_wait_status, None, "no status was read: {facts:?}");
 }
+
+/// A body that hands work to another thread keeps its admission class only if
+/// it carries it: a new thread starts in the process default, which turned a
+/// worktree create's devmap provisioning back into optional work.
+#[test]
+fn carry_admission_puts_the_callers_class_on_the_thread_that_runs_the_body() {
+    let (plain, carried) = run_as_user_action(|| {
+        assert_eq!(current_admission(), Admission::Interactive);
+        thread::scope(|scope| {
+            let plain = scope.spawn(current_admission);
+            let carried = scope.spawn(carry_admission(current_admission));
+            (plain.join().unwrap(), carried.join().unwrap())
+        })
+    });
+    assert_eq!(plain, Admission::Reactive, "a bare spawn keeps the default");
+    assert_eq!(carried, Admission::Interactive);
+    assert_eq!(
+        current_admission(),
+        Admission::Reactive,
+        "the user action ends with its body"
+    );
+}
+
+/// A hand-run `--ignored` helper must not drain the developer's own per-user
+/// record: without the marker an isolated test profile sets, the spend is
+/// refused before the record is opened.
+#[test]
+fn exhaust_per_user_record_refuses_without_the_isolated_profile_marker() {
+    assert!(std::env::var_os(super::EXHAUST_RECORD_MARKER).is_none());
+    let refused = exhaust_per_user_record().expect_err("no marker, no spend");
+    assert!(refused.contains(super::EXHAUST_RECORD_MARKER), "{refused}");
+}
+
+/// The marker names the isolated profile, and the spend is refused for a record
+/// anywhere else: a marker left in the environment of a run under the real home
+/// does not unlock the real record.
+#[test]
+fn the_spend_is_refused_unless_the_record_is_under_the_marked_profile() {
+    let record = Path::new("/tmp/iso/Library/Application Support/GitPulse/spawn-budget.v2");
+    let spend = |marker: Option<&str>, record: &Path| {
+        shared_budget::spend_allowed(marker.map(std::ffi::OsStr::new), record)
+    };
+    assert!(spend(Some("/tmp/iso"), record).is_ok());
+    assert!(spend(None, record).is_err());
+    assert!(spend(Some(""), record).is_err());
+    assert!(spend(Some("/tmp/other"), record).is_err());
+    assert!(
+        spend(Some("1"), record).is_err(),
+        "a bare flag names no profile"
+    );
+}
+
+/// Unmetered spawns (a `devmap` read) neither wait for nor spend a git rate
+/// token, but are still concurrency-limited: a spent bucket sheds background
+/// work, and the same thread inside `with_unmetered_spawn_rate` is admitted.
+#[test]
+fn an_unmetered_background_spawn_is_admitted_on_a_spent_bucket_a_metered_one_is_shed() {
+    let gate = spent_gate();
+    let far = || Instant::now() + Duration::from_secs(5);
+    with_background_processes(|| {
+        assert_eq!(
+            gate.acquire_until(far(), &|| false).err(),
+            Some(Refusal::Shed),
+            "the control: a metered background spawn on this bucket is shed"
+        );
+        let permit = with_unmetered_spawn_rate(|| gate.acquire_until(far(), &|| false));
+        assert!(permit.is_ok(), "{:?}", permit.err());
+        assert_eq!(
+            gate.counters()[Admission::Background.index()].admitted,
+            1,
+            "it holds a slot like any other spawn"
+        );
+    });
+    assert_eq!(gate.state.lock().unwrap().tokens, 0, "no token was spent");
+}
