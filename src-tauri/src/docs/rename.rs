@@ -601,7 +601,7 @@ fn reference_definition(line: &str) -> Option<(&str, &str)> {
     if value.trim().is_empty() {
         return None;
     }
-    Some((&line[..line.len() - value.len()], value))
+    Some((line.strip_suffix(value)?, value))
 }
 
 /// The values of `src="…"` and `href="…"` attributes on a line, skipping any
