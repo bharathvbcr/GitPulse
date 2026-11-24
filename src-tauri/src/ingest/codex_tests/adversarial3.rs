@@ -321,7 +321,14 @@ fn j01_a_deferred_resume_keeps_its_cursor_and_is_read_next_pass() {
     let w1 = pair.wt[0].clone();
     let claude = tempfile::tempdir().unwrap();
     let codex = tempfile::tempdir().unwrap();
-    let pad_mib = 100usize;
+    // The real budget against three 100 MiB rollouts, scaled down a hundred
+    // times: two replays fit and the third defers either way, but at full size
+    // the padding alone wrote 300 MiB of the suite's disk-write budget.
+    let pad_mib = 1usize;
+    pass::RESUME_BUDGET.with(|budget| budget.set(Some(source::RESUME_PASS_BYTES / 100)));
+    let _restore = std::mem::DropGuard::new((), |()| {
+        pass::RESUME_BUDGET.with(|budget| budget.set(None));
+    });
     let paths: Vec<PathBuf> = (0..3)
         .map(|i| {
             let path = rollout_path(codex.path(), &format!("J{i}"));

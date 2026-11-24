@@ -23,9 +23,18 @@ pub(super) fn old_ledger(repo: &str) -> PathBuf {
     let db = ledger_path(repo);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let conn = Connection::open(&db).unwrap();
-    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    // Built unjournalled and unsynced, then put in WAL as a generation-1
+    // writer leaves it. Every statement of the schema committed through the
+    // WAL with a sync, so each wrote its pages twice and as fresh blocks; the
+    // ledger tests build hundreds of these.
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
+    conn.pragma_update(None, "journal_mode", "OFF").unwrap();
     conn.execute_batch(WRITER1_SCHEMA).unwrap();
     conn.pragma_update(None, "user_version", 1).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
     db
 }
 
