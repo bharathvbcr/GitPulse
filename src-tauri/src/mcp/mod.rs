@@ -309,16 +309,29 @@ impl PruneOutcome {
     }
 }
 
+/// What one `gitpulse_worktree_prune` call reads once for every worktree it
+/// judges: the repository's anchor, its default branch, and its locked-in
+/// branches (or why they could not be read).
+#[derive(Clone, Copy)]
+struct PruneContext<'a> {
+    anchor: &'a std::path::Path,
+    default_base: &'a str,
+    locked: Result<&'a std::collections::HashSet<String>, &'a str>,
+}
+
 fn prune_one(
     repo_path: &str,
-    anchor: &std::path::Path,
-    default_base: &str,
+    ctx: PruneContext<'_>,
     wt: &crate::engine::worktree::WorktreeInfo,
-    locked: Result<&std::collections::HashSet<String>, &str>,
     force: bool,
     dry_run: bool,
     reap: bool,
 ) -> PruneOutcome {
+    let PruneContext {
+        anchor,
+        default_base,
+        locked,
+    } = ctx;
     let skipped = |reason: String| PruneOutcome::new("skipped", Some(reason));
     // First, and whatever `force` says: an agent working in the lane (a lane
     // claim, a live session attributed to it) is not removed over MCP, where
@@ -4668,10 +4681,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 }
                 let outcome = prune_one(
                     &a.repo_path,
-                    &anchor,
-                    &default_base,
+                    PruneContext {
+                        anchor: &anchor,
+                        default_base: &default_base,
+                        locked: locked.as_ref().map_err(String::as_str),
+                    },
                     &wt,
-                    locked.as_ref().map_err(String::as_str),
                     force,
                     dry_run,
                     reap,

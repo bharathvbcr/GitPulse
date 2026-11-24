@@ -737,13 +737,23 @@ pub fn scan_stale_branches(
         repo_path,
         &repo,
         config,
-        &checked_out,
-        &locked,
+        BranchHolds {
+            checked_out: &checked_out,
+            locked: &locked,
+        },
         None,
         false,
         warnings,
     )
     .map(|scan| scan.result)
+}
+
+/// The branches a scan marks as held: those checked out in a worktree (one
+/// `git worktree list` the caller ran) and the locked-in full refs
+/// [`locked_in_refs`] named.
+struct BranchHolds<'a> {
+    checked_out: &'a HashSet<String>,
+    locked: &'a HashSet<String>,
 }
 
 /// A scan plus the default branch it was measured against, `None` when no
@@ -753,8 +763,7 @@ struct Scan {
     default_branch: Option<String>,
 }
 
-/// The scan itself. `checked_out` is one `git worktree list` the caller ran,
-/// and `locked` the full refs [`locked_in_refs`] names, both marked protected;
+/// The scan itself. `holds` names the checked-out and locked-in branches;
 /// `only`, when given, limits the result — and the per-branch merge-tree
 /// work — to branches whose full ref is named there.
 ///
@@ -765,12 +774,15 @@ fn scan_branches(
     repo_path: &str,
     repo: &Path,
     config: &DeadbranchConfig,
-    checked_out: &HashSet<String>,
-    locked: &HashSet<String>,
+    holds: BranchHolds<'_>,
     only: Option<&HashSet<&str>>,
     fresh_base: bool,
     mut warnings: Vec<String>,
 ) -> Result<Scan, CommandError> {
+    let BranchHolds {
+        checked_out,
+        locked,
+    } = holds;
     let all_branches = GitReader::list_branches(repo_path)?;
     let total_scanned = all_branches.len();
 
@@ -1134,8 +1146,10 @@ where
             check_squash: !force,
             ..Default::default()
         },
-        &checked_out,
-        &locked,
+        BranchHolds {
+            checked_out: &checked_out,
+            locked: &locked,
+        },
         Some(&target_set),
         true,
         Vec::new(),
