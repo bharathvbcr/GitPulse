@@ -273,7 +273,8 @@ mod tests {
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+        let mut command = Command::new("git");
+        let ok = crate::test_support::pin_git(&mut command)
             .args([
                 "-c",
                 "user.email=t@t",

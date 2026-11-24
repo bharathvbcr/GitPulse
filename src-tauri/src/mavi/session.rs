@@ -1078,7 +1078,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
-            assert!(Command::new("git")
+            let mut command = Command::new("git");
+            assert!(crate::test_support::pin_git(&mut command)
                 .args([
                     "-c",
                     "user.email=t@t",
@@ -1220,7 +1221,8 @@ read never
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let git = |args: &[&str]| {
-            assert!(Command::new("git")
+            let mut command = Command::new("git");
+            assert!(crate::test_support::pin_git(&mut command)
                 .args([
                     "-c",
                     "user.email=t@t",
