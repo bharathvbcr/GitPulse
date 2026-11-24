@@ -652,29 +652,36 @@ pub(crate) mod diskio {
     /// How long the rate is averaged over, so a legitimate burst (a fixture
     /// repository, a build of a cache) is not mistaken for a runaway.
     pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(30);
-    /// Bytes one test process may write in total.
+    /// Bytes one test process may write in total. The process is the whole
+    /// lib suite (one binary, every test, `--test-threads=1` in CI), so this
+    /// bounds the suite, not one test. 8 GiB stopped holding on 2026-11-23:
+    /// the Ubuntu lib suite aborted at 8196 MiB in `workbench::` (run
+    /// 45266451066) and the coverage suite at 8193 and 8203 MiB in `mcp::` and
+    /// `terminal::` (runs 45268885253, 45270424352), every one a healthy run
+    /// stopped by the cap, never by the rate limit. Run whole as one process
+    /// with this guard off, that suite wrote 9485 MiB, and its 8644 tests
+    /// measured alone (`scripts/test-disk-writes.mjs`) sum to 9623 MiB. Scaled
+    /// from where each run crossed 8 GiB, the coverage suite wrote about
+    /// 10.2 GiB. 16 GiB is about 1.6x that, and still aborts long before a
+    /// runaway like the 549.8 GiB one above.
     ///
-    /// It is the whole lib suite's budget when the suite runs in one process,
-    /// as the coverage workflow runs it (`cargo llvm-cov ... --test-threads=1`).
-    /// On 2026-11-23 that run went over it: coverage runs 192 and 208 aborted
-    /// at 8216 and 8196 MiB, and `scripts/test-disk-writes.mjs` summed the
-    /// lib tests to 8608 MiB. That was not growth but waste. A model check
-    /// replaced a small file with `fs::write` ~180 000 times, 1.3 GiB;
+    /// Part of that growth was waste, and it has since been cut: a model check
+    /// replaced a small file with `fs::write` ~180 000 times (1.3 GiB);
     /// fixtures wrote 64-300 MiB to cross a limit a test seam can lower; and
     /// SQLite fixtures committed every row through the WAL with a sync. After
-    /// those were cut, the per-test sum was about 5.4 GiB, and the coverage
-    /// command, instrumented, in one process, wrote 6904 MiB before the last
-    /// cut (384 MiB of copy fixtures) and stayed under this budget, which is
-    /// kept. Measure before raising it.
+    /// those cuts the per-test sum was about 5.4 GiB and the instrumented
+    /// coverage command, in one process, wrote 6904 MiB before the last cut
+    /// (384 MiB of copy fixtures). So the budget now has headroom over the
+    /// suite; it is not a target. Measure before raising it again.
     ///
-    /// What the Linux counter charges, for whoever is next: a page is counted
-    /// when it goes from clean to dirty. Rewriting a dirty page in place is
-    /// free; truncating a file to zero and writing it again is a fresh 4 KiB
-    /// block every time; an `fsync` cleans every page it flushes, so the next
-    /// write to each is counted again; and a WAL commit appends new frames,
-    /// which the checkpoint then writes a second time. Deleting a file
+    /// What the Linux counter (`ru_oublock`) charges, for whoever is next: a
+    /// page is counted when it goes from clean to dirty. Rewriting a dirty page
+    /// in place is free; truncating a file to zero and writing it again is a
+    /// fresh 4 KiB block every time; an `fsync` cleans every page it flushes, so
+    /// the next write to each is counted again; and a WAL commit appends new
+    /// frames, which the checkpoint then writes a second time. Deleting a file
     /// afterwards takes nothing back.
-    pub(crate) const MAX_TOTAL_WRITES: u64 = 8 * 1024 * 1024 * 1024;
+    pub(crate) const MAX_TOTAL_WRITES: u64 = 16 * 1024 * 1024 * 1024;
     const SAMPLE_EVERY: Duration = Duration::from_millis(500);
     /// The watchdog prints the process's running total each time it passes
     /// another multiple of this. Under `--test-threads=1` each line lands
