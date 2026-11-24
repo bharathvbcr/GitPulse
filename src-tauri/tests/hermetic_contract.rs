@@ -253,6 +253,26 @@ const ALLOWED_ENV_NAMES: &[(&str, &str)] = &[
     ("GP_MEASURE_REPO", "opt-in measurement input"),
     ("PROFILE_REPO", "opt-in measurement input"),
     (
+        "MAVI_LIVE_CLAUDE",
+        "opt-in test driver: an ignored test runs the real Claude CLI only when set to 1",
+    ),
+    (
+        "MAVI_LIVE_RESUME_DIR",
+        "opt-in test driver: checkout of a real conversation an ignored test resumes",
+    ),
+    (
+        "MAVI_LIVE_RESUME_ID",
+        "opt-in test driver: id of a real conversation an ignored test resumes",
+    ),
+    (
+        "MAVI_TRANSCRIPT",
+        "opt-in test driver: transcript an ignored test converts into a fixture",
+    ),
+    (
+        "MAVI_HISTORY_OUT",
+        "opt-in test driver: where an ignored test writes the converted fixture",
+    ),
+    (
         "ADV_CODEX_FILES",
         "adversarial-suite parameter, set by the parent test for its child",
     ),
