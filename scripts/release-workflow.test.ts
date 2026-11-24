@@ -109,7 +109,7 @@ it("pins third-party actions to the commit their tag resolved to", () => {
     "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2",
     "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2",
     "tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1",
-    "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2",
+    "taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2",
     "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3",
   ]) {
     expect(workflow).toContain(`uses: ${pin}`);
