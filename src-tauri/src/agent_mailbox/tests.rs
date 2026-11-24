@@ -1439,3 +1439,49 @@ fn a_claimed_file_keeps_its_window_from_the_claim_and_a_retry_does_not_redeliver
     assert_eq!(mailbox.claim_next(SESSION, after).unwrap(), None);
     assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Absent);
 }
+#[test]
+fn a_waiter_looks_past_a_hop_limited_envelope_and_returns_the_first_acceptable_one() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now,
+        )
+        .unwrap();
+    mailbox
+        .deposit(
+            SESSION,
+            "human",
+            "a person's message",
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_secs(2),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, EnvelopeWait::Message(env) if env.claim.request_id == "human"),
+        "the waiter was held up by the hop-limited envelope ahead of it: {outcome:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    // With nothing acceptable left, the paused envelope is still reported as paused.
+    let outcome = mailbox
+        .wait_in_pool_filtered(
+            SESSION,
+            Duration::from_secs(2),
+            WaitPool::Hosted,
+            hop_filter,
+        )
+        .unwrap();
+    assert!(matches!(outcome, EnvelopeWait::Declined(_)), "{outcome:?}");
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+}

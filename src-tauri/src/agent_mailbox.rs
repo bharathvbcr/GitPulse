@@ -1440,15 +1440,17 @@ impl Mailbox {
             if let Some(reason) = waiter.displaced_reason()? {
                 return Ok(EnvelopeWait::Declined(reason));
             }
-            if let Some(reason) = self.peek_rejected_by(&key, &dir, SystemTime::now(), &accept)? {
-                return Ok(EnvelopeWait::Declined(reason));
-            }
-            // Claim through the filter the peek used: another consumer may have taken what
-            // was peeked, and an unfiltered claim would then hand over the next message even
-            // when it is a peer message at its hop limit.
+            // Claim first, through the filter: it skips an envelope `accept` refuses (a peer
+            // message at its hop limit) and takes the first acceptable one behind it, which
+            // stays correct when another consumer took what an earlier peek saw.
             let mut claimed = self.try_claim_batch_filtered(&key, 1, SystemTime::now(), &accept)?;
             if let Some(envelope) = claimed.pop() {
                 return Ok(EnvelopeWait::Message(envelope));
+            }
+            // Nothing acceptable is pending. A refused envelope at the head is reported as
+            // paused rather than waited on until the limit.
+            if let Some(reason) = self.peek_rejected_by(&key, &dir, SystemTime::now(), &accept)? {
+                return Ok(EnvelopeWait::Declined(reason));
             }
             let spent = started.elapsed();
             if spent >= limit {
