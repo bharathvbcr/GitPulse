@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_cli::{git_captured, git_text, validate_repo};
 use crate::engine::git_reader::{compute_default_base, default_base, GitReader};
 use crate::engine::git_writer::{
     checked_out_branches, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
@@ -48,6 +48,80 @@ pub const DEFAULT_PROTECTED_BRANCHES: &[&str] = &[
 
 /// Default glob patterns for branches representing work-in-progress.
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &["wip/*", "draft/*", "*/draft", "*/wip"];
+
+/// Local git config key naming the branches a repository keeps whatever their
+/// state, one value per branch or pattern under `refs/heads/`. The landing
+/// skills (`gitpulse:commit-and-merge`) read the same key.
+pub const LOCKED_BRANCH_CONFIG_KEY: &str = "gitpulse.lockedBranch";
+
+/// Branch families that are locked-in in every repository.
+const ALWAYS_LOCKED_BRANCHES: &[&str] = &["archive"];
+
+/// Full refs of the repository's locked-in branches: every local branch under
+/// a `gitpulse.lockedBranch` value or under `archive/`, and the same names
+/// under each of `remotes`.
+///
+/// `git for-each-ref` expands the values, so they match exactly as the landing
+/// skills match them: a value with no wildcard matches that branch and every
+/// branch under it, `*` stays inside one path segment, and `**` crosses `/`.
+/// A leading `refs/heads/` or `heads/` on a value is dropped first.
+///
+/// A config or listing that cannot be read is an error, never an empty set, so
+/// a caller about to delete refuses rather than delete a branch the owner kept.
+pub(crate) fn locked_in_refs(
+    repo: &Path,
+    remotes: &[String],
+) -> Result<HashSet<String>, CommandError> {
+    let config = git_captured(repo, &["config", "--get-all", LOCKED_BRANCH_CONFIG_KEY])?;
+    let configured = locked_values(&config)?;
+    let values = ALWAYS_LOCKED_BRANCHES
+        .iter()
+        .map(|v| v.to_string())
+        .chain(configured);
+    let mut patterns = Vec::new();
+    for value in values {
+        for remote in remotes {
+            patterns.push(format!("{REMOTE_REFS}{remote}/{value}"));
+        }
+        patterns.push(format!("refs/heads/{value}"));
+    }
+    let mut args = vec!["for-each-ref", "--format=%(refname)"];
+    args.extend(patterns.iter().map(String::as_str));
+    Ok(git_text(repo, &args)?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The values a `git config --get-all gitpulse.lockedBranch` run listed,
+/// normalised. Exit 1 with no output is git's answer for an unset key; any
+/// other failure, or a cut-short answer, is an error.
+fn locked_values(run: &crate::engine::process::BoundedRun) -> Result<Vec<String>, CommandError> {
+    if run.success && run.incomplete.is_none() {
+        return Ok(String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .strip_prefix("refs/heads/")
+                    .or_else(|| value.strip_prefix("heads/"))
+                    .unwrap_or(value)
+                    .to_string()
+            })
+            .collect());
+    }
+    if !run.success && run.status_code == 1 && run.stdout.is_empty() && run.signal.is_none() {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "could not read {LOCKED_BRANCH_CONFIG_KEY} (git exit {}): {}",
+        run.status_code,
+        String::from_utf8_lossy(&run.stderr).trim()
+    )
+    .into())
+}
 
 /// Configuration for scanning and cleaning stale branches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,16 +714,46 @@ pub fn scan_stale_branches(
         ));
         HashSet::new()
     });
+    let remotes = if config.include_remote {
+        crate::engine::git_reader::configured_remote_names_fresh(&repo).unwrap_or_else(|e| {
+            warnings.push(format!(
+                "Could not list remotes ({e}); locked-in remote branches are not marked",
+                e = e.message()
+            ));
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    // A display scan only labels rows; a clean re-reads this and refuses.
+    let locked = locked_in_refs(&repo, &remotes).unwrap_or_else(|e| {
+        warnings.push(format!(
+            "Could not read the locked-in branches ({e}); branches under {LOCKED_BRANCH_CONFIG_KEY} or archive/ are not marked protected",
+            e = e.message()
+        ));
+        HashSet::new()
+    });
     scan_branches(
         repo_path,
         &repo,
         config,
-        &checked_out,
+        BranchHolds {
+            checked_out: &checked_out,
+            locked: &locked,
+        },
         None,
         false,
         warnings,
     )
     .map(|scan| scan.result)
+}
+
+/// The branches a scan marks as held: those checked out in a worktree (one
+/// `git worktree list` the caller ran) and the locked-in full refs
+/// [`locked_in_refs`] named.
+struct BranchHolds<'a> {
+    checked_out: &'a HashSet<String>,
+    locked: &'a HashSet<String>,
 }
 
 /// A scan plus the default branch it was measured against, `None` when no
@@ -659,7 +763,7 @@ struct Scan {
     default_branch: Option<String>,
 }
 
-/// The scan itself. `checked_out` is one `git worktree list` the caller ran;
+/// The scan itself. `holds` names the checked-out and locked-in branches;
 /// `only`, when given, limits the result — and the per-branch merge-tree
 /// work — to branches whose full ref is named there.
 ///
@@ -670,11 +774,15 @@ fn scan_branches(
     repo_path: &str,
     repo: &Path,
     config: &DeadbranchConfig,
-    checked_out: &HashSet<String>,
+    holds: BranchHolds<'_>,
     only: Option<&HashSet<&str>>,
     fresh_base: bool,
     mut warnings: Vec<String>,
 ) -> Result<Scan, CommandError> {
+    let BranchHolds {
+        checked_out,
+        locked,
+    } = holds;
     let all_branches = GitReader::list_branches(repo_path)?;
     let total_scanned = all_branches.len();
 
@@ -727,6 +835,7 @@ fn scan_branches(
         }
 
         let is_prot = branch.is_default
+            || locked.contains(&full_ref)
             || config.protected_branches.iter().any(|p| {
                 p.eq_ignore_ascii_case(&short_name) || p.eq_ignore_ascii_case(&branch.name)
             });
@@ -1016,6 +1125,14 @@ where
     let target_set: HashSet<&str> = target_refs.iter().map(String::as_str).collect();
     // The remote-tracking refs are listed only when a target is one.
     let wants_remote = target_refs.iter().any(|r| r.starts_with(REMOTE_REFS));
+    // Read before anything is deleted; a config that cannot be read refuses
+    // the whole clean.
+    let locked_remotes = if wants_remote {
+        crate::engine::git_reader::configured_remote_names_fresh(&repo)?
+    } else {
+        Vec::new()
+    };
+    let locked = locked_in_refs(&repo, &locked_remotes)?;
 
     // Rescan only the targets, for exact tips and squash-merge metadata. With
     // `force` every delete is `-D`, so the merge-tree pass would decide nothing.
@@ -1029,7 +1146,10 @@ where
             check_squash: !force,
             ..Default::default()
         },
-        &checked_out,
+        BranchHolds {
+            checked_out: &checked_out,
+            locked: &locked,
+        },
         Some(&target_set),
         true,
         Vec::new(),
@@ -1103,8 +1223,16 @@ where
         });
     }
 
-    // Safety checks: reject deleting default branch or any worktree-checked-out branch
+    // Safety checks: reject deleting the default branch, a locked-in branch or
+    // any worktree-checked-out branch
     for b in &to_clean {
+        if locked.contains(&b.full_ref) {
+            return Err(format!(
+                "Refusing to delete '{name}': it is locked-in ({LOCKED_BRANCH_CONFIG_KEY} or archive/)",
+                name = b.name
+            )
+            .into());
+        }
         if scan.default_branch.as_deref() == Some(b.short_name.as_str()) {
             return Err(format!(
                 "Refusing to delete '{name}': it is the repository's default branch",
@@ -1787,6 +1915,171 @@ mod tests {
         assert!(result.failed[0].1.contains("quoting"), "{result:?}");
     }
 
+    #[test]
+    fn locked_in_branches_are_marked_protected_and_a_clean_refuses_them() {
+        let (_dir, repo) = seeded_repo();
+        for name in [
+            "labs/geek",
+            "labs/team/v2",
+            "labs-other",
+            "archive/old",
+            "keep",
+            "feature/done",
+            "team/a",
+            "team/b/c",
+            "frozen",
+            "x/frozen",
+        ] {
+            git_in(&repo, &["branch", name]);
+        }
+        for value in ["team/*", "**/frozen"] {
+            git_in(
+                &repo,
+                &[
+                    "config",
+                    "--local",
+                    "--add",
+                    LOCKED_BRANCH_CONFIG_KEY,
+                    value,
+                ],
+            );
+        }
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--add",
+                LOCKED_BRANCH_CONFIG_KEY,
+                "labs",
+            ],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--add",
+                LOCKED_BRANCH_CONFIG_KEY,
+                "refs/heads/keep",
+            ],
+        );
+        let repo_path = repo.to_str().unwrap();
+
+        let scan = scan_stale_branches(
+            repo_path,
+            &DeadbranchConfig {
+                days_threshold: 0,
+                merged_only: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let protected = |name: &str| {
+            scan.branches
+                .iter()
+                .find(|b| b.short_name == name)
+                .unwrap_or_else(|| panic!("{name} not scanned: {:?}", scan.branches))
+                .is_protected
+        };
+        // A bare value covers its whole subtree, as `git for-each-ref` reads it.
+        // `*` stays inside one segment; `**` crosses `/` and matches at the top.
+        for kept in [
+            "labs/geek",
+            "labs/team/v2",
+            "archive/old",
+            "keep",
+            "team/a",
+            "frozen",
+            "x/frozen",
+        ] {
+            assert!(protected(kept), "{kept} should be locked-in");
+        }
+        for free in ["labs-other", "feature/done", "team/b/c"] {
+            assert!(!protected(free), "{free} should not be locked-in");
+        }
+
+        for kept in ["labs/team/v2", "archive/old", "keep"] {
+            let err = clean_branches(repo_path, &[kept.to_string()], true, false)
+                .expect_err("a locked-in branch is refused");
+            assert!(
+                err.message().contains("locked-in"),
+                "{kept}: {}",
+                err.message()
+            );
+            assert!(
+                rev(&repo, &format!("refs/heads/{kept}")).is_some(),
+                "{kept} was deleted"
+            );
+        }
+        let done = clean_branches(repo_path, &["feature/done".to_string()], true, false).unwrap();
+        assert_eq!(done.deleted, vec!["feature/done".to_string()]);
+    }
+
+    #[test]
+    fn a_locked_in_remote_branch_is_marked_and_its_remote_delete_refused() {
+        let (_dir, bare, repo) = repo_with_remote_branch("origin", "archive/old");
+        let repo_path = repo.to_str().unwrap();
+        let scan = scan_stale_branches(
+            repo_path,
+            &DeadbranchConfig {
+                include_remote: true,
+                merged_only: false,
+                days_threshold: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = scan
+            .branches
+            .iter()
+            .find(|b| b.full_ref == "refs/remotes/origin/archive/old")
+            .unwrap_or_else(|| panic!("remote row not scanned: {:?}", scan.branches));
+        assert!(row.is_protected, "{row:?}");
+
+        let err = clean_branches(
+            repo_path,
+            &["refs/remotes/origin/archive/old".to_string()],
+            true,
+            false,
+        )
+        .expect_err("a locked-in remote branch is refused");
+        assert!(err.message().contains("locked-in"), "{}", err.message());
+        assert!(
+            rev(bare.path(), "refs/heads/archive/old").is_some(),
+            "the remote's branch was deleted"
+        );
+    }
+
+    #[test]
+    fn locked_values_read_an_unset_key_as_empty_and_any_other_failure_as_an_error() {
+        let run =
+            |success: bool, status_code: i32, stdout: &str| crate::engine::process::BoundedRun {
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: b"fatal: bad config line 3".to_vec(),
+                success,
+                status_code,
+                signal: None,
+                incomplete: None,
+                stderr_incomplete: None,
+                cancelled: false,
+            };
+        assert_eq!(
+            locked_values(&run(true, 0, "labs\nrefs/heads/keep\nheads/x/y\n\n")).unwrap(),
+            vec!["labs".to_string(), "keep".to_string(), "x/y".to_string()]
+        );
+        assert!(locked_values(&run(false, 1, "")).unwrap().is_empty());
+        // A malformed config exits 128 (`fatal: bad config line`): that is
+        // not "nothing is locked".
+        let err = locked_values(&run(false, 128, "")).unwrap_err();
+        assert!(
+            err.message().contains(LOCKED_BRANCH_CONFIG_KEY),
+            "{}",
+            err.message()
+        );
+        assert!(locked_values(&run(false, 1, "labs\n")).is_err());
+    }
+
     /// A refused clean deletes nothing, so it journals no deletion.
     #[test]
     fn a_refused_clean_journals_no_deletes() {
@@ -2181,9 +2474,11 @@ mod tests {
         assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");
         assert_eq!(deletes, BRANCHES);
         // 16 plus the two `git config` reads that tell a partial clone once
-        // for the whole scan (a merge there would make git fetch blobs). The
+        // for the whole scan (a merge there would make git fetch blobs), plus
+        // the locked-in read (`git config --get-all gitpulse.lockedBranch`
+        // and one `for-each-ref` for every pattern) once per clean. The
         // per-branch terms above are exact and unchanged.
-        const CONSTANT: usize = 18;
+        const CONSTANT: usize = 20;
         assert!(
             used.len() <= 2 * BRANCHES + CONSTANT,
             "{} spawns for {BRANCHES} branches: {used:#?}",

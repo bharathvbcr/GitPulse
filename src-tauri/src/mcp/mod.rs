@@ -309,15 +309,29 @@ impl PruneOutcome {
     }
 }
 
+/// What one `gitpulse_worktree_prune` call reads once for every worktree it
+/// judges: the repository's anchor, its default branch, and its locked-in
+/// branches (or why they could not be read).
+#[derive(Clone, Copy)]
+struct PruneContext<'a> {
+    anchor: &'a std::path::Path,
+    default_base: &'a str,
+    locked: Result<&'a std::collections::HashSet<String>, &'a str>,
+}
+
 fn prune_one(
     repo_path: &str,
-    anchor: &std::path::Path,
-    default_base: &str,
+    ctx: PruneContext<'_>,
     wt: &crate::engine::worktree::WorktreeInfo,
     force: bool,
     dry_run: bool,
     reap: bool,
 ) -> PruneOutcome {
+    let PruneContext {
+        anchor,
+        default_base,
+        locked,
+    } = ctx;
     let skipped = |reason: String| PruneOutcome::new("skipped", Some(reason));
     // First, and whatever `force` says: an agent working in the lane (a lane
     // claim, a live session attributed to it) is not removed over MCP, where
@@ -326,6 +340,20 @@ fn prune_one(
         crate::engine::worktree::agent_hold(repo_path, &wt.path, wt.branch.as_deref(), true)
     {
         return skipped(reason);
+    }
+    // A locked-in branch (`gitpulse.lockedBranch`, `archive/`) keeps its
+    // worktree, `force` or not; when that list cannot be read, every branch does.
+    if let Some(branch) = wt.branch.as_deref() {
+        match locked {
+            Err(e) => return skipped(format!("could not read the locked-in branches: {e}")),
+            Ok(set) if set.contains(&format!("refs/heads/{branch}")) => {
+                return skipped(format!(
+                    "branch {branch} is locked-in ({} or archive/), so it is never pruned",
+                    crate::engine::deadbranch::LOCKED_BRANCH_CONFIG_KEY
+                ))
+            }
+            Ok(_) => {}
+        }
     }
     if !force {
         // A check that could not run is a skip with its error, never a pass.
@@ -4633,6 +4661,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .unwrap_or_else(|| "main".to_string());
             let worktrees = crate::engine::worktree::list_worktrees(&a.repo_path)
                 .map_err(CommandError::into_message)?;
+            let locked = crate::engine::deadbranch::locked_in_refs(&anchor, &[])
+                .map_err(CommandError::into_message);
             let mut pruned = Vec::new();
             let mut all_reaped = Vec::new();
             let mut outcomes = Vec::new();
@@ -4651,8 +4681,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 }
                 let outcome = prune_one(
                     &a.repo_path,
-                    &anchor,
-                    &default_base,
+                    PruneContext {
+                        anchor: &anchor,
+                        default_base: &default_base,
+                        locked: locked.as_ref().map_err(String::as_str),
+                    },
                     &wt,
                     force,
                     dry_run,
@@ -13104,6 +13137,52 @@ mod tests {
             out["ok"], false,
             "a kept branch is not a clean prune: {out}"
         );
+    }
+
+    #[test]
+    fn prune_never_removes_a_locked_in_branch_even_with_force() {
+        let (_sandbox, repo) = honesty_repo();
+        let kept = create_lane(&repo, "labs/geek");
+        let other = create_lane(&repo, "feat/other");
+        git_ok(&[
+            "-C",
+            &repo,
+            "config",
+            "--local",
+            "--add",
+            "gitpulse.lockedBranch",
+            "labs",
+        ]);
+        let (err, out) = tool_json(
+            "gitpulse_worktree_prune",
+            json!({ "repo_path": repo, "force": true }),
+        );
+        assert!(!err, "{out}");
+        let find = |path: &str| {
+            out["outcomes"]
+                .as_array()
+                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
+                .clone()
+        };
+        let kept_outcome = find(&kept);
+        assert_eq!(kept_outcome["status"], "skipped", "{out}");
+        assert!(
+            kept_outcome["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("locked-in")),
+            "{out}"
+        );
+        assert!(std::path::Path::new(&kept).is_dir(), "{out}");
+        git_ok(&[
+            "-C",
+            &repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/labs/geek",
+        ]);
+        assert_eq!(find(&other)["status"], "removed", "{out}");
     }
 
     #[test]
