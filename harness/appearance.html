@@ -478,14 +478,22 @@
       const refusal = $("[data-wallpaper-failure]")?.textContent.trim() ?? "";
       check(`the clip is accepted as a video wallpaper and chosen${refusal ? ` (refused: ${refusal})` : ""}`, () =>
         $("[data-custom-video-badge]") !== null && get(interfaceStore).backdrop === "custom" && !$("[data-wallpaper-failure]"));
-      check("its still is the clip's first frame, not a blank one", () => {
-        const img = $('[data-backdrop-option="custom"] img');
-        if (!img?.complete || img.naturalWidth === 0) return false;
+      // The still is an <img> the browser decodes on its own time; with a 2 KB
+      // fixture the badge can land before it has, so wait for it to load.
+      const stillImage = () => $('[data-backdrop-option="custom"] img');
+      await wait(() => { const img = stillImage(); return !!img?.complete && img.naturalWidth > 0; }, 5000);
+      let stillWhy = "";
+      const stillIsFirstFrame = (() => {
+        const img = stillImage();
+        if (!img) { stillWhy = "no still image"; return false; }
+        if (!img.complete || img.naturalWidth === 0) { stillWhy = `still not loaded: complete ${img.complete}, ${img.naturalWidth}x${img.naturalHeight}`; return false; }
         const probe = Object.assign(document.createElement("canvas"), { width: img.naturalWidth, height: img.naturalHeight });
         const g = probe.getContext("2d"); g.drawImage(img, 0, 0);
-        const [r, gr] = g.getImageData(Math.floor(img.naturalWidth * 0.8), Math.floor(img.naturalHeight * 0.8), 1, 1).data;
+        const [r, gr, b] = g.getImageData(Math.floor(img.naturalWidth * 0.8), Math.floor(img.naturalHeight * 0.8), 1, 1).data;
+        stillWhy = `${img.naturalWidth}x${img.naturalHeight}, rgb(${r}, ${gr}, ${b}) at 80%/80%`;
         return r > 150 && gr < 100;
-      });
+      })();
+      check(`its still is the clip's first frame, not a blank one${stillIsFirstFrame ? "" : ` (${stillWhy})`}`, () => stillIsFirstFrame);
       const video = () => layer()?.querySelector("video") ?? null;
       check("plugged in and quiet, the layer plays it muted, looping, with the still as its poster", () =>
         video() !== null && video().muted && video().loop && !video().controls && video().poster.startsWith("blob:"));
