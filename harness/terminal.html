@@ -232,6 +232,10 @@
         if (!el) throw new Error(`missing control: ${name}`);
         return el;
       };
+      const dockMenu = async (testid) => {
+        [...document.querySelectorAll('[data-testid="dock-overflow"]')].find((el) => el.getClientRects().length).click(); await wait();
+        document.querySelector(`[data-testid="${testid}"]`).click(); await wait();
+      };
 
       /**
        * Points the mouse at one character of a rendered row, measured rather
@@ -540,7 +544,7 @@
           await press(document.activeElement, "ArrowRight");
           check("ArrowRight selects next tab and keeps strip focus", () => document.activeElement === visible('[role="tab"]')[1]);
           const beforeHide = report.spawned;
-          button("Hide the terminal dock").click(); await wait();
+          button("Hide the dock").click(); await wait();
           button("Show terminal").click(); await wait();
           check("hide/show preserves both sessions", () => report.spawned === beforeHide && report.killed === 0);
           // A double-click on the page hides the dock (the shell keeps running);
@@ -674,7 +678,7 @@
             check("the on-screen session's canvas holds a live WebGL2 context", () => !!firstGl && !firstGl.isContextLost());
 
             // -- A tab flick inside the hold keeps the warm context.
-            button("Hide the terminal dock").click(); await wait(150);
+            button("Hide the dock").click(); await wait(150);
             check("hiding the dock keeps the session's context through the hold: same canvas, live, still webgl",
               () => target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
             await showAndProbe();
@@ -702,7 +706,7 @@
             // before these waits end and fires first: timers run in order.
             check("a session that stays hidden past the hold gives its context up",
               () => other.dataset.renderer === "dom" && !glCanvas(other) && !other.contains(otherCanvas) && !!otherGl && otherGl.isContextLost());
-            button("Hide the terminal dock").click(); await wait(900);
+            button("Hide the dock").click(); await wait(900);
             check("hiding the dock past the hold releases the on-screen session's context too",
               () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
             check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
@@ -716,7 +720,7 @@
             gpuPolicy.hideGraceMs = 3000;
             const beforeFlicks = glCanvas(target);
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
             }
             await wait(100);
@@ -728,7 +732,7 @@
             gpuPolicy.hideGraceMs = 0;
             const everAttached = [];
             for (let cycle = 0; cycle < 40; cycle += 1) {
-              button("Hide the terminal dock").click(); await wait(40);
+              button("Hide the dock").click(); await wait(40);
               button("Show terminal").click(); await wait(40);
               const attached = glCanvas(target)?.getContext("webgl2");
               if (attached && !everAttached.includes(attached)) everAttached.push(attached);
@@ -942,7 +946,7 @@
               () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost() && gpuNote() === "");
             await loseNow();
             check("the second loss is recoverable too (inside the budget)", () => target.dataset.renderer === "reset");
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !target.querySelector("canvas"));
             await showAndProbe(); await wait(100);
             check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
@@ -950,7 +954,7 @@
             // session's held one: that ends the hold, it is not a counted loss.
             const graceBefore = gpuPolicy.hideGraceMs;
             gpuPolicy.hideGraceMs = 3000;
-            button("Hide the terminal dock").click(); await wait(100);
+            button("Hide the dock").click(); await wait(100);
             const heldCanvas = glCanvas(target);
             check("a hidden session holds its context through the hold", () => !!heldCanvas && target.dataset.renderer === "webgl");
             heldCanvas.getContext("webgl2").getExtension("WEBGL_lose_context").loseContext();
@@ -962,7 +966,7 @@
             await loseNow();
             check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));
-            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Hide the dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             button("Show terminal").click(); await wait(gpuPolicy.recoverDelayMs + 300);
             check("a session past its budget is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
@@ -1001,12 +1005,12 @@
           }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
-          button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
-          button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          button("Expand the dock").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
+          button("Restore dock size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
           {
             // The resize handle is a WAI-ARIA separator: it reports its value,
             // and the arrow keys nudge the dock without a pointer.
-            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const handle = visible('[role="separator"][aria-label="Resize the dock"]')[0];
             const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
             if (handle) await press(handle, "ArrowUp");
             const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
@@ -1016,10 +1020,10 @@
                 && Math.abs(dock.getBoundingClientRect().height - height) < 1 && Number(handle.getAttribute("aria-valuenow")) === valueBefore);
           }
           button("Toggle narrow layout").click(); await wait();
-          check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
+          check("narrow toolbar stays inside its panel", () => label("Dock").scrollWidth === label("Dock").clientWidth);
           button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
           check("terminal palette follows the completed theme transition", () => getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
-          button("Console").click(); await wait();
+          [...document.querySelectorAll('[data-testid="dock-section-console"]')].find((el) => el.getClientRects().length).click(); await wait();
           check("the console command field has an accessible name", () => !!label("Console command"));
           {
             // Console has no tabs: a tab chord there belongs to the command
@@ -1049,15 +1053,15 @@
             await run("git log");
             check("an incomplete output carries the backend's reason, never an invented cap",
               () => consoleText().includes("[Output is incomplete: the stream was not read to the end]") && !consoleText().includes("exceeded cap") && consoleText().includes("exit 2"));
-            button("Clear")?.click(); await wait();
+            await dockMenu("dock-menu-clear-output");
             check("Clear empties the Console's output", () => !consoleText().includes("On branch main") && !consoleText().includes("the stream was not read"));
           }
-          button("Shell").click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
+          [...document.querySelectorAll('[data-testid="dock-section-shell"]')].find((el) => el.getClientRects().length).click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
           for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
           await wait(); check("font size is bounded", () => button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);
           button("Reset terminal text size").click(); await wait();
           const beforeClear = report.spawned;
-          button("Clear scrollback").click(); await wait();
+          await dockMenu("dock-menu-clear-scrollback");
           check("clear keeps the prompt and running session", () => visible('[role="tabpanel"]')[0].textContent.includes("/fixture/GitPulse $") && report.spawned === beforeClear && report.killed === 0);
           const aboveGrid = (el) => {
             const chrome = el.getBoundingClientRect();
@@ -1066,12 +1070,12 @@
           };
           check("the dock toolbar has no separate terminal shortcuts button", () => !label("Terminal shortcuts"));
           const beforeOptions = report.spawned;
-          button("Terminal tab options").click(); await wait();
+          await dockMenu("dock-menu-tab-options");
           check("tab options sit above the grid instead of overlapping it", () => aboveGrid(label("Terminal tab name").closest("form")));
           const name = label("Terminal tab name"); name.value = "Build logs"; name.dispatchEvent(new Event("input", { bubbles: true }));
           button("Rename").click(); await wait();
           check("custom tab names survive program titles", () => visible('[role="tab"][aria-selected="true"]')[0].textContent.includes("Build logs"));
-          button("Find terminal session").click(); await wait();
+          await dockMenu("dock-menu-find-session");
           check("session search sits above the grid instead of overlapping it", () => aboveGrid(label("Search this repository's terminals")));
           const sessionSearch = label("Search this repository's terminals");
           sessionSearch.value = "Build"; sessionSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
@@ -1106,7 +1110,7 @@
           launcherSearch.value = "shell"; launcherSearch.dispatchEvent(new Event("input", { bubbles: true })); await wait();
           visible('[aria-label="Session types"] [role="option"]')[0].click(); await wait();
           check("launcher search restores a matching type", () => Boolean(button("New Shell session")));
-          button("Terminal tab options").click(); await wait();
+          await dockMenu("dock-menu-tab-options");
           button("Move terminal tab left").click(); await wait();
           check("tab reorder preserves sessions and selection", () => visible('[role="tab"]')[0].getAttribute("aria-selected") === "true" && report.spawned === beforeOptions);
           await press(label("Terminal tab name"), "Escape");
@@ -1126,7 +1130,7 @@
           button("Close find").click(); interfaceStore.setTerminalDockHeight(400); await wait();
           button("Close split view").click(); await wait();
           check("closing split preserves both sessions", () => visible('[role="tabpanel"]').length === 1 && report.killed === 0);
-          button("All terminal sessions").click(); await wait();
+          await dockMenu("terminal-session-count");
           check("session list sits above the grid instead of overlapping it", () => aboveGrid(label("Sessions across repositories")));
           check("session manager includes both repositories", () => label("Sessions across repositories").textContent.includes("Other") && label("Sessions across repositories").textContent.includes("GitPulse"));
           {
@@ -1177,13 +1181,19 @@
             await wait(40);
           }
           check("global session limit spans both repositories", () => report.spawned === SESSION_LIMIT && button("New Shell session").disabled);
-          check("the session count names the limit", () => document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
+          check("the session count names the limit, in the header once every slot is taken",
+            () => visible('[data-testid="dock-session-limit"]')[0]?.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT} limit`));
           // The limit is live: raising it in Settings frees a place at once
           // (a waiting task terminal opens off the same `canCreate`), and
           // lowering it again closes nothing.
           setTerminalSessionLimit(SESSION_LIMIT + 1); await wait();
+          // Below the limit the count is back in the ⋯ menu, not the header.
+          const limitChipGone = !visible('[data-testid="dock-session-limit"]').length;
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
+          const menuCount = document.querySelector('[data-testid="dock-overflow-menu"]')?.textContent ?? "";
+          visible('[data-testid="dock-overflow"]')[0].click(); await wait();
           check("raising the limit frees a place at once",
-            () => !button("New Shell session").disabled && document.body.textContent.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
+            () => !button("New Shell session").disabled && limitChipGone && menuCount.includes(`${SESSION_LIMIT} open / ${SESSION_LIMIT + 1} limit`));
           setTerminalSessionLimit(undefined); await wait();
           check("lowering it again closes nothing",
             () => button("New Shell session").disabled && report.spawned === SESSION_LIMIT && report.killed === 0);
@@ -1269,7 +1279,7 @@
             const { adoptDetachedSessions, DETACHED_STATUS } = await import("../src/lib/terminal/detachedSessions.ts");
             const adopted = await adoptDetachedSessions();
             check("a session a reload left running is adopted into this page", () => adopted === 1);
-            button("All terminal sessions").click(); await wait();
+            await dockMenu("terminal-session-count");
             const row = [...label("Sessions across repositories").children].find((el) => el.textContent.includes(DETACHED_STATUS));
             check("it is listed as still running", () => Boolean(row));
             const spawnsBeforeAttach = report.spawned;
@@ -1291,7 +1301,7 @@
             const { taskOpenRequest, consumeTaskOpen } = await import("../src/lib/workbench/taskOpen.ts");
             const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
             const handle = terminalSessions.reserve({ key: "fixture-task-tab", repoPath: "/fixture/GitPulse", label: "Claude", title: "Fix the flaky test", taskRunId: "fixture-run", status: "running", close: async () => {} });
-            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            if (!label("Sessions across repositories")) { await dockMenu("terminal-session-count"); }
             const rows = () => [...(label("Sessions across repositories")?.children ?? [])];
             const taskRow = rows().find((el) => el.textContent.includes("Fix the flaky test"));
             const link = taskRow?.querySelector('[data-testid="session-open-task"]');
@@ -1331,7 +1341,7 @@
             while (performance.now() < keptDeadline && (report.detached ?? 0) === detachedBefore) await wait(20);
             check("a busy session in a closed repository tab is detached, never killed",
               () => (report.detached ?? 0) === detachedBefore + 1 && report.killed === killedBefore);
-            if (!label("Sessions across repositories")) { button("All terminal sessions").click(); await wait(); }
+            if (!label("Sessions across repositories")) { await dockMenu("terminal-session-count"); }
             const listedDeadline = performance.now() + 2000;
             const kept = () => [...(label("Sessions across repositories")?.children ?? [])]
               .some((el) => (el.textContent ?? "").includes("not shown in any tab"));
@@ -1521,7 +1531,7 @@
           }
           check("a live oversized chunk stays on the status row", () =>
             liveStatus.includes("exceeded its limit") && !liveStatus.includes("This session ended."));
-          button("All terminal sessions").click();
+          if (!label("Sessions across repositories")) await dockMenu("terminal-session-count");
           const listDeadline = performance.now() + 2000;
           let closeSession = null;
           while (performance.now() < listDeadline) {
@@ -1544,6 +1554,9 @@
           }
           check("closing the session keeps the oversized-chunk notice", () =>
             closedStatus.includes("exceeded its limit") && !closedStatus.includes("This session ended."));
+          // Leave the list as the steps after this expect it: closed. (It sits
+          // above the grid, so an open list would shrink every pane below.)
+          if (label("Sessions across repositories")) await dockMenu("terminal-session-count");
           earlyLoss = true;
           button("New Shell session").click();
           const earlyDeadline = performance.now() + 2000;
@@ -1664,13 +1677,13 @@
         await section(async (check) => {
           tabs()[0].click(); await wait(300);
           let mark = resizeLog.length;
-          button("Hide the terminal dock").click(); await wait(400);
+          button("Hide the dock").click(); await wait(400);
           button("Show terminal").click(); await wait(400);
           check(`hiding and showing the dock tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
           check("the grid survives the dock being hidden and shown", () => sameGrid() && shownPanels().every(fitsHeight));
           // Resized while hidden: nothing may be told until it is shown, and
           // then once.
-          button("Hide the terminal dock").click(); await wait(300);
+          button("Hide the dock").click(); await wait(300);
           mark = resizeLog.length;
           await setDockHeight(300);
           check(`a dock resized while hidden tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
@@ -2028,8 +2041,8 @@
             await wait(250);
           }
 
-          const consoleBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
-          const shellModeBtn = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Shell");
+          const consoleBtn = visible('[data-testid="dock-section-console"]')[0];
+          const shellModeBtn = visible('[data-testid="dock-section-shell"]')[0];
           if (
             shellModeBtn &&
             (visible('[data-testid="terminal-active-session-summary"]').length > 0 ||
@@ -2345,7 +2358,7 @@
             );
           });
 
-          const consoleSwitcher = visible('[aria-label="Terminal mode"] button').find((el) => el.textContent?.trim() === "Console");
+          const consoleSwitcher = visible('[data-testid="dock-section-console"]')[0];
           if (!consoleSwitcher) throw new Error("Missing Console mode toggle button");
           consoleSwitcher.click();
           const summaryBtn = await waitFor(() => visible('button[data-testid="terminal-active-session-summary"]')[0]);
@@ -2446,7 +2459,7 @@
           await wait(120);
 
           const isMacHost = button("Split terminal right").getAttribute("title")?.includes("⌘") ?? true;
-          const panelRegion = visible('[role="region"][aria-label="Terminal"]')[0];
+          const panelRegion = visible('[role="region"][aria-label="Dock"]')[0];
           panelRegion?.dispatchEvent(
             new KeyboardEvent(
               "keydown",
