@@ -32,7 +32,15 @@ released version needs a heading of the form `## [x.y.z] - YYYY-MM-DD` (or
   `gitpulse.*` git config, so no skill carries any one repository's names or
   paths.
 
+- **The managed Antigravity plugin installs `gitpulse-merge-train`**, with its
+  `failset` helper, beside `gitpulse-commit-and-merge`, `gitpulse-merge-prs` and
+  `gitpulse-wrap-up`, so the landing skills' references to it resolve there too.
+
 ### Changed
+
+- **The plugin manifests no longer say GitPulse "never writes git".** Its
+  worktree tools and landing skills do write; the description now says it never
+  pushes, and that the skills that merge act only after you approve their plan.
 
 - **`gitpulse:merge-train` no longer names particular repositories or paths.**
   It reads each repository's gate from its settings or its own instructions.
