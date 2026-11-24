@@ -97,6 +97,11 @@ export interface SourceFreshness {
   fresh: boolean | null;
   generation_id?: number;
   reason?: string;
+  /**
+   * Milliseconds since the walk that backs this verdict. Absent means the age
+   * is unknown, not that the verdict is fresh.
+   */
+  verified_age_ms?: number;
 }
 
 export interface CodeintelResponse<T> {
