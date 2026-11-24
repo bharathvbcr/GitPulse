@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 import {
   DEFAULT_BASELINE_FILE,
   RULES,
@@ -20,9 +21,6 @@ import {
   readGateConfig,
   type Violation,
 } from "./design-lint.mjs";
-
-/** For a test that lints the whole tree; see "passes the strict gate on this tree". */
-const WHOLE_TREE_TIMEOUT = 30_000;
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/design-lint/", import.meta.url));
 
@@ -900,6 +898,15 @@ describe("design-lint gate (--strict) against a scratch repository", () => {
   });
 });
 
+/**
+ * Linting the whole committed tree is the one heavy thing these tests do:
+ * about 1.3 s on an ordinary run, 2.3-2.5 s under v8 coverage on an idle
+ * host, and past vitest's default 5 s on a loaded coverage runner. The
+ * ordinary-run limit stays the default 5 s; a coverage run scales it the
+ * way every other wall-clock limit does (`wallClock.ts`).
+ */
+const WHOLE_TREE_LINT_MS = wallClockBudget(5_000);
+
 describe("the committed gate config", () => {
   const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
   const configFile = path.join(repoRoot, "scripts", "design-lint.config.json");
@@ -926,11 +933,7 @@ describe("the committed gate config", () => {
     ]);
   });
 
-  // Lints the whole tree (~1.8k files), so it scales with the repository, not
-  // with this test: under coverage instrumentation and a full parallel run it
-  // outgrew vitest's default 5 s. Same budget as the other whole-repo scan
-  // (check-ipc-contract.test.ts).
-  it("passes the strict gate on this tree", { timeout: WHOLE_TREE_TIMEOUT }, () => {
+  it("passes the strict gate on this tree", () => {
     const logs: string[] = [];
     const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => void logs.push(a.join(" ")));
     try {
@@ -939,7 +942,7 @@ describe("the committed gate config", () => {
       spy.mockRestore();
     }
     expect(logs.join("\n")).toContain("allowed (");
-  });
+  }, WHOLE_TREE_LINT_MS);
 });
 
 describe("the committed baseline", () => {
@@ -955,7 +958,7 @@ describe("the committed baseline", () => {
     expect(baseline.retake).toContain("BASE_SHA");
   });
 
-  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", { timeout: WHOLE_TREE_TIMEOUT }, () => {
+  it("matches a fresh run exactly when src/ is unchanged since the baseline commit, and otherwise never rises above it", () => {
     const fresh = countViolations(lintRepo({ root: repoRoot }).violations);
     const cmp = compareToBaseline(fresh, baseline);
     expect(cmp.increases).toEqual([]);
@@ -965,5 +968,5 @@ describe("the committed baseline", () => {
       // so a stale baseline (a rule changed without retaking it) cannot hide a regression.
       expect(cmp.decreases).toEqual([]);
     }
-  });
+  }, WHOLE_TREE_LINT_MS);
 });

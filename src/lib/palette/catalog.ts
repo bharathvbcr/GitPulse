@@ -183,7 +183,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "tasks", label: "Open Tasks — global and workspace Kanban boards", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setGlobalSurface("tasks") },
     { id: "fleet", label: "Open Fleet — every repository at a glance", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setFleetOpen(true) },
     { id: "agents", label: "Open Agents — sessions, worktrees, and what needs you", category: "Workspace", icon: Bot, shortcut: "⌘⇧A", action: () => interfaceStore.setAgentsOpen(true) },
-    { id: "terminal-dock", label: "Toggle terminal — the shell, docked under this repository", category: "Workspace", icon: Terminal, shortcut: "⌃`", disabledReason: unavailable, action: () => repoStore.toggleTerminal() },
+    { id: "terminal-dock", label: "Toggle dock — shell, agents and files under this repository", keywords: "terminal shell console files agents", category: "Workspace", icon: Terminal, shortcut: "⌃`", disabledReason: unavailable, action: () => repoStore.toggleTerminal() },
     { id: "mavi:new", label: "New Mavi thread — ask an agent in a conversation", category: "Mavi", icon: MessagesSquare, keywords: "agent chat claude conversation", disabledReason: unavailable, action: () => composeMaviThread() },
     {
       id: "mavi:ask-file",
@@ -218,7 +218,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
       label: launcher.kind === "shell"
         ? "New terminal session — a shell in this repository"
         : launcher.kind === "browser"
-          ? "New browser session — a local dev server in the terminal dock"
+          ? "New browser session — a local dev server in the dock"
           : `New ${launcher.label} session — in this repository`,
       keywords: launcher.kind === "browser"
         ? "terminal session new browser web page localhost dev server preview inspect"

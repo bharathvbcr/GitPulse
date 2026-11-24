@@ -39,10 +39,8 @@ const BARS: ReadonlyArray<readonly [file: string, anchors: readonly string[]]> =
     "px-2.5 py-1 text-textMuted text-micro",
     "px-2.5 py-1 text-micro",
   ]],
-  ["../components/TerminalPanel.svelte", [
-    "px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0",
-    'px-2 h-9 min-w-0"',
-  ]],
+  ["../components/TerminalPanel.svelte", ['px-2 h-9 min-w-0"']],
+  ["../components/DockHeader.svelte", ["px-3 py-1.5 flex flex-wrap gap-2 items-center shrink-0"]],
   ["../components/TerminalSession.svelte", ["min-w-0 flex items-center gap-2 px-4 h-8"]],
   ["../components/TerminalDock.svelte", ["px-2.5 flex items-center gap-2 select-none"]],
   ["../components/CoverageViewer.svelte", ["data-coverage-family-strip", "px-3 py-1.5 font-sans flex flex-wrap"]],

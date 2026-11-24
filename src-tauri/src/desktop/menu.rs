@@ -325,7 +325,7 @@ pub fn build_native_menu<R: Runtime>(
     let sep_one = PredefinedMenuItem::separator(app)?;
     let fleet_item = item(app, actions::FLEET, "Fleet", Some(FLEET_ACCEL))?;
     let agents_item = item(app, actions::AGENTS, "Agents", Some(AGENTS_ACCEL))?;
-    let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
+    let terminal_item = item(app, actions::TERMINAL_DOCK, "Dock", Some("Ctrl+`"))?;
     let sep_two = PredefinedMenuItem::separator(app)?;
     let search_item = item(
         app,
