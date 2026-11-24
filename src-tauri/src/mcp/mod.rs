@@ -3068,6 +3068,10 @@ fn build_tools() -> Vec<Value> {
                     "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "pinned_below_dropped_before_seq": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
                     "has_more": { "type": "boolean" },
                     "messages": { "type": "array" }
                 },
@@ -3098,6 +3102,10 @@ fn build_tools() -> Vec<Value> {
                     "ack_error": { "type": ["string", "null"] },
                     "latest_seq": { "type": "integer", "minimum": 0 },
                     "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "pinned_below_dropped_before_seq": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 }
+                    },
                     "has_more": { "type": "boolean" },
                     "messages": { "type": "array" }
                 },
