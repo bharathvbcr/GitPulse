@@ -2872,6 +2872,72 @@ pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDeta
     parse_pr_view(&stdout).map_err(CommandError::from)
 }
 
+/// Cap on inline pull request unified-diff payloads returned to the WebView.
+pub const MAX_PR_DIFF_BYTES: usize = 512 * 1024;
+
+/// Unified diff payload for one pull request (`gh pr diff`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestDiff {
+    pub number: u64,
+    pub patch: String,
+    pub truncated: bool,
+    pub total_bytes: usize,
+}
+
+/// Pure argv builder for `gh pr diff <number> --color=never`.
+pub fn pr_diff_leading_args(number: &str) -> [&str; 4] {
+    ["pr", "diff", number, "--color=never"]
+}
+
+/// Parses and safely bounds raw `gh pr diff` output on a UTF-8 line boundary.
+pub fn parse_pr_diff(number: u64, raw: &str) -> PullRequestDiff {
+    let total_bytes = raw.len();
+    if total_bytes <= MAX_PR_DIFF_BYTES {
+        return PullRequestDiff {
+            number,
+            patch: raw.to_string(),
+            truncated: false,
+            total_bytes,
+        };
+    }
+    let mut end = MAX_PR_DIFF_BYTES;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let line_cut = raw[..end].rfind('\n').filter(|pos| *pos > 0).unwrap_or(end);
+    PullRequestDiff {
+        number,
+        patch: raw[..line_cut].to_string(),
+        truncated: true,
+        total_bytes,
+    }
+}
+
+/// Fetches the unified diff for one pull request via `gh pr diff`. Read-only.
+pub fn fetch_pull_request_diff(
+    repo_path: &str,
+    number: u64,
+) -> Result<PullRequestDiff, CommandError> {
+    if number == 0 {
+        return Err("Invalid pull request number".into());
+    }
+    let repo = validate_repo(repo_path)?;
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason.into());
+    }
+    let remote = discover_github_remote(repo_path)?
+        .ok_or_else(|| "No GitHub remote configured".to_string())?;
+    let num_str = number.to_string();
+    let stdout = run_gh(
+        &remote,
+        &pr_diff_leading_args(&num_str),
+        Duration::from_secs(45),
+        Some(&repo),
+    )?;
+    let patch = String::from_utf8_lossy(&stdout);
+    Ok(parse_pr_diff(number, &patch))
+}
+
 /// What a review says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -6209,5 +6275,31 @@ mod non_ascii_tail_tests {
         assert!(logged
             .lines()
             .any(|l| l.starts_with("issue close 77 --repo acme/repo")));
+    }
+
+    #[test]
+    fn parse_pr_diff_bounds_oversized_diffs_on_line_boundaries() {
+        assert_eq!(
+            pr_diff_leading_args("42"),
+            ["pr", "diff", "42", "--color=never"]
+        );
+
+        let small = "diff --git a/a.rs b/a.rs\n+hello\n";
+        let ok = parse_pr_diff(42, small);
+        assert_eq!(ok.number, 42);
+        assert!(!ok.truncated);
+        assert_eq!(ok.total_bytes, small.len());
+        assert_eq!(ok.patch, small);
+
+        let chunk = format!("+{}\n", "é".repeat(500));
+        let mut huge = String::new();
+        while huge.len() <= MAX_PR_DIFF_BYTES + 1024 {
+            huge.push_str(&chunk);
+        }
+        let capped = parse_pr_diff(99, &huge);
+        assert!(capped.truncated);
+        assert_eq!(capped.total_bytes, huge.len());
+        assert!(capped.patch.len() <= MAX_PR_DIFF_BYTES);
+        assert!(capped.patch.ends_with('é'));
     }
 }

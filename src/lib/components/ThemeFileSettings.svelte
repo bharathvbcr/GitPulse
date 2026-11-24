@@ -8,11 +8,11 @@
   import { sameTheme } from "../ui/appearance/presets";
   import { MAX_SAVED_THEMES } from "../ui/appearance/savedThemes";
   import {
-    MAX_THEME_FILE_BYTES,
     exportCurrentTheme,
-    importThemeText,
+    importThemeFile,
     themeToPatch,
   } from "../ui/appearance/themeFile";
+  import { MAX_VSCODE_JSON_BYTES, MAX_VSIX_BYTES } from "../ui/appearance/vscodeTheme";
   import type { GitPulseTheme } from "../ui/appearance/themeSchema";
   import ThemeTile from "./ThemeTile.svelte";
 
@@ -81,23 +81,27 @@
     if (!file) return;
     failure = null;
     status = "";
-    if (file.size > MAX_THEME_FILE_BYTES) {
-      fail("import", "the theme", `The file is larger than ${MAX_THEME_FILE_BYTES / 1024} KB, which is more than a theme needs.`);
+    if (/\.vsix$/i.test(file.name) && file.size > MAX_VSIX_BYTES) {
+      fail("import", "the theme", `The .vsix file is larger than ${MAX_VSIX_BYTES / (1024 * 1024)} MB.`);
       return;
     }
-    let text: string;
+    if (!/\.vsix$/i.test(file.name) && file.size > MAX_VSCODE_JSON_BYTES) {
+      fail("import", "the theme", `The file is larger than ${MAX_VSCODE_JSON_BYTES / 1024} KB, which is more than a theme needs.`);
+      return;
+    }
+    let result;
     try {
-      text = await file.text();
+      result = await importThemeFile(file, { preferredAppearance: theme });
     } catch (error) {
       failure = describeFailure({ verb: "read", object: "the file" }, error);
       return;
     }
-    const result = importThemeText(text);
     if (!result.ok) {
       fail("import", "the theme", result.reason);
       return;
     }
     interfaceStore.patchAppearance(themeToPatch(result.theme));
+    themeStore.setTheme(result.theme.appearance);
     // Kept on the shelf too, so it can be switched back to after trying another.
     const shelved = interfaceStore.saveTheme(result.theme);
     name = result.theme.name;
@@ -191,7 +195,7 @@
   <input
     bind:this={picker}
     type="file"
-    accept="application/json,.json"
+    accept="application/json,.json,.jsonc,.vsix"
     hidden
     aria-label="Theme file"
     data-theme-file-input
@@ -239,7 +243,7 @@
   {/if}
 
   <p class="text-micro text-textMuted">
-    Save, Export and Copy JSON use the name above. A theme file is small JSON: colors, an optional corner scale,
-    background field and font names. Anything else in a file, including CSS, URLs, filters and layering, is refused.
+    Save, Export and Copy JSON use the name above. Import supports <code>.gitpulse-theme.json</code> and VS Code
+    <code>.json</code>/<code>.jsonc</code>/<code>.vsix</code> color themes. CSS, URLs, filters and layering are refused.
   </p>
 </div>

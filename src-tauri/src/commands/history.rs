@@ -357,3 +357,31 @@ pub(super) fn rebase_planned_commands(
 
     Ok(planned)
 }
+
+#[tauri::command(async)]
+pub async fn cmd_list_turn_checkpoints(
+    repo_path: String,
+    limit: Option<usize>,
+) -> Result<crate::engine::turn_checkpoint::TurnCheckpointList, IpcError> {
+    off_thread(move || {
+        let _ = validate_repo(&repo_path)?;
+        let capped = limit.unwrap_or(50).clamp(1, 200);
+        crate::engine::turn_checkpoint::list_turn_checkpoints(&repo_path, capped)
+            .map_err(CommandError::from)
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_diff_turn_checkpoint(
+    repo_path: String,
+    id: String,
+    against: Option<String>,
+) -> Result<crate::engine::turn_checkpoint::TurnCheckpointDiff, IpcError> {
+    off_thread(move || {
+        let _ = validate_repo(&repo_path)?;
+        crate::engine::turn_checkpoint::diff_turn_checkpoint(&repo_path, &id, against.as_deref())
+            .map_err(CommandError::from)
+    })
+    .await
+}

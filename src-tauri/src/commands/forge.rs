@@ -190,6 +190,14 @@ pub async fn cmd_github_pr_view(
     off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
 }
 
+#[tauri::command(async)]
+pub async fn cmd_github_pr_diff(
+    repo_path: String,
+    number: u64,
+) -> Result<crate::github::PullRequestDiff, IpcError> {
+    off_thread(move || crate::github::fetch_pull_request_diff(&repo_path, number)).await
+}
+
 /// Creates, reviews or merges a pull request through gh. Each is published
 /// on GitHub, so the frontend confirms first. The argv is built once, judged,
 /// and that same argv is what runs.

@@ -18,7 +18,7 @@
  */
 import type { GraphRenderConfig } from "../canvas/GraphRenderer";
 
-export type RailTab = "files" | "history";
+export type RailTab = "files" | "history" | "turns";
 
 /** Whether the rail column is showing, and which of its tabs. */
 export interface RailView {
@@ -35,6 +35,13 @@ export function toggleHistoryView(view: RailView): RailView {
   return view.open && view.tab === "history"
     ? { open: true, tab: "files" }
     : { open: true, tab: "history" };
+}
+
+/** Turns tab toggle: opens Turns from Files/History/collapsed, returns to Files from Turns. */
+export function toggleTurnsView(view: RailView): RailView {
+  return view.open && view.tab === "turns"
+    ? { open: true, tab: "files" }
+    : { open: true, tab: "turns" };
 }
 
 /**
