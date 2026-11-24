@@ -1532,3 +1532,32 @@ fn a_waiter_keeps_waiting_while_only_refused_envelopes_are_pending() {
     );
     assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
 }
+
+#[test]
+fn stamps_follow_publish_order_even_when_the_callers_clocks_do_not() {
+    let (_dir, mailbox) = mailbox();
+    let t0 = SystemTime::now();
+    // The first publisher's clock reads later than the second's, as when one process stamped
+    // before waiting on the lock, or the clock stepped back.
+    let first = mailbox
+        .deposit(
+            SESSION,
+            "req-late-clock",
+            "published first",
+            t0 + Duration::from_millis(5_000),
+        )
+        .unwrap();
+    let second = mailbox
+        .deposit(SESSION, "req-early-clock", "published second", t0)
+        .unwrap();
+    assert!(
+        second.created_at_ms > first.created_at_ms,
+        "a reader that saw {} must not find a later publish at {}",
+        first.created_at_ms,
+        second.created_at_ms
+    );
+    // Even after the first is claimed away, the next stamp still climbs.
+    mailbox.claim_next(SESSION, t0).unwrap();
+    let third = mailbox.deposit(SESSION, "req-third", "third", t0).unwrap();
+    assert!(third.created_at_ms > second.created_at_ms);
+}

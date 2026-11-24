@@ -6,6 +6,7 @@
 //! <GitPulse config dir>/agent-mailbox/            0700
 //!   .lock                                         0600, advisory flock for root dir mutations
 //!   .locks/<session uuid>.lock                    0600, advisory flock per session
+//!   .locks/<session uuid>.hw                      0600, highest envelope stamp issued (stamps only climb)
 //!   .meta/<session uuid>/<request id>.json        0600, EnvelopeProvenance sidecar
 //!   .epochs/<session uuid>                        0600, monotonic turn_epoch counter
 //!   .continuations/<session uuid>                 0600, per-turn continuation counter
@@ -678,6 +679,7 @@ impl Mailbox {
                 .is_ok_and(|m| age(now, m) > EMPTY_SESSION_TTL);
             if empty && old && std::fs::remove_dir(&dir).is_ok() {
                 let _ = std::fs::remove_file(self.root.join(".locks").join(format!("{name}.lock")));
+                let _ = std::fs::remove_file(self.high_water_path(&name));
                 let _ = std::fs::remove_file(self.root.join(".epochs").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".continuations").join(&name));
                 let _ = std::fs::remove_file(self.root.join(".stop_continued").join(&name));
@@ -706,6 +708,41 @@ impl Mailbox {
                 }
             }
         }
+    }
+
+    fn high_water_path(&self, session_key: &str) -> PathBuf {
+        self.root.join(".locks").join(format!("{session_key}.hw"))
+    }
+
+    /// The creation stamp for the next envelope of a session: the caller's clock, but strictly
+    /// above every stamp this session has issued or holds (a persisted high-water mark and the
+    /// files present). Callers stamp before they wait for the lock, and a clock can step back, so
+    /// the raw clock does not follow publish order; a reader that has seen stamp T must never
+    /// find a later publish below it. Must be called with the session lock held.
+    fn next_stamp(
+        &self,
+        session_key: &str,
+        files: &[(String, SystemTime)],
+        now: SystemTime,
+    ) -> Result<u64, MailboxError> {
+        let path = self.high_water_path(session_key);
+        let persisted = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let held = files
+            .iter()
+            .filter_map(|(name, _)| parse_message_name(name).map(|(_, stamp, _)| stamp))
+            .max()
+            .unwrap_or(0);
+        let stamp = millis(now).max(persisted.max(held).saturating_add(1));
+        let temp = path.with_extension(format!("hw-tmp-{}", std::process::id()));
+        write_private_replacing(&temp, stamp.to_string().as_bytes())?;
+        std::fs::rename(&temp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            io("could not record the mailbox high-water mark", &e)
+        })?;
+        Ok(stamp)
     }
 
     /// Puts one human-confirmed message in a session's mailbox.
@@ -836,8 +873,10 @@ impl Mailbox {
                 "This session already has {MAX_PENDING} messages waiting for it."
             )));
         }
+        // Assigned here, under the session lock, so the stamp order is the publish order a
+        // cursor-reading peeker sees (see `next_stamp`).
+        let created = self.next_stamp(&key, &files, now)?;
         self.write_provenance(&key, request_id, &provenance, now)?;
-        let created = millis(now);
         let temp = dir.join(format!(".tmp-{}-{:08x}", std::process::id(), nonce(now)));
         if let Err(err) = write_private(&temp, normalized.as_bytes()) {
             self.remove_provenance(&key, request_id);
@@ -1912,6 +1951,12 @@ fn create_private(path: &Path) -> Result<File, MailboxError> {
     options
         .open(path)
         .map_err(|e| io("could not create a mailbox file", &e))
+}
+
+/// [`write_private`] that first clears a stale file of the same name.
+fn write_private_replacing(path: &Path, bytes: &[u8]) -> Result<(), MailboxError> {
+    let _ = std::fs::remove_file(path);
+    write_private(path, bytes)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), MailboxError> {
