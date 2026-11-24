@@ -61,14 +61,18 @@ use Marked as Sleepers;
 #[cfg(target_os = "linux")]
 use NamedSleepers as Sleepers;
 
-/// Sleepers whose kernel name is their marker: each is this test binary, run
-/// into [`named_sleeper_body`] through a symlink named by the marker, with the
-/// marker as `argv[0]` too. The kernel names a process after the file it was
-/// started through, so `comm` is the marker; the marker is at most 15 bytes so
-/// `comm` is not cut. The link must not point at `/bin/sleep`: on Ubuntu 26.04
-/// that is rust-coreutils, which refuses to run under a name that is not the
-/// utility's ("Requested utility ... does not match executable name") and
-/// exits at once, so every sleeper was a zombie before the first `pgrep`.
+/// Sleepers whose kernel name is their marker: each is this test binary run
+/// through a symlink named by the marker, with the marker as `argv[0]` too,
+/// running only [`named_sleeper_600_body`]. The marker is at most 15 bytes so
+/// `comm` is not cut.
+///
+/// They were `/bin/sleep` through that symlink. On the CI runner's image
+/// (Ubuntu 26.04, whose coreutils is uutils by default) that `sleep` exited
+/// at once: it is picked by the name of the path it is run through, and the
+/// marker names no utility. `/bin/sleep` run under its own path with only
+/// `argv[0]` changed (`Marked`) still sleeps there. Every case then compared
+/// `pgrep`, which lists the zombies, with a guard that rightly leaves them
+/// out. This binary ignores both names: libtest ignores `argv[0]`.
 #[cfg(target_os = "linux")]
 struct NamedSleepers {
     marker: String,
@@ -89,13 +93,17 @@ impl NamedSleepers {
         let dir = std::env::temp_dir().join(format!("gpsg-{marker}"));
         std::fs::create_dir_all(&dir).expect("a directory for the symlink");
         let link = dir.join(&marker);
-        let exe = std::env::current_exe().expect("this test binary");
-        std::os::unix::fs::symlink(&exe, &link).expect("link the sleeper under the marker");
+        let this = std::env::current_exe().expect("this test binary");
+        std::os::unix::fs::symlink(&this, &link).expect("link this binary under the marker");
         let children = (0..count)
             .map(|_| {
                 Command::new(&link)
                     .arg0(&marker)
-                    .args(["--exact", "named_sleeper_body", "--test-threads=1", "-q"])
+                    // The command line is exactly `<marker> 600`, as it was
+                    // for `sleep 600`: the `-f` cases match on it. To libtest
+                    // `600` is a name filter, which selects only
+                    // `named_sleeper_600_body`.
+                    .arg("600")
                     .env(NAMED_SLEEPER, "1")
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
@@ -104,7 +112,7 @@ impl NamedSleepers {
                     .expect("spawn a named sleeper")
             })
             .collect::<Vec<_>>();
-        let sleepers = Self {
+        let mut sleepers = Self {
             marker,
             dir,
             children,
@@ -116,6 +124,26 @@ impl NamedSleepers {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        // `pgrep` lists a zombie too, so a sleeper that exited at once would
+        // pass the wait above and every comparison after it would be wrong.
+        for child in &mut sleepers.children {
+            let state = child
+                .try_wait()
+                .expect("ask a named sleeper whether it ran");
+            assert!(
+                state.is_none(),
+                "the named sleeper {} exited at once: {state:?}",
+                child.id()
+            );
+        }
+        // The `-f` cases match the full command line, so it must be what they
+        // name, or they compare two empty answers and test nothing.
+        let full = format!("{} 600", sleepers.marker);
+        assert_eq!(
+            pgrep(&["-fx", &full]).len(),
+            count,
+            "the named sleepers' command line is not `{full}`"
+        );
         sleepers
     }
 
@@ -130,21 +158,6 @@ impl NamedSleepers {
     }
 }
 
-/// Set in a [`NamedSleepers`] child's environment to make
-/// [`named_sleeper_body`] sleep.
-#[cfg(target_os = "linux")]
-const NAMED_SLEEPER: &str = "GITPULSE_TEST_NAMED_SLEEPER";
-
-/// What a [`NamedSleepers`] child runs: ten minutes asleep. In a normal test
-/// run (no [`NAMED_SLEEPER`]) it returns at once.
-#[cfg(target_os = "linux")]
-#[test]
-fn named_sleeper_body() {
-    if std::env::var_os(NAMED_SLEEPER).is_some() {
-        std::thread::sleep(Duration::from_secs(600));
-    }
-}
-
 #[cfg(target_os = "linux")]
 impl Drop for NamedSleepers {
     fn drop(&mut self) {
@@ -154,6 +167,20 @@ impl Drop for NamedSleepers {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// What a named sleeper runs: nothing but a long sleep, and only when started
+/// as one; in the suite itself it passes at once.
+#[cfg(target_os = "linux")]
+const NAMED_SLEEPER: &str = "GITPULSE_TEST_NAMED_SLEEPER";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_sleeper_600_body() {
+    if std::env::var_os(NAMED_SLEEPER).is_none() {
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(600));
 }
 
 fn user_id() -> String {
