@@ -4300,13 +4300,12 @@ pub(crate) mod tests {
         let uids = parse_status_ids(status, "Uid:").expect("uids");
         let gids = parse_status_ids(status, "Gid:").expect("gids");
         assert_eq!(uids, [1001, 1001, 0, 1001]);
-        // On the GitHub ubuntu runner, `(sd-pam)` refused its environment and
-        // working directory to the runner's own test process (EACCES on
-        // environ), with no capability to explain it. `(sd-pam)` is forked by
-        // root's PAM stack before it drops to the user, so a kept root id is
-        // the likely cause; this row is that shape, not a capture of it.
-        // Linux requires each of real, effective and saved to match the
-        // reader's filesystem id.
+        // A process that kept root as its saved uid (a set-id program midway
+        // through dropping privilege). Linux requires each of real, effective
+        // and saved to match the reader's filesystem id. (The runner's
+        // `(sd-pam)` is not this case: CI printed its ids as all 1001; it is
+        // refused because it is not dumpable, which `withheld_from_its_user`
+        // reads off its /proc files' owner.)
         assert!(!ids_admit_reader(uids, gids, 1001, 1001));
         assert!(ids_admit_reader([1001; 4], [1001; 4], 1001, 1001));
         assert!(!ids_admit_reader(
