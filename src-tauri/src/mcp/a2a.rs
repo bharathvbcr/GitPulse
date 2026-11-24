@@ -556,6 +556,13 @@ pub(crate) fn handle_agent_send(a: super::AgentSendArgs) -> Result<Value, String
         max_hops,
     )
     .map_err(CommandError::into_message)?;
+    // An exact retry returns the stored row, and a threaded retry recomputed a hop one past
+    // that row (the thread's last message is now the original). The stored row is the truth for
+    // the response, the mailbox provenance and the hop-limit decision; the mailbox refuses the
+    // same request id under different provenance, so a recomputed hop reported a delivered
+    // message as bus-only.
+    let hop = message.hop.unwrap_or(hop);
+    let max_hops = message.max_hops.unwrap_or(max_hops);
     let msg_id = message
         .msg_id
         .clone()

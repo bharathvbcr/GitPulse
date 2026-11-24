@@ -1624,3 +1624,21 @@ fn an_inbox_and_a_wait_carry_the_pinned_below_dropped_before_seq_list() {
         "{wait}"
     );
 }
+
+#[test]
+fn an_exact_retry_of_a_threaded_send_keeps_the_stored_hop_and_the_mailbox_deposit() {
+    let (_dir, repo) = trusted_git_repo();
+    let sid = "99999999-9999-4999-8999-999999999991";
+    register_forgery_target(&repo, sid, "retry-target");
+    let args = json!({"from_peer": "claude:a", "to_peer": "retry-target", "body": "q",
+                      "thread_key": "retry-thread", "msg_id": "retry-1"});
+
+    let first = send_json(&repo, args.clone()).expect("first send");
+    let retry = send_json(&repo, args).expect("exact retry");
+
+    assert_eq!(retry["hop"], first["hop"], "a retry must not climb a hop");
+    assert_eq!(retry["message"]["seq"], first["message"]["seq"]);
+    assert_eq!(retry["mailbox"]["deposited"], true, "{retry}");
+    assert_eq!(retry["mailbox"]["duplicate"], true, "{retry}");
+    assert_eq!(retry["delivery_outcome"], first["delivery_outcome"]);
+}
