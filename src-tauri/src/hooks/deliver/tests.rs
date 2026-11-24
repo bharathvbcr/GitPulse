@@ -546,3 +546,13 @@ fn system_steward_envelope_never_wakes_idle_stop_and_renders_escaped_governor_xm
         "{rendered}"
     );
 }
+
+#[test]
+fn a_delivered_peer_message_tells_the_reader_to_reply_with_in_reply_to_its_msg_id() {
+    let rendered = format_peer_xml("req-7", "claude:a", "claude", "main", "", 2, 8, "hello");
+    assert!(
+        rendered.contains("`gitpulse_agent_send` with in_reply_to=\"req-7\""),
+        "{rendered}"
+    );
+    assert!(rendered.contains("msg_id=\"req-7\""), "{rendered}");
+}
