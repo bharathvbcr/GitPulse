@@ -1,8 +1,8 @@
 //! Manvi policy approval ticket transport (Opus §4 & R9).
 //!
 //! **Manvi remains the policy authority.** GitPulse transports Manvi policy
-//! approval requests to mobile and turns verified mobile decisions into
-//! **single-use, hash-bound, TTL'd grants**:
+//! approval requests to mobile and turns `gitpulse-protocol`-verified mobile
+//! decisions into **single-use, hash-bound, TTL'd grants**:
 //! - **Never cached from mobile:** any decision requesting a reusable/cached
 //!   grant is refused loudly (`once: true` always).
 //! - **Hash-bound:** every grant is cryptographically bound to
@@ -14,17 +14,17 @@
 //!   strictly refused.
 //! - **Enterprise `remote_approval` policy honored:** `Deny` blocks all remote
 //!   Manvi approvals; `StepUp` requires fresh hardware P-256 step-up auth;
-//!   `Allow` still requires a valid hardware P-256 signature (Opus R2).
+//!   `Allow` still requires a valid hardware P-256 signature verified through
+//!   `gitpulse_protocol::crypto::verify_approval_decision` (Opus R2 & #31).
 //! - **Audit export:** every ticket, decision, grant, redemption, and refusal
 //!   is recorded for Enterprise `audit_export`.
 
 use crate::remote::config::RemoteApprovalPolicy;
 use crate::remote::pty_gate::sha256_hex;
-use crate::remote::revocations::{DeviceCertificate, RevocationCache};
-use crate::remote::tunnel::ApprovalDecisionKind;
-use base64::Engine as _;
-use p256::ecdsa::signature::Verifier as P256Verifier;
-use p256::ecdsa::Signature as P256Signature;
+use crate::remote::revocations::RevocationCache;
+use gitpulse_protocol::canonical::hex_encode;
+use gitpulse_protocol::crypto::verify_approval_decision;
+use gitpulse_protocol::wire::{ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -32,11 +32,7 @@ use std::sync::{Mutex, OnceLock};
 /// Maximum TTL for a remotely issued Manvi single-use grant (5 minutes).
 pub const MAX_MANVI_GRANT_TTL_SECS: i64 = 5 * 60;
 
-/// Maximum clock skew on mobile Manvi decision signatures.
-const DECISION_SKEW_SECS: i64 = 60;
-
 const MANVI_ACTION_DOMAIN: &[u8] = b"gitpulse-manvi-action/v1\0";
-const MANVI_DECISION_DOMAIN: &[u8] = b"gitpulse-manvi-decision/v1\0";
 
 fn rule_severities() -> Result<&'static HashMap<String, String>, String> {
     static SEVERITIES: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
@@ -96,52 +92,17 @@ pub struct ManviPolicyTicket {
     pub expires_at: i64,
 }
 
-/// Mobile decision for a Manvi policy ticket.
+/// Mobile decision for a Manvi policy ticket wrapping `gitpulse-protocol`'s
+/// hardware P-256 [`SignedApprovalDecision`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedManviDecision {
-    pub host_id: String,
-    pub ticket_id: String,
-    pub action_sha256: String,
-    pub decision: ApprovalDecisionKind,
+pub struct ManviMobileDecision {
+    pub signed: SignedApprovalDecision,
     /// Must always be `false`; mobile is forbidden from caching Manvi grants.
     #[serde(default)]
     pub cache_requested: bool,
     /// True when the mobile device performed biometric step-up verification.
     #[serde(default)]
     pub step_up_confirmed: bool,
-    pub nonce: String,
-    pub issued_at: i64,
-    pub expires_at: i64,
-    pub device_id: String,
-    /// Base64-encoded ASN.1 DER P-256 ECDSA signature from hardware approval key.
-    pub sig_p256_der_b64: String,
-}
-
-impl SignedManviDecision {
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let decision_str = match self.decision {
-            ApprovalDecisionKind::AllowOnce => "allow_once",
-            ApprovalDecisionKind::Deny => "deny",
-            ApprovalDecisionKind::DenyAndInterrupt => "deny_and_interrupt",
-        };
-        let mut out = Vec::with_capacity(256);
-        out.extend_from_slice(MANVI_DECISION_DOMAIN);
-        let canonical = format!(
-            "host_id={}\nticket_id={}\naction_sha256={}\ndecision={}\ncache_requested={}\nstep_up_confirmed={}\nnonce={}\nissued_at={}\nexpires_at={}\ndevice_id={}\n",
-            self.host_id,
-            self.ticket_id,
-            self.action_sha256,
-            decision_str,
-            self.cache_requested,
-            self.step_up_confirmed,
-            self.nonce,
-            self.issued_at,
-            self.expires_at,
-            self.device_id,
-        );
-        out.extend_from_slice(canonical.as_bytes());
-        out
-    }
 }
 
 /// Single-use, hash-bound, TTL'd Manvi override grant minted from a verified
@@ -193,12 +154,9 @@ pub enum ManviTicketError {
     CachedGrantForbidden,
     TicketNotFound(String),
     TicketExpired(String),
-    HostMismatch,
     ActionHashMismatch,
-    NonceReplayedOrEmpty,
-    DecisionWindowInvalid,
-    DeviceOrRevocationFailed(String),
-    InvalidSignature,
+    NonceReplayed,
+    ProtocolVerificationFailed(String),
     GrantNotFound(String),
     GrantAlreadyConsumed(String),
     GrantExpired(String),
@@ -225,21 +183,14 @@ impl std::fmt::Display for ManviTicketError {
             }
             ManviTicketError::TicketNotFound(id) => write!(f, "Manvi ticket '{id}' not found"),
             ManviTicketError::TicketExpired(id) => write!(f, "Manvi ticket '{id}' expired"),
-            ManviTicketError::HostMismatch => write!(f, "Manvi decision host_id mismatch"),
             ManviTicketError::ActionHashMismatch => {
                 write!(f, "action_sha256 does not match the ticket or grant binding")
             }
-            ManviTicketError::NonceReplayedOrEmpty => {
-                write!(f, "Manvi decision nonce is missing or already used")
+            ManviTicketError::NonceReplayed => {
+                write!(f, "Manvi decision nonce already used")
             }
-            ManviTicketError::DecisionWindowInvalid => {
-                write!(f, "Manvi decision timestamp window is expired or invalid")
-            }
-            ManviTicketError::DeviceOrRevocationFailed(m) => {
-                write!(f, "device certificate or revocation check failed: {m}")
-            }
-            ManviTicketError::InvalidSignature => {
-                write!(f, "mobile P-256 signature verification failed")
+            ManviTicketError::ProtocolVerificationFailed(m) => {
+                write!(f, "gitpulse-protocol verification failed: {m}")
             }
             ManviTicketError::GrantNotFound(id) => write!(f, "Manvi grant '{id}' not found"),
             ManviTicketError::GrantAlreadyConsumed(id) => {
@@ -336,7 +287,6 @@ impl ManviTicketBridge {
                 });
             }
             None => {
-                // Unknown rules are hard by default in Manvi (see grants/mod.rs).
                 self.record_audit(
                     now_secs,
                     "ticket_refused",
@@ -357,7 +307,7 @@ impl ManviTicketBridge {
         let clamped_ttl = ttl_secs.clamp(1, MAX_MANVI_GRANT_TTL_SECS);
         let mut raw_id = [0u8; 12];
         let _ = getrandom::fill(&mut raw_id);
-        let ticket_id = format!("mvtk_{}", hex_lower(&raw_id));
+        let ticket_id = format!("mvtk_{}", hex_encode(&raw_id));
 
         let ticket = ManviPolicyTicket {
             ticket_id: ticket_id.clone(),
@@ -389,11 +339,11 @@ impl ManviTicketBridge {
         Ok(ticket)
     }
 
-    /// Resolves an open Manvi ticket with a P-256 hardware-signed mobile
-    /// decision, minting a single-use, hash-bound, TTL'd grant on `AllowOnce`.
+    /// Resolves an open Manvi ticket via `gitpulse_protocol::crypto::verify_approval_decision`,
+    /// minting a single-use, hash-bound, TTL'd grant on `AllowOnce`.
     pub fn apply_mobile_decision(
         &self,
-        decision: &SignedManviDecision,
+        decision: &ManviMobileDecision,
         device_cert: &DeviceCertificate,
         revocations: &RevocationCache,
         now_secs: i64,
@@ -405,66 +355,63 @@ impl ManviTicketBridge {
             self.record_audit(
                 now_secs,
                 "decision_refused",
-                &decision.ticket_id,
+                &decision.signed.ticket_id,
                 None,
-                Some(&decision.device_id),
+                Some(&decision.signed.device_id),
                 "",
-                &decision.action_sha256,
+                &decision.signed.input_sha256,
                 "cached_grant_forbidden",
             );
             return Err(ManviTicketError::CachedGrantForbidden);
         }
         if self.policy == RemoteApprovalPolicy::StepUp
-            && decision.decision == ApprovalDecisionKind::AllowOnce
+            && decision.signed.decision == ApprovalDecisionKind::AllowOnce
             && !decision.step_up_confirmed
         {
             self.record_audit(
                 now_secs,
                 "decision_refused",
-                &decision.ticket_id,
+                &decision.signed.ticket_id,
                 None,
-                Some(&decision.device_id),
+                Some(&decision.signed.device_id),
                 "",
-                &decision.action_sha256,
+                &decision.signed.input_sha256,
                 "step_up_required",
             );
             return Err(ManviTicketError::StepUpRequired);
         }
-        if decision.host_id != self.host_id {
-            return Err(ManviTicketError::HostMismatch);
-        }
-        if decision.nonce.trim().is_empty() || decision.nonce.len() > 128 {
-            return Err(ManviTicketError::NonceReplayedOrEmpty);
-        }
-        if decision.issued_at > now_secs + DECISION_SKEW_SECS
-            || decision.expires_at <= decision.issued_at
-            || now_secs >= decision.expires_at
-        {
-            return Err(ManviTicketError::DecisionWindowInvalid);
-        }
 
-        // Verify device cert + fresh revocation list first (fail closed).
-        if device_cert.device_id != decision.device_id {
-            return Err(ManviTicketError::DeviceOrRevocationFailed(
-                "certificate device_id mismatch".into(),
-            ));
-        }
-        let verified_device = revocations
-            .verify_device_certificate(device_cert, now_secs)
-            .map_err(|e| ManviTicketError::DeviceOrRevocationFailed(e.to_string()))?;
+        // Peek open ticket to get expected hash & expiry before verifying signature.
+        let expected_action_sha256 = {
+            let guard = self
+                .open_tickets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing = guard
+                .get(&decision.signed.ticket_id)
+                .ok_or_else(|| ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone()))?;
+            if now_secs >= existing.expires_at {
+                return Err(ManviTicketError::TicketExpired(decision.signed.ticket_id.clone()));
+            }
+            existing.action_sha256.clone()
+        };
 
-        // Verify hardware P-256 signature over canonical decision bytes.
-        let approval_key = verified_device
-            .require_approval_key()
-            .map_err(|e| ManviTicketError::DeviceOrRevocationFailed(e.to_string()))?;
-        let sig_der = base64::engine::general_purpose::STANDARD
-            .decode(decision.sig_p256_der_b64.trim())
-            .map_err(|_| ManviTicketError::InvalidSignature)?;
-        let sig = P256Signature::from_der(&sig_der)
-            .map_err(|_| ManviTicketError::InvalidSignature)?;
-        approval_key
-            .verify(&decision.signing_bytes(), &sig)
-            .map_err(|_| ManviTicketError::InvalidSignature)?;
+        // Delegate 100% of cert + mandatory RevocationPolicy::Enforced + P-256
+        // DER signature verification to `gitpulse-protocol`!
+        let rev_policy = revocations
+            .enforced_policy(now_secs)
+            .map_err(|e| ManviTicketError::ProtocolVerificationFailed(e.to_string()))?;
+        let verified_kind = verify_approval_decision(
+            &decision.signed,
+            device_cert,
+            revocations.identity_pub_ed25519(),
+            &self.host_id,
+            &decision.signed.ticket_id,
+            &expected_action_sha256,
+            rev_policy,
+            now_secs,
+        )
+        .map_err(|e| ManviTicketError::ProtocolVerificationFailed(e.to_string()))?;
 
         // Commit nonce to prevent replays.
         {
@@ -472,38 +419,28 @@ impl ManviTicketBridge {
                 .used_nonces
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !nonces.insert(decision.nonce.clone()) {
-                return Err(ManviTicketError::NonceReplayedOrEmpty);
+            if !nonces.insert(decision.signed.nonce.clone()) {
+                return Err(ManviTicketError::NonceReplayed);
             }
         }
 
-        // Look up and consume the open ticket.
+        // Consume the open ticket.
         let ticket = {
             let mut guard = self
                 .open_tickets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let existing = guard
-                .get(&decision.ticket_id)
-                .ok_or_else(|| ManviTicketError::TicketNotFound(decision.ticket_id.clone()))?;
-            if now_secs >= existing.expires_at {
-                guard.remove(&decision.ticket_id);
-                return Err(ManviTicketError::TicketExpired(decision.ticket_id.clone()));
-            }
-            if existing.action_sha256 != decision.action_sha256.to_ascii_lowercase() {
-                return Err(ManviTicketError::ActionHashMismatch);
-            }
-            guard.remove(&decision.ticket_id).expect("checked above")
+            guard
+                .remove(&decision.signed.ticket_id)
+                .ok_or_else(|| ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone()))?
         };
 
-        match decision.decision {
+        match verified_kind {
             ApprovalDecisionKind::AllowOnce => {
                 let mut raw_id = [0u8; 12];
                 let _ = getrandom::fill(&mut raw_id);
-                let grant_id = format!("mvgr_{}", hex_lower(&raw_id));
-                let grant_expires = ticket
-                    .expires_at
-                    .min(now_secs + MAX_MANVI_GRANT_TTL_SECS);
+                let grant_id = format!("mvgr_{}", hex_encode(&raw_id));
+                let grant_expires = ticket.expires_at.min(now_secs + MAX_MANVI_GRANT_TTL_SECS);
                 let grant = ManviSingleUseGrant {
                     grant_id: grant_id.clone(),
                     ticket_id: ticket.ticket_id.clone(),
@@ -513,7 +450,7 @@ impl ManviTicketBridge {
                     target: ticket.target,
                     action_sha256: ticket.action_sha256.clone(),
                     once: true,
-                    granted_by_device: decision.device_id.clone(),
+                    granted_by_device: decision.signed.device_id.clone(),
                     issued_at: now_secs,
                     expires_at: grant_expires,
                     consumed: false,
@@ -527,7 +464,7 @@ impl ManviTicketBridge {
                     "grant_issued",
                     &ticket.ticket_id,
                     Some(&grant_id),
-                    Some(&decision.device_id),
+                    Some(&decision.signed.device_id),
                     &ticket.rule,
                     &ticket.action_sha256,
                     "allow_once",
@@ -540,7 +477,7 @@ impl ManviTicketBridge {
                     "ticket_denied",
                     &ticket.ticket_id,
                     None,
-                    Some(&decision.device_id),
+                    Some(&decision.signed.device_id),
                     &ticket.rule,
                     &ticket.action_sha256,
                     "deny",
@@ -556,7 +493,7 @@ impl ManviTicketBridge {
                     "ticket_denied",
                     &ticket.ticket_id,
                     None,
-                    Some(&decision.device_id),
+                    Some(&decision.signed.device_id),
                     &ticket.rule,
                     &ticket.action_sha256,
                     "deny_and_interrupt",
@@ -570,10 +507,6 @@ impl ManviTicketBridge {
     }
 
     /// Redeems a single-use, hash-bound, TTL'd grant for one exact Manvi action.
-    ///
-    /// Fails closed if the grant does not exist, was already consumed, has
-    /// expired, or if `(repo_root, task_id, rule, target)` does not match the
-    /// grant's `action_sha256`.
     pub fn redeem_grant(
         &self,
         grant_id: &str,
@@ -661,14 +594,4 @@ impl ManviTicketBridge {
                 outcome: outcome.to_string(),
             });
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }

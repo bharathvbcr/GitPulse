@@ -1051,6 +1051,7 @@ mod tests {
         let pro = gitpulse_lib::remote::config::RemoteControlConfig {
             tier: gitpulse_lib::remote::config::Tier::Pro,
             remote_control_enabled: true,
+            keychain_access_group: "com.gitpulse.test.unprovisioned-group".into(),
             ..Default::default()
         };
         std::fs::write(
@@ -1062,8 +1063,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             gitpulse_lib::remote::run_relay_mode(pro_dir.path(), true, None),
-            0,
-            "opted-in pro tier --once preflight must succeed"
+            4,
+            "pro tier without provisioned OS Keychain trust anchor must fail closed with exit 4 (never in-memory fallback)"
+        );
+        let state = gitpulse_lib::remote::tunnel::read_remote_approval_state(pro_dir.path())
+            .expect("state written");
+        assert!(state.is_released(), "expected released state: {state:?}");
+        let state_json = serde_json::to_string(&state).unwrap();
+        assert!(
+            state_json.contains("trust_anchor_unavailable")
+                || state_json.contains("keychain_locked"),
+            "expected trust_anchor_unavailable or keychain_locked, got {state_json}"
         );
     }
 }

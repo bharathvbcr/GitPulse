@@ -1,26 +1,9 @@
 //! Remote control plane host modules for `gitpulsed --relay`.
 //!
-//! - [`config`]: Tier gate (`free` / opt-out refuses with exit `4` before any
-//!   socket or network call), Enterprise BYOC offline org-signed policy bundles,
-//!   single-owner `gitpulsed-relay.lock`, Keychain non-blocking probe, and
-//!   dynamic trusted-workspace discovery (`workspace_registry` + `repository_trust`).
-//! - [`revocations`]: IdentityKey-signed monotonic revocation list cache
-//!   (fails closed / releases remote holds when stale past TTL) and
-//!   `DeviceCertificate` v2 verification anchored in OS Keychain / Secret Service.
-//! - [`tunnel`]: Outbound-only WSS client (`tokio-tungstenite`), Noise `IK`
-//!   E2EE per paired mobile device, `inbox_snapshot` re-announcement on connect,
-//!   immediate `remote-approval.state` release on WS `4003`, and jittered
-//!   `250ms..15s` reconnect backoff.
-//! - [`ptyd_handoff`]: Opus R5 `TakeoverPtyd` → daemon close → `HANDOFF_GRACE`
-//!   (`250ms`) post-FIN drain → bounded retry `Hello` sequence.
-//! - [`pty_gate`]: Opus P0-7 read-only `<=16 KiB` lossy PTY streaming by default
-//!   plus Desktop-consented, P-256 step-up-signed, audited `pty.input` RCE gate.
-//! - [`codex_app_server`]: Codex Tier 1 `codex app-server` JSON-RPC stdio
-//!   hosting with item-ID-bound approvals, true idle wake via `turn/start`, and
-//!   strict refusal of remote `approval_policy` / `sandbox_mode` relaxation.
-//! - [`manvi_tickets`]: Single-use, hash-bound, TTL'd Manvi policy override
-//!   grants (never cached from mobile, hard-denies non-overridable, Enterprise
-//!   `remote_approval` policy enforced).
+//! All Noise `IK` E2EE, 1024-bit sliding replay windows, Ed25519 WS signing,
+//! `DeviceCertificate` v2, `SignedRevocationList`, hardware P-256 approval &
+//! steering verification, and canonical JSON hashing delegate strictly to the
+//! single audited `gitpulse-protocol` crate (Opus R1/M4/#31).
 
 pub mod codex_app_server;
 pub mod config;
@@ -34,9 +17,10 @@ pub mod tunnel;
 mod tests;
 
 use config::{
-    acquire_relay_lock, discover_trusted_repositories, evaluate_relay_gate, probe_keychain_status,
-    EffectiveRelayConfig, KeychainStatus, RemoteControlConfig,
+    acquire_relay_lock, discover_trusted_repositories, evaluate_relay_gate, EffectiveRelayConfig,
+    KeychainStatus, RemoteControlConfig, EXIT_CODE_FREE_OR_DISABLED,
 };
+use revocations::{PlatformTrustAnchor, TrustAnchorError, TrustAnchorProvider};
 use serde::Serialize;
 use std::path::Path;
 use tunnel::{now_unix_ms, now_unix_secs, write_remote_approval_state, RemoteApprovalState};
@@ -56,13 +40,18 @@ pub struct RelayStartupReport {
     pub status: String,
 }
 
-/// Executes the `gitpulsed --relay` preflight, lock acquisition, and loop.
+/// Production entrypoint for `gitpulsed --relay`.
 ///
-/// # Hard Free/Local Invariant
-///
-/// Checks [`evaluate_relay_gate`] FIRST — before acquiring any lock, binding
-/// any Unix socket, or opening any network socket. On `free` tier or when
-/// `remote_control_enabled == false`, immediately returns exit code `4`.
+/// Always enforces:
+/// 1. **Hard Free/Local Invariant:** checks [`evaluate_relay_gate`] BEFORE
+///    acquiring any lock or opening any Unix/network socket; exits **`4`** on
+///    `free` tier or when `remote_control_enabled == false`.
+/// 2. **Production Trust Anchor Invariant (Opus #15 & #31):** loads the
+///    OS-backed [`PlatformTrustAnchor`] (macOS Data Protection Keychain Access
+///    Group / Linux Secret Service) and NEVER falls back to an in-memory or
+///    agent-writable file anchor. If no real platform trust anchor is
+///    provisioned or the Keychain is locked, refuses with exit **`4`** and
+///    emits `trust_anchor_unavailable` / `keychain_locked`.
 pub fn run_relay_mode(
     config_dir: &Path,
     once: bool,
@@ -76,13 +65,49 @@ pub fn run_relay_mode(
         }
     };
 
-    let effective: EffectiveRelayConfig = match evaluate_relay_gate(&cfg, pinned_org_key, now_unix_secs()) {
-        Ok(effective) => effective,
-        Err(refusal) => {
-            log::error!(target: "gitpulsed", "{refusal}");
-            return refusal.exit_code();
-        }
-    };
+    let effective: EffectiveRelayConfig =
+        match evaluate_relay_gate(&cfg, pinned_org_key, now_unix_secs()) {
+            Ok(effective) => effective,
+            Err(refusal) => {
+                log::error!(target: "gitpulsed", "{refusal}");
+                return refusal.exit_code();
+            }
+        };
+
+    // Production trust anchor ONLY — never falls back to an in-memory anchor!
+    let platform_trust = PlatformTrustAnchor::new(&effective.keychain_access_group);
+    run_relay_with_trust_anchor(config_dir, once, &effective, &platform_trust)
+}
+
+/// Core relay lifecycle parameterized over [`TrustAnchorProvider`].
+///
+/// Production [`run_relay_mode`] always supplies [`PlatformTrustAnchor`]; tests
+/// may call this directly with a mock anchor to exercise the post-anchor path
+/// without weakening production's fail-closed `PlatformTrustAnchor` requirement.
+pub fn run_relay_with_trust_anchor(
+    config_dir: &Path,
+    once: bool,
+    effective: &EffectiveRelayConfig,
+    trust: &dyn TrustAnchorProvider,
+) -> i32 {
+    if let Err(err) = trust.verify_ready() {
+        let code_reason = match &err {
+            TrustAnchorError::KeychainLocked(reason) => format!("keychain_locked: {reason}"),
+            TrustAnchorError::Unavailable(reason) => format!("trust_anchor_unavailable: {reason}"),
+            TrustAnchorError::InvalidKeyMaterial(reason) => {
+                format!("trust_anchor_unavailable: {reason}")
+            }
+        };
+        log::error!(target: "gitpulsed", "refusing --relay startup: {code_reason}");
+        let _ = write_remote_approval_state(
+            config_dir,
+            &RemoteApprovalState::ReleasedToNative {
+                reason: code_reason,
+                updated_at_ms: now_unix_ms(),
+            },
+        );
+        return EXIT_CODE_FREE_OR_DISABLED;
+    }
 
     let lock_dir = config_dir.join("gitpulsed");
     let _relay_lock = match acquire_relay_lock(&lock_dir, env!("CARGO_PKG_VERSION")) {
@@ -102,17 +127,7 @@ pub fn run_relay_mode(
         }
     };
 
-    let keychain_status = probe_keychain_status(&effective.keychain_access_group);
-    if !keychain_status.is_unlocked() {
-        let _ = write_remote_approval_state(
-            config_dir,
-            &RemoteApprovalState::ReleasedToNative {
-                reason: "keychain_locked".into(),
-                updated_at_ms: now_unix_ms(),
-            },
-        );
-    }
-
+    let keychain_status = trust.keychain_status();
     let discovery = discover_trusted_repositories(&effective.workspace_roots);
     let report = RelayStartupReport {
         mode: "relay",
@@ -121,13 +136,9 @@ pub fn run_relay_mode(
         org_id: effective.org_id.clone(),
         trusted_repos: discovery.trusted.len(),
         skipped_untrusted_repos: discovery.skipped_untrusted.len(),
-        keychain_status: keychain_status.clone(),
+        keychain_status,
         pty_input_entitled: effective.pty_input_entitled,
-        status: if keychain_status.is_unlocked() {
-            "ready".into()
-        } else {
-            "keychain_locked".into()
-        },
+        status: "ready".into(),
     };
 
     if let Ok(line) = serde_json::to_string(&report) {
@@ -138,8 +149,6 @@ pub fn run_relay_mode(
         return 0;
     }
 
-    // Long-lived relay loop: wait cleanly for shutdown signal while keeping the
-    // single-owner lock held and re-checking keychain/config state cleanly.
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

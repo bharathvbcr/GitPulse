@@ -1,52 +1,50 @@
 //! `pty.input` RCE gate and read-only lossy PTY streaming buffer (Opus P0-7 / R7).
 //!
+//! All P-256 step-up signature, certificate, and mandatory revocation checks
+//! delegate strictly to `gitpulse-protocol` (zero local crypto duplication).
+//!
 //! # Security Model (Opus P0-7)
 //!
 //! Writing bytes to a live PTY is remote code execution. Therefore:
 //! 1. **Read-only PTY streaming is the default** (`LossyPtyStreamBuffer`, `<= 16 KiB`
 //!    chunk cap, lossy drop-oldest so a slow mobile link never stalls `gitpulse-ptyd`).
 //! 2. **`pty.input` is gated behind a separate entitlement and is OFF by default.**
-//! 3. Even when entitled, every `pty.input` write MUST present:
+//! 3. Even when entitled, every `pty.input` authorization MUST present:
 //!    - an active, in-memory, Desktop-granted, time-boxed [`PtyInputConsentToken`]
 //!      bound to `(session_id, mobile_device_id)` (never read from an agent-writable file);
-//!    - a fresh mobile hardware **P-256** step-up signature verified against the
-//!      device's `DeviceCertificate`-verified approval key (chained to the Keychain-pinned
-//!      Account `IdentityKey` and checked against a non-stale [`RevocationCache`]);
+//!    - a fresh mobile hardware **P-256** [`SignedApprovalDecision`] verified via
+//!      `gitpulse_protocol::crypto::verify_approval_decision` against the
+//!      Keychain-pinned Account `IdentityKey` and mandatory non-stale [`RevocationCache`];
 //!    - an unspent nonce and valid payload digest (`<= 16 KiB`).
-//! 4. Every attempt (both allowed and denied) is appended to [`PtyAuditLog`]
-//!    with its SHA-256 digest and outcome (never logging raw keystrokes).
+//! 4. Every attempt (both allowed and denied) is appended to [`PtyAuditEntry`]
+//!    log with its SHA-256 digest and outcome (never logging raw keystrokes).
 //!
 //! # Accepted Residual Risk (Opus Review Board #23)
 //!
 //! Within an active Desktop-granted, time-boxed consent window (after initial
-//! biometric step-up authorization), individual interactive keystrokes are not
-//! required to prompt biometrics per keystroke. Consent tokens remain strictly
-//! bounded in time (`<= 15m`), session-scoped, device-scoped, revocable
-//! immediately by Desktop, and audited.
+//! biometric step-up authorization), individual interactive keystrokes are
+//! authenticated by the Noise `IK` tunnel and audited rather than prompting
+//! biometrics per keystroke. Consent tokens remain strictly bounded in time
+//! (`<= 15m`), session-scoped, device-scoped, and revocable immediately by Desktop.
 
 use crate::remote::config::RemoteApprovalPolicy;
-use crate::remote::revocations::{DeviceCertificate, RevocationCache};
+use crate::remote::revocations::RevocationCache;
 use base64::Engine as _;
-use p256::ecdsa::signature::Verifier as P256Verifier;
-use p256::ecdsa::Signature as P256Signature;
+use gitpulse_protocol::canonical::hex_encode;
+use gitpulse_protocol::crypto::verify_approval_decision;
+use gitpulse_protocol::wire::{
+    ApprovalDecisionKind, DeviceCertificate, SignedApprovalDecision, MAX_PTY_FRAME_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-/// Maximum PTY stream chunk / `pty.input` payload size (`16 KiB`, Opus R7).
-pub const MAX_PTY_FRAME_BYTES: usize = 16 * 1024;
+/// Re-exported `<= 16 KiB` PTY chunk ceiling from `gitpulse-protocol`.
+pub const MAX_PTY_CHUNK_BYTES: usize = MAX_PTY_FRAME_BYTES;
 
 /// Maximum time-box for a Desktop-granted `pty.input` consent token (15 min).
 pub const MAX_PTY_CONSENT_TTL_SECS: i64 = 15 * 60;
-
-/// Maximum clock skew accepted on step-up P-256 `pty.input` requests.
-const STEP_UP_SKEW_SECS: i64 = 60;
-
-/// Maximum validity window for a single signed `pty.input` step-up request (60s).
-const MAX_STEP_UP_WINDOW_SECS: i64 = 60;
-
-const PTY_INPUT_SIGNING_DOMAIN: &[u8] = b"gitpulse-pty-input/v1\0";
 
 /// Lossy drop-oldest buffer for read-only mobile PTY streaming (`<= 16 KiB` per chunk).
 ///
@@ -76,7 +74,7 @@ impl LossyPtyStreamBuffer {
         if data.is_empty() {
             return;
         }
-        for slice in data.chunks(MAX_PTY_FRAME_BYTES) {
+        for slice in data.chunks(MAX_PTY_CHUNK_BYTES) {
             if self.queue.len() >= self.max_chunks {
                 if let Some(evicted) = self.queue.pop_front() {
                     self.dropped_chunks += 1;
@@ -109,7 +107,7 @@ impl LossyPtyStreamBuffer {
 }
 
 /// In-memory Desktop-granted, time-boxed consent token authorizing one mobile
-/// device to send step-up-signed `pty.input` to one specific terminal session.
+/// device to send step-up-authorized `pty.input` to one specific terminal session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtyInputConsentToken {
     pub token_id: String,
@@ -119,45 +117,17 @@ pub struct PtyInputConsentToken {
     pub expires_at: i64,
 }
 
-/// Mobile request to inject keystrokes into a PTY session.
+/// Mobile request to inject keystrokes into a PTY session, carrying a hardware
+/// P-256 [`SignedApprovalDecision`] (`ticket_id == consent_token_id`,
+/// `input_sha256 == sha256(payload)`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedPtyInputRequest {
-    pub host_id: String,
     pub session_id: String,
     pub consent_token_id: String,
     /// Base64-encoded raw bytes to write (`<= 16 KiB` decoded).
     pub payload_b64: String,
-    /// Lowercase hex SHA-256 of the decoded payload bytes.
-    pub payload_sha256: String,
-    /// Unique per-request nonce (replay rejected).
-    pub nonce: String,
-    pub issued_at: i64,
-    pub expires_at: i64,
-    pub device_id: String,
-    /// Base64-encoded ASN.1 DER P-256 ECDSA signature from mobile hardware key.
-    pub sig_p256_der_b64: String,
-}
-
-impl SignedPtyInputRequest {
-    /// Canonical domain-separated bytes signed by the mobile device's hardware
-    /// P-256 approval key (step-up auth).
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256);
-        out.extend_from_slice(PTY_INPUT_SIGNING_DOMAIN);
-        let canonical = format!(
-            "host_id={}\nsession_id={}\nconsent_token_id={}\npayload_sha256={}\nnonce={}\nissued_at={}\nexpires_at={}\ndevice_id={}\n",
-            self.host_id,
-            self.session_id,
-            self.consent_token_id,
-            self.payload_sha256,
-            self.nonce,
-            self.issued_at,
-            self.expires_at,
-            self.device_id,
-        );
-        out.extend_from_slice(canonical.as_bytes());
-        out
-    }
+    /// Hardware P-256 step-up authorization verified via `gitpulse-protocol`.
+    pub step_up: SignedApprovalDecision,
 }
 
 /// Why a `pty.input` request was refused.
@@ -166,7 +136,6 @@ impl SignedPtyInputRequest {
 pub enum PtyGateDenial {
     EntitlementDisabled,
     EnterprisePolicyDenied,
-    HostMismatch,
     ConsentMissing,
     ConsentExpired,
     ConsentSessionMismatch,
@@ -174,11 +143,9 @@ pub enum PtyGateDenial {
     PayloadInvalidBase64,
     PayloadEmpty,
     PayloadTooLarge,
-    PayloadHashMismatch,
-    NonceMissingOrReplayed,
-    RequestExpiredOrFuture,
-    DeviceCertOrRevocationFailed(String),
-    StepUpSignatureInvalid,
+    StepUpMustAllowOnce,
+    NonceReplayed,
+    ProtocolVerificationFailed(String),
 }
 
 impl std::fmt::Display for PtyGateDenial {
@@ -190,7 +157,6 @@ impl std::fmt::Display for PtyGateDenial {
             PtyGateDenial::EnterprisePolicyDenied => {
                 write!(f, "enterprise policy forbids remote pty.input")
             }
-            PtyGateDenial::HostMismatch => write!(f, "pty.input host_id mismatch"),
             PtyGateDenial::ConsentMissing => {
                 write!(f, "no active Desktop-granted pty.input consent token")
             }
@@ -204,22 +170,16 @@ impl std::fmt::Display for PtyGateDenial {
             PtyGateDenial::PayloadInvalidBase64 => write!(f, "payload_b64 is invalid base64"),
             PtyGateDenial::PayloadEmpty => write!(f, "pty.input payload is empty"),
             PtyGateDenial::PayloadTooLarge => {
-                write!(f, "pty.input payload exceeds {MAX_PTY_FRAME_BYTES} bytes")
+                write!(f, "pty.input payload exceeds {MAX_PTY_CHUNK_BYTES} bytes")
             }
-            PtyGateDenial::PayloadHashMismatch => {
-                write!(f, "payload_sha256 does not match decoded payload bytes")
+            PtyGateDenial::StepUpMustAllowOnce => {
+                write!(f, "pty.input step-up decision must be allow_once")
             }
-            PtyGateDenial::NonceMissingOrReplayed => {
-                write!(f, "pty.input step-up nonce is missing or already used")
+            PtyGateDenial::NonceReplayed => {
+                write!(f, "pty.input step-up nonce already used")
             }
-            PtyGateDenial::RequestExpiredOrFuture => {
-                write!(f, "pty.input step-up request timestamp is expired or invalid")
-            }
-            PtyGateDenial::DeviceCertOrRevocationFailed(reason) => {
-                write!(f, "device certificate or revocation check failed: {reason}")
-            }
-            PtyGateDenial::StepUpSignatureInvalid => {
-                write!(f, "mobile P-256 step-up signature verification failed")
+            PtyGateDenial::ProtocolVerificationFailed(reason) => {
+                write!(f, "gitpulse-protocol verification failed: {reason}")
             }
         }
     }
@@ -253,8 +213,6 @@ pub struct PtyInputGate {
 }
 
 impl PtyInputGate {
-    /// Constructs a new gate. `pty_input_entitled` defaults to `false` via
-    /// [`Self::default_readonly`].
     pub fn new(
         host_id: impl Into<String>,
         pty_input_entitled: bool,
@@ -280,7 +238,7 @@ impl PtyInputGate {
     }
 
     /// Grants an in-memory, time-boxed Desktop consent token for one session and
-    /// one mobile device. Refuses if `pty_input` entitlement is off or TTL is invalid.
+    /// one mobile device. Refuses if `pty_input` entitlement is off.
     pub fn grant_desktop_consent(
         &self,
         session_id: impl Into<String>,
@@ -297,7 +255,7 @@ impl PtyInputGate {
         let clamped_ttl = ttl_secs.clamp(1, MAX_PTY_CONSENT_TTL_SECS);
         let mut raw_id = [0u8; 16];
         let _ = getrandom::fill(&mut raw_id);
-        let token_id = format!("ptyc_{}", hex_lower(&raw_id));
+        let token_id = format!("ptyc_{}", hex_encode(&raw_id));
         let token = PtyInputConsentToken {
             token_id: token_id.clone(),
             session_id: session_id.into(),
@@ -321,9 +279,9 @@ impl PtyInputGate {
             .is_some()
     }
 
-    /// Validates a mobile `pty.input` request against all Opus P0-7 gates,
-    /// records an audit entry regardless of outcome, and returns the verified
-    /// raw payload bytes only if every check passes.
+    /// Validates a mobile `pty.input` request against all Opus P0-7 gates via
+    /// `gitpulse-protocol`, records an audit entry regardless of outcome, and
+    /// returns the verified raw payload bytes only if every check passes.
     pub fn authorize_input(
         &self,
         req: &SignedPtyInputRequest,
@@ -341,11 +299,11 @@ impl PtyInputGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(PtyAuditEntry {
                 timestamp_secs: now_secs,
-                host_id: req.host_id.clone(),
+                host_id: self.host_id.clone(),
                 session_id: req.session_id.clone(),
-                device_id: req.device_id.clone(),
+                device_id: req.step_up.device_id.clone(),
                 consent_token_id: req.consent_token_id.clone(),
-                payload_sha256: req.payload_sha256.clone(),
+                payload_sha256: req.step_up.input_sha256.clone(),
                 payload_bytes,
                 allowed,
                 denial_reason,
@@ -366,9 +324,6 @@ impl PtyInputGate {
         if self.enterprise_policy == RemoteApprovalPolicy::Deny {
             return Err(PtyGateDenial::EnterprisePolicyDenied);
         }
-        if req.host_id != self.host_id {
-            return Err(PtyGateDenial::HostMismatch);
-        }
 
         // 1. Validate Desktop-granted, in-memory, time-boxed consent token.
         let consent = {
@@ -387,69 +342,57 @@ impl PtyInputGate {
         if consent.session_id != req.session_id {
             return Err(PtyGateDenial::ConsentSessionMismatch);
         }
-        if consent.mobile_device_id != req.device_id || device_cert.device_id != req.device_id {
+        if consent.mobile_device_id != req.step_up.device_id
+            || device_cert.device_id != req.step_up.device_id
+        {
             return Err(PtyGateDenial::ConsentDeviceMismatch);
         }
 
-        // 2. Validate payload bytes & digest.
+        // 2. Decode & bound payload bytes, computing exact SHA-256 binding.
         let payload = base64::engine::general_purpose::STANDARD
             .decode(req.payload_b64.trim())
             .map_err(|_| PtyGateDenial::PayloadInvalidBase64)?;
         if payload.is_empty() {
             return Err(PtyGateDenial::PayloadEmpty);
         }
-        if payload.len() > MAX_PTY_FRAME_BYTES {
+        if payload.len() > MAX_PTY_CHUNK_BYTES {
             return Err(PtyGateDenial::PayloadTooLarge);
         }
-        let computed_hash = sha256_hex(&payload);
-        if computed_hash != req.payload_sha256.to_ascii_lowercase() {
-            return Err(PtyGateDenial::PayloadHashMismatch);
+        let payload_sha256 = sha256_hex(&payload);
+
+        // 3. Delegate cert + mandatory RevocationPolicy::Enforced + P-256 DER
+        //    signature verification strictly to `gitpulse-protocol`!
+        let policy = revocations
+            .enforced_policy(now_secs)
+            .map_err(|e| PtyGateDenial::ProtocolVerificationFailed(e.to_string()))?;
+        let kind = verify_approval_decision(
+            &req.step_up,
+            device_cert,
+            revocations.identity_pub_ed25519(),
+            &self.host_id,
+            &req.consent_token_id,
+            &payload_sha256,
+            policy,
+            now_secs,
+        )
+        .map_err(|e| PtyGateDenial::ProtocolVerificationFailed(e.to_string()))?;
+
+        if kind != ApprovalDecisionKind::AllowOnce {
+            return Err(PtyGateDenial::StepUpMustAllowOnce);
         }
 
-        // 3. Validate fresh timestamp window and single-use nonce.
-        if req.nonce.trim().is_empty() || req.nonce.len() > 128 {
-            return Err(PtyGateDenial::NonceMissingOrReplayed);
-        }
-        if req.issued_at > now_secs + STEP_UP_SKEW_SECS
-            || req.expires_at <= req.issued_at
-            || req.expires_at - req.issued_at > MAX_STEP_UP_WINDOW_SECS
-            || now_secs >= req.expires_at
-        {
-            return Err(PtyGateDenial::RequestExpiredOrFuture);
-        }
-
-        // 4. Verify device certificate against Keychain-pinned IdentityKey & fresh revocation list.
-        let verified_device = revocations
-            .verify_device_certificate(device_cert, now_secs)
-            .map_err(|e| PtyGateDenial::DeviceCertOrRevocationFailed(e.to_string()))?;
-
-        // 5. Verify mobile hardware P-256 step-up signature.
-        let approval_key = verified_device
-            .require_approval_key()
-            .map_err(|e| PtyGateDenial::DeviceCertOrRevocationFailed(e.to_string()))?;
-        let sig_der = base64::engine::general_purpose::STANDARD
-            .decode(req.sig_p256_der_b64.trim())
-            .map_err(|_| PtyGateDenial::StepUpSignatureInvalid)?;
-        let signature = P256Signature::from_der(&sig_der)
-            .map_err(|_| PtyGateDenial::StepUpSignatureInvalid)?;
-        approval_key
-            .verify(&req.signing_bytes(), &signature)
-            .map_err(|_| PtyGateDenial::StepUpSignatureInvalid)?;
-
-        // 6. Commit nonce after signature succeeds so unauthenticated junk cannot
-        //    fill the replay table.
+        // 4. Commit nonce only after P-256 signature succeeds.
         let mut nonces = self
             .used_nonces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !nonces.insert(req.nonce.clone()) {
-            return Err(PtyGateDenial::NonceMissingOrReplayed);
+        if !nonces.insert(req.step_up.nonce.clone()) {
+            return Err(PtyGateDenial::NonceReplayed);
         }
 
         Ok(payload)
     }
 
-    /// Returns a snapshot of all recorded audit entries.
     pub fn audit_entries(&self) -> Vec<PtyAuditEntry> {
         self.audit_log
             .lock()
@@ -461,15 +404,5 @@ impl PtyInputGate {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    hex_lower(&h.finalize())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+    hex_encode(&h.finalize())
 }

@@ -15,7 +15,8 @@
 //!   3. GitPulse never mutates Codex's trust store.
 
 use crate::remote::pty_gate::sha256_hex;
-use crate::remote::tunnel::ApprovalDecisionKind;
+use gitpulse_protocol::canonical::canonical_json_string;
+use gitpulse_protocol::wire::ApprovalDecisionKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -606,8 +607,12 @@ fn parse_approval_request(rpc_id: Value, method: String, params: Value) -> Codex
         .or_else(|| params.get("reason").and_then(Value::as_str))
         .unwrap_or(&method)
         .to_string();
-    let canonical_bytes = canonicalize_json(&params);
-    let input_sha256 = sha256_hex(canonical_bytes.as_bytes());
+    let canonical_bytes = canonical_json_string(&params).unwrap_or_default();
+    let input_sha256 = if canonical_bytes.is_empty() {
+        String::new()
+    } else {
+        sha256_hex(canonical_bytes.as_bytes())
+    };
 
     CodexApprovalRequest {
         rpc_id,
@@ -639,38 +644,4 @@ fn extract_id(value: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
-}
-
-/// Deterministic canonical JSON serializer (sorted object keys) so mobile and
-/// host compute identical `input_sha256` digests.
-pub fn canonicalize_json(value: &Value) -> String {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = String::from("{");
-            for (idx, k) in keys.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(k).unwrap_or_else(|_| "\"\"".into()));
-                out.push(':');
-                out.push_str(&canonicalize_json(&map[*k]));
-            }
-            out.push('}');
-            out
-        }
-        Value::Array(items) => {
-            let mut out = String::from("[");
-            for (idx, item) in items.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                out.push_str(&canonicalize_json(item));
-            }
-            out.push(']');
-            out
-        }
-        other => serde_json::to_string(other).unwrap_or_else(|_| "null".into()),
-    }
 }

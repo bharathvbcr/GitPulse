@@ -1,41 +1,46 @@
-//! IdentityKey-signed revocation list cache, short-lived `DeviceCertificate` v2
-//! verification, and Keychain-backed trust anchors (Opus R3, board #15, and
-//! protocol contract #18).
+//! Host revocation list cache and OS Keychain-backed trust anchors
+//! (Opus R3, board #15, and board #31).
 //!
-//! # Security Invariant (Opus Board #15)
+//! All certificate, revocation-list, and signature verification delegates
+//! strictly to the single audited `gitpulse-protocol` crate (zero local
+//! crypto reimplementation).
 //!
-//! Because agents run as the same UID as GitPulse, an agent-writable `0600`
-//! file MUST NEVER be trusted as the root of trust for the Account
-//! `IdentityKey` or paired mobile P-256 approval keys. All trust anchors are
-//! loaded exclusively via [`TrustAnchorProvider`] (Data Protection Keychain
-//! Access Group on macOS, Secret Service on Linux, or in-memory test doubles).
+//! # Security Invariant (Opus Board #15 & #31)
 //!
-//! # Fail-Closed Staleness (Opus R3)
-//!
-//! If the host has no verified [`SignedRevocationList`], or if the cached list
-//! is expired or older than `stale_ttl`, [`RevocationCache::should_bypass_remote_holds`]
-//! returns `true` and [`RevocationCache::verify_device_certificate`] fails closed.
+//! Agents run as the same UID as GitPulse, so an agent-writable `0600` file
+//! MUST NEVER be trusted as the root of trust for the Account `IdentityKey` or
+//! paired mobile P-256 approval keys.
+//! - Production (`run_relay_mode`) uses [`PlatformTrustAnchor`] backed by the
+//!   macOS Data Protection Keychain Access Group (`SecItemCopyMatching` with
+//!   `kSecUseDataProtectionKeychain = kCFBooleanTrue` + `kSecAttrAccessGroup`,
+//!   preceded by a non-blocking `<1ms` lock check) or Linux Secret Service.
+//! - If no real platform trust anchor is provisioned or the Keychain is locked,
+//!   [`PlatformTrustAnchor`] fails closed (`TrustAnchorError::Unavailable` /
+//!   `KeychainLocked`) and `gitpulsed --relay` refuses with exit code `4`.
+//! - [`InMemoryTrustAnchor`] is strictly `#[cfg(test)]`-only.
 
-use crate::remote::config::KeychainStatus;
-use base64::Engine as _;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use p256::ecdsa::VerifyingKey as P256VerifyingKey;
-use serde::{Deserialize, Serialize};
+use crate::remote::config::{probe_keychain_status, KeychainStatus};
+pub use gitpulse_protocol::crypto::{
+    issue_device_certificate, issue_revocation_list, verify_device_certificate,
+    verify_revocation_list, RevocationPolicy,
+};
+pub use gitpulse_protocol::wire::{DeviceCertificate, DeviceKind, SignedRevocationList};
+use gitpulse_protocol::ProtocolError;
 use std::collections::HashSet;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// Maximum lifetime of a `DeviceCertificate` (30 days, Opus R3 / P0-6).
-pub const MAX_DEVICE_CERT_TTL_SECS: i64 = 30 * 24 * 3600;
-
 /// Default staleness ceiling for the host's cached revocation list (15 minutes).
 pub const DEFAULT_REVOCATION_STALE_TTL: Duration = Duration::from_secs(15 * 60);
 
-const CLOCK_SKEW_SECS: i64 = 300;
-/// Exact domain prefix from protocol contract #18.
-const REVOCATION_DOMAIN: &[u8] = b"gitpulse-protocol/v1/revocation-list\0";
-/// Exact domain prefix from protocol contract #18.
-const DEVICE_CERT_V2_DOMAIN: &[u8] = b"gitpulse-protocol/v2/device-cert\0";
+/// Keychain service identifier for GitPulse remote-control trust anchors.
+pub const TRUST_ANCHOR_SERVICE: &str = "com.gitpulse.desktop.remote-trust";
+/// Keychain account name storing the 32-byte pinned Account IdentityKey Ed25519 pubkey.
+pub const IDENTITY_PUB_ACCOUNT: &str = "account-identity-ed25519-pub";
+/// Keychain account name storing the 32-byte host device Ed25519 signing seed.
+pub const HOST_ED25519_SEED_ACCOUNT: &str = "host-device-ed25519-seed";
+/// Keychain account name storing the 32-byte host static X25519 Noise IK secret.
+pub const HOST_NOISE_X25519_ACCOUNT: &str = "host-noise-static-x25519";
 
 /// Errors produced when loading trust anchors from the platform Keychain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +54,7 @@ impl std::fmt::Display for TrustAnchorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrustAnchorError::KeychainLocked(msg) => write!(f, "keychain_locked: {msg}"),
-            TrustAnchorError::Unavailable(msg) => write!(f, "trust anchor unavailable: {msg}"),
+            TrustAnchorError::Unavailable(msg) => write!(f, "trust_anchor_unavailable: {msg}"),
             TrustAnchorError::InvalidKeyMaterial(msg) => write!(f, "invalid key material: {msg}"),
         }
     }
@@ -57,8 +62,8 @@ impl std::fmt::Display for TrustAnchorError {
 
 impl std::error::Error for TrustAnchorError {}
 
-/// Source of pinned trust anchors and host secrets (Keychain-backed in
-/// production; never an agent-writable `0600` file).
+/// Source of pinned trust anchors and host secrets (OS Keychain / Secret
+/// Service in production; never an agent-writable `0600` file).
 pub trait TrustAnchorProvider: Send + Sync {
     /// Non-blocking Keychain status check.
     fn keychain_status(&self) -> KeychainStatus;
@@ -69,10 +74,285 @@ pub trait TrustAnchorProvider: Send + Sync {
     fn host_device_ed25519_seed(&self) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError>;
     /// This host device's static X25519 secret key (32 bytes) for Noise `IK`.
     fn host_noise_static_x25519(&self) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError>;
+
+    /// Verifies that every required trust anchor and host secret is present and
+    /// readable without prompting. Fails closed on locked/missing anchors.
+    fn verify_ready(&self) -> Result<(), TrustAnchorError> {
+        match self.keychain_status() {
+            KeychainStatus::Unlocked { .. } => {}
+            KeychainStatus::KeychainLocked { reason } => {
+                return Err(TrustAnchorError::KeychainLocked(reason));
+            }
+            KeychainStatus::Unavailable { reason } => {
+                return Err(TrustAnchorError::Unavailable(reason));
+            }
+        }
+        let _ = self.pinned_identity_key_ed25519()?;
+        let _ = self.host_device_ed25519_seed()?;
+        let _ = self.host_noise_static_x25519()?;
+        Ok(())
+    }
 }
 
-/// In-memory trust anchor provider (for unit/integration tests and in-memory
-/// key handoff over authenticated control plane).
+/// Production OS-backed trust anchor provider.
+///
+/// - On macOS: queries the Data Protection Keychain (`kSecUseDataProtectionKeychain`)
+///   scoped to `access_group` via Security.framework `SecItemCopyMatching`,
+///   after a non-blocking `<1ms` lock check (`probe_keychain_status`). Never
+///   reads keys from an agent-writable `0600` file and never prompts.
+/// - On Linux / other platforms: fails closed with `trust_anchor_unavailable`
+///   unless backed by an OS Secret Service integration.
+#[derive(Debug, Clone)]
+pub struct PlatformTrustAnchor {
+    access_group: String,
+    service: String,
+}
+
+impl PlatformTrustAnchor {
+    pub fn new(access_group: impl Into<String>) -> Self {
+        Self {
+            access_group: access_group.into(),
+            service: TRUST_ANCHOR_SERVICE.to_string(),
+        }
+    }
+
+    pub fn access_group(&self) -> &str {
+        &self.access_group
+    }
+
+    fn read_fixed_32(&self, account: &str) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError> {
+        match self.keychain_status() {
+            KeychainStatus::Unlocked { .. } => {}
+            KeychainStatus::KeychainLocked { reason } => {
+                return Err(TrustAnchorError::KeychainLocked(reason));
+            }
+            KeychainStatus::Unavailable { reason } => {
+                return Err(TrustAnchorError::Unavailable(reason));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            macos_data_protection::read_item_32(&self.access_group, &self.service, account)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = account;
+            Err(TrustAnchorError::Unavailable(
+                "OS Secret Service trust anchor is not provisioned on this platform".into(),
+            ))
+        }
+    }
+}
+
+impl TrustAnchorProvider for PlatformTrustAnchor {
+    fn keychain_status(&self) -> KeychainStatus {
+        probe_keychain_status(&self.access_group)
+    }
+
+    fn pinned_identity_key_ed25519(&self) -> Result<[u8; 32], TrustAnchorError> {
+        let bytes = self.read_fixed_32(IDENTITY_PUB_ACCOUNT)?;
+        Ok(*bytes)
+    }
+
+    fn host_device_ed25519_seed(&self) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError> {
+        self.read_fixed_32(HOST_ED25519_SEED_ACCOUNT)
+    }
+
+    fn host_noise_static_x25519(&self) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError> {
+        self.read_fixed_32(HOST_NOISE_X25519_ACCOUNT)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_data_protection {
+    use super::TrustAnchorError;
+    use std::ffi::c_void;
+    use zeroize::Zeroizing;
+
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFDataRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type CFBooleanRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    type CFIndex = i64;
+    type OSStatus = i32;
+
+    const ERR_SEC_SUCCESS: OSStatus = 0;
+    const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: OSStatus = -25308;
+    const ERR_SEC_MISSING_ENTITLEMENT: OSStatus = -34018;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecAttrAccessGroup: CFStringRef;
+        static kSecUseDataProtectionKeychain: CFStringRef;
+        static kSecReturnData: CFStringRef;
+        static kSecMatchLimit: CFStringRef;
+        static kSecMatchLimitOne: CFStringRef;
+        fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: CFBooleanRef;
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        fn CFStringCreateWithBytes(
+            alloc: CFAllocatorRef,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFStringRef;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        fn CFDataGetLength(the_data: CFDataRef) -> CFIndex;
+        fn CFDataGetBytePtr(the_data: CFDataRef) -> *const u8;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    struct CfGuard(CFTypeRef);
+    impl Drop for CfGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is a valid owned CoreFoundation object.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn cf_string(s: &str) -> Result<CfGuard, TrustAnchorError> {
+        // SAFETY: `s.as_ptr()` is valid UTF-8 for `s.len()` bytes.
+        let ptr = unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        };
+        if ptr.is_null() {
+            return Err(TrustAnchorError::Unavailable(
+                "CFStringCreateWithBytes returned null".into(),
+            ));
+        }
+        Ok(CfGuard(ptr))
+    }
+
+    /// Reads a 32-byte key from the macOS Data Protection Keychain Access Group
+    /// via `SecItemCopyMatching` without ever prompting the user.
+    pub(super) fn read_item_32(
+        access_group: &str,
+        service: &str,
+        account: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, TrustAnchorError> {
+        let cf_service = cf_string(service)?;
+        let cf_account = cf_string(account)?;
+        let cf_group = cf_string(access_group)?;
+
+        // SAFETY: Security.framework and CoreFoundation extern statics are valid
+        // constant CFTypeRefs for the lifetime of the process.
+        let (keys, values) = unsafe {
+            (
+                [
+                    kSecClass as CFTypeRef,
+                    kSecAttrService as CFTypeRef,
+                    kSecAttrAccount as CFTypeRef,
+                    kSecAttrAccessGroup as CFTypeRef,
+                    kSecUseDataProtectionKeychain as CFTypeRef,
+                    kSecReturnData as CFTypeRef,
+                    kSecMatchLimit as CFTypeRef,
+                ],
+                [
+                    kSecClassGenericPassword as CFTypeRef,
+                    cf_service.0,
+                    cf_account.0,
+                    cf_group.0,
+                    kCFBooleanTrue as CFTypeRef,
+                    kCFBooleanTrue as CFTypeRef,
+                    kSecMatchLimitOne as CFTypeRef,
+                ],
+            )
+        };
+
+        // SAFETY: `keys` and `values` have identical length (7) and remain alive
+        // throughout `CFDictionaryCreate`.
+        let dict_ptr = unsafe {
+            CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                keys.len() as CFIndex,
+                &kCFTypeDictionaryKeyCallBacks as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const c_void,
+            )
+        };
+        if dict_ptr.is_null() {
+            return Err(TrustAnchorError::Unavailable(
+                "CFDictionaryCreate returned null".into(),
+            ));
+        }
+        let _dict = CfGuard(dict_ptr);
+
+        let mut out: CFTypeRef = std::ptr::null();
+        // SAFETY: `dict_ptr` is a valid CFDictionaryRef and `out` is a valid out-pointer.
+        let status = unsafe { SecItemCopyMatching(dict_ptr, &mut out) };
+        let _out_guard = CfGuard(out);
+
+        match status {
+            ERR_SEC_SUCCESS => {
+                if out.is_null() {
+                    return Err(TrustAnchorError::Unavailable(format!(
+                        "Keychain item '{account}' returned empty data"
+                    )));
+                }
+                // SAFETY: `kSecReturnData = true` guarantees `out` is a CFDataRef on success.
+                let len = unsafe { CFDataGetLength(out as CFDataRef) };
+                if len != 32 {
+                    return Err(TrustAnchorError::InvalidKeyMaterial(format!(
+                        "Keychain item '{account}' expected 32 bytes, got {len}"
+                    )));
+                }
+                // SAFETY: `len == 32`, non-null CFDataRef kept alive by `_out_guard`.
+                let slice = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(out as CFDataRef), 32) };
+                let mut key = Zeroizing::new([0u8; 32]);
+                key.copy_from_slice(slice);
+                Ok(key)
+            }
+            ERR_SEC_INTERACTION_NOT_ALLOWED => Err(TrustAnchorError::KeychainLocked(format!(
+                "Data Protection Keychain locked for '{account}' (OSStatus {status})"
+            ))),
+            ERR_SEC_ITEM_NOT_FOUND => Err(TrustAnchorError::Unavailable(format!(
+                "Keychain trust anchor '{account}' not provisioned in access group '{access_group}'"
+            ))),
+            ERR_SEC_MISSING_ENTITLEMENT => Err(TrustAnchorError::Unavailable(format!(
+                "Data Protection Keychain entitlement missing for access group '{access_group}' (OSStatus {status})"
+            ))),
+            other => Err(TrustAnchorError::Unavailable(format!(
+                "Data Protection Keychain lookup for '{account}' failed (OSStatus {other})"
+            ))),
+        }
+    }
+}
+
+/// Test-only in-memory trust anchor provider.
+///
+/// Strictly `#[cfg(test)]` so production binaries can NEVER silently run on an
+/// in-memory or file-loaded trust anchor (Opus board #15 & #31).
+#[cfg(test)]
 #[derive(Clone)]
 pub struct InMemoryTrustAnchor {
     pub status: KeychainStatus,
@@ -81,6 +361,7 @@ pub struct InMemoryTrustAnchor {
     pub host_noise_static_x25519: Zeroizing<[u8; 32]>,
 }
 
+#[cfg(test)]
 impl InMemoryTrustAnchor {
     pub fn unlocked(
         identity_pub_ed25519: [u8; 32],
@@ -109,6 +390,7 @@ impl InMemoryTrustAnchor {
     }
 }
 
+#[cfg(test)]
 impl TrustAnchorProvider for InMemoryTrustAnchor {
     fn keychain_status(&self) -> KeychainStatus {
         self.status.clone()
@@ -151,259 +433,14 @@ impl TrustAnchorProvider for InMemoryTrustAnchor {
     }
 }
 
-/// Device kind matching protocol contract #18 (`desktop` = 1, `mobile` = 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeviceKind {
-    Desktop,
-    Mobile,
-}
-
-impl DeviceKind {
-    fn wire_tag(self) -> u8 {
-        match self {
-            DeviceKind::Desktop => 1,
-            DeviceKind::Mobile => 2,
-        }
-    }
-}
-
-/// Short-lived IdentityKey-signed `DeviceCertificate` v2 matching protocol
-/// contract #18 byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceCertificate {
-    pub version: u8,
-    pub device_id: String,
-    pub kind: DeviceKind,
-    #[serde(default)]
-    pub name: String,
-    pub ed25519_pub_b64: String,
-    pub x25519_pub_b64: String,
-    /// Optional SEC1-encoded P-256 public key (33B compressed or 65B uncompressed)
-    /// held in Secure Enclave / StrongBox; required for mobile approval signing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_pub_p256_b64: Option<String>,
-    pub created_at: i64,
-    pub expires_at: i64,
-    pub identity_sig_b64: String,
-}
-
-impl DeviceCertificate {
-    /// Exact binary preimage from protocol contract #18:
-    /// `b"gitpulse-protocol/v2/device-cert\0" || version(u8=2) || u16BE+device_id ||
-    /// kind(1=desktop,2=mobile) || u16BE+name || ed25519_pub(32B) || x25519_pub(32B) ||
-    /// (0u8 | 1u8 || u16BE+sec1_p256_pub) || created_at(i64 BE) || expires_at(i64 BE)`
-    pub fn signing_bytes(&self) -> Result<Vec<u8>, RevocationError> {
-        let ed25519_pub = decode_fixed_32(&self.ed25519_pub_b64, "ed25519_pub_b64")?;
-        let x25519_pub = decode_fixed_32(&self.x25519_pub_b64, "x25519_pub_b64")?;
-        let p256_opt = match &self.approval_pub_p256_b64 {
-            Some(b64) => Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(b64.trim())
-                    .map_err(|e| {
-                        RevocationError::InvalidCertificateField(format!(
-                            "approval_pub_p256_b64: {e}"
-                        ))
-                    })?,
-            ),
-            None => None,
-        };
-
-        let mut out = Vec::with_capacity(256);
-        out.extend_from_slice(DEVICE_CERT_V2_DOMAIN);
-        out.push(self.version);
-        put_u16_str(&mut out, &self.device_id, "device_id")?;
-        out.push(self.kind.wire_tag());
-        put_u16_str(&mut out, &self.name, "name")?;
-        out.extend_from_slice(&ed25519_pub);
-        out.extend_from_slice(&x25519_pub);
-        match p256_opt {
-            None => out.push(0u8),
-            Some(bytes) => {
-                let len = u16::try_from(bytes.len()).map_err(|_| {
-                    RevocationError::InvalidCertificateField("approval_pub_p256 too long".into())
-                })?;
-                out.push(1u8);
-                out.extend_from_slice(&len.to_be_bytes());
-                out.extend_from_slice(&bytes);
-            }
-        }
-        out.extend_from_slice(&self.created_at.to_be_bytes());
-        out.extend_from_slice(&self.expires_at.to_be_bytes());
-        Ok(out)
-    }
-
-    /// Issues and signs a `DeviceCertificate` v2 under the Account `IdentityKey`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn issue(
-        identity_signing_key: &SigningKey,
-        device_id: impl Into<String>,
-        kind: DeviceKind,
-        ed25519_pub: &[u8; 32],
-        x25519_pub: &[u8; 32],
-        approval_pub_p256_sec1: Option<&[u8]>,
-        name: impl Into<String>,
-        created_at: i64,
-        expires_at: i64,
-    ) -> Self {
-        let mut cert = Self {
-            version: 2,
-            device_id: device_id.into(),
-            kind,
-            name: name.into(),
-            ed25519_pub_b64: base64::engine::general_purpose::STANDARD.encode(ed25519_pub),
-            x25519_pub_b64: base64::engine::general_purpose::STANDARD.encode(x25519_pub),
-            approval_pub_p256_b64: approval_pub_p256_sec1
-                .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
-            created_at,
-            expires_at,
-            identity_sig_b64: String::new(),
-        };
-        let preimage = cert.signing_bytes().expect("valid issued certificate fields");
-        let sig = identity_signing_key.sign(&preimage);
-        cert.identity_sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        cert
-    }
-}
-
-/// Verified key material extracted from a non-revoked, non-expired
-/// `DeviceCertificate` v2.
-#[derive(Debug, Clone)]
-pub struct VerifiedDevice {
-    pub device_id: String,
-    pub kind: DeviceKind,
-    pub ed25519_pub: [u8; 32],
-    pub x25519_pub: [u8; 32],
-    pub approval_verifying_key: Option<P256VerifyingKey>,
-    pub expires_at: i64,
-}
-
-impl VerifiedDevice {
-    /// Returns the mobile hardware P-256 approval verifying key, failing closed
-    /// if the certificate did not enroll one.
-    pub fn require_approval_key(&self) -> Result<&P256VerifyingKey, RevocationError> {
-        self.approval_verifying_key.as_ref().ok_or_else(|| {
-            RevocationError::InvalidCertificateField(
-                "certificate has no enrolled hardware P-256 approval key".into(),
-            )
-        })
-    }
-}
-
-/// IdentityKey-signed, monotonically versioned revocation list matching
-/// protocol contract #18 byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedRevocationList {
-    pub version: u64,
-    pub issued_at: i64,
-    pub expires_at: i64,
-    pub revoked_device_ids: Vec<String>,
-    pub identity_sig_b64: String,
-}
-
-impl SignedRevocationList {
-    /// Exact binary preimage from protocol contract #18:
-    /// `b"gitpulse-protocol/v1/revocation-list\0" || version(u64 BE) ||
-    /// issued_at(i64 BE) || expires_at(i64 BE) || count(u32 BE) ||
-    /// for each id in revoked_device_ids (sorted unique): len(u16 BE) || utf8(id)`
-    pub fn signing_bytes(&self) -> Result<Vec<u8>, RevocationError> {
-        let mut sorted = self.revoked_device_ids.clone();
-        sorted.sort();
-        sorted.dedup();
-        let count = u32::try_from(sorted.len()).map_err(|_| {
-            RevocationError::InvalidCertificateField("revoked_device_ids count overflow".into())
-        })?;
-        let mut out = Vec::with_capacity(REVOCATION_DOMAIN.len() + 32 + sorted.len() * 24);
-        out.extend_from_slice(REVOCATION_DOMAIN);
-        out.extend_from_slice(&self.version.to_be_bytes());
-        out.extend_from_slice(&self.issued_at.to_be_bytes());
-        out.extend_from_slice(&self.expires_at.to_be_bytes());
-        out.extend_from_slice(&count.to_be_bytes());
-        for id in &sorted {
-            put_u16_str(&mut out, id, "revoked_device_id")?;
-        }
-        Ok(out)
-    }
-
-    pub fn sign(
-        identity_signing_key: &SigningKey,
-        version: u64,
-        issued_at: i64,
-        expires_at: i64,
-        mut revoked_device_ids: Vec<String>,
-    ) -> Self {
-        revoked_device_ids.sort();
-        revoked_device_ids.dedup();
-        let mut list = Self {
-            version,
-            issued_at,
-            expires_at,
-            revoked_device_ids,
-            identity_sig_b64: String::new(),
-        };
-        let preimage = list.signing_bytes().expect("valid revocation list fields");
-        let sig = identity_signing_key.sign(&preimage);
-        list.identity_sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        list
-    }
-}
-
-/// Failure modes for revocation list updates and certificate verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RevocationError {
-    InvalidIdentityKey(String),
-    InvalidSignature(String),
-    RollbackRejected { current: u64, incoming: u64 },
-    RevocationListExpired,
-    RevocationListFutureDated,
-    RevocationListStale,
-    DeviceRevoked(String),
-    CertificateExpired,
-    CertificateLifetimeExceeded,
-    CertificateFutureDated,
-    InvalidCertificateField(String),
-}
-
-impl std::fmt::Display for RevocationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RevocationError::InvalidIdentityKey(m) => write!(f, "invalid identity key: {m}"),
-            RevocationError::InvalidSignature(m) => write!(f, "invalid signature: {m}"),
-            RevocationError::RollbackRejected { current, incoming } => write!(
-                f,
-                "revocation list rollback rejected (current version {current} > incoming {incoming})"
-            ),
-            RevocationError::RevocationListExpired => write!(f, "revocation list is expired"),
-            RevocationError::RevocationListFutureDated => {
-                write!(f, "revocation list issued_at is in the future")
-            }
-            RevocationError::RevocationListStale => {
-                write!(f, "revocation list is missing or stale past TTL; failing closed")
-            }
-            RevocationError::DeviceRevoked(id) => write!(f, "device '{id}' is revoked"),
-            RevocationError::CertificateExpired => write!(f, "device certificate is expired"),
-            RevocationError::CertificateLifetimeExceeded => {
-                write!(f, "device certificate exceeds 30-day maximum lifetime")
-            }
-            RevocationError::CertificateFutureDated => {
-                write!(f, "device certificate created_at is in the future")
-            }
-            RevocationError::InvalidCertificateField(m) => {
-                write!(f, "invalid device certificate field: {m}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RevocationError {}
-
-/// Host-side cache for the IdentityKey-signed revocation list (Opus R3).
+/// Host-side cache for the Account IdentityKey-signed [`SignedRevocationList`]
+/// (Opus R3). Delegates all cryptographic verification to `gitpulse-protocol`.
 #[derive(Debug, Clone)]
 pub struct RevocationCache {
-    identity_key: VerifyingKey,
+    identity_pub_ed25519: [u8; 32],
     stale_ttl: Duration,
+    current_list: Option<SignedRevocationList>,
     current_version: u64,
-    list_expires_at: Option<i64>,
     last_refreshed_at: Option<i64>,
     revoked_ids: HashSet<String>,
 }
@@ -417,68 +454,57 @@ impl RevocationCache {
         stale_ttl: Duration,
     ) -> Result<Self, TrustAnchorError> {
         let pub_bytes = provider.pinned_identity_key_ed25519()?;
-        Self::new(pub_bytes, stale_ttl)
-            .map_err(|e| TrustAnchorError::InvalidKeyMaterial(e.to_string()))
+        Ok(Self::new(pub_bytes, stale_ttl))
     }
 
-    pub fn new(
-        identity_pub_ed25519: [u8; 32],
-        stale_ttl: Duration,
-    ) -> Result<Self, RevocationError> {
-        let identity_key = VerifyingKey::from_bytes(&identity_pub_ed25519)
-            .map_err(|e| RevocationError::InvalidIdentityKey(e.to_string()))?;
-        Ok(Self {
-            identity_key,
+    pub fn new(identity_pub_ed25519: [u8; 32], stale_ttl: Duration) -> Self {
+        Self {
+            identity_pub_ed25519,
             stale_ttl,
+            current_list: None,
             current_version: 0,
-            list_expires_at: None,
             last_refreshed_at: None,
             revoked_ids: HashSet::new(),
-        })
+        }
+    }
+
+    pub fn identity_pub_ed25519(&self) -> &[u8; 32] {
+        &self.identity_pub_ed25519
     }
 
     pub fn current_version(&self) -> u64 {
         self.current_version
     }
 
-    /// Ingests a freshly fetched [`SignedRevocationList`], enforcing strict
-    /// Ed25519 verification (`verify_strict`), monotonic version progression,
-    /// and validity bounds.
+    /// Ingests a freshly fetched [`SignedRevocationList`] via
+    /// `gitpulse_protocol::crypto::verify_revocation_list`, enforcing strict
+    /// Ed25519 verification, monotonic version progression, and expiry bounds.
     pub fn update(
         &mut self,
-        list: &SignedRevocationList,
+        list: SignedRevocationList,
         now_secs: i64,
-    ) -> Result<(), RevocationError> {
-        if self.last_refreshed_at.is_some() && list.version < self.current_version {
-            return Err(RevocationError::RollbackRejected {
-                current: self.current_version,
-                incoming: list.version,
-            });
-        }
-        if list.issued_at > now_secs + CLOCK_SKEW_SECS {
-            return Err(RevocationError::RevocationListFutureDated);
-        }
-        if list.expires_at <= list.issued_at || now_secs >= list.expires_at {
-            return Err(RevocationError::RevocationListExpired);
-        }
-        let preimage = list.signing_bytes()?;
-        verify_ed25519_strict_b64(&self.identity_key, &preimage, &list.identity_sig_b64)?;
+    ) -> Result<(), ProtocolError> {
+        let min_version = if self.last_refreshed_at.is_some() {
+            self.current_version
+        } else {
+            0
+        };
+        verify_revocation_list(&list, &self.identity_pub_ed25519, min_version, now_secs)?;
 
         self.current_version = list.version;
-        self.list_expires_at = Some(list.expires_at);
-        self.last_refreshed_at = Some(now_secs);
         self.revoked_ids = list.revoked_device_ids.iter().cloned().collect();
+        self.current_list = Some(list);
+        self.last_refreshed_at = Some(now_secs);
         Ok(())
     }
 
     /// Returns `true` when no valid list has been loaded, the list is expired,
     /// or `stale_ttl` has elapsed since the last verified refresh.
     pub fn is_stale(&self, now_secs: i64) -> bool {
-        let (Some(refreshed), Some(expires_at)) = (self.last_refreshed_at, self.list_expires_at)
-        else {
+        let (Some(refreshed), Some(list)) = (self.last_refreshed_at, &self.current_list) else {
             return true;
         };
-        if now_secs >= expires_at {
+        if now_secs >= list.expires_at {
             return true;
         }
         let age = now_secs.saturating_sub(refreshed);
@@ -495,102 +521,32 @@ impl RevocationCache {
         self.revoked_ids.contains(device_id)
     }
 
-    /// Verifies a `DeviceCertificate` v2 against the pinned Account `IdentityKey`,
-    /// the 30-day max TTL, current clock, and the non-stale revocation cache.
+    /// Produces a mandatory [`RevocationPolicy::Enforced`] for `gitpulse-protocol`
+    /// verifiers. Fails closed with [`ProtocolError::Expired`] whenever the
+    /// cache is missing or stale past TTL.
+    pub fn enforced_policy(&self, now_secs: i64) -> Result<RevocationPolicy<'_>, ProtocolError> {
+        if self.is_stale(now_secs) {
+            return Err(ProtocolError::Expired(
+                "revocation list missing or stale past TTL; failing closed".into(),
+            ));
+        }
+        let list = self.current_list.as_ref().ok_or_else(|| {
+            ProtocolError::Expired("revocation list not loaded; failing closed".into())
+        })?;
+        Ok(RevocationPolicy::Enforced {
+            list,
+            min_version: self.current_version,
+        })
+    }
+
+    /// Verifies a `DeviceCertificate` v2 through `gitpulse_protocol::crypto::verify_device_certificate`
+    /// using our mandatory non-stale [`RevocationPolicy::Enforced`].
     pub fn verify_device_certificate(
         &self,
         cert: &DeviceCertificate,
         now_secs: i64,
-    ) -> Result<VerifiedDevice, RevocationError> {
-        if self.is_stale(now_secs) {
-            return Err(RevocationError::RevocationListStale);
-        }
-        if cert.version != 2 {
-            return Err(RevocationError::InvalidCertificateField(format!(
-                "unsupported certificate version {}",
-                cert.version
-            )));
-        }
-        if cert.device_id.trim().is_empty() || cert.device_id.len() > 64 {
-            return Err(RevocationError::InvalidCertificateField("device_id".into()));
-        }
-        if self.is_revoked(&cert.device_id) {
-            return Err(RevocationError::DeviceRevoked(cert.device_id.clone()));
-        }
-        if cert.created_at > now_secs + CLOCK_SKEW_SECS {
-            return Err(RevocationError::CertificateFutureDated);
-        }
-        if cert.expires_at <= cert.created_at || now_secs >= cert.expires_at {
-            return Err(RevocationError::CertificateExpired);
-        }
-        if cert.expires_at - cert.created_at > MAX_DEVICE_CERT_TTL_SECS {
-            return Err(RevocationError::CertificateLifetimeExceeded);
-        }
-
-        let preimage = cert.signing_bytes()?;
-        verify_ed25519_strict_b64(&self.identity_key, &preimage, &cert.identity_sig_b64)?;
-
-        let ed25519_pub = decode_fixed_32(&cert.ed25519_pub_b64, "ed25519_pub_b64")?;
-        VerifyingKey::from_bytes(&ed25519_pub)
-            .map_err(|e| RevocationError::InvalidCertificateField(format!("ed25519_pub: {e}")))?;
-
-        let x25519_pub = decode_fixed_32(&cert.x25519_pub_b64, "x25519_pub_b64")?;
-
-        let approval_verifying_key = match &cert.approval_pub_p256_b64 {
-            Some(b64) => {
-                let p256_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(b64.trim())
-                    .map_err(|e| {
-                        RevocationError::InvalidCertificateField(format!(
-                            "approval_pub_p256_b64: {e}"
-                        ))
-                    })?;
-                Some(P256VerifyingKey::from_sec1_bytes(&p256_bytes).map_err(|e| {
-                    RevocationError::InvalidCertificateField(format!("approval_pub_p256: {e}"))
-                })?)
-            }
-            None => None,
-        };
-
-        Ok(VerifiedDevice {
-            device_id: cert.device_id.clone(),
-            kind: cert.kind,
-            ed25519_pub,
-            x25519_pub,
-            approval_verifying_key,
-            expires_at: cert.expires_at,
-        })
+    ) -> Result<(), ProtocolError> {
+        let policy = self.enforced_policy(now_secs)?;
+        verify_device_certificate(cert, &self.identity_pub_ed25519, policy, now_secs)
     }
-}
-
-fn verify_ed25519_strict_b64(
-    key: &VerifyingKey,
-    payload: &[u8],
-    sig_b64: &str,
-) -> Result<(), RevocationError> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(sig_b64.trim())
-        .map_err(|e| RevocationError::InvalidSignature(format!("base64 decode: {e}")))?;
-    let arr: [u8; 64] = raw
-        .try_into()
-        .map_err(|_| RevocationError::InvalidSignature("signature must be 64 bytes".into()))?;
-    let sig = Signature::from_bytes(&arr);
-    key.verify_strict(payload, &sig)
-        .map_err(|_| RevocationError::InvalidSignature("Ed25519 strict verification failed".into()))
-}
-
-fn decode_fixed_32(b64: &str, field: &str) -> Result<[u8; 32], RevocationError> {
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|e| RevocationError::InvalidCertificateField(format!("{field}: {e}")))?;
-    raw.try_into()
-        .map_err(|_| RevocationError::InvalidCertificateField(format!("{field} must be 32 bytes")))
-}
-
-fn put_u16_str(out: &mut Vec<u8>, text: &str, field: &str) -> Result<(), RevocationError> {
-    let len = u16::try_from(text.len())
-        .map_err(|_| RevocationError::InvalidCertificateField(format!("{field} too long")))?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(text.as_bytes());
-    Ok(())
 }
