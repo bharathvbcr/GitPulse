@@ -631,6 +631,13 @@ impl Mailbox {
     fn prune_sessions(&self, now: SystemTime) {
         for name in self.session_names() {
             let dir = self.root.join(&name);
+            // Under the session's lock, like every other path that removes a message and its
+            // sidecar: unlocked, the sidecar removal here could delete one a concurrent deposit
+            // of the same request id had just written for its new message. No path takes a
+            // session lock and then the root lock, so root -> session cannot deadlock.
+            let Ok(_session_lock) = self.lock_session(&name) else {
+                continue;
+            };
             self.expire_session(&name, &dir, now);
             let empty = std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none());
             let old = std::fs::metadata(&dir)
@@ -964,7 +971,7 @@ impl Mailbox {
                     }
                 }
             }
-            if !rename_to_claimed(&dir, &name)? {
+            if !rename_to_claimed(&dir, &name, now)? {
                 continue;
             }
             let claimed = format!("c-{}", &name[2..]);
@@ -1144,7 +1151,7 @@ impl Mailbox {
         for (name, _) in regular_files(&dir) {
             if let Some(('p', _, id)) = parse_message_name(&name) {
                 if id == request_id {
-                    return rename_to_claimed(&dir, &name);
+                    return rename_to_claimed(&dir, &name, now);
                 }
             }
         }
@@ -1496,12 +1503,40 @@ impl Mailbox {
 
 /// Renames one pending `p-*` file to its `c-*` name. `Ok(false)` means the file
 /// was no longer there: another consumer took it first, or it expired.
-fn rename_to_claimed(dir: &Path, pending_name: &str) -> Result<bool, MailboxError> {
+///
+/// A rename keeps the file's modification time, which is when the message was deposited, and
+/// [`CLAIMED_TTL`] is measured from it. A message that sat pending for most of its window
+/// would lose its claimed copy almost at once, and an idempotent retry of its request id would
+/// then deliver it a second time. So the claimed file is restamped with the claim time.
+fn rename_to_claimed(
+    dir: &Path,
+    pending_name: &str,
+    now: SystemTime,
+) -> Result<bool, MailboxError> {
     let claimed = format!("c-{}", &pending_name[2..]);
-    match crate::fs_entry::rename_noreplace(&dir.join(pending_name), &dir.join(claimed)) {
-        Ok(()) => Ok(true),
+    let claimed_path = dir.join(claimed);
+    match crate::fs_entry::rename_noreplace(&dir.join(pending_name), &claimed_path) {
+        Ok(()) => {
+            restamp(&claimed_path, now);
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(io("could not claim a message", &e)),
+    }
+}
+
+/// Sets a claimed file's modification time to the claim time. Best effort: failing leaves the
+/// deposit time, which only shortens how long a retry is recognised.
+fn restamp(path: &Path, at: SystemTime) {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Err(error) = options.open(path).and_then(|file| file.set_modified(at)) {
+        log::warn!(target: "mailbox", "could not restamp a claimed message: {error}");
     }
 }
 
@@ -1560,6 +1595,7 @@ where
             Err(e) => return Err(io("could not look at the session's mailbox", &e)),
         }
         let _session_lock = mailbox.lock_session(&key)?;
+        let now = SystemTime::now();
         let mut won = Vec::new();
         for item in items {
             let unchanged = mailbox
@@ -1568,7 +1604,7 @@ where
             if !unchanged {
                 continue;
             }
-            match rename_to_claimed(&dir, &item.file) {
+            match rename_to_claimed(&dir, &item.file, now) {
                 Ok(true) => won.push((item.envelope, item.built)),
                 Ok(false) => {}
                 Err(error) if won.is_empty() => return Err(error),

@@ -1314,3 +1314,128 @@ fn a_claimed_overflow_notice_is_reissued_by_the_next_overflow() {
         "the recipient was never told about the second overflow"
     );
 }
+
+fn hop_filter(prov: &EnvelopeProvenance) -> bool {
+    !matches!(prov, EnvelopeProvenance::PeerAgent { hop, max_hops, .. } if *hop >= *max_hops)
+}
+
+#[test]
+fn two_waiters_on_one_session_leave_a_hop_limited_peer_message_pending_and_split_the_rest() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    // The acceptable message is the older one, so both waiters can reach it; the hop-limited
+    // one behind it must survive whichever waiter wins.
+    mailbox
+        .deposit(SESSION, "fine", "an acceptable message", now)
+        .unwrap();
+    mailbox
+        .deposit_with_provenance(
+            SESSION,
+            "at-limit",
+            "peer at its hop limit",
+            peer_provenance("at-limit", 6, 6),
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes: Vec<EnvelopeWait> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    mailbox
+                        .wait_in_pool_filtered(
+                            SESSION,
+                            Duration::from_secs(3),
+                            WaitPool::Hosted,
+                            hop_filter,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let delivered: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            EnvelopeWait::Message(env) => Some(env.claim.request_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["fine"], "outcomes: {outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|o| matches!(o, EnvelopeWait::Declined(_))),
+        "the other waiter is told the hop-limited message is paused: {outcomes:?}"
+    );
+    assert_eq!(mailbox.status(SESSION, "at-limit"), Delivery::Pending);
+    assert_eq!(mailbox.status(SESSION, "fine"), Delivery::Claimed);
+}
+
+#[test]
+fn pruning_waits_for_a_sessions_lock_before_removing_its_message_and_sidecar() {
+    let (_dir, mailbox) = mailbox();
+    let other = session_n(7);
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "reused", "first life", now)
+        .unwrap();
+    let late = now + PENDING_TTL + Duration::from_secs(60);
+    // A deposit of the same request id holds the session's lock while it publishes.
+    let held = mailbox
+        .lock_session(&session_key(SESSION).unwrap())
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            mailbox.ensure_session(&other, late).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "pruning finished while a deposit held the session's lock"
+        );
+        assert_eq!(
+            mailbox.status(SESSION, "reused"),
+            Delivery::Pending,
+            "pruning removed an expired message without the session's lock"
+        );
+        drop(held);
+        done_rx.recv().unwrap();
+    });
+    assert_eq!(mailbox.status(SESSION, "reused"), Delivery::Absent);
+}
+
+#[test]
+fn a_claimed_file_keeps_its_window_from_the_claim_and_a_retry_does_not_redeliver() {
+    let (_dir, mailbox) = mailbox();
+    let now = SystemTime::now();
+    mailbox
+        .deposit(SESSION, "slow", "pending for a long time", now)
+        .unwrap();
+    // Claimed with a minute of its pending window left.
+    let claimed_at = now + PENDING_TTL - Duration::from_secs(60);
+    let taken = mailbox.claim_next(SESSION, claimed_at).unwrap();
+    assert!(taken.is_some());
+    // Almost the whole claimed window later the claimed file is still there.
+    let retry_at = claimed_at + CLAIMED_TTL - Duration::from_secs(60);
+    assert_eq!(
+        mailbox
+            .deposit(SESSION, "slow", "pending for a long time", retry_at)
+            .map(|d| d.duplicate),
+        Ok(true),
+        "the retry was not recognised as a duplicate of the claimed message"
+    );
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Claimed);
+    assert_eq!(
+        mailbox.claim_next(SESSION, retry_at).unwrap(),
+        None,
+        "a retried request id was delivered a second time"
+    );
+    // And it is forgotten once the window counted from the claim has passed.
+    let after = claimed_at + CLAIMED_TTL + Duration::from_secs(60);
+    assert_eq!(mailbox.claim_next(SESSION, after).unwrap(), None);
+    assert_eq!(mailbox.status(SESSION, "slow"), Delivery::Absent);
+}
