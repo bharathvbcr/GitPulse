@@ -652,8 +652,20 @@ pub(crate) mod diskio {
     /// How long the rate is averaged over, so a legitimate burst (a fixture
     /// repository, a build of a cache) is not mistaken for a runaway.
     pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(30);
-    /// Bytes one test process may write in total.
-    pub(crate) const MAX_TOTAL_WRITES: u64 = 8 * 1024 * 1024 * 1024;
+    /// Bytes one test process may write in total. The process is the whole
+    /// lib suite (one binary, every test, `--test-threads=1` in CI), so this
+    /// bounds the suite, not one test. 8 GiB stopped holding on 2026-11-23:
+    /// the Ubuntu lib suite aborted at 8196 MiB in `workbench::` (run
+    /// 45266451066) and the coverage suite at 8193 and 8203 MiB in `mcp::` and
+    /// `terminal::` (runs 45268885253, 45270424352), every one a healthy run
+    /// stopped by the cap, never by the rate limit. Run whole as one process
+    /// with this guard off, that suite wrote 9485 MiB, and its 8644 tests
+    /// measured alone (`scripts/test-disk-writes.mjs`) sum to 9623 MiB: no
+    /// test leaves a writer behind, the suite grew. Scaled from where each run
+    /// crossed 8 GiB, the coverage suite writes about 10.2 GiB. 16 GiB is
+    /// about 1.6x that, and still aborts long before a runaway like the
+    /// 549.8 GiB one above.
+    pub(crate) const MAX_TOTAL_WRITES: u64 = 16 * 1024 * 1024 * 1024;
     const SAMPLE_EVERY: Duration = Duration::from_millis(500);
     /// `0` disables the watchdog, for a run that is meant to write. Any other
     /// number replaces both limits with that many MiB (total) and MiB/s (rate),
