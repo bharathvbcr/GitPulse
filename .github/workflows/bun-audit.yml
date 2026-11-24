@@ -70,7 +70,7 @@ jobs:
       # Fetches the RustSec database on every run, so the scheduled run is
       # never judged against a stale copy.
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: src-tauri/Cargo.toml
           command: check
