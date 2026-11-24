@@ -159,6 +159,15 @@ export interface PlaneProbe {
   skipReason: "" | "deadline" | "cap";
 }
 
+/** One live subagent reported under a session via hook `subagent` + `agent_id`. */
+export interface PlaneSubagent {
+  agentId: string;
+  state: string;
+  event: string | null;
+  detail: string | null;
+  changedMs: number | null;
+}
+
 export interface PlaneTerminal {
   key: string;
   repoPath: string;
@@ -171,6 +180,10 @@ export interface PlaneTerminal {
   /** Unknown is null. It is not the repository root. */
   cwd: string | null;
   attention: "needs-you" | "error" | "signalled" | "finished" | null;
+  /** Live hook-reported subagents tracked under this session (`HubSessionState.active_subagents`). */
+  activeSubagents?: readonly PlaneSubagent[];
+  /** Explicit turn-idle flag (`HubSessionState.fully_idle`). */
+  fullyIdle?: boolean | null;
 }
 
 export interface PlaneTask {
@@ -219,6 +232,8 @@ export interface AgentRollup {
   attention: AttentionReason[];
   /** Descendants whose attention nothing observes (a process the table shows, with no terminal here). */
   unobserved: number;
+  /** Hook-reported active subagents owned by this row and its descendants. */
+  subagents: number;
 }
 
 export interface AgentRow {
@@ -263,6 +278,10 @@ export interface AgentRow {
   dirtyKnown: boolean;
   liveKey: string | null;
   taskRunId: string | null;
+  /** Hook-reported active subagents owned by this session (`HubSessionState.active_subagents`). */
+  activeSubagents: PlaneSubagent[];
+  /** Explicit turn-idle flag (`HubSessionState.fully_idle`). */
+  fullyIdle: boolean | null;
   /**
    * Top-level agent processes the process table shows in this row's checkout
    * with no GitPulse launch behind them (no `tree`): an agent started outside
@@ -342,6 +361,8 @@ interface Draft {
   runRole: "attempt" | "continuation" | null;
   /** The draft this one nests under. Set after the attempts are folded. */
   parent: Draft | null;
+  activeSubagents: PlaneSubagent[];
+  fullyIdle: boolean | null;
 }
 
 /** One repository, however many of its checkouts were probed. */
@@ -573,6 +594,16 @@ function attach(draft: Draft, terminal: PlaneTerminal): void {
     draft.runRole = "continuation";
   }
   for (const reason of terminalReasons(terminal)) draft.attention.add(reason);
+  draft.fullyIdle = typeof terminal.fullyIdle === "boolean" ? terminal.fullyIdle : null;
+  draft.activeSubagents = (terminal.activeSubagents ?? [])
+    .filter((sub) => Boolean(sub.agentId?.trim()))
+    .map((sub) => ({
+      agentId: clean(sub.agentId, 96),
+      state: clean(sub.state || "working", 32),
+      event: sub.event ? clean(sub.event, 64) : null,
+      detail: sub.detail ? clean(sub.detail, 240) : null,
+      changedMs: typeof sub.changedMs === "number" && Number.isFinite(sub.changedMs) ? sub.changedMs : null,
+    }));
   const title = clean(terminal.title || terminal.label, 80);
   if (title && draft.session === draft.kind) draft.session = title;
   else if (title && !draft.session) draft.session = title;
@@ -602,6 +633,8 @@ function fromCheckout(family: Family, item: WorktreeSummary, collisions: Set<str
     sessionId: null,
     runRole: null,
     parent: null,
+    activeSubagents: [],
+    fullyIdle: null,
   };
 }
 
@@ -640,6 +673,8 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
     sessionId: null,
     runRole: null,
     parent: null,
+    activeSubagents: [],
+    fullyIdle: null,
   };
 }
 
@@ -689,6 +724,8 @@ function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: Pa
     sessionId: null,
     runRole: null,
     parent: null,
+    activeSubagents: [],
+    fullyIdle: null,
   };
 }
 
@@ -697,7 +734,7 @@ function completeRead(snapshot: InsightsSnapshot): boolean {
   return snapshot.agents.ok && !snapshot.agents.truncated && !snapshot.worktrees.truncated;
 }
 
-const EMPTY_ROLLUP: AgentRollup = Object.freeze({ descendants: 0, live: 0, attention: [] as AttentionReason[], unobserved: 0 });
+const EMPTY_ROLLUP: AgentRollup = Object.freeze({ descendants: 0, live: 0, attention: [] as AttentionReason[], unobserved: 0, subagents: 0 });
 
 /** Most urgent first, then by repository, kind and name: the order rows and a row's children are shown in. */
 function compareRows(a: AgentRow, b: AgentRow): number {
@@ -880,6 +917,8 @@ function childSessionRow(id: string, process: LiveProcess, above: AgentRow): Age
     dirtyKnown: false,
     liveKey: null,
     taskRunId: null,
+    activeSubagents: [],
+    fullyIdle: null,
     outsideSessions: 0,
   };
 }
@@ -894,16 +933,25 @@ function settleRollups(row: AgentRow): AgentRollup {
   let descendants = 0;
   let live = 0;
   let unobserved = 0;
+  let subagents = row.activeSubagents.length;
   const reasons = new Set<AttentionReason>();
+  for (const sub of row.activeSubagents) {
+    if (sub.state === "blocked") {
+      reasons.add(sub.event === "error" ? "error" : "needs-you");
+    }
+  }
   for (const child of row.children) {
     const below = settleRollups(child);
     descendants += 1 + below.descendants;
     live += (child.presence === "live" ? 1 : 0) + below.live;
     unobserved += (child.attentionObserved ? 0 : 1) + below.unobserved;
+    subagents += below.subagents;
     for (const reason of child.attention) if (asks(reason)) reasons.add(reason);
     for (const reason of below.attention) reasons.add(reason);
   }
-  row.rollup = descendants === 0 ? EMPTY_ROLLUP : { descendants, live, attention: orderReasons(reasons), unobserved };
+  row.rollup = descendants === 0 && subagents === 0
+    ? EMPTY_ROLLUP
+    : { descendants, live, attention: orderReasons(reasons), unobserved, subagents };
   return row.rollup;
 }
 
@@ -1074,7 +1122,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       continue;
     }
     const draft: Draft = host
-      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null, sessionId: null, runRole: null, parent: null }
+      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null, sessionId: null, runRole: null, parent: null, activeSubagents: [], fullyIdle: null }
       : fromTerminal(terminal, cwd, places, paths);
     attach(draft, terminal);
     // A second process in a checkout is its own row, not a rewrite of the first.
@@ -1221,6 +1269,8 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       dirtyKnown: draft.dirtyKnown,
       liveKey: draft.liveKey,
       taskRunId: draft.taskRunId,
+      activeSubagents: draft.activeSubagents,
+      fullyIdle: draft.fullyIdle,
       outsideSessions: 0,
     };
     finished.push(row);
@@ -1360,13 +1410,16 @@ export function flattenAgentTree(roots: readonly AgentRow[], collapsed: Readonly
  * changed by what is under it; these say the rest.
  */
 export function rollupSummary(row: AgentRow): { presence: string; attention: string } {
-  const { descendants, live, attention, unobserved } = row.rollup;
-  if (descendants === 0) return { presence: "", attention: "" };
+  const { descendants, live, attention, unobserved, subagents } = row.rollup;
+  if (descendants === 0 && subagents === 0) return { presence: "", attention: "" };
+  const presenceParts: string[] = [];
+  if (descendants > 0) presenceParts.push(`${live} of ${plural(descendants, "nested row", "nested rows")} live`);
+  if (subagents > 0) presenceParts.push(plural(subagents, "active subagent", "active subagents"));
   const parts: string[] = [];
   if (attention.length > 0) parts.push(`Under it: ${attentionText(attention)}`);
   if (unobserved > 0) parts.push(`${unobserved} not observed`);
   return {
-    presence: `${live} of ${plural(descendants, "nested row", "nested rows")} live`,
+    presence: presenceParts.join(" · "),
     attention: parts.join(" · "),
   };
 }

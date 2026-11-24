@@ -30,6 +30,11 @@
             "command": "gitpulse-hook notify permission_request",
             "timeout": 5,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "gitpulse-hook permission-bridge",
+            "timeout": 1800
           }
         ]
       }

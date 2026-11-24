@@ -8,6 +8,7 @@ import {
   liveAgentCount,
   planeHeadline,
   projectAgentPlane,
+  rollupSummary,
   terminalInScope,
   type PlaneProbe,
   type PlaneTask,
@@ -516,5 +517,32 @@ describe("filters and the headline", () => {
       ],
     });
     expect(planeHeadline(plane, 0)).toContain("2 repositories not read");
+  });
+
+  it("projects hook-reported activeSubagents onto rows and rolls up blocked subagents", () => {
+    const plane = project({
+      terminals: [
+        terminal({
+          key: "t-swarm",
+          sessionId: "s-swarm",
+          cwd: "/repo/.claude/worktrees/alpha",
+          fullyIdle: false,
+          activeSubagents: [
+            { agentId: "sub-1", state: "working", event: "tool_finished", detail: "cargo check", changedMs: 100 },
+            { agentId: "sub-2", state: "blocked", event: "permission_request", detail: "Bash: rm -rf", changedMs: 200 },
+          ],
+        }),
+      ],
+    });
+    expect(plane.rows).toHaveLength(1);
+    const row = plane.rows[0];
+    expect(row.activeSubagents).toHaveLength(2);
+    expect(row.fullyIdle).toBe(false);
+    expect(row.rollup.subagents).toBe(2);
+    expect(row.rollup.attention).toEqual(["needs-you"]);
+    expect(rollupSummary(row)).toEqual({
+      presence: "2 active subagents",
+      attention: "Under it: Needs you",
+    });
   });
 });

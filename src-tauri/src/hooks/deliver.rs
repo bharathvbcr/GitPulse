@@ -147,7 +147,23 @@ fn trusted_bus_root(repo_root: Option<&Path>, recorded: &str) -> Option<std::pat
 /// [`acknowledge_read`], done once the text is actually going out.
 pub(crate) fn render_message(envelope: &ClaimedEnvelope, repo_root: Option<&Path>) -> String {
     match &envelope.provenance {
-        EnvelopeProvenance::HumanConfirmed => human_reminder(&envelope.claim.text),
+        EnvelopeProvenance::HumanConfirmed if envelope.human_verified => {
+            human_reminder(&envelope.claim.text)
+        }
+        EnvelopeProvenance::HumanConfirmed => {
+            // Defense in depth (Opus P0-3): never emit human_reminder unless
+            // the envelope passed control-plane issuance verification.
+            format_peer_xml(
+                &envelope.claim.request_id,
+                "unverified-local-mailbox",
+                "unknown",
+                "",
+                "",
+                0,
+                1,
+                &envelope.claim.text,
+            )
+        }
         EnvelopeProvenance::PeerAgent {
             msg_id,
             from_peer,

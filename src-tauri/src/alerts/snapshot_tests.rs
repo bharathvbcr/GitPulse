@@ -233,6 +233,8 @@ fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
             state: "blocked".into(),
             event: Some("permission_request".into()),
             changed_ms: 1000,
+            active_subagents: Vec::new(),
+            fully_idle: None,
         }],
     };
     write_state_snapshot_atomic(&path, &snap).unwrap();
@@ -340,4 +342,85 @@ fn worker_writes_initial_snapshot_debounced_updates_and_removes_on_exit() {
     drop(tx);
     handle.join().unwrap();
     assert!(!path.exists(), "clean worker shutdown removes snapshot");
+}
+
+#[test]
+fn hub_session_state_projects_subagents_and_fully_idle_with_backward_compatible_serde() {
+    // Legacy JSON without `active_subagents` / `fully_idle` still deserializes cleanly.
+    let legacy_json = r#"{
+        "key": "term-legacy",
+        "state": "working",
+        "changed_ms": 500
+    }"#;
+    let parsed: HubSessionState = serde_json::from_str(legacy_json).unwrap();
+    assert!(parsed.active_subagents.is_empty());
+    assert_eq!(parsed.fully_idle, None);
+    let reencoded = serde_json::to_string(&parsed).unwrap();
+    assert!(
+        !reencoded.contains("active_subagents"),
+        "empty active_subagents must skip_serializing_if empty: {reencoded}"
+    );
+    assert!(!reencoded.contains("fully_idle"));
+
+    let mut tracked: HashMap<String, Tracked> = HashMap::new();
+    let counters = Counters::default();
+    let t0 = Instant::now();
+
+    let mut parent = hook_notice("term-swarm", Some("prompt_submitted"), Some("sid-s"), Some("/repo"));
+    parent.fully_idle = Some(false);
+    let _ = admit_at(parent, t0, 1_000, &mut tracked, &counters);
+
+    // Non-blocking subagent reports track under `active_subagents` without clobbering parent state.
+    let mut sub_a = hook_notice("term-swarm", Some("tool_finished"), None, None);
+    sub_a.subagent = true;
+    sub_a.agent_id = Some("sub-alpha".into());
+    sub_a.detail = Some("running tests".into());
+    let _ = admit_at(sub_a, t0 + Duration::from_secs(1), 2_000, &mut tracked, &counters);
+
+    let mut sub_b = hook_notice("term-swarm", Some("permission_request"), None, None);
+    sub_b.subagent = true;
+    sub_b.agent_id = Some("sub-beta".into());
+    sub_b.detail = Some("Bash: cargo build".into());
+    let _ = admit_at(sub_b, t0 + Duration::from_secs(2), 3_000, &mut tracked, &counters);
+
+    let snap = snapshot_of(&tracked, 42, 100, 3_500);
+    assert_eq!(snap.sessions.len(), 1);
+    let session = &snap.sessions[0];
+    assert_eq!(session.fully_idle, Some(false));
+    assert_eq!(session.active_subagents.len(), 2);
+    assert_eq!(session.active_subagents[0].agent_id, "sub-alpha");
+    assert_eq!(session.active_subagents[0].state, "working");
+    assert_eq!(session.active_subagents[1].agent_id, "sub-beta");
+    assert_eq!(session.active_subagents[1].state, "blocked");
+    assert_eq!(
+        session.active_subagents[1].detail.as_deref(),
+        Some("Bash: cargo build")
+    );
+
+    // Subagent ending removes only that subagent; parent fully_idle updates to true.
+    let mut sub_a_end = hook_notice("term-swarm", Some("session_ended"), None, None);
+    sub_a_end.subagent = true;
+    sub_a_end.agent_id = Some("sub-alpha".into());
+    let _ = admit_at(
+        sub_a_end,
+        t0 + Duration::from_secs(3),
+        4_000,
+        &mut tracked,
+        &counters,
+    );
+
+    let mut parent_idle = hook_notice("term-swarm", Some("turn_finished"), None, None);
+    parent_idle.fully_idle = Some(true);
+    let _ = admit_at(
+        parent_idle,
+        t0 + Duration::from_secs(4),
+        5_000,
+        &mut tracked,
+        &counters,
+    );
+
+    let after = snapshot_of(&tracked, 42, 100, 5_500);
+    assert_eq!(after.sessions[0].fully_idle, Some(true));
+    assert_eq!(after.sessions[0].active_subagents.len(), 1);
+    assert_eq!(after.sessions[0].active_subagents[0].agent_id, "sub-beta");
 }

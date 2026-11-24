@@ -161,6 +161,7 @@ describe("plugin hooks", () => {
           const subcommand = bareHookCommand(String(handler.command)).split(/\s+/)[1];
           const reports = subcommand === "notify";
           const injectsPeerInbox = subcommand === "peer-inbox";
+          const bridgesPermission = subcommand === "permission-bridge";
           // `deliver` is the one hook that waits, in the background: `asyncRewake`
           // runs it without blocking the agent and wakes the agent on exit 2. It
           // is not `async`, which "cannot block" and so cannot wake.
@@ -169,6 +170,12 @@ describe("plugin hooks", () => {
             expect(event, "deliver only makes sense where a turn ends").toBe("Stop");
             expect(handler.asyncRewake, "deliver is asyncRewake").toBe(true);
             expect(handler.async, "an async hook cannot wake the agent").toBeUndefined();
+            continue;
+          }
+          if (bridgesPermission) {
+            expect(event, "permission-bridge only runs on PermissionRequest").toBe("PermissionRequest");
+            expect(handler.async, "permission-bridge returns synchronous decisions when away").toBeUndefined();
+            expect(handler.asyncRewake, "permission-bridge is not a Stop waiter").toBeUndefined();
             continue;
           }
           if (injectsPeerInbox) {
@@ -209,7 +216,9 @@ describe("plugin hooks", () => {
           // written down. Everything else is on the agent's path and stays
           // under a minute.
           const worktree = event === "WorktreeCreate" || event === "WorktreeRemove";
-          const ceiling = handler.asyncRewake === true ? 1800 : worktree ? 600 : 60;
+          const permissionBridge =
+            bareHookCommand(String(handler.command)).split(/\s+/)[1] === "permission-bridge";
+          const ceiling = handler.asyncRewake === true || permissionBridge ? 1800 : worktree ? 600 : 60;
           expect(handler.timeout as number, `${event} ${handler.command}`).toBeLessThanOrEqual(ceiling);
         }
       }
@@ -625,6 +634,19 @@ function deliverWaitSeconds(): number {
   return Number(declared![1]);
 }
 
+function permissionBridgeWaitSeconds(): number {
+  const source = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "hooks", "permission_bridge.rs"),
+    "utf8",
+  );
+  const declared = /pub const PERMISSION_BRIDGE_WAIT: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+  expect(
+    declared,
+    "PERMISSION_BRIDGE_WAIT is no longer a whole number of seconds; update this contract",
+  ).toBeTruthy();
+  return Number(declared![1]);
+}
+
 /**
  * What one `notify` run waits out for `event`: the read and then the socket
  * report, each for the budget `notify_input::budgets_for` gives that event.
@@ -706,6 +728,7 @@ function stopOrNotifySeconds(): number {
 function budgetSecondsFor(subcommand: string, argument = ""): number {
   if (subcommand === "notify") return notifyRunSeconds(argument);
   if (subcommand === "deliver") return deliverWaitSeconds();
+  if (subcommand === "permission-bridge") return permissionBridgeWaitSeconds();
   if (subcommand === "worktree-create" || subcommand === "worktree-remove") return worktreeBudgetSeconds();
   if (subcommand === "stop-or-notify") return stopOrNotifySeconds();
   if (subcommand === "peer-inbox") return peerInboxSeconds();
@@ -824,6 +847,46 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(wait).toBeGreaterThan(hookDurationSeconds("TOTAL_BUDGET"));
   });
 
+  it("keeps permission-bridge separate from async notify permission_request and preserves the narrow allow invariant", () => {
+    const manifest = JSON.parse(readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8")) as {
+      hooks: {
+        PermissionRequest: Array<{ hooks: Array<{ command: string; timeout: number; async?: boolean; asyncRewake?: boolean }> }>;
+      };
+    };
+    const handlers = manifest.hooks.PermissionRequest.flatMap((g) => g.hooks);
+    const notifyEntry = handlers.find((h) => h.command === "gitpulse-hook notify permission_request");
+    const bridgeEntry = handlers.find((h) => h.command === "gitpulse-hook permission-bridge");
+    expect(notifyEntry, "existing async notify permission_request must remain untouched").toBeDefined();
+    expect(notifyEntry!.async).toBe(true);
+    expect(notifyEntry!.timeout).toBe(5);
+    expect(bridgeEntry, "permission-bridge must be registered as a separate PermissionRequest entry").toBeDefined();
+    expect(bridgeEntry!.async).toBeUndefined();
+    expect(bridgeEntry!.asyncRewake).toBeUndefined();
+
+    const wait = permissionBridgeWaitSeconds();
+    expect(bridgeEntry!.timeout - wait).toBeGreaterThanOrEqual(30);
+    expect(bridgeEntry!.timeout).toBeLessThanOrEqual(1800);
+
+    // PreToolUse PermissionDecision enum in hooks/mod.rs must NEVER carry an Allow variant.
+    const enumBlock = /pub enum PermissionDecision\s*\{([\s\S]*?)\}/.exec(hookSource)?.[1] ?? "";
+    expect(enumBlock).toContain("Deny");
+    expect(enumBlock).toContain("Ask");
+    expect(enumBlock).not.toMatch(/\bAllow\b/);
+
+    // Narrow carve-out is documented in hooks/mod.rs and permission_bridge.rs never models updatedInput/updatedPermissions.
+    expect(hookSource).toContain("permission_bridge");
+    const bridgeRust = readFileSync(
+      path.join(ROOT, "src-tauri", "src", "hooks", "permission_bridge.rs"),
+      "utf8",
+    );
+    const decisionEnum = /enum ClaudePermissionDecision\s*\{([\s\S]*?)\n\}/.exec(bridgeRust)?.[1] ?? "";
+    expect(decisionEnum).toContain("Allow");
+    expect(decisionEnum).toContain("Deny");
+    expect(decisionEnum).not.toContain("updated_input");
+    expect(decisionEnum).not.toContain("updated_permissions");
+    expect(decisionEnum).not.toContain("add_permission_rule");
+  });
+
   it("ends the whole process, not just each wait, a stated margin before the host's timeout", () => {
     // Each wait is cut to what is left of TOTAL_BUDGET from process start, so
     // stdin + scope check + scan cannot add up to the host's timeout. The margin
@@ -834,7 +897,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(margin).toBeGreaterThan(0);
     for (const { manifest, event, command, timeout } of declaredTimeouts()) {
       const [, subcommand = "", argument = ""] = command.split(/\s+/);
-      if (subcommand === "deliver") continue;
+      if (subcommand === "deliver" || subcommand === "permission-bridge") continue;
       // SessionEnd has its own tighter 1 s exit budget checked below.
       if (event === "SessionEnd") continue;
       const required = minHostTimeoutSeconds(subcommand, argument);
