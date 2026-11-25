@@ -630,6 +630,48 @@ pub struct BindingHistory {
     unreadable: bool,
 }
 
+/// The spelling [`bind`] stores a worktree's path under: the canonical one,
+/// `\\?\C:\...` on Windows. A caller that holds the plain spelling a transcript
+/// or a shell reported (`C:\...`, `C:/...`) reads the rows the bind wrote only
+/// when asking for this one. A worktree that has been removed cannot be
+/// canonicalised, so its canonical spelling is derived from the text. Elsewhere
+/// a path has one spelling and is returned as given.
+fn bound_spelling(worktree: &str) -> String {
+    if !cfg!(windows) {
+        return worktree.to_string();
+    }
+    let canonical = super::canonical_repo(worktree);
+    verbatim_spelling(&canonical).unwrap_or(canonical)
+}
+
+/// `path` as `std::fs::canonicalize` spells it on Windows: `\\?\C:\dir` for a
+/// drive path, `\\?\UNC\server\share` for a share, with `\` for every
+/// separator. `None` for a path that is already verbatim, a device path, or
+/// not absolute: those have no other spelling to derive.
+fn verbatim_spelling(path: &str) -> Option<String> {
+    if path.starts_with(r"\\?\") {
+        return None;
+    }
+    let text = path.replace('/', "\\");
+    if let Some(share) = text.strip_prefix(r"\\") {
+        let device = share.starts_with(".\\") || share.starts_with('?');
+        return (!share.is_empty() && !device).then(|| format!(r"\\?\UNC\{share}"));
+    }
+    let bytes = text.as_bytes();
+    let is_drive_path = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) == Some(&b'\\');
+    if !is_drive_path {
+        return None;
+    }
+    let trimmed = if text.len() > 3 {
+        text.trim_end_matches('\\')
+    } else {
+        &text
+    };
+    Some(format!(r"\\?\{trimmed}"))
+}
+
 impl BindingHistory {
     fn from_rows(rows: Vec<super::BindingRow>) -> Self {
         let mut suffix_min: Vec<String> = Vec::with_capacity(rows.len());
@@ -660,7 +702,7 @@ impl BindingHistory {
         let stored_worktree = super::redact::text(worktree);
         Ok(Self::from_rows(super::binding_history(
             anchor,
-            worktree,
+            &bound_spelling(worktree),
             &stored_worktree,
         )?))
     }
