@@ -119,6 +119,14 @@ jobs:
 
       - name: Frontend Svelte Check
         if: ${{ !cancelled() }}
+        # V8 sizes its default heap from physical memory: ~4 GB on the Linux
+        # and Windows runners, ~2 GB on the 7 GB macOS one. svelte-check peaks
+        # near 2 GB here (2.45 GB resident locally at a 2048 MB cap), so the
+        # macOS leg alone died with "heap out of memory" on code the other two
+        # checked clean. The same 4 GB on every leg; a real growth past it
+        # still fails everywhere.
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: bun run check
 
       - name: Frontend Unit Tests (Vitest)
