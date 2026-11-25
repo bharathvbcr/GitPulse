@@ -259,3 +259,98 @@ fn a_reactive_read_behind_the_line_while_slots_are_full_names_the_slots() {
     drop(held);
     assert!(front.join().unwrap(), "the front kept its ticket");
 }
+
+/// The line cause's text at its edges: zero and enormous counts render, both
+/// sentences stay deferrals that `RunError` classifies as such, a line cause never leaks into the rate-limit sentence.
+#[test]
+fn a_line_cause_renders_at_its_edges_and_stays_a_deferral() {
+    let waited = Refusal::Refused {
+        waited: Duration::from_millis(2_004),
+    };
+    for (in_flight, limit, ahead, expected) in [
+        (
+            0,
+            0,
+            0,
+            "no process slot came free (0 of 0 busy, 0 read(s) ahead in line)",
+        ),
+        (
+            16,
+            16,
+            3,
+            "no process slot came free (16 of 16 busy, 3 read(s) ahead in line)",
+        ),
+        (
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            &format!(
+                "no process slot came free ({m} of {m} busy, {m} read(s) ahead in line)",
+                m = usize::MAX
+            ),
+        ),
+        (
+            2,
+            16,
+            1,
+            "1 read(s) ahead in line were still waiting (2 of 16 process slots busy)",
+        ),
+    ] {
+        let cause = Some(RefusalCause::Line {
+            in_flight,
+            limit,
+            ahead,
+        });
+        let message = refusal_message_at("git status", waited, cause);
+        let text = message.message();
+        assert_eq!(
+            text,
+            format!("git status deferred under load after 2.004s: {expected}")
+        );
+        assert!(is_deferred_under_load(text), "{text}");
+        assert_eq!(RunError::classify(text), RunError::Deferred);
+        assert!(!text.contains("admitted nothing sooner"), "{text}");
+    }
+}
+
+/// The rate-limit refusal text is unchanged byte for byte for no cause and for
+/// a bucket cause, and a line cause only rewrites a `Refused`: every other
+/// refusal renders as it does with no cause.
+#[test]
+fn only_a_refused_read_takes_the_line_sentence_and_rate_text_is_unchanged() {
+    let waited = Refusal::Refused {
+        waited: Duration::from_millis(2_004),
+    };
+    assert_eq!(
+        refusal_message_at("git status", waited, None).message(),
+        "git status deferred under load after 2.004s: the git spawn rate limit admitted nothing sooner"
+    );
+    let bucket = Some(RefusalCause::Bucket(level(RefusingBucket::Shared, 0, 0, 8)));
+    assert_eq!(
+        refusal_message_at("git status", waited, bucket).message(),
+        "git status deferred under load after 2.004s: the git spawn rate limit admitted nothing sooner \
+         (shared bucket: 0 token(s), needs more than 0, burst 8)"
+    );
+    let line = Some(RefusalCause::Line {
+        in_flight: 1,
+        limit: 1,
+        ahead: 1,
+    });
+    for other in [
+        Refusal::Shed,
+        Refusal::Cancelled,
+        Refusal::Pressure {
+            reactive: true,
+            cause: None,
+        },
+        Refusal::TimedOut {
+            deadline: Duration::from_secs(1),
+        },
+    ] {
+        assert_eq!(
+            refusal_message_at("git status", other, line),
+            refusal_message_at("git status", other, None),
+            "{other:?}"
+        );
+    }
+}

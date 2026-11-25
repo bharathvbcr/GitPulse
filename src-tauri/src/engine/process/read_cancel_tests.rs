@@ -404,6 +404,52 @@ fn a_joiner_gone_by_its_deadline_does_not_keep_the_leaders_child_alive() {
     }
 }
 
+/// Departure is per joiner: with several joiners, two of which leave by their
+/// own deadline (one named, one without an id), the one still waiting keeps the
+/// child alive after the leader is cancelled, and the child goes only when that
+/// last one is cancelled too. Pins that a `Left` entry never stands in for the
+/// others (index stability) and that a joiner's departure is not a cancel of its
+/// request's shared flag.
+#[cfg(unix)]
+#[test]
+fn only_the_last_waiting_joiner_keeps_the_child_after_the_others_left_by_deadline() {
+    let rig = Rig::new(1);
+    let held = rig
+        .gate
+        .acquire(Instant::now() + Duration::from_secs(30))
+        .unwrap();
+    let script = rig.script("many", "exec sleep 60");
+    let leader = rig.lead(Some("rc-many-lead"), script.clone());
+    let short = Duration::from_millis(200);
+    let gone_named = rig.read_for(Some("rc-many-a"), script.clone(), short);
+    let gone_plain = rig.read_for(None, script.clone(), short);
+    let staying = rig.read(Some("rc-many-stay"), script);
+    rig.wait_joined(3);
+    for gone in [gone_named, gone_plain] {
+        let error = gone.join().unwrap().expect_err("left by its deadline");
+        assert!(is_timed_out(error.message()), "{}", error.message());
+    }
+    drop(held);
+    let pid = rig.wait_started(1)[0];
+    assert!(read_cancel::cancel("rc-many-lead"));
+    assert!(
+        !wait_gone(pid, Duration::from_millis(600)),
+        "pid {pid} was stopped while a joiner still waited"
+    );
+    assert!(read_cancel::cancel("rc-many-stay"));
+    assert!(
+        wait_gone(pid, gone_within()),
+        "pid {pid} outlived the last waiter"
+    );
+    // Either the joiner saw its own cancel first, or the leader's cancelled run
+    // was already published: both end it, neither is an answer.
+    match staying.join().unwrap() {
+        Err(_) => {}
+        Ok(run) => assert!(run.cancelled, "an answer reached a cancelled joiner"),
+    }
+    assert!(leader.join().unwrap().expect("returned").cancelled);
+}
+
 /// A read that never named an id is a waiter that never leaves.
 #[cfg(unix)]
 #[test]
