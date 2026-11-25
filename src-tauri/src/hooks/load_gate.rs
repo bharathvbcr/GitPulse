@@ -11,7 +11,9 @@
 //! # What it reads, and what it never does
 //!
 //! It reads the app's published verdict from `host-load.v1`
-//! ([`PublishedVerdict`]) and nothing else about the host. It never samples the
+//! ([`PublishedVerdict`]) and nothing else about the host, plus, once a command
+//! is known to be in the table, the pressure-relief supervisor's
+//! `host-relief.v1.json` (see "Paused builds" below). It never samples the
 //! machine and never re-derives a threshold: whether a launch is admitted is
 //! the governor's decision, made once, and this refuses exactly what that
 //! refuses. The setting that decides what to do with it is read from
@@ -46,6 +48,18 @@
 //! | heavy | clear | nothing |
 //! | heavy | none: older writer, sensor stale-old or dead, no snapshot, switched off | one line saying it was **not** load-checked, never a refusal |
 //! | in the table as advise-only | elevated or severe | one line of advice, never a refusal |
+//! | any classified command | the relief supervisor paused a tree for this session | the paused command named, "resumes automatically", do not retry or run in parallel; inside the reason when the command is refused |
+//! | any classified command | the supervisor only slowed agent processes | one line of advice |
+//! | any classified command | the relief status is stale or unreadable | one line saying it could **not** be checked, once per session; never "nothing is paused" |
+//! | any classified command | no relief status, or one at rest | nothing |
+//!
+//! # Paused builds
+//!
+//! A tree is "this session's" when its `terminal_session_id` is the terminal
+//! this hook runs under (`GITPULSE_SESSION_ID`), or the call's `cwd` is inside
+//! its `repo_path`. An advised-only entry is what Act would have paused and is
+//! never reported as paused. The relief note is silent with the gate set to Off
+//! and for the heavy lane's holder, like everything else in this stage.
 //!
 //! It never emits `allow`: an unearned allow would override the person's own
 //! permission rules. A check that could not run says so; it does not look like
@@ -74,7 +88,7 @@ use super::heavy_commands::{classify, Classified, Hit};
 use super::{
     decision, fnv1a, HookInput, HookOutput, HookSpecificOutput, PermissionDecision, PRE_TOOL_USE,
 };
-use crate::sysload::relief_status::{self, ReadOutcome, ReliefStatus, Rung};
+use crate::sysload::relief_status::{self, ReliefOutcome, ReliefRung, ReliefStatus};
 use crate::sysload::{
     Binding, InputMode, PublishedVerdict, Reading, SensorReport, SensorState, Snapshot, Tier,
 };
@@ -129,7 +143,7 @@ pub(super) struct Gathered {
     pub steward_throttle: Option<crate::harness::steward::ActiveThrottleRecord>,
     /// What the pressure-relief supervisor published (`host-relief.v1.json`).
     /// `Absent` is the normal state until a supervisor has ever written one.
-    pub relief: ReadOutcome,
+    pub relief: ReliefOutcome,
     /// The GitPulse terminal this hook runs under (`GITPULSE_SESSION_ID`), the
     /// key a paused tree is matched to a caller by. Injected, never read from
     /// the environment inside the judge.
@@ -425,7 +439,7 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
             exempt,
             DiskFacts::from_settings(None),
             None,
-            ReadOutcome::Absent,
+            ReliefOutcome::Absent,
         );
     }
     live(
@@ -443,10 +457,10 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
 
 /// The supervisor's published status, read once per classified command. No
 /// config directory is a read that could not be made, never an empty file.
-fn relief_live() -> ReadOutcome {
+fn relief_live() -> ReliefOutcome {
     match relief_status::default_dir() {
         Some(dir) => relief_status::read_status(&dir),
-        None => ReadOutcome::Unreadable {
+        None => ReliefOutcome::Unreadable {
             reason: "there is no per-user config directory (HOME unset)".into(),
         },
     }
@@ -725,9 +739,9 @@ const MAX_ECHOED_COMMAND: usize = 120;
 /// * absent, or a rest status: nothing.
 fn relief_note(input: &HookInput, g: &Gathered) -> Option<String> {
     match &g.relief {
-        ReadOutcome::Absent => None,
-        ReadOutcome::Fresh { status } => relief_text(status, input, g),
-        ReadOutcome::Stale { age_ms, .. } => unchecked_relief(
+        ReliefOutcome::Absent => None,
+        ReliefOutcome::Fresh { status } => relief_text(status, input, g),
+        ReliefOutcome::Stale { age_ms, .. } => unchecked_relief(
             input,
             g,
             &format!(
@@ -735,7 +749,7 @@ fn relief_note(input: &HookInput, g: &Gathered) -> Option<String> {
                 age_ms / 1000
             ),
         ),
-        ReadOutcome::Unreadable { reason } => unchecked_relief(input, g, reason),
+        ReliefOutcome::Unreadable { reason } => unchecked_relief(input, g, reason),
     }
 }
 
@@ -772,14 +786,14 @@ fn relief_text(status: &ReliefStatus, input: &HookInput, g: &Gathered) -> Option
             "GitPulse's memory protection paused `{command}` (pid {}) because {}. \
              It will resume automatically. Do not retry it, and do not re-run it or another build in parallel; wait for it to resume.",
             tree.pid,
-            status.binding.map_or("memory is nearly exhausted", relief_status::Binding::phrase)
+            status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
         ));
     }
-    if status.rung != Rung::None && status.slowed > 0 {
+    if status.rung != ReliefRung::None && status.slowed > 0 {
         return Some(format!(
             "GitPulse's memory protection has lowered the priority of {} agent process(es) because {}, so builds and tests run slower. Run one at a time.",
             status.slowed,
-            status.binding.map_or("memory is nearly exhausted", relief_status::Binding::phrase)
+            status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
         ));
     }
     None

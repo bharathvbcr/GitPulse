@@ -121,7 +121,7 @@ export function statusChip(
   const title =
     relief.paused > 0
       ? "GitPulse's memory protection paused a build or test under an agent. It resumes automatically. Open Health, Host load, to resume it now."
-      : "GitPulse could not verify whether its memory protection has paused anything. Open Health, Host load.";
+      : "GitPulse couldn't verify whether its memory protection has paused anything. Open Health, Host load.";
   if (base) return { ...base, text: base.text + note, title: `${base.title} ${title}` };
   return {
     text: `Memory protection${note}`,

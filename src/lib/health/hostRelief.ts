@@ -28,9 +28,11 @@ export interface FrozenTree {
   advised_only: boolean;
 }
 
+export type ReliefActionKind = "slow" | "freeze" | "resume" | "cap_resume" | "refused";
+
 export interface ReliefAction {
   at_ms: number;
-  kind: "slow" | "freeze" | "resume" | "cap_resume" | "refused";
+  kind: ReliefActionKind;
   detail: string;
 }
 
@@ -172,7 +174,7 @@ export function reliefHeadline(outcome: ReliefOutcome | null): string {
     case "absent":
       return "No memory protection status has been published. Nothing is known to be paused.";
     case "unreadable":
-      return `The memory protection status could not be read, so whether anything is paused is unknown: ${outcome.reason}`;
+      return `The memory protection status couldn't be read, so whether anything is paused is unknown: ${outcome.reason}`;
     case "stale":
       return `The memory protection status was last written ${reliefAge(outcome.age_ms)} ago, so the supervisor may no longer be running. What follows may be out of date, and a paused process may still be paused.`;
     case "fresh": {

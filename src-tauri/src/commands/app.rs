@@ -377,8 +377,8 @@ pub async fn cmd_host_load_admit_anyway() -> Result<String, IpcError> {
 /// absent, fresh, stale or unreadable, never a bare "nothing paused" for a
 /// file that could not be read. Read-only.
 #[tauri::command(async)]
-pub async fn cmd_host_relief_status() -> Result<crate::sysload::relief_status::ReadOutcome, IpcError>
-{
+pub async fn cmd_host_relief_status(
+) -> Result<crate::sysload::relief_status::ReliefOutcome, IpcError> {
     off_thread(|| {
         let dir = crate::sysload::relief_status::default_dir().ok_or_else(|| {
             CommandError::from("there is no per-user config directory".to_string())
@@ -394,8 +394,11 @@ pub async fn cmd_host_relief_status() -> Result<crate::sysload::relief_status::R
 /// Security impact: this widens nothing a person could not already do. It
 /// writes one small file in GitPulse's own per-user config directory and sends
 /// no signal itself; what the supervisor does with it is resume processes it
-/// stopped, which only ever ends a pause. Granted to the main window only, like
-/// the other host-load commands; no agent path reaches it.
+/// stopped, which only ever ends a pause. This IPC is granted to the main
+/// window only. The request file it writes is not behind that grant: any
+/// process of the same user, an agent whose build was paused included, can write
+/// the same file, so what the supervisor does with a request is its own
+/// decision to bound.
 #[tauri::command(async)]
 pub async fn cmd_host_relief_request_resume() -> Result<(), IpcError> {
     off_thread(|| {

@@ -166,10 +166,10 @@
     <SettingSegment
       ariaLabel="What GitPulse does when memory runs out"
       options={SUPERVISOR_MODES}
-      value={supervisor ?? "act"}
+      value={supervisor ?? ""}
       disabled={supervisor === undefined}
       onselect={(next) => {
-        if (readOk && !busy && supervisor !== undefined) void save({ supervisor: next });
+        if (readOk && !busy && supervisor !== undefined && next !== "") void save({ supervisor: next });
       }}
     />
   </div>

@@ -741,7 +741,7 @@ mod tests {
                     severe: true,
                     ..Default::default()
                 },
-                "Memory is critically low",
+                "Host load is severe",
             ),
             (
                 HostPressure {

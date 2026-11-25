@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     pausedRows,
+    reliefAge,
     reliefBindingLabel,
     reliefHeadline,
     reliefModeLabel,
@@ -100,7 +101,13 @@
         >
           Resume all
         </button>
-        {#if requested}
+        {#if requested && outcome?.state === "stale"}
+          <span class="text-warn" data-testid="host-relief-requested-stale">
+            Requested, but the supervisor has not reported in for {reliefAge(outcome.age_ms)}. If it is not running,
+            nothing will act on this and a paused process stays paused until it is resumed by hand
+            (kill -CONT with its pid).
+          </span>
+        {:else if requested}
           <span class="text-textMuted" data-testid="host-relief-requested">
             Requested. The supervisor resumes them on its next check.
           </span>
@@ -117,7 +124,7 @@
 
     {#if status.failures.length > 0}
       <div data-testid="host-relief-failures">
-        <p class="text-warn">Could not pause or resume {status.failures.length} process(es):</p>
+        <p class="text-warn">Couldn't pause or resume {status.failures.length} process(es):</p>
         <ul class="list-disc pl-5 text-textMuted">
           {#each status.failures as failure (`${failure.at_ms}:${failure.pid}`)}
             <li>pid {failure.pid}: {failure.what}</li>

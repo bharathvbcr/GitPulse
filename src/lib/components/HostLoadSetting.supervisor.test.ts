@@ -36,6 +36,8 @@ describe("the memory supervisor setting", () => {
     const block = supervisorBlock(render(HostLoadSetting).body);
     expect(block).toContain("This build of GitPulse has no memory supervisor to switch yet.");
     expect(block.match(/disabled/g)?.length).toBeGreaterThanOrEqual(3);
+    // Nothing is shown as selected: no mode is in force to select.
+    expect(block).not.toContain('aria-pressed="true"');
   });
 
   it("shows the reported mode as pressed and is enabled once the backend reports the key", async () => {

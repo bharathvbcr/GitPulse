@@ -42,7 +42,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         read_free: |_| Free::Missing,
         lease: LeaseSource::Fixed(LeaseFacts::default()),
         steward_throttle: None,
-        relief: ReadOutcome::Absent,
+        relief: ReliefOutcome::Absent,
         terminal_session: None,
     }
 }
@@ -1812,7 +1812,7 @@ fn without_a_hook_deadline_the_steward_slowdown_advises_but_never_sleeps() {
 mod relief {
     use super::*;
     use crate::sysload::relief_status::{
-        Binding as ReliefBinding, FrozenTree, Mode, ReliefStatus, Rung,
+        FrozenTree, ReliefBinding, ReliefMode, ReliefRung, ReliefStatus,
     };
 
     const OURS: &str = "term-4000-ab12";
@@ -1831,18 +1831,18 @@ mod relief {
         }
     }
 
-    fn frozen(trees: Vec<FrozenTree>) -> ReadOutcome {
-        ReadOutcome::Fresh {
+    fn frozen(trees: Vec<FrozenTree>) -> ReliefOutcome {
+        ReliefOutcome::Fresh {
             status: ReliefStatus {
-                rung: Rung::Freeze,
+                rung: ReliefRung::Freeze,
                 binding: Some(ReliefBinding::CompressorSegments),
                 frozen: trees,
-                ..ReliefStatus::at_rest(Mode::Act, 1)
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
         }
     }
 
-    fn with(relief: ReadOutcome, dir: &Path) -> Gathered {
+    fn with(relief: ReliefOutcome, dir: &Path) -> Gathered {
         let mut g = gathered(verdict(Tier::Elevated, Some(Binding::Swap), true), dir);
         g.relief = relief;
         g.terminal_session = Some(OURS.into());
@@ -1904,12 +1904,12 @@ mod relief {
     #[test]
     fn a_slowdown_alone_is_one_line_of_advice() {
         let dir = tempfile::tempdir().unwrap();
-        let relief = ReadOutcome::Fresh {
+        let relief = ReliefOutcome::Fresh {
             status: ReliefStatus {
-                rung: Rung::Slow,
+                rung: ReliefRung::Slow,
                 binding: Some(ReliefBinding::Swap),
                 slowed: 5,
-                ..ReliefStatus::at_rest(Mode::Act, 1)
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
         };
         let text = context(&judged(HEAVY, &with(relief, dir.path())));
@@ -1921,11 +1921,11 @@ mod relief {
     #[test]
     fn a_stale_or_unreadable_status_says_it_could_not_check_and_never_nothing_paused() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = ReadOutcome::Stale {
-            status: ReliefStatus::at_rest(Mode::Act, 1),
+        let stale = ReliefOutcome::Stale {
+            status: ReliefStatus::at_rest(ReliefMode::Act, 1),
             age_ms: 61_000,
         };
-        let unreadable = ReadOutcome::Unreadable {
+        let unreadable = ReliefOutcome::Unreadable {
             reason: "not a status this build understands".into(),
         };
         for (relief, expect) in [(stale, "61s ago"), (unreadable, "not a status")] {
@@ -1943,7 +1943,7 @@ mod relief {
     fn an_unchecked_status_is_said_once_per_session() {
         let dir = tempfile::tempdir().unwrap();
         let g = with(
-            ReadOutcome::Unreadable {
+            ReliefOutcome::Unreadable {
                 reason: "garbled".into(),
             },
             dir.path(),
@@ -1956,9 +1956,9 @@ mod relief {
     fn an_absent_status_and_a_status_at_rest_are_silent() {
         let dir = tempfile::tempdir().unwrap();
         for relief in [
-            ReadOutcome::Absent,
-            ReadOutcome::Fresh {
-                status: ReliefStatus::at_rest(Mode::Act, 1),
+            ReliefOutcome::Absent,
+            ReliefOutcome::Fresh {
+                status: ReliefStatus::at_rest(ReliefMode::Act, 1),
             },
         ] {
             let mut g = gathered(verdict(Tier::Clear, None, true), dir.path());

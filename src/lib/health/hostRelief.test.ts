@@ -134,10 +134,23 @@ describe("the Health row for memory protection", () => {
     expect(body).not.toContain('data-tone="ok"');
   });
 
+  it("does not promise a Stale supervisor will act on Resume all", () => {
+    const requested = render(HostReliefPanel, {
+      props: { outcome: stale(), now: NOW, requested: true },
+    }).body;
+    expect(requested).toContain("host-relief-requested-stale");
+    expect(requested).toContain("If it is not running");
+    expect(requested).toContain("kill -CONT");
+    expect(requested).not.toContain("resumes them on its next check");
+    const live = render(HostReliefPanel, { props: { outcome: fresh(), now: NOW, requested: true } }).body;
+    expect(live).toContain("resumes them on its next check");
+    expect(live).not.toContain("kill -CONT");
+  });
+
   it("says Unreadable with its reason and shows no list that could pass for an empty one", () => {
     const body = render(HostReliefPanel, { props: { outcome: unreadable, now: NOW } }).body;
     expect(body).toContain('data-state="unreadable"');
-    expect(body).toContain("could not be read, so whether anything is paused is unknown");
+    expect(body).toContain("couldn't be read, so whether anything is paused is unknown");
     expect(body).toContain("not a status this build understands");
     expect(body).not.toContain("host-relief-paused");
     expect(body).not.toContain("Memory protection is idle");

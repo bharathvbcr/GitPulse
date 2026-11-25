@@ -12,9 +12,9 @@
 //! as nothing paused.
 
 use crate::sysload::relief_status::{
-    self, ActionKind, FrozenTree, ReadOutcome, ReliefStatus, Rung,
+    self, FrozenTree, ReliefActionKind, ReliefOutcome, ReliefRung, ReliefStatus,
 };
-use crate::sysload::{Clock, Reading, Tier};
+use crate::sysload::{Binding, Clock, Reading, Tier};
 use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 
@@ -33,6 +33,9 @@ const MAX_COMMAND: usize = 80;
 pub struct HostPressure {
     /// The governor's held verdict is Severe.
     pub severe: bool,
+    /// What that verdict is bound by, when it names one. Severe is not always
+    /// memory: a disk about to fill or a runaway load binds it too.
+    pub cause: Option<Binding>,
     /// Process trees the supervisor has stopped. Advised-only entries do not
     /// count: nothing is stopped for them.
     pub paused: u32,
@@ -47,15 +50,16 @@ impl HostPressure {
         self.severe || self.paused > 0 || self.unverified
     }
 
-    pub fn of(outcome: &ReadOutcome, severe: bool) -> Self {
+    pub fn of(outcome: &ReliefOutcome, severe: bool, cause: Option<Binding>) -> Self {
         let (paused, unverified) = match outcome {
-            ReadOutcome::Absent => (0, false),
-            ReadOutcome::Fresh { status } => (status.paused_count(), false),
-            ReadOutcome::Stale { status, .. } => (status.paused_count(), true),
-            ReadOutcome::Unreadable { .. } => (0, true),
+            ReliefOutcome::Absent => (0, false),
+            ReliefOutcome::Fresh { status } => (status.paused_count(), false),
+            ReliefOutcome::Stale { status, .. } => (status.paused_count(), true),
+            ReliefOutcome::Unreadable { .. } => (0, true),
         };
         Self {
             severe,
+            cause: if severe { cause } else { None },
             paused: u32::try_from(paused).unwrap_or(u32::MAX),
             unverified,
         }
@@ -74,7 +78,10 @@ impl HostPressure {
             lines.push("Memory protection status could not be verified".to_string());
         }
         if self.severe {
-            lines.push("Memory is critically low".to_string());
+            lines.push(match self.cause {
+                Some(cause) => format!("Host load is severe: {}", cause.cause_phrase()),
+                None => "Host load is severe".to_string(),
+            });
         }
         lines
     }
@@ -124,15 +131,15 @@ impl Episode {
     /// neither starts nor ends one: a status that flaps between readable and
     /// not must not announce the same pause twice, and "could not read" is not
     /// "resumed".
-    pub fn observe(&mut self, outcome: &ReadOutcome, now_ms: u64) -> Option<Notice> {
-        let ReadOutcome::Fresh { status } = outcome else {
+    pub fn observe(&mut self, outcome: &ReliefOutcome, now_ms: u64) -> Option<Notice> {
+        let ReliefOutcome::Fresh { status } = outcome else {
             return None;
         };
-        if status.rung == Rung::None && status.paused_count() == 0 {
+        if status.rung == ReliefRung::None && status.paused_count() == 0 {
             self.announced_pause = false;
         }
         if let Some(action) = &status.last_action {
-            if action.kind == ActionKind::CapResume
+            if action.kind == ReliefActionKind::CapResume
                 && action.at_ms > self.announced_cap_at_ms
                 && now_ms.saturating_sub(action.at_ms) <= CAP_NEWS_MS
             {
@@ -175,9 +182,10 @@ fn gib(bytes: u64) -> String {
 }
 
 fn pause_notice(status: &ReliefStatus, tree: &FrozenTree) -> Notice {
-    let why = status
-        .binding
-        .map_or("memory is nearly exhausted", relief_status::Binding::phrase);
+    let why = status.binding.map_or(
+        "memory is nearly exhausted",
+        relief_status::ReliefBinding::phrase,
+    );
     let more = status.paused_count().saturating_sub(1);
     let also = if more == 0 {
         String::new()
@@ -214,17 +222,23 @@ fn cap_notice(detail: &str) -> Notice {
 
 /// The governor's held verdict is Severe, from the published snapshot. A
 /// snapshot that cannot be acted on says nothing here: the item then simply
-/// does not claim Severe.
-fn severe_now() -> bool {
+/// does not claim Severe. The second value is what the verdict is bound by.
+fn severity_now() -> (bool, Option<Binding>) {
     let Some(dir) = crate::tool_config::default_config_dir() else {
-        return false;
+        return (false, None);
     };
     let (report, snapshot) =
         crate::sysload::report(&dir.join(crate::sysload::SNAPSHOT_FILE_NAME), Clock::now());
-    report.state.governs()
-        && snapshot.is_some_and(|s| {
-            s.enabled && matches!(s.verdict, Reading::Value(v) if v.tier == Tier::Severe)
-        })
+    if !report.state.governs() {
+        return (false, None);
+    }
+    match snapshot {
+        Some(s) if s.enabled => match s.verdict {
+            Reading::Value(v) if v.tier == Tier::Severe => (true, v.binding),
+            _ => (false, None),
+        },
+        _ => (false, None),
+    }
 }
 
 /// Starts the thread that keeps the status item and the banner current. It
@@ -241,11 +255,12 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                 std::thread::sleep(POLL);
                 let outcome = match relief_status::default_dir() {
                     Some(dir) => relief_status::read_status(&dir),
-                    None => ReadOutcome::Unreadable {
+                    None => ReliefOutcome::Unreadable {
                         reason: "there is no per-user config directory (HOME unset)".into(),
                     },
                 };
-                let pressure = HostPressure::of(&outcome, severe_now());
+                let (severe, cause) = severity_now();
+                let pressure = HostPressure::of(&outcome, severe, cause);
                 if shown != Some(pressure) {
                     let handle = app.clone();
                     let applied = app.run_on_main_thread(move || {
@@ -261,12 +276,20 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     }
                 }
                 if let Some(notice) = episode.observe(&outcome, relief_status::now_ms()) {
-                    if let Err(error) = crate::workbench::notifications::post_relief(
+                    // Marked announced either way: a refused banner is not
+                    // retried every poll, but it is never silent in the log.
+                    match crate::workbench::notifications::post_relief(
                         notice.native_id(),
                         notice.heading,
                         &notice.body,
                     ) {
-                        log::warn!(target: "desktop", "pressure relief banner not posted: {error}");
+                        Ok(true) => {}
+                        Ok(false) => {
+                            log::warn!(target: "desktop", "pressure relief banner was not accepted by the notification centre")
+                        }
+                        Err(error) => {
+                            log::warn!(target: "desktop", "pressure relief banner not posted: {error}")
+                        }
                     }
                 }
             }
@@ -280,7 +303,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sysload::relief_status::{Mode, ReliefAction};
+    use crate::sysload::relief_status::{ReliefAction, ReliefMode};
 
     fn tree(advised_only: bool) -> FrozenTree {
         FrozenTree {
@@ -296,78 +319,112 @@ mod tests {
         }
     }
 
-    fn fresh(rung: Rung, trees: Vec<FrozenTree>, last: Option<ReliefAction>) -> ReadOutcome {
-        ReadOutcome::Fresh {
+    fn fresh(
+        rung: ReliefRung,
+        trees: Vec<FrozenTree>,
+        last: Option<ReliefAction>,
+    ) -> ReliefOutcome {
+        ReliefOutcome::Fresh {
             status: ReliefStatus {
                 rung,
                 frozen: trees,
                 last_action: last,
-                ..ReliefStatus::at_rest(Mode::Act, 1)
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
         }
     }
 
-    fn rest() -> ReadOutcome {
-        fresh(Rung::None, vec![], None)
+    fn rest() -> ReliefOutcome {
+        fresh(ReliefRung::None, vec![], None)
     }
 
     fn cap_at(at_ms: u64) -> Option<ReliefAction> {
         Some(ReliefAction {
             at_ms,
-            kind: ActionKind::CapResume,
+            kind: ReliefActionKind::CapResume,
             detail: "cargo test".into(),
         })
     }
 
     #[test]
     fn pressure_reflects_a_pause_the_tier_and_what_could_not_be_checked() {
-        let calm = HostPressure::of(&rest(), false);
+        let calm = HostPressure::of(&rest(), false, None);
         assert!(!calm.needs_glance());
         assert!(calm.tooltip_lines().is_empty());
-        assert!(HostPressure::of(&ReadOutcome::Absent, false) == calm);
+        assert!(HostPressure::of(&ReliefOutcome::Absent, false, None) == calm);
 
-        let severe = HostPressure::of(&ReadOutcome::Absent, true);
+        let severe = HostPressure::of(&ReliefOutcome::Absent, true, Some(Binding::Swap));
         assert!(severe.needs_glance());
-        assert_eq!(severe.tooltip_lines(), ["Memory is critically low"]);
+        assert_eq!(
+            severe.tooltip_lines(),
+            ["Host load is severe: swap in use is above GitPulse's limit for it"]
+        );
 
-        let paused = HostPressure::of(&fresh(Rung::Freeze, vec![tree(false)], None), true);
+        let paused = HostPressure::of(
+            &fresh(ReliefRung::Freeze, vec![tree(false)], None),
+            true,
+            Some(Binding::CompressorSegments),
+        );
         assert_eq!(paused.paused, 1);
         assert!(paused.needs_glance());
         assert_eq!(
             paused.tooltip_lines(),
             [
                 "1 build or test paused by memory protection",
-                "Memory is critically low"
+                "Host load is severe: the memory compressor is nearly out of segments"
             ]
         );
 
+        // Severe is not always memory: a disk bound verdict says disk, and
+        // never "memory".
+        let disk = HostPressure::of(&ReliefOutcome::Absent, true, Some(Binding::LowDisk));
+        let lines = disk.tooltip_lines();
+        assert_eq!(
+            lines,
+            ["Host load is severe: free disk space is below GitPulse's floor"]
+        );
+        assert!(!lines[0].to_lowercase().contains("memory"));
+        // A severe verdict naming nothing still says only what is known.
+        let unnamed = HostPressure::of(&ReliefOutcome::Absent, true, None);
+        assert_eq!(unnamed.tooltip_lines(), ["Host load is severe"]);
+        // A cause with no severe verdict is dropped.
+        assert_eq!(
+            HostPressure::of(&ReliefOutcome::Absent, false, Some(Binding::Swap)),
+            calm
+        );
+
         // Advise mode records what it would pause; nothing is stopped.
-        let advised = HostPressure::of(&fresh(Rung::Freeze, vec![tree(true)], None), false);
+        let advised = HostPressure::of(
+            &fresh(ReliefRung::Freeze, vec![tree(true)], None),
+            false,
+            None,
+        );
         assert_eq!(advised.paused, 0);
         assert!(!advised.needs_glance());
     }
 
     #[test]
     fn stale_and_unreadable_are_unverified_never_clear() {
-        let stale = ReadOutcome::Stale {
+        let stale = ReliefOutcome::Stale {
             status: ReliefStatus {
-                rung: Rung::Freeze,
+                rung: ReliefRung::Freeze,
                 frozen: vec![tree(false)],
-                ..ReliefStatus::at_rest(Mode::Act, 1)
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
             age_ms: 90_000,
         };
-        let pressure = HostPressure::of(&stale, false);
+        let pressure = HostPressure::of(&stale, false, None);
         assert!(pressure.unverified && pressure.paused == 1 && pressure.needs_glance());
         assert_eq!(
             pressure.tooltip_lines(),
             ["1 build or test paused by memory protection (unverified)"]
         );
         let unreadable = HostPressure::of(
-            &ReadOutcome::Unreadable {
+            &ReliefOutcome::Unreadable {
                 reason: "garbled".into(),
             },
             false,
+            None,
         );
         assert!(unreadable.needs_glance());
         assert_eq!(
@@ -379,7 +436,7 @@ mod tests {
     #[test]
     fn a_pause_is_announced_once_per_episode() {
         let mut episode = Episode::default();
-        let paused = fresh(Rung::Freeze, vec![tree(false)], None);
+        let paused = fresh(ReliefRung::Freeze, vec![tree(false)], None);
         let notice = episode.observe(&paused, 100).expect("the pause is news");
         assert_eq!(notice.kind, NoticeKind::Paused);
         for needle in [
@@ -392,27 +449,27 @@ mod tests {
         }
         assert!(episode.observe(&paused, 200).is_none());
         // A second tree in the same episode is not a second banner.
-        let two = fresh(Rung::Freeze, vec![tree(false), tree(false)], None);
+        let two = fresh(ReliefRung::Freeze, vec![tree(false), tree(false)], None);
         assert!(episode.observe(&two, 300).is_none());
     }
 
     #[test]
     fn a_flapping_status_does_not_announce_the_same_pause_twice() {
         let mut episode = Episode::default();
-        let paused = fresh(Rung::Freeze, vec![tree(false)], None);
+        let paused = fresh(ReliefRung::Freeze, vec![tree(false)], None);
         assert!(episode.observe(&paused, 1).is_some());
-        let unreadable = ReadOutcome::Unreadable {
+        let unreadable = ReliefOutcome::Unreadable {
             reason: "torn".into(),
         };
         assert!(episode.observe(&unreadable, 2).is_none());
-        assert!(episode.observe(&ReadOutcome::Absent, 3).is_none());
+        assert!(episode.observe(&ReliefOutcome::Absent, 3).is_none());
         assert!(episode.observe(&paused, 4).is_none());
     }
 
     #[test]
     fn a_new_episode_after_rest_is_announced_again() {
         let mut episode = Episode::default();
-        let paused = fresh(Rung::Freeze, vec![tree(false)], None);
+        let paused = fresh(ReliefRung::Freeze, vec![tree(false)], None);
         assert!(episode.observe(&paused, 1).is_some());
         assert!(episode.observe(&rest(), 2).is_none());
         assert!(episode.observe(&paused, 3).is_some());
@@ -422,14 +479,14 @@ mod tests {
     fn an_advised_only_entry_is_not_a_pause_to_announce() {
         let mut episode = Episode::default();
         assert!(episode
-            .observe(&fresh(Rung::Freeze, vec![tree(true)], None), 1)
+            .observe(&fresh(ReliefRung::Freeze, vec![tree(true)], None), 1)
             .is_none());
     }
 
     #[test]
     fn the_cap_resume_is_announced_once_and_old_ones_are_history() {
         let mut episode = Episode::default();
-        let capped = fresh(Rung::Slow, vec![], cap_at(1_000_000));
+        let capped = fresh(ReliefRung::Slow, vec![], cap_at(1_000_000));
         let notice = episode.observe(&capped, 1_030_000).expect("cap news");
         assert_eq!(notice.kind, NoticeKind::CapResumed);
         assert!(notice.body.contains("10-minute"));
@@ -438,7 +495,7 @@ mod tests {
         let mut late = Episode::default();
         assert!(late.observe(&capped, 1_000_000 + CAP_NEWS_MS + 1).is_none());
         // A later cap is news again.
-        let again = fresh(Rung::Slow, vec![], cap_at(1_100_000));
+        let again = fresh(ReliefRung::Slow, vec![], cap_at(1_100_000));
         assert!(episode.observe(&again, 1_101_000).is_some());
     }
 
@@ -449,9 +506,9 @@ mod tests {
         t.repo_path = format!("/work/{}", "r".repeat(500));
         let notice = pause_notice(
             &ReliefStatus {
-                rung: Rung::Freeze,
+                rung: ReliefRung::Freeze,
                 frozen: vec![t.clone()],
-                ..ReliefStatus::at_rest(Mode::Act, 1)
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
             &t,
         );
@@ -461,7 +518,7 @@ mod tests {
 
     #[test]
     fn each_kind_has_its_own_banner_identifier() {
-        let a = pause_notice(&ReliefStatus::at_rest(Mode::Act, 1), &tree(false));
+        let a = pause_notice(&ReliefStatus::at_rest(ReliefMode::Act, 1), &tree(false));
         let b = cap_notice("");
         assert_ne!(a.native_id(), b.native_id());
         assert!(a.native_id().starts_with("gitpulse.relief."));

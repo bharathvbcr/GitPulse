@@ -15,9 +15,9 @@
 //! # Honesty
 //!
 //! A reader never turns "could not tell" into "nothing is paused".
-//! [`ReadOutcome`] has four states: [`Absent`](ReadOutcome::Absent) (no
-//! supervisor has ever written one), [`Fresh`](ReadOutcome::Fresh),
-//! [`Stale`](ReadOutcome::Stale) and [`Unreadable`](ReadOutcome::Unreadable).
+//! [`ReliefOutcome`] has four states: [`Absent`](ReliefOutcome::Absent) (no
+//! supervisor has ever written one), [`Fresh`](ReliefOutcome::Fresh),
+//! [`Stale`](ReliefOutcome::Stale) and [`Unreadable`](ReliefOutcome::Unreadable).
 //! The writer refreshes the file every tick while its rung is not `none` and
 //! writes once more on the transition to `none`, so a file that claims a rung
 //! and is older than [`STALE_AFTER_MS`] is Stale: its writer may be gone with a
@@ -32,7 +32,9 @@
 //! (`{reason, at_ms}`) atomically beside the status file. The supervisor
 //! consumes it on its next tick: it calls `relief::resume_all(true, reason)`
 //! and removes the file. Until the backend consumes it the request does
-//! nothing, which is why a reader reports a request that is still pending.
+//! nothing, and nothing in this module reads it back. Any process of the same
+//! user can write the file, so the supervisor decides how far to trust one
+//! (it can only end a pause, never start one).
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -58,7 +60,7 @@ const MAX_REASON: usize = 64;
 /// What the supervisor is allowed to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Mode {
+pub enum ReliefMode {
     Off,
     Advise,
     Act,
@@ -67,7 +69,7 @@ pub enum Mode {
 /// How far the supervisor has gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Rung {
+pub enum ReliefRung {
     None,
     Slow,
     Freeze,
@@ -76,14 +78,14 @@ pub enum Rung {
 /// The resource the verdict that justified the rung was bound by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Binding {
+pub enum ReliefBinding {
     Swap,
     CompressorSegments,
     CompressorThrash,
     MemoryPressure,
 }
 
-impl Binding {
+impl ReliefBinding {
     /// The resource in words a person reads.
     pub fn phrase(self) -> &'static str {
         match self {
@@ -114,7 +116,7 @@ pub struct FrozenTree {
 /// What an action did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActionKind {
+pub enum ReliefActionKind {
     Slow,
     Freeze,
     Resume,
@@ -125,7 +127,7 @@ pub enum ActionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReliefAction {
     pub at_ms: u64,
-    pub kind: ActionKind,
+    pub kind: ReliefActionKind,
     pub detail: String,
 }
 
@@ -141,9 +143,9 @@ pub struct ReliefFailure {
 pub struct ReliefStatus {
     pub version: u32,
     pub written_at_ms: u64,
-    pub mode: Mode,
-    pub rung: Rung,
-    pub binding: Option<Binding>,
+    pub mode: ReliefMode,
+    pub rung: ReliefRung,
+    pub binding: Option<ReliefBinding>,
     pub slowed: u32,
     pub frozen: Vec<FrozenTree>,
     pub last_action: Option<ReliefAction>,
@@ -154,12 +156,12 @@ pub struct ReliefStatus {
 
 impl ReliefStatus {
     /// A status at rest: nothing slowed, nothing paused.
-    pub fn at_rest(mode: Mode, now_ms: u64) -> Self {
+    pub fn at_rest(mode: ReliefMode, now_ms: u64) -> Self {
         Self {
             version: VERSION,
             written_at_ms: now_ms,
             mode,
-            rung: Rung::None,
+            rung: ReliefRung::None,
             binding: None,
             slowed: 0,
             frozen: Vec::new(),
@@ -183,14 +185,14 @@ impl ReliefStatus {
     /// Whether the file claims the supervisor is doing something, which is
     /// what makes its age matter.
     pub fn claims_activity(&self) -> bool {
-        self.rung != Rung::None
+        self.rung != ReliefRung::None
     }
 }
 
 /// What a read found. Serialised for IPC as `{state, ...}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum ReadOutcome {
+pub enum ReliefOutcome {
     /// No file: no supervisor has written one here.
     Absent,
     /// Readable, and either at rest or refreshed within [`STALE_AFTER_MS`].
@@ -202,7 +204,7 @@ pub enum ReadOutcome {
     Unreadable { reason: String },
 }
 
-impl ReadOutcome {
+impl ReliefOutcome {
     /// Whether the answer to "is anything paused" is known.
     pub fn is_checked(&self) -> bool {
         matches!(self, Self::Absent | Self::Fresh { .. })
@@ -236,31 +238,31 @@ pub fn write_status(dir: &Path, status: &ReliefStatus) -> io::Result<()> {
 }
 
 /// [`read_status_at`] at the present moment.
-pub fn read_status(dir: &Path) -> ReadOutcome {
+pub fn read_status(dir: &Path) -> ReliefOutcome {
     read_status_at(dir, now_ms())
 }
 
 /// Reads the status as of `now_ms`.
-pub fn read_status_at(dir: &Path, now_ms: u64) -> ReadOutcome {
+pub fn read_status_at(dir: &Path, now_ms: u64) -> ReliefOutcome {
     use crate::fs_entry::{read_bounded_nofollow, BoundedRead};
     let path = dir.join(STATUS_FILE_NAME);
     let bytes = match read_bounded_nofollow(&path, MAX_BYTES) {
         Ok(bytes) => bytes,
         Err(BoundedRead::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            return ReadOutcome::Absent;
+            return ReliefOutcome::Absent;
         }
         Err(BoundedRead::Io(error)) => {
-            return ReadOutcome::Unreadable {
+            return ReliefOutcome::Unreadable {
                 reason: format!("the status file could not be read: {error}"),
             };
         }
         Err(BoundedRead::NotRegular) => {
-            return ReadOutcome::Unreadable {
+            return ReliefOutcome::Unreadable {
                 reason: "the status file is not a regular file".into(),
             };
         }
         Err(BoundedRead::TooLarge | BoundedRead::Grew) => {
-            return ReadOutcome::Unreadable {
+            return ReliefOutcome::Unreadable {
                 reason: format!("the status file is larger than {MAX_BYTES} bytes"),
             };
         }
@@ -268,13 +270,13 @@ pub fn read_status_at(dir: &Path, now_ms: u64) -> ReadOutcome {
     let status: ReliefStatus = match serde_json::from_slice(&bytes) {
         Ok(status) => status,
         Err(error) => {
-            return ReadOutcome::Unreadable {
+            return ReliefOutcome::Unreadable {
                 reason: format!("the status file is not a status this build understands: {error}"),
             };
         }
     };
     if status.version != VERSION {
-        return ReadOutcome::Unreadable {
+        return ReliefOutcome::Unreadable {
             reason: format!(
                 "the status file is version {}, and this build reads version {VERSION}",
                 status.version
@@ -283,9 +285,9 @@ pub fn read_status_at(dir: &Path, now_ms: u64) -> ReadOutcome {
     }
     let age_ms = now_ms.saturating_sub(status.written_at_ms);
     if status.claims_activity() && age_ms > STALE_AFTER_MS {
-        return ReadOutcome::Stale { status, age_ms };
+        return ReliefOutcome::Stale { status, age_ms };
     }
-    ReadOutcome::Fresh { status }
+    ReliefOutcome::Fresh { status }
 }
 
 /// The request a banner action or Health button leaves for the supervisor.
@@ -342,16 +344,16 @@ mod tests {
 
     fn frozen_at(written: u64) -> ReliefStatus {
         ReliefStatus {
-            rung: Rung::Freeze,
-            binding: Some(Binding::CompressorSegments),
+            rung: ReliefRung::Freeze,
+            binding: Some(ReliefBinding::CompressorSegments),
             frozen: vec![tree()],
             slowed: 3,
             last_action: Some(ReliefAction {
                 at_ms: written,
-                kind: ActionKind::Freeze,
+                kind: ReliefActionKind::Freeze,
                 detail: "cargo test".into(),
             }),
-            ..ReliefStatus::at_rest(Mode::Act, written)
+            ..ReliefStatus::at_rest(ReliefMode::Act, written)
         }
     }
 
@@ -362,7 +364,7 @@ mod tests {
         write_status(dir.path(), &status).unwrap();
         assert_eq!(
             read_status_at(dir.path(), 10_500),
-            ReadOutcome::Fresh { status }
+            ReliefOutcome::Fresh { status }
         );
     }
 
@@ -374,9 +376,9 @@ mod tests {
         assert_eq!(json["binding"], "compressor_segments");
         assert_eq!(json["last_action"]["kind"], "freeze");
         assert_eq!(json["frozen"][0]["advised_only"], false);
-        let cap = serde_json::to_value(ActionKind::CapResume).unwrap();
+        let cap = serde_json::to_value(ReliefActionKind::CapResume).unwrap();
         assert_eq!(cap, "cap_resume");
-        let outcome = serde_json::to_value(ReadOutcome::Absent).unwrap();
+        let outcome = serde_json::to_value(ReliefOutcome::Absent).unwrap();
         assert_eq!(outcome, serde_json::json!({"state": "absent"}));
     }
 
@@ -389,14 +391,14 @@ mod tests {
         std::fs::write(dir.path().join(STATUS_FILE_NAME), json.to_string()).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 10_001),
-            ReadOutcome::Fresh { .. }
+            ReliefOutcome::Fresh { .. }
         ));
     }
 
     #[test]
     fn absent_when_no_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_status_at(dir.path(), 1), ReadOutcome::Absent);
+        assert_eq!(read_status_at(dir.path(), 1), ReliefOutcome::Absent);
     }
 
     #[test]
@@ -405,25 +407,25 @@ mod tests {
         write_status(dir.path(), &frozen_at(1_000)).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1_000 + STALE_AFTER_MS),
-            ReadOutcome::Fresh { .. }
+            ReliefOutcome::Fresh { .. }
         ));
         match read_status_at(dir.path(), 1_000 + STALE_AFTER_MS + 1) {
-            ReadOutcome::Stale { status, age_ms } => {
+            ReliefOutcome::Stale { status, age_ms } => {
                 assert_eq!(age_ms, STALE_AFTER_MS + 1);
                 assert_eq!(status.paused_count(), 1);
             }
             other => panic!("expected Stale, got {other:?}"),
         }
         // The writer stops refreshing once it is at rest, so age means nothing.
-        write_status(dir.path(), &ReliefStatus::at_rest(Mode::Act, 1_000)).unwrap();
+        write_status(dir.path(), &ReliefStatus::at_rest(ReliefMode::Act, 1_000)).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1_000 + 24 * 3_600_000),
-            ReadOutcome::Fresh { .. }
+            ReliefOutcome::Fresh { .. }
         ));
         // A clock that moved backwards is not an age.
         assert!(matches!(
             read_status_at(dir.path(), 0),
-            ReadOutcome::Fresh { .. }
+            ReliefOutcome::Fresh { .. }
         ));
     }
 
@@ -434,13 +436,15 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1),
-            ReadOutcome::Unreadable { .. }
+            ReliefOutcome::Unreadable { .. }
         ));
         let mut json = serde_json::to_value(frozen_at(1)).unwrap();
         json["version"] = serde_json::json!(2);
         std::fs::write(&path, json.to_string()).unwrap();
         match read_status_at(dir.path(), 1) {
-            ReadOutcome::Unreadable { reason } => assert!(reason.contains("version 2"), "{reason}"),
+            ReliefOutcome::Unreadable { reason } => {
+                assert!(reason.contains("version 2"), "{reason}")
+            }
             other => panic!("expected Unreadable, got {other:?}"),
         }
         let mut json = serde_json::to_value(frozen_at(1)).unwrap();
@@ -448,12 +452,12 @@ mod tests {
         std::fs::write(&path, json.to_string()).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1),
-            ReadOutcome::Unreadable { .. }
+            ReliefOutcome::Unreadable { .. }
         ));
         std::fs::write(&path, vec![b' '; MAX_BYTES + 1]).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1),
-            ReadOutcome::Unreadable { .. }
+            ReliefOutcome::Unreadable { .. }
         ));
     }
 
@@ -463,7 +467,7 @@ mod tests {
         std::fs::create_dir(dir.path().join(STATUS_FILE_NAME)).unwrap();
         assert!(matches!(
             read_status_at(dir.path(), 1),
-            ReadOutcome::Unreadable { .. }
+            ReliefOutcome::Unreadable { .. }
         ));
         #[cfg(unix)]
         {
@@ -477,7 +481,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 read_status_at(link.path(), 1),
-                ReadOutcome::Unreadable { .. }
+                ReliefOutcome::Unreadable { .. }
             ));
         }
     }
@@ -502,7 +506,7 @@ mod tests {
             })
             .collect();
         write_status(dir.path(), &status).unwrap();
-        let ReadOutcome::Fresh { status } = read_status_at(dir.path(), 1) else {
+        let ReliefOutcome::Fresh { status } = read_status_at(dir.path(), 1) else {
             panic!("expected Fresh");
         };
         assert_eq!(status.failures.len(), MAX_FAILURES);
