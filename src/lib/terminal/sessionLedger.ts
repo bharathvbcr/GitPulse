@@ -54,9 +54,9 @@ export interface SessionLedgerOffer {
   title?: string;
   /**
    * `row_id` of the orchestrating agent that spawned this one. Absent from
-   * older backends: read it as null.
+   * older backends, and omitted when there is no parent.
    */
-  parent_row_id?: string | null;
+  parent_row_id?: string;
 }
 
 /** Snapshot of durable recovery offers returned by the backend ledger. */
