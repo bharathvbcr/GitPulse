@@ -232,9 +232,8 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     let (dir, output) = pinned_git(dir, args);
     assert!(
         output.status.success(),
-        "git {args:?} failed with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        "git {args:?} failed with {}",
+        output.status
     );
     if args.first() == Some(&"init") {
         trust_repo(&dir);
