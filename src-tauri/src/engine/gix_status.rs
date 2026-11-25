@@ -2,10 +2,11 @@
 //!
 //! `gix 0.90.0` does not talk to `fsmonitor--daemon`, avoiding Apple Git's
 //! un-timed `_pthread_cond_wait` hangs while matching `--porcelain=v1 -u -z`
-//! semantics across tracked changes, staged renames/copies (`old_path`),
+//! semantics across tracked changes, staged renames (`old_path`),
 //! typechanges, conflict stage pairs, submodules, symlinks, CRLF filters, and
 //! untracked enumeration. Repositories requiring unsupported features
 //! (bare checkouts, repo-local `filter.*` drivers, split or sparse indexes,
+//! copy detection configured through `status.renames` or `diff.renames`,
 //! non-UTF-8 paths, or worktree-to-index rewrites) return
 //! [`GixStatus::Fallback`] so `worktree::spawn_porcelain` falls back cleanly
 //! to `git_cli` with `core.fsmonitor=false`.
@@ -317,6 +318,24 @@ fn has_local_external_filter(repo: &gix::Repository) -> bool {
     found
 }
 
+/// Whether `status.renames` or `diff.renames` names `copies` (or `copy`; git
+/// compares both without case). `gix 0.90` and git disagree in both
+/// directions once either key asks for copies: with `status.renames=copies`
+/// gix reports a staged copy as an addition where git reports
+/// `C  <new>\0<source>\0`, and with `diff.renames=copies` under
+/// `status.renames=true` gix reports a copy (and drops the source's own `M`
+/// row) where git reports neither. git is the reference, so these
+/// repositories read through it.
+fn asks_for_copy_detection(repo: &gix::Repository) -> bool {
+    let config = repo.config_snapshot();
+    ["status.renames", "diff.renames"].into_iter().any(|key| {
+        config.string(key).is_some_and(|value| {
+            let value: &BStr = value.as_ref();
+            value.eq_ignore_ascii_case(b"copies") || value.eq_ignore_ascii_case(b"copy")
+        })
+    })
+}
+
 fn has_unregistered_gitlink(repo: &gix::Repository, index: &gix::index::State) -> bool {
     use gix::bstr::ByteSlice;
     let mut gitlinks = index
@@ -417,6 +436,9 @@ fn run_status_with_interrupt(
     }
     if repo.config_snapshot().boolean("core.splitIndex") == Some(true) {
         return Ok(GixStatus::Fallback("split_index"));
+    }
+    if asks_for_copy_detection(&repo) {
+        return Ok(GixStatus::Fallback("copy_detection"));
     }
 
     let Ok(index) = repo.index_or_empty() else {
@@ -698,6 +720,60 @@ mod tests {
         match porcelain_v1_z(root, None).expect("status") {
             GixStatus::Fallback(reason) => assert_eq!(reason, "split_index"),
             GixStatus::Porcelain(text) => panic!("expected fallback, got porcelain {text:?}"),
+        }
+    }
+
+    /// A staged duplicate of a changed file, the shape git reports as a copy
+    /// when asked to look for copies.
+    fn staged_copy_repo() -> tempfile::TempDir {
+        let dir = git_repo();
+        let root = dir.path();
+        std::fs::write(root.join("orig.txt"), "same\nlines\n").unwrap();
+        git_in(root, &["add", "orig.txt"]);
+        git_in(root, &["commit", "-q", "-m", "seed"]);
+        std::fs::copy(root.join("orig.txt"), root.join("dup.txt")).unwrap();
+        std::fs::write(root.join("orig.txt"), "same\nlines\nplus one\n").unwrap();
+        git_in(root, &["add", "-A"]);
+        dir
+    }
+
+    /// Wherever either key asks for copies, gix and git disagree about a
+    /// staged copy (gix says `A  dup.txt` under `status.renames=copies`, and
+    /// `C  dup.txt` without the source's `M` under `diff.renames=copies` with
+    /// `status.renames=true`, where git says the opposite each time), so the
+    /// repository is read by git, through either key, in either case.
+    #[test]
+    fn configured_copy_detection_triggers_fallback() {
+        for settings in [
+            &[("status.renames", "copies")][..],
+            &[("status.renames", "Copy")][..],
+            &[("diff.renames", "copies")][..],
+            &[("diff.renames", "copies"), ("status.renames", "true")][..],
+        ] {
+            let dir = staged_copy_repo();
+            for (key, value) in settings {
+                git_in(dir.path(), &["config", "--local", key, value]);
+            }
+            match porcelain_v1_z(dir.path(), None).expect("status") {
+                GixStatus::Fallback(reason) => {
+                    assert_eq!(reason, "copy_detection", "{settings:?}")
+                }
+                GixStatus::Porcelain(text) => {
+                    panic!("{settings:?}: expected fallback, got porcelain {text:?}")
+                }
+            }
+        }
+    }
+
+    /// Renames without copies stay in-process, and agree with git on the
+    /// staged duplicate: an addition, and the source's own modification.
+    #[test]
+    fn renames_without_copies_stay_in_process() {
+        let dir = staged_copy_repo();
+        git_in(dir.path(), &["config", "--local", "status.renames", "true"]);
+        match porcelain_v1_z(dir.path(), None).expect("status") {
+            GixStatus::Porcelain(text) => assert_eq!(text, "A  dup.txt\0M  orig.txt\0"),
+            GixStatus::Fallback(reason) => panic!("unexpected fallback: {reason}"),
         }
     }
 }
