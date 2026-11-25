@@ -653,7 +653,7 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u
         move || {
             let _slot = slot;
             let outcome = handle_into(stream, budget, &mut |notice, seq| {
-                note_hook_resolution(&notice);
+                note_hook_prompt(&notice);
                 super::offer_stamped(notice, order_for(seq, stamp))
             });
             if let Outcome::Refused(reason) = outcome {
@@ -1110,31 +1110,37 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("cursor", "Cursor"),
 ];
 
-/// Told, by session key, that a hook reported the agent working again (a tool
-/// finished, a prompt was submitted, the session ended). The terminal layer
-/// registers one to drop a dialog it read off that session's screen.
-type ResolutionObserver = Box<dyn Fn(&str) + Send + Sync>;
+/// Told about a hook report that opens or closes a wait on the person: a
+/// `permission_prompt` (the agent is parked on a dialog) or a resolving event
+/// (a tool finished, a prompt was submitted, the session ended). The terminal
+/// layer registers one, so `wait` and `read` know a hooked agent is waiting
+/// as they know it of one whose dialog was read off its screen.
+type PromptObserver = Box<dyn Fn(&Notice) + Send + Sync>;
 
-static RESOLUTION_OBSERVER: std::sync::OnceLock<ResolutionObserver> = std::sync::OnceLock::new();
+static PROMPT_OBSERVER: std::sync::OnceLock<PromptObserver> = std::sync::OnceLock::new();
 
-/// Registers the one observer of hook resolutions. A second registration is
-/// ignored: there is one terminal registry per app.
-pub(crate) fn observe_hook_resolutions(observer: impl Fn(&str) + Send + Sync + 'static) {
-    let _ = RESOLUTION_OBSERVER.set(Box::new(observer));
+/// Registers the one observer of hook prompts and resolutions. A second
+/// registration is ignored: there is one terminal registry per app.
+pub(crate) fn observe_hook_prompts(observer: impl Fn(&Notice) + Send + Sync + 'static) {
+    let _ = PROMPT_OBSERVER.set(Box::new(observer));
 }
 
 #[cfg(unix)]
-fn note_hook_resolution(notice: &Notice) {
+fn note_hook_prompt(notice: &Notice) {
+    let raises = notice.event == Some("permission_prompt");
     let resolves = notice
         .event
         .and_then(event)
         .is_some_and(|event| event.role == Role::Resolve);
-    if resolves {
-        if let Some(observer) = RESOLUTION_OBSERVER.get() {
-            observer(&notice.key);
+    if raises || resolves {
+        if let Some(observer) = PROMPT_OBSERVER.get() {
+            observer(notice);
         }
     }
 }
+
+/// The channel of a notice an agent's hook reported.
+pub(crate) const HOOK_CHANNEL: &str = "hook";
 
 /// The channel of a notice read off a terminal screen (see [`screen_prompt_notice`]).
 pub(crate) const SCREEN_CHANNEL: &str = "screen";
@@ -1383,7 +1389,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         detail,
         // A hook only exists because an agent installed it.
         is_agent: true,
-        channel: "hook",
+        channel: HOOK_CHANNEL,
         subject,
         subagent,
         agent_id,

@@ -922,14 +922,20 @@ impl TerminalSessions {
 
 impl TerminalSessions {
     /// Connects what orchestration raises about a session: `mavi-child-state`
-    /// events to the app, and hook resolutions (which close a dialog read off a
-    /// screen) from the alert bridge to this registry.
+    /// events to the app, and hook reports from the alert bridge to this
+    /// registry: a `permission_prompt` opens the session's agent prompt (a
+    /// hooked agent parked on the person), a resolving event closes it.
     fn bind_orchestration_events<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
-        self.orchestration
-            .set_child_state_emitter(Arc::new(orchestrate::AppOrchestrateUiSink::new(app.clone())));
+        self.orchestration.set_child_state_emitter(Arc::new(
+            orchestrate::AppOrchestrateUiSink::new(app.clone()),
+        ));
         let registry = self.orchestration.clone();
-        crate::alerts::bridge::observe_hook_resolutions(move |key| {
-            registry.note_hook_resolution(key);
+        crate::alerts::bridge::observe_hook_prompts(move |notice| {
+            if notice.event == Some("permission_prompt") {
+                registry.note_prompt_notice(notice);
+            } else {
+                registry.note_hook_resolution(&notice.key);
+            }
         });
     }
 }
@@ -2003,7 +2009,11 @@ pub(crate) fn apply_telemetry_events(
                     .collect();
                 let detail = (!detail.is_empty()).then_some(detail);
                 // The dialog repainted is the same dialog, not a new one.
-                if state.agent_prompt.as_ref().is_some_and(|p| p.detail == detail) {
+                if state
+                    .agent_prompt
+                    .as_ref()
+                    .is_some_and(|p| p.detail == detail)
+                {
                     continue;
                 }
                 let since_ms = std::time::SystemTime::now()
@@ -2134,7 +2144,8 @@ impl SessionWatcher {
             };
             if let Some(detail) = raised {
                 self.prompt_announced = true;
-                self.events.notice(self.screen_notice("permission_prompt", detail));
+                self.events
+                    .notice(self.screen_notice("permission_prompt", detail));
             }
             if saw_probe
                 && self
@@ -2203,7 +2214,8 @@ impl SessionWatcher {
             .is_some();
         if !open {
             self.prompt_announced = false;
-            self.events.notice(self.screen_notice("prompt_submitted", None));
+            self.events
+                .notice(self.screen_notice("prompt_submitted", None));
         }
     }
 
@@ -10607,7 +10619,10 @@ mod tests {
             &mut telemetry,
             &agy_dialog(&format!("aws s3 ls --key {secret} {long}")),
         );
-        assert_eq!(again["last_prompt_event_seq"], json["last_prompt_event_seq"]);
+        assert_eq!(
+            again["last_prompt_event_seq"],
+            json["last_prompt_event_seq"]
+        );
         assert_eq!(again["event_seq"], json["event_seq"]);
     }
 

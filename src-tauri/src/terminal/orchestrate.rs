@@ -144,7 +144,10 @@ pub fn standalone_caller_id(fallback: impl FnOnce() -> String) -> Result<String,
     standalone_caller_id_from(raw.as_deref(), fallback)
 }
 
-fn standalone_caller_id_from(
+/// [`standalone_caller_id`] over a value the caller already read from the
+/// environment, so a parser that takes its environment as arguments (the hook
+/// CLI) reads no process state.
+pub fn standalone_caller_id_from(
     raw: Option<&str>,
     fallback: impl FnOnce() -> String,
 ) -> Result<String, String> {
@@ -802,7 +805,7 @@ struct OrchestratedRecord {
 /// The app's telemetry scanner over the output it mirrors from the terminal
 /// host. It reads no agent dialogs: the host reads them (it sees every
 /// session, attached or not) and says so in a notice, which
-/// [`OrchestrationRegistry::note_screen_notice`] takes.
+/// [`OrchestrationRegistry::note_prompt_notice`] takes.
 fn host_scanner() -> crate::alerts::scan::Scanner {
     let mut scanner = crate::alerts::scan::Scanner::new();
     scanner.set_agent_prompts(false);
@@ -1267,7 +1270,11 @@ impl OrchestrationRegistry {
         let retain = match inner.sessions.get_mut(session_id) {
             Some(record) => {
                 if !record.ended {
-                    let state = if exit_code == Some(0) { "done" } else { "ended" };
+                    let state = if exit_code == Some(0) {
+                        "done"
+                    } else {
+                        "ended"
+                    };
                     announce = mavi_child_payload(session_id, record, state, None, exit_code);
                 }
                 record.token_hash = None;
@@ -1372,12 +1379,16 @@ impl OrchestrationRegistry {
         emit_child_state(&self.child_emitter, announce);
     }
 
-    /// The terminal host read a dialog off a session's screen (or saw it
-    /// answered) and said so in a notice: the one place the app learns it,
-    /// for attached and detached sessions alike. Records it in the session's
-    /// telemetry so `wait` and `read` can say so, and tells the Mavi page.
-    pub(crate) fn note_screen_notice(&self, notice: &crate::alerts::Notice) {
-        if notice.channel != crate::alerts::bridge::SCREEN_CHANNEL {
+    /// A session is waiting on the person (or no longer is), said in a notice:
+    /// either the terminal host read the dialog off the screen (agy, which has
+    /// no hook for it), or the agent's own hook reported it (Claude, Codex).
+    /// Records it in the session's telemetry so `wait` and `read` can say so,
+    /// and tells the Mavi page. Bells, OSC sequences and other channels carry
+    /// no dialog and are ignored.
+    pub(crate) fn note_prompt_notice(&self, notice: &crate::alerts::Notice) {
+        if notice.channel != crate::alerts::bridge::SCREEN_CHANNEL
+            && notice.channel != crate::alerts::bridge::HOOK_CHANNEL
+        {
             return;
         }
         match notice.event {
@@ -2112,7 +2123,11 @@ fn settings_flags(launcher: &str, relative: &str, repo_root: &Path) -> Result<Ve
         .map_err(|e| format!("settings file {relative} is not readable text: {e}"))?;
     let object = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(object)) => object,
-        _ => return Err(format!("settings file {relative} must hold one JSON object")),
+        _ => {
+            return Err(format!(
+                "settings file {relative} must hold one JSON object"
+            ))
+        }
     };
     let default_mode = object
         .get("permissions")
@@ -2314,7 +2329,7 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                         blocks.feed(&raw, dims.1);
                         rec.blocks = Some(blocks);
                         if !remote_tel_synced {
-                                let mut scanner = host_scanner();
+                            let mut scanner = host_scanner();
                             apply_scanner_telemetry(&mut scanner, &rec.telemetry, &raw);
                             rec.host_scanner = Some(scanner);
                         }
@@ -4416,8 +4431,10 @@ pub(crate) mod tests {
         });
         let first = wait(8_000);
         assert_eq!(
-            first["matched_reason"], "needs_input",
-            "{first}\nscreen: {}", read()["text"]
+            first["matched_reason"],
+            "needs_input",
+            "{first}\nscreen: {}",
+            read()["text"]
         );
         assert_eq!(first["agent_prompt"]["kind"], "permission", "{first}");
         assert!(
@@ -4522,7 +4539,7 @@ pub(crate) mod tests {
         let (registry, seen) = registry_with_child(&repo, &owner, child);
         let telemetry = registry.telemetry_for(child).unwrap();
         let open = |detail: &str| {
-            registry.note_screen_notice(&crate::alerts::bridge::screen_prompt_notice(
+            registry.note_prompt_notice(&crate::alerts::bridge::screen_prompt_notice(
                 child,
                 "Antigravity",
                 None,
@@ -4565,6 +4582,47 @@ pub(crate) mod tests {
         let seen = seen.0.lock().unwrap();
         assert_eq!(seen.len(), before + 1);
         assert_eq!(seen.last().unwrap().state, "ended");
+    }
+
+    /// A Claude or Codex child reports its permission prompt through its hook,
+    /// not on the screen. That report must stand as the child's agent prompt
+    /// too, or `wait` keeps answering "working" for an agent parked on the
+    /// person, which is the stall this branch exists to end.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_reported_permission_prompt_stands_as_the_childs_agent_prompt() {
+        let (_dir, repo) = init_trusted_repo();
+        let owner = mavi_owner_key("0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b").unwrap();
+        let child = "term-91003-1";
+        let (registry, seen) = registry_with_child(&repo, &owner, child);
+        let telemetry = registry.telemetry_for(child).unwrap();
+        let hook = |event: &'static str, detail: Option<&str>| {
+            let mut notice = crate::alerts::bridge::screen_prompt_notice(
+                child,
+                "Claude Code",
+                None,
+                event,
+                detail.map(str::to_owned),
+            );
+            notice.channel = crate::alerts::bridge::HOOK_CHANNEL;
+            notice
+        };
+        registry.note_prompt_notice(&hook("permission_prompt", Some("Bash(git -C /r log)")));
+        {
+            let state = telemetry.0.lock().unwrap();
+            let prompt = state.agent_prompt.as_ref().expect("hook prompt stands");
+            assert_eq!(prompt.kind, "permission");
+            assert_eq!(prompt.detail.as_deref(), Some("Bash(git -C /r log)"));
+        }
+        {
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].state, "needs_input");
+        }
+        // The agent's next hook report that it works again closes it.
+        registry.note_hook_resolution(child);
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        assert_eq!(seen.0.lock().unwrap().last().unwrap().state, "cleared");
     }
 
     #[cfg(unix)]
@@ -5008,9 +5066,27 @@ pub(crate) mod tests {
     fn an_agent_child_takes_a_permission_mode_and_defaults_to_ask() {
         let dir = tempfile::tempdir().unwrap();
         let none = AgentLaunchOptions::default();
-        assert_eq!(flag_values(&child_args("claude", none.clone(), dir.path()).unwrap(), "--permission-mode"), ["manual"]);
-        assert_eq!(flag_values(&child_args("claude", opts(None, Some("edit"), None), dir.path()).unwrap(), "--permission-mode"), ["acceptEdits"]);
-        assert_eq!(flag_values(&child_args("agy", opts(None, Some("inspect"), None), dir.path()).unwrap(), "--mode"), ["plan"]);
+        assert_eq!(
+            flag_values(
+                &child_args("claude", none.clone(), dir.path()).unwrap(),
+                "--permission-mode"
+            ),
+            ["manual"]
+        );
+        assert_eq!(
+            flag_values(
+                &child_args("claude", opts(None, Some("edit"), None), dir.path()).unwrap(),
+                "--permission-mode"
+            ),
+            ["acceptEdits"]
+        );
+        assert_eq!(
+            flag_values(
+                &child_args("agy", opts(None, Some("inspect"), None), dir.path()).unwrap(),
+                "--mode"
+            ),
+            ["plan"]
+        );
         let codex = child_args("codex", opts(None, Some("edit"), None), dir.path()).unwrap();
         assert_eq!(flag_values(&codex, "--sandbox"), ["workspace-write"]);
         assert!(flag_values(&child_args("agy", none, dir.path()).unwrap(), "--mode").is_empty());
@@ -5020,8 +5096,7 @@ pub(crate) mod tests {
     fn bypass_unknown_and_inapplicable_modes_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         for bad in ["bypass", "yolo", "", "EDIT"] {
-            let err = child_args("claude", opts(None, Some(bad), None), dir.path())
-                .expect_err(bad);
+            let err = child_args("claude", opts(None, Some(bad), None), dir.path()).expect_err(bad);
             assert!(!err.is_empty(), "{bad}");
         }
         let err = child_args("manvi", opts(None, Some("edit"), None), dir.path()).unwrap_err();
@@ -5037,7 +5112,10 @@ pub(crate) mod tests {
         assert_eq!(flag_values(&agy, "--model"), ["gemini-3-pro"]);
         assert!(child_args("manvi", opts(Some("opus"), None, None), dir.path()).is_err());
         for bad in ["--evil", "a b", "x,y", ""] {
-            assert!(child_args("claude", opts(Some(bad), None, None), dir.path()).is_err(), "{bad:?}");
+            assert!(
+                child_args("claude", opts(Some(bad), None, None), dir.path()).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -5050,17 +5128,33 @@ pub(crate) mod tests {
             r#"{"permissions":{"allow":["Bash(git -C /repo log:*)"]}}"#,
         )
         .unwrap();
-        let claude = child_args("claude", opts(None, None, Some(".gitpulse/review.json")), dir.path()).unwrap();
+        let claude = child_args(
+            "claude",
+            opts(None, None, Some(".gitpulse/review.json")),
+            dir.path(),
+        )
+        .unwrap();
         let settings = flag_values(&claude, "--settings");
         assert_eq!(settings.len(), 1, "one --settings object: {claude:?}");
         let object: serde_json::Value = serde_json::from_str(settings[0]).unwrap();
-        assert_eq!(object["permissions"]["allow"][0], "Bash(git -C /repo log:*)");
+        assert_eq!(
+            object["permissions"]["allow"][0],
+            "Bash(git -C /repo log:*)"
+        );
         let at = |flag: &str| claude.iter().position(|a| a == flag).unwrap();
         assert!(at("--settings") < at("--"), "{claude:?}");
 
-        let agy = child_args("agy", opts(None, None, Some(".gitpulse/review.json")), dir.path()).unwrap();
+        let agy = child_args(
+            "agy",
+            opts(None, None, Some(".gitpulse/review.json")),
+            dir.path(),
+        )
+        .unwrap();
         let canonical = std::fs::canonicalize(dir.path().join(".gitpulse/review.json")).unwrap();
-        assert_eq!(flag_values(&agy, "--settings"), [canonical.to_str().unwrap()]);
+        assert_eq!(
+            flag_values(&agy, "--settings"),
+            [canonical.to_str().unwrap()]
+        );
     }
 
     #[test]
@@ -5078,16 +5172,29 @@ pub(crate) mod tests {
         assert!(try_settings("claude", "/etc/hosts").is_err());
         assert!(try_settings("claude", "missing.json").is_err());
         assert!(try_settings("claude", "sub").is_err(), "a directory");
-        assert!(try_settings("claude", "array.json").is_err(), "claude needs a JSON object");
+        assert!(
+            try_settings("claude", "array.json").is_err(),
+            "claude needs a JSON object"
+        );
         for launcher in ["codex", "grok", "manvi"] {
             let err = try_settings(launcher, "ok.json").unwrap_err();
-            assert!(err.contains("--settings") || err.contains("settings"), "{launcher}: {err}");
+            assert!(
+                err.contains("--settings") || err.contains("settings"),
+                "{launcher}: {err}"
+            );
         }
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(outside.path().join("s.json"), dir.path().join("link.json")).unwrap();
-            assert!(try_settings("claude", "link.json").is_err(), "symlink out of the repo");
-            assert!(try_settings("agy", "link.json").is_err(), "symlink out of the repo");
+            std::os::unix::fs::symlink(outside.path().join("s.json"), dir.path().join("link.json"))
+                .unwrap();
+            assert!(
+                try_settings("claude", "link.json").is_err(),
+                "symlink out of the repo"
+            );
+            assert!(
+                try_settings("agy", "link.json").is_err(),
+                "symlink out of the repo"
+            );
         }
     }
 
@@ -5099,12 +5206,19 @@ pub(crate) mod tests {
             r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
         )
         .unwrap();
-        std::fs::write(dir.path().join("nohooks.json"), r#"{"disableAllHooks":true}"#).unwrap();
+        std::fs::write(
+            dir.path().join("nohooks.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
         for file in ["bypass.json", "nohooks.json"] {
             for launcher in ["claude", "agy"] {
-                let err = child_args(launcher, opts(None, None, Some(file)), dir.path())
-                    .expect_err(file);
-                assert!(err.contains("not available over MCP"), "{launcher} {file}: {err}");
+                let err =
+                    child_args(launcher, opts(None, None, Some(file)), dir.path()).expect_err(file);
+                assert!(
+                    err.contains("not available over MCP"),
+                    "{launcher} {file}: {err}"
+                );
             }
         }
     }
@@ -5202,9 +5316,16 @@ pub(crate) mod tests {
         for n in 0..MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
             register_fake_child(&state, &repo, &format!("term-91002-{n}"), &live_owner);
         }
-        let err = execute(&state, &ui, external_spawn(&repo, "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b"))
-            .unwrap_err();
-        assert!(err.contains("external terminal orchestrators already have"), "{err}");
+        let err = execute(
+            &state,
+            &ui,
+            external_spawn(&repo, "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("external terminal orchestrators already have"),
+            "{err}"
+        );
     }
 
     /// Before: nothing said a child's owner was gone, and nothing kept the

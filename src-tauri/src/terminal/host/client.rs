@@ -1877,7 +1877,7 @@ impl Inner {
             }
             HostFrame::Notice { notice } => match notice.into_notice() {
                 Ok(notice) => {
-                    self.orchestration.note_screen_notice(&notice);
+                    self.orchestration.note_prompt_notice(&notice);
                     crate::alerts::offer(notice);
                 }
                 Err(error) => log::warn!(target: "terminal", "{error}"),
