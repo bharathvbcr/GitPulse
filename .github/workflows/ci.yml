@@ -430,7 +430,8 @@ jobs:
             bash "$src/scripts/fetch-modules.sh"
             CGO_ENABLED=0 go -C "$src/manvi" build -trimpath -o "$root/bin/$exe" ./cmd/manvi
           fi
-          echo "$root/bin" >> "$GITHUB_PATH"
+          # A native spelling, so the Rust test step's own PATH walk finds it on Windows.
+          if command -v cygpath >/dev/null 2>&1; then cygpath -w "$root/bin"; else echo "$root/bin"; fi >> "$GITHUB_PATH"
           "$root/bin/$exe" --version
 
       - name: Keep the manvi build
