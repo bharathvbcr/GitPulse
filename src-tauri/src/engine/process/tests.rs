@@ -1720,6 +1720,40 @@ fn own_run_timeout_ignores_the_label_charset_but_not_the_cause() {
         "sleep",
         "Failed to spawn sleep: No such file"
     ));
+    // The exact text run_bounded writes: whole or fractional seconds only.
+    for ok in ["1s", "0.2s", "1.5s", "3600s"] {
+        let ran = format!("sleep{TIMEOUT_MARKER}{ok}");
+        assert!(is_own_run_timeout("sleep", &ran), "{ran}");
+    }
+    // Every other message that carries the marker never ran the child, or is
+    // not the runner's text, and fails the shape.
+    for bad in [
+        "0s: deadline must be positive and at most 3600s",
+        "1s waiting for a process slot",
+        "s",
+        ".s",
+        "1.2.3s",
+        "1s ",
+        "1s\n",
+        "-1s",
+        "1e3s",
+        "1 s",
+        "",
+    ] {
+        let message = format!("sleep{TIMEOUT_MARKER}{bad}");
+        assert!(!is_own_run_timeout("sleep", &message), "{message:?}");
+    }
+    let zero = format!("sleep{TIMEOUT_MARKER}0s: deadline must be positive and at most 3600s");
+    assert!(!is_own_run_timeout("sleep", &zero));
+    let deferred = refusal_message(
+        "sleep",
+        Refusal::Refused {
+            waited: Duration::from_secs(2),
+        },
+    );
+    assert!(!is_own_run_timeout("sleep", deferred.message()));
+    let cancelled = refusal_message("sleep", Refusal::Cancelled);
+    assert!(!is_own_run_timeout("sleep", cancelled.message()));
 }
 
 /// A load deferral never ran the child either; it must not become an outcome.
@@ -1997,7 +2031,6 @@ fn run_captured_keeps_an_oversized_deadline_an_error() {
 /// be reported as a run that timed out.
 #[cfg(unix)]
 #[test]
-#[ignore = "lane B attack: a zero timeout is refused before spawn but its text carries the timeout marker, so run_captured returns Ok(TimedOut(0s)) for a child that never ran"]
 fn run_captured_does_not_report_a_zero_deadline_as_a_timed_out_run() {
     let outcome = run_captured(
         "/usr/bin/true",

@@ -8,7 +8,7 @@ use super::env::{
 use super::gate::{
     current_admission, is_deferred_under_load, is_slot_wait_timeout, refusal_message_at,
     spawn_gate, strip_code_prefix, with_admission, with_exec_probe, Admission, Refusal, SpawnGate,
-    SLOT_WAIT_SUFFIX, TIMEOUT_MARKER,
+    TIMEOUT_MARKER,
 };
 #[cfg(test)]
 use super::gate::{refusal_message, spawn_log};
@@ -437,19 +437,28 @@ pub(crate) fn is_timed_out(err: &str) -> bool {
     err.contains(TIMEOUT_MARKER)
 }
 
-/// True when `err` is the deadline text of the child `run_captured` ran as
-/// `program`: it starts with the program (the label `run_bounded` uses, in
-/// whatever characters the path holds) and carries the timeout marker. A
-/// refused slot wait carries the marker too, and a deferral can, but neither
-/// ran the child, so neither is a run that timed out. The slot-wait refusal is
-/// recognised by its ending, which the gate writes after the label: a path
-/// that merely spells the phrase, and really ran out of time, ends in the
-/// runner's own `<n>s`.
+/// True when `err` is exactly the deadline text `run_bounded` writes for the
+/// child `run_captured` ran as `program`: `<program> timed out after <n>s`,
+/// where `<n>` is the seconds as a plain decimal and nothing follows.
+///
+/// The label is the program in whatever characters its path holds, so it is
+/// matched by prefix, not by shape. Everything else that carries the marker
+/// is refused by construction, because none of it ends in digits and `s`: a
+/// slot-wait refusal (`... waiting for a process slot`), a deferral, the
+/// up-front rejection of a zero deadline (`...0s: deadline must be positive
+/// ...`), a cancellation and a spawn failure. A child that never ran is not a
+/// run that timed out.
 pub(super) fn is_own_run_timeout(program: &str, err: &str) -> bool {
-    err.starts_with(program)
-        && is_timed_out(err)
-        && !strip_code_prefix(err).ends_with(SLOT_WAIT_SUFFIX)
-        && !is_deferred_under_load(err)
+    let Some(seconds) = err
+        .strip_prefix(program)
+        .and_then(|rest| rest.strip_prefix(TIMEOUT_MARKER))
+        .and_then(|rest| rest.strip_suffix('s'))
+    else {
+        return false;
+    };
+    seconds.bytes().any(|b| b.is_ascii_digit())
+        && seconds.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && seconds.bytes().filter(|&b| b == b'.').count() <= 1
 }
 
 /// What a runner failure message says happened, read once and in one place.
