@@ -277,6 +277,7 @@ describe("report alignment (A3)", () => {
       violations: [] as string[],
       unregistered: [] as string[],
       annotatedCount: 95,
+      ungranted: [] as string[] | null,
       ok: true,
     };
     const long = formatReport(result, "a/very/deeply/nested/path/to/src-tauri/src/lib.rs".repeat(3));
