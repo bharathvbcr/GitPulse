@@ -101,21 +101,81 @@ struct StatKey {
 
 impl StatKey {
     #[cfg(unix)]
-    fn of(meta: &std::fs::Metadata) -> Option<StatKey> {
+    fn from_meta(meta: &std::fs::Metadata) -> StatKey {
         use std::os::unix::fs::MetadataExt;
-        Some(StatKey {
+        StatKey {
             dev: meta.dev(),
             ino: meta.ino(),
             size: meta.size(),
             mtime: (meta.mtime(), meta.mtime_nsec()),
             ctime: (meta.ctime(), meta.ctime_nsec()),
-        })
+        }
     }
 
-    /// No ctime here, so nothing is skipped: every file is read and compared.
-    #[cfg(not(unix))]
-    fn of(_meta: &std::fs::Metadata) -> Option<StatKey> {
-        None
+    /// The key of a file already open: Unix reads it off `meta`, Windows asks
+    /// the handle for the file id and `ChangeTime`. Elsewhere there is no
+    /// change time, so nothing is skipped: every file is read and compared.
+    fn of_open(file: &std::fs::File, meta: &std::fs::Metadata) -> Option<StatKey> {
+        #[cfg(unix)]
+        {
+            let _ = file;
+            Some(Self::from_meta(meta))
+        }
+        #[cfg(windows)]
+        {
+            let (volume, id) = crate::fs_entry::windows_file_identity(file).ok()?;
+            let changed = crate::fs_entry::windows_change_time(file).ok()?;
+            let low = u64::from_le_bytes(id[..8].try_into().ok()?);
+            let high = u64::from_le_bytes(id[8..].try_into().ok()?);
+            let stamp = |time: SystemTime| {
+                let after = time.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+                Some((
+                    i64::try_from(after.as_secs()).ok()?,
+                    i64::from(after.subsec_nanos()),
+                ))
+            };
+            Some(StatKey {
+                dev: volume,
+                ino: low ^ high.rotate_left(32),
+                size: meta.len(),
+                mtime: stamp(meta.modified().ok()?)?,
+                ctime: stamp(changed)?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, meta);
+            None
+        }
+    }
+
+    /// The key of the file at `path`, whose `lstat` is `meta`. Windows opens
+    /// it for attributes only, a reparse point not followed and every share
+    /// mode allowed, so reading the key never conflicts with a writer.
+    fn of_path(path: &Path, meta: &std::fs::Metadata) -> Option<StatKey> {
+        #[cfg(unix)]
+        {
+            let _ = path;
+            Some(Self::from_meta(meta))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                // FILE_READ_ATTRIBUTES: no data access, so no sharing conflict.
+                .access_mode(0x80)
+                .share_mode(1 | 2 | 4)
+                // FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS.
+                .custom_flags(0x0020_0000 | 0x0200_0000)
+                .open(path)
+                .ok()?;
+            Self::of_open(&file, meta)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (path, meta);
+            None
+        }
     }
 
     /// Whether a later write must produce a different key: the change time
@@ -449,7 +509,7 @@ fn build_vault(
             truncated = true;
             continue;
         }
-        if let Some(key) = StatKey::of(&stat) {
+        if let Some(key) = StatKey::of_path(&abs, &stat) {
             let seen = known
                 .as_deref()
                 .and_then(|memo| memo.files.get(rel.as_str()))
@@ -510,7 +570,11 @@ fn build_vault(
         // Metadata can race a growing file; bound the actual read as well.
         let limit = DEFAULT_MAX_NOTE_BYTES.min(remaining);
         let mut bytes = Vec::new();
-        if file.take(limit as u64 + 1).read_to_end(&mut bytes).is_err() {
+        if (&file)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
             skipped_unreadable = skipped_unreadable.saturating_add(1);
             continue;
         }
@@ -525,7 +589,7 @@ fn build_vault(
         // The key the bytes just read were opened under, recorded only when
         // settled and of the same length. A write racing the read moves
         // ctime, so the next scan sees another key and reads again.
-        let read_key = StatKey::of(&meta)
+        let read_key = StatKey::of_open(&file, &meta)
             .filter(|key| key.settled(scan_started) && key.size == bytes.len() as u64);
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
@@ -646,7 +710,7 @@ fn index_key(repo: &Path) -> Option<(PathBuf, StatKey)> {
     if !meta.is_file() {
         return None;
     }
-    StatKey::of(&meta).map(|key| (index, key))
+    StatKey::of_path(&index, &meta).map(|key| (index, key))
 }
 
 /// Tracked markdown paths from `git ls-files`, never a filesystem walk.
