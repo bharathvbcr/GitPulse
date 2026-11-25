@@ -291,47 +291,62 @@
   let fleetShed = $state(false);
   let tasksShed = $state(false);
   let agentsShed = $state(false);
+  // Each surface's mounted/shed flags are its effect's own output, so they are
+  // read and written under untrack: the effect re-runs on the surface and the
+  // idle stage only, never on a flag it just wrote.
   $effect(() => {
-    if ($interfaceStore.globalSurface === "tasks") {
-      tasksMounted = true;
-      if (tasksShed) {
+    const open = $interfaceStore.globalSurface === "tasks";
+    const shedNow = shouldShedInactiveSurfaces;
+    return untrack(() => {
+      if (open) {
+        tasksMounted = true;
+        if (!tasksShed) return;
         const frame = requestAnimationFrame(() => {
           tasksShed = false;
         });
         return () => cancelAnimationFrame(frame);
       }
-    } else if (shouldShedInactiveSurfaces && tasksMounted) {
-      tasksMounted = false;
-      tasksShed = true;
-    }
+      if (shedNow && tasksMounted) {
+        tasksMounted = false;
+        tasksShed = true;
+      }
+    });
   });
   $effect(() => {
-    if (fleetOpen) {
-      fleetMounted = true;
-      if (fleetShed) {
+    const open = fleetOpen;
+    const shedNow = shouldShedInactiveSurfaces;
+    return untrack(() => {
+      if (open) {
+        fleetMounted = true;
+        if (!fleetShed) return;
         const frame = requestAnimationFrame(() => {
           fleetShed = false;
         });
         return () => cancelAnimationFrame(frame);
       }
-    } else if (shouldShedInactiveSurfaces && fleetMounted) {
-      fleetMounted = false;
-      fleetShed = true;
-    }
+      if (shedNow && fleetMounted) {
+        fleetMounted = false;
+        fleetShed = true;
+      }
+    });
   });
   $effect(() => {
-    if ($interfaceStore.globalSurface === "agents") {
-      agentsMounted = true;
-      if (agentsShed) {
+    const open = $interfaceStore.globalSurface === "agents";
+    const shedNow = shouldShedInactiveSurfaces;
+    return untrack(() => {
+      if (open) {
+        agentsMounted = true;
+        if (!agentsShed) return;
         const frame = requestAnimationFrame(() => {
           agentsShed = false;
         });
         return () => cancelAnimationFrame(frame);
       }
-    } else if (shouldShedInactiveSurfaces && agentsMounted) {
-      agentsMounted = false;
-      agentsShed = true;
-    }
+      if (shedNow && agentsMounted) {
+        agentsMounted = false;
+        agentsShed = true;
+      }
+    });
   });
 
   // Forward legacy repoStore.error to the centralized toast queue AND to the

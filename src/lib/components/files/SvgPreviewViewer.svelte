@@ -549,12 +549,37 @@
     }
   }
 
-  function handleStepZoom(delta: 1 | -1) {
-    const current = fitMode
+  /** The zoom the stage shows now: the fitted percent while fitting, else the set zoom. */
+  function currentZoomPercent(): number {
+    return fitMode
       ? Math.max(SVG_ZOOM_MIN, Math.min(SVG_ZOOM_MAX, displaySize.effectivePercent))
       : zoom;
+  }
+
+  function handleStepZoom(delta: 1 | -1) {
+    const current = currentZoomPercent();
     fitMode = false;
     zoom = stepSvgZoom(current, delta);
+  }
+
+  // Ctrl/⌘ + wheel (and trackpad pinch) zoom. A plain handler rather than a
+  // closure inside the stage effect: it reads and writes fitMode/zoom, and
+  // only ever runs from an event, never while that effect is tracking.
+  function handleStageWheel(event: WheelEvent) {
+    if (!event.ctrlKey && !event.metaKey) return;
+    if (!canRenderStageImage) return;
+    event.preventDefault();
+    if (event.deltaY === 0) return;
+    const current = currentZoomPercent();
+    fitMode = false;
+    if (Math.abs(event.deltaY) >= 40) {
+      zoom = stepSvgZoom(current, event.deltaY < 0 ? 1 : -1);
+    } else {
+      const factor = Math.exp(-event.deltaY * 0.01);
+      let next = Math.round(current * factor);
+      if (next === current) next = current + (event.deltaY < 0 ? 1 : -1);
+      zoom = Math.max(SVG_ZOOM_MIN, Math.min(SVG_ZOOM_MAX, next));
+    }
   }
 
   function resetZoomActual() {
@@ -566,25 +591,6 @@
   $effect(() => {
     const el = stageEl;
     if (!el) return;
-
-    const onWheel = (event: WheelEvent) => {
-      if (!event.ctrlKey && !event.metaKey) return;
-      if (!canRenderStageImage) return;
-      event.preventDefault();
-      if (event.deltaY === 0) return;
-      const current = fitMode
-        ? Math.max(SVG_ZOOM_MIN, Math.min(SVG_ZOOM_MAX, displaySize.effectivePercent))
-        : zoom;
-      fitMode = false;
-      if (Math.abs(event.deltaY) >= 40) {
-        zoom = stepSvgZoom(current, event.deltaY < 0 ? 1 : -1);
-      } else {
-        const factor = Math.exp(-event.deltaY * 0.01);
-        let next = Math.round(current * factor);
-        if (next === current) next = current + (event.deltaY < 0 ? 1 : -1);
-        zoom = Math.max(SVG_ZOOM_MIN, Math.min(SVG_ZOOM_MAX, next));
-      }
-    };
 
     const onPointerDown = (event: PointerEvent) => {
       if (event.button !== 0) return;
@@ -627,10 +633,10 @@
       window.addEventListener("pointercancel", cleanup);
     };
 
-    el.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("wheel", handleStageWheel, { passive: false });
     el.addEventListener("pointerdown", onPointerDown);
     return () => {
-      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("wheel", handleStageWheel);
       el.removeEventListener("pointerdown", onPointerDown);
       stopPanDrag?.();
     };
