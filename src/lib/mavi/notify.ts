@@ -13,6 +13,7 @@
  * The same notice for the same thread is not repeated within
  * {@link REPEAT_MS}: approve, work, approve again is one toast, not three.
  */
+import type { ChildCard } from "./childTabs.svelte";
 import type { ThreadStatus } from "./threads";
 
 export type MaviNoticeKind = "needs_you" | "failed";
@@ -50,4 +51,14 @@ export function maviNotices(
   }
   for (const key of [...seen.keys()]) if (!present.has(key)) seen.delete(key);
   return out;
+}
+
+/**
+ * The toast text for a terminal tab a thread started changing state. The tab's
+ * title leads, then the thread it belongs to, so two tabs from two threads
+ * read apart.
+ */
+export function childTabNotice(card: Pick<ChildCard, "title" | "state">, threadTitle: string): string {
+  const what = card.state === "needs_input" ? "needs your approval" : card.state === "done" ? "finished" : "ended";
+  return `“${card.title}” (from “${threadTitle}”) ${what}.`;
 }

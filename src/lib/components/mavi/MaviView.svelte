@@ -21,6 +21,7 @@
   import MaviRail from "./MaviRail.svelte";
   import MaviTimeline from "./MaviTimeline.svelte";
   import MaviComposer from "./MaviComposer.svelte";
+  import MaviChildTabs from "./MaviChildTabs.svelte";
   import MaviChanges from "./MaviChanges.svelte";
   import MaviNewThread from "./MaviNewThread.svelte";
   import Checkbox from "../Checkbox.svelte";
@@ -369,6 +370,7 @@
       {#if maviStore.errors[record.key]}
         <p class="gp-notice gp-notice-error text-meta" role="alert">{maviStore.errors[record.key]}</p>
       {/if}
+      <MaviChildTabs threadKey={record.key} onAsk={(text) => maviStore.send(record.key, text)} />
       {#if running}
         {#key record.key}
           <MaviComposer

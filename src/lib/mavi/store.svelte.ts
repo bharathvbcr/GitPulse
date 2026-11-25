@@ -9,6 +9,7 @@
  */
 import { applyLine, continueInNewSession, emptyThread } from "./reduce";
 import { changedPaths } from "./files";
+import { childTabs, closeThreadChildren } from "./childTabs.svelte";
 import { maviClient, onMaviEvents, onMaviStatus, type MaviModeId, type StartRequest } from "./client";
 import {
   readThreadRecords,
@@ -300,11 +301,14 @@ class MaviStore {
         : { host: options.target.host, dir: options.target.dir, mode: options.mode };
     if (options.acknowledged) request.acknowledged = true;
     if (options.model) request.model = options.model;
+    // The key exists before the agent does: the host names the agent's tabs by it.
+    const threadKey = newKey();
+    request.threadKey = threadKey;
     const summary = await maviClient.start(request);
     const target: MaviTarget = summary.target;
     const now = Date.now();
     const record: ThreadRecord = {
-      key: newKey(),
+      key: threadKey,
       sessionId: summary.id,
       title: titleFrom(options.firstMessage),
       target,
@@ -347,6 +351,7 @@ class MaviStore {
     if (record.conversationId) base.resume = record.conversationId;
     if (record.model) base.model = record.model;
     if (acknowledged) base.acknowledged = true;
+    base.threadKey = key;
     delete this.errors[key];
     const summary = await maviClient.start(base);
     record.sessionId = summary.id;
@@ -390,6 +395,16 @@ class MaviStore {
   }): Promise<string> {
     const request: StartRequest = { repoPath: options.root, mode: options.mode, resume: options.conversationId };
     if (options.acknowledged) request.acknowledged = true;
+    // A thread this conversation already had keeps its key (and its tabs);
+    // otherwise the key minted here becomes the new thread's.
+    const known = this.records.find(
+      (r) =>
+        r.conversationId?.toLowerCase() === options.conversationId.toLowerCase() &&
+        r.target.kind === "local" &&
+        r.target.root === options.root,
+    );
+    const mintedKey = known?.key ?? newKey();
+    request.threadKey = mintedKey;
     const summary = await maviClient.start(request);
     const startedIn = summary.target.kind === "local" ? summary.target.root : null;
     const existing = this.records.find(
@@ -410,7 +425,7 @@ class MaviStore {
       record.lastActivityAt = now;
       key = record.key;
     } else {
-      key = newKey();
+      key = mintedKey;
       record = {
         key,
         sessionId: summary.id,
@@ -505,6 +520,11 @@ class MaviStore {
   forget(key: string): void {
     const record = this.record(key);
     if (record?.sessionId && this.summaries[record.sessionId]?.phase !== "ended") void maviClient.stop(record.sessionId);
+    // Forgetting a thread ends its terminal tabs too; a stop or interrupt does not.
+    if (record) {
+      childTabs.forget(key);
+      void closeThreadChildren(key).catch(() => {});
+    }
     this.records = this.records.filter((r) => r.key !== key);
     delete this.timelines[key];
     delete this.queues[key];
