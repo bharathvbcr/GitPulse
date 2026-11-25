@@ -68,6 +68,7 @@ const fixtures={
  cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,shared_worktrees:[],sessions_ok:true,sessions_error:""}),
  cmd_fleet_snapshot:()=>({repos:[],requested:2,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
  cmd_host_load_status:()=>hostLoadStatusFixture(),
+ cmd_host_relief_status:()=>({state:"absent"}),
  // The view bar's agents read (lane I) asks for the insights snapshot. This page
  // has no agents fixture, so the read is answered as unavailable on purpose;
  // the bar shows that state and nothing here depends on the snapshot.

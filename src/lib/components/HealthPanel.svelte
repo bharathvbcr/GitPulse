@@ -120,6 +120,7 @@
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
   import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
+  import HostReliefSection from "./health/HostReliefSection.svelte";
   import SecretsSection from "./health/SecretsSection.svelte";
   import ListPreviewToggle from "./ListPreviewToggle.svelte";
   import { runManviAction } from "../terminal/manviAction";
@@ -2043,6 +2044,7 @@
            above rather than one of them. -->
       <HealthSection id="host-load">
         <HostLoadSection />
+        <HostReliefSection />
       </HealthSection>
     {:else}
       <EmptyState icon={FolderOpen} title="Open a repository to scan dependency health" />

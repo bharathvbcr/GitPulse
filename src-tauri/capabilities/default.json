@@ -202,6 +202,8 @@
     "allow-cmd-host-load-status",
     "allow-cmd-host-load-terminate-orphan",
     "allow-cmd-host-platform",
+    "allow-cmd-host-relief-request-resume",
+    "allow-cmd-host-relief-status",
     "allow-cmd-hygiene-cancel",
     "allow-cmd-hygiene-execute",
     "allow-cmd-hygiene-prepare",

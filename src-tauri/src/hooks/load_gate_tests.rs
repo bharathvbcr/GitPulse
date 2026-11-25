@@ -42,6 +42,8 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         read_free: |_| Free::Missing,
         lease: LeaseSource::Fixed(LeaseFacts::default()),
         steward_throttle: None,
+        relief: ReadOutcome::Absent,
+        terminal_session: None,
     }
 }
 
@@ -1803,4 +1805,197 @@ fn without_a_hook_deadline_the_steward_slowdown_advises_but_never_sleeps() {
         "{text}"
     );
     assert!(!text.contains("paced this command"), "{text}");
+}
+
+// -- the pressure-relief supervisor's status, as the hook says it ------------
+
+mod relief {
+    use super::*;
+    use crate::sysload::relief_status::{
+        Binding as ReliefBinding, FrozenTree, Mode, ReliefStatus, Rung,
+    };
+
+    const OURS: &str = "term-4000-ab12";
+
+    fn tree(session: Option<&str>, repo: &str, advised_only: bool) -> FrozenTree {
+        FrozenTree {
+            pid: 4242,
+            start_us: 1,
+            agent_root_pid: 4000,
+            terminal_session_id: session.map(str::to_owned),
+            repo_path: repo.into(),
+            command: "cargo test --workspace".into(),
+            footprint_bytes: 9 << 30,
+            since_ms: 1,
+            advised_only,
+        }
+    }
+
+    fn frozen(trees: Vec<FrozenTree>) -> ReadOutcome {
+        ReadOutcome::Fresh {
+            status: ReliefStatus {
+                rung: Rung::Freeze,
+                binding: Some(ReliefBinding::CompressorSegments),
+                frozen: trees,
+                ..ReliefStatus::at_rest(Mode::Act, 1)
+            },
+        }
+    }
+
+    fn with(relief: ReadOutcome, dir: &Path) -> Gathered {
+        let mut g = gathered(verdict(Tier::Elevated, Some(Binding::Swap), true), dir);
+        g.relief = relief;
+        g.terminal_session = Some(OURS.into());
+        g
+    }
+
+    const HEAVY: &str = "cargo test --lib";
+
+    #[test]
+    fn a_tree_paused_for_this_session_is_named_and_the_agent_is_told_to_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = with(
+            frozen(vec![tree(Some(OURS), "/elsewhere", false)]),
+            dir.path(),
+        );
+        let text = context(&judged(HEAVY, &g));
+        for must in [
+            "paused `cargo test --workspace`",
+            "memory protection",
+            "compressor",
+            "resume automatically",
+            "Do not retry",
+            "in parallel",
+        ] {
+            assert!(text.contains(must), "lacks {must:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_tree_is_also_matched_by_the_sessions_cwd_inside_its_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        // The call's cwd is /repo; the tree has no terminal id.
+        let g = with(frozen(vec![tree(None, "/repo", false)]), dir.path());
+        assert!(context(&judged(HEAVY, &g)).contains("paused `cargo test"));
+        // A sibling directory with the same prefix is not inside it.
+        let g = with(frozen(vec![tree(None, "/rep", false)]), dir.path());
+        assert!(!context(&judged(HEAVY, &g)).contains("paused `cargo test"));
+    }
+
+    #[test]
+    fn a_tree_paused_for_another_session_is_not_this_sessions_business() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = with(
+            frozen(vec![tree(Some("term-9-zz"), "/other/repo", false)]),
+            dir.path(),
+        );
+        let text = context(&judged(HEAVY, &g));
+        assert!(!text.contains("paused `"), "{text}");
+        assert!(!text.contains("could NOT check"), "{text}");
+    }
+
+    #[test]
+    fn an_advised_only_tree_is_not_reported_as_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = with(frozen(vec![tree(Some(OURS), "/repo", true)]), dir.path());
+        assert!(!context(&judged(HEAVY, &g)).contains("paused `"));
+    }
+
+    #[test]
+    fn a_slowdown_alone_is_one_line_of_advice() {
+        let dir = tempfile::tempdir().unwrap();
+        let relief = ReadOutcome::Fresh {
+            status: ReliefStatus {
+                rung: Rung::Slow,
+                binding: Some(ReliefBinding::Swap),
+                slowed: 5,
+                ..ReliefStatus::at_rest(Mode::Act, 1)
+            },
+        };
+        let text = context(&judged(HEAVY, &with(relief, dir.path())));
+        assert!(text.contains("lowered the priority of 5"), "{text}");
+        assert!(text.contains("swap is nearly full"), "{text}");
+        assert!(!text.contains("paused `"), "{text}");
+    }
+
+    #[test]
+    fn a_stale_or_unreadable_status_says_it_could_not_check_and_never_nothing_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = ReadOutcome::Stale {
+            status: ReliefStatus::at_rest(Mode::Act, 1),
+            age_ms: 61_000,
+        };
+        let unreadable = ReadOutcome::Unreadable {
+            reason: "not a status this build understands".into(),
+        };
+        for (relief, expect) in [(stale, "61s ago"), (unreadable, "not a status")] {
+            let g = with(relief, dir.path());
+            let text = context(&judged(HEAVY, &g));
+            assert!(text.contains("could NOT check"), "{text}");
+            assert!(text.contains(expect), "{text}");
+            // It warns against assuming nothing is paused; it never claims it.
+            assert!(text.contains("Do not assume nothing is paused"), "{text}");
+            assert!(!text.contains("paused `"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unchecked_status_is_said_once_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = with(
+            ReadOutcome::Unreadable {
+                reason: "garbled".into(),
+            },
+            dir.path(),
+        );
+        assert!(context(&judged(HEAVY, &g)).contains("could NOT check"));
+        assert!(!context(&judged(HEAVY, &g)).contains("could NOT check"));
+    }
+
+    #[test]
+    fn an_absent_status_and_a_status_at_rest_are_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        for relief in [
+            ReadOutcome::Absent,
+            ReadOutcome::Fresh {
+                status: ReliefStatus::at_rest(Mode::Act, 1),
+            },
+        ] {
+            let mut g = gathered(verdict(Tier::Clear, None, true), dir.path());
+            g.relief = relief;
+            assert!(judged(HEAVY, &g).is_silent());
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_the_paused_note_in_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = severe(dir.path());
+        g.relief = frozen(vec![tree(Some(OURS), "/repo", false)]);
+        g.terminal_session = Some(OURS.into());
+        let out = judged(HEAVY, &g);
+        assert_eq!(decision_of(&out), Some(PermissionDecision::Deny));
+        assert!(reason(&out).contains("paused `cargo test --workspace`"));
+    }
+
+    #[test]
+    fn a_gate_set_to_off_and_the_heavy_lane_hear_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = with(frozen(vec![tree(Some(OURS), "/repo", false)]), dir.path());
+        g.mode = HostLoadHookMode::Off;
+        assert!(judged(HEAVY, &g).is_silent());
+        let mut g = with(frozen(vec![tree(Some(OURS), "/repo", false)]), dir.path());
+        g.exempt = true;
+        assert!(judged(HEAVY, &g).is_silent());
+    }
+
+    #[test]
+    fn the_echoed_command_is_cleaned_and_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tree(Some(OURS), "/repo", false);
+        t.command = format!("cargo test \u{202e}{}", "x".repeat(400));
+        let text = context(&judged(HEAVY, &with(frozen(vec![t]), dir.path())));
+        assert!(!text.contains('\u{202e}'), "{text}");
+        assert!(text.contains('…') && text.len() < MAX_TEXT, "{text}");
+    }
 }

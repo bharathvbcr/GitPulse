@@ -31,6 +31,7 @@ pub fn glyph_variant(state: &MenuState) -> GlyphVariant {
         || state.status.operation.is_some()
         || state.status.watch_status == "degraded"
         || state.agents_waiting > 0
+        || state.pressure.needs_glance()
         || state
             .agent_requests
             .iter()
@@ -92,11 +93,19 @@ pub fn tray_tooltip(state: &MenuState) -> String {
         agents.push_str(&parts.join(" · "));
         agents.push('\n');
     }
+    // Host pressure leads: a paused build or a nearly exhausted Mac is what the
+    // reader most needs to find here, and none of it comes from a repository.
+    let pressure: String = state
+        .pressure
+        .tooltip_lines()
+        .into_iter()
+        .map(|line| format!("{line}\n"))
+        .collect();
     // The detail and the summary carry repository and branch names, which a
     // repository controls: each is cleaned to one line, and the newlines here
     // are the tooltip's own.
     format!(
-        "GitPulse\n{agents}{}\n{}",
+        "GitPulse\n{pressure}{agents}{}\n{}",
         crate::alerts::text::sanitize(&state.tray_detail),
         crate::alerts::text::sanitize(&state.tray_summary.text)
     )
@@ -124,6 +133,7 @@ pub fn needs_apply(previous: &MenuState, next: &MenuState) -> bool {
         || previous.agent_requests_hidden != next.agent_requests_hidden
         || previous.agents_running != next.agents_running
         || previous.agents_informational != next.agents_informational
+        || previous.pressure != next.pressure
         || glyph_variant(previous) != glyph_variant(next)
 }
 
@@ -718,6 +728,46 @@ mod tests {
         state.status.operation = None;
         state.status.watch_status = "degraded".into();
         assert_eq!(glyph_variant(&state), GlyphVariant::Attention);
+    }
+
+    #[test]
+    fn glyph_and_tooltip_reflect_severe_load_a_pause_and_an_unverified_status() {
+        use crate::desktop::pressure::HostPressure;
+        let calm = MenuState::default();
+        assert_eq!(glyph_variant(&calm), GlyphVariant::Plain);
+        for (pressure, line) in [
+            (
+                HostPressure {
+                    severe: true,
+                    ..Default::default()
+                },
+                "Memory is critically low",
+            ),
+            (
+                HostPressure {
+                    paused: 2,
+                    ..Default::default()
+                },
+                "2 build or test paused by memory protection",
+            ),
+            (
+                HostPressure {
+                    unverified: true,
+                    ..Default::default()
+                },
+                "Memory protection status could not be verified",
+            ),
+        ] {
+            let state = MenuState {
+                pressure,
+                ..MenuState::default()
+            };
+            assert_eq!(glyph_variant(&state), GlyphVariant::Attention, "{line}");
+            assert!(tray_tooltip(&state).contains(line), "{line}");
+            // The status item is redrawn for a change in pressure alone.
+            assert!(needs_apply(&calm, &state), "{line}");
+        }
+        assert!(!tray_tooltip(&calm).contains("Memory"));
     }
 
     #[test]

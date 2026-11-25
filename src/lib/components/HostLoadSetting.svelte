@@ -21,7 +21,8 @@
     updateHostLoadSettings,
     type HostLoadHookMode,
     type LeaseMode,
-    type HostLoadSettings,
+    type HostLoadSettingsExt,
+    type SupervisorMode,
   } from "../stores/hostLoadStore";
   import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
   import { loadOnce } from "../settings/loadOnce";
@@ -30,13 +31,20 @@
 
   // The shared copy: the input rows save through the same store, so a toggle
   // here never saves their thresholds back stale.
-  const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
+  const settings = $derived<HostLoadSettingsExt>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
   const thresholdsAreDefault = $derived(defaultThresholds(settings.thresholds));
   const HOOK_MODES: readonly { value: HostLoadHookMode; label: string; title: string }[] = [
     { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
     { value: "advise", label: "Advise", title: "Tell the agent, never refuse" },
     { value: "off", label: "Off", title: "Say nothing about load" },
   ];
+  const SUPERVISOR_MODES: readonly { value: SupervisorMode; label: string; title: string }[] = [
+    { value: "act", label: "Act", title: "Pause the heaviest build or test under an agent" },
+    { value: "advise", label: "Advise", title: "Only say what it would pause" },
+    { value: "off", label: "Off", title: "Do nothing" },
+  ];
+  // Absent until the backend reports it: there is nothing to switch before then.
+  const supervisor = $derived(settings.supervisor);
   const LEASE_MODES: readonly { value: LeaseMode; label: string; title: string }[] = [
     { value: "on", label: "Queue", title: "A cargo or go build waits for a free slot" },
     { value: "off", label: "Off", title: "Builds run at once and the wrapper says nothing" },
@@ -64,7 +72,7 @@
     }
   }
 
-  async function save(change: Partial<HostLoadSettings>) {
+  async function save(change: Partial<HostLoadSettingsExt>) {
     if (busy) return;
     busy = true;
     error = "";
@@ -142,6 +150,26 @@
         // Before a read has succeeded `settings` is the defaults; saving one
         // would write them over the real configuration.
         if (readOk && !busy) void save({ hook_mode: next });
+      }}
+    />
+  </div>
+  <div class="space-y-1 pt-1" data-testid="host-load-supervisor">
+    <p class="text-text">When memory runs out</p>
+    <p class="text-textMuted text-micro leading-snug">
+      Act (the default): pause the heaviest build or test under an agent GitPulse launched, never the agent
+      itself, until the pressure eases or 10 minutes pass; first, agent processes are slowed to background
+      priority. Advise: only tell me what it would pause. Off: do nothing.
+      {#if supervisor === undefined}
+        This build of GitPulse has no memory supervisor to switch yet.
+      {/if}
+    </p>
+    <SettingSegment
+      ariaLabel="What GitPulse does when memory runs out"
+      options={SUPERVISOR_MODES}
+      value={supervisor ?? "act"}
+      disabled={supervisor === undefined}
+      onselect={(next) => {
+        if (readOk && !busy && supervisor !== undefined) void save({ supervisor: next });
       }}
     />
   </div>

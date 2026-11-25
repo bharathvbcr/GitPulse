@@ -21,6 +21,7 @@
     type MetricSeverity,
   } from "../health/hostLoadMetrics";
   import { pollHostLoad } from "../health/hostLoadPoll";
+  import { hostRelief, reliefChipInput } from "../health/hostRelief";
   import {
     hostLoadHistory,
     hostLoadPulse,
@@ -47,7 +48,7 @@
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let openHealthBtnEl = $state<HTMLButtonElement | null>(null);
 
-  let bar = $derived(bottomBarMetrics($hostLoadPulse, detail));
+  let bar = $derived(bottomBarMetrics($hostLoadPulse, detail, reliefChipInput($hostRelief)));
   let panelModel = $derived(
     $hostLoadPulse ? popoverDetailModel($hostLoadPulse, $hostLoadStatus, $hostLoadHistory) : null,
   );

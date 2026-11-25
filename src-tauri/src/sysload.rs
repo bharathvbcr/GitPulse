@@ -47,6 +47,7 @@ mod probe;
 pub(crate) mod procscan;
 mod profile;
 pub mod relief;
+pub(crate) mod relief_status;
 pub(crate) mod sampler;
 mod sensor;
 mod snapshot;

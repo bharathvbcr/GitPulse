@@ -373,6 +373,39 @@ pub async fn cmd_host_load_admit_anyway() -> Result<String, IpcError> {
     .await
 }
 
+/// What the pressure-relief supervisor has published (`host-relief.v1.json`):
+/// absent, fresh, stale or unreadable, never a bare "nothing paused" for a
+/// file that could not be read. Read-only.
+#[tauri::command(async)]
+pub async fn cmd_host_relief_status() -> Result<crate::sysload::relief_status::ReadOutcome, IpcError>
+{
+    off_thread(|| {
+        let dir = crate::sysload::relief_status::default_dir().ok_or_else(|| {
+            CommandError::from("there is no per-user config directory".to_string())
+        })?;
+        Ok(crate::sysload::relief_status::read_status(&dir))
+    })
+    .await
+}
+
+/// A person's "Resume all" in Health: leaves `host-relief-resume.request` for
+/// the supervisor, which resumes every process it paused on its next tick.
+///
+/// Security impact: this widens nothing a person could not already do. It
+/// writes one small file in GitPulse's own per-user config directory and sends
+/// no signal itself; what the supervisor does with it is resume processes it
+/// stopped, which only ever ends a pause. Granted to the main window only, like
+/// the other host-load commands; no agent path reaches it.
+#[tauri::command(async)]
+pub async fn cmd_host_relief_request_resume() -> Result<(), IpcError> {
+    off_thread(|| {
+        crate::sysload::relief_status::request_resume("health").map_err(|error| {
+            CommandError::from(format!("the resume request was not written: {error}"))
+        })
+    })
+    .await
+}
+
 /// The host-load kill switch, as stored.
 #[tauri::command(async)]
 pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, IpcError> {

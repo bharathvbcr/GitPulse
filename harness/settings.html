@@ -338,6 +338,7 @@
             window.__gpHostLoadCalls.push("status");
             return structuredClone(hostLoadStatus);
           }
+          if (cmd === "cmd_host_relief_status") return { state: "absent" };
           if (cmd === "cmd_lappi_settings") {
             return {
               settings: { ask_on_ambiguous_commit_type: false, record_caller_data: false },

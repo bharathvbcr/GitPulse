@@ -14,6 +14,7 @@ pub mod launch;
 pub mod launch_agent;
 mod menu;
 pub mod popover;
+pub mod pressure;
 pub mod shell;
 pub mod state;
 #[cfg(target_os = "macos")]
@@ -1272,6 +1273,12 @@ pub fn menu_state<R: Runtime>(app: &AppHandle<R>) -> MenuState {
 pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result<(), String> {
     next.validate()?;
     let previous = menu_state(app);
+    // The renderer does not know the host's pressure, so its state never
+    // carries it: keep what the native poller last set.
+    let next = MenuState {
+        pressure: previous.pressure,
+        ..next
+    };
     let rebuild_menu = previous
         .repositories
         .iter()
@@ -1297,6 +1304,30 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         .map_err(|error| error.to_string())? = next.clone();
     hibernate::persist_boot_tray_hint(next.show_status_icon, next.hide_dock_when_closed);
     popover::publish(app, &next)
+}
+
+/// Records the host's pressure for the status item and redraws it when that
+/// changes what it shows. Main thread, like every tray update.
+pub fn set_host_pressure<R: Runtime>(
+    app: &AppHandle<R>,
+    pressure: pressure::HostPressure,
+) -> Result<(), String> {
+    let previous = menu_state(app);
+    if previous.pressure == pressure {
+        return Ok(());
+    }
+    let next = MenuState {
+        pressure,
+        ..previous.clone()
+    };
+    if tray::needs_apply(&previous, &next) {
+        tray::apply(app, &next)?;
+    }
+    *app.state::<DesktopState>()
+        .menu_state
+        .lock()
+        .map_err(|error| error.to_string())? = next;
+    Ok(())
 }
 
 /// Runs `update`, turning a panic into the error the caller is waiting for.

@@ -287,6 +287,9 @@
         // What an open dock asks after its shell spawns (a screenshot opens it).
         "cmd_terminal_context", "cmd_terminal_resize", "cmd_session_alerts_visible",
         "cmd_catch_up","cmd_ledger_status", "cmd_mcp_info", "cmd_codeintel_cancel", "cmd_host_load_status",
+        // The status bar's memory-protection chip reads the supervisor's status;
+        // nothing is published here, so it stays quiet.
+        "cmd_host_relief_status",
         // The header checks open the Fleet surface (row 2 inert under it), which
         // asks for its snapshot; the answer is not what they look at.
         "cmd_fleet_snapshot",

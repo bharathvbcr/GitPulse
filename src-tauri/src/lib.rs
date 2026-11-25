@@ -372,6 +372,10 @@ pub fn run() {
             // that). A second GitPulse beside this one loses the snapshot's
             // writer election and reads instead.
             start_host_load_sampler(app.handle());
+            // The status item and the banner for a build the relief
+            // supervisor paused. Native and read-only: it works when the web
+            // view is gone, and the supervisor itself is not started here.
+            desktop::pressure::start(app.handle());
             {
                 use tauri::Manager as _;
                 harness::steward::install(
@@ -822,6 +826,8 @@ pub fn run() {
             cmd_lappi_settings,
             cmd_lappi_settings_save,
             cmd_host_load_status,
+            cmd_host_relief_status,
+            cmd_host_relief_request_resume,
             cmd_host_load_leases,
             cmd_host_load_idle,
             cmd_host_load_park,

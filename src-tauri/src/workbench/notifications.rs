@@ -54,6 +54,7 @@ mod platform {
     }
     pub(super) fn withdraw(_natives: &[String]) {}
     pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
+    pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
 }
 
 pub(super) struct Coordinator {
@@ -71,6 +72,19 @@ pub(super) enum Event {
     /// is the person saying "not now", and stealing focus would contradict it.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Snooze(String),
+    /// The pressure-relief banner's Settings button or its body: open
+    /// Settings. Its "Resume now" never becomes an event; the delegate leaves
+    /// the supervisor's request file itself.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Relief,
+}
+
+/// Posts a pressure-relief banner (`desktop::pressure`) in its own category,
+/// whose "Resume now" and "Settings" buttons the delegate answers. `native`
+/// replaces the banner of the same identifier rather than stacking.
+pub(crate) fn post_relief(native: &str, heading: &str, body: &str) -> Result<bool, String> {
+    platform::post(native, heading, body, true, platform::RELIEF_CATEGORY)
+        .map_err(|error| error.message)
 }
 
 /// How long the banner's Snooze defers a notice. The activity inbox's own
@@ -462,7 +476,9 @@ impl ResponseTap {
             match self.0.try_recv().ok()? {
                 Event::Activate(native) => return Some((native, false)),
                 Event::Snooze(native) => return Some((native, true)),
-                Event::Wake => continue,
+                // Settings from a relief banner needs the running app's
+                // window; the launch that only passes responses on has none.
+                Event::Wake | Event::Relief => continue,
             }
         }
     }
@@ -620,6 +636,16 @@ fn run(
                 let opening = app.clone();
                 if let Err(error) = app.run_on_main_thread(move || {
                     deliver_notification_activation(&opening, session);
+                }) {
+                    if let Ok(mut current) = status.lock() {
+                        current.error = Some(error.to_string());
+                    }
+                }
+            }
+            Ok(Event::Relief) => {
+                let opening = app.clone();
+                if let Err(error) = app.run_on_main_thread(move || {
+                    crate::desktop::handle_menu_event(&opening, "tray:settings");
                 }) {
                     if let Ok(mut current) = status.lock() {
                         current.error = Some(error.to_string());

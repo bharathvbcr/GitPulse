@@ -74,6 +74,7 @@ use super::heavy_commands::{classify, Classified, Hit};
 use super::{
     decision, fnv1a, HookInput, HookOutput, HookSpecificOutput, PermissionDecision, PRE_TOOL_USE,
 };
+use crate::sysload::relief_status::{self, ReadOutcome, ReliefStatus, Rung};
 use crate::sysload::{
     Binding, InputMode, PublishedVerdict, Reading, SensorReport, SensorState, Snapshot, Tier,
 };
@@ -126,6 +127,13 @@ pub(super) struct Gathered {
     /// Active Manvi system steward critical slowdown lease, when in force for
     /// this repository and not exempt (`MAC_HEAVY_LABEL`).
     pub steward_throttle: Option<crate::harness::steward::ActiveThrottleRecord>,
+    /// What the pressure-relief supervisor published (`host-relief.v1.json`).
+    /// `Absent` is the normal state until a supervisor has ever written one.
+    pub relief: ReadOutcome,
+    /// The GitPulse terminal this hook runs under (`GITPULSE_SESSION_ID`), the
+    /// key a paused tree is matched to a caller by. Injected, never read from
+    /// the environment inside the judge.
+    pub terminal_session: Option<String>,
 }
 
 /// Where the facts about the build lease come from.
@@ -396,7 +404,7 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
     } else {
         crate::harness::steward::active_throttle_for_cwd(cwd)
     };
-    let live = |availability, exempt, disk, steward_throttle| Gathered {
+    let live = |availability, exempt, disk, steward_throttle, relief| Gathered {
         mode,
         exempt,
         availability,
@@ -406,6 +414,10 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
         read_free: real_free,
         lease: LeaseSource::Live,
         steward_throttle,
+        relief,
+        terminal_session: std::env::var(crate::alerts::bridge::SESSION_ENV)
+            .ok()
+            .filter(|id| !id.is_empty()),
     };
     if mode == HostLoadHookMode::Off && steward_throttle.is_none() {
         return live(
@@ -413,6 +425,7 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
             exempt,
             DiskFacts::from_settings(None),
             None,
+            ReadOutcome::Absent,
         );
     }
     live(
@@ -424,7 +437,19 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
             real_free,
         )),
         steward_throttle,
+        relief_live(),
     )
+}
+
+/// The supervisor's published status, read once per classified command. No
+/// config directory is a read that could not be made, never an empty file.
+fn relief_live() -> ReadOutcome {
+    match relief_status::default_dir() {
+        Some(dir) => relief_status::read_status(&dir),
+        None => ReadOutcome::Unreadable {
+            reason: "there is no per-user config directory (HOME unset)".into(),
+        },
+    }
 }
 
 /// The app's held verdict as a reader may act on it, read from the published
@@ -650,6 +675,127 @@ pub(super) fn judge_with_steward_and_pacer(
 }
 
 fn judge_classified(
+    input: &HookInput,
+    classified: &Classified,
+    g: &Gathered,
+    started: Option<std::time::Instant>,
+    pace: impl FnOnce(Duration),
+) -> HookOutput {
+    let answer = judge_load(input, classified, g, started, pace);
+    // The heavy-lane holder and a gate set to Off hear nothing from this stage,
+    // the relief note included: it is the same "say nothing" switch.
+    if g.exempt || g.mode == HostLoadHookMode::Off {
+        return answer;
+    }
+    match relief_note(input, g) {
+        Some(note) => with_note(answer, &note),
+        None => answer,
+    }
+}
+
+/// `note` on `answer`: inside the reason of a refusal, where the model reads
+/// it as the cause, and as context otherwise.
+fn with_note(answer: HookOutput, note: &str) -> HookOutput {
+    if !refuses(&answer) {
+        return fold(answer, advice(note));
+    }
+    let mut answer = answer;
+    if let Some(specific) = answer.hook_specific_output.as_mut() {
+        let reason = specific
+            .permission_decision_reason
+            .take()
+            .unwrap_or_default();
+        specific.permission_decision_reason = Some(format!("{reason}\n{note}"));
+    }
+    answer
+}
+
+/// The longest command echoed into the model's context.
+const MAX_ECHOED_COMMAND: usize = 120;
+
+/// What the hook says about the relief supervisor, if anything:
+///
+/// * a tree paused for this session (matched by terminal session id, or by the
+///   session's cwd being inside the tree's repository): which command, that
+///   GitPulse's memory protection paused it, that it resumes by itself and must
+///   not be retried or run alongside;
+/// * only a slowdown: one line of advice;
+/// * a status that is stale or could not be read: said once per session that
+///   it could not be checked, never that nothing is paused;
+/// * absent, or a rest status: nothing.
+fn relief_note(input: &HookInput, g: &Gathered) -> Option<String> {
+    match &g.relief {
+        ReadOutcome::Absent => None,
+        ReadOutcome::Fresh { status } => relief_text(status, input, g),
+        ReadOutcome::Stale { age_ms, .. } => unchecked_relief(
+            input,
+            g,
+            &format!(
+                "the status was last written {}s ago, so the supervisor may no longer be running",
+                age_ms / 1000
+            ),
+        ),
+        ReadOutcome::Unreadable { reason } => unchecked_relief(input, g, reason),
+    }
+}
+
+fn unchecked_relief(input: &HookInput, g: &Gathered, why: &str) -> Option<String> {
+    let why = clip(&crate::alerts::text::sanitize(why), 200);
+    match first_notice(g, input, &format!("relief: {why}")) {
+        Notice::Repeat => None,
+        notice => Some(format!(
+            "GitPulse could NOT check whether its memory protection has paused a build or test ({why}). \
+             Do not assume nothing is paused: a command that hangs without output may be.{}",
+            notice.suffix()
+        )),
+    }
+}
+
+fn relief_text(status: &ReliefStatus, input: &HookInput, g: &Gathered) -> Option<String> {
+    let cwd = Path::new(&input.cwd);
+    let mine = status.paused().find(|tree| {
+        let by_session = matches!(
+            (&tree.terminal_session_id, &g.terminal_session),
+            (Some(theirs), Some(ours)) if theirs == ours
+        );
+        let by_repo = cwd.is_absolute()
+            && !tree.repo_path.is_empty()
+            && cwd.starts_with(Path::new(&tree.repo_path));
+        by_session || by_repo
+    });
+    if let Some(tree) = mine {
+        let command = clip(
+            &crate::alerts::text::sanitize(&tree.command),
+            MAX_ECHOED_COMMAND,
+        );
+        return Some(format!(
+            "GitPulse's memory protection paused `{command}` (pid {}) because {}. \
+             It will resume automatically. Do not retry it, and do not re-run it or another build in parallel; wait for it to resume.",
+            tree.pid,
+            status.binding.map_or("memory is nearly exhausted", relief_status::Binding::phrase)
+        ));
+    }
+    if status.rung != Rung::None && status.slowed > 0 {
+        return Some(format!(
+            "GitPulse's memory protection has lowered the priority of {} agent process(es) because {}, so builds and tests run slower. Run one at a time.",
+            status.slowed,
+            status.binding.map_or("memory is nearly exhausted", relief_status::Binding::phrase)
+        ));
+    }
+    None
+}
+
+/// The first `max` characters of `text`, with an ellipsis when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
+fn judge_load(
     input: &HookInput,
     classified: &Classified,
     g: &Gathered,

@@ -55,6 +55,31 @@ define_class!(
             completion: &DynBlock<dyn Fn()>,
         ) {
             let native = response.notification().request().identifier().to_string();
+            // A pressure-relief banner is not an activity or session notice and
+            // has no durable claim behind it. "Resume now" leaves the request
+            // file the supervisor reads (`relief_status::request_resume`), here,
+            // so it works in whichever launch macOS delivered it to; Settings
+            // and the body click open Settings.
+            if response
+                .notification()
+                .request()
+                .content()
+                .categoryIdentifier()
+                .to_string()
+                == RELIEF_CATEGORY
+            {
+                if response.actionIdentifier().to_string() == RELIEF_RESUME_ACTION {
+                    if let Err(error) =
+                        crate::sysload::relief_status::request_resume("notification")
+                    {
+                        log::warn!(target:"workbench","resume request from a banner was not written: {error}");
+                    }
+                } else if let Err(error) = self.ivars().sender.try_send(Event::Relief) {
+                    log::warn!(target:"workbench","relief banner activation could not be queued: {error}");
+                }
+                completion.call(());
+                return;
+            }
             // Snooze is the only action that is not an open: the body click
             // (UNNotificationDefaultActionIdentifier) and the Open button both
             // open. Dismiss never arrives — no category sets CustomDismissAction.
@@ -142,6 +167,28 @@ pub(super) fn install(
             UNNotificationCategoryOptions::empty(),
         )
     })
+    .chain(std::iter::once({
+        // Resume is a background action: pressing it must not bring GitPulse
+        // forward over the thing the person is trying to get back to.
+        let actions = [
+            UNNotificationAction::actionWithIdentifier_title_options(
+                &NSString::from_str(RELIEF_RESUME_ACTION),
+                &NSString::from_str("Resume now"),
+                UNNotificationActionOptions::empty(),
+            ),
+            UNNotificationAction::actionWithIdentifier_title_options(
+                &NSString::from_str(RELIEF_SETTINGS_ACTION),
+                &NSString::from_str("Settings"),
+                UNNotificationActionOptions::Foreground,
+            ),
+        ];
+        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(RELIEF_CATEGORY),
+            &NSArray::from_retained_slice(&actions),
+            &NSArray::<NSString>::new(),
+            UNNotificationCategoryOptions::empty(),
+        )
+    }))
     .collect();
     center.setNotificationCategories(&NSSet::from_retained_slice(&categories));
     Ok(())
@@ -155,6 +202,12 @@ pub(super) const WORKBENCH_CATEGORY: &str = "gitpulse-workbench";
 pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
 /// Action identifier of an activity banner's Snooze button.
 const SNOOZE_ACTION: &str = "snooze";
+/// Category and thread of the pressure-relief supervisor's banners
+/// (`desktop::pressure`).
+pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
+/// The relief banner's "Resume now" and "Settings" buttons.
+const RELIEF_RESUME_ACTION: &str = "relief-resume";
+const RELIEF_SETTINGS_ACTION: &str = "relief-settings";
 
 fn timeout() -> WorkbenchError {
     WorkbenchError::new("timeout","macOS notification reply was not confirmed. Recheck status; a delivery will not be sent again automatically.")
@@ -378,6 +431,10 @@ mod tests {
         assert_eq!(SESSION_CATEGORY, "gitpulse-session");
         assert_eq!(SNOOZE_ACTION, "snooze");
         assert_ne!(WORKBENCH_CATEGORY, SESSION_CATEGORY);
+        assert_eq!(RELIEF_CATEGORY, "gitpulse-relief");
+        assert_ne!(RELIEF_RESUME_ACTION, RELIEF_SETTINGS_ACTION);
+        assert_ne!(RELIEF_CATEGORY, SESSION_CATEGORY);
+        assert_ne!(RELIEF_CATEGORY, WORKBENCH_CATEGORY);
 
         let minute = local_minute().expect("local_minute succeeds");
         assert!(minute < 1440, "minute out of range: {minute}");

@@ -8,6 +8,7 @@
  * and is never shown as zero.
  */
 import { humanBytes } from "../storage/format";
+import { NO_RELIEF_CHIP, type ReliefChipInput } from "./hostRelief";
 import type {
   AgentKind,
   AgentSession,
@@ -104,7 +105,32 @@ export interface StatusChip {
  * is meant to run. A sensor the user switched off is their choice, and
  * Settings already says so.
  */
-export function statusChip(pulse: HostLoadPulse | null): StatusChip | null {
+export function statusChip(
+  pulse: HostLoadPulse | null,
+  relief: ReliefChipInput = NO_RELIEF_CHIP,
+): StatusChip | null {
+  const base = pressureChip(pulse);
+  if (relief.paused === 0 && !relief.unverified) return base;
+  // The relief supervisor's word, appended to whatever the bar already says,
+  // or said alone when the bar would have been quiet. A status that was
+  // stale or unreadable says so: it is never "nothing paused".
+  const note =
+    relief.paused > 0
+      ? ` · ${relief.paused} paused${relief.unverified ? " (unverified)" : ""}`
+      : " · pause status unverified";
+  const title =
+    relief.paused > 0
+      ? "GitPulse's memory protection paused a build or test under an agent. It resumes automatically. Open Health, Host load, to resume it now."
+      : "GitPulse could not verify whether its memory protection has paused anything. Open Health, Host load.";
+  if (base) return { ...base, text: base.text + note, title: `${base.title} ${title}` };
+  return {
+    text: `Memory protection${note}`,
+    tone: relief.paused > 0 ? "warn" : "muted",
+    title,
+  };
+}
+
+function pressureChip(pulse: HostLoadPulse | null): StatusChip | null {
   if (!pulse || pulse.role === "unsupported" || pulse.role === "not_sampling") return null;
   if (!pulse.enabled && pulse.state !== "dead") return null;
   if (pulse.state === "dead" || pulse.state === "stale_old") {
