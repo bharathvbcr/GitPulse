@@ -174,7 +174,11 @@ fn creates_at_claude_codes_path_on_its_branch_from_the_local_default() {
     );
 
     assert_eq!(finished.exit_code, EXIT_DONE, "{finished:?}");
-    let expected = fixture.root.join(".gitpulse/worktrees/bold-oak-a3f2");
+    let expected = fixture
+        .root
+        .join(".gitpulse")
+        .join("worktrees")
+        .join("bold-oak-a3f2");
     assert_eq!(finished.path.as_deref(), expected.to_str());
     // GitPulse's lane attribution and git-status exclude both hold on the new worktree.
     let layout = agent_layout(expected.to_str().unwrap()).expect("an agent layout");
