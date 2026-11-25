@@ -10,6 +10,7 @@ import {
   DEFAULT_LIB_RS,
   DEFAULT_SRC_DIR,
   ORPHAN_ALLOWLIST,
+  allowPermissionFor,
   formatReport,
   runContractCheck,
   scanAnnotatedCommands,
@@ -458,5 +459,49 @@ describe("annotated but unregistered commands", () => {
     expect(result.violations.join(" ")).toContain("cmd_dead");
     // The text report must name it, not just the JSON.
     expect(formatReport(result, "lib.rs")).toContain("annotated but never registered");
+  });
+
+  it("fails an invoked command the capability file does not grant, and says when it could not check", async () => {
+    // build.rs puts every registered command into the ACL; without an
+    // allow-cmd-* entry Tauri refuses it for the main window. Eleven Labs
+    // commands shipped invoked, registered and ungranted.
+    const dir = await mkdtemp(path.join(tmpdir(), "gp-ungranted-"));
+    tempDirs.push(dir);
+    const srcDir = path.join(dir, "src-tauri", "src");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(
+      path.join(srcDir, "lib.rs"),
+      "fn main() {\n  tauri::generate_handler![commands::cmd_granted, commands::cmd_spend_summary];\n}\n",
+    );
+    await writeFile(
+      path.join(srcDir, "commands.rs"),
+      "#[tauri::command]\npub fn cmd_granted() {}\n#[tauri::command]\npub fn cmd_spend_summary() {}\n",
+    );
+    const frontend = path.join(dir, "src");
+    await mkdir(frontend, { recursive: true });
+    await writeFile(path.join(frontend, "app.ts"), 'invoke("cmd_granted");\ninvoke("cmd_spend_summary");\n');
+    const libPath = path.join(srcDir, "lib.rs");
+
+    // No capability file: the grant check did not run, and the report says so.
+    const unchecked = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(unchecked.ungranted).toBeNull();
+    expect(formatReport(unchecked, "lib.rs")).toMatch(/ungranted commands\s*: not checked/);
+
+    const capabilities = path.join(dir, "src-tauri", "capabilities");
+    await mkdir(capabilities, { recursive: true });
+    const write = (permissions: unknown[]) =>
+      writeFile(path.join(capabilities, "default.json"), JSON.stringify({ identifier: "default", permissions }));
+
+    await write(["core:default", allowPermissionFor("cmd_granted")]);
+    const refused = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(refused.ok).toBe(false);
+    expect(refused.ungranted).toEqual(["cmd_spend_summary"]);
+    expect(refused.violations.join(" ")).toContain('"allow-cmd-spend-summary"');
+    expect(formatReport(refused, "lib.rs")).toContain("ungranted commands:");
+
+    await write(["allow-cmd-granted", { identifier: "allow-cmd-spend-summary" }]);
+    const granted = runContractCheck({ libPath, srcDirs: [frontend] });
+    expect(granted.ungranted).toEqual([]);
+    expect(granted.violations.filter((v) => v.startsWith("ungranted:"))).toEqual([]);
   });
 });
