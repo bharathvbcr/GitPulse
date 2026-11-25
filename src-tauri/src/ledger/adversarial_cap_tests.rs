@@ -35,7 +35,10 @@ fn append_row(repo: &str, object: &str, detail: Option<&str>) -> LedgerEvent {
 }
 
 fn hash_of(text: &str) -> String {
-    format!("fnv1a64:{:016x}", devmap_extract::fnv1a64(text.as_bytes()))
+    format!(
+        "fnv1a64:{:016x}",
+        crate::ledger::ids::fnv1a64(text.as_bytes())
+    )
 }
 
 fn legacy_event(object: &str) -> LedgerEvent {

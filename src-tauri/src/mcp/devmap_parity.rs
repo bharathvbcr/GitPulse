@@ -1226,6 +1226,11 @@ mod tests {
     #[test]
     fn search_and_explore_verify_whole_tree_freshness() {
         let repo = crate::codeintel::tests::freshness_audit_matching_source_fixture();
+        // A walk that matches a base the current analyzer did not write reads
+        // `fresh: null` (resolver-stale base), so this fixture must describe a
+        // store the current analyzer and resolver wrote before `true` can mean
+        // the tree was verified.
+        crate::codeintel::tests::stamp_current_payload_identity(repo.path());
         let root = repo.path().to_string_lossy().into_owned();
         // The fixture's payloads carry stamps no current analyzer wrote. The
         // tree matches the stored hashes, but the index is not the one this

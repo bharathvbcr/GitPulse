@@ -14,6 +14,31 @@
 //! take the table at all while it lived there. A second copy of the table
 //! would have been the alternative, and a second table is how a key redacted
 //! by one consumer leaks out of another.
+//!
+//! # What a value is judged on
+//!
+//! A credential-named key (`password=`, `"token": `, `--password`) is followed
+//! by a value that may be a secret or may be a reference to one, and the
+//! detectors decide which by reading the value: its length, whether it reads as
+//! an identifier or as words, whether it is a placeholder. That judgement reads
+//! at most the first `MAX_JUDGED_VALUE` (512) bytes of the value, cut at a
+//! character boundary. The detectors ask at every separator of a line, and the
+//! value after a separator can run to the end of it, so an unbounded read made
+//! a long line of repeated `password=` quadratic; the bound makes a line cost
+//! time proportional to its length (`tests/scaling.rs` measures 100 KB against
+//! 400 KB). A real password, key or token is far shorter than 512 bytes. The
+//! bound is on the judgement only: a value judged a secret is redacted whole,
+//! however long, and a value whose first 512 bytes read as words or an
+//! identifier is not judged by anything past them.
+//!
+//! # Same-line joins
+//!
+//! The scan reads one line at a time. On one line, a run of two or more quoted
+//! literals separated only by whitespace or one `+` is also scanned once as one
+//! joined literal, so a key written as two quoted halves is the key it reads as. The
+//! line as written is always scanned first, and a match in the joined copy
+//! counts only when it starts in one literal and ends in a later one. A split
+//! across lines and a headerless PEM body stay misses.
 
 /// A credential shape worth stopping a commit for.
 struct SecretPattern {
@@ -79,7 +104,11 @@ impl Body {
 impl SecretPattern {
     /// Validated UTF-8 byte spans. Rejected prefixes do not hide subsequent
     /// candidates; a matched token is consumed once, including nested prefixes.
-    fn spans<'a>(&'a self, content: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    fn spans<'a>(
+        &'a self,
+        content: &'a str,
+        boundary: &'a dyn Fn(usize) -> bool,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
         let pem = self.prefix == "-----BEGIN";
         let mut token_end = 0;
         let mut consumed = 0;
@@ -88,7 +117,7 @@ impl SecretPattern {
             .filter_map(move |(start, _)| {
                 // A PEM header opens with its own dashes, which are the
                 // boundary; one glued to the word before it is still a header.
-                if start < consumed || !(pem || starts_a_token(content, start)) {
+                if start < consumed || !(pem || starts_a_token(content, start) || boundary(start)) {
                     return None;
                 }
                 let end = if pem {
@@ -184,11 +213,19 @@ fn pem_private_header_end(content: &str, label_at: usize) -> Option<usize> {
 /// Two evasions remain, and they are written down rather than left implied,
 /// because a gate is only safe to rely on while what it cannot see is known:
 ///
-///   - **A key split across added lines.** `const k = "sk-ant-" +` on one line
-///     and `"api03-…"` on the next is not detected; the scan reads one line at
-///     a time. Joining lines first would mean deciding where a logical line
-///     ends in every language a repository contains, and getting that wrong
-///     brings back the false positives this design exists to avoid.
+///   - **A key split across lines.** `const k = "sk-ant-" +` on one line and
+///     `"api03-…"` on the next is not detected; the scan reads one line at a
+///     time. On one line, a run of quoted literals separated only by
+///     whitespace or by one `+` is joined and scanned as one token
+///     ([`join_quoted_literals`]), but only a match that starts in one literal
+///     and ends in a later one is taken from that join. A secret wholly inside
+///     one literal is read on the original line, so the literal before it
+///     cannot hide the token start. A Rust raw string (`r`, `br`, `cr`, or
+///     `bcr`, any ASCII case, then one or more hashes) is not a join. Joining
+///     lines first would mean deciding
+///     where a logical line ends in every language a repository contains, and
+///     getting that wrong brings back the false positives this design exists
+///     to avoid.
 ///   - **A PEM body without its header.** The private-key pattern requires a
 ///     header whose label says `private key`, because matching the
 ///     dashes alone flagged certificates and public keys — ordinary
@@ -270,6 +307,18 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "openai admin api key",
         prefix: "sk-admin-",
+        min_len: 24,
+        body: Body::Any,
+    },
+    // OpenAI service-account keys: `sk-svcacct-`, then a body written in the
+    // URL-safe alphabet with `-` and `_`, which is why the legacy `sk-` rule
+    // below (alphanumeric bodies only) never saw them. Gitleaks'
+    // `openai-api-key` rule names `sk-(?:proj|svcacct|admin)-` as one family
+    // (https://github.com/gitleaks/gitleaks, config/gitleaks.toml); OpenAI
+    // states no length, so the floor matches the sibling prefixes above.
+    SecretPattern {
+        name: "openai service account api key",
+        prefix: "sk-svcacct-",
         min_len: 24,
         body: Body::Any,
     },
@@ -806,6 +855,40 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 30,
         body: Body::Any,
     },
+    // Groq: `gsk_` and 52 letters and digits, TruffleHog's `groq` detector
+    // (`gsk_[a-zA-Z0-9]{52}`, https://github.com/trufflesecurity/trufflehog,
+    // pkg/detectors/groq). Groq's documentation does not state the format. The
+    // floor sits below that length, and the alphanumeric body keeps a
+    // `gsk_config_value` identifier from reading as a key.
+    SecretPattern {
+        name: "groq api key",
+        prefix: "gsk_",
+        min_len: 48,
+        body: Body::Alphanumeric,
+    },
+    // Atlassian API tokens: `ATATT3` and a long run of URL-safe base64 with
+    // `=`, 186 characters after the prefix in Gitleaks'
+    // `atlassian-api-token` rule (config/gitleaks.toml). Atlassian documents
+    // no length, and other scanners anchor on the prefix alone, so the floor is
+    // half of that.
+    SecretPattern {
+        name: "atlassian api token",
+        prefix: "ATATT3",
+        min_len: 100,
+        body: Body::Shape(atlassian_body),
+    },
+    // Databricks personal access token: `dapi`, 32 hex digits and an optional
+    // `-` and digit (Kingfisher's imported Betterleaks rule
+    // `dapi[a-f0-9]{32}(?:-\d)?`; AWS Secrets Manager's partner documentation
+    // describes it as "dapi followed by 32 hexadecimal characters",
+    // https://docs.aws.amazon.com/secretsmanager/latest/userguide/mes-partner-DatabricksPAT.html).
+    // `dapi` begins ordinary words, so only the hex body makes it a key.
+    SecretPattern {
+        name: "databricks personal access token",
+        prefix: "dapi",
+        min_len: 36,
+        body: Body::Shape(databricks_body),
+    },
     SecretPattern {
         name: "private key block",
         prefix: "-----BEGIN",
@@ -819,6 +902,23 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
 fn base64_body(body: &str) -> bool {
     body.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+/// Atlassian's body: the URL-safe base64 alphabet, and `=`.
+fn atlassian_body(body: &str) -> bool {
+    body.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'='))
+}
+
+/// Databricks' body: at least 32 hex digits, then optionally `-` and digits.
+fn databricks_body(body: &str) -> bool {
+    let hex = match body.rsplit_once('-') {
+        Some((hex, suffix)) if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            hex
+        }
+        _ => body,
+    };
+    hex.len() >= 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Stripe's body: base64's alphabet — letters and digits for Stripe's own
@@ -918,13 +1018,559 @@ const CONTEXT_PATTERNS: &[ContextPattern] = &[
 /// sit fixtures (`"test"`), flags and enum values.
 const MIN_LITERAL_LEN: usize = 8;
 
+/// One quoted literal on `line`.
+struct Lit {
+    /// First byte of the literal, including a string prefix.
+    start: usize,
+    /// The opening quote. A triple quote still records its first byte.
+    quote_at: usize,
+    /// First byte of the raw interior.
+    content: usize,
+    /// The closing quote, or `line.len()` when the literal never closes.
+    content_end: usize,
+    /// One past the closing delimiter, or `line.len()` when it never closes.
+    end: usize,
+    /// Closed, and not a format string, a verbatim string, or an identifier
+    /// glued to the quote. Only joinable literals are concatenated.
+    joinable: bool,
+    /// A plain quote that never closed. The scan treats the quote as an
+    /// ordinary character and goes on at the next one, so an apostrophe in a
+    /// comment does not swallow the well-formed literals after it.
+    resync: bool,
+}
+
+fn is_prefix_letter(b: u8) -> bool {
+    matches!(
+        b,
+        b'r' | b'R' | b'u' | b'U' | b'b' | b'B' | b'f' | b'F' | b'c' | b'C'
+    )
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// A hashed Rust raw string: `r#"..."#`, `br#"..."#`, `cr#"..."#`, or
+/// `bcr#"..."#`, with the prefix in any ASCII case and one or more hashes.
+/// The hashes are part of the delimiter, so quotes inside it are not string
+/// boundaries and the span is not joinable. The same prefixes with no hash
+/// (`r"..."`, `br"..."`, `cr"..."`) stay ordinary prefixed literals and stay
+/// joinable. An identifier glued on the front (`xr#"..."#`) is not a raw
+/// string. An unclosed or mismatched closer runs to the end of the line and
+/// is not joinable.
+fn try_raw_hash(line: &str, i: usize) -> Option<Lit> {
+    let b = line.as_bytes();
+    if i >= b.len() || !matches!(b[i].to_ascii_lowercase(), b'b' | b'c' | b'r') {
+        return None;
+    }
+    // Longest first, so `bcr` is not read as `br` plus a stray `c`.
+    const PREFIXES: [&[u8]; 4] = [b"bcr", b"br", b"cr", b"r"];
+    let prefix_len = PREFIXES.into_iter().find_map(|prefix| {
+        let end = i.checked_add(prefix.len())?;
+        let got = b.get(i..end)?;
+        got.iter()
+            .zip(prefix)
+            .all(|(got, want)| got.eq_ignore_ascii_case(want))
+            .then_some(prefix.len())
+    })?;
+    // `foo_r#"..."#` and `xr#"..."#` are identifiers, not raw strings.
+    if i > 0 && is_ident_byte(b[i - 1]) {
+        return None;
+    }
+    let mut hash_end = i + prefix_len;
+    if hash_end >= b.len() || b[hash_end] != b'#' {
+        return None;
+    }
+    while hash_end < b.len() && b[hash_end] == b'#' {
+        hash_end += 1;
+    }
+    let hashes = hash_end - (i + prefix_len);
+    if hash_end >= b.len() || b[hash_end] != b'"' {
+        return None;
+    }
+    let quote_at = hash_end;
+    let content = quote_at + 1;
+    let mut k = content;
+    while k < b.len() {
+        if b[k] == b'"'
+            && let Some(end) = k.checked_add(1 + hashes)
+            && end <= b.len()
+            && b[k + 1..end].iter().all(|c| *c == b'#')
+        {
+            return Some(Lit {
+                start: i,
+                quote_at,
+                content,
+                content_end: k,
+                end,
+                joinable: false,
+                resync: false,
+            });
+        }
+        k += 1;
+    }
+    Some(Lit {
+        start: i,
+        quote_at,
+        content,
+        content_end: line.len(),
+        end: line.len(),
+        joinable: false,
+        resync: false,
+    })
+}
+
+/// The literal at `i`: a hashed Rust raw string, or an ordinary quote.
+fn at_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    try_raw_hash(line, i).or_else(|| try_literal(line, i, dead))
+}
+
+/// The ordinary literal that starts at `i`, if one does.
+///
+/// An unclosed quote is a literal through the end of the line and is not
+/// joinable, so a `+` inside it stays text: the bytes are copied unchanged
+/// and a secret written there is still scanned. Format strings (`f`, `fr`,
+/// `rf`) and C# verbatim `@"..."` are recognised so they are not joined, and
+/// then skipped the same way. Backticks and macro calls are not literals.
+/// Hashed Rust raw strings are handled by [`try_raw_hash`] before this runs.
+fn try_literal(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    let b = line.as_bytes();
+    if i >= b.len() {
+        return None;
+    }
+    let prev_ident = i > 0 && is_ident_byte(b[i - 1]);
+    let (quote_at, format_prefix) = if b[i] == b'"' || b[i] == b'\'' {
+        (i, false)
+    } else if prev_ident || !is_prefix_letter(b[i]) {
+        return None;
+    } else {
+        let mut j = i;
+        while j < b.len() && j - i < 2 && is_prefix_letter(b[j]) {
+            j += 1;
+        }
+        if j < b.len() && is_prefix_letter(b[j]) {
+            return None;
+        }
+        if j >= b.len() || (b[j] != b'"' && b[j] != b'\'') {
+            return None;
+        }
+        let format = b[i..j].contains(&b'f') || b[i..j].contains(&b'F');
+        (j, format)
+    };
+    let quote = b[quote_at];
+    let verbatim = quote == b'"' && quote_at > 0 && b[quote_at - 1] == b'@';
+    let glued = quote_at == i && prev_ident;
+    let triple = quote_at + 2 < b.len() && b[quote_at + 1] == quote && b[quote_at + 2] == quote;
+    let single = usize::from(quote == b'\'');
+    let kind = if triple {
+        2 + single
+    } else if verbatim {
+        4
+    } else {
+        single
+    };
+    let closer = if dead.0[kind].get() {
+        None
+    } else if triple {
+        close_triple(b, quote_at, quote)
+    } else if verbatim {
+        close_verbatim(b, quote_at)
+    } else {
+        close_quoted(line, quote_at, quote)
+    };
+    // A scan of this kind that ran off the end means no later opener of the
+    // same kind closes either (an escaped quote is skipped the same way from
+    // wherever it is reached), so the answer is remembered rather than found
+    // again at every later opener: that is what keeps `"\"\"\"…` linear.
+    if closer.is_none() {
+        dead.0[kind].set(true);
+    }
+    let unclosed_open = if triple { quote_at + 3 } else { quote_at + 1 };
+    let (content, content_end, end) = closer.unwrap_or((unclosed_open, line.len(), line.len()));
+    let closed = content_end < line.len();
+    // `"$URL"` and `"Bearer ${TOKEN}"` are references written as literals.
+    // Joining one onto the string beside it pulls the reference into a value
+    // the scanners already found, and the redaction of that line changes.
+    let reference = closed && interior_is_reference(line, content, content_end);
+    Some(Lit {
+        start: i,
+        quote_at,
+        content,
+        content_end,
+        end,
+        joinable: closed && !format_prefix && !verbatim && !glued && !reference,
+        resync: !closed,
+    })
+}
+
+/// A quoted interior that names a value rather than being one: a shell
+/// `$var` (or `\$var`, as it is written inside an eval or a heredoc), a
+/// template, or a printf format with a conversion in it (`'KEY=%s\n'`). A `$`
+/// later in a password is still a character.
+fn interior_is_reference(line: &str, content: usize, content_end: usize) -> bool {
+    let v = &line[content..content_end];
+    v.starts_with('$')
+        || v.starts_with("\\$")
+        || ["${", "$(", "{{", "%("].iter().any(|t| v.contains(t))
+        || has_printf_conversion(v)
+}
+
+/// Whether `v` holds a printf conversion: `%`, optional flags, width and
+/// precision, then a conversion letter (`%s`, `%q`, `%v`, `%-8.3f`). `%%` is
+/// a literal percent sign and is not one.
+fn has_printf_conversion(v: &str) -> bool {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && matches!(b[j], b'-' | b'+' | b'#' | b' ' | b'0'..=b'9' | b'.' | b'*') {
+            j += 1;
+        }
+        if j < b.len() && b"sdqvxXfFeEgGcTtpbouUi".contains(&b[j]) {
+            return true;
+        }
+        i = j.max(i + 1);
+    }
+    false
+}
+
+/// `(content_end, end)` of a single-quoted literal, honouring backslash escapes.
+fn close_quoted(line: &str, quote_at: usize, quote: u8) -> Option<(usize, usize, usize)> {
+    let b = line.as_bytes();
+    let mut i = quote_at + 1;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 1;
+            if i >= b.len() {
+                break;
+            }
+            i += line[i..].chars().next()?.len_utf8();
+            continue;
+        }
+        if b[i] == quote {
+            return Some((quote_at + 1, i, i + 1));
+        }
+        i += line[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn close_triple(b: &[u8], quote_at: usize, quote: u8) -> Option<(usize, usize, usize)> {
+    let mut i = quote_at + 3;
+    while i + 2 < b.len() {
+        if b[i] == quote && b[i + 1] == quote && b[i + 2] == quote {
+            return Some((quote_at + 3, i, i + 3));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn close_verbatim(b: &[u8], quote_at: usize) -> Option<(usize, usize, usize)> {
+    let mut i = quote_at + 1;
+    while i < b.len() {
+        if b[i] == b'"' {
+            if i + 1 < b.len() && b[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            return Some((quote_at + 1, i, i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_hspace(b: &[u8], mut j: usize) -> usize {
+    while j < b.len() && matches!(b[j], b' ' | b'\t' | 0x0c) {
+        j += 1;
+    }
+    j
+}
+
+/// The next joinable literal after `i` when only whitespace, or whitespace
+/// around one `+`, separates them.
+fn join_sep(line: &str, i: usize, dead: &Dead) -> Option<Lit> {
+    let b = line.as_bytes();
+    let j = skip_hspace(b, i);
+    if let Some(lit) = at_literal(line, j, dead)
+        && lit.joinable
+    {
+        return Some(lit);
+    }
+    if j < b.len() && b[j] == b'+' && !matches!(b.get(j + 1).copied(), Some(b'+' | b'=')) {
+        let k = skip_hspace(b, j + 1);
+        if let Some(lit) = at_literal(line, k, dead)
+            && lit.joinable
+        {
+            return Some(lit);
+        }
+    }
+    None
+}
+
+/// Quote kinds whose closer was looked for and not found, one flag each: plain
+/// `"`, plain `'`, triple `"`, triple `'`, and C# verbatim. See `try_literal`.
+#[derive(Default)]
+struct Dead([std::cell::Cell<bool>; 5]);
+
+/// Appends `range` of `line` to `out`.
+fn push_slice(out: &mut String, line: &str, range: std::ops::Range<usize>) {
+    out.push_str(&line[range]);
+}
+
+/// Whether `line` holds a run of two or more joinable literals. Stops at the
+/// second literal of the first run, so a line with no join costs one pass and
+/// a line with one costs the distance to it.
+fn has_quoted_join(line: &str, dead: &Dead) -> bool {
+    let mut i = 0;
+    while i < line.len() {
+        match at_literal(line, i, dead) {
+            Some(first) if !first.resync => {
+                if first.joinable && join_sep(line, first.end, dead).is_some() {
+                    return true;
+                }
+                i = first.end;
+            }
+            _ => i += line[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    false
+}
+
+/// The set bit that marks a [`Cut`] as the start of a joined piece.
+const PIECE: usize = 1 << (usize::BITS - 1);
+
+/// A point where the joined copy stops being a byte-for-byte copy of the line.
+///
+/// From shadow position `at()` on, shadow position `p` is line position
+/// `orig + (p - at())`, until the next cut. There is one cut per joined piece
+/// (flagged) and one after each run of pieces, so the map is sixteen bytes per
+/// literal rather than eight per byte of the line.
+struct Cut {
+    at_and_flag: usize,
+    orig: usize,
+}
+
+impl Cut {
+    fn piece(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at | PIECE,
+            orig,
+        }
+    }
+
+    fn after(at: usize, orig: usize) -> Cut {
+        Cut {
+            at_and_flag: at,
+            orig,
+        }
+    }
+
+    fn at(&self) -> usize {
+        self.at_and_flag & !PIECE
+    }
+
+    fn is_piece(&self) -> bool {
+        self.at_and_flag & PIECE != 0
+    }
+}
+
+/// The joined copy of a line: every run of two or more joinable literals is
+/// one literal (one opening quote, the concatenated interiors, one closing
+/// quote), everything else is as written. `cuts` maps it back to the line.
+struct Joined {
+    shadow: String,
+    cuts: Vec<Cut>,
+}
+
+impl Joined {
+    /// Line position of shadow position `p`.
+    fn orig_of(&self, p: usize) -> usize {
+        match self.cuts.partition_point(|c| c.at() <= p) {
+            0 => p,
+            n => self.cuts[n - 1].orig + (p - self.cuts[n - 1].at()),
+        }
+    }
+
+    /// The line bytes a shadow span was joined from; `None` for an empty span
+    /// or one off the end of the shadow.
+    fn orig_range(&self, span: &std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        if span.start >= span.end || span.end > self.shadow.len() {
+            return None;
+        }
+        Some(self.orig_of(span.start)..self.orig_of(span.end - 1) + 1)
+    }
+
+    /// The cut that starts the piece holding shadow byte `p`, if one does. A
+    /// piece ends where the next cut begins, less the closing quote the copy
+    /// keeps after the last piece of a run.
+    fn piece_at(&self, p: usize) -> Option<usize> {
+        let idx = self.cuts.partition_point(|c| c.at() <= p).checked_sub(1)?;
+        if !self.cuts[idx].is_piece() {
+            return None;
+        }
+        let next = self.cuts.get(idx + 1)?;
+        let end = if next.is_piece() {
+            next.at()
+        } else {
+            next.at() - 1
+        };
+        (p < end).then_some(idx)
+    }
+
+    /// Whether `span` starts in one joined piece and ends in a later one. A
+    /// match wholly inside one piece is visible on the line as written, and
+    /// taking it from the copy too would hide the quote that bounds it.
+    fn crosses(&self, span: &std::ops::Range<usize>) -> bool {
+        if span.start >= span.end {
+            return false;
+        }
+        match (self.piece_at(span.start), self.piece_at(span.end - 1)) {
+            (Some(first), Some(last)) => last > first,
+            _ => false,
+        }
+    }
+
+    /// Whether a piece begins at shadow position `p`. A piece begins at a
+    /// quote, so a key that starts there starts a token whatever the piece
+    /// before it ended in.
+    fn is_piece_start(&self, p: usize) -> bool {
+        let mut k = self.cuts.partition_point(|c| c.at() < p);
+        while let Some(cut) = self.cuts.get(k)
+            && cut.at() == p
+        {
+            if cut.is_piece() {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+
+    /// The joined text of line bytes `a..b`: those bytes, less the quotes and
+    /// separators the copy took out between pieces. It is the secret as a
+    /// reader of the line sees it, and what a marker's length counts.
+    fn joined_text(&self, a: usize, b: usize) -> String {
+        let mut out = String::new();
+        // Segment i is the shadow bytes from cut i to cut i+1, which are the
+        // line bytes from cut i's `orig` on; segment -1 runs from 0 to cut 0.
+        let first = self.cuts.partition_point(|c| c.orig <= a);
+        let mut seg = first.checked_sub(1);
+        loop {
+            let (at, orig) = seg.map_or((0, 0), |k| (self.cuts[k].at(), self.cuts[k].orig));
+            if orig >= b {
+                break;
+            }
+            let next = seg.map_or(0, |k| k + 1);
+            let end = self.cuts.get(next).map_or(self.shadow.len(), |c| c.at());
+            let len = end - at;
+            let (lo, hi) = (a.max(orig), b.min(orig + len));
+            if lo < hi {
+                out.push_str(&self.shadow[at + (lo - orig)..at + (hi - orig)]);
+            }
+            if next >= self.cuts.len() {
+                break;
+            }
+            seg = Some(next);
+        }
+        out
+    }
+}
+
+/// A line in which every same-line run of two or more quoted literals is one
+/// literal, with the map back to `line`.
+///
+/// `None` when there is no such run, so the caller scans `line` itself and
+/// redaction of every other line stays byte-identical. The join is lexical,
+/// not a parse: `'` and `"` (including a Python `r`/`u`/`b` prefix and a
+/// triple quote), separated by whitespace or one `+`. Not joined: a format
+/// string, a quoted reference (`"$URL"`, `"${TOKEN}"`, `'KEY=%s'`), a backtick
+/// template, a C# verbatim string, a hashed Rust raw string, a call or macro
+/// (`concat!("A", "B")` is an accepted miss), or anything on the next line. A
+/// quote that never closes is an ordinary character, and the scan goes on at
+/// the next one. Interiors are copied raw, escapes and all; they are not
+/// decoded.
+fn join_quoted_literals(line: &str) -> Option<Joined> {
+    let b = line.as_bytes();
+    if !b.contains(&b'"') && !b.contains(&b'\'') {
+        return None;
+    }
+    let dead = Dead::default();
+    if !has_quoted_join(line, &dead) {
+        return None;
+    }
+    let mut shadow = String::with_capacity(line.len());
+    let mut cuts = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        match at_literal(line, i, &dead) {
+            Some(first) if !first.resync => {
+                let second = if first.joinable {
+                    join_sep(line, first.end, &dead)
+                } else {
+                    None
+                };
+                let Some(second) = second else {
+                    push_slice(&mut shadow, line, first.start..first.end);
+                    i = first.end;
+                    continue;
+                };
+                // One opening quote, so the scanners that already understand a
+                // quoted literal see the concatenated interior. Extra quotes of
+                // a triple-quoted piece are left out of the copy.
+                push_slice(&mut shadow, line, first.start..first.quote_at + 1);
+                let mut lit = first;
+                let mut next = Some(second);
+                loop {
+                    cuts.push(Cut::piece(shadow.len(), lit.content));
+                    push_slice(&mut shadow, line, lit.content..lit.content_end);
+                    let Some(n) = next.take() else { break };
+                    lit = n;
+                    next = join_sep(line, lit.end, &dead);
+                }
+                push_slice(&mut shadow, line, lit.content_end..lit.content_end + 1);
+                i = lit.end;
+                cuts.push(Cut::after(shadow.len(), i));
+            }
+            _ => {
+                let n = line[i..].chars().next().map_or(1, char::len_utf8);
+                push_slice(&mut shadow, line, i..i + n);
+                i += n;
+            }
+        }
+    }
+    Some(Joined { shadow, cuts })
+}
+
 /// Every credential on `line`, from both tables, as (name, span, bytes kept).
+///
+/// Spans refer to `line` as passed. A joined shadow is a different line; only
+/// a span that crosses its pieces is mapped back onto the original.
 fn detections(
     line: &str,
 ) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + '_ {
-    let prefixed = SECRET_PATTERNS
-        .iter()
-        .flat_map(move |p| p.spans(line).map(move |s| (p.name, s, p.prefix.len())));
+    detections_at(line, &|_| false)
+}
+
+/// [`detections`] where `boundary(p)` also says that a token may start at byte
+/// `p`: the start of a joined piece, which is the quote that opens a literal.
+fn detections_at<'a>(
+    line: &'a str,
+    boundary: &'a dyn Fn(usize) -> bool,
+) -> impl Iterator<Item = (&'static str, std::ops::Range<usize>, usize)> + 'a {
+    let prefixed = SECRET_PATTERNS.iter().flat_map(move |p| {
+        p.spans(line, boundary)
+            .map(move |s| (p.name, s, p.prefix.len()))
+    });
     let contextual = CONTEXT_PATTERNS.iter().flat_map(move |p| {
         (p.spans)(line)
             .into_iter()
@@ -1836,11 +2482,21 @@ pub struct SecretMatch {
 /// of another's evidence field. Table order is what makes the most specific
 /// vendor win when one prefix starts another.
 pub fn find_secret(line: &str) -> Option<SecretMatch> {
-    detections(line)
-        .next()
-        .map(|(name, span, keep)| SecretMatch {
+    if let Some((name, span, keep)) = detections(line).next() {
+        return Some(SecretMatch {
             name,
             redacted: redact(&line[span], keep),
+        });
+    }
+    // Nothing on the original line. A secret split across literals exists
+    // only in the joined copy, and only when the match itself crosses.
+    let joined = join_quoted_literals(line)?;
+    let boundary = |p: usize| joined.is_piece_start(p);
+    detections_at(&joined.shadow, &boundary)
+        .find(|(_, span, _)| joined.crosses(span))
+        .map(|(name, span, keep)| SecretMatch {
+            name,
+            redacted: redact(&joined.shadow[span], keep),
         })
 }
 
@@ -1854,6 +2510,49 @@ pub fn find_secret(line: &str) -> Option<SecretMatch> {
 /// gate reports. A token is replaced wherever it appears, not only at its
 /// first occurrence.
 pub fn redact_secrets(text: &str) -> String {
+    redact_text(text, None)
+}
+
+/// What [`redact_secrets_report`] answers: the redacted text and an exact
+/// account of what was replaced in it.
+///
+/// `non_exhaustive`: fields may be added later without breaking a vendored copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RedactionReport {
+    /// Exactly [`redact_secrets`]`(text)`, byte for byte.
+    pub text: String,
+    /// Replacements made, counting every merged span of every pass. A line
+    /// that never converged and was redacted whole counts that whole-line
+    /// replacement as one more span.
+    pub spans: usize,
+    /// Every vendor shape a detection matched, sorted and de-duplicated. A
+    /// shape whose match overlapped another's, and so shared its span, is
+    /// still named.
+    pub kinds: Vec<&'static str>,
+}
+
+/// [`redact_secrets`] that also reports how many spans it replaced and which
+/// shapes it matched, where [`find_secret`] names only the first shape on a
+/// line. Additive: the output text is identical to `redact_secrets`.
+pub fn redact_secrets_report(text: &str) -> RedactionReport {
+    let mut tally = Tally::default();
+    let text = redact_text(text, Some(&mut tally));
+    RedactionReport {
+        text,
+        spans: tally.spans,
+        kinds: tally.kinds.into_iter().collect(),
+    }
+}
+
+/// What a report accumulates while a redaction runs.
+#[derive(Default)]
+struct Tally {
+    spans: usize,
+    kinds: std::collections::BTreeSet<&'static str>,
+}
+
+fn redact_text(text: &str, mut tally: Option<&mut Tally>) -> String {
     // One line at a time, exactly as `contains_secret` reads. Every detector
     // is a one-line rule; run over a whole text, one line's `${` made the next
     // line's password look like template syntax, so the password was found by
@@ -1862,7 +2561,7 @@ pub fn redact_secrets(text: &str) -> String {
     for segment in text.split_inclusive('\n') {
         let line = segment.trim_suffix('\n');
         let line = line.trim_suffix('\r');
-        out.push_str(&redact_line(line));
+        out.push_str(&redact_line(line, tally.as_deref_mut()));
         out.push_str(&segment[line.len()..]);
     }
     out
@@ -1882,55 +2581,110 @@ const MAX_REDACTION_PASSES: usize = 16;
 /// a single pass. Redaction must leave nothing a scan would still stop, so it
 /// runs until a scan stops nothing. A line that has not converged at the cap
 /// is redacted whole: fail closed, never return a line still carrying one.
-fn redact_line(line: &str) -> String {
-    let mut text = redact_pass(line);
+fn redact_line(line: &str, mut tally: Option<&mut Tally>) -> String {
+    let mut text = redact_pass(line, tally.as_deref_mut());
     if text == line {
         return text;
     }
     for _ in 1..MAX_REDACTION_PASSES {
-        let next = redact_pass(&text);
+        let next = redact_pass(&text, tally.as_deref_mut());
         if next == text {
             return text;
         }
         text = next;
     }
+    if let Some(tally) = tally {
+        tally.spans += 1;
+    }
     redact(line, 0)
 }
 
 /// One redaction pass over a line: every detection, overlaps merged.
-fn redact_pass(text: &str) -> String {
+///
+/// Detections are found on the line as written and, when the line holds a
+/// same-line join, on the joined copy (only matches that cross pieces). They
+/// are merged in line coordinates exactly as a line with no join is, and a
+/// merged span's marker is rendered from the whole merged text, so a line
+/// with no join comes out byte for byte as it always did.
+fn redact_pass(text: &str, mut tally: Option<&mut Tally>) -> String {
+    // (span in `text`, bytes kept, found on the joined copy)
+    let mut hits: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (name, span, keep) in detections(text) {
+        if let Some(tally) = tally.as_deref_mut() {
+            tally.kinds.insert(name);
+        }
+        hits.push((span, keep, false));
+    }
+    let joined = join_quoted_literals(text);
+    if let Some(joined) = &joined {
+        let boundary = |p: usize| joined.is_piece_start(p);
+        for (name, span, keep) in detections_at(&joined.shadow, &boundary) {
+            if !joined.crosses(&span) {
+                continue;
+            }
+            if let Some(tally) = tally.as_deref_mut() {
+                tally.kinds.insert(name);
+            }
+            match joined.orig_range(&span) {
+                Some(orig) if orig.end <= text.len() => hits.push((orig, keep, true)),
+                // A span that cannot be placed on the line is still a
+                // credential: redact the line whole rather than leave it.
+                _ => {
+                    if let Some(tally) = tally {
+                        tally.spans += 1;
+                    }
+                    return redact(text, 0);
+                }
+            }
+        }
+    }
     // Preserve byte offsets until every family has been checked. Sorting and
     // merging overlaps keeps the most specific prefix at a shared start and
     // prevents replacement text from being interpreted as another credential.
     // The prefix is chosen before the length: a vendor key and a context match
     // that start together merge into the longer span, and that span still
     // shows the vendor's prefix, which says what leaked and nothing more.
-    let mut spans: Vec<_> = detections(text)
-        .map(|(_, span, keep)| (span, keep))
-        .collect();
-    spans.sort_by_key(|(span, keep)| {
+    hits.sort_by_key(|(span, keep, _)| {
         (
             span.start,
             std::cmp::Reverse(*keep),
             std::cmp::Reverse(span.end),
         )
     });
-    let mut merged: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
-    for (span, keep) in spans {
-        if let Some((previous, _)) = merged.last_mut()
+    let mut merged: Vec<(std::ops::Range<usize>, usize, bool)> = Vec::new();
+    for (span, keep, on_copy) in hits {
+        if let Some((previous, _, previous_on_copy)) = merged.last_mut()
             && span.start < previous.end
         {
             previous.end = previous.end.max(span.end);
+            *previous_on_copy |= on_copy;
             continue;
         }
-        merged.push((span, keep));
+        merged.push((span, keep, on_copy));
+    }
+    if let Some(tally) = tally {
+        tally.spans += merged.len();
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for (span, keep) in merged {
-        out.push_str(&text[copied..span.start]);
-        out.push_str(&redact(&text[span.clone()], keep));
-        copied = span.end;
+    for (span, keep, on_copy) in merged {
+        // Widened, never narrowed, to character boundaries: a bad span may
+        // redact too much of a line, and cannot leave part of one in the clear.
+        let mut start = span.start.min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = span.end.min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let start = start.max(copied);
+        out.push_str(&text[copied..start]);
+        match &joined {
+            Some(joined) if on_copy => out.push_str(&redact(&joined.joined_text(start, end), keep)),
+            _ => out.push_str(&redact(&text[start..end], keep)),
+        }
+        copied = end;
     }
     out.push_str(&text[copied..]);
     out
@@ -1941,7 +2695,13 @@ fn redact_pass(text: &str) -> String {
 /// Callers that must *refuse* rather than redact use this: a value that cannot
 /// be safely stored is not the same as one that was stored redacted.
 pub fn contains_secret(text: &str) -> bool {
-    text.lines().any(|line| detections(line).next().is_some())
+    text.lines().any(|line| {
+        detections(line).next().is_some()
+            || join_quoted_literals(line).is_some_and(|joined| {
+                let boundary = |p: usize| joined.is_piece_start(p);
+                detections_at(&joined.shadow, &boundary).any(|(_, span, _)| joined.crosses(&span))
+            })
+    })
 }
 
 /// redact keeps the identifying prefix and hides the rest.
@@ -1971,6 +2731,21 @@ mod redaction_tests {
     /// A GitHub classic token shape, split so that no source line is one (see
     /// `no_line_of_this_file_is_itself_a_vendor_token`).
     const GITHUB_TOKEN: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
+
+    #[test]
+    fn report_counts_every_span_and_names_every_shape_on_one_line() {
+        let aws = concat!("AK", "IAQYPD7W3KXN2MZB5T");
+        let text = format!("A={GITHUB_TOKEN} B={aws}\nplain\nC={GITHUB_TOKEN}\n");
+        let report = redact_secrets_report(&text);
+        assert_eq!(report.text, redact_secrets(&text));
+        assert_eq!(report.spans, 3, "{}", report.text);
+        assert_eq!(
+            report.kinds,
+            vec!["aws access key id", "github personal access token"]
+        );
+        let clean = redact_secrets_report("nothing here\n");
+        assert_eq!((clean.spans, clean.kinds.len()), (0, 0));
+    }
 
     #[test]
     fn redacts_a_credential_in_an_argv_line() {
@@ -2407,7 +3182,7 @@ mod redaction_tests {
             .filter(|(_, line)| {
                 SECRET_PATTERNS
                     .iter()
-                    .any(|p| p.spans(line).next().is_some())
+                    .any(|p| p.spans(line, &|_| false).next().is_some())
             })
             .map(|(i, _)| i + 1)
             .collect();
