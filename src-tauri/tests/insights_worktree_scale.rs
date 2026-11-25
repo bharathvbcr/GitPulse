@@ -218,12 +218,24 @@ fn forty_two_worktrees_scan_completely_without_truncation_and_fail_closed_when_b
     assert_eq!(risk.items.len(), OVERLAPPING_FILES);
 
     // 3. Real `gitpulse-mcp` CLI binary under production background spawn gate:
-    //    both `gitpulse_insights` and `gitpulse_collision_risk` must exit 0.
+    //    `gitpulse_collision_risk` must exit 0. `gitpulse_insights` also
+    //    reports the code-intelligence facet, and this farm has no DevMap
+    //    store: that facet says `available: false`, which the CLI reports as
+    //    an incomplete answer (exit 3). It must be the only incomplete part;
+    //    every git facet below is still checked whole.
     let (insights_code, insights_json, insights_err) =
         call_mcp_cli("gitpulse_insights", &farm.repo);
     assert_eq!(
-        insights_code, 0,
-        "gitpulse_insights returned {insights_code}: stderr={insights_err}\npayload={insights_json}"
+        insights_json["codeintel"]["available"], false,
+        "the farm has no DevMap store: {insights_json}"
+    );
+    assert_eq!(
+        (insights_code, insights_err.as_str()),
+        (
+            3,
+            "gitpulse-mcp call: the answer is incomplete (codeintel.available); read its error fields before relying on it\n"
+        ),
+        "the absent index must be the only incomplete part\npayload={insights_json}"
     );
     assert_eq!(insights_json["deadline_expired"], false);
     assert_eq!(insights_json["worktrees"]["scanned"], TOTAL_WORKTREES);
