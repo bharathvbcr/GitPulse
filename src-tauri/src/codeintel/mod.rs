@@ -4948,7 +4948,7 @@ pub(crate) mod tests {
     /// Restamps every payload with the identity this build computes, and every
     /// generation with its resolver epoch, so the fixture describes a store the
     /// current analyzer and resolver wrote.
-    fn stamp_current_payload_identity(repo: &std::path::Path) {
+    pub(crate) fn stamp_current_payload_identity(repo: &std::path::Path) {
         let (grammar, analyzer) = devmap_extract::cache::current_payload_identity("rust");
         let conn = rusqlite::Connection::open(map_path(repo)).unwrap();
         conn.execute(
