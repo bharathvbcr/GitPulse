@@ -17,7 +17,13 @@ const SEC: u64 = 1_000;
 
 fn repo_dir() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path().to_str().unwrap().to_string();
+    // Spelled with `/` on Windows, as git and a shell write it: a backslash in
+    // a command's `git -C <path>` is an escape to the tokenizer that reads it.
+    let repo = if cfg!(windows) {
+        dir.path().to_str().unwrap().replace('\\', "/")
+    } else {
+        dir.path().to_str().unwrap().to_string()
+    };
     (dir, repo)
 }
 
@@ -3155,11 +3161,10 @@ fn w9r_lexical_reads_a_path_as_text() {
         ("a/b", None),
         ("", None),
     ] {
-        assert_eq!(
-            lexical(path).as_deref().and_then(Path::to_str),
-            want,
-            "{path}"
-        );
+        // `Path::extend` joins with the platform's separator, so the text is
+        // compared as the POSIX spelling the table is written in.
+        let got = lexical(path).and_then(|p| p.to_str().map(|text| text.replace('\\', "/")));
+        assert_eq!(got.as_deref(), want, "{path}");
     }
 }
 

@@ -102,7 +102,11 @@ fn a_linked_worktree_commit_and_a_default_branch_fast_forward_appear_after_one_c
     assert_eq!(out.failed_records, 0, "{out:?}");
 
     let rows = reflog_rows(&anchor);
-    let wt_str = wt.to_string_lossy().into_owned();
+    // Rows name a checkout by its canonical path, the address's spelling.
+    let wt_str = std::fs::canonicalize(&wt)
+        .unwrap_or_else(|_| wt.clone())
+        .to_string_lossy()
+        .into_owned();
     assert!(
         rows.iter().any(|event| {
             event.worktree_path.as_deref() == Some(wt_str.as_str())
@@ -182,7 +186,7 @@ fn the_reflog_spawn_count_is_bounded_and_a_larger_family_is_reported() {
         .collect();
     let shows = || {
         dirs.iter()
-            .flat_map(|dir| spawn_log::spawns_in(dir))
+            .flat_map(|dir| spawn_log::spawns_in(&super::catch_up_progress_tests::as_spawned(dir)))
             .filter(|argv| argv.iter().any(|arg| arg == "reflog"))
             .filter(|argv| argv.iter().any(|arg| arg == "show"))
             .count()

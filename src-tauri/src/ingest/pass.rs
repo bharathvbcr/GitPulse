@@ -398,7 +398,7 @@ fn ingest_family(
                     ));
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !below_a_file(&root.path) => {
                 if root.explicit || !source.optional() {
                     missing_root = true;
                     blocks_forget |= !source.optional();
@@ -1422,6 +1422,15 @@ fn owed_on(
             })
         })
         .collect()
+}
+
+/// Whether some ancestor of `path` exists and is not a directory. Unix reports
+/// that as `NotADirectory`; Windows reports `NotFound`, which would read as
+/// a root never made when it is one that cannot be reached.
+fn below_a_file(path: &std::path::Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| std::fs::metadata(ancestor).is_ok_and(|meta| !meta.is_dir()))
 }
 
 /// The file's name in a row's identity: the key of its canonical path, so one
