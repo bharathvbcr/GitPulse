@@ -16,12 +16,19 @@
   import {
     hasUndismissedInterrupted,
     interruptedNoticeText,
+    LEDGER_UNRECONCILED_TEXT,
     reopenAllSessionLedgerOffers,
     sessionLedgerStore,
     subscribeSessionLedger,
     summarizeInterrupted,
   } from "../terminal/sessionLedger";
   import { formatError } from "../ui/formatError";
+  import {
+    interruptedManagedStore,
+    interruptedManagedText,
+    openInterruptedManaged,
+    refreshInterruptedManaged,
+  } from "../workbench/interruptedManaged";
 
   /** Pause between spawns: seventeen `--resume` at once recreates the load that caused the hang. */
   const REOPEN_PACE_MS = 600;
@@ -31,12 +38,24 @@
   let dismissed = $state<ReadonlySet<string>>(new Set());
   let reopening = $state(false);
   let failedCount = $state(0);
-  const visible = $derived(hasUndismissedInterrupted(summary, dismissed));
+  /** Run ids the user closed the managed line for; in memory, like the agent rows. */
+  let dismissedRuns = $state<ReadonlySet<string>>(new Set());
+  let pendingDismissed = $state(false);
+  const unreconciled = $derived($sessionLedgerStore.reconcile_pending === true && !pendingDismissed);
+  const managedRuns = $derived($interruptedManagedStore.runs.filter((run) => !dismissedRuns.has(run.id)));
+  const agentsVisible = $derived(hasUndismissedInterrupted(summary, dismissed));
+  const managedFailed = $derived($interruptedManagedStore.status === "failed" && managedRuns.length === 0 && !pendingDismissed);
+  const visible = $derived(agentsVisible || unreconciled || managedFailed || managedRuns.length > 0);
 
-  onMount(() => subscribeSessionLedger());
+  onMount(() => {
+    void refreshInterruptedManaged();
+    return subscribeSessionLedger();
+  });
 
   function dismiss() {
     dismissed = new Set([...dismissed, ...summary.agents.map((offer) => offer.row_id)]);
+    dismissedRuns = new Set([...dismissedRuns, ...$interruptedManagedStore.runs.map((run) => run.id)]);
+    pendingDismissed = true;
   }
 
   async function reopenAll() {
@@ -58,6 +77,14 @@
     }
   }
 
+  function openManaged() {
+    try {
+      openInterruptedManaged(managedRuns);
+    } catch (error) {
+      toastStore.error(`Couldn't open the task. ${formatError(error)}`);
+    }
+  }
+
   async function review() {
     try {
       interfaceStore.setGlobalSurface("repository");
@@ -75,19 +102,45 @@
 {#if visible}
   <div
     class="gp-notice flex items-center justify-between gap-2 flex-wrap mx-2 mt-1"
-    data-tone={summary.resumable.length > 0 ? "warn" : "unknown"}
+    data-tone={(agentsVisible && summary.resumable.length > 0) || managedRuns.length > 0 ? "warn" : "unknown"}
     role="region"
     aria-label="Interrupted agent sessions"
     data-testid="interrupted-agents-notice"
   >
-    <span class="font-medium text-textPrimary" data-testid="interrupted-agents-text">
-      {interruptedNoticeText(summary)}
-      {#if failedCount > 0}
-        <span class="text-danger"> {failedCount} failed to reopen.</span>
+    <div class="flex flex-col gap-0.5">
+      {#if agentsVisible}
+        <span class="font-medium text-textPrimary" data-testid="interrupted-agents-text">
+          {interruptedNoticeText(summary)}
+          {#if failedCount > 0}
+            <span class="text-danger"> {failedCount} failed to reopen.</span>
+          {/if}
+        </span>
       {/if}
-    </span>
+      {#if managedRuns.length > 0}
+        <span class="font-medium text-textPrimary" data-testid="interrupted-managed-text">
+          {interruptedManagedText(managedRuns.length)}
+        </span>
+      {/if}
+      {#if managedFailed}
+        <span class="text-textMuted" data-tone="unknown" data-testid="interrupted-managed-unread">GitPulse couldn't check whether managed agents were interrupted.</span>
+      {/if}
+      {#if unreconciled}
+        <span class="text-textMuted" data-tone="unknown" data-testid="interrupted-unreconciled-text">{LEDGER_UNRECONCILED_TEXT}</span>
+      {/if}
+    </div>
     <div class="flex items-center gap-1 shrink-0">
-      {#if summary.resumable.length > 0}
+      {#if managedRuns.length > 0}
+        <button
+          type="button"
+          class="gp-btn"
+          data-size="sm"
+          data-testid="interrupted-managed-open"
+          onclick={() => openManaged()}
+        >
+          {managedRuns.length === 1 ? "Open task" : "Open first task"}
+        </button>
+      {/if}
+      {#if agentsVisible && summary.resumable.length > 0}
         <button
           type="button"
           class="gp-btn"
@@ -99,9 +152,11 @@
           <RotateCw size={12} /> Reopen all ({summary.resumable.length})
         </button>
       {/if}
-      <button type="button" class="gp-btn" data-size="sm" data-testid="interrupted-agents-review" onclick={() => void review()}>
-        Review
-      </button>
+      {#if agentsVisible}
+        <button type="button" class="gp-btn" data-size="sm" data-testid="interrupted-agents-review" onclick={() => void review()}>
+          Review
+        </button>
+      {/if}
       <button
         type="button"
         class="gp-icon-btn"

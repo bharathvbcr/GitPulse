@@ -52,6 +52,11 @@ export interface SessionLedgerOffer {
   reason: string | null;
   last_error: string | null;
   title?: string;
+  /**
+   * `row_id` of the orchestrating agent that spawned this one. Absent from
+   * older backends: read it as null.
+   */
+  parent_row_id?: string | null;
 }
 
 /** Snapshot of durable recovery offers returned by the backend ledger. */
@@ -59,6 +64,12 @@ export interface SessionLedgerView {
   offers: SessionLedgerOffer[];
   reopenable_count: number;
   unreadable_count: number;
+  /**
+   * True while the backend has not yet reconciled the ledger against the live
+   * processes, so an empty or short `offers` is not a statement that nothing
+   * needs recovering. Absent from older backends: read it as false.
+   */
+  reconcile_pending?: boolean;
 }
 
 /** Result of pre-checking whether one ledger row can be reopened right now. */
@@ -80,11 +91,12 @@ export const sessionLedgerStore: Readable<SessionLedgerView> = {
   subscribe: ledgerStore.subscribe,
 };
 
-function recomputeCounts(offers: readonly SessionLedgerOffer[]): SessionLedgerView {
+function recomputeCounts(offers: readonly SessionLedgerOffer[], reconcilePending = false): SessionLedgerView {
   return {
     offers: [...offers],
     reopenable_count: offers.filter((offer) => offer.resumable).length,
     unreadable_count: offers.filter((offer) => offer.end_state === "unreadable").length,
+    ...(reconcilePending ? { reconcile_pending: true } : {}),
   };
 }
 
@@ -95,7 +107,7 @@ function mergeOfferInStore(updated: SessionLedgerOffer): void {
       idx === -1
         ? [updated, ...current.offers]
         : current.offers.map((item, i) => (i === idx ? updated : item));
-    return recomputeCounts(nextOffers);
+    return recomputeCounts(nextOffers, current.reconcile_pending === true);
   });
 }
 
@@ -107,21 +119,21 @@ function recordOfferError(rowId: string, error: string): SessionLedgerOffer | nu
       recorded = { ...item, last_error: error };
       return recorded;
     });
-    return recorded ? recomputeCounts(nextOffers) : current;
+    return recorded ? recomputeCounts(nextOffers, current.reconcile_pending === true) : current;
   });
   return recorded;
 }
 
 /** Replaces the reactive ledger snapshot in unit tests. */
 export function setSessionLedgerViewForTest(view: SessionLedgerView): void {
-  ledgerStore.set(recomputeCounts(view.offers));
+  ledgerStore.set(recomputeCounts(view.offers, view.reconcile_pending === true));
 }
 
 export function normalizeSessionLedgerView(raw: unknown): SessionLedgerView {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return EMPTY_VIEW;
   const candidate = raw as Partial<SessionLedgerView>;
   if (!Array.isArray(candidate.offers)) return EMPTY_VIEW;
-  return recomputeCounts(candidate.offers);
+  return recomputeCounts(candidate.offers, candidate.reconcile_pending === true);
 }
 
 /** Reads the current durable session ledger from the backend. */
@@ -178,7 +190,10 @@ export async function dismissSessionLedgerRow(rowId: string): Promise<SessionLed
   if (!isTauri()) {
     let next: SessionLedgerView = EMPTY_VIEW;
     ledgerStore.update((current) => {
-      next = recomputeCounts(current.offers.filter((offer) => offer.row_id !== rowId));
+      next = recomputeCounts(
+        current.offers.filter((offer) => offer.row_id !== rowId),
+        current.reconcile_pending === true,
+      );
       return next;
     });
     return next;
@@ -215,6 +230,54 @@ export function filterOffersForRepo(
 /** Subset of offers that can actually be reopened as agent tabs right now. */
 export function reopenableOffers(offers: readonly SessionLedgerOffer[]): SessionLedgerOffer[] {
   return offers.filter((offer) => offer.resumable && Boolean(offer.native_id));
+}
+
+/** The offered ancestor a row hangs under, or null when it is itself top-level. */
+function offeredRoot(offer: SessionLedgerOffer, byId: ReadonlyMap<string, SessionLedgerOffer>): SessionLedgerOffer | null {
+  const seen = new Set<string>([offer.row_id]);
+  let root: SessionLedgerOffer | null = null;
+  let cursor = offer;
+  for (;;) {
+    const parentId = cursor.parent_row_id ?? null;
+    const parent = parentId === null ? undefined : byId.get(parentId);
+    if (!parent) return root;
+    // A cycle (or a self-parent) has no top: every member stays a normal offer.
+    if (seen.has(parent.row_id)) return null;
+    seen.add(parent.row_id);
+    root = parent;
+    cursor = parent;
+  }
+}
+
+/**
+ * Offers that stand on their own: those with no parent, or whose parent is not
+ * itself offered. An orchestrated child whose parent is offered is not here:
+ * resuming the parent may re-spawn it, so it is shown beneath the parent and
+ * left out of every "Reopen all".
+ */
+export function topLevelOffers(offers: readonly SessionLedgerOffer[]): SessionLedgerOffer[] {
+  const byId = new Map(offers.map((offer) => [offer.row_id, offer]));
+  return offers.filter((offer) => offeredRoot(offer, byId) === null);
+}
+
+/** Children (any depth) of each top-level offer, keyed by the top-level row id, in ledger order. */
+export function childOffersByParent(offers: readonly SessionLedgerOffer[]): Map<string, SessionLedgerOffer[]> {
+  const byId = new Map(offers.map((offer) => [offer.row_id, offer]));
+  const out = new Map<string, SessionLedgerOffer[]>();
+  for (const offer of offers) {
+    const root = offeredRoot(offer, byId);
+    if (root) out.set(root.row_id, [...(out.get(root.row_id) ?? []), offer]);
+  }
+  return out;
+}
+
+/** Offers in display order: each top-level row followed by its children, which are marked `child`. */
+export function offerRows(offers: readonly SessionLedgerOffer[]): { offer: SessionLedgerOffer; child: boolean }[] {
+  const children = childOffersByParent(offers);
+  return topLevelOffers(offers).flatMap((offer) => [
+    { offer, child: false },
+    ...(children.get(offer.row_id) ?? []).map((kid) => ({ offer: kid, child: true })),
+  ]);
 }
 
 /** Heading for the persistent recovery banner/panel ("Reopen N agents"). */
@@ -339,14 +402,15 @@ export interface ReopenAllDeps extends ReopenOfferDeps {
 /**
  * Attempts to reopen every currently resumable offer in `offers`, one at a
  * time, returning counts so callers can keep any failed rows visible with
- * their per-row errors. Non-resumable rows are never touched, and a row that
+ * their per-row errors. Non-resumable rows are never touched, children of an
+ * offered parent are left to their parent's resume, and a row that
  * another reopen is already handling is skipped (counted in `skipped`).
  */
 export async function reopenAllSessionLedgerOffers(
   offers: readonly SessionLedgerOffer[],
   deps: ReopenAllDeps = {},
 ): Promise<{ reopened: number; failed: number; skipped: number; results: ReopenOfferResult[] }> {
-  const candidates = reopenableOffers(offers);
+  const candidates = reopenableOffers(topLevelOffers(offers));
   const results: ReopenOfferResult[] = [];
   let reopened = 0;
   let failed = 0;
@@ -372,10 +436,17 @@ export async function reopenAllSessionLedgerOffers(
   return { reopened, failed, skipped, results };
 }
 
+/** Shown while the backend has not reconciled the ledger: silence there would read as "nothing to recover". */
+export const LEDGER_UNRECONCILED_TEXT = "GitPulse couldn't check which agents survived yet.";
+
 /** Agent rows the app-level "interrupted agents" notice speaks for. */
 export interface InterruptedSummary {
   /** Every interrupted agent row, in every repository, open tab or not. */
   agents: SessionLedgerOffer[];
+  /** The entries the notice counts: agents with children (whose parent is offered) folded under that parent. */
+  entries: SessionLedgerOffer[];
+  /** Children of each entry, keyed by entry row id. Never part of `resumable`. */
+  children: Map<string, SessionLedgerOffer[]>;
   resumable: SessionLedgerOffer[];
   unresumable: SessionLedgerOffer[];
 }
@@ -383,14 +454,21 @@ export interface InterruptedSummary {
 /** Splits the ledger into agent rows that can be resumed and those that cannot (shell and corrupt rows are not agents). */
 export function summarizeInterrupted(offers: readonly SessionLedgerOffer[]): InterruptedSummary {
   const agents = offers.filter((offer) => offer.end_state !== "unreadable" && offer.launcher !== "shell");
-  const resumable = reopenableOffers(agents);
+  const entries = topLevelOffers(agents);
+  const resumable = reopenableOffers(entries);
   const ids = new Set(resumable.map((offer) => offer.row_id));
-  return { agents, resumable, unresumable: agents.filter((offer) => !ids.has(offer.row_id)) };
+  return {
+    agents,
+    entries,
+    children: childOffersByParent(agents),
+    resumable,
+    unresumable: entries.filter((offer) => !ids.has(offer.row_id)),
+  };
 }
 
 /** "3 agent sessions were interrupted. 1 cannot be resumed." */
 export function interruptedNoticeText(summary: InterruptedSummary): string {
-  const total = summary.agents.length;
+  const total = summary.entries.length;
   const head = `${total} agent ${total === 1 ? "session was" : "sessions were"} interrupted.`;
   const gone = summary.unresumable.length;
   return gone > 0 ? `${head} ${gone} cannot be resumed.` : head;
