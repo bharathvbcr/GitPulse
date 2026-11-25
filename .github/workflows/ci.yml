@@ -342,42 +342,52 @@ jobs:
       # CLI, which no runner has: eight of them failed on every macOS shard with
       # "devmap is not installed". It is built from DevCouncil at DEVMAP_REV and
       # cached on that SHA; the step after it fails the job when the CLI's schema
-      # and the vendored one differ, so a stale pin cannot pass quietly. Not on
-      # Windows, where this leg does not build yet.
+      # and the vendored one differ, so a stale pin cannot pass quietly. Windows
+      # too: the overlay tests failed there with the same "devmap is not
+      # installed" once that leg built (827a0666f).
       # Restore and save are separate steps: `actions/cache` saves in a post step
       # that runs only when the whole job succeeded, and this job's suite is red
       # on a runner more often than not, so the build would never be kept. It is
       # saved the moment the schema check passes, whatever the tests do after. Saving over
       # an existing key is a logged no-op, so no step-level `if` is needed to skip it.
       - name: Cache devmap
-        if: ${{ runner.os != 'Windows' }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       - name: Install devmap
-        if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
           set -euo pipefail
           root="$HOME/.cache/gitpulse-ci/devmap"
-          if [ ! -x "$root/bin/devmap" ]; then
+          exe=devmap
+          if [ "$RUNNER_OS" = Windows ]; then exe=devmap.exe; fi
+          if [ ! -x "$root/bin/$exe" ]; then
             cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
           fi
-          echo "$root/bin" >> "$GITHUB_PATH"
-          "$root/bin/devmap" --version
+          # A native spelling, so the PowerShell and cmd steps after this read it too.
+          if command -v cygpath >/dev/null 2>&1; then cygpath -w "$root/bin"; else echo "$root/bin"; fi >> "$GITHUB_PATH"
+          "$root/bin/$exe" --version
 
       - name: Installed devmap matches the vendored schema
-        if: ${{ runner.os != 'Windows' }}
         run: bun run check:vendor-schema
 
       - name: Keep the verified devmap build
-        if: ${{ runner.os != 'Windows' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/gitpulse-ci/devmap
           key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      # Two ledger tests hold the ledger's write lock from a second process,
+      # the real `sqlite3` CLI, and failed on Windows with "program not found":
+      # the Linux and macOS images ship it, the Windows one does not.
+      - name: Install sqlite3 (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          choco install sqlite -y --no-progress
+          sqlite3 -version
 
       # Two tests drive a real `manvi` under its default gate, which no runner
       # has: mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
