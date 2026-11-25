@@ -351,7 +351,7 @@ fn main() {
 
 fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     use std::sync::{Arc, Mutex};
-    use tauri::Listener;
+    use tauri::{Listener, Manager};
     let ids = [
         "stage-all",
         "unstage-all",
@@ -397,7 +397,9 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
     set_menu_state(app.handle(), state.clone()).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&events);
-    let listener = app.listen(gitpulse_lib::desktop::MENU_EVENT, move |event| {
+    // Any target: menu events are broadcast while there is no "main", and
+    // sent to "main" once revealing has built it.
+    let listener = app.listen_any(gitpulse_lib::desktop::MENU_EVENT, move |event| {
         observed
             .lock()
             .unwrap()
@@ -416,7 +418,28 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
         .collect();
     gitpulse_lib::desktop::handle_menu_event(app.handle(), "activate-repo:/r/with:colon/repo");
     expected.push(serde_json::json!({"id":"activate-repo", "path":"/r/with:colon/repo", "repo_path":"/r/with:colon/repo"}));
+    // A status-menu action other than the in-menu ones reveals "main". This
+    // app has no main window yet, so revealing builds one, and the event
+    // waits in the hibernation queue until that page says it is ready, as
+    // the real page does on mount (`cmd_main_ready`).
     gitpulse_lib::desktop::handle_menu_event(app.handle(), "tray:focus-agent:term:colon-1");
+    let desktop = app.state::<DesktopState>();
+    let hibernation = &desktop.hibernation;
+    assert!(
+        app.get_webview_window("main").is_some(),
+        "revealing built the main window"
+    );
+    assert_eq!(
+        hibernation.pending_len(),
+        1,
+        "the event waits for the page that was just built"
+    );
+    gitpulse_lib::desktop::hibernate::main_ready(app.handle());
+    assert_eq!(
+        hibernation.pending_len(),
+        0,
+        "the ready page drained the queue"
+    );
     expected.push(serde_json::json!({"id":"focus-agent", "path":"term:colon-1", "repo_path":"/r/with:colon/repo"}));
     assert_eq!(*events.lock().unwrap(), expected);
     state.enabled.retain(|id| id != "stage-all");
@@ -428,6 +451,11 @@ fn check_contextual_events(app: &tauri::App<tauri::test::MockRuntime>) {
         *events.lock().unwrap(),
         expected,
         "disabled actions must not emit"
+    );
+    assert_eq!(
+        hibernation.pending_len(),
+        0,
+        "nor wait to emit once the page is ready"
     );
     app.unlisten(listener);
     set_menu_state(app.handle(), MenuState::default()).unwrap();

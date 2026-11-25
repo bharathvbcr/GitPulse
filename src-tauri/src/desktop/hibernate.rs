@@ -934,6 +934,15 @@ pub async fn cmd_main_hibernate(
 
 #[tauri::command(async)]
 pub fn cmd_main_ready(app: AppHandle) -> Result<WakePayload, String> {
+    Ok(main_ready(&app))
+}
+
+/// What `"main"` saying it is ready does: finishes the wake, and replays on
+/// the main thread the events queued while it was hibernated or still
+/// mounting. [`cmd_main_ready`] is this for the page; a host that drives
+/// another runtime (the mock one the native menu tests use) calls it
+/// directly.
+pub fn main_ready<R: Runtime>(app: &AppHandle<R>) -> WakePayload {
     let (visible, minimized) = app
         .get_webview_window("main")
         .map(|w| {
@@ -963,7 +972,7 @@ pub fn cmd_main_ready(app: AppHandle) -> Result<WakePayload, String> {
             log::warn!(target: "desktop", "could not replay pending main events: {error}");
         }
     }
-    Ok(payload)
+    payload
 }
 
 fn replay_pending_events<R: Runtime>(app: &AppHandle<R>, events: Vec<PendingMainEvent>) {
