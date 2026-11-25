@@ -25,6 +25,12 @@
   import type { PrMergeMethod, PrReviewVerdict, PullRequestDetail, PullRequestDiff } from "../../github/types";
   import { shortHash } from "../../format";
   import UnifiedPatchView from "../UnifiedPatchView.svelte";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../../platform";
+  import { liquidSelection } from "../../ui/transitions";
+
+  const macos = isMacOS();
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
 
   let {
     repoPath,
@@ -229,7 +235,7 @@
       {#if detail.review_decision}<span>{detail.review_decision.toLowerCase().replace("_", " ")}</span>{/if}
       {#if !open}<span class="gp-chip" data-tone="neutral">{detail.state.toLowerCase()}</span>{/if}
     </div>
-    <div class="gp-segmented my-2 inline-flex p-0.5!" role="tablist" aria-label="Pull request view">
+    <div class="gp-segmented my-2 inline-flex p-0.5!" class:gp-liquid-tabs={macos} role="tablist" aria-label="Pull request view">
       <button
         type="button"
         role="tab"
@@ -238,7 +244,15 @@
         data-active={activeTab === "overview" ? "true" : "false"}
         onclick={() => selectTab("overview")}
       >
-        Overview
+        {#if macos && activeTab === "overview"}
+          <span
+            class="gp-liquid-selection gp-gpu"
+            aria-hidden="true"
+            in:receiveSelection={{ key: "pr-detail-view" }}
+            out:sendSelection={{ key: "pr-detail-view" }}
+          ></span>
+        {/if}
+        <span>Overview</span>
       </button>
       <button
         type="button"
@@ -248,7 +262,15 @@
         data-active={activeTab === "files" ? "true" : "false"}
         onclick={() => selectTab("files")}
       >
-        Files ({detail.changed_files})
+        {#if macos && activeTab === "files"}
+          <span
+            class="gp-liquid-selection gp-gpu"
+            aria-hidden="true"
+            in:receiveSelection={{ key: "pr-detail-view" }}
+            out:sendSelection={{ key: "pr-detail-view" }}
+          ></span>
+        {/if}
+        <span>Files ({detail.changed_files})</span>
       </button>
     </div>
     {#if activeTab === "files"}
