@@ -1617,7 +1617,11 @@ const idOf = (repo: string): string => {
   return reading.id;
 };
 
-describe("workingTreeId reads the tree that is on disk", () => {
+// Each case spawns git about nine times (three to build the repository, three per
+// reading). A Windows runner spawns git far slower than macOS or Linux, and under the
+// full suite one case passed 5 s (Frontend (windows-latest), 15be00ece), so the cases
+// get the time this file's other git-spawning contracts get.
+describe("workingTreeId reads the tree that is on disk", { timeout: 30_000 }, () => {
   it("is the same on two calls when nothing changed", () => {
     const repo = makeRepo();
     expect(idOf(repo)).toBe(idOf(repo));
