@@ -948,6 +948,23 @@ mod tests {
         assert!(out["reason"].is_string(), "{out}");
     }
 
+    /// `answer` without `verified_age_ms`, which is the time since the freshness
+    /// walk and so differs between two otherwise identical answers.
+    fn without_verified_age(mut answer: Value) -> Value {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    map.remove("verified_age_ms");
+                    map.values_mut().for_each(strip);
+                }
+                Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut answer);
+        answer
+    }
+
     /// The validator calls `5.0` an integer, so the handler has to answer it as
     /// 5 rather than refuse it or read it as absent.
     #[test]
@@ -971,7 +988,7 @@ mod tests {
                 args.as_object_mut()
                     .unwrap()
                     .extend(base.as_object().unwrap().clone());
-                ask(name, args)
+                without_verified_age(ask(name, args))
             };
             assert_eq!(answer(json!(5.0)), answer(json!(5)), "{name}");
             assert_eq!(answer(json!(1.0)), answer(json!(1)), "{name}");
