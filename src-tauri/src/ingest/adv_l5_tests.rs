@@ -414,17 +414,16 @@ fn good_session(root: &std::path::Path, repo: &str) {
     );
 }
 
+/// One catch-up pass over the transcripts under `root`, with no deadline.
+///
+/// `catch_up_into` gives each pass [`CATCH_UP_DEADLINE`] (5 s), and a pass
+/// that is slow or cut off comes back `truncated`, so not `finished()`, with a
+/// `catch-up truncated: …` note added to `error`. On a loaded runner that can
+/// land on any pass, and every test here asserts on `finished()`, the error
+/// or the counts. These tests are about unreadable and odd transcripts, not
+/// the clock (the deadline has its own tests, which set their own budgets),
+/// so the passes run unbounded, as `reflog_coverage_tests` does.
 fn catch_up_under(root: &std::path::Path, repo: &str) -> CatchUp {
-    with_transcript_root(root, || catch_up_into(repo, repo))
-}
-
-/// [`catch_up_under`] with no deadline. `catch_up_into` gives each pass
-/// [`CATCH_UP_DEADLINE`] (5 s), and a pass that is slow or cut off adds a
-/// `catch-up truncated: …` note to `error`. On a loaded runner that note can
-/// land on any one pass. A test that compares `error` across passes is about
-/// the unreadable file, not the clock, so it runs the passes unbounded, as
-/// `reflog_coverage_tests` does.
-fn catch_up_unbounded_under(root: &std::path::Path, repo: &str) -> CatchUp {
     with_transcript_root(root, || catch_up_into_bounded(repo, repo, None))
 }
 
@@ -635,7 +634,7 @@ fn adv_permanent_unreadable_file_is_unfinished_every_pass_with_a_stable_error() 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
     let mut errors = Vec::new();
     for _ in 0..4 {
-        let out = catch_up_unbounded_under(root.path(), &repo);
+        let out = catch_up_under(root.path(), &repo);
         assert_eq!(out.io_errors, 1, "{out:?}");
         assert!(!out.finished());
         errors.push(out.error);
