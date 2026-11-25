@@ -8,7 +8,7 @@ use super::env::{
 use super::gate::{
     current_admission, is_deferred_under_load, is_slot_wait_timeout, refusal_message_at,
     spawn_gate, strip_code_prefix, with_admission, with_exec_probe, Admission, Refusal, SpawnGate,
-    TIMEOUT_MARKER,
+    SLOT_WAIT_SUFFIX, TIMEOUT_MARKER,
 };
 #[cfg(test)]
 use super::gate::{refusal_message, spawn_log};
@@ -440,15 +440,16 @@ pub(crate) fn is_timed_out(err: &str) -> bool {
 /// True when `err` is the deadline text of the child `run_captured` ran as
 /// `program`: it starts with the program (the label `run_bounded` uses, in
 /// whatever characters the path holds) and carries the timeout marker. A
-/// refused slot wait carries the marker too, and so does a deferral that spells
-/// it, but neither ran the child, so neither is a run that timed out.
+/// refused slot wait carries the marker too, and a deferral can, but neither
+/// ran the child, so neither is a run that timed out. The slot-wait refusal is
+/// recognised by its ending, which the gate writes after the label: a path
+/// that merely spells the phrase, and really ran out of time, ends in the
+/// runner's own `<n>s`.
 pub(super) fn is_own_run_timeout(program: &str, err: &str) -> bool {
     err.starts_with(program)
         && is_timed_out(err)
-        && !matches!(
-            RunError::classify(err),
-            RunError::SlotWaitTimeout | RunError::Deferred
-        )
+        && !strip_code_prefix(err).ends_with(SLOT_WAIT_SUFFIX)
+        && !is_deferred_under_load(err)
 }
 
 /// What a runner failure message says happened, read once and in one place.

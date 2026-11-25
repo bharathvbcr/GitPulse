@@ -1661,6 +1661,33 @@ fn run_captured_reports_a_timeout_for_a_program_path_with_odd_characters() {
     );
 }
 
+/// The slot-wait refusal is recognised by its ending, not by containing the
+/// phrase: a program whose path spells it and which really ran out of time is
+/// still a run that timed out.
+#[cfg(unix)]
+#[test]
+fn run_captured_keeps_a_real_timeout_when_the_program_path_spells_the_slot_phrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let spelled = dir
+        .path()
+        .join(format!("x{TIMEOUT_MARKER}1{SLOT_WAIT_SUFFIX}"));
+    std::fs::create_dir(&spelled).unwrap();
+    let program = spelled.join("sleep");
+    std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+    let outcome = run_captured(
+        program.to_str().unwrap(),
+        &["5"],
+        None,
+        Duration::from_secs(1),
+        &[],
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(
+        matches!(outcome, Ok(RunOutcome::TimedOut(d)) if d.as_secs() == 1),
+        "expected TimedOut(1s), got {outcome:?}"
+    );
+}
+
 /// The predicate behind that outcome depends on neither the label's character
 /// set nor its being a plain word: odd paths are run timeouts, and the gate's
 /// slot-wait refusal under the same odd label is not.
@@ -1672,6 +1699,7 @@ fn own_run_timeout_ignores_the_label_charset_but_not_the_cause() {
         "g++",
         "/Users/José/t",
         "/opt/homebrew/opt/node@20/bin/node",
+        "/tmp/x timed out after 1s waiting for a process slot/sleep",
     ] {
         let ran = format!("{program}{TIMEOUT_MARKER}5s");
         assert!(is_own_run_timeout(program, &ran), "{ran}");
