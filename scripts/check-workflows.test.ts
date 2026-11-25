@@ -316,13 +316,15 @@ describe("check:workflows", () => {
         expect(test, `${file} ${name} runs its tests after manvi`).toBeGreaterThan(install);
         // The pins Manvi's own commit names, never whatever sibling happens to exist.
         expect(job!.slice(install, test)).toContain('bash "$src/scripts/fetch-modules.sh"');
-        // The built binary's directory reaches GITHUB_PATH on one line...
         const steps = job!.slice(install, test);
-        expect(steps).toMatch(/"\$root\/bin"[^\n]*>> "\$GITHUB_PATH"/);
-        // ...and on a Windows runner in its native spelling: the Rust test
-        // step's own PATH walk drops a `/c/...` entry as not absolute.
-        if (job!.includes("windows-latest")) {
+        // On a Windows runner the directory goes on PATH in its native spelling:
+        // the Rust test step's own PATH walk drops a `/c/...` entry as not absolute.
+        if (name.includes("windows") || job!.includes("windows-latest")) {
           expect(steps, `${file} ${name} puts manvi on PATH in Windows spelling`).toContain('cygpath -w "$root/bin"');
+          expect(steps).toContain('>> "$GITHUB_PATH"');
+        } else {
+          // Elsewhere the built binary's directory reaches GITHUB_PATH on one line.
+          expect(steps).toMatch(/"\$root\/bin"[^\n]*>> "\$GITHUB_PATH"/);
         }
       }
     }
