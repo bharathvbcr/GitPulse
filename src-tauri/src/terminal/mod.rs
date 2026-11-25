@@ -503,6 +503,33 @@ fn clock_ms() -> u64 {
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What older-protocol hosts hold, for the ledger's startup reconcile. An older
+/// host whose socket has nothing behind it is gone (its sessions died with it);
+/// one that is refused, failed or has no dialect here could not be asked.
+#[cfg(unix)]
+pub(crate) fn foreign_holds(reports: &[LegacyHostReport]) -> session_ledger::ForeignHolds {
+    use host::legacy::LegacyStatus;
+    let mut holds = session_ledger::ForeignHolds::default();
+    for report in reports {
+        match &report.status {
+            LegacyStatus::Listed { sessions, .. } => {
+                holds.held.extend(sessions.iter().map(|s| s.id.clone()));
+            }
+            LegacyStatus::Unreachable { .. } => {}
+            LegacyStatus::NoCompat
+            | LegacyStatus::Refused { .. }
+            | LegacyStatus::Failed { .. } => holds.unverified = true,
+        }
+    }
+    holds
+}
+
+/// No terminal hosts off Unix, so nothing is held elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn foreign_holds(_reports: &[LegacyHostReport]) -> session_ledger::ForeignHolds {
+    session_ledger::ForeignHolds::default()
+}
+
 /// An earlier terminal host's report. Only Unix has terminal hosts; here the
 /// list is always empty, so this carries nothing.
 #[cfg(not(unix))]
@@ -808,7 +835,11 @@ impl TerminalSessions {
             Ok(listed) => {
                 let live_ids: std::collections::HashSet<String> =
                     listed.into_iter().map(|s| s.id).collect();
-                self.session_ledger.reconcile_startup(&live_ids)
+                // Sessions an older-protocol host still runs are alive too: a
+                // row for one is never `lost`, and so never offered for reopen.
+                let foreign = foreign_holds(&self.legacy_hosts());
+                self.session_ledger
+                    .reconcile_startup_with(&live_ids, &foreign)
             }
             Err(error) => {
                 log::warn!(

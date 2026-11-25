@@ -28,6 +28,13 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// `reason` of a `running` row whose session an older-protocol terminal host holds.
+pub const OLDER_HOST_REASON: &str =
+    "Still running on an older terminal host; stop it there before reopening here.";
+/// `reason` of a `running` row when an older terminal host could not be asked.
+pub const UNVERIFIED_HOST_REASON: &str =
+    "Could not check an older terminal host for this session; it may still be running there.";
+
 /// Maximum rows kept on disk and in memory so the ledger stays strictly bounded.
 pub const MAX_LEDGER_ROWS: usize = 64;
 /// Maximum byte length accepted for one JSONL line before treating it as corrupt.
@@ -105,6 +112,17 @@ pub struct SessionLedgerView {
     /// empty offer list is then "not known", not "nothing to recover".
     #[serde(default)]
     pub reconcile_pending: bool,
+}
+
+/// What hosts other than the current one hold, as startup reconcile needs it.
+/// Their sessions are alive, so their rows are not `lost`; a host that could
+/// not be asked leaves every unaccounted row unverified rather than lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignHolds {
+    /// Session ids an older host listed.
+    pub held: HashSet<String>,
+    /// Set when an older host exists that could not be asked.
+    pub unverified: bool,
 }
 
 /// Result of pre-checking whether one ledger row can be reopened right now.
@@ -258,6 +276,10 @@ pub struct SessionLedger {
     reconcile_attempts: AtomicU32,
     /// Serialises reconciles: startup and a later connect may race.
     reconcile_gate: Mutex<()>,
+    /// `running` rows the last reconcile left alone because another host holds
+    /// (or may hold) them: terminal id to the reason shown. Rebuilt on every
+    /// reconcile, never persisted.
+    elsewhere: Mutex<HashMap<String, &'static str>>,
 }
 
 /// What a close needs to know about a session, from its ledger row.
@@ -284,6 +306,7 @@ impl SessionLedger {
             reconcile_pending: AtomicBool::new(false),
             reconcile_attempts: AtomicU32::new(0),
             reconcile_gate: Mutex::new(()),
+            elsewhere: Mutex::default(),
         }
     }
 
@@ -333,6 +356,7 @@ impl SessionLedger {
             reconcile_pending: AtomicBool::new(true),
             reconcile_attempts: AtomicU32::new(0),
             reconcile_gate: Mutex::new(()),
+            elsewhere: Mutex::default(),
         };
         // Before anything can deliver an exit: rows an older build recorded
         // as clean for sessions whose outcome it never saw become offers.
@@ -998,6 +1022,18 @@ impl SessionLedger {
     /// `terminal_id` is absent from `live_terminal_ids` (left behind by
     /// `SIGKILL`, crash, or reboot) transitions to [`SessionEndState::Lost`].
     pub fn reconcile_startup(&self, live_terminal_ids: &HashSet<String>) -> usize {
+        self.reconcile_startup_with(live_terminal_ids, &ForeignHolds::default())
+    }
+
+    /// [`Self::reconcile_startup`] that also knows what older hosts hold: a row
+    /// one of them lists is alive, and with an older host that could not be
+    /// asked every other `running` row is unverified, not lost. Both stay
+    /// `running` and are shown non-resumable by the view.
+    pub fn reconcile_startup_with(
+        &self,
+        live_terminal_ids: &HashSet<String>,
+        foreign: &ForeignHolds,
+    ) -> usize {
         let mut guard = self
             .state
             .lock()
@@ -1010,6 +1046,7 @@ impl SessionLedger {
         if settle_reopens(&mut guard.entries, now) {
             count += 1;
         }
+        let mut elsewhere: HashMap<String, &'static str> = HashMap::new();
         for entry in &mut guard.entries {
             let Entry::Valid(row) = entry else { continue };
             if row.withdrawn || row.end_state != SessionEndState::Running {
@@ -1022,6 +1059,16 @@ impl SessionLedger {
             if still_alive {
                 continue;
             }
+            if let Some(id) = row.terminal_id.as_deref() {
+                if foreign.held.contains(id) {
+                    elsewhere.insert(id.to_owned(), OLDER_HOST_REASON);
+                    continue;
+                }
+                if foreign.unverified {
+                    elsewhere.insert(id.to_owned(), UNVERIFIED_HOST_REASON);
+                    continue;
+                }
+            }
             row.end_state = SessionEndState::Lost;
             row.ended_at = Some(now);
             ensure_agy_fallback(row);
@@ -1033,6 +1080,10 @@ impl SessionLedger {
         if count > 0 {
             self.persist_locked(&guard.entries);
         }
+        *self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = elsewhere;
         self.reconcile_pending.store(false, Ordering::Release);
         self.reconcile_attempts.store(0, Ordering::Release);
         // Rows repaired while opening count as changed the first time, so the
@@ -1188,6 +1239,11 @@ impl SessionLedger {
                 _ => None,
             })
             .collect();
+        let elsewhere = self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut offers = Vec::new();
         if let Some(err) = &guard.load_error {
             offers.push(project_corrupt_row("corrupt-ledger-file", err));
@@ -1220,6 +1276,24 @@ impl SessionLedger {
                     // not an offer still hides every older one.
                     if is_failed_reopen(row) {
                         continue;
+                    }
+                    // Alive on a host this one is not: shown, never reopenable
+                    // (a second copy would resume the same conversation twice).
+                    if !row.withdrawn && row.end_state == SessionEndState::Running {
+                        if let Some(reason) = row
+                            .terminal_id
+                            .as_deref()
+                            .and_then(|id| elsewhere.get(id))
+                        {
+                            offers.push(project_valid_row_with_status(
+                                row,
+                                conversation::ProviderResumability {
+                                    resumable: false,
+                                    reason: Some((*reason).to_owned()),
+                                },
+                            ));
+                            continue;
+                        }
                     }
                     let newest = conversation_key(row).is_none_or(|key| taken.insert(key));
                     if !newest || reopening.contains(row.row_id.as_str()) || row.withdrawn || !is_offer_end_state(row.end_state) {
@@ -2863,6 +2937,90 @@ mod tests {
         assert!(!view.reconcile_pending);
         assert_eq!(view.offers.len(), 1);
         assert!(!ledger.begin_reconcile_retry());
+    }
+
+    #[test]
+    fn a_session_only_an_older_host_lists_is_not_lost_and_not_reopenable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let first = SessionLedger::open(&path);
+        first.record_spawn(spawn_spec("term-old-host", "claude", Some(UUID_1), dir.path(), None));
+        first.record_spawn(spawn_spec("term-gone", "claude", Some(UUID_2), dir.path(), None));
+        drop(first);
+        let ledger = SessionLedger::open(&path);
+        let foreign = ForeignHolds {
+            held: HashSet::from(["term-old-host".to_owned()]),
+            unverified: false,
+        };
+        ledger.reconcile_startup_with(&HashSet::new(), &foreign);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        let held = view
+            .offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some("term-old-host"))
+            .expect("shown");
+        assert!(!held.resumable);
+        assert_eq!(held.reason.as_deref(), Some(OLDER_HOST_REASON));
+        assert_eq!(view.reopenable_count, 1, "only the genuinely lost row");
+        // Reopen all offers only resumable rows.
+        assert!(view.offers.iter().filter(|o| o.resumable).all(|o| o.terminal_id.as_deref() == Some("term-gone")));
+        // Once the older host lets go, the next reconcile loses it.
+        ledger.reconcile_startup_with(&HashSet::new(), &ForeignHolds::default());
+        assert_eq!(ledger.view_with(|_, _| Transcript::Found).reopenable_count, 2);
+    }
+
+    #[test]
+    fn an_older_host_that_could_not_be_asked_makes_rows_unverified_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec("term-x", "claude", Some(UUID_1), dir.path(), None));
+        let foreign = ForeignHolds {
+            held: HashSet::new(),
+            unverified: true,
+        };
+        ledger.reconcile_startup_with(&HashSet::new(), &foreign);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.reopenable_count, 0);
+        assert_eq!(view.offers[0].reason.as_deref(), Some(UNVERIFIED_HOST_REASON));
+        assert!(!view.offers[0].resumable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn older_host_reports_map_to_held_ids_and_unverified() {
+        use crate::terminal::host::legacy::{LegacyHostInfo, LegacySession, LegacyStatus};
+        let report = |status| crate::terminal::LegacyHostReport {
+            protocol: 4,
+            socket: std::path::PathBuf::from("/x"),
+            status,
+        };
+        let session = LegacySession {
+            id: "term-4-1".into(),
+            program: "claude".into(),
+            cwd: String::new(),
+            repo: String::new(),
+            launcher: None,
+            run_id: None,
+            title: None,
+            parent_session_id: None,
+            detached: true,
+            ending: false,
+            quiet_ms: None,
+        };
+        let listed = report(LegacyStatus::Listed {
+            info: LegacyHostInfo { protocol: 4, build: "b".into(), pid: 1, sessions: 1 },
+            sessions: vec![session],
+        });
+        let holds = crate::terminal::foreign_holds(&[
+            listed,
+            report(LegacyStatus::Unreachable { reason: "stale".into() }),
+        ]);
+        assert!(holds.held.contains("term-4-1"));
+        assert!(!holds.unverified, "a socket with no host is gone, not unverified");
+        let holds = crate::terminal::foreign_holds(&[report(LegacyStatus::Failed {
+            reason: "slow".into(),
+        })]);
+        assert!(holds.unverified);
     }
 
     #[test]
