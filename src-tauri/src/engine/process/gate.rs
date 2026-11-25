@@ -102,6 +102,44 @@ impl BucketLevel {
     }
 }
 
+/// What a refused waiter was short of, when the gate knows: the side channel
+/// beside [`Refusal`] that [`refusal_message_at`] renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalCause {
+    /// The rate budget: the bucket that refused and its level.
+    Bucket(BucketLevel),
+    /// A reactive read queued behind older reads for the next token, while
+    /// the slots were the reason that line was not moving. `ahead` is this
+    /// waiter's place in the line (how many reads are in front of it).
+    Line {
+        in_flight: usize,
+        limit: usize,
+        ahead: usize,
+    },
+}
+
+impl RefusalCause {
+    fn describe(&self) -> String {
+        match self {
+            Self::Bucket(level) => level.describe(),
+            Self::Line {
+                in_flight,
+                limit,
+                ahead,
+            } if in_flight >= limit => format!(
+                "no process slot came free ({in_flight} of {limit} busy, {ahead} read(s) ahead in line)"
+            ),
+            Self::Line {
+                in_flight,
+                limit,
+                ahead,
+            } => format!(
+                "{ahead} read(s) ahead in line were still waiting ({in_flight} of {limit} process slots busy)"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> CommandError {
     refusal_message_at(label, refusal, None)
@@ -118,9 +156,12 @@ pub(super) const CANCELLED_BEFORE_SPAWN: &str = " cancelled before spawn";
 pub(crate) fn refusal_message_at(
     label: &str,
     refusal: Refusal,
-    level: Option<BucketLevel>,
+    cause: Option<RefusalCause>,
 ) -> CommandError {
-    let by = level.map_or_else(String::new, |level| format!(" ({})", level.describe()));
+    let by = match cause {
+        Some(RefusalCause::Bucket(level)) => format!(" ({})", level.describe()),
+        _ => String::new(),
+    };
     // A deferral is typed where it is written (see `crate::ipc_error`): the
     // error carries the kind to the command's edge, and nothing reads the
     // marker back out of a message.
@@ -133,10 +174,21 @@ pub(crate) fn refusal_message_at(
             deadline.as_secs_f64()
         )
         .into(),
-        Refusal::Refused { waited } => deferred(format!(
-            "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner{by}",
-            waited.as_secs_f64()
-        )),
+        // A reactive read refused for the line it queued in names that, in
+        // its own sentence: the rate limit did not refuse it, so the rate-limit
+        // sentence would name the wrong cause. Both follow the same marker and
+        // seconds, which is all [`is_deferred_under_load`] reads.
+        Refusal::Refused { waited } => match cause {
+            Some(line @ RefusalCause::Line { .. }) => deferred(format!(
+                "{label}{DEFERRED_MARKER}{:.3}s: {}",
+                waited.as_secs_f64(),
+                line.describe()
+            )),
+            _ => deferred(format!(
+                "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner{by}",
+                waited.as_secs_f64()
+            )),
+        },
         Refusal::Shed => deferred(format!(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
              budget is low{by}"
@@ -1321,7 +1373,7 @@ impl SpawnGate {
         &self,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<SpawnPermit<'_>, (Refusal, Option<BucketLevel>)> {
+    ) -> Result<SpawnPermit<'_>, (Refusal, Option<RefusalCause>)> {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
@@ -1392,7 +1444,7 @@ impl SpawnGate {
         // which bucket was short the last time this waiter was refused a
         // token: what a refusal names.
         let mut shared_denial: Option<BucketLevel> = None;
-        let mut short: Option<BucketLevel> = None;
+        let mut short: Option<RefusalCause> = None;
         let outcome = loop {
             // The cancel check is the caller's code. Under the gate lock, a
             // check that took a lock of its own or spawned anything would
@@ -1457,10 +1509,16 @@ impl SpawnGate {
             // ask: the token that lands next is the oldest waiter's. It naps
             // like any waiter short of a token, and is woken when the front
             // changes.
-            if reservation
-                .ticket
-                .is_some_and(|ticket| state.reactive_line.front() != Some(&ticket))
-            {
+            // Where it stands, when it is not first: what a refusal names if
+            // this is all it was short of.
+            let behind_in_line = reservation.ticket.and_then(|ticket| {
+                state
+                    .reactive_line
+                    .iter()
+                    .position(|t| *t == ticket)
+                    .filter(|at| *at > 0)
+            });
+            if behind_in_line.is_some() {
                 tokens_ok = false;
             }
             // The shared budget is asked last, and only by a spawn that would
@@ -1527,10 +1585,23 @@ impl SpawnGate {
             }
             if !tokens_ok {
                 // The process bucket is short first; past it, the record is.
-                short = if tokens_available(&state) {
-                    shared_denial
+                // A reactive read held back only by the line has asked no
+                // bucket anything: with every slot busy the front cannot ask
+                // either, so the slots are the cause, not the rate limit.
+                short = if !tokens_available(&state) {
+                    Some(RefusalCause::Bucket(self.level_of(
+                        RefusingBucket::Local,
+                        state.tokens,
+                        class,
+                    )))
+                } else if let Some(ahead) = behind_in_line {
+                    Some(RefusalCause::Line {
+                        in_flight: state.in_flight,
+                        limit: self.limit,
+                        ahead,
+                    })
                 } else {
-                    Some(self.level_of(RefusingBucket::Local, state.tokens, class))
+                    shared_denial.map(RefusalCause::Bucket)
                 };
                 // Background is shed at once: it is the first thing to go
                 // under load, and waiting would only hold a pool thread.
@@ -1835,7 +1906,7 @@ impl SpawnGate {
         &self,
         counters: &[AdmissionCounters; 3],
         sharing: &str,
-        refused_by: Option<BucketLevel>,
+        refused_by: Option<RefusalCause>,
         top: impl FnOnce() -> String,
     ) {
         if !self.report_due_at(&self.refusal_report_at, self.clock.now()) {

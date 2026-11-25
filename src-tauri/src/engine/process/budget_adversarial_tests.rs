@@ -5,6 +5,7 @@
 //!
 //! A child of `shared_budget` so it can drive the private `take_at`.
 
+use super::super::gate::RefusalCause;
 use super::super::{
     is_deferred_under_load, refusal_message_at, with_admission, Admission, BucketLevel, Refusal,
     RefusingBucket, SpawnGate,
@@ -759,12 +760,12 @@ fn host_wake_50ms() -> Duration {
 /// after the first `s:` still parses.
 #[test]
 fn refusal_tail_is_single_line_json_safe_and_classified() {
-    let level = Some(BucketLevel {
+    let level = Some(RefusalCause::Bucket(BucketLevel {
         bucket: RefusingBucket::Shared,
         tokens: u32::MAX,
         floor: u32::MAX,
         burst: u32::MAX,
-    });
+    }));
     for refusal in [
         Refusal::Refused {
             waited: Duration::from_millis(2_013),
