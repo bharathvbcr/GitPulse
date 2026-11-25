@@ -21,7 +21,7 @@
     updateHostLoadSettings,
     type HostLoadHookMode,
     type LeaseMode,
-    type HostLoadSettingsExt,
+    type HostLoadSettings,
     type SupervisorMode,
   } from "../stores/hostLoadStore";
   import { asProfileChoice, PROFILE_CHOICES, profileNote } from "../health/hostLoad";
@@ -31,7 +31,7 @@
 
   // The shared copy: the input rows save through the same store, so a toggle
   // here never saves their thresholds back stale.
-  const settings = $derived<HostLoadSettingsExt>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
+  const settings = $derived<HostLoadSettings>($hostLoadSettings ?? DEFAULT_HOST_LOAD_SETTINGS);
   const thresholdsAreDefault = $derived(defaultThresholds(settings.thresholds));
   const HOOK_MODES: readonly { value: HostLoadHookMode; label: string; title: string }[] = [
     { value: "enforce", label: "Refuse", title: "Refuse a heavy command the host cannot take, with a reason" },
@@ -43,7 +43,6 @@
     { value: "advise", label: "Advise", title: "Only say what it would pause" },
     { value: "off", label: "Off", title: "Do nothing" },
   ];
-  // Absent until the backend reports it: there is nothing to switch before then.
   const supervisor = $derived(settings.supervisor);
   const LEASE_MODES: readonly { value: LeaseMode; label: string; title: string }[] = [
     { value: "on", label: "Queue", title: "A cargo or go build waits for a free slot" },
@@ -72,7 +71,7 @@
     }
   }
 
-  async function save(change: Partial<HostLoadSettingsExt>) {
+  async function save(change: Partial<HostLoadSettings>) {
     if (busy) return;
     busy = true;
     error = "";
@@ -159,17 +158,13 @@
       Act (the default): pause the heaviest build or test under an agent GitPulse launched, never the agent
       itself, until the pressure eases or 10 minutes pass; first, agent processes are slowed to background
       priority. Advise: only tell me what it would pause. Off: do nothing.
-      {#if supervisor === undefined}
-        This build of GitPulse has no memory supervisor to switch yet.
-      {/if}
     </p>
     <SettingSegment
       ariaLabel="What GitPulse does when memory runs out"
       options={SUPERVISOR_MODES}
-      value={supervisor ?? ""}
-      disabled={supervisor === undefined}
+      value={supervisor}
       onselect={(next) => {
-        if (readOk && !busy && supervisor !== undefined && next !== "") void save({ supervisor: next });
+        if (readOk && !busy) void save({ supervisor: next });
       }}
     />
   </div>

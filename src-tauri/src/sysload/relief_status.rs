@@ -79,8 +79,6 @@ pub const FUTURE_SLACK_MS: u64 = 5_000;
 /// A resume request older than this is dropped unread.
 pub const REQUEST_TTL_MS: u64 = 2 * 60_000;
 /// The most failures the file carries, newest last.
-// Used by `write_status`, whose caller is the supervisor's writer.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_FAILURES: usize = 16;
 /// The most bytes read from either file; a larger one is Unreadable.
 const MAX_BYTES: usize = 256 * 1024;
@@ -330,9 +328,6 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Writes `status` atomically and privately (see the module doc).
-// The supervisor's writer (`relief`, built in its own lane) is the caller; this
-// build reads the file and only tests write it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_status(dir: &Path, status: &ReliefStatus) -> io::Result<()> {
     let mut bounded = status.clone();
     let excess = bounded.failures.len().saturating_sub(MAX_FAILURES);
@@ -479,8 +474,6 @@ pub fn request_resume_in(dir: &Path, reason: &str, now_ms: u64) -> io::Result<()
 /// makes on each tick. `None` when there is none, when it is older than
 /// [`REQUEST_TTL_MS`], or when it is not a request this user wrote: all three
 /// delete it, so a stale or foreign request is never acted on later.
-// The supervisor (built in its own lane) is the caller.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn take_resume_request(dir: &Path, now_ms: u64) -> Option<ResumeRequest> {
     let path = dir.join(RESUME_REQUEST_FILE_NAME);
     let record = read_private(&path);

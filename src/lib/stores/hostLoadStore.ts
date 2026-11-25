@@ -690,22 +690,12 @@ export interface HostLoadSettings {
    * `host_load_profile`, never inside `host_load`.
    */
   profile: ProfileChoice;
+  /** What the memory-pressure supervisor may do. Stored as the top-level `host_load_supervisor`. */
+  supervisor: SupervisorMode;
 }
 
 /** Off does nothing, Advise only says what it would pause, Act pauses. */
 export type SupervisorMode = "off" | "advise" | "act";
-
-/**
- * The settings plus what the memory-pressure supervisor may do
- * (`host_load.supervisor`). Kept out of `HostLoadSettings` until the Rust
- * struct carries the key: `scripts/check-coverage-types.mjs` refuses a field
- * the backend never sends, and the backend refuses a key it does not know. The
- * key is absent from a build that has no supervisor, so its Settings control
- * is then disabled rather than shown at a default nothing honours. When the
- * Rust field lands, move `supervisor` into the interface above and delete
- * this type.
- */
-export type HostLoadSettingsExt = HostLoadSettings & { supervisor?: SupervisorMode };
 
 /** Mirrors `HostLoadLeases::default` in Rust. */
 export const DEFAULT_LEASES: HostLoadLeases = {
@@ -1124,6 +1114,7 @@ export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   leases: DEFAULT_LEASES,
   idle: DEFAULT_IDLE,
   profile: "auto",
+  supervisor: "act",
 };
 
 /**
@@ -1175,7 +1166,7 @@ export function ensureHostLoadSettings(): Promise<HostLoadSettings> {
 }
 
 /** Saves `change` on top of the latest settings read or saved anywhere. */
-export function updateHostLoadSettings(change: Partial<HostLoadSettingsExt>): Promise<HostLoadSettings> {
+export function updateHostLoadSettings(change: Partial<HostLoadSettings>): Promise<HostLoadSettings> {
   let latest: HostLoadSettings = DEFAULT_HOST_LOAD_SETTINGS;
   settingsStore.subscribe((value) => {
     if (value) latest = value;

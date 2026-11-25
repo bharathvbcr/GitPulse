@@ -3,7 +3,7 @@ import { render } from "svelte/server";
 import HostLoadSetting from "./HostLoadSetting.svelte";
 import {
   DEFAULT_HOST_LOAD_SETTINGS,
-  type HostLoadSettingsExt,
+  type HostLoadSettings,
   resetHostLoadForTests,
   saveHostLoadSettings,
 } from "../stores/hostLoadStore";
@@ -32,16 +32,14 @@ describe("the memory supervisor setting", () => {
     expect(block).toContain("only tell me what it would pause");
   });
 
-  it("is disabled, and says why, while the backend does not report a supervisor key", () => {
+  it("shows the default, act, as pressed before the backend has answered", () => {
     const block = supervisorBlock(render(HostLoadSetting).body);
-    expect(block).toContain("This build of GitPulse has no memory supervisor to switch yet.");
-    expect(block.match(/disabled/g)?.length).toBeGreaterThanOrEqual(3);
-    // Nothing is shown as selected: no mode is in force to select.
-    expect(block).not.toContain('aria-pressed="true"');
+    expect(block).not.toContain("no memory supervisor to switch");
+    expect(block).toMatch(/aria-pressed="true"[^>]*data-active="true"[^>]*title="Pause the heaviest build or test under an agent"/);
   });
 
-  it("shows the reported mode as pressed and is enabled once the backend reports the key", async () => {
-    const reported: HostLoadSettingsExt = { ...DEFAULT_HOST_LOAD_SETTINGS, supervisor: "advise" };
+  it("shows the reported mode as pressed", async () => {
+    const reported: HostLoadSettings = { ...DEFAULT_HOST_LOAD_SETTINGS, supervisor: "advise" };
     await saveHostLoadSettings(reported);
     const block = supervisorBlock(render(HostLoadSetting).body);
     expect(block).not.toContain("no memory supervisor to switch");

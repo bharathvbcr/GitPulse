@@ -225,14 +225,14 @@ describe("hostLoadStore", () => {
   });
 
   it("saves the kill switch and returns what was stored", async () => {
-    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    const stored = { enabled: false, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const, supervisor: "advise" as const };
     vi.mocked(invoke).mockResolvedValue(stored);
     await expect(saveHostLoadSettings(stored)).resolves.toEqual(stored);
     expect(invoke).toHaveBeenCalledWith("cmd_host_load_settings_save", { settings: stored });
   });
 
   it("saves one row's change on top of the latest settings, not a stale copy", async () => {
-    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    const first = { enabled: true, govern_launches: true, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const, supervisor: "act" as const };
     vi.mocked(invoke).mockResolvedValueOnce(first);
     await ensureHostLoadSettings();
     // A row saves a new swap rule; the store takes what the backend returns.
@@ -243,14 +243,14 @@ describe("hostLoadStore", () => {
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);
     await updateHostLoadSettings({ govern_launches: false });
     expect(lastSave()).toEqual(["cmd_host_load_settings_save", {
-      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap }, profile: "auto" },
+      settings: { enabled: true, govern_launches: false, hook_mode: "enforce", leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: { ...DEFAULT_THRESHOLDS, swap }, profile: "auto", supervisor: "act" },
     }]);
     expect(get(hostLoadSettings)?.thresholds.swap).toEqual(swap);
   });
 
   it("saves the command gate's mode on top of the latest settings, and defaults to enforcing", async () => {
     expect(DEFAULT_HOST_LOAD_SETTINGS.hook_mode).toBe("enforce");
-    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const };
+    const first = { enabled: true, govern_launches: false, hook_mode: "enforce" as const, leases: DEFAULT_LEASES, idle: DEFAULT_IDLE, thresholds: DEFAULT_THRESHOLDS, profile: "auto" as const, supervisor: "act" as const };
     vi.mocked(invoke).mockResolvedValueOnce(first);
     await ensureHostLoadSettings();
     vi.mocked(invoke).mockImplementationOnce(async (_cmd, args) => (args as { settings: unknown }).settings);

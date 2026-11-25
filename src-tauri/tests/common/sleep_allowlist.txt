@@ -553,3 +553,7 @@ site | tests/terminal_session_survival.rs | detaching_leaves_the_process_running
 site | tests/terminal_session_survival.rs | read_pid | 0 | bounded-poll
 site | tests/terminal_session_survival.rs | settled_count | 0 | bounded-poll
 site | tests/terminal_session_survival.rs | wait_until | 0 | bounded-poll
+
+# src/sysload/relief_tests.rs
+site | src/sysload/relief_tests.rs | Fake::set_background | 0 | bounded-poll
+site | src/sysload/relief_tests.rs | Sleeper::wait_for | 0 | bounded-poll

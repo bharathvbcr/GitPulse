@@ -2873,6 +2873,190 @@ fn environments_and_arguments_are_read_once_per_process_across_selections() {
 }
 
 // ---------------------------------------------------------------------------
+// The published status file and the resume request seam.
+// ---------------------------------------------------------------------------
+
+use crate::sysload::relief_status as file;
+
+/// A rig whose relief publishes `host-relief.v1.json` beside its journal.
+fn publishing_rig(mode: SupervisorMode) -> Rig {
+    let mut rig = Rig::new(mode);
+    let dir = rig.dir.path().to_path_buf();
+    rig.relief = std::mem::replace(
+        &mut rig.relief,
+        // A throwaway to move out of; nothing ticks it.
+        Relief::new(
+            dir.clone(),
+            Box::new(Fake::default()),
+            Box::new(FakeProbe::new(&dir)),
+            Box::new(|| SupervisorMode::Off),
+            Box::new(|_| false),
+        ),
+    )
+    .with_status_dir(dir);
+    rig
+}
+
+fn published(rig: &Rig) -> file::ReliefStatus {
+    match file::read_status(rig.dir.path()) {
+        file::ReliefOutcome::Fresh { status } | file::ReliefOutcome::Stale { status, .. } => status,
+        other => panic!("no status file: {other:?}"),
+    }
+}
+
+fn two_sessions() -> ReliefTable {
+    ReliefTable {
+        sessions: (0..2)
+            .map(|n| {
+                let base = 200 + 10 * n;
+                session(
+                    base,
+                    true,
+                    vec![
+                        proc(base + 1, base, "zsh", 10),
+                        proc(base + 2, base + 1, "cargo", 500 + 100 * n as u64),
+                    ],
+                )
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn the_status_file_is_written_at_startup_every_active_tick_and_on_the_way_back_to_rest() {
+    let table = standard();
+    let mut rig = publishing_rig(SupervisorMode::Act);
+    live_all(&rig, &table);
+    // A previous run's claim is replaced at startup, not left to be believed.
+    let mut stale = file::ReliefStatus::at_rest(file::ReliefMode::Act, file::now_ms());
+    stale.rung = file::ReliefRung::Freeze;
+    file::write_status(rig.dir.path(), &stale).unwrap();
+    rig.relief.recover();
+    let at_start = published(&rig);
+    assert_eq!(at_start.rung, file::ReliefRung::None);
+    assert_eq!(at_start.writer_pid, std::process::id());
+
+    rig.ticks(ENTER_SAMPLES as usize, |_| input(Level::Warn, 0), &table);
+    let slow = published(&rig);
+    assert_eq!(slow.rung, file::ReliefRung::Slow);
+    assert_eq!((slow.slowed, slow.would_slow), (5, 0));
+    assert_eq!(slow.binding, Some(file::ReliefBinding::MemoryPressure));
+    // Every active tick rewrites it, so its age is what says the writer lives.
+    std::fs::remove_file(rig.dir.path().join(file::STATUS_FILE_NAME)).unwrap();
+    rig.tick(&input(Level::Warn, 0), &table);
+    assert_eq!(published(&rig).rung, file::ReliefRung::Slow);
+
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let frozen = published(&rig);
+    assert_eq!(frozen.rung, file::ReliefRung::Freeze);
+    let tree = &frozen.frozen[0];
+    assert_eq!((tree.pid, tree.agent_root_pid), (102, 100));
+    assert!(!tree.advised_only && tree.since_ms > 0);
+    assert_eq!(tree.terminal_session_id.as_deref(), Some("term-100"));
+    assert_eq!(frozen.paused_count(), 1);
+    assert_eq!(
+        frozen.last_action.as_ref().map(|a| a.kind),
+        Some(file::ReliefActionKind::Freeze)
+    );
+
+    rig.ticks(
+        SEVERE_BREAK_SAMPLES as usize,
+        |_| input(Level::Normal, 0),
+        &table,
+    );
+    let rest = published(&rig);
+    assert_eq!(
+        rest.rung,
+        file::ReliefRung::None,
+        "the transition to rest is written"
+    );
+    assert_eq!((rest.slowed, rest.frozen.len(), rest.binding), (0, 0, None));
+    assert!(rest.last_action.is_some());
+    // At rest and unchanged, it is not rewritten every tick.
+    std::fs::remove_file(rig.dir.path().join(file::STATUS_FILE_NAME)).unwrap();
+    rig.tick(&input(Level::Normal, 0), &table);
+    assert!(matches!(
+        file::read_status(rig.dir.path()),
+        file::ReliefOutcome::Absent
+    ));
+}
+
+#[test]
+fn advise_publishes_would_slow_and_advised_only_trees_and_slows_nothing() {
+    let table = standard();
+    let mut rig = publishing_rig(SupervisorMode::Advise);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize + 5, rising(100), &table);
+    let status = published(&rig);
+    assert_eq!(status.mode, file::ReliefMode::Advise);
+    assert_eq!((status.slowed, status.would_slow), (0, 5));
+    assert_eq!(status.frozen.len(), 1);
+    assert!(status.frozen[0].advised_only);
+    assert_eq!(status.paused_count(), 0, "nothing is paused in advise");
+}
+
+#[test]
+fn a_resume_request_resumes_an_older_pause_and_not_a_newer_one() {
+    let table = two_sessions();
+    let mut rig = publishing_rig(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let mut stops = rig.fake.stops();
+    stops.sort_unstable();
+    assert_eq!(stops, [202, 212]);
+    // The session at 210 was paused ten seconds after the one at 200.
+    let newer = rig
+        .relief
+        .frozen
+        .iter()
+        .position(|f| f.session.0 == 210)
+        .unwrap();
+    let older_since = rig.relief.frozen[1 - newer].info.since_unix_ms;
+    rig.relief.frozen[newer].info.since_unix_ms = older_since + 10_000;
+    let session = rig.relief.frozen[newer].info.session_id.clone();
+    for entry in &mut rig.relief.journal {
+        if entry.session_id == session {
+            entry.at_unix_ms = older_since + 10_000;
+        }
+    }
+    rig.relief.sync_journal().unwrap();
+    // The person asked after the first pause and before the second.
+    file::request_resume_in(rig.dir.path(), "banner", older_since + 5_000).unwrap();
+    rig.tick(&severe(9000), &table);
+    assert_eq!(rig.fake.conts(), [202], "the older pause, and only it");
+    assert_eq!(rig.relief.status.frozen.len(), 1);
+    assert_eq!(rig.relief.status.frozen[0].session_pid, 210);
+    let note = rig.relief.status.last_action.clone().unwrap();
+    assert_eq!(note.kind, ActionKind::Resume);
+    assert!(note.detail.contains("banner"), "{note:?}");
+    assert_eq!(published(&rig).paused_count(), 1);
+    assert!(
+        !rig.dir.path().join(file::RESUME_REQUEST_FILE_NAME).exists(),
+        "a request is taken once"
+    );
+    // The episode is held off: nothing is frozen again meanwhile.
+    rig.ticks(100, |i| severe(9000 + 100 * i as u64), &table);
+    assert_eq!(rig.fake.stops().len(), 2);
+}
+
+#[test]
+fn an_expired_resume_request_resumes_nothing() {
+    let table = standard();
+    let mut rig = publishing_rig(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let old = file::now_ms() - file::REQUEST_TTL_MS - 5_000;
+    file::request_resume_in(rig.dir.path(), "too late", old).unwrap();
+    rig.tick(&severe(9000), &table);
+    assert!(rig.fake.conts().is_empty(), "{:?}", rig.fake.conts());
+    assert_eq!(rig.relief.status.frozen.len(), 1);
+    assert!(
+        !rig.dir.path().join(file::RESUME_REQUEST_FILE_NAME).exists(),
+        "and it is dropped, not kept for later"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Real processes: real signals to a `sleep` this test started.
 // ---------------------------------------------------------------------------
 

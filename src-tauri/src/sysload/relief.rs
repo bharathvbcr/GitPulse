@@ -1432,6 +1432,34 @@ pub fn shutdown() {
         SHUTDOWN_WAIT,
     );
     *lock(&SNAPSHOT) = None;
+    rest_the_status_file(dir);
+}
+
+/// The transition to rest on the way out: what this process published is
+/// replaced by an at-rest status, so the next reader does not take the last
+/// claim for a live one. Only a file this process wrote: a GitPulse that lost
+/// the writer election must not say the writer's relief is at rest.
+fn rest_the_status_file(dir: &Path) {
+    use super::relief_status as file;
+    let ours = match file::read_status(dir) {
+        file::ReliefOutcome::Fresh { status } | file::ReliefOutcome::Stale { status, .. } => {
+            status.writer_pid == std::process::id()
+        }
+        _ => false,
+    };
+    if !ours {
+        return;
+    }
+    let mode = match crate::tool_config::host_load_supervisor() {
+        SupervisorMode::Off => file::ReliefMode::Off,
+        SupervisorMode::Advise => file::ReliefMode::Advise,
+        SupervisorMode::Act => file::ReliefMode::Act,
+    };
+    let mut status = file::ReliefStatus::at_rest(mode, file::now_ms());
+    status.writer_start_us = super::process_start_us(std::process::id()).unwrap_or(0);
+    if let Err(why) = file::write_status(dir, &status) {
+        log::warn!(target: "relief", "the status file could not be set to rest: {why}");
+    }
 }
 
 /// [`shutdown`]'s work. The frozen processes are continued first, from the
@@ -1751,6 +1779,8 @@ struct External {
     generation: u64,
     hold_off: bool,
     reason: String,
+    /// Only the pauses that began at or before this (Unix ms); all when `None`.
+    up_to_ms: Option<u64>,
 }
 
 /// Per relief directory, so the reliefs of two directories (two tests) never
@@ -1783,6 +1813,20 @@ pub(crate) fn resume_all_in(
     hold_off_episode: bool,
     reason: &str,
 ) -> ResumeOutcome {
+    resume_up_to_in(dir, actuator, hold_off_episode, reason, None)
+}
+
+/// [`resume_all_in`] limited to the pauses that began at or before `up_to_ms`
+/// (Unix milliseconds): a person's request resumes what they saw, never a pause
+/// that began after they asked. Every journal entry of one pause carries that
+/// pause's start, so a pause is resumed whole or not at all.
+pub(crate) fn resume_up_to_in(
+    dir: &Path,
+    actuator: &dyn Actuator,
+    hold_off_episode: bool,
+    reason: &str,
+    up_to_ms: Option<u64>,
+) -> ResumeOutcome {
     let _act = lock(&ACT);
     let mut out = ResumeOutcome::default();
     let journal = match read_journal(dir) {
@@ -1803,10 +1847,10 @@ pub(crate) fn resume_all_in(
             ));
             return out;
         }
-        let (frozen, rest): (Vec<JournalEntry>, Vec<JournalEntry>) = journal
-            .entries
-            .into_iter()
-            .partition(|e| e.rung == JournalRung::Freeze);
+        let (frozen, rest): (Vec<JournalEntry>, Vec<JournalEntry>) =
+            journal.entries.into_iter().partition(|e| {
+                e.rung == JournalRung::Freeze && up_to_ms.is_none_or(|up_to| e.at_unix_ms <= up_to)
+            });
         for entry in frozen.iter().rev() {
             let (ok, detail) = match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
                 Ok(_) => (true, None),
@@ -1830,6 +1874,7 @@ pub(crate) fn resume_all_in(
     external.generation += 1;
     external.hold_off = hold_off_episode;
     external.reason = reason.to_string();
+    external.up_to_ms = up_to_ms;
     out
 }
 
@@ -1868,6 +1913,13 @@ pub(crate) struct Relief {
     marks: MarkCache,
     /// The lease board was refusing new builds at the last tick.
     refusing: bool,
+    /// Where the published status file (`relief_status`) and the resume
+    /// request live; `None` publishes nothing (a relief a test builds).
+    status_dir: Option<PathBuf>,
+    /// The status last written, without its time, to write on a change.
+    last_written: Option<super::relief_status::ReliefStatus>,
+    /// The last write failed (logged once, retried every tick).
+    status_write_failed: bool,
     #[cfg(test)]
     table_override: Option<std::sync::Arc<dyn Fn() -> ReliefTable + Send + Sync>>,
     actuator: Box<dyn Actuator>,
@@ -1909,6 +1961,9 @@ impl Relief {
             watch: std::sync::Arc::default(),
             marks: MarkCache::default(),
             refusing: false,
+            status_dir: None,
+            last_written: None,
+            status_write_failed: false,
             #[cfg(test)]
             table_override: None,
             dir,
@@ -1946,7 +2001,16 @@ impl Relief {
         // watch.
         relief.ns = PathBuf::new();
         relief.watch = app_watch();
+        relief.status_dir = Some(relief.dir.clone());
         relief
+    }
+
+    /// Publishes the status file and takes resume requests in `dir`: a test's
+    /// seam for what [`Relief::os`] does for the app.
+    #[cfg(test)]
+    pub(crate) fn with_status_dir(mut self, dir: PathBuf) -> Self {
+        self.status_dir = Some(dir);
+        self
     }
 
     /// Reads this relief's process table from `table` instead of the scan the
@@ -1974,6 +2038,16 @@ impl Relief {
     /// Puts back what a previous GitPulse left (a crash, a kill): called once,
     /// on the tick this sampler wins the writer election.
     pub(crate) fn recover(&mut self) {
+        let first = !self.recovered;
+        self.recover_locked();
+        if first {
+            // An at-rest file at startup, so a reader never mistakes the
+            // previous run's last claim for this one's.
+            self.publish_file();
+        }
+    }
+
+    fn recover_locked(&mut self) {
         if self.recovered {
             return;
         }
@@ -2015,11 +2089,24 @@ impl Relief {
             return;
         }
         self.seen_external = external.generation;
-        let had = self.frozen.iter().filter(|f| !f.info.advised_only).count();
-        self.frozen.clear();
+        let covered = |since_ms: u64| external.up_to_ms.is_none_or(|up_to| since_ms <= up_to);
+        // Exactly the pauses the request covered were continued (their journal
+        // entries carry the pause's own start); the others stay frozen.
+        let (resumed, kept): (Vec<Frozen>, Vec<Frozen>) = std::mem::take(&mut self.frozen)
+            .into_iter()
+            .partition(|f| !f.info.advised_only && covered(f.info.since_unix_ms));
+        self.frozen = kept;
+        let had = resumed.len();
+        // An advised pause is nothing stopped: a person's resume clears it too.
+        if external.up_to_ms.is_none() {
+            self.frozen.retain(|f| !f.info.advised_only);
+        }
         self.watch_frozen();
-        self.journal.retain(|e| e.rung != JournalRung::Freeze);
-        self.trigger.ended();
+        self.journal
+            .retain(|e| e.rung != JournalRung::Freeze || !covered(e.at_unix_ms));
+        if self.frozen.is_empty() {
+            self.trigger.ended();
+        }
         if external.hold_off {
             self.trigger.hold_off();
         }
@@ -2032,6 +2119,170 @@ impl Relief {
         );
     }
 
+    /// One sample: a person's pending resume request first, then the tick
+    /// itself under the action lock, then the published status file once that
+    /// lock is released (the write is synced to disk, which must never happen
+    /// under [`ACT`] or the ledger). See [`Relief::tick_locked`].
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        input: &GovernorInput,
+        refuses: bool,
+        table: &dyn Fn() -> ReliefTable,
+    ) {
+        self.take_resume_request();
+        self.tick_locked(now, input, refuses, table);
+        self.publish_file();
+    }
+
+    /// Resumes what a banner or Health "Resume now" asked for
+    /// (`relief_status::take_resume_request`): the pauses that began at or
+    /// before the request, through the journal like every resume, holding off
+    /// a new freeze this episode. The tick that follows takes account of it and
+    /// records it as the last action.
+    fn take_resume_request(&mut self) {
+        let Some(dir) = self.status_dir.clone() else {
+            return;
+        };
+        if STOPPING.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(request) =
+            super::relief_status::take_resume_request(&dir, super::relief_status::now_ms())
+        else {
+            return;
+        };
+        let outcome = resume_up_to_in(
+            &self.dir,
+            &*self.actuator,
+            true,
+            &request.reason,
+            Some(request.at_ms),
+        );
+        if let Some(why) = outcome.refused {
+            self.fail(None, format!("a resume request was not carried out: {why}"));
+        }
+        for result in outcome.results.into_iter().filter(|r| !r.ok) {
+            self.fail(
+                Some(result.pid),
+                format!(
+                    "could not resume pid {} on request: {}",
+                    result.pid,
+                    result.detail.unwrap_or_default()
+                ),
+            );
+        }
+    }
+
+    /// The status as the published file carries it.
+    fn file_status(&self) -> super::relief_status::ReliefStatus {
+        use super::relief_status as file;
+        let snapshot = &self.status;
+        let pid = std::process::id();
+        let act = snapshot.mode == SupervisorMode::Act;
+        let rung = match snapshot.rung {
+            Rung::None => file::ReliefRung::None,
+            Rung::Slow => file::ReliefRung::Slow,
+            Rung::Freeze => file::ReliefRung::Freeze,
+        };
+        file::ReliefStatus {
+            version: file::VERSION,
+            written_at_ms: file::now_ms(),
+            writer_pid: pid,
+            writer_start_us: super::process_start_us(pid).unwrap_or(0),
+            mode: match snapshot.mode {
+                SupervisorMode::Off => file::ReliefMode::Off,
+                SupervisorMode::Advise => file::ReliefMode::Advise,
+                SupervisorMode::Act => file::ReliefMode::Act,
+            },
+            rung,
+            // The binding says why a rung is in force; at rest there is none.
+            binding: (rung != file::ReliefRung::None)
+                .then_some(snapshot.binding)
+                .flatten()
+                .and_then(|binding| match binding {
+                    Binding::Swap => Some(file::ReliefBinding::Swap),
+                    Binding::CompressorSegments => Some(file::ReliefBinding::CompressorSegments),
+                    Binding::CompressorThrash => Some(file::ReliefBinding::CompressorThrash),
+                    Binding::MemoryPressure => Some(file::ReliefBinding::MemoryPressure),
+                    _ => None,
+                }),
+            // Only what was actually slowed, and only what Act would have.
+            slowed: if act { snapshot.slowed } else { 0 },
+            would_slow: if snapshot.mode == SupervisorMode::Advise {
+                snapshot.would_slow
+            } else {
+                0
+            },
+            frozen: snapshot
+                .frozen
+                .iter()
+                .map(|f| file::FrozenTree {
+                    pid: u32::try_from(f.root_pid).unwrap_or(0),
+                    start_us: f.start_us,
+                    agent_root_pid: u32::try_from(f.session_pid).unwrap_or(0),
+                    terminal_session_id: f.terminal_session_id.clone(),
+                    repo_path: f.repo_path.clone().unwrap_or_default(),
+                    command: f.command.clone(),
+                    footprint_bytes: f.footprint_bytes,
+                    since_ms: f.since_unix_ms,
+                    advised_only: f.advised_only,
+                })
+                .collect(),
+            last_action: snapshot.last_action.as_ref().map(|a| file::ReliefAction {
+                at_ms: a.at_unix_ms,
+                kind: match a.kind {
+                    ActionKind::Slow => file::ReliefActionKind::Slow,
+                    ActionKind::Freeze => file::ReliefActionKind::Freeze,
+                    ActionKind::Resume => file::ReliefActionKind::Resume,
+                    ActionKind::CapResume => file::ReliefActionKind::CapResume,
+                    ActionKind::Refused => file::ReliefActionKind::Refused,
+                },
+                detail: a.detail.clone(),
+            }),
+            failures: snapshot
+                .failures
+                .iter()
+                .map(|f| file::ReliefFailure {
+                    at_ms: f.at_unix_ms,
+                    pid: f.pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
+                    what: f.what.clone(),
+                })
+                .collect(),
+            cap_hits: u32::try_from(snapshot.cap_hits).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Writes the status file: every tick while it claims activity, and once
+    /// on each change (including the one back to rest, and the first). Called
+    /// with no lock held.
+    fn publish_file(&mut self) {
+        let Some(dir) = self.status_dir.clone() else {
+            return;
+        };
+        if STOPPING.load(Ordering::SeqCst) {
+            return;
+        }
+        let status = self.file_status();
+        let mut key = status.clone();
+        key.written_at_ms = 0;
+        if !status.claims_activity() && self.last_written.as_ref() == Some(&key) {
+            return;
+        }
+        match super::relief_status::write_status(&dir, &status) {
+            Ok(()) => {
+                self.last_written = Some(key);
+                self.status_write_failed = false;
+            }
+            Err(why) => {
+                if !self.status_write_failed {
+                    log::warn!(target: "relief", "the status file could not be written: {why}");
+                }
+                self.status_write_failed = true;
+            }
+        }
+    }
+
     /// One sample. `table` reads the sessions of the scan this tick just made;
     /// it is called only when something needs the processes.
     ///
@@ -2039,7 +2290,7 @@ impl Relief {
     /// the governor's verdict (`lease::capacity(..).refuses`): while it is, a
     /// build that holds a slot may be frozen, and the first tick it is not,
     /// those are continued.
-    pub(crate) fn tick(
+    fn tick_locked(
         &mut self,
         now: Instant,
         input: &GovernorInput,
@@ -2567,8 +2818,15 @@ impl Relief {
     fn freeze(&mut self, pick: &Selection, now: Instant) -> bool {
         let session = format!("{}-{}", pick.session_pid, pick.session_start_us);
         let before = self.journal.len();
+        // One stamp for the whole pause: the journal's entries and the status's
+        // `since_ms` agree on when it began, so a resume request covers it
+        // whole or not at all.
+        let since_ms = unix_ms();
         for m in &pick.members {
-            let entry = self.entry(m.pid, m.start_us, &session, JournalRung::Freeze);
+            let entry = JournalEntry {
+                at_unix_ms: since_ms,
+                ..self.entry(m.pid, m.start_us, &session, JournalRung::Freeze)
+            };
             self.journal.push(entry);
         }
         if let Err(why) = self.sync_journal() {
@@ -2641,7 +2899,8 @@ impl Relief {
         if let Err(why) = self.sync_journal() {
             self.fail(None, format!("the journal could not be trimmed: {why}"));
         }
-        let info = frozen_info(pick, false);
+        let mut info = frozen_info(pick, false);
+        info.since_unix_ms = since_ms;
         self.note(
             ActionKind::Freeze,
             format!(
@@ -2865,8 +3124,12 @@ impl Relief {
             }
             let session_id = self.frozen[at].info.session_id.clone();
             let before = self.journal.len();
+            let since_ms = self.frozen[at].info.since_unix_ms;
             for m in &fresh {
-                let entry = self.entry(m.pid, m.start_us, &session_id, JournalRung::Freeze);
+                let entry = JournalEntry {
+                    at_unix_ms: since_ms,
+                    ..self.entry(m.pid, m.start_us, &session_id, JournalRung::Freeze)
+                };
                 self.journal.push(entry);
             }
             if let Err(why) = self.sync_journal() {

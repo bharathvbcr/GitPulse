@@ -1081,6 +1081,10 @@ pub struct HostLoadSettings {
     /// `host_load_idle`.
     #[serde(default)]
     pub idle: HostLoadIdle,
+    /// What the pressure-relief supervisor may do (`off`, `advise`, `act`).
+    /// Stored at the top level as `host_load_supervisor`, like `hook_mode`.
+    #[serde(default)]
+    pub supervisor: SupervisorMode,
 }
 
 fn is_default_hook_mode(mode: &HostLoadHookMode) -> bool {
@@ -1101,6 +1105,7 @@ impl Default for HostLoadSettings {
             hook_mode: HostLoadHookMode::default(),
             leases: HostLoadLeases::default(),
             idle: HostLoadIdle::default(),
+            supervisor: SupervisorMode::default(),
         }
     }
 }
@@ -2477,6 +2482,7 @@ pub fn host_load_settings() -> HostLoadSettings {
                 profile: cfg.host_load_profile,
                 leases: cfg.host_load_leases,
                 idle: cfg.host_load_idle,
+                supervisor: cfg.host_load_supervisor,
                 ..cfg.host_load
             }
         })
@@ -2568,6 +2574,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     cfg.host_load_profile = next.profile;
     cfg.host_load_leases = next.leases.clone();
     cfg.host_load_idle = next.idle.clone();
+    cfg.host_load_supervisor = next.supervisor;
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -4035,6 +4042,34 @@ mod tests {
             invalidate_cache();
             let loaded = load().unwrap();
             assert_eq!(loaded.manvi.source_root.as_deref(), Some("/good/root"));
+        });
+    }
+
+    #[test]
+    fn the_host_load_settings_report_and_save_the_supervisor_mode() {
+        with_temp_config(|path| {
+            assert_eq!(host_load_settings().supervisor, SupervisorMode::Act);
+            // Over IPC the settings carry it under `supervisor`.
+            let wire = serde_json::to_value(host_load_settings()).unwrap();
+            assert_eq!(wire["supervisor"], "act");
+            set_host_load_settings(HostLoadSettings {
+                supervisor: SupervisorMode::Advise,
+                ..host_load_settings()
+            })
+            .unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_settings().supervisor, SupervisorMode::Advise);
+            assert_eq!(host_load_supervisor(), SupervisorMode::Advise);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load_supervisor"], "advise");
+            assert!(
+                stored["host_load"].get("supervisor").is_none(),
+                "never inside host_load, which an older build would discard whole"
+            );
+            // A save from a client that does not know the key sends the default.
+            let sent: HostLoadSettings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+            assert_eq!(sent.supervisor, SupervisorMode::Act);
         });
     }
 

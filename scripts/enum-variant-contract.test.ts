@@ -48,6 +48,10 @@ const NO_TS_MIRROR = new Map<string, string>([
   ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
+    "ResumeReason",
+    "why a pressure-relief freeze ended; it is written into the relief's last-action text, which the published status carries as a sentence, and no IPC command or file field carries the variant",
+  ],
+  [
     "SkipReason",
     "the secret scan's skip reason rides in a `secret_scan_blocked` error's detail; the commit view renders the refusal's message and never branches on the reason",
   ],

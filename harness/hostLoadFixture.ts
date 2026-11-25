@@ -123,6 +123,7 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
     leases: { mode: "on", slots: 4, wait_max_s: 1800, wait_hard_s: 14400, incremental_off: false },
     idle: { idle_after_s: 900, park_after_s: 3600 },
     profile: "auto",
+    supervisor: "act",
     thresholds: {
       swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
       compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },

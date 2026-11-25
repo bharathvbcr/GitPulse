@@ -31,8 +31,9 @@ describe("Settings panels load once (SO-1)", () => {
     // The two original switches, the incremental-compilation switch and the
     // memory profile select.
     expect(source.match(/disabled=\{busy \|\| !readOk/g)).toHaveLength(4);
-    // The segments (command gate, lease mode, slot count) save only after a read.
-    expect(source.match(/if \(readOk && !busy\)/g)).toHaveLength(3);
+    // The segments (command gate, memory supervisor, lease mode, slot count)
+    // save only after a read.
+    expect(source.match(/if \(readOk && !busy\)/g)).toHaveLength(4);
   });
 
   it("the command-gate mode is not saved before a read has succeeded either", () => {

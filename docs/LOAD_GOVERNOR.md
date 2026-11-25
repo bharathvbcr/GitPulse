@@ -1071,13 +1071,38 @@ rung (none, slow, freeze), the memory binding and tier, the frozen subtrees
 (root pid and start time, session root, terminal session id, repository,
 command, footprint, since, advise-only), the slowed count, the last action
 (slow, freeze, resume, cap resume, refused), the latest signal failures with
-their pids and their count, and the cap hits. The tick writes no status file and
-`host-load.v1` is unchanged; the published status type is another module's.
+their pids and their count, and the cap hits. `host-load.v1` is unchanged.
 `sysload::relief::resume_all(hold_off_episode, reason)` resumes every frozen
 subtree from any thread, through the journal and `signal_process` like every
 other resume, returns each pid's success or failure, and with `hold_off_episode`
 keeps the relief from freezing again until the memory tier has dropped below
-Severe. No IPC command and no UI exist in this slice.
+Severe. The `supervisor` field of the host-load settings (`cmd_host_load_settings`
+and its save) carries the mode over IPC; it is stored only as
+`host_load_supervisor`, never inside `host_load`.
+
+### The published file and the resume request
+
+The relief publishes `host-relief.v1.json` beside `host-load.v1`
+(`sysload::relief_status`, whose module documentation is the contract), for the
+processes that cannot call it: the command-gate hook, the menu-bar glyph, the
+native banner and Health. The elected writer writes it **after the tick has
+released the action lock and the ledger** (the write is synced), every tick
+while it claims activity (a rung above none, a tree really paused, or a process
+really slowed), once on every change including the one back to rest, once at
+startup (so the last run's claim is replaced) and once at quit, and only if the
+file is this process's. `slowed` counts what was actually slowed (0 in `advise`,
+where `would_slow` carries the count); a tree the relief only chose in `advise`
+is `advised_only: true`; `since_ms` and the journal entries of one pause share a
+stamp; failures are the last 16, newest last.
+
+A banner or Health "Resume now" leaves `host-relief-resume.request`
+(`relief_status::request_resume`). The writer's tick takes it
+(`take_resume_request`: read and deleted, dropped when older than 2 minutes or
+not this user's) and resumes **only the pauses whose `since_ms` is at or before
+the request's `at_ms`**, through the journal like every resume, holding off a
+new freeze until the tier drops below Severe; a pause that began after the
+request stays frozen. It is recorded as the last action. A request can only end
+a pause, never start one. The contract needed no change for the writer.
 
 Only the writer's relief acts, and a journal belongs to the GitPulse that wrote
 it: a process that lost the writer election and quits does not continue or
