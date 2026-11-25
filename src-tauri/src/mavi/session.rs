@@ -516,22 +516,25 @@ impl Session {
         decision: wire::Decision,
         message: Option<&str>,
     ) -> Result<(), String> {
-        let (line, input) = {
+        let (line, tool, input) = {
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            let input = core
+            let (tool, input) = core
                 .pending
-                .take(request_id)
+                .peek(request_id)
                 .ok_or("That request is no longer waiting for an answer.")?;
-            let line = wire::Pending::response(request_id, &input, decision, message);
+            // Built before the request closes: an answer the host refuses (a
+            // question allowed without answers) leaves it open and answerable.
+            let line = wire::Pending::respond(request_id, &tool, &input, decision, message)?;
+            core.pending.take(request_id);
             if core.pending.len() == 0 && core.phase == MaviPhase::Approval {
                 core.phase = MaviPhase::Working;
             }
-            (line, input)
+            (line, tool, input)
         };
         if let Err(e) = self.write(line) {
             // Not delivered: the request is still open, and still answerable.
             let mut core = self.core.lock().unwrap_or_else(|p| p.into_inner());
-            core.pending.restore(request_id, input);
+            core.pending.restore(request_id, tool, input);
             if core.phase == MaviPhase::Working {
                 core.phase = MaviPhase::Approval;
             }
@@ -1055,6 +1058,141 @@ mod tests {
             .flat_map(|(_, v)| v["entries"].as_array().cloned().unwrap_or_default())
             .map(|e| serde_json::from_str(e["line"].as_str().unwrap()).unwrap_or(Value::Null))
             .collect()
+    }
+
+    /// A fake agent that asks `AskUserQuestion` (two questions, one multi
+    /// select) and writes the first line the host sends back to `answer.json`.
+    /// Returns the session, the temp dir (kept alive) and the event collector.
+    #[cfg(unix)]
+    fn asking_session() -> (Arc<Session>, tempfile::TempDir, Seen) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut git = Command::new("git");
+        assert!(crate::test_support::pin_git(&mut git)
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status_locked()
+            .unwrap()
+            .success());
+        crate::test_support::trust_repo(root);
+        let root_text = root.to_string_lossy().into_owned();
+        let script = r#"read first
+echo '{"type":"system","subtype":"init","session_id":"0d235a3d-03cf-44a9-ad04-effb59321456","tools":["AskUserQuestion"]}'
+echo '{"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which audit scope?","header":"Scope","multiSelect":false,"options":[{"label":"Quick","description":"fast"},{"label":"Full","description":"slow"}]},{"question":"Which checks?","header":"Checks","multiSelect":true,"options":[{"label":"lint","description":"l"},{"label":"tests","description":"t"}]}]},"tool_use_id":"t1"}}'
+read answer
+echo "$answer" > answer.json
+echo '{"type":"result","subtype":"success","total_cost_usd":0.1}'
+read never
+"#;
+        let mut command = Command::new("sh");
+        command.args(["-c", script]).current_dir(root);
+        let (emit, seen) = collector();
+        let session = Session::spawn(
+            "t".into(),
+            MaviTarget::Local { root: root_text },
+            "ask".into(),
+            None,
+            command,
+            emit,
+            super::super::history::History::default(),
+        )
+        .unwrap();
+        session.send("audit").unwrap();
+        wait_for(&seen, |s| {
+            s.iter()
+                .any(|(n, v)| *n == STATUS_EVENT && v["phase"] == "approval")
+        });
+        (session, dir, seen)
+    }
+
+    #[cfg(unix)]
+    fn written_answer(dir: &tempfile::TempDir) -> Value {
+        let path = dir.path().join("answer.json");
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.ends_with('\n') {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("the agent never received an answer");
+    }
+
+    /// The incident: Allow on a question echoed the input with no `answers`,
+    /// so Claude Code reported "The user did not answer the questions".
+    #[cfg(unix)]
+    #[test]
+    fn a_question_answer_carries_the_chosen_labels_keyed_by_question_text() {
+        let (session, dir, _seen) = asking_session();
+        let answers = r#"{"answers":{"Which audit scope?":"Full","Which checks?":"lint, tests"}}"#;
+        session
+            .answer("q1", wire::Decision::Allow, Some(answers))
+            .unwrap();
+        let line = written_answer(&dir);
+        let response = &line["response"]["response"];
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(
+            response["updatedInput"]["answers"]["Which audit scope?"],
+            "Full"
+        );
+        assert_eq!(
+            response["updatedInput"]["answers"]["Which checks?"],
+            "lint, tests"
+        );
+        assert_eq!(
+            response["updatedInput"]["questions"][0]["question"], "Which audit scope?",
+            "the agent's own questions are echoed, not the page's"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_question_cannot_be_allowed_without_answers_or_with_foreign_keys() {
+        let (session, dir, _seen) = asking_session();
+        // A bare Allow used to answer "no answers"; it is refused and the
+        // request stays open.
+        assert!(session.answer("q1", wire::Decision::Allow, None).is_err());
+        assert!(session
+            .answer("q1", wire::Decision::Allow, Some(r#"{"answers":{}}"#))
+            .is_err());
+        let foreign = r#"{"answers":{"Which audit scope?":"Full","Which checks?":"lint","Rm everything?":"yes"}}"#;
+        assert!(session
+            .answer("q1", wire::Decision::Allow, Some(foreign))
+            .is_err());
+        let blank = r#"{"answers":{"Which audit scope?":"  ","Which checks?":"lint"}}"#;
+        assert!(session
+            .answer("q1", wire::Decision::Allow, Some(blank))
+            .is_err());
+        let missing = r#"{"answers":{"Which audit scope?":"Full"}}"#;
+        assert!(session
+            .answer("q1", wire::Decision::Allow, Some(missing))
+            .is_err());
+        assert!(!dir.path().join("answer.json").exists());
+        // Still open and answerable. A free-text answer is the person's text.
+        let ok =
+            r#"{"answers":{"Which audit scope?":"only the mavi folder","Which checks?":"lint"}}"#;
+        session
+            .answer("q1", wire::Decision::Allow, Some(ok))
+            .unwrap();
+        let line = written_answer(&dir);
+        assert_eq!(
+            line["response"]["response"]["updatedInput"]["answers"]["Which audit scope?"],
+            "only the mavi folder"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declining_a_question_says_it_is_not_consent() {
+        let (session, dir, _seen) = asking_session();
+        session.answer("q1", wire::Decision::Deny, None).unwrap();
+        let line = written_answer(&dir);
+        let response = &line["response"]["response"];
+        assert_eq!(response["behavior"], "deny");
+        let message = response["message"].as_str().unwrap();
+        assert!(message.contains("declined"), "{message}");
+        assert!(message.contains("not consent"), "{message}");
     }
 
     #[test]

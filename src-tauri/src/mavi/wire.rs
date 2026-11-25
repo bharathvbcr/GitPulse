@@ -150,7 +150,8 @@ impl Decision {
 /// is what the agent sent, held so the answer echoes it.
 #[derive(Default)]
 pub(crate) struct Pending {
-    open: HashMap<String, Value>,
+    /// Request id to the tool the agent asked about and the input it sent.
+    open: HashMap<String, (String, Value)>,
 }
 
 impl Pending {
@@ -165,7 +166,12 @@ impl Pending {
             .pointer("/request/input")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        self.open.insert(request_id.to_owned(), input);
+        let tool = line
+            .pointer("/request/tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.open.insert(request_id.to_owned(), (tool, input));
         true
     }
 
@@ -187,20 +193,46 @@ impl Pending {
         decision: Decision,
         message: Option<&str>,
     ) -> Result<String, String> {
-        let Some(input) = self.take(request_id) else {
+        let Some((tool, input)) = self.peek(request_id) else {
             return Err("That request is no longer waiting for an answer.".into());
         };
-        Ok(Self::response(request_id, &input, decision, message))
+        // An answer the host refuses leaves the request open.
+        let line = Self::respond(request_id, &tool, &input, decision, message)?;
+        self.take(request_id);
+        Ok(line)
     }
 
-    /// Closes a request, returning the input the agent sent with it.
-    pub(crate) fn take(&mut self, request_id: &str) -> Option<Value> {
+    /// The tool and input of an open request, without closing it.
+    pub(crate) fn peek(&self, request_id: &str) -> Option<(String, Value)> {
+        self.open.get(request_id).cloned()
+    }
+
+    /// Closes a request, returning the tool and input the agent sent with it.
+    pub(crate) fn take(&mut self, request_id: &str) -> Option<(String, Value)> {
         self.open.remove(request_id)
     }
 
     /// Reopens a request whose answer could not be delivered.
-    pub(crate) fn restore(&mut self, request_id: &str, input: Value) {
-        self.open.insert(request_id.to_owned(), input);
+    pub(crate) fn restore(&mut self, request_id: &str, tool: String, input: Value) {
+        self.open.insert(request_id.to_owned(), (tool, input));
+    }
+
+    /// The line answering `request_id` for `tool`. A question is answered by
+    /// [`question_response`]; every other tool echoes its own input. This is
+    /// the one place that picks, so no caller can answer a question the
+    /// generic way (an Allow with no answers, which Claude Code reports to the
+    /// model as "The user did not answer the questions").
+    pub(crate) fn respond(
+        request_id: &str,
+        tool: &str,
+        input: &Value,
+        decision: Decision,
+        message: Option<&str>,
+    ) -> Result<String, String> {
+        if tool == ASK_TOOL {
+            return question_response(request_id, input, decision, message);
+        }
+        Ok(Self::response(request_id, input, decision, message))
     }
 
     /// The `control_response` line answering `request_id`.
@@ -227,6 +259,116 @@ impl Pending {
         })
         .to_string()
     }
+}
+
+/// The tool whose permission request is a question put to the person.
+pub(crate) const ASK_TOOL: &str = "AskUserQuestion";
+
+/// The longest answer to one question the host forwards.
+pub(crate) const MAX_ANSWER_BYTES: usize = 4000;
+
+/// What the agent is told when the person declines to answer. It must not read
+/// as consent or as a choice of any option: an agent that took its own
+/// recommended option after a bare refusal acted without the person.
+pub(crate) const QUESTION_DECLINED: &str = "The user declined to answer these questions. This is not consent and not a choice of any option: do not pick one yourself or carry on as if they agreed. Ask again in plain text, or stop and wait for them.";
+
+/// Guidance appended to the agent's system prompt (`--append-system-prompt`).
+/// A question left unanswered or declined, and a terminal tab that is waiting
+/// on the person, are the two ways an agent has acted as if it had consent.
+// Passed by `claude_args` in mod.rs, which another change owns; until that
+// line lands only the tests read it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AGENT_GUIDANCE: &str = "A question you ask with AskUserQuestion that the person has not answered, or has declined, is not consent: do not choose an option for them and do not continue as if they agreed. Ask again in plain text, or stop and wait. After you start an agent or a long-running process in a terminal tab with gitpulse_terminal_spawn, call gitpulse_terminal_wait on it. If it reports needs_input, tell the person which tab needs them and what it is asking; do not approve its prompt on their behalf, and do not report that tab as working or finished while it waits.";
+
+/// The `control_response` line for a request that asks the person a question.
+///
+/// Allow carries the answers, keyed by the question's text, merged into the
+/// input the agent sent (never an input the page supplied). Without answers
+/// the request cannot be allowed: Claude Code would tell the model nobody
+/// answered. Deny is a refusal to answer and says it is not consent.
+pub(crate) fn question_response(
+    request_id: &str,
+    input: &Value,
+    decision: Decision,
+    message: Option<&str>,
+) -> Result<String, String> {
+    let response = match decision {
+        Decision::Allow => {
+            json!({"behavior":"allow","updatedInput":merge_answers(input, message)?})
+        }
+        Decision::Deny => {
+            let note: String = message
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(1000)
+                .collect();
+            let text = if note.is_empty() {
+                QUESTION_DECLINED.to_owned()
+            } else {
+                format!("{QUESTION_DECLINED} The person added: {note}")
+            };
+            json!({"behavior":"deny","message":text})
+        }
+    };
+    Ok(json!({
+        "type":"control_response",
+        "response":{"subtype":"success","request_id":request_id,"response":response}
+    })
+    .to_string())
+}
+
+/// The agent's own input with the person's answers added.
+///
+/// `message` is `{"answers": {"<question text>": "<answer>"}}`. Every key must
+/// be the text of one of the agent's questions and every question must be
+/// answered, with a non-empty, bounded string: an option label, labels joined
+/// with ", " for a multi-select question, or the person's own words. Anything
+/// else is refused and the request stays open.
+fn merge_answers(input: &Value, message: Option<&str>) -> Result<Value, String> {
+    let refuse = "Answer every question, or decline.";
+    let Some(message) = message else {
+        return Err(refuse.into());
+    };
+    let parsed: Value = serde_json::from_str(message).map_err(|_| refuse.to_string())?;
+    let Some(given) = parsed.get("answers").and_then(Value::as_object) else {
+        return Err(refuse.into());
+    };
+    let questions: Vec<&str> = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|q| q.get("question").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    if questions.is_empty() {
+        return Err("This request has no questions to answer.".into());
+    }
+    if let Some(unknown) = given.keys().find(|k| !questions.contains(&k.as_str())) {
+        let shown: String = unknown.chars().take(80).collect();
+        return Err(format!("“{shown}” is not one of the agent's questions."));
+    }
+    let mut answers = serde_json::Map::new();
+    for question in &questions {
+        let answer = given
+            .get(*question)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| refuse.to_string())?;
+        if answer.len() > MAX_ANSWER_BYTES || answer.chars().any(|c| c.is_control() && c != '\n') {
+            return Err("An answer is too long or has control characters.".into());
+        }
+        answers.insert((*question).to_owned(), Value::String(answer.to_owned()));
+    }
+    let mut merged = input.clone();
+    if let Some(object) = merged.as_object_mut() {
+        object.insert("answers".into(), Value::Object(answers));
+    }
+    Ok(merged)
 }
 
 /// The longest text a single tool result keeps. A `Read` of a large file or a
@@ -553,6 +695,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("declined"));
+    }
+
+    #[test]
+    fn only_a_question_needs_answers_and_the_guidance_names_the_two_rules() {
+        let mut pending = Pending::default();
+        let ask = json!({"type":"control_request","request_id":"q","request":{
+            "subtype":"can_use_tool","tool_name":"AskUserQuestion",
+            "input":{"questions":[{"question":"Scope?","options":[{"label":"A"},{"label":"B"}]}]}}});
+        pending.record("q", &ask);
+        assert!(pending.answer("q", Decision::Allow, None).is_err());
+        assert_eq!(pending.len(), 1, "a refused answer leaves the request open");
+        let ok: Value = serde_json::from_str(
+            &pending
+                .answer("q", Decision::Allow, Some(r#"{"answers":{"Scope?":"B"}}"#))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ok["response"]["response"]["updatedInput"]["answers"]["Scope?"],
+            "B"
+        );
+        // Another tool's Allow still needs no message.
+        pending.record("r-1", &classify(REQ).1.unwrap());
+        assert!(pending.answer("r-1", Decision::Allow, None).is_ok());
+        assert!(AGENT_GUIDANCE.contains("not consent"));
+        assert!(AGENT_GUIDANCE.contains("gitpulse_terminal_wait"));
+        assert!(AGENT_GUIDANCE.contains("needs_input"));
     }
 
     #[test]
