@@ -320,8 +320,10 @@ pub fn run() {
                     let lost = terminals.reconcile_session_ledger();
                     if lost > 0 {
                         log::info!(target: "terminal", "marked {lost} previously running terminal session(s) as lost on launch");
-                        terminals.session_ledger().emit_view(app.handle());
                     }
+                    // Always: the ledger opened unreconciled, and a window
+                    // that read it before now would otherwise keep saying so.
+                    terminals.session_ledger().emit_view(app.handle());
                 }
                 let ledger_app = app.handle().clone();
                 if let Err(error) = supervisor::spawn_once(
@@ -337,12 +339,12 @@ pub fn run() {
                             log::error!(target: "terminal", "the terminal host could not be reached at startup; its runs are left alone: {error}");
                         }
                         if terminals.backend() == "host" {
-                            let changed = terminals.reconcile_session_ledger();
-                            // Also when it could not complete: the view then
-                            // carries `reconcile_pending` instead of looking empty.
-                            if changed > 0 || terminals.session_ledger().reconcile_pending() {
-                                terminals.session_ledger().emit_view(&ledger_app);
-                            }
+                            terminals.reconcile_session_ledger();
+                            // Always, whether it completed or not: the ledger
+                            // opened unreconciled, so a window that read it
+                            // before now shows "could not check" until it is
+                            // told otherwise, and a failed reconcile must say so.
+                            terminals.session_ledger().emit_view(&ledger_app);
                         }
                         match state.reconcile_stale_runs() {
                         Ok(0) => {}

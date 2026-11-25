@@ -194,6 +194,36 @@ enum Entry {
     },
 }
 
+/// Most exits held for sessions whose row is not written yet.
+const MAX_EARLY_EXITS: usize = 64;
+
+/// An exit that arrived before its session's row: the spawn owner writes the
+/// row after the host has started the process, so a program that dies at once
+/// (an account wrapper refusing, a bad flag) can report its end first. Held
+/// until [`SessionLedger::record_spawn`] writes the row, then applied, so the
+/// row is never left `running` to be offered as lost at the next launch.
+#[derive(Debug, Clone)]
+struct EarlyExit {
+    terminal_id: String,
+    ended_by_gitpulse: bool,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    error: Option<String>,
+    reaped: bool,
+}
+
+impl EarlyExit {
+    fn facts(&self) -> ExitFacts<'_> {
+        ExitFacts {
+            ended_by_gitpulse: self.ended_by_gitpulse,
+            exit_code: self.exit_code,
+            signal: self.signal.as_deref(),
+            error: self.error.as_deref(),
+            reaped: self.reaped,
+        }
+    }
+}
+
 /// What was observed when a session ended, as [`SessionLedger::record_exit`]
 /// needs it. A host's synthetic exit is `reaped: false`, no code, no signal.
 #[derive(Debug, Clone, Copy, Default)]
@@ -274,6 +304,9 @@ pub struct SpawnHints {
 struct LedgerState {
     entries: Vec<Entry>,
     load_error: Option<String>,
+    /// Exits for sessions with no row yet, oldest first, at most
+    /// [`MAX_EARLY_EXITS`]. In memory only: a restart reconciles instead.
+    early_exits: std::collections::VecDeque<EarlyExit>,
 }
 
 /// Thread-safe, bounded durable store for hosted terminal tab recovery rows.
@@ -318,6 +351,7 @@ impl SessionLedger {
             state: Mutex::new(LedgerState {
                 entries: Vec::new(),
                 load_error: None,
+                early_exits: std::collections::VecDeque::new(),
             }),
             lifecycle: None,
             archive: None,
@@ -368,6 +402,7 @@ impl SessionLedger {
             state: Mutex::new(LedgerState {
                 entries,
                 load_error,
+                early_exits: std::collections::VecDeque::new(),
             }),
             lifecycle,
             archive,
@@ -626,7 +661,15 @@ impl SessionLedger {
         guard.entries.push(Entry::Valid(Box::new(row)));
         let evicted = enforce_bound(&mut guard.entries);
         self.persist_locked(&guard.entries);
+        let early = spawned_terminal.as_deref().and_then(|id| {
+            let at = guard.early_exits.iter().position(|e| e.terminal_id == id)?;
+            guard.early_exits.remove(at)
+        });
         drop(guard);
+        if let (Some(early), Some(id)) = (early, spawned_terminal.as_deref()) {
+            // The session already ended: record it now, as if in order.
+            self.record_exit(id, early.facts());
+        }
         archive_evicted(self.archive.as_ref(), &evicted);
         self.record_lifecycle(
             "spawn",
@@ -984,11 +1027,13 @@ impl SessionLedger {
         // exit is classified, so only an early exit can fail the reopen.
         settle_reopens(&mut guard.entries, now);
         let mut reopen: Option<(String, bool, String)> = None;
+        let mut matched = false;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
                 continue;
             }
+            matched = true;
             if row.resume_unconfirmed {
                 let detail = if let Some(e) = error {
                     e.to_owned()
@@ -1039,6 +1084,21 @@ impl SessionLedger {
             row.exit_code = facts.exit_code;
             changed = true;
             break;
+        }
+        if !matched {
+            // Its row is not written yet: hold the exit for `record_spawn`.
+            guard.early_exits.retain(|early| early.terminal_id != terminal_id);
+            if guard.early_exits.len() >= MAX_EARLY_EXITS {
+                guard.early_exits.pop_front();
+            }
+            guard.early_exits.push_back(EarlyExit {
+                terminal_id: terminal_id.to_owned(),
+                ended_by_gitpulse: facts.ended_by_gitpulse,
+                exit_code: facts.exit_code,
+                signal: signal.map(str::to_owned),
+                error: error.map(str::to_owned),
+                reaped: facts.reaped,
+            });
         }
         if let Some((id, deliberate, why)) = reopen {
             changed |= if deliberate {
@@ -2761,6 +2821,36 @@ mod tests {
         let view = ledger.view_with(|_, _| Transcript::Found);
         assert_eq!(view.offers.len(), 1);
         assert_eq!(view.offers[0].row_id, new);
+    }
+
+    /// A program that dies at once can report its exit before the spawn owner
+    /// writes its row. The exit is held and applied when the row arrives, so
+    /// the row is not left `running` and offered as lost at the next launch.
+    #[test]
+    fn an_exit_that_beats_its_row_is_applied_when_the_row_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let ledger = SessionLedger::open(&path);
+        assert!(!ledger.record_exit(
+            "term-fast",
+            ExitFacts::reaped(false, Some(1), None)
+        ));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-fast",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::ExitedClean, false));
+        drop(ledger);
+        let relaunched = SessionLedger::open(&path);
+        assert_eq!(relaunched.reconcile_startup(&HashSet::new()), 0);
+        assert_eq!(
+            relaunched.view_with(|_, _| Transcript::Found).reopenable_count,
+            0,
+            "a session that ended on its own is not offered after a relaunch"
+        );
     }
 
     /// A conversation lost in one reboot and then continued in a later tab
