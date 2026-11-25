@@ -2145,7 +2145,17 @@ pub struct SessionScan {
 
 /// Start time in microseconds since the Unix epoch of a live process,
 /// or `None` when the process is gone or this platform cannot report it.
+///
+/// Windows has no process scan, but `GetProcessTimes` answers the one question
+/// this asks, so it reads the creation time through the same reader that
+/// records `proc_start_ns` for peers. A process that has exited, or one whose
+/// creation time cannot be read, stays `None` rather than a guessed value.
 pub fn process_start_us(pid: u32) -> Option<u64> {
+    if cfg!(windows) {
+        return crate::workbench::process_birth::started_unix_nanos(pid)
+            .map(|nanos| nanos / 1_000)
+            .filter(|&start_us| start_us > 0);
+    }
     if !os::SUPPORTED {
         return None;
     }
@@ -7804,5 +7814,19 @@ pub(crate) mod tests {
             vec![203],
             "only the agent server's build; not the server itself, the terminal host, the shell or what was typed in it"
         );
+    }
+
+    /// Windows has no process scan, so its start time comes from the process
+    /// birth reader. Every consumer (the steward lease, the session snapshot)
+    /// reads `None` as "no live writer", so a `None` for this very process
+    /// would make every foreign lease look stale there.
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_live_process_has_a_stable_nonzero_start_time_and_no_pid_has_none() {
+        let me = std::process::id();
+        let first = process_start_us(me).expect("own start time is readable");
+        assert!(first > 0);
+        assert_eq!(process_start_us(me), Some(first));
+        assert_eq!(process_start_us(0), None);
     }
 }

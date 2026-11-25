@@ -220,9 +220,9 @@ fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
     ));
 
     let me = std::process::id();
-    // A platform that cannot read a process's start time (Windows has no
-    // process scan) cannot tell a live writer from a reused pid, so the reader
-    // refuses every snapshot there rather than trusting one it cannot check.
+    // A platform that cannot read a process's start time cannot tell a live
+    // writer from a reused pid, so the reader refuses every snapshot there
+    // rather than trusting one it cannot check.
     let Some(my_start) = crate::sysload::process_start_us(me) else {
         let unverifiable = HubStateSnapshot {
             version: STATE_SNAPSHOT_VERSION,
@@ -347,7 +347,8 @@ fn worker_writes_initial_snapshot_debounced_updates_and_removes_on_exit() {
     .unwrap();
 
     // Where the writer's start time cannot be read, the reader refuses every
-    // snapshot, so the file is read as the worker wrote it.
+    // snapshot, so the file is read as the worker wrote it. Unix and Windows
+    // both read it; only a platform with neither takes the raw-file branch.
     let reader_can_identify_the_writer =
         crate::sysload::process_start_us(std::process::id()).is_some();
     let saw_done = crate::test_support::wait_until(Duration::from_secs(2), || {
