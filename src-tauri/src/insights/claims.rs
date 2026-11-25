@@ -828,6 +828,20 @@ fn trim(rows: Vec<FileClaim>, now_ms: u64, ttl_ms: u64, cap: usize) -> (Vec<File
     (newest_first, dropped)
 }
 
+/// The nearest ancestor of `path` that exists, when it is not a directory.
+/// Unix says "not a directory" for a store under a regular file; Windows says
+/// "not found", which would read as a store never written. A path whose
+/// nearest existing ancestor is a directory is simply missing.
+fn file_in_the_way(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .skip(1)
+        .find_map(|ancestor| match fs::metadata(ancestor) {
+            Ok(meta) => Some((!meta.is_dir()).then_some(ancestor)),
+            Err(_) => None,
+        })
+        .flatten()
+}
+
 /// Every parsable, terminated line of the store, and how many were skipped.
 ///
 /// A store past [`MAX_STORE_BYTES`] is read from its tail; its cut head counts
@@ -836,6 +850,13 @@ fn load_lines(store: &Path) -> Result<Loaded, String> {
     let mut file = match fs::File::open(store) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(blocker) = file_in_the_way(store) {
+                return Err(format!(
+                    "cannot read claims {}: {} is not a directory",
+                    store.display(),
+                    blocker.display()
+                ));
+            }
             return Ok(Loaded::default());
         }
         Err(error) => {
@@ -1172,6 +1193,29 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<FileClaim>(line).ok())
             .map(|claim| claim.path)
             .collect()
+    }
+
+    /// A store under a regular file cannot be read, and says so, on every
+    /// platform; one under a directory that is merely absent is just empty.
+    /// Windows reports the first as "not found", which read as an empty store.
+    #[test]
+    fn a_store_under_a_file_is_an_error_and_one_under_nothing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("gitpulse"), b"x").unwrap();
+        let under_a_file = dir.path().join("gitpulse").join("claims.jsonl");
+        let error = load_lines(&under_a_file)
+            .err()
+            .expect("an error, not empty");
+        assert!(error.to_lowercase().contains("not a directory"), "{error}");
+
+        let under_nothing = dir
+            .path()
+            .join("absent")
+            .join("deeper")
+            .join("claims.jsonl");
+        assert!(load_lines(&under_nothing).is_ok());
+        let in_a_directory = dir.path().join("claims.jsonl");
+        assert!(load_lines(&in_a_directory).is_ok());
     }
 
     #[test]
