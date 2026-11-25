@@ -3,8 +3,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -204,50 +203,51 @@ pub fn parse_lsof_listeners(stdout: &str) -> Vec<(u32, String, u16)> {
     listeners
 }
 
+/// The listener table from `lsof`, run through the engine's gated spawn seam
+/// (inheritance lock, spawn gate, deadline and output cap) rather than a
+/// hand-rolled child and reader thread.
+///
+/// `lsof` exits non-zero when some sockets cannot be listed, so the status is
+/// not consulted: whatever it printed is the table. A run that could not
+/// start, was deferred, or hit [`LSOF_TIMEOUT`] yields `None`. Output past
+/// [`MAX_LSOF_OUTPUT_BYTES`] keeps its prefix, as before, cut back to the last
+/// whole line so a record split at the cap cannot be read as a shorter port.
 #[cfg(unix)]
 fn run_lsof_bounded() -> Option<String> {
-    let mut child = Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    use crate::engine::process::{build_capture_command, run_bounded_capped, Incomplete};
 
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout
-            .by_ref()
-            .take(MAX_LSOF_OUTPUT_BYTES)
-            .read_to_end(&mut buf);
-        buf
-    });
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let bytes = reader.join().ok()?;
-                return Some(String::from_utf8_lossy(&bytes).into_owned());
-            }
-            Ok(None) => {
-                if start.elapsed() >= LSOF_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
+    let path_var = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    let cmd = build_capture_command(
+        "lsof",
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+        None,
+        &[],
+        path_var.as_deref(),
+        home.as_deref(),
+    );
+    let run = run_bounded_capped(
+        cmd,
+        "lsof",
+        LSOF_TIMEOUT,
+        None,
+        MAX_LSOF_OUTPUT_BYTES as usize,
+    )
+    .ok()?;
+    let stdout = match run.incomplete {
+        None => run.stdout,
+        Some(Incomplete::OverCap(_)) => {
+            let mut prefix = run.stdout;
+            let whole = prefix
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |at| at + 1);
+            prefix.truncate(whole);
+            prefix
         }
-    }
+        Some(_) => return None,
+    };
+    Some(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 #[cfg(not(unix))]

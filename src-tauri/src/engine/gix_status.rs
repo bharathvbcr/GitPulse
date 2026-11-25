@@ -146,9 +146,12 @@ impl DeadlineWatcher {
                 cvar: Condvar::new(),
             });
             let bg = Arc::clone(&watcher);
-            if let Err(err) = std::thread::Builder::new()
-                .name("gitpulse-gix-deadline".into())
-                .spawn(move || bg.run())
+            // Long-lived, so it starts under the supervisor: a panic is
+            // recorded and the loop restarts with backoff. `run` rebuilds
+            // nothing but the lock guard, and the due list it serves lives
+            // in `bg`, so a restart resumes the same deadlines.
+            if let Err(err) =
+                crate::supervisor::spawn_service("gitpulse-gix-deadline", move || bg.run())
             {
                 log::warn!("failed to spawn gitpulse-gix-deadline thread: {err}");
             }
