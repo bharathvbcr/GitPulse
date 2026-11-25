@@ -275,9 +275,7 @@ pub(crate) const QUESTION_DECLINED: &str = "The user declined to answer these qu
 /// Guidance appended to the agent's system prompt (`--append-system-prompt`).
 /// A question left unanswered or declined, and a terminal tab that is waiting
 /// on the person, are the two ways an agent has acted as if it had consent.
-// Passed by `claude_args` in mod.rs, which another change owns; until that
-// line lands only the tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Passed by `claude_args` in mod.rs.
 pub(crate) const AGENT_GUIDANCE: &str = "A question you ask with AskUserQuestion that the person has not answered, or has declined, is not consent: do not choose an option for them and do not continue as if they agreed. Ask again in plain text, or stop and wait. After you start an agent or a long-running process in a terminal tab with gitpulse_terminal_spawn, call gitpulse_terminal_wait on it. If it reports needs_input, tell the person which tab needs them and what it is asking; do not approve its prompt on their behalf, and do not report that tab as working or finished while it waits.";
 
 /// The `control_response` line for a request that asks the person a question.

@@ -161,7 +161,13 @@ fn owner_key_for(request: &StartRequest) -> Option<String> {
 }
 
 fn claude_args(request: &StartRequest) -> Result<Vec<String>, String> {
-    let mut args: Vec<String> = CLAUDE_STRUCTURED.iter().map(|s| (*s).to_owned()).collect();
+    // An unanswered question is not consent, and a terminal agent waiting on
+    // the person must be named to them: said to the agent up front.
+    let mut args: Vec<String> = vec![
+        "--append-system-prompt".to_owned(),
+        wire::AGENT_GUIDANCE.to_owned(),
+    ];
+    args.extend(CLAUDE_STRUCTURED.iter().map(|s| (*s).to_owned()));
     if let Some(id) = request
         .resume
         .as_deref()
@@ -719,6 +725,16 @@ mod tests {
         ] {
             assert!(removed.iter().any(|r| r == name), "{name} is inherited: {removed:?}");
         }
+    }
+
+    #[test]
+    fn the_agent_is_told_an_unanswered_question_is_not_consent() {
+        let args = claude_args(&request("ask", false)).unwrap();
+        let at = args
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("the agent guidance is appended to the system prompt");
+        assert_eq!(args[at + 1], wire::AGENT_GUIDANCE);
     }
 
     #[test]
