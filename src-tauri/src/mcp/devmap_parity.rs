@@ -957,6 +957,21 @@ mod tests {
         assert!(out["reason"].is_string(), "{out}");
     }
 
+    /// Drops every `source_freshness.verified_age_ms`: the milliseconds since
+    /// the store's cached walk, which grow between two otherwise identical
+    /// asks (1 then 2 when a millisecond boundary falls between them), so two
+    /// answers are compared on what the arguments decide.
+    fn without_verification_age(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("verified_age_ms");
+                object.values_mut().for_each(without_verification_age);
+            }
+            Value::Array(items) => items.iter_mut().for_each(without_verification_age),
+            _ => {}
+        }
+    }
+
     /// The validator calls `5.0` an integer, so the handler has to answer it as
     /// 5 rather than refuse it or read it as absent.
     #[test]
@@ -980,7 +995,9 @@ mod tests {
                 args.as_object_mut()
                     .unwrap()
                     .extend(base.as_object().unwrap().clone());
-                ask(name, args)
+                let mut out = ask(name, args);
+                without_verification_age(&mut out);
+                out
             };
             assert_eq!(answer(json!(5.0)), answer(json!(5)), "{name}");
             assert_eq!(answer(json!(1.0)), answer(json!(1)), "{name}");
