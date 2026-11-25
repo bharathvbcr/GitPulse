@@ -328,23 +328,82 @@ export async function reopenSessionLedgerOffer(
   }
 }
 
+/** Rows currently being reopened, so two surfaces' "Reopen all" never double-spawn one agent. */
+const reopeningRows = new Set<string>();
+
+export interface ReopenAllDeps extends ReopenOfferDeps {
+  /** Pause between rows so a post-crash "Reopen all" does not spawn every `--resume` at once. */
+  delayMs?: number;
+}
+
 /**
- * Attempts to reopen every currently resumable offer in `offers`, returning
- * counts so callers can keep any failed rows visible with their per-row errors.
+ * Attempts to reopen every currently resumable offer in `offers`, one at a
+ * time, returning counts so callers can keep any failed rows visible with
+ * their per-row errors. Non-resumable rows are never touched, and a row that
+ * another reopen is already handling is skipped (counted in `skipped`).
  */
 export async function reopenAllSessionLedgerOffers(
   offers: readonly SessionLedgerOffer[],
-  deps: ReopenOfferDeps = {},
-): Promise<{ reopened: number; failed: number; results: ReopenOfferResult[] }> {
+  deps: ReopenAllDeps = {},
+): Promise<{ reopened: number; failed: number; skipped: number; results: ReopenOfferResult[] }> {
   const candidates = reopenableOffers(offers);
   const results: ReopenOfferResult[] = [];
   let reopened = 0;
   let failed = 0;
+  let skipped = 0;
   for (const offer of candidates) {
-    const outcome = await reopenSessionLedgerOffer(offer, deps);
-    results.push(outcome);
-    if (outcome.reopened) reopened += 1;
-    else failed += 1;
+    if (reopeningRows.has(offer.row_id)) {
+      skipped += 1;
+      continue;
+    }
+    if (results.length > 0 && deps.delayMs && deps.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, deps.delayMs));
+    }
+    reopeningRows.add(offer.row_id);
+    try {
+      const outcome = await reopenSessionLedgerOffer(offer, deps);
+      results.push(outcome);
+      if (outcome.reopened) reopened += 1;
+      else failed += 1;
+    } finally {
+      reopeningRows.delete(offer.row_id);
+    }
   }
-  return { reopened, failed, results };
+  return { reopened, failed, skipped, results };
+}
+
+/** Agent rows the app-level "interrupted agents" notice speaks for. */
+export interface InterruptedSummary {
+  /** Every interrupted agent row, in every repository, open tab or not. */
+  agents: SessionLedgerOffer[];
+  resumable: SessionLedgerOffer[];
+  unresumable: SessionLedgerOffer[];
+}
+
+/** Splits the ledger into agent rows that can be resumed and those that cannot (shell and corrupt rows are not agents). */
+export function summarizeInterrupted(offers: readonly SessionLedgerOffer[]): InterruptedSummary {
+  const agents = offers.filter((offer) => offer.end_state !== "unreadable" && offer.launcher !== "shell");
+  const resumable = reopenableOffers(agents);
+  const ids = new Set(resumable.map((offer) => offer.row_id));
+  return { agents, resumable, unresumable: agents.filter((offer) => !ids.has(offer.row_id)) };
+}
+
+/** "3 agent sessions were interrupted. 1 cannot be resumed." */
+export function interruptedNoticeText(summary: InterruptedSummary): string {
+  const total = summary.agents.length;
+  const head = `${total} agent ${total === 1 ? "session was" : "sessions were"} interrupted.`;
+  const gone = summary.unresumable.length;
+  return gone > 0 ? `${head} ${gone} cannot be resumed.` : head;
+}
+
+/**
+ * True when some interrupted row has not been dismissed yet. Keyed by row id,
+ * so reopening or dismissing rows never re-raises a notice the user closed,
+ * while a genuinely new interrupted row does.
+ */
+export function hasUndismissedInterrupted(
+  summary: InterruptedSummary,
+  dismissed: ReadonlySet<string>,
+): boolean {
+  return summary.agents.some((offer) => !dismissed.has(offer.row_id));
 }
