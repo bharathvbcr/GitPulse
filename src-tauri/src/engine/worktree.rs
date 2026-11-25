@@ -6246,7 +6246,9 @@ fn path_is_gone(path: &Path) -> bool {
 /// the tree is gone it is done, and if it is not the walk is run again over
 /// what is left. Every other error is returned as it came, and a NotFound
 /// that persists past [`VANISHED_WALK_RETRIES`] with the tree still there is
-/// returned too.
+/// returned too. On Windows an access denial counts as that too, since it is
+/// how a tree another delete is finishing answers; a denial that outlasts the
+/// retries is returned as it came.
 fn delete_dir_tree_with(
     path: &Path,
     remove_once: &dyn Fn(&Path) -> std::io::Result<()>,
@@ -6254,7 +6256,7 @@ fn delete_dir_tree_with(
     let mut attempt = 0;
     loop {
         match remove_once(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if is_vanishing_walk(&e) => {
                 if path_is_gone(path) {
                     return Ok(());
                 }
@@ -6262,10 +6264,32 @@ fn delete_dir_tree_with(
                 if attempt > VANISHED_WALK_RETRIES {
                     return Err(e);
                 }
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    std::thread::sleep(DELETE_PENDING_BACKOFF);
+                }
             }
             other => return other,
         }
     }
+}
+
+/// How long to wait before walking again a tree Windows refused access to
+/// because another delete has not finished with it.
+const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Whether a failed delete may only be another delete of the same tree
+/// finishing. Unix says so with NotFound. Windows keeps a deleted entry in a
+/// delete-pending state until its last handle closes, and says "Access is
+/// denied" to anything that touches it meanwhile, or "directory not empty"
+/// when the other delete is still removing children; the tree is then gone a
+/// moment later, which the caller confirms before calling it done.
+fn is_vanishing_walk(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (cfg!(windows)
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::DirectoryNotEmpty
+            ))
 }
 
 /// Deletes the files [`remove_worktree_split`] moved aside, with the lock
@@ -8689,7 +8713,21 @@ mod tests {
         )
         .unwrap();
         assert!(merged.ok);
-        assert!(merged.worktree_removed);
+        if cfg!(windows) {
+            // Windows has no process scan, and two agent kinds keep no
+            // registry there, so the merge cannot rule out a live session in
+            // the lane. It keeps the worktree and its branch rather than
+            // remove files from under one, and says why.
+            assert!(!merged.worktree_removed, "{merged:?}");
+            let reason = merged.worktree_kept_reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains("could not rule out a live agent session"),
+                "{merged:?}"
+            );
+            assert!(wt_clean.exists(), "the lane must be kept");
+        } else {
+            assert!(merged.worktree_removed);
+        }
         assert!(merged.squashed_commit.is_some());
         assert_eq!(
             std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(),
@@ -9794,7 +9832,7 @@ some-future-field whatever
         assert!(WorktreeLayout::parse(Some("elsewhere")).is_err());
 
         let repo = dirty_repo();
-        let canon = repo.path().canonicalize().unwrap();
+        let canon = plain(repo.path());
         let canon_str = canon.to_str().unwrap();
 
         for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
@@ -10249,12 +10287,7 @@ some-future-field whatever
     fn teardown_asks_the_gate_about_each_command_it_runs() {
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
-        let wt_path = wt
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let wt_path = plain(wt.path()).to_string_lossy().to_string();
         let mut asked = Vec::new();
         merge_and_teardown_worktree(
             repo.to_str().unwrap(),
@@ -11180,12 +11213,7 @@ some-future-field whatever
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
         diverge_main(&dir);
-        let wt_path = wt
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let wt_path = plain(wt.path()).to_string_lossy().to_string();
         let branch_tip = rev(wt.path(), "HEAD");
         let mut asked = Vec::new();
         let result = merge_and_teardown_worktree(
@@ -13710,6 +13738,9 @@ some-future-field whatever
     }
 
     /// Entries in `<common>/gitpulse-teardown`, or none when it does not exist.
+    /// An aside beside the old place (every aside where the two are not known
+    /// to share a device, as on Windows) is listed by its marker, named
+    /// `<aside name>.sibling`.
     fn teardown_entries(repo: &Path) -> Vec<String> {
         std::fs::read_dir(teardown_holding_dir(repo))
             .map(|listing| {
@@ -13719,6 +13750,24 @@ some-future-field whatever
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The name of the aside a [`teardown_entries`] entry stands for: the
+    /// entry itself, or the marker's name without its `.sibling`.
+    fn aside_name(entry: &str) -> &str {
+        entry.strip_suffix(".sibling").unwrap_or(entry)
+    }
+
+    /// The directory holding the files of the aside a [`teardown_entries`]
+    /// entry stands for: the entry itself under the holding directory, or the
+    /// place its marker names when it was put beside the old one.
+    fn teardown_aside_dir(repo: &Path, entry: &str) -> PathBuf {
+        let holding = teardown_holding_dir(repo);
+        std::fs::read_to_string(holding.join(entry))
+            .ok()
+            .filter(|_| entry.ends_with(".sibling"))
+            .and_then(|text| text.lines().next().map(PathBuf::from))
+            .unwrap_or_else(|| holding.join(entry))
     }
 
     /// A planted leftover named like ours, old enough that no sweep treats it
@@ -13832,7 +13881,7 @@ some-future-field whatever
         let left = teardown_entries(dir.path());
         assert_eq!(left.len(), 1, "{left:?}");
         assert!(
-            reported.contains(&left[0]),
+            reported.contains(aside_name(&left[0])),
             "the report does not name the aside {}: {reported}",
             left[0]
         );
@@ -14139,7 +14188,7 @@ some-future-field whatever
         );
         let entries = teardown_entries(repo);
         assert_eq!(entries.len(), 1, "{entries:?}");
-        let aside = teardown_holding_dir(repo).join(&entries[0]);
+        let aside = teardown_aside_dir(repo, &entries[0]);
         assert!(aside.join("feature.txt").exists(), "the files were lost");
         assert!(aside.join(HOLD_FILE).exists());
         // Old enough that nothing but the hold file protects it.
@@ -14461,6 +14510,24 @@ some-future-field whatever
 
     /// 1. The other sweep deletes children while this one walks the tree, so
     ///    NotFound surfaces from inside the recursive delete.
+    /// A delete another delete is finishing answers NotFound on unix and, on
+    /// Windows, "access denied" or "directory not empty" until the tree is
+    /// gone. Anything else is the caller's error as it came.
+    #[test]
+    fn only_the_answers_of_a_tree_another_delete_is_finishing_are_waited_out() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_vanishing_walk(&Error::from(ErrorKind::NotFound)));
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::DirectoryNotEmpty] {
+            assert_eq!(
+                is_vanishing_walk(&Error::from(kind)),
+                cfg!(windows),
+                "{kind:?}"
+            );
+        }
+        assert!(!is_vanishing_walk(&Error::other("disk on fire")));
+        assert!(!is_vanishing_walk(&Error::from(ErrorKind::TimedOut)));
+    }
+
     #[test]
     fn deleting_an_aside_survives_children_vanishing_mid_walk() {
         let dir = tempfile::tempdir().unwrap();
@@ -14574,7 +14641,14 @@ some-future-field whatever
     fn adv_a_very_long_worktree_name_takes_the_split() {
         let (dir, _wt) = teardown_fixture(None);
         let parent = tempfile::tempdir().unwrap();
-        let lane = parent.path().join("l".repeat(240));
+        // Windows refuses a path past MAX_PATH (260), and git's own
+        // `.git/worktrees/<name>` record is named after the final component
+        // too, so 240 characters under a temp directory cannot be created
+        // there at all: git stops at "Filename too long" before the removal
+        // this test is about. 100 is the longest name that leaves the record,
+        // and the sibling aside Windows moves a lane to, inside the limit.
+        let name_len = if cfg!(windows) { 100 } else { 240 };
+        let lane = parent.path().join("l".repeat(name_len));
         add_lane_at(dir.path(), &lane, "long-lane");
         let (result, asides) = remove_recording(dir.path(), &lane, true);
         assert_eq!(result.unwrap(), WorktreeRemoval::default());
@@ -14863,7 +14937,7 @@ some-future-field whatever
         let left = teardown_entries(dir.path());
         let reported = removal.cleanup_error.expect("reported");
         assert!(
-            reported.contains("disk on fire") && reported.contains(&left[0]),
+            reported.contains("disk on fire") && reported.contains(aside_name(&left[0])),
             "{reported}"
         );
         assert!(!is_listed(dir.path(), wt.path()) && !wt.path().exists());
@@ -14897,10 +14971,14 @@ some-future-field whatever
     fn adv_lock_released_before_delete_branch_deleted_under_it_hooks_after() {
         let marker_dir = tempfile::tempdir().unwrap();
         let ran = marker_dir.path().join("hook-ran");
-        let hooks = format!(
-            r#"{{"worktree":{{"post_merge":["touch {}"]}}}}"#,
-            ran.display()
-        );
+        // Hooks run through `sh -c`, or `cmd /C` on Windows, which has no
+        // `touch` and whose paths hold backslashes the JSON must escape.
+        let command = if cfg!(windows) {
+            format!("type nul > {}", ran.display())
+        } else {
+            format!("touch {}", ran.display())
+        };
+        let hooks = serde_json::json!({"worktree": {"post_merge": [command]}}).to_string();
         let (dir, wt) = teardown_fixture(Some(&hooks));
         let other = second_lane(dir.path());
         let mut observed = None;
@@ -16800,9 +16878,16 @@ mod scan_once_tests {
         assert_eq!(spawned(&linked, "--shortstat"), linked.len());
         clock.advance(crate::engine::ref_cache::racy_window() + Duration::from_secs(1));
         let second = list_worktrees(root.to_str().unwrap()).expect("second");
+        // Only unix can prove a stamp (`diff_stamp`); elsewhere every listing
+        // measures, which is the honest answer to a stamp that cannot be proven.
+        let expected = if cfg!(unix) {
+            linked.len()
+        } else {
+            linked.len() * 2
+        };
         assert_eq!(
             spawned(&linked, "--shortstat"),
-            linked.len(),
+            expected,
             "the second listing diffed again"
         );
         assert_eq!(
@@ -16895,10 +16980,19 @@ mod scan_once_tests {
                 skipped += 1;
             }
         }
-        assert!(
-            skipped >= 1,
-            "the stamp never skipped: the test proves nothing ({trace:?})"
-        );
+        if cfg!(unix) {
+            assert!(
+                skipped >= 1,
+                "the stamp never skipped: the test proves nothing ({trace:?})"
+            );
+        } else {
+            // No stamp can be proven off unix, so no step may be skipped; the
+            // agreement with a fresh measurement above is the whole claim.
+            assert_eq!(
+                skipped, 0,
+                "a stamp skipped where none can exist ({trace:?})"
+            );
+        }
     }
 
     /// A stamp that cannot be proven never skips and is never kept.
@@ -16929,7 +17023,8 @@ mod scan_once_tests {
         {
             let clock = ManualClock::install();
             let _ = clock.now();
-            assert_eq!(measures(&status, &dir, 2), 1, "control");
+            let control = if cfg!(unix) { 1 } else { 2 };
+            assert_eq!(measures(&status, &dir, 2), control, "control");
         }
         // Racy: a file written inside the window cannot be told from a later
         // write in the same tick.
@@ -16977,7 +17072,12 @@ mod scan_once_tests {
         // A deletion explains an absent path; nothing else does.
         std::fs::remove_file(dir.join("sub").join("f.txt")).unwrap();
         let deleted: Arc<str> = Arc::from(" D sub/f.txt\0");
-        assert_eq!(measures(&deleted, &dir, 2), 1, "a deleted path is provable");
+        let provable = if cfg!(unix) { 1 } else { 2 };
+        assert_eq!(
+            measures(&deleted, &dir, 2),
+            provable,
+            "a deleted path is provable"
+        );
         let vanished: Arc<str> = Arc::from(" M sub/f.txt\0");
         assert_eq!(
             measures(&vanished, &dir, 2),
@@ -16999,6 +17099,14 @@ mod scan_once_tests {
         let status: Arc<str> = Arc::from(" M seed.txt\0");
         let capture = || diff_stamp::DiffStamp::capture(&dir, &status, &ScanPass::now());
 
+        if !cfg!(unix) {
+            assert_eq!(
+                capture(),
+                None,
+                "a platform with no change time proves no stamp"
+            );
+            return;
+        }
         let base = capture().expect("a provable stamp");
         assert_eq!(capture().as_ref(), Some(&base), "stable while untouched");
 
