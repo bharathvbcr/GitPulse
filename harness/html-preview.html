@@ -11,7 +11,7 @@
   import "../src/app.css";
   import { mount, tick } from "svelte";
   import { createChecks } from "./checks.ts";
-  import { mockIPCWithEvents } from "./tauriMocks";
+  import { mockIPC } from "@tauri-apps/api/mocks";
   import HtmlPreviewHost from "./HtmlPreviewHost.svelte";
 
   const { results, check, stopped } = createChecks();
@@ -69,7 +69,7 @@
     "sub/clone-b.html": { path: "sub/clone-b.html", is_binary: false, is_image: false, mime: "text/html", text: identicalCloneHtml, base64: null, invalid_utf8_bytes: 0 },
   };
 
-  mockIPCWithEvents((cmd, args) => {
+  mockIPC((cmd, args) => {
     switch (cmd) {
       case "cmd_resolve_repo": return { path: args.repoPath, name: "html-preview", is_bare: false };
       case "cmd_list_repo_files": return ["docs/demo.html", "docs/styles.css", "docs/logo.svg", "sub/second.html", "src/app.ts"];
@@ -91,7 +91,7 @@
         unexpected.add(cmd);
         throw new Error(`Unconfigured harness command: ${cmd}`);
     }
-  });
+  }, { shouldMockEvents: true });
 
   const { repoStore } = await import("../src/lib/stores/repoStore");
   const { triggerFileSearch } = await import("../src/lib/files/fileSearchTarget");

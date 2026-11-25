@@ -224,6 +224,30 @@ describe("attachWebglAddon", () => {
     expect(addon.disposed).toBe(1);
   });
 
+  it("finds the WebGL canvas in the screen, not the atlas scratch canvas parked on the root ahead of it", () => {
+    // addon-webgl's shared glyph atlas puts a classless 2D canvas on the root
+    // of whichever terminal last rasterized a glyph; here it comes first in
+    // document order, so a root search would pick it.
+    const atlasScratch = fakeCanvas([]);
+    const linkCanvas = fakeCanvas(["xterm-link-layer"]);
+    const glCanvas = fakeCanvas([]);
+    const root: ReturnType<typeof fakeCanvas>[] = [];
+    const screen: ReturnType<typeof fakeCanvas>[] = [];
+    const handle = attachWebglAddon(
+      {
+        element: { querySelectorAll: () => root },
+        screenElement: { querySelectorAll: () => screen },
+        loadAddon() {
+          root.push(atlasScratch, linkCanvas, glCanvas);
+          screen.push(linkCanvas, glCanvas);
+        },
+      },
+      () => fakeAddon(),
+    );
+
+    expect(handle.canvas).toBe(glCanvas);
+  });
+
   it("cleans up orphaned canvases and disposes the addon when loadAddon throws mid-constructor", () => {
     const existing = fakeCanvas([]);
     const linkCanvas = fakeCanvas(["xterm-link-layer"]);

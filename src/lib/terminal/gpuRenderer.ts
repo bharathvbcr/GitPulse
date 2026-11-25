@@ -305,7 +305,11 @@ export function attachWebglAddon<
   TAddon extends GpuAddon,
   TCanvas extends WebglHostCanvas<TCanvas> = WebglHostCanvas,
 >(
-  terminal: { element?: WebglHostElement<TCanvas> | null; loadAddon(addon: NoInfer<TAddon>): void },
+  terminal: {
+    element?: WebglHostElement<TCanvas> | null;
+    screenElement?: WebglHostElement<TCanvas> | null;
+    loadAddon(addon: NoInfer<TAddon>): void;
+  },
   createAddon: () => TAddon,
 ): GpuAddon {
   const addon = createAddon();
@@ -349,7 +353,15 @@ export function attachWebglAddon<
   // The addon exposes no canvas; its WebGL one is the only canvas on the
   // screen without a `-layer` class (the link layer has one). The renderer
   // loses its context on release (xterm.js #6068).
-  const canvases = [...(terminal.element?.querySelectorAll("canvas") ?? [])];
+  // Searched from the screen, not the root: the addon's glyph atlas, shared by
+  // terminals with the same config, parks its hidden 2D scratch canvas
+  // (`TextureAtlas._tmpCanvas`, also classless) on the root of whichever
+  // terminal last rasterized a glyph. From the root the WebGL canvas is found
+  // first only by document order; were that to change, release would lose
+  // nothing and the context would wait for the collector. The root is the
+  // fallback only for a terminal that has no screen element yet.
+  const host = terminal.screenElement ?? terminal.element;
+  const canvases = [...(host?.querySelectorAll("canvas") ?? [])];
   const canvas =
     canvases.find((node) => !before.has(node) && !isLayerCanvas(node))
     ?? canvases.find((node) => !isLayerCanvas(node));
