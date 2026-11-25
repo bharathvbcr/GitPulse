@@ -171,13 +171,23 @@ impl Rig {
         id: Option<&str>,
         script: String,
     ) -> thread::JoinHandle<Result<BoundedRun, CommandError>> {
+        self.read_for(id, script, read_deadline())
+    }
+
+    /// [`Self::read`] with its own deadline: a joiner's budget is its own.
+    fn read_for(
+        &self,
+        id: Option<&str>,
+        script: String,
+        deadline: Duration,
+    ) -> thread::JoinHandle<Result<BoundedRun, CommandError>> {
         let (gate, cwd, id) = (self.gate, self.cwd.clone(), id.map(str::to_string));
         thread::spawn(move || {
             let scope = ReadScope::open(id.as_deref());
             let _in = scope.enter();
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", script.as_str()]).current_dir(&cwd);
-            super::run_read_shared_with(cmd, "cancel-test", read_deadline(), 4096, gate)
+            super::run_read_shared_with(cmd, "cancel-test", deadline, 4096, gate)
         })
     }
 
@@ -349,6 +359,49 @@ fn a_late_joiner_of_a_cancelled_flight_gets_a_fresh_complete_read() {
         1,
         "only the fresh read started a child"
     );
+}
+
+/// A joiner that left by its own deadline no longer waits for the answer, so
+/// the leader's cancel, arriving afterwards, stops the child. Run for a joiner
+/// that named an id and for one that did not: the id-less one used to pin the
+/// flight for good once it had gone.
+#[cfg(unix)]
+#[test]
+fn a_joiner_gone_by_its_deadline_does_not_keep_the_leaders_child_alive() {
+    for (leader_id, joiner_id, tag) in [
+        ("rc-dl-lead-a", Some("rc-dl-join-a"), "dl-a"),
+        ("rc-dl-lead-b", None, "dl-b"),
+    ] {
+        let rig = Rig::new(1);
+        let held = rig
+            .gate
+            .acquire(Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let script = rig.script(tag, "exec sleep 60");
+        let leader = rig.lead(Some(leader_id), script.clone());
+        let joiner = rig.read_for(joiner_id, script, Duration::from_millis(200));
+        rig.wait_joined(1);
+        let error = joiner
+            .join()
+            .unwrap()
+            .expect_err("the joiner ran out of time");
+        assert!(
+            is_timed_out(error.message()),
+            "{joiner_id:?}: {}",
+            error.message()
+        );
+        drop(held);
+        let pid = rig.wait_started(1)[0];
+        assert!(read_cancel::cancel(leader_id));
+        // Before joining the leader: a pre-fix run would block there until the
+        // read's own deadline.
+        assert!(
+            wait_gone(pid, gone_within()),
+            "{joiner_id:?}: pid {pid} outlived the leader's cancel"
+        );
+        let run = leader.join().unwrap().expect("a cancelled run is returned");
+        assert!(run.cancelled, "{joiner_id:?}: the leader was cancelled");
+    }
 }
 
 /// A read that never named an id is a waiter that never leaves.
