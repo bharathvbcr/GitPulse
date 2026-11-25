@@ -75,12 +75,12 @@
     "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-autostart": "^2.7.0",
     "@tauri-apps/plugin-opener": "^2.7.3",
-    "@xterm/addon-fit": "0.12.0-beta.334",
-    "@xterm/addon-search": "0.17.0-beta.332",
-    "@xterm/addon-serialize": "0.15.0-beta.332",
-    "@xterm/addon-unicode11": "0.10.0-beta.332",
-    "@xterm/addon-webgl": "0.20.0-beta.331",
-    "@xterm/xterm": "6.1.0-beta.338"
+    "@xterm/addon-fit": "0.12.0-beta.335",
+    "@xterm/addon-search": "0.17.0-beta.333",
+    "@xterm/addon-serialize": "0.15.0-beta.333",
+    "@xterm/addon-unicode11": "0.10.0-beta.333",
+    "@xterm/addon-webgl": "0.20.0-beta.332",
+    "@xterm/xterm": "6.1.0-beta.339"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
