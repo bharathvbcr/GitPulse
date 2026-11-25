@@ -718,13 +718,9 @@ fn is_command_wrapper(tok: &ShellToken<'_>) -> bool {
     COMMAND_WRAPPERS.contains(&name.strip_suffix(".exe").unwrap_or(&name))
 }
 
-/// The index of the word the shell would run as git in one clause, or None.
-///
-/// Assignments, redirections, reserved words and [`COMMAND_WRAPPERS`] come
-/// first; a git word anywhere else (an argument of `echo`, a quoted command
-/// line) is not found here on purpose — the caller decides what an unreadable
-/// `-C` means (see [`unresolved_git_c`]).
-fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
+/// The index of the first word of the command the shell would run: past
+/// assignments, redirections and reserved words.
+fn command_position(tokens: &[ShellToken<'_>]) -> usize {
     let mut at = 0usize;
     while at < tokens.len() {
         let tok = &tokens[at];
@@ -756,6 +752,18 @@ fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
         }
         break;
     }
+    at
+}
+
+/// The index of the word the shell would run as git in one clause, or None.
+///
+/// Assignments, redirections, reserved words and [`COMMAND_WRAPPERS`] come
+/// first; a git word anywhere else (an argument of `echo`, a quoted command
+/// line) is not found here on purpose — the caller decides what an unreadable
+/// `-C` means (see [`unresolved_git_c`]).
+fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
+    let at = command_position(tokens);
+
     let first = tokens.get(at)?;
     if is_git_command_word(first) {
         return Some(at);
@@ -785,34 +793,136 @@ fn is_dash_c_text(word: &str) -> bool {
     word.starts_with("-C")
 }
 
-/// A clause in which `-C` follows a git word but git could not be located as
-/// the command (`bash -c 'git -C ../wt-b …'`, `echo git -C …`, a wrapper not in
-/// [`COMMAND_WRAPPERS`]). Such a `-C` may be aimed at another worktree whose
-/// scope was never consulted, so a bound caller is refused rather than judged
-/// against its own scope. A clause git is located in is not this case: the
-/// `-C` there is resolved (or not) by [`sibling_git_clauses`]. A `-C` before
-/// any git word (`grep -C 3 git f`) or after git's subcommand (`git log -C`)
-/// is not this case either. Over-reports (`rg git -C2`) rather than under:
-/// the only outcome is a refusal.
-fn unresolved_git_c(command: &str) -> Option<&str> {
-    for clause in split_shell_clauses(command) {
-        let tokens = scan_shell_tokens(clause);
-        if locate_git(&tokens).is_some() {
+/// How far into nested shell scripts (`bash -c "bash -c '…'"`) the -C reader
+/// follows. A script nested deeper that contains an evaluator is refused: a
+/// check that could not finish must not read as one that passed.
+const MAX_SCRIPT_DEPTH: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Evaluator {
+    /// `eval`: its arguments are joined into one script.
+    Eval,
+    /// A shell, `su` or `script`: the argument of its `-c` is a script.
+    Shell,
+}
+
+fn evaluator_of(tok: &ShellToken<'_>) -> Option<Evaluator> {
+    let name = tok.text.rsplit(['/', '\\']).next().unwrap_or_default();
+    let name = name.to_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "eval" => Some(Evaluator::Eval),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "su" | "script" => Some(Evaluator::Shell),
+        _ => None,
+    }
+}
+
+/// The first shell evaluator in command position: the command word itself, or
+/// one behind a [`COMMAND_WRAPPERS`] word (`env bash -c …`, `xargs sh -c …`,
+/// `find -exec sh -c …`). A word like `sh` that is only an argument
+/// (`echo sh -c …`) is not one.
+fn locate_evaluator(tokens: &[ShellToken<'_>]) -> Option<(usize, Evaluator)> {
+    let start = command_position(tokens);
+    let mut armed = false;
+    let mut j = start;
+    while j < tokens.len() {
+        let tok = &tokens[j];
+        if tok.is_redirect {
+            j += 2;
             continue;
         }
-        let mut seen_git = false;
-        for tok in tokens.iter().filter(|tok| !tok.is_redirect) {
-            for word in tok.text.split_whitespace() {
-                if seen_git && is_dash_c_text(word) {
-                    return Some(clause);
-                }
-                if is_git_text(word) {
-                    seen_git = true;
-                }
+        if j == start {
+            armed = true;
+        }
+        if armed {
+            if let Some(kind) = evaluator_of(tok) {
+                return Some((j, kind));
+            }
+        }
+        armed = is_command_wrapper(tok) || (armed && j != start);
+        j += 1;
+    }
+    None
+}
+
+/// The script string an evaluator runs: the argument of its `-c` (also inside
+/// a short-option cluster such as `-lc`) for a shell, `su` or `script`, or
+/// everything after `eval`. None when it runs a script file or reads stdin.
+fn script_of(tokens: &[ShellToken<'_>], at: usize, kind: Evaluator) -> Option<String> {
+    match kind {
+        Evaluator::Eval => {
+            let words: Vec<&str> = tokens[at + 1..]
+                .iter()
+                .filter(|tok| !tok.is_redirect)
+                .map(|tok| tok.text.as_str())
+                .collect();
+            (!words.is_empty()).then(|| words.join(" "))
+        }
+        Evaluator::Shell => (at + 1..tokens.len()).find_map(|k| {
+            let flag = tokens[k].text.as_str();
+            let cluster = flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag.len() > 1
+                && flag[1..].chars().all(char::is_alphabetic)
+                && flag.contains('c');
+            (cluster || flag == "--command")
+                .then(|| tokens.get(k + 1).map(|tok| tok.text.clone()))
+                .flatten()
+        }),
+    }
+}
+
+/// Whether one clause carries a `-C` that no located git invocation accounts
+/// for. `in_script` is true for a clause read out of a string an evaluator
+/// runs, where even a located `git -C` is refused: [`sibling_git_clauses`]
+/// resolves the target of a clause it can see, not one inside a string.
+fn clause_has_unresolved_git_c(clause: &str, in_script: bool, depth: usize) -> bool {
+    let tokens = scan_shell_tokens(clause);
+    if locate_git(&tokens).is_some() {
+        return in_script && parse_git_invocation(clause).is_some();
+    }
+    // Unquoted words only: a quoted "git -C" is text being searched for or
+    // printed, not a command.
+    let mut seen_git = false;
+    for tok in tokens.iter().filter(|tok| !tok.is_redirect && !tok.quoted) {
+        for word in tok.text.split_whitespace() {
+            if seen_git && is_dash_c_text(word) {
+                return true;
+            }
+            if is_git_text(word) {
+                seen_git = true;
             }
         }
     }
-    None
+    let Some((at, kind)) = locate_evaluator(&tokens) else {
+        return false;
+    };
+    let Some(script) = script_of(&tokens, at, kind) else {
+        return false;
+    };
+    depth >= MAX_SCRIPT_DEPTH
+        || split_shell_clauses(&script)
+            .into_iter()
+            .any(|inner| clause_has_unresolved_git_c(inner, true, depth + 1))
+}
+
+/// A clause with a `-C` that no located git invocation accounts for:
+///
+/// - unquoted `git` then `-C…` where git is not the command (`echo git -C ../x`,
+///   a wrapper not in [`COMMAND_WRAPPERS`]), and
+/// - a script string run by a shell evaluator (`bash -c '…'`, `sh -lc "…"`,
+///   `eval "…"`, also behind a wrapper) that holds a git `-C`, located or not.
+///
+/// Such a `-C` may be aimed at another worktree whose scope was never
+/// consulted, so a bound caller is refused rather than judged against its own
+/// scope. A clause git is located in is left to [`sibling_git_clauses`]. A quoted
+/// string that no evaluator runs (`rg -n "git -C" src`, `echo "git -C <dir>"`), a
+/// `-C` before any git word (`grep -C 3 git f`) and one after git's subcommand
+/// (`git log -C`) are not this case. Over-reports on purpose in one place:
+/// an unquoted `rg git -C2 f`.
+fn unresolved_git_c(command: &str) -> Option<&str> {
+    split_shell_clauses(command)
+        .into_iter()
+        .find(|clause| clause_has_unresolved_git_c(clause, false, 0))
 }
 
 fn unresolved_git_c_verdict(command: &str, clause: &str, task_id: &str) -> PolicyVerdict {
@@ -2518,7 +2628,11 @@ done
             format!("echo git -C ../{rel} checkout -- unplanned.txt"),
             format!("somewrapper git -C ../{rel} checkout -- unplanned.txt"),
             format!("true && eval \"git -C ../{rel} checkout -- unplanned.txt\""),
-            "printf x | env -S 'git -C ..' status".to_string(),
+            format!("sh -lc \"git -C ../{rel} checkout -- unplanned.txt\""),
+            format!("env bash -c 'git -C ../{rel} checkout -- unplanned.txt'"),
+            "xargs sh -c 'git -C \"$0\" status'".to_string(),
+            "find . -exec sh -c 'git -C \"$1\" status' _ {} \\;".to_string(),
+            "bash -c \"bash -c 'git -C ../x status'\"".to_string(),
         ];
         for cmd in &unreadable {
             let judged = check_command_in_scope(Lane::Shared, &fixture.main_path, cmd);
@@ -2540,6 +2654,15 @@ done
             "git log -C --stat".to_string(),
             "git status".to_string(),
             format!("env git -C ../{rel} status"),
+            // Searches for the text "git -C" are routine and must not be refused.
+            "rg -n \"git -C\" src".to_string(),
+            "grep -rn 'git -C' .".to_string(),
+            "rg \"git\" -C 3 src".to_string(),
+            "echo \"use git -C <dir>\"".to_string(),
+            "bash -c 'rg \"git -C\" src'".to_string(),
+            "bash -c 'git status'".to_string(),
+            "bash -c 'git log -C --stat'".to_string(),
+            "bash script.sh".to_string(),
         ] {
             let judged = check_command_in_scope(Lane::Shared, &fixture.main_path, &cmd);
             assert_ne!(judged.verdict.rule, GIT_C_UNRESOLVED, "{cmd:?}: {judged:?}");
@@ -2681,6 +2804,25 @@ mod git_invocation_tests {
             ("echo git -C ../x", true),
             ("bash -c 'git -C ../x status'", true),
             ("ls && somewrapper git -C ../x", true),
+            ("sh -lc \"git -C ../x y\"", true),
+            ("sh -ec 'git -C ../x y'", true),
+            ("/bin/bash.exe -c 'git -C ../x y'", true),
+            ("env bash -c 'git -C ../x y'", true),
+            ("xargs sh -c 'git -C \"$0\" status'", true),
+            ("eval \"git -C ../x y\"", true),
+            ("su root -c 'git -C ../x y'", true),
+            ("script -q f -c 'git -C ../x y'", true),
+            ("bash -c 'x; git -C ../x y'", true),
+            ("bash -c \"sh -c 'git -C ../x y'\"", true),
+            ("rg -n \"git -C\" src", false),
+            ("grep -rn 'git -C' .", false),
+            ("rg \"git\" -C 3 src", false),
+            ("echo \"use git -C <dir>\"", false),
+            ("echo sh -c 'git -C x'", false),
+            ("bash -c 'git status'", false),
+            ("bash -c 'rg \"git -C\" src'", false),
+            ("bash -c \"$CMD\"", false),
+            ("bash script.sh", false),
             ("env git -C ../x status", false),
             ("git -C ../x status", false),
             ("git log -C", false),
