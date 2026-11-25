@@ -1637,7 +1637,8 @@ pub(crate) fn fold_status_paths_for_focus(repo: &Path, focus: &str, paths: &mut 
 }
 
 /// Why a status that never started did not.
-pub(super) const DEADLINE_PASSED: &str = "the deadline passed before this worktree's status was read";
+pub(super) const DEADLINE_PASSED: &str =
+    "the deadline passed before this worktree's status was read";
 
 /// Test seam: records each unfiltered status read executed by [`spawn_porcelain`]
 /// along with its backend (`Gix` vs `GitCli`) and caller [`Admission`], keyed by
@@ -17599,7 +17600,8 @@ mod scan_once_tests {
                         let leader = scope.spawn(|| read_status_since(dir_ref, None, early));
                         entered_rx.recv().expect("leader entered probe");
                         let later = Instant::now();
-                        let waiter = scope.spawn(move || read_status_since(&dir_waiter, None, later));
+                        let waiter =
+                            scope.spawn(move || read_status_since(&dir_waiter, None, later));
                         (leader.join().unwrap(), waiter.join().unwrap())
                     })
                 })

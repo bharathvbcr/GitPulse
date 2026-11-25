@@ -11,7 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin};
+use wry::{
+    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin,
+};
 
 /// Where a pane reports what its page did.
 pub type EventSink = Arc<dyn Fn(PaneEvent) + Send + Sync>;

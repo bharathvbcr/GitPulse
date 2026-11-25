@@ -217,7 +217,10 @@ fn run_lsof_bounded() -> Option<String> {
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout.by_ref().take(MAX_LSOF_OUTPUT_BYTES).read_to_end(&mut buf);
+        let _ = stdout
+            .by_ref()
+            .take(MAX_LSOF_OUTPUT_BYTES)
+            .read_to_end(&mut buf);
         buf
     });
 
@@ -361,8 +364,14 @@ mod tests {
             Some("http://[::1]:5174/app?q=1")
         );
 
-        assert_eq!(parse_run_script_preview("# gitpulse-preview: about:blank\n"), None);
-        assert_eq!(parse_run_script_preview("# gitpulse-preview: https://example.com\n"), None);
+        assert_eq!(
+            parse_run_script_preview("# gitpulse-preview: about:blank\n"),
+            None
+        );
+        assert_eq!(
+            parse_run_script_preview("# gitpulse-preview: https://example.com\n"),
+            None
+        );
         assert_eq!(
             parse_run_script_preview("# gitpulse-preview: http://evil.localhost:3000\n"),
             None
@@ -411,7 +420,10 @@ n*:8000
         let mut noisy = String::new();
         for idx in 0..30u16 {
             let port = 50_000 + idx;
-            noisy.push_str(&format!("p{}\ncdaemon{idx}\nn127.0.0.1:{port}\n", 100 + idx));
+            noisy.push_str(&format!(
+                "p{}\ncdaemon{idx}\nn127.0.0.1:{port}\n",
+                100 + idx
+            ));
         }
         noisy.push_str("p8888\nccargo\nn127.0.0.1:1420\n");
         let parsed = parse_lsof_listeners(&noisy);
@@ -446,7 +458,11 @@ n*:8000
         let repo = TempDir::new().expect("repo");
         let outside = TempDir::new().expect("outside");
         let outside_file = outside.path().join("outside.sh");
-        fs::write(&outside_file, "#!/bin/sh\n# gitpulse-preview: http://localhost:3000\n").unwrap();
+        fs::write(
+            &outside_file,
+            "#!/bin/sh\n# gitpulse-preview: http://localhost:3000\n",
+        )
+        .unwrap();
 
         #[cfg(unix)]
         {

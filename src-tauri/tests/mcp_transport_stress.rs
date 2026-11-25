@@ -1050,7 +1050,11 @@ fn resolve_real_git(orig_path: &std::ffi::OsStr) -> std::path::PathBuf {
                 }
             }
         }
-        for fallback in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+        for fallback in [
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+        ] {
             let candidate = std::path::PathBuf::from(fallback);
             if candidate.is_file() {
                 return candidate;

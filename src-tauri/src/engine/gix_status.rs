@@ -174,7 +174,10 @@ impl DeadlineWatcher {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if state.due.is_empty() {
-                state = self.cvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+                state = self
+                    .cvar
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
                 continue;
             }
             let now = Instant::now();
@@ -327,7 +330,11 @@ fn has_unregistered_gitlink(repo: &gix::Repository, index: &gix::index::State) -
     };
     let mut registered: Vec<BString> = submodules.filter_map(|sm| sm.path().ok()).collect();
     registered.sort();
-    gitlinks.any(|path| registered.binary_search_by(|p| p.as_bstr().cmp(path)).is_err())
+    gitlinks.any(|path| {
+        registered
+            .binary_search_by(|p| p.as_bstr().cmp(path))
+            .is_err()
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -378,7 +385,13 @@ pub(crate) fn porcelain_v1_z(
         cancel_atomic,
     );
 
-    run_status_with_interrupt(dir, started, effective_deadline, cancel.as_ref(), &interrupt)
+    run_status_with_interrupt(
+        dir,
+        started,
+        effective_deadline,
+        cancel.as_ref(),
+        &interrupt,
+    )
 }
 
 fn run_status_with_interrupt(
@@ -645,7 +658,8 @@ mod tests {
     fn expired_deadline_returns_error_not_clean_status() {
         let dir = git_repo();
         let expired = ScanDeadline::after(Instant::now(), Duration::ZERO);
-        let err = porcelain_v1_z(dir.path(), Some(&expired)).expect_err("expired deadline must fail");
+        let err =
+            porcelain_v1_z(dir.path(), Some(&expired)).expect_err("expired deadline must fail");
         assert_eq!(err.message(), DEADLINE_PASSED);
     }
 

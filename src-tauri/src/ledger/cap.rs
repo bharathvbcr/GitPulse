@@ -107,7 +107,10 @@ pub(super) fn cap_object(redacted: String) -> (String, Option<ObjectCap>) {
     let cap = ObjectCap {
         at,
         bytes: redacted.len(),
-        hash: format!("fnv1a64:{:016x}", devmap_extract::fnv1a64(redacted.as_bytes())),
+        hash: format!(
+            "fnv1a64:{:016x}",
+            devmap_extract::fnv1a64(redacted.as_bytes())
+        ),
     };
     (kept, Some(cap))
 }

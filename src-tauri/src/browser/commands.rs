@@ -130,7 +130,11 @@ pub async fn cmd_browser_discover_local_servers(
     repo_path: Option<String>,
 ) -> Result<super::local_servers::LocalServerDiscovery, String> {
     crate::commands::off_thread(move || {
-        let repo_dir = match repo_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let repo_dir = match repo_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(path) => Some(crate::engine::git_cli::validate_repo(path)?),
             None => None,
         };

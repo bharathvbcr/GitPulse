@@ -939,11 +939,8 @@ pub(super) fn collect_worktree_deltas(
         let untracked = git_captured(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
         merge_untracked_listing(&mut map, untracked)?;
     } else {
-        let status = crate::engine::worktree::read_status_since(
-            repo,
-            None,
-            std::time::Instant::now(),
-        )?;
+        let status =
+            crate::engine::worktree::read_status_since(repo, None, std::time::Instant::now())?;
         for (path, kind) in parse_nul_porcelain_status(status.bytes.as_bytes()) {
             map.insert(path, kind);
         }

@@ -512,7 +512,10 @@ fn cases() -> Vec<Case> {
         c("touched_unchanged (stale stat)", touched_unchanged),
         c("added_staged", added_staged),
         c("added_staged_then_modified", added_staged_then_modified),
-        c("staged_modified_then_modified", staged_modified_then_modified),
+        c(
+            "staged_modified_then_modified",
+            staged_modified_then_modified,
+        ),
         c("deleted_worktree", deleted_worktree),
         c("deleted_staged", deleted_staged),
         c("deleted_staged_recreated", deleted_staged_recreated),
@@ -639,7 +642,10 @@ fn unsupported_features_fall_back_cleanly_through_get_status() {
     // Local external filter falls back from gix to git_cli and agrees with git.
     let filter_dir = tempfile::tempdir().expect("tempdir");
     let filter_repo = init(filter_dir.path());
-    git(&filter_repo, &["config", "--local", "filter.custom.clean", "sed s/a/A/g"]);
+    git(
+        &filter_repo,
+        &["config", "--local", "filter.custom.clean", "sed s/a/A/g"],
+    );
     write(&filter_repo, ".gitattributes", "*.txt filter=custom\n");
     write(&filter_repo, "a.txt", "edited\n");
     assert_eq!(
@@ -658,12 +664,18 @@ fn unsupported_features_fall_back_cleanly_through_get_status() {
     let split_native_repo = init(split_native_dir.path());
     git(&split_native_repo, &["update-index", "--split-index"]);
     write(&split_native_repo, "b.txt", "edited in split index\n");
-    assert_eq!(gix_rows_at(&split_native_repo), git_status(&split_native_repo));
+    assert_eq!(
+        gix_rows_at(&split_native_repo),
+        git_status(&split_native_repo)
+    );
 
     // Explicit `core.splitIndex=true` falls back from gix to git_cli and agrees with git.
     let split_dir = tempfile::tempdir().expect("tempdir");
     let split_repo = init(split_dir.path());
-    git(&split_repo, &["config", "--local", "core.splitIndex", "true"]);
+    git(
+        &split_repo,
+        &["config", "--local", "core.splitIndex", "true"],
+    );
     git(&split_repo, &["update-index", "--split-index"]);
     write(&split_repo, "b.txt", "edited in split index\n");
     assert_eq!(

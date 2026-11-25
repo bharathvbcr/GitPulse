@@ -701,7 +701,12 @@ fn apple_git_never_offers_or_plans_fsmonitor() {
 #[test]
 fn warnings_flag_core_fsmonitor_on_small_and_large_repos() {
     let mut small = report(3_503, 1, 0);
-    key(&mut small, "core.fsmonitor", Some("true"), ConfigScope::Local);
+    key(
+        &mut small,
+        "core.fsmonitor",
+        Some("true"),
+        ConfigScope::Local,
+    );
     let small_warnings = warnings(&small);
     assert!(
         small_warnings
@@ -711,7 +716,12 @@ fn warnings_flag_core_fsmonitor_on_small_and_large_repos() {
     );
 
     let mut large = report(50_000, 1, 0);
-    key(&mut large, "core.fsmonitor", Some("true"), ConfigScope::Local);
+    key(
+        &mut large,
+        "core.fsmonitor",
+        Some("true"),
+        ConfigScope::Local,
+    );
     let large_warnings = warnings(&large);
     assert!(
         large_warnings
