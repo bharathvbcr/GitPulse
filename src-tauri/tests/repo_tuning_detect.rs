@@ -269,6 +269,32 @@ fn a_real_split_index_is_found_in_the_index_file_and_refuses_many_files() {
     assert_eq!(plain.index.entries, Some(25_000));
 }
 
+/// A split index stores an entry that replaces one in the shared index with an
+/// empty name. Re-adding a changed file that the shared index holds always
+/// writes one, in every index version. The walker refused them as "an entry
+/// has an empty path", so the split-index test above passed or failed on
+/// whether git happened to smudge a racily clean entry.
+#[test]
+fn a_split_index_whose_entries_replace_shared_ones_is_read() {
+    let _g = serial();
+    for version in ["2", "3", "4"] {
+        let dir = repo_with_files(40);
+        run_git(dir.path(), &["config", "index.version", version]);
+        run_git(dir.path(), &["update-index", "--split-index"]);
+        for i in [3, 17, 29] {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "changed\n").unwrap();
+        }
+        run_git(dir.path(), &["add", "f3.txt", "f17.txt", "f29.txt"]);
+        let report = detect(dir.path());
+        assert_eq!(
+            report.index.state,
+            IndexReadState::Present,
+            "v{version}: {report:?}"
+        );
+        assert_eq!(report.index.split_index, Some(true), "v{version}: {report:?}");
+    }
+}
+
 #[test]
 fn real_indexes_of_every_shape_git_writes_are_walked() {
     let _g = serial();

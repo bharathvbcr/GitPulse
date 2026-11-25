@@ -8,11 +8,12 @@
 //! a split index (the `link` extension) or a sparse index (`sdir`).
 //!
 //! What it checks, from the format document: each entry's fixed fields, a
-//! non-empty path, the `0x4000` extended-flags bit only from version 3, the NUL
-//! padding of versions 2 and 3, the prefix-compressed path of version 4
-//! (strip count, then a NUL-terminated suffix that must leave a non-empty
-//! path), and that the extensions (four byte signature starting with a letter,
-//! four byte size) end exactly where the trailing checksum begins.
+//! non-empty path (except in a split index, whose entries that replace a shared
+//! entry are written with no name), the `0x4000` extended-flags bit only from
+//! version 3, the NUL padding of versions 2 and 3, the prefix-compressed path
+//! of version 4 (strip count, then a NUL-terminated suffix), and that the
+//! extensions (four byte signature starting with a letter, four byte size) end
+//! exactly where the trailing checksum begins.
 //!
 //! What it does NOT check: the checksum itself. No SHA-1 implementation is a
 //! direct dependency of this crate and adding one is not allowed here, so a
@@ -257,6 +258,13 @@ fn walk_entries(
     let mut fields = vec![0u8; fixed];
     let mut path_buf: Vec<u8> = Vec::new();
     let mut has_skip_worktree = false;
+    // A split index writes an entry that replaces one in the shared index with
+    // an empty name: the name is the shared entry's. Whether the index is split
+    // is only known from the `link` extension after the entries, so an unnamed
+    // entry is counted here and judged there. Whether git writes one at all
+    // depends on file timestamps, so a split index of the same files can be
+    // walked one run and refused the next without this.
+    let mut unnamed = 0usize;
     for _ in 0..header.entries {
         cur.take(&mut fields)?;
         let mode = u32::from_be_bytes([fields[24], fields[25], fields[26], fields[27]]);
@@ -278,9 +286,6 @@ fn walk_entries(
             let long = name_len >= 0x0FFF;
             path_buf.clear();
             let path_len = if !long {
-                if name_len == 0 {
-                    return Err("an entry has an empty path".to_string());
-                }
                 path_buf.resize(name_len, 0);
                 cur.take(&mut path_buf)?;
                 name_len
@@ -304,7 +309,11 @@ fn walk_entries(
             if padding.iter().any(|b| *b != 0) {
                 return Err("an entry's padding is not NUL".to_string());
             }
-            on_entry(mode, &path_buf)?;
+            if path_buf.is_empty() {
+                unnamed += 1;
+            } else {
+                on_entry(mode, &path_buf)?;
+            }
         } else {
             // Version 4: offset-encoded strip count, then a NUL-terminated suffix.
             let mut b = cur.byte()?;
@@ -324,9 +333,10 @@ fn walk_entries(
             path_buf.truncate(path_buf.len() - strip);
             cur.append_until_nul(&mut path_buf)?;
             if path_buf.is_empty() {
-                return Err("an entry has an empty path".to_string());
+                unnamed += 1;
+            } else {
+                on_entry(mode, &path_buf)?;
             }
-            on_entry(mode, &path_buf)?;
         }
     }
 
@@ -356,6 +366,9 @@ fn walk_entries(
     }
     if cur.pos != end {
         return Err("the extensions do not end where the checksum begins".to_string());
+    }
+    if unnamed > 0 && !shape.split {
+        return Err("an entry has an empty path".to_string());
     }
     let mut trailer = vec![0u8; hash_len];
     cur.inner
