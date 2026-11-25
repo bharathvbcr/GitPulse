@@ -138,7 +138,50 @@ fn a_new_boot_keeps_the_old_ring_as_prev_and_replaces_an_older_prev() {
     assert_eq!(
         read_ring(&prev).unwrap(),
         [rec(2)],
-        "an older prev is replaced"
+        "prev always holds the boot just before this one"
+    );
+    assert_eq!(
+        read_ring(&dir.path().join(PREVIOUS_TRACE_FILE_NAMES[1])).unwrap(),
+        [rec(1)],
+        "the older prev moves down instead of being replaced"
+    );
+}
+
+/// 2026-11-24: the Mac hung, was reset, and booted twice more within ten
+/// minutes. Each boot renamed the ring over `prev`, so the second one replaced
+/// the hang's readings with the eight minutes after the reset: the only trace
+/// of the incident was gone before anyone looked. The last three boots are
+/// kept, and only the fourth-oldest is dropped.
+#[test]
+fn the_last_three_boots_survive_two_quick_reboots_after_a_hang() {
+    let dir = tempfile::tempdir().unwrap();
+    for boot in 1..=4u64 {
+        let mut writer = TraceWriter::open_with_capacity(dir.path(), boot, 4).unwrap();
+        writer.append(&rec(boot)).unwrap();
+        drop(writer);
+    }
+    let kept = |n: usize| read_ring(&dir.path().join(PREVIOUS_TRACE_FILE_NAMES[n])).unwrap();
+    assert_eq!(kept(0), [rec(3)], "the boot just before");
+    assert_eq!(kept(1), [rec(2)], "two boots back");
+    assert_eq!(
+        kept(2),
+        [rec(1)],
+        "three boots back: the hang's ring survives"
+    );
+
+    let _fifth = TraceWriter::open_with_capacity(dir.path(), 5, 4).unwrap();
+    assert_eq!(kept(0), [rec(4)]);
+    assert_eq!(kept(1), [rec(3)]);
+    assert_eq!(kept(2), [rec(2)], "only the oldest is dropped");
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("host-load-trace"))
+        .collect();
+    assert_eq!(
+        names.len(),
+        4,
+        "the ring and three previous boots, no more: {names:?}"
     );
 }
 
