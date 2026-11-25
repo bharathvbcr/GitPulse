@@ -900,6 +900,27 @@ mod tests {
         super::git_in(second.path(), &["init", "-q"]);
     }
 
+    /// The code under test commits with whatever identity git resolves, and
+    /// the hermetic home pins one, so that resolution never reaches the
+    /// host's account. Without it, commits by the code under test failed on
+    /// the Linux CI runner (`empty ident name`) and in containers (`unable to
+    /// auto-detect email address`) but passed where the account had a name.
+    /// Asked through `GitWriter::identity`, whose git reads `$HOME/.gitconfig`
+    /// rather than `GIT_CONFIG_GLOBAL`, so the home copy is the one checked.
+    #[test]
+    fn a_fresh_repository_resolves_the_hermetic_identity_not_the_hosts() {
+        let repo = tempfile::tempdir().unwrap();
+        super::git_in(repo.path(), &["init", "-q"]);
+        let identity =
+            crate::engine::git_writer::GitWriter::identity(repo.path().to_str().unwrap()).unwrap();
+        assert_eq!(identity.name.as_deref(), Some("GitPulse"), "{identity:?}");
+        assert_eq!(
+            identity.email.as_deref(),
+            Some("gitpulse@test.local"),
+            "{identity:?}"
+        );
+    }
+
     /// `GIT_WORK_TREE` moves the work tree git reads files from: with a
     /// neighbour's value inherited, `add f.txt` looks for `f.txt` in the
     /// neighbour's directory and the fixture's file is never staged.

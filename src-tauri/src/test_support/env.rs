@@ -265,6 +265,26 @@ impl Drop for EnvBinding<'_> {
 /// [`hermetic::pinned_git_config`].
 pub(crate) const GIT_MAINTENANCE_PIN: &str = "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n";
 
+/// The identity the hermetic home's git configs carry.
+///
+/// Fixtures pin their own identity on each command (`git_in`'s `-c`, or
+/// `GIT_AUTHOR_*` on the child), but the code under test commits, tags,
+/// rebases and merges with whatever identity git resolves, as the app does on
+/// a user's machine. With none configured, git falls back to the account's
+/// passwd name and the host name, so the same test passed where that name was
+/// set (a developer's laptop, macOS runners) and failed where it was not
+/// (`empty ident name` on the Linux CI runner, `unable to auto-detect email
+/// address` in a container): a fact about the host decided the result, which
+/// is what the hermetic home exists to stop.
+///
+/// It is the fixtures' own identity, an address the repository's
+/// fixture-identity denylist (`.githooks/lib/fixture-identity.cases`) refuses,
+/// so a commit that escaped into a real checkout with it is stopped there. A
+/// test that needs no identity still blanks `user.*` in its repository, which
+/// outranks this global one.
+pub(crate) const HERMETIC_IDENTITY: &str =
+    "[user]\n\tname = GitPulse\n\temail = gitpulse@test.local\n";
+
 /// Writes `path` as a git config holding [`GIT_MAINTENANCE_PIN`] followed by
 /// `extra` (more git config text, or empty).
 pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::Result<()> {
@@ -421,12 +441,12 @@ pub(crate) mod hermetic {
                 .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", dir.display()));
         }
         let gitconfig = root.join("gitconfig");
-        super::write_git_config(&gitconfig, "")
+        super::write_git_config(&gitconfig, super::HERMETIC_IDENTITY)
             .unwrap_or_else(|error| panic!("hermetic gitconfig {}: {error}", gitconfig.display()));
         // The application's own git runs with `GIT_CONFIG_GLOBAL` stripped and
         // reads `$HOME/.gitconfig` instead, so the pin has to be there too.
         let home_config = home.join(".gitconfig");
-        super::write_git_config(&home_config, "").unwrap_or_else(|error| {
+        super::write_git_config(&home_config, super::HERMETIC_IDENTITY).unwrap_or_else(|error| {
             panic!("hermetic gitconfig {}: {error}", home_config.display())
         });
 
