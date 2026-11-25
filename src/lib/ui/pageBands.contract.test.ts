@@ -56,7 +56,7 @@ const BARS: ReadonlyArray<readonly [file: string, anchors: readonly string[]]> =
   ["../components/WorkOverviewPane.svelte", ['data-testid="work-blocked-verdict"', 'data-testid="work-retained-drafts"']],
   ["../components/HealthPanel.svelte", ["px-4 py-1.5 flex flex-wrap items-center"]],
   ["../components/BlameViewer.svelte", [
-    "px-4 py-2 flex items-center justify-between gap-3",
+    "px-4 py-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5",
     "px-4 py-2 font-sans shrink-0 flex flex-col gap-1.5",
   ]],
   ["../components/DiffViewer.svelte", ["gap-y-1 px-3 py-1.5 font-sans", "gap-y-1 px-3 py-1 font-sans"]],

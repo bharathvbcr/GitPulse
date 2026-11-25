@@ -588,7 +588,7 @@
       <!-- One filter at a time, so a segmented switch, not toggles. -->
       <div class="flex min-w-0 max-w-full items-center gap-1.5" role="group" aria-label="Show">
         <span class="gp-label shrink-0">Show</span>
-        <div class="gp-header-scroll gp-segmented min-w-0 max-w-full flex-nowrap" class:gp-liquid-tabs={macos}>
+        <div class="gp-segmented gp-header-scroll min-w-0 max-w-full flex-nowrap" class:gp-liquid-tabs={macos}>
           {#each FILTERS as item (item.id)}
             <button
               type="button"
