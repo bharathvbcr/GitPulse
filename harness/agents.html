@@ -130,6 +130,7 @@
         cmd_last_fetch_at: () => null,
         cmd_note_tab_activated: () => null,
         cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_list_repo_files: () => [],
         cmd_workspace_sync: () => ({ repos: [] }),
         cmd_devcouncil_init: (args) => ({
           repo: args.repoPath, state_dir: `${args.repoPath}/.devmap`,
@@ -224,7 +225,10 @@
       const stage = document.querySelector("#stage");
       const root = () => stage.querySelector("[data-testid=agents-view]");
       const text = () => root()?.textContent ?? "";
-      const button = (name) => [...root().querySelectorAll("button")].find((node) => node.textContent.trim() === name);
+      const button = (name) => [...root().querySelectorAll("button")].find((node) => {
+        if (node.textContent.trim() === name) return true;
+        return node.dataset.testid?.startsWith("agents-filter-") && node.querySelector("span")?.textContent.trim() === name;
+      });
       const row = (name) => [...root().querySelectorAll("[data-testid=agents-row]")].find((node) => node.textContent.includes(name));
       const rows = () => [...root().querySelectorAll("[data-testid=agents-row]")];
       const wait = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -284,7 +288,9 @@
           text().includes("4 agent checkouts · 0 live terminals · 1 task run · 2 need attention")
           && !text().includes("session") && !text().includes("at least"));
         check("an attempt is placed in the repository its id names, not the directory it runs in", () =>
-          row("Fix the gate").textContent.includes("GitPulse") && row("Fix the gate").querySelectorAll("td")[3].textContent.trim() === "5");
+          !!root().querySelector("[data-testid=agents-repo-group]")?.textContent.includes("GitPulse")
+          && !!root().querySelector("[data-testid=agents-attention-tray]")?.textContent.includes("GitPulse")
+          && row("Fix the gate").querySelectorAll("td")[3].textContent.trim() === "5");
         check("parallel counts agree across the repository's rows", () =>
           ["alpha", "beta", "gamma", "bad name"].every((name) => row(name).querySelectorAll("td")[3].textContent.trim() === "5"));
         check("kinds read as names and every row has a labelled action", () =>
@@ -326,17 +332,23 @@
         check("a permission prompt outranks the checkout's uncommitted files", () =>
           row("alpha").textContent.includes("Needs you"));
 
-        await press("Changes");
+        root().querySelector("[data-testid=agents-columns-toggle]").click();
+        await settle();
+        root().querySelector("[data-testid=agents-columns-menu] [aria-label='Changes']").click();
+        await settle();
         check("hiding changes removes the column and keeps the attention", () =>
           !text().includes("Uncommitted changes")
           && row("alpha").textContent.includes("Needs you")
-          && button("Show columns")
+          && root().querySelector("[data-testid=agents-columns-toggle]").textContent.includes("4/5")
           && ![...root().querySelectorAll("th")].some((cell) => cell.textContent.trim() === "Changes"));
-        await press("Show columns");
+        button("Show all columns").click();
+        await settle();
+        root().querySelector("[data-testid=agents-columns-toggle]").click();
+        await settle();
         check("show columns brings the change count back", () =>
           [...root().querySelectorAll("th")].some((cell) => cell.textContent.trim() === "Changes")
           && row("alpha").querySelectorAll("td")[4].textContent.trim() === "3"
-          && !button("Show columns"));
+          && !root().querySelector("[data-testid=agents-columns-toggle]").textContent.includes("4/5"));
 
         const compact = root().querySelector("[aria-label='Use compact rows']");
         compact.click();
@@ -362,7 +374,7 @@
           root().querySelector("table")?.getAttribute("role") === "treegrid"
           && !!root().querySelector("table").getAttribute("aria-label"));
         check("a child agent process nests one level under the session it is in", () =>
-          levelOf("alpha") === 1 && levelOf("Child session") === 2
+          levelOf("alpha") === 2 && levelOf("Child session") === 3
           && treeRow("alpha").getAttribute("aria-expanded") === "true"
           && treeRow("Child session").getAttribute("aria-posinset") === "1"
           && treeRow("Child session").getAttribute("aria-setsize") === "1"
@@ -375,7 +387,7 @@
           && treeRow("alpha").textContent.includes("1 of 1 nested row live"));
         check("the parent's own cells are still its own", () =>
           treeRow("alpha").textContent.includes("Needs you") && !treeRow("Child session").textContent.includes("Needs you"));
-        const roving = () => rows().filter((item) => item.getAttribute("tabindex") === "0").length;
+        const roving = () => root().querySelectorAll("tbody tr[tabindex='0']").length;
         check("exactly one row is in the tab order", () => roving() === 1);
 
         treeRow("alpha").focus();
@@ -398,7 +410,8 @@
         await key("ArrowRight");
         check("Right on an open parent steps into its first child", () => document.activeElement === treeRow("Child session"));
         await key("Home");
-        check("Home goes to the first row", () => document.activeElement === rows()[0]);
+        check("Home goes to the first row", () =>
+          document.activeElement === root().querySelector("[data-testid=agents-repo-group]"));
         row("alpha").querySelector("[data-testid=agents-row-toggle]").click();
         await settle();
         check("the toggle button closes a parent as the keys do", () =>
@@ -489,13 +502,19 @@
         await until(() => text().includes("did not cover every worktree"), "an incomplete collision scan looked clear");
         check("an incomplete collision scan is not a clear one", () =>
           text().includes("Collisions not fully read") && root().querySelector("[data-testid=agents-gaps]"));
-        await press("Attention");
+        root().querySelector("[data-testid=agents-columns-toggle]").click();
+        await settle();
+        root().querySelector("[data-testid=agents-columns-menu] [aria-label='Attention']").click();
+        await settle();
         check("the collision gap stays when its column is hidden", () => {
           const gaps = root().querySelector("[data-testid=agents-gaps]");
           const table = root().querySelector("table");
           return gaps && (!table || gaps.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
         });
-        await press("Show columns");
+        button("Show all columns").click();
+        await settle();
+        root().querySelector("[data-testid=agents-columns-toggle]").click();
+        await settle();
         await press("All");
 
         stage.style.width = "390px";
@@ -506,6 +525,62 @@
         await settle();
         check("the plane fits the wide window as well", () =>
           stage.scrollWidth <= 1281 && root().scrollWidth <= root().clientWidth + 1);
+
+        // Search, repo grouping, RepoLogo, and running indicators.
+        const searchEl = root().querySelector("[data-testid=agents-search]");
+        searchEl.value = "gamma";
+        searchEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await settle();
+        check("search filters rows to matching agent", () =>
+          rows().length === 1 && !!row("gamma"));
+        searchEl.value = "no-such-agent-xyz";
+        searchEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await settle();
+        check("unmatched search shows recovery empty state", () =>
+          rows().length === 0 && text().includes("No agents match"));
+        searchEl.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+        await settle();
+        check("Escape clears search and restores rows", () => rows().length === 5);
+
+        const groupBtn = root().querySelector("[data-testid=agents-group-toggle]");
+        check("auto mode keeps repository grouping and renders Attention & Done tray above", () =>
+          !!root().querySelector("[data-testid=agents-attention-tray]")
+          && !!root().querySelector("[data-testid=agents-repo-group]")
+          && !!root().querySelector("[data-testid=agents-repo-group] [data-repo-logo]")
+          && groupBtn.getAttribute("aria-pressed") === "true");
+        root().querySelector("[data-testid=agents-repo-group-toggle]").click();
+        await settle();
+        check("collapsing repository group hides its agent rows", () => rows().length === 0);
+        root().querySelector("[data-testid=agents-repo-group-toggle]").click();
+        await settle();
+        groupBtn.click();
+        await settle();
+        check("group toggle switches to flat mode and hides repository groups and tray", () =>
+          !root().querySelector("[data-testid=agents-repo-group]")
+          && !root().querySelector("[data-testid=agents-attention-tray]")
+          && groupBtn.getAttribute("aria-pressed") === "false");
+        groupBtn.click();
+        await settle();
+        await press("Needs action");
+        check("Needs action filter renders ungrouped without duplicate tray", () =>
+          !root().querySelector("[data-testid=agents-attention-tray]")
+          && !root().querySelector("[data-testid=agents-repo-group]"));
+        await press("All");
+
+        mode = "ready";
+        button("Refresh").click();
+        await until(() => row("beta") && !row("beta").textContent.includes("Collisions not fully read"), "ready refresh did not clear unscanned");
+
+        const runBetaSlot = terminalSessions.reserve({
+          key: "live-run-beta", repoPath: MAIN, label: "Antigravity", launcher: "agy", title: "beta", status: "running",
+          sessionId: "pty-agy-beta", close: async () => {},
+        });
+        await until(() => row("beta")?.querySelector("[data-testid=agents-running-indicator]"), "running indicator did not render");
+        check("actively running live row renders animated loading indicator and live dot", () =>
+          !!row("beta").querySelector("[data-testid=agents-running-indicator] svg.animate-spin")
+          && !!row("beta").querySelector(".gp-live-dot"));
+        runBetaSlot.release();
+        await settle();
 
         slot.release();
         taskMode = "empty";

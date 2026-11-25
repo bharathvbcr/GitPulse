@@ -21,6 +21,7 @@
     Pin,
     Check,
     Ellipsis,
+    Loader2,
     Search,
     Settings2,
     SquareTerminal,
@@ -52,6 +53,8 @@
     os: HostOS;
     /** Agents here that want the reader: drawn as a dot on the Agents button. */
     agentAttention?: number;
+    /** Live running agents across repositories: shown on Agents when no agent needs attention. */
+    agentsRunning?: number;
     repoName: string | null;
     repoPath: string | null;
     /** Tooltip for the context chip; the full repository, checkout and branch. */
@@ -100,6 +103,7 @@
     onSection,
     os,
     agentAttention = 0,
+    agentsRunning = 0,
     repoName,
     repoPath,
     contextTitle = null,
@@ -136,6 +140,22 @@
 
   const FOCUS_RING = "focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent";
   const SECTION_ICONS = { shell: SquareTerminal, agents: Bot, files: FolderTree, console: ListChecks } as const;
+
+  function sectionTitle(entry: (typeof DOCK_SECTIONS)[number]): string {
+    const chord = dockSectionChordLabel(entry.id, os);
+    if (entry.id === "agents") {
+      if (agentAttention > 0 && agentsRunning > 0) {
+        return `${entry.hint} — ${agentAttention} ${agentAttention === 1 ? "needs" : "need"} you, ${agentsRunning} running (${chord})`;
+      }
+      if (agentAttention > 0) {
+        return `${entry.hint} — ${agentAttention} ${agentAttention === 1 ? "needs" : "need"} you (${chord})`;
+      }
+      if (agentsRunning > 0) {
+        return `${entry.hint} — ${agentsRunning} running (${chord})`;
+      }
+    }
+    return `${entry.hint} (${chord})`;
+  }
 
   const contextParts = $derived([repoName ?? "No repository", checkoutLabel, branch].filter((part): part is string => Boolean(part)));
   const STATUS_TESTID = {
@@ -231,13 +251,17 @@
           data-testid="dock-section-{entry.id}"
           class="gp-seg-btn text-meta! relative inline-flex items-center gap-1 {FOCUS_RING}"
           aria-keyshortcuts={os === "macos" ? `Alt+Shift+Meta+${index + 1}` : `Control+Alt+Shift+${index + 1}`}
-          title="{entry.hint} ({dockSectionChordLabel(entry.id, os)})"
+          title={sectionTitle(entry)}
           onclick={() => onSection(entry.id)}
         >
           <Icon size={13} class="shrink-0" /><span class="@max-[34rem]:sr-only">{entry.label}</span>
           {#if entry.id === "agents" && agentAttention > 0}
             <span class="inline-block h-1.5 w-1.5 rounded-full bg-warn shrink-0" aria-hidden="true" data-testid="dock-agents-attention"></span>
-            <span class="sr-only">, {agentAttention} {agentAttention === 1 ? "agent needs" : "agents need"} you</span>
+            <span class="sr-only">, {agentAttention} {agentAttention === 1 ? "agent needs" : "agents need"} you{agentsRunning > 0 ? `, ${agentsRunning} running` : ""}</span>
+          {:else if entry.id === "agents" && agentsRunning > 0}
+            <Loader2 size={10} class="animate-spin text-accent shrink-0" aria-hidden="true" data-testid="dock-agents-running" />
+            <span class="tabular-nums text-micro text-accent shrink-0" aria-hidden="true" data-testid="dock-agents-running-count">{agentsRunning}</span>
+            <span class="sr-only">, {agentsRunning} {agentsRunning === 1 ? "agent" : "agents"} running</span>
           {/if}
         </button>
       {/each}

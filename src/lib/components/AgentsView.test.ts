@@ -15,6 +15,7 @@ import { requestInboxFocus, takeInboxFocus } from "../agents/inboxFocus";
 import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
 import AgentInbox from "./AgentInbox.svelte";
 import AgentsView from "./AgentsView.svelte";
+import MaviAgentsTable from "./mavi/MaviAgentsTable.svelte";
 
 const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "AgentsView.svelte"), "utf8");
 
@@ -120,6 +121,7 @@ describe("AgentsView", () => {
 
 describe("AgentsView F11 attention UX and SSR rendering", () => {
   const savedFilter = get(interfaceStore).agentsFilter;
+  const savedGroupMode = get(interfaceStore).agentsGroupByRepo;
   const slots: ReturnType<typeof terminalSessions.reserve>[] = [];
   const sessions: string[] = [];
 
@@ -129,12 +131,13 @@ describe("AgentsView F11 attention UX and SSR rendering", () => {
     launcher: "claude" | "agy";
     title: string;
     sessionId: string;
+    repoPath?: string;
   }) {
     sessions.push(opts.sessionId);
     slots.push(
       terminalSessions.reserve({
         key: opts.key,
-        repoPath: "/repo/f11",
+        repoPath: opts.repoPath ?? "/repo/f11",
         label: opts.label,
         launcher: opts.launcher,
         title: opts.title,
@@ -147,7 +150,9 @@ describe("AgentsView F11 attention UX and SSR rendering", () => {
 
   afterEach(async () => {
     setSignalledAsksForReader(false);
+    setAgentsRepositoryScope(null);
     interfaceStore.setAgentsFilter(savedFilter);
+    interfaceStore.setAgentsGroupByRepo(savedGroupMode);
     while (sessions.length > 0) sessionActivity.forget(sessions.pop()!);
     while (slots.length > 0) slots.pop()?.release();
     vi.restoreAllMocks();
@@ -188,7 +193,10 @@ describe("AgentsView F11 attention UX and SSR rendering", () => {
     expect(html).toContain('data-tone="warn"');
     expect(html).toContain('data-tone="danger"');
     expect(html).toContain('data-tone="info"');
-    expect(html).toContain('data-tone="ok"');
+    expect(html).toContain('data-tone="accent"');
+    expect(html).toContain('data-testid="agents-running-indicator"');
+    expect(html).toContain("gp-live-dot");
+    expect(html).toContain("animate-spin");
     expect(html).toContain("Allow Bash: cargo test --locked");
     expect(html).toContain("Synthesized M3b implementation plan");
     expect(html).toContain("API rate limit exceeded");
@@ -440,6 +448,154 @@ describe("AgentsView F11 attention UX and SSR rendering", () => {
     expect(source).toContain("setAgentsRepositoryScope(req.repoPath ?? null)");
     setAgentsRepositoryScope(req?.repoPath ?? null);
     expect(get(agentsRepositoryScope)).toBeNull();
+  });
+
+  it("auto-groups by repository when no agent needs attention or is done, and renders RepoLogo and running chips", () => {
+    addTerminal({ key: "k-alpha", label: "Claude Code", launcher: "claude", title: "alpha-work", sessionId: "s-alpha-work", repoPath: "/repo/alpha" });
+    addTerminal({ key: "k-beta", label: "Antigravity", launcher: "agy", title: "beta-work", sessionId: "s-beta-work", repoPath: "/repo/beta" });
+    sessionActivity.output("s-alpha-work");
+    sessionActivity.output("s-beta-work");
+
+    interfaceStore.setAgentsGroupByRepo("auto");
+    const autoHtml = render(AgentsView).body;
+    expect(autoHtml).toContain('data-testid="agents-group-toggle"');
+    expect(autoHtml).toContain('aria-pressed="true"');
+    expect(autoHtml).toContain('data-testid="agents-groups-collapse-all"');
+    expect(autoHtml).toContain('data-testid="agents-repo-group"');
+    expect(autoHtml).toContain('data-repo-logo');
+    expect(autoHtml).toContain('data-testid="agents-repo-group-running"');
+    expect(autoHtml).toContain('data-testid="agents-repo-focus"');
+    // Clean running rows hide the attention tray.
+    expect(autoHtml).not.toContain('data-testid="agents-attention-tray"');
+    // Grouped rows omit redundant repository label in subtitle and avoid duplicate title spinner when Attention column is visible.
+    expect(autoHtml).not.toContain("Claude Code ·");
+
+    // Manual flat mode ungroups and shows RepoLogo beside each row's repository label.
+    interfaceStore.setAgentsGroupByRepo("flat");
+    const flatHtml = render(AgentsView).body;
+    expect(flatHtml).toContain('aria-pressed="false"');
+    expect(flatHtml).not.toContain('data-testid="agents-repo-group"');
+    expect(flatHtml).toContain('data-repo-logo');
+    expect(flatHtml).toContain("alpha");
+  });
+
+  it("keeps repository grouping active in auto mode with an Attention & Done tray above, and omits redundant row repo labels", () => {
+    addTerminal({ key: "k-done", label: "Antigravity", launcher: "agy", title: "agy-done-1", sessionId: "s-done-1", repoPath: "/repo/alpha" });
+    addTerminal({ key: "k-ask", label: "Claude Code", launcher: "claude", title: "claude-ask-1", sessionId: "s-ask-1", repoPath: "/repo/beta" });
+    sessionActivity.announce({ session: "s-done-1", channel: "hook", event: "turn_finished", detail: "Plan complete" });
+    sessionActivity.announce({ session: "s-ask-1", channel: "hook", event: "permission_prompt", detail: "Approve write" });
+
+    interfaceStore.setAgentsGroupByRepo("auto");
+    const html = render(AgentsView).body;
+    expect(html).toContain('data-testid="agents-attention-tray"');
+    expect(html).toContain("Needs attention &amp; finished");
+    expect(html).toContain('data-testid="agents-attention-item"');
+    expect(html).toContain('data-testid="agents-repo-group"');
+    expect(html).toContain('data-testid="agents-repo-group-attention"');
+    expect(html).toContain('data-testid="agents-repo-group-done"');
+    expect(html).toContain("1 needs attention");
+    expect(html).toContain("1 done");
+    expect(html).toContain('data-testid="agents-dismiss-all"');
+    expect(html).toContain('data-testid="agents-search"');
+    expect(html).toContain('data-testid="agents-columns-toggle"');
+
+    // Filtered Needs action / Notifications views render ungrouped without the tray.
+    interfaceStore.setAgentsFilter("attention");
+    const attentionHtml = render(AgentsView).body;
+    expect(attentionHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(attentionHtml).not.toContain('data-testid="agents-repo-group"');
+
+    interfaceStore.setAgentsFilter("notifications");
+    const notifHtml = render(AgentsView).body;
+    expect(notifHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(notifHtml).not.toContain('data-testid="agents-repo-group"');
+
+    // Reset filter and verify scoped view hides repo groups and tray, showing RepoLogo inside Only <repo> chip.
+    interfaceStore.setAgentsFilter("all");
+    setAgentsRepositoryScope("/repo/alpha");
+    const scopedHtml = render(AgentsView).body;
+    expect(scopedHtml).toContain('data-testid="agents-scope"');
+    expect(scopedHtml).toContain('data-repo-logo');
+    expect(scopedHtml).not.toContain('data-testid="agents-attention-tray"');
+    expect(scopedHtml).not.toContain("Antigravity ·");
+  });
+
+  it("wires search keyboard shortcuts, Columns popover, empty search recovery, and Enter primary action in AgentsView", () => {
+    expect(source).toContain('data-testid="agents-search"');
+    expect(source).toContain('placeholder="Search agents, repositories, branches…"');
+    expect(source).toContain('aria-label="Clear search"');
+    expect(source).toContain('event.key !== "/"');
+    expect(source).toContain('event.key === "Escape"');
+    expect(source).toContain('event.key === "ArrowDown"');
+    expect(source).toContain('data-testid="agents-search-count"');
+    expect(source).toContain('data-testid="agents-columns-toggle"');
+    expect(source).toContain('data-testid="agents-columns-menu"');
+    expect(source).toContain("Show all columns");
+    expect(source).toContain("Show all repositories");
+    expect(source).toContain('case "Enter":');
+    expect(source).toContain("No agents match");
+  });
+
+  it("renders RepoLogo on local Mavi rows, checkout fallback when Checkout hidden, and animated running indicator", () => {
+    const rows = [
+      {
+        key: "m-local",
+        title: "Local working thread",
+        where: "GitPulse",
+        root: "/code/GitPulse",
+        ssh: false,
+        live: true,
+        presence: "Working",
+        status: "working" as const,
+        attention: "",
+        needsAction: false,
+        edited: 1,
+        lastActivityAt: 1000,
+      },
+      {
+        key: "m-ssh",
+        title: "Remote idle thread",
+        where: "gpu:~/app",
+        root: null,
+        ssh: true,
+        live: false,
+        presence: "Not running",
+        status: "not_running" as const,
+        attention: "",
+        needsAction: false,
+        edited: null,
+        lastActivityAt: 500,
+      },
+    ];
+    const body = render(MaviAgentsTable, {
+      props: {
+        rows,
+        compact: false,
+        columnVisible: () => true,
+      },
+    }).body;
+    expect(body).toContain('data-repo-logo');
+    expect(body).toContain('data-testid="mavi-running-indicator"');
+    expect(body).toContain("animate-spin");
+
+    const noCheckoutBody = render(MaviAgentsTable, {
+      props: {
+        rows,
+        compact: false,
+        columnVisible: (key) => key !== "checkout",
+      },
+    }).body;
+    expect(noCheckoutBody).toContain("Mavi thread · GitPulse");
+    expect(noCheckoutBody).toContain("Mavi thread · SSH host · gpu:~/app");
+  });
+
+  it("persists and resets agentsGroupByRepo on interfaceStore", () => {
+    interfaceStore.setAgentsGroupByRepo("repo");
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("repo");
+    interfaceStore.setAgentsGroupByRepo("flat");
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("flat");
+    interfaceStore.setAgentsGroupByRepo("invalid" as never);
+    expect(get(interfaceStore).agentsGroupByRepo).toBe("auto");
   });
 });
 
