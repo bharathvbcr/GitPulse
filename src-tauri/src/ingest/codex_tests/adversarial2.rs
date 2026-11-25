@@ -240,7 +240,7 @@ fn m02_a_codex_root_that_held_nothing_and_is_gone_does_not_stop_claude_cursors_b
     let codex = scratch.path().join("sessions");
     std::fs::create_dir_all(&codex).unwrap();
     let claude = tempfile::tempdir().unwrap();
-    let cpath = claude.path().join("slug/C.jsonl");
+    let cpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&cpath, &[claude_edit(w1, "C", 1, &format!("{w1}/c.rs"))]);
     let out = with_roots(Some(claude.path()), Some(&codex), || {
         pair.pass();

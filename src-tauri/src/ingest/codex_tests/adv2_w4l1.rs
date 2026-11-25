@@ -28,7 +28,7 @@ fn u1_pre_change_random_ulid_rows_rerecord_once_then_never() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    let lpath = claude.path().join("slug/C.jsonl");
+    let lpath = claude.path().join_parts("slug/C.jsonl");
     write_lines(&lpath, &three_lines(w1));
     with_roots(Some(claude.path()), None, || {
         assert_eq!(pair.pass().recorded, 3);
@@ -67,7 +67,7 @@ fn i1_a_symlinked_root_spelling_records_nothing_twice() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
     let claude = tempfile::tempdir().unwrap();
-    write_lines(&claude.path().join("slug/C.jsonl"), &three_lines(w1));
+    write_lines(&claude.path().join_parts("slug/C.jsonl"), &three_lines(w1));
     let link_parent = tempfile::tempdir().unwrap();
     let link: PathBuf = link_parent.path().join("alias");
     std::os::unix::fs::symlink(claude.path(), &link).unwrap();
