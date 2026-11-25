@@ -1299,11 +1299,7 @@ fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_vol
             unix.to_string()
         }
     };
-    let (small, denied, gone) = (
-        abs("/volumes/small/work"),
-        abs("/denied"),
-        abs("/gone"),
-    );
+    let (small, denied, gone) = (abs("/volumes/small/work"), abs("/denied"), abs("/gone"));
     let there = Path::new(&small);
     let here = PathBuf::from(abs("/volumes/big/hook"));
     let read = |path: &Path| {

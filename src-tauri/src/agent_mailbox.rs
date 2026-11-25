@@ -439,8 +439,15 @@ impl AdvisoryLock {
                 path.display()
             )));
         }
-        file.lock()
-            .map_err(|e| io("could not lock the mailbox", &e))?;
+        // A signal can interrupt the blocking `flock`; the Unix code this
+        // replaced retried it, and `File::lock` makes one attempt.
+        loop {
+            match file.lock() {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(io("could not lock the mailbox", &e)),
+            }
+        }
         Ok(Self { file })
     }
 }

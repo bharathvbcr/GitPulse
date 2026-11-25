@@ -423,7 +423,9 @@ fn link_details_say_what_depends_on_path() {
             .expect("the hook link was attempted");
         assert!(!refusal.ok);
         assert!(
-            refusal.message.contains("links are not created on this platform"),
+            refusal
+                .message
+                .contains("links are not created on this platform"),
             "{}",
             refusal.message
         );

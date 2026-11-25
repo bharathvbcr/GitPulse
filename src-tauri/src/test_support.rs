@@ -537,7 +537,11 @@ pub(crate) fn platform_can_hold(rel: &str) -> bool {
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     rel.split('/').all(|part| {
-        let stem = part.split('.').next().unwrap_or_default().to_ascii_uppercase();
+        let stem = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
         !part.is_empty()
             && !part.ends_with(['.', ' '])
             && !part

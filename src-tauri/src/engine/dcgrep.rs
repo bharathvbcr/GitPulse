@@ -878,12 +878,7 @@ mod tests {
     /// A launcher that answers `health` with `json` after `delay_secs`, exits 1
     /// for anything else, and writes `trace` whenever it starts. A shell script
     /// on Unix; Windows runs no `#!` script, so there it is a batch file.
-    fn health_stub(
-        dir: &Path,
-        json: &str,
-        delay_secs: u32,
-        trace: Option<&Path>,
-    ) -> PathBuf {
+    fn health_stub(dir: &Path, json: &str, delay_secs: u32, trace: Option<&Path>) -> PathBuf {
         #[cfg(unix)]
         {
             let trace = trace

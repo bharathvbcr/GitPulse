@@ -4591,7 +4591,13 @@ fn a_scrubbed_child_keeps_only_allowlisted_inherited_variables() {
         })
         .collect();
     let names: Vec<&str> = seen.keys().map(String::as_str).collect();
-    let mut expected = ["EXPLICIT", HOME_ENV_VAR, "HTTPS_PROXY", "LC_ALL", "MY_API_KEY"];
+    let mut expected = [
+        "EXPLICIT",
+        HOME_ENV_VAR,
+        "HTTPS_PROXY",
+        "LC_ALL",
+        "MY_API_KEY",
+    ];
     expected.sort_unstable();
     assert_eq!(names, expected, "{seen:?}");
     // A PATH the builder removed is not resurrected from the inherited one.

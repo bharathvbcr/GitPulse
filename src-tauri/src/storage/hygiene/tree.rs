@@ -57,37 +57,15 @@ impl Stamp {
 /// itself: what `dev`, `ino` and `ctime` are to a Unix stamp.
 #[cfg(windows)]
 mod windows_stamp {
-    use std::ffi::c_void;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
-
-    /// `FILE_BASIC_INFO`: four times, then the attributes, padded to eight.
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileBasicInfo {
-        creation_time: i64,
-        last_access_time: i64,
-        last_write_time: i64,
-        change_time: i64,
-        file_attributes: u32,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            handle: *mut c_void,
-            class: i32,
-            info: *mut c_void,
-            size: u32,
-        ) -> i32;
-    }
 
     /// `((volume, file id), (seconds, nanoseconds of the change time))` of the
     /// entry at `path`, a reparse point not followed. The file id is 128 bits
     /// on ReFS and 64 on NTFS; folded to 64, which tells two files apart for
     /// every purpose a stamp has. The change time moves with any write and
-    /// with a restored modification time, which is what a rewrite hides.
+    /// with a restored modification time, which is what a rewrite hides; it is
+    /// read through `fs_entry::windows_change_time`, the one owner of that call.
     pub(super) fn read(path: &Path) -> std::io::Result<((u64, u64), (i64, i64))> {
         let file = std::fs::OpenOptions::new()
             // FILE_READ_ATTRIBUTES: no data access, so no sharing conflict.
@@ -100,26 +78,18 @@ mod windows_stamp {
         let (volume, id) = crate::fs_entry::windows_file_identity(&file)?;
         let low = u64::from_le_bytes(id[..8].try_into().unwrap_or_default());
         let high = u64::from_le_bytes(id[8..].try_into().unwrap_or_default());
-        let mut info = FileBasicInfo::default();
-        // SAFETY: `file` owns the live handle; class 0 is FILE_BASIC_INFO,
-        // whose documented layout `FileBasicInfo` repeats, and the size is the
-        // output buffer's exact size.
-        let ok = unsafe {
-            GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                0,
-                (&mut info as *mut FileBasicInfo).cast(),
-                std::mem::size_of::<FileBasicInfo>() as u32,
-            )
+        let changed = crate::fs_entry::windows_change_time(&file)?;
+        let changed = match changed.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => (after.as_secs() as i64, i64::from(after.subsec_nanos())),
+            Err(before) => {
+                let before = before.duration();
+                (
+                    -(before.as_secs() as i64),
+                    -i64::from(before.subsec_nanos()),
+                )
+            }
         };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ticks = info.change_time;
-        Ok((
-            (volume, low ^ high.rotate_left(32)),
-            (ticks / 10_000_000, ticks.rem_euclid(10_000_000) * 100),
-        ))
+        Ok(((volume, low ^ high.rotate_left(32)), changed))
     }
 }
 

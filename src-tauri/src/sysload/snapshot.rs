@@ -1264,7 +1264,11 @@ pub fn report(path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
 /// [`report`] for a reader on `platform`: a reader with no sensor has nothing
 /// to say about the sampler whatever the record holds. Named so the replay
 /// tests can read a record as a reader that has one on any host.
-pub(crate) fn report_on(platform: Platform, path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
+pub(crate) fn report_on(
+    platform: Platform,
+    path: &Path,
+    now: Clock,
+) -> (SensorReport, Option<Snapshot>) {
     let dead = |reason: String| SensorReport {
         state: SensorState::Dead,
         age_ms: None,
