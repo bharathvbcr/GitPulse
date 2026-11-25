@@ -923,14 +923,14 @@ impl CampaignController {
 
         let mut anchor_oid_out = None;
         if let Some((trust_root, common)) = enclosing_git_common_dir(path) {
-            let Some(common_str) = common.to_str() else {
+            let Some(common_str) = git_dir_arg(&common) else {
                 return Err("Git common directory path is not valid UTF-8".to_string());
             };
             let state_sha256 = hex_sha256(&sha256_digest(&[&bytes]));
             let oid = verify_odb_state_anchor(
                 &trust_root,
                 &common,
-                common_str,
+                &common_str,
                 &key,
                 &state_sha256,
                 &envelope.envelope_hmac_sha256,
@@ -952,10 +952,10 @@ impl CampaignController {
 
         let git_ctx = enclosing_git_common_dir(path);
         let existing_anchor = if let Some((ref trust_root, ref common)) = git_ctx {
-            let Some(common_str) = common.to_str() else {
+            let Some(common_str) = git_dir_arg(common) else {
                 return Err("Git common directory path is not valid UTF-8".to_string());
             };
-            read_odb_state_anchor(trust_root, common_str)?
+            read_odb_state_anchor(trust_root, &common_str)?
         } else {
             None
         };
@@ -1043,7 +1043,7 @@ impl CampaignController {
         }
 
         if let Some((ref trust_root, ref common)) = git_ctx {
-            let Some(common_str) = common.to_str() else {
+            let Some(common_str) = git_dir_arg(common) else {
                 return Err("Git common directory path is not valid UTF-8".to_string());
             };
             let state_sha256 = hex_sha256(&sha256_digest(&[&encoded]));
@@ -1068,7 +1068,7 @@ impl CampaignController {
                 self.target_history.len(),
                 &key,
             )?;
-            write_and_cas_odb_state_anchor(trust_root, common_str, &anchor, prev_oid.as_deref())?;
+            write_and_cas_odb_state_anchor(trust_root, &common_str, &anchor, prev_oid.as_deref())?;
         }
 
         write_private_atomic(path, &encoded)
@@ -1616,6 +1616,14 @@ impl CampaignOdbStateAnchor {
     }
 }
 
+/// `dir` as the text git takes for `--git-dir`. The repository identity spells
+/// the common directory `\\?\C:\...` on Windows and git refuses that form
+/// ("not a git repository"), so the argument uses the plain spelling; the
+/// identity paths themselves are untouched.
+fn git_dir_arg(dir: &Path) -> Option<String> {
+    dir.to_str().map(crate::engine::process::plain_path_text)
+}
+
 fn enclosing_git_common_dir(state_path: &Path) -> Option<(PathBuf, PathBuf)> {
     let git_dir = state_path.parent()?.parent()?;
     if !git_dir.join("HEAD").is_file() || !git_dir.join("objects").is_dir() {
@@ -2030,14 +2038,14 @@ fn verify_campaign_against_git_odb(
     common: &Path,
     ctrl: &CampaignController,
 ) -> (Option<String>, Option<bool>, Option<String>) {
-    let Some(common_str) = common.to_str() else {
+    let Some(common_str) = git_dir_arg(common) else {
         return (
             None,
             None,
             Some("Git common directory path is not valid UTF-8".to_string()),
         );
     };
-    let live_head = match resolve_canonical_commit_oid(repo, common_str, "HEAD") {
+    let live_head = match resolve_canonical_commit_oid(repo, &common_str, "HEAD") {
         Err(msg) => return (None, None, Some(msg)),
         Ok(None) => {
             return (
@@ -2062,7 +2070,7 @@ fn verify_campaign_against_git_odb(
             )),
         );
     }
-    match resolve_canonical_commit_oid(repo, common_str, genesis) {
+    match resolve_canonical_commit_oid(repo, &common_str, genesis) {
         Err(msg) => return (Some(live_head), Some(false), Some(msg)),
         Ok(Some(resolved)) if resolved.eq_ignore_ascii_case(genesis) => {}
         Ok(_) => {
@@ -2088,7 +2096,7 @@ fn verify_campaign_against_git_odb(
                     )),
                 );
             }
-            match resolve_canonical_commit_oid(repo, common_str, oid) {
+            match resolve_canonical_commit_oid(repo, &common_str, oid) {
                 Err(msg) => return (Some(live_head), Some(false), Some(msg)),
                 Ok(Some(resolved)) if resolved.eq_ignore_ascii_case(oid) => {}
                 Ok(_) => {
@@ -2109,7 +2117,7 @@ fn verify_campaign_against_git_odb(
             &[
                 "--no-optional-locks",
                 "--git-dir",
-                common_str,
+                &common_str,
                 "merge-base",
                 "--is-ancestor",
                 &rec.parent_oid,
@@ -2194,10 +2202,9 @@ pub fn audit_repo_campaign(
             let key_path = campaign_key_path_for(&state_path);
             let key_present = std::fs::symlink_metadata(&key_path).is_ok();
             let key_ok = load_verified_campaign_key(&key_path).is_ok();
-            let odb_probe = common
-                .to_str()
+            let odb_probe = git_dir_arg(&common)
                 .ok_or_else(|| "Git common directory path is not valid UTF-8".to_string())
-                .and_then(|cs| read_odb_state_anchor(&repo, cs));
+                .and_then(|cs| read_odb_state_anchor(&repo, &cs));
             match odb_probe {
                 Err(err_msg) => {
                     return Ok(CampaignAuditReport {
