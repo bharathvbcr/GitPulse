@@ -60,6 +60,7 @@ const VENDORED_ALLOWED: &[(&str, usize, &str)] = &[
     ("devmap-query/src/cypher.rs", 1,"upstream DevCouncil: guarded, `ends_with(open)` so the `len - open.len_utf8()` tail is exactly one char"),
     ("devmap-analyze/src/scoping.rs", 3, "upstream DevCouncil: all three are safe, read at scoping.rs:232-238. `pattern[..len - 1]` and `pattern[..len - 2]` run only after `pattern.ends_with(\"/*\")`, and `target[..len - 2]` only after `target.ends_with(\"/*\")`; both tail chars are one-byte ASCII, so each cut is a boundary and len >= 2 (no underflow). The `specifier[prefix.len() + 1..]` that follows is not a len-N cut: `specifier.starts_with(pattern[..len - 1])` makes prefix.len() + 1 a boundary within specifier"),
     ("devmap-resolve/src/lsp.rs", 1, "upstream DevCouncil: slice of a Vec<&str> of stderr lines (`all[all.len().saturating_sub(N)..]`), not a str"),
+    ("dc-store/src/workbench/vacuum.rs", 1, "upstream DevCouncil: guarded, `word[..word.len() - 1]` runs only after `word.ends_with('%')` and `word.len() > 1`; `%` is one ASCII byte, so the cut is a boundary"),
 ];
 
 fn check(
