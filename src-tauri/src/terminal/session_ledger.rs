@@ -1036,8 +1036,10 @@ impl SessionLedger {
         }
         // Cache repeated (provider, session_id) transcript filesystem probes within one view build.
         let mut cache: HashMap<(String, String), conversation::Transcript> = HashMap::new();
-        // One offer per conversation: the newest row wins, and a conversation
-        // that is running again offers nothing.
+        // One offer per conversation: the newest row of any state wins, and a
+        // conversation that is running again offers nothing. A conversation
+        // continued in a later tab that then ended cleanly, or was closed,
+        // must not be offered again from an older row.
         let mut taken: HashSet<(String, String)> = guard
             .entries
             .iter()
@@ -1056,13 +1058,11 @@ impl SessionLedger {
                     offers.push(project_corrupt_row(row_id, detail));
                 }
                 Entry::Valid(row) => {
-                    if row.withdrawn || !is_offer_end_state(row.end_state) {
+                    // Claimed before the offer test, so a newer row that is
+                    // not an offer still hides every older one.
+                    let newest = conversation_key(row).is_none_or(|key| taken.insert(key));
+                    if !newest || row.withdrawn || !is_offer_end_state(row.end_state) {
                         continue;
-                    }
-                    if let Some(key) = conversation_key(row) {
-                        if !taken.insert(key) {
-                            continue;
-                        }
                     }
                     let offer = project_valid_row(row, |prov, sid| {
                         conversation::check_session_resumability_with(
@@ -2260,15 +2260,15 @@ mod tests {
     fn startup_repairs_clean_rows_that_carry_no_code_and_no_signal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_LEDGER_FILE);
-        let row = |id: &str, state: &str, code: &str, wd: bool| {
+        let row = |id: &str, state: &str, code: &str, wd: bool, sid: &str| {
             format!(
-                "{{\"v\":1,\"row_id\":\"{id}\",\"terminal_id\":\"t-{id}\",\"launcher\":\"claude\",\"native_id\":\"{UUID_1}\",\"repo_path\":\"/r\",\"start_dir\":null,\"cwd\":\"/r\",\"mode\":null,\"started_at\":1,\"ended_at\":2,\"end_state\":\"{state}\",\"signal\":null,\"exit_code\":{code},\"last_error\":null,\"withdrawn\":{wd}}}\n"
+                "{{\"v\":1,\"row_id\":\"{id}\",\"terminal_id\":\"t-{id}\",\"launcher\":\"claude\",\"native_id\":\"{sid}\",\"repo_path\":\"/r\",\"start_dir\":null,\"cwd\":\"/r\",\"mode\":null,\"started_at\":1,\"ended_at\":2,\"end_state\":\"{state}\",\"signal\":null,\"exit_code\":{code},\"last_error\":null,\"withdrawn\":{wd}}}\n"
             )
         };
         let mut text = String::new();
-        text += &row("bad", "exited_clean", "null", false);
-        text += &row("user", "exited_clean", "null", true);
-        text += &row("coded", "exited_clean", "0", false);
+        text += &row("bad", "exited_clean", "null", false, UUID_1);
+        text += &row("user", "exited_clean", "null", true, UUID_2);
+        text += &row("coded", "exited_clean", "0", false, UUID_3);
         fs::write(&path, text).unwrap();
         let ledger = SessionLedger::open(&path);
         assert_eq!(state_of(&ledger, "bad"), (SessionEndState::Lost, false));
@@ -2395,6 +2395,45 @@ mod tests {
         let view = ledger.view_with(|_, _| Transcript::Found);
         assert_eq!(view.offers.len(), 1);
         assert_eq!(view.offers[0].row_id, new);
+    }
+
+    /// A conversation lost in one reboot and then continued in a later tab
+    /// that ended on its own must not be offered again from the older row:
+    /// the startup repair revives old rows, and the newest row decides.
+    #[test]
+    fn an_older_offer_yields_to_a_newer_row_of_any_state_for_the_same_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let lost = ledger.record_spawn(spawn_spec(
+            "term-old",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.record_exit(
+            "term-old",
+            ExitFacts {
+                error: Some("host ended"),
+                ..ExitFacts::default()
+            },
+        ));
+        assert_eq!(state_of(&ledger, &lost).0, SessionEndState::Lost);
+        // Continued by hand in a new tab (not a reopen), which then exits cleanly.
+        ledger.record_spawn(spawn_spec(
+            "term-new",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.record_exit("term-new", ExitFacts::reaped(false, Some(0), None)));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(
+            view.offers.iter().all(|o| o.row_id != lost),
+            "a conversation that was continued and ended cleanly is not offered again"
+        );
+        assert_eq!(view.reopenable_count, 0);
     }
 
     #[test]
