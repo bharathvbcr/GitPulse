@@ -449,31 +449,57 @@ export interface InterruptedSummary {
   entries: SessionLedgerOffer[];
   /** Children of each entry, keyed by entry row id. Never part of `resumable`. */
   children: Map<string, SessionLedgerOffer[]>;
+  /** Entries from the latest incident: what the notice counts and "Reopen all" acts on. */
+  latest: SessionLedgerOffer[];
+  /** Resumable entries from the latest incident. */
   resumable: SessionLedgerOffer[];
+  /** Entries from the latest incident that cannot be resumed. */
   unresumable: SessionLedgerOffer[];
+  /** Entries from earlier incidents: still offered one by one in Review, never in "Reopen all". */
+  earlier: SessionLedgerOffer[];
 }
+
+/**
+ * How far before the newest interrupted entry another still belongs to the
+ * same incident. A crash ends every session within seconds of the others; a
+ * row lost days before (or repaired from an older build's ledger) is a
+ * conversation the person may since have continued by hand, so "Reopen all"
+ * must not resume it unasked.
+ */
+export const INCIDENT_WINDOW_MS = 60 * 60 * 1000;
 
 /** Splits the ledger into agent rows that can be resumed and those that cannot (shell and corrupt rows are not agents). */
 export function summarizeInterrupted(offers: readonly SessionLedgerOffer[]): InterruptedSummary {
   const agents = offers.filter((offer) => offer.end_state !== "unreadable" && offer.launcher !== "shell");
   const entries = topLevelOffers(agents);
-  const resumable = reopenableOffers(entries);
+  const newest = Math.max(0, ...entries.map((offer) => offer.ended_at ?? 0));
+  // A row with no end time is still running or unknown: it is current, never "earlier".
+  const isLatest = (offer: SessionLedgerOffer) =>
+    offer.ended_at == null || offer.ended_at >= newest - INCIDENT_WINDOW_MS;
+  const latest = entries.filter(isLatest);
+  const resumable = reopenableOffers(latest);
   const ids = new Set(resumable.map((offer) => offer.row_id));
   return {
     agents,
     entries,
     children: childOffersByParent(agents),
+    latest,
     resumable,
-    unresumable: entries.filter((offer) => !ids.has(offer.row_id)),
+    unresumable: latest.filter((offer) => !ids.has(offer.row_id)),
+    earlier: entries.filter((offer) => !isLatest(offer)),
   };
 }
 
 /** "3 agent sessions were interrupted. 1 cannot be resumed." */
 export function interruptedNoticeText(summary: InterruptedSummary): string {
-  const total = summary.entries.length;
+  const total = summary.latest.length;
   const head = `${total} agent ${total === 1 ? "session was" : "sessions were"} interrupted.`;
   const gone = summary.unresumable.length;
-  return gone > 0 ? `${head} ${gone} cannot be resumed.` : head;
+  const parts = [head];
+  if (gone > 0) parts.push(`${gone} cannot be resumed.`);
+  const older = summary.earlier.length;
+  if (older > 0) parts.push(`${older} from earlier ${older === 1 ? "is" : "are"} in Review.`);
+  return parts.join(" ");
 }
 
 /**

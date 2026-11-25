@@ -74,6 +74,34 @@ describe("interrupted-agents notice logic", () => {
   });
 });
 
+describe("latest incident only", () => {
+  // The user's real ledger on 2026-11-24: 15 agents lost at 15:32 that day,
+  // 17 more repaired from the 11-19 reboot five days earlier.
+  const DAY = 24 * 3600 * 1000;
+  const today = 1_795_559_524_000;
+  const uuid = (n: number) => `6f0a6d1e-1111-4222-8333-${String(n).padStart(12, "0")}`;
+  const lostAt = (prefix: string, at: number, n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      makeOffer({ row_id: `${prefix}${i}`, native_id: uuid(prefix === "t" ? i : 100 + i), ended_at: at + i * 30 }),
+    );
+  const offers = [...lostAt("t", today, 15), ...lostAt("o", today - 5 * DAY, 17)];
+
+  it("counts and reopens only the latest incident, and names the earlier ones", () => {
+    const summary = summarizeInterrupted(offers);
+    expect(summary.resumable).toHaveLength(15);
+    expect(summary.earlier).toHaveLength(17);
+    expect(interruptedNoticeText(summary)).toBe(
+      "15 agent sessions were interrupted. 17 from earlier are in Review.",
+    );
+  });
+
+  it("keeps a lone older incident whole when nothing newer exists", () => {
+    const summary = summarizeInterrupted(lostAt("o", today - 5 * DAY, 17));
+    expect(summary.resumable).toHaveLength(17);
+    expect(summary.earlier).toHaveLength(0);
+  });
+});
+
 describe("bounded Reopen all", () => {
   it("reopens one row at a time and never touches non-resumable rows", async () => {
     let active = 0;
