@@ -243,6 +243,9 @@ site | src/leak_scan/recall_tests.rs | run | 0 | bounded-poll
 site | src/logging/performance.rs | a_burst_of_quick_calls_wakes_the_watchdog_once_not_once_per_call | 0 | spacing
 site | src/logging/performance.rs | wait_until | 0 | bounded-poll
 
+# src/mavi/session.rs
+site | src/mavi/session.rs | written_answer | 0 | bounded-poll
+
 # src/mcp/worktree_seed_tests.rs
 site | src/mcp/worktree_seed_tests.rs | assert_build_runs_in | 0 | bounded-poll
 
@@ -334,6 +337,9 @@ site | src/terminal/mod.rs | characterization_a_terminal_claude_with_no_registry
 site | src/terminal/mod.rs | output_printed_while_detached_is_replayed_to_the_next_view | 0 | bounded-poll
 site | src/terminal/mod.rs | read_pid | 0 | bounded-poll
 site | src/terminal/mod.rs | wait_until | 0 | bounded-poll
+
+# src/terminal/port_probe.rs
+site | src/terminal/port_probe.rs | start_listener_named | 0 | bounded-poll
 
 # src/test_support.rs
 site | src/test_support.rs | wait_gone | 0 | bounded-poll

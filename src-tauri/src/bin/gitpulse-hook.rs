@@ -382,8 +382,8 @@ Close options:
 /// The external owner a hook-CLI call with no terminal credentials runs as:
 /// the Mavi thread key in `GITPULSE_ORCHESTRATE_CALLER` when the host set one
 /// (an invalid value is an error), otherwise `ext-<ppid>`.
-fn external_hook_caller_id() -> Result<String, String> {
-    gitpulse_lib::terminal::orchestrate::standalone_caller_id(|| {
+fn external_hook_caller_id(env_caller: Option<&str>) -> Result<String, String> {
+    gitpulse_lib::terminal::orchestrate::standalone_caller_id_from(env_caller, || {
         #[cfg(unix)]
         {
             format!("ext-{}", std::os::unix::process::parent_id())
@@ -447,11 +447,25 @@ fn parse_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
         .map_err(|_| format!("flag {flag:?} expects a positive integer, got {raw:?}"))
 }
 
+#[cfg(test)]
 fn parse_term_cli(
     args: &[String],
     default_repo: Option<&str>,
     env_session_id: Option<&str>,
     env_session_token: Option<&str>,
+) -> Result<TermCliOutcome, String> {
+    parse_term_cli_with(args, default_repo, env_session_id, env_session_token, None)
+}
+
+/// Parses a `term` command line. Every value that comes from the environment
+/// (repository, session id, token, the orchestrate caller variable) is passed
+/// in by the caller, so the parse reads no process state.
+fn parse_term_cli_with(
+    args: &[String],
+    default_repo: Option<&str>,
+    env_session_id: Option<&str>,
+    env_session_token: Option<&str>,
+    env_caller: Option<&str>,
 ) -> Result<TermCliOutcome, String> {
     use gitpulse_lib::terminal::orchestrate::OrchestrateCall;
 
@@ -495,7 +509,7 @@ fn parse_term_cli(
             .filter(|s| !s.is_empty());
         match (sid, tok) {
             (Some(s), Some(t)) => Ok((repo, Some(s), Some(t), None)),
-            (None, None) => Ok((repo, None, None, Some(external_hook_caller_id()?))),
+            (None, None) => Ok((repo, None, None, Some(external_hook_caller_id(env_caller)?))),
             (Some(_), None) => Err(format!(
                 "missing caller session capability token: {} is not set",
                 gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV
@@ -1030,12 +1044,15 @@ fn run_term_cli(args: &[String]) -> i32 {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var(gitpulse_lib::alerts::bridge::SESSION_ENV).ok());
     let env_tok = std::env::var(gitpulse_lib::terminal::orchestrate::SESSION_TOKEN_ENV).ok();
+    let env_caller =
+        std::env::var(gitpulse_lib::terminal::orchestrate::ORCHESTRATE_CALLER_ENV).ok();
 
-    match parse_term_cli(
+    match parse_term_cli_with(
         args,
         default_repo.as_deref(),
         env_sid.as_deref(),
         env_tok.as_deref(),
+        env_caller.as_deref(),
     ) {
         Ok(TermCliOutcome::Help(help)) => {
             emit(help);
@@ -1093,40 +1110,16 @@ mod tests {
         assert_eq!(run_guarded(|| 0), 0);
     }
 
-    /// Serializes the tests that read or write `GITPULSE_ORCHESTRATE_CALLER`,
-    /// which is process-global.
-    static CALLER_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// `GITPULSE_ORCHESTRATE_CALLER` set to `value` (or removed) for `f`, and
-    /// restored after, even when `f` panics.
-    fn with_caller_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        use gitpulse_lib::terminal::orchestrate::ORCHESTRATE_CALLER_ENV as NAME;
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                // SAFETY: serialized by CALLER_ENV, held by the caller.
-                match self.0.take() {
-                    Some(v) => unsafe { std::env::set_var(NAME, v) },
-                    None => unsafe { std::env::remove_var(NAME) },
-                }
-            }
-        }
-        let _lock = CALLER_ENV.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = Restore(std::env::var_os(NAME));
-        // SAFETY: serialized by CALLER_ENV.
-        match value {
-            Some(v) => unsafe { std::env::set_var(NAME, v) },
-            None => unsafe { std::env::remove_var(NAME) },
-        }
-        f()
-    }
-
-    fn standalone_exec_caller() -> Result<Option<String>, String> {
-        match parse_term_cli(
+    /// A standalone `term exec` parsed with `env_caller` as the value of
+    /// `GITPULSE_ORCHESTRATE_CALLER`: passed in, as the CLI's entry point
+    /// passes what it read, so no test writes the process environment.
+    fn standalone_exec_caller(env_caller: Option<&str>) -> Result<Option<String>, String> {
+        match parse_term_cli_with(
             &vec_args(&["exec", "--command", "true"]),
             Some(REPO_ROOT),
             None,
             None,
+            env_caller,
         )? {
             TermCliOutcome::Call(OrchestrateCall::Exec {
                 external_caller_id, ..
@@ -1138,14 +1131,14 @@ mod tests {
     #[test]
     fn a_mavi_agents_caller_variable_names_its_thread_as_the_hook_owner() {
         let key = "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
-        let got = with_caller_env(Some(key), standalone_exec_caller).expect("parse");
+        let got = standalone_exec_caller(Some(key)).expect("parse");
         assert_eq!(got.as_deref(), Some(key));
     }
 
     #[test]
     fn an_invalid_caller_variable_is_refused_by_the_hook_not_replaced_by_ext_ppid() {
         for bad in ["ext-1234", "ext-mavi-not-a-uuid", "someone-else"] {
-            let err = with_caller_env(Some(bad), standalone_exec_caller)
+            let err = standalone_exec_caller(Some(bad))
                 .expect_err("an invalid caller variable must fail loudly");
             assert!(err.contains("GITPULSE_ORCHESTRATE_CALLER"), "{bad}: {err}");
         }
@@ -1309,7 +1302,7 @@ mod tests {
             })
         );
 
-        let (exec, standalone_owner) = with_caller_env(None, || {
+        let (exec, standalone_owner) = {
             let parsed = parse_term_cli(
                 &vec_args(&[
                     "exec",
@@ -1328,8 +1321,11 @@ mod tests {
                 None,
             )
             .expect("standalone exec parse");
-            (parsed, external_hook_caller_id().expect("standalone owner"))
-        });
+            (
+                parsed,
+                external_hook_caller_id(None).expect("standalone owner"),
+            )
+        };
         assert_eq!(
             exec,
             TermCliOutcome::Call(OrchestrateCall::Exec {
