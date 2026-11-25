@@ -2111,9 +2111,11 @@ mod tests {
         let records = crate::lappi::record::Store::default_dir().expect("store dir");
         assert!(config.starts_with(&root), "{config:?} escapes {root:?}");
         assert!(records.starts_with(&root), "{records:?} escapes {root:?}");
-        if let Some(real) = crate::test_support::env::hermetic::real_home() {
-            assert!(!config.starts_with(&real) && !records.starts_with(&real));
-        }
+        assert!(
+            !crate::test_support::env::hermetic::reaches_real_home(&config)
+                && !crate::test_support::env::hermetic::reaches_real_home(&records),
+            "{config:?} or {records:?} reaches the developer's home"
+        );
 
         let dir = tempfile::TempDir::new().expect("config dir");
         let bound = dir.path().join("tools.json");

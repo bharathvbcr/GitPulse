@@ -366,6 +366,15 @@ pub(crate) mod hermetic {
             .map(PathBuf::from)
     }
 
+    /// Whether `path` reaches the developer's own home: under the real `HOME`
+    /// and not under this process's root. "Under the real home" alone is not
+    /// the leak: on Windows the root lives in `%TEMP%`, which is
+    /// `%USERPROFILE%\AppData\Local\Temp`, so every hermetic path is under the
+    /// real home there and none of them is the developer's state.
+    pub(crate) fn reaches_real_home(path: &Path) -> bool {
+        real_home().is_some_and(|real| path.starts_with(&real) && !path.starts_with(root()))
+    }
+
     /// Variables that, set in the developer's shell or leaked by a git hook that
     /// launched the test run, redirect git or point GitPulse at their state.
     const SCRUBBED: &[&str] = &[

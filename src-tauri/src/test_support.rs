@@ -1231,13 +1231,11 @@ mod hermetic_canary {
             "HOME is {home:?}, not under {}",
             hermetic::root().display()
         );
-        if let Some(real) = hermetic::real_home() {
-            assert!(
-                !home.as_deref().is_some_and(|home| home.starts_with(&real)),
-                "HOME still points into the developer's {}",
-                real.display()
-            );
-        }
+        assert!(
+            !home.as_deref().is_some_and(hermetic::reaches_real_home),
+            "HOME still points into the developer's {:?}",
+            hermetic::real_home()
+        );
     }
 
     /// A developer's `core.hooksPath`, `init.defaultBranch` or `commit.gpgsign`
@@ -1282,9 +1280,43 @@ mod hermetic_canary {
         );
     }
 
+    /// The Windows runner's lines, spelled with a backslash git must quote on
+    /// any platform: read raw, a quoted origin named no file under the root.
+    #[test]
+    fn a_quoted_origin_is_read_as_the_path_it_quotes() {
+        let root = Path::new(r"/tmp/gph-1\2");
+        assert!(origin_is_under(
+            "file:\"/tmp/gph-1\\\\2/gitconfig\"\tgc.auto=0",
+            root
+        ));
+        assert!(origin_is_under(
+            "file:/tmp/gph-1\\2/gitconfig\tgc.auto=0",
+            root
+        ));
+        assert!(!origin_is_under(
+            "file:\"/Users/dev/.gitconfig\"\tcore.hooksPath=/x",
+            root
+        ));
+        // An unterminated quote names nothing, so it counts as foreign.
+        assert!(!origin_is_under("file:\"/tmp/gph-1\\\\2/gitconfig", root));
+        assert!(!origin_is_under("command line:\tgc.auto=0", root));
+    }
+
+    /// `file:<path>\t<key>=<value>`. git quotes the path C-style when it holds
+    /// a backslash, so on Windows the origin is `file:"C:\\Users\\…\\gitconfig"`
+    /// and, read raw, named no file under any root.
     fn origin_is_under(line: &str, root: &Path) -> bool {
-        line.strip_prefix("file:")
-            .is_some_and(|rest| Path::new(rest).starts_with(root))
+        let Some(rest) = line.strip_prefix("file:") else {
+            return false;
+        };
+        let origin = match rest.strip_prefix('"') {
+            Some(quoted) => match quoted.find("\"\t") {
+                Some(end) => quoted[..end].replace("\\\\", "\\").replace("\\\"", "\""),
+                None => return false,
+            },
+            None => rest.split('\t').next().unwrap_or(rest).to_string(),
+        };
+        Path::new(&origin).starts_with(root)
     }
 }
 
