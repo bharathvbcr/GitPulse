@@ -124,3 +124,63 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
         missing = missing.message()
     );
 }
+
+/// A child that never started because no process slot came free inside its
+/// deadline is not a run that timed out: `run_captured` hands it back as the
+/// gate's error, which classifies as `SlotWaitTimeout`.
+#[cfg(unix)]
+#[test]
+fn run_captured_reports_a_slot_wait_as_an_error_not_a_timed_out_run() {
+    use std::time::Instant;
+    let gate = leak_gate(SpawnGate::new(1));
+    let permit = gate
+        .acquire(Instant::now() + Duration::from_secs(10))
+        .expect("slot");
+    let out = with_gate_for_test(gate, || {
+        run_captured(
+            "/usr/bin/true",
+            &[],
+            None,
+            Duration::from_millis(50),
+            &[],
+            MAX_OUTPUT_BYTES,
+        )
+    });
+    drop(permit);
+    match out {
+        Err(e) => assert_eq!(
+            RunError::classify(e.message()),
+            RunError::SlotWaitTimeout,
+            "{}",
+            e.message()
+        ),
+        Ok(outcome) => panic!("a slot wait came back as an outcome: {outcome:?}"),
+    }
+}
+
+/// The slot-wait check is anchored at the message's end: a program whose path
+/// spells the phrase and which really ran out of time is still a timed-out run.
+#[cfg(unix)]
+#[test]
+fn run_captured_keeps_a_real_timeout_when_the_program_path_spells_the_slot_phrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = dir
+        .path()
+        .join(format!("x{TIMEOUT_MARKER}1{SLOT_WAIT_SUFFIX}"));
+    std::fs::create_dir(&hostile).unwrap();
+    let program = hostile.join("sleep");
+    std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+    let out = run_captured(
+        program.to_str().unwrap(),
+        &["5"],
+        None,
+        Duration::from_secs(1),
+        &[],
+        MAX_OUTPUT_BYTES,
+    )
+    .expect("a real timeout is an outcome");
+    assert!(
+        matches!(out, RunOutcome::TimedOut(d) if d == Duration::from_secs(1)),
+        "{out:?}"
+    );
+}
