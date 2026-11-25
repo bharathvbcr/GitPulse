@@ -1447,16 +1447,16 @@ mod tests {
         let (_dir, repo) = home();
         super::super::with_conn(&repo, |conn| {
             for i in 0..1_000 {
-                reanchor_to(conn, &format!("/other/{i}"), &["/elsewhere".to_string()]);
+                reanchor_to(conn, &gone(&format!("/other/{i}")), &[gone("/elsewhere")]);
             }
             assert_eq!(
-                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
+                aliases(conn, &home_spellings(&repo)).unwrap(),
                 Vec::<String>::new()
             );
-            reanchor_to(conn, &repo, &["/elsewhere".to_string()]);
+            reanchor_to(conn, &repo, &[gone("/elsewhere")]);
             assert_eq!(
-                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
-                vec!["/elsewhere"]
+                aliases(conn, &home_spellings(&repo)).unwrap(),
+                vec![gone("/elsewhere")]
             );
             Ok(())
         })
@@ -1806,7 +1806,7 @@ mod tests {
         let identity = Identity::read(&repo).unwrap();
         super::super::with_conn(&repo, |conn| {
             record(conn, prior, ANCHOR, identity.to_detail(&[], None)).unwrap();
-            row_of(conn, prior);
+            row_of(conn, &canonical_repo(prior));
             Ok(())
         })
         .unwrap();
@@ -1888,10 +1888,11 @@ mod tests {
         let (db, b) = home();
         crate::test_support::git_in(db.path(), &["clone", "-q", &a, &b]);
         crate::test_support::trust_repo(Path::new(&b));
+        let a_stored = canonical_repo(&a);
         let identity = Identity::read(&b).unwrap();
         super::super::with_conn(&b, |conn| {
             record(conn, &a, ANCHOR, identity.to_detail(&[], None)).unwrap();
-            row_of(conn, &a);
+            row_of(conn, &a_stored);
             Ok(())
         })
         .unwrap();
@@ -1905,7 +1906,7 @@ mod tests {
         let waiting = settle_with(&b, &prober).unwrap_err();
         assert_eq!(waiting.message, live.message, "answered from the cache");
         clock.advance(Duration::from_secs(2));
-        assert_eq!(settle_with(&b, &prober).unwrap(), Some(vec![a]));
+        assert_eq!(settle_with(&b, &prober).unwrap(), Some(vec![a_stored]));
     }
 
     fn bound(site: Option<Site>) -> String {
@@ -2048,7 +2049,7 @@ mod tests {
             uuid: "7f9c24e8-3b1a-4c5d-9e2f-0a1b2c3d4e5f".into(),
             site: Some(Site::new(3, 4)),
         };
-        let detail = recorded.to_detail(&["/old".to_string()], Some(&binding));
+        let detail = recorded.to_detail(&[gone("/old")], Some(&binding));
         let value: serde_json::Value = serde_json::from_str(&detail).unwrap();
         assert_eq!(Identity::from_detail(&value), Some(recorded));
         assert_eq!(Binding::from_detail(&value), Some(binding));
@@ -2056,8 +2057,8 @@ mod tests {
         super::super::with_conn(&repo, |conn| {
             record(conn, &repo, REANCHOR, detail.clone()).unwrap();
             assert_eq!(
-                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
-                vec!["/old"]
+                aliases(conn, &home_spellings(&repo)).unwrap(),
+                vec![gone("/old")]
             );
             Ok(())
         })
@@ -2278,7 +2279,7 @@ mod tests {
             value["uuid"] = anchor["uuid"].clone();
             value["site"] = anchor["site"].clone();
             record(conn, prior, ANCHOR, value.to_string()).unwrap();
-            row_of(conn, prior);
+            row_of(conn, &canonical_repo(prior));
             Ok(())
         })
         .unwrap();
@@ -2331,14 +2332,17 @@ mod tests {
         let events = adopt_events(&repo);
         assert_eq!(events.len(), 1, "{events:?}");
         let audit = &events[0];
-        let here = site_of(Path::new(&canonical_repo(&repo))).unwrap();
+        let here = site_of(Path::new(&canonical_repo(&repo)));
         assert_eq!(
             audit["from_paths"],
             serde_json::json!([gone("/gone/before")])
         );
         assert_eq!(audit["to_path"], canonical_repo(&repo));
         assert_eq!(audit["old_site"], Site::new(u64::MAX, u64::MAX).to_json());
-        assert_eq!(audit["new_site"], here.to_json());
+        assert_eq!(
+            audit["new_site"],
+            serde_json::json!(here.as_ref().map(Site::to_json))
+        );
         assert!(is_lineage(audit["uuid"].as_str().unwrap()));
         assert_eq!(audit["actor"], "user:test");
         assert_eq!(audit["row_actor_kind"], "human");
@@ -2353,7 +2357,7 @@ mod tests {
         let latest = latest_identity(&Connection::open(super::super::ledger_path(&repo)).unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(latest.binding.unwrap().site, Some(here));
+        assert_eq!(latest.binding.unwrap().site, here);
         assert_eq!(settle_with(&repo, &prober).unwrap(), None);
         let again = adopt_with(&repo, "user:test", &|_| true, &prober).unwrap_err();
         assert_eq!(again.code, "nothing_to_adopt");
@@ -2441,12 +2445,15 @@ mod tests {
         crate::test_support::trust_repo(&canonical);
         let spelling = canonical.to_string_lossy().into_owned();
         settle(&spelling).unwrap();
+        // The spelling every row of this repository is stored under, taken now
+        // because a path that no longer exists falls back to the one given.
+        let stored = canonical_repo(&spelling);
         super::super::with_conn(&spelling, |conn| {
-            row_of(conn, &spelling);
+            row_of(conn, &stored);
             Ok(())
         })
         .unwrap();
-        spelling
+        stored
     }
 
     /// The anchor-writing path of a binary that predates the lineage.
@@ -2594,7 +2601,9 @@ mod tests {
         let (_da, prior) = home();
         let (_dir, repo) = moved_legacy_ledger(&prior);
         let home_path = PathBuf::from(canonical_repo(&repo));
-        let probed = real_prober().probe(vec![prior.clone()], &home_path);
+        // The rows name the prior path under its canonical spelling, so that is
+        // the spelling the probe has to have covered.
+        let probed = real_prober().probe(vec![canonical_repo(&prior)], &home_path);
         assert_eq!(probed.verdict, Ok(None));
         crate::test_support::git_in(Path::new(&prior), &["init", "-b", "main"]);
         let out = super::super::with_conn(&repo, |conn| {
@@ -2616,10 +2625,11 @@ mod tests {
         let (db, b) = home();
         crate::test_support::git_in(db.path(), &["clone", "-q", &a, &b]);
         crate::test_support::trust_repo(Path::new(&b));
+        let a_stored = canonical_repo(&a);
         let identity = Identity::read(&b).unwrap();
         super::super::with_conn(&b, |conn| {
             record(conn, &a, ANCHOR, identity.to_detail(&[], None)).unwrap();
-            row_of(conn, &a);
+            row_of(conn, &a_stored);
             Ok(())
         })
         .unwrap();
@@ -2632,7 +2642,7 @@ mod tests {
         std::fs::remove_dir_all(&a).unwrap();
         assert_eq!(
             settle_with(&b, &real_prober()).unwrap(),
-            Some(vec![a]),
+            Some(vec![a_stored]),
             "a refusal stamped on the manual clock outlived it"
         );
     }
@@ -2645,17 +2655,21 @@ mod tests {
         let (db, b) = home();
         crate::test_support::git_in(db.path(), &["clone", "-q", &a, &b]);
         crate::test_support::trust_repo(Path::new(&b));
+        let a_stored = canonical_repo(&a);
         let identity = Identity::read(&b).unwrap();
         super::super::with_conn(&b, |conn| {
             record(conn, &a, ANCHOR, identity.to_detail(&[], None)).unwrap();
-            row_of(conn, &a);
+            row_of(conn, &a_stored);
             Ok(())
         })
         .unwrap();
         settle_with(&b, &real_prober()).unwrap_err();
         std::fs::remove_dir_all(&a).unwrap();
         let _clock = crate::engine::ref_cache::ManualClock::install();
-        assert_eq!(settle_with(&b, &real_prober()).unwrap(), Some(vec![a]));
+        assert_eq!(
+            settle_with(&b, &real_prober()).unwrap(),
+            Some(vec![a_stored])
+        );
     }
 
     /// One ledger that names 64 hung paths must not be able to occupy the
@@ -2803,8 +2817,10 @@ mod tests {
             .into_owned();
         crate::test_support::trust_repo(&crate::engine::process::canonicalize_plain(&old).unwrap());
         settle(&wt).unwrap();
+        // Taken before the move: a path that is gone falls back to the one given.
+        let stored = canonical_repo(&wt);
         super::super::with_conn(&wt, |conn| {
-            row_of(conn, &wt);
+            row_of(conn, &stored);
             Ok(())
         })
         .unwrap();
@@ -2820,6 +2836,6 @@ mod tests {
         );
         crate::test_support::trust_repo(&crate::engine::process::canonicalize_plain(&new).unwrap());
         let out = settle(&new.to_string_lossy());
-        assert_eq!(out.unwrap(), Some(vec![wt]));
+        assert_eq!(out.unwrap(), Some(vec![stored]));
     }
 }
