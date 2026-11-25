@@ -317,6 +317,29 @@ describe("check:workflows", () => {
     }
   });
 
+  // Two ledger tests hold the write lock from the real `sqlite3` CLI, which the
+  // Windows image lacks. The Chocolatey feed answered 504 once, so a single
+  // `choco install` is not enough: the step must retry and then fail loudly.
+  it("puts sqlite3 on PATH on the Windows Rust leg, retrying a failed install and failing after the last", () => {
+    const text = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    const body = text.slice(text.search(/^jobs:\s*$/m));
+    const start = body.search(/^ {2}rust-test:\s*$/m);
+    const rest = body.slice(start + 1);
+    const job = body.slice(start, start + 1 + Math.max(rest.search(/^ {2}[a-z0-9-]+:\s*$/m), 0));
+    expect(job).toContain("windows-latest");
+    const step = job.indexOf("- name: Install sqlite3 (Windows)");
+    const test = job.indexOf("- name: Rust Unit & Integration Tests");
+    expect(step, "rust-test installs sqlite3").toBeGreaterThan(-1);
+    expect(test, "rust-test runs its tests after sqlite3").toBeGreaterThan(step);
+    const sqlite = job.slice(step, test).split(/^ {6}- name: /m)[0];
+    expect(sqlite).toContain("if: ${{ runner.os == 'Windows' }}");
+    expect(sqlite).toContain("choco install sqlite");
+    expect(sqlite, "retries").toMatch(/for \(\$i = 1; \$i -le \$attempts; \$i\+\+\)/);
+    expect(sqlite, "bounded").toMatch(/\$attempts = \d+/);
+    expect(sqlite, "verifies the CLI answers").toContain("sqlite3 -version");
+    expect(sqlite, "fails loudly after the last attempt").toMatch(/throw "sqlite3 could not be installed/);
+  });
+
   it("names the tool on every taiki-e/install-action step, so a re-pinned ref still installs it", () => {
     // A per-tool ref (`@cargo-llvm-cov`) carries the tool in its name; a pinned
     // v2 commit installs only what `tool:` lists. #28 re-pinned coverage's step

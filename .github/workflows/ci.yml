@@ -386,8 +386,23 @@ jobs:
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          choco install sqlite -y --no-progress
-          sqlite3 -version
+          # The Chocolatey community feed 504s now and then ("installed 0/0
+          # packages" and sqlite3 absent, as in the run that prompted this), so
+          # try a bounded number of times and judge success by the CLI itself
+          # answering, never by choco's exit code. Out of attempts is a failed
+          # job, not a Windows suite that goes on to fail with a different
+          # message.
+          $attempts = 5
+          for ($i = 1; $i -le $attempts; $i++) {
+            choco install sqlite -y --no-progress
+            if (Get-Command sqlite3 -ErrorAction SilentlyContinue) {
+              sqlite3 -version
+              if ($LASTEXITCODE -eq 0) { exit 0 }
+            }
+            Write-Host "sqlite3 is not usable after attempt $i of $attempts"
+            if ($i -lt $attempts) { Start-Sleep -Seconds (10 * $i) }
+          }
+          throw "sqlite3 could not be installed after $attempts attempts"
 
       # Two tests drive a real `manvi` under its default gate, which no runner
       # has: mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
