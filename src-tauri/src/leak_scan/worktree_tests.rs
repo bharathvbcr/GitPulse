@@ -6,7 +6,7 @@ use super::tests::github_pat;
 use super::worktree::{parse_listing, scan_worktree, WorktreeLimits};
 use super::{scans_completed, SkipReason};
 use crate::engine::git_cli::git;
-use crate::test_support::{git_in, git_repo, write};
+use crate::test_support::{git_in, git_merge_in, git_repo, write};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -202,8 +202,10 @@ fn conflicted_repo(secret_line: &str) -> TempDir {
     git_in(dir.path(), &["checkout", "-q", "main"]);
     write(dir.path(), "a.txt", &format!("{secret_line}\n"));
     git_in(dir.path(), &["commit", "-q", "-am", "main"]);
-    let merged = git(dir.path(), &["merge", "side"]);
-    assert!(merged.is_err(), "the merge was expected to conflict");
+    assert!(
+        git_merge_in(dir.path(), &["merge", "side"]),
+        "the merge was expected to conflict"
+    );
     dir
 }
 

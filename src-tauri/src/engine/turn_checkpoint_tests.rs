@@ -379,7 +379,7 @@ fn a_parked_merge_is_skipped_and_the_conflicted_file_is_not_staged_by_the_captur
     std::fs::write(root.join("tracked.txt"), "main\n").unwrap();
     git_ok(root, &["commit", "-q", "-am", "main"]);
     assert!(
-        !git(root, &["merge", "other"]).status.success(),
+        crate::test_support::git_merge_in(root, &["merge", "other"]),
         "a conflict is the point"
     );
     let index_before = std::fs::read(root.join(".git/index")).unwrap();
