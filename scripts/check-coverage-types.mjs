@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 135 contracts over
- * 358 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 140 contracts over
+ * 371 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -227,7 +227,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repository trust", rustPath: rust("repository_trust.rs"), tsPath: ts("repos", "repositoryTrust.ts"), structs: ["TrustPreview"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
-  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo", "WorkflowRunInfo", "GitHubRunsReport", "PullRequestDetail"] },
+  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo", "WorkflowRunInfo", "GitHubRunsReport", "PullRequestDetail", "PullRequestDiff"] },
   // Firebase deployment state. `RolloutCommit.hash` is the join key to local
   // history, so a rename there would silently stop every commit matching and
   // render as "nothing is deployed" rather than as an error.
@@ -360,10 +360,22 @@ export const CONTRACTS = Object.freeze([
   { label: "agent-inbox-ipc", rustPath: rust("commands", "worktrees.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxSnapshot", "InboxMessageReceipt"] },
   { label: "agent-inbox-decompose", rustPath: rust("workbench.rs"), tsPath: ts("agents", "inboxTypes.ts"), structs: ["InboxDecomposeSubtask", "InboxDecomposeReceipt"] },
   { label: "browser", rustPath: rust("browser", "mod.rs"), tsPath: ts("browser", "browserSession.ts"), structs: ["BrowserSnapshotPreview", "BrowserElementRect", "BrowserElementPick"] },
+  // The browser pane's empty state offers these servers and the run script's preview
+  // URL; a renamed field would read as "nothing is listening".
+  { label: "browser-local-servers", rustPath: rust("browser", "local_servers.rs"), tsPath: ts("browser", "browserSession.ts"), structs: ["LocalServerDiscovery", "LocalServerInfo", "RunScriptInfo"] },
   { label: "terminal-agent-events", rustPath: TERMINAL_RUST_SOURCE, tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalAgentMetaPayload", "TerminalAgentTouchedFilePayload"] },
   { label: "terminal-orchestrate-events", rustPath: rust("terminal", "orchestrate.rs"), tsPath: ts("terminal", "agentEvents.ts"), structs: ["TerminalChildSpawnedPayload", "TerminalChildClosedPayload", "TerminalOpenFileRequestPayload"] },
   { label: "manvi-steward-settings", rustPath: rust("tool_config.rs"), tsPath: ts("steward", "types.ts"), structs: ["RepoStewardOverride", "EffectiveStewardPolicy", "ManviStewardSettings"] },
   { label: "manvi-steward", rustPath: rust("harness", "steward.rs"), tsPath: ts("steward", "types.ts"), structs: ["StewardCleanItem", "StewardTickRecord", "ManviStewardStatus"] },
+  // Idle memory: the Settings row reads the mode and the hibernation status,
+  // and `cmd_main_ready` hands a rebuilt page the snapshot it was hibernated
+  // with. A dropped `snapshot` field would wake to a blank surface.
+  { label: "idle-memory-settings", rustPath: rust("tool_config.rs"), tsPath: ts("runtime", "idleShedderWiring.ts"), structs: ["IdleMemorySettings"] },
+  { label: "idle-memory", rustPath: rust("desktop", "hibernate.rs"), tsPath: ts("runtime", "idleShedderWiring.ts"), structs: ["IdleMemoryStatus", "WakePayload", "HibernationSnapshot"] },
+  { label: "idle-trim", rustPath: rust("idle_trim.rs"), tsPath: ts("runtime", "idleShedderWiring.ts"), structs: ["IdleTrimReport"] },
+  // Turn checkpoints (`refs/gitpulse/turns/`): `omissions` is how a partial
+  // checkpoint says so, and a renamed field there would read as complete.
+  { label: "turn-checkpoints", rustPath: rust("engine", "turn_checkpoint.rs"), tsPath: ts("diff", "turnCheckpoints.ts"), structs: ["TurnCheckpointList", "TurnCheckpointSummary", "Omissions", "TurnCheckpointDiff"] },
 ]);
 
 /**

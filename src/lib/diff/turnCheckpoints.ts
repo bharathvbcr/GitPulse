@@ -3,7 +3,8 @@
  */
 import { invoke } from "../ipc/invoke";
 
-export interface TurnCheckpointOmissions {
+/** Mirrors `Omissions` in src-tauri/src/engine/turn_checkpoint.rs: what a checkpoint left out. */
+export interface Omissions {
   untracked_found: number;
   untracked_admitted: number;
   env_files: number;
@@ -34,7 +35,7 @@ export interface TurnCheckpointSummary {
   additions: number;
   deletions: number;
   stats_complete: boolean;
-  omissions: TurnCheckpointOmissions;
+  omissions: Omissions;
 }
 
 export interface TurnCheckpointList {
@@ -69,7 +70,7 @@ export async function diffTurnCheckpoint(
   return invoke<TurnCheckpointDiff>("cmd_diff_turn_checkpoint", { repoPath, id, against });
 }
 
-export function totalOmittedFiles(omissions: TurnCheckpointOmissions): number {
+export function totalOmittedFiles(omissions: Omissions): number {
   const skippedUntracked = Math.max(0, omissions.untracked_found - omissions.untracked_admitted);
   return (
     skippedUntracked +
@@ -82,7 +83,7 @@ export function totalOmittedFiles(omissions: TurnCheckpointOmissions): number {
   );
 }
 
-export function formatOmissionSummary(omissions: TurnCheckpointOmissions): string[] {
+export function formatOmissionSummary(omissions: Omissions): string[] {
   const notes: string[] = [];
   if (omissions.wholesale) {
     const detail = omissions.wholesale_detail ? `: ${omissions.wholesale_detail}` : "";

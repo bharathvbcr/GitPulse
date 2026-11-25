@@ -98,7 +98,7 @@
     startIdleShedder,
     stopIdleShedder,
     waitForBootListeners,
-    type MainReadyPayload,
+    type WakePayload,
   } from "./lib/runtime/idleShedderWiring";
 
   // Views the app does not need to start. Each becomes its own chunk, so
@@ -1083,7 +1083,7 @@
       ])
         .then(() => {
           if (listeners.disposed) return;
-          return invoke<MainReadyPayload>("cmd_main_ready");
+          return invoke<WakePayload>("cmd_main_ready");
         })
         .then(() => {
           clearWakeSkeletonHint();

@@ -13,11 +13,11 @@ import {
   formatRelativeTurnTime,
   listTurnCheckpoints,
   totalOmittedFiles,
-  type TurnCheckpointOmissions,
+  type Omissions,
   type TurnCheckpointSummary,
 } from "./turnCheckpoints";
 
-function baseOmissions(overrides: Partial<TurnCheckpointOmissions> = {}): TurnCheckpointOmissions {
+function baseOmissions(overrides: Partial<Omissions> = {}): Omissions {
   return {
     untracked_found: 2,
     untracked_admitted: 2,

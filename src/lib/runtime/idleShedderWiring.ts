@@ -32,10 +32,12 @@ import {
   type IdleStage,
 } from "./idleShedder";
 
+/** Mirrors `HibernationSnapshot` in src-tauri/src/desktop/hibernate.rs. */
 export interface HibernationSnapshot {
   surface: string;
   active_repo: string | null;
-  sidebar_width: number;
+  /** `Option<f64>` in Rust: a restored snapshot can come back without it. */
+  sidebar_width: number | null;
   has_terminal_dock: boolean;
   parked_browser_urls: string[];
   saved_at_ms: number;
@@ -55,24 +57,36 @@ export type PendingMainEvent =
   | { kind: "notification"; payload: { id: string } }
   | { kind: "emit"; payload: { event: string; payload: unknown } };
 
-export interface MainReadyPayload {
+/** Mirrors `WakePayload` in src-tauri/src/desktop/hibernate.rs (`cmd_main_ready`). */
+export interface WakePayload {
   wake_from_hibernation: boolean;
   snapshot: HibernationSnapshot | null;
   pending_events: PendingMainEvent[];
 }
 
+/** Mirrors `IdleMemorySettings` in src-tauri/src/tool_config.rs (`cmd_idle_memory_settings`). */
+export interface IdleMemorySettings {
+  mode: IdleMemoryMode;
+}
+
+/** Mirrors `IdleTrimReport` in src-tauri/src/idle_trim.rs. */
+export interface IdleTrimReport {
+  ref_cache_evicted: number;
+  docs_vault_evicted: number;
+  sqlite_trimmed: number;
+  os_allocator_trimmed: boolean;
+}
+
+/** Mirrors `IdleMemoryStatus` in src-tauri/src/desktop/hibernate.rs (`cmd_idle_memory_status`). */
 export interface IdleMemoryStatus {
-  lifecycle?: MainWindowLifecycle;
-  mode?: IdleMemoryMode;
-  hibernate_count?: number;
-  last_hibernated_at_ms?: number | null;
-  last_wake_ms?: number | null;
-  last_trim_report?: {
-    ref_cache_evicted?: number;
-    docs_vault_evicted?: number;
-    sqlite_trimmed?: number;
-    os_allocator_trimmed?: boolean;
-  } | null;
+  mode: IdleMemoryMode;
+  lifecycle: MainWindowLifecycle;
+  main_ready: boolean;
+  hibernate_count: number;
+  last_hibernated_at_ms: number | null;
+  last_wake_ms: number | null;
+  pending_event_count: number;
+  last_trim_report: IdleTrimReport | null;
 }
 
 export type InvokeLike = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -164,7 +178,7 @@ export async function loadIdleMemoryMode(
   const tauri = deps.isTauri ?? isTauri;
   const invokeFn = deps.invoke ?? (invoke as InvokeLike);
   if (!tauri()) return get(modeStore);
-  const payload = await invokeFn<{ mode?: unknown }>("cmd_idle_memory_settings");
+  const payload = await invokeFn<IdleMemorySettings>("cmd_idle_memory_settings");
   const mode = normalizeIdleMemoryMode(payload?.mode);
   modeStore.set(mode);
   activeShedder?.setMode(mode);
@@ -183,7 +197,7 @@ export async function saveIdleMemoryMode(
     activeShedder?.setMode(normalized);
     return normalized;
   }
-  const saved = await invokeFn<{ mode?: unknown }>("cmd_idle_memory_settings_save", {
+  const saved = await invokeFn<IdleMemorySettings>("cmd_idle_memory_settings_save", {
     settings: { mode: normalized },
   });
   const resolved = normalizeIdleMemoryMode(saved?.mode ?? normalized);
