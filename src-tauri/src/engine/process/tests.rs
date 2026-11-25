@@ -1635,6 +1635,65 @@ fn run_captured_does_not_report_a_slot_wait_refusal_as_a_timeout() {
     }
 }
 
+/// A genuine runtime timeout is an outcome whatever characters the program's
+/// path holds: the label of the runner's deadline text is the program as the
+/// caller spelled it, so `@`, a space or a non-ASCII name must not turn a
+/// child that ran out of time into an error.
+#[cfg(unix)]
+#[test]
+fn run_captured_reports_a_timeout_for_a_program_path_with_odd_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let odd = dir.path().join("node@20 é");
+    std::fs::create_dir(&odd).unwrap();
+    let program = odd.join("sleep");
+    std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+    let outcome = run_captured(
+        program.to_str().unwrap(),
+        &["5"],
+        None,
+        Duration::from_secs(1),
+        &[],
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(
+        matches!(outcome, Ok(RunOutcome::TimedOut(d)) if d.as_secs() == 1),
+        "expected TimedOut(1s), got {outcome:?}"
+    );
+}
+
+/// The predicate behind that outcome depends on neither the label's character
+/// set nor its being a plain word: odd paths are run timeouts, and the gate's
+/// slot-wait refusal under the same odd label is not.
+#[test]
+fn own_run_timeout_ignores_the_label_charset_but_not_the_cause() {
+    use super::{is_own_run_timeout, refusal_message, Refusal};
+    for program in [
+        "C:\\Program Files\\x.exe",
+        "g++",
+        "/Users/José/t",
+        "/opt/homebrew/opt/node@20/bin/node",
+    ] {
+        let ran = format!("{program}{TIMEOUT_MARKER}5s");
+        assert!(is_own_run_timeout(program, &ran), "{ran}");
+        let slot = refusal_message(
+            program,
+            Refusal::TimedOut {
+                deadline: Duration::from_secs(5),
+            },
+        );
+        assert!(
+            !is_own_run_timeout(program, slot.message()),
+            "{}",
+            slot.message()
+        );
+        assert!(!is_own_run_timeout("other", &ran), "{ran}");
+    }
+    assert!(!is_own_run_timeout(
+        "sleep",
+        "Failed to spawn sleep: No such file"
+    ));
+}
+
 /// A load deferral never ran the child either; it must not become an outcome.
 #[cfg(unix)]
 #[test]
