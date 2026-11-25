@@ -77,6 +77,11 @@ describe("devmap pin contract", () => {
   it("holds the coverage workflow to the same rules and the same pin as ci.yml", () => {
     expect(devmapPinProblems(coverage)).toEqual([]);
     expect(devmapPin(coverage), "coverage.yml builds devmap from another commit than ci.yml").toBe(devmapPin(ci));
+    // The step, not the words: a comment near the top already mentions `cargo llvm-cov`.
+    const install = coverage.indexOf("name: Install devmap");
+    const suite = coverage.indexOf("name: Generate Rust Coverage");
+    expect(suite, "coverage.yml has no 'Generate Rust Coverage' step; this contract needs updating").toBeGreaterThan(-1);
+    expect(install !== -1 && install < suite, "coverage.yml runs the instrumented suite before it installs devmap").toBe(true);
   });
 
   it("builds from the commit the vendored devmap-store schema number comes from", () => {
