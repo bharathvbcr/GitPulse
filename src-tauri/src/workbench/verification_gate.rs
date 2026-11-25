@@ -217,11 +217,19 @@ pub(crate) fn is_full_commit_id(text: &str) -> bool {
 /// The local checkout a repository identity (`local:<git dir>`) names, when it
 /// is a directory on this machine.
 pub(crate) fn checkout_of(repository_identity: &str) -> Option<String> {
-    repository_identity
-        .strip_prefix("local:")
-        .and_then(|git_dir| git_dir.strip_suffix("/.git").or(Some(git_dir)))
-        .filter(|path| Path::new(path).is_dir())
-        .map(str::to_owned)
+    let git_dir = Path::new(repository_identity.strip_prefix("local:")?);
+    // By path component, not text: the identity spells a Windows checkout
+    // `\\?\C:\...\.git`, with a backslash before `.git`.
+    let checkout = match git_dir.file_name() {
+        Some(name) if name == ".git" => git_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())?,
+        _ => git_dir,
+    };
+    if !checkout.is_dir() {
+        return None;
+    }
+    checkout.to_str().map(str::to_owned)
 }
 
 /// Whether `commit` is the tip of, or an ancestor of, the default branch of the
