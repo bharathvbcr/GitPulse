@@ -21,7 +21,13 @@ use common::run_git;
 fn shared_fixture_can_commit_without_global_identity() {
     let dir = tempfile::TempDir::new().unwrap();
     run_git(dir.path(), &["init", "-b", "main"]);
-    let empty_global = common::env::hermetic::pinned_git_config();
+    // Not the hermetic config: that one carries an identity of its own
+    // (`HERMETIC_IDENTITY`), and with it this commit would succeed even if
+    // `run_git` stopped persisting the repository's. Written through
+    // `write_git_config` so it keeps the maintenance pin.
+    let globals = tempfile::TempDir::new().unwrap();
+    let empty_global = globals.path().join("gitconfig");
+    common::env::write_git_config(&empty_global, "").unwrap();
     std::fs::write(dir.path().join("file"), "content\n").unwrap();
     run_git(dir.path(), &["add", "file"]);
     let output = std::process::Command::new("git")
@@ -35,7 +41,7 @@ fn shared_fixture_can_commit_without_global_identity() {
             "fixture identity",
         ])
         .current_dir(dir.path())
-        .env("GIT_CONFIG_GLOBAL", empty_global)
+        .env("GIT_CONFIG_GLOBAL", &empty_global)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("GIT_AUTHOR_NAME")
         .env_remove("GIT_AUTHOR_EMAIL")
@@ -47,6 +53,18 @@ fn shared_fixture_can_commit_without_global_identity() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let author = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%an <%ae>"])
+        .current_dir(dir.path())
+        .env("GIT_CONFIG_GLOBAL", &empty_global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output_locked()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&author.stdout).trim(),
+        "Test User <test@example.com>",
+        "the commit took its identity from somewhere other than the repository"
     );
 }
 
