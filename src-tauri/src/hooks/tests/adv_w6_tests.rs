@@ -335,13 +335,22 @@ fn w6_a_slow_git_over_eighteen_worktrees_answers_inside_the_budget_and_partial()
     not_silent("a slow git over 18 worktrees", &output);
 }
 
-/// 18 siblings and git is fast, but only the LAST one holds the file: the scan
-/// cap leaves it unread, and that must not be a silent pass.
+/// More siblings than the scan cap reads and git is fast, but only the LAST
+/// one holds the file: the scan cap leaves it unread, and that must not be a
+/// silent pass. Sized from [`insights::MAX_COLLISION_SCANS`], so raising the
+/// cap (16, then 64) cannot leave the farm inside it and the test vacuous.
 #[cfg(unix)]
 #[test]
 fn w6_a_holder_past_the_scan_cap_is_not_silent() {
-    let farm = farm_bound(false, false, 18);
-    for holder in 0..18 {
+    let siblings = insights::MAX_COLLISION_SCANS + 2;
+    let farm = farm_bound(false, false, siblings);
+    assert!(
+        farm.dirs.len() > insights::MAX_COLLISION_SCANS,
+        "{} worktrees fit inside the cap of {}",
+        farm.dirs.len(),
+        insights::MAX_COLLISION_SCANS
+    );
+    for holder in 0..siblings {
         std::fs::write(sib(&farm, holder).join("seed.txt"), "theirs").unwrap();
         let o = guard_here(&target(&farm, "seed.txt"));
         not_silent(&format!("holder {holder}"), &o);
@@ -353,11 +362,11 @@ fn w6_a_holder_past_the_scan_cap_is_not_silent() {
     let output = guard_here(&target(&farm, "seed.txt"));
     let cost = spawn_cost(&farm.dirs, &marks);
     eprintln!(
-        "18 siblings, uncontended-until-last: {:?}, {cost:?} -> {}",
+        "{siblings} siblings, uncontended-until-last: {:?}, {cost:?} -> {}",
         started.elapsed(),
         say(&output)
     );
-    not_silent("the only holder is the 18th worktree", &output);
+    not_silent("the scan cap left worktrees unread", &output);
 }
 
 /// A scan slower than the hook's budget is a machine that is slow, not a file
