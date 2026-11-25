@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum rows kept on disk and in memory so the ledger stays strictly bounded.
@@ -39,6 +39,9 @@ const LEDGER_SCHEMA_VERSION: u32 = 1;
 /// How long a reopened session must stay alive before the offer it replaced is
 /// withdrawn, for launchers whose `SessionStart` hook never reports in.
 pub const REOPEN_SURVIVAL_MS: u64 = 20_000;
+/// How many times a host that connects later may re-run the startup reconcile
+/// that its first attempt could not complete.
+pub const MAX_RECONCILE_RETRIES: u32 = 6;
 
 /// Durable JSONL filename inside GitPulse's config directory.
 pub const SESSION_LEDGER_FILE: &str = "terminal-sessions.v1.jsonl";
@@ -97,6 +100,11 @@ pub struct SessionLedgerView {
     pub offers: Vec<SessionLedgerOffer>,
     pub reopenable_count: usize,
     pub unreadable_count: usize,
+    /// The startup reconcile has not completed (the terminal host could not be
+    /// asked which sessions live), so a row still `running` may be lost. An
+    /// empty offer list is then "not known", not "nothing to recover".
+    #[serde(default)]
+    pub reconcile_pending: bool,
 }
 
 /// Result of pre-checking whether one ledger row can be reopened right now.
@@ -243,6 +251,13 @@ pub struct SessionLedger {
     /// Rows [`Self::repair_unobserved_exits`] rewrote while opening, handed to
     /// the first [`Self::reconcile_startup`] so its caller emits the view.
     repaired_on_open: AtomicUsize,
+    /// Set when a durable ledger opens, cleared when [`Self::reconcile_startup`]
+    /// has run against a host that answered.
+    reconcile_pending: AtomicBool,
+    /// Retries spent since the ledger opened, capped at [`MAX_RECONCILE_RETRIES`].
+    reconcile_attempts: AtomicU32,
+    /// Serialises reconciles: startup and a later connect may race.
+    reconcile_gate: Mutex<()>,
 }
 
 /// What a close needs to know about a session, from its ledger row.
@@ -266,6 +281,9 @@ impl SessionLedger {
             lifecycle: None,
             archive: None,
             repaired_on_open: AtomicUsize::new(0),
+            reconcile_pending: AtomicBool::new(false),
+            reconcile_attempts: AtomicU32::new(0),
+            reconcile_gate: Mutex::new(()),
         }
     }
 
@@ -312,6 +330,9 @@ impl SessionLedger {
             lifecycle,
             archive,
             repaired_on_open: AtomicUsize::new(0),
+            reconcile_pending: AtomicBool::new(true),
+            reconcile_attempts: AtomicU32::new(0),
+            reconcile_gate: Mutex::new(()),
         };
         // Before anything can deliver an exit: rows an older build recorded
         // as clean for sessions whose outcome it never saw become offers.
@@ -804,6 +825,30 @@ impl SessionLedger {
         count
     }
 
+    /// Whether the startup reconcile still has to complete.
+    pub fn reconcile_pending(&self) -> bool {
+        self.reconcile_pending.load(Ordering::Acquire)
+    }
+
+    /// Held for the length of one reconcile so two cannot interleave.
+    pub fn reconcile_gate(&self) -> MutexGuard<'_, ()> {
+        self.reconcile_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a reconcile retry may run now: one is still owed and fewer than
+    /// [`MAX_RECONCILE_RETRIES`] were spent. Spends one when it says yes.
+    pub fn begin_reconcile_retry(&self) -> bool {
+        self.reconcile_pending()
+            && self
+                .reconcile_attempts
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_RECONCILE_RETRIES).then_some(n + 1)
+                })
+                .is_ok()
+    }
+
     /// Settles unconfirmed reopens as of `now` and persists a change.
     pub(crate) fn settle_reopens_at(&self, now: u64) -> bool {
         let mut guard = self
@@ -988,6 +1033,8 @@ impl SessionLedger {
         if count > 0 {
             self.persist_locked(&guard.entries);
         }
+        self.reconcile_pending.store(false, Ordering::Release);
+        self.reconcile_attempts.store(0, Ordering::Release);
         // Rows repaired while opening count as changed the first time, so the
         // caller emits the view for them too.
         count + self.repaired_on_open.swap(0, Ordering::Relaxed)
@@ -1207,6 +1254,7 @@ impl SessionLedger {
             offers,
             reopenable_count,
             unreadable_count,
+            reconcile_pending: self.reconcile_pending(),
         }
     }
 
@@ -2780,6 +2828,41 @@ mod tests {
         assert!(offered(&ledger).is_empty());
         assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
         assert_eq!(offered(&ledger)[0].row_id, old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_host_leaves_the_ledger_marked_unreconciled_until_it_answers() {
+        use crate::terminal::TerminalSessions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let first = SessionLedger::open(&path);
+        first.record_spawn(spawn_spec("term-run", "claude", Some(UUID_1), dir.path(), None));
+        drop(first);
+        let ledger = std::sync::Arc::new(SessionLedger::open(&path));
+        let sessions = TerminalSessions::with_unavailable_host("host down".into());
+        let sessions = TerminalSessions {
+            session_ledger: ledger.clone(),
+            ..sessions
+        };
+        assert_eq!(sessions.reconcile_session_ledger(), 0);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(view.offers.is_empty());
+        assert!(
+            view.reconcile_pending,
+            "an empty view must not read as nothing to recover"
+        );
+        // Retries are bounded.
+        for _ in 0..MAX_RECONCILE_RETRIES {
+            assert!(ledger.begin_reconcile_retry());
+        }
+        assert!(!ledger.begin_reconcile_retry());
+        // A reconcile against an answering host completes it.
+        ledger.reconcile_startup(&HashSet::new());
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(!view.reconcile_pending);
+        assert_eq!(view.offers.len(), 1);
+        assert!(!ledger.begin_reconcile_retry());
     }
 
     #[test]

@@ -797,7 +797,13 @@ impl TerminalSessions {
     }
 
     /// Reconciles leftover `Running` rows on startup against currently live PTYs.
+    ///
+    /// When the host cannot be asked this changes nothing and leaves
+    /// [`session_ledger::SessionLedger::reconcile_pending`] set, so the view says
+    /// the ledger is unreconciled; the host's next successful connect retries
+    /// (`SessionEvents::host_adopted`, bounded by `MAX_RECONCILE_RETRIES`).
     pub fn reconcile_session_ledger(&self) -> usize {
+        let _gate = self.session_ledger.reconcile_gate();
         match list_sessions(self) {
             Ok(listed) => {
                 let live_ids: std::collections::HashSet<String> =
@@ -812,6 +818,14 @@ impl TerminalSessions {
                 0
             }
         }
+    }
+
+    /// The reconcile a later host connect owes: `None` when none is owed or the
+    /// retries are spent, else how many rows it changed.
+    pub fn retry_session_ledger_reconcile(&self) -> Option<usize> {
+        self.session_ledger
+            .begin_reconcile_retry()
+            .then(|| self.reconcile_session_ledger())
     }
 }
 
