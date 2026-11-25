@@ -3862,7 +3862,9 @@ pub(crate) fn parse_pulse_stream(
 /// Resolves the remote whose HEAD marks the repository's default branch.
 ///
 /// Priority: `checkout.defaultRemote`, the current branch's configured
-/// upstream remote, a lone configured remote, else "origin".
+/// upstream remote (each only when it names a configured remote, so `.` for a
+/// branch tracking a local branch falls through), a lone configured remote,
+/// else "origin".
 #[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
     default_remote_from(
@@ -3894,9 +3896,10 @@ fn default_remote_from(
             HashMap::new()
         }
     };
-    if let Some(configured) = config.get("checkout.defaultremote") {
-        let trimmed = configured.trim();
-        if !trimmed.is_empty() {
+    let configured = configured_remotes(&config);
+    if let Some(named) = config.get("checkout.defaultremote") {
+        let trimmed = named.trim();
+        if names_a_remote(repo, &configured, trimmed, &mut unread) {
             return (trimmed.to_string(), unread);
         }
     }
@@ -3910,12 +3913,11 @@ fn default_remote_from(
     if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
         if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
             let trimmed = upstream.trim();
-            if !trimmed.is_empty() {
+            if names_a_remote(repo, &configured, trimmed, &mut unread) {
                 return (trimmed.to_string(), unread);
             }
         }
     }
-    let configured = configured_remotes(&config);
     let names: Vec<String> = if configured.is_empty() || has_legacy_remotes(repo) {
         // `git remote` also lists `.git/remotes` and `.git/branches` entries,
         // which no config key names; only it can count those.
@@ -3938,6 +3940,35 @@ fn default_remote_from(
         return (only.clone(), unread);
     }
     ("origin".to_string(), unread)
+}
+
+/// Whether `name` is a remote of `repo`. `branch.<b>.remote` is `.` for a
+/// branch tracking a local branch and `checkout.defaultRemote` may hold any
+/// text; neither is a remote unless it is configured. Only a name no config key
+/// lists, in a repository with legacy `.git/remotes` or `.git/branches`
+/// entries, is checked against `git remote`, which alone counts those.
+fn names_a_remote(
+    repo: &Path,
+    configured: &[String],
+    name: &str,
+    unread: &mut Option<CommandError>,
+) -> bool {
+    if name.is_empty() || name == "." {
+        return false;
+    }
+    if configured.iter().any(|remote| remote == name) {
+        return true;
+    }
+    if !has_legacy_remotes(repo) {
+        return false;
+    }
+    match git_text(repo, &["remote"]) {
+        Ok(remotes) => remotes.lines().any(|remote| remote.trim() == name),
+        Err(error) => {
+            unread.get_or_insert(error);
+            false
+        }
+    }
 }
 
 /// The effective config as `git config --list -z` prints it, last value of a
@@ -16410,6 +16441,74 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let before = remote_listings();
         assert_eq!(resolve_default_remote(&repo), expected);
         assert_eq!(remote_listings() - before, 1, "`git remote` was asked");
+    }
+
+    /// `branch.<b>.remote` is `.` when a branch tracks a local branch, and
+    /// `checkout.defaultRemote` can hold any text. Neither names a remote, so
+    /// neither may be the default remote (it made the branch and tag listings
+    /// fail): a value counts only when it is a configured remote.
+    #[test]
+    fn the_default_remote_is_only_ever_a_configured_remote() {
+        // A branch tracking a local branch: remote ".", one real remote.
+        let dir = init_repo_with_remotes(&["upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "--track", "feat", "main"]);
+        git_in(&repo, &["checkout", "feat"]);
+        let config = config_snapshot_fresh(&repo).unwrap();
+        assert_eq!(
+            config.get("branch.feat.remote").map(String::as_str),
+            Some(".")
+        );
+        assert_eq!(resolve_default_remote(&repo), "upstream");
+        assert_eq!(compute_default_base(&repo).remote, "upstream");
+        let path = repo.to_str().unwrap();
+        GitReader::list_branches(path).expect("the branch list for a branch tracking a local one");
+        GitReader::list_tags(path).expect("the tag list for a branch tracking a local one");
+
+        // Two remotes and a local-tracking branch: no choice, so "origin".
+        let dir = init_repo_with_remotes(&["upstream", "fork"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["branch", "--track", "feat", "main"]);
+        git_in(&repo, &["checkout", "feat"]);
+        assert_eq!(resolve_default_remote(&repo), "origin");
+
+        // A tracked remote that is not configured falls through.
+        let dir = init_repo_with_remotes(&["upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.main.remote", "ghost"]);
+        assert_eq!(resolve_default_remote(&repo), "upstream");
+
+        // checkout.defaultRemote naming "." or an unknown name falls through;
+        // naming a configured remote still wins.
+        let dir = init_repo_with_remotes(&["upstream", "fork"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "checkout.defaultRemote", "."]);
+        assert_eq!(resolve_default_remote(&repo), "origin");
+        git_in(&repo, &["config", "checkout.defaultRemote", "ghost"]);
+        assert_eq!(resolve_default_remote(&repo), "origin");
+        git_in(&repo, &["config", "checkout.defaultRemote", "fork"]);
+        assert_eq!(resolve_default_remote(&repo), "fork");
+
+        // A configured upstream remote still wins over the lone-remote rule.
+        let dir = init_repo_with_remotes(&["upstream", "fork"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.main.remote", "fork"]);
+        assert_eq!(resolve_default_remote(&repo), "fork");
+
+        // A legacy .git/remotes entry is a remote: honoured as the upstream
+        // remote when git lists it, and "." beside it is still refused.
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let legacy = repo.join(".git/remotes");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old"), "URL: https://example.invalid/old.git\n").unwrap();
+        let listed = crate::engine::git_cli::git_text(&repo, &["remote"]).unwrap();
+        let sees_legacy = listed.lines().any(|l| l.trim() == "old");
+        git_in(&repo, &["config", "branch.main.remote", "old"]);
+        let expected = if sees_legacy { "old" } else { "origin" };
+        assert_eq!(resolve_default_remote(&repo), expected);
+        git_in(&repo, &["config", "branch.main.remote", "."]);
+        assert_eq!(resolve_default_remote(&repo), expected);
     }
 
     /// A repository whose one commit touches `files` files, and that
