@@ -1927,10 +1927,11 @@ mod tests {
         let dst = temp.path().join("dest_cache");
 
         fs::create_dir_all(src.join("sub")).unwrap();
-        let mut file1 = File::create(src.join("file1.txt")).unwrap();
-        writeln!(file1, "Hello CoW!").unwrap();
-        let mut file2 = File::create(src.join("sub/file2.txt")).unwrap();
-        writeln!(file2, "Nested CoW!").unwrap();
+        // Written and closed, not held open: a directory listing on Windows
+        // reports a file's length as of its last close, so the walk measured a
+        // file still open here as empty and copied no bytes of it.
+        fs::write(src.join("file1.txt"), "Hello CoW!\n").unwrap();
+        fs::write(src.join("sub/file2.txt"), "Nested CoW!\n").unwrap();
 
         let result = reflink_copy_dir(&src, &dst).expect("reflink_copy_dir failed");
         assert_eq!(result.files_cloned, 2);
@@ -2293,7 +2294,9 @@ mod tests {
     ) {
         let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
-        let script = PathBuf::from("debug/build/ring-0f3a9c");
+        // Component by component: the tests compare this path's text with what
+        // the rewrite wrote, and on Windows a `/` in a plain path stays a `/`.
+        let script: PathBuf = "debug/build/ring-0f3a9c".split('/').collect();
         let out = anchor.join("target").join(&script).join("out");
         fs::create_dir_all(&out).unwrap();
         fs::write(out.join("libring_core.a"), "archive").unwrap();
@@ -2411,7 +2414,7 @@ mod tests {
     ) {
         let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
         let anchor = main.path().canonicalize().unwrap();
-        let unit = PathBuf::from("debug/build/ring/0f3a9c11");
+        let unit: PathBuf = "debug/build/ring/0f3a9c11".split('/').collect();
         let unit_dir = anchor.join("target").join(&unit);
         let out = unit_dir.join("out");
         fs::create_dir_all(&out).unwrap();
@@ -3124,8 +3127,15 @@ mod tests {
         for i in 0..50 {
             fs::write(anchor.join(format!("node_modules/p/f{i}")), [b'x'; 100]).unwrap();
         }
-        let report = with_forced_byte_copy(|| {
-            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        // Where a volume has no block size to round files up to (Windows),
+        // the fifty files plan 5,000 bytes against 10,000 of headroom and the
+        // copy begins; only a re-check inside it stops it, and the real
+        // 64 MiB interval would never be reached by 5 KB. Ten files of this
+        // interval's worth is where the re-check falls.
+        let report = with_recheck_every(1_000, || {
+            with_forced_byte_copy(|| {
+                clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+            })
         })
         .unwrap();
         assert!(

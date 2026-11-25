@@ -59,7 +59,12 @@ fn adv2_volume_of_missing_path_collapses_to_shared_key_zero() {
     // nearest existing ancestor; only a path with no ancestor shares key 0.
     let d = tempdir().unwrap();
     assert_eq!(volume_of(&d.path().join("nope")), volume_of(d.path()));
+    // Where the platform reads no volume identity (Windows) every path shares
+    // the one key, so concurrent copies are held to one pool of headroom.
+    #[cfg(unix)]
     assert_ne!(volume_of(d.path()), 0);
+    #[cfg(not(unix))]
+    assert_eq!(volume_of(d.path()), 0);
 }
 
 fn leftovers(dir: &Path) -> usize {
