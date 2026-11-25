@@ -7834,8 +7834,10 @@ mod tests {
             ];
             for (what, result) in results {
                 let err = result.expect_err(what);
+                // The refusal names the remote Debug-quoted, so a path's
+                // backslashes are doubled on Windows.
                 assert!(
-                    err.contains(target) && err.contains("not a configured remote"),
+                    err.contains(&format!("{target:?}")) && err.contains("not a configured remote"),
                     "{what} {target}: {err}",
                     err = err.message()
                 );
@@ -9227,18 +9229,12 @@ mod tests {
     #[test]
     fn pull_with_rebase_replays_local_commits_without_a_merge() {
         let (local, _origin) = diverged_clone();
-        // Unset in the repository, so whatever answers comes from outside it:
-        // Git for Windows' installer writes `pull.rebase=false` to the system
-        // config, which a fresh clone there inherits.
-        let inherited = git_text(
-            local.path(),
-            &["config", "--system", "--get", "pull.rebase"],
-        )
-        .ok()
-        .map(|value| value.trim().to_owned());
+        // Unset in the repository. The suite runs git with `GIT_CONFIG_NOSYSTEM`,
+        // so the system config (Git for Windows' installer writes
+        // `pull.rebase=false` there) is not consulted either: nothing answers.
         assert_eq!(
             GitWriter::pull_rebase_config(&repo_path(&local)).unwrap(),
-            inherited
+            None
         );
         GitWriter::pull(&repo_path(&local), None, None, Some(true)).unwrap();
         assert_eq!(parents_of_head(&local), 1, "rebased, not merged");
@@ -9612,7 +9608,8 @@ mod tests {
     fn staging_attributed_treats_exotic_names_literally() {
         let dir = init_repo_with_commit();
         let path = repo_path(&dir);
-        let names = [
+        // Windows cannot hold the names with `:`, `*`, `?`, a newline or a tab.
+        let names: Vec<&str> = [
             "-leading-dash.md",
             ":(top)magic.md",
             ":(glob)**.md",
@@ -9623,7 +9620,10 @@ mod tests {
             "caf\u{e9}-nfc.md",
             "cafe\u{301}-decomposed.md",
             "#hash?query%41.md",
-        ];
+        ]
+        .into_iter()
+        .filter(|name| crate::test_support::platform_can_hold(name))
+        .collect();
         let files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
         for name in &names {
             std::fs::write(dir.path().join(name), "x\n").unwrap();

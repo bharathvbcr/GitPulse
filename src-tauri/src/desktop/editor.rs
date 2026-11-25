@@ -790,7 +790,12 @@ mod tests {
 
     #[test]
     fn a_colon_in_the_file_name_refuses_a_line_but_not_a_plain_open() {
-        let (_dir, target) = file_in_temp("a:5");
+        // Windows cannot hold a file named `a:5`; the refusal reads only the
+        // name, so the path alone is enough there.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("a:5");
+        #[cfg(unix)]
+        fs::write(&target, b"x").expect("write");
         let installed = Installed {
             bundles: vec![],
             on_path: vec!["code", "zed"],

@@ -840,6 +840,10 @@ fn scrubbed_env_allows(name: &str) -> bool {
     upper == "PATH" || upper.starts_with("LC_") || SCRUBBED_ENV_ALLOWLIST.contains(&upper.as_str())
 }
 
+/// The variable a child reads its home directory from: `USERPROFILE` on
+/// Windows, `HOME` elsewhere.
+pub(super) const HOME_ENV_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
 /// Replaces `cmd`'s environment with the allowlisted part of `inherited` plus
 /// everything the builder set explicitly (PATH, the git pins, `extra_env`).
 /// A variable the builder explicitly removed stays removed. `also_allowed`
@@ -885,7 +889,7 @@ pub(super) fn restrict_env_to_allowlist_plus<I>(
         }
     }
     if let Some(home) = home {
-        cmd.env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, home);
+        cmd.env(HOME_ENV_VAR, home);
     }
     for (key, value) in explicit {
         cmd.env(key, value);

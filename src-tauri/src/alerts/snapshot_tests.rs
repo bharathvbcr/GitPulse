@@ -220,7 +220,26 @@ fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
     ));
 
     let me = std::process::id();
-    let my_start = crate::sysload::process_start_us(me).unwrap();
+    // A platform that cannot read a process's start time (Windows has no
+    // process scan) cannot tell a live writer from a reused pid, so the reader
+    // refuses every snapshot there rather than trusting one it cannot check.
+    let Some(my_start) = crate::sysload::process_start_us(me) else {
+        let unverifiable = HubStateSnapshot {
+            version: STATE_SNAPSHOT_VERSION,
+            writer_pid: me,
+            writer_start_us: 1,
+            updated_ms: 1234,
+            sessions: Vec::new(),
+        };
+        write_state_snapshot_atomic(&path, &unverifiable).unwrap();
+        match read_state_snapshot_at(Some(&path)) {
+            HubStateRead::Unavailable(reason) => {
+                assert!(reason.contains("is no longer running"), "{reason}")
+            }
+            HubStateRead::Ok(_) => panic!("a writer that cannot be identified must be refused"),
+        }
+        return;
+    };
     let snap = HubStateSnapshot {
         version: STATE_SNAPSHOT_VERSION,
         writer_pid: me,
@@ -322,15 +341,26 @@ fn worker_writes_initial_snapshot_debounced_updates_and_removes_on_exit() {
     ))
     .unwrap();
 
+    // Where the writer's start time cannot be read, the reader refuses every
+    // snapshot, so the file is read as the worker wrote it.
+    let reader_can_identify_the_writer =
+        crate::sysload::process_start_us(std::process::id()).is_some();
     let saw_done = crate::test_support::wait_until(Duration::from_secs(2), || {
-        matches!(
-            read_state_snapshot_at(Some(&path)),
-            HubStateRead::Ok(snap)
-                if snap
-                    .sessions
-                    .iter()
-                    .any(|s| s.key == "term-live" && s.state == "done")
-        )
+        let snap = if reader_can_identify_the_writer {
+            match read_state_snapshot_at(Some(&path)) {
+                HubStateRead::Ok(snap) => Some(snap),
+                HubStateRead::Unavailable(_) => None,
+            }
+        } else {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HubStateSnapshot>(&bytes).ok())
+        };
+        snap.is_some_and(|snap| {
+            snap.sessions
+                .iter()
+                .any(|s| s.key == "term-live" && s.state == "done")
+        })
     });
     assert!(
         saw_done,

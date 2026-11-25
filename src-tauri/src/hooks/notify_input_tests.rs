@@ -129,8 +129,9 @@ fn notify_timeouts(hooks: &Value) -> Vec<(String, f64)> {
     for groups in hooks.as_object().unwrap().values() {
         for group in groups.as_array().unwrap() {
             for hook in group["hooks"].as_array().unwrap() {
-                if let Some((_, argument)) =
-                    hook["command"].as_str().unwrap().split_once(" notify ")
+                if let Some((_, argument)) = super::notify_routes_tests::command_line(hook)
+                    .split_once(" notify ")
+                    .map(|(head, tail)| (head.to_owned(), tail.to_owned()))
                 {
                     found.push((
                         argument.to_owned(),

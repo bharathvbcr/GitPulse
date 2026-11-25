@@ -409,10 +409,12 @@ fn is_waiter_name(name: &str) -> bool {
     parse_waiter_pool(name).is_some()
 }
 
-/// Cross-process exclusive advisory lock on a `0600` `O_NOFOLLOW` lock file.
+/// Cross-process exclusive lock on a private lock file: `flock` on Unix,
+/// `LockFileEx` on Windows, both through [`File::lock`]. The lock is held by
+/// this open handle, so a second handle (another thread, another process)
+/// blocks until this one is dropped. The lock file is never read or written, so
+/// Windows' mandatory byte-range lock gets in nobody's way.
 struct AdvisoryLock {
-    /// Held open for its lock; only the Unix `flock` release in `drop` reads it.
-    #[cfg_attr(not(unix), allow(dead_code))]
     file: File,
 }
 
@@ -437,34 +439,15 @@ impl AdvisoryLock {
                 path.display()
             )));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            loop {
-                // SAFETY: `file` is an open descriptor we own for the duration of the call.
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-                if rc == 0 {
-                    break;
-                }
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(io("could not lock the mailbox", &err));
-            }
-        }
+        file.lock()
+            .map_err(|e| io("could not lock the mailbox", &e))?;
         Ok(Self { file })
     }
 }
 
 impl Drop for AdvisoryLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `self.file` remains valid until after `drop` returns.
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        let _ = self.file.unlock();
     }
 }
 

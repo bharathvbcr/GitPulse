@@ -12888,13 +12888,18 @@ mod tests {
         );
         let outcome = out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == wt.as_str()))
+            .and_then(|o| o.iter().find(|o| names_path(o, &wt)))
             .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
         assert_eq!(outcome["status"], "skipped", "{out}");
+        // Windows has no process scan, so it cannot say which process is in the
+        // worktree; it refuses on the session check instead of a named process.
+        let why = if cfg!(windows) {
+            "could not rule out a live agent session"
+        } else {
+            "process"
+        };
         assert!(
-            outcome["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("process")),
+            outcome["reason"].as_str().is_some_and(|r| r.contains(why)),
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
@@ -12930,10 +12935,19 @@ mod tests {
         alive
     }
 
+    /// Whether an outcome's `worktree_path` names `path`. Create answers with
+    /// the path as the platform spells it (`C:\...`) and prune with the one git
+    /// lists (`C:/...`); one directory, so one spelling for the comparison.
+    fn names_path(outcome: &Value, path: &str) -> bool {
+        outcome["worktree_path"]
+            .as_str()
+            .is_some_and(|found| found.replace('\\', "/") == path.replace('\\', "/"))
+    }
+
     fn outcome_for(out: &Value, path: &str) -> Value {
         out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+            .and_then(|o| o.iter().find(|o| names_path(o, path)))
             .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
             .clone()
     }
@@ -13119,13 +13133,24 @@ mod tests {
         .expect("lock the ref");
         let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
-        let find = |path: &str| {
-            out["outcomes"]
-                .as_array()
-                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
-                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
-                .clone()
-        };
+        let find = |path: &str| outcome_for(&out, path);
+        if cfg!(windows) {
+            // No process scan, so no worktree can be shown free of a live agent
+            // session, and prune removes none: there is no branch delete to
+            // fail and nothing to keep going past.
+            for path in [&stuck, &other] {
+                let outcome = find(path);
+                assert_eq!(outcome["status"], "skipped", "{out}");
+                assert!(
+                    outcome["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("could not rule out a live agent session")),
+                    "{out}"
+                );
+                assert!(std::path::Path::new(path).is_dir(), "{out}");
+            }
+            return;
+        }
         let stuck_outcome = find(&stuck);
         assert_eq!(stuck_outcome["status"], "removed_branch_kept", "{out}");
         assert_eq!(stuck_outcome["branch_deleted"], false, "{out}");
@@ -13152,7 +13177,12 @@ mod tests {
                 "repo_path": repo,
                 "branch": "feat/cmd-fails",
                 "share_cache": false,
-                "execute_command": "echo boom >&2; exit 3"
+                // The command runs under `sh -c` on Unix and `cmd /C` on Windows.
+                "execute_command": if cfg!(windows) {
+                    "echo boom 1>&2 & exit 3"
+                } else {
+                    "echo boom >&2; exit 3"
+                }
             }),
         );
         assert!(

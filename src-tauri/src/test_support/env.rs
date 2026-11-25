@@ -187,8 +187,31 @@ pub(crate) fn bind_env_owned(serial: EnvGuard) -> EnvBinding<'static> {
 
 impl EnvBinding<'_> {
     /// Set `key` to `value` until this binding is dropped.
-    pub(crate) fn set(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        let key = key.as_ref();
+    ///
+    /// Setting `HOME` moves the whole home on Windows: the per-user config and
+    /// cache directories there come from `USERPROFILE`, `APPDATA` and
+    /// `LOCALAPPDATA`, not from `HOME`, so a test that bound only `HOME` kept
+    /// writing GitPulse's state into the one directory every test shares.
+    pub(crate) fn set(self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        let (key, value) = (key.as_ref(), value.as_ref());
+        let mut this = self.set_one(key, value);
+        if cfg!(windows) && key == "HOME" {
+            let home = std::path::Path::new(value);
+            this = this
+                .set_one(OsStr::new("USERPROFILE"), home.as_os_str())
+                .set_one(
+                    OsStr::new("APPDATA"),
+                    home.join("AppData").join("Roaming").as_os_str(),
+                )
+                .set_one(
+                    OsStr::new("LOCALAPPDATA"),
+                    home.join("AppData").join("Local").as_os_str(),
+                );
+        }
+        this
+    }
+
+    fn set_one(mut self, key: &OsStr, value: &OsStr) -> Self {
         self.save(key);
         // SAFETY: serialized behind the guard `bind_env` required, and undone
         // by this binding's `Drop` on the unwinding path as well as the normal

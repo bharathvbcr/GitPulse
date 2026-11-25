@@ -20,10 +20,13 @@ impl R {
         r
     }
 
-    /// A repository whose directory name contains the list separator.
+    /// A repository whose directory name contains the list separator: `:`, or
+    /// `;` where `:` is a drive and cannot be in a name.
+    const SEPARATED: &'static str = if cfg!(windows) { "a;b" } else { "a:b" };
+
     fn with_colon() -> Self {
         let parent = tempfile::tempdir().expect("tempdir");
-        let dir = parent.path().join("a:b");
+        let dir = parent.path().join(Self::SEPARATED);
         std::fs::create_dir(&dir).unwrap();
         // Keep `parent` alive by leaking it into the struct's tempdir: the
         // repository lives under it, so its removal removes both.
@@ -62,7 +65,7 @@ impl R {
     }
 
     fn work(&self) -> PathBuf {
-        let colon = self.path().join("a:b");
+        let colon = self.path().join(Self::SEPARATED);
         if colon.is_dir() {
             colon
         } else {

@@ -6182,7 +6182,7 @@ impl UntrackedScan {
             return UntrackedLines::Counted(0);
         }
 
-        let identity = ScanIdentity::of(&meta);
+        let identity = ScanIdentity::of_path(full_path, &meta);
         // Only trust cache if identity has a valid, non-zero file identifier.
         if identity.inode != 0 {
             if let Some(known) = self.previous.get(full_path) {
@@ -7593,12 +7593,13 @@ impl ScanIdentity {
                 .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
             (meta.ino(), changed)
         };
+        // Windows' creation time is a nonzero stand-in here; a write does not
+        // move it, so it is not a change stamp. [`ScanIdentity::of_path`]
+        // replaces it with NTFS's `ChangeTime`.
         #[cfg(windows)]
         let (inode, changed) = {
             use std::os::windows::fs::MetadataExt;
-            let creation_ns = meta.creation_time();
-            let changed = meta.created().ok();
-            (creation_ns, changed)
+            (meta.creation_time(), None)
         };
         #[cfg(all(not(unix), not(windows)))]
         let (inode, changed) = (0, None);
@@ -7607,6 +7608,36 @@ impl ScanIdentity {
             inode,
             modified: meta.modified().ok(),
             changed,
+        }
+    }
+
+    /// [`Self::of`] for a file at `path`. Windows has no ctime in `Metadata`, so
+    /// the change stamp is read from the file; when it cannot be, the identity
+    /// is zero and the file is never remembered, because an mtime and a size
+    /// alone do not show a same-size rewrite that put the old mtime back.
+    fn of_path(path: &Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut identity = Self::of(meta);
+            // FILE_READ_ATTRIBUTES, shared with every other handle, and no
+            // reparse point followed.
+            let changed = std::fs::OpenOptions::new()
+                .access_mode(0x80)
+                .share_mode(7)
+                .custom_flags(0x0020_0000)
+                .open(path)
+                .and_then(|file| crate::fs_entry::windows_change_time(&file));
+            match changed {
+                Ok(changed) => identity.changed = Some(changed),
+                Err(_) => identity.inode = 0,
+            }
+            identity
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Self::of(meta)
         }
     }
 
@@ -7772,7 +7803,7 @@ fn scan_one(
     if !meta.is_file() {
         return ScanOutcome::Unreadable;
     }
-    let identity = ScanIdentity::of(&meta);
+    let identity = ScanIdentity::of_path(&path, &meta);
     if let Some(entry) = previous.get(rel_path) {
         if entry.identity == identity && entry.path_info == path_info {
             return ScanOutcome::Remembered(entry.tally);
@@ -15445,19 +15476,24 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-        let names = [
+        // Windows cannot hold `glob*.txt` or `:colon.txt`; the pathspec reading
+        // of those two is pinned by the pure-function test above.
+        let names: Vec<&str> = [
             "glob*.txt",
             "glob_decoy.txt",
             ":colon.txt",
             "src/routes/[id]/+page.svelte",
-        ];
-        for name in names {
+        ]
+        .into_iter()
+        .filter(|name| crate::test_support::platform_can_hold(name))
+        .collect();
+        for &name in &names {
             std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
             std::fs::write(root.join(name), "a\n").unwrap();
         }
         crate::test_support::git_in(&root, &["add", "."]);
         crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-        for name in names {
+        for &name in &names {
             std::fs::write(root.join(name), "a\nb\n").unwrap();
         }
         let (limited, whole, spawned) = status_both_ways(&root);
@@ -17626,7 +17662,16 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         text
     }
 
-    const ADV_NAMES: &[&str] = &[
+    /// The awkward names, less the ones this platform cannot hold.
+    fn adv_names() -> Vec<&'static str> {
+        ADV_NAMES_ALL
+            .iter()
+            .copied()
+            .filter(|name| crate::test_support::platform_can_hold(name))
+            .collect()
+    }
+
+    const ADV_NAMES_ALL: &[&str] = &[
         "a.txt",
         "b c.txt",
         "d b/e.txt",
@@ -17642,17 +17687,18 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     ];
 
     fn adv_pick_new(rng: &mut AdvRng, taken: &[String]) -> String {
+        let names = adv_names();
         loop {
             let dirs = ["", "pkg/", "pkg2/"];
             let name = format!(
                 "{}{}",
                 dirs[rng.below(dirs.len())],
-                ADV_NAMES[rng.below(ADV_NAMES.len())]
+                names[rng.below(names.len())]
             );
             if !taken.contains(&name) {
                 return name;
             }
-            if taken.len() > ADV_NAMES.len() * 3 - 2 {
+            if taken.len() > names.len() * 3 - 2 {
                 return format!("overflow{}.txt", taken.len());
             }
         }
@@ -17838,7 +17884,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
     #[test]
     fn adv_awkward_names_agree_as_rename_target_and_copy_source() {
         let mut problems = Vec::new();
-        for name in ADV_NAMES {
+        for name in adv_names() {
             let rename = init_repo_with_remotes(&[], "main");
             let path = rename.path().to_str().unwrap();
             let oid = merge_with_second_parent(
@@ -17910,7 +17956,18 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
     fn adv_directory_rename_of_thousands_of_files_opens() {
         let dir = init_repo_with_remotes(&[], "main");
         let path = dir.path().to_str().unwrap();
-        let long = "n".repeat(200);
+        // 200 bytes a name, as long as the path may be. Git for Windows refuses a
+        // path past MAX_PATH (260) unless `core.longpaths` is set, and an `add`
+        // that refuses leaves an empty commit, so there the name takes what the
+        // temp directory leaves of 240.
+        let name_len = if cfg!(windows) {
+            240usize
+                .saturating_sub(path.len() + "/pkg2/".len() + "00000.txt".len())
+                .min(200)
+        } else {
+            200
+        };
+        let long = "n".repeat(name_len);
         for i in 0..6000 {
             adv_write(
                 dir.path(),
@@ -18226,19 +18283,23 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 for n in 0..130 {
                     write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
                 }
-                let hot = [
+                // Windows cannot hold the newline and tab names; the rest stay.
+                let hot: Vec<&str> = [
                     "src/zz new\nline.rs",
                     "src/zz\ttab.rs",
                     "src/zz space name.rs",
                     "src/-zz dash.rs",
                     "src/zz \u{e9}.rs",
-                ];
-                for name in hot {
+                ]
+                .into_iter()
+                .filter(|name| crate::test_support::platform_can_hold(name))
+                .collect();
+                for &name in &hot {
                     write(dir.path(), name, "fn hot() {}\n");
                 }
                 commit_as(dir.path(), "feat: seed", "A <a@example.com>");
                 for round in 0..3 {
-                    for name in hot {
+                    for &name in &hot {
                         write(dir.path(), name, &lines(60, &format!("r{round}")));
                     }
                     commit_as(dir.path(), "feat: churn", "A <a@example.com>");
@@ -18246,7 +18307,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
                 let report = GitReader::knowledge_report(path, None).expect("report");
-                assert_eq!(report.candidate_files, 135);
+                assert_eq!(report.candidate_files, 130 + hot.len());
                 assert_eq!(report.scanned_files, 128, "{report:?}");
                 assert_eq!(
                     report.scanned_lines,
@@ -18667,6 +18728,18 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 );
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
+                if cfg!(windows) {
+                    // Git for Windows has no `~user` expansion and refuses the
+                    // setting outright, so there is no report to keep.
+                    let refused = GitReader::knowledge_report(path, None)
+                        .expect_err("git refuses a ~user mailmap path on Windows");
+                    assert!(
+                        refused.message().contains("failed to expand user dir"),
+                        "{}",
+                        refused.message()
+                    );
+                    return;
+                }
                 GitReader::knowledge_report(path, None).expect("first");
                 let cold = blame_spawns(&root);
                 GitReader::knowledge_report(path, None).expect("second");
