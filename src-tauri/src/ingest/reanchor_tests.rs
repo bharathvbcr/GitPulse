@@ -338,10 +338,6 @@ fn a_ledger_copied_from_a_live_clone_is_refused() {
 /// apart. What does is the directory the ledger was anchored in: the clone is
 /// another one, so the carried ledger stays refused once the source is gone.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
-)]
 fn a_ledger_copied_from_a_clone_stays_refused_once_the_source_is_gone() {
     let parent = tempfile::tempdir().unwrap();
     let upstream = upstream_in(parent.path());
@@ -731,10 +727,6 @@ fn shallow_clone_at(parent: &Path, name: &str) -> String {
 /// from a root added by an orphan branch; the directory the ledger was anchored
 /// in can, and the merging repository is another directory.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
-)]
 fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     let parent = tempfile::tempdir().unwrap();
     let a = repo_at(parent.path(), "a", "alpha");
@@ -776,10 +768,6 @@ fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
 /// the pre-move history stays, the adoption is an audit row, and recording
 /// goes on.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
-)]
 fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
     let parent = tempfile::tempdir().unwrap();
     let old = repo_at(parent.path(), "before", "seed");

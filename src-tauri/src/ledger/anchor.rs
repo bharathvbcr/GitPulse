@@ -2333,6 +2333,9 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         let audit = &events[0];
         let here = site_of(Path::new(&canonical_repo(&repo)));
+        // Where the platform names a site, an adopted ledger must record one.
+        #[cfg(unix)]
+        assert!(here.is_some(), "a live repository has a site on unix");
         assert_eq!(
             audit["from_paths"],
             serde_json::json!([gone("/gone/before")])
