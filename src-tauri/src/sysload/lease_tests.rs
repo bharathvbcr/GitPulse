@@ -163,15 +163,19 @@ fn a_session_is_named_by_its_terminal_then_its_run_then_its_agent_then_its_paren
 
 #[test]
 fn the_lease_folder_leads_the_agent_path_once() {
-    use std::ffi::OsStr;
     let bin = Path::new("/c/lease-bin");
     let joined = |p: &std::ffi::OsString| {
         std::env::split_paths(p)
             .map(|e| e.display().to_string())
             .collect::<Vec<_>>()
     };
+    // The inherited PATH in this platform's own separator (`:` or `;`).
+    let path = |entries: &[&str]| std::env::join_paths(entries).unwrap();
     assert_eq!(
-        joined(&path_with_bin_first(bin, Some(OsStr::new("/usr/bin:/bin")))),
+        joined(&path_with_bin_first(
+            bin,
+            Some(path(&["/usr/bin", "/bin"]).as_os_str())
+        )),
         ["/c/lease-bin", "/usr/bin", "/bin"]
     );
     // Already there, but not first (a login shell put the shim ahead of it):
@@ -179,7 +183,7 @@ fn the_lease_folder_leads_the_agent_path_once() {
     assert_eq!(
         joined(&path_with_bin_first(
             bin,
-            Some(OsStr::new("/home/x/.claude-bin:/c/lease-bin:/bin"))
+            Some(path(&["/home/x/.claude-bin", "/c/lease-bin", "/bin"]).as_os_str())
         )),
         ["/c/lease-bin", "/home/x/.claude-bin", "/bin"]
     );

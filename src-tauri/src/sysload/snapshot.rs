@@ -1258,6 +1258,13 @@ fn read_as(path: &Path, min_version: u32, known_len: usize) -> Result<Snapshot, 
 
 /// What a reader can say about the sampler from the record at `path`.
 pub fn report(path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
+    report_on(Platform::current(), path, now)
+}
+
+/// [`report`] for a reader on `platform`: a reader with no sensor has nothing
+/// to say about the sampler whatever the record holds. Named so the replay
+/// tests can read a record as a reader that has one on any host.
+pub(crate) fn report_on(platform: Platform, path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
     let dead = |reason: String| SensorReport {
         state: SensorState::Dead,
         age_ms: None,
@@ -1265,7 +1272,7 @@ pub fn report(path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
         enabled: None,
         reason: Some(reason),
     };
-    if Platform::current() == Platform::Unavailable {
+    if platform == Platform::Unavailable {
         return (dead("ungoverned: no sensor on this platform".into()), None);
     }
     let snapshot = match read(path) {
@@ -1925,7 +1932,11 @@ mod tests {
             "a second process loses while the first lives"
         );
         winner.publish(&full(clock(3))).unwrap();
-        let (seen, snapshot) = report(&dir.path().join(SNAPSHOT_FILE_NAME), clock(4));
+        let (seen, snapshot) = report_on(
+            Platform::Governed,
+            &dir.path().join(SNAPSHOT_FILE_NAME),
+            clock(4),
+        );
         assert_eq!(seen.state, SensorState::Fresh, "{seen:?}");
         assert_eq!(seen.level, Some(Level::Warn));
         assert_eq!(snapshot.unwrap().writer, writer_id());
@@ -2015,7 +2026,7 @@ mod tests {
     fn report_names_each_way_there_is_nothing_to_go_on() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SNAPSHOT_FILE_NAME);
-        let (missing, none) = report(&path, clock(1));
+        let (missing, none) = report_on(Platform::Governed, &path, clock(1));
         assert_eq!(missing.state, SensorState::Dead);
         assert_eq!(missing.reason.as_deref(), Some("no sampler"));
         assert!(none.is_none());
@@ -2024,7 +2035,7 @@ mod tests {
         let mut off = full(clock(10));
         off.enabled = false;
         writer.publish(&off).unwrap();
-        let (switched_off, _) = report(&path, clock(11));
+        let (switched_off, _) = report_on(Platform::Governed, &path, clock(11));
         assert_eq!(switched_off.state, SensorState::Fresh);
         assert_eq!(switched_off.enabled, Some(false));
         assert_eq!(
@@ -2035,9 +2046,22 @@ mod tests {
         let mut blind = full(clock(10));
         blind.platform = Platform::Unavailable;
         writer.publish(&blind).unwrap();
-        let (ungoverned, _) = report(&path, clock(11));
+        let (ungoverned, _) = report_on(Platform::Governed, &path, clock(11));
         assert_eq!(ungoverned.state, SensorState::Dead);
         assert!(ungoverned.reason.unwrap().contains("ungoverned"));
+
+        // A reader with no sensor says so whatever the record holds, and
+        // never hands that record back as something it could act on. Windows
+        // is such a reader.
+        let (blind_reader, handed_back) = report_on(Platform::Unavailable, &path, clock(11));
+        assert_eq!(blind_reader.state, SensorState::Dead);
+        assert_eq!(
+            blind_reader.reason.as_deref(),
+            Some("ungoverned: no sensor on this platform")
+        );
+        assert!(handed_back.is_none());
+        #[cfg(windows)]
+        assert_eq!(Platform::current(), Platform::Unavailable);
     }
 
     /// Replayed: one snapshot read at the four ages that bound the states.
@@ -2053,14 +2077,15 @@ mod tests {
             (300, SensorState::StaleOld),
             (601, SensorState::Dead),
         ] {
-            let (seen, _) = report(&path, clock(100 + later_s));
+            let (seen, _) = report_on(Platform::Governed, &path, clock(100 + later_s));
             assert_eq!(seen.state, state, "{later_s}s");
             assert_eq!(seen.age_ms, Some(later_s * 1000));
             // The last-known level travels with every state, so a consumer
             // can say "critical, 5 min ago" rather than nothing.
             assert_eq!(seen.level, Some(Level::Warn), "{later_s}s");
         }
-        let (rebooted, _) = report(
+        let (rebooted, _) = report_on(
+            Platform::Governed,
             &path,
             Clock {
                 boot_id: 0xdead_b007,
