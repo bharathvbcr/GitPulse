@@ -164,7 +164,7 @@ class ChildTabs {
 export const childTabs = new ChildTabs();
 
 /** What closing a forgotten thread's terminal tabs did. */
-export interface CloseChildrenResult {
+export interface MaviThreadChildrenClosed {
   closed: number;
   skippedProtected: number;
 }
@@ -174,6 +174,6 @@ export interface CloseChildrenResult {
  * forgotten, never on an interrupt or a stop: those leave work running that
  * the person may still want.
  */
-export function closeThreadChildren(threadKey: string): Promise<CloseChildrenResult> {
-  return invoke<CloseChildrenResult>("cmd_mavi_close_thread_children", { threadKey });
+export function closeThreadChildren(threadKey: string): Promise<MaviThreadChildrenClosed> {
+  return invoke<MaviThreadChildrenClosed>("cmd_mavi_close_thread_children", { threadKey });
 }
