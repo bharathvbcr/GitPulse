@@ -7324,19 +7324,29 @@ done
         collision_guard_with(input, BUDGET, |job| Some(job()))
     }
 
-    /// Where each directory's spawn log stood, to count only what follows.
+    /// Where each directory's spawn log and in-process status log stood, to
+    /// count only what follows.
     #[cfg(unix)]
-    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<usize> {
+    fn spawn_marks(dirs: &[std::path::PathBuf]) -> Vec<(usize, usize)> {
         dirs.iter()
-            .map(|dir| crate::engine::process::spawn_log::spawns_in(dir).len())
+            .map(|dir| {
+                (
+                    crate::engine::process::spawn_log::spawns_in(dir).len(),
+                    crate::engine::worktree::status_reads::in_dir(dir).len(),
+                )
+            })
             .collect()
     }
 
-    /// Git children one burst of guarded edits started, by what they ran.
+    /// Git reads one burst of guarded edits made, by what they ran.
     #[cfg(unix)]
     #[derive(Debug)]
     struct SpawnCost {
         worktree_list: usize,
+        /// Status reads by either backend: a `git status` child, or an
+        /// unfiltered read made in-process by `gix` (no child, so the spawn
+        /// log alone would count it as nothing). A read that fell back to git
+        /// is counted once, by its child.
         status: usize,
         /// Everything else: the symbol check's `ls-files`, `rev-parse`, `diff`.
         other: usize,
@@ -7349,23 +7359,31 @@ done
         }
     }
 
-    /// Git children started in `dirs` since `marks`.
+    /// Git children started, and in-process status reads made, in `dirs`
+    /// since `marks`.
     #[cfg(unix)]
-    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[usize]) -> SpawnCost {
+    fn spawn_cost(dirs: &[std::path::PathBuf], marks: &[(usize, usize)]) -> SpawnCost {
+        use crate::engine::worktree::status_reads::{self, StatusBackend};
         let argvs: Vec<Vec<String>> = dirs
             .iter()
             .zip(marks)
-            .flat_map(|(dir, mark)| {
+            .flat_map(|(dir, (mark, _))| {
                 crate::engine::process::spawn_log::spawns_in(dir)[*mark..].to_vec()
             })
             .collect();
+        let in_process = dirs
+            .iter()
+            .zip(marks)
+            .flat_map(|(dir, (_, mark))| status_reads::in_dir(dir)[*mark..].to_vec())
+            .filter(|(backend, _)| *backend == StatusBackend::Gix)
+            .count();
         let has = |argv: &[String], word: &str| argv.iter().any(|arg| arg == word);
         let worktree_list = argvs.iter().filter(|a| has(a, "worktree")).count();
-        let status = argvs.iter().filter(|a| has(a, "status")).count();
+        let status_children = argvs.iter().filter(|a| has(a, "status")).count();
         SpawnCost {
             worktree_list,
-            status,
-            other: argvs.len() - worktree_list - status,
+            status: status_children + in_process,
+            other: argvs.len() - worktree_list - status_children,
         }
     }
 

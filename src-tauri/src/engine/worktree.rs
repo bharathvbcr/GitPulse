@@ -12376,6 +12376,19 @@ some-future-field whatever
             .count()
     }
 
+    /// Unfiltered status reads of `cwds` by either backend: a `git status`
+    /// child, or an in-process `gix` read ([`status_reads`]). Counting only
+    /// children reads zero once the read moved in-process; a read that fell
+    /// back to git is counted once, by its child.
+    fn status_reads_with(cwds: &[PathBuf]) -> usize {
+        let in_process = cwds
+            .iter()
+            .flat_map(|cwd| status_reads::in_dir(cwd))
+            .filter(|(backend, _)| *backend == status_reads::StatusBackend::Gix)
+            .count();
+        spawned_with(cwds, "status") + in_process
+    }
+
     /// The default-base lookup is a property of the repository: one per
     /// listing, not two processes for every worktree.
     #[test]
@@ -12514,14 +12527,14 @@ some-future-field whatever
 
         let listing = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Listing).unwrap();
         assert!(listing.iter().all(|w| w.dirty_files.is_none()));
-        assert_eq!(spawned_with(&cwds, "status"), 0);
+        assert_eq!(status_reads_with(&cwds), 0);
 
         let dirty = list_worktrees_scanned(root.to_str().unwrap(), ScanDepth::Dirty).unwrap();
         assert!(dirty.iter().all(|w| w.dirty_files == Some(0)));
         assert!(dirty
             .iter()
             .all(|w| w.diff_stat.is_none() && w.main_divergence.is_none()));
-        assert_eq!(spawned_with(&cwds, "status"), 4);
+        assert_eq!(status_reads_with(&cwds), 4);
         assert_eq!(spawned_with(&cwds, "--shortstat"), 0);
         assert_eq!(spawned_with(&cwds, "rev-list"), 0);
         assert_eq!(spawned_with(&cwds, "for-each-ref"), 0);
@@ -12591,7 +12604,8 @@ some-future-field whatever
         assert_eq!(target.dirty_files, Some(1));
         assert_eq!(target.scan_note, None);
         let others = [plain(main.path()), linked[0].clone()];
-        assert_eq!(spawned_with(&others, "status"), 0);
+        assert_eq!(status_reads_with(&others), 0);
+        assert_eq!(status_reads_with(std::slice::from_ref(&linked[1])), 1);
     }
 
     /// The wire names are the variant names in lowercase, and nothing else:
@@ -12695,7 +12709,7 @@ some-future-field whatever
         let mut cwds = linked.clone();
         cwds.push(root.clone());
         assert_eq!(
-            spawned_with(&cwds, "status"),
+            status_reads_with(&cwds),
             linked.len() + 1,
             "one status per worktree"
         );
