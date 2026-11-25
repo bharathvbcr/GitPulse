@@ -283,10 +283,7 @@ pub fn run_captured(
                 truncation_reason,
             }))
         }
-        // Only a child that started and ran past its deadline is an outcome. A
-        // refused slot wait or a load deferral never ran it, and stays an error
-        // carrying the gate's own message.
-        Err(e) if is_run_timeout(e.message()) => Ok(RunOutcome::TimedOut(timeout)),
+        Err(e) if is_own_run_timeout(program, e.message()) => Ok(RunOutcome::TimedOut(timeout)),
         Err(e) => Err(e),
     }
 }
@@ -438,6 +435,20 @@ pub(super) fn next_poll_backoff(current: Duration) -> Duration {
 /// slot. A load deferral never carries the marker, so it is not one.
 pub(crate) fn is_timed_out(err: &str) -> bool {
     err.contains(TIMEOUT_MARKER)
+}
+
+/// True when `err` is the deadline text of the child `run_captured` ran as
+/// `program`: it starts with the program (the label `run_bounded` uses, in
+/// whatever characters the path holds) and carries the timeout marker. A
+/// refused slot wait carries the marker too, and so does a deferral that spells
+/// it, but neither ran the child, so neither is a run that timed out.
+pub(super) fn is_own_run_timeout(program: &str, err: &str) -> bool {
+    err.starts_with(program)
+        && is_timed_out(err)
+        && !matches!(
+            RunError::classify(err),
+            RunError::SlotWaitTimeout | RunError::Deferred
+        )
 }
 
 /// What a runner failure message says happened, read once and in one place.

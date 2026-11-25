@@ -127,8 +127,8 @@ pub(crate) use runner::{
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use runner::{
-    is_cancellation, next_poll_backoff, spawn_error, DRAIN_JOIN_GRACE, POLL_BACKOFF_MAX,
-    POLL_BACKOFF_START,
+    is_cancellation, is_own_run_timeout, next_poll_backoff, spawn_error, DRAIN_JOIN_GRACE,
+    POLL_BACKOFF_MAX, POLL_BACKOFF_START,
 };
 pub(in crate::engine::process) use runner::{observe_output, Drained, Stop};
 
