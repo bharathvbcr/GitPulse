@@ -14508,8 +14508,6 @@ some-future-field whatever
         assert!(!aside.exists());
     }
 
-    /// 1. The other sweep deletes children while this one walks the tree, so
-    ///    NotFound surfaces from inside the recursive delete.
     /// A delete another delete is finishing answers NotFound on unix and, on
     /// Windows, "access denied" or "directory not empty" until the tree is
     /// gone. Anything else is the caller's error as it came.
@@ -14528,6 +14526,8 @@ some-future-field whatever
         assert!(!is_vanishing_walk(&Error::from(ErrorKind::TimedOut)));
     }
 
+    /// 1. The other sweep deletes children while this one walks the tree, so
+    ///    NotFound surfaces from inside the recursive delete.
     #[test]
     fn deleting_an_aside_survives_children_vanishing_mid_walk() {
         let dir = tempfile::tempdir().unwrap();
