@@ -29,7 +29,10 @@ fn a_mavi_agents_caller_variable_names_its_thread_as_the_external_owner() {
     let (_, sid, tok, external) =
         super::resolve_orchestrate_context(&repo, None, None).expect("resolve");
     assert_eq!((sid, tok), (None, None));
-    assert_eq!(external.as_deref(), Some(format!("ext-mavi-{THREAD}").as_str()));
+    assert_eq!(
+        external.as_deref(),
+        Some(format!("ext-mavi-{THREAD}").as_str())
+    );
 }
 
 #[test]
@@ -58,12 +61,9 @@ fn terminal_credentials_outrank_the_caller_variable() {
         .remove(SESSION_TOKEN_ENV)
         .set(ORCHESTRATE_CALLER_ENV, format!("ext-mavi-{THREAD}"));
 
-    let (_, sid, tok, external) = super::resolve_orchestrate_context(
-        &repo,
-        Some("term-1-abc".into()),
-        Some("tok".into()),
-    )
-    .expect("resolve");
+    let (_, sid, tok, external) =
+        super::resolve_orchestrate_context(&repo, Some("term-1-abc".into()), Some("tok".into()))
+            .expect("resolve");
     assert_eq!(sid.as_deref(), Some("term-1-abc"));
     assert_eq!(tok.as_deref(), Some("tok"));
     assert_eq!(external, None);
@@ -80,8 +80,5 @@ fn without_the_variable_the_standalone_caller_is_still_mcp_pid() {
         .remove(ORCHESTRATE_CALLER_ENV);
     let (_, _, _, external) =
         super::resolve_orchestrate_context(&repo, None, None).expect("resolve");
-    assert_eq!(
-        external,
-        Some(format!("mcp-{}", std::process::id()))
-    );
+    assert_eq!(external, Some(format!("mcp-{}", std::process::id())));
 }

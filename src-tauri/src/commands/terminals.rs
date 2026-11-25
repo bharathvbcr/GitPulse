@@ -343,10 +343,11 @@ pub async fn cmd_mavi_close_thread_children(
     let owner = crate::terminal::orchestrate::mavi_owner_key(&thread_key)
         .ok_or_else(|| "That is not a Mavi thread key.".to_string())?;
     let ui = crate::terminal::orchestrate::AppOrchestrateUiSink::new(app);
-    let summary = crate::terminal::control_async(&state, "mavi_close_thread_children", move |state| {
-        crate::terminal::orchestrate::close_owner_children(state, &ui, &owner)
-    })
-    .await?;
+    let summary =
+        crate::terminal::control_async(&state, "mavi_close_thread_children", move |state| {
+            crate::terminal::orchestrate::close_owner_children(state, &ui, &owner)
+        })
+        .await?;
     Ok(MaviThreadChildrenClosed {
         closed: summary.closed,
         skipped_protected: summary.skipped_protected,

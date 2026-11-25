@@ -723,7 +723,10 @@ mod tests {
             crate::alerts::bridge::SESSION_ENV,
             crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
         ] {
-            assert!(removed.iter().any(|r| r == name), "{name} is inherited: {removed:?}");
+            assert!(
+                removed.iter().any(|r| r == name),
+                "{name} is inherited: {removed:?}"
+            );
         }
     }
 

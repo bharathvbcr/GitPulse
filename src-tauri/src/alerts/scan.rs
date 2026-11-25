@@ -198,7 +198,9 @@ pub enum TelemetryEvent {
     LoopbackUrl(String),
     /// An interactive agent dialog is waiting on the user (see
     /// [`Scanner::observe_prompt_line`]); `detail` is the command it names.
-    AgentPrompt { detail: String },
+    AgentPrompt {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
