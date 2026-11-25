@@ -298,7 +298,11 @@ function run(
   }
 }
 
-describe.skipIf(!hasBash)("the fixture address rule", () => {
+// Every suite below spawns bash and git. Process start-up on a Windows runner
+// can take longer than vitest's 5 s default for one test (four of these timed
+// out there in CI), so each suite gets the 30 s the hook suites above use.
+// A test that needs more still sets its own limit.
+describe.skipIf(!hasBash)("the fixture address rule", { timeout: 30_000 }, () => {
   it("agrees with every row of the table GitWriter is tested against", () => {
     // fixture-identity.cases is read by GitWriter's Rust test too; this runs
     // the shell rule over the same rows, so the two cannot drift apart.
@@ -335,7 +339,7 @@ done`;
   });
 });
 
-describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", () => {
+describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", { timeout: 30_000 }, () => {
   const script = join(LIB, "fixture-commits.sh");
 
   it("exits 0 for a clean range, 1 naming each fixture commit, 2 for a range it could not read", () => {
@@ -417,7 +421,7 @@ describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", () => {
 // The multi-ref and long-history cases spawn hundreds of git processes. Their
 // limits are set per test, well above what they take, because vitest's 5 s
 // default is shorter than a loaded machine needs (measured: 5.4 s at load 28).
-describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and many refs", () => {
+describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and many refs", { timeout: 30_000 }, () => {
   it("lets a published fixture commit reach a second remote", () => {
     // Excluding only the pushed-to remote's refs would refuse every push to a
     // new remote forever: the fixture commits published before the check
