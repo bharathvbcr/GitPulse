@@ -575,6 +575,7 @@ fn parse_term_cli(
                 split,
                 rows,
                 cols,
+                agent: None,
             }
         }
         "exec" => {
@@ -1200,6 +1201,7 @@ mod tests {
                 split: Some(false),
                 rows: Some(36),
                 cols: Some(120),
+                agent: None,
             })
         );
 

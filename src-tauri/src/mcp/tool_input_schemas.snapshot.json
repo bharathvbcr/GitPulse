@@ -2271,6 +2271,24 @@
         "maxLength": 32,
         "type": "string"
       },
+      "mode": {
+        "description": "Optional permission mode for an agent launcher",
+        "enum": [
+          "inspect",
+          "ask",
+          "edit",
+          "auto_review",
+          "preapproved"
+        ],
+        "maxLength": 32,
+        "type": "string"
+      },
+      "model": {
+        "description": "Optional model id for an agent launcher",
+        "maxLength": 160,
+        "minLength": 1,
+        "type": "string"
+      },
       "prompt": {
         "description": "Optional initial task prompt when launcher is an agent",
         "maxLength": 8192,
@@ -2288,6 +2306,12 @@
         "maximum": 500,
         "minimum": 4,
         "type": "integer"
+      },
+      "settings": {
+        "description": "Optional repo-relative settings file for claude or agy",
+        "maxLength": 1024,
+        "minLength": 1,
+        "type": "string"
       },
       "split": {
         "description": "Open the child session as a right-hand split pane beside the parent session",

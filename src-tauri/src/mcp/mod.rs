@@ -1043,6 +1043,20 @@ tool_args! {
         ),
         rows: Option<u32> = Spec::int("Initial PTY height in rows (default 28)", 4, 500),
         cols: Option<u32> = Spec::int("Initial PTY width in columns (default 100)", 20, 1000),
+        model: Option<String> = Spec::bytes(
+            "Optional model id for an agent launcher ('claude', 'agy', 'codex', 'grok'), passed as --model; refused for 'shell' and 'manvi'",
+            1,
+            crate::workbench::terminal_command::MAX_MODEL_ID_LEN,
+        ),
+        mode: Option<String> = Spec::one_of(
+            "Optional permission mode for an agent launcher (default 'ask'; 'bypass' is never available over MCP). 'inspect' plans without editing, 'edit' accepts edits, 'preapproved' accepts edits and never asks, 'auto_review' lets the agent review its own actions",
+            &crate::terminal::orchestrate::CHILD_PERMISSION_MODES,
+        ),
+        settings: Option<String> = Spec::bytes(
+            "Optional path, relative to repo_path, of an existing settings file for the agent ('claude' or 'agy' only; passed as --settings). Use it to pre-approve the exact command shapes your brief mandates; the file must resolve inside the repository",
+            1,
+            1024,
+        ),
         caller_session_id: Option<String> = Spec::bytes(
             "Optional parent session id override; defaults to GITPULSE_TERMINAL_SESSION from the environment",
             1,
@@ -2652,7 +2666,7 @@ fn build_tools() -> Vec<Value> {
         open_world(mutating_tool(
             "gitpulse_terminal_spawn",
             "Spawn a scoped child terminal session",
-            "Ask the running GitPulse (macOS) to spawn a scoped child terminal session (shell or coding agent) inside a trusted repository. Inside a GitPulse PTY it authenticates via GITPULSE_SESSION_TOKEN; standalone MCP callers spawn under a caller-scoped mcp-<pid> identity (never touching user shells or another caller's children)",
+            "Ask the running GitPulse (macOS) to spawn a scoped child terminal session (shell or coding agent) inside a trusted repository. Inside a GitPulse PTY it authenticates via GITPULSE_SESSION_TOKEN; standalone MCP callers spawn under a caller-scoped mcp-<pid> identity (never touching user shells or another caller's children). To run another agent, prefer an agent launcher with prompt, mode, model and settings over launcher 'shell' with a hand-typed command line, then call gitpulse_terminal_wait: matched_reason 'needs_input' means that child is waiting on the user (tell them which tab). Allow rules in a settings file must match the exact command shapes your brief mandates ('git -C <path> log' is not matched by 'git log')",
             TerminalSpawnArgs::properties(),
             &TerminalSpawnArgs::required(),
             json!({
@@ -4919,6 +4933,13 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 split: a.split,
                 rows: a.rows.map(|r| r as u16),
                 cols: a.cols.map(|c| c as u16),
+                agent: (a.model.is_some() || a.mode.is_some() || a.settings.is_some()).then(
+                    || crate::terminal::orchestrate::AgentLaunchOptions {
+                        model: a.model,
+                        mode: a.mode,
+                        settings: a.settings,
+                    },
+                ),
             })
         }
         "gitpulse_terminal_exec" => {

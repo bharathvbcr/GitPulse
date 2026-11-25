@@ -269,6 +269,11 @@ pub(crate) fn close_owner_children(
     }
 }
 
+/// Permission modes a spawned agent child may ask for: the shared table without
+/// `bypass`, which no MCP caller can select.
+pub const CHILD_PERMISSION_MODES: [&str; 5] =
+    ["inspect", "ask", "edit", "auto_review", "preapproved"];
+
 /// Allowed child launchers for `Spawn`.
 pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
 
@@ -1432,6 +1437,24 @@ impl OrchestrationRegistry {
     }
 }
 
+/// What a `Spawn` of an agent launcher may choose beyond the prompt. Every
+/// field is optional; absent means the launch default (`ask` mode, the user's
+/// configured model, no extra settings).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLaunchOptions {
+    /// A model id the launcher accepts (`--model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// A permission mode from the shared table, never `bypass`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Repo-relative path of an existing settings file (`--settings`), for
+    /// `claude` and `agy` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<String>,
+}
+
 /// Wire request carried inside `desktop::instance::Request::TerminalOrchestrate`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -1460,6 +1483,8 @@ pub enum OrchestrateCall {
         rows: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cols: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentLaunchOptions>,
     },
     Exec {
         repo_path: String,
@@ -2052,19 +2077,116 @@ fn authorize_readable_session<'a>(
     Err(LINEAGE_REFUSAL.to_string())
 }
 
+/// The largest settings file a spawn may pass on (it is read whole for
+/// `claude`, which takes it inline).
+const MAX_SETTINGS_FILE_BYTES: u64 = 64 * 1024;
+
+/// `--settings <value>` for a spawned agent, from a repo-relative file that
+/// must already exist inside the repository (symlinks resolve first, and one
+/// that leaves the repository is refused).
+///
+/// Claude Code takes the object inline, so its launch's own `--settings` (the
+/// notification channel, the command gate's hook) can be folded into it
+/// rather than dropped, which is what a bare file path would cause. `agy` takes
+/// the path. A file that would turn the permission model off is refused,
+/// because `bypass` is not available over MCP and a file must not be the way
+/// around that.
+fn settings_flags(launcher: &str, relative: &str, repo_root: &Path) -> Result<Vec<String>, String> {
+    if !matches!(launcher, "claude" | "agy") {
+        return Err(format!(
+            "settings applies only to the claude and agy launchers (they take --settings); {launcher} does not"
+        ));
+    }
+    let path = sandbox_join_canonical(repo_root, relative.trim())?;
+    let meta = std::fs::metadata(&path)
+        .map_err(|_| format!("settings file {relative} does not exist inside the repository"))?;
+    if !meta.is_file() {
+        return Err(format!("settings {relative} is not a file"));
+    }
+    if meta.len() > MAX_SETTINGS_FILE_BYTES {
+        return Err(format!(
+            "settings file {relative} is larger than {MAX_SETTINGS_FILE_BYTES} bytes"
+        ));
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("settings file {relative} is not readable text: {e}"))?;
+    let object = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => object,
+        _ => return Err(format!("settings file {relative} must hold one JSON object")),
+    };
+    let default_mode = object
+        .get("permissions")
+        .and_then(|p| p.get("defaultMode"))
+        .and_then(Value::as_str);
+    if default_mode == Some("bypassPermissions")
+        || object.get("disableAllHooks").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(format!(
+            "settings file {relative} turns off permission checks or hooks; that is not available over MCP"
+        ));
+    }
+    let value = if launcher == "agy" {
+        path.to_string_lossy().into_owned()
+    } else {
+        Value::Object(object).to_string()
+    };
+    Ok(vec!["--settings".to_string(), value])
+}
+
 fn build_agent_child_args(
     launcher: &str,
     prompt: Option<&str>,
+    options: &AgentLaunchOptions,
+    repo_root: &Path,
 ) -> Result<Option<Vec<String>>, String> {
-    let prompt_args = match prompt.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(text) => match launcher {
-            "claude" => Some(vec!["--".to_string(), text.to_string()]),
-            "agy" => Some(vec!["--prompt-interactive".to_string(), text.to_string()]),
-            _ => Some(vec![text.to_string()]),
-        },
-        None => None,
+    // The mode is validated against the shared table here, and `bypass` is not
+    // in the list a spawn may pick from, so it stays unreachable: it would also
+    // need an acknowledgement, and `apply_permission_mode` is never given one.
+    let mode = match options.mode.as_deref() {
+        None => "ask",
+        Some(mode) if CHILD_PERMISSION_MODES.contains(&mode) => mode,
+        Some(other) => {
+            return Err(format!(
+                "unsupported permission mode {other:?}; expected one of {} (bypass is never available over MCP)",
+                CHILD_PERMISSION_MODES.join(", ")
+            ))
+        }
     };
+    // `manvi` takes no permission-mode flag.
+    let mode = if matches!(launcher, "claude" | "agy" | "codex" | "grok") {
+        Some(mode)
+    } else if options.mode.is_some() {
+        return Err(format!("{launcher} does not take a permission mode"));
+    } else {
+        None
+    };
+
     let defaults = crate::tool_config::agent_defaults();
+    let model_choice = match options.model.as_deref() {
+        Some(model) => {
+            let mut choice = defaults.model_for(launcher).cloned().unwrap_or_default();
+            choice.model = Some(model.to_owned());
+            crate::workbench::terminal_command::validate_model_choice(launcher, &choice)?;
+            Some(choice)
+        }
+        None => defaults.model_for(launcher).cloned(),
+    };
+
+    let mut leading = match options.settings.as_deref() {
+        Some(relative) => settings_flags(launcher, relative, repo_root)?,
+        None => Vec::new(),
+    };
+    let prompt_args = match prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => {
+            match launcher {
+                "claude" => leading.extend(["--".to_string(), text.to_string()]),
+                "agy" => leading.extend(["--prompt-interactive".to_string(), text.to_string()]),
+                _ => leading.push(text.to_string()),
+            }
+            Some(leading)
+        }
+        None => (!leading.is_empty()).then_some(leading),
+    };
     let sources = defaults.claude_setting_sources_arg();
     let hook = crate::workbench::claude_hook::for_launch(launcher);
     let with_flags = crate::workbench::terminal_command::with_launch_flags(
@@ -2072,19 +2194,11 @@ fn build_agent_child_args(
         &crate::workbench::terminal_command::LaunchOptions {
             notify: crate::tool_config::session_alerts().configure_agents,
             setting_sources: sources.as_deref(),
-            model: defaults.model_for(launcher),
+            model: model_choice.as_ref(),
             hook: hook.binary(),
         },
         prompt_args,
     )?;
-    // `manvi` takes no permission-mode flag; every other supported agent CLI
-    // starts in `"ask"` mode with `acknowledged = false`, making `bypass`
-    // structurally unreachable from orchestrated child spawns.
-    let mode = if matches!(launcher, "claude" | "agy" | "codex" | "grok") {
-        Some("ask")
-    } else {
-        None
-    };
     crate::workbench::terminal_command::apply_permission_mode(
         Some(launcher),
         mode,
@@ -2360,6 +2474,7 @@ fn encode_exec_wrapper(command: &str, exec_tag: &str, exit_after: bool) -> Strin
 }
 
 struct SpawnParams {
+    agent: Option<AgentLaunchOptions>,
     launcher: Option<String>,
     cwd: Option<String>,
     command: Option<String>,
@@ -2470,6 +2585,12 @@ fn spawn_child_internal(
         if params.prompt.is_some() {
             return Err("prompt applies only to agent launchers; pass command for shell".into());
         }
+        if params.agent.is_some() {
+            return Err(
+                "model, mode and settings apply only to an agent launcher; use launcher claude, agy, codex or grok instead of shell"
+                    .into(),
+            );
+        }
         if let Some(cmd) = params.command {
             validate_child_input_bytes(&cmd)?;
             let (checked, notice) = gate_lines(&resolved_cwd_str, &cmd)?;
@@ -2483,7 +2604,12 @@ fn spawn_child_internal(
                 "command applies only to shell launcher; pass prompt for agent launchers".into(),
             );
         }
-        let agent_args = build_agent_child_args(&launcher, params.prompt.as_deref())?;
+        let agent_args = build_agent_child_args(
+            &launcher,
+            params.prompt.as_deref(),
+            &params.agent.clone().unwrap_or_default(),
+            repo_buf,
+        )?;
         (Some(launcher.clone()), agent_args, None, true, None)
     };
 
@@ -2846,6 +2972,7 @@ pub(crate) fn execute_with_shell_reads(
             split,
             rows,
             cols,
+            agent,
         } => {
             let repo_buf = canonical_trusted_repo(&repo_path)?;
             let canonical_repo = repo_buf.to_string_lossy().into_owned();
@@ -2871,6 +2998,7 @@ pub(crate) fn execute_with_shell_reads(
                     split,
                     rows,
                     cols,
+                    agent,
                 },
             )?;
             Ok(json!({
@@ -2949,6 +3077,7 @@ pub(crate) fn execute_with_shell_reads(
                         split: Some(split.unwrap_or(keep)),
                         rows: None,
                         cols: None,
+                        agent: None,
                     },
                 )?;
                 (res.child_session_id, true, res.cwd)
@@ -3705,6 +3834,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("parent_a spawns child");
@@ -3829,6 +3959,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         );
         assert!(
@@ -3852,6 +3983,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("clean child spawn")["child_session_id"]
@@ -3956,6 +4088,7 @@ pub(crate) mod tests {
                 split: Some(true),
                 rows: Some(24),
                 cols: Some(100),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4125,6 +4258,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4545,6 +4679,7 @@ pub(crate) mod tests {
                     split: Some(false),
                     rows: Some(24),
                     cols: Some(80),
+                    agent: None,
                 },
             )
             .expect("spawn child within cap");
@@ -4568,6 +4703,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .unwrap_err();
@@ -4648,6 +4784,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn replacement in freed slot");
@@ -4754,6 +4891,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4798,6 +4936,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(80),
+                agent: None,
             },
         )
         .expect("spawn child");
@@ -4835,6 +4974,158 @@ pub(crate) mod tests {
             .any(|s| s.id == child && !s.ending));
         assert!(ledger.set_protected(&child, false));
         assert_eq!(close().expect("close once unprotected")["ok"], true);
+    }
+
+    fn child_args(
+        launcher: &str,
+        options: AgentLaunchOptions,
+        repo: &Path,
+    ) -> Result<Vec<String>, String> {
+        build_agent_child_args(launcher, Some("do the audit"), &options, repo)
+            .map(Option::unwrap_or_default)
+    }
+
+    fn flag_values<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == flag)
+            .filter_map(|(i, _)| args.get(i + 1).map(String::as_str))
+            .collect()
+    }
+
+    fn opts(model: Option<&str>, mode: Option<&str>, settings: Option<&str>) -> AgentLaunchOptions {
+        AgentLaunchOptions {
+            model: model.map(str::to_owned),
+            mode: mode.map(str::to_owned),
+            settings: settings.map(str::to_owned),
+        }
+    }
+
+    /// Before: every agent child started in `ask` whatever the caller asked
+    /// for, which sent the Mavi agent to `launcher: shell` and hand-typed flags.
+    #[test]
+    fn an_agent_child_takes_a_permission_mode_and_defaults_to_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = AgentLaunchOptions::default();
+        assert_eq!(flag_values(&child_args("claude", none.clone(), dir.path()).unwrap(), "--permission-mode"), ["manual"]);
+        assert_eq!(flag_values(&child_args("claude", opts(None, Some("edit"), None), dir.path()).unwrap(), "--permission-mode"), ["acceptEdits"]);
+        assert_eq!(flag_values(&child_args("agy", opts(None, Some("inspect"), None), dir.path()).unwrap(), "--mode"), ["plan"]);
+        let codex = child_args("codex", opts(None, Some("edit"), None), dir.path()).unwrap();
+        assert_eq!(flag_values(&codex, "--sandbox"), ["workspace-write"]);
+        assert!(flag_values(&child_args("agy", none, dir.path()).unwrap(), "--mode").is_empty());
+    }
+
+    #[test]
+    fn bypass_unknown_and_inapplicable_modes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["bypass", "yolo", "", "EDIT"] {
+            let err = child_args("claude", opts(None, Some(bad), None), dir.path())
+                .expect_err(bad);
+            assert!(!err.is_empty(), "{bad}");
+        }
+        let err = child_args("manvi", opts(None, Some("edit"), None), dir.path()).unwrap_err();
+        assert!(err.contains("manvi"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_child_takes_a_model_where_the_launcher_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = child_args("claude", opts(Some("opus"), None, None), dir.path()).unwrap();
+        assert_eq!(flag_values(&claude, "--model"), ["opus"]);
+        let agy = child_args("agy", opts(Some("gemini-3-pro"), None, None), dir.path()).unwrap();
+        assert_eq!(flag_values(&agy, "--model"), ["gemini-3-pro"]);
+        assert!(child_args("manvi", opts(Some("opus"), None, None), dir.path()).is_err());
+        for bad in ["--evil", "a b", "x,y", ""] {
+            assert!(child_args("claude", opts(Some(bad), None, None), dir.path()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_inside_the_repo_reaches_claude_and_agy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".gitpulse")).unwrap();
+        std::fs::write(
+            dir.path().join(".gitpulse/review.json"),
+            r#"{"permissions":{"allow":["Bash(git -C /repo log:*)"]}}"#,
+        )
+        .unwrap();
+        let claude = child_args("claude", opts(None, None, Some(".gitpulse/review.json")), dir.path()).unwrap();
+        let settings = flag_values(&claude, "--settings");
+        assert_eq!(settings.len(), 1, "one --settings object: {claude:?}");
+        let object: serde_json::Value = serde_json::from_str(settings[0]).unwrap();
+        assert_eq!(object["permissions"]["allow"][0], "Bash(git -C /repo log:*)");
+        let at = |flag: &str| claude.iter().position(|a| a == flag).unwrap();
+        assert!(at("--settings") < at("--"), "{claude:?}");
+
+        let agy = child_args("agy", opts(None, None, Some(".gitpulse/review.json")), dir.path()).unwrap();
+        let canonical = std::fs::canonicalize(dir.path().join(".gitpulse/review.json")).unwrap();
+        assert_eq!(flag_values(&agy, "--settings"), [canonical.to_str().unwrap()]);
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_existing_file_in_the_repo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("s.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("ok.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("array.json"), "[]").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let try_settings = |launcher: &str, path: &str| {
+            child_args(launcher, opts(None, None, Some(path)), dir.path())
+        };
+        assert!(try_settings("claude", "../escape.json").is_err());
+        assert!(try_settings("claude", "/etc/hosts").is_err());
+        assert!(try_settings("claude", "missing.json").is_err());
+        assert!(try_settings("claude", "sub").is_err(), "a directory");
+        assert!(try_settings("claude", "array.json").is_err(), "claude needs a JSON object");
+        for launcher in ["codex", "grok", "manvi"] {
+            let err = try_settings(launcher, "ok.json").unwrap_err();
+            assert!(err.contains("--settings") || err.contains("settings"), "{launcher}: {err}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("s.json"), dir.path().join("link.json")).unwrap();
+            assert!(try_settings("claude", "link.json").is_err(), "symlink out of the repo");
+            assert!(try_settings("agy", "link.json").is_err(), "symlink out of the repo");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_cannot_turn_off_permissions_or_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bypass.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("nohooks.json"), r#"{"disableAllHooks":true}"#).unwrap();
+        for file in ["bypass.json", "nohooks.json"] {
+            for launcher in ["claude", "agy"] {
+                let err = child_args(launcher, opts(None, None, Some(file)), dir.path())
+                    .expect_err(file);
+                assert!(err.contains("not available over MCP"), "{launcher} {file}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shell_child_takes_none_of_the_agent_options() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        for agent in [
+            opts(Some("opus"), None, None),
+            opts(None, Some("edit"), None),
+            opts(None, None, Some("src/main.rs")),
+        ] {
+            let mut call = external_spawn(&repo, &format!("mcp-{}", std::process::id()));
+            if let OrchestrateCall::Spawn { agent: slot, .. } = &mut call {
+                *slot = Some(agent);
+            }
+            let err = execute(&state, &ui, call).expect_err("shell takes no agent options");
+            assert!(err.contains("agent launcher"), "{err}");
+        }
+        assert!(crate::terminal::list_sessions(&state).unwrap().is_empty());
     }
 
     /// A pid no process can have: past the kernel's pid ceiling on every
@@ -4879,6 +5170,7 @@ pub(crate) mod tests {
             split: Some(false),
             rows: Some(24),
             cols: Some(80),
+            agent: None,
         }
     }
 
