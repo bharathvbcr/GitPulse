@@ -240,7 +240,9 @@ function offeredRoot(offer: SessionLedgerOffer, byId: ReadonlyMap<string, Sessio
   for (;;) {
     const parentId = cursor.parent_row_id ?? null;
     const parent = parentId === null ? undefined : byId.get(parentId);
-    if (!parent) return root;
+    // A parent that cannot be resumed will not re-spawn its children, so they
+    // stand on their own (and count for "Reopen all") rather than wait on it.
+    if (!parent || !parent.resumable) return root;
     // A cycle (or a self-parent) has no top: every member stays a normal offer.
     if (seen.has(parent.row_id)) return null;
     seen.add(parent.row_id);

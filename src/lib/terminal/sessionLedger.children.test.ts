@@ -83,6 +83,13 @@ describe("orchestrated children", () => {
     expect(check.mock.calls.map((c) => c[0])).toEqual(["p"]);
   });
 
+  it("lets the children of a parent that cannot be resumed stand alone and join Reopen all", () => {
+    const stuck = offer("s", { resumable: false, reason: "No saved claude transcript was found" });
+    const kid = offer("k", { parent_row_id: "s" });
+    expect(topLevelOffers([stuck, kid]).map((o) => o.row_id)).toEqual(["s", "k"]);
+    expect(summarizeInterrupted([stuck, kid]).resumable.map((o) => o.row_id)).toEqual(["k"]);
+  });
+
   it("survives a parent cycle without dropping rows", () => {
     const a = offer("a", { parent_row_id: "b" });
     const b = offer("b", { parent_row_id: "a" });
