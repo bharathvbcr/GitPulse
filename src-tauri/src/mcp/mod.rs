@@ -8474,7 +8474,9 @@ mod tests {
         );
 
         // Resource template `gitpulse://campaign{+repo_path}` serves the identical verified document.
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        // `repo_uri`, not `encode_path`: a Windows path has no leading `/` and
+        // its `\` and `:` must become a `/C:/...` path, not `%5C` and `%3A`.
+        let uri = uri::repo_uri("campaign", repo_path);
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");
@@ -8637,7 +8639,9 @@ mod tests {
             );
         }
 
-        let uri = format!("gitpulse://campaign{}", uri::encode_path(repo_path));
+        // `repo_uri`, not `encode_path`: a Windows path has no leading `/` and
+        // its `\` and `:` must become a `/C:/...` path, not `%5C` and `%3A`.
+        let uri = uri::repo_uri("campaign", repo_path);
         let res = modern_call("resources/read", json!({ "uri": uri }));
         let res_doc: Value =
             serde_json::from_str(res["contents"][0]["text"].as_str().unwrap()).expect("json doc");

@@ -1800,7 +1800,8 @@ mod scope_tests {
         crate::test_support::trust_repo(main.path());
 
         // Missing.
-        std::fs::remove_dir_all(&worktree).expect("delete worktree");
+        crate::test_support::remove_dir_all_retrying(Path::new(&worktree))
+            .expect("delete worktree");
         assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
     }
 

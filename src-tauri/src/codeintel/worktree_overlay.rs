@@ -3682,6 +3682,15 @@ mod tests {
             perms.set_mode(0o644);
             fs::set_permissions(&csr_path, perms).unwrap();
         }
+        // Windows has no mode bits: the sidecar is sealed read-only there, and
+        // writing to it is "Access is denied" until the attribute is cleared.
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&csr_path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&csr_path, perms).unwrap();
+        }
         let mut csr_bytes = fs::read(&csr_path).unwrap();
         let last = csr_bytes.len() - 1;
         csr_bytes[last] ^= 0xFF;

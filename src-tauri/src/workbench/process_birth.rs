@@ -267,6 +267,66 @@ fn observe(pid: u32) -> Result<Option<Birth>, String> {
     }))
 }
 
+/// The process that started this one, on Windows, where `getppid` has no
+/// counterpart in `std`. The Toolhelp snapshot records each process's parent
+/// pid as of its creation, and Windows reuses pids, so the answer stands only
+/// when the parent was created no later than this process: a "parent" that
+/// started after its child is a different process that took the pid.
+#[cfg(target_os = "windows")]
+pub(crate) fn parent_pid() -> Option<u32> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        base_priority: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    /// `TH32CS_SNAPPROCESS`.
+    const SNAP_PROCESS: u32 = 0x2;
+    let me = std::process::id();
+    // SAFETY: a snapshot request names no caller memory.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(SNAP_PROCESS, 0) };
+    // INVALID_HANDLE_VALUE is -1.
+    if snapshot.is_null() || snapshot as usize == usize::MAX {
+        return None;
+    }
+    // SAFETY: an all-zero entry is valid for this plain-data struct.
+    let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+    let mut parent = None;
+    // SAFETY: the snapshot is live and `entry` is a writable, sized
+    // PROCESSENTRY32W, as both calls require.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.process_id == me {
+            parent = Some(entry.parent_process_id);
+            break;
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: this function owns the snapshot handle and closes it once.
+    unsafe { CloseHandle(snapshot) };
+    let parent = parent.filter(|pid| *pid != 0)?;
+    let mine = observe(me).ok().flatten()?;
+    let theirs = observe(parent).ok().flatten()?;
+    (theirs.started_unix_nanos <= mine.started_unix_nanos).then_some(parent)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("Task terminal process identity requires a platform adapter");
 
@@ -281,6 +341,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    /// Windows only (CI): the parent of a test process is a live process that
+    /// started before it, and `running_since` agrees under the recorded start.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_parent_is_found_and_alive_at_its_recorded_start() {
+        let parent = super::parent_pid().expect("a test process has a live parent");
+        assert_ne!(parent, std::process::id());
+        let start = super::started_unix_nanos(parent).expect("the parent's start");
+        assert_eq!(running_since(parent, u128::from(start)), Liveness::Alive);
     }
 
     #[test]

@@ -46,6 +46,19 @@ fn call(tool: &str, args: &[(&str, String)]) -> (i32, Value, String) {
     )
 }
 
+/// Why a call failed: its output without the `WARN [setup]` lines every
+/// Windows child prints first, which filled the 160-200 characters a failure
+/// used to show and left the actual error unread.
+fn failure_reason(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.contains(" WARN [setup] "))
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .take(300)
+        .collect()
+}
+
 fn s(x: impl ToString) -> String {
     x.to_string()
 }
@@ -496,7 +509,11 @@ fn concurrent_senders_in_separate_processes_lose_nothing() {
                         code,
                         v["message"]["seq"].as_u64(),
                         t.elapsed().as_millis(),
-                        if code == 0 { String::new() } else { raw },
+                        if code == 0 {
+                            String::new()
+                        } else {
+                            failure_reason(&raw)
+                        },
                     ));
                 }
                 res
@@ -610,7 +627,11 @@ fn concurrent_large_senders_lose_nothing() {
                         (
                             code,
                             t.elapsed().as_millis(),
-                            raw.chars().take(160).collect::<String>(),
+                            if code == 0 {
+                                String::new()
+                            } else {
+                                failure_reason(&raw)
+                            },
                         )
                     })
                     .collect::<Vec<_>>()
