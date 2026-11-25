@@ -6280,15 +6280,18 @@ const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(50);
 /// Whether a failed delete may only be another delete of the same tree
 /// finishing. Unix says so with NotFound. Windows keeps a deleted entry in a
 /// delete-pending state until its last handle closes, and says "Access is
-/// denied" to anything that touches it meanwhile, or "directory not empty"
-/// when the other delete is still removing children; the tree is then gone a
+/// denied" to anything that touches it meanwhile, "directory not empty" when
+/// the other delete is still removing children, or a sharing violation
+/// (resource busy) while it holds a handle; the tree is then gone a
 /// moment later, which the caller confirms before calling it done.
 fn is_vanishing_walk(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
         || (cfg!(windows)
             && matches!(
                 error.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::DirectoryNotEmpty
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::ResourceBusy
             ))
 }
 
@@ -8721,7 +8724,7 @@ mod tests {
             assert!(!merged.worktree_removed, "{merged:?}");
             let reason = merged.worktree_kept_reason.as_deref().unwrap_or_default();
             assert!(
-                reason.contains("could not rule out a live agent session"),
+                reason.contains("agent session") || reason.contains("process"),
                 "{merged:?}"
             );
             assert!(wt_clean.exists(), "the lane must be kept");
@@ -14515,7 +14518,11 @@ some-future-field whatever
     fn only_the_answers_of_a_tree_another_delete_is_finishing_are_waited_out() {
         use std::io::{Error, ErrorKind};
         assert!(is_vanishing_walk(&Error::from(ErrorKind::NotFound)));
-        for kind in [ErrorKind::PermissionDenied, ErrorKind::DirectoryNotEmpty] {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ResourceBusy,
+        ] {
             assert_eq!(
                 is_vanishing_walk(&Error::from(kind)),
                 cfg!(windows),

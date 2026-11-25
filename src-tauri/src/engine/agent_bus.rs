@@ -4087,7 +4087,17 @@ mod tests {
             forged_wt.to_str().unwrap(),
         )
         .unwrap();
-        let verified_checkouts = forged_pair.best_effort_registered_checkouts();
+        // The pair's checkouts are identity paths (`\\?\C:\...` on Windows);
+        // the plain spelling is what the test names them by.
+        let verified_checkouts: Vec<PathBuf> = forged_pair
+            .best_effort_registered_checkouts()
+            .iter()
+            .map(|p| {
+                PathBuf::from(crate::engine::process::plain_path_text(
+                    &p.to_string_lossy(),
+                ))
+            })
+            .collect();
         assert!(
             verified_checkouts
                 .iter()
