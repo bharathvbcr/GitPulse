@@ -508,6 +508,18 @@ pub(crate) fn canonical_slash_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(plain)
 }
 
+/// Binds the devmap binary the product itself resolves (`GITPULSE_DEVMAP_BIN`,
+/// saved config, the app bin dir, then `PATH`, with `.exe` and `USERPROFILE`
+/// handled on Windows) for the life of the returned guard. The tests that need
+/// a real index build used to probe `$HOME/.local/bin` first: that has no
+/// `.exe`, is dead on Windows, and could prefer a stale copy over the one the
+/// product would run. Panics when no devmap is installed.
+#[cfg(test)]
+pub(crate) fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
+    let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
+    crate::devmap::cli::bind_test_binary(resolved.path)
+}
+
 /// An absolute path that names no directory. `unix` is written the Unix way
 /// (`/gone/a`); on Windows it gains a drive (`C:\gone\a`), because `/gone` has
 /// no root there and is refused as a relative path.

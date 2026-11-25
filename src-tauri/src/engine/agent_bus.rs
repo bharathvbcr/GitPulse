@@ -2668,21 +2668,6 @@ mod tests {
         assert_eq!(list_lanes(anchor.to_str().unwrap()).unwrap().len(), 1);
     }
 
-    fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            for rel in [".local/bin/devmap", ".cargo/bin/devmap"] {
-                let candidate = home.join(rel);
-                if candidate.is_file() {
-                    return crate::devmap::cli::bind_test_binary(
-                        candidate.to_string_lossy().into_owned(),
-                    );
-                }
-            }
-        }
-        let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
-        crate::devmap::cli::bind_test_binary(resolved.path)
-    }
-
     fn seed_clean_indexed_anchor_with_csr() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path();
@@ -2841,7 +2826,7 @@ mod tests {
 
     #[test]
     fn radar_detects_cross_file_1hop_caller_callee_collision_over_zero_copy_csr() {
-        let _devmap = bind_real_devmap();
+        let _devmap = crate::test_support::bind_real_devmap();
         let anchor_dir = seed_clean_indexed_anchor_with_csr();
         let anchor = anchor_dir.path();
 
