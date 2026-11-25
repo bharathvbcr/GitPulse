@@ -367,6 +367,11 @@ pub struct Store {
     /// profile forward (a read-only server, a daemon) clears it with
     /// [`Store::refuse_workbench_upgrades`].
     workbench_upgrades: bool,
+    /// How many `pre-schema` backups an upgrade leaves. Defaults to the
+    /// process-wide `DC_STORE_KEEP_BACKUPS` setting, else the newest two.
+    backup_retention: workbench::BackupRetention,
+    /// What retiring the legacy `tasks` table did while this handle opened.
+    retired: workbench::Retired,
 }
 
 impl std::fmt::Debug for Store {
@@ -462,6 +467,8 @@ impl Store {
             conn,
             now_fn: None,
             workbench_upgrades: false,
+            backup_retention: workbench::BackupRetention::from_environment(),
+            retired: workbench::Retired::default(),
         })
     }
 
@@ -510,21 +517,22 @@ impl Store {
         };
         // A store newer than this build is refused before anything is moved.
         schema::check_stored_version(&conn, SCHEMA_VERSION).map_err(too_new)?;
-        let store = Store {
+        let mut store = Store {
             conn,
             now_fn: None,
             workbench_upgrades: true,
+            backup_retention: workbench::BackupRetention::from_environment(),
+            retired: workbench::Retired::default(),
         };
         // The legacy tasks table becomes workbench items and the version is
         // stamped in one transaction: a refusal leaves the store as found, at
         // the old version with its tasks table, which an older reader still
         // understands.
-        workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget).map_err(|e| {
-            StoreError::Workbench {
+        store.retired = workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget)
+            .map_err(|e| StoreError::Workbench {
                 code: e.code,
                 message: e.message,
-            }
-        })?;
+            })?;
         schema::migrate(&store.conn, SCHEMA_VERSION).map_err(too_new)?;
         Ok(store)
     }
@@ -537,6 +545,13 @@ impl Store {
         Self::prepare_with(Connection::open(path)?, &mut Some(steps))
     }
 
+    /// What retiring the legacy `tasks` table did while this handle was opened:
+    /// the rows archived and any retire backup that had to be moved aside. All
+    /// zero and empty when there was nothing to retire.
+    pub fn legacy_retirement(&self) -> &workbench::Retired {
+        &self.retired
+    }
+
     /// Stops this handle from upgrading an older workbench profile. A request
     /// that would need the upgrade fails with `schema_upgrade_required` and
     /// leaves the profile untouched, so only the host that owns the profile
@@ -544,6 +559,13 @@ impl Store {
     /// MCP server or sidecar that shares it is never locked out by a reader.
     pub fn refuse_workbench_upgrades(&mut self) {
         self.workbench_upgrades = false;
+    }
+
+    /// Sets how many `pre-schema` backups an upgrade through this handle
+    /// leaves: the newest `n` ([`workbench::BackupRetention::keep`]) or all of
+    /// them. Overrides `DC_STORE_KEEP_BACKUPS` for this handle.
+    pub fn set_backup_retention(&mut self, retention: workbench::BackupRetention) {
+        self.backup_retention = retention;
     }
 
     /// Replaces the clock. Tests use this to move past a TTL instantly.

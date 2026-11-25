@@ -61,10 +61,10 @@ fn sha256_hex(data: &[u8]) -> String {
         padded.push(0);
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -119,7 +119,9 @@ fn validate_repo_slug(slug: &str) -> Result<()> {
         return Err(Error::invalid("repo_slug must have owner/repo format"));
     };
     if repo.contains('/') || !valid_part(owner) || !valid_part(repo) {
-        return Err(Error::invalid("repo_slug must have valid owner/repo format"));
+        return Err(Error::invalid(
+            "repo_slug must have valid owner/repo format",
+        ));
     }
     Ok(())
 }
@@ -143,9 +145,7 @@ impl IssueSnapshot {
             "open" => "open".to_string(),
             "closed" => "closed".to_string(),
             _ => {
-                return Err(Error::invalid(
-                    "GitHub issue state must be open or closed",
-                ));
+                return Err(Error::invalid("GitHub issue state must be open or closed"));
             }
         };
         let mut labels = input.strings("labels", 64, 128, false)?;
@@ -191,7 +191,13 @@ impl IssueSnapshot {
         let labels_json = encode_string_array(conn, &self.labels)?;
         Ok(conn.query_row(
             "SELECT json_object('state',?1,'title',?2,'body',?3,'labels',json(?4),'updated_at',?5)",
-            params![self.state, self.title, self.body, labels_json, self.updated_at],
+            params![
+                self.state,
+                self.title,
+                self.body,
+                labels_json,
+                self.updated_at
+            ],
             |r| r.get(0),
         )?)
     }
@@ -210,11 +216,9 @@ impl IssueSnapshot {
 fn encode_string_array(conn: &Connection, values: &[String]) -> Result<String> {
     let mut arr = "[]".to_string();
     for v in values {
-        arr = conn.query_row(
-            "SELECT json_insert(?1,'$[#]',?2)",
-            params![arr, v],
-            |r| r.get(0),
-        )?;
+        arr = conn.query_row("SELECT json_insert(?1,'$[#]',?2)", params![arr, v], |r| {
+            r.get(0)
+        })?;
     }
     Ok(arr)
 }
@@ -320,7 +324,9 @@ fn normalize_sync_fields(input: &Input<'_>, key: &str, default_all: bool) -> Res
                     )));
                 }
                 if !seen.insert(f.as_str()) {
-                    return Err(Error::invalid(format!("{key} contains duplicate field {f}")));
+                    return Err(Error::invalid(format!(
+                        "{key} contains duplicate field {f}"
+                    )));
                 }
             }
             Ok(requested)
@@ -336,7 +342,11 @@ fn require_live_task(conn: &Connection, task_id: &str) -> Result<(i64, String)> 
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
     .optional()?
-    .ok_or_else(|| Error::invalid(format!("linked task {task_id} does not exist or is deleted")))
+    .ok_or_else(|| {
+        Error::invalid(format!(
+            "linked task {task_id} does not exist or is deleted"
+        ))
+    })
 }
 
 fn load_sync_for_task(conn: &Connection, task_id: &str) -> Result<Option<(String, i64, String)>> {
@@ -403,11 +413,12 @@ fn sync_link(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()>
     }
     let issue_url = input.text("issue_url", 2048)?;
     let outbound_opt_in = input.boolean("outbound_opt_in", false)?;
-    let last_seen_raw: Option<String> = input.conn.query_row(
-        "SELECT json_extract(?1,'$.last_seen')",
-        [input.raw],
-        |r| r.get(0),
-    )?;
+    let last_seen_raw: Option<String> =
+        input
+            .conn
+            .query_row("SELECT json_extract(?1,'$.last_seen')", [input.raw], |r| {
+                r.get(0)
+            })?;
     let last_seen_json = match last_seen_raw {
         Some(raw) if raw != "null" => {
             let snap = IssueSnapshot::from_json(input.conn, &raw)?;
@@ -461,14 +472,17 @@ fn sync_link(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()>
     } else {
         let prior: String = input
             .conn
-            .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?
             .ok_or_else(Error::missing)?;
-        let prior_task: String = input.conn.query_row(
-            "SELECT json_extract(?1,'$.task_id')",
-            [&prior],
-            |r| r.get(0),
-        )?;
+        let prior_task: String =
+            input
+                .conn
+                .query_row("SELECT json_extract(?1,'$.task_id')", [&prior], |r| {
+                    r.get(0)
+                })?;
         if prior_task != task_id {
             return Err(Error::invalid("sync link task_id cannot change"));
         }
@@ -507,15 +521,18 @@ fn sync_observe(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     if input.kind("remote")?.as_deref() != Some("object") {
         return Err(Error::invalid("remote must be an issue snapshot object"));
     }
-    let remote_raw: String = input.conn.query_row(
-        "SELECT json_extract(?1,'$.remote')",
-        [input.raw],
-        |r| r.get(0),
-    )?;
+    let remote_raw: String =
+        input
+            .conn
+            .query_row("SELECT json_extract(?1,'$.remote')", [input.raw], |r| {
+                r.get(0)
+            })?;
     let remote = IssueSnapshot::from_json(input.conn, &remote_raw)?;
     let prior: String = input
         .conn
-        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| r.get(0))
+        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
         .optional()?
         .ok_or_else(Error::missing)?;
     let (task_id, base_raw, dismissed): (String, Option<String>, Option<String>) = input.conn.query_row(
@@ -595,7 +612,9 @@ fn sync_accept(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<(
     ])?;
     let prior: String = input
         .conn
-        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| r.get(0))
+        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
         .optional()?
         .ok_or_else(Error::missing)?;
     let (task_id, proposal_raw): (String, Option<String>) = input.conn.query_row(
@@ -618,11 +637,12 @@ fn sync_accept(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<(
             "the task changed before inbound GitHub proposal acceptance",
         ));
     }
-    let remote_raw: String = input.conn.query_row(
-        "SELECT json_extract(?1,'$.remote')",
-        [&proposal_raw],
-        |r| r.get(0),
-    )?;
+    let remote_raw: String =
+        input
+            .conn
+            .query_row("SELECT json_extract(?1,'$.remote')", [&proposal_raw], |r| {
+                r.get(0)
+            })?;
     let remote = IssueSnapshot::from_json(input.conn, &remote_raw)?;
     let locked = task_locked_fields(input.conn, &task_body)?;
     let explicit_fields = normalize_sync_fields(input, "fields", false)?;
@@ -724,7 +744,9 @@ fn sync_dismiss(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     input.fields(&["request_id", "id", "expected_revision"])?;
     let prior: String = input
         .conn
-        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| r.get(0))
+        .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
         .optional()?
         .ok_or_else(Error::missing)?;
     let (proposal_raw, digest): (Option<String>, Option<String>) = input.conn.query_row(
@@ -746,6 +768,7 @@ fn sync_dismiss(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     put_body(input.conn, Entity::IssueSync, id, revision, &next_body)
 }
 
+#[allow(clippy::type_complexity)]
 fn build_outbound_payload(
     conn: &Connection,
     task_id: &str,
@@ -901,11 +924,12 @@ pub(super) fn preview(input: &Input<'_>) -> Result<String> {
     let remote_override = match input.kind("remote")?.as_deref() {
         None | Some("null") => None,
         Some("object") => {
-            let raw: String = input.conn.query_row(
-                "SELECT json_extract(?1,'$.remote')",
-                [input.raw],
-                |r| r.get(0),
-            )?;
+            let raw: String =
+                input
+                    .conn
+                    .query_row("SELECT json_extract(?1,'$.remote')", [input.raw], |r| {
+                        r.get(0)
+                    })?;
             Some(IssueSnapshot::from_json(input.conn, &raw)?)
         }
         _ => return Err(Error::invalid("remote must be an object")),
@@ -993,7 +1017,11 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         ));
     }
     let create_opt_in = input.boolean("outbound_opt_in", false)?;
-    let max_attempts = input.integer("max_attempts", Some(DEFAULT_MAX_ATTEMPTS), MAX_ATTEMPTS_CEILING)?;
+    let max_attempts = input.integer(
+        "max_attempts",
+        Some(DEFAULT_MAX_ATTEMPTS),
+        MAX_ATTEMPTS_CEILING,
+    )?;
     if max_attempts < 1 {
         return Err(Error::invalid("max_attempts must be at least 1"));
     }
@@ -1016,13 +1044,13 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
             "outbound GitHub sync is disabled on this link; opt in explicitly before enqueueing updates",
         ));
     }
-    if let Some(expected) = confirm_digest {
-        if expected != digest {
-            return Err(refuse(
-                "payload_changed",
-                "the task changed after preview; re-preview and re-confirm before sending",
-            ));
-        }
+    if let Some(expected) = confirm_digest
+        && expected != digest
+    {
+        return Err(refuse(
+            "payload_changed",
+            "the task changed after preview; re-preview and re-confirm before sending",
+        ));
     }
     if !conflict_fields.is_empty() {
         return Err(refuse(
@@ -1096,9 +1124,11 @@ fn outbox_enqueue(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
 }
 
 fn load_outbox_body(conn: &Connection, id: &str) -> Result<String> {
-    conn.query_row("SELECT body FROM work_outbox WHERE id=?1", [id], |r| r.get(0))
-        .optional()?
-        .ok_or_else(Error::missing)
+    conn.query_row("SELECT body FROM work_outbox WHERE id=?1", [id], |r| {
+        r.get(0)
+    })
+    .optional()?
+    .ok_or_else(Error::missing)
 }
 
 fn update_outbox_body(
@@ -1129,14 +1159,22 @@ fn outbox_claim(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<
     if state != "pending" {
         return Err(refuse(
             "invalid_state",
-            format!("cannot claim outbox entry in state {state}; preflight or resolve conflicts first"),
+            format!(
+                "cannot claim outbox entry in state {state}; preflight or resolve conflicts first"
+            ),
         ));
     }
     if now < next_at {
-        return Err(refuse("not_due", "outbox entry retry backoff has not elapsed"));
+        return Err(refuse(
+            "not_due",
+            "outbox entry retry backoff has not elapsed",
+        ));
     }
     if attempts >= max_attempts {
-        return Err(refuse("invalid_state", "outbox entry exhausted max_attempts"));
+        return Err(refuse(
+            "invalid_state",
+            "outbox entry exhausted max_attempts",
+        ));
     }
     let next_body: String = input.conn.query_row(
         "SELECT json_set(?1,'$.revision',?2,'$.state','delivering','$.attempts',?3,'$.claimed_at',?4,'$.updated_at',?4)",
@@ -1159,11 +1197,10 @@ fn outbox_mark_unknown(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| default_reason.to_string());
     let prior = load_outbox_body(input.conn, id)?;
-    let state: String = input.conn.query_row(
-        "SELECT json_extract(?1,'$.state')",
-        [&prior],
-        |r| r.get(0),
-    )?;
+    let state: String =
+        input
+            .conn
+            .query_row("SELECT json_extract(?1,'$.state')", [&prior], |r| r.get(0))?;
     if state != "delivering" {
         return Err(refuse(
             "invalid_state",
@@ -1290,11 +1327,12 @@ fn outbox_preflight(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Res
     let remote_snap = match input.kind("remote")?.as_deref() {
         None | Some("null") => None,
         Some("object") => {
-            let raw: String = input.conn.query_row(
-                "SELECT json_extract(?1,'$.remote')",
-                [input.raw],
-                |r| r.get(0),
-            )?;
+            let raw: String =
+                input
+                    .conn
+                    .query_row("SELECT json_extract(?1,'$.remote')", [input.raw], |r| {
+                        r.get(0)
+                    })?;
             Some(IssueSnapshot::from_json(input.conn, &raw)?)
         }
         _ => return Err(Error::invalid("remote must be an object")),
@@ -1308,12 +1346,15 @@ fn outbox_preflight(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Res
         IssueSnapshot::from_json(input.conn, &trimmed)?
     };
     let selected_fields: Vec<String> = {
-        let fields_raw: String = input.conn.query_row(
-            "SELECT json_extract(?1,'$.fields')",
-            [&payload_raw],
-            |r| r.get(0),
-        )?;
-        let mut stmt = input.conn.prepare_cached("SELECT value FROM json_each(?1)")?;
+        let fields_raw: String =
+            input
+                .conn
+                .query_row("SELECT json_extract(?1,'$.fields')", [&payload_raw], |r| {
+                    r.get(0)
+                })?;
+        let mut stmt = input
+            .conn
+            .prepare_cached("SELECT value FROM json_each(?1)")?;
         let mut rows = stmt.query([fields_raw])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
@@ -1326,7 +1367,9 @@ fn outbox_preflight(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Res
         if matched_remote {
             let issue_number = input.integer("issue_number", None, MAX_INTEGER)?;
             if issue_number < 1 {
-                return Err(Error::invalid("issue_number must be at least 1 when matched_remote=true"));
+                return Err(Error::invalid(
+                    "issue_number must be at least 1 when matched_remote=true",
+                ));
             }
             let snap = remote_snap.as_ref().unwrap_or(&payload_snap);
             let sid = upsert_sync_from_delivery(
@@ -1477,11 +1520,12 @@ fn outbox_complete(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resu
     let issue_url = input.text("issue_url", 2048)?;
     let remote = match input.kind("remote")?.as_deref() {
         Some("object") => {
-            let raw: String = input.conn.query_row(
-                "SELECT json_extract(?1,'$.remote')",
-                [input.raw],
-                |r| r.get(0),
-            )?;
+            let raw: String =
+                input
+                    .conn
+                    .query_row("SELECT json_extract(?1,'$.remote')", [input.raw], |r| {
+                        r.get(0)
+                    })?;
             IssueSnapshot::from_json(input.conn, &raw)?
         }
         None | Some("null") => {
@@ -1534,11 +1578,17 @@ fn outbox_fail(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<(
             format!("cannot fail outbox entry in state {state}"),
         ));
     }
-    let default_delay = (5i64).saturating_mul(1i64 << attempts.saturating_sub(1).clamp(0, 6)).min(300);
+    let default_delay = (5i64)
+        .saturating_mul(1i64 << attempts.saturating_sub(1).clamp(0, 6))
+        .min(300);
     let delay = input.integer("retry_after_seconds", Some(default_delay), 86_400)?;
     let will_retry = retryable && attempts < max_attempts;
     let next_state = if will_retry { "pending" } else { "failed" };
-    let next_attempt_at = if will_retry { now.saturating_add(delay) } else { now };
+    let next_attempt_at = if will_retry {
+        now.saturating_add(delay)
+    } else {
+        now
+    };
     let next_body: String = input.conn.query_row(
         "SELECT json_set(?1,'$.revision',?2,'$.state',?3,'$.last_error',?4,'$.next_attempt_at',?5,'$.updated_at',?6)",
         params![prior, revision, next_state, error, next_attempt_at, now],
@@ -1551,11 +1601,10 @@ fn outbox_cancel(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result
     input.fields(&["request_id", "id", "expected_revision", "reason"])?;
     let reason = input.text("reason", 1024)?;
     let prior = load_outbox_body(input.conn, id)?;
-    let state: String = input.conn.query_row(
-        "SELECT json_extract(?1,'$.state')",
-        [&prior],
-        |r| r.get(0),
-    )?;
+    let state: String =
+        input
+            .conn
+            .query_row("SELECT json_extract(?1,'$.state')", [&prior], |r| r.get(0))?;
     if !matches!(
         state.as_str(),
         "pending" | "outcome_unknown" | "conflict" | "failed"
@@ -1581,15 +1630,21 @@ pub(super) fn get_sync(input: &Input<'_>) -> Result<String> {
     let has_num = input.kind("issue_number")?.is_some();
     let body: Option<String> = if let Some(id) = id {
         if task_id.is_some() || repo_slug.is_some() || has_num {
-            return Err(Error::invalid("give id, task_id, or (repo_slug, issue_number)"));
+            return Err(Error::invalid(
+                "give id, task_id, or (repo_slug, issue_number)",
+            ));
         }
         input
             .conn
-            .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| r.get(0))
+            .query_row("SELECT body FROM work_issue_sync WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?
     } else if let Some(tid) = task_id {
         if repo_slug.is_some() || has_num {
-            return Err(Error::invalid("give id, task_id, or (repo_slug, issue_number)"));
+            return Err(Error::invalid(
+                "give id, task_id, or (repo_slug, issue_number)",
+            ));
         }
         input
             .conn
@@ -1614,7 +1669,9 @@ pub(super) fn get_sync(input: &Input<'_>) -> Result<String> {
             )
             .optional()?
     } else {
-        return Err(Error::invalid("give id, task_id, or (repo_slug, issue_number)"));
+        return Err(Error::invalid(
+            "give id, task_id, or (repo_slug, issue_number)",
+        ));
     };
     let body = body.ok_or_else(Error::missing)?;
     Ok(input.conn.query_row(
@@ -1671,10 +1728,10 @@ pub(super) fn list_outbox(input: &Input<'_>, now: i64) -> Result<String> {
     input.fields(&["limit", "cursor", "state", "task_id", "due_only"])?;
     let p = page(input)?;
     let state = input.text("state", 32)?;
-    if let Some(s) = &state {
-        if !OUTBOX_STATES.contains(&s.as_str()) {
-            return Err(Error::invalid("unknown outbox state"));
-        }
+    if let Some(s) = &state
+        && !OUTBOX_STATES.contains(&s.as_str())
+    {
+        return Err(Error::invalid("unknown outbox state"));
     }
     let task_id = input.optional_id("task_id")?;
     let due_only = input.boolean("due_only", false)?;
