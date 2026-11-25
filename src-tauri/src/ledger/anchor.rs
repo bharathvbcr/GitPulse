@@ -339,12 +339,12 @@ impl Observed {
     }
 }
 
-/// The site of the directory at `path`, where the platform has inodes.
+/// The site of the directory at `path`: its device and inode on unix, its
+/// volume serial and file id on Windows.
 ///
-/// Read here rather than through the database's `file_id`, which also answers
-/// on Windows: a site is part of the repository's recorded identity, and giving
-/// Windows one is a change to what an anchor matches, not to how a database
-/// file is recognised.
+/// Read here rather than through the database's `file_id`: a site is part of
+/// the repository's recorded identity, which directory an anchor matches, not
+/// how a database file is recognised.
 #[cfg(unix)]
 fn site_of(path: &Path) -> Option<Site> {
     use std::os::unix::fs::MetadataExt;
@@ -356,7 +356,59 @@ fn site_of(path: &Path) -> Option<Site> {
     })
 }
 
-#[cfg(not(unix))]
+/// Windows names a directory by the volume serial number and the file id
+/// `GetFileInformationByHandleEx(FileIdInfo)` reports for it: the counterpart
+/// of `(st_dev, st_ino)`. The serial is written when the volume is formatted,
+/// so it is stable across boots and the device rule applies as it does on
+/// Linux. Without a site a copied ledger was taken over on Windows once its
+/// source was gone, because the "not the directory it was anchored in"
+/// refusal had nothing to compare.
+///
+/// The handle asks for attributes only and shares every mode, so reading a
+/// site never pins, locks or blocks the directory. A reparse point is read as
+/// itself, as `symlink_metadata` reads it on unix.
+#[cfg(windows)]
+fn site_of(path: &Path) -> Option<Site> {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_READ_ATTRIBUTES`.
+    const READ_ATTRIBUTES: u32 = 0x80;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
+    const SHARE_ALL: u32 = 1 | 2 | 4;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`; the second
+    /// is what lets a directory be opened at all.
+    const DIRECTORY_AS_ITSELF: u32 = 0x0020_0000 | 0x0200_0000;
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL)
+        .custom_flags(DIRECTORY_AS_ITSELF)
+        .open(path)
+        .ok()?;
+    let (serial, id) = crate::fs_entry::windows_file_identity(&directory).ok()?;
+    Some(Site {
+        dev: serial,
+        ino: fold_file_id(id),
+        volume: None,
+    })
+}
+
+/// The `FILE_ID_128` of a directory as the `u64` a site records. An NTFS id is
+/// a 64-bit file reference in the low half, with the high half zero, and
+/// passes unchanged; a ReFS id uses all 128 bits, so its halves are folded
+/// together (two directories on one volume would have to collide in 64 bits
+/// to be taken for each other).
+#[cfg(any(windows, test))]
+fn fold_file_id(id: [u8; 16]) -> u64 {
+    let (low, high) = id.split_at(8);
+    let half = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .rev()
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+    };
+    half(low) ^ half(high)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn site_of(_path: &Path) -> Option<Site> {
     None
 }
@@ -2334,8 +2386,8 @@ mod tests {
         let audit = &events[0];
         let here = site_of(Path::new(&canonical_repo(&repo)));
         // Where the platform names a site, an adopted ledger must record one.
-        #[cfg(unix)]
-        assert!(here.is_some(), "a live repository has a site on unix");
+        #[cfg(any(unix, windows))]
+        assert!(here.is_some(), "a live repository has a site");
         assert_eq!(
             audit["from_paths"],
             serde_json::json!([gone("/gone/before")])
@@ -2493,6 +2545,23 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// An NTFS file id (a 64-bit reference, high half zero) is recorded as is;
+    /// a 128-bit ReFS id still separates ids that differ in either half.
+    #[test]
+    fn a_windows_file_id_is_recorded_whole_on_ntfs_and_folded_on_refs() {
+        let mut ntfs = [0u8; 16];
+        ntfs[..8].copy_from_slice(&0x0005_0000_0000_1a2bu64.to_le_bytes());
+        assert_eq!(fold_file_id(ntfs), 0x0005_0000_0000_1a2b);
+
+        let mut refs = ntfs;
+        refs[8..].copy_from_slice(&7u64.to_le_bytes());
+        assert_ne!(fold_file_id(refs), fold_file_id(ntfs));
+        let mut other_high = refs;
+        other_high[15] = 1;
+        assert_ne!(fold_file_id(other_high), fold_file_id(refs));
+        assert_eq!(fold_file_id([0; 16]), 0);
     }
 
     /// The directory rule on both platform policies, so neither is only tested
