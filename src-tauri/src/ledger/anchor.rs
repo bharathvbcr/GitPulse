@@ -340,13 +340,25 @@ impl Observed {
 }
 
 /// The site of the directory at `path`, where the platform has inodes.
+///
+/// Read here rather than through the database's `file_id`, which also answers
+/// on Windows: a site is part of the repository's recorded identity, and giving
+/// Windows one is a change to what an anchor matches, not to how a database
+/// file is recognised.
+#[cfg(unix)]
 fn site_of(path: &Path) -> Option<Site> {
-    let id = super::file_id(path)?;
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
     Some(Site {
-        dev: id.0,
-        ino: id.1,
+        dev: meta.dev(),
+        ino: meta.ino(),
         volume: volume_uuid(path),
     })
+}
+
+#[cfg(not(unix))]
+fn site_of(_path: &Path) -> Option<Site> {
+    None
 }
 
 /// The persistent UUID of the volume holding `path`, as `getattrlist(2)` names
@@ -392,7 +404,7 @@ fn volume_uuid(path: &Path) -> Option<String> {
     Some(hyphenated(&reply.uuid))
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn volume_uuid(_path: &Path) -> Option<String> {
     None
 }
