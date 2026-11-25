@@ -301,6 +301,18 @@ export function createAgentEventBus(listenFn: EventListen) {
     forgetAgentMeta(terminalId: string): void {
       cachedMeta.delete(terminalId);
     },
+    /**
+     * A file an agent outside the terminal changed (a Mavi thread), routed
+     * like the native hook's event: open file panes showing it reload, and
+     * Follow agent may show it. Validated exactly as a native event is; an
+     * id that names no terminal tab is fine, the panels match by repository.
+     */
+    dispatchTouchedFile(raw: TerminalAgentTouchedFilePayload): boolean {
+      const parsed = validTouchedFile(raw);
+      if (!parsed) return false;
+      for (const sub of panelSubscribers) sub.onTouchedFile?.(parsed);
+      return true;
+    },
     subscribePanelEvents(handlers: PanelEventHandlers): () => void {
       panelSubscribers.add(handlers);
       ensureAttached();

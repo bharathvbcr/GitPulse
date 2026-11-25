@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { maviStore } from "../mavi/store.svelte";
   import { repoStore } from "../stores/repoStore";
   import { harnessStore } from "../stores/harnessStore";
   import { handleTablistKeydown } from "../dom/tablist";
@@ -65,9 +66,12 @@
   let navItems = $derived(
     visibleViewNav($interfaceStore.hiddenViews, { activeTab, conflictedCount }),
   );
+  let maviCounts = $derived(maviStore.attention());
   let attention: AttentionContext = $derived({
     conflictedCount,
     verdictStatus: $harnessStore.lastVerdict?.status ?? null,
+    maviNeedsYou: maviCounts.needsYou,
+    maviFailed: maviCounts.failed,
   });
 
   function selectTab(tab: ViewTab, section?: string) {

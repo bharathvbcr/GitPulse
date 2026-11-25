@@ -39,6 +39,18 @@ const ALLOWED: &[(&str, &str)] = &[
          whole life would starve every git call behind it",
     ),
     (
+        "src/mavi/mod.rs",
+        "Mavi's agent (`claude`, or `ssh` running it on a host): one long-lived \
+         child per thread that reads a conversation from stdin and streams it \
+         on stdout until the person ends it. A timeout or an output cap would \
+         end the conversation, and a gate permit held for its life would starve \
+         every git call behind it. `command_for` only builds the `Command`; it \
+         is started by `procguard::spawn` (trust admission, its own process \
+         group, the quit sweep) and stopped through its `Registration`. Mavi's \
+         bounded reads (git status, diffs, the ssh probe) go through \
+         `process::run_bounded_capped`",
+    ),
+    (
         "src/terminal/host/client.rs",
         "the terminal host, gitpulse-ptyd: started once, detached in a session \
          of its own, and meant to outlive this process. A gate permit, a \

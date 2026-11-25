@@ -11,6 +11,7 @@ import {
   HardDrive,
   HeartPulse,
   LayoutDashboard,
+  MessagesSquare,
   ListChecks,
   Network,
   Search,
@@ -32,6 +33,7 @@ export type ViewIcon = typeof Search;
 
 export const VIEW_ICONS: Readonly<Record<ViewTab, ViewIcon>> = {
   work: Briefcase,
+  mavi: MessagesSquare,
   code: CodeXml,
   history: GitCommitHorizontal,
   insights: ChartNoAxesCombined,
@@ -43,6 +45,7 @@ export const SECTION_ICONS: Readonly<Record<ViewTab, Readonly<Record<string, Vie
     remote: Cloud,
     tasks: ListChecks,
   },
+  mavi: {},
   code: {
     explorer: FolderTree,
     map: Network,

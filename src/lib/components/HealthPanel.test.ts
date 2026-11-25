@@ -31,15 +31,23 @@ describe("HealthPanel rendering", () => {
   });
 
   it("scans automatically only through the shared settle, reusing a fresh audit", () => {
-    // Behaviour is pinned in harness/healthChecks.js (vitest never runs
-    // $effect); this keeps the wiring from being inlined back into the effect.
-    const effect = source.slice(source.indexOf("$effect(() => {\n    const path = $currentRepoPath;"), source.indexOf("async function openExternal"));
-    expect(effect).toContain("isScanStale(cached.scannedAtMs, Date.now())");
-    expect(effect).toContain("scheduleAutoScan({");
-    expect(effect).toContain("scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs })");
-    // No bare `void scan(path);` is left in the effect: that was the
+    // Behaviour is pinned in harness/healthChecks.js (vitest never mounts the
+    // panel); this keeps the wiring from being inlined back into the
+    // repository follower.
+    const start = source.indexOf("function followRepository(path: string | null) {");
+    expect(start).toBeGreaterThan(-1);
+    const follow = source.slice(start, source.indexOf("async function openExternal"));
+    expect(follow).toContain("isScanStale(cached.scannedAtMs, Date.now())");
+    expect(follow).toContain("scheduleAutoScan({");
+    expect(follow).toContain("scan(path, { deps: cached.deps, scannedAtMs: cached.scannedAtMs })");
+    // No bare `void scan(path);` is left in it: that was the
     // scan-on-every-mount.
-    expect(effect).not.toMatch(/^\s*void scan\(path\);/m);
+    expect(follow).not.toMatch(/^\s*void scan\(path\);/m);
+    // It follows the store's subscription, not an `$effect`: a reset written
+    // inside an effect lands in a later update than the switch, the likeliest
+    // way the report's children rendered against a null report on CI.
+    expect(source).toContain("currentRepoPath.subscribe((path) => untrack(() => followRepository(path)))");
+    expect(source).not.toContain("$effect(() => {\n    const path = $currentRepoPath;");
     expect(source).toContain("onclick={() => scan()}");
   });
 

@@ -8,7 +8,7 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
         direction TB
-        Views["4 Views · 11 Sections<br/>(Work, Code, History, Insights)"]
+        Views["5 Views · 11 Sections<br/>(Work, Mavi, Code, History, Insights)"]
         Canvas["GPU Canvas Graph"]
         Dock["Terminal Dock (portable-pty)"]
         Stores["Domain Stores & SWR Cache"]
@@ -65,7 +65,7 @@ GitPulse/
 │   ├── lib/stores/       repo, graph, filter, theme, …
 │   ├── lib/components/   UI
 │   ├── lib/canvas/       commit-graph renderer
-│   ├── lib/views/        routerless view registry (4 views)
+│   ├── lib/views/        routerless view registry (5 views)
 │   └── lib/<domain>/     pure logic: files, diff, coverage, health, …
 ├── crates/gitpulse-worktree/ standalone worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
