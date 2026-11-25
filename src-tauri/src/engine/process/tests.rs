@@ -679,7 +679,7 @@ fn a_deferral_is_recognized_only_where_the_gate_writes_it() {
 #[test]
 fn every_refusal_formats_to_the_one_cause_its_classifiers_name() {
     use super::{
-        is_deferred_under_load, is_slot_wait_timeout, is_timeout_error, refusal_message, Refusal,
+        is_deferred_under_load, is_run_timeout, is_slot_wait_timeout, refusal_message, Refusal,
     };
     let waited = std::time::Duration::from_millis(2_013);
     let deferred = refusal_message("git status", Refusal::Refused { waited });
@@ -701,7 +701,7 @@ fn every_refusal_formats_to_the_one_cause_its_classifiers_name() {
             message = message.message()
         );
         assert!(
-            !is_timeout_error("git status", message.message()),
+            !is_run_timeout(message.message()),
             "{message}",
             message = message.message()
         );
@@ -718,8 +718,8 @@ fn every_refusal_formats_to_the_one_cause_its_classifiers_name() {
         timed_out = timed_out.message()
     );
     assert!(
-        is_timeout_error("git status", timed_out.message()),
-        "{timed_out}",
+        !is_run_timeout(timed_out.message()),
+        "a refused slot wait is not a run that timed out: {timed_out}",
         timed_out = timed_out.message()
     );
     assert!(
@@ -1602,6 +1602,63 @@ fn run_captured_reports_timeout_as_an_outcome() {
     );
 }
 
+/// A child refused a concurrency slot never started, so it did not run out of
+/// time. The gate words that refusal with the same `timed out after` marker a
+/// real deadline kill uses, and the label is the program name, so a bare
+/// prefix-plus-marker match reported it as `RunOutcome::TimedOut` ("killed at
+/// N s") for a process that never ran. It stays an error carrying the gate's
+/// own message.
+#[cfg(unix)]
+#[test]
+fn run_captured_does_not_report_a_slot_wait_refusal_as_a_timeout() {
+    let gate = leak_gate(SpawnGate::new(1));
+    let held = gate
+        .acquire(Instant::now() + Duration::from_secs(30))
+        .expect("the one slot");
+    let outcome = with_gate_for_test(gate, || {
+        run_captured(
+            "sleep",
+            &["5"],
+            None,
+            Duration::from_millis(200),
+            &[],
+            MAX_OUTPUT_BYTES,
+        )
+    });
+    drop(held);
+    match outcome {
+        Err(e) => {
+            assert!(is_slot_wait_timeout(e.message()), "{}", e.message());
+            assert_eq!(RunError::classify(e.message()), RunError::SlotWaitTimeout);
+        }
+        other => panic!("a refused slot wait must stay an error, got {other:?}"),
+    }
+}
+
+/// A load deferral never ran the child either; it must not become an outcome.
+#[cfg(unix)]
+#[test]
+fn run_captured_does_not_report_a_deferral_as_a_timeout() {
+    let outcome = with_gate_for_test(spent_gate(), || {
+        run_captured(
+            "sleep",
+            &["5"],
+            None,
+            Duration::from_millis(200),
+            &[],
+            MAX_OUTPUT_BYTES,
+        )
+    });
+    match outcome {
+        Err(e) => assert!(
+            is_deferred_under_load(e.message()) || is_slot_wait_timeout(e.message()),
+            "{}",
+            e.message()
+        ),
+        other => panic!("a refused spawn must stay an error, got {other:?}"),
+    }
+}
+
 #[test]
 fn byte_tail_keeps_the_end_and_stays_char_safe() {
     assert_eq!(byte_tail(b"hello world", 5), "world");
@@ -1698,24 +1755,21 @@ fn a_tool_probe_says_not_found_only_when_the_os_found_nothing() {
 /// The formatter in `run_bounded` and the matcher behind `run_captured`
 /// share TIMEOUT_MARKER; this pins the round trip so neither side can
 /// drift without breaking here first, even on a platform where the
-/// end-to-end timeout test above does not run. Production always formats
-/// with `label == program`, and the starts_with guard rejects errors
-/// from any other program.
+/// end-to-end timeout test above does not run.
 #[test]
 fn timeout_marker_round_trips_between_formatter_and_matcher() {
     let formatted = format!("sleep{TIMEOUT_MARKER}3s");
-    assert!(is_timeout_error("sleep", &formatted));
+    assert!(is_run_timeout(&formatted));
     // Same contract when the program is spelled as a path: the label is
-    // then the full path too, so the prefix still matches.
+    // then the full path too.
     let path_formatted = format!("/usr/bin/sleep{TIMEOUT_MARKER}3s");
-    assert!(is_timeout_error("/usr/bin/sleep", &path_formatted));
-    // A spawn failure with unrelated text must not classify as a timeout…
-    assert!(!is_timeout_error(
-        "sleep",
-        "Failed to spawn sleep: No such file"
-    ));
-    // …and another program's timeout must not match either.
-    assert!(!is_timeout_error("git", &formatted));
+    assert!(is_run_timeout(&path_formatted));
+    // A spawn failure with unrelated text must not classify as a timeout.
+    assert!(!is_run_timeout("Failed to spawn sleep: No such file"));
+    // A refused slot wait carries the marker too and is not a run timeout.
+    assert!(!is_run_timeout(&format!(
+        "sleep{TIMEOUT_MARKER}3.000{SLOT_WAIT_SUFFIX}"
+    )));
 }
 
 #[test]
