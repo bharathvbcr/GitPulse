@@ -316,7 +316,7 @@ site | src/terminal/host/client_adversarial_tests.rs | serve | 3 | fixture-delay
 site | src/terminal/host/client_adversarial_tests.rs | until | 0 | bounded-poll
 
 # src/terminal/host/client_tests.rs
-site | src/terminal/host/client_tests.rs | FakeHost::start | 0 | unbounded-poll
+site | src/terminal/host/client_tests.rs | FakeHost::start_on | 0 | unbounded-poll
 site | src/terminal/host/client_tests.rs | a_failed_first_listing_is_retried_in_the_background | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | a_session_that_exited_is_no_longer_known | 0 | bounded-poll
 site | src/terminal/host/client_tests.rs | delivered_exits_are_not_vouched_for_while_their_recording_is_pending | 0 | bounded-poll

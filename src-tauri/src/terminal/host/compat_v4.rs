@@ -9,8 +9,8 @@
 //! `TranscriptRead`): those move on with every protocol, and this copy must
 //! not move with them. Edit it only to fix a mistake against what a v4 host
 //! really sends, never to follow a later protocol; `compat_v4_tests.rs` pins
-//! every shape against literal JSON and, while `PROTOCOL` is 4, against
-//! `proto.rs` itself.
+//! every shape against literal JSON (it was also pinned against `proto.rs`
+//! while that spoke protocol 4; protocol 5 retired that check).
 //!
 //! The subset is what stage one of `legacy` uses: `Hello` (become the
 //! connected app), `List`, `Kill`, and the read-only `Transcript`. Everything a
