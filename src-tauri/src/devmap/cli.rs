@@ -345,6 +345,19 @@ pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
     TestBinaryBinding(serial)
 }
 
+/// Binds the devmap binary the product itself resolves, for tests that need a
+/// real index build. It resolves with the serial already held: no other test
+/// can have a stub bound then, so the answer is never another test's fake, and
+/// the serial is taken once (a second guard on top of [`bind_test_binary`]'s
+/// would deadlock). Panics when no devmap is installed.
+#[cfg(test)]
+pub(crate) fn bind_resolved_test_binary() -> TestBinaryBinding {
+    let serial = crate::test_support::env::env_serial();
+    let resolved = resolve_binary().expect("real devmap binary installed");
+    set_test_binary(Some(resolved.path));
+    TestBinaryBinding(serial)
+}
+
 /// A `devmap status --json` answer that parsed, for a test that is about what
 /// the decision logic does with it.
 #[cfg(all(test, unix))]

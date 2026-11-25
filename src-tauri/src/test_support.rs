@@ -516,8 +516,7 @@ pub(crate) fn canonical_slash_path(path: &Path) -> std::io::Result<PathBuf> {
 /// product would run. Panics when no devmap is installed.
 #[cfg(test)]
 pub(crate) fn bind_real_devmap() -> crate::devmap::cli::TestBinaryBinding {
-    let resolved = crate::devmap::cli::resolve_binary().expect("real devmap binary installed");
-    crate::devmap::cli::bind_test_binary(resolved.path)
+    crate::devmap::cli::bind_resolved_test_binary()
 }
 
 /// An absolute path that names no directory. `unix` is written the Unix way
