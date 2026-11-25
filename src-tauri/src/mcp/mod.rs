@@ -13234,7 +13234,15 @@ mod tests {
         );
     }
 
+    /// Needs a real `manvi`: the lane's write is judged by its policy, and
+    /// without one the gate reports `Unchecked`. No CI runner installs it.
+    ///
+    /// `GITPULSE_MANVI_BIN=$(command -v manvi) cargo test --manifest-path
+    /// src-tauri/Cargo.toml --lib
+    /// mcp::tests::worktree_create_default_lane_is_writable_under_default_manvi_gate
+    /// -- --ignored`
     #[test]
+    #[ignore = "needs a real manvi (GITPULSE_MANVI_BIN or on PATH)"]
     fn worktree_create_default_lane_is_writable_under_default_manvi_gate() {
         let (_sandbox, repo) = honesty_repo();
         let (err, created_lane) = tool_json(

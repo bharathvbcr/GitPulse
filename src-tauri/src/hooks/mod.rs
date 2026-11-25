@@ -11250,7 +11250,17 @@ done
         /// own checkout cannot be read is judged as the session's own file: a
         /// task-bound session is refused what its plan does not name, as it was
         /// before nested checkouts were resolved.
+        ///
+        /// Needs a real `manvi`: the scope judgement goes through
+        /// `harness::policy::check_file`, and without one the write runs
+        /// ungated. No CI runner installs it.
+        ///
+        /// `GITPULSE_MANVI_BIN=$(command -v manvi) cargo test --manifest-path
+        /// src-tauri/Cargo.toml --lib
+        /// hooks::tests::adv_held::a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout
+        /// -- --ignored`
         #[test]
+        #[ignore = "needs a real manvi (GITPULSE_MANVI_BIN or on PATH)"]
         fn a_bound_session_is_denied_an_unplanned_write_into_an_unreadable_nested_checkout() {
             for gitfile in [
                 "gitdir: /nowhere\n",
