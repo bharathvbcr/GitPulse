@@ -336,8 +336,13 @@ pub fn run() {
                         if let Err(error) = terminals.connect_host() {
                             log::error!(target: "terminal", "the terminal host could not be reached at startup; its runs are left alone: {error}");
                         }
-                        if terminals.backend() == "host" && terminals.reconcile_session_ledger() > 0 {
-                            terminals.session_ledger().emit_view(&ledger_app);
+                        if terminals.backend() == "host" {
+                            let changed = terminals.reconcile_session_ledger();
+                            // Also when it could not complete: the view then
+                            // carries `reconcile_pending` instead of looking empty.
+                            if changed > 0 || terminals.session_ledger().reconcile_pending() {
+                                terminals.session_ledger().emit_view(&ledger_app);
+                            }
                         }
                         match state.reconcile_stale_runs() {
                         Ok(0) => {}

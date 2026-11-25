@@ -503,6 +503,33 @@ fn clock_ms() -> u64 {
     u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What older-protocol hosts hold, for the ledger's startup reconcile. An older
+/// host whose socket has nothing behind it is gone (its sessions died with it);
+/// one that is refused, failed or has no dialect here could not be asked.
+#[cfg(unix)]
+pub(crate) fn foreign_holds(reports: &[LegacyHostReport]) -> session_ledger::ForeignHolds {
+    use host::legacy::LegacyStatus;
+    let mut holds = session_ledger::ForeignHolds::default();
+    for report in reports {
+        match &report.status {
+            LegacyStatus::Listed { sessions, .. } => {
+                holds.held.extend(sessions.iter().map(|s| s.id.clone()));
+            }
+            LegacyStatus::Unreachable { .. } => {}
+            LegacyStatus::NoCompat
+            | LegacyStatus::Refused { .. }
+            | LegacyStatus::Failed { .. } => holds.unverified = true,
+        }
+    }
+    holds
+}
+
+/// No terminal hosts off Unix, so nothing is held elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn foreign_holds(_reports: &[LegacyHostReport]) -> session_ledger::ForeignHolds {
+    session_ledger::ForeignHolds::default()
+}
+
 /// An earlier terminal host's report. Only Unix has terminal hosts; here the
 /// list is always empty, so this carries nothing.
 #[cfg(not(unix))]
@@ -797,12 +824,22 @@ impl TerminalSessions {
     }
 
     /// Reconciles leftover `Running` rows on startup against currently live PTYs.
+    ///
+    /// When the host cannot be asked this changes nothing and leaves
+    /// [`session_ledger::SessionLedger::reconcile_pending`] set, so the view says
+    /// the ledger is unreconciled; the host's next successful connect retries
+    /// (`SessionEvents::host_adopted`, bounded by `MAX_RECONCILE_RETRIES`).
     pub fn reconcile_session_ledger(&self) -> usize {
+        let _gate = self.session_ledger.reconcile_gate();
         match list_sessions(self) {
             Ok(listed) => {
                 let live_ids: std::collections::HashSet<String> =
                     listed.into_iter().map(|s| s.id).collect();
-                self.session_ledger.reconcile_startup(&live_ids)
+                // Sessions an older-protocol host still runs are alive too: a
+                // row for one is never `lost`, and so never offered for reopen.
+                let foreign = foreign_holds(&self.legacy_hosts());
+                self.session_ledger
+                    .reconcile_startup_with(&live_ids, &foreign)
             }
             Err(error) => {
                 log::warn!(
@@ -812,6 +849,14 @@ impl TerminalSessions {
                 0
             }
         }
+    }
+
+    /// The reconcile a later host connect owes: `None` when none is owed or the
+    /// retries are spent, else how many rows it changed.
+    pub fn retry_session_ledger_reconcile(&self) -> Option<usize> {
+        self.session_ledger
+            .begin_reconcile_retry()
+            .then(|| self.reconcile_session_ledger())
     }
 }
 
@@ -2357,6 +2402,29 @@ pub fn spawn_session_in<R: tauri::Runtime>(
     )
 }
 
+/// [`spawn_session_in`] for a caller that knows what the session resumes, in
+/// which mode it runs and which offer it reopens ([`session_ledger::SpawnHints`]).
+/// Every session is recorded in the ledger by the spawn owner ([`spawn_at`]),
+/// whichever route started it; this only carries what the owner cannot see.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_session_recorded<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    start_dir: Option<&str>,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
+    spawn_session_with_hints(
+        app, state, repo_path, start_dir, rows, cols, program, args, env, output, None, hints,
+    )
+}
+
 /// Longest `start_dir` accepted over IPC, in bytes: PATH_MAX on both Unix hosts.
 const START_DIR_BYTES_CAP: usize = 4096;
 
@@ -3303,12 +3371,43 @@ fn spawn_session_inner<R: tauri::Runtime>(
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, CommandError> {
+    spawn_session_with_hints(
+        app,
+        state,
+        repo_path,
+        start_dir,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        output,
+        observer,
+        session_ledger::SpawnHints::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_session_with_hints<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    start_dir: Option<&str>,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    observer: Option<Arc<dyn SessionObserver>>,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
     let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(
         app,
         state.incidents.clone(),
         state.session_ledger.clone(),
     ));
-    spawn_at(
+    spawn_at_with_hints(
         state,
         Place::Repo {
             repo_path: repo_path.to_owned(),
@@ -3323,6 +3422,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         events,
         observer,
         None,
+        hints,
     )
 }
 
@@ -3344,6 +3444,39 @@ pub(crate) fn spawn_at(
     observer: Option<Arc<dyn SessionObserver>>,
     orchestrated: Option<orchestrate::ChildSpawnMeta>,
 ) -> Result<TerminalSpawned, CommandError> {
+    spawn_at_with_hints(
+        state,
+        place,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        output,
+        events,
+        observer,
+        orchestrated,
+        session_ledger::SpawnHints::default(),
+    )
+}
+
+/// [`spawn_at`] with what the caller knows of the session's conversation, mode
+/// and reopened offer. The one place a session is recorded in the ledger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_at_with_hints(
+    state: &TerminalSessions,
+    place: Place,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    events: Arc<dyn SessionEvents>,
+    observer: Option<Arc<dyn SessionObserver>>,
+    orchestrated: Option<orchestrate::ChildSpawnMeta>,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
     let token = orchestrate::mint_session_token()?;
     let token_hash_hex = orchestrate::token_hash_hex(&token)?;
     let mut env_with_token = env.unwrap_or_default();
@@ -3364,6 +3497,16 @@ pub(crate) fn spawn_at(
         .as_deref()
         .and_then(launcher_kind)
         .unwrap_or("shell");
+    let row_launcher = launcher_label.to_owned();
+    // The ledger names the repository as the caller gave it, the same string
+    // a reopen sends back; a task attempt has only its checkout.
+    let (row_repo, row_start) = match &place {
+        Place::Repo {
+            repo_path,
+            start_dir,
+        } => (repo_path.clone(), start_dir.clone()),
+        Place::Task { .. } => (repo.to_string_lossy().into_owned(), None),
+    };
     let (parent_session_id, child_launcher, child_title) = match &orchestrated {
         Some(meta) => (
             Some(meta.parent_session_id.clone()),
@@ -3406,6 +3549,8 @@ pub(crate) fn spawn_at(
             .unwrap_or_else(default_shell),
         request.args.clone(),
     );
+    let recorded_events = events.clone();
+    let parent_terminal = request.parent_session_id.clone();
     #[cfg(unix)]
     let started_res = state
         .host
@@ -3434,6 +3579,23 @@ pub(crate) fn spawn_at(
         ledger.1,
         agent_launcher(&spawned.shell).is_some(),
     );
+    let parent_row_id = parent_terminal
+        .as_deref()
+        .and_then(|parent| state.session_ledger.row_id_for_terminal(parent));
+    state
+        .session_ledger
+        .record_spawn(session_ledger::NewSessionRow {
+            terminal_id: spawned.id.clone(),
+            launcher: row_launcher,
+            native_id: hints.native_id,
+            repo_path: row_repo,
+            start_dir: row_start,
+            cwd: spawned.cwd.clone(),
+            mode: hints.mode,
+            reopen_row_id: hints.reopen_row_id,
+            parent_row_id,
+        });
+    recorded_events.session_recorded();
     Ok(spawned)
 }
 
@@ -10977,6 +11139,7 @@ mod tests {
             cwd: spawned.cwd.clone(),
             mode: None,
             reopen_row_id: None,
+            parent_row_id: None,
         });
         (state, ledger, spawned.id)
     }
