@@ -96,10 +96,10 @@ const PERSISTED_ROWS: usize = 50_000;
 const MEMORY_ROWS: usize = 8_192;
 /// How long a write waits for another GitPulse process holding the file.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(100);
-/// How long an open waits for another process switching the file to WAL. The
-/// first open of a session runs under the pinned store's initialiser, so this
-/// is short; past it the session keeps churn in memory and the file is left
-/// alone.
+/// How long an open waits, in all, for another process switching the file to
+/// WAL and then creating or rebuilding its schema. The first open of a session
+/// runs under the pinned store's initialiser, so this is short; past it the
+/// session keeps churn in memory and the file is left alone.
 const WAL_PATIENCE: Duration = Duration::from_secs(2);
 /// How long a git version probe is believed: a git upgraded under a running
 /// app is noticed within this.
@@ -399,6 +399,7 @@ impl Store {
     }
 
     fn open_once(path: &Path, cap: usize, wal_patience: Duration) -> Result<Self, OpenFailure> {
+        let deadline = Instant::now() + wal_patience;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -409,18 +410,41 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
             OpenFailure::new(format!("cannot configure {}: {e}", path.display()), &e)
         })?;
-        crate::engine::sqlite_wal::enter_wal(&conn, wal_patience)
-            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
+        crate::engine::sqlite_wal::enter_wal(&conn, wal_patience).map_err(|e| {
+            OpenFailure::new(
+                format!("{} is not usable: switching to WAL: {e}", path.display()),
+                &e,
+            )
+        })?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
+            .map_err(|e| {
+                OpenFailure::new(
+                    format!("{} is not usable: setting synchronous: {e}", path.display()),
+                    &e,
+                )
+            })?;
         let mut store = Self {
             conn,
             cap,
             persistent: true,
         };
-        store
-            .ensure_schema()
-            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
+        // A sibling opener creating or rebuilding the schema holds the write
+        // lock as part of opening, so the wait for it shares the open's
+        // patience. Steady-state writes keep BUSY_TIMEOUT once it is applied.
+        let patience = deadline
+            .saturating_duration_since(Instant::now())
+            .max(BUSY_TIMEOUT);
+        let applied = store
+            .conn
+            .busy_timeout(patience)
+            .and_then(|()| store.ensure_schema())
+            .and_then(|()| store.conn.busy_timeout(BUSY_TIMEOUT));
+        applied.map_err(|e| {
+            OpenFailure::new(
+                format!("{} is not usable: applying the schema: {e}", path.display()),
+                &e,
+            )
+        })?;
         Ok(store)
     }
 
@@ -1912,6 +1936,30 @@ mod tests {
         );
     }
 
+    /// The racing test above failed on a loaded coverage runner with two
+    /// openers at "database is locked". The likeliest cause, and the one this
+    /// reproduces: the opener creating the schema held the write lock past
+    /// `BUSY_TIMEOUT`, the 100 ms meant for a steady-state write, while the
+    /// switch to WAL just before it was given `WAL_PATIENCE`.
+    /// A sibling creating the schema is part of opening, so it gets the open's
+    /// patience: here one holds the lock for 300 ms and the open still lands.
+    #[test]
+    fn an_opener_waits_out_a_sibling_creating_the_schema() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        let sibling = Connection::open(&path).unwrap();
+        crate::engine::sqlite_wal::enter_wal(&sibling, Duration::from_secs(1)).unwrap();
+        sibling.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            sibling.execute_batch("COMMIT;").unwrap();
+        });
+        let opened = Store::open_within(&path, 10, Duration::from_secs(2));
+        release.join().unwrap();
+        let store = opened.expect("a sibling creating the schema is waited for");
+        assert_eq!(store.rows(), 0);
+    }
+
     fn aged_cache(rows: usize, version: i64) -> (tempfile::TempDir, PathBuf) {
         let cache = tempfile::tempdir().unwrap();
         let path = cache.path().join(FILE_NAME);
@@ -1928,8 +1976,8 @@ mod tests {
 
     /// ADVERSARIAL W6-L3: openers racing to rebuild an OLD-version cache
     /// that has rows to drop (the first racing test starts from an empty
-    /// file, where the rebuild is instant). The loser waits only
-    /// `BUSY_TIMEOUT` (100 ms) for the IMMEDIATE lock.
+    /// file, where the rebuild is instant). The loser waits for the IMMEDIATE
+    /// lock within what is left of the open's `WAL_PATIENCE`.
     #[test]
     fn openers_racing_to_rebuild_an_old_cache_all_get_a_store() {
         const OPENERS: usize = 6;
