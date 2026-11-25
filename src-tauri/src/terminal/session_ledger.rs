@@ -5,10 +5,15 @@
 //! with its launcher, native conversation id, checkout/start directory, permission mode,
 //! timestamps, and lifecycle end state:
 //! - `running`: tab currently has a live PTY
-//! - `exited_clean`: natural exit (`/exit`, `exit 0`) or user-requested Close (never offered)
+//! - `exited_clean`: an exit GitPulse *observed* (it reaped the process and has a code) or a
+//!   user-requested Close (never offered). A clean row with neither an exit code nor a
+//!   signal is impossible by construction and is repaired to `lost` when the ledger opens
 //! - `exited_signal`: external signal killed the PTY while the app stayed up
 //! - `app_quit`: written synchronously in teardown *before* `SIGHUP` so quit+reopen keeps them
-//! - `lost`: left `running` by a prior `SIGKILL`, crash, or reboot and reconciled at startup
+//! - `lost`: the outcome was never observed: left `running` by a prior `SIGKILL`, crash, or
+//!   reboot (reconciled at startup), the host ended while holding it (the synthetic exit
+//!   with no code, no signal, not reaped), or GitPulse's own reader failed. Offered, and
+//!   never overwritten by a later exit; a deliberate Close of such a session withdraws it
 //! - `unreadable`: corrupt JSONL line on disk, preserved and surfaced as `"unreadable"`
 
 use super::lifecycle::{self, KillOrigin, RotatingJsonl};
@@ -19,9 +24,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// `reason` of a `running` row whose session an older-protocol terminal host holds.
+pub const OLDER_HOST_REASON: &str =
+    "Still running on an older terminal host; stop it there before reopening here.";
+/// `reason` of a `running` row when an older terminal host could not be asked.
+pub const UNVERIFIED_HOST_REASON: &str =
+    "Could not check an older terminal host for this session; it may still be running there.";
 
 /// Maximum rows kept on disk and in memory so the ledger stays strictly bounded.
 pub const MAX_LEDGER_ROWS: usize = 64;
@@ -31,6 +43,12 @@ const MAX_LINE_BYTES: usize = 16 * 1024;
 const MAX_CORRUPT_RAW_BYTES: usize = 4096;
 /// Current schema version for JSONL rows.
 const LEDGER_SCHEMA_VERSION: u32 = 1;
+/// How long a reopened session must stay alive before the offer it replaced is
+/// withdrawn, for launchers whose `SessionStart` hook never reports in.
+pub const REOPEN_SURVIVAL_MS: u64 = 20_000;
+/// How many times a host that connects later may re-run the startup reconcile
+/// that its first attempt could not complete.
+pub const MAX_RECONCILE_RETRIES: u32 = 6;
 
 /// Durable JSONL filename inside GitPulse's config directory.
 pub const SESSION_LEDGER_FILE: &str = "terminal-sessions.v1.jsonl";
@@ -80,6 +98,10 @@ pub struct SessionLedgerOffer {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The ledger row of the session that spawned this one (an orchestrated
+    /// child), when that session is a tab this ledger recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_row_id: Option<String>,
 }
 
 /// Current snapshot of durable recovery offers pushed via `SESSION_LEDGER_EVENT`
@@ -89,6 +111,22 @@ pub struct SessionLedgerView {
     pub offers: Vec<SessionLedgerOffer>,
     pub reopenable_count: usize,
     pub unreadable_count: usize,
+    /// The startup reconcile has not completed (the terminal host could not be
+    /// asked which sessions live), so a row still `running` may be lost. An
+    /// empty offer list is then "not known", not "nothing to recover".
+    #[serde(default)]
+    pub reconcile_pending: bool,
+}
+
+/// What hosts other than the current one hold, as startup reconcile needs it.
+/// Their sessions are alive, so their rows are not `lost`; a host that could
+/// not be asked leaves every unaccounted row unverified rather than lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForeignHolds {
+    /// Session ids an older host listed.
+    pub held: HashSet<String>,
+    /// Set when an older host exists that could not be asked.
+    pub unverified: bool,
 }
 
 /// Result of pre-checking whether one ledger row can be reopened right now.
@@ -128,6 +166,22 @@ struct StoredRow {
     /// governor. Kept on the row so it survives a page reload and a restart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     protected: bool,
+    /// Set on a row that reopened `resumes_row_id` and has not yet proved the
+    /// resumed conversation is alive. Cleared by [`confirm_reopen`] (a
+    /// `SessionStart` bind, [`REOPEN_SURVIVAL_MS`] alive, a deliberate close, a
+    /// quit) or turned into a failed reopen by [`fail_reopen`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resume_unconfirmed: bool,
+    /// The row this one reopened. With `resume_unconfirmed` clear it marks a
+    /// reopen that failed: the row is withdrawn and the old offer stands.
+    /// Older builds ignore both fields (no `deny_unknown_fields` here), so a
+    /// downgrade shows the old row and the new one as two offers, never none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumes_row_id: Option<String>,
+    /// The row of the session that spawned this one (an orchestrated child).
+    /// Absent on rows written before it existed; older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_row_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +192,89 @@ enum Entry {
         raw_line: String,
         detail: String,
     },
+}
+
+/// Most exits held for sessions whose row is not written yet.
+const MAX_EARLY_EXITS: usize = 64;
+
+/// An exit that arrived before its session's row: the spawn owner writes the
+/// row after the host has started the process, so a program that dies at once
+/// (an account wrapper refusing, a bad flag) can report its end first. Held
+/// until [`SessionLedger::record_spawn`] writes the row, then applied, so the
+/// row is never left `running` to be offered as lost at the next launch.
+#[derive(Debug, Clone)]
+struct EarlyExit {
+    terminal_id: String,
+    ended_by_gitpulse: bool,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    error: Option<String>,
+    reaped: bool,
+}
+
+impl EarlyExit {
+    fn facts(&self) -> ExitFacts<'_> {
+        ExitFacts {
+            ended_by_gitpulse: self.ended_by_gitpulse,
+            exit_code: self.exit_code,
+            signal: self.signal.as_deref(),
+            error: self.error.as_deref(),
+            reaped: self.reaped,
+        }
+    }
+}
+
+/// What was observed when a session ended, as [`SessionLedger::record_exit`]
+/// needs it. A host's synthetic exit is `reaped: false`, no code, no signal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExitFacts<'a> {
+    /// GitPulse ended it (Close, shutdown, or its own reader failing).
+    pub ended_by_gitpulse: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<&'a str>,
+    /// Why the exit is not a plain one (a failed reap, a failed reader, the
+    /// host ending).
+    pub error: Option<&'a str>,
+    /// GitPulse reaped the process and so knows how it ended.
+    pub reaped: bool,
+}
+
+impl<'a> ExitFacts<'a> {
+    /// An exit GitPulse reaped, with no error: how it ended is known.
+    pub fn reaped(
+        ended_by_gitpulse: bool,
+        exit_code: Option<i32>,
+        signal: Option<&'a str>,
+    ) -> Self {
+        Self {
+            ended_by_gitpulse,
+            exit_code,
+            signal,
+            error: None,
+            reaped: true,
+        }
+    }
+}
+
+/// `last_error` of a row [`SessionLedger::record_exit`] could not classify and
+/// the exit carried no reason for.
+const UNOBSERVED_EXIT: &str = "The session ended and GitPulse never observed how.";
+/// `last_error` of a row [`SessionLedger::repair_unobserved_exits`] rewrote.
+const REPAIRED_UNOBSERVED_EXIT: &str =
+    "The session's outcome was never observed (its host ended); repaired at startup.";
+
+/// Whether a close from `origin` means the person is finished with the
+/// session, so an exit nobody observed after it is withdrawn rather than
+/// offered. The kill stamps `closed_by` before it asks the host, so when the
+/// host is already dead the kill errors, `mark_user_closed` never runs, and
+/// this is all that says the person closed it.
+///
+/// Every route is deliberate except [`KillOrigin::LoadGovernor`]: it parks an
+/// idle session to give memory back and means it to come back (see
+/// [`SessionLedger::mark_parked`]). `Unspecified` is a direct close by
+/// definition, and `QuitStopAll` is a stop-everything the person chose.
+fn is_deliberate_close(origin: KillOrigin) -> bool {
+    !matches!(origin, KillOrigin::LoadGovernor)
 }
 
 /// Parameters captured when spawning a hosted terminal tab.
@@ -151,11 +288,25 @@ pub struct NewSessionRow {
     pub cwd: String,
     pub mode: Option<String>,
     pub reopen_row_id: Option<String>,
+    pub parent_row_id: Option<String>,
+}
+
+/// What a caller of the spawn owner knows about a session that its command
+/// line does not carry: the conversation it resumes or starts, the permission
+/// mode it asked for, and the offer it reopens. The owner adds the rest.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnHints {
+    pub native_id: Option<String>,
+    pub mode: Option<String>,
+    pub reopen_row_id: Option<String>,
 }
 
 struct LedgerState {
     entries: Vec<Entry>,
     load_error: Option<String>,
+    /// Exits for sessions with no row yet, oldest first, at most
+    /// [`MAX_EARLY_EXITS`]. In memory only: a restart reconciles instead.
+    early_exits: std::collections::VecDeque<EarlyExit>,
 }
 
 /// Thread-safe, bounded durable store for hosted terminal tab recovery rows.
@@ -167,6 +318,20 @@ pub struct SessionLedger {
     lifecycle: Option<RotatingJsonl>,
     /// Rows the cap evicted, kept so a row is never silently lost.
     archive: Option<RotatingJsonl>,
+    /// Rows [`Self::repair_unobserved_exits`] rewrote while opening, handed to
+    /// the first [`Self::reconcile_startup`] so its caller emits the view.
+    repaired_on_open: AtomicUsize,
+    /// Set when a durable ledger opens, cleared when [`Self::reconcile_startup`]
+    /// has run against a host that answered.
+    reconcile_pending: AtomicBool,
+    /// Retries spent since the ledger opened, capped at [`MAX_RECONCILE_RETRIES`].
+    reconcile_attempts: AtomicU32,
+    /// Serialises reconciles: startup and a later connect may race.
+    reconcile_gate: Mutex<()>,
+    /// `running` rows the last reconcile left alone because another host holds
+    /// (or may hold) them: terminal id to the reason shown. Rebuilt on every
+    /// reconcile, never persisted.
+    elsewhere: Mutex<HashMap<String, &'static str>>,
 }
 
 /// What a close needs to know about a session, from its ledger row.
@@ -186,9 +351,15 @@ impl SessionLedger {
             state: Mutex::new(LedgerState {
                 entries: Vec::new(),
                 load_error: None,
+                early_exits: std::collections::VecDeque::new(),
             }),
             lifecycle: None,
             archive: None,
+            repaired_on_open: AtomicUsize::new(0),
+            reconcile_pending: AtomicBool::new(false),
+            reconcile_attempts: AtomicU32::new(0),
+            reconcile_gate: Mutex::new(()),
+            elsewhere: Mutex::default(),
         }
     }
 
@@ -231,10 +402,20 @@ impl SessionLedger {
             state: Mutex::new(LedgerState {
                 entries,
                 load_error,
+                early_exits: std::collections::VecDeque::new(),
             }),
             lifecycle,
             archive,
+            repaired_on_open: AtomicUsize::new(0),
+            reconcile_pending: AtomicBool::new(true),
+            reconcile_attempts: AtomicU32::new(0),
+            reconcile_gate: Mutex::new(()),
+            elsewhere: Mutex::default(),
         };
+        // Before anything can deliver an exit: rows an older build recorded
+        // as clean for sessions whose outcome it never saw become offers.
+        let repaired = ledger.repair_unobserved_exits();
+        ledger.repaired_on_open.store(repaired, Ordering::Relaxed);
         if trimmed_on_load {
             // The evicted rows are archived now; rewriting the file keeps the
             // next open from archiving them a second time.
@@ -397,6 +578,20 @@ impl SessionLedger {
         changed
     }
 
+    /// The newest row recorded for the tab `terminal_id`.
+    pub fn row_id_for_terminal(&self, terminal_id: &str) -> Option<String> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Valid(row) if row.terminal_id.as_deref() == Some(terminal_id) => {
+                Some(row.row_id.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Path of the durable `.jsonl` file, or `None` when in-memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -420,17 +615,20 @@ impl SessionLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut inherited_title: Option<String> = None;
         let mut inherited_pinned = false;
+        let mut resumes_row_id: Option<String> = None;
         if let Some(reopen_id) = spec.reopen_row_id.as_deref() {
-            for entry in &mut guard.entries {
+            // The old row (and its siblings) stay offered-in-waiting: the
+            // newest-row rule hides them while this one runs, and they are
+            // withdrawn only once the reopened session proves itself.
+            for entry in &guard.entries {
                 if let Entry::Valid(existing) = entry {
                     if existing.row_id == reopen_id {
                         inherited_title = existing.title.clone();
                         inherited_pinned = existing.title_pinned && inherited_title.is_some();
-                        existing.withdrawn = true;
-                        existing.last_error = None;
                     }
                 }
             }
+            resumes_row_id = Some(reopen_id.to_owned());
         }
         let row = StoredRow {
             v: LEDGER_SCHEMA_VERSION,
@@ -453,6 +651,9 @@ impl SessionLedger {
             withdrawn: false,
             closed_by: None,
             protected: false,
+            resume_unconfirmed: resumes_row_id.is_some(),
+            resumes_row_id,
+            parent_row_id: spec.parent_row_id,
         };
         let spawned_launcher = row.launcher.clone();
         let spawned_repo = row.repo_path.clone();
@@ -460,7 +661,15 @@ impl SessionLedger {
         guard.entries.push(Entry::Valid(Box::new(row)));
         let evicted = enforce_bound(&mut guard.entries);
         self.persist_locked(&guard.entries);
+        let early = spawned_terminal.as_deref().and_then(|id| {
+            let at = guard.early_exits.iter().position(|e| e.terminal_id == id)?;
+            guard.early_exits.remove(at)
+        });
         drop(guard);
+        if let (Some(early), Some(id)) = (early, spawned_terminal.as_deref()) {
+            // The session already ended: record it now, as if in order.
+            self.record_exit(id, early.facts());
+        }
         archive_evicted(self.archive.as_ref(), &evicted);
         self.record_lifecycle(
             "spawn",
@@ -568,6 +777,7 @@ impl SessionLedger {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut changed = false;
+        let mut confirmed: Option<String> = None;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
@@ -580,7 +790,14 @@ impl SessionLedger {
                 row.native_id = Some(normalized_id);
                 changed = true;
             }
+            // SessionStart fired: the agent is alive, whether or not the id moved.
+            if row.resume_unconfirmed {
+                confirmed = Some(row.row_id.clone());
+            }
             break;
+        }
+        if let Some(id) = confirmed {
+            changed |= confirm_reopen(&mut guard.entries, &id);
         }
         if changed {
             self.persist_locked(&guard.entries);
@@ -597,6 +814,7 @@ impl SessionLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
         let mut changed = false;
+        let mut confirmed: Option<String> = None;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
@@ -610,7 +828,13 @@ impl SessionLedger {
                 }
                 changed = true;
             }
+            if row.resume_unconfirmed {
+                confirmed = Some(row.row_id.clone());
+            }
             break;
+        }
+        if let Some(id) = confirmed {
+            changed |= confirm_reopen(&mut guard.entries, &id);
         }
         if changed {
             self.persist_locked(&guard.entries);
@@ -631,6 +855,7 @@ impl SessionLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
         let mut changed = false;
+        let mut confirmed: Option<String> = None;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
@@ -641,7 +866,13 @@ impl SessionLedger {
             row.ended_at = Some(now);
             ensure_agy_fallback(row);
             changed = true;
+            if row.resume_unconfirmed {
+                confirmed = Some(row.row_id.clone());
+            }
             break;
+        }
+        if let Some(id) = confirmed {
+            confirm_reopen(&mut guard.entries, &id);
         }
         if changed {
             self.persist_locked(&guard.entries);
@@ -658,6 +889,27 @@ impl SessionLedger {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
         let mut count = 0;
+        // A reopened session still running at quit is alive: it becomes the
+        // one offer for its conversation and the row it reopened goes.
+        let alive: Vec<String> = guard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Valid(row)
+                    if row.resume_unconfirmed
+                        && !row.withdrawn
+                        && row.end_state == SessionEndState::Running =>
+                {
+                    Some(row.row_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut settled = false;
+        for id in alive {
+            settled |= confirm_reopen(&mut guard.entries, &id);
+        }
+        settled |= settle_reopens(&mut guard.entries, now);
         for entry in &mut guard.entries {
             let Entry::Valid(row) = entry else { continue };
             if row.withdrawn || row.end_state != SessionEndState::Running {
@@ -668,42 +920,160 @@ impl SessionLedger {
             ensure_agy_fallback(row);
             count += 1;
         }
-        if count > 0 {
+        if count > 0 || settled {
             self.persist_locked(&guard.entries);
         }
         count
     }
 
-    /// Records the observed process exit for `terminal_id`.
+    /// Whether the startup reconcile still has to complete.
+    pub fn reconcile_pending(&self) -> bool {
+        self.reconcile_pending.load(Ordering::Acquire)
+    }
+
+    /// Held for the length of one reconcile so two cannot interleave.
+    pub fn reconcile_gate(&self) -> MutexGuard<'_, ()> {
+        self.reconcile_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a reconcile retry may run now: one is still owed and fewer than
+    /// [`MAX_RECONCILE_RETRIES`] were spent. Spends one when it says yes.
+    pub fn begin_reconcile_retry(&self) -> bool {
+        self.reconcile_pending()
+            && self
+                .reconcile_attempts
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_RECONCILE_RETRIES).then_some(n + 1)
+                })
+                .is_ok()
+    }
+
+    /// Settles unconfirmed reopens as of `now` and persists a change.
+    #[cfg(test)]
+    pub(crate) fn settle_reopens_at(&self, now: u64) -> bool {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = settle_reopens(&mut guard.entries, now);
+        if changed {
+            self.persist_locked(&guard.entries);
+        }
+        changed
+    }
+
+    /// Rewrites every row shaped like an exit nobody observed into
+    /// [`SessionEndState::Lost`], and returns how many it changed.
     ///
-    /// Crucial race guard (`S2-03`): if [`Self::mark_app_quit`] already marked
-    /// this row `AppQuit` (or the user withdrew it via Close), subsequent
-    /// `SIGHUP` exit delivery never overwrites `AppQuit`.
-    pub fn record_exit(
-        &self,
-        terminal_id: &str,
-        ended_by_gitpulse: bool,
-        exit_code: Option<i32>,
-        signal: Option<&str>,
-    ) -> bool {
+    /// Before exits carried their facts, the synthetic exit a dead host's
+    /// sessions get (no code, no signal, not reaped) was recorded as a clean
+    /// exit, which is never offered. Such a row is `ExitedClean`, not
+    /// withdrawn, with neither an exit code nor a signal: a user Close is
+    /// withdrawn, and a reaped exit always has a code or a signal
+    /// (`finalize_pty_session`). Idempotent: a repaired row is `Lost`.
+    pub fn repair_unobserved_exits(&self) -> usize {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut repaired = 0;
+        for entry in &mut guard.entries {
+            let Entry::Valid(row) = entry else { continue };
+            if row.end_state == SessionEndState::ExitedClean
+                && !row.withdrawn
+                && row.exit_code.is_none()
+                && row.signal.is_none()
+            {
+                row.end_state = SessionEndState::Lost;
+                row.last_error = Some(REPAIRED_UNOBSERVED_EXIT.to_owned());
+                row.ended_at.get_or_insert_with(now_ms);
+                ensure_agy_fallback(row);
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            self.persist_locked(&guard.entries);
+        }
+        repaired
+    }
+
+    /// Records how the session `terminal_id` ended.
+    ///
+    /// Classification, in order:
+    /// - A row already `AppQuit` or withdrawn is never overwritten: the
+    ///   `SIGHUP` after [`Self::mark_app_quit`] or a Close must not undo it
+    ///   (`S2-03`). A `Lost` row is never overwritten either; it only gains
+    ///   `last_error` when it has none.
+    /// - GitPulse never observed how it ended (`!reaped` and no signal, as for
+    ///   the exit a dead host's sessions get): a row whose close was a
+    ///   [`is_deliberate_close`] is withdrawn, anything else is `Lost` so it
+    ///   is offered for reopening, with `error` as `last_error`.
+    /// - GitPulse ended it and says why (`ended_by_gitpulse` with an `error`:
+    ///   its own reader failed) and nobody deliberately closed it: `Lost` too.
+    /// - Otherwise the outcome was observed: GitPulse ended it, withdrawn;
+    ///   a signal, `ExitedSignal`; else `ExitedClean`.
+    pub fn record_exit(&self, terminal_id: &str, facts: ExitFacts<'_>) -> bool {
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
+        let signal = facts.signal.map(str::trim).filter(|s| !s.is_empty());
+        let error = facts.error.map(str::trim).filter(|e| !e.is_empty());
         let mut changed = false;
+        // A reopened session that lived long enough is confirmed before the
+        // exit is classified, so only an early exit can fail the reopen.
+        settle_reopens(&mut guard.entries, now);
+        let mut reopen: Option<(String, bool, String)> = None;
+        let mut matched = false;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
                 continue;
             }
+            matched = true;
+            if row.resume_unconfirmed {
+                let detail = if let Some(e) = error {
+                    e.to_owned()
+                } else if let Some(sig) = signal {
+                    format!("was killed by signal {sig}")
+                } else if let Some(code) = facts.exit_code {
+                    format!("exited with code {code}")
+                } else {
+                    "ended without a known outcome".to_owned()
+                };
+                let secs = now.saturating_sub(row.started_at) / 1000;
+                let deliberate = row.closed_by.is_some_and(is_deliberate_close);
+                reopen = Some((
+                    row.row_id.clone(),
+                    deliberate,
+                    format!("Reopen failed: {} {detail} after {secs} s.", row.launcher),
+                ));
+            }
+            if row.end_state == SessionEndState::Lost {
+                if row.last_error.is_none() && !row.withdrawn {
+                    row.last_error = error.map(str::to_owned);
+                    changed = row.last_error.is_some();
+                }
+                break;
+            }
             if row.end_state == SessionEndState::AppQuit || row.withdrawn {
                 return false;
             }
-            if ended_by_gitpulse {
+            let deliberate = row.closed_by.is_some_and(is_deliberate_close);
+            let observed = facts.reaped || signal.is_some();
+            let unknown = (!observed && !deliberate)
+                || (facts.ended_by_gitpulse && error.is_some() && !deliberate);
+            if unknown {
+                row.end_state = SessionEndState::Lost;
+                row.last_error = Some(error.unwrap_or(UNOBSERVED_EXIT).to_owned());
+                ensure_agy_fallback(row);
+            } else if facts.ended_by_gitpulse || !observed {
                 row.end_state = SessionEndState::ExitedClean;
                 row.withdrawn = true;
-            } else if let Some(sig) = signal.map(str::trim).filter(|s| !s.is_empty()) {
+            } else if let Some(sig) = signal {
                 row.end_state = SessionEndState::ExitedSignal;
                 row.signal = Some(sig.to_owned());
                 ensure_agy_fallback(row);
@@ -711,9 +1081,31 @@ impl SessionLedger {
                 row.end_state = SessionEndState::ExitedClean;
             }
             row.ended_at = Some(now);
-            row.exit_code = exit_code;
+            row.exit_code = facts.exit_code;
             changed = true;
             break;
+        }
+        if !matched {
+            // Its row is not written yet: hold the exit for `record_spawn`.
+            guard.early_exits.retain(|early| early.terminal_id != terminal_id);
+            if guard.early_exits.len() >= MAX_EARLY_EXITS {
+                guard.early_exits.pop_front();
+            }
+            guard.early_exits.push_back(EarlyExit {
+                terminal_id: terminal_id.to_owned(),
+                ended_by_gitpulse: facts.ended_by_gitpulse,
+                exit_code: facts.exit_code,
+                signal: signal.map(str::to_owned),
+                error: error.map(str::to_owned),
+                reaped: facts.reaped,
+            });
+        }
+        if let Some((id, deliberate, why)) = reopen {
+            changed |= if deliberate {
+                confirm_reopen(&mut guard.entries, &id)
+            } else {
+                fail_reopen(&mut guard.entries, &id, &why)
+            };
         }
         if changed {
             self.persist_locked(&guard.entries);
@@ -725,12 +1117,31 @@ impl SessionLedger {
     /// `terminal_id` is absent from `live_terminal_ids` (left behind by
     /// `SIGKILL`, crash, or reboot) transitions to [`SessionEndState::Lost`].
     pub fn reconcile_startup(&self, live_terminal_ids: &HashSet<String>) -> usize {
+        self.reconcile_startup_with(live_terminal_ids, &ForeignHolds::default())
+    }
+
+    /// [`Self::reconcile_startup`] that also knows what older hosts hold: a row
+    /// one of them lists is alive, and with an older host that could not be
+    /// asked every other `running` row is unverified, not lost. Both stay
+    /// `running` and are shown non-resumable by the view.
+    pub fn reconcile_startup_with(
+        &self,
+        live_terminal_ids: &HashSet<String>,
+        foreign: &ForeignHolds,
+    ) -> usize {
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
         let mut count = 0;
+        // A reopen that outlived the window before the crash is confirmed; one
+        // that did not, and is no longer live, fails below and the old offer
+        // stands, so exactly one row offers the conversation either way.
+        if settle_reopens(&mut guard.entries, now) {
+            count += 1;
+        }
+        let mut elsewhere: HashMap<String, &'static str> = HashMap::new();
         for entry in &mut guard.entries {
             let Entry::Valid(row) = entry else { continue };
             if row.withdrawn || row.end_state != SessionEndState::Running {
@@ -743,15 +1154,36 @@ impl SessionLedger {
             if still_alive {
                 continue;
             }
+            if let Some(id) = row.terminal_id.as_deref() {
+                if foreign.held.contains(id) {
+                    elsewhere.insert(id.to_owned(), OLDER_HOST_REASON);
+                    continue;
+                }
+                if foreign.unverified {
+                    elsewhere.insert(id.to_owned(), UNVERIFIED_HOST_REASON);
+                    continue;
+                }
+            }
             row.end_state = SessionEndState::Lost;
             row.ended_at = Some(now);
             ensure_agy_fallback(row);
             count += 1;
         }
+        if settle_reopens(&mut guard.entries, now) {
+            count += 1;
+        }
         if count > 0 {
             self.persist_locked(&guard.entries);
         }
-        count
+        *self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = elsewhere;
+        self.reconcile_pending.store(false, Ordering::Release);
+        self.reconcile_attempts.store(0, Ordering::Release);
+        // Rows repaired while opening count as changed the first time, so the
+        // caller emits the view for them too.
+        count + self.repaired_on_open.swap(0, Ordering::Relaxed)
     }
 
     /// Withdraws a valid recovery offer or removes a corrupt `Unreadable` row.
@@ -883,23 +1315,83 @@ impl SessionLedger {
     where
         F: FnMut(&str, &str) -> conversation::Transcript,
     {
-        let guard = self
+        let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if settle_reopens(&mut guard.entries, now_ms()) {
+            self.persist_locked(&guard.entries);
+        }
+        // Rows an unconfirmed reopen is standing in for: hidden while it runs
+        // even when they name no conversation (agy's continue sentinel).
+        let reopening: HashSet<&str> = guard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Valid(row) if row.resume_unconfirmed && !row.withdrawn => {
+                    row.resumes_row_id.as_deref()
+                }
+                _ => None,
+            })
+            .collect();
+        let elsewhere = self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut offers = Vec::new();
         if let Some(err) = &guard.load_error {
             offers.push(project_corrupt_row("corrupt-ledger-file", err));
         }
         // Cache repeated (provider, session_id) transcript filesystem probes within one view build.
         let mut cache: HashMap<(String, String), conversation::Transcript> = HashMap::new();
+        // One offer per conversation: the newest row of any state wins, and a
+        // conversation that is running again offers nothing. A conversation
+        // continued in a later tab that then ended cleanly, or was closed,
+        // must not be offered again from an older row.
+        let mut taken: HashSet<(String, String)> = guard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Valid(row)
+                    if !row.withdrawn && row.end_state == SessionEndState::Running =>
+                {
+                    conversation_key(row)
+                }
+                _ => None,
+            })
+            .collect();
         for entry in guard.entries.iter().rev() {
             match entry {
                 Entry::Corrupt { row_id, detail, .. } => {
                     offers.push(project_corrupt_row(row_id, detail));
                 }
                 Entry::Valid(row) => {
-                    if row.withdrawn || !is_offer_end_state(row.end_state) {
+                    // Claimed before the offer test, so a newer row that is
+                    // not an offer still hides every older one.
+                    if is_failed_reopen(row) {
+                        continue;
+                    }
+                    // Alive on a host this one is not: shown, never reopenable
+                    // (a second copy would resume the same conversation twice).
+                    if !row.withdrawn && row.end_state == SessionEndState::Running {
+                        if let Some(reason) = row
+                            .terminal_id
+                            .as_deref()
+                            .and_then(|id| elsewhere.get(id))
+                        {
+                            offers.push(project_valid_row_with_status(
+                                row,
+                                conversation::ProviderResumability {
+                                    resumable: false,
+                                    reason: Some((*reason).to_owned()),
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                    let newest = conversation_key(row).is_none_or(|key| taken.insert(key));
+                    if !newest || reopening.contains(row.row_id.as_str()) || row.withdrawn || !is_offer_end_state(row.end_state) {
                         continue;
                     }
                     let offer = project_valid_row(row, |prov, sid| {
@@ -931,6 +1423,7 @@ impl SessionLedger {
             offers,
             reopenable_count,
             unreadable_count,
+            reconcile_pending: self.reconcile_pending(),
         }
     }
 
@@ -1004,6 +1497,98 @@ fn probe_with_dirs(
     }
 }
 
+/// The reopened session `new_row_id` is alive: clear its flag and withdraw
+/// the row it reopened plus every other non-running row for the same
+/// conversation, so nothing offers it a second time. Returns whether it
+/// changed anything.
+fn confirm_reopen(entries: &mut [Entry], new_row_id: &str) -> bool {
+    let mut old_id = None;
+    let mut key = None;
+    for entry in entries.iter_mut() {
+        let Entry::Valid(row) = entry else { continue };
+        if row.row_id == new_row_id && row.resume_unconfirmed {
+            row.resume_unconfirmed = false;
+            old_id = row.resumes_row_id.take();
+            key = conversation_key(row);
+            break;
+        }
+    }
+    let Some(old_id) = old_id else { return false };
+    for entry in entries.iter_mut() {
+        let Entry::Valid(other) = entry else { continue };
+        let sibling = other.end_state != SessionEndState::Running
+            && key.is_some()
+            && conversation_key(other) == key;
+        if !other.withdrawn && (other.row_id == old_id || sibling) && other.row_id != new_row_id {
+            other.withdrawn = true;
+            other.last_error = None;
+        }
+    }
+    true
+}
+
+/// The reopened session `new_row_id` ended before proving itself: withdraw it
+/// (it is not a second offer), keep it marked as a failed reopen so it does
+/// not hide the conversation, and put `why` on the row that is still offered.
+fn fail_reopen(entries: &mut [Entry], new_row_id: &str, why: &str) -> bool {
+    let mut old_id = None;
+    for entry in entries.iter_mut() {
+        let Entry::Valid(row) = entry else { continue };
+        if row.row_id == new_row_id && row.resume_unconfirmed {
+            row.resume_unconfirmed = false;
+            row.withdrawn = true;
+            row.last_error = Some(why.to_owned());
+            old_id = row.resumes_row_id.clone();
+            break;
+        }
+    }
+    let Some(old_id) = old_id else { return false };
+    for entry in entries.iter_mut() {
+        let Entry::Valid(old) = entry else { continue };
+        if old.row_id == old_id && !old.withdrawn {
+            old.last_error = Some(why.to_owned());
+        }
+    }
+    true
+}
+
+/// A row that reopened another and was withdrawn without being confirmed.
+fn is_failed_reopen(row: &StoredRow) -> bool {
+    row.resumes_row_id.is_some() && !row.resume_unconfirmed
+}
+
+/// Settles every unconfirmed reopen as of `now`, lazily (there is no timer):
+/// a running one alive for [`REOPEN_SURVIVAL_MS`] is confirmed, one someone
+/// already withdrew is confirmed (a person finished with it), and one that is
+/// no longer running (a reboot's `Lost`, a stray exit) failed.
+fn settle_reopens(entries: &mut [Entry], now: u64) -> bool {
+    let pending: Vec<(String, bool, bool, u64)> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Valid(row) if row.resume_unconfirmed => Some((
+                row.row_id.clone(),
+                row.withdrawn,
+                row.end_state == SessionEndState::Running,
+                row.started_at,
+            )),
+            _ => None,
+        })
+        .collect();
+    let mut changed = false;
+    for (id, withdrawn, running, started) in pending {
+        if withdrawn || (running && now.saturating_sub(started) >= REOPEN_SURVIVAL_MS) {
+            changed |= confirm_reopen(entries, &id);
+        } else if !running {
+            changed |= fail_reopen(
+                entries,
+                &id,
+                "Reopen failed: the resumed session was no longer running when the app checked.",
+            );
+        }
+    }
+    changed
+}
+
 fn is_offer_end_state(state: SessionEndState) -> bool {
     matches!(
         state,
@@ -1012,6 +1597,16 @@ fn is_offer_end_state(state: SessionEndState) -> bool {
             | SessionEndState::ExitedSignal
             | SessionEndState::Unreadable
     )
+}
+
+/// The conversation a row belongs to: its launcher and native id. The agy
+/// "continue" sentinel names no conversation, so it has no key.
+fn conversation_key(row: &StoredRow) -> Option<(String, String)> {
+    let native = row.native_id.as_deref()?;
+    if native == terminal_command::AGY_CONTINUE_SENTINEL {
+        return None;
+    }
+    Some((row.launcher.clone(), native.to_owned()))
 }
 
 fn ensure_agy_fallback(row: &mut StoredRow) {
@@ -1063,6 +1658,7 @@ fn project_corrupt_row(row_id: &str, detail: &str) -> SessionLedgerOffer {
         reason: Some("unreadable".to_owned()),
         last_error: Some(detail.to_owned()),
         title: None,
+        parent_row_id: None,
     }
 }
 
@@ -1108,6 +1704,7 @@ fn project_valid_row_with_status(
         reason,
         last_error: row.last_error.clone(),
         title: row.title.clone(),
+        parent_row_id: row.parent_row_id.clone(),
     }
 }
 
@@ -1186,19 +1783,21 @@ fn enforce_bound(entries: &mut Vec<Entry>) -> Vec<Entry> {
             evicted.push(entries.remove(pos));
             continue;
         }
+        // A corrupt line goes before any offer: it can only be dismissed,
+        // while an offer is a conversation the person can still get back.
+        if let Some(pos) = entries
+            .iter()
+            .position(|e| matches!(e, Entry::Corrupt { .. }))
+        {
+            evicted.push(entries.remove(pos));
+            continue;
+        }
         if let Some(pos) = entries.iter().position(|e| {
             matches!(
                 e,
                 Entry::Valid(r) if r.end_state != SessionEndState::Running
             )
         }) {
-            evicted.push(entries.remove(pos));
-            continue;
-        }
-        if let Some(pos) = entries
-            .iter()
-            .position(|e| matches!(e, Entry::Corrupt { .. }))
-        {
             evicted.push(entries.remove(pos));
             continue;
         }
@@ -1474,6 +2073,7 @@ mod tests {
             cwd: repo_str,
             mode: Some("edit".to_owned()),
             reopen_row_id: reopen_row_id.map(str::to_owned),
+            parent_row_id: None,
         }
     }
 
@@ -1498,7 +2098,10 @@ mod tests {
         // Simulate reader thread reporting SIGHUP immediately after mark_app_quit.
         for idx in 0..3 {
             assert!(
-                !ledger.record_exit(&format!("term-1-{idx}"), true, None, Some("Hangup: 1")),
+                !ledger.record_exit(
+                    &format!("term-1-{idx}"),
+                    ExitFacts::reaped(true, None, Some("Hangup: 1"))
+                ),
                 "SIGHUP after AppQuit must not overwrite AppQuit"
             );
         }
@@ -1529,7 +2132,7 @@ mod tests {
         assert!(ledger.mark_user_closed("term-1-1"));
         // The first was parked; GitPulse's own hangup arrives afterwards.
         assert!(ledger.mark_parked("term-1-0"));
-        assert!(!ledger.record_exit("term-1-0", true, None, Some("Hangup: 1")));
+        assert!(!ledger.record_exit("term-1-0", ExitFacts::reaped(true, None, Some("Hangup: 1"))));
         assert!(
             !ledger.mark_parked("term-nope"),
             "an unknown tab changes nothing"
@@ -1564,7 +2167,7 @@ mod tests {
             &repo,
             None,
         ));
-        assert!(first.record_exit("term-clean", false, Some(0), None));
+        assert!(first.record_exit("term-clean", ExitFacts::reaped(false, Some(0), None)));
         drop(first);
 
         // Relaunch after SIGKILL (no mark_app_quit ran).
@@ -1824,7 +2427,7 @@ mod tests {
         assert!(ledger.set_protected("term-7-1", true));
         assert!(ledger.is_protected("term-7-1"));
         // The session exits on its own, then the id is reused after a restart.
-        assert!(ledger.record_exit("term-7-1", false, Some(0), None));
+        assert!(ledger.record_exit("term-7-1", ExitFacts::reaped(false, Some(0), None)));
         assert!(
             !ledger.is_protected("term-7-1"),
             "an ended row protects nothing"
@@ -1875,5 +2478,714 @@ mod tests {
             ledger.brief("term-blocked").is_some(),
             "the spawn still recorded"
         );
+    }
+
+    // ---- exit classification, repair, eviction, dedupe (reboot-loss fix) ----
+
+    /// The synthetic exit ptyd and the client give every session a dead host
+    /// held: no code, no signal, not reaped, `HOST_ENDED`.
+    fn host_ended(ledger: &SessionLedger, id: &str) -> bool {
+        exit_facts(ledger, id, false, None, None, Some("host ended"), false)
+    }
+
+    fn exit_facts(
+        ledger: &SessionLedger,
+        id: &str,
+        ended_by_gitpulse: bool,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        error: Option<&str>,
+        reaped: bool,
+    ) -> bool {
+        ledger.record_exit(
+            id,
+            ExitFacts {
+                ended_by_gitpulse,
+                exit_code,
+                signal,
+                error,
+                reaped,
+            },
+        )
+    }
+
+    fn state_of(ledger: &SessionLedger, row_id: &str) -> (SessionEndState, bool) {
+        ledger
+            .raw_states()
+            .into_iter()
+            .find(|(id, _, _)| id == row_id)
+            .map(|(_, s, w)| (s, w))
+            .expect("row exists")
+    }
+
+    #[test]
+    fn a_host_ended_exit_makes_the_session_lost_and_offered_not_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-h",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(host_ended(&ledger, "term-h"));
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::Lost, false));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert!(view.offers[0].resumable);
+        assert_eq!(view.offers[0].last_error.as_deref(), Some("host ended"));
+        assert!(view.offers[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn an_unobserved_exit_after_a_deliberate_close_is_withdrawn_but_a_parked_origin_is_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let closed = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let governed = ledger.record_spawn(spawn_spec(
+            "term-g",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.set_closed_by("term-c", KillOrigin::TabClose));
+        assert!(ledger.set_closed_by("term-g", KillOrigin::LoadGovernor));
+        assert!(host_ended(&ledger, "term-c"));
+        assert!(host_ended(&ledger, "term-g"));
+        assert_eq!(
+            state_of(&ledger, &closed),
+            (SessionEndState::ExitedClean, true)
+        );
+        assert_eq!(state_of(&ledger, &governed), (SessionEndState::Lost, false));
+    }
+
+    #[test]
+    fn a_reader_failure_is_lost_with_its_error_but_a_plain_close_is_withdrawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let failed = ledger.record_spawn(spawn_spec(
+            "term-f",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let closed = ledger.record_spawn(spawn_spec(
+            "term-k",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.set_closed_by("term-k", KillOrigin::TabClose);
+        // reader_failure_payload: reaped, a code, GitPulse-ended, with an error.
+        assert!(exit_facts(
+            &ledger,
+            "term-f",
+            true,
+            Some(0),
+            None,
+            Some("PTY reader failed: x"),
+            true
+        ));
+        // A Close: reaped, signalled, GitPulse-ended, no error.
+        assert!(exit_facts(
+            &ledger,
+            "term-k",
+            true,
+            None,
+            Some("Hangup: 1"),
+            None,
+            true
+        ));
+        assert_eq!(state_of(&ledger, &failed), (SessionEndState::Lost, false));
+        assert_eq!(
+            state_of(&ledger, &closed),
+            (SessionEndState::ExitedClean, true)
+        );
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert_eq!(
+            view.offers[0].last_error.as_deref(),
+            Some("PTY reader failed: x")
+        );
+    }
+
+    #[test]
+    fn a_lost_row_is_never_overwritten_by_a_later_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-l",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert_eq!(ledger.reconcile_startup(&HashSet::new()), 1);
+        exit_facts(&ledger, "term-l", false, Some(0), None, None, true);
+        exit_facts(
+            &ledger,
+            "term-l",
+            false,
+            None,
+            Some("Killed: 9"),
+            None,
+            true,
+        );
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::Lost, false));
+    }
+
+    #[test]
+    fn reaped_exits_keep_their_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let sig = ledger.record_spawn(spawn_spec(
+            "term-s",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let ok = ledger.record_spawn(spawn_spec(
+            "term-o",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        exit_facts(
+            &ledger,
+            "term-s",
+            false,
+            None,
+            Some("Killed: 9"),
+            None,
+            true,
+        );
+        exit_facts(&ledger, "term-o", false, Some(0), None, None, true);
+        assert_eq!(
+            state_of(&ledger, &sig),
+            (SessionEndState::ExitedSignal, false)
+        );
+        assert_eq!(
+            state_of(&ledger, &ok),
+            (SessionEndState::ExitedClean, false)
+        );
+    }
+
+    #[test]
+    fn startup_repairs_clean_rows_that_carry_no_code_and_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let row = |id: &str, state: &str, code: &str, wd: bool, sid: &str| {
+            format!(
+                "{{\"v\":1,\"row_id\":\"{id}\",\"terminal_id\":\"t-{id}\",\"launcher\":\"claude\",\"native_id\":\"{sid}\",\"repo_path\":\"/r\",\"start_dir\":null,\"cwd\":\"/r\",\"mode\":null,\"started_at\":1,\"ended_at\":2,\"end_state\":\"{state}\",\"signal\":null,\"exit_code\":{code},\"last_error\":null,\"withdrawn\":{wd}}}\n"
+            )
+        };
+        let mut text = String::new();
+        text += &row("bad", "exited_clean", "null", false, UUID_1);
+        text += &row("user", "exited_clean", "null", true, UUID_2);
+        text += &row("coded", "exited_clean", "0", false, UUID_3);
+        fs::write(&path, text).unwrap();
+        let ledger = SessionLedger::open(&path);
+        assert_eq!(state_of(&ledger, "bad"), (SessionEndState::Lost, false));
+        assert_eq!(
+            state_of(&ledger, "user"),
+            (SessionEndState::ExitedClean, true)
+        );
+        assert_eq!(
+            state_of(&ledger, "coded"),
+            (SessionEndState::ExitedClean, false)
+        );
+        let offer = &ledger.view_with(|_, _| Transcript::Found).offers[0];
+        assert!(offer
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("repaired at startup")));
+        // Persisted and idempotent.
+        let again = SessionLedger::open(&path);
+        assert_eq!(state_of(&again, "bad"), (SessionEndState::Lost, false));
+        assert_eq!(again.repair_unobserved_exits(), 0);
+        assert_eq!(again.reconcile_startup(&HashSet::new()), 0);
+    }
+
+    #[test]
+    fn eviction_spares_unactioned_offers_and_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let offer = ledger.record_spawn(spawn_spec(
+            "term-keep",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        for i in 0..(MAX_LEDGER_ROWS + 20) {
+            let id = format!("term-n-{i}");
+            ledger.record_spawn(spawn_spec(&id, "claude", Some(UUID_2), dir.path(), None));
+            exit_facts(&ledger, &id, false, Some(0), None, None, true);
+        }
+        assert_eq!(ledger.raw_states().len(), MAX_LEDGER_ROWS);
+        assert_eq!(state_of(&ledger, &offer), (SessionEndState::AppQuit, false));
+    }
+
+    #[test]
+    fn a_full_ledger_evicts_a_corrupt_line_before_any_unactioned_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        fs::write(&path, "{corrupt json line\n").unwrap();
+        let ledger = SessionLedger::open(&path);
+        let first = ledger.record_spawn(spawn_spec(
+            "term-0",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        for i in 1..(MAX_LEDGER_ROWS - 1) {
+            ledger.record_spawn(spawn_spec(
+                &format!("term-{i}"),
+                "claude",
+                Some(UUID_2),
+                dir.path(),
+                None,
+            ));
+        }
+        ledger.mark_app_quit();
+        ledger.record_spawn(spawn_spec(
+            "term-new",
+            "claude",
+            Some(UUID_3),
+            dir.path(),
+            None,
+        ));
+        let states = ledger.raw_states();
+        assert_eq!(states.len(), MAX_LEDGER_ROWS);
+        assert_eq!(state_of(&ledger, &first), (SessionEndState::AppQuit, false));
+        assert!(
+            states
+                .iter()
+                .all(|(_, s, _)| *s != SessionEndState::Unreadable),
+            "the corrupt line went first"
+        );
+    }
+
+    #[test]
+    fn offers_dedupe_by_launcher_and_native_id_and_yield_to_a_running_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec(
+            "term-a",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let new = ledger.record_spawn(spawn_spec(
+            "term-b",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let other = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        let ids: Vec<&str> = view.offers.iter().map(|o| o.row_id.as_str()).collect();
+        assert_eq!(ids, vec![other.as_str(), new.as_str()]);
+        assert_eq!(view.reopenable_count, 2);
+        // A running session with the same conversation hides its stale offers.
+        ledger.record_spawn(spawn_spec(
+            "term-d",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert_eq!(view.offers[0].row_id, new);
+    }
+
+    /// A program that dies at once can report its exit before the spawn owner
+    /// writes its row. The exit is held and applied when the row arrives, so
+    /// the row is not left `running` and offered as lost at the next launch.
+    #[test]
+    fn an_exit_that_beats_its_row_is_applied_when_the_row_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let ledger = SessionLedger::open(&path);
+        assert!(!ledger.record_exit(
+            "term-fast",
+            ExitFacts::reaped(false, Some(1), None)
+        ));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-fast",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::ExitedClean, false));
+        drop(ledger);
+        let relaunched = SessionLedger::open(&path);
+        assert_eq!(relaunched.reconcile_startup(&HashSet::new()), 0);
+        assert_eq!(
+            relaunched.view_with(|_, _| Transcript::Found).reopenable_count,
+            0,
+            "a session that ended on its own is not offered after a relaunch"
+        );
+    }
+
+    /// A conversation lost in one reboot and then continued in a later tab
+    /// that ended on its own must not be offered again from the older row:
+    /// the startup repair revives old rows, and the newest row decides.
+    #[test]
+    fn an_older_offer_yields_to_a_newer_row_of_any_state_for_the_same_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let lost = ledger.record_spawn(spawn_spec(
+            "term-old",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.record_exit(
+            "term-old",
+            ExitFacts {
+                error: Some("host ended"),
+                ..ExitFacts::default()
+            },
+        ));
+        assert_eq!(state_of(&ledger, &lost).0, SessionEndState::Lost);
+        // Continued by hand in a new tab (not a reopen), which then exits cleanly.
+        ledger.record_spawn(spawn_spec(
+            "term-new",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.record_exit("term-new", ExitFacts::reaped(false, Some(0), None)));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(
+            view.offers.iter().all(|o| o.row_id != lost),
+            "a conversation that was continued and ended cleanly is not offered again"
+        );
+        assert_eq!(view.reopenable_count, 0);
+    }
+
+    #[test]
+    fn a_reopen_withdraws_every_other_non_running_row_for_the_same_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let a = ledger.record_spawn(spawn_spec(
+            "term-a",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let b = ledger.record_spawn(spawn_spec(
+            "term-b",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let c = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        ledger.record_spawn(spawn_spec(
+            "term-r",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            Some(&b),
+        ));
+        // Not withdrawn until the reopened session proves itself.
+        assert!(!state_of(&ledger, &a).1);
+        assert!(!state_of(&ledger, &b).1);
+        assert!(ledger.bind_native_id("term-r", "claude", UUID_1));
+        assert!(state_of(&ledger, &a).1);
+        assert!(state_of(&ledger, &b).1);
+        assert!(!state_of(&ledger, &c).1);
+    }
+
+    /// Quit, reopen `UUID_1` as `term-r`, and return (ledger, old row id, new row id).
+    fn reopened(dir: &Path, native: &str, launcher: &str) -> (SessionLedger, String, String) {
+        let ledger = SessionLedger::open(dir.join(SESSION_LEDGER_FILE));
+        let old = ledger.record_spawn(spawn_spec("term-old", launcher, Some(native), dir, None));
+        ledger.mark_app_quit();
+        let new = ledger.record_spawn(spawn_spec("term-r", launcher, Some(native), dir, Some(&old)));
+        (ledger, old, new)
+    }
+
+    fn offered(ledger: &SessionLedger) -> Vec<SessionLedgerOffer> {
+        ledger.view_with(|_, _| Transcript::Found).offers
+    }
+
+    #[test]
+    fn a_reopen_that_dies_at_once_leaves_the_old_offer_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, old, new) = reopened(dir.path(), UUID_1, "claude");
+        assert!(offered(&ledger).is_empty(), "hidden while the reopen runs");
+        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        let offers = offered(&ledger);
+        assert_eq!(offers.len(), 1, "{offers:?}");
+        assert_eq!(offers[0].row_id, old);
+        assert!(offers[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("exited with code 1")));
+        assert!(state_of(&ledger, &new).1, "the failed reopen is not a duplicate offer");
+        // It survives a restart as the same single offer.
+        let reloaded = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let offers = offered(&reloaded);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].row_id, old);
+        // And can be reopened again.
+        reloaded.record_spawn(spawn_spec("term-r2", "claude", Some(UUID_1), dir.path(), Some(&old)));
+        assert!(offered(&reloaded).is_empty());
+    }
+
+    #[test]
+    fn a_reopen_is_confirmed_by_session_start_even_without_an_id_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, old, _) = reopened(dir.path(), UUID_1, "claude");
+        // The id is unchanged (the spawn already carried it); the bind still confirms.
+        ledger.bind_native_id("term-r", "claude", UUID_1);
+        assert!(state_of(&ledger, &old).1);
+        // A later early-looking exit is now an ordinary exit, not a failed reopen.
+        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        assert!(offered(&ledger).is_empty());
+    }
+
+    #[test]
+    fn a_reopen_that_survives_the_window_is_confirmed_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, old, new) = reopened(dir.path(), UUID_1, "claude");
+        assert!(!ledger.settle_reopens_at(now_ms() + REOPEN_SURVIVAL_MS - 5_000));
+        assert!(!state_of(&ledger, &old).1);
+        assert!(ledger.settle_reopens_at(now_ms() + REOPEN_SURVIVAL_MS + 1_000));
+        assert!(state_of(&ledger, &old).1);
+        assert!(!state_of(&ledger, &new).1);
+        assert!(offered(&ledger).is_empty());
+    }
+
+    #[test]
+    fn a_reopen_cut_short_by_quit_leaves_exactly_one_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, _, new) = reopened(dir.path(), UUID_1, "claude");
+        ledger.mark_app_quit();
+        let reloaded = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let offers = offered(&reloaded);
+        assert_eq!(offers.len(), 1, "{offers:?}");
+        assert_eq!(offers[0].row_id, new);
+    }
+
+    #[test]
+    fn a_reopen_lost_to_a_reboot_leaves_exactly_one_offer_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, old, new) = reopened(dir.path(), UUID_1, "claude");
+        drop(ledger);
+        let reloaded = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        assert!(reloaded.reconcile_startup(&HashSet::new()) > 0);
+        let offers = offered(&reloaded);
+        assert_eq!(offers.len(), 1, "{offers:?}");
+        assert_eq!(offers[0].row_id, old);
+        assert!(state_of(&reloaded, &new).1);
+    }
+
+    #[test]
+    fn an_agy_reopen_without_a_conversation_key_hides_the_old_offer_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let old = ledger.record_spawn(spawn_spec("term-old", "agy", None, dir.path(), None));
+        ledger.mark_app_quit();
+        assert_eq!(offered(&ledger).len(), 1);
+        ledger.record_spawn(spawn_spec("term-r", "agy", None, dir.path(), Some(&old)));
+        assert!(offered(&ledger).is_empty());
+        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        assert_eq!(offered(&ledger)[0].row_id, old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_host_leaves_the_ledger_marked_unreconciled_until_it_answers() {
+        use crate::terminal::TerminalSessions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let first = SessionLedger::open(&path);
+        first.record_spawn(spawn_spec("term-run", "claude", Some(UUID_1), dir.path(), None));
+        drop(first);
+        let ledger = std::sync::Arc::new(SessionLedger::open(&path));
+        let sessions = TerminalSessions::with_unavailable_host("host down".into());
+        let sessions = TerminalSessions {
+            session_ledger: ledger.clone(),
+            ..sessions
+        };
+        assert_eq!(sessions.reconcile_session_ledger(), 0);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(view.offers.is_empty());
+        assert!(
+            view.reconcile_pending,
+            "an empty view must not read as nothing to recover"
+        );
+        // Retries are bounded.
+        for _ in 0..MAX_RECONCILE_RETRIES {
+            assert!(ledger.begin_reconcile_retry());
+        }
+        assert!(!ledger.begin_reconcile_retry());
+        // A reconcile against an answering host completes it.
+        ledger.reconcile_startup(&HashSet::new());
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert!(!view.reconcile_pending);
+        assert_eq!(view.offers.len(), 1);
+        assert!(!ledger.begin_reconcile_retry());
+    }
+
+    #[test]
+    fn a_session_only_an_older_host_lists_is_not_lost_and_not_reopenable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let first = SessionLedger::open(&path);
+        first.record_spawn(spawn_spec("term-old-host", "claude", Some(UUID_1), dir.path(), None));
+        first.record_spawn(spawn_spec("term-gone", "claude", Some(UUID_2), dir.path(), None));
+        drop(first);
+        let ledger = SessionLedger::open(&path);
+        let foreign = ForeignHolds {
+            held: HashSet::from(["term-old-host".to_owned()]),
+            unverified: false,
+        };
+        ledger.reconcile_startup_with(&HashSet::new(), &foreign);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        let held = view
+            .offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some("term-old-host"))
+            .expect("shown");
+        assert!(!held.resumable);
+        assert_eq!(held.reason.as_deref(), Some(OLDER_HOST_REASON));
+        assert_eq!(view.reopenable_count, 1, "only the genuinely lost row");
+        // Reopen all offers only resumable rows.
+        assert!(view.offers.iter().filter(|o| o.resumable).all(|o| o.terminal_id.as_deref() == Some("term-gone")));
+        // Once the older host lets go, the next reconcile loses it.
+        ledger.reconcile_startup_with(&HashSet::new(), &ForeignHolds::default());
+        assert_eq!(ledger.view_with(|_, _| Transcript::Found).reopenable_count, 2);
+    }
+
+    #[test]
+    fn an_older_host_that_could_not_be_asked_makes_rows_unverified_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec("term-x", "claude", Some(UUID_1), dir.path(), None));
+        let foreign = ForeignHolds {
+            held: HashSet::new(),
+            unverified: true,
+        };
+        ledger.reconcile_startup_with(&HashSet::new(), &foreign);
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.reopenable_count, 0);
+        assert_eq!(view.offers[0].reason.as_deref(), Some(UNVERIFIED_HOST_REASON));
+        assert!(!view.offers[0].resumable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn older_host_reports_map_to_held_ids_and_unverified() {
+        use crate::terminal::host::legacy::{LegacyHostInfo, LegacySession, LegacyStatus};
+        let report = |status| crate::terminal::LegacyHostReport {
+            protocol: 4,
+            socket: std::path::PathBuf::from("/x"),
+            status,
+        };
+        let session = LegacySession {
+            id: "term-4-1".into(),
+            program: "claude".into(),
+            cwd: String::new(),
+            repo: String::new(),
+            launcher: None,
+            run_id: None,
+            title: None,
+            parent_session_id: None,
+            detached: true,
+            ending: false,
+            quiet_ms: None,
+        };
+        let listed = report(LegacyStatus::Listed {
+            info: LegacyHostInfo { protocol: 4, build: "b".into(), pid: 1, sessions: 1 },
+            sessions: vec![session],
+        });
+        let holds = crate::terminal::foreign_holds(&[
+            listed,
+            report(LegacyStatus::Unreachable { reason: "stale".into() }),
+        ]);
+        assert!(holds.held.contains("term-4-1"));
+        assert!(!holds.unverified, "a socket with no host is gone, not unverified");
+        let holds = crate::terminal::foreign_holds(&[report(LegacyStatus::Failed {
+            reason: "slow".into(),
+        })]);
+        assert!(holds.unverified);
+    }
+
+    /// A protocol this build cannot speak is never connected to, so a stale
+    /// socket left by a host that died in a crash must be judged by its lock:
+    /// free means gone (the agents are lost and offered), held means a live
+    /// host GitPulse cannot ask (unverified).
+    #[cfg(unix)]
+    #[test]
+    fn a_protocol_without_a_dialect_is_unverified_only_while_its_lock_is_held() {
+        use crate::terminal::host::legacy::LegacyStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let report = crate::terminal::LegacyHostReport {
+            protocol: 3,
+            socket: dir.path().join(crate::terminal::host::socket_name(3)),
+            status: LegacyStatus::NoCompat,
+        };
+        let stale = crate::terminal::foreign_holds(std::slice::from_ref(&report));
+        assert!(
+            !stale.unverified,
+            "a stale socket with a free lock is a dead host, not one that could not be asked"
+        );
+        let held = crate::daemon_lock::acquire_named(
+            dir.path(),
+            &crate::terminal::host::lock_name(3),
+            "test",
+        );
+        assert!(matches!(held, crate::daemon_lock::Acquire::Held(_)));
+        let live = crate::terminal::foreign_holds(std::slice::from_ref(&report));
+        assert!(live.unverified, "a live host with no dialect could not be asked");
+        drop(held);
+    }
+
+    #[test]
+    fn a_deliberate_close_of_a_reopen_does_not_restore_the_old_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ledger, _, _) = reopened(dir.path(), UUID_1, "claude");
+        assert!(ledger.mark_user_closed("term-r"));
+        assert!(offered(&ledger).is_empty());
     }
 }

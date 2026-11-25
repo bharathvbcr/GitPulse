@@ -294,7 +294,8 @@ export function monitorAttempt(run: TaskRun, context: MonitorContext): Monitored
  *
  * `tone` is the pill's colour: `live` for work in progress, `ask` for a
  * reader wanted, `bad` for something that will not proceed by itself,
- * `done` for an attempt that has ended.
+ * `done` for an attempt that has ended, and `ask` for one that ended with its
+ * outcome unobserved (killed mid-work: it needs a reader, it did not finish).
  */
 export interface AttemptStage {
   stage: "starting" | "waiting" | "running" | "needs-you" | "failed" | "expired" | "ended" | "unresolved" | "unstarted";
@@ -309,7 +310,7 @@ export function attemptStage(row: Pick<MonitoredAttempt, "run" | "view" | "tone"
   if (run.state === "unresolved") return { stage: "unresolved", label: "Unresolved", tone: "bad" };
   if (run.state === "failed") return { stage: "ended", label: "Failed", tone: "bad" };
   if (run.state === "cancelled") return { stage: "ended", label: "Canceled", tone: "done" };
-  if (run.state === "exited") return { stage: "ended", label: run.outcome_uncertain ? "Ended · outcome unknown" : "Exited", tone: "done" };
+  if (run.state === "exited") return { stage: "ended", label: run.outcome_uncertain ? "Ended · outcome unknown" : "Exited", tone: run.outcome_uncertain ? "ask" : "done" };
   if (asksForReader(row.tone)) return { stage: "needs-you", label: "Needs you", tone: "ask" };
   if (row.view.waiting?.role === "attempt") return { stage: "waiting", label: row.view.waiting.reason === "trust" ? "Needs trust" : "Starting agent", tone: row.view.waiting.reason === "trust" ? "ask" : "live" };
   if (row.unstarted) return { stage: "unstarted", label: "Not started", tone: "live" };

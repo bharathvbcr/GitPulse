@@ -1346,6 +1346,9 @@ impl Inner {
             return Err(trouble);
         }
         self.probe_other_protocols();
+        if let Some(events) = self.events() {
+            events.host_adopted();
+        }
         Ok(conn)
     }
 

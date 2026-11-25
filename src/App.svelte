@@ -65,6 +65,7 @@
   import { VIEW_PANE_ID } from "./lib/views/viewRegistry";
   import Tooltip from "./lib/components/Tooltip.svelte";
   import ToastContainer from "./lib/components/ToastContainer.svelte";
+  import InterruptedAgentsNotice from "./lib/components/InterruptedAgentsNotice.svelte";
   import NativeNotificationBridge from "./lib/components/NativeNotificationBridge.svelte";
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
   import MaviBridge from "./lib/components/mavi/MaviBridge.svelte";
@@ -1386,6 +1387,7 @@
 
   <!-- Global Toast Notification Queue -->
   <ToastContainer />
+  <InterruptedAgentsNotice />
   <NativeNotificationBridge />
   <SessionNotificationBridge />
   <MaviBridge />

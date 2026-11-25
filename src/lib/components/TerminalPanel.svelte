@@ -131,7 +131,9 @@
     reopenAllSessionLedgerOffers,
     reopenBannerHeading,
     reopenSessionLedgerOffer,
+    offerRows,
     reopenableOffers,
+    topLevelOffers,
     sessionLedgerStore,
     subscribeSessionLedger,
   } from "../terminal/sessionLedger";
@@ -2197,7 +2199,7 @@
   });
 
   const repoLedgerOffers = $derived(filterOffersForRepo($sessionLedgerStore.offers, repoPath, pathOpts));
-  const repoReopenableOffers = $derived(reopenableOffers(repoLedgerOffers));
+  const repoReopenableOffers = $derived(reopenableOffers(topLevelOffers(repoLedgerOffers)));
   let reopeningLedgerRowId = $state<string | null>(null);
   let reopeningAllLedger = $state(false);
   let ledgerRowErrors = $state<Record<string, string>>({});
@@ -4825,7 +4827,7 @@
       <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
-  {#if repoLedgerOffers.length > 0 && mode === "shell"}
+  {#if repoLedgerOffers.length > 0}
     <div
       class="gp-notice flex flex-col gap-1.5"
       data-tone={repoReopenableOffers.length > 0 ? "warn" : "unknown"}
@@ -4851,11 +4853,13 @@
         {/if}
       </div>
       <ul class="space-y-1 max-h-40 overflow-y-auto">
-        {#each repoLedgerOffers as offer (offer.row_id)}
+        {#each offerRows(repoLedgerOffers) as { offer, child } (offer.row_id)}
           {@const rowErr = ledgerRowErrors[offer.row_id] ?? offer.last_error ?? (offer.end_state !== "unreadable" && offer.launcher !== "shell" && !offer.resumable ? offer.reason : null)}
           {@const ledgerTitle = offer.title ? stripTitleSpinner(offer.title).replace(/^[✳✦★•]+\s+/u, "").trim() : ""}
           <li
             class="flex items-start justify-between gap-2 rounded-lg border border-border/65 bg-surface/60 px-2 py-1 text-micro"
+            class:ml-4={child}
+            data-child={child ? "true" : undefined}
             data-testid="terminal-ledger-row"
             data-end-state={offer.end_state}
           >

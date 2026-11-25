@@ -285,6 +285,13 @@ describe("the bell setting reaches the board and the pane through one rule", () 
   });
   afterEach(() => setSignalledAsksForReader(false));
 
+  it("does not show an outcome-unknown exit as done", () => {
+    const uncertain = { ...attempt, state: "exited" as const, exit_code: null, outcome_uncertain: true };
+    expect(attemptStage(monitorAttempt(uncertain, context()), NOW)).toMatchObject({ stage: "ended", label: "Ended · outcome unknown", tone: "ask" });
+    const observed = { ...attempt, state: "exited" as const, exit_code: 0, outcome_uncertain: false };
+    expect(attemptStage(monitorAttempt(observed, context()), NOW)).toMatchObject({ label: "Exited", tone: "done" });
+  });
+
   it("ignores a bell by default and counts it when opted in", () => {
     expect(taskAgentSummaries([attempt], context()).get("t1")).toEqual({ working: 1, asking: 0, tone: "signalled" });
     expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "running" });
