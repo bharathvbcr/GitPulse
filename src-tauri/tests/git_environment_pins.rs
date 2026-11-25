@@ -149,10 +149,7 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     // `*` is not a legal Windows NTFS filename character; `[a]` is legal on
     // Windows and is still a glob metacharacter to git that would match
     // `fa.txt` if literal pathspecs or the ambient pathspec strips broke.
-    #[cfg(windows)]
-    let glob_name = "f[a].txt";
-    #[cfg(not(windows))]
-    let glob_name = "f*.txt";
+    let glob_name = if cfg!(windows) { "f[a].txt" } else { "f*.txt" };
     std::fs::write(dir.path().join(glob_name), "star").unwrap();
     std::fs::write(dir.path().join("fa.txt"), "other").unwrap();
     trust_repo(dir.path());

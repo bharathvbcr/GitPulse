@@ -55,7 +55,7 @@ fn code_injection_and_config_override_variables_never_survive() {
     ];
     let pairs: Vec<(&str, &str)> = hostile.iter().map(|k| (*k, "x")).collect();
     let kept = surviving(&pairs);
-    assert_eq!(kept, ["HOME"], "survivors: {kept:?}");
+    assert_eq!(kept, [HOME_ENV_VAR], "survivors: {kept:?}");
 }
 
 /// The allowlist compares upper-cased names, so a case variant of an allowed
@@ -74,12 +74,12 @@ fn explicit_home_beats_inherited_home() {
     let mut cmd = Command::new("true");
     restrict_env_to_allowlist(
         &mut cmd,
-        [(OsString::from("HOME"), OsString::from("/elsewhere"))],
+        [(OsString::from(HOME_ENV_VAR), OsString::from("/elsewhere"))],
         Some(OsStr::new("/h")),
     );
     let home = cmd
         .get_envs()
-        .find(|(k, _)| *k == OsStr::new("HOME"))
+        .find(|(k, _)| *k == OsStr::new(HOME_ENV_VAR))
         .and_then(|(_, v)| v);
     assert_eq!(home, Some(OsStr::new("/h")));
 }

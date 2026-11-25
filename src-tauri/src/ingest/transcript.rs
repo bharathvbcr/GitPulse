@@ -1145,6 +1145,20 @@ fn deepest_match<'a>(path: &str, roots: &RootSet<'a>) -> Option<(usize, &'a str)
         .reduce(|best, found| if found.0 > best.0 { found } else { best })
 }
 
+/// Whether `path`, as a transcript's agent wrote it, names a place without
+/// help from the directory it ran in. A leading `/` does everywhere. On Windows
+/// a drive letter (`C:\repo`, `C:/repo`) or a UNC or verbatim prefix does too:
+/// joining the turn's directory in front of one of those makes a path that
+/// names nothing (`C:\repo/C:\repo/a.rs`). Off Windows such a spelling is a
+/// relative name, as it is to the shell that wrote it.
+pub fn is_absolute_text(path: &str) -> bool {
+    is_absolute_as(path, cfg!(windows))
+}
+
+fn is_absolute_as(path: &str, windows: bool) -> bool {
+    path.starts_with('/') || (windows && WindowsForm::of(path).is_some())
+}
+
 /// A path longer than this is never attributed, and a call whose `cwd` is
 /// longer is never read as a removed worktree's.
 const MAX_PATH_BYTES: usize = 4096;
@@ -1606,6 +1620,27 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_spelled_path_is_absolute_only_where_windows_spells_it() {
+        for path in [
+            r"C:\repo\a.rs",
+            "c:/repo/a.rs",
+            r"\\?\C:\repo",
+            r"\\srv\share\a",
+            "//srv/share/a",
+            "/repo/a.rs",
+        ] {
+            assert!(is_absolute_as(path, true), "{path}");
+        }
+        for path in ["a.rs", "src/a.rs", "../a.rs", "C:repo", r"\rooted\no\drive"] {
+            assert!(!is_absolute_as(path, true), "{path}");
+        }
+        // Off Windows `C:\repo` is a relative name; only `/` roots a path.
+        assert!(!is_absolute_as(r"C:\repo\a.rs", false));
+        assert!(!is_absolute_as("c:/repo/a.rs", false));
+        assert!(is_absolute_as("/repo/a.rs", false));
+    }
+
+    #[test]
     fn parses_a_file_edit() {
         let calls = parse_line(&record("Edit", r#"{"file_path":"/repo/src/a.rs"}"#));
         assert_eq!(calls.len(), 1);
@@ -1951,7 +1986,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let written = tmp.path().join("repo");
         std::fs::create_dir(&written).unwrap();
-        let real = written.canonicalize().unwrap();
+        let real = crate::test_support::canonical_slash_path(&written).unwrap();
         let (written, real) = (written.to_str().unwrap(), real.to_str().unwrap());
         if written == real {
             eprintln!("skipped: {written} is already its real spelling");
@@ -1964,10 +1999,12 @@ mod tests {
     #[test]
     fn a_case_folded_match_never_slices_inside_a_character() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap().join("Kx");
+        let parent = crate::test_support::canonical_slash_path(tmp.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let root = format!("{parent}/Kx");
         std::fs::create_dir(&root).unwrap();
-        let parent = root.parent().unwrap().to_str().unwrap().to_string();
-        let root = root.to_str().unwrap().to_string();
         if !ignores_case(std::path::Path::new(&root)) {
             eprintln!("skipped: {root} is on a volume that keeps case");
             return;

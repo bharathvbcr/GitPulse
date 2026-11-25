@@ -1972,6 +1972,21 @@ class C:
             "glob*[x]?.rs",
             "dir/ünï/日本語.rs",
         ] {
+            // Windows cannot hold a file named with a control character or one
+            // of `<>:"|?*`: that is the file system's refusal, not a defect
+            // here, so the outcome asserted there is the refusal itself.
+            if cfg!(windows)
+                && name
+                    .chars()
+                    .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+            {
+                let dir = tempfile::tempdir().unwrap();
+                assert!(
+                    std::fs::write(dir.path().join(name), "x").is_err(),
+                    "{name:?} was created where Windows refuses it"
+                );
+                continue;
+            }
             let syms: Vec<codeintel_tests::SeedSymbol<'_>> = vec![
                 ("foo", "x::foo", "Function", 16, 18),
                 ("bar", "x::bar", "Function", 20, 22),

@@ -1069,6 +1069,14 @@ mod tests {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// An absolute path on the platform under test: `/repo/root` has no drive,
+    /// so Windows reads it as relative and refuses it.
+    const REPO_ROOT: &str = if cfg!(windows) {
+        r"C:\repo\root"
+    } else {
+        "/repo/root"
+    };
+
     const SAMPLE_TOKEN: &str =
         "gpst_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1109,7 +1117,7 @@ mod tests {
                 "--cols",
                 "120",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1117,7 +1125,7 @@ mod tests {
         assert_eq!(
             spawn,
             TermCliOutcome::Call(OrchestrateCall::Spawn {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1134,7 +1142,7 @@ mod tests {
 
         let open_file = parse_term_cli(
             &vec_args(&["open-file", "src/main.rs", "--line", "42", "--column=7"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1142,7 +1150,7 @@ mod tests {
         assert_eq!(
             open_file,
             TermCliOutcome::Call(OrchestrateCall::OpenFile {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1186,7 +1194,7 @@ mod tests {
                 "--no-wait-for-idle",
                 "--since-seq=7",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1194,7 +1202,7 @@ mod tests {
         assert_eq!(
             wait,
             TermCliOutcome::Call(OrchestrateCall::Wait {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1216,7 +1224,7 @@ mod tests {
                 "--grep=FAIL",
                 "--last-command-only",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1224,7 +1232,7 @@ mod tests {
         assert_eq!(
             read,
             TermCliOutcome::Call(OrchestrateCall::Read {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1249,7 +1257,7 @@ mod tests {
                 "Check build",
                 "--max-lines=300",
             ]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             None,
             None,
         )
@@ -1257,7 +1265,7 @@ mod tests {
         assert_eq!(
             exec,
             TermCliOutcome::Call(OrchestrateCall::Exec {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: None,
                 caller_token: None,
                 external_caller_id: Some(external_hook_caller_id()),
@@ -1275,7 +1283,7 @@ mod tests {
 
         let send = parse_term_cli(
             &vec_args(&["send", "term-100-2", "--input", "echo ok", "--no-newline"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1283,7 +1291,7 @@ mod tests {
         assert_eq!(
             send,
             TermCliOutcome::Call(OrchestrateCall::Send {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1295,7 +1303,7 @@ mod tests {
 
         let close = parse_term_cli(
             &vec_args(&["close", "term-100-2"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1303,7 +1311,7 @@ mod tests {
         assert_eq!(
             close,
             TermCliOutcome::Call(OrchestrateCall::Close {
-                repo_path: "/repo/root".into(),
+                repo_path: REPO_ROOT.into(),
                 caller_session_id: Some("term-100-1".into()),
                 caller_token: Some(SAMPLE_TOKEN.into()),
                 external_caller_id: None,
@@ -1316,7 +1324,7 @@ mod tests {
     fn term_cli_refuses_unknown_flags_missing_credentials_and_bad_paths() {
         let missing_tok = parse_term_cli(
             &vec_args(&["list"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             None,
         )
@@ -1328,7 +1336,7 @@ mod tests {
 
         let bad_flag = parse_term_cli(
             &vec_args(&["list", "--bogus"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )
@@ -1346,7 +1354,7 @@ mod tests {
 
         let traversal = parse_term_cli(
             &vec_args(&["open-file", "../secret.txt"]),
-            Some("/repo/root"),
+            Some(REPO_ROOT),
             Some("term-100-1"),
             Some(SAMPLE_TOKEN),
         )

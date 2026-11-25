@@ -196,7 +196,11 @@ fn a_user_path_is_validated_when_saved_and_again_when_reported() {
     refused("relative/dir", "not an absolute path");
     refused(&format!("{}/../models", home.display()), "components");
     refused(&format!("{}/./models", home.display()), "components");
-    refused("/", "filesystem root");
+    // This platform's own root: `/`, or the drive's root (`C:\`) on Windows.
+    refused(
+        home.ancestors().last().unwrap().to_str().unwrap(),
+        "filesystem root",
+    );
     refused(home.to_str().unwrap(), "home directory");
     refused(root.to_str().unwrap(), "ancestors");
     refused(&format!("{}/missing", home.display()), "cannot be read");

@@ -329,6 +329,20 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// What a handler runs, as the one line `binary words`: the shell-form
+    /// `command` as it is, or on Windows the exec form's `command` (the bare
+    /// path) followed by its `args`.
+    fn invocation(handler: &Value) -> String {
+        let command = handler["command"].as_str().unwrap().to_owned();
+        match handler.get("args").and_then(Value::as_array) {
+            Some(args) => args
+                .iter()
+                .filter_map(Value::as_str)
+                .fold(command, |line, word| format!("{line} {word}")),
+            None => command,
+        }
+    }
+
     fn hook() -> Result<PathBuf, String> {
         Ok(PathBuf::from(
             "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook",
@@ -385,8 +399,8 @@ mod tests {
             .iter()
             .flat_map(|group| group["hooks"].as_array().unwrap().clone())
             .map(|hook| {
-                let command = hook["command"].as_str().unwrap().to_owned();
-                command.rsplit(' ').next().unwrap().to_owned()
+                let line = invocation(&hook);
+                line.rsplit(' ').next().unwrap().to_owned()
             })
             .collect();
         injected.sort();
@@ -451,12 +465,19 @@ mod tests {
         let mut subcommands = Vec::new();
         for (injected, shipped) in injected.iter().zip(shipped) {
             assert_eq!(injected["matcher"], shipped["matcher"]);
-            let command = injected["hooks"][0]["command"].as_str().unwrap();
+            let command = invocation(&injected["hooks"][0]);
             let original = shipped["hooks"][0]["command"].as_str().unwrap();
             let subcommand = original.strip_prefix("gitpulse-hook ").unwrap();
+            // Shell form quotes the path; Windows runs the bare path with the
+            // subcommand in `args` (see `settings_hooks_for`).
+            let path = "/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook";
             assert_eq!(
                 command,
-                format!("'/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook' {subcommand}")
+                if cfg!(windows) {
+                    format!("{path} {subcommand}")
+                } else {
+                    format!("'{path}' {subcommand}")
+                }
             );
             assert_eq!(
                 injected["hooks"][0]["timeout"],
@@ -524,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_quote_in_the_path_cannot_end_the_quoting() {
-        let hooks = settings_hooks(Path::new("/tmp/it's/gitpulse-hook")).unwrap();
+        let hooks = settings_hooks_for(Path::new("/tmp/it's/gitpulse-hook"), false).unwrap();
         let command = hooks["PreToolUse"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -532,6 +553,12 @@ mod tests {
             command.starts_with(r"'/tmp/it'\''s/gitpulse-hook' "),
             "{command}"
         );
+        // Windows runs no shell, so a quote has nothing to end: the path
+        // arrives in `command` unquoted and whole.
+        let hooks = settings_hooks_for(Path::new(r"C:\it's\gitpulse-hook.exe"), true).unwrap();
+        let handler = &hooks["PreToolUse"][0]["hooks"][0];
+        assert_eq!(handler["command"], r"C:\it's\gitpulse-hook.exe");
+        assert_eq!(handler["args"][0], "collision-guard");
     }
 
     #[test]
@@ -568,7 +595,7 @@ mod tests {
                 .collect();
             let waiters: Vec<&&Value> = handlers
                 .iter()
-                .filter(|hook| hook["command"].as_str().unwrap().ends_with(" deliver"))
+                .filter(|hook| invocation(hook).ends_with(" deliver"))
                 .collect();
             assert_eq!(waiters.len(), 1, "{label}: {handlers:?}");
             let waiter = waiters[0];
@@ -588,12 +615,7 @@ mod tests {
             // The existing report is still there, still in the background.
             let report = handlers
                 .iter()
-                .find(|hook| {
-                    hook["command"]
-                        .as_str()
-                        .unwrap()
-                        .ends_with("notify turn_finished")
-                })
+                .find(|hook| invocation(hook).ends_with("notify turn_finished"))
                 .unwrap_or_else(|| panic!("{label}: turn_finished is gone"));
             assert_eq!(report["async"], json!(true), "{label}");
             assert!(report.get("asyncRewake").is_none(), "{label}");
@@ -602,12 +624,16 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|hook| hook["command"].as_str().unwrap().to_owned())
+            .map(invocation)
             .find(|command| command.ends_with(" deliver"))
             .unwrap();
         assert_eq!(
             command,
-            "'/Applications/Git Pulse.app/gitpulse-hook' deliver"
+            if cfg!(windows) {
+                "/Applications/Git Pulse.app/gitpulse-hook deliver"
+            } else {
+                "'/Applications/Git Pulse.app/gitpulse-hook' deliver"
+            }
         );
     }
 

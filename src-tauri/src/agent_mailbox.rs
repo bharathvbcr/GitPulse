@@ -415,10 +415,12 @@ fn is_waiter_name(name: &str) -> bool {
     parse_waiter_pool(name).is_some()
 }
 
-/// Cross-process exclusive advisory lock on a `0600` `O_NOFOLLOW` lock file.
+/// Cross-process exclusive lock on a private lock file: `flock` on Unix,
+/// `LockFileEx` on Windows, both through [`File::lock`]. The lock is held by
+/// this open handle, so a second handle (another thread, another process)
+/// blocks until this one is dropped. The lock file is never read or written, so
+/// Windows' mandatory byte-range lock gets in nobody's way.
 struct AdvisoryLock {
-    /// Held open for its lock; only the Unix `flock` release in `drop` reads it.
-    #[cfg_attr(not(unix), allow(dead_code))]
     file: File,
 }
 
@@ -432,7 +434,6 @@ impl AdvisoryLock {
         Self::open_locked(path, false)
     }
 
-    #[cfg_attr(not(unix), allow(unused_variables))]
     fn open_locked(path: &Path, wait: bool) -> Result<Option<Self>, MailboxError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
@@ -453,28 +454,30 @@ impl AdvisoryLock {
                 path.display()
             )));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let op = if wait {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_EX | libc::LOCK_NB
-            };
+        // A signal can interrupt the blocking `flock`; retry `EINTR` on both
+        // blocking and non-blocking acquisitions across Unix and Windows.
+        if wait {
             loop {
-                // SAFETY: `file` is an open descriptor we own for the duration of the call.
-                let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-                if rc == 0 {
-                    break;
+                match file.lock() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(io("could not lock the mailbox", &e)),
                 }
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+            }
+        } else {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(e))
+                        if e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        continue
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        return Err(io("could not lock the mailbox", &e))
+                    }
                 }
-                if !wait && err.kind() == std::io::ErrorKind::WouldBlock {
-                    return Ok(None);
-                }
-                return Err(io("could not lock the mailbox", &err));
             }
         }
         Ok(Some(Self { file }))
@@ -483,12 +486,7 @@ impl AdvisoryLock {
 
 impl Drop for AdvisoryLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            // SAFETY: `self.file` remains valid until after `drop` returns.
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        let _ = self.file.unlock();
     }
 }
 

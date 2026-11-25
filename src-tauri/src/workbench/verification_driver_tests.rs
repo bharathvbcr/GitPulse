@@ -1860,6 +1860,18 @@ fn the_driver_reopens_a_store_that_was_replaced() {
         companion.push(suffix);
         let _ = std::fs::remove_file(companion);
     }
+    if cfg!(windows) {
+        // Windows will not replace a database a connection holds open (the
+        // driver's, and the memo's probe), so there is no replaced file to
+        // follow: the move is refused, the connection is kept and still reads
+        // the file it opened. (`FileId` knows no identity there, by design.)
+        let refused = std::fs::rename(&replacement, &path).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        let kept = driver_store(Some(path.clone()), &mut held).expect("kept");
+        assert_eq!(verdict_of(kept).as_deref(), Some("passed"));
+        assert!(driver_store(None, &mut held).is_none());
+        return;
+    }
     std::fs::rename(&replacement, &path).unwrap();
     let after = driver_store(Some(path.clone()), &mut held).expect("reopens");
     assert_eq!(

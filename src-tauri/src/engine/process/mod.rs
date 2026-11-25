@@ -54,7 +54,7 @@ pub(crate) use env::{
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(in crate::engine::process) use env::{
     default_child_path_with_env, gui_launch_fallback_dirs, restrict_env_to_allowlist,
-    restrict_env_to_allowlist_plus, spawn_candidate_names, MAX_INHERITED_PATH_BYTES,
+    restrict_env_to_allowlist_plus, spawn_candidate_names, HOME_ENV_VAR, MAX_INHERITED_PATH_BYTES,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use env::{developer_dirs, past_xcrun_git_shim, REAL_GIT_DIRS};

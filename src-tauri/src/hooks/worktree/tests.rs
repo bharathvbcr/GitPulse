@@ -106,7 +106,7 @@ fn fixture_with(setup: impl FnOnce(&Path)) -> Fixture {
     let origin = tempfile::tempdir().unwrap();
     git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
     let main = tempfile::tempdir().unwrap();
-    let root = main.path().canonicalize().unwrap();
+    let root = crate::engine::process::canonicalize_plain(main.path()).unwrap();
     git_in(&root, &["init", "-q", "-b", "main"]);
     fs::write(root.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
     setup(&root);

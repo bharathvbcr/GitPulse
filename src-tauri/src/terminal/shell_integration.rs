@@ -394,6 +394,16 @@ mod tests {
         let mut cmd = CommandBuilder::new("/bin/zsh");
         cmd.env("ZDOTDIR", "/Users/dev/.zsh");
         apply_to_default_shell_in(&mut cmd, "/bin/zsh", true, false, tmp.path());
+        if cfg!(windows) {
+            // No wiring on Windows by design: the scripts are written, the
+            // shell is launched as it was, and the user's own ZDOTDIR stays.
+            assert_eq!(cmd.get_env(USER_ZDOTDIR_ENV), None);
+            assert_eq!(
+                cmd.get_env("ZDOTDIR").and_then(|v| v.to_str()),
+                Some("/Users/dev/.zsh")
+            );
+            return;
+        }
         assert_eq!(
             cmd.get_env(USER_ZDOTDIR_ENV).and_then(|v| v.to_str()),
             Some("/Users/dev/.zsh")
@@ -428,6 +438,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cmd = CommandBuilder::new("/opt/homebrew/bin/fish");
         apply_to_default_shell_in(&mut cmd, "/opt/homebrew/bin/fish", true, false, tmp.path());
+        if cfg!(windows) {
+            // No wiring on Windows by design.
+            assert_eq!(cmd.get_env("XDG_DATA_DIRS"), None);
+            return;
+        }
         let xdg = cmd
             .get_env("XDG_DATA_DIRS")
             .and_then(|v| v.to_str())

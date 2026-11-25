@@ -12980,13 +12980,18 @@ mod tests {
         );
         let outcome = out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == wt.as_str()))
+            .and_then(|o| o.iter().find(|o| names_path(o, &wt)))
             .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
         assert_eq!(outcome["status"], "skipped", "{out}");
+        // Windows has no process scan, so it cannot say which process is in the
+        // worktree; it refuses on the session check instead of a named process.
+        let why = if cfg!(windows) {
+            "could not rule out a live agent session"
+        } else {
+            "process"
+        };
         assert!(
-            outcome["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("process")),
+            outcome["reason"].as_str().is_some_and(|r| r.contains(why)),
             "{out}"
         );
         assert_eq!(out["reaped_pids"], json!([]));
@@ -13022,10 +13027,19 @@ mod tests {
         alive
     }
 
+    /// Whether an outcome's `worktree_path` names `path`. Create answers with
+    /// the path as the platform spells it (`C:\...`) and prune with the one git
+    /// lists (`C:/...`); one directory, so one spelling for the comparison.
+    fn names_path(outcome: &Value, path: &str) -> bool {
+        outcome["worktree_path"]
+            .as_str()
+            .is_some_and(|found| found.replace('\\', "/") == path.replace('\\', "/"))
+    }
+
     fn outcome_for(out: &Value, path: &str) -> Value {
         out["outcomes"]
             .as_array()
-            .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+            .and_then(|o| o.iter().find(|o| names_path(o, path)))
             .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
             .clone()
     }
@@ -13211,13 +13225,24 @@ mod tests {
         .expect("lock the ref");
         let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
         assert!(!err, "{out}");
-        let find = |path: &str| {
-            out["outcomes"]
-                .as_array()
-                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
-                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
-                .clone()
-        };
+        let find = |path: &str| outcome_for(&out, path);
+        if cfg!(windows) {
+            // No process scan, so no worktree can be shown free of a live agent
+            // session, and prune removes none: there is no branch delete to
+            // fail and nothing to keep going past.
+            for path in [&stuck, &other] {
+                let outcome = find(path);
+                assert_eq!(outcome["status"], "skipped", "{out}");
+                assert!(
+                    outcome["reason"]
+                        .as_str()
+                        .is_some_and(|r| r.contains("could not rule out a live agent session")),
+                    "{out}"
+                );
+                assert!(std::path::Path::new(path).is_dir(), "{out}");
+            }
+            return;
+        }
         let stuck_outcome = find(&stuck);
         assert_eq!(stuck_outcome["status"], "removed_branch_kept", "{out}");
         assert_eq!(stuck_outcome["branch_deleted"], false, "{out}");
@@ -13290,7 +13315,12 @@ mod tests {
                 "repo_path": repo,
                 "branch": "feat/cmd-fails",
                 "share_cache": false,
-                "execute_command": "echo boom >&2; exit 3"
+                // The command runs under `sh -c` on Unix and `cmd /C` on Windows.
+                "execute_command": if cfg!(windows) {
+                    "echo boom 1>&2 & exit 3"
+                } else {
+                    "echo boom >&2; exit 3"
+                }
             }),
         );
         assert!(
@@ -13328,7 +13358,8 @@ mod tests {
     #[test]
     fn worktree_create_defaults_to_gitpulse_lane_and_allows_explicit_sibling() {
         let (_sandbox, repo) = honesty_repo();
-        let canon_repo = std::path::Path::new(&repo).canonicalize().unwrap();
+        let canon_repo =
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&repo)).unwrap();
 
         // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
         //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
@@ -13341,9 +13372,10 @@ mod tests {
             }),
         );
         assert!(!err, "create failed: {created}");
-        let actual = std::path::PathBuf::from(created["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            created["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let expected = canon_repo.join(".gitpulse/worktrees/feat-auth-lane");
         assert_eq!(actual, expected, "{created}");
         let resolved = crate::engine::worktree::resolve_worktree_path(
@@ -13382,9 +13414,10 @@ mod tests {
             }),
         );
         assert!(!err, "create from inside lane failed: {nested}");
-        let nested_actual = std::path::PathBuf::from(nested["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let nested_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            nested["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             nested_actual,
             canon_repo.join(".gitpulse/worktrees/feat-from-lane"),
@@ -13419,9 +13452,10 @@ mod tests {
             }),
         );
         assert!(!err, "sparse create failed: {sparse}");
-        let sparse_actual = std::path::PathBuf::from(sparse["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sparse_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sparse["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             sparse_actual,
             canon_repo.join(".gitpulse/worktrees/feat-sparse-lane"),
@@ -13439,9 +13473,10 @@ mod tests {
             }),
         );
         assert!(!err, "sibling create failed: {sibling}");
-        let sibling_actual = std::path::PathBuf::from(sibling["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sibling_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sibling["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let sibling_expected = crate::engine::worktree::resolve_worktree_path(
             &canon_repo,
             "feat-sibling-opt",

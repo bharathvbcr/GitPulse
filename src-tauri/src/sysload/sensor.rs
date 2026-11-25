@@ -61,6 +61,13 @@ impl Why {
             Some(e) if e == libc::ENOENT || e == libc::ENOTSUP || e == libc::EOPNOTSUPP => {
                 Self::Unsupported
             }
+            // Win32 codes, which is what `raw_os_error` holds there:
+            // ERROR_ACCESS_DENIED, then ERROR_FILE_NOT_FOUND and
+            // ERROR_PATH_NOT_FOUND.
+            #[cfg(windows)]
+            Some(5) => Self::Unreadable,
+            #[cfg(windows)]
+            Some(2 | 3) => Self::Unsupported,
             _ => Self::Failed,
         }
     }
@@ -528,6 +535,12 @@ mod tests {
         {
             assert_eq!(Why::of_errno(Some(libc::EPERM)), Why::Unreadable);
             assert_eq!(Why::of_errno(Some(libc::ENOENT)), Why::Unsupported);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(Why::of_errno(Some(5)), Why::Unreadable);
+            assert_eq!(Why::of_errno(Some(2)), Why::Unsupported);
+            assert_eq!(Why::of_errno(Some(3)), Why::Unsupported);
         }
         assert_eq!(Why::of_errno(None), Why::Failed);
     }

@@ -394,7 +394,7 @@ impl CodexParser {
         for command in found.commands {
             // A relative workdir is relative to the turn's directory.
             let cwd = match command.workdir {
-                Some(dir) if dir.starts_with('/') => dir,
+                Some(dir) if super::transcript::is_absolute_text(&dir) => dir,
                 Some(dir) => format!("{}/{dir}", self.cwd.trim_end_matches('/')),
                 None => self.cwd.clone(),
             };
@@ -403,7 +403,7 @@ impl CodexParser {
                 .push(call("Bash", &cwd, None, Some(command.cmd)));
         }
         for path in found.patched {
-            let absolute = if path.starts_with('/') {
+            let absolute = if super::transcript::is_absolute_text(&path) {
                 path
             } else {
                 format!("{}/{path}", self.cwd.trim_end_matches('/'))

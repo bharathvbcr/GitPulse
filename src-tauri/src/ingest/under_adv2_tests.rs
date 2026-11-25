@@ -347,14 +347,19 @@ fn adv2_permission_denied_root_keeps_the_lexical_answer() {
     let _ = through_link;
 }
 
-/// Case folding is probed on the root only when the root exists.
+/// Case folding is probed on the root only when the root exists. A root spelled
+/// as a Windows path (a drive letter) is compared without case by its spelling
+/// alone, so on Windows the probe is not what decides.
 #[test]
 fn adv2_case_fold_on_a_nonexistent_root_is_exact() {
     let tmp = canon_tmp();
     let base = real(&tmp);
     let root = base.join("Gone");
     let path = base.join("gone").join("f.rs");
-    assert!(!is_under(path.to_str().unwrap(), root.to_str().unwrap()));
+    assert_eq!(
+        is_under(path.to_str().unwrap(), root.to_str().unwrap()),
+        cfg!(windows)
+    );
 }
 
 // ---- Windows spellings -------------------------------------------------------

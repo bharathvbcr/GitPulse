@@ -580,10 +580,16 @@ impl WalkBudget {
 
     #[cfg(test)]
     fn injected(&self, path: &Path) -> Option<io::Error> {
+        // EIO, which is neither a permission error nor a missing entry. On
+        // Windows 5 is ERROR_ACCESS_DENIED, so the I/O device error stands in.
+        #[cfg(unix)]
+        const INJECTED_IO_ERROR: i32 = 5;
+        #[cfg(windows)]
+        const INJECTED_IO_ERROR: i32 = 1117;
         self.fail_paths
             .iter()
             .any(|p| p == path)
-            .then(|| io::Error::from_raw_os_error(5))
+            .then(|| io::Error::from_raw_os_error(INJECTED_IO_ERROR))
     }
 
     /// `read_dir`, with the failure classified. `None` means skip the subtree.

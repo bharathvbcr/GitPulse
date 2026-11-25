@@ -602,6 +602,63 @@ pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
     PathBuf::from(rest)
 }
 
+/// `path` canonicalized and spelled the way git and Node print a Windows path
+/// (`C:/Users/...`): no `\\?\` prefix, `/` for every separator. A fixture
+/// that appends `/name` to a root as text then holds one spelling throughout,
+/// where `canonicalize` plus a `/` join is `\\?\C:\...\/name`, a name Windows
+/// refuses (os error 123). Identical to `canonicalize` off Windows.
+#[cfg(test)]
+pub(crate) fn canonical_slash_path(path: &Path) -> std::io::Result<PathBuf> {
+    let plain = crate::engine::process::canonicalize_plain(path)?;
+    if cfg!(windows) {
+        return Ok(PathBuf::from(plain.to_string_lossy().replace('\\', "/")));
+    }
+    Ok(plain)
+}
+
+/// An absolute path that names no directory. `unix` is written the Unix way
+/// (`/gone/a`); on Windows it gains a drive (`C:\gone\a`), because `/gone` has
+/// no root there and is refused as a relative path.
+#[cfg(test)]
+pub(crate) fn absent_absolute_path(unix: &str) -> String {
+    if cfg!(windows) {
+        return format!("C:{}", unix.replace('/', "\\"));
+    }
+    unix.to_string()
+}
+
+/// Whether this platform's file system can hold a file at `rel`, a repository
+/// path spelled with `/`. Everywhere but Windows it can hold anything a git
+/// path can. Windows refuses a component with `< > : " \ | ? *` or a control
+/// character (a `\` there is a separator, so the name would not be one
+/// component), one that ends in a dot or a space, and a reserved device name
+/// (`CON`, `NUL`, `COM1`, ... with or without an extension). That is not a
+/// GitPulse bug, so a fixture that exercises such a name asserts the platform's
+/// outcome instead of creating it.
+#[cfg(test)]
+pub(crate) fn platform_can_hold(rel: &str) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    rel.split('/').all(|part| {
+        let stem = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        !part.is_empty()
+            && !part.ends_with(['.', ' '])
+            && !part
+                .chars()
+                .any(|c| c.is_control() || "<>:\"\\|?*".contains(c))
+            && !RESERVED.contains(&stem.as_str())
+    })
+}
+
 #[cfg(test)]
 mod pin_adversary_tests;
 
@@ -1440,13 +1497,11 @@ mod hermetic_canary {
             "HOME is {home:?}, not under {}",
             hermetic::root().display()
         );
-        if let Some(real) = hermetic::real_home() {
-            assert!(
-                !home.as_deref().is_some_and(|home| home.starts_with(&real)),
-                "HOME still points into the developer's {}",
-                real.display()
-            );
-        }
+        assert!(
+            !home.as_deref().is_some_and(hermetic::reaches_real_home),
+            "HOME still points into the developer's {:?}",
+            hermetic::real_home()
+        );
     }
 
     /// A developer's `core.hooksPath`, `init.defaultBranch` or `commit.gpgsign`
@@ -1491,9 +1546,43 @@ mod hermetic_canary {
         );
     }
 
+    /// The Windows runner's lines, spelled with a backslash git must quote on
+    /// any platform: read raw, a quoted origin named no file under the root.
+    #[test]
+    fn a_quoted_origin_is_read_as_the_path_it_quotes() {
+        let root = Path::new(r"/tmp/gph-1\2");
+        assert!(origin_is_under(
+            "file:\"/tmp/gph-1\\\\2/gitconfig\"\tgc.auto=0",
+            root
+        ));
+        assert!(origin_is_under(
+            "file:/tmp/gph-1\\2/gitconfig\tgc.auto=0",
+            root
+        ));
+        assert!(!origin_is_under(
+            "file:\"/Users/dev/.gitconfig\"\tcore.hooksPath=/x",
+            root
+        ));
+        // An unterminated quote names nothing, so it counts as foreign.
+        assert!(!origin_is_under("file:\"/tmp/gph-1\\\\2/gitconfig", root));
+        assert!(!origin_is_under("command line:\tgc.auto=0", root));
+    }
+
+    /// `file:<path>\t<key>=<value>`. git quotes the path C-style when it holds
+    /// a backslash, so on Windows the origin is `file:"C:\\Users\\…\\gitconfig"`
+    /// and, read raw, named no file under any root.
     fn origin_is_under(line: &str, root: &Path) -> bool {
-        line.strip_prefix("file:")
-            .is_some_and(|rest| Path::new(rest).starts_with(root))
+        let Some(rest) = line.strip_prefix("file:") else {
+            return false;
+        };
+        let origin = match rest.strip_prefix('"') {
+            Some(quoted) => match quoted.find("\"\t") {
+                Some(end) => quoted[..end].replace("\\\\", "\\").replace("\\\"", "\""),
+                None => return false,
+            },
+            None => rest.split('\t').next().unwrap_or(rest).to_string(),
+        };
+        Path::new(&origin).starts_with(root)
     }
 }
 

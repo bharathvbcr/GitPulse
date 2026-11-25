@@ -1684,8 +1684,18 @@ mod tests {
                         for t in threads {
                             t.join().unwrap();
                         }
-                        wait_until("the incident", || !rec.recent().is_empty());
+                        // `publish` stores an incident in `recent` and then hands
+                        // it to the sink, so waiting on `recent` alone can read
+                        // `seen` in between (lane 3 round 2 on a CI runner saw
+                        // `[]`). Wait for the delivery the assertions are about,
+                        // and for every stored incident to have been delivered.
+                        wait_until("the incident to be delivered", || {
+                            !seen.lock().unwrap().is_empty()
+                        });
                         wait_until("the worker to stop", || !rec.worker_running());
+                        wait_until("every stored incident to be delivered", || {
+                            seen.lock().unwrap().len() == rec.recent().len()
+                        });
                         let got = seen.lock().unwrap().clone();
                         assert_eq!(got.len(), 1, "lane {lane} round {round}: {got:?}");
                         let mut ids = got[0].session_ids.clone();

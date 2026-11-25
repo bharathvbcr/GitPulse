@@ -46,9 +46,15 @@ struct World {
 
 impl World {
     fn new() -> Self {
+        // `/tmp` keeps the path short on Unix; Windows has no such directory.
+        let parent = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from("/tmp")
+        };
         let root = tempfile::Builder::new()
             .prefix("dtc")
-            .tempdir_in("/tmp")
+            .tempdir_in(parent)
             .expect("root");
         let base = root.path().canonicalize().expect("canonical root");
         let (home, logs, repo, outside) = (

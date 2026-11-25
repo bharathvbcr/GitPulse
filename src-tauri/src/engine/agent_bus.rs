@@ -369,10 +369,7 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// Both are read only by `acquire_bus_file_lock`'s unix arm.
-#[cfg(unix)]
 const BUS_LOCK_FILE: &str = ".bus.lock";
-#[cfg(unix)]
 const BUS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {
@@ -385,44 +382,47 @@ fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {
     )
 }
 
-/// An exclusive `flock(2)` held until dropped.
-#[cfg(unix)]
+/// An exclusive advisory lock on a file (`flock(2)` on unix, `LockFileEx` on
+/// Windows, both through the standard library) held until dropped.
 pub(crate) struct AdvisoryFileLock {
     file: fs::File,
 }
 
-#[cfg(unix)]
 impl Drop for AdvisoryFileLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: `self.file` remains open across this call before closing on drop.
-        unsafe {
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        // Closing the file releases the lock too; this says so first.
+        let _ = self.file.unlock();
     }
 }
 
-#[cfg(unix)]
+/// Opens `path` for locking: read and write, created when `create`, and
+/// private (mode 0600) where the platform has modes.
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn acquire_bus_file_lock(
     lanes_dir: &Path,
     create_dir: bool,
 ) -> Result<Option<AdvisoryFileLock>, CommandError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     if create_dir {
         fs::create_dir_all(lanes_dir).map_err(|e| {
             CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
         })?;
     }
     let lock_path = lanes_dir.join(BUS_LOCK_FILE);
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create_dir)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-    {
+    let file = match open_lock_file(&lock_path, create_dir) {
         Ok(f) => f,
         Err(e) if !create_dir && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
@@ -435,36 +435,31 @@ fn acquire_bus_file_lock(
     lock_exclusive_within(file, &lock_path, BUS_LOCK_TIMEOUT, "coordination bus").map(Some)
 }
 
-/// Takes an exclusive `flock(2)` on the already-open `file`, retrying with
-/// backoff (1–25 ms) until `timeout`. `what` names the lock in errors.
-#[cfg(unix)]
+/// Takes an exclusive lock on the already-open `file`, retrying with backoff
+/// (1-25 ms) until `timeout`. `what` names the lock in errors.
 fn lock_exclusive_within(
     file: fs::File,
     lock_path: &Path,
     timeout: std::time::Duration,
     what: &str,
 ) -> Result<AdvisoryFileLock, CommandError> {
-    use std::os::unix::io::AsRawFd;
     let deadline = std::time::Instant::now() + timeout;
     let mut backoff_ms = 1u64;
     loop {
-        // SAFETY: `file` is a valid open file descriptor owned by this stack frame.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(AdvisoryFileLock { file });
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        let contended = err.kind() == std::io::ErrorKind::WouldBlock
-            || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-            || err.raw_os_error() == Some(libc::EAGAIN);
-        if !contended {
-            return Err(CommandError::from(format!(
-                "cannot lock {what} {}: {err}",
-                lock_path.display()
-            )));
+        match file.try_lock() {
+            Ok(()) => return Ok(AdvisoryFileLock { file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(CommandError::from(format!(
+                    "cannot lock {what} {}: {err}",
+                    lock_path.display()
+                )));
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(CommandError::from(format!(
@@ -478,49 +473,22 @@ fn lock_exclusive_within(
     }
 }
 
-/// An exclusive advisory lock on `lock_path`, created (mode 0600, with its
+/// An exclusive advisory lock on `lock_path`, created (private, with its
 /// directory) when missing, waited for up to `timeout`. Another process
 /// holding it is waited out; anything else is an error. `what` names the lock
-/// in errors. Elsewhere than Unix there is no such lock and this is `None`.
-#[cfg(unix)]
+/// in errors.
 pub(crate) fn exclusive_file_lock(
     lock_path: &Path,
     timeout: std::time::Duration,
     what: &str,
-) -> Result<Option<AdvisoryFileLock>, CommandError> {
-    use std::os::unix::fs::OpenOptionsExt;
+) -> Result<AdvisoryFileLock, CommandError> {
     if let Some(dir) = lock_path.parent() {
         fs::create_dir_all(dir)
             .map_err(|e| CommandError::from(format!("cannot create {}: {e}", dir.display())))?;
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
+    let file = open_lock_file(lock_path, true)
         .map_err(|e| format!("cannot open {what} lock {}: {e}", lock_path.display()))?;
-    lock_exclusive_within(file, lock_path, timeout, what).map(Some)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn exclusive_file_lock(
-    _lock_path: &Path,
-    _timeout: std::time::Duration,
-    _what: &str,
-) -> Result<Option<()>, CommandError> {
-    Ok(None)
-}
-
-#[cfg(not(unix))]
-fn acquire_bus_file_lock(lanes_dir: &Path, create_dir: bool) -> Result<Option<()>, CommandError> {
-    if create_dir {
-        fs::create_dir_all(lanes_dir).map_err(|e| {
-            CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
-        })?;
-    }
-    Ok(None)
+    lock_exclusive_within(file, lock_path, timeout, what)
 }
 
 fn with_bus_lock<T>(
@@ -2369,8 +2337,10 @@ pub(crate) fn list_reconciled_peers_from_observation(
         let fallback_checkouts = admit_worktree_pair(repo_path, repo_path)
             .map(|pair| pair.best_effort_checkouts())
             .unwrap_or_else(|_| vec![repo.clone()]);
+        // Recorded in the spelling `git worktree list` gives the same
+        // checkout, not the `\\?\` identity spelling Windows admission uses.
         for checkout in fallback_checkouts {
-            let path_str = checkout.to_string_lossy().into_owned();
+            let path_str = crate::engine::process::plain_path_text(&checkout.to_string_lossy());
             if wt_seen.insert(path_str.clone()) {
                 wt_paths.push(path_str.clone());
             }
@@ -2387,7 +2357,8 @@ pub(crate) fn list_reconciled_peers_from_observation(
                 continue;
             };
             if resolve_git_common_dir(&canonical).ok().as_ref() == Some(common) {
-                let path_str = canonical.to_string_lossy().into_owned();
+                let path_str =
+                    crate::engine::process::plain_path_text(&canonical.to_string_lossy());
                 if wt_seen.insert(path_str.clone()) {
                     wt_paths.push(path_str.clone());
                 }
@@ -2398,7 +2369,9 @@ pub(crate) fn list_reconciled_peers_from_observation(
         }
     }
     if wt_paths.is_empty() {
-        wt_paths.push(repo.to_string_lossy().into_owned());
+        wt_paths.push(crate::engine::process::plain_path_text(
+            &repo.to_string_lossy(),
+        ));
     }
 
     let live_facet = crate::insights::live_sessions::attribute(live_obs, &wt_paths);
@@ -4042,7 +4015,14 @@ mod tests {
         }
 
         let homes = vec![agy_home.path().to_path_buf()];
-        assert!(is_antigravity_presence_locked(&homes, conv_live));
+        // Antigravity's presence is read from a held `flock`, which only unix
+        // has: elsewhere no presence is ever claimed, so a held lock reads as
+        // no session rather than as a guess.
+        assert_eq!(
+            is_antigravity_presence_locked(&homes, conv_live),
+            cfg!(unix),
+            "a held presence lock is seen on unix only"
+        );
         assert!(
             !is_antigravity_presence_locked(&homes, conv_stale),
             "unlocked 0-byte presence file must not report live"
@@ -4096,7 +4076,7 @@ mod tests {
             .iter()
             .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
             .expect("conv_live peer");
-        assert_eq!(r_live.liveness, "live");
+        assert_eq!(r_live.liveness, if cfg!(unix) { "live" } else { "exited" });
 
         let r_stale = reconciled
             .iter()
@@ -4118,6 +4098,27 @@ mod tests {
             .find(|p| p.record.provider_session_id.as_deref() == Some(conv_live))
             .unwrap();
         assert_eq!(r_exited.liveness, "exited");
+    }
+
+    /// The lock that serializes two runs of one hook is held against a second
+    /// taker until it is dropped, on every platform. Off unix it was a no-op
+    /// that returned at once, so two registrations of the worktree hook raced
+    /// and one died on "a branch named ... already exists".
+    #[test]
+    fn an_exclusive_file_lock_is_held_against_a_second_taker_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("nested").join("one.lock");
+        let held = exclusive_file_lock(&lock, std::time::Duration::from_secs(5), "test").unwrap();
+        let refused = exclusive_file_lock(&lock, std::time::Duration::from_millis(60), "test");
+        let message = refused.err().expect("a second taker waits and times out");
+        assert!(
+            message.message().contains("timed out"),
+            "{}",
+            message.message()
+        );
+        drop(held);
+        exclusive_file_lock(&lock, std::time::Duration::from_secs(5), "test")
+            .expect("free once dropped");
     }
 
     #[test]
@@ -4683,7 +4684,17 @@ mod tests {
             forged_wt.to_str().unwrap(),
         )
         .unwrap();
-        let verified_checkouts = forged_pair.best_effort_registered_checkouts();
+        // The pair's checkouts are identity paths (`\\?\C:\...` on Windows);
+        // the plain spelling is what the test names them by.
+        let verified_checkouts: Vec<PathBuf> = forged_pair
+            .best_effort_registered_checkouts()
+            .iter()
+            .map(|p| {
+                PathBuf::from(crate::engine::process::plain_path_text(
+                    &p.to_string_lossy(),
+                ))
+            })
+            .collect();
         assert!(
             verified_checkouts
                 .iter()

@@ -1539,11 +1539,17 @@ mod tests {
         std::fs::write(dir.path().join("cooling_device0/temp"), "99000\n").unwrap();
         assert_eq!(linux_thermal_temp_in(dir.path()), Reading::Value(68.8));
 
+        // A directory where the reading file should be: opening it fails
+        // as a read error on Unix (EISDIR) and as access denied on Windows.
         let err_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(err_dir.path().join("thermal_zone0/temp")).unwrap();
         assert_eq!(
             linux_thermal_temp_in(err_dir.path()),
-            Reading::Unavailable(Why::Failed)
+            Reading::Unavailable(if cfg!(windows) {
+                Why::Unreadable
+            } else {
+                Why::Failed
+            })
         );
 
         assert_eq!(
@@ -1562,13 +1568,21 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut probe = HostProbe::new(dir.path());
+        // What a probe with no baseline yet reads: not-yet where there is a
+        // sensor, and (Windows) unsupported, which has no baseline to clear.
+        let unprimed =
+            Reading::Unavailable(if cfg!(any(target_os = "macos", target_os = "linux")) {
+                Why::NotYet
+            } else {
+                Why::Unsupported
+            });
         let first = probe.sample();
-        assert_eq!(first.cpu_usage, Reading::Unavailable(Why::NotYet));
+        assert_eq!(first.cpu_usage, unprimed);
         std::thread::sleep(std::time::Duration::from_millis(25));
         let _second = probe.sample();
         probe.reset();
         let after_reset = probe.sample();
-        assert_eq!(after_reset.cpu_usage, Reading::Unavailable(Why::NotYet));
+        assert_eq!(after_reset.cpu_usage, unprimed);
     }
 
     #[cfg(target_os = "macos")]

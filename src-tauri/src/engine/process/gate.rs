@@ -2019,6 +2019,8 @@ pub(crate) mod spawn_log {
         }
 
         fn push(&mut self, cwd: &Path, entry: Entry) {
+            let cwd = directory_key(cwd);
+            let cwd = cwd.as_path();
             self.touched += 1;
             let touched = self.touched;
             if !self.by_directory.contains_key(cwd) && self.by_directory.len() >= self.directories {
@@ -2045,9 +2047,20 @@ pub(crate) mod spawn_log {
 
         fn entries(&self, cwd: &Path) -> Vec<Entry> {
             self.by_directory
-                .get(cwd)
+                .get(directory_key(cwd).as_path())
                 .map(|(_, entries)| entries.iter().cloned().collect())
                 .unwrap_or_default()
+        }
+    }
+
+    /// A directory keyed by one spelling. The repository identity spells a
+    /// checkout `\\?\C:\...` on Windows while git lists the same directory
+    /// `C:/...`, and a test counting a repository's children must find them
+    /// whichever of the two spawned them or asks.
+    fn directory_key(cwd: &Path) -> PathBuf {
+        match cwd.to_str() {
+            Some(text) => PathBuf::from(crate::engine::process::plain_path_text(text)),
+            None => cwd.to_path_buf(),
         }
     }
 
@@ -2109,6 +2122,23 @@ pub(crate) mod spawn_log {
             }
             assert_eq!(log.entries(quiet).len(), 3);
             assert_eq!(log.entries(busy).len(), 8, "bounded by its own volume");
+        }
+
+        /// A child spawned in the identity spelling of a directory is counted
+        /// by a test that names it the way git lists it, and the other way
+        /// round: on Windows `\\?\C:\x` and `C:\x` are one directory.
+        #[test]
+        fn one_directory_is_one_key_whichever_spelling_names_it() {
+            let mut log = Log::bounded(8, 4);
+            let (verbatim, plain) = if cfg!(windows) {
+                (Path::new(r"\\?\C:\gp\repo"), Path::new(r"C:\gp\repo"))
+            } else {
+                (Path::new("/gp/repo"), Path::new("/gp/repo"))
+            };
+            log.push(verbatim, entry());
+            log.push(plain, entry());
+            assert_eq!(log.entries(verbatim).len(), 2);
+            assert_eq!(log.entries(plain).len(), 2);
         }
 
         #[test]

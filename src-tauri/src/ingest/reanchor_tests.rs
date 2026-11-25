@@ -12,13 +12,12 @@ use super::event_time_tests::{call, stamp, with_transcript_root, write_corpus};
 use super::*;
 
 use crate::ledger::ids;
-use crate::procguard::LockedSpawn;
 use crate::test_support::{git_in, trust_repo};
 use std::path::Path;
 
 /// A trusted checkout of one commit (`message`) at `parent/name`, canonical.
 fn repo_at(parent: &Path, name: &str, message: &str) -> String {
-    let path = parent.canonicalize().unwrap().join(name);
+    let path = canon(parent).join(name);
     std::fs::create_dir(&path).unwrap();
     git_in(&path, &["init", "-b", "main"]);
     std::fs::write(path.join("seed.txt"), message).unwrap();
@@ -29,7 +28,7 @@ fn repo_at(parent: &Path, name: &str, message: &str) -> String {
 
 /// A trusted clone of `upstream` at `parent/name`.
 fn clone_at(parent: &Path, upstream: &str, name: &str) -> String {
-    let path = parent.canonicalize().unwrap().join(name);
+    let path = canon(parent).join(name);
     git_in(parent, &["clone", "-q", upstream, path.to_str().unwrap()]);
     trust_repo(&path);
     path.to_string_lossy().into_owned()
@@ -38,7 +37,7 @@ fn clone_at(parent: &Path, upstream: &str, name: &str) -> String {
 /// A bare upstream with one commit.
 fn upstream_in(parent: &Path) -> String {
     let seed = repo_at(parent, "seed", "root");
-    let bare = parent.canonicalize().unwrap().join("upstream.git");
+    let bare = canon(parent).join("upstream.git");
     git_in(
         parent,
         &["clone", "-q", "--bare", &seed, bare.to_str().unwrap()],
@@ -46,24 +45,50 @@ fn upstream_in(parent: &Path) -> String {
     bare.to_string_lossy().into_owned()
 }
 
+/// `path` canonicalized in a spelling git accepts (no `\\?\` prefix on Windows).
+fn canon(path: &Path) -> std::path::PathBuf {
+    crate::engine::process::canonicalize_plain(path).unwrap()
+}
+
+/// What a process restart does to the ledger's open connection to `repo`.
+/// Windows cannot rename or delete a directory holding an open file, so a test
+/// that moves or deletes a repository the pass has already written lets go of
+/// the cached connection first, as the real move happens with the app closed.
+fn release_ledger(repo: &str) {
+    ledger::tests_support::reset_registry_for(repo);
+}
+
+/// Deletes a repository, as a user does once a move has copied it elsewhere.
+fn remove_repo(repo: &str) {
+    release_ledger(repo);
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
 /// `mv from to`, trusting the new location as the user must in the app.
 fn mv(from: &str, to: &Path) -> String {
+    release_ledger(from);
     std::fs::rename(from, to).unwrap();
     trust_repo(to);
     to.to_string_lossy().into_owned()
 }
 
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// `cp -R from to` for a repository with its ledger, trusted at `to`.
 fn cp_r(from: &str, to: &Path) -> String {
-    let out = std::process::Command::new("cp")
-        .args(["-R", from, to.to_str().unwrap()])
-        .output_locked()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    copy_tree(Path::new(from), to).unwrap();
     trust_repo(to);
     to.to_string_lossy().into_owned()
 }
@@ -159,7 +184,7 @@ fn a_renamed_repository_keeps_recording_with_no_loss_and_no_duplicate() {
     let recorded_before = transcript_rows(&old);
     assert_eq!(recorded_before.len(), 1);
 
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("after"));
+    let new = mv(&old, &canon(parent.path()).join("after"));
     let after_file = corpus.edit(&new);
     let out = corpus.pass(&new);
     assert_eq!(out.error, "", "{out:?}");
@@ -270,7 +295,7 @@ fn a_ledger_from_a_different_repository_is_still_refused() {
     assert_eq!(corpus.pass(&a).recorded, 1);
     carry_ledger(&a, &b);
     // Even with the source gone, the roots differ: only the rule can refuse it.
-    std::fs::remove_dir_all(&a).unwrap();
+    remove_repo(&a);
     corpus.edit(&b);
     let out = corpus.pass(&b);
     assert_refused(&out, "root commit");
@@ -300,7 +325,7 @@ fn a_ledger_copied_from_a_live_clone_is_refused_until_the_source_is_gone() {
     // ledger copy carries the same lineage UUID, so none of those tell them
     // apart. What does is the directory the ledger was anchored in: the clone
     // is another one, so the carried ledger stays refused once the source is gone.
-    std::fs::remove_dir_all(&first).unwrap();
+    remove_repo(&first);
     ledger::forget_identity_state(&second);
     let out = corpus.pass(&second);
     assert_refused(&out, "not the directory the ledger was anchored in");
@@ -327,7 +352,7 @@ fn a_ledger_carried_into_a_fork_is_refused() {
     corpus.edit(&original);
     assert_eq!(corpus.pass(&original).recorded, 1);
     carry_ledger(&original, &fork);
-    std::fs::remove_dir_all(&original).unwrap();
+    remove_repo(&original);
     corpus.edit(&fork);
     assert_refused(&corpus.pass(&fork), "remotes");
 }
@@ -340,7 +365,7 @@ fn a_repository_whose_root_was_rewritten_after_the_move_is_refused() {
     let mut corpus = Corpus::new();
     corpus.edit(&old);
     assert_eq!(corpus.pass(&old).recorded, 1);
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("new"));
+    let new = mv(&old, &canon(parent.path()).join("new"));
     git_in(
         Path::new(&new),
         &["commit", "--amend", "-m", "rewritten root"],
@@ -359,7 +384,7 @@ fn a_repository_with_no_commit_cannot_take_over_a_ledger() {
     corpus.edit(&source);
     assert_eq!(corpus.pass(&source).recorded, 1);
 
-    let empty = parent.path().canonicalize().unwrap().join("empty");
+    let empty = canon(parent.path()).join("empty");
     std::fs::create_dir(&empty).unwrap();
     git_in(&empty, &["init", "-b", "main"]);
     let empty = empty.to_string_lossy().into_owned();
@@ -376,12 +401,12 @@ fn a_repository_with_no_commit_cannot_take_over_a_ledger() {
         "no root, nothing to record"
     );
 
-    let carried = parent.path().canonicalize().unwrap().join("carried");
+    let carried = canon(parent.path()).join("carried");
     std::fs::create_dir(&carried).unwrap();
     git_in(&carried, &["init", "-b", "main"]);
     let carried = carried.to_string_lossy().into_owned();
     carry_ledger(&source, &carried);
-    std::fs::remove_dir_all(&source).unwrap();
+    remove_repo(&source);
     corpus.edit(&carried);
     assert_refused(&corpus.pass(&carried), "identity could not be read");
 }
@@ -394,7 +419,7 @@ fn a_ledger_that_recorded_no_identity_is_refused_after_a_move() {
     let parent = tempfile::tempdir().unwrap();
     let old = repo_at(parent.path(), "old", "seed");
     ledger::bindings::bind(&old, &old, "T1").unwrap();
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("new"));
+    let new = mv(&old, &canon(parent.path()).join("new"));
     let mut corpus = Corpus::new();
     corpus.edit(&new);
     assert_refused(&corpus.pass(&new), "records no repository identity");
@@ -410,7 +435,7 @@ fn a_row_naming_an_unlisted_path_after_a_reanchor_is_foreign() {
     let mut corpus = Corpus::new();
     corpus.edit(&old);
     corpus.pass(&old);
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("new"));
+    let new = mv(&old, &canon(parent.path()).join("new"));
     corpus.edit(&new);
     assert_eq!(corpus.pass(&new).reanchored_from, vec![old]);
     assert!(ledger::tail(&new, 0, 1000).is_ok());
@@ -434,7 +459,7 @@ fn a_row_naming_an_unlisted_path_after_a_reanchor_is_foreign() {
 #[test]
 fn moving_back_and_moving_twice_are_each_reported_once() {
     let parent = tempfile::tempdir().unwrap();
-    let base = parent.path().canonicalize().unwrap();
+    let base = canon(parent.path());
     let one = repo_at(parent.path(), "one", "seed");
     let mut corpus = Corpus::new();
     corpus.edit(&one);
@@ -488,7 +513,7 @@ fn moving_back_and_moving_twice_are_each_reported_once() {
 #[test]
 fn a_symlink_left_at_the_old_path_does_not_make_it_look_occupied() {
     let parent = tempfile::tempdir().unwrap();
-    let base = parent.path().canonicalize().unwrap();
+    let base = canon(parent.path());
     let old = repo_at(parent.path(), "old", "seed");
     let mut corpus = Corpus::new();
     corpus.edit(&old);
@@ -512,10 +537,7 @@ fn a_copy_beside_a_live_original_is_refused_and_the_original_is_unaffected() {
     let mut corpus = Corpus::new();
     corpus.edit(&original);
     assert_eq!(corpus.pass(&original).recorded, 1);
-    let copy = cp_r(
-        &original,
-        &parent.path().canonicalize().unwrap().join("copy"),
-    );
+    let copy = cp_r(&original, &canon(parent.path()).join("copy"));
     let before = count_action(&copy, "session.edit");
 
     corpus.edit(&copy);
@@ -553,7 +575,7 @@ fn a_remote_added_after_the_move_is_fine_and_all_replaced_is_not() {
         let mut corpus = Corpus::new();
         corpus.edit(&old);
         assert_eq!(corpus.pass(&old).recorded, 1);
-        let new = mv(&old, &parent.path().canonicalize().unwrap().join("new"));
+        let new = mv(&old, &canon(parent.path()).join("new"));
         let new_path = Path::new(&new);
         if replace {
             git_in(new_path, &["remote", "remove", "origin"]);
@@ -582,7 +604,7 @@ fn a_remote_added_after_the_move_is_fine_and_all_replaced_is_not() {
 #[test]
 fn a_linked_worktree_of_a_moved_repository_records_into_the_taken_over_ledger() {
     let parent = tempfile::tempdir().unwrap();
-    let base = parent.path().canonicalize().unwrap();
+    let base = canon(parent.path());
     let old = repo_at(parent.path(), "old", "seed");
     let mut corpus = Corpus::new();
     corpus.edit(&old);
@@ -625,7 +647,7 @@ fn concurrent_first_passes_after_a_move_reanchor_once() {
     let mut corpus = Corpus::new();
     corpus.edit(&old);
     assert_eq!(corpus.pass(&old).recorded, 1);
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("new"));
+    let new = mv(&old, &canon(parent.path()).join("new"));
     let file = corpus.edit(&new);
 
     let outs: Vec<CatchUp> = with_transcript_root(corpus.dir.path(), || {
@@ -660,7 +682,7 @@ fn shallow_clone_at(parent: &Path, name: &str) -> String {
     std::fs::write(Path::new(&source).join("two.txt"), "two").unwrap();
     git_in(Path::new(&source), &["add", "two.txt"]);
     git_in(Path::new(&source), &["commit", "-m", "two"]);
-    let path = parent.canonicalize().unwrap().join(name);
+    let path = canon(parent).join(name);
     git_in(
         parent,
         &[
@@ -689,7 +711,7 @@ fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     corpus.edit(&a);
     assert_eq!(corpus.pass(&a).recorded, 1);
 
-    let b = parent.path().canonicalize().unwrap().join("b");
+    let b = canon(parent.path()).join("b");
     std::fs::create_dir(&b).unwrap();
     git_in(&b, &["init", "-b", "main"]);
     std::fs::write(b.join("other.txt"), "b").unwrap();
@@ -710,7 +732,7 @@ fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     trust_repo(&b);
     let b = b.to_string_lossy().into_owned();
     carry_ledger(&a, &b);
-    std::fs::remove_dir_all(&a).unwrap();
+    remove_repo(&a);
     corpus.edit(&b);
     let out = corpus.pass(&b);
     assert_refused(&out, "not the directory the ledger was anchored in");
@@ -731,8 +753,8 @@ fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
     assert_eq!(corpus.pass(&old).recorded, 1);
 
     // What `mv` across devices does: copy, then delete the source.
-    let new = cp_r(&old, &parent.path().canonicalize().unwrap().join("after"));
-    std::fs::remove_dir_all(&old).unwrap();
+    let new = cp_r(&old, &canon(parent.path()).join("after"));
+    remove_repo(&old);
     let after_file = corpus.edit(&new);
     let out = corpus.pass(&new);
     assert_refused(&out, "not the directory the ledger was anchored in");
@@ -789,7 +811,7 @@ fn a_renamed_repository_that_grew_an_orphan_root_keeps_its_ledger() {
     std::fs::write(Path::new(&old).join("island.txt"), "i").unwrap();
     git_in(Path::new(&old), &["add", "island.txt"]);
     git_in(Path::new(&old), &["commit", "-q", "-m", "island"]);
-    let new = mv(&old, &parent.path().canonicalize().unwrap().join("renamed"));
+    let new = mv(&old, &canon(parent.path()).join("renamed"));
     corpus.edit(&new);
     let out = corpus.pass(&new);
     assert_eq!(out.reanchored_from, vec![old], "{out:?}");
@@ -881,7 +903,7 @@ fn a_remote_with_a_credential_in_it_still_identifies_a_moved_repository() {
     let mut corpus = Corpus::new();
     corpus.edit(&repo);
     assert_eq!(corpus.pass(&repo).recorded, 1);
-    let moved = mv(&repo, &parent.path().canonicalize().unwrap().join("moved"));
+    let moved = mv(&repo, &canon(parent.path()).join("moved"));
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
     assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
@@ -899,10 +921,7 @@ fn a_remote_with_a_credential_in_it_still_identifies_a_moved_repository() {
     );
     corpus.edit(&other);
     assert_eq!(corpus.pass(&other).recorded, 1);
-    let moved = mv(
-        &other,
-        &parent.path().canonicalize().unwrap().join("other-moved"),
-    );
+    let moved = mv(&other, &canon(parent.path()).join("other-moved"));
     git_in(
         Path::new(&moved),
         &[
@@ -951,7 +970,7 @@ fn a_rewritten_root_without_a_move_keeps_recording() {
     let out = corpus.pass(&repo);
     assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
     // And the rewritten identity is the one a later move is judged against.
-    let moved = mv(&repo, &parent.path().canonicalize().unwrap().join("moved"));
+    let moved = mv(&repo, &canon(parent.path()).join("moved"));
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
     assert_eq!(out.reanchored_from, vec![repo], "{out:?}");
@@ -968,10 +987,7 @@ fn a_moved_shallow_repository_is_taken_over_unless_it_was_unshallowed_too() {
     let plain = shallow_clone_at(parent.path(), "plain");
     corpus.edit(&plain);
     assert_eq!(corpus.pass(&plain).recorded, 1);
-    let moved = mv(
-        &plain,
-        &parent.path().canonicalize().unwrap().join("plain-moved"),
-    );
+    let moved = mv(&plain, &canon(parent.path()).join("plain-moved"));
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
     assert_eq!(out.reanchored_from, vec![plain], "{out:?}");
@@ -979,10 +995,7 @@ fn a_moved_shallow_repository_is_taken_over_unless_it_was_unshallowed_too() {
     let deep = shallow_clone_at(parent.path(), "deep");
     corpus.edit(&deep);
     assert_eq!(corpus.pass(&deep).recorded, 1);
-    let moved = mv(
-        &deep,
-        &parent.path().canonicalize().unwrap().join("deep-moved"),
-    );
+    let moved = mv(&deep, &canon(parent.path()).join("deep-moved"));
     git_in(Path::new(&moved), &["fetch", "-q", "--unshallow"]);
     corpus.edit(&moved);
     assert_refused(&corpus.pass(&moved), "root commit");

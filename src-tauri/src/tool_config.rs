@@ -4421,6 +4421,12 @@ mod model_setting_tests {
 
     #[test]
     fn manvi_steward_round_trips_global_and_repo_overrides_and_omits_defaults() {
+        // `/repo/alpha/.git` has no drive, so Windows reads it as relative.
+        let alpha = if cfg!(windows) {
+            r"C:\repo\alpha\.git"
+        } else {
+            "/repo/alpha/.git"
+        };
         with_temp_config(|path| {
             assert_eq!(manvi_steward_settings(), ManviStewardSettings::default());
 
@@ -4455,7 +4461,7 @@ mod model_setting_tests {
             })
             .unwrap();
             let updated = set_manvi_steward_repo_override(
-                "/repo/alpha/.git",
+                alpha,
                 Some(RepoStewardOverride {
                     enabled: None,
                     message_agents: Some(false),
@@ -4470,15 +4476,15 @@ mod model_setting_tests {
             assert!(global_eff.message_agents);
             assert!(!global_eff.clean_critical);
 
-            let alpha_eff = updated.effective_for(Some("/repo/alpha/.git"));
+            let alpha_eff = updated.effective_for(Some(alpha));
             assert!(alpha_eff.overridden);
             assert!(!alpha_eff.message_agents);
             assert!(alpha_eff.clean_critical);
             assert!(alpha_eff.slow_critical);
 
             // Clearing the override restores global inheritance.
-            let cleared = set_manvi_steward_repo_override("/repo/alpha/.git", None).unwrap();
-            assert!(!cleared.effective_for(Some("/repo/alpha/.git")).overridden);
+            let cleared = set_manvi_steward_repo_override(alpha, None).unwrap();
+            assert!(!cleared.effective_for(Some(alpha)).overridden);
 
             // Malformed `manvi_steward` degrades cleanly without losing `devmap` paths.
             write_raw(
@@ -4492,14 +4498,14 @@ mod model_setting_tests {
             // `manvi_steward` must NEVER reset `enabled: false` back to `true`!
             write_raw(
                 path,
-                r#"{
+                &serde_json::json!({
                     "version": 1,
                     "manvi_steward": {
                         "enabled": false,
                         "interval_secs": "bad-type",
                         "future_steward_key": true,
                         "repositories": {
-                            "/repo/alpha/.git": {
+                            (alpha): {
                                 "enabled": false,
                                 "slow_critical": "invalid",
                                 "future_repo_flag": 42
@@ -4509,7 +4515,8 @@ mod model_setting_tests {
                             }
                         }
                     }
-                }"#,
+                })
+                .to_string(),
             );
             let lenient = manvi_steward_settings();
             assert!(
@@ -4521,7 +4528,7 @@ mod model_setting_tests {
                 ManviStewardSettings::default().interval_secs
             );
             assert!(
-                !lenient.effective_for(Some("/repo/alpha/.git")).enabled,
+                !lenient.effective_for(Some(alpha)).enabled,
                 "per-repo enabled=false must survive unknown/invalid sibling override fields"
             );
             assert!(

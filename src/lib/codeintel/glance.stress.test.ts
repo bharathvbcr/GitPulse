@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestOf } from "../__tests__/perfBudget";
+import {
+  STRESS_TIMEOUT_MS,
+  expectWithinBudget,
+  fastestCpuOf,
+  fastestOf,
+} from "../__tests__/perfBudget";
 import { blastGlance, confidenceLabel, hedgedCount } from "./blastGlance";
 import { nodeLabel, nodeLabelText, nodeFilePath, looksLikePath } from "./codeMap";
 import { firstClause, summarizeWalkIncomplete, tooltipWalkIncomplete } from "./walkIncomplete";
@@ -75,15 +80,57 @@ describe("engine prose folding survives hostile shapes", () => {
   );
 
   it(
-    "scales sub-quadratically as the whitespace run doubles",
+    "scales linearly as the whitespace run grows",
     () => {
-      // The structural claim, independent of any machine: doubling the input
-      // must not quadruple the cost. A quadratic scan reads ~4x here.
-      const small = fastestOf(3, () => summarizeWalkIncomplete([whitespaceBomb(60_000)]));
-      const large = fastestOf(3, () => summarizeWalkIncomplete([whitespaceBomb(120_000)]));
-      // Guard against a zero denominator on a fast machine.
-      const ratio = large / Math.max(small, 0.05);
-      expect(ratio, `doubling cost ratio ${ratio.toFixed(1)}x looks quadratic`).toBeLessThan(3);
+      // The structural claim, independent of any machine: SIZE_FACTOR times the
+      // input must cost about what SIZE_FACTOR calls on the small input cost.
+      // Linear read 0.87–1.04 over 20 runs (macOS, load ~4); with the whitespace
+      // collapse removed it read 3.94. The limit is 2.
+      //
+      // One fold is tiny once whitespace is collapsed (~0.02ms for 30k chars),
+      // so the old single-call doubling ratio measured timer and GC noise over
+      // a 0.05ms floor: it read 4.0 against a limit of 3 on macOS CI with the
+      // fix in place. Each sample is now a batch grown until it costs 250ms of
+      // CPU (about 16 of Windows' 15.6ms process-time ticks, so one tick either
+      // side moves the ratio ~6%), the two sizes are timed as equal work in
+      // alternating rounds, and the minimum of each is compared (as
+      // markdevRender.test.ts does). GITPULSE_PERF_REPORT=1 prints the ratio.
+      const SIZE_FACTOR = 4;
+      const small = whitespaceBomb(30_000);
+      const large = whitespaceBomb(30_000 * SIZE_FACTOR);
+      const foldLarge = (reps: number) => () => {
+        for (let call = 0; call < reps; call += 1) summarizeWalkIncomplete([large]);
+      };
+      const foldSmall = (reps: number) => () => {
+        for (let call = 0; call < reps * SIZE_FACTOR; call += 1) summarizeWalkIncomplete([small]);
+      };
+      // One linear fold of the large input costs ~0.07ms; the quadratic one
+      // costs most of a minute. Fail on the first call rather than spend
+      // several more minutes measuring a ratio that is already decided.
+      const firstCall = fastestCpuOf(1, foldLarge(1));
+      expect(firstCall, `one fold of the large input took ${firstCall.toFixed(0)}ms`).toBeLessThan(
+        1000,
+      );
+      let reps = 1;
+      while (reps < 1 << 16 && fastestCpuOf(1, foldLarge(reps)) < 250) reps *= 2;
+      let cpuSmallBatch = Number.POSITIVE_INFINITY;
+      let cpuLarge = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < 3; round += 1) {
+        cpuSmallBatch = Math.min(cpuSmallBatch, fastestCpuOf(1, foldSmall(reps)));
+        cpuLarge = Math.min(cpuLarge, fastestCpuOf(1, foldLarge(reps)));
+      }
+      const ratio = cpuLarge / cpuSmallBatch;
+      if (process.env.GITPULSE_PERF_REPORT) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `PERF whitespace scaling: ratio ${ratio.toFixed(3)} (${reps} reps, ` +
+            `large ${cpuLarge.toFixed(0)}ms, small batch ${cpuSmallBatch.toFixed(0)}ms)`,
+        );
+      }
+      expect(
+        ratio,
+        `${SIZE_FACTOR}x the input cost ${ratio.toFixed(2)}x the equal small-input work (${reps} reps)`,
+      ).toBeLessThan(2);
     },
     STRESS_TIMEOUT_MS,
   );

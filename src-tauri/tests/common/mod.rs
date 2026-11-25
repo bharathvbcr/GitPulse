@@ -72,22 +72,16 @@ pub fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 /// The test owns this fixture and explicitly admits it through the real trust
-/// boundary. This is a session grant, never a bypass or a user's saved grant —
-/// unless the terminal suites run against the terminal host: a session grant
-/// never reaches another process, so there it is saved, in the hermetic home
-/// both processes read.
+/// boundary, never a bypass. The grant is saved, in the hermetic home this
+/// process and every child it spawns read, never the user's: a session grant
+/// lives only in this process, and these suites hand the repository to other
+/// processes (`gitpulse-ptyd`, `gitpulse-mcp`). It was saved on Unix only,
+/// tied to the PTY host, so on Windows every `gitpulse-mcp` child refused the
+/// fixture with REPOSITORY_TRUST_REQUIRED.
 pub fn trust_repo(repo: &Path) {
     let path = repo.to_str().expect("fixture path");
     let preview = gitpulse_lib::repository_trust::inspect(path).expect("inspect fixture");
-    gitpulse_lib::repository_trust::grant(path, &preview.identity, terminal_host_selected())
-        .expect("approve fixture");
-}
-
-/// Which backend the terminal suites run against: on Unix the real
-/// `gitpulse-ptyd` host is unconditional; non-Unix still uses the in-process
-/// engine until its own host exists.
-pub fn terminal_host_selected() -> bool {
-    cfg!(unix)
+    gitpulse_lib::repository_trust::grant(path, &preview.identity, true).expect("approve fixture");
 }
 
 /// A session registry on the selected backend. On Unix every registry gets a

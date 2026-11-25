@@ -2214,7 +2214,16 @@ mod readonly_tests {
         let forged_parent = tempfile::tempdir().unwrap();
         let forged = forged_parent.path().join("forged");
         std::fs::create_dir(&forged).unwrap();
-        std::fs::write(forged.join(".git"), format!("gitdir: {other_repo}/.git\n")).unwrap();
+        // Joined as a path: `other_repo` is canonical, `\\?\C:\...` on Windows,
+        // where `/` is no separator, so a textual `/.git` named no directory.
+        std::fs::write(
+            forged.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                std::path::Path::new(&other_repo).join(".git").display()
+            ),
+        )
+        .unwrap();
         crate::test_support::trust_repo(&forged);
         let forged = canonical(&forged);
         assert_eq!(
@@ -2272,7 +2281,10 @@ mod readonly_tests {
         std::fs::create_dir(&forged).unwrap();
         std::fs::write(
             forged.join(".git"),
-            format!("gitdir: {}/.git\n", other_repo),
+            format!(
+                "gitdir: {}\n",
+                std::path::Path::new(&other_repo).join(".git").display()
+            ),
         )
         .unwrap();
         crate::test_support::trust_repo(&forged);
@@ -2785,6 +2797,11 @@ mod family_cost_tests {
         let gone = siblings[0].1.clone();
         repository_address(&gone).expect("warm address from the worktree");
 
+        // The fixture wrote `gone`'s legacy ledger through this process's
+        // connection registry, which keeps it open. An install's legacy ledger
+        // is read and closed, never held, and on Windows a held database is a
+        // file `git worktree remove` cannot delete ("Invalid argument").
+        crate::ledger::tests_support::reset_registry_for(&gone);
         crate::test_support::git_in(dir.path(), &["worktree", "remove", "--force", &gone]);
 
         let error = repository_address(&gone).expect_err("a removed worktree must not resolve");

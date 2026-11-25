@@ -3616,15 +3616,22 @@ mod hook_launch_tests {
         let mut keys: Vec<_> = settings.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["hooks", "preferredNotifChannel"]);
-        let commands: Vec<String> = settings["hooks"]["PreToolUse"]
+        let handlers: Vec<&Value> = settings["hooks"]["PreToolUse"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_owned())
+            .map(|group| &group["hooks"][0])
             .collect();
-        assert_eq!(commands.len(), 2);
-        for command in commands {
-            assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+        assert_eq!(handlers.len(), 2);
+        for handler in handlers {
+            let command = handler["command"].as_str().unwrap();
+            if cfg!(windows) {
+                // The exec form: the bare path, the words in `args`.
+                assert_eq!(command, HOOK);
+                assert!(handler["args"][0].is_string(), "{handler}");
+            } else {
+                assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+            }
         }
     }
 

@@ -3221,11 +3221,14 @@ fn hooks_config_for(
                     // is named by path too. It runs the binary when it can and
                     // plain git when it cannot, so a missing binary never costs
                     // Claude Code a worktree.
-                    let launcher = Path::new(plugin_root).join(crate::hooks::worktree::LAUNCHER);
-                    format!(
-                        "sh {} {quoted} {args}",
-                        sh_quote(&launcher.to_string_lossy())
-                    )
+                    // Joined with `/` as text, not `Path::join`: this is a `sh`
+                    // command line, and a Windows host would put a `\` in it.
+                    let launcher = format!(
+                        "{}/{}",
+                        plugin_root.trim_end_matches('/'),
+                        crate::hooks::worktree::LAUNCHER
+                    );
+                    format!("sh {} {quoted} {args}", sh_quote(&launcher))
                 } else {
                     match args.split_whitespace().next() {
                         Some("collision-guard" | "command-gate") => format!(
@@ -5512,7 +5515,8 @@ mod tests {
             ctx.collisions.items.iter().all(|item| item
                 .worktrees
                 .iter()
-                .any(|p| Path::new(&p.path) == fs::canonicalize(main.path()).unwrap())),
+                .any(|p| Path::new(&p.path)
+                    == crate::engine::process::canonicalize_plain(main.path()).unwrap())),
             "rows must involve the requested worktree: {:?}",
             ctx.collisions.items
         );

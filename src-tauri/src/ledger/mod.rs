@@ -1047,18 +1047,41 @@ struct Live {
 
 /// Device and inode of the database file: enough to notice that
 /// `.devcouncil/` was deleted and recreated underneath an open connection.
+/// On Windows the volume serial and the 128-bit file ID (`FILE_ID_INFO`), so
+/// the second field is wide enough to hold it whole: a truncated ID could
+/// call two different files the same one.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileId(u64, u64);
+struct FileId(u64, u128);
 
 #[cfg(unix)]
 fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path)
         .ok()
-        .map(|meta| FileId(meta.dev(), meta.ino()))
+        .map(|meta| FileId(meta.dev(), u128::from(meta.ino())))
 }
 
-#[cfg(not(unix))]
+/// `None` here made every warm consolidation pass on Windows re-open every
+/// sibling ledger: [`consolidated::is_current`] trusts a remembered import only
+/// for a known anchor file, and without an identity there never was one.
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_READ_ATTRIBUTES, every share mode so SQLite's own handles are never
+    // refused, and the reparse point itself rather than its target, as
+    // `symlink_metadata` reads the Unix entry. BACKUP_SEMANTICS opens a
+    // directory too, which a path that was swapped for one may now be.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x80)
+        .share_mode(1 | 2 | 4)
+        .custom_flags(0x0020_0000 | 0x0200_0000)
+        .open(path)
+        .ok()?;
+    let (volume, id) = crate::fs_entry::windows_file_identity(&file).ok()?;
+    Some(FileId(volume, u128::from_le_bytes(id)))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn file_id(_path: &Path) -> Option<FileId> {
     None
 }

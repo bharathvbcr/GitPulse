@@ -2610,7 +2610,16 @@ fn a_disk_cause_brings_the_schedule_forward_once_per_gap() {
     // A save carrying the revision read before the bring-forward still lands.
     let mut open_page = cleaner.state().unwrap().config;
     open_page.next_run_at = later;
-    assert!(cleaner.save(open_page).is_ok());
+    if cfg!(unix) {
+        assert!(cleaner.save(open_page).is_ok());
+    } else {
+        // An enabled schedule is refused where there is no cleanup to run:
+        // the brought-forward schedule was set by the scheduler, not saved.
+        assert!(cleaner
+            .save(open_page)
+            .unwrap_err()
+            .contains("Scheduled cleanup is unavailable on this platform"));
+    }
     // Due now, and not asked again within the gap, whatever the cause.
     cleaner
         .update(|saved| {
@@ -3506,10 +3515,21 @@ fn the_long_lived_list_is_validated_when_saved() {
     assert!(save(vec![ok.to_string_lossy().into_owned()]).is_ok());
     for (path, why) in [
         ("relative", "absolute"),
-        ("/", "filesystem root"),
+        // This platform's own root: `/`, or the drive's root on Windows.
+        (
+            home.ancestors().last().unwrap().to_str().unwrap(),
+            "filesystem root",
+        ),
         (home.to_str().unwrap(), "home directory"),
         (root.to_str().unwrap(), "contains the repository root"),
-        ("/definitely/not/here", "cannot be read"),
+        (
+            home.join("definitely")
+                .join("not")
+                .join("here")
+                .to_str()
+                .unwrap(),
+            "cannot be read",
+        ),
     ] {
         let error = save(vec![path.to_string()]).expect_err(path);
         assert!(error.message().contains(why), "{path}: {}", error.message());
@@ -3677,6 +3697,22 @@ fn one_session_cleaner_with(
     (temp, cleaner, targets)
 }
 
+/// Where this platform has no reviewed removal, a run offers and judges as
+/// anywhere and then skips every folder whole, with the platform's text, and
+/// leaves each as it was: none completes, none is partly removed.
+fn assert_refused_by_platform(run: &CleanerRun, targets: &[std::path::PathBuf]) {
+    assert!(!run.items.is_empty(), "{run:?}");
+    for item in &run.items {
+        assert_eq!(item.status, "skipped", "{item:?}");
+        assert_eq!(item.message, super::super::tree::NO_REMOVAL, "{item:?}");
+    }
+    assert!(
+        targets.iter().all(|t| t.join("debug/app.o").exists()),
+        "{:?}",
+        run.items
+    );
+}
+
 /// Removing one target changes its parent folder's modification time. The
 /// recency guard is judged again for every candidate at delete time, so without
 /// the run knowing what it removed itself, the second target of the same
@@ -3688,6 +3724,9 @@ fn a_finished_session_with_two_targets_is_cleared_in_one_run() {
     let (_temp, cleaner, targets) = one_session_cleaner(&["target-a", "target-b"]);
     let saved = cleaner.state().unwrap().config;
     let run = run_now(&cleaner, &saved, "two-targets-run");
+    if !cfg!(unix) {
+        return assert_refused_by_platform(&run, &targets);
+    }
     let done = run.items.iter().filter(|i| i.status == "completed").count();
     assert_eq!(done, 2, "{:?}", run.items);
     assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
@@ -3709,6 +3748,10 @@ fn a_partly_removed_target_keeps_its_sibling_this_period() {
     TOUCH_AT_CALL.store(4, Ordering::SeqCst);
     let run = run_now(&cleaner, &saved, "partial-sibling-run");
     TOUCH_AT_CALL.store(0, Ordering::SeqCst);
+    if !cfg!(unix) {
+        // Nothing is unlinked, so nothing stops part way and no sibling waits.
+        return assert_refused_by_platform(&run, &targets);
+    }
     let row = |name: &str| {
         run.items
             .iter()
@@ -3796,6 +3839,9 @@ fn a_wrapper_with_two_children_is_cleared_in_one_run() {
     let (_temp, cleaner, targets) = one_session_cleaner(&["target-wrap/t0", "target-wrap/t1"]);
     let saved = cleaner.state().unwrap().config;
     let run = run_now(&cleaner, &saved, "wrapper-run");
+    if !cfg!(unix) {
+        return assert_refused_by_platform(&run, &targets);
+    }
     let done = run.items.iter().filter(|i| i.status == "completed").count();
     assert_eq!(done, 2, "{:?}", run.items);
     assert!(targets.iter().all(|t| !t.exists()), "{:?}", run.items);
@@ -3816,6 +3862,10 @@ fn a_partly_removed_candidate_is_charged_and_the_next_one_meets_the_cap() {
     // re-judgement and 4 the re-check right before its first unlink.
     TOUCH_AT_CALL.store(4, Ordering::SeqCst);
     let run = run_now(&cleaner, &saved, "partial-run");
+    if !cfg!(unix) {
+        // Nothing is unlinked, so nothing is charged against the cap.
+        return assert_refused_by_platform(&run, &targets);
+    }
     let session_rows: Vec<_> = run
         .items
         .iter()

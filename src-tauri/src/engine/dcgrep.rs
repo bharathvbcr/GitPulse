@@ -875,6 +875,51 @@ mod tests {
         path
     }
 
+    /// A launcher that answers `health` with `json` after `delay_secs`, exits 1
+    /// for anything else, and writes `trace` whenever it starts. A shell script
+    /// on Unix; Windows runs no `#!` script, so there it is a batch file.
+    fn health_stub(dir: &Path, json: &str, delay_secs: u32, trace: Option<&Path>) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let trace = trace
+                .map(|path| format!("echo spawned > '{}'\n", path.display()))
+                .unwrap_or_default();
+            let delay = if delay_secs > 0 {
+                format!("  sleep {delay_secs}\n")
+            } else {
+                String::new()
+            };
+            write_exe(
+                dir,
+                "dcgrep",
+                &format!(
+                    "#!/bin/sh\n{trace}if [ \"$1\" = \"health\" ]; then\n{delay}  echo '{json}'\n  exit 0\nfi\nexit 1\n"
+                ),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let trace = trace
+                .map(|path| format!("echo spawned> \"{}\"\r\n", path.display()))
+                .unwrap_or_default();
+            // `ping -n N` waits N-1 seconds.
+            let delay = if delay_secs > 0 {
+                format!("  ping -n {} 127.0.0.1 >nul\r\n", delay_secs + 1)
+            } else {
+                String::new()
+            };
+            write_exe(
+                dir,
+                "dcgrep.cmd",
+                &format!(
+                    "@echo off\r\n{trace}if \"%1\"==\"health\" (\r\n{delay}  echo {json}\r\n  exit /b 0\r\n)\r\nexit /b 1\r\n"
+                ),
+            )
+        }
+    }
+
+    const FULL_HEALTH: &str = r#"{"ok":true,"searcher":"dc-grep","schema_version":1,"capabilities":{"fixed_strings":true,"include_hidden":true,"preserve_whitespace":true,"include_oversized":true,"include_symlinks":true,"precompose_unicode":true,"include_devcouncil":true,"ignore_dot_ignore":true,"include_git_tracked":true}}"#;
+
     #[test]
     fn installed_dcgrep_handles_search_with_zero_git_grep_and_list_uses_git_ls_files() {
         let _serial = env_serial();
@@ -1673,11 +1718,7 @@ mod tests {
         git_in(dir.path(), &["commit", "-m", "init"]);
 
         let stub_dir = TempDir::new().unwrap();
-        let slow_health = write_exe(
-            stub_dir.path(),
-            "dcgrep",
-            "#!/bin/sh\nif [ \"$1\" = \"health\" ]; then\n  sleep 1\n  echo '{\"ok\":true,\"searcher\":\"dc-grep\",\"schema_version\":1,\"capabilities\":{\"fixed_strings\":true,\"include_hidden\":true,\"preserve_whitespace\":true,\"include_oversized\":true,\"include_symlinks\":true,\"precompose_unicode\":true,\"include_devcouncil\":true,\"ignore_dot_ignore\":true,\"include_git_tracked\":true}}'\n  exit 0\nfi\nexit 1\n",
-        );
+        let slow_health = health_stub(stub_dir.path(), FULL_HEALTH, 1, None);
 
         let _binding = TestDcgrepBinding::bind_test_binary(&slow_health);
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -1732,14 +1773,7 @@ mod tests {
 
         let stub_dir = TempDir::new().unwrap();
         let marker = stub_dir.path().join("health_ran");
-        let stub_exe = write_exe(
-            stub_dir.path(),
-            "dcgrep",
-            &format!(
-                "#!/bin/sh\necho spawned > '{}'\nif [ \"$1\" = \"health\" ]; then\n  echo '{{\"ok\":true,\"searcher\":\"dc-grep\",\"schema_version\":1,\"capabilities\":{{\"fixed_strings\":true,\"include_hidden\":true,\"preserve_whitespace\":true,\"include_oversized\":true,\"include_symlinks\":true,\"precompose_unicode\":true,\"include_devcouncil\":true,\"ignore_dot_ignore\":true,\"include_git_tracked\":true}}}}'\n  exit 0\nfi\nexit 1\n",
-                marker.display()
-            ),
-        );
+        let stub_exe = health_stub(stub_dir.path(), FULL_HEALTH, 0, Some(&marker));
 
         struct ReleaseHolder(std::path::PathBuf);
         impl Drop for ReleaseHolder {
