@@ -4370,6 +4370,7 @@ pub(crate) mod tests {
                 split: Some(false),
                 rows: Some(24),
                 cols: Some(100),
+                agent: None,
             },
         )
         .expect("spawn child");

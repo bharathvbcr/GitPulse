@@ -175,5 +175,5 @@ export interface CloseChildrenResult {
  * the person may still want.
  */
 export function closeThreadChildren(threadKey: string): Promise<CloseChildrenResult> {
-  return invoke<CloseChildrenResult>("mavi_close_thread_children", { threadKey });
+  return invoke<CloseChildrenResult>("cmd_mavi_close_thread_children", { threadKey });
 }

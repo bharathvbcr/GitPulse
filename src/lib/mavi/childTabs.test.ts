@@ -119,7 +119,7 @@ describe("childTabs", () => {
 describe("closeThreadChildren", () => {
   it("sends the contract's command and argument name", async () => {
     await expect(closeThreadChildren(T)).resolves.toEqual({ closed: 2, skippedProtected: 1 });
-    expect(calls.invoke).toEqual([["mavi_close_thread_children", { threadKey: T }]]);
+    expect(calls.invoke).toEqual([["cmd_mavi_close_thread_children", { threadKey: T }]]);
   });
 });
 
