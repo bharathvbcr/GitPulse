@@ -144,6 +144,20 @@ pub struct StartRequest {
     /// A conversation to continue.
     #[serde(default)]
     resume: Option<String>,
+    /// The page's thread key (a UUID, stable across resumes). On a local start
+    /// it becomes the agent's orchestrate owner key.
+    #[serde(default)]
+    thread_key: Option<String>,
+}
+
+/// The owner key a local agent orchestrates as, from the page's thread key:
+/// `None` for a missing or non-UUID key, so only a stable thread identity is
+/// ever handed to the agent's `gitpulse-mcp`.
+fn owner_key_for(request: &StartRequest) -> Option<String> {
+    request
+        .thread_key
+        .as_deref()
+        .and_then(crate::terminal::orchestrate::mavi_owner_key)
 }
 
 fn claude_args(request: &StartRequest) -> Result<Vec<String>, String> {
@@ -215,6 +229,17 @@ fn command_for(program: &str, path: Option<std::ffi::OsString>) -> Command {
     ] {
         command.env_remove(name);
     }
+    // Nor may a GitPulse started from one of its own terminals hand the agent
+    // that terminal's id without its token (or the reverse), or an owner key
+    // of its own: the agent's identity is the one `start` sets, or none.
+    for name in [
+        crate::terminal::TERMINAL_SESSION_ENV,
+        crate::terminal::orchestrate::SESSION_TOKEN_ENV,
+        crate::alerts::bridge::SESSION_ENV,
+        crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
+    ] {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -249,6 +274,9 @@ fn start(
             let (program, path) = resolve("claude")?;
             let mut command = command_for(&program, path);
             command.args(&args).current_dir(&root_text);
+            if let Some(owner) = owner_key_for(&request) {
+                command.env(crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV, owner);
+            }
             (MaviTarget::Local { root: root_text }, command)
         }
         (None, Some(host)) => {
@@ -652,6 +680,44 @@ mod tests {
             acknowledged,
             model: None,
             resume: None,
+            thread_key: None,
+        }
+    }
+
+    #[test]
+    fn only_a_uuid_thread_key_names_an_owner() {
+        let key = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let mut req = request("ask", false);
+        assert_eq!(owner_key_for(&req), None);
+        req.thread_key = Some("t1795634163229abc".into());
+        assert_eq!(owner_key_for(&req), None);
+        req.thread_key = Some(key.into());
+        assert_eq!(owner_key_for(&req), Some(format!("ext-mavi-{key}")));
+        let parsed: StartRequest = serde_json::from_value(
+            serde_json::json!({ "repoPath": "/r", "mode": "ask", "threadKey": key }),
+        )
+        .expect("threadKey is accepted");
+        assert_eq!(parsed.thread_key.as_deref(), Some(key));
+    }
+
+    #[test]
+    fn the_agent_never_inherits_a_terminal_callers_credentials() {
+        // A GitPulse started from one of its own terminals carries that
+        // terminal's id and token; the Mavi agent must see neither half, nor a
+        // stale owner key from the environment GitPulse was started in.
+        let command = command_for("claude", None);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            crate::terminal::TERMINAL_SESSION_ENV,
+            crate::terminal::orchestrate::SESSION_TOKEN_ENV,
+            crate::alerts::bridge::SESSION_ENV,
+            crate::terminal::orchestrate::ORCHESTRATE_CALLER_ENV,
+        ] {
+            assert!(removed.iter().any(|r| r == name), "{name} is inherited: {removed:?}");
         }
     }
 

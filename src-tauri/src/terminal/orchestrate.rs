@@ -98,7 +98,7 @@ pub(crate) const MAVI_OWNER_PREFIX: &str = "ext-mavi-";
 /// Environment variable a host sets on an agent process so that agent's
 /// `gitpulse-mcp` / `gitpulse-hook` orchestrate as a stable external caller
 /// (today only `ext-mavi-<uuid>`) instead of the per-process `mcp-<pid>`.
-pub(crate) const ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
+pub const ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
 
 /// A canonical (lowercase, hyphenated, 36-byte) UUID, as `crypto.randomUUID`
 /// writes it. Anything else is not a Mavi thread key.
@@ -124,6 +124,40 @@ pub(crate) fn mavi_thread_of_owner(owner_key: &str) -> Option<&str> {
     owner_key
         .strip_prefix(MAVI_OWNER_PREFIX)
         .filter(|rest| is_canonical_uuid(rest))
+}
+
+/// The external caller id a process with no terminal credentials orchestrates
+/// as: the Mavi owner key its host put in [`ORCHESTRATE_CALLER_ENV`], or
+/// `fallback()` (the per-process `mcp-<pid>` / `ext-<ppid>`) when the variable
+/// is unset or blank.
+///
+/// A value that is not exactly `ext-mavi-<uuid>` is an error, never a quiet
+/// fallback: the caller would otherwise orchestrate under an owner the host
+/// did not name, and its children would be unreachable from the thread.
+///
+/// The key carries no secret. Any same-user process that sets the variable can
+/// act as that thread's orchestrator over its own children in a trusted
+/// repository; that is no wider than the `ext-*` / `mcp-*` keys any same-user
+/// process can already claim, and repository trust still gates every call.
+pub fn standalone_caller_id(fallback: impl FnOnce() -> String) -> Result<String, String> {
+    let raw = std::env::var(ORCHESTRATE_CALLER_ENV).ok();
+    standalone_caller_id_from(raw.as_deref(), fallback)
+}
+
+fn standalone_caller_id_from(
+    raw: Option<&str>,
+    fallback: impl FnOnce() -> String,
+) -> Result<String, String> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(fallback());
+    };
+    if mavi_thread_of_owner(value).is_some() {
+        return Ok(value.to_owned());
+    }
+    let shown: String = value.chars().take(64).collect();
+    Err(format!(
+        "{ORCHESTRATE_CALLER_ENV} must be ext-mavi-<thread uuid> (got {shown:?}); unset it to orchestrate as a standalone caller"
+    ))
 }
 
 /// Allowed child launchers for `Spawn`.

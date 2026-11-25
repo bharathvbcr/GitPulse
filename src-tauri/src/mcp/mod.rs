@@ -3981,7 +3981,12 @@ fn resolve_orchestrate_context(
 
     match (sid, tok) {
         (Some(sid), Some(tok)) => Ok((repo, Some(sid), Some(tok), None)),
-        (None, None) => Ok((repo, None, None, Some(format!("mcp-{}", std::process::id())))),
+        (None, None) => {
+            let external = crate::terminal::orchestrate::standalone_caller_id(|| {
+                format!("mcp-{}", std::process::id())
+            })?;
+            Ok((repo, None, None, Some(external)))
+        }
         (Some(_), None) => Err(format!(
             "partial terminal caller credentials: caller_session_id is set without {} / caller_token (provide both, or omit both to use standalone mcp-<pid> orchestration)",
             crate::terminal::orchestrate::SESSION_TOKEN_ENV
@@ -14047,3 +14052,6 @@ mod ledger_brief_adv_tests;
 
 #[cfg(test)]
 mod a2a_tests;
+
+#[cfg(test)]
+mod orchestrate_identity_tests;
