@@ -2711,6 +2711,312 @@ done
         assert_ne!(judged.verdict.rule, GIT_C_UNRESOLVED, "{judged:?}");
         assert!(!judged.verdict.blocks(), "{judged:?}");
     }
+
+    /// Lane C adversarial coverage: a command that names the sibling worktree
+    /// is "covered" when it is either judged against that sibling's scope
+    /// ([sibling_git_clauses]) or refused as an unresolved -C.
+    #[cfg(unix)]
+    fn lane_c_covered(fixture: &SiblingFixture, template: &str) -> (bool, bool, String) {
+        let command = template.replace("{R}", &fixture.rel_wt_b);
+        let refused = unresolved_git_c(&command).is_some();
+        let judged = !sibling_git_clauses(Path::new(&fixture.main_path), &command).is_empty();
+        (refused, judged, command)
+    }
+
+    #[cfg(unix)]
+    fn lane_c_assert_covered(templates: &[&str]) {
+        let fixture = sibling_fixture();
+        for template in templates {
+            let (refused, judged, command) = lane_c_covered(&fixture, template);
+            assert!(
+                refused || judged,
+                "{command:?} writes into the sibling and is neither judged against it nor refused"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_wrapped_and_odd_spellings_are_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git -C../{R} checkout -- x",
+            "env -- git -C ../{R} checkout -- x",
+            "command -p git -C ../{R} checkout -- x",
+            "sudo -- git -C ../{R} checkout -- x",
+            "nice -n -5 git -C ../{R} checkout -- x",
+            "/usr/bin/env git -C ../{R} checkout -- x",
+            "\\git -C ../{R} checkout -- x",
+            "\"git\" -C ../{R} checkout -- x",
+            "g\\it -C ../{R} checkout -- x",
+            "strace git -C ../{R} checkout -- x",
+            "bash -xc 'git -C ../{R} checkout -- x'",
+            "bash --norc -c 'git -C ../{R} checkout -- x'",
+            "true; env git -C ../{R} x",
+            "a && env git -C ../{R} x",
+            "a || env git -C ../{R} x",
+            "(env git -C ../{R} x)",
+            "{ env git -C ../{R} x; }",
+            "true\nenv git -C ../{R} x",
+            "cat f | env git -C ../{R} x",
+            "bash -c \"bash -c \\\"bash -c 'bash -c \\\\\\\"bash -c \\\\\\\\\\\\\\\"git -C ../{R} x\\\\\\\\\\\\\\\"\\\\\\\"'\\\"\"",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_a_lookalike_git_is_not_git_and_nothing_panics() {
+        let fixture = sibling_fixture();
+        let (_, judged, command) = lane_c_covered(&fixture, "g\u{456}t -C ../{R} checkout -- x");
+        assert!(!judged, "{command:?}");
+    }
+
+    #[test]
+    fn lane_c_routine_read_only_commands_are_not_refused() {
+        for command in [
+            "rg -n \"git -C\" src",
+            "git log -C",
+            "git grep -n \"git -C\"",
+            "bash -c 'rg \"git -C\" src'",
+            "grep -C3 git f",
+            "git -C . status",
+            "env git status",
+            "make -C sub git",
+            "make -C sub && git status",
+            "tar -C dir -xf x.tar; git status",
+            "bash -c 'echo hi'",
+            "echo $(git log -C)",
+        ] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: a git-named argument of a wrapper (sudo -u git, env -u git) is taken as the git word, so the real git -C is neither judged nor refused"]
+    fn lane_c_git_named_wrapper_argument_does_not_hide_the_real_git() {
+        lane_c_assert_covered(&[
+            "sudo -u git git -C ../{R} checkout -- x",
+            "env -u git git -C ../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: an unknown wrapper followed by a quoted git or a quoted -C (strace \"git\" -C, strace git \"-C\") is skipped by the unquoted-only reader"]
+    fn lane_c_quoted_git_or_dash_c_behind_an_unknown_wrapper_is_refused() {
+        lane_c_assert_covered(&[
+            "strace \"git\" -C ../{R} checkout -- x",
+            "strace git \"-C\" ../{R} checkout -- x",
+            "strace \\git -C ../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: an expanding command word ($(which git), GIT-default expansion, $GIT) followed by -C is neither located as git nor refused (pre-existing: main never judged it either)"]
+    fn lane_c_expanding_command_word_with_dash_c_is_refused() {
+        lane_c_assert_covered(&[
+            "$(which git) -C ../{R} checkout -- x",
+            "${GIT:-git} -C ../{R} checkout -- x",
+            "$GIT -C ../{R} checkout -- x",
+            "\"$GIT\" -C ../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: git glued to a subshell or substitution opener ((git -C, $(git -C, x=$(git -C, backticks) is not in command position for either reader (pre-existing: main never judged it either)"]
+    fn lane_c_git_glued_to_a_subshell_or_substitution_is_refused() {
+        lane_c_assert_covered(&[
+            "(git -C ../{R} checkout -- x)",
+            "$(git -C ../{R} checkout -- x)",
+            "x=$(git -C ../{R} checkout -- x)",
+            "echo `git -C ../{R} checkout -- x`",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: bash -c -- '<script>' reads \"--\" as the script, so the real script is never inspected"]
+    fn lane_c_double_dash_between_dash_c_and_the_script_is_read() {
+        lane_c_assert_covered(&["bash -c -- 'git -C ../{R} checkout -- x'"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: -C naming a subdirectory of the sibling worktree does not resolve to a registered worktree root, so it is neither judged against the sibling nor refused (pre-existing: same resolution on main)"]
+    fn lane_c_dash_c_into_a_sibling_subdirectory_is_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git -C ../{R}/src checkout -- x",
+            "env git -C ../{R}/src checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: a located git whose -C value expands (tilde, variable, glob) is skipped by sibling_git_clauses and is not refused (pre-existing: same on main)"]
+    fn lane_c_dash_c_value_that_expands_is_refused() {
+        lane_c_assert_covered(&[
+            "git -C ~/{R} checkout -- x",
+            "git -C \"$WT\" checkout -- x",
+            "git -C ../wt-* checkout -- x",
+            "env git -C $(pwd)/../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: --git-dir/--work-tree, GIT_DIR/GIT_WORK_TREE and -c core.worktree aim git at the sibling with no -C; parse_git_invocation skips the values and nothing judges them (pre-existing: main skips them identically)"]
+    fn lane_c_git_dir_and_work_tree_spellings_are_judged_or_refused() {
+        lane_c_assert_covered(&[
+            "git --git-dir=../{R}/.git --work-tree=../{R} checkout -- x",
+            "git --work-tree=../{R} checkout -- x",
+            "GIT_DIR=../{R}/.git GIT_WORK_TREE=../{R} git checkout -- x",
+            "git -c core.worktree=../{R} checkout -- x",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: a script the evaluator reads from stdin or builds by expansion (here-string, pipe into sh, bash -c with a command substitution) is not inspectable and is not refused (inherent; main never read scripts)"]
+    fn lane_c_uninspectable_scripts_are_refused() {
+        lane_c_assert_covered(&[
+            "bash <<<'git -C ../{R} x'",
+            "echo 'git -C ../{R} x' | sh",
+            "sh -c \"$(printf 'git -C ../{R} x')\"",
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "lane C attack: changing directory (cd, env -C, bash -c 'cd … && git') moves git into the sibling with no -C; residual gap, identical on main"]
+    fn lane_c_directory_change_into_a_sibling_is_refused() {
+        lane_c_assert_covered(&[
+            "bash -c 'cd ../{R} && git checkout -- x'",
+            "cd ../{R} && git checkout -- x",
+            "env -C ../{R} git checkout -- x",
+        ]);
+    }
+
+    #[test]
+    #[ignore = "lane C attack: false refusal; an unquoted git then -C as arguments of a search (grep -n git -C3 f, grep -rn git -C 3 src) is refused as git.c_unresolved (the rg \"git\" -C 3 form is only allowed because git is quoted)"]
+    fn lane_c_grep_with_unquoted_git_pattern_and_context_flag_is_not_refused() {
+        for command in [
+            "grep -n git -C3 f",
+            "grep -rn git -C 3 src",
+            "rg -n git -C2 src",
+        ] {
+            assert!(unresolved_git_c(command).is_none(), "{command:?}");
+        }
+    }
+
+    /// Deterministic fuzz: shell-ish strings built from the attack tokens,
+    /// quotes and unicode must never panic any reader, and the readers
+    /// terminate (the loops are bounded by token count and MAX_SCRIPT_DEPTH).
+    #[cfg(unix)]
+    #[test]
+    fn lane_c_fuzz_readers_never_panic() {
+        let fixture = sibling_fixture();
+        let main = Path::new(&fixture.main_path);
+        let tokens: Vec<String> = [
+            "git",
+            "-C",
+            "-C../x",
+            "../{R}",
+            "env",
+            "sudo",
+            "nice",
+            "-n",
+            "5",
+            "--",
+            "bash",
+            "-c",
+            "-lc",
+            "sh",
+            "eval",
+            "xargs",
+            "find",
+            "-exec",
+            "checkout",
+            "x",
+            ";",
+            "&&",
+            "||",
+            "|",
+            "(",
+            ")",
+            "{",
+            "}",
+            "'",
+            "\"",
+            "\\",
+            "$",
+            "$(",
+            "`",
+            "$'",
+            "<<<",
+            ">",
+            "2>&1",
+            "&",
+            "\n",
+            " ",
+            "g\u{456}t",
+            "日本",
+            "é",
+            "git -C ../{R} x",
+            "'git -C ../{R} x'",
+            "\"bash -c 'git -C y'\"",
+            "VAR=1",
+            "--git-dir=../{R}",
+            "--work-tree",
+            "~",
+            "*",
+            "-c",
+            "core.worktree=1",
+            "\u{0}",
+            "\r",
+        ]
+        .iter()
+        .map(|t| t.replace("{R}", &fixture.rel_wt_b))
+        .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let started = std::time::Instant::now();
+        for round in 0..600 {
+            let len = 1 + (next() % 14) as usize;
+            let mut command = String::new();
+            for _ in 0..len {
+                command.push_str(&tokens[(next() % tokens.len() as u64) as usize]);
+                if next() % 3 != 0 {
+                    command.push(' ');
+                }
+            }
+            let _ = unresolved_git_c(&command);
+            let _ = scan_shell_tokens(&command).len();
+            if round % 8 == 0 {
+                let _ = sibling_git_clauses(main, &command);
+                let _ = has_divergent_relative_git_c(main, main, &command);
+            }
+        }
+        // A very long single clause and a deep nest stay finite.
+        let long = format!("env {}git -C x", "nice ".repeat(5_000));
+        let _ = unresolved_git_c(&long);
+        let _ = sibling_git_clauses(main, &long);
+        let mut nested = "git -C ../x y".to_string();
+        for _ in 0..6 {
+            nested = format!("bash -c '{}'", nested.replace('\'', "'\\''"));
+        }
+        assert!(
+            unresolved_git_c(&nested).is_some(),
+            "a deep nest is refused, not passed"
+        );
+        eprintln!("lane C fuzz finished in {:?}", started.elapsed());
+    }
 }
 
 #[cfg(test)]
