@@ -164,6 +164,17 @@ fn count_action(repo: &str, action: &str) -> i64 {
     .unwrap()
 }
 
+/// The earlier locations a pass reported, spelled as git takes them. The
+/// ledger stores (and so reports) a checkout in the spelling its repository
+/// identity uses, `\\?\C:\...` on Windows, where the fixtures spell the same
+/// directory `C:\...`; the identity is unchanged, only the text is compared.
+fn moved_from(out: &CatchUp) -> Vec<String> {
+    out.reanchored_from
+        .iter()
+        .map(|from| crate::engine::process::plain_path_text(from))
+        .collect()
+}
+
 fn assert_refused(out: &CatchUp, because: &str) {
     assert_eq!(out.recorded, 0, "a refused pass records nothing: {out:?}");
     assert!(out.reanchored_from.is_empty(), "{out:?}");
@@ -193,7 +204,7 @@ fn a_renamed_repository_keeps_recording_with_no_loss_and_no_duplicate() {
         "the call made after the move is recorded: {out:?}"
     );
     assert_eq!(
-        out.reanchored_from,
+        moved_from(&out),
         vec![old.clone()],
         "the move is reported: {out:?}"
     );
@@ -306,7 +317,7 @@ fn a_ledger_from_a_different_repository_is_still_refused() {
 /// Threat: a copy of a clone's ledger, with the clone still there, is not a
 /// move: it would attribute that clone's agent activity to this one.
 #[test]
-fn a_ledger_copied_from_a_live_clone_is_refused_until_the_source_is_gone() {
+fn a_ledger_copied_from_a_live_clone_is_refused() {
     let parent = tempfile::tempdir().unwrap();
     let upstream = upstream_in(parent.path());
     let first = clone_at(parent.path(), &upstream, "first");
@@ -320,13 +331,29 @@ fn a_ledger_copied_from_a_live_clone_is_refused_until_the_source_is_gone() {
     let out = corpus.pass(&second);
     assert_refused(&out, "copy or another clone");
     assert_eq!(count_action(&second, "ledger.reanchor"), 0);
+}
 
-    // Two clones of one upstream have the same root commits and remotes, and a
-    // ledger copy carries the same lineage UUID, so none of those tell them
-    // apart. What does is the directory the ledger was anchored in: the clone
-    // is another one, so the carried ledger stays refused once the source is gone.
+/// Two clones of one upstream have the same root commits and remotes, and a
+/// ledger copy carries the same lineage UUID, so none of those tell them
+/// apart. What does is the directory the ledger was anchored in: the clone is
+/// another one, so the carried ledger stays refused once the source is gone.
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
+)]
+fn a_ledger_copied_from_a_clone_stays_refused_once_the_source_is_gone() {
+    let parent = tempfile::tempdir().unwrap();
+    let upstream = upstream_in(parent.path());
+    let first = clone_at(parent.path(), &upstream, "first");
+    let second = clone_at(parent.path(), &upstream, "second");
+    let mut corpus = Corpus::new();
+    corpus.edit(&first);
+    assert_eq!(corpus.pass(&first).recorded, 1);
+    carry_ledger(&first, &second);
+
     remove_repo(&first);
-    ledger::forget_identity_state(&second);
+    corpus.edit(&second);
     let out = corpus.pass(&second);
     assert_refused(&out, "not the directory the ledger was anchored in");
     assert_eq!(count_action(&second, "ledger.reanchor"), 0);
@@ -437,7 +464,7 @@ fn a_row_naming_an_unlisted_path_after_a_reanchor_is_foreign() {
     corpus.pass(&old);
     let new = mv(&old, &canon(parent.path()).join("new"));
     corpus.edit(&new);
-    assert_eq!(corpus.pass(&new).reanchored_from, vec![old]);
+    assert_eq!(moved_from(&corpus.pass(&new)), vec![old]);
     assert!(ledger::tail(&new, 0, 1000).is_ok());
 
     let conn = rusqlite::Connection::open(ledger::ledger_path(&new)).unwrap();
@@ -469,7 +496,7 @@ fn moving_back_and_moving_twice_are_each_reported_once() {
     corpus.edit(&two);
     let out = corpus.pass(&two);
     assert_eq!(
-        (out.recorded, out.reanchored_from.clone()),
+        (out.recorded, moved_from(&out)),
         (1, vec![one.clone()]),
         "{out:?}"
     );
@@ -478,7 +505,7 @@ fn moving_back_and_moving_twice_are_each_reported_once() {
     corpus.edit(&three);
     let out = corpus.pass(&three);
     assert_eq!(out.recorded, 1, "{out:?}");
-    let mut listed = out.reanchored_from.clone();
+    let mut listed = moved_from(&out);
     listed.sort();
     let mut expected = vec![one.clone(), two.clone()];
     expected.sort();
@@ -490,7 +517,7 @@ fn moving_back_and_moving_twice_are_each_reported_once() {
     corpus.edit(&back);
     let out = corpus.pass(&back);
     assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
-    let mut listed = out.reanchored_from.clone();
+    let mut listed = moved_from(&out);
     listed.sort();
     let mut expected = vec![three, two];
     expected.sort();
@@ -525,7 +552,7 @@ fn a_symlink_left_at_the_old_path_does_not_make_it_look_occupied() {
     let out = corpus.pass(&old);
     assert_eq!(out.error, "", "{out:?}");
     assert_eq!(out.recorded, 1, "{out:?}");
-    assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+    assert_eq!(moved_from(&out), vec![old], "{out:?}");
 }
 
 /// `cp -R` with the original still in place: the original keeps its ledger and
@@ -592,7 +619,7 @@ fn a_remote_added_after_the_move_is_fine_and_all_replaced_is_not() {
         corpus.edit(&new);
         let out = corpus.pass(&new);
         if accepted {
-            assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+            assert_eq!(moved_from(&out), vec![old], "{out:?}");
             assert_eq!(out.recorded, 1, "{out:?}");
         } else {
             assert_refused(&out, "remotes");
@@ -629,7 +656,7 @@ fn a_linked_worktree_of_a_moved_repository_records_into_the_taken_over_ledger() 
     let out = with_transcript_root(corpus.dir.path(), || ingest_transcripts_into(&new, &linked));
     assert_eq!(out.error, "", "{out:?}");
     assert_eq!(out.recorded, 1, "{out:?}");
-    assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+    assert_eq!(moved_from(&out), vec![old], "{out:?}");
     let rows = ledger::tail(&new, 0, 1000).unwrap();
     let row = rows
         .iter()
@@ -704,6 +731,10 @@ fn shallow_clone_at(parent: &Path, name: &str) -> String {
 /// from a root added by an orphan branch; the directory the ledger was anchored
 /// in can, and the merging repository is another directory.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
+)]
 fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     let parent = tempfile::tempdir().unwrap();
     let a = repo_at(parent.path(), "a", "alpha");
@@ -745,6 +776,10 @@ fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
 /// the pre-move history stays, the adoption is an audit row, and recording
 /// goes on.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "an anchor has no site on Windows (ledger::anchor::site_of), so a copied ledger is taken over once its source is gone"
+)]
 fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
     let parent = tempfile::tempdir().unwrap();
     let old = repo_at(parent.path(), "before", "seed");
@@ -814,7 +849,7 @@ fn a_renamed_repository_that_grew_an_orphan_root_keeps_its_ledger() {
     let new = mv(&old, &canon(parent.path()).join("renamed"));
     corpus.edit(&new);
     let out = corpus.pass(&new);
-    assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+    assert_eq!(moved_from(&out), vec![old], "{out:?}");
     assert_eq!(out.error, "", "{out:?}");
 }
 
@@ -907,7 +942,7 @@ fn a_remote_with_a_credential_in_it_still_identifies_a_moved_repository() {
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
     assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
-    assert_eq!(out.reanchored_from, vec![repo.clone()], "{out:?}");
+    assert_eq!(moved_from(&out), vec![repo.clone()], "{out:?}");
 
     let other = repo_at(parent.path(), "other", "seed");
     git_in(
@@ -973,7 +1008,7 @@ fn a_rewritten_root_without_a_move_keeps_recording() {
     let moved = mv(&repo, &canon(parent.path()).join("moved"));
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
-    assert_eq!(out.reanchored_from, vec![repo], "{out:?}");
+    assert_eq!(moved_from(&out), vec![repo], "{out:?}");
 }
 
 /// A shallow repository that moves is the same repository; one unshallowed in
@@ -990,7 +1025,7 @@ fn a_moved_shallow_repository_is_taken_over_unless_it_was_unshallowed_too() {
     let moved = mv(&plain, &canon(parent.path()).join("plain-moved"));
     corpus.edit(&moved);
     let out = corpus.pass(&moved);
-    assert_eq!(out.reanchored_from, vec![plain], "{out:?}");
+    assert_eq!(moved_from(&out), vec![plain], "{out:?}");
 
     let deep = shallow_clone_at(parent.path(), "deep");
     corpus.edit(&deep);
