@@ -977,24 +977,44 @@ fn admitted_rev_parse_is_attributed_to_the_scope_it_ran_under() {
 
 #[test]
 fn spawn_rate_cap_stops_a_burst_from_becoming_a_sustained_storm() {
-    let gate = super::SpawnGate::with_rate(8, 4, 4);
+    use super::clock::{Clock, FakeClock};
+    // At 4/s one token refills every 250 ms. On the wall clock the two 80 ms
+    // refusals below, plus whatever a loaded runner adds between them, could
+    // reach that refill, and the gate then rightly admitted the spawn the test
+    // expected it to refuse (macOS CI, 8112e2aac). The stepping clock moves only
+    // by the time each wait asks for, so the window is exactly 160 ms.
+    let start = std::time::Instant::now();
+    let clock = Arc::new(FakeClock::stepping(start));
+    let gate = super::SpawnGate::with_clock(8, 4, 4, clock.clone());
     let mut held = Vec::new();
     for _ in 0..4 {
         held.push(
-            gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(200))
+            gate.acquire(clock.now() + std::time::Duration::from_millis(200))
                 .expect("burst slot"),
         );
     }
     assert!(
-        gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+        gate.acquire(clock.now() + std::time::Duration::from_millis(80))
             .is_none(),
         "the fifth spawn inside the burst must not start"
     );
     drop(held);
     assert!(
-        gate.acquire(std::time::Instant::now() + std::time::Duration::from_millis(80))
+        gate.acquire(clock.now() + std::time::Duration::from_millis(80))
             .is_none(),
         "a free concurrency slot must not bypass the per-second cap"
+    );
+    assert!(
+        clock.now().saturating_duration_since(start) < std::time::Duration::from_millis(250),
+        "the refusals were judged inside one refill interval"
+    );
+    // Control: the refusals were the rate, not a gate that admits nothing.
+    // Once a refill interval has passed, the same ask is admitted.
+    clock.advance(std::time::Duration::from_millis(250));
+    assert!(
+        gate.acquire(clock.now() + std::time::Duration::from_millis(80))
+            .is_some(),
+        "a refilled token admits the next spawn"
     );
     let (burst, rate) = super::production_spawn_rate();
     assert!(
