@@ -555,5 +555,6 @@ site | tests/terminal_session_survival.rs | settled_count | 0 | bounded-poll
 site | tests/terminal_session_survival.rs | wait_until | 0 | bounded-poll
 
 # src/sysload/relief_tests.rs
-site | src/sysload/relief_tests.rs | Fake::set_background | 0 | bounded-poll
+# The kernel applies SIGSTOP/SIGCONT to a real child asynchronously and offers no
+# event for it short of consuming the wait statuses `Child::wait` owns, so `ps` is polled.
 site | src/sysload/relief_tests.rs | Sleeper::wait_for | 0 | bounded-poll

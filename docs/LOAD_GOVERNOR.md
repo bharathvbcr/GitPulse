@@ -943,7 +943,16 @@ first 5, by at least 256 MiB of swap or 1 percentage point of the segment limit:
 `SWAP_RISE_BYTES`, `SEGMENT_RISE_POINTS`), **or pinned at the edge for the whole
 window**: the kernel level Critical, compressor thrash, or segments at 95 % of
 their limit (`PINNED_SEGMENT_PCT`), where flat is still failing. A freeze begun
-that way is not ended by "flat" while it stays pinned. **Swap level never counts
+that way is not ended by "flat" while it stays pinned. **Pinned alone may start
+one freeze per Severe episode**: a host pinned by something unrelated (the kernel
+at Critical, segments at 95 %) would otherwise have the same builds frozen again
+about a minute after every ten-minute cap, for ever. After any resume of such a
+freeze (the cap, flat, the watchdog) rung B needs a fresh rise (the rule above,
+over a new 60 s window) or the tier leaving Severe and coming back; and a process
+a freeze stopped is never the root of another freeze in the same episode (a
+person's resume without hold-off clears that). A pinned run is forgotten only
+after three consecutive samples below the edge (`PINNED_BREAK_SAMPLES`), so a
+kernel level that flickers does not restart the minute. **Swap level never counts
 for either**: a high but flat swap is not a reason. Five consecutive samples
 below Severe end a Severe run; one dip does not restart the minute. An unreadable
 swap or segment reading never starts a freeze and never holds one.
@@ -1041,9 +1050,30 @@ of its own, and a watchdog thread continues what is past the cap plus 60 s, or
 everything when the tick has not advanced for 60 s (a hung sampler, or one that
 lost the writer election with a freeze standing). The teardown waits at most 2 s
 for a tick that is mid-action, then continues from that copy and leaves the
-journal for the next start. A freeze a live GitPulse left past its cap and grace
-is continued by the sampler that wins the next election; the rest of that
-journal stays the writer's.
+journal for the next start. A journal a *live* GitPulse wrote stays that
+GitPulse's, whatever its age: its own watchdog continues what it stopped, and a
+second GitPulse that guessed at the entries by age could continue a process the
+user had paused.
+
+**Only what the relief stopped is the relief's to continue.** Immediately
+before each stop the process's state is read from the OS (`SSTOP` on macOS,
+`T` on Linux), and again just before the signal. A process that is already
+stopped (a Ctrl-Z job, a debugger) is somebody else's: it is left alone, is
+not journaled, and no resume path (the cap, a person's request, the watchdog,
+the shutdown, a replay) ever continues it. A subtree whose first process is
+stopped already, or whose state cannot be read, is not frozen at all. Every
+journal entry carries `was_running: true`, set only after that read; a replay
+or a request acts only on such entries, so an entry without it (an older
+writer's) is never continued. The watchdog's copy takes a process only after
+its stop was delivered, so a tick that hangs *between* a delivered stop and
+that one append leaves the journal (and the shutdown replay) as the only record.
+
+**When the watchdog continued a freeze.** It records what it continued, and the
+next tick's first step drops those subtrees from the relief's own record, the
+journal and the snapshot (`last_action` says the watchdog continued it), and
+holds rung B off as after a cap. A late child of a subtree whose first process
+reads as running is never stopped, whoever continued it. If the watchdog thread
+could not start, that is a `failures` entry, not only a log line.
 
 ### Slowing has one owner
 
@@ -1076,7 +1106,11 @@ their pids and their count, and the cap hits. `host-load.v1` is unchanged.
 subtree from any thread, through the journal and `signal_process` like every
 other resume, returns each pid's success or failure, and with `hold_off_episode`
 keeps the relief from freezing again until the memory tier has dropped below
-Severe. The `supervisor` field of the host-load settings (`cmd_host_load_settings`
+Severe. It waits at most 2 s for the action lock and then answers
+`busy: true` having done nothing; the request consumer (the sampler's own tick)
+keeps a request that found it busy and tries again each tick until the
+request's two-minute time to live is up, and then records that it was not
+carried out. The `supervisor` field of the host-load settings (`cmd_host_load_settings`
 and its save) carries the mode over IPC; it is stored only as
 `host_load_supervisor`, never inside `host_load`.
 
@@ -1113,9 +1147,16 @@ next. A slowed process that has left the scanned trees (its agent ended and it
 became launchd's child) is **put back** before it is forgotten, and a process
 that is gone leaves the ledger, the cap and the journal; the children that
 inherited the background from a slowed parent after the last pass are put back
-with it (they read back as in the background and are not the steward's). A
-process the OS refused once is not asked again until the slowing ends. Those
-inheritors are not journaled, so a crash restores only what the journal lists.
+with it. A child counts as an inheritor only if it started after the pass that
+slowed its ancestor read the process table, it is not the steward's, and it is
+not under a process the steward owns; one that was already there and in the
+background was put there by something else, and stays. Residual: a descendant
+born after the slowing that put *itself* in the background is put back with
+the rest. A process the OS refused once is not asked again until the slowing
+ends. Inheritors are not journaled by name, but the journal's stamps are enough
+for a best-effort, bounded sweep (one read of the process table, at most 256
+restores) at shutdown and at a startup replay, so a crash does not leave them
+in the background either.
 
 ### Not verified
 

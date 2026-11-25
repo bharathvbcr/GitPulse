@@ -2138,6 +2138,37 @@ pub(crate) fn argv_of_pid(pid: i32) -> Option<Vec<String>> {
     os::argv_sized(pid)
 }
 
+/// Whether `pid` (still the process that started at `start_us`) is stopped by
+/// a signal now (`SSTOP` on macOS, state `T` on Linux). `Err` carries "no
+/// longer running" or "recycled" for a process that ended or is another one
+/// now, and any other reason it could not be read: a caller that is about to
+/// signal a process must not take an unreadable state for a running one.
+pub(crate) fn is_stopped(pid: i32, start_us: u64) -> Result<bool, String> {
+    if pid <= 1 {
+        return Err("refused to read the state of a reserved process".into());
+    }
+    let (started, stopped) = os::state(pid)?;
+    if started != start_us {
+        return Err("pid was recycled by a newer process".into());
+    }
+    Ok(stopped)
+}
+
+/// Every process as `(pid, ppid, start_us)`, at most `limit` of them, for a
+/// caller that walks descendants once (a shutdown that looks for what
+/// inherited a background priority). Empty when the platform cannot list.
+pub(crate) fn process_table(limit: usize) -> Vec<(i32, i32, u64)> {
+    let mut pids = Vec::new();
+    if os::list_pids(&mut pids).is_err() {
+        return Vec::new();
+    }
+    pids.into_iter()
+        .filter(|&pid| pid > 1)
+        .take(limit)
+        .filter_map(|pid| os::pid_ppid_start(pid).map(|(ppid, start_us)| (pid, ppid, start_us)))
+        .collect()
+}
+
 /// Places (`enable = true`) or restores (`enable = false`) a live current-user
 /// process in OS background scheduler / I/O throttle after re-verifying both
 /// `pid` and `start_us` against the live process table.
@@ -3405,6 +3436,27 @@ mod os {
         Ok(unsafe { info.assume_init() })
     }
 
+    /// `(start_us, stopped)` of `pid`, from `PROC_PIDTBSDINFO`'s status. A
+    /// process that ended (or is a zombie) is "no longer running"; one the OS
+    /// will not describe (another user's) is an error, never "running".
+    pub(super) fn state(pid: i32) -> Result<(u64, bool), String> {
+        match bsdinfo(pid) {
+            Ok(info) if info.pbi_status == libc::SZOMB => {
+                Err("process is no longer running".into())
+            }
+            Ok(info) => Ok((
+                info.pbi_start_tvsec
+                    .saturating_mul(1_000_000)
+                    .saturating_add(info.pbi_start_tvusec),
+                info.pbi_status == libc::SSTOP,
+            )),
+            Err(Some(libc::ESRCH)) => Err("process is no longer running".into()),
+            Err(errno) => Err(format!(
+                "the state of process {pid} could not be read (errno {errno:?})"
+            )),
+        }
+    }
+
     fn c_name(raw: &[libc::c_char]) -> String {
         let bytes: Vec<u8> = raw
             .iter()
@@ -4089,6 +4141,8 @@ mod os {
         cpu_ticks: u64,
         start_ticks: u64,
         zombie: bool,
+        /// Stopped by a signal (`T`) or by a tracer (`t`).
+        stopped: bool,
         /// `PF_KTHREAD` is set: a kernel thread, not a user process.
         kernel_thread: bool,
     }
@@ -4104,6 +4158,7 @@ mod os {
         Some(Stat {
             name,
             zombie: fields.first() == Some(&"Z"),
+            stopped: matches!(fields.first(), Some(&"T") | Some(&"t")),
             kernel_thread: field(6).is_some_and(|flags| flags & super::PF_KTHREAD != 0),
             ppid: field(1).and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             cpu_ticks: field(11)?.saturating_add(field(12)?),
@@ -4345,6 +4400,24 @@ mod os {
         let boot = boot_us();
         let start_us = boot.saturating_add(st.start_ticks.saturating_mul(1_000_000) / ticks);
         Some((st.ppid, start_us))
+    }
+
+    /// `(start_us, stopped)` of `pid`; an error says whether it ended or its
+    /// state could not be read.
+    pub(super) fn state(pid: i32) -> Result<(u64, bool), String> {
+        let Some(st) = stat(pid) else {
+            return Err(if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                format!("the state of process {pid} could not be read")
+            } else {
+                "process is no longer running".into()
+            });
+        };
+        if st.zombie {
+            return Err("process is no longer running".into());
+        }
+        let start_us = boot_us()
+            .saturating_add(st.start_ticks.saturating_mul(1_000_000) / clock_ticks().max(1));
+        Ok((start_us, st.stopped))
     }
 
     pub(super) struct OsSource {
@@ -4617,6 +4690,10 @@ mod os {
 
     pub(super) fn pid_ppid_start(_pid: i32) -> Option<(i32, u64)> {
         None
+    }
+
+    pub(super) fn state(_pid: i32) -> Result<(u64, bool), String> {
+        Err("process state is not readable on this platform".into())
     }
 
     pub(crate) fn read_use(_pid: i32, _buf: &mut Vec<u8>) -> Option<super::ProcessUse> {

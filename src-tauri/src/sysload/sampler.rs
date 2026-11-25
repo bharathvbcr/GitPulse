@@ -1724,6 +1724,12 @@ mod tests {
             fn is_background(&self, _: i32, _: u64) -> Option<bool> {
                 None
             }
+            fn is_stopped(&self, _: i32, _: u64) -> Result<bool, String> {
+                Err("this test never reads a process state".into())
+            }
+            fn process_table(&self) -> Vec<(i32, i32, u64)> {
+                Vec::new()
+            }
         }
         struct Blind;
         impl Probe for Blind {

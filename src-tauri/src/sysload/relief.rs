@@ -216,6 +216,15 @@ pub const PINNED_SEGMENT_PCT: f64 = 95.0;
 const MAX_SLOW_PER_PASS: usize = 256;
 /// Most per-process records (environment markers, argv) kept across ticks.
 const MAX_MARKS: usize = 4096;
+/// The most processes a replay's one look at the process table reads.
+const MAX_TABLE_PROCESSES: usize = 16_384;
+/// The most processes one replay restores by walking descendants.
+const MAX_SWEPT: usize = 256;
+/// The longest a person's resume waits for the action lock before it answers
+/// "busy" (the request is kept and tried again on the next tick).
+const ACT_WAIT: Duration = Duration::from_secs(2);
+/// Consecutive samples below the edge before a pinned run is forgotten.
+pub const PINNED_BREAK_SAMPLES: u32 = 3;
 
 /// Names of the shells an agent runs commands through.
 const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"];
@@ -284,6 +293,11 @@ pub enum ResumeReason {
     /// The build-lease board stopped refusing new builds: a frozen build that
     /// held a slot goes on at once.
     LeaseOpened,
+    /// The watchdog continued it because the sampler stopped ticking (or its
+    /// freeze outlived the cap and the grace).
+    Watchdog,
+    /// Something else continued the subtree's first process.
+    Continued,
 }
 
 impl ResumeReason {
@@ -296,6 +310,8 @@ impl ResumeReason {
             Self::Gone => "the subtree's process ended",
             Self::Shutdown => "GitPulse stopped",
             Self::LeaseOpened => "the build lease board is taking new builds again",
+            Self::Watchdog => "the watchdog continued it when the sampler stopped ticking",
+            Self::Continued => "something else continued it",
         }
     }
 }
@@ -339,14 +355,30 @@ pub(crate) struct Trigger {
     slow_down: u32,
     severe_run: u32,
     calm_run: u32,
-    /// Consecutive Severe samples that were also [`Sample::pinned`].
+    /// Consecutive Severe samples that were also [`Sample::pinned`]. It
+    /// survives a sample or two below the edge ([`PINNED_BREAK_SAMPLES`]).
     pinned_run: u32,
+    /// Consecutive samples that were not Severe and pinned.
+    unpinned_run: u32,
     window: VecDeque<(Option<u64>, Option<f64>)>,
     phase: Phase,
     retry_wait: u32,
     /// A person ended this episode's freeze (`resume_all`): no new freeze
     /// until the tier has read below Severe for [`SEVERE_BREAK_SAMPLES`].
     held_off: bool,
+    /// A freeze that began on *pinned alone* (nothing rising) has been spent
+    /// in this Severe episode: a host pinned by something unrelated would
+    /// otherwise have the same builds frozen again after every cap. Rung B
+    /// then needs a fresh rise (the deterioration rule) or a new episode.
+    /// Cleared only where the episode ends, never by [`Trigger::ended`].
+    pinned_spent: bool,
+    /// The freeze [`Step::Begin`] asked for rested on pinned alone.
+    begin_pinned_only: bool,
+    /// A freeze has begun in this Severe episode.
+    froze_this_episode: bool,
+    /// Counts the Severe episodes that have ended: the relief forgets what it
+    /// froze in the last one when this moves.
+    episode: u64,
 }
 
 impl Trigger {
@@ -356,7 +388,16 @@ impl Trigger {
     }
 
     pub(crate) fn reset(&mut self) {
+        let episode = self.episode.wrapping_add(1);
         *self = Self::default();
+        self.episode = episode;
+    }
+
+    /// Which Severe episode this is; it moves when one ends (the tier read
+    /// below Severe for [`SEVERE_BREAK_SAMPLES`] after a freeze or a person's
+    /// resume) and on [`Trigger::reset`].
+    pub(crate) fn episode(&self) -> u64 {
+        self.episode
     }
 
     pub(crate) fn observe(&mut self, now: Instant, sample: &Sample) -> Verdict {
@@ -367,16 +408,27 @@ impl Trigger {
         } else {
             self.calm_run = self.calm_run.saturating_add(1);
             if self.calm_run >= SEVERE_BREAK_SAMPLES {
+                if self.froze_this_episode || self.held_off {
+                    self.episode = self.episode.wrapping_add(1);
+                }
                 self.severe_run = 0;
                 self.window.clear();
                 self.held_off = false;
+                self.pinned_spent = false;
+                self.froze_this_episode = false;
             }
         }
-        self.pinned_run = if tier == Some(Tier::Severe) && sample.pinned {
-            self.pinned_run.saturating_add(1)
+        if tier == Some(Tier::Severe) && sample.pinned {
+            self.pinned_run = self.pinned_run.saturating_add(1);
+            self.unpinned_run = 0;
         } else {
-            0
-        };
+            // Kernel Critical flickers: a sample or two below the edge is not
+            // a host that recovered.
+            self.unpinned_run = self.unpinned_run.saturating_add(1);
+            if self.unpinned_run >= PINNED_BREAK_SAMPLES {
+                self.pinned_run = 0;
+            }
+        }
         self.window
             .push_back((sample.swap_used, sample.segment_pct));
         while self.window.len() > SEVERE_SAMPLES as usize {
@@ -410,11 +462,14 @@ impl Trigger {
         let freeze = match self.phase {
             Phase::Idle => {
                 self.retry_wait = self.retry_wait.saturating_sub(1);
+                let rose = deteriorating(self.window.iter());
+                let pinned = self.pinned_run >= SEVERE_SAMPLES && !self.pinned_spent;
                 if self.retry_wait == 0
                     && !self.held_off
                     && self.severe_run >= SEVERE_SAMPLES
-                    && (deteriorating(self.window.iter()) || self.pinned_run >= SEVERE_SAMPLES)
+                    && (rose || pinned)
                 {
+                    self.begin_pinned_only = !rose;
                     Step::Begin
                 } else {
                     Step::Hold
@@ -456,6 +511,10 @@ impl Trigger {
                 since: now,
                 samples: 0,
             };
+            self.froze_this_episode = true;
+            if self.begin_pinned_only {
+                self.pinned_spent = true;
+            }
         } else {
             self.retry_wait = RETRY_SAMPLES;
         }
@@ -469,6 +528,7 @@ impl Trigger {
         self.severe_run = 0;
         self.calm_run = 0;
         self.pinned_run = 0;
+        self.unpinned_run = 0;
         self.window.clear();
         self.retry_wait = 0;
     }
@@ -540,6 +600,17 @@ pub(crate) trait Actuator: Send {
     /// Whether the process reads back as in the background; `None` when that
     /// cannot be read (it ended, it is not ours, the platform cannot say).
     fn is_background(&self, pid: i32, start_us: u64) -> Option<bool>;
+    /// Whether the process is stopped now, read from the OS immediately before
+    /// the relief signals it: a process somebody else stopped (a Ctrl-Z job, a
+    /// debugger) is not the relief's to stop, and not its to continue. `Err`
+    /// names a process that ended ("no longer running"), is another one now
+    /// ("recycled"), or whose state could not be read: that is never taken for
+    /// a running one.
+    fn is_stopped(&self, pid: i32, start_us: u64) -> Result<bool, String>;
+    /// Every process as `(pid, ppid, start_us)`, bounded; empty when the host
+    /// cannot list them. Read once by a replay that looks for what inherited a
+    /// background priority.
+    fn process_table(&self) -> Vec<(i32, i32, u64)>;
 }
 
 /// Who is on the build-lease board, by pid.
@@ -601,6 +672,14 @@ impl Actuator for OsActuator {
 
     fn is_background(&self, pid: i32, start_us: u64) -> Option<bool> {
         super::procscan::is_background(pid, start_us)
+    }
+
+    fn is_stopped(&self, pid: i32, start_us: u64) -> Result<bool, String> {
+        super::procscan::is_stopped(pid, start_us)
+    }
+
+    fn process_table(&self) -> Vec<(i32, i32, u64)> {
+        super::procscan::process_table(MAX_TABLE_PROCESSES)
     }
 }
 
@@ -858,13 +937,15 @@ impl Screen<'_> {
     }
 
     /// Every check, for one process that joined a frozen subtree late.
-    fn eligible(&mut self, p: &ReliefProc) -> Result<(), String> {
+    /// `Ok(true)` when it holds a lease slot (eligible only while the board
+    /// refuses), which makes the whole subtree a holder.
+    fn eligible(&mut self, p: &ReliefProc) -> Result<bool, String> {
         if p.exempt {
             return Err(format!("{} is exempt from throttling", p.name));
         }
-        self.by_name(p)?;
-        self.by_environment(p)?;
-        self.by_directory(p)
+        let holder = self.by_name(p)? | self.by_environment(p)?;
+        self.by_directory(p)?;
+        Ok(holder)
     }
 }
 
@@ -901,6 +982,7 @@ fn barred(
 fn select_in_session(
     session: &ReliefSession,
     screen: &mut Screen<'_>,
+    spent: &HashSet<(i32, u64)>,
     notes: &mut Vec<String>,
 ) -> Option<Selection> {
     let members = &session.members;
@@ -973,6 +1055,13 @@ fn select_in_session(
     ranked.sort_by_key(|&n| (std::cmp::Reverse(sums[n]), members[order[n]].pid));
     for &n in ranked.iter().take(MAX_CANDIDATES_CHECKED) {
         let top = order[n];
+        if spent.contains(&(members[top].pid, members[top].start_us)) {
+            notes.push(format!(
+                "{} was frozen already in this Severe episode",
+                members[top].name
+            ));
+            continue;
+        }
         let mut subtree = Vec::new();
         let mut walk = vec![top];
         while let Some(i) = walk.pop() {
@@ -1029,6 +1118,9 @@ pub(crate) struct Want<'a> {
     pub room: usize,
     /// The lease board is refusing new builds.
     pub refusing: bool,
+    /// Processes this Severe episode already froze: never the root of another
+    /// subtree.
+    pub spent: &'a HashSet<(i32, u64)>,
 }
 
 /// The subtrees rung B stops: for each GitPulse-launched session in a trusted
@@ -1047,6 +1139,7 @@ pub(crate) fn select(
         busy,
         room,
         refusing,
+        spent,
     } = *want;
     if room == 0 {
         return Ok(Vec::new());
@@ -1081,7 +1174,7 @@ pub(crate) fn select(
             ));
             continue;
         }
-        if let Some(mut pick) = select_in_session(session, &mut screen, notes) {
+        if let Some(mut pick) = select_in_session(session, &mut screen, spent, notes) {
             pick.repo_path = Some(
                 crate::engine::git_cli::find_git_root(&cwd)
                     .unwrap_or(cwd)
@@ -1213,6 +1306,13 @@ struct JournalEntry {
     session_id: String,
     at_unix_ms: u64,
     rung: JournalRung,
+    /// The process was read as running (not stopped) immediately before the
+    /// relief stopped it, so the stop and the continue are the relief's own.
+    /// A resume acts only on entries that say so: an entry without it (an
+    /// older writer's, or a hand-edited file) is not known to be ours, and
+    /// continuing a process somebody else stopped would undo their pause.
+    #[serde(default)]
+    was_running: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1340,6 +1440,9 @@ pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> 
     // while its parent is still stopped and would be blocked on it.
     for entry in journal.entries.iter().rev() {
         match entry.rung {
+            // Only an entry read as running before it was stopped is ours to
+            // continue; anything else may be a process somebody else stopped.
+            JournalRung::Freeze if !entry.was_running => {}
             JournalRung::Freeze => match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
                 Ok(Delivery::Delivered) => out.resumed += 1,
                 Ok(Delivery::Gone) => {}
@@ -1358,6 +1461,7 @@ pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> 
             },
         }
     }
+    sweep_inheritors(&journal.entries, ns, actuator, &mut out);
     if let Err(why) = write_journal(dir, &[]) {
         out.failures
             .push(format!("the relief journal could not be removed: {why}"));
@@ -1365,36 +1469,78 @@ pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> 
     out
 }
 
-/// A frozen entry of a journal another GitPulse that is still running wrote
-/// is that one's, until it has stood past what the cap and the watchdog's grace
-/// allow: then the writer is hung (or lost its election with the freeze
-/// standing) and nothing else will continue it. Continues those and leaves the
-/// rest, and the writer's file, alone. Returns how many were continued.
-pub(crate) fn resume_aged_of_live_writer(
-    dir: &Path,
+/// The journal lists the processes the relief slowed *by name*. A child one of
+/// them started after it was slowed inherited the priority without ever being
+/// named, so a restore of the listed ones alone leaves it in the background.
+/// One best-effort pass over a single read of the process table puts those
+/// back too, bounded by [`MAX_SWEPT`]. Only a descendant that started at or
+/// after its ancestor's journal stamp qualifies, never the steward's (or
+/// anything under one) and never one that is not in the background now.
+///
+/// Residual: a descendant born after the slowing that put *itself* in the
+/// background (`taskpolicy -b`) is restored with them; the stamp separates
+/// what was already there, not why a newer process is in the background.
+fn sweep_inheritors(
+    entries: &[JournalEntry],
+    ns: &Path,
     actuator: &dyn Actuator,
-    now_ms: u64,
-    failures: &mut Vec<String>,
-) -> u32 {
-    let Ok(Some(journal)) = read_journal(dir) else {
-        return 0;
-    };
-    let limit = u64::try_from((FREEZE_CAP + WATCHDOG_GRACE).as_millis()).unwrap_or(u64::MAX);
-    let mut resumed = 0;
-    for entry in journal.entries.iter().rev() {
-        if entry.rung != JournalRung::Freeze || now_ms.saturating_sub(entry.at_unix_ms) < limit {
+    out: &mut Replay,
+) {
+    let slowed: Vec<&JournalEntry> = entries
+        .iter()
+        .filter(|e| e.rung == JournalRung::Slow)
+        .collect();
+    if slowed.is_empty() {
+        return;
+    }
+    let table = actuator.process_table();
+    if table.is_empty() {
+        return;
+    }
+    let stewards = ledger_stewards(&lock(&LEDGER), ns);
+    // The mark a descendant must have started after, by pid: the stamp of the
+    // nearest listed ancestor, in microseconds.
+    let mut under: HashMap<i32, u64> = slowed
+        .iter()
+        .map(|e| (e.pid, e.at_unix_ms.saturating_mul(1000)))
+        .collect();
+    let named: HashSet<i32> = under.keys().copied().collect();
+    for _ in 0..MAX_TREE_DEPTH {
+        let before = under.len();
+        for &(pid, ppid, start_us) in &table {
+            if under.contains_key(&pid) || stewards.contains(&(pid, start_us)) {
+                continue;
+            }
+            if let Some(&mark) = under.get(&ppid) {
+                under.insert(pid, mark);
+            }
+        }
+        if under.len() == before {
+            break;
+        }
+    }
+    let mut swept = 0;
+    for &(pid, _, start_us) in &table {
+        if named.contains(&pid) || swept >= MAX_SWEPT {
             continue;
         }
-        match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
-            Ok(Delivery::Delivered) => resumed += 1,
-            Ok(Delivery::Gone) => {}
-            Err(why) => failures.push(format!(
-                "could not resume process {} that GitPulse process {} left stopped past its limit: {why}",
-                entry.pid, journal.writer_pid
+        let Some(&mark) = under.get(&pid) else {
+            continue;
+        };
+        if start_us < mark || actuator.is_background(pid, start_us) != Some(true) {
+            continue;
+        }
+        match restore_priority(actuator, ns, pid, start_us) {
+            Ok(true) => {
+                out.restored += 1;
+                swept += 1;
+            }
+            Ok(false) => {}
+            Err(why) => out.failures.push(format!(
+                "could not restore the priority of process {pid}, which inherited it: {why}"
             )),
         }
     }
-    resumed
 }
 
 /// Restores a priority, treating a process that ended as nothing to restore.
@@ -1523,6 +1669,12 @@ struct WatchState {
     frozen: Vec<Watched>,
     /// The last tick, on the monotonic clock.
     last_tick: Option<Instant>,
+    /// What the watchdog continued, until the next tick takes account of it:
+    /// the relief's own record of a freeze must not outlive the processes
+    /// being stopped.
+    released: Vec<(i32, u64)>,
+    /// Why the watchdog thread did not start; the relief reports it.
+    start_error: Option<String>,
 }
 
 /// The frozen processes and the tick's pulse, kept where an independent thread
@@ -1545,6 +1697,21 @@ impl Watch {
         lock(&self.state).frozen = frozen;
     }
 
+    /// One more stopped process, added once its stop was delivered: the
+    /// watchdog only ever continues what the relief really stopped.
+    fn add(&self, watched: Watched) {
+        lock(&self.state).frozen.push(watched);
+    }
+
+    /// What the watchdog continued since the last call.
+    fn take_released(&self) -> Vec<(i32, u64)> {
+        std::mem::take(&mut lock(&self.state).released)
+    }
+
+    fn start_error(&self) -> Option<String> {
+        lock(&self.state).start_error.clone()
+    }
+
     /// Continues what is overdue: every entry when the tick has not advanced
     /// for [`WATCHDOG_STALL`], else the entries older than
     /// [`FREEZE_CAP`] + [`WATCHDOG_GRACE`] (the sampler's own cap resume has
@@ -1562,7 +1729,9 @@ impl Watch {
             state.frozen = keep;
             due
         };
-        Self::send_cont(&due, actuator)
+        let sent = Self::send_cont(&due, actuator);
+        lock(&self.state).released.extend(sent.iter().copied());
+        sent
     }
 
     /// Continues everything, now.
@@ -1609,6 +1778,9 @@ fn app_watch() -> std::sync::Arc<Watch> {
         });
         if let Err(why) = started {
             log::error!(target: "relief", "the relief watchdog did not start: {why}");
+            // The relief puts it in its snapshot too: a freeze with no
+            // watchdog behind it is a fact the status must carry.
+            lock(&watch.state).start_error = Some(why.to_string());
         }
         watch
     });
@@ -1770,6 +1942,9 @@ pub struct ResumeOutcome {
     /// Why nothing was done at all (no relief here, another GitPulse's journal,
     /// an unreadable one).
     pub refused: Option<String>,
+    /// A tick held the action lock for the whole wait ([`ACT_WAIT`]): nothing
+    /// was done, and the request may be made again.
+    pub busy: bool,
 }
 
 /// What the relief's sampler is told about a [`resume_all`] it did not make
@@ -1827,8 +2002,30 @@ pub(crate) fn resume_up_to_in(
     reason: &str,
     up_to_ms: Option<u64>,
 ) -> ResumeOutcome {
-    let _act = lock(&ACT);
+    resume_up_to_within(dir, actuator, hold_off_episode, reason, up_to_ms, ACT_WAIT)
+}
+
+/// [`resume_up_to_in`] waiting at most `wait` for the action lock, so a tick
+/// stalled on a disk write cannot hang the caller (a command thread, the
+/// request consumer on the sampler's own thread): the answer is
+/// [`ResumeOutcome::busy`] and nothing was done.
+pub(crate) fn resume_up_to_within(
+    dir: &Path,
+    actuator: &dyn Actuator,
+    hold_off_episode: bool,
+    reason: &str,
+    up_to_ms: Option<u64>,
+    wait: Duration,
+) -> ResumeOutcome {
     let mut out = ResumeOutcome::default();
+    let Some(_act) = lock_within(&ACT, wait) else {
+        out.busy = true;
+        out.refused = Some(format!(
+            "a pass of the relief held the action lock for over {} ms",
+            wait.as_millis()
+        ));
+        return out;
+    };
     let journal = match read_journal(dir) {
         Ok(journal) => journal,
         Err(why) => {
@@ -1847,11 +2044,14 @@ pub(crate) fn resume_up_to_in(
             ));
             return out;
         }
-        let (frozen, rest): (Vec<JournalEntry>, Vec<JournalEntry>) =
+        let (covered, rest): (Vec<JournalEntry>, Vec<JournalEntry>) =
             journal.entries.into_iter().partition(|e| {
                 e.rung == JournalRung::Freeze && up_to_ms.is_none_or(|up_to| e.at_unix_ms <= up_to)
             });
-        for entry in frozen.iter().rev() {
+        // Only an entry read as running before it was stopped is the relief's
+        // to continue; one that is not is dropped from the file, not signalled.
+        let frozen = covered.iter().filter(|e| e.was_running);
+        for entry in frozen.rev() {
             let (ok, detail) = match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
                 Ok(_) => (true, None),
                 Err(why) => (false, Some(why)),
@@ -1900,6 +2100,9 @@ struct Frozen {
     /// A build holding a lease slot is in it: continued on the first tick the
     /// lease board stops refusing.
     holder: bool,
+    /// Members somebody else had stopped already: left alone, never stopped,
+    /// never continued, and not asked about again.
+    left: BTreeSet<(i32, u64)>,
 }
 
 /// The relief. One per sampler; it lives on the sampler's thread and is
@@ -1929,6 +2132,11 @@ pub(crate) struct Relief {
     trigger: Trigger,
     /// Processes this relief put in the background (its ledger share).
     slowed: BTreeMap<i32, u64>,
+    /// For each of `slowed`, the newest process start time in the scan that
+    /// slowed it: a process that started after that read inherited the
+    /// priority; one that started at or before it was already there and is not
+    /// the restore's to touch.
+    slowed_mark: BTreeMap<i32, u64>,
     /// Already in the background when first seen and not by a parent of ours:
     /// someone else's choice, left alone until the slowing ends.
     foreign: BTreeSet<(i32, u64)>,
@@ -1944,6 +2152,22 @@ pub(crate) struct Relief {
     /// slowing.
     slow_since_pass: Option<u32>,
     recovered: bool,
+    /// Every process a freeze of this Severe episode stopped, and their
+    /// subtrees' roots: none is chosen again until the episode ends.
+    spent: HashSet<(i32, u64)>,
+    /// The trigger's [`Trigger::episode`] when `spent` was last cleared.
+    episode_seen: u64,
+    /// A person's resume request that found the action lock busy, kept (it
+    /// was already taken from its file) and tried again each tick until its
+    /// time to live is up.
+    pending_request: Option<super::relief_status::ResumeRequest>,
+    /// How long a request waits for the action lock.
+    act_wait: Duration,
+    /// The watchdog thread's failure to start is in the snapshot's failures.
+    watchdog_reported: bool,
+    /// A test's hook, called just before the tick takes the action lock.
+    #[cfg(test)]
+    before_act: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Relief {
@@ -1973,6 +2197,7 @@ impl Relief {
             trusted,
             trigger: Trigger::default(),
             slowed: BTreeMap::new(),
+            slowed_mark: BTreeMap::new(),
             foreign: BTreeSet::new(),
             frozen: Vec::new(),
             journal: Vec::new(),
@@ -1981,6 +2206,13 @@ impl Relief {
             seen_external,
             slow_since_pass: None,
             recovered: false,
+            spent: HashSet::new(),
+            episode_seen: 0,
+            pending_request: None,
+            act_wait: ACT_WAIT,
+            watchdog_reported: false,
+            #[cfg(test)]
+            before_act: None,
         }
     }
 
@@ -2053,18 +2285,10 @@ impl Relief {
         }
         self.recovered = true;
         let _act = lock(&ACT);
-        let mut replay = replay_journal(&self.dir, &self.ns, &*self.actuator);
-        if replay.left_to.is_some() {
-            // Another GitPulse that is still running owns the journal; what
-            // it left stopped past the cap and the watchdog's grace is
-            // nobody's to continue but ours.
-            replay.resumed = resume_aged_of_live_writer(
-                &self.dir,
-                &*self.actuator,
-                unix_ms(),
-                &mut replay.failures,
-            );
-        }
+        // A journal another running GitPulse wrote is that one's: its
+        // watchdog continues what it stopped, and nothing here guesses at its
+        // entries by age (that could continue a process somebody else stopped).
+        let replay = replay_journal(&self.dir, &self.ns, &*self.actuator);
         log_replay("recovery", &replay);
         if replay.resumed > 0 || replay.restored > 0 {
             self.note(
@@ -2079,6 +2303,54 @@ impl Relief {
             self.fail(None, failure);
         }
         self.publish();
+    }
+
+    /// Takes account of what the watchdog continued from its own copy while
+    /// this sampler was stalled: those subtrees are running, so they leave
+    /// `frozen`, the journal and the snapshot, and rung B holds off as after a
+    /// cap (a whole new Severe run). Without this the relief would go on
+    /// stopping the late children of a build that is running.
+    fn reconcile_watchdog(&mut self) {
+        let released: HashSet<(i32, u64)> = self.watch.take_released().into_iter().collect();
+        if released.is_empty() {
+            return;
+        }
+        let (hit, kept): (Vec<Frozen>, Vec<Frozen>) = std::mem::take(&mut self.frozen)
+            .into_iter()
+            .partition(|f| !f.info.advised_only && f.members.iter().any(|m| released.contains(m)));
+        self.frozen = kept;
+        if hit.is_empty() {
+            return;
+        }
+        for f in &hit {
+            // Whatever of it the watchdog did not reach is still ours to continue.
+            let rest: Vec<(i32, u64)> = f
+                .members
+                .iter()
+                .copied()
+                .filter(|m| !released.contains(m))
+                .collect();
+            self.continue_all(&rest);
+            let ids: HashSet<i32> = f.members.iter().map(|(pid, _)| *pid).collect();
+            self.journal
+                .retain(|e| e.rung != JournalRung::Freeze || !ids.contains(&e.pid));
+            self.note(
+                ActionKind::Resume,
+                format!(
+                    "resumed {} in session {}: {}",
+                    f.info.command,
+                    f.info.session_id,
+                    ResumeReason::Watchdog.words()
+                ),
+            );
+        }
+        if let Err(why) = self.sync_journal() {
+            self.fail(None, format!("the journal could not be trimmed: {why}"));
+        }
+        self.watch_frozen();
+        if self.frozen.is_empty() {
+            self.trigger.ended();
+        }
     }
 
     /// Takes account of a [`resume_all`] made from another thread: it already
@@ -2109,6 +2381,10 @@ impl Relief {
         }
         if external.hold_off {
             self.trigger.hold_off();
+        } else {
+            // A person who resumed without holding off decided the next
+            // Severe minute may freeze again, the same builds included.
+            self.spent.clear();
         }
         self.note(
             ActionKind::Resume,
@@ -2147,18 +2423,41 @@ impl Relief {
         if STOPPING.load(Ordering::SeqCst) {
             return;
         }
-        let Some(request) =
-            super::relief_status::take_resume_request(&dir, super::relief_status::now_ms())
-        else {
-            return;
+        let now_ms = super::relief_status::now_ms();
+        // A request that found the lock busy is still the first in line; the
+        // file it came from is gone, so it is held here, for the contract's
+        // time to live and no longer.
+        let request = match self.pending_request.take() {
+            Some(held)
+                if now_ms.saturating_sub(held.at_ms) <= super::relief_status::REQUEST_TTL_MS =>
+            {
+                held
+            }
+            Some(_) => {
+                self.fail(
+                    None,
+                    "a resume request was not carried out: the action lock stayed busy until it expired"
+                        .into(),
+                );
+                return;
+            }
+            None => match super::relief_status::take_resume_request(&dir, now_ms) {
+                Some(request) => request,
+                None => return,
+            },
         };
-        let outcome = resume_up_to_in(
+        let outcome = resume_up_to_within(
             &self.dir,
             &*self.actuator,
             true,
             &request.reason,
             Some(request.at_ms),
+            self.act_wait,
         );
+        if outcome.busy {
+            self.pending_request = Some(request);
+            return;
+        }
         if let Some(why) = outcome.refused {
             self.fail(None, format!("a resume request was not carried out: {why}"));
         }
@@ -2304,6 +2603,10 @@ impl Relief {
         // read: a `resume_all` from another thread is then either wholly
         // before this tick (its generation is read below, under the lock) or
         // wholly after it, never between the read and the action it changes.
+        #[cfg(test)]
+        if let Some(hook) = self.before_act.clone() {
+            hook();
+        }
         let _act = lock(&ACT);
         if STOPPING.load(Ordering::SeqCst) {
             return;
@@ -2314,6 +2617,18 @@ impl Relief {
         let table: &dyn Fn() -> ReliefTable = &|| over.as_ref().map_or_else(table, |read| read());
         self.watch.beat(now);
         self.refusing = refuses;
+        if !self.watchdog_reported {
+            if let Some(why) = self.watch.start_error() {
+                self.watchdog_reported = true;
+                self.fail(
+                    None,
+                    format!("the watchdog thread did not start, so nothing continues a freeze if this sampler stalls: {why}"),
+                );
+            }
+        }
+        // The watchdog's work first, before anything rebuilds its copy from
+        // this relief's own record of what is frozen.
+        self.reconcile_watchdog();
         self.reconcile_external();
         let mode = (self.mode)();
         self.status.mode = mode;
@@ -2328,6 +2643,11 @@ impl Relief {
         self.status.tier = sample.tier.map(|(tier, _)| tier);
         self.status.binding = sample.tier.and_then(|(_, binding)| binding);
         let verdict = self.trigger.observe(now, &sample);
+        if self.trigger.episode() != self.episode_seen {
+            // The Severe episode is over: what it froze may be frozen again.
+            self.episode_seen = self.trigger.episode();
+            self.spent.clear();
+        }
         let act = mode == SupervisorMode::Act;
 
         // An advised freeze left `act`, or the setting moved to `advise` with
@@ -2450,6 +2770,9 @@ impl Relief {
             session_id: session.to_string(),
             at_unix_ms: unix_ms(),
             rung,
+            // Callers write a freeze entry only for a process they read as
+            // running just before; a slow entry has no such question.
+            was_running: true,
         }
     }
 
@@ -2509,6 +2832,7 @@ impl Relief {
             let stewards = ledger_stewards(&lock(&LEDGER), &self.ns);
             for &(pid, start_us) in &gone {
                 self.slowed.remove(&pid);
+                self.slowed_mark.remove(&pid);
                 if !stewards.contains(&(pid, start_us)) {
                     match self.actuator.set_background(pid, start_us, false) {
                         Ok(_) => {}
@@ -2594,11 +2918,20 @@ impl Relief {
             .iter()
             .map(|(_, m, _)| self.actuator.set_background(m.pid, m.start_us, true))
             .collect();
+        // The newest start in this scan: whatever starts after it is born of
+        // the slowing, not part of what was there.
+        let mark = table
+            .sessions
+            .iter()
+            .flat_map(|s| s.members.iter().map(|m| m.start_us))
+            .max()
+            .unwrap_or(0);
         let mut ledger = lock(&LEDGER);
         for ((_, m, _), answer) in fresh.iter().zip(answers) {
             match answer {
                 Ok(true) => {
                     self.slowed.insert(m.pid, m.start_us);
+                    self.slowed_mark.insert(m.pid, mark);
                     ledger_put(&mut ledger, &self.ns, m.pid, m.start_us, SlowOwner::Relief);
                     taken += 1;
                 }
@@ -2606,6 +2939,7 @@ impl Relief {
                     if self.slowed.contains_key(&m.ppid) {
                         // Inherited from a parent this relief slowed.
                         self.slowed.insert(m.pid, m.start_us);
+                        self.slowed_mark.insert(m.pid, mark);
                         ledger_put(&mut ledger, &self.ns, m.pid, m.start_us, SlowOwner::Relief);
                     } else {
                         self.foreign.insert((m.pid, m.start_us));
@@ -2662,18 +2996,30 @@ impl Relief {
         let scan = table();
         let mut found = Vec::new();
         for session in &scan.sessions {
-            let mut under: HashSet<i32> = session
+            // Each process under a slowed one, with the scan mark a descendant
+            // must have started after (no mark, no inheritor).
+            let mut under: HashMap<i32, u64> = session
                 .members
                 .iter()
                 .filter(|m| slowed.get(&m.pid) == Some(&m.start_us))
-                .map(|m| m.pid)
+                .map(|m| {
+                    (
+                        m.pid,
+                        self.slowed_mark.get(&m.pid).copied().unwrap_or(u64::MAX),
+                    )
+                })
                 .collect();
-            // Members come in table order, not tree order: sweep until none joins.
+            // Members come in table order, not tree order: sweep until none
+            // joins. What the steward owns does not carry the walk on: its
+            // children inherited *its* priority, which is its to put back.
             for _ in 0..MAX_TREE_DEPTH {
                 let before = under.len();
                 for m in &session.members {
-                    if under.contains(&m.ppid) {
-                        under.insert(m.pid);
+                    if under.contains_key(&m.pid) || stewards.contains(&(m.pid, m.start_us)) {
+                        continue;
+                    }
+                    if let Some(&mark) = under.get(&m.ppid) {
+                        under.insert(m.pid, mark);
                     }
                 }
                 if under.len() == before {
@@ -2682,7 +3028,10 @@ impl Relief {
             }
             for m in &session.members {
                 let key = (m.pid, m.start_us);
-                if under.contains(&m.pid)
+                // Started after the slowing pass read the table: born of it.
+                // One that was there already and is in the background was put
+                // there by something else, and stays.
+                if under.get(&m.pid).is_some_and(|&mark| m.start_us > mark)
                     && slowed.get(&m.pid) != Some(&m.start_us)
                     && !stewards.contains(&key)
                     && self.actuator.is_background(m.pid, m.start_us) == Some(true)
@@ -2697,10 +3046,12 @@ impl Relief {
 
     fn restore_slowed(&mut self, table: &dyn Fn() -> ReliefTable) {
         let slowed = std::mem::take(&mut self.slowed);
+        // The marks are read by `inheritors` below, then forgotten with them.
         let mut restored = 0u32;
         let mut refused: BTreeMap<String, u32> = BTreeMap::new();
         let stewards = ledger_stewards(&lock(&LEDGER), &self.ns);
         let inherited = self.inheritors(&slowed, &stewards, table);
+        self.slowed_mark.clear();
         for &(pid, start_us) in &inherited {
             match self.actuator.set_background(pid, start_us, false) {
                 Ok(true) => restored += 1,
@@ -2754,10 +3105,12 @@ impl Relief {
         let busy: BTreeSet<(i32, u64)> = self.frozen.iter().map(|f| f.session).collect();
         let room = MAX_FROZEN_PER_HOST.saturating_sub(self.frozen.len());
         let mut notes = Vec::new();
+        let spent = self.spent.clone();
         let want = Want {
             busy: &busy,
             room,
             refusing: self.refusing,
+            spent: &spent,
         };
         let picks = match select(
             table,
@@ -2798,7 +3151,10 @@ impl Relief {
                     members: Vec::new(),
                     since: now,
                     holder: pick.holder,
+                    left: BTreeSet::new(),
                 });
+                self.spent
+                    .extend(pick.members.iter().map(|m| (m.pid, m.start_us)));
                 self.note(
                     ActionKind::Freeze,
                     format!(
@@ -2814,15 +3170,58 @@ impl Relief {
         self.trigger.began(now, any);
     }
 
-    /// Stops one subtree: journal first, then the root, then the rest.
+    /// Stops one subtree. Each member's state is read first: one that is
+    /// already stopped (a Ctrl-Z job, a debugger) is somebody else's, so it is
+    /// left alone: not journaled, not stopped, never continued. The journal
+    /// (each entry `was_running`) is written before the first signal, every
+    /// process is read again immediately before its own stop, and a stop that
+    /// was delivered goes into the watchdog's copy at once, so the watchdog
+    /// only ever continues what this relief really stopped.
     fn freeze(&mut self, pick: &Selection, now: Instant) -> bool {
         let session = format!("{}-{}", pick.session_pid, pick.session_start_us);
+        let mut left: BTreeSet<(i32, u64)> = BTreeSet::new();
+        let mut running: Vec<&ReliefProc> = Vec::new();
+        for (n, m) in pick.members.iter().enumerate() {
+            match self.actuator.is_stopped(m.pid, m.start_us) {
+                Ok(false) => running.push(m),
+                Ok(true) => {
+                    left.insert((m.pid, m.start_us));
+                    if n == 0 {
+                        self.note(
+                            ActionKind::Refused,
+                            format!(
+                                "{} was not frozen: something else had stopped it already",
+                                m.name
+                            ),
+                        );
+                        return false;
+                    }
+                }
+                Err(why) if has_ended(&why) => {
+                    if n == 0 {
+                        return false;
+                    }
+                }
+                Err(why) => {
+                    self.fail(
+                        Some(m.pid),
+                        format!(
+                            "{} (pid {}) was not stopped: its state could not be read: {why}",
+                            m.name, m.pid
+                        ),
+                    );
+                    if n == 0 {
+                        return false;
+                    }
+                }
+            }
+        }
         let before = self.journal.len();
         // One stamp for the whole pause: the journal's entries and the status's
         // `since_ms` agree on when it began, so a resume request covers it
         // whole or not at all.
         let since_ms = unix_ms();
-        for m in &pick.members {
+        for m in &running {
             let entry = JournalEntry {
                 at_unix_ms: since_ms,
                 ..self.entry(m.pid, m.start_us, &session, JournalRung::Freeze)
@@ -2840,19 +3239,8 @@ impl Relief {
             );
             return false;
         }
-        // The watchdog's copy is made before the first signal, like the
-        // journal: a tick that hangs after a stop must leave something that
-        // continues it.
-        self.sync_watch(
-            pick.members
-                .iter()
-                .map(|m| (m.pid, m.start_us))
-                .collect::<Vec<_>>()
-                .as_slice(),
-            now,
-        );
         let mut stopped: Vec<(i32, u64)> = Vec::new();
-        for (n, m) in pick.members.iter().enumerate() {
+        for (n, m) in running.iter().enumerate() {
             // GitPulse is quitting: stop nothing more, and undo what this
             // freeze stopped (the teardown may already have continued the
             // rest, and would not know of these).
@@ -2861,8 +3249,42 @@ impl Relief {
                 stopped.clear();
                 break;
             }
+            // Read again just before the signal: a person may have stopped it
+            // since the first read, and then it is not ours.
+            match self.actuator.is_stopped(m.pid, m.start_us) {
+                Ok(false) => {}
+                Ok(true) => {
+                    left.insert((m.pid, m.start_us));
+                    if n == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                Err(why) => {
+                    if !has_ended(&why) {
+                        self.fail(
+                            Some(m.pid),
+                            format!(
+                                "{} (pid {}) was not stopped: its state could not be read: {why}",
+                                m.name, m.pid
+                            ),
+                        );
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                    continue;
+                }
+            }
             match self.actuator.signal(m.pid, m.start_us, Signal::Stop) {
-                Ok(Delivery::Delivered) => stopped.push((m.pid, m.start_us)),
+                Ok(Delivery::Delivered) => {
+                    stopped.push((m.pid, m.start_us));
+                    self.watch.add(Watched {
+                        pid: m.pid,
+                        start_us: m.start_us,
+                        since: now,
+                    });
+                }
                 Ok(Delivery::Gone) => {}
                 Err(why) => {
                     self.fail(
@@ -2911,6 +3333,21 @@ impl Relief {
                 session
             ),
         );
+        if !left.is_empty() {
+            self.note(
+                ActionKind::Freeze,
+                format!(
+                    "froze {} ({} process(es), {}) in session {}; {} already stopped by something else was left alone",
+                    pick.root.name,
+                    stopped.len(),
+                    human_bytes(pick.footprint),
+                    session,
+                    left.len()
+                ),
+            );
+        }
+        self.spent
+            .extend(pick.members.iter().map(|m| (m.pid, m.start_us)));
         self.frozen.push(Frozen {
             info,
             session: (pick.session_pid, pick.session_start_us),
@@ -2918,15 +3355,17 @@ impl Relief {
             members: stopped,
             since: now,
             holder: pick.holder,
+            left,
         });
         self.watch_frozen();
         true
     }
 
-    /// Makes the watchdog's copy what this relief has frozen, plus `joining`
-    /// (about to be stopped), counted from `now`.
-    fn sync_watch(&self, joining: &[(i32, u64)], now: Instant) {
-        let mut entries: Vec<Watched> = self
+    /// The watchdog's copy is exactly what this relief has frozen: the
+    /// processes whose stop was delivered, each counted from its subtree's
+    /// own start.
+    fn watch_frozen(&self) {
+        let entries: Vec<Watched> = self
             .frozen
             .iter()
             .filter(|f| !f.info.advised_only)
@@ -2939,17 +3378,7 @@ impl Relief {
                 })
             })
             .collect();
-        entries.extend(joining.iter().map(|&(pid, start_us)| Watched {
-            pid,
-            start_us,
-            since: now,
-        }));
         self.watch.set(entries);
-    }
-
-    /// The watchdog's copy is exactly what this relief has frozen.
-    fn watch_frozen(&self) {
-        self.sync_watch(&[], Instant::now());
     }
 
     /// `SIGCONT`s each, last first; failures are recorded.
@@ -3038,7 +3467,7 @@ impl Relief {
     /// stopped (forked before the parent was), and lets go of a subtree whose
     /// root ended.
     fn maintain_frozen(&mut self, table: &ReliefTable) {
-        let mut ended = Vec::new();
+        let mut ended: Vec<(usize, ResumeReason)> = Vec::new();
         // What joined each subtree, judged by the same predicate that chose
         // it: a late member that is an MCP server, a lease waiter, a heavy job,
         // a git process or in a worktree with a live index.lock is left
@@ -3046,7 +3475,9 @@ impl Relief {
         // checked is left too. The board is read once for all of them.
         let board = self.probe.lease_board();
         let mut locks: HashMap<PathBuf, bool> = HashMap::new();
-        let mut joiners: Vec<(usize, Vec<ReliefProc>)> = Vec::new();
+        // Per subtree: the late members, and whether one of them holds a lease
+        // slot (which makes the whole subtree a holder).
+        let mut joiners: Vec<(usize, Vec<ReliefProc>, bool)> = Vec::new();
         {
             let mut screen = board.as_ref().ok().map(|board| Screen {
                 probe: &*self.probe,
@@ -3066,11 +3497,11 @@ impl Relief {
                     .iter()
                     .find(|s| (s.root.pid, s.root.start_us) == session)
                 else {
-                    ended.push(at);
+                    ended.push((at, ResumeReason::Gone));
                     continue;
                 };
                 if !scan.members.iter().any(|m| (m.pid, m.start_us) == root) {
-                    ended.push(at);
+                    ended.push((at, ResumeReason::Gone));
                     continue;
                 }
                 let Some(screen) = screen.as_mut() else {
@@ -3079,6 +3510,7 @@ impl Relief {
                 let mut inside: HashSet<i32> = frozen.members.iter().map(|(p, _)| *p).collect();
                 let mut rejected: HashSet<i32> = HashSet::new();
                 let mut fresh: Vec<ReliefProc> = Vec::new();
+                let mut holder = false;
                 // Members are in table order, not tree order: sweep until no more join.
                 for _ in 0..MAX_TREE_DEPTH {
                     let before = (fresh.len(), rejected.len());
@@ -3086,6 +3518,7 @@ impl Relief {
                         if inside.contains(&m.pid)
                             || !inside.contains(&m.ppid)
                             || rejected.contains(&m.pid)
+                            || frozen.left.contains(&(m.pid, m.start_us))
                         {
                             continue;
                         }
@@ -3094,11 +3527,15 @@ impl Relief {
                             continue;
                         }
                         checked += 1;
-                        if screen.eligible(m).is_ok() {
-                            inside.insert(m.pid);
-                            fresh.push(m.clone());
-                        } else {
-                            rejected.insert(m.pid);
+                        match screen.eligible(m) {
+                            Ok(holds) => {
+                                holder |= holds;
+                                inside.insert(m.pid);
+                                fresh.push(m.clone());
+                            }
+                            Err(_) => {
+                                rejected.insert(m.pid);
+                            }
                         }
                     }
                     if (fresh.len(), rejected.len()) == before {
@@ -3107,7 +3544,7 @@ impl Relief {
                 }
                 let room = MAX_SUBTREE_MEMBERS.saturating_sub(frozen.members.len());
                 fresh.truncate(room);
-                joiners.push((at, fresh));
+                joiners.push((at, fresh, holder));
             }
         }
         if let Err(why) = &board {
@@ -3118,7 +3555,51 @@ impl Relief {
                 ),
             );
         }
-        for (at, fresh) in joiners {
+        for (at, fresh, holder) in joiners {
+            if fresh.is_empty() {
+                continue;
+            }
+            // A late child is stopped only while its subtree's root is stopped
+            // by us. A root that reads as running (the watchdog or a person
+            // continued it) means the subtree is not frozen any more: stopping
+            // a child of a running build hangs the build against it.
+            let (root_pid, root_start) = self.frozen[at].root;
+            match self.actuator.is_stopped(root_pid, root_start) {
+                Ok(true) => {}
+                Ok(false) => {
+                    ended.push((at, ResumeReason::Continued));
+                    continue;
+                }
+                // Ended: the next tick's table says so.
+                Err(why) if has_ended(&why) => continue,
+                Err(why) => {
+                    self.fail(
+                        Some(root_pid),
+                        format!("late members were not stopped: the root's state could not be read: {why}"),
+                    );
+                    continue;
+                }
+            }
+            // Each is read as running first; one somebody else stopped is left
+            // alone (and remembered, so it is not asked about every tick).
+            let mut running: Vec<ReliefProc> = Vec::new();
+            for m in fresh {
+                match self.actuator.is_stopped(m.pid, m.start_us) {
+                    Ok(false) => running.push(m),
+                    Ok(true) => {
+                        self.frozen[at].left.insert((m.pid, m.start_us));
+                    }
+                    Err(why) if has_ended(&why) => {}
+                    Err(why) => self.fail(
+                        Some(m.pid),
+                        format!(
+                            "{} (pid {}) was not stopped: its state could not be read: {why}",
+                            m.name, m.pid
+                        ),
+                    ),
+                }
+            }
+            let fresh = running;
             if fresh.is_empty() {
                 continue;
             }
@@ -3137,26 +3618,29 @@ impl Relief {
                 self.fail(None, format!("a new member of a frozen subtree was not stopped: the journal could not be written: {why}"));
                 continue;
             }
-            // In the watchdog's copy before the first signal, counted from
-            // the subtree's own start.
-            self.sync_watch(
-                fresh
-                    .iter()
-                    .map(|m| (m.pid, m.start_us))
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                self.frozen[at].since,
-            );
+            let since = self.frozen[at].since;
             let mut added = Vec::new();
             for m in &fresh {
                 match self.actuator.signal(m.pid, m.start_us, Signal::Stop) {
-                    Ok(Delivery::Delivered) => added.push((m.pid, m.start_us)),
+                    Ok(Delivery::Delivered) => {
+                        added.push((m.pid, m.start_us));
+                        // In the watchdog's copy once it is stopped, counted
+                        // from the subtree's own start.
+                        self.watch.add(Watched {
+                            pid: m.pid,
+                            start_us: m.start_us,
+                            since,
+                        });
+                    }
                     Ok(Delivery::Gone) => {}
                     Err(why) => self.fail(
                         Some(m.pid),
                         format!("could not stop {} (pid {}): {why}", m.name, m.pid),
                     ),
                 }
+            }
+            if holder && !added.is_empty() {
+                self.frozen[at].holder = true;
             }
             let added_ids: HashSet<i32> = added.iter().map(|(p, _)| *p).collect();
             let fresh_ids: HashSet<i32> = fresh.iter().map(|m| m.pid).collect();
@@ -3174,7 +3658,9 @@ impl Relief {
                 u32::try_from(self.frozen[at].members.len()).unwrap_or(u32::MAX);
             self.watch_frozen();
         }
-        for at in ended.into_iter().rev() {
+        // Highest index first, so a removal never moves one still to come.
+        ended.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        for (at, reason) in ended {
             let f = self.frozen.remove(at);
             self.continue_all(&f.members);
             let ids: HashSet<i32> = f.members.iter().map(|(p, _)| *p).collect();
@@ -3189,7 +3675,7 @@ impl Relief {
                     "resumed {} in session {}: {}",
                     f.info.command,
                     f.info.session_id,
-                    ResumeReason::Gone.words()
+                    reason.words()
                 ),
             );
         }
@@ -3238,6 +3724,13 @@ impl Drop for Relief {
 /// process ended, or its pid belongs to another process now.
 fn process_is_gone(why: &str) -> bool {
     why.contains("no longer running") || why.contains("recycled")
+}
+
+/// Whether a state read says the process ended: nothing to report. A
+/// *recycled* pid is not that; it is a table entry that no longer describes a
+/// live process, and is recorded as a failure like any refused signal.
+fn has_ended(why: &str) -> bool {
+    why.contains("no longer running")
 }
 
 fn frozen_info(pick: &Selection, advised_only: bool) -> FrozenSubtree {
