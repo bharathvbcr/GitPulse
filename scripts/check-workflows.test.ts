@@ -331,6 +331,9 @@ describe("check:workflows", () => {
     const test = job.indexOf("- name: Rust Unit & Integration Tests");
     expect(step, "rust-test installs sqlite3").toBeGreaterThan(-1);
     expect(test, "rust-test runs its tests after sqlite3").toBeGreaterThan(step);
+    // A step that fails skips every later one, so a feed outage here must not
+    // take the manvi build down with it.
+    expect(step, "sqlite3 comes after the manvi build").toBeGreaterThan(job.indexOf("- name: Keep the manvi build"));
     const sqlite = job.slice(step, test).split(/^ {6}- name: /m)[0];
     expect(sqlite).toContain("if: ${{ runner.os == 'Windows' }}");
     expect(sqlite).toContain("choco install sqlite");
