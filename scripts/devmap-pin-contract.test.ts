@@ -21,11 +21,17 @@ function jobText(ci: string, id: string): string {
   return new RegExp(`\\n  ${id}:\\n([\\s\\S]*?)(?=\\n  [a-z][a-z-]*:\\n|$)`).exec(ci)?.[1] ?? "";
 }
 
-export function devmapPinProblems(ci: string): string[] {
+/** The workflow's one top-level `DEVMAP_REV`, or undefined when it has none or several. */
+function pinOf(workflow: string): string | undefined {
+  const pins = [...workflow.matchAll(/^ {2}DEVMAP_REV: (\S+)\s*$/gm)].map((m) => m[1]);
+  return pins.length === 1 ? pins[0] : undefined;
+}
+
+export function devmapPinProblems(ci: string, file = "ci.yml"): string[] {
   const problems: string[] = [];
 
   const pins = [...ci.matchAll(/^ {2}DEVMAP_REV: (\S+)\s*$/gm)].map((m) => m[1]);
-  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in ci.yml, found ${pins.length}`);
+  if (pins.length !== 1) problems.push(`expected exactly one DEVMAP_REV in ${file}, found ${pins.length}`);
   else if (!/^[0-9a-f]{40}$/.test(pins[0])) problems.push(`DEVMAP_REV ${pins[0]} is not a full 40-character commit SHA`);
 
   for (const line of ci.split("\n").filter((l) => l.includes("cargo install --git"))) {
@@ -59,8 +65,54 @@ export function devmapPinProblems(ci: string): string[] {
   return problems;
 }
 
+/**
+ * coverage.yml runs the same lib suite, instrumented, so it needs the same CLI.
+ * A workflow cannot read another's env, so it carries its own copy of the pin,
+ * and the copy is only safe while it equals ci.yml's: a stale one would build
+ * an older CLI under a cache key ci.yml never writes.
+ */
+export function coverageDevmapProblems(coverage: string, ci: string): string[] {
+  const problems = devmapPinProblems(coverage, "coverage.yml");
+  const own = pinOf(coverage);
+  const gating = pinOf(ci);
+  if (own !== undefined && gating !== undefined && own !== gating) {
+    problems.push(`coverage.yml's DEVMAP_REV ${own} differs from ci.yml's ${gating}`);
+  }
+  const install = coverage.indexOf("name: Install devmap");
+  // The step, not the words: a comment near the top already mentions `cargo llvm-cov`.
+  const suite = coverage.indexOf("name: Generate Rust Coverage");
+  if (suite === -1) problems.push("coverage.yml has no 'Generate Rust Coverage' step; this contract needs updating");
+  else if (install === -1 || install > suite) problems.push("coverage.yml runs the instrumented suite before it installs devmap");
+  return problems;
+}
+
 describe("devmap pin contract", () => {
   const ci = read(".github/workflows/ci.yml");
+  const coverage = read(".github/workflows/coverage.yml");
+
+  it("coverage.yml installs the same pinned devmap, checked and kept, before its instrumented suite", () => {
+    expect(coverageDevmapProblems(coverage, ci)).toEqual([]);
+  });
+
+  describe("the coverage rules fail on the shapes they are for", () => {
+    const has = (problems: string[], text: string) => expect(problems).toEqual(expect.arrayContaining([expect.stringContaining(text)]));
+    const mutate = (from: string | RegExp, to: string) => {
+      const mutated = coverage.replace(from, to);
+      expect(mutated, `the mutation ${String(from)} matched nothing`).not.toBe(coverage);
+      return mutated;
+    };
+
+    it("a copy of the pin that drifted from ci.yml's", () => {
+      has(coverageDevmapProblems(mutate(/DEVMAP_REV: [0-9a-f]{40}/, `DEVMAP_REV: ${"0".repeat(40)}`), ci), "differs from ci.yml's");
+    });
+    it("a coverage job with no devmap install", () => {
+      has(coverageDevmapProblems(mutate("name: Install devmap", "name: Fetch devmap"), ci), "before it installs devmap");
+    });
+    it("an install that ignores the pin or is never checked", () => {
+      has(coverageDevmapProblems(mutate('--rev "$DEVMAP_REV" ', ""), ci), 'does not use --rev "$DEVMAP_REV"');
+      has(coverageDevmapProblems(mutate(/\n {6}- name: Installed devmap matches the vendored schema\n {8}run: bun run check:vendor-schema\n/, "\n"), ci), "never runs check:vendor-schema");
+    });
+  });
 
   it("pins devmap to one full commit, installs it from that pin, and checks it against the vendored schema", () => {
     expect(devmapPinProblems(ci)).toEqual([]);

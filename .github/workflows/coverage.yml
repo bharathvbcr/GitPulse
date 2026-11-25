@@ -18,6 +18,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The same DevCouncil commit ci.yml builds `devmap` from, for the same
+  # tests (see its DEVMAP_REV). It is a copy, not a reference, because a
+  # workflow cannot read another's env; scripts/devmap-pin-contract.test.ts
+  # fails when the two differ.
+  DEVMAP_REV: b32d2862ed65c979fcf59e5d8dfb490705cdb79d
+
 jobs:
   coverage:
     name: Generate Code Coverage Reports
@@ -105,6 +112,39 @@ jobs:
           name: frontend-lcov
           path: coverage/lcov.info
           if-no-files-found: error
+
+      # The worktree-overlay and agent-bus radar tests drive the real `devmap`
+      # CLI. Without it the instrumented lib suite failed eight of them with
+      # "devmap is not installed", on every coverage run. Built, checked and
+      # kept exactly as ci.yml's rust-test job does, under the same cache key,
+      # so a build either workflow made serves the other. The build is saved
+      # as soon as the schema check passes, because `actions/cache` would save
+      # only if this whole job went green.
+      - name: Cache devmap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
+
+      - name: Install devmap
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$HOME/.cache/gitpulse-ci/devmap"
+          if [ ! -x "$root/bin/devmap" ]; then
+            cargo install --git https://github.com/bharathvbcr/DevCouncil --rev "$DEVMAP_REV" devmap-cli --locked --root "$root"
+          fi
+          echo "$root/bin" >> "$GITHUB_PATH"
+          "$root/bin/devmap" --version
+
+      - name: Installed devmap matches the vendored schema
+        run: bun run check:vendor-schema
+
+      - name: Keep the verified devmap build
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/gitpulse-ci/devmap
+          key: devmap-${{ runner.os }}-${{ runner.arch }}-${{ env.DEVMAP_REV }}
 
       - name: Generate Rust Coverage (LCOV + summary)
         run: |
