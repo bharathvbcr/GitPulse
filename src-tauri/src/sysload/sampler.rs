@@ -315,6 +315,11 @@ pub struct SamplerOptions {
     /// [`start_app`] turns it on: the ring is process-wide, so a sampler a
     /// test starts must not write to it.
     pub watch_webcontent: bool,
+    /// Makes the pressure relief (`sysload::relief`) this sampler ticks while
+    /// it holds the writer election. `None` (the default) is no relief: a
+    /// sampler a test or the soak starts must never stop or slow the agents
+    /// running on the machine. Only [`start_app`] sets it.
+    pub(crate) relief: Option<Box<dyn Fn() -> super::relief::Relief + Send>>,
 }
 
 impl SamplerOptions {
@@ -340,6 +345,7 @@ impl SamplerOptions {
             #[cfg(test)]
             sensor_factory: None,
             watch_webcontent: false,
+            relief: None,
         }
     }
 }
@@ -433,6 +439,10 @@ pub fn start_app(mut options: SamplerOptions) -> Result<StopHandle, String> {
     // 15 s, which a sampler started by a test or a second process must not.
     let probe = super::exec_probe::start();
     options.watch_webcontent = true;
+    let relief_dir = options.dir.clone();
+    options.relief = Some(Box::new(move || {
+        super::relief::Relief::os(relief_dir.clone())
+    }));
     if let Some(probe) = &probe {
         options.exec_latency = Box::new(probe.reader());
     }
@@ -688,6 +698,8 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     #[cfg(not(test))]
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
+    let mut relief = options.relief.as_ref().map(|make| make());
+    let me_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut trend = CompressorTrend::default();
     // The free-space history behind the disk fill rate. Only the writer keeps
     // one; its rate rides in the snapshot for everyone else.
@@ -880,6 +892,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         let govern_launches = (options.govern_launches)();
         let thresholds = (options.thresholds)();
         let mut status = status;
+        let mut relief_input = None;
         {
             let mut governor = shared
                 .governor
@@ -893,6 +906,9 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             );
             // Measured in this process, so it is not in the snapshot.
             input.readings.exec_latency = (options.exec_latency)();
+            if relief.is_some() && writer.is_some() {
+                relief_input = Some(input.clone());
+            }
             let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
                 governor.observe(Instant::now(), input)
             } else {
@@ -912,6 +928,15 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             } else {
                 Reading::Unavailable(Why::NotYet)
             };
+        }
+
+        // The pressure relief: on the elected writer's tick, from the scan this
+        // tick just made, with no Manvi, spawn gate or subprocess. It reads the
+        // memory inputs itself, so the governor's hysteresis does not decide
+        // for it.
+        if let (Some(relief), Some(input)) = (relief.as_mut(), relief_input.as_ref()) {
+            relief.recover();
+            relief.tick(Instant::now(), input, &|| scanner.relief_table(me_pid));
         }
 
         // One record every fifth tick (10 s), from the elected writer only.
@@ -1660,6 +1685,68 @@ mod tests {
             status.governor.verdict
         );
         sampler.stop();
+    }
+
+    /// Real: the elected sampler ticks the pressure relief itself, from its
+    /// own scan and its own governor input, and publishes what it decided.
+    /// Nothing else is running in this test: no steward, no `manvi use`
+    /// probe, no spawn gate. The relief's actuator is one that refuses every
+    /// change, so the live agents on this host are never touched.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_elected_sampler_ticks_the_relief_without_manvi_and_serves_its_snapshot() {
+        use super::super::relief::{snapshot, Actuator, Delivery, Probe, Relief, Rung, Signal};
+        struct Refusing;
+        impl Actuator for Refusing {
+            fn set_background(&self, _: i32, _: u64, _: bool) -> Result<bool, String> {
+                Err("this test never changes a priority".into())
+            }
+            fn signal(&self, _: i32, _: u64, _: Signal) -> Result<Delivery, String> {
+                Err("this test never signals".into())
+            }
+        }
+        struct Blind;
+        impl Probe for Blind {
+            fn cwd(&self, _: i32) -> Option<PathBuf> {
+                None
+            }
+            fn environment(&self, _: i32) -> Option<Vec<String>> {
+                None
+            }
+            fn lease_pids(&self) -> Result<std::collections::BTreeSet<i32>, String> {
+                Err("this test reads no lease board".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(20);
+        options.sensor_factory = Some(Box::new(|_| {
+            Box::new(super::super::sensor::ReplaySensor::new(vec![HostSample {
+                pressure: Reading::Value(Level::Critical),
+                ..HostSample::default()
+            }]))
+        }));
+        let relief_dir = dir.path().to_path_buf();
+        options.relief = Some(Box::new(move || {
+            Relief::new(
+                relief_dir.clone(),
+                Box::new(Refusing),
+                Box::new(Blind),
+                Box::new(|| crate::tool_config::SupervisorMode::Act),
+                Box::new(|_| false),
+            )
+            .publishing()
+        }));
+        let sampler = start(options).unwrap();
+        let reached = crate::test_support::wait_until(Duration::from_secs(30), || {
+            snapshot().rung == Rung::Slow
+        });
+        let seen = snapshot();
+        sampler.stop();
+        assert!(reached, "the relief never reported a slowing: {seen:?}");
+        assert_eq!(seen.tier, Some(super::super::Tier::Severe));
+        assert_eq!(seen.binding, Some(super::super::Binding::MemoryPressure));
+        assert_eq!(seen.mode, crate::tool_config::SupervisorMode::Act);
     }
 
     /// Real: while the trace write is blocked the sampler keeps publishing at

@@ -472,6 +472,43 @@ fn sample(input: &Input) -> Option<Sample> {
     })
 }
 
+/// The memory inputs alone, as [`sample`] reads them: the highest tier any of
+/// memory pressure, compressor thrash, compressor segments and swap reaches,
+/// and the one that put it there. `None` when the host cannot be governed on
+/// (the same availability test as [`sample`]).
+///
+/// The pressure-relief supervisor (`sysload::relief`) acts only on these. The
+/// governor's held binding names whichever input entered the tier, so a Severe
+/// that a full disk entered keeps naming the disk when memory later joins it;
+/// reading memory directly cannot miss the compound crisis, and a Severe that
+/// only the disk, the CPU or the battery holds never reaches the relief.
+pub(super) fn memory_sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
+    if !matches!(availability(input), Availability::Governing) {
+        return None;
+    }
+    let mut best = (Tier::Clear, None);
+    let mut consider = |tier: Tier, binding: Binding| {
+        if tier > best.0 {
+            best = (tier, Some(binding));
+        }
+    };
+    if input.level == Some(Level::Critical) {
+        consider(Tier::Severe, Binding::MemoryPressure);
+    }
+    if input.compressor_thrash {
+        consider(Tier::Severe, Binding::CompressorThrash);
+    }
+    if input.level == Some(Level::Warn) {
+        consider(Tier::Elevated, Binding::MemoryPressure);
+    }
+    for c in input.thresholds.assess(&input.readings).contributions {
+        if matches!(c.binding, Binding::CompressorSegments | Binding::Swap) {
+            consider(c.tier, c.binding);
+        }
+    }
+    Some(best)
+}
+
 /// What one sample read: the tier and the resource that put it there, and what
 /// the winner hides. `fill` is the tier the fill rule itself read: its release
 /// hold follows that reading, not whichever cause the binding happens to name.

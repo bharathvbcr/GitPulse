@@ -43,6 +43,11 @@ pub(crate) fn steps(terminals: &TerminalSessions, deadline: Duration, sweep: imp
     crate::desktop::launch::shutdown();
     // Before anything that can stall, so a hung terminal shutdown cannot lose it.
     crate::logging::performance::flush();
+    // Anything the pressure relief stopped or slowed is continued and put back
+    // before the terminals are closed: a hangup sent to a stopped process
+    // stays pending until it is continued, and a terminal that "closed" would
+    // leave a build frozen with nothing left to resume it.
+    crate::sysload::relief::shutdown();
     close_terminals_within(terminals, deadline);
     // Restore any agent child processes placed into OS background throttle and
     // remove `<config>/steward/active.json` before stopping Manvi workers.

@@ -162,6 +162,38 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
+/// Writes `dir/name` atomically: a temporary file made `O_EXCL | O_NOFOLLOW`
+/// with mode 0600, synced, then renamed over the target. `dir` must exist (see
+/// [`private_dir`]); a reader sees the old file or the whole new one, never a
+/// torn write, and the file is never reached through a link.
+pub(crate) fn write_private_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
+    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    drop(file);
+    std::fs::rename(&tmp, dir.join(name)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 /// Removes claims older than [`MARKER_TTL`], looking at no more than
 /// [`PRUNE_SCAN`] entries. Errors are ignored: a stale marker costs a few
 /// bytes, and a marker another copy is about to read must not be raced away,

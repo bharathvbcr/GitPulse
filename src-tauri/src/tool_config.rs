@@ -682,6 +682,46 @@ fn is_default_idle_memory_mode(mode: &IdleMemoryMode) -> bool {
     *mode == IdleMemoryMode::default()
 }
 
+/// What the pressure-relief supervisor (`sysload::relief`, load-governor card
+/// 4) does when memory pressure bears down on agent trees. Stored as the
+/// top-level key `host_load_supervisor`, host-wide: a repository override is
+/// not offered, because the supervisor acts on every agent session on the
+/// host and a per-repository switch would leave the same memory pressure
+/// bearing down on the sessions that opted out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorMode {
+    /// Nothing is slowed or frozen, and what was is put back.
+    Off,
+    /// The decisions are computed and published (`relief.v1.json`), and no
+    /// signal or priority change is sent.
+    Advise,
+    /// Slow descendants of agent sessions under memory pressure, and freeze
+    /// the heaviest runaway subtree of a GitPulse-launched session when it
+    /// holds and worsens. An unreadable value is this: the default.
+    #[default]
+    #[serde(other)]
+    Act,
+}
+
+fn lenient_supervisor_mode<'de, D>(deserializer: D) -> Result<SupervisorMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load_supervisor, keeping act: {error}"
+        );
+        SupervisorMode::Act
+    }))
+}
+
+fn is_default_supervisor_mode(mode: &SupervisorMode) -> bool {
+    *mode == SupervisorMode::default()
+}
+
 /// Whether builds take a slot (`sysload::lease`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1679,6 +1719,15 @@ pub struct ToolConfig {
         skip_serializing_if = "HostLoadIdle::is_default"
     )]
     pub host_load_idle: HostLoadIdle,
+    /// What the pressure-relief supervisor does (`off`, `advise`, `act`). A
+    /// sibling key of the host-load block, not a field in it: that block is
+    /// mirrored field for field by the frontend.
+    #[serde(
+        default,
+        deserialize_with = "lenient_supervisor_mode",
+        skip_serializing_if = "is_default_supervisor_mode"
+    )]
+    pub host_load_supervisor: SupervisorMode,
     /// Periodic Manvi system steward settings (host-wide and per-repository).
     #[serde(
         default,
@@ -1721,6 +1770,7 @@ impl Default for ToolConfig {
             turn_checkpoints: TurnCheckpointSettings::default(),
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
+            host_load_supervisor: SupervisorMode::default(),
             manvi_steward: ManviStewardSettings::default(),
             idle_memory_mode: IdleMemoryMode::default(),
             unknown: serde_json::Map::new(),
@@ -2458,6 +2508,25 @@ pub fn host_load_leases() -> HostLoadLeases {
 /// What GitPulse does about an idle session, or the defaults (advise).
 pub fn host_load_idle() -> HostLoadIdle {
     load().map(|cfg| cfg.host_load_idle).unwrap_or_default()
+}
+
+/// What the pressure-relief supervisor does, or the default (act).
+///
+/// An unreadable file is "act": the supervisor only ever answers sustained
+/// memory pressure, and a broken config must not be what quietly turns the
+/// last defence against a hung Mac off. Read by the sampler once per tick.
+pub fn host_load_supervisor() -> SupervisorMode {
+    load()
+        .map(|cfg| cfg.host_load_supervisor)
+        .unwrap_or_default()
+}
+
+/// Stores the supervisor's mode (`off`, `advise`, `act`).
+pub fn set_host_load_supervisor(mode: SupervisorMode) -> Result<(), String> {
+    update(|cfg| {
+        cfg.host_load_supervisor = mode;
+        Ok(())
+    })
 }
 
 /// The stored turn-checkpoint switch. Any failure to read it is "off": a
@@ -3966,6 +4035,46 @@ mod tests {
             invalidate_cache();
             let loaded = load().unwrap();
             assert_eq!(loaded.manvi.source_root.as_deref(), Some("/good/root"));
+        });
+    }
+
+    #[test]
+    fn the_supervisor_setting_defaults_to_act_omits_the_default_and_survives_bad_values() {
+        assert_eq!(SupervisorMode::default(), SupervisorMode::Act);
+        for (text, want) in [
+            (r#""off""#, SupervisorMode::Off),
+            (r#""advise""#, SupervisorMode::Advise),
+            (r#""act""#, SupervisorMode::Act),
+            (r#""enforce""#, SupervisorMode::Act),
+        ] {
+            assert_eq!(serde_json::from_str::<SupervisorMode>(text).unwrap(), want);
+        }
+        with_temp_config(|path| {
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
+            for mode in [SupervisorMode::Off, SupervisorMode::Advise] {
+                set_host_load_supervisor(mode).unwrap();
+                invalidate_cache();
+                assert_eq!(host_load_supervisor(), mode);
+                let stored: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+                assert_eq!(stored["host_load_supervisor"], serde_json::json!(mode));
+            }
+            // Saving the host-load block keeps the sibling key.
+            set_host_load_settings(host_load_settings()).unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_supervisor(), SupervisorMode::Advise);
+            set_host_load_supervisor(SupervisorMode::Act).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored.get("host_load_supervisor").is_none(),
+                "the default is not stored"
+            );
+            // A value this build cannot read is act, never off.
+            fs::write(path, r#"{"host_load_supervisor": 7}"#).unwrap();
+            invalidate_cache();
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
         });
     }
 

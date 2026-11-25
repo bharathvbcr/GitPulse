@@ -951,6 +951,9 @@ pub struct Scanner {
     index: HashMap<i32, usize>,
     tree_of: Vec<Option<u32>>,
     session_of: Vec<Option<u32>>,
+    /// Each session's root, by the number `session_of` carries: the last
+    /// attribution's, for [`Scanner::relief_table`].
+    sessions_at: Vec<usize>,
     tree_names: Vec<String>,
     written_before: HashMap<(i32, u64), u64>,
     written_now: HashMap<(i32, u64), u64>,
@@ -969,6 +972,7 @@ impl Scanner {
             index: HashMap::with_capacity(4096),
             tree_of: Vec::with_capacity(4096),
             session_of: Vec::with_capacity(4096),
+            sessions_at: Vec::new(),
             tree_names: Vec::new(),
             written_before: HashMap::with_capacity(4096),
             written_now: HashMap::with_capacity(4096),
@@ -1117,6 +1121,7 @@ impl Scanner {
                 resolved[i] = true;
             }
         }
+        self.sessions_at.clone_from(&sessions);
         sessions
     }
 
@@ -1712,6 +1717,37 @@ pub(crate) struct AgentThrottleCandidate {
     pub ancestor_pids: Vec<i32>,
 }
 
+/// One process of an agent session as the pressure relief sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReliefProc {
+    pub pid: i32,
+    pub ppid: i32,
+    pub start_us: u64,
+    pub name: String,
+    /// `None` when the OS refused the reading: unknown, never zero.
+    pub footprint: Option<u64>,
+    /// Spared by the shared exemption list ([`Scanner::throttle_exempt`]).
+    pub exempt: bool,
+}
+
+/// One agent session: its root and every other process of its tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReliefSession {
+    pub root: ReliefProc,
+    pub kind: AgentKind,
+    /// Started by GitPulse (the root or an ancestor carries a launch id).
+    pub launched: bool,
+    pub terminal_session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub members: Vec<ReliefProc>,
+}
+
+/// The agent sessions of one scan, for [`Scanner::relief_table`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReliefTable {
+    pub sessions: Vec<ReliefSession>,
+}
+
 /// Most ancestor working directories one candidate carries.
 const MAX_LINEAGE_CWDS: usize = 8;
 
@@ -1765,44 +1801,7 @@ impl Scanner {
             let Some(session_kind) = root.ident.kind else {
                 continue;
             };
-            // Never throttle GitPulse's own Manvi worker trees.
-            if session_kind == AgentKind::Manvi {
-                continue;
-            }
-            if f.pid <= 1 || f.start_us == 0 || f.pid == me_pid || f.uid != me_uid {
-                continue;
-            }
-            if f.ident.memguard {
-                continue;
-            }
-            // Never throttle the session root itself (interactive CLI TUI or IDE
-            // host): keeping the root at normal priority preserves Ctrl+C / hook
-            // responsiveness and prevents XNU fork() inheritance of PRIO_DARWIN_BG
-            // onto newly spawned long-lived child helpers.
-            if f.pid == root.pid {
-                continue;
-            }
-            // An IDE-hosted root is the whole editor: beside its agent server
-            // it parents the integrated-terminal shells and everything the
-            // person types there. Only the agent server's own descendants are
-            // the agent's work.
-            if root.ident.ide_hosted
-                && !is_ide_agent_server(root)
-                && !self.descends_from_agent_server(i, root_i)
-            {
-                continue;
-            }
-            let lower_name = f.ident.name.to_ascii_lowercase();
-            if matches!(
-                lower_name.as_str(),
-                "gitpulse"
-                    | "gitpulsed"
-                    | "gitpulse-mcp"
-                    | "gitpulse-hook"
-                    | "manvi"
-                    | "ptyd"
-                    | "devmap"
-            ) {
+            if self.throttle_exempt(i, root_i, me_pid, me_uid) {
                 continue;
             }
             let own_cwd = self
@@ -1826,6 +1825,110 @@ impl Scanner {
             });
         }
         Ok(out)
+    }
+
+    /// Whether process `i`, in the session rooted at `root_i`, is never slowed
+    /// or frozen. The one exemption list: the steward's slowdown
+    /// ([`Scanner::collect_throttle_candidates`]) and the pressure relief
+    /// (`sysload::relief`, rung A and rung B) all ask it.
+    ///
+    /// Exempt are: any Manvi worker tree; a process this scan cannot name, or
+    /// that is another user's, this process, or pid 1 or below; `memguard`; the
+    /// session root itself (keeping it at normal priority preserves Ctrl+C and
+    /// hook responsiveness, and keeps XNU's `fork()` from handing
+    /// `PRIO_DARWIN_BG` to newly spawned long-lived helpers, and a stopped root
+    /// would be a hung agent); an IDE host's own processes beside its agent
+    /// server (the editor parents the integrated-terminal shells and everything
+    /// the person types there); and GitPulse's, Manvi's, ptyd's and devmap's own
+    /// binaries.
+    fn throttle_exempt(&self, i: usize, root_i: usize, me_pid: i32, me_uid: u32) -> bool {
+        let f = &self.facts[i];
+        let root = &self.facts[root_i];
+        if root.ident.kind == Some(AgentKind::Manvi) {
+            return true;
+        }
+        if f.pid <= 1 || f.start_us == 0 || f.pid == me_pid || f.uid != me_uid {
+            return true;
+        }
+        if f.ident.memguard || f.pid == root.pid {
+            return true;
+        }
+        if root.ident.ide_hosted
+            && !is_ide_agent_server(root)
+            && !self.descends_from_agent_server(i, root_i)
+        {
+            return true;
+        }
+        matches!(
+            f.ident.name.to_ascii_lowercase().as_str(),
+            "gitpulse"
+                | "gitpulsed"
+                | "gitpulse-mcp"
+                | "gitpulse-hook"
+                | "manvi"
+                | "ptyd"
+                | "devmap"
+        )
+    }
+
+    /// The sessions of the last [`Scanner::scan`] as the pressure relief reads
+    /// them: each session's root and every other member of its tree, with its
+    /// footprint and whether [`Scanner::throttle_exempt`] spares it. It reads
+    /// the state that scan left (no second read of the process table, no
+    /// per-process syscall), so it is meaningful only straight after a scan.
+    /// A Manvi worker tree is left out whole.
+    pub(crate) fn relief_table(&self, me_pid: i32) -> ReliefTable {
+        let me_uid = self.source.me_uid();
+        let proc_of = |i: usize, exempt: bool| {
+            let f = &self.facts[i];
+            ReliefProc {
+                pid: f.pid,
+                ppid: f.ppid,
+                start_us: f.start_us,
+                name: f.ident.name.clone(),
+                footprint: f.footprint.value(),
+                exempt,
+            }
+        };
+        let mut sessions: Vec<ReliefSession> = Vec::new();
+        let mut at_of: HashMap<u32, usize> = HashMap::new();
+        for (n, &root_i) in self.sessions_at.iter().enumerate() {
+            let root = &self.facts[root_i];
+            let Some(kind) = root.ident.kind else {
+                continue;
+            };
+            if kind == AgentKind::Manvi || root.uid != me_uid {
+                continue;
+            }
+            at_of.insert(n as u32, sessions.len());
+            sessions.push(ReliefSession {
+                root: proc_of(root_i, true),
+                kind,
+                launched: self.tree_of.get(root_i).copied().flatten().is_some(),
+                terminal_session_id: root
+                    .ident
+                    .launch
+                    .as_ref()
+                    .and_then(|k| k.session_id.clone()),
+                run_id: root.ident.launch.as_ref().and_then(|k| k.run_id.clone()),
+                members: Vec::new(),
+            });
+        }
+        for i in 0..self.facts.len() {
+            let Some(n) = self.session_of.get(i).copied().flatten() else {
+                continue;
+            };
+            let (Some(&at), Some(&root_i)) = (at_of.get(&n), self.sessions_at.get(n as usize))
+            else {
+                continue;
+            };
+            if i == root_i {
+                continue;
+            }
+            let exempt = self.throttle_exempt(i, root_i, me_pid, me_uid);
+            sessions[at].members.push(proc_of(i, exempt));
+        }
+        ReliefTable { sessions }
     }
 
     /// Working directories of `i`'s ancestors, nearest first, through the
@@ -2741,6 +2844,14 @@ pub(crate) fn cwd_of(pid: i32) -> Option<PathBuf> {
     os::cwd(pid)
 }
 
+/// A process's environment as `NAME=value` strings, when the OS will say.
+/// macOS shows no environment for Apple platform binaries (`/bin/sh`,
+/// `/usr/bin/git`): that reads as an empty list, so an environment marker is
+/// found only on the programs that carry one (`cargo`, `rustc`, `node`...).
+pub(crate) fn environment_of(pid: i32) -> Option<Vec<String>> {
+    os::environment(pid)
+}
+
 /// One process as something about to signal it would see it: what `pkill`,
 /// `pgrep` and `killall` match against, and whether GitPulse would call it
 /// its own.
@@ -3071,6 +3182,15 @@ mod os {
         }
         pids.truncate(written);
         Ok(())
+    }
+
+    /// The `NAME=value` strings of `pid`'s environment from
+    /// `KERN_PROCARGS2`, `None` when the kernel refuses it. An Apple platform
+    /// binary reads back with an empty environment, which this cannot tell
+    /// from one that has none.
+    pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+        let mut buf = vec![0u8; argmax()];
+        full_procargs(pid, &mut buf).map(|(_, _, env)| env)
     }
 
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
@@ -3796,6 +3916,18 @@ mod os {
         Ok(())
     }
 
+    /// The `NAME=value` strings of `pid`'s environment, `None` when it cannot
+    /// be read (gone, or not this user's).
+    pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
+        let raw = read_bounded(&format!("/proc/{pid}/environ"), 1 << 20).ok()?;
+        Some(
+            raw.split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+                .map(|item| String::from_utf8_lossy(item).into_owned())
+                .collect(),
+        )
+    }
+
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
         let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
         // A deleted directory reads back as "/old/path (deleted)", which is still
@@ -4340,6 +4472,10 @@ mod os {
     }
 
     pub(crate) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
+    }
+
+    pub(crate) fn environment(_pid: i32) -> Option<Vec<String>> {
         None
     }
 

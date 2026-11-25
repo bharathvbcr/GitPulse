@@ -47,7 +47,7 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 |---|---|---|
 | One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
-| The **sum** of a GitPulse-launched tree | Card 4 (supervisor) | Advise by default; enforce is opt-in. |
+| A tree's processes while **memory** is short, and a runaway subtree that keeps making it worse | Card 4 (pressure relief, `sysload::relief`) | Slow and freeze by default, with a setting (`host_load_supervisor`: off, advise, act). Terminate is opt-in and not built. See Pressure relief. |
 | Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
 | Leases, the hook, advice | Cards 1d, 3 | **The sensor only measures and publishes.** They consume the same verdict. |
 
@@ -66,7 +66,7 @@ in Health. That signal is re-checked on the live process before it is sent
 | 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
-| 4 | Tree-sum supervisor and launched-orphan stop, advise by default | Not started |
+| 4 | Pressure relief: slow and freeze by default; terminate is opt-in | Implemented for this slice: slowing and freezing (see Pressure relief). Terminate and the launched-orphan stop are not built |
 | 5 | Disk-write budget; consumes the per-tree write rate | Not started |
 
 ## Sensor states
@@ -902,6 +902,167 @@ alone, and a build from a shell that line does not reach is not.
 - The idle thresholds (900 s, 3600 s, 5% of a core) are a starting guess, not
   measured against real sessions.
 - No automatic reclaim of build caches and no automatic park exist.
+
+## Pressure relief (card 4)
+
+On 2026-11-24 the Mac hung for two hours on memory-compressor exhaustion and
+about eighteen agent sessions in GitPulse terminals were lost. The governor
+shed GitPulse's own work and refused new launches; nothing acted on the agent
+trees already running. The relief (`sysload::relief`) does, and it is the one
+card that touches an agent's processes. It still never kills one, and memguard
+(above) stays the only thing that ends a process for its footprint: **GitPulse
+never kills a single process for its footprint.**
+
+It runs on the elected sensor writer's sampler tick (2 s), from the scan that
+tick just made, with no spawn gate, no `manvi use` probe and no subprocess:
+only the in-process scan, `setpriority(2)` and `kill(2)`. A Mac with no Manvi,
+or one whose Manvi probe is deferred under load, is relieved the same.
+
+### Trigger
+
+Only the memory inputs count: memory pressure, compressor thrash, compressor
+segments and swap (`governor::memory_sample`, read straight from the sample, not
+from the governor's held binding, which keeps naming whichever input entered
+the tier). A Severe held by CPU load, thermals, the battery or a filling disk
+never acts.
+
+| Rung | When | Does |
+|---|---|---|
+| A, slow | Memory-bound Elevated or worse for 3 samples; released after 5 samples below Elevated | `PRIO_DARWIN_BG` on every non-exempt process of every agent session, launched or observed |
+| B, freeze | Memory-bound Severe for 30 consecutive samples (60 s) **and** deterioration | `SIGSTOP` of one subtree per session, at most three on the host |
+
+Deterioration is swap in use or compressor segments still rising across that
+60 s window: the median of the last 5 readings over the median of the first 5,
+by at least 256 MiB of swap or 1 percentage point of the segment limit
+(`SWAP_RISE_BYTES`, `SEGMENT_RISE_POINTS`). **Level alone never triggers
+rung B**: swap does not drain after a recovery, so a high but flat swap is not a
+reason. Five consecutive samples below Severe end a Severe run; one dip does not
+restart the minute. An unreadable swap or segment reading never starts a freeze
+and never holds one.
+
+### Selection (rung B)
+
+Only a **GitPulse-launched** session (its tree carries a launch id) in a
+**trusted** repository (`repository_trust::require` on the session's checkout,
+which starts no `git`). In it, the single heaviest eligible *subtree* by
+footprint sum, at least 256 MiB, **below a shell that is a direct child of the
+agent**: never the agent, never that shell. Every other direct child of the
+agent (an MCP server's stdio process, a helper) and everything under it is
+outside the search.
+
+### Exemptions
+
+One predicate (`Scanner::throttle_exempt` in `procscan`) serves both rungs and
+the steward's slowdown: the session root, `memguard`, GitPulse's, Manvi's,
+ptyd's and devmap's binaries, an IDE host's non-agent children, Manvi worker
+trees. Rung B adds, and **one exempt member spares the whole subtree**:
+
+- `git` processes, and any process whose working directory is in a worktree
+  with a live `index.lock` (the nearest `.git` directory, or the gitdir a linked
+  worktree's `.git` file names);
+- **build-lease holders and waiters**, read from the lease board
+  (`lease::Dir::board`: the `F_GETLK` owner of each slot and each waiter's
+  ticket), because `procscan` cannot see a descriptor lock. A holder anywhere
+  in the subtree or in the chain above it spares it, so the children of a
+  holder are spared too. A board that cannot be read in full freezes nothing;
+- trees whose environment carries `GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD` or
+  `MAC_HEAVY_LABEL` (a non-empty value), read from `KERN_PROCARGS2` on the
+  subtree's root, its first 24 members and the shells above it. **Limit:** macOS
+  hides the environment of Apple platform binaries (`/bin/bash`, `/usr/bin/git`),
+  so the marker is found on the program that carries it (`cargo`, `go`,
+  `rustc`), not on the script that started it. An environment that cannot be
+  read spares the subtree: unknown is never clear;
+- MCP servers: the direct children of the agent that are not shells, and any
+  process named `*mcp*`. **Limit:** an MCP server started as `sh -c "npx ..."`
+  looks like a shell's child; it is frozen only if it is the heaviest eligible
+  subtree, and is resumed within the cap;
+- the shells that are direct children of the agent, and a process whose working
+  directory cannot be read.
+
+### Recovery
+
+A freeze never lasts indefinitely. It ends at the first of:
+
+- deterioration flat for 15 samples (swap may stay high);
+- the tier below Severe for 5 samples;
+- **10 minutes** on the monotonic clock (`FREEZE_CAP`). At the cap the subtree
+  resumes and is not refrozen until a whole new Severe minute with
+  deterioration; there is no terminate rung in this slice. The cap hit is
+  counted (`cap_hits`) and said in `last_action`.
+
+Processes that forked under a frozen subtree before their parent stopped are
+stopped on the following ticks; a subtree whose own process ended is let go. Any
+future kill path must `SIGCONT` first: a signal to a stopped process waits for
+the continue.
+
+**Crash safety.** Before a `SIGSTOP` (or a priority change) the process is
+written to a private journal, `<config>/relief/journal.v1.json` (pid, start
+time, session, time, rung); a journal write that fails means no signal. The
+journal is replayed (`SIGCONT`, priority restored) when a sampler wins the
+writer election, when the relief is dropped (a sampler stop or panic), and from
+the app's teardown, before the terminals close. An entry is cleared only after
+its resume was attempted. Signals go through `procguard::signal::signal_process`,
+which refuses a recycled pid by its start time; a refusal or any failed signal
+is recorded in `failures` and `failure_count`, never as done.
+
+### Slowing has one owner
+
+Every priority change GitPulse makes to an agent's process goes through the
+relief's ledger. The steward's slowdown (`slow_critical`, opt-in, needs Manvi)
+now delegates to it (`relief::steward_throttle`): it may slow what the relief
+has not, and it cannot put back what the relief slowed. Before this, a steward
+tick with Manvi unconfigured restored every priority it knew of, which would
+have undone rung A. The steward keeps its lease, its pacing and its directive
+text; the relief releases rung A itself when pressure eases.
+
+### Setting and status
+
+`host_load_supervisor` in `tools.json`: `off` (nothing is done, and what was is
+put back), `advise` (decisions are computed and published, no signal and no
+priority change), `act` (the default; an unreadable value is `act`). It is a
+top-level sibling key like `host_load_idle`, host-wide: a per-repository
+override is not offered, because the relief acts on every agent session on the
+host and the same memory pressure bears down on a session that opted out.
+
+`sysload::relief::snapshot()` serves the state in process, read-only: mode,
+rung (none, slow, freeze), the memory binding and tier, the frozen subtrees
+(root pid and start time, session root, terminal session id, repository,
+command, footprint, since, advise-only), the slowed count, the last action
+(slow, freeze, resume, cap resume, refused), the latest signal failures with
+their pids and their count, and the cap hits. The tick writes no status file and
+`host-load.v1` is unchanged; the published status type is another module's.
+`sysload::relief::resume_all(hold_off_episode, reason)` resumes every frozen
+subtree from any thread, through the journal and `signal_process` like every
+other resume, returns each pid's success or failure, and with `hold_off_episode`
+keeps the relief from freezing again until the memory tier has dropped below
+Severe. No IPC command and no UI exist in this slice.
+
+Only the writer's relief acts, and a journal belongs to the GitPulse that wrote
+it: a process that lost the writer election and quits does not continue or
+restore what the writer's relief did (the steward's journal follows the same
+rule). Rung A runs at once when a slowing begins and then every fifth sample;
+processes that have ended leave the ledger, the cap (2,048 live processes) and
+the journal on each pass; a process the OS refused once is not asked again until
+the slowing ends.
+
+### Not verified
+
+- No run on a host under real memory exhaustion. The thresholds above (60 s,
+  256 MiB, 1 point, 15 samples, 10 minutes) are a starting guess; the trigger is
+  tested with fabricated samples and the signals with real child processes, not
+  with a machine that is actually failing.
+- Whether `SIGSTOP` of a build's subtree lowers pressure, rather than only
+  stopping new allocation, was not measured: a stopped process keeps its pages
+  until the kernel compresses or swaps them.
+- Linux: the sensor only advises there, so the relief never acts.
+- Selection was run read-only on this host's real trees (no signals): GitPulse-
+  launched Claude sessions showed root-child shells and launch ids, and
+  `KERN_PROCARGS2` returned environments. Every heavy subtree was then barred by
+  `GITPULSE_LEASE_HELD` (the builds running at the time), so a positive pick on a
+  real tree was not observed. A Codex session's root is its wrapper, so its
+  shells are grandchildren of the root and are never candidates.
+- Apple platform binaries show an empty environment (a shell read back with 0
+  variables), so a marker is found only on the non-Apple program that carries it.
 
 ## Health and the status bar
 
