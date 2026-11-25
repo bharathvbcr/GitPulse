@@ -1087,7 +1087,9 @@ impl SessionLedger {
         }
         if !matched {
             // Its row is not written yet: hold the exit for `record_spawn`.
-            guard.early_exits.retain(|early| early.terminal_id != terminal_id);
+            guard
+                .early_exits
+                .retain(|early| early.terminal_id != terminal_id);
             if guard.early_exits.len() >= MAX_EARLY_EXITS {
                 guard.early_exits.pop_front();
             }
@@ -1375,10 +1377,8 @@ impl SessionLedger {
                     // Alive on a host this one is not: shown, never reopenable
                     // (a second copy would resume the same conversation twice).
                     if !row.withdrawn && row.end_state == SessionEndState::Running {
-                        if let Some(reason) = row
-                            .terminal_id
-                            .as_deref()
-                            .and_then(|id| elsewhere.get(id))
+                        if let Some(reason) =
+                            row.terminal_id.as_deref().and_then(|id| elsewhere.get(id))
                         {
                             offers.push(project_valid_row_with_status(
                                 row,
@@ -1391,7 +1391,11 @@ impl SessionLedger {
                         }
                     }
                     let newest = conversation_key(row).is_none_or(|key| taken.insert(key));
-                    if !newest || reopening.contains(row.row_id.as_str()) || row.withdrawn || !is_offer_end_state(row.end_state) {
+                    if !newest
+                        || reopening.contains(row.row_id.as_str())
+                        || row.withdrawn
+                        || !is_offer_end_state(row.end_state)
+                    {
                         continue;
                     }
                     let offer = project_valid_row(row, |prov, sid| {
@@ -2831,10 +2835,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_LEDGER_FILE);
         let ledger = SessionLedger::open(&path);
-        assert!(!ledger.record_exit(
-            "term-fast",
-            ExitFacts::reaped(false, Some(1), None)
-        ));
+        assert!(!ledger.record_exit("term-fast", ExitFacts::reaped(false, Some(1), None)));
         let row = ledger.record_spawn(spawn_spec(
             "term-fast",
             "claude",
@@ -2842,12 +2843,17 @@ mod tests {
             dir.path(),
             None,
         ));
-        assert_eq!(state_of(&ledger, &row), (SessionEndState::ExitedClean, false));
+        assert_eq!(
+            state_of(&ledger, &row),
+            (SessionEndState::ExitedClean, false)
+        );
         drop(ledger);
         let relaunched = SessionLedger::open(&path);
         assert_eq!(relaunched.reconcile_startup(&HashSet::new()), 0);
         assert_eq!(
-            relaunched.view_with(|_, _| Transcript::Found).reopenable_count,
+            relaunched
+                .view_with(|_, _| Transcript::Found)
+                .reopenable_count,
             0,
             "a session that ended on its own is not offered after a relaunch"
         );
@@ -2939,7 +2945,13 @@ mod tests {
         let ledger = SessionLedger::open(dir.join(SESSION_LEDGER_FILE));
         let old = ledger.record_spawn(spawn_spec("term-old", launcher, Some(native), dir, None));
         ledger.mark_app_quit();
-        let new = ledger.record_spawn(spawn_spec("term-r", launcher, Some(native), dir, Some(&old)));
+        let new = ledger.record_spawn(spawn_spec(
+            "term-r",
+            launcher,
+            Some(native),
+            dir,
+            Some(&old),
+        ));
         (ledger, old, new)
     }
 
@@ -2952,7 +2964,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ledger, old, new) = reopened(dir.path(), UUID_1, "claude");
         assert!(offered(&ledger).is_empty(), "hidden while the reopen runs");
-        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        assert!(exit_facts(
+            &ledger,
+            "term-r",
+            false,
+            Some(1),
+            None,
+            None,
+            true
+        ));
         let offers = offered(&ledger);
         assert_eq!(offers.len(), 1, "{offers:?}");
         assert_eq!(offers[0].row_id, old);
@@ -2960,14 +2980,23 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|e| e.contains("exited with code 1")));
-        assert!(state_of(&ledger, &new).1, "the failed reopen is not a duplicate offer");
+        assert!(
+            state_of(&ledger, &new).1,
+            "the failed reopen is not a duplicate offer"
+        );
         // It survives a restart as the same single offer.
         let reloaded = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
         let offers = offered(&reloaded);
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].row_id, old);
         // And can be reopened again.
-        reloaded.record_spawn(spawn_spec("term-r2", "claude", Some(UUID_1), dir.path(), Some(&old)));
+        reloaded.record_spawn(spawn_spec(
+            "term-r2",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            Some(&old),
+        ));
         assert!(offered(&reloaded).is_empty());
     }
 
@@ -2979,7 +3008,15 @@ mod tests {
         ledger.bind_native_id("term-r", "claude", UUID_1);
         assert!(state_of(&ledger, &old).1);
         // A later early-looking exit is now an ordinary exit, not a failed reopen.
-        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        assert!(exit_facts(
+            &ledger,
+            "term-r",
+            false,
+            Some(1),
+            None,
+            None,
+            true
+        ));
         assert!(offered(&ledger).is_empty());
     }
 
@@ -3028,7 +3065,15 @@ mod tests {
         assert_eq!(offered(&ledger).len(), 1);
         ledger.record_spawn(spawn_spec("term-r", "agy", None, dir.path(), Some(&old)));
         assert!(offered(&ledger).is_empty());
-        assert!(exit_facts(&ledger, "term-r", false, Some(1), None, None, true));
+        assert!(exit_facts(
+            &ledger,
+            "term-r",
+            false,
+            Some(1),
+            None,
+            None,
+            true
+        ));
         assert_eq!(offered(&ledger)[0].row_id, old);
     }
 
@@ -3039,7 +3084,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_LEDGER_FILE);
         let first = SessionLedger::open(&path);
-        first.record_spawn(spawn_spec("term-run", "claude", Some(UUID_1), dir.path(), None));
+        first.record_spawn(spawn_spec(
+            "term-run",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
         drop(first);
         let ledger = std::sync::Arc::new(SessionLedger::open(&path));
         let sessions = TerminalSessions::with_unavailable_host("host down".into());
@@ -3072,8 +3123,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_LEDGER_FILE);
         let first = SessionLedger::open(&path);
-        first.record_spawn(spawn_spec("term-old-host", "claude", Some(UUID_1), dir.path(), None));
-        first.record_spawn(spawn_spec("term-gone", "claude", Some(UUID_2), dir.path(), None));
+        first.record_spawn(spawn_spec(
+            "term-old-host",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        first.record_spawn(spawn_spec(
+            "term-gone",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
         drop(first);
         let ledger = SessionLedger::open(&path);
         let foreign = ForeignHolds {
@@ -3091,17 +3154,30 @@ mod tests {
         assert_eq!(held.reason.as_deref(), Some(OLDER_HOST_REASON));
         assert_eq!(view.reopenable_count, 1, "only the genuinely lost row");
         // Reopen all offers only resumable rows.
-        assert!(view.offers.iter().filter(|o| o.resumable).all(|o| o.terminal_id.as_deref() == Some("term-gone")));
+        assert!(view
+            .offers
+            .iter()
+            .filter(|o| o.resumable)
+            .all(|o| o.terminal_id.as_deref() == Some("term-gone")));
         // Once the older host lets go, the next reconcile loses it.
         ledger.reconcile_startup_with(&HashSet::new(), &ForeignHolds::default());
-        assert_eq!(ledger.view_with(|_, _| Transcript::Found).reopenable_count, 2);
+        assert_eq!(
+            ledger.view_with(|_, _| Transcript::Found).reopenable_count,
+            2
+        );
     }
 
     #[test]
     fn an_older_host_that_could_not_be_asked_makes_rows_unverified_not_lost() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
-        ledger.record_spawn(spawn_spec("term-x", "claude", Some(UUID_1), dir.path(), None));
+        ledger.record_spawn(spawn_spec(
+            "term-x",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
         let foreign = ForeignHolds {
             held: HashSet::new(),
             unverified: true,
@@ -3109,7 +3185,10 @@ mod tests {
         ledger.reconcile_startup_with(&HashSet::new(), &foreign);
         let view = ledger.view_with(|_, _| Transcript::Found);
         assert_eq!(view.reopenable_count, 0);
-        assert_eq!(view.offers[0].reason.as_deref(), Some(UNVERIFIED_HOST_REASON));
+        assert_eq!(
+            view.offers[0].reason.as_deref(),
+            Some(UNVERIFIED_HOST_REASON)
+        );
         assert!(!view.offers[0].resumable);
     }
 
@@ -3136,15 +3215,25 @@ mod tests {
             quiet_ms: None,
         };
         let listed = report(LegacyStatus::Listed {
-            info: LegacyHostInfo { protocol: 4, build: "b".into(), pid: 1, sessions: 1 },
+            info: LegacyHostInfo {
+                protocol: 4,
+                build: "b".into(),
+                pid: 1,
+                sessions: 1,
+            },
             sessions: vec![session],
         });
         let holds = crate::terminal::foreign_holds(&[
             listed,
-            report(LegacyStatus::Unreachable { reason: "stale".into() }),
+            report(LegacyStatus::Unreachable {
+                reason: "stale".into(),
+            }),
         ]);
         assert!(holds.held.contains("term-4-1"));
-        assert!(!holds.unverified, "a socket with no host is gone, not unverified");
+        assert!(
+            !holds.unverified,
+            "a socket with no host is gone, not unverified"
+        );
         let holds = crate::terminal::foreign_holds(&[report(LegacyStatus::Failed {
             reason: "slow".into(),
         })]);
@@ -3177,7 +3266,10 @@ mod tests {
         );
         assert!(matches!(held, crate::daemon_lock::Acquire::Held(_)));
         let live = crate::terminal::foreign_holds(std::slice::from_ref(&report));
-        assert!(live.unverified, "a live host with no dialect could not be asked");
+        assert!(
+            live.unverified,
+            "a live host with no dialect could not be asked"
+        );
         drop(held);
     }
 

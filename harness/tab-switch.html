@@ -160,6 +160,8 @@
         cmd_get_language_stats: () => langStats(),
         cmd_apple_intelligence_status: () => ({ compiled: false, state: "unsupported_os", reason: "not_compiled", detail: "Not in this build." }),
         cmd_commit: () => null,
+        // The app-level interrupted-agents notice reads the session ledger on mount.
+        cmd_terminal_session_ledger: () => ({ offers: [], reopenable_count: 0, unreadable_count: 0 }),
         // The glance's fetch chip; answered as cmd_commit is.
         cmd_fetch: () => null,
         // The wire shape of `AiStatus` (src/lib/stores/harnessStore.ts). Answered
