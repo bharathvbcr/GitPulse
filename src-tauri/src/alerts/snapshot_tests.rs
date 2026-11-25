@@ -234,7 +234,12 @@ fn snapshot_reader_rejects_missing_dead_and_reused_writers_and_sets_0600() {
         write_state_snapshot_atomic(&path, &unverifiable).unwrap();
         match read_state_snapshot_at(Some(&path)) {
             HubStateRead::Unavailable(reason) => {
-                assert!(reason.contains("is no longer running"), "{reason}")
+                // The reason is not echoed: an open refusal names the owner's
+                // uid, which has no place in test output.
+                assert!(
+                    reason.contains("is no longer running"),
+                    "an unidentifiable writer is refused as not running"
+                )
             }
             HubStateRead::Ok(_) => panic!("a writer that cannot be identified must be refused"),
         }
