@@ -621,7 +621,16 @@ fn is_git_command_word(tok: &ShellToken<'_>) -> bool {
 fn parse_git_invocation(clause: &str) -> Option<GitInvocation<'_>> {
     let tokens = scan_shell_tokens(clause);
     let at = locate_git(&tokens)?;
+    let c_args = git_c_args(&tokens, at);
+    if c_args.is_empty() {
+        return None;
+    }
+    Some(GitInvocation { tokens, c_args })
+}
 
+/// The `-C` global options of the git word at `at`: (flag index, value index
+/// when separate, value, value expands).
+fn git_c_args(tokens: &[ShellToken<'_>], at: usize) -> Vec<(usize, Option<usize>, String, bool)> {
     let mut c_args = Vec::new();
     let mut i = at + 1;
     while i < tokens.len() {
@@ -663,10 +672,7 @@ fn parse_git_invocation(clause: &str) -> Option<GitInvocation<'_>> {
         };
         i = next;
     }
-    if c_args.is_empty() {
-        return None;
-    }
-    Some(GitInvocation { tokens, c_args })
+    c_args
 }
 
 /// The rule a `-C` that cannot be attributed to a git invocation is refused under.
@@ -771,6 +777,12 @@ fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
     if !is_command_wrapper(first) {
         return None;
     }
+    // A git word that is an option's argument (`sudo -u git git -C …`, `env -u
+    // git git -C …`) must not hide the real one: of the git words after the
+    // wrapper, take the first that carries a `-C`, else the first. Choosing a
+    // git that has a -C only ever adds a judgement (the sibling scope, or the
+    // refusal) for a command the first-git reading passed on unjudged.
+    let mut first = None;
     let mut j = at + 1;
     while j < tokens.len() {
         if tokens[j].is_redirect {
@@ -778,11 +790,14 @@ fn locate_git(tokens: &[ShellToken<'_>]) -> Option<usize> {
             continue;
         }
         if is_git_command_word(&tokens[j]) {
-            return Some(j);
+            if !git_c_args(tokens, j).is_empty() {
+                return Some(j);
+            }
+            first.get_or_insert(j);
         }
         j += 1;
     }
-    None
+    first
 }
 
 fn is_git_text(word: &str) -> bool {
@@ -864,9 +879,15 @@ fn script_of(tokens: &[ShellToken<'_>], at: usize, kind: Evaluator) -> Option<St
                 && flag.len() > 1
                 && flag[1..].chars().all(char::is_alphabetic)
                 && flag.contains('c');
-            (cluster || flag == "--command")
-                .then(|| tokens.get(k + 1).map(|tok| tok.text.clone()))
-                .flatten()
+            if !(cluster || flag == "--command") {
+                return None;
+            }
+            // `bash -c -- 'script'`: a lone `--` ends the options, the script follows.
+            let next = match tokens.get(k + 1) {
+                Some(tok) if tok.text == "--" => tokens.get(k + 2),
+                other => other,
+            };
+            next.map(|tok| tok.text.clone())
         }),
     }
 }
@@ -2792,7 +2813,6 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: a git-named argument of a wrapper (sudo -u git, env -u git) is taken as the git word, so the real git -C is neither judged nor refused"]
     fn lane_c_git_named_wrapper_argument_does_not_hide_the_real_git() {
         lane_c_assert_covered(&[
             "sudo -u git git -C ../{R} checkout -- x",
@@ -2802,7 +2822,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: an unknown wrapper followed by a quoted git or a quoted -C (strace \"git\" -C, strace git \"-C\") is skipped by the unquoted-only reader"]
+    #[ignore = "owner decision: an unknown wrapper followed by a quoted git or a quoted -C (strace \"git\" -C, strace git \"-C\") is skipped by the unquoted-only reader; counting whole quoted \"git\" tokens would bring back the rg \"git\" -C 3 false refusal"]
     fn lane_c_quoted_git_or_dash_c_behind_an_unknown_wrapper_is_refused() {
         lane_c_assert_covered(&[
             "strace \"git\" -C ../{R} checkout -- x",
@@ -2813,7 +2833,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: an expanding command word ($(which git), GIT-default expansion, $GIT) followed by -C is neither located as git nor refused (pre-existing: main never judged it either)"]
+    #[ignore = "pre-existing on main: lane C attack: an expanding command word ($(which git), GIT-default expansion, $GIT) followed by -C is neither located as git nor refused (pre-existing: main never judged it either)"]
     fn lane_c_expanding_command_word_with_dash_c_is_refused() {
         lane_c_assert_covered(&[
             "$(which git) -C ../{R} checkout -- x",
@@ -2825,7 +2845,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: git glued to a subshell or substitution opener ((git -C, $(git -C, x=$(git -C, backticks) is not in command position for either reader (pre-existing: main never judged it either)"]
+    #[ignore = "pre-existing on main: lane C attack: git glued to a subshell or substitution opener ((git -C, $(git -C, x=$(git -C, backticks) is not in command position for either reader (pre-existing: main never judged it either)"]
     fn lane_c_git_glued_to_a_subshell_or_substitution_is_refused() {
         lane_c_assert_covered(&[
             "(git -C ../{R} checkout -- x)",
@@ -2837,14 +2857,13 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: bash -c -- '<script>' reads \"--\" as the script, so the real script is never inspected"]
     fn lane_c_double_dash_between_dash_c_and_the_script_is_read() {
         lane_c_assert_covered(&["bash -c -- 'git -C ../{R} checkout -- x'"]);
     }
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: -C naming a subdirectory of the sibling worktree does not resolve to a registered worktree root, so it is neither judged against the sibling nor refused (pre-existing: same resolution on main)"]
+    #[ignore = "pre-existing on main: lane C attack: -C naming a subdirectory of the sibling worktree does not resolve to a registered worktree root, so it is neither judged against the sibling nor refused (pre-existing: same resolution on main)"]
     fn lane_c_dash_c_into_a_sibling_subdirectory_is_judged_or_refused() {
         lane_c_assert_covered(&[
             "git -C ../{R}/src checkout -- x",
@@ -2854,7 +2873,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: a located git whose -C value expands (tilde, variable, glob) is skipped by sibling_git_clauses and is not refused (pre-existing: same on main)"]
+    #[ignore = "pre-existing on main: lane C attack: a located git whose -C value expands (tilde, variable, glob) is skipped by sibling_git_clauses and is not refused (pre-existing: same on main)"]
     fn lane_c_dash_c_value_that_expands_is_refused() {
         lane_c_assert_covered(&[
             "git -C ~/{R} checkout -- x",
@@ -2866,7 +2885,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: --git-dir/--work-tree, GIT_DIR/GIT_WORK_TREE and -c core.worktree aim git at the sibling with no -C; parse_git_invocation skips the values and nothing judges them (pre-existing: main skips them identically)"]
+    #[ignore = "pre-existing on main: lane C attack: --git-dir/--work-tree, GIT_DIR/GIT_WORK_TREE and -c core.worktree aim git at the sibling with no -C; parse_git_invocation skips the values and nothing judges them (pre-existing: main skips them identically)"]
     fn lane_c_git_dir_and_work_tree_spellings_are_judged_or_refused() {
         lane_c_assert_covered(&[
             "git --git-dir=../{R}/.git --work-tree=../{R} checkout -- x",
@@ -2878,7 +2897,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: a script the evaluator reads from stdin or builds by expansion (here-string, pipe into sh, bash -c with a command substitution) is not inspectable and is not refused (inherent; main never read scripts)"]
+    #[ignore = "pre-existing on main: lane C attack: a script the evaluator reads from stdin or builds by expansion (here-string, pipe into sh, bash -c with a command substitution) is not inspectable and is not refused (inherent; main never read scripts)"]
     fn lane_c_uninspectable_scripts_are_refused() {
         lane_c_assert_covered(&[
             "bash <<<'git -C ../{R} x'",
@@ -2889,7 +2908,7 @@ done
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "lane C attack: changing directory (cd, env -C, bash -c 'cd … && git') moves git into the sibling with no -C; residual gap, identical on main"]
+    #[ignore = "pre-existing on main: lane C attack: changing directory (cd, env -C, bash -c 'cd … && git') moves git into the sibling with no -C; residual gap, identical on main"]
     fn lane_c_directory_change_into_a_sibling_is_refused() {
         lane_c_assert_covered(&[
             "bash -c 'cd ../{R} && git checkout -- x'",
