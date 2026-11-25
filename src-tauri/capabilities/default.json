@@ -241,6 +241,7 @@
     "allow-cmd-manvi-steward-status",
     "allow-cmd-manvi-use",
     "allow-cmd-mavi-answer",
+    "allow-cmd-mavi-close-thread-children",
     "allow-cmd-mavi-conversation-check",
     "allow-cmd-mavi-events",
     "allow-cmd-mavi-file-diff",

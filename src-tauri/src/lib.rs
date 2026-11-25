@@ -705,6 +705,7 @@ pub fn run() {
             cmd_terminal_read_agent_artifact,
             cmd_terminal_resize,
             cmd_terminal_kill,
+            cmd_mavi_close_thread_children,
             cmd_terminal_incidents,
             cmd_terminal_legacy_hosts,
             cmd_terminal_legacy_kill,

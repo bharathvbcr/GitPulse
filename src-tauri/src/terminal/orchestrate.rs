@@ -160,6 +160,115 @@ fn standalone_caller_id_from(
     ))
 }
 
+/// The process id inside a standalone owner key (`mcp-<pid>` or `ext-<pid>`),
+/// or `None` for any other key (a terminal session id, `ext-mavi-<uuid>`).
+fn standalone_owner_pid(key: &str) -> Option<u32> {
+    let digits = key
+        .strip_prefix("mcp-")
+        .or_else(|| key.strip_prefix("ext-"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Whether a process with this id exists. `EPERM` means it exists and is not
+/// ours (macOS answers it for a process group that is all zombies too), so it
+/// counts as alive: only `ESRCH` proves the owner gone.
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a cheap probe, an owner is never declared dead.
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+/// Whether `key` names a standalone orchestrator (`mcp-<pid>` / `ext-<pid>`)
+/// whose process is gone. A Mavi thread key, or a terminal session id, is
+/// never dead by this test: a resumed thread owns its children again.
+pub(crate) fn owner_is_dead(key: &str) -> bool {
+    standalone_owner_pid(key).is_some_and(|pid| !process_exists(pid))
+}
+
+/// What [`close_owner_children`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerCloseSummary {
+    pub closed: usize,
+    pub skipped_protected: usize,
+}
+
+/// Closes every live child owned by the Mavi thread key `owner_key`, as the
+/// user's "stop children" does: a protected session is left running and
+/// counted. Only the app calls this (the user forgot the thread); no MCP
+/// caller reaches it, and children of any other owner are never touched.
+pub(crate) fn close_owner_children(
+    state: &TerminalSessions,
+    ui: &dyn OrchestrateUiSink,
+    owner_key: &str,
+) -> Result<OwnerCloseSummary, String> {
+    if mavi_thread_of_owner(owner_key).is_none() {
+        return Err("not a Mavi thread owner key".into());
+    }
+    let targets: Vec<(String, String)> = {
+        let inner = state.orchestration.lock();
+        inner
+            .sessions
+            .iter()
+            .filter(|(_, rec)| !rec.ended && rec.parent_session_id.as_deref() == Some(owner_key))
+            .map(|(id, rec)| (id.clone(), rec.repo_path.clone()))
+            .collect()
+    };
+    let mut summary = OwnerCloseSummary {
+        closed: 0,
+        skipped_protected: 0,
+    };
+    let mut failures = Vec::new();
+    for (id, repo_path) in targets {
+        match crate::terminal::kill_session_as(
+            state,
+            &id,
+            KillOrigin::StopChildren,
+            Some(owner_key),
+        ) {
+            Ok(KillOutcome::Killed) => {
+                state.orchestration.mark_ended(&id, None);
+                ui.child_closed(TerminalChildClosedPayload {
+                    id,
+                    parent_session_id: owner_key.to_owned(),
+                    repo_path,
+                });
+                summary.closed += 1;
+            }
+            Ok(KillOutcome::SkippedProtected) => summary.skipped_protected += 1,
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(summary)
+    } else {
+        Err(format!(
+            "closed {}, left {} protected, and could not close {}: {}",
+            summary.closed,
+            summary.skipped_protected,
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
 /// Allowed child launchers for `Spawn`.
 pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
 
@@ -2076,11 +2185,30 @@ fn spawn_child_internal(
 ) -> Result<SpawnResult, String> {
     {
         let inner = state.orchestration.lock();
+        // A child whose standalone owner process is gone is orphaned, not
+        // active: it stays open for the user to close, but it must not keep
+        // the next orchestrator out. One probe per distinct owner.
+        let mut dead_owners: HashMap<String, bool> = HashMap::new();
+        let mut counts_toward_caps = |rec: &OrchestratedRecord| {
+            !rec.ended
+                && rec.parent_session_id.as_deref().is_some_and(|owner| {
+                    let dead = match dead_owners.get(owner) {
+                        Some(known) => *known,
+                        None => {
+                            let probed = owner_is_dead(owner);
+                            dead_owners.insert(owner.to_owned(), probed);
+                            probed
+                        }
+                    };
+                    !dead
+                })
+        };
         let active_children = inner
             .sessions
             .values()
             .filter(|rec| {
-                !rec.ended && rec.parent_session_id.as_deref() == Some(caller.parent_key())
+                rec.parent_session_id.as_deref() == Some(caller.parent_key())
+                    && counts_toward_caps(rec)
             })
             .count();
         if active_children >= MAX_CHILDREN_PER_PARENT {
@@ -2093,11 +2221,10 @@ fn spawn_child_internal(
                 .sessions
                 .values()
                 .filter(|rec| {
-                    !rec.ended
-                        && rec
-                            .parent_session_id
-                            .as_deref()
-                            .is_some_and(is_valid_external_caller_id)
+                    rec.parent_session_id
+                        .as_deref()
+                        .is_some_and(is_valid_external_caller_id)
+                        && counts_toward_caps(rec)
                 })
                 .count();
             if active_external >= MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
@@ -2854,6 +2981,10 @@ pub(crate) fn execute_with_shell_reads(
                                 "cwd": active_cwd,
                                 "title": rec.title,
                                 "owned": owned,
+                                "orphaned": rec
+                                    .parent_session_id
+                                    .as_deref()
+                                    .is_some_and(owner_is_dead),
                                 "ended": ended,
                                 "exit_code": exit_code,
                                 "command_running": tel.command_running,
@@ -4260,6 +4391,167 @@ pub(crate) mod tests {
             .any(|s| s.id == child && !s.ending));
         assert!(ledger.set_protected(&child, false));
         assert_eq!(close().expect("close once unprotected")["ok"], true);
+    }
+
+    /// A pid no process can have: past the kernel's pid ceiling on every
+    /// supported system, so `kill(pid, 0)` answers ESRCH.
+    const DEAD_PID_OWNER: &str = "ext-2000000000";
+    const THREAD_A: &str = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+    const THREAD_B: &str = "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
+    /// A child with no PTY, owned by `owner`, for tests about ownership alone.
+    fn register_fake_child(state: &TerminalSessions, repo: &str, id: &str, owner: &str) {
+        state
+            .orchestration
+            .register_session(
+                id,
+                &mint_session_token().unwrap(),
+                Path::new(repo),
+                Path::new(repo),
+                "shell",
+                24,
+                80,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: owner.into(),
+                    launcher: "shell".into(),
+                    title: None,
+                }),
+            )
+            .unwrap();
+    }
+
+    fn external_spawn(repo: &str, owner: &str) -> OrchestrateCall {
+        OrchestrateCall::Spawn {
+            repo_path: repo.into(),
+            caller_session_id: None,
+            caller_token: None,
+            external_caller_id: Some(owner.into()),
+            launcher: Some("shell".into()),
+            cwd: None,
+            command: None,
+            prompt: None,
+            title: None,
+            split: Some(false),
+            rows: Some(24),
+            cols: Some(80),
+        }
+    }
+
+    /// Before: sixteen children of owners whose process was gone filled the
+    /// external cap for good, so every later external spawn was refused.
+    #[test]
+    fn children_of_a_dead_owner_do_not_fill_the_external_cap() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        for n in 0..MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
+            register_fake_child(&state, &repo, &format!("term-91001-{n}"), DEAD_PID_OWNER);
+        }
+        let live_owner = format!("mcp-{}", std::process::id());
+        let spawned = execute(&state, &ui, external_spawn(&repo, &live_owner))
+            .expect("a dead owner's children must not count toward the cap");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    /// A live owner's children still count, so the cap is not simply gone.
+    #[test]
+    fn children_of_a_live_owner_still_fill_the_external_cap() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let live_owner = format!("mcp-{}", std::process::id());
+        for n in 0..MAX_EXTERNAL_ORCHESTRATED_CHILDREN {
+            register_fake_child(&state, &repo, &format!("term-91002-{n}"), &live_owner);
+        }
+        let err = execute(&state, &ui, external_spawn(&repo, "ext-mavi-0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b"))
+            .unwrap_err();
+        assert!(err.contains("external terminal orchestrators already have"), "{err}");
+    }
+
+    /// Before: nothing said a child's owner was gone, and nothing kept the
+    /// rest of the world from reaching a dead owner's children.
+    #[test]
+    fn a_dead_owners_children_are_marked_orphaned_and_unreachable_to_others() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let live_owner = format!("mcp-{}", std::process::id());
+        register_fake_child(&state, &repo, "term-91003-1", DEAD_PID_OWNER);
+        register_fake_child(&state, &repo, "term-91003-2", &live_owner);
+        let list = |owner: &str| {
+            execute(
+                &state,
+                &ui,
+                OrchestrateCall::List {
+                    repo_path: repo.clone(),
+                    caller_session_id: None,
+                    caller_token: None,
+                    external_caller_id: Some(owner.into()),
+                    include_repo_shells: None,
+                },
+            )
+            .expect("list")
+        };
+        let dead = list(DEAD_PID_OWNER);
+        assert_eq!(dead["children"][0]["child_session_id"], "term-91003-1");
+        assert_eq!(dead["children"][0]["orphaned"], true, "{dead}");
+        let live = list(&live_owner);
+        assert_eq!(live["total"], 1, "a live owner sees only its own: {live}");
+        assert_eq!(live["children"][0]["orphaned"], false, "{live}");
+        let refusal = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Close {
+                repo_path: repo.clone(),
+                caller_session_id: None,
+                caller_token: None,
+                external_caller_id: Some(live_owner),
+                child_session_id: "term-91003-1".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(refusal, LINEAGE_REFUSAL);
+    }
+
+    /// New entry point: closing a forgotten thread's children closes its own,
+    /// leaves another thread's alone, and leaves a protected one running.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_threads_children_skips_protected_and_other_threads() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let owner_a = mavi_owner_key(THREAD_A).unwrap();
+        let owner_b = mavi_owner_key(THREAD_B).unwrap();
+        let spawn = |owner: &str| {
+            let out = execute(&state, &ui, external_spawn(&repo, owner)).expect("spawn");
+            out["child_session_id"].as_str().unwrap().to_string()
+        };
+        let (a1, a2, a3) = (spawn(&owner_a), spawn(&owner_a), spawn(&owner_a));
+        let b1 = spawn(&owner_b);
+        assert!(state.session_ledger().set_protected(&a3, true));
+
+        let summary = close_owner_children(&state, &ui, &owner_a).expect("close thread children");
+        assert_eq!((summary.closed, summary.skipped_protected), (2, 1));
+        let live: Vec<String> = crate::terminal::list_sessions(&state)
+            .unwrap()
+            .into_iter()
+            .filter(|s| !s.ending)
+            .map(|s| s.id)
+            .collect();
+        assert!(!live.contains(&a1) && !live.contains(&a2), "{live:?}");
+        assert!(live.contains(&a3), "a protected child stays: {live:?}");
+        assert!(live.contains(&b1), "another thread's child stays: {live:?}");
+        assert_eq!(ui.closed.lock().unwrap().len(), 2);
+
+        // Not a Mavi owner key: refused, nothing closed.
+        assert!(close_owner_children(&state, &ui, "mcp-1234").is_err());
+        assert!(live.contains(&b1));
+        for id in [&a3, &b1] {
+            let _ = crate::terminal::kill_session(&state, id, KillOrigin::Unspecified);
+        }
     }
 
     #[test]

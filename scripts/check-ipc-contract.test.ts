@@ -368,8 +368,10 @@ describe("annotated but unregistered commands", () => {
     // supervisor's published status, and a person's request to resume what it
     // paused). 369 with cmd_host_relief_request_terminate and
     // cmd_host_relief_request_pause (a person's request to end a paused tree,
-    // and to pause one of an agent GitPulse did not launch).
-    expect(found.size).toBe(369);
+    // and to pause one of an agent GitPulse did not launch). 370 with
+    // cmd_mavi_close_thread_children (forgetting a Mavi thread closes its
+    // terminal children).
+    expect(found.size).toBe(370);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }
