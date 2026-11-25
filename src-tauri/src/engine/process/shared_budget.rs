@@ -1555,9 +1555,13 @@ mod tests {
         if state.tokens > 0 {
             state.tokens -= 1;
         }
-        let before = std::fs::read(shared.path()).unwrap();
-        let torn = torn_after(&before, &encode(state), cut);
+        // Read through the locked handle: Windows' byte-range lock refuses a
+        // read through any other handle to the file.
         let mut file: &File = &locked.file;
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut before = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut before).unwrap();
+        let torn = torn_after(&before, &encode(state), cut);
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&torn).unwrap();
     }

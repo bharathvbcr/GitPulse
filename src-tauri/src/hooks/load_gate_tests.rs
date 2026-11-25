@@ -1291,21 +1291,34 @@ fn a_real_coverage_build_behind_a_subcommand_word_is_refused() {
 
 #[test]
 fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_volume() {
-    let there = Path::new("/volumes/small/work");
-    let here = PathBuf::from("/volumes/big/hook");
+    // `/volumes/...` has no drive, so Windows reads it as relative.
+    let abs = |unix: &str| {
+        if cfg!(windows) {
+            format!("C:{unix}")
+        } else {
+            unix.to_string()
+        }
+    };
+    let (small, denied, gone) = (
+        abs("/volumes/small/work"),
+        abs("/denied"),
+        abs("/gone"),
+    );
+    let there = Path::new(&small);
+    let here = PathBuf::from(abs("/volumes/big/hook"));
     let read = |path: &Path| {
         if path == there {
             Free::Bytes(5 * GIB)
         } else if path == here {
             Free::Bytes(500 * GIB)
-        } else if path == Path::new("/denied") {
+        } else if path == Path::new(&denied) {
             Free::Unreadable
         } else {
             Free::Missing
         }
     };
     assert_eq!(
-        live_free_bytes("/volumes/small/work", Some(here.clone()), read),
+        live_free_bytes(&small, Some(here.clone()), read),
         Some(5 * GIB),
         "the command's own directory wins"
     );
@@ -1315,7 +1328,7 @@ fn free_space_is_read_where_the_command_runs_and_never_borrowed_from_another_vol
         "no cwd was given: the process's directory is the best guess"
     );
     // A cwd that was given and cannot be read is not "has room".
-    for cwd in ["/gone", "/denied", "relative/dir", "."] {
+    for cwd in [gone.as_str(), denied.as_str(), "relative/dir", "."] {
         assert_eq!(
             live_free_bytes(cwd, Some(here.clone()), read),
             None,
@@ -1523,7 +1536,13 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
         .invalidating(crate::tool_config::invalidate_cache);
     let here = root.path().to_string_lossy().into_owned();
     let free = gather_live(&here).disk.free_bytes;
-    assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+    // Windows has no free-space reader (`sysload::free_bytes` is Unsupported):
+    // the answer there is unknown, never a number guessed from another source.
+    if cfg!(unix) {
+        assert!(free.is_some_and(|bytes| bytes > 0), "{free:?}");
+    } else {
+        assert_eq!(free, None, "no reader: unknown");
+    }
     let gone = root.path().join("missing").to_string_lossy().into_owned();
     assert_eq!(
         gather_live(&gone).disk.free_bytes,
@@ -1531,9 +1550,10 @@ fn the_real_reader_reads_a_real_directory_and_says_none_for_a_missing_or_relativ
         "a missing cwd is not has room"
     );
     assert_eq!(gather_live("relative/dir").disk.free_bytes, None);
-    assert!(
+    assert_eq!(
         gather_live("").disk.free_bytes.is_some(),
-        "no cwd given: the process's own directory"
+        cfg!(unix),
+        "no cwd given: the process's own directory, where a reader exists"
     );
 }
 

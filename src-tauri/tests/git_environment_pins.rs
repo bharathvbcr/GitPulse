@@ -146,7 +146,10 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     let serial = common::env::env_serial();
     let dir = repo();
     commit_file(dir.path(), "base.txt", "base");
-    std::fs::write(dir.path().join("f*.txt"), "star").unwrap();
+    // Windows cannot hold a `*` in a file name; `f[a].txt` is glob magic that
+    // matches the bystander `fa.txt` just as `f*.txt` does.
+    let named = if cfg!(windows) { "f[a].txt" } else { "f*.txt" };
+    std::fs::write(dir.path().join(named), "star").unwrap();
     std::fs::write(dir.path().join("fa.txt"), "other").unwrap();
     trust_repo(dir.path());
     let path = dir.path().to_str().unwrap();
@@ -160,9 +163,9 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     for name in names {
         pins = pins.set(name, "1");
     }
-    let staged = GitWriter::stage_file(path, "f*.txt");
+    let staged = GitWriter::stage_file(path, named);
     drop(pins);
-    staged.expect("stage the one file named f*.txt");
+    staged.expect("stage the one file named by the glob-looking name");
 
     let cached = Command::new("git")
         .args(["diff", "--cached", "--name-only", "-z"])
@@ -171,7 +174,7 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
         .expect("git diff --cached");
     assert_eq!(
         String::from_utf8_lossy(&cached.stdout).trim_end_matches('\0'),
-        "f*.txt",
+        named,
         "staging touched something other than the file named"
     );
 }
