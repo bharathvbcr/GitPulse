@@ -3148,6 +3148,189 @@ mod adv_keep_pid_tests {
         );
     }
 
+    /// ATTACK: a zero bound allows one poll and no wait; the child is not
+    /// reaped, so the pid stays registered.
+    #[test]
+    fn adv_a_zero_reap_bound_never_calls_the_callers_wait() {
+        let mut b = bystander();
+        let slot = slot_holding("adv-zero-bound", b.id());
+        let registration = Registration {
+            key: next_key(),
+            slot: Arc::clone(&slot),
+        };
+        let mut calls = 0u32;
+        let outcome = registration.stop_and_reap_bounded(
+            &mut b,
+            Duration::ZERO,
+            &mut |_| calls += 1,
+            Duration::ZERO,
+        );
+        let pid_after = *lock(&slot.pid);
+        std::mem::forget(registration);
+        reap(b);
+        let error = outcome.expect_err("an unsignalled child cannot be reaped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(calls, 0, "a zero bound still waited");
+        assert!(pid_after.is_some(), "an unreaped child was forgotten");
+    }
+
+    /// ATTACK: a wait that returns at once must not end the reap early or hang
+    /// it: the Instant deadline decides, and the pid is kept.
+    #[test]
+    fn adv_a_wait_that_returns_at_once_still_ends_at_the_bound() {
+        let mut b = bystander();
+        let slot = slot_holding("adv-noop-wait", b.id());
+        let registration = Registration {
+            key: next_key(),
+            slot: Arc::clone(&slot),
+        };
+        let bound = LIVENESS_POLL * 2;
+        let mut spans: Vec<Duration> = Vec::new();
+        let outcome = registration.stop_and_reap_bounded(
+            &mut b,
+            Duration::ZERO,
+            &mut |span| spans.push(span),
+            bound,
+        );
+        let pid_after = *lock(&slot.pid);
+        std::mem::forget(registration);
+        reap(b);
+        let error = outcome.expect_err("an unsignalled child cannot be reaped");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(!spans.is_empty());
+        assert!(
+            spans
+                .iter()
+                .all(|s| !s.is_zero() && *s <= LIVENESS_POLL.min(bound)),
+            "{spans:?}"
+        );
+        assert!(pid_after.is_some());
+    }
+
+    /// ATTACK: the caller's wait runs outside the entry lock (an owner that
+    /// drains may touch the registration), and a panic in it leaves the pid
+    /// registered and the lock free so the drop's retry can still kill it.
+    #[test]
+    fn adv_a_panicking_wait_leaves_the_pid_registered_and_the_lock_free() {
+        let mut b = bystander();
+        let slot = slot_holding("adv-panic-wait", b.id());
+        let registration = Registration {
+            key: next_key(),
+            slot: Arc::clone(&slot),
+        };
+        let mut lock_was_free = false;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registration.stop_and_reap_bounded(
+                &mut b,
+                Duration::ZERO,
+                &mut |_| {
+                    lock_was_free = slot.pid.try_lock().is_ok();
+                    panic!("owner wait failed");
+                },
+                LIVENESS_POLL * 3,
+            )
+        }));
+        let pid_after = *lock(&slot.pid);
+        let alive = b_alive(&b);
+        std::mem::forget(registration);
+        reap(b);
+        assert!(caught.is_err(), "the wait's panic was swallowed");
+        assert!(lock_was_free, "wait ran under the entry lock");
+        assert!(pid_after.is_some(), "a panic mid-reap forgot the pid");
+        assert!(alive, "the refused kill signalled the child");
+    }
+
+    /// ATTACK: a second stop-and-reap after a successful one finds the pid
+    /// cleared, signals nothing and returns the cached status.
+    #[test]
+    fn adv_a_second_stop_and_reap_returns_the_same_status_without_signalling() {
+        let (mut child, guard) = registered_sh("exit 3", "double-reap", false);
+        let first = guard.stop_and_reap(&mut child, CHILD_GRACE).expect("first");
+        let mut calls = 0u32;
+        let second = guard
+            .stop_and_reap_waiting(&mut child, Duration::ZERO, &mut |_| calls += 1)
+            .expect("second");
+        assert_eq!(first.code(), Some(3));
+        assert_eq!(second.code(), Some(3));
+        assert_eq!(calls, 0);
+        assert_eq!(*lock(&guard.slot.pid), None);
+    }
+
+    /// ATTACK: the pid is already cleared, so the group kill is never asked
+    /// and the direct kill is withheld (the number may be recycled).
+    #[test]
+    fn adv_kill_tree_outcome_via_with_no_pid_never_calls_force() {
+        let mut c = bystander();
+        let slot = slot_holding("via-none", c.id());
+        *lock(&slot.pid) = None;
+        let registration = Registration {
+            key: next_key(),
+            slot,
+        };
+        let mut asked = false;
+        let outcome = registration.kill_tree_outcome_via(&mut c, |_, _| {
+            asked = true;
+            Ok(true)
+        });
+        let alive = b_alive(&c);
+        std::mem::forget(registration);
+        reap(c);
+        assert_eq!(outcome, KillOutcome::NothingToKill);
+        assert!(!asked);
+        assert!(alive, "a cleared pid was signalled");
+    }
+
+    /// ATTACK: an unexpected (non-refusal) failure of the group kill still
+    /// backstops with the direct kill, and a refusal never does.
+    #[test]
+    fn adv_kill_tree_outcome_via_backstops_a_failed_kill_but_not_a_refusal() {
+        let mut failed = bystander();
+        let slot = slot_holding("via-err", failed.id());
+        let registration = Registration {
+            key: next_key(),
+            slot,
+        };
+        let outcome = registration
+            .kill_tree_outcome_via(&mut failed, |_, _| Err(io::Error::other("kill failed")));
+        let status = failed.wait().expect("wait");
+        std::mem::forget(registration);
+        assert_eq!(outcome, KillOutcome::Delivered);
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+
+        let mut refused = bystander();
+        let slot = slot_holding("via-refused", refused.id());
+        let registration = Registration {
+            key: next_key(),
+            slot,
+        };
+        let outcome = registration
+            .kill_tree_outcome_via(&mut refused, |_, _| Err(signal::refusal("test refusal")));
+        let alive = b_alive(&refused);
+        std::mem::forget(registration);
+        reap(refused);
+        assert_eq!(outcome, KillOutcome::Refused);
+        assert!(alive, "a refusal still killed the child");
+    }
+
+    /// ATTACK: the child already exited (a zombie) when the group kill
+    /// reports it reached members: the backstop must be harmless and the
+    /// reap must still collect the real status.
+    #[test]
+    fn adv_a_group_kill_after_the_leader_exited_still_reaps_its_status() {
+        let (mut child, guard) = registered_sh("exit 7", "via-zombie", false);
+        assert!(crate::test_support::wait_until(
+            Duration::from_secs(5),
+            || { super::sys::exited_without_reaping(child.id()) }
+        ));
+        let outcome = guard.kill_tree_outcome_via(&mut child, |_, _| Ok(true));
+        let status = guard.reap(|| child.wait()).expect("reap");
+        assert_eq!(outcome, KillOutcome::Delivered);
+        assert_eq!(status.code(), Some(7), "the backstop rewrote the status");
+    }
+
     #[test]
     fn kill_tree_does_not_call_child_kill_when_pid_is_none() {
         let mut c = bystander();
