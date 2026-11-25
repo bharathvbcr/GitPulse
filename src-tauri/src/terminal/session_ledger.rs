@@ -5,10 +5,15 @@
 //! with its launcher, native conversation id, checkout/start directory, permission mode,
 //! timestamps, and lifecycle end state:
 //! - `running`: tab currently has a live PTY
-//! - `exited_clean`: natural exit (`/exit`, `exit 0`) or user-requested Close (never offered)
+//! - `exited_clean`: an exit GitPulse *observed* (it reaped the process and has a code) or a
+//!   user-requested Close (never offered). A clean row with neither an exit code nor a
+//!   signal is impossible by construction and is repaired to `lost` when the ledger opens
 //! - `exited_signal`: external signal killed the PTY while the app stayed up
 //! - `app_quit`: written synchronously in teardown *before* `SIGHUP` so quit+reopen keeps them
-//! - `lost`: left `running` by a prior `SIGKILL`, crash, or reboot and reconciled at startup
+//! - `lost`: the outcome was never observed: left `running` by a prior `SIGKILL`, crash, or
+//!   reboot (reconciled at startup), the host ended while holding it (the synthetic exit
+//!   with no code, no signal, not reaped), or GitPulse's own reader failed. Offered, and
+//!   never overwritten by a later exit; a deliberate Close of such a session withdraws it
 //! - `unreadable`: corrupt JSONL line on disk, preserved and surfaced as `"unreadable"`
 
 use super::lifecycle::{self, KillOrigin, RotatingJsonl};
@@ -19,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -140,6 +145,59 @@ enum Entry {
     },
 }
 
+/// What was observed when a session ended, as [`SessionLedger::record_exit`]
+/// needs it. A host's synthetic exit is `reaped: false`, no code, no signal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExitFacts<'a> {
+    /// GitPulse ended it (Close, shutdown, or its own reader failing).
+    pub ended_by_gitpulse: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<&'a str>,
+    /// Why the exit is not a plain one (a failed reap, a failed reader, the
+    /// host ending).
+    pub error: Option<&'a str>,
+    /// GitPulse reaped the process and so knows how it ended.
+    pub reaped: bool,
+}
+
+impl<'a> ExitFacts<'a> {
+    /// An exit GitPulse reaped, with no error: how it ended is known.
+    pub fn reaped(
+        ended_by_gitpulse: bool,
+        exit_code: Option<i32>,
+        signal: Option<&'a str>,
+    ) -> Self {
+        Self {
+            ended_by_gitpulse,
+            exit_code,
+            signal,
+            error: None,
+            reaped: true,
+        }
+    }
+}
+
+/// `last_error` of a row [`SessionLedger::record_exit`] could not classify and
+/// the exit carried no reason for.
+const UNOBSERVED_EXIT: &str = "The session ended and GitPulse never observed how.";
+/// `last_error` of a row [`SessionLedger::repair_unobserved_exits`] rewrote.
+const REPAIRED_UNOBSERVED_EXIT: &str =
+    "The session's outcome was never observed (its host ended); repaired at startup.";
+
+/// Whether a close from `origin` means the person is finished with the
+/// session, so an exit nobody observed after it is withdrawn rather than
+/// offered. The kill stamps `closed_by` before it asks the host, so when the
+/// host is already dead the kill errors, `mark_user_closed` never runs, and
+/// this is all that says the person closed it.
+///
+/// Every route is deliberate except [`KillOrigin::LoadGovernor`]: it parks an
+/// idle session to give memory back and means it to come back (see
+/// [`SessionLedger::mark_parked`]). `Unspecified` is a direct close by
+/// definition, and `QuitStopAll` is a stop-everything the person chose.
+fn is_deliberate_close(origin: KillOrigin) -> bool {
+    !matches!(origin, KillOrigin::LoadGovernor)
+}
+
 /// Parameters captured when spawning a hosted terminal tab.
 #[derive(Debug, Clone)]
 pub struct NewSessionRow {
@@ -167,6 +225,9 @@ pub struct SessionLedger {
     lifecycle: Option<RotatingJsonl>,
     /// Rows the cap evicted, kept so a row is never silently lost.
     archive: Option<RotatingJsonl>,
+    /// Rows [`Self::repair_unobserved_exits`] rewrote while opening, handed to
+    /// the first [`Self::reconcile_startup`] so its caller emits the view.
+    repaired_on_open: AtomicUsize,
 }
 
 /// What a close needs to know about a session, from its ledger row.
@@ -189,6 +250,7 @@ impl SessionLedger {
             }),
             lifecycle: None,
             archive: None,
+            repaired_on_open: AtomicUsize::new(0),
         }
     }
 
@@ -234,7 +296,12 @@ impl SessionLedger {
             }),
             lifecycle,
             archive,
+            repaired_on_open: AtomicUsize::new(0),
         };
+        // Before anything can deliver an exit: rows an older build recorded
+        // as clean for sessions whose outcome it never saw become offers.
+        let repaired = ledger.repair_unobserved_exits();
+        ledger.repaired_on_open.store(repaired, Ordering::Relaxed);
         if trimmed_on_load {
             // The evicted rows are archived now; rewriting the file keeps the
             // next open from archiving them a second time.
@@ -428,6 +495,24 @@ impl SessionLedger {
                         inherited_pinned = existing.title_pinned && inherited_title.is_some();
                         existing.withdrawn = true;
                         existing.last_error = None;
+                    }
+                }
+            }
+            // The conversation is running again: every other row that could
+            // still offer it (a second copy from another exit or reboot) goes
+            // too, or it would be offered a second time.
+            if let Some(native) = native_id.as_deref() {
+                if native != terminal_command::AGY_CONTINUE_SENTINEL {
+                    for entry in &mut guard.entries {
+                        let Entry::Valid(other) = entry else { continue };
+                        if !other.withdrawn
+                            && other.end_state != SessionEndState::Running
+                            && other.launcher == launcher
+                            && other.native_id.as_deref() == Some(native)
+                        {
+                            other.withdrawn = true;
+                            other.last_error = None;
+                        }
                     }
                 }
             }
@@ -674,36 +759,92 @@ impl SessionLedger {
         count
     }
 
-    /// Records the observed process exit for `terminal_id`.
+    /// Rewrites every row shaped like an exit nobody observed into
+    /// [`SessionEndState::Lost`], and returns how many it changed.
     ///
-    /// Crucial race guard (`S2-03`): if [`Self::mark_app_quit`] already marked
-    /// this row `AppQuit` (or the user withdrew it via Close), subsequent
-    /// `SIGHUP` exit delivery never overwrites `AppQuit`.
-    pub fn record_exit(
-        &self,
-        terminal_id: &str,
-        ended_by_gitpulse: bool,
-        exit_code: Option<i32>,
-        signal: Option<&str>,
-    ) -> bool {
+    /// Before exits carried their facts, the synthetic exit a dead host's
+    /// sessions get (no code, no signal, not reaped) was recorded as a clean
+    /// exit, which is never offered. Such a row is `ExitedClean`, not
+    /// withdrawn, with neither an exit code nor a signal: a user Close is
+    /// withdrawn, and a reaped exit always has a code or a signal
+    /// (`finalize_pty_session`). Idempotent: a repaired row is `Lost`.
+    pub fn repair_unobserved_exits(&self) -> usize {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut repaired = 0;
+        for entry in &mut guard.entries {
+            let Entry::Valid(row) = entry else { continue };
+            if row.end_state == SessionEndState::ExitedClean
+                && !row.withdrawn
+                && row.exit_code.is_none()
+                && row.signal.is_none()
+            {
+                row.end_state = SessionEndState::Lost;
+                row.last_error = Some(REPAIRED_UNOBSERVED_EXIT.to_owned());
+                row.ended_at.get_or_insert_with(now_ms);
+                ensure_agy_fallback(row);
+                repaired += 1;
+            }
+        }
+        if repaired > 0 {
+            self.persist_locked(&guard.entries);
+        }
+        repaired
+    }
+
+    /// Records how the session `terminal_id` ended.
+    ///
+    /// Classification, in order:
+    /// - A row already `AppQuit` or withdrawn is never overwritten: the
+    ///   `SIGHUP` after [`Self::mark_app_quit`] or a Close must not undo it
+    ///   (`S2-03`). A `Lost` row is never overwritten either; it only gains
+    ///   `last_error` when it has none.
+    /// - GitPulse never observed how it ended (`!reaped` and no signal, as for
+    ///   the exit a dead host's sessions get): a row whose close was a
+    ///   [`is_deliberate_close`] is withdrawn, anything else is `Lost` so it
+    ///   is offered for reopening, with `error` as `last_error`.
+    /// - GitPulse ended it and says why (`ended_by_gitpulse` with an `error`:
+    ///   its own reader failed) and nobody deliberately closed it: `Lost` too.
+    /// - Otherwise the outcome was observed: GitPulse ended it, withdrawn;
+    ///   a signal, `ExitedSignal`; else `ExitedClean`.
+    pub fn record_exit(&self, terminal_id: &str, facts: ExitFacts<'_>) -> bool {
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = now_ms();
+        let signal = facts.signal.map(str::trim).filter(|s| !s.is_empty());
+        let error = facts.error.map(str::trim).filter(|e| !e.is_empty());
         let mut changed = false;
         for entry in guard.entries.iter_mut().rev() {
             let Entry::Valid(row) = entry else { continue };
             if row.terminal_id.as_deref() != Some(terminal_id) {
                 continue;
             }
+            if row.end_state == SessionEndState::Lost {
+                if row.last_error.is_none() && !row.withdrawn {
+                    row.last_error = error.map(str::to_owned);
+                    changed = row.last_error.is_some();
+                }
+                break;
+            }
             if row.end_state == SessionEndState::AppQuit || row.withdrawn {
                 return false;
             }
-            if ended_by_gitpulse {
+            let deliberate = row.closed_by.is_some_and(is_deliberate_close);
+            let observed = facts.reaped || signal.is_some();
+            let unknown = (!observed && !deliberate)
+                || (facts.ended_by_gitpulse && error.is_some() && !deliberate);
+            if unknown {
+                row.end_state = SessionEndState::Lost;
+                row.last_error = Some(error.unwrap_or(UNOBSERVED_EXIT).to_owned());
+                ensure_agy_fallback(row);
+            } else if facts.ended_by_gitpulse || !observed {
                 row.end_state = SessionEndState::ExitedClean;
                 row.withdrawn = true;
-            } else if let Some(sig) = signal.map(str::trim).filter(|s| !s.is_empty()) {
+            } else if let Some(sig) = signal {
                 row.end_state = SessionEndState::ExitedSignal;
                 row.signal = Some(sig.to_owned());
                 ensure_agy_fallback(row);
@@ -711,7 +852,7 @@ impl SessionLedger {
                 row.end_state = SessionEndState::ExitedClean;
             }
             row.ended_at = Some(now);
-            row.exit_code = exit_code;
+            row.exit_code = facts.exit_code;
             changed = true;
             break;
         }
@@ -751,7 +892,9 @@ impl SessionLedger {
         if count > 0 {
             self.persist_locked(&guard.entries);
         }
-        count
+        // Rows repaired while opening count as changed the first time, so the
+        // caller emits the view for them too.
+        count + self.repaired_on_open.swap(0, Ordering::Relaxed)
     }
 
     /// Withdraws a valid recovery offer or removes a corrupt `Unreadable` row.
@@ -893,6 +1036,20 @@ impl SessionLedger {
         }
         // Cache repeated (provider, session_id) transcript filesystem probes within one view build.
         let mut cache: HashMap<(String, String), conversation::Transcript> = HashMap::new();
+        // One offer per conversation: the newest row wins, and a conversation
+        // that is running again offers nothing.
+        let mut taken: HashSet<(String, String)> = guard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Valid(row)
+                    if !row.withdrawn && row.end_state == SessionEndState::Running =>
+                {
+                    conversation_key(row)
+                }
+                _ => None,
+            })
+            .collect();
         for entry in guard.entries.iter().rev() {
             match entry {
                 Entry::Corrupt { row_id, detail, .. } => {
@@ -901,6 +1058,11 @@ impl SessionLedger {
                 Entry::Valid(row) => {
                     if row.withdrawn || !is_offer_end_state(row.end_state) {
                         continue;
+                    }
+                    if let Some(key) = conversation_key(row) {
+                        if !taken.insert(key) {
+                            continue;
+                        }
                     }
                     let offer = project_valid_row(row, |prov, sid| {
                         conversation::check_session_resumability_with(
@@ -1012,6 +1174,16 @@ fn is_offer_end_state(state: SessionEndState) -> bool {
             | SessionEndState::ExitedSignal
             | SessionEndState::Unreadable
     )
+}
+
+/// The conversation a row belongs to: its launcher and native id. The agy
+/// "continue" sentinel names no conversation, so it has no key.
+fn conversation_key(row: &StoredRow) -> Option<(String, String)> {
+    let native = row.native_id.as_deref()?;
+    if native == terminal_command::AGY_CONTINUE_SENTINEL {
+        return None;
+    }
+    Some((row.launcher.clone(), native.to_owned()))
 }
 
 fn ensure_agy_fallback(row: &mut StoredRow) {
@@ -1186,19 +1358,21 @@ fn enforce_bound(entries: &mut Vec<Entry>) -> Vec<Entry> {
             evicted.push(entries.remove(pos));
             continue;
         }
+        // A corrupt line goes before any offer: it can only be dismissed,
+        // while an offer is a conversation the person can still get back.
+        if let Some(pos) = entries
+            .iter()
+            .position(|e| matches!(e, Entry::Corrupt { .. }))
+        {
+            evicted.push(entries.remove(pos));
+            continue;
+        }
         if let Some(pos) = entries.iter().position(|e| {
             matches!(
                 e,
                 Entry::Valid(r) if r.end_state != SessionEndState::Running
             )
         }) {
-            evicted.push(entries.remove(pos));
-            continue;
-        }
-        if let Some(pos) = entries
-            .iter()
-            .position(|e| matches!(e, Entry::Corrupt { .. }))
-        {
             evicted.push(entries.remove(pos));
             continue;
         }
@@ -1498,7 +1672,10 @@ mod tests {
         // Simulate reader thread reporting SIGHUP immediately after mark_app_quit.
         for idx in 0..3 {
             assert!(
-                !ledger.record_exit(&format!("term-1-{idx}"), true, None, Some("Hangup: 1")),
+                !ledger.record_exit(
+                    &format!("term-1-{idx}"),
+                    ExitFacts::reaped(true, None, Some("Hangup: 1"))
+                ),
                 "SIGHUP after AppQuit must not overwrite AppQuit"
             );
         }
@@ -1529,7 +1706,7 @@ mod tests {
         assert!(ledger.mark_user_closed("term-1-1"));
         // The first was parked; GitPulse's own hangup arrives afterwards.
         assert!(ledger.mark_parked("term-1-0"));
-        assert!(!ledger.record_exit("term-1-0", true, None, Some("Hangup: 1")));
+        assert!(!ledger.record_exit("term-1-0", ExitFacts::reaped(true, None, Some("Hangup: 1"))));
         assert!(
             !ledger.mark_parked("term-nope"),
             "an unknown tab changes nothing"
@@ -1564,7 +1741,7 @@ mod tests {
             &repo,
             None,
         ));
-        assert!(first.record_exit("term-clean", false, Some(0), None));
+        assert!(first.record_exit("term-clean", ExitFacts::reaped(false, Some(0), None)));
         drop(first);
 
         // Relaunch after SIGKILL (no mark_app_quit ran).
@@ -1824,7 +2001,7 @@ mod tests {
         assert!(ledger.set_protected("term-7-1", true));
         assert!(ledger.is_protected("term-7-1"));
         // The session exits on its own, then the id is reused after a restart.
-        assert!(ledger.record_exit("term-7-1", false, Some(0), None));
+        assert!(ledger.record_exit("term-7-1", ExitFacts::reaped(false, Some(0), None)));
         assert!(
             !ledger.is_protected("term-7-1"),
             "an ended row protects nothing"
@@ -1875,5 +2052,386 @@ mod tests {
             ledger.brief("term-blocked").is_some(),
             "the spawn still recorded"
         );
+    }
+
+    // ---- exit classification, repair, eviction, dedupe (reboot-loss fix) ----
+
+    /// The synthetic exit ptyd and the client give every session a dead host
+    /// held: no code, no signal, not reaped, `HOST_ENDED`.
+    fn host_ended(ledger: &SessionLedger, id: &str) -> bool {
+        exit_facts(ledger, id, false, None, None, Some("host ended"), false)
+    }
+
+    fn exit_facts(
+        ledger: &SessionLedger,
+        id: &str,
+        ended_by_gitpulse: bool,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        error: Option<&str>,
+        reaped: bool,
+    ) -> bool {
+        ledger.record_exit(
+            id,
+            ExitFacts {
+                ended_by_gitpulse,
+                exit_code,
+                signal,
+                error,
+                reaped,
+            },
+        )
+    }
+
+    fn state_of(ledger: &SessionLedger, row_id: &str) -> (SessionEndState, bool) {
+        ledger
+            .raw_states()
+            .into_iter()
+            .find(|(id, _, _)| id == row_id)
+            .map(|(_, s, w)| (s, w))
+            .expect("row exists")
+    }
+
+    #[test]
+    fn a_host_ended_exit_makes_the_session_lost_and_offered_not_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-h",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert!(host_ended(&ledger, "term-h"));
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::Lost, false));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert!(view.offers[0].resumable);
+        assert_eq!(view.offers[0].last_error.as_deref(), Some("host ended"));
+        assert!(view.offers[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn an_unobserved_exit_after_a_deliberate_close_is_withdrawn_but_a_parked_origin_is_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let closed = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let governed = ledger.record_spawn(spawn_spec(
+            "term-g",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        assert!(ledger.set_closed_by("term-c", KillOrigin::TabClose));
+        assert!(ledger.set_closed_by("term-g", KillOrigin::LoadGovernor));
+        assert!(host_ended(&ledger, "term-c"));
+        assert!(host_ended(&ledger, "term-g"));
+        assert_eq!(
+            state_of(&ledger, &closed),
+            (SessionEndState::ExitedClean, true)
+        );
+        assert_eq!(state_of(&ledger, &governed), (SessionEndState::Lost, false));
+    }
+
+    #[test]
+    fn a_reader_failure_is_lost_with_its_error_but_a_plain_close_is_withdrawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let failed = ledger.record_spawn(spawn_spec(
+            "term-f",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let closed = ledger.record_spawn(spawn_spec(
+            "term-k",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.set_closed_by("term-k", KillOrigin::TabClose);
+        // reader_failure_payload: reaped, a code, GitPulse-ended, with an error.
+        assert!(exit_facts(
+            &ledger,
+            "term-f",
+            true,
+            Some(0),
+            None,
+            Some("PTY reader failed: x"),
+            true
+        ));
+        // A Close: reaped, signalled, GitPulse-ended, no error.
+        assert!(exit_facts(
+            &ledger,
+            "term-k",
+            true,
+            None,
+            Some("Hangup: 1"),
+            None,
+            true
+        ));
+        assert_eq!(state_of(&ledger, &failed), (SessionEndState::Lost, false));
+        assert_eq!(
+            state_of(&ledger, &closed),
+            (SessionEndState::ExitedClean, true)
+        );
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert_eq!(
+            view.offers[0].last_error.as_deref(),
+            Some("PTY reader failed: x")
+        );
+    }
+
+    #[test]
+    fn a_lost_row_is_never_overwritten_by_a_later_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let row = ledger.record_spawn(spawn_spec(
+            "term-l",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        assert_eq!(ledger.reconcile_startup(&HashSet::new()), 1);
+        exit_facts(&ledger, "term-l", false, Some(0), None, None, true);
+        exit_facts(
+            &ledger,
+            "term-l",
+            false,
+            None,
+            Some("Killed: 9"),
+            None,
+            true,
+        );
+        assert_eq!(state_of(&ledger, &row), (SessionEndState::Lost, false));
+    }
+
+    #[test]
+    fn reaped_exits_keep_their_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let sig = ledger.record_spawn(spawn_spec(
+            "term-s",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let ok = ledger.record_spawn(spawn_spec(
+            "term-o",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        exit_facts(
+            &ledger,
+            "term-s",
+            false,
+            None,
+            Some("Killed: 9"),
+            None,
+            true,
+        );
+        exit_facts(&ledger, "term-o", false, Some(0), None, None, true);
+        assert_eq!(
+            state_of(&ledger, &sig),
+            (SessionEndState::ExitedSignal, false)
+        );
+        assert_eq!(
+            state_of(&ledger, &ok),
+            (SessionEndState::ExitedClean, false)
+        );
+    }
+
+    #[test]
+    fn startup_repairs_clean_rows_that_carry_no_code_and_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        let row = |id: &str, state: &str, code: &str, wd: bool| {
+            format!(
+                "{{\"v\":1,\"row_id\":\"{id}\",\"terminal_id\":\"t-{id}\",\"launcher\":\"claude\",\"native_id\":\"{UUID_1}\",\"repo_path\":\"/r\",\"start_dir\":null,\"cwd\":\"/r\",\"mode\":null,\"started_at\":1,\"ended_at\":2,\"end_state\":\"{state}\",\"signal\":null,\"exit_code\":{code},\"last_error\":null,\"withdrawn\":{wd}}}\n"
+            )
+        };
+        let mut text = String::new();
+        text += &row("bad", "exited_clean", "null", false);
+        text += &row("user", "exited_clean", "null", true);
+        text += &row("coded", "exited_clean", "0", false);
+        fs::write(&path, text).unwrap();
+        let ledger = SessionLedger::open(&path);
+        assert_eq!(state_of(&ledger, "bad"), (SessionEndState::Lost, false));
+        assert_eq!(
+            state_of(&ledger, "user"),
+            (SessionEndState::ExitedClean, true)
+        );
+        assert_eq!(
+            state_of(&ledger, "coded"),
+            (SessionEndState::ExitedClean, false)
+        );
+        let offer = &ledger.view_with(|_, _| Transcript::Found).offers[0];
+        assert!(offer
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("repaired at startup")));
+        // Persisted and idempotent.
+        let again = SessionLedger::open(&path);
+        assert_eq!(state_of(&again, "bad"), (SessionEndState::Lost, false));
+        assert_eq!(again.repair_unobserved_exits(), 0);
+        assert_eq!(again.reconcile_startup(&HashSet::new()), 0);
+    }
+
+    #[test]
+    fn eviction_spares_unactioned_offers_and_stays_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let offer = ledger.record_spawn(spawn_spec(
+            "term-keep",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        for i in 0..(MAX_LEDGER_ROWS + 20) {
+            let id = format!("term-n-{i}");
+            ledger.record_spawn(spawn_spec(&id, "claude", Some(UUID_2), dir.path(), None));
+            exit_facts(&ledger, &id, false, Some(0), None, None, true);
+        }
+        assert_eq!(ledger.raw_states().len(), MAX_LEDGER_ROWS);
+        assert_eq!(state_of(&ledger, &offer), (SessionEndState::AppQuit, false));
+    }
+
+    #[test]
+    fn a_full_ledger_evicts_a_corrupt_line_before_any_unactioned_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_LEDGER_FILE);
+        fs::write(&path, "{corrupt json line\n").unwrap();
+        let ledger = SessionLedger::open(&path);
+        let first = ledger.record_spawn(spawn_spec(
+            "term-0",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        for i in 1..(MAX_LEDGER_ROWS - 1) {
+            ledger.record_spawn(spawn_spec(
+                &format!("term-{i}"),
+                "claude",
+                Some(UUID_2),
+                dir.path(),
+                None,
+            ));
+        }
+        ledger.mark_app_quit();
+        ledger.record_spawn(spawn_spec(
+            "term-new",
+            "claude",
+            Some(UUID_3),
+            dir.path(),
+            None,
+        ));
+        let states = ledger.raw_states();
+        assert_eq!(states.len(), MAX_LEDGER_ROWS);
+        assert_eq!(state_of(&ledger, &first), (SessionEndState::AppQuit, false));
+        assert!(
+            states
+                .iter()
+                .all(|(_, s, _)| *s != SessionEndState::Unreadable),
+            "the corrupt line went first"
+        );
+    }
+
+    #[test]
+    fn offers_dedupe_by_launcher_and_native_id_and_yield_to_a_running_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        ledger.record_spawn(spawn_spec(
+            "term-a",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let new = ledger.record_spawn(spawn_spec(
+            "term-b",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let other = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        let ids: Vec<&str> = view.offers.iter().map(|o| o.row_id.as_str()).collect();
+        assert_eq!(ids, vec![other.as_str(), new.as_str()]);
+        assert_eq!(view.reopenable_count, 2);
+        // A running session with the same conversation hides its stale offers.
+        ledger.record_spawn(spawn_spec(
+            "term-d",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        let view = ledger.view_with(|_, _| Transcript::Found);
+        assert_eq!(view.offers.len(), 1);
+        assert_eq!(view.offers[0].row_id, new);
+    }
+
+    #[test]
+    fn a_reopen_withdraws_every_other_non_running_row_for_the_same_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = SessionLedger::open(dir.path().join(SESSION_LEDGER_FILE));
+        let a = ledger.record_spawn(spawn_spec(
+            "term-a",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let b = ledger.record_spawn(spawn_spec(
+            "term-b",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            None,
+        ));
+        let c = ledger.record_spawn(spawn_spec(
+            "term-c",
+            "claude",
+            Some(UUID_2),
+            dir.path(),
+            None,
+        ));
+        ledger.mark_app_quit();
+        ledger.record_spawn(spawn_spec(
+            "term-r",
+            "claude",
+            Some(UUID_1),
+            dir.path(),
+            Some(&b),
+        ));
+        assert!(state_of(&ledger, &a).1);
+        assert!(state_of(&ledger, &b).1);
+        assert!(!state_of(&ledger, &c).1);
     }
 }

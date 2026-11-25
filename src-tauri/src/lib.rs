@@ -320,6 +320,7 @@ pub fn run() {
                     let lost = terminals.reconcile_session_ledger();
                     if lost > 0 {
                         log::info!(target: "terminal", "marked {lost} previously running terminal session(s) as lost on launch");
+                        terminals.session_ledger().emit_view(app.handle());
                     }
                 }
                 let ledger_app = app.handle().clone();

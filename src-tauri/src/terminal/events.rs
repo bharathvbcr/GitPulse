@@ -86,6 +86,8 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
                 "session_id": ended.payload.id,
                 "exit_code": ended.payload.exit_code,
                 "signal": ended.payload.signal,
+                "error": ended.payload.error,
+                "reaped": ended.payload.reaped,
                 "ended_by_gitpulse": ended.ended_by_gitpulse,
                 "program": ended.program,
                 "cwd": ended.cwd,
@@ -93,9 +95,13 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
         );
         if self.session_ledger.record_exit(
             &ended.payload.id,
-            ended.ended_by_gitpulse,
-            ended.payload.exit_code,
-            Some(ended.payload.signal.as_str()).filter(|s| !s.is_empty()),
+            session_ledger::ExitFacts {
+                ended_by_gitpulse: ended.ended_by_gitpulse,
+                exit_code: ended.payload.exit_code,
+                signal: Some(ended.payload.signal.as_str()).filter(|s| !s.is_empty()),
+                error: ended.payload.error.as_deref(),
+                reaped: ended.payload.reaped,
+            },
         ) {
             self.session_ledger.emit_view(&self.app);
         }
