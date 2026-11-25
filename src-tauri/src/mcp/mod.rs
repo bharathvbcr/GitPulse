@@ -521,6 +521,20 @@ fn destructive_tool(
 // nothing reads is dead code, which `clippy -D warnings` refuses. Before this,
 // both directions were held by a test that scanned the handler's source text.
 
+/// Output schema of a terminal reply's `agent_prompt`: the dialog an agent in
+/// the session is blocked on, or null.
+fn agent_prompt_schema() -> serde_json::Value {
+    json!({
+        "type": ["object", "null"],
+        "properties": {
+            "kind": { "type": "string" },
+            "detail": { "type": ["string", "null"] },
+            "since_ms": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["kind", "detail", "since_ms"]
+    })
+}
+
 pub(crate) fn repo_spec() -> Spec {
     Spec::chars(
         "Absolute path to a git repository",
@@ -2686,6 +2700,7 @@ fn build_tools() -> Vec<Value> {
                     "truncated": { "type": "boolean" },
                     "cwd": { "type": "string" },
                     "dev_server_url": { "type": ["string", "null"] },
+                    "agent_prompt": agent_prompt_schema(),
                     "gate_checked": { "type": "boolean" },
                     "gate_notice": { "type": ["string", "null"] }
                 },
@@ -2761,7 +2776,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_terminal_wait",
             "Wait for a child terminal session event or screen pattern",
-            "Wait without busy-polling until a child session spawned by this parent matches a plain-text substring on its rendered screen, finishes an OSC 133 shell command, reports OSC 7501 idle/done/blocked/error, exposes a loopback dev server, exits, or reaches timeout_ms",
+            "Wait without busy-polling until a child session spawned by this parent matches a plain-text substring on its rendered screen, finishes an OSC 133 shell command, reports OSC 7501 idle/done/blocked/error, exposes a loopback dev server, exits, or reaches timeout_ms. A child blocked on an agent dialog (agy asking permission to run a command) ends the wait as matched_reason 'needs_input' with agent_prompt {kind, detail, since_ms}: it cannot continue until someone answers it, so tell the user rather than waiting again",
             TerminalWaitArgs::properties(),
             &TerminalWaitArgs::required(),
             json!({
@@ -2778,7 +2793,8 @@ fn build_tools() -> Vec<Value> {
                     "command_running": { "type": "boolean" },
                     "last_exit_code": { "type": ["integer", "null"] },
                     "herdr_status": { "type": ["string", "null"] },
-                    "dev_server_url": { "type": ["string", "null"] }
+                    "dev_server_url": { "type": ["string", "null"] },
+                    "agent_prompt": agent_prompt_schema()
                 },
                 "required": [
                     "ok", "child_session_id", "matched", "timed_out", "matched_reason",
@@ -2790,7 +2806,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_terminal_read",
             "Read a child terminal session's rendered vt100 screen",
-            "Read the clean 2D vt100 screen or latest OSC 133 command block of an owned child session (or a repository user shell when allow_agent_shell_reads is enabled), supporting scrollback paging (max_lines up to 1000, offset_lines) and plain-text grep while redacting secrets and capability tokens before filtering",
+            "Read the clean 2D vt100 screen or latest OSC 133 command block of an owned child session (agent_prompt names the dialog the agent is blocked on, or is null) (or a repository user shell when allow_agent_shell_reads is enabled), supporting scrollback paging (max_lines up to 1000, offset_lines) and plain-text grep while redacting secrets and capability tokens before filtering",
             TerminalReadArgs::properties(),
             &TerminalReadArgs::required(),
             json!({
@@ -2811,7 +2827,8 @@ fn build_tools() -> Vec<Value> {
                     "command_running": { "type": "boolean" },
                     "last_exit_code": { "type": ["integer", "null"] },
                     "herdr_status": { "type": ["string", "null"] },
-                    "dev_server_url": { "type": ["string", "null"] }
+                    "dev_server_url": { "type": ["string", "null"] },
+                    "agent_prompt": agent_prompt_schema()
                 },
                 "required": [
                     "ok", "child_session_id", "owned", "text", "lines_returned",

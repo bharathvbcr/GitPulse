@@ -653,6 +653,7 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u
         move || {
             let _slot = slot;
             let outcome = handle_into(stream, budget, &mut |notice, seq| {
+                note_hook_resolution(&notice);
                 super::offer_stamped(notice, order_for(seq, stamp))
             });
             if let Outcome::Refused(reason) = outcome {
@@ -1108,6 +1109,64 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("agy", "Antigravity"),
     ("cursor", "Cursor"),
 ];
+
+/// Told, by session key, that a hook reported the agent working again (a tool
+/// finished, a prompt was submitted, the session ended). The terminal layer
+/// registers one to drop a dialog it read off that session's screen.
+type ResolutionObserver = Box<dyn Fn(&str) + Send + Sync>;
+
+static RESOLUTION_OBSERVER: std::sync::OnceLock<ResolutionObserver> = std::sync::OnceLock::new();
+
+/// Registers the one observer of hook resolutions. A second registration is
+/// ignored: there is one terminal registry per app.
+pub(crate) fn observe_hook_resolutions(observer: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = RESOLUTION_OBSERVER.set(Box::new(observer));
+}
+
+#[cfg(unix)]
+fn note_hook_resolution(notice: &Notice) {
+    let resolves = notice
+        .event
+        .and_then(event)
+        .is_some_and(|event| event.role == Role::Resolve);
+    if resolves {
+        if let Some(observer) = RESOLUTION_OBSERVER.get() {
+            observer(&notice.key);
+        }
+    }
+}
+
+/// The channel of a notice read off a terminal screen (see [`screen_prompt_notice`]).
+pub(crate) const SCREEN_CHANNEL: &str = "screen";
+
+/// A notice about a dialog an agent is showing in its terminal, read off the
+/// screen because that agent has no hook for it (agy asks permission in its
+/// own UI). Built like a hook report (`permission_prompt` while it is open,
+/// `prompt_submitted` once answered) so the hub stands, expires and resolves
+/// it exactly as it does one an agent reported.
+pub(crate) fn screen_prompt_notice(
+    key: &str,
+    label: &str,
+    place: Option<String>,
+    event: &'static str,
+    detail: Option<String>,
+) -> Notice {
+    Notice {
+        key: key.to_owned(),
+        origin: Origin::Hook,
+        label: label.to_owned(),
+        place,
+        event: Some(event),
+        detail,
+        is_agent: true,
+        channel: SCREEN_CHANNEL,
+        subject: None,
+        subagent: false,
+        agent_id: None,
+        fully_idle: None,
+        provider_session_id: None,
+    }
+}
 
 pub(crate) fn valid_key(value: &str) -> bool {
     !value.is_empty()

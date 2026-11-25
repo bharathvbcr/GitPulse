@@ -412,6 +412,52 @@ pub struct SessionTelemetry {
     pub herdr_status: Option<crate::alerts::scan::HerdrStatus>,
     pub dev_server_url: Option<String>,
     pub ended: bool,
+    /// An interactive dialog the agent in this session is showing and waiting
+    /// on. Set from its rendered output (see [`AgentPrompt`]), cleared when the
+    /// user answers, a hook reports the agent working again, or the session ends.
+    #[serde(default)]
+    pub agent_prompt: Option<AgentPrompt>,
+    #[serde(default)]
+    pub last_prompt_event_seq: u64,
+}
+
+/// What an agent's dialog asks. Only commands waiting for a permission are
+/// read from the screen today, so `kind` is `"permission"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPrompt {
+    pub kind: String,
+    /// The command the dialog names, secret-redacted and bounded.
+    pub detail: Option<String>,
+    /// Unix milliseconds when the dialog was first seen.
+    pub since_ms: u64,
+}
+
+/// `AgentPrompt::kind` of a command permission dialog.
+pub(crate) const AGENT_PROMPT_PERMISSION: &str = "permission";
+/// Characters of a dialog's command kept in telemetry and sent in banners.
+const MAX_AGENT_PROMPT_DETAIL_CHARS: usize = 400;
+
+/// Whether keystrokes answer or dismiss a dialog: anything but cursor
+/// navigation (`ESC [ … final`, `ESC O x`), which only moves the highlight.
+pub(crate) fn input_answers_prompt(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && matches!(bytes.get(i + 1), Some(b'[' | b'O')) {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Drops the standing dialog, if any. `true` when there was one.
+pub(crate) fn clear_agent_prompt(state: &mut SessionTelemetry) -> bool {
+    state.agent_prompt.take().is_some()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -874,6 +920,20 @@ impl TerminalSessions {
     }
 }
 
+impl TerminalSessions {
+    /// Connects what orchestration raises about a session: `mavi-child-state`
+    /// events to the app, and hook resolutions (which close a dialog read off a
+    /// screen) from the alert bridge to this registry.
+    fn bind_orchestration_events<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
+        self.orchestration
+            .set_child_state_emitter(Arc::new(orchestrate::AppOrchestrateUiSink::new(app.clone())));
+        let registry = self.orchestration.clone();
+        crate::alerts::bridge::observe_hook_resolutions(move |key| {
+            registry.note_hook_resolution(key);
+        });
+    }
+}
+
 #[cfg(unix)]
 impl TerminalSessions {
     /// Creates an isolated registry backed by `ledger` (used by persistence tests).
@@ -985,6 +1045,7 @@ impl TerminalSessions {
             self.incidents.clone(),
             self.session_ledger.clone(),
         )));
+        self.bind_orchestration_events(app);
     }
 
     /// How a task run whose terminal outlived the app that launched it is
@@ -1167,7 +1228,7 @@ impl TerminalSessions {
     }
 
     pub fn bind_app<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
-        let _ = app;
+        self.bind_orchestration_events(app);
     }
 
     pub fn connect_host(&self) -> Result<(), String> {
@@ -1935,6 +1996,29 @@ pub(crate) fn apply_telemetry_events(
                 state.last_dev_event_seq = state.event_seq;
                 notify = true;
             }
+            crate::alerts::scan::TelemetryEvent::AgentPrompt { detail } => {
+                let detail: String = orchestrate::scrub_screen_text(&detail)
+                    .chars()
+                    .take(MAX_AGENT_PROMPT_DETAIL_CHARS)
+                    .collect();
+                let detail = (!detail.is_empty()).then_some(detail);
+                // The dialog repainted is the same dialog, not a new one.
+                if state.agent_prompt.as_ref().is_some_and(|p| p.detail == detail) {
+                    continue;
+                }
+                let since_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_millis().max(1) as u64);
+                state.agent_prompt = Some(AgentPrompt {
+                    kind: AGENT_PROMPT_PERMISSION.to_owned(),
+                    detail,
+                    since_ms,
+                });
+                // Its own counter: the host rewrites `event_seq` from its own
+                // telemetry, which knows nothing of a dialog read off the screen.
+                state.last_prompt_event_seq = state.last_prompt_event_seq.saturating_add(1);
+                notify = true;
+            }
         }
     }
     (notify, herdr_notices, saw_probe)
@@ -1964,6 +2048,8 @@ struct SessionWatcher {
     telemetry: SharedSessionTelemetry,
     probe_reply: Option<ProbeReplyFn>,
     last_probe_reply: Option<Instant>,
+    /// A dialog notice has gone out and not been resolved.
+    prompt_announced: bool,
 }
 
 impl SessionWatcher {
@@ -1974,6 +2060,11 @@ impl SessionWatcher {
         events: Arc<dyn SessionEvents>,
     ) -> Self {
         let agent = agent_launcher(program);
+        // agy asks permission in its own UI and has no hook for it, so a dialog
+        // is read off its screen: in an `agy` session, and in a shell in which
+        // one may be typed. Claude and Codex report theirs through hooks.
+        let mut scanner = crate::alerts::scan::Scanner::new();
+        scanner.set_agent_prompts(launcher_kind(program).is_none_or(|kind| kind == "agy"));
         Self {
             key: session_id.to_owned(),
             label: agent.unwrap_or("Terminal").to_owned(),
@@ -1981,12 +2072,13 @@ impl SessionWatcher {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
             is_agent: agent.is_some(),
-            scanner: crate::alerts::scan::Scanner::new(),
+            scanner,
             reported_drops: 0,
             events,
             telemetry: new_shared_telemetry(),
             probe_reply: None,
             last_probe_reply: None,
+            prompt_announced: false,
         }
     }
 
@@ -2024,19 +2116,26 @@ impl SessionWatcher {
         let telemetry_events = self.scanner.drain_telemetry();
         let mut notify_waiters = false;
         if !telemetry_events.is_empty() {
-            let (herdr_notices, saw_probe) = {
+            let (herdr_notices, saw_probe, raised) = {
                 let (lock, cvar) = &*self.telemetry;
                 let mut state = lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let before = state.last_prompt_event_seq;
                 let (changed, notices, probe) =
                     apply_telemetry_events(&mut state, telemetry_events);
                 notify_waiters = changed;
                 if notify_waiters {
                     cvar.notify_all();
                 }
-                (notices, probe)
+                let raised = (state.last_prompt_event_seq != before)
+                    .then(|| state.agent_prompt.as_ref().and_then(|p| p.detail.clone()));
+                (notices, probe, raised)
             };
+            if let Some(detail) = raised {
+                self.prompt_announced = true;
+                self.events.notice(self.screen_notice("permission_prompt", detail));
+            }
             if saw_probe
                 && self
                     .last_probe_reply
@@ -2065,6 +2164,7 @@ impl SessionWatcher {
                 });
             }
         }
+        self.resolve_answered_prompt();
         let dropped = self.scanner.dropped();
         let new_drops = dropped.saturating_sub(self.reported_drops);
         if new_drops > 0 {
@@ -2072,6 +2172,39 @@ impl SessionWatcher {
         }
         self.reported_drops = dropped;
         notify_waiters
+    }
+
+    /// A notice about a dialog read off this session's screen, in the hub's
+    /// own words for a hook-reported one.
+    fn screen_notice(&self, event: &'static str, detail: Option<String>) -> crate::alerts::Notice {
+        let label = agent_launcher("agy").unwrap_or("Antigravity");
+        crate::alerts::bridge::screen_prompt_notice(
+            &self.key,
+            label,
+            self.place.clone(),
+            event,
+            detail,
+        )
+    }
+
+    /// The user answered a dialog announced earlier (input to the PTY clears
+    /// the telemetry, see [`engine_write_pty_bytes`]): say so, so the hub stops
+    /// standing on it. Costs one telemetry read per chunk only while one is open.
+    fn resolve_answered_prompt(&mut self) {
+        if !self.prompt_announced {
+            return;
+        }
+        let open = self
+            .telemetry
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agent_prompt
+            .is_some();
+        if !open {
+            self.prompt_announced = false;
+            self.events.notice(self.screen_notice("prompt_submitted", None));
+        }
     }
 
     /// The session's output has ended. Whatever it was asking can no longer
@@ -4667,14 +4800,32 @@ pub(in crate::terminal) fn engine_write_pty_bytes(
             data.len()
         ));
     }
-    let (writer, dead) = {
+    let (writer, dead, telemetry) = {
         let guard = engine.lock_sessions();
         guard
             .get(session_id)
-            .map(|session| (session.writer.clone(), session.dead.clone()))
+            .map(|session| {
+                (
+                    session.writer.clone(),
+                    session.dead.clone(),
+                    session.telemetry.clone(),
+                )
+            })
             .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?
     };
     note_erase_input(data);
+    // Whatever the keystrokes do, a dialog they answer is no longer open; the
+    // session's watcher says so when the agent next draws (`resolve_answered_prompt`).
+    if input_answers_prompt(data) {
+        let (lock, cvar) = &*telemetry;
+        if clear_agent_prompt(
+            &mut lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) {
+            cvar.notify_all();
+        }
+    }
     #[cfg(unix)]
     {
         input::write(&writer, &dead, data)
@@ -10418,6 +10569,103 @@ mod tests {
         assert_eq!(notices[0].event, Some("agent_needs_input"));
         assert!(notices[0].is_agent);
         assert_eq!(notices[0].detail.as_deref(), Some("Approve migration?"));
+    }
+
+    fn agy_dialog(command: &str) -> String {
+        format!(
+            "\x1b[37;1mRequesting permission for:\x1b[m\x1b[K\r\n\x1b[37m   {command}\x1b[m\r\n\r\n\
+             \x1b[1mRun this command?\x1b[m\r\n\x1b[94m> 1. Yes, run command\x1b[m\r\n  4. No, cancel\r\n"
+        )
+    }
+
+    fn telemetry_json_after(telemetry: &mut SessionTelemetry, output: &str) -> serde_json::Value {
+        let mut scanner = crate::alerts::scan::Scanner::new();
+        scanner.feed(output.as_bytes());
+        apply_telemetry_events(telemetry, scanner.drain_telemetry());
+        serde_json::to_value(&*telemetry).unwrap()
+    }
+
+    #[test]
+    fn an_agy_permission_dialog_becomes_a_redacted_bounded_agent_prompt_once() {
+        let mut telemetry = SessionTelemetry::default();
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let long = "x".repeat(2_000);
+        let json = telemetry_json_after(
+            &mut telemetry,
+            &agy_dialog(&format!("aws s3 ls --key {secret} {long}")),
+        );
+        assert_eq!(json["agent_prompt"]["kind"], "permission", "{json}");
+        let detail = json["agent_prompt"]["detail"].as_str().expect("detail");
+        assert!(!detail.contains(secret), "{detail}");
+        assert!(detail.chars().count() <= 400, "{}", detail.chars().count());
+        assert!(json["agent_prompt"]["since_ms"].as_u64().unwrap() > 0);
+        let seq = json["last_prompt_event_seq"].as_u64().unwrap();
+        assert_eq!(seq, 1, "{json}");
+
+        // The dialog repainted whole is the same prompt, not a second one.
+        let again = telemetry_json_after(
+            &mut telemetry,
+            &agy_dialog(&format!("aws s3 ls --key {secret} {long}")),
+        );
+        assert_eq!(again["last_prompt_event_seq"], json["last_prompt_event_seq"]);
+        assert_eq!(again["event_seq"], json["event_seq"]);
+    }
+
+    #[test]
+    fn the_watcher_raises_a_screen_dialog_for_agy_and_shells_only_and_resolves_it_after_input() {
+        for (program, raises) in [
+            ("/usr/local/bin/agy", true),
+            ("/bin/zsh", true),
+            ("/usr/local/bin/claude", false),
+            ("/usr/local/bin/codex", false),
+        ] {
+            let events = Arc::new(RecordedEvents::default());
+            let telemetry = new_shared_telemetry();
+            let mut watcher = SessionWatcher::new(
+                "term-8",
+                program,
+                std::path::Path::new("/w/repo"),
+                events.clone(),
+            )
+            .with_telemetry(telemetry.clone());
+            let dialog = agy_dialog("git status");
+            // Split across reads, as a PTY delivers it.
+            for chunk in dialog.as_bytes().chunks(9) {
+                watcher.observe(chunk);
+            }
+            let notices = events.notices.lock().unwrap().clone();
+            if !raises {
+                assert!(notices.is_empty(), "{program}: {notices:?}");
+                continue;
+            }
+            assert_eq!(notices.len(), 1, "{program}: {notices:?}");
+            assert_eq!(notices[0].event, Some("permission_prompt"));
+            assert_eq!(notices[0].detail.as_deref(), Some("git status"));
+            assert_eq!(notices[0].channel, "screen");
+            assert!(notices[0].is_agent);
+            assert_eq!(notices[0].origin, crate::alerts::Origin::Hook);
+
+            // Repainted, still one. Answered (what the write path does), and the
+            // next thing the agent draws resolves it, once.
+            watcher.observe(dialog.as_bytes());
+            assert_eq!(events.notices.lock().unwrap().len(), 1);
+            assert!(clear_agent_prompt(&mut telemetry.0.lock().unwrap()));
+            watcher.observe(b"ran git status\r\n");
+            watcher.observe(b"more output\r\n");
+            let notices = events.notices.lock().unwrap().clone();
+            assert_eq!(notices.len(), 2, "{notices:?}");
+            assert_eq!(notices[1].event, Some("prompt_submitted"));
+        }
+    }
+
+    #[test]
+    fn hosted_telemetry_without_the_prompt_fields_still_deserializes() {
+        let old = r#"{"cwd":null,"last_exit_code":null,"command_running":false,"command_seq":3,
+            "herdr_status":null,"dev_server_url":null,"ended":false}"#;
+        let telemetry: SessionTelemetry = serde_json::from_str(old).expect("old payload");
+        let json = serde_json::to_value(&telemetry).unwrap();
+        assert!(json["agent_prompt"].is_null(), "{json}");
+        assert_eq!(json["last_prompt_event_seq"], 0);
     }
 
     /// Every event an engine session reports, kept for a test to read.

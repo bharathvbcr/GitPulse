@@ -231,8 +231,17 @@ pub struct WireNotice {
 }
 
 /// The channels a terminal's own output can raise a notice on: the scanner's,
-/// `osc7501` for Herdr agent status coordination, and `exit` for session end.
-const TERMINAL_CHANNELS: [&str; 6] = ["bell", "osc9", "osc777", "osc99", "osc7501", "exit"];
+/// `osc7501` for Herdr agent status coordination, `exit` for session end, and
+/// `screen` for an agent dialog read off the screen (it reads as a hook report).
+const TERMINAL_CHANNELS: [&str; 7] = [
+    "bell",
+    "osc9",
+    "osc777",
+    "osc99",
+    "osc7501",
+    "exit",
+    crate::alerts::bridge::SCREEN_CHANNEL,
+];
 
 impl WireNotice {
     pub fn from_notice(notice: &crate::alerts::Notice) -> Self {
@@ -279,7 +288,11 @@ impl WireNotice {
         }
         Ok(crate::alerts::Notice {
             key: self.key,
-            origin: crate::alerts::Origin::Terminal,
+            origin: if channel == crate::alerts::bridge::SCREEN_CHANNEL {
+                crate::alerts::Origin::Hook
+            } else {
+                crate::alerts::Origin::Terminal
+            },
             label: self.label,
             place: self.place,
             event,

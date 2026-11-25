@@ -365,6 +365,72 @@ impl<R: tauri::Runtime> OrchestrateUiSink for AppOrchestrateUiSink<R> {
     }
 }
 
+/// Tauri event telling a Mavi thread's page that one of its terminal children
+/// needs the user, stopped needing them, or ended.
+pub const MAVI_CHILD_STATE_EVENT: &str = "mavi-child-state";
+
+/// Payload of [`MAVI_CHILD_STATE_EVENT`], snake_case on the wire. `state` is
+/// `needs_input` (a dialog is open), `cleared` (it was answered while the
+/// child lives), `done` (the child exited 0) or `ended` (any other end).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaviChildStatePayload {
+    pub thread_id: String,
+    pub child_session_id: String,
+    pub title: Option<String>,
+    pub state: String,
+    pub detail: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+/// Where [`MaviChildStatePayload`]s go. The app's sink emits a Tauri event;
+/// tests record them.
+pub trait ChildStateEmitter: Send + Sync {
+    fn mavi_child_state(&self, payload: MaviChildStatePayload);
+}
+
+impl<R: tauri::Runtime> ChildStateEmitter for AppOrchestrateUiSink<R> {
+    fn mavi_child_state(&self, payload: MaviChildStatePayload) {
+        use tauri::Emitter as _;
+        if let Err(error) = self.app.emit(MAVI_CHILD_STATE_EVENT, payload) {
+            log::warn!(target: "terminal", "could not announce a Mavi child's state: {error}");
+        }
+    }
+}
+
+type ChildEmitterSlot = Mutex<Option<Arc<dyn ChildStateEmitter>>>;
+
+fn emit_child_state(emitter: &ChildEmitterSlot, payload: Option<MaviChildStatePayload>) {
+    let Some(payload) = payload else {
+        return;
+    };
+    let sink = emitter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(sink) = sink {
+        sink.mavi_child_state(payload);
+    }
+}
+
+/// The payload for a child owned by a Mavi thread, `None` for any other.
+fn mavi_child_payload(
+    session_id: &str,
+    record: &OrchestratedRecord,
+    state: &str,
+    detail: Option<String>,
+    exit_code: Option<i32>,
+) -> Option<MaviChildStatePayload> {
+    let thread = mavi_thread_of_owner(record.parent_session_id.as_deref()?)?;
+    Some(MaviChildStatePayload {
+        thread_id: thread.to_owned(),
+        child_session_id: session_id.to_owned(),
+        title: record.title.clone(),
+        state: state.to_owned(),
+        detail,
+        exit_code,
+    })
+}
+
 /// Mints a fresh 256-bit CSPRNG session capability token (`gpst_<64 lowercase hex>`).
 pub(crate) fn mint_session_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
@@ -728,6 +794,16 @@ struct OrchestratedRecord {
     telemetry: SharedSessionTelemetry,
 }
 
+/// The app's telemetry scanner over the output it mirrors from the terminal
+/// host. It reads no agent dialogs: the host reads them (it sees every
+/// session, attached or not) and says so in a notice, which
+/// [`OrchestrationRegistry::note_screen_notice`] takes.
+fn host_scanner() -> crate::alerts::scan::Scanner {
+    let mut scanner = crate::alerts::scan::Scanner::new();
+    scanner.set_agent_prompts(false);
+    scanner
+}
+
 #[cfg(unix)]
 fn apply_scanner_telemetry(
     scanner: &mut crate::alerts::scan::Scanner,
@@ -772,6 +848,8 @@ pub struct OrchestrationRegistry {
     changed: Arc<Condvar>,
     feed: Arc<ScreenFeed>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Where `mavi-child-state` goes; set once the app exists.
+    child_emitter: Arc<ChildEmitterSlot>,
 }
 
 /// What a reader got from [`OrchestrationRegistry::sync_screen`].
@@ -824,7 +902,7 @@ fn apply_screen_batch(inner: &Mutex<RegistryInner>, feed: &ScreenFeed, batch: &B
                     blocks.resync();
                 }
                 if record.host_scanner.is_some() {
-                    record.host_scanner = Some(crate::alerts::scan::Scanner::new());
+                    record.host_scanner = Some(host_scanner());
                 }
             }
             if let Some(parser) = record.parser.as_mut() {
@@ -973,7 +1051,7 @@ impl OrchestrationRegistry {
         let parser = track_screen.then(|| {
             vt100::Parser::new(nz_u16(size.rows), nz_u16(size.cols), PARSER_SCROLLBACK_ROWS)
         });
-        let host_scanner = track_screen.then(crate::alerts::scan::Scanner::new);
+        let host_scanner = track_screen.then(|| host_scanner());
         let blocks = track_screen.then(CommandBlockRecorder::default);
         let mut inner = self.lock();
         inner.sessions.insert(
@@ -1089,6 +1167,7 @@ impl OrchestrationRegistry {
                 self.feed.register(&snap.session_id);
                 tracked = true;
             }
+            let host_scanner = track_screen.then(|| host_scanner());
             let telemetry = crate::terminal::new_shared_telemetry();
             *telemetry
                 .0
@@ -1116,7 +1195,7 @@ impl OrchestrationRegistry {
                             PARSER_SCROLLBACK_ROWS,
                         )
                     }),
-                    host_scanner: track_screen.then(crate::alerts::scan::Scanner::new),
+                    host_scanner,
                     blocks: track_screen.then(CommandBlockRecorder::default),
                     telemetry,
                 },
@@ -1179,11 +1258,24 @@ impl OrchestrationRegistry {
     /// can complete a post-exit `wait` or `read`.
     pub(crate) fn mark_ended(&self, session_id: &str, exit_code: Option<i32>) {
         let mut inner = self.lock();
+        let mut announce = None;
         let retain = match inner.sessions.get_mut(session_id) {
             Some(record) => {
+                if !record.ended {
+                    let state = if exit_code == Some(0) { "done" } else { "ended" };
+                    announce = mavi_child_payload(session_id, record, state, None, exit_code);
+                }
                 record.token_hash = None;
                 record.ended = true;
                 record.exit_code = exit_code;
+                // Nobody can answer a dialog in a session that is gone.
+                crate::terminal::clear_agent_prompt(
+                    &mut record
+                        .telemetry
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
                 record.parent_session_id.is_some() || record.launcher == "shell"
             }
             None => return,
@@ -1208,6 +1300,115 @@ impl OrchestrationRegistry {
         }
         drop(inner);
         self.changed.notify_all();
+        emit_child_state(&self.child_emitter, announce);
+    }
+
+    /// Where `mavi-child-state` events go. Called once, when the app exists.
+    pub(crate) fn set_child_state_emitter(&self, emitter: Arc<dyn ChildStateEmitter>) {
+        *self
+            .child_emitter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(emitter);
+    }
+
+    /// Keystrokes written to `session_id`'s PTY. Anything but cursor
+    /// navigation answers or dismisses a standing dialog.
+    pub(crate) fn note_input(&self, session_id: &str, bytes: &[u8]) {
+        if crate::terminal::input_answers_prompt(bytes) {
+            self.clear_prompt(session_id, true);
+        }
+    }
+
+    /// A hook reported the agent working again in `session_id`: a dialog read
+    /// off its screen is no longer open.
+    pub(crate) fn note_hook_resolution(&self, session_id: &str) {
+        self.clear_prompt(session_id, true);
+    }
+
+    /// Drops the dialog read off `session_id`'s screen, wakes waiters, resolves
+    /// the banner and tells the Mavi page. Nothing happens when none is open.
+    fn clear_prompt(&self, session_id: &str, resolve_banner: bool) {
+        let (cleared, announce, label, place) = {
+            let inner = self.lock();
+            let Some(record) = inner.sessions.get(session_id) else {
+                return;
+            };
+            let cleared = crate::terminal::clear_agent_prompt(
+                &mut record
+                    .telemetry
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            (
+                cleared,
+                (cleared && !record.ended)
+                    .then(|| mavi_child_payload(session_id, record, "cleared", None, None))
+                    .flatten(),
+                crate::terminal::agent_launcher("agy").unwrap_or("Antigravity"),
+                Path::new(&record.cwd)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            )
+        };
+        if !cleared {
+            return;
+        }
+        self.changed.notify_all();
+        if resolve_banner {
+            crate::alerts::offer(crate::alerts::bridge::screen_prompt_notice(
+                session_id,
+                label,
+                place,
+                "prompt_submitted",
+                None,
+            ));
+        }
+        emit_child_state(&self.child_emitter, announce);
+    }
+
+    /// The terminal host read a dialog off a session's screen (or saw it
+    /// answered) and said so in a notice: the one place the app learns it,
+    /// for attached and detached sessions alike. Records it in the session's
+    /// telemetry so `wait` and `read` can say so, and tells the Mavi page.
+    pub(crate) fn note_screen_notice(&self, notice: &crate::alerts::Notice) {
+        if notice.channel != crate::alerts::bridge::SCREEN_CHANNEL {
+            return;
+        }
+        match notice.event {
+            Some("permission_prompt") => {
+                let announce = {
+                    let inner = self.lock();
+                    let Some(record) = inner.sessions.get(&notice.key) else {
+                        return;
+                    };
+                    if record.ended {
+                        return;
+                    }
+                    let (lock, cvar) = &*record.telemetry;
+                    let mut state = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let before = state.last_prompt_event_seq;
+                    crate::terminal::apply_telemetry_events(
+                        &mut state,
+                        vec![crate::alerts::scan::TelemetryEvent::AgentPrompt {
+                            detail: notice.detail.clone().unwrap_or_default(),
+                        }],
+                    );
+                    if state.last_prompt_event_seq == before {
+                        return;
+                    }
+                    cvar.notify_all();
+                    let detail = state.agent_prompt.as_ref().and_then(|p| p.detail.clone());
+                    mavi_child_payload(&notice.key, record, "needs_input", detail, None)
+                };
+                self.changed.notify_all();
+                emit_child_state(&self.child_emitter, announce);
+            }
+            Some("prompt_submitted") => self.clear_prompt(&notice.key, false),
+            _ => {}
+        }
     }
 
     /// Registers a synthetic parent session for hermetic unit/contract tests
@@ -1931,10 +2132,14 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
             let mut local_tel = lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if remote_tel.event_seq >= local_tel.event_seq || remote_tel != *local_tel {
-                let ended = local_tel.ended || remote_tel.ended;
-                *local_tel = remote_tel;
-                local_tel.ended = ended;
+            // The host reads no dialogs off the screen (the app does, from the
+            // output it mirrors), so what the app holds about one survives the sync.
+            let mut merged = remote_tel;
+            merged.agent_prompt = local_tel.agent_prompt.clone();
+            merged.last_prompt_event_seq = local_tel.last_prompt_event_seq;
+            merged.ended = local_tel.ended || merged.ended;
+            if merged != *local_tel {
+                *local_tel = merged;
                 cvar.notify_all();
             }
         }
@@ -1995,7 +2200,7 @@ fn refresh_detached_host_screen(state: &TerminalSessions, child_session_id: &str
                         blocks.feed(&raw, dims.1);
                         rec.blocks = Some(blocks);
                         if !remote_tel_synced {
-                            let mut scanner = crate::alerts::scan::Scanner::new();
+                                let mut scanner = host_scanner();
                             apply_scanner_telemetry(&mut scanner, &rec.telemetry, &raw);
                             rec.host_scanner = Some(scanner);
                         }
@@ -2358,6 +2563,8 @@ struct WaitOutcome {
     last_exit_code: Option<i32>,
     herdr_status: Option<String>,
     dev_server_url: Option<String>,
+    /// The dialog the child is blocked on, when one is open.
+    agent_prompt: Option<crate::terminal::AgentPrompt>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2461,7 +2668,7 @@ fn wait_child_internal(
         let herdr = herdr_state_str(&tel.herdr_status);
 
         let exit_known = ended && !behind;
-        let matched_reason = if let Some(tag) = required_exec_tag {
+        let mut matched_reason = if let Some(tag) = required_exec_tag {
             if let Some(pat) = pattern {
                 let (screen, _, _, _) = render_redacted_screen(rec, MAX_READ_LINES);
                 if screen.contains(pat) {
@@ -2509,6 +2716,12 @@ fn wait_child_internal(
         } else {
             None
         };
+        // A child blocked on a dialog is not progressing, whatever else its
+        // screen says: that outranks every reason but its exit. A dialog still
+        // open answers every wait, since it still holds.
+        if tel.agent_prompt.is_some() && matched_reason != Some("ended") {
+            matched_reason = Some("needs_input");
+        }
 
         if let Some(reason) = matched_reason {
             if owned {
@@ -2528,6 +2741,7 @@ fn wait_child_internal(
                 last_exit_code: tel.last_exit_code,
                 herdr_status: herdr,
                 dev_server_url: tel.dev_server_url,
+                agent_prompt: tel.agent_prompt,
             });
         }
 
@@ -2544,6 +2758,7 @@ fn wait_child_internal(
                 last_exit_code: tel.last_exit_code,
                 herdr_status: herdr,
                 dev_server_url: tel.dev_server_url,
+                agent_prompt: tel.agent_prompt,
             });
         }
 
@@ -2870,6 +3085,7 @@ pub(crate) fn execute_with_shell_reads(
                 "truncated": truncated,
                 "cwd": active_cwd,
                 "dev_server_url": wait.dev_server_url,
+                "agent_prompt": wait.agent_prompt,
                 "screen": state.orchestration.screen_status(&target_id),
                 "gate_checked": gate_checked,
                 "gate_notice": gate_notice,
@@ -2991,6 +3207,7 @@ pub(crate) fn execute_with_shell_reads(
                                 "last_exit_code": tel.last_exit_code,
                                 "herdr_status": herdr_state_str(&tel.herdr_status),
                                 "dev_server_url": tel.dev_server_url,
+                                "agent_prompt": tel.agent_prompt,
                             }),
                         ))
                     })
@@ -3053,6 +3270,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": outcome.last_exit_code,
                 "herdr_status": outcome.herdr_status,
                 "dev_server_url": outcome.dev_server_url,
+                "agent_prompt": outcome.agent_prompt,
                 "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
@@ -3146,6 +3364,7 @@ pub(crate) fn execute_with_shell_reads(
                 "last_exit_code": tel.last_exit_code,
                 "herdr_status": herdr_state_str(&tel.herdr_status),
                 "dev_server_url": tel.dev_server_url,
+                "agent_prompt": tel.agent_prompt,
                 "screen": state.orchestration.screen_status(&child_session_id),
             }))
         }
@@ -3986,6 +4205,231 @@ pub(crate) mod tests {
         );
 
         let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    /// A shell child that prints agy's permission dialog, driven only through
+    /// `execute`. The command is typed with printf escapes, so the echoed input
+    /// line never starts with the marker and only the output can raise it.
+    #[cfg(unix)]
+    #[test]
+    fn a_shown_agy_permission_dialog_ends_a_wait_as_needs_input_and_input_clears_it() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90007-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: Some("agy-dialog".into()),
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(100),
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let call = |call: OrchestrateCall| execute(&state, &ui, call).expect("call");
+        let wait = |ms: u64| {
+            call(OrchestrateCall::Wait {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.clone(),
+                timeout_ms: Some(ms),
+                pattern: None,
+                wait_for_idle: Some(true),
+                since_seq: None,
+            })
+        };
+        let read = || {
+            call(OrchestrateCall::Read {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token.clone()),
+                external_caller_id: None,
+                child_session_id: child.clone(),
+                max_lines: None,
+                offset_lines: None,
+                grep: None,
+                last_command_only: None,
+            })
+        };
+        // Let the shell's own startup marks settle so the dialog is the news.
+        let _ = wait(1_500);
+        call(OrchestrateCall::Send {
+            repo_path: repo.clone(),
+            caller_session_id: Some(parent.into()),
+            caller_token: Some(token.clone()),
+            external_caller_id: None,
+            child_session_id: child.clone(),
+            input: r#"printf 'Requesting permission for:\r\n   git status\r\n\r\nRun this command?\r\n> 1. Yes, run command\r\n  4. No, cancel\r\n'; sleep 30"#
+                .into(),
+            append_newline: Some(true),
+        });
+        let first = wait(8_000);
+        assert_eq!(
+            first["matched_reason"], "needs_input",
+            "{first}\nscreen: {}", read()["text"]
+        );
+        assert_eq!(first["agent_prompt"]["kind"], "permission", "{first}");
+        assert!(
+            first["agent_prompt"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("git status")),
+            "{first}"
+        );
+        let seen = read();
+        assert_eq!(seen["agent_prompt"]["kind"], "permission", "{seen}");
+
+        // The user answers in the tab: the question is no longer open.
+        call(OrchestrateCall::Send {
+            repo_path: repo.clone(),
+            caller_session_id: Some(parent.into()),
+            caller_token: Some(token.clone()),
+            external_caller_id: None,
+            child_session_id: child.clone(),
+            input: "1".into(),
+            append_newline: Some(true),
+        });
+        let after = read();
+        assert!(after["agent_prompt"].is_null(), "{after}");
+
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
+    #[derive(Default)]
+    struct RecordedChildStates(Mutex<Vec<MaviChildStatePayload>>);
+
+    impl ChildStateEmitter for RecordedChildStates {
+        fn mavi_child_state(&self, payload: MaviChildStatePayload) {
+            self.0.lock().unwrap().push(payload);
+        }
+    }
+
+    fn registry_with_child(
+        repo: &str,
+        parent: &str,
+        child: &str,
+    ) -> (OrchestrationRegistry, Arc<RecordedChildStates>) {
+        let registry = OrchestrationRegistry::default();
+        let seen = Arc::new(RecordedChildStates::default());
+        registry.set_child_state_emitter(seen.clone());
+        let token = mint_session_token().unwrap();
+        registry
+            .register_session(
+                child,
+                &token,
+                Path::new(repo),
+                Path::new(repo),
+                "shell",
+                24,
+                100,
+                crate::terminal::new_shared_telemetry(),
+                Some(ChildSpawnMeta {
+                    parent_session_id: parent.into(),
+                    launcher: "shell".into(),
+                    title: Some("audit".into()),
+                }),
+            )
+            .unwrap();
+        (registry, seen)
+    }
+
+    #[test]
+    fn a_mavi_childs_end_is_announced_once_as_done_or_ended() {
+        let (_dir, repo) = init_trusted_repo();
+        let thread = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let owner = mavi_owner_key(thread).unwrap();
+        for (code, state) in [(Some(0), "done"), (Some(2), "ended"), (None, "ended")] {
+            let (registry, seen) = registry_with_child(&repo, &owner, "term-91000-1");
+            registry.mark_ended("term-91000-1", code);
+            registry.mark_ended("term-91000-1", code);
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].thread_id, thread);
+            assert_eq!(seen[0].child_session_id, "term-91000-1");
+            assert_eq!(seen[0].title.as_deref(), Some("audit"));
+            assert_eq!((seen[0].state.as_str(), seen[0].exit_code), (state, code));
+            let wire = serde_json::to_value(&seen[0]).unwrap();
+            assert_eq!(wire["thread_id"], thread);
+        }
+    }
+
+    #[test]
+    fn only_mavi_owned_children_are_announced() {
+        let (_dir, repo) = init_trusted_repo();
+        for parent in ["term-90001-1", "ext-4242", "ext-mavi-not-a-uuid"] {
+            let (registry, seen) = registry_with_child(&repo, parent, "term-91001-1");
+            registry.mark_ended("term-91001-1", Some(0));
+            assert!(seen.0.lock().unwrap().is_empty(), "{parent}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_dialog_is_announced_cleared_by_input_not_by_navigation_and_dropped_at_exit() {
+        let (_dir, repo) = init_trusted_repo();
+        let owner = mavi_owner_key("0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b").unwrap();
+        let child = "term-91002-1";
+        let (registry, seen) = registry_with_child(&repo, &owner, child);
+        let telemetry = registry.telemetry_for(child).unwrap();
+        let open = |detail: &str| {
+            registry.note_screen_notice(&crate::alerts::bridge::screen_prompt_notice(
+                child,
+                "Antigravity",
+                None,
+                "permission_prompt",
+                Some(detail.to_owned()),
+            ));
+        };
+        open("git status");
+        {
+            let seen = seen.0.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].state, "needs_input");
+            assert_eq!(seen[0].detail.as_deref(), Some("git status"));
+        }
+        // The host repeating the same dialog is the same dialog.
+        open("git status");
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
+        // Moving the highlight answers nothing; typing does.
+        registry.note_input(child, b"\x1b[B\x1b[A");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_some());
+        registry.note_input(child, b"1\r");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        assert_eq!(seen.0.lock().unwrap().last().unwrap().state, "cleared");
+        // A second answer with nothing open announces nothing.
+        let count = seen.0.lock().unwrap().len();
+        registry.note_input(child, b"\r");
+        assert_eq!(seen.0.lock().unwrap().len(), count);
+
+        // A hook saying the agent works again closes it too.
+        open("git log");
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_some());
+        registry.note_hook_resolution(child);
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+
+        // And so does the session ending, which says `ended`, never `cleared`.
+        open("git diff");
+        let before = seen.0.lock().unwrap().len();
+        registry.mark_ended(child, Some(1));
+        assert!(telemetry.0.lock().unwrap().agent_prompt.is_none());
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(seen.len(), before + 1);
+        assert_eq!(seen.last().unwrap().state, "ended");
     }
 
     #[cfg(unix)]

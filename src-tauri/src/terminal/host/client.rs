@@ -784,7 +784,11 @@ impl HostClient {
                 bytes,
                 CALL_DEADLINE,
             )
-            .map(|_| ())
+            .map(|_| ())?;
+        // Every keystroke into a hosted session passes here, so a dialog the
+        // user answers in the tab is closed on the app's side too.
+        self.inner.orchestration.note_input(session, bytes);
+        Ok(())
     }
 
     /// Resizes `session`'s PTY. Called on the session's geometry lane.
@@ -1872,7 +1876,10 @@ impl Inner {
                 }
             }
             HostFrame::Notice { notice } => match notice.into_notice() {
-                Ok(notice) => crate::alerts::offer(notice),
+                Ok(notice) => {
+                    self.orchestration.note_screen_notice(&notice);
+                    crate::alerts::offer(notice);
+                }
                 Err(error) => log::warn!(target: "terminal", "{error}"),
             },
             HostFrame::ScanDrops { dropped } => crate::alerts::record_scan_drops(dropped),
