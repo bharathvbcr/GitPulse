@@ -81,15 +81,15 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let corpus = tempfile::tempdir().unwrap();
-        let base = root.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_slash_path(root.path()).unwrap();
         let worktrees = ["w1", "w2", "w3"].map(|name| {
-            let path = base.join(name);
+            let path = std::path::PathBuf::from(format!("{}/{name}", base.display()));
             std::fs::create_dir_all(&path).unwrap();
             path.to_string_lossy().into_owned()
         });
         let root_text = base.to_string_lossy().into_owned();
         Self {
-            corpus: corpus.path().canonicalize().unwrap(),
+            corpus: crate::test_support::canonical_slash_path(corpus.path()).unwrap(),
             _root: root,
             _corpus: corpus,
             root: root_text,
@@ -599,14 +599,15 @@ impl Nested {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let corpus = tempfile::tempdir().unwrap();
-        let base = root.path().canonicalize().unwrap();
+        let base = crate::test_support::canonical_slash_path(root.path()).unwrap();
         let worktrees = ["w1", "w2", "w3"].map(|name| {
-            let path = base.join(".claude/worktrees").join(name);
+            let path =
+                std::path::PathBuf::from(format!("{}/.claude/worktrees/{name}", base.display()));
             std::fs::create_dir_all(path.join("src")).unwrap();
             path.to_string_lossy().into_owned()
         });
         Self {
-            corpus: corpus.path().canonicalize().unwrap(),
+            corpus: crate::test_support::canonical_slash_path(corpus.path()).unwrap(),
             _root: root,
             _corpus: corpus,
             base: base.to_string_lossy().into_owned(),
@@ -817,7 +818,7 @@ fn a_hostile_cwd_is_attributed_without_panic_or_a_departed_root() {
 fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
     use crate::test_support::{git_in, trust_repo};
     let main = tempfile::tempdir().unwrap();
-    let base = main.path().canonicalize().unwrap();
+    let base = crate::test_support::canonical_slash_path(main.path()).unwrap();
     git_in(&base, &["init", "-b", "main"]);
     std::fs::write(base.join("seed.txt"), "seed").unwrap();
     git_in(&base, &["add", "seed.txt"]);
@@ -828,14 +829,14 @@ fn a_removed_git_worktree_keeps_its_path_and_never_takes_the_main_task() {
         &["worktree", "add", "--detach", linked.to_str().unwrap()],
     );
     trust_repo(&linked);
-    let linked = linked.canonicalize().unwrap();
+    let linked = crate::test_support::canonical_slash_path(&linked).unwrap();
     let w = linked.to_string_lossy().into_owned();
     let anchor = base.to_string_lossy().into_owned();
     ledger::bindings::bind(&anchor, &anchor, "T-MAIN").unwrap();
     ledger::bindings::bind(&anchor, &w, "T-W").unwrap();
 
     let corpus = tempfile::tempdir().unwrap();
-    let corpus_dir = corpus.path().canonicalize().unwrap();
+    let corpus_dir = crate::test_support::canonical_slash_path(corpus.path()).unwrap();
     let file = corpus_dir.join("slug/G1.jsonl");
     let rows = || -> Vec<(Option<String>, String, Option<String>)> {
         let mut rows: Vec<_> = ledger::tail(&anchor, 0, 5000)
@@ -2182,7 +2183,7 @@ fn row_detail(base: &str, needle: &str) -> serde_json::Value {
 fn a_departed_worktree_resolves_from_its_own_history() {
     use crate::test_support::{git_in, trust_repo};
     let main = tempfile::tempdir().unwrap();
-    let base = main.path().canonicalize().unwrap();
+    let base = crate::test_support::canonical_slash_path(main.path()).unwrap();
     git_in(&base, &["init", "-b", "main"]);
     std::fs::write(base.join("seed.txt"), "seed").unwrap();
     git_in(&base, &["add", "seed.txt"]);
@@ -2193,8 +2194,7 @@ fn a_departed_worktree_resolves_from_its_own_history() {
         &["worktree", "add", "--detach", linked.to_str().unwrap()],
     );
     trust_repo(&linked);
-    let w = linked
-        .canonicalize()
+    let w = crate::test_support::canonical_slash_path(&linked)
         .unwrap()
         .to_string_lossy()
         .into_owned();
@@ -2203,7 +2203,7 @@ fn a_departed_worktree_resolves_from_its_own_history() {
     ledger::bindings::bind(&anchor, &w, "T-W").unwrap();
 
     let corpus = tempfile::tempdir().unwrap();
-    let corpus_dir = corpus.path().canonicalize().unwrap();
+    let corpus_dir = crate::test_support::canonical_slash_path(corpus.path()).unwrap();
     let file = corpus_dir.join("slug/D1.jsonl");
     with_transcript_root(&corpus_dir, || {
         git_in(&base, &["worktree", "remove", "--force", &w]);

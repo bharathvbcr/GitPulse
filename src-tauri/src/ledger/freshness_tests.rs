@@ -222,6 +222,8 @@ fn an_unreadable_database_is_never_reported_fresh() {
     // A file that is not a database: the open succeeds, every query fails.
     let garbage = [0x5a_u8; 4096];
     let moved = db.with_extension("sqlite.orig");
+    // Windows cannot rename a file the cached connection still holds open.
+    crate::ledger::tests_support::reset_registry_for(&repo);
     std::fs::rename(&db, &moved).unwrap();
     // The write-ahead log and its index would otherwise be replayed over the
     // garbage and make it read as the old database.

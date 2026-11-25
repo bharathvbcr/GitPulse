@@ -494,6 +494,31 @@ pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
     PathBuf::from(rest)
 }
 
+/// `path` canonicalized and spelled the way git and Node print a Windows path
+/// (`C:/Users/...`): no `\\?\` prefix, `/` for every separator. A fixture
+/// that appends `/name` to a root as text then holds one spelling throughout,
+/// where `canonicalize` plus a `/` join is `\\?\C:\...\/name`, a name Windows
+/// refuses (os error 123). Identical to `canonicalize` off Windows.
+#[cfg(test)]
+pub(crate) fn canonical_slash_path(path: &Path) -> std::io::Result<PathBuf> {
+    let plain = crate::engine::process::canonicalize_plain(path)?;
+    if cfg!(windows) {
+        return Ok(PathBuf::from(plain.to_string_lossy().replace('\\', "/")));
+    }
+    Ok(plain)
+}
+
+/// An absolute path that names no directory. `unix` is written the Unix way
+/// (`/gone/a`); on Windows it gains a drive (`C:\gone\a`), because `/gone` has
+/// no root there and is refused as a relative path.
+#[cfg(test)]
+pub(crate) fn absent_absolute_path(unix: &str) -> String {
+    if cfg!(windows) {
+        return format!("C:{}", unix.replace('/', "\\"));
+    }
+    unix.to_string()
+}
+
 #[cfg(test)]
 mod pin_adversary_tests;
 

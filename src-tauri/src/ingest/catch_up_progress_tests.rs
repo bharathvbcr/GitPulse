@@ -24,6 +24,13 @@ fn plain(path: &std::path::Path) -> String {
         .into_owned()
 }
 
+/// `dir` in the spelling a pass spawns its git children under. The repository
+/// address names every checkout by its canonical path (`\\?\C:\...` on
+/// Windows), and the spawn log files a child under the directory it was given.
+pub(super) fn as_spawned(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
 /// Runs `f` with the transcript root pointed at an empty corpus on this thread.
 fn with_empty_transcripts<T>(f: impl FnOnce() -> T) -> T {
     let corpus = tempfile::tempdir().expect("corpus");
@@ -34,7 +41,7 @@ fn with_empty_transcripts<T>(f: impl FnOnce() -> T) -> T {
 /// under.
 fn classed_git_children(dirs: &[std::path::PathBuf]) -> Vec<(Vec<String>, Admission)> {
     dirs.iter()
-        .flat_map(|dir| spawn_log::classed_spawns_in(dir))
+        .flat_map(|dir| spawn_log::classed_spawns_in(&as_spawned(dir)))
         .collect()
 }
 
@@ -122,7 +129,7 @@ fn eager_gate() -> flight::Gate {
 
 fn git_count(dirs: &[std::path::PathBuf], verb: &[&str]) -> usize {
     dirs.iter()
-        .flat_map(|dir| spawn_log::spawns_in(dir))
+        .flat_map(|dir| spawn_log::spawns_in(&as_spawned(dir)))
         .filter(|argv| verb.iter().all(|word| argv.iter().any(|arg| arg == word)))
         .count()
 }
