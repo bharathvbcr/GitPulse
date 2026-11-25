@@ -3301,10 +3301,11 @@ pub fn doc_drift_report_with_stacked(
         walk_incomplete: Some(reason.to_string()),
     };
     let page_and_files = if let Some(stacked) = stacked.filter(|s| s.has_delta_changes()) {
-        match (stacked.all_merged_symbols()?, stacked.all_indexed_files()?) {
-            (Some(page), Some((_, _, files))) => Some((page, files)),
-            _ => None,
-        }
+        // One base snapshot for the rows and the files: two "latest generation"
+        // reads let a commit between them pair rows with another generation's files.
+        stacked
+            .merged_corpus()?
+            .map(|(page, (_, _, files))| (page, files))
     } else {
         let mut loaded = store.all_symbols_page_with_files()?;
         if let (Some((page, _)), Some(stacked)) = (loaded.as_mut(), stacked) {

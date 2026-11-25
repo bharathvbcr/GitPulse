@@ -833,6 +833,22 @@ fn visit_python_manifest(root: &Path, rel_str: &str, found: &std::sync::Mutex<Fo
 /// One walk for every manifest kind, so a build pays for the tree once: this
 /// is already the second walk of it on the build path.
 pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests> {
+    collect_project_manifests_with(root, None)
+}
+
+/// [`collect_project_manifests`] that stops between directory entries when
+/// `cancel` is set, returning [`crate::BuildCancelled`].
+pub fn collect_project_manifests_cancellable(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<ProjectManifests> {
+    collect_project_manifests_with(root, Some(cancel))
+}
+
+fn collect_project_manifests_with(
+    root: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<ProjectManifests> {
     let walk_root = root.to_path_buf();
     let marker_errors = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
         String,
@@ -881,6 +897,9 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let found = std::sync::Mutex::new(Found::default());
     walker.run(|| {
         Box::new(|result| {
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return ignore::WalkState::Quit;
+            }
             let entry = match result {
                 Ok(entry) => entry,
                 // Stepped over when it names a path below the root, for the
@@ -913,6 +932,9 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
             ignore::WalkState::Continue
         })
     });
+    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(crate::BuildCancelled.into());
+    }
     let Found {
         mut modules,
         mut rust_crates,

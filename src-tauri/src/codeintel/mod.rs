@@ -1394,6 +1394,7 @@ fn open_repo_map_checked(
                             fresh: None,
                             generation_id: gen_id,
                             reason: Some(format!("whole-tree freshness check failed: {e}")),
+                            verified_age_ms: None,
                         }),
                         None,
                     ),
@@ -1410,6 +1411,7 @@ fn open_repo_map_checked(
                                 fresh: wt_fresh,
                                 generation_id: summary.latest_generation.or(gen_id),
                                 reason: combined_reason,
+                                verified_age_ms: None,
                             }),
                             None,
                         )
@@ -1837,7 +1839,7 @@ fn blob_for_line_spans(
             crate::engine::git_reader::GitReader::get_file_blob_view(repo_path, file_path, commit)
                 .ok()?;
         let text = blob.text?;
-        if devmap_extract::content_hash(&text) != expected {
+        if devmap_extract::source_identity(&text) != expected {
             return None;
         }
         Some(text)
@@ -2502,6 +2504,7 @@ pub fn affected_tests(
                         fresh: wt_fresh,
                         generation_id: summary.latest_generation,
                         reason: combined_reason.clone(),
+                        verified_age_ms: None,
                     };
                     candidate.tests.source_freshness = sf.clone();
                     candidate.blast_radius.layers.source_freshness = sf;
@@ -3776,7 +3779,7 @@ pub(crate) mod tests {
                 (
                     id,
                     if id == 1 {
-                        -477_759_399_776_341_435i64
+                        -2_658_498_691_388_418_655i64
                     } else {
                         id
                     },
@@ -4093,7 +4096,7 @@ pub(crate) mod tests {
     ///
     /// GitPulse cannot write generations (the `parse` feature is off), so the
     /// rows go in by SQL exactly as [`repo_with_one_generation`] does. The
-    /// content hash is the real `devmap_extract::content_hash` of `text`, which
+    /// content hash is the real `devmap_extract::source_identity` of `text`, which
     /// is what lets `symbols_for_file` convert byte spans to lines. Spans are
     /// derived from the line numbers: they start at the first line's first byte
     /// and end on the last line's last byte before its newline.
@@ -4135,7 +4138,7 @@ pub(crate) mod tests {
                 parse_outcome_json, engine_json, extraction_json,
                 entry_wiring_json, grammar_version, analyzer_version)
              VALUES (1, 1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
-            [devmap_extract::content_hash(text) as i64],
+            [devmap_extract::source_identity(text) as i64],
         )
         .expect("insert file payload");
         conn.execute(

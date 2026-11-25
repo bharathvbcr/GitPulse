@@ -27,6 +27,7 @@ export function mountCodeGraphPage(root: HTMLElement, DATA: Record<string, unkno
     caption: view.level ? `Code graph · ${view.level}` : "Code graph",
     flagFilters: view.flagFilters,
     capHint: view.capHint,
+    unplacedNote: view.unplacedNote,
     ringLegend: {
       rings: [["--cm-dead", "dead candidate"], ["--cm-unwired", "unwired"], ["--cm-entry", "entry point"]],
       // An isolated config or README has no ring and no edges, and beside a legend

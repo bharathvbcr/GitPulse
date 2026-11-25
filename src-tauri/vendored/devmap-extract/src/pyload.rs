@@ -1469,13 +1469,23 @@ impl<'a, 'tree> Pass<'a, 'tree> {
     /// with no `anchor_up` and an empty directory: it could point anywhere,
     /// and vetoes every `sys.path`-derived link in the file.
     ///
-    /// All or nothing otherwise. A write this pass cannot follow —
-    /// `sys.path.remove`, reassignment, `del`, or a module-level insert of a
-    /// directory it cannot read — anywhere in the file leaves the search path
-    /// unknown, and an unknown entry ahead of a known one could hold the
-    /// module first. So one such write withdraws every directory.
+    /// A module-level insert whose directory cannot be read is the same veto,
+    /// file-wide (`scope: None`), and one row at the first such insert is
+    /// enough. The readable entries stay: they are the evidence that an
+    /// ordinary import is shadowed by a directory known to precede it, and
+    /// the resolver stores a file's search path only while it has entries, so
+    /// a veto with none would be dropped unread.
+    ///
+    /// A write this pass cannot follow — `sys.path.remove`, `pop`, `clear`,
+    /// reassignment, `del` — anywhere in the file still withdraws every
+    /// directory and emits nothing. It may already have removed an entry this
+    /// pass recorded, so keeping that entry could make a correct ordinary
+    /// import abstain; and a veto row without entries is dropped by the
+    /// resolver, so recording one would change nothing.
     fn search_directories(&self) -> Vec<ExtractedImport> {
         let mut out = Vec::new();
+        // The file-wide veto for the first unreadable module-level insert.
+        let mut unreadable: Option<ExtractedImport> = None;
         for event in self.events {
             let Event::SysPath {
                 node,
@@ -1501,7 +1511,13 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                 .flatten();
             let (tail, anchor_up, entry_scope) = match (read, *module_level) {
                 (Some((tail, anchor_up)), true) => (tail, Some(anchor_up), None),
-                (None, true) => return Vec::new(),
+                (None, true) => {
+                    if unreadable.is_none() {
+                        unreadable =
+                            Some(self.search_directory_row(*node, String::new(), None, None));
+                    }
+                    continue;
+                }
                 (read, false) => {
                     let entry_scope = scope
                         .clone()
@@ -1512,29 +1528,43 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                     }
                 }
             };
-            out.push(ExtractedImport {
-                raw_import: raw_text(text(*node, self.source)),
-                module_specifier: tail,
-                imported_names: Vec::new(),
-                local_names: Vec::new(),
-                alias: None,
-                span: Span {
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                },
-                path_load: Some(PathLoad {
-                    scope: entry_scope,
-                    anchor_up,
-                    kind: PathLoadKind::SearchDirectory,
-                }),
-            });
+            out.push(self.search_directory_row(*node, tail, anchor_up, entry_scope));
         }
+        // The veto counts toward the cap, so a payload this pass emits is
+        // never one the resolver's own count guard would refuse.
+        out.extend(unreadable);
         // A real script inserts a handful. Past the cap every import would be
         // checked against every entry, so the file abstains instead.
         if out.len() > MAX_SEARCH_DIRECTORIES {
             return Vec::new();
         }
         out
+    }
+
+    /// One `SearchDirectory` row for the `sys.path` write at `node`.
+    fn search_directory_row(
+        &self,
+        node: Node<'tree>,
+        tail: String,
+        anchor_up: Option<u32>,
+        scope: Option<String>,
+    ) -> ExtractedImport {
+        ExtractedImport {
+            raw_import: raw_text(text(node, self.source)),
+            module_specifier: tail,
+            imported_names: Vec::new(),
+            local_names: Vec::new(),
+            alias: None,
+            span: Span {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            },
+            path_load: Some(PathLoad {
+                scope,
+                anchor_up,
+                kind: PathLoadKind::SearchDirectory,
+            }),
+        }
     }
 }
 
@@ -1926,6 +1956,33 @@ mod tests {
             ratio < 40.0,
             "10x the inserts took {ratio:.1}x the time ({small_best:?} -> {large_best:?})"
         );
+    }
+
+    /// The cap counts the veto row: one unreadable insert among
+    /// `MAX_SEARCH_DIRECTORIES - 1` readable ones is exactly at the cap and
+    /// keeps its rows; one more readable insert abstains the whole file.
+    #[test]
+    fn the_veto_row_counts_toward_the_search_directory_cap() {
+        let file = |readable: usize| -> String {
+            let mut source = String::from(
+                "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n",
+            );
+            for i in 0..readable {
+                source.push_str(&format!("sys.path.insert(0, str(ROOT / \"d{i}\"))\n"));
+            }
+            source.push_str("sys.path.insert(0, somewhere)\n");
+            source
+        };
+        let under = file(super::MAX_SEARCH_DIRECTORIES - 1);
+        let under_tree = parse(&under);
+        let under_loads = python_path_loads(under_tree.root_node(), &under, "s/a.py");
+        let rows = search_directories(&under_loads);
+        assert_eq!(rows.len(), super::MAX_SEARCH_DIRECTORIES);
+        assert_eq!(rows.iter().filter(|tail| tail.is_empty()).count(), 1);
+        let over = file(super::MAX_SEARCH_DIRECTORIES);
+        let over_tree = parse(&over);
+        let over_loads = python_path_loads(over_tree.root_node(), &over, "s/a.py");
+        assert!(search_directories(&over_loads).is_empty());
     }
 
     /// A file that names no loader API costs one substring scan and yields

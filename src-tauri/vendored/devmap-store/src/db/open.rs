@@ -1,6 +1,6 @@
 use super::{
-    refusal, sidecar_links, GenerationChecks, ReaderMemory, SidecarLinks, Store, WriterLock,
-    CONNECTION_SETUP,
+    refusal, sidecar_links, GenerationChecks, LazyWalk, ReaderMemory, SidecarLinks, Store,
+    WriterLock, CONNECTION_SETUP,
 };
 use crate::schema::CURRENT_SCHEMA_VERSION;
 use rusqlite::{Connection, Result, TransactionBehavior};
@@ -350,6 +350,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage,
@@ -457,6 +460,17 @@ impl Store {
         // repair after `Connection::open` is a repair the connection never
         // sees. See `repair_sidecar_modes`.
         Self::repair_sidecar_modes(path)?;
+        // If a store is being created at `path`, the consumer sidecars beside it
+        // (`.csr`, `.artifacts.json`) were written by an earlier store at this
+        // path, never by this one, and each describes the store it sat beside.
+        // Readers accept a CSR on its generation number alone, so an orphan
+        // stamped with the new store's generation would be served as its graph.
+        // The writer lock is taken for every creation, not only when an orphan
+        // is there to sweep, and held to the end of this open: it is what keeps
+        // a seed from placing its sidecars or its store between the sweep and
+        // the creation. Taken before `CONNECTION_SETUP`, which it must not be
+        // waited on under.
+        let _creation_lock = Self::lock_creation_and_sweep(path)?;
         // Held to the end of this open; see `CONNECTION_SETUP`.
         let _setup = CONNECTION_SETUP
             .lock()
@@ -527,11 +541,91 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only,
             full_text_damage: None,
             repo_root_override: None,
         })
+    }
+
+    /// Take the store's writer lock for the creation of a store that does not
+    /// exist yet, and sweep the consumer sidecars an earlier store left beside
+    /// it while holding it. Returns the guard so the caller holds it through
+    /// the creation; `None` when the store already exists (nothing is created,
+    /// nothing is swept) or its directory does not (the open reports that).
+    ///
+    /// `CONNECTION_SETUP` serialises one process only. A seed in another
+    /// process places a store's sidecars first and its store last, under this
+    /// same lock, so a creation that did not take it could delete the sidecars
+    /// a seed had just placed, or create an empty store the seed's final
+    /// placement then replaced. The store's absence is checked again under the
+    /// lock: a seed that finished while this waited has left a store, and its
+    /// sidecars are its own. The lock is taken whenever the store is absent,
+    /// orphans or not, because the second harm needs no orphan.
+    ///
+    /// A caller that already holds the lock on this thread (`devmap build`
+    /// takes it, then opens the store it is about to create) is not asked for
+    /// it a second time: that would wait on itself. See [`Store::lock_writer_at`]
+    /// for what "the same lock" means.
+    fn lock_creation_and_sweep(db_path: &Path) -> Result<Option<WriterLock>> {
+        let absent = |path: &Path| {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        };
+        let parent_exists = db_path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty() || parent.is_dir());
+        if !absent(db_path) || !parent_exists {
+            return Ok(None);
+        }
+        let lock_path = Self::writer_lock_path(db_path);
+        let held_here = super::held_writer_locks()
+            .as_ref()
+            .and_then(|held| held.get(&lock_path))
+            .is_some_and(|holder| *holder == std::thread::current().id());
+        let guard = if held_here {
+            None
+        } else {
+            Some(
+                Self::lock_file_at(&lock_path, Self::WRITER_LOCK_WAIT).map_err(|error| {
+                    refusal(format!(
+                        "a new devmap store at {} could not be created: the writer lock that \
+                         keeps a seed's placement and this creation apart could not be taken: \
+                         {error:#}",
+                        db_path.display()
+                    ))
+                })?,
+            )
+        };
+        if absent(db_path) {
+            Self::remove_foreign_sidecars(db_path)?;
+        }
+        Ok(guard)
+    }
+
+    /// Unlink each consumer sidecar of the not-yet-created store `db_path`. A
+    /// symlink is unlinked, never followed; an absent sidecar is fine and any
+    /// other failure is returned, because a store created beside an orphan it
+    /// could not remove would be served the orphan.
+    fn remove_foreign_sidecars(db_path: &Path) -> Result<()> {
+        for suffix in crate::seed::STORE_SIDECARS {
+            let sidecar = crate::seed::sidecar(db_path, suffix);
+            crate::seed::remove_file_if_present(&sidecar).map_err(|error| {
+                refusal(format!(
+                    "a new devmap store at {} would sit beside {}, which an earlier store left \
+                     and which describes that store, not this one; it could not be removed: \
+                     {error:#}",
+                    db_path.display(),
+                    sidecar.display()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// `SQLITE_READONLY_DIRECTORY`: the database is read-only because the
@@ -664,10 +758,17 @@ impl Store {
         };
         // Schema 7 is the first that records an owner. Older than that, and a
         // version this kernel cannot migrate, are reported by the open itself.
-        if stamped < 7 || !Self::schema_is_migratable(stamped) {
+        // Stamp 0 is read for whatever owner record the file already holds.
+        if (stamped != 0 && stamped < 7) || !Self::schema_is_migratable(stamped) {
             return Ok(());
         }
-        match Self::stored_repo_root(&conn, stamped) {
+        let owner_schema = match Self::owner_schema_of(&conn, stamped) {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return Ok(()),
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
+        };
+        match Self::stored_repo_root(&conn, owner_schema) {
             Ok(_) => Ok(()),
             Err(error) => Err(error),
         }
@@ -992,6 +1093,14 @@ impl Store {
     /// behind a wedged peer is not an improvement on one that fails.
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
+    ///
+    /// The process also records which thread holds each lock, by lock-file
+    /// path as spelled after alias resolution, so that `Store::open` creating
+    /// a store under a lock its own thread holds does not wait on itself.
+    /// That contract is per thread and per spelling: the same store reached
+    /// through a different spelling (a symlinked parent that did not exist when
+    /// the lock was taken) or opened from another thread is not recognised and
+    /// waits on the lock like any other process would.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
         let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
         Self::validate_database_file(&db_path)?;
@@ -1034,6 +1143,9 @@ impl Store {
             &lock_path.with_extension("lock.owner"),
             std::process::id().to_string().as_bytes(),
         )?;
+        super::held_writer_locks()
+            .get_or_insert_with(Default::default)
+            .insert(lock_path.clone(), std::thread::current().id());
         Ok(WriterLock {
             file: Some(file),
             path: Some(lock_path),
@@ -1221,10 +1333,9 @@ impl Store {
                 )));
             }
         }
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut sidecar = path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            let sidecar_path = std::path::Path::new(&sidecar);
+        for suffix in crate::seed::SQLITE_SIDECARS {
+            let sidecar = crate::seed::sidecar(path, suffix);
+            let sidecar_path = sidecar.as_path();
             match std::fs::symlink_metadata(sidecar_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
@@ -1272,6 +1383,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: Some(path.to_path_buf()),
             read_only: true,
             full_text_damage: None,
@@ -1292,6 +1406,9 @@ impl Store {
             generation_analysis_status: Mutex::new(None),
             generation_checks: Mutex::new(GenerationChecks::default()),
             source_freshness_cache: Mutex::new(None),
+            source_freshness_watcher_live: std::sync::atomic::AtomicBool::new(false),
+            lazy_source_verification: std::sync::atomic::AtomicBool::new(false),
+            lazy_walk: Mutex::new(LazyWalk::default()),
             db_path: None,
             read_only: false,
             full_text_damage: None,

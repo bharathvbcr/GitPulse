@@ -280,7 +280,20 @@ pub fn link_candidates(
                 continue;
             }
         };
-        loaded.push((repo.name.as_str(), store.latest_extractions()?));
+        // A store that opens but whose extractions will not decode is the same
+        // kind of hole as one that will not open. `?` here failed the whole
+        // workspace answer for one damaged repository, discarding the links
+        // every healthy repository had.
+        match store.latest_extractions() {
+            Ok(extractions) => loaded.push((repo.name.as_str(), extractions)),
+            Err(error) => coverage_gaps.push(RepoUnavailable {
+                repo: repo.name.clone(),
+                reason: format!(
+                    "stored extractions at {} could not be read ({error}), so none of its imports were examined",
+                    db.display()
+                ),
+            }),
+        }
     }
     // Every Metal entry point in the workspace, by name: `(repo, file, symbol)`.
     let mut entry_points: std::collections::BTreeMap<&str, Vec<(&str, &str, &str)>> =

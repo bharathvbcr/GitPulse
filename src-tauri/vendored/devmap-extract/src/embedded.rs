@@ -458,20 +458,28 @@ fn absorb_template_expressions(
             // `{#each xs as pattern, index (key)}`: the collection is read
             // outside the block, the key inside it, and the pattern and the
             // index are bound for its body. An `{:else}` branch is outside it.
+            //
+            // Split the header ourselves rather than reading tree-sitter's
+            // `identifier` / `parameter` fields: `tree-sitter-svelte-ng`'s
+            // scanner splits on the first `as ` substring even inside
+            // parentheses (`(["a"] as T[]) as t`) or at the tail of an
+            // identifier (`areas as area`).
             "each_statement" if svelte => {
                 if let Some(start) = child_of_kind(node, "each_start") {
-                    let parameter = start.child_by_field_name("parameter");
-                    let (list, key) = parameter
-                        .map(|node| split_each_parameter(node, source))
-                        .unwrap_or_default();
-                    let names = match parameter {
-                        Some(node) => {
-                            walk.bind_list(extraction, &list, node.start_byte(), at, true)
+                    let EachHeader {
+                        collection,
+                        parameter,
+                    } = split_each_header(start, source);
+                    let (names, key) = match parameter {
+                        Some((raw, offset)) => {
+                            let (list, key) = split_each_parameter_str(&raw, offset);
+                            let names = walk.bind_list(extraction, &list, offset, at, true);
+                            (names, key)
                         }
-                        None => Vec::new(),
+                        None => (Vec::new(), None),
                     };
-                    if let Some(collection) = start.child_by_field_name("identifier") {
-                        take_template_expression(collection, extraction, &mut walk, at);
+                    if let Some((expr, span)) = collection {
+                        take_expression(expr, span, extraction, &mut walk, at);
                     }
                     let inside = push_block(
                         &mut walk,
@@ -1534,13 +1542,44 @@ fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
     if i >= j {
         return None;
     }
-    let body = raw.get(i..j)?.to_string();
+    let body = raw.get(i..j)?;
+    // Svelte 5 `{@attach expr}`: strip `@attach` + whitespace so the inner
+    // expression (e.g. `trackMenu`, `watchActivity(key)`) is extracted at its
+    // exact file offset rather than skipped as an `@` tag.
+    if delimiters {
+        if let Some(rest) = body.strip_prefix("@attach") {
+            if rest.bytes().next().is_some_and(|b| b.is_ascii_whitespace()) {
+                let trimmed = rest.trim_start();
+                if !trimmed.is_empty() {
+                    let delta = body.len() - trimmed.len();
+                    return Some(JsExpr {
+                        offset: start + i + delta,
+                        body: trimmed.to_string(),
+                    });
+                }
+            }
+        }
+        // Svelte spread attributes `<Comp {...props} />` / `{...fn(x)}`: the
+        // leading `...` is Svelte attribute spread syntax, not a standalone JS
+        // expression; strip it when an expression follows so `props` / `fn(x)`
+        // parses cleanly at its exact offset (bare `{...}` stays invalid).
+        if let Some(rest) = body.strip_prefix("...") {
+            let trimmed = rest.trim_start();
+            if !trimmed.is_empty() {
+                let delta = body.len() - trimmed.len();
+                return Some(JsExpr {
+                    offset: start + i + delta,
+                    body: trimmed.to_string(),
+                });
+            }
+        }
+    }
     if body.starts_with('#') || body.starts_with('@') || body.starts_with(':') {
         return None;
     }
     Some(JsExpr {
         offset: start + i,
-        body,
+        body: body.to_string(),
     })
 }
 
@@ -1719,21 +1758,102 @@ fn trimmed_expression(text: &str, base: usize) -> Option<(JsExpr, Span)> {
     ))
 }
 
+struct EachHeader {
+    collection: Option<(JsExpr, Span)>,
+    parameter: Option<(String, usize)>,
+}
+
+/// The collection expression and optional parameter clause of `{#each ...}`.
+///
+/// Splits the full header between `#each` and `}` on the **last** top-level
+/// word-bounded `as` (outside parens, brackets, braces, and string/template
+/// literals), avoiding `tree-sitter-svelte-ng`'s greedy split on any `as `
+/// substring inside `(["a"] as T[]) as t` or `areas as area`. Also supports
+/// Svelte 5 `{#each expression, index}` without `as`.
+fn split_each_header(start: Node, source: &str) -> EachHeader {
+    let Some(tag) = child_of_kind(start, "block_start_tag") else {
+        let collection = start
+            .child_by_field_name("identifier")
+            .and_then(|node| js_expression_body(node, source).map(|expr| (expr, span_of(node))));
+        let parameter = start
+            .child_by_field_name("parameter")
+            .map(|node| (text_of(node, source), node.start_byte()));
+        return EachHeader {
+            collection,
+            parameter,
+        };
+    };
+    let base = tag.end_byte();
+    let end = start.end_byte();
+    let content_end = if end > base && source.as_bytes().get(end - 1) == Some(&b'}') {
+        end - 1
+    } else {
+        end
+    };
+    let Some(header) = source.get(base..content_end) else {
+        return EachHeader {
+            collection: None,
+            parameter: None,
+        };
+    };
+    let top = top_level(header);
+    let as_at = top.iter().rev().find_map(|&(at, c)| {
+        if c != 'a' {
+            return None;
+        }
+        let rest = &header[at..];
+        if !rest.starts_with("as") {
+            return None;
+        }
+        let before = header[..at].chars().next_back();
+        let after = rest[2..].chars().next();
+        (before.is_some_and(char::is_whitespace) && after.is_some_and(char::is_whitespace))
+            .then_some(at)
+    });
+    if let Some(at) = as_at {
+        let param_raw = &header[at + 2..];
+        let trimmed_lead = param_raw.len() - param_raw.trim_start().len();
+        return EachHeader {
+            collection: trimmed_expression(&header[..at], base),
+            parameter: Some((
+                param_raw[trimmed_lead..].to_string(),
+                base + at + 2 + trimmed_lead,
+            )),
+        };
+    }
+    // Svelte 5 `{#each expression, index}` (no `as`): a top-level comma splits
+    // the collection from the index binding.
+    if let Some((comma_at, _)) = top.iter().find(|&&(_, c)| c == ',') {
+        let param_raw = &header[comma_at + 1..];
+        let trimmed_lead = param_raw.len() - param_raw.trim_start().len();
+        return EachHeader {
+            collection: trimmed_expression(&header[..*comma_at], base),
+            parameter: Some((
+                param_raw[trimmed_lead..].to_string(),
+                base + comma_at + 1 + trimmed_lead,
+            )),
+        };
+    }
+    EachHeader {
+        collection: trimmed_expression(header, base),
+        parameter: None,
+    }
+}
+
 /// The parameter of `{#each xs as PATTERN, INDEX (KEY)}`: the binding list
 /// `PATTERN, INDEX` as written, and the key expression when there is one.
-fn split_each_parameter(node: Node, source: &str) -> (String, Option<JsExpr>) {
-    let raw = text_of(node, source);
+fn split_each_parameter_str(raw: &str, base: usize) -> (String, Option<JsExpr>) {
     let end = raw.trim_end().len();
-    let open = top_level(&raw)
+    let open = top_level(raw)
         .into_iter()
         .find(|&(_, c)| c == '(')
         .map(|(at, _)| at);
     if let Some(open) = open.filter(|open| raw[..end].ends_with(')') && open + 1 < end) {
-        let key = trimmed_expression(&raw[open + 1..end - 1], node.start_byte() + open + 1)
+        let key = trimmed_expression(&raw[open + 1..end - 1], base + open + 1)
             .map(|(expression, _)| expression);
         return (raw[..open].to_string(), key);
     }
-    (raw, None)
+    (raw.to_string(), None)
 }
 
 /// The expression of an `{#await}` header, and the binding its shorthand names.

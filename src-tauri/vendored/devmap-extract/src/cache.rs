@@ -843,7 +843,47 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// resolution-reuse blob. That also retires edges written under the resolver
 /// rules that changed after `RESOLUTION_REUSE_EPOCH` 2, so the epoch does not
 /// move with this bump.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "99";
+///
+/// v100 keeps a Python file's readable module-level `sys.path` entries when a
+/// module-level insert's directory cannot be read, and adds one
+/// `SearchDirectory` row with an empty specifier, no `anchor_up` and no scope
+/// at the first such insert: the resolver's `veto_all`. v99 withdrew every
+/// entry and emitted no row for that insert, so an ordinary import that
+/// a known entry shadowed bound the sibling file confidently; a warm cache
+/// would keep serving that edge. A `sys.path` write the pass cannot follow
+/// (`remove`, reassignment, `del`) still withdraws every entry. The veto is an
+/// extractor change and moves no resolver rule by itself. The same landing
+/// moves `RESOLUTION_REUSE_EPOCH` from 2 to 3 for a different reason: commit
+/// 7767f7cf changed what the resolver binds (bare-name candidates, receiver
+/// types, sibling-field fallbacks) and left the epoch at 2, so a store built
+/// before it would have kept serving the old edges.
+///
+/// v100 also folds the byte length into the source identity
+/// (`source_identity`, stored as `content_hash`): a v99 row holds plain
+/// FNV-1a 64, so it never matches, and two inputs with one FNV-1a 64 and
+/// different lengths no longer read as the same file. `ipc_identity_for` and
+/// the artifact fingerprint stay on plain FNV (`fnv1a64`). The value moves
+/// with no DDL, so the store schema constants do not move.
+///
+/// v101 extracts a C function written between `@implementation` and `@end` as
+/// a free function (`file::name`, `Function`) instead of a method of the class
+/// (`file::T.name`, `Method`). A v100 row holds the method spelling, so a warm
+/// cache would keep serving it.
+///
+/// v102 fixes Svelte 5 template parsing and embedded expressions (`{@attach}`,
+/// attribute spread `{...props}`, and `{#each (xs as T[]) as item}`), adds
+/// error-localized same-width syntax repairs for TypeScript (`import("...").T`,
+/// `typeof import(...)`, predefined-type tuple labels, `< unique.`), Rust 2024
+/// (`unsafe extern`, `&raw`, `#[cfg(...)]` in struct patterns), and Shell
+/// (`${var:+ (...)}` inside double quotes), strips leading horizontal/vertical
+/// whitespace after Rust string line-continuation backslashes, extracts
+/// function-valued properties inside JS/TS factory-returned object literals and
+/// `export default { ... }` as `Method` symbols with matching call attribution,
+/// and records module-level JS/TS factory return shapes (`"<factory>()"`)
+/// including unmodified local factory spreads. A v101 cache row would keep
+/// stale `Partial` outcomes, missing factory methods, and unstripped Rust
+/// line-continuation literals.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "102";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -864,7 +904,7 @@ pub struct CacheKey {
 #[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {
-        Self::for_content_hash(language, crate::content_hash(source))
+        Self::for_content_hash(language, crate::source_identity(source))
     }
 
     fn for_content_hash(language: &str, content_hash: u64) -> Self {

@@ -183,3 +183,83 @@ fn s9_negative_limits_are_unbounded_and_the_clamped_one_is_a_cap() {
     );
     assert_eq!(count(sqlite_limit(2)), 2, "a real cap still truncates");
 }
+
+#[test]
+fn fts_match_query_splits_double_colon_qualifiers_and_preserves_safety() {
+    assert_eq!(
+        fts_match_query("webcontent::snapshot").unwrap(),
+        "\"webcontent\"* AND \"snapshot\"*"
+    );
+    assert_eq!(
+        fts_match_query("sysload::webcontent::Ring::dump").unwrap(),
+        "\"sysload\"* AND \"webcontent\"* AND \"Ring\"* AND \"dump\"*"
+    );
+    // Single colons stay inside the quoted FTS literal so column syntax cannot leak.
+    assert_eq!(fts_match_query("path:foo").unwrap(), "\"path:foo\"*");
+    // Degenerate or empty inputs stay valid quoted FTS literals, and NUL is refused.
+    assert_eq!(fts_match_query("::").unwrap(), "\"::\"*");
+    assert_eq!(fts_match_query("   ").unwrap(), "\"   \"*");
+    assert!(fts_match_query("a\0b").is_err());
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn partial_parse_gaps_order_charged_rows_before_uncharged_rows_within_cap() {
+    use devmap_analyze::analyze;
+    use devmap_extract::extract_file;
+    use devmap_resolve::Resolver;
+
+    let store = Store::open_in_memory().unwrap();
+    let extractions = vec![
+        extract_file("a_vendored/a.py", "def a():\n    return 1\n"),
+        extract_file("b_vendored/b.py", "def b():\n    return 2\n"),
+        extract_file("z_app/view.py", "def view():\n    return 3\n"),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = analyze(&extractions, &resolution);
+    let generation = store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+
+    // Seed coverage-gap rows with alphabetically-earlier uncharged/exempt entries
+    // and an alphabetically-later charged entry.
+    let conn = store.conn.lock().unwrap();
+    let label = devmap_analyze::ExtractionGap::PartialParse.label();
+    for (path, reason) in [
+        (
+            "a_vendored/a.py",
+            "1 error region; not charged: would be charged 1 region(s) outside every surviving declaration (0..10)",
+        ),
+        (
+            "b_vendored/b.py",
+            "1 error region; not charged: would be charged 1 region(s) outside every surviving declaration (0..10)",
+        ),
+        (
+            "z_app/view.py",
+            "1 error region; charged: 1 region(s) outside every surviving declaration (0..10)",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO generation_coverage_gaps (generation_id, gap, path, reason)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![generation, label, path, reason],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // With limit=1, the charged row must come first despite sorting alphabetically last.
+    let (rows, total) = store
+        .latest_partial_parse_gaps("surviving declaration (", None, 1)
+        .unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, "z_app/view.py");
+}

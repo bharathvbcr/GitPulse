@@ -84,7 +84,7 @@ impl Store {
     /// source root and analysis. No lock is held while the caller ranks them.
     pub fn all_symbols_page(&self) -> Result<Option<SearchPage>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let rows = Self::all_symbols_in(&snapshot, generation)?;
@@ -108,7 +108,7 @@ impl Store {
     /// derived from the rows, so a file is listed whatever it declares.
     pub fn all_symbols_page_with_files(&self) -> Result<Option<(SearchPage, IndexedFiles)>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let rows = Self::all_symbols_in(&snapshot, generation)?;
@@ -216,7 +216,7 @@ impl Store {
         }))
     }
 
-    fn generation_repo_root_in(
+    pub(super) fn generation_repo_root_in(
         &self,
         snapshot: &Connection,
         generation: u32,
@@ -352,7 +352,7 @@ impl Store {
     /// so the refusal and the page describe one snapshot.
     pub fn latest_scope_inputs(&self) -> Result<Option<(u32, Option<String>, IndexedFiles)>> {
         let conn = lock_conn(&self.conn)?;
-        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+        let Some((snapshot, generation)) = Self::latest_snapshot_paused(&conn)? else {
             return Ok(None);
         };
         let files = Self::indexed_files_in(&snapshot, generation)?;
@@ -361,6 +361,11 @@ impl Store {
     }
 
     /// [`Self::search_page`] against a generation the caller already pinned.
+    ///
+    /// The existence check, the count, the page and the two disclosures read
+    /// one deferred snapshot ([`Self::generation_snapshot`]), so a prune that
+    /// commits mid-call cannot turn a hit into `total: 0, rows: []`. `None` is
+    /// a generation the snapshot did not hold.
     ///
     /// `narrowing` of `None`, or one with every list empty, runs the unfiltered
     /// statements unchanged. A set filter joins the same generation's paths and
@@ -375,23 +380,16 @@ impl Store {
         narrowing: Option<&KeywordNarrowing>,
     ) -> Result<Option<SearchPage>> {
         let conn = lock_conn(&self.conn)?;
-        let present: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM generations WHERE id = ?1",
-                params![generation],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if present.is_none() {
+        let Some(snapshot) = Self::generation_snapshot(&conn, generation)? else {
             return Ok(None);
-        }
+        };
         let active = narrowing.filter(|filter| filter.active());
         let (total, rows, applied) = if let Some(filter) = active {
-            Self::search_narrowed(&conn, generation, query, limit, filter)?
+            Self::search_narrowed(&snapshot, generation, query, limit, filter)?
         } else {
             (
-                Self::count_search_symbols_locked(&conn, generation, query)?,
-                Self::search_symbols_locked(&conn, generation, query, limit)?,
+                Self::count_search_symbols_locked(&snapshot, generation, query)?,
+                Self::search_symbols_locked(&snapshot, generation, query, limit)?,
                 None,
             )
         };
@@ -399,8 +397,8 @@ impl Store {
             generation,
             total,
             rows,
-            repo_root: self.generation_repo_root_in(&conn, generation)?,
-            analysis: Self::analysis_disclosure_in(&conn, generation)?,
+            repo_root: self.generation_repo_root_in(&snapshot, generation)?,
+            analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
             narrowing: applied,
         }))
     }
@@ -1827,6 +1825,50 @@ impl Store {
             Some(generation) => Ok(Some((snapshot, generation))),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::latest_snapshot`] with the generation-read pause fired once the
+    /// snapshot is taken, as [`Self::generation_snapshot`] fires it.
+    ///
+    /// Only for the readers whose snapshot a test must race: the corpus reads
+    /// a stacked store pairs (`all_symbols_page`, `all_symbols_page_with_files`,
+    /// `latest_scope_inputs`). `search_page` stays on the plain
+    /// [`Self::latest_snapshot`] and never pauses; a test pins that.
+    fn latest_snapshot_paused(
+        conn: &Connection,
+    ) -> Result<Option<(rusqlite::Transaction<'_>, u32)>> {
+        let pinned = Self::latest_snapshot(conn)?;
+        if pinned.is_some() {
+            super::fire_generation_read_pause();
+        }
+        Ok(pinned)
+    }
+
+    /// [`Self::latest_snapshot`] for a generation the caller already holds.
+    ///
+    /// `BEGIN DEFERRED`; the existence check is the transaction's first
+    /// statement, so it is the snapshot every later read sees. A prune that
+    /// commits afterwards, from another connection or process, is invisible to
+    /// those reads: the reader gets the generation's rows as they were when the
+    /// check passed, not an empty or partial answer from a store that has
+    /// since lost it. `None` means the generation is not in this store in that
+    /// snapshot (pruned or never written), which is a refusal and not an empty
+    /// read. Rolled back on drop; takes no write lock.
+    pub(super) fn generation_snapshot(
+        conn: &Connection,
+        generation: u32,
+    ) -> Result<Option<rusqlite::Transaction<'_>>> {
+        let snapshot = conn.unchecked_transaction()?;
+        let present: bool = snapshot.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
+            params![generation],
+            |row| row.get::<_, i64>(0).map(|found| found != 0),
+        )?;
+        if !present {
+            return Ok(None);
+        }
+        super::fire_generation_read_pause();
+        Ok(Some(snapshot))
     }
 
     /// Refuse a search whose index is not there, instead of reporting that the

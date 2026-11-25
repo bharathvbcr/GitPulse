@@ -163,14 +163,25 @@ fn error_regions_without_a_name_are_recorded_as_nameless() {
         (text(&error_ranges), text(&nameless_ranges))
     };
 
-    let (errors, nameless) = outcome(
-        "a.test.ts",
-        "typescript",
-        "vi.mock('m', async (o) => ({\n  ...(await o<typeof import('m')>()),\n}));\n\
+    // `typeof import('m')` is repaired cleanly by `parse_repair`, while a
+    // genuinely broken punctuation-only TS error stays Partial and nameless.
+    assert!(matches!(
+        extract_treesitter(
+            "a.test.ts",
+            "typescript",
+            "vi.mock('m', async (o) => ({\n  ...(await o<typeof import('m')>()),\n}));\n\
              function after(): number { return 2; }\n",
+        )
+        .parse_outcome,
+        ParseOutcome::Clean
+    ));
+    let (errors, nameless) = outcome(
+        "broken.ts",
+        "typescript",
+        "const x = [1, )];\nfunction after(): number { return 2; }\n",
     );
-    assert_eq!(errors, vec![">()"]);
-    assert_eq!(nameless, vec![">()"]);
+    assert!(!errors.is_empty(), "{errors:?}");
+    assert_eq!(errors, nameless, "punctuation-only errors stay nameless");
 
     let (errors, nameless) = outcome(
         "k.cu",

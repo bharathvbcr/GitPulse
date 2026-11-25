@@ -7,6 +7,7 @@
  */
 
 import { asRecord } from "../record";
+import { readUnresolvedHandoffs, unplacedText } from "./previewModel";
 
 export interface GraphView {
   title: string;
@@ -14,6 +15,11 @@ export interface GraphView {
   suffix: string;
   /** What to do about a capped view ("raise --max-nodes"); empty when nothing was cut. */
   capHint: string;
+  /** Note summarising unplaced handoffs (e.g. "150 handoffs unplaced (100 of 150 listed)"); empty when none. */
+  unplacedNote: string;
+  unresolvedHandoffs: Array<{ from: string; text: string }>;
+  unresolvedTotal: number;
+  unresolvedBySubsystem: Record<string, { total: number; listed: number }>;
   /** `[label, node key]` pairs the inspector lists for the selected node. */
   detailFields: Array<[string, string]>;
   /** `[flag, label]` pairs offered as "only nodes carrying this flag" filters. */
@@ -31,11 +37,21 @@ function labelled(value: unknown): Array<[string, string]> {
 
 export function readView(DATA: Record<string, unknown>): GraphView {
   const VIEW = asRecord(DATA.view) ?? {};
+  const handoffs = readUnresolvedHandoffs(
+    DATA.unresolved_handoffs,
+    DATA.unresolved_handoffs_total,
+    DATA.unresolved_handoffs_by_subsystem,
+  );
+  const viewUnplaced = typeof VIEW.unplaced_note === "string" ? VIEW.unplaced_note : "";
   return {
     title: typeof VIEW.title === "string" && VIEW.title ? VIEW.title : "devmap",
     level: typeof VIEW.level === "string" ? VIEW.level : "",
     suffix: typeof VIEW.suffix === "string" && VIEW.suffix ? VIEW.suffix : "code graph",
     capHint: typeof VIEW.cap_hint === "string" ? VIEW.cap_hint : "",
+    unplacedNote: viewUnplaced || unplacedText(handoffs.unresolvedTotal, handoffs.unresolved.length),
+    unresolvedHandoffs: handoffs.unresolved,
+    unresolvedTotal: handoffs.unresolvedTotal,
+    unresolvedBySubsystem: handoffs.unresolvedBySubsystem,
     detailFields: labelled(VIEW.detail_fields),
     flagFilters: labelled(VIEW.flag_filters),
   };

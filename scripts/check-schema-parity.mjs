@@ -515,9 +515,12 @@ async function serverReading(reader, bin, absent, timeoutMs) {
   if (probe.dcStoreSchema !== null) schemas.dcStore = probe.dcStoreSchema;
   if (probe.workbenchSchema !== null) schemas.workbench = probe.workbenchSchema;
   if (probe.extractSchema !== null) schemas.extract = probe.extractSchema;
-  // The manifest names no lease format yet, so this row is unverifiable for it
-  // until gitpulse-mcp's manifest reports `STACK_FORMAT_VERSION`.
-  return { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" };
+  if (probe.leaseSchema !== null) schemas.lease = probe.leaseSchema;
+  // A binary built before the manifest named `stackLeaseFormatVersion` is
+  // unverifiable for the lease format, never assumed to match.
+  return schemas.lease === undefined
+    ? { reader, keys: ALL_KEYS, schemas, note: "the gitpulse-mcp manifest does not name its stack lease format" }
+    : { reader, keys: ALL_KEYS, schemas };
 }
 
 /**

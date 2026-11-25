@@ -363,6 +363,11 @@ struct ChargedHoles {
     /// Attribution did not run (the query names no identifier) over partial
     /// files in scope: said, never silent.
     skipped: Option<String>,
+    /// The scope was resolved against a generation the store no longer holds, so
+    /// its partial-parse files could not be checked. Only a scoped lookup can
+    /// say this, and a scoped lookup that could not check its scope is
+    /// unavailable, not a clean miss: it is the reason, never background.
+    generation_gone: Option<String>,
 }
 
 fn listed(items: Vec<String>) -> String {
@@ -446,6 +451,9 @@ impl ChargedHoles {
     fn split(&self, query: &str) -> (Option<String>, Option<String>) {
         let matched = self.match_sentence(query);
         let unchecked = self.unchecked_sentence();
+        if let Some(gone) = &self.generation_gone {
+            return (Some(gone.clone()), None);
+        }
         if let Some(skipped) = &self.skipped {
             return (None, Some(skipped.clone()));
         }
@@ -773,29 +781,55 @@ impl StoreQueryEngine<'_> {
         // The scope layer's own resolution of paths and languages, so an
         // absolute path, `./sub` and a language-only scope admit exactly the
         // files the search itself was narrowed to.
+        let mut scope_generation = None;
         let resolved = match filter
             .map(|filter| filter.symbol_scope())
             .transpose()?
             .flatten()
         {
             Some(scope) => match self.latest_scope_inputs()? {
-                Some((_, root, files)) => Some(scope.resolve(&files, root.as_deref())?),
+                Some((generation, root, files)) => {
+                    scope_generation = Some(generation);
+                    Some(scope.resolve(&files, root.as_deref())?)
+                }
                 None => None,
             },
             None => None,
         };
+        // The gap rows are read from the generation the scope was resolved
+        // against: a build that commits between the two reads must not pair one
+        // generation's files with the next one's gaps. `None` is a generation
+        // pruned since, which is said, never read as "no gaps".
         found.scoped = resolved.is_some();
         let admit_in_scope =
             |path: &str| resolved.as_ref().is_some_and(|scope| scope.contains(path));
         let admit: Option<&dyn Fn(&str) -> bool> = resolved.as_ref().map(|_| &admit_in_scope as _);
+        let read_gaps = |limit: usize| match scope_generation {
+            Some(generation) => {
+                self.store
+                    .partial_parse_gaps_in(generation, REGION_LIST, admit, limit)
+            }
+            None => self
+                .store
+                .latest_partial_parse_gaps(REGION_LIST, admit, limit)
+                .map(Some),
+        };
+        let gaps_gone = || {
+            format!(
+                "the generation this scope was resolved against is no longer in the store, so \
+                 its partial-parse files were not checked for `{}`",
+                crate::bounded_text(query, REASON_NAME_BYTES)
+            )
+        };
         let (qualifiers, name) = match target {
             Ok(target) => target,
             Err(why) => {
                 // Attribution is skipped, and with partial files in scope that
                 // must not read as a clean miss.
-                let (_, held) = self
-                    .store
-                    .latest_partial_parse_gaps(REGION_LIST, admit, 0)?;
+                let Some((_, held)) = read_gaps(0)? else {
+                    found.generation_gone = Some(gaps_gone());
+                    return Ok(found);
+                };
                 if held > 0 {
                     found.skipped = Some(format!(
                         "{held} partial-parse file(s) in scope hold charged regions this lookup \
@@ -806,9 +840,10 @@ impl StoreQueryEngine<'_> {
                 return Ok(found);
             }
         };
-        let (rows, total) =
-            self.store
-                .latest_partial_parse_gaps(REGION_LIST, admit, MAX_CHARGED_FILES_READ)?;
+        let Some((rows, total)) = read_gaps(MAX_CHARGED_FILES_READ)? else {
+            found.generation_gone = Some(gaps_gone());
+            return Ok(found);
+        };
         found.files_past_cap = total.saturating_sub(rows.len());
         for row in rows {
             self.cancel.check()?;
@@ -834,7 +869,7 @@ impl StoreQueryEngine<'_> {
                             crate::bounded_text(&error.to_string(), REASON_PATH_BYTES)
                         ));
                     }
-                    Ok(source) if devmap_extract::content_hash(&source) != row.content_hash => {
+                    Ok(source) if devmap_extract::source_identity(&source) != row.content_hash => {
                         regions_unchecked += ranges.len();
                         why.push(
                             "changed since the build; its charged ranges were not checked"
@@ -1071,16 +1106,17 @@ pub(super) fn radius_note(
                     continue;
                 }
             }
-            if let Some(path) = row.receiver.as_deref().filter(|r| r.contains("::")) {
+            // The receiver is text copied out of the file: it decides which
+            // reason applies, but is never written into the prose. A host that
+            // gates reads on `CONTENT_BEARING_KEYS` treats every other string
+            // as metadata, and a secret path's text is withheld outright.
+            if row.receiver.as_deref().is_some_and(|r| r.contains("::")) {
                 path_sites += 1;
-                path_labels.insert(format!("{path}::{}", row.callee_name));
+                path_labels.insert(row.callee_name);
                 continue;
             }
             sites += 1;
-            labels.insert(match &row.receiver {
-                Some(receiver) => format!("{receiver}.{}", row.callee_name),
-                None => row.callee_name,
-            });
+            labels.insert(row.callee_name);
         }
     }
     let mut notes = Vec::new();
@@ -1398,7 +1434,16 @@ pub(super) fn rank_symbol_rows(
 /// costing the caller anything.
 pub(super) fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 {
     let name = row.name.to_lowercase();
-    if name == query_lower || row.qualified_name.to_lowercase() == query_lower {
+    let qualified = row.qualified_name.to_lowercase();
+    if name == query_lower
+        || qualified == query_lower
+        || (query_lower.contains("::")
+            && crate::query_match::traversal_start_matches(
+                query_lower,
+                &qualified,
+                &row.path.to_lowercase(),
+            ))
+    {
         1.0
     } else if name.starts_with(query_lower) {
         0.95
@@ -1458,7 +1503,11 @@ mod radius_note_tests {
     fn a_qualified_path_is_not_called_an_untyped_receiver() {
         let note = note_for(Some("gitpulse_lib::hooks"));
         assert!(note.contains("not mapped to an indexed root"), "{note}");
-        assert!(note.contains("gitpulse_lib::hooks::dispatch"), "{note}");
+        assert!(note.contains("(dispatch)"), "{note}");
+        assert!(
+            !note.contains("gitpulse_lib"),
+            "receiver text is not prose: {note}"
+        );
         assert!(
             !note.contains("an untyped receiver, a local binding"),
             "{note}"
@@ -1468,6 +1517,10 @@ mod radius_note_tests {
     #[test]
     fn a_value_receiver_keeps_the_untyped_receiver_reason() {
         let note = note_for(Some("state"));
+        assert!(
+            !note.contains("state."),
+            "receiver text is not prose: {note}"
+        );
         assert!(
             note.contains("an untyped receiver, a local binding"),
             "{note}"

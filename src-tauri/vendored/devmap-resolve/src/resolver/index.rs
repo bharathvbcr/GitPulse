@@ -1530,6 +1530,30 @@ impl Resolver {
                             .or_insert(shape);
                     }
                 }
+                let is_type_scope = reference.enclosing_symbol.as_deref().is_some_and(|scope| {
+                    if scope == ext.file_path {
+                        return false;
+                    }
+                    let is_type = |name: &str| {
+                        ext.symbols.iter().any(|s| {
+                            (s.name == name
+                                || s.qualified_name == name
+                                || s.name == name.rsplit("::").next().unwrap_or(name))
+                                && matches!(
+                                    s.kind,
+                                    SymbolKind::Class
+                                        | SymbolKind::Struct
+                                        | SymbolKind::Interface
+                                        | SymbolKind::Trait
+                                        | SymbolKind::Enum
+                                )
+                        })
+                    };
+                    is_type(scope)
+                        || self
+                            .declaring_type_of(&ext.file_path, scope)
+                            .is_some_and(is_type)
+                });
                 // SC25: record what the author declared *before* asking whether
                 // it is indexed. A `*testing.T` parameter names a type this
                 // corpus will never contain, which is exactly what makes it
@@ -1557,12 +1581,14 @@ impl Resolver {
                             &reference.name,
                         );
                     }
-                    Self::bind_receiver(
-                        &mut self.declared_types,
-                        &mut self.poisoned_receiver_keys,
-                        format!("{}:{}{}", ext.file_path, receiver, slot),
-                        &reference.name,
-                    );
+                    if !is_type_scope {
+                        Self::bind_receiver(
+                            &mut self.declared_types,
+                            &mut self.poisoned_receiver_keys,
+                            format!("{}:{}{}", ext.file_path, receiver, slot),
+                            &reference.name,
+                        );
+                    }
                 }
                 let Some(candidates) = self.symbol_index.get(&reference.name) else {
                     continue;
@@ -1658,17 +1684,20 @@ impl Resolver {
                             &reference.name,
                         );
                     }
-                    Self::bind_receiver(
-                        &mut self.receiver_types,
-                        &mut self.poisoned_receiver_keys,
-                        format!("{}:{}", ext.file_path, receiver),
-                        &reference.name,
-                    );
+                    if !is_type_scope {
+                        Self::bind_receiver(
+                            &mut self.receiver_types,
+                            &mut self.poisoned_receiver_keys,
+                            format!("{}:{}", ext.file_path, receiver),
+                            &reference.name,
+                        );
+                    }
                 }
             }
             self.index_module_value_types(ext, family);
             self.index_inert_values(ext, family);
             self.index_js_objects(ext);
+            self.index_swift_environment_properties(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
             // are indexed just above; this pass is a second walk so a field

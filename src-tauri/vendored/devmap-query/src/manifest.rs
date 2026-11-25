@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::artifacts::write_atomic;
+use crate::artifacts::{file_area, write_consumer_artifact};
 use crate::model::*;
 use devmap_analyze::model::*;
 use devmap_analyze::{extraction_gaps, ExtractionGap};
@@ -936,15 +936,6 @@ mod wire_format_tests {
     }
 }
 
-fn file_area(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .and_then(|parent| parent.to_str())
-        .filter(|parent| !parent.is_empty() && *parent != ".")
-        .unwrap_or(".")
-        .replace('\\', "/")
-}
-
 /// How many neighbours one subsystem may name.
 ///
 /// A cap, because `area_for_path` falls back to a file's own parent directory
@@ -1571,74 +1562,18 @@ pub fn resolve_manifest_output(repo_root: Option<&str>, output: &Path) -> PathBu
 /// `force` is set. Identity is `map_engine == "devmap-rust"` — missing that
 /// key is the live Python schema.
 pub fn write_manifest_atomically(path: &Path, json: &str, force: bool) -> anyhow::Result<bool> {
-    if path.exists() && !force && is_foreign_repo_map(path)? {
-        anyhow::bail!(
-            "refuse to overwrite a non-devmap-rust repo map at {} (pass --force to replace)",
-            path.display()
-        );
-    }
-    Ok(write_atomic(path, json.as_bytes())?)
-}
-
-fn is_foreign_repo_map(path: &Path) -> anyhow::Result<bool> {
-    let existing = std::fs::read_to_string(path)?;
-    let Ok(value) = serde_json::from_str::<Value>(&existing) else {
-        return Ok(true);
-    };
-    Ok(value.get("map_engine").and_then(Value::as_str) != Some(CONSUMER_MAP_ENGINE))
+    write_consumer_artifact(path, json.as_bytes(), force, "/map_engine", "repo map")
 }
 
 #[cfg(all(test, feature = "parse"))]
 mod tests {
     use super::*;
+    use crate::artifacts::is_foreign_artifact;
+    use crate::artifacts::test_support::{empty_analysis, freshness, tmp_artifact_file};
     use devmap_extract::extract_file;
 
     fn tmp_map(contents: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "devmap-manifest-{}-{stamp}-{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("repo_map.json");
-        std::fs::write(&path, contents).unwrap();
-        path
-    }
-
-    fn freshness() -> FreshnessInfo {
-        FreshnessInfo {
-            head_sha: "abc123".to_string(),
-            generation_id: 1,
-            pending_count: 0,
-            stamped: Default::default(),
-        }
-    }
-
-    fn empty_analysis() -> AnalysisSummary {
-        AnalysisSummary {
-            // No discovery step ran over this hand-built corpus, so there is no
-            // refusal count to report. `None` says that; `0` would claim a walk.
-            discovery_refused_files: None,
-            total_files: 0,
-            total_symbols: 0,
-            total_edges: 0,
-            dead_symbols: Vec::new(),
-            communities: Vec::new(),
-            status: AnalysisStatus::Ok,
-            unresolved_calls: 0,
-            clone_coverage: Default::default(),
-            // Fields this fixture does not exercise. Spread rather than
-            // enumerated so a new analysis field does not break every test
-            // literal in the workspace; the one production construction in
-            // `analyze()` still names every field exhaustively.
-            ..Default::default()
-        }
+        tmp_artifact_file("devmap-manifest", "repo_map.json", contents)
     }
 
     /// The manifest's important-file list matches on equality, not inequality.
@@ -2080,7 +2015,7 @@ mod tests {
         // Our own map: not foreign, so a refresh is allowed.
         let ours = tmp_map(&format!(r#"{{"map_engine": "{CONSUMER_MAP_ENGINE}"}}"#));
         assert!(
-            !is_foreign_repo_map(&ours).unwrap(),
+            !is_foreign_artifact(&ours, "/map_engine").unwrap(),
             "a map devmap wrote itself must be refreshable, or devmap can never \
              update its own output"
         );
@@ -2088,7 +2023,7 @@ mod tests {
         // Someone else's map: foreign, so it is protected.
         let theirs = tmp_map(r#"{"map_engine": "python-repo-mapper"}"#);
         assert!(
-            is_foreign_repo_map(&theirs).unwrap(),
+            is_foreign_artifact(&theirs, "/map_engine").unwrap(),
             "another engine's map must be protected from being overwritten"
         );
 
@@ -2096,7 +2031,7 @@ mod tests {
         // wrote it is not proof that we did.
         let unmarked = tmp_map(r#"{"files": []}"#);
         assert!(
-            is_foreign_repo_map(&unmarked).unwrap(),
+            is_foreign_artifact(&unmarked, "/map_engine").unwrap(),
             "a map with no engine marker must be treated as foreign"
         );
 
@@ -2104,7 +2039,7 @@ mod tests {
         // not report the same result as a check that ran and passed.
         let broken = tmp_map("not json at all {{{");
         assert!(
-            is_foreign_repo_map(&broken).unwrap(),
+            is_foreign_artifact(&broken, "/map_engine").unwrap(),
             "unreadable content must fail closed, not be assumed ours"
         );
 

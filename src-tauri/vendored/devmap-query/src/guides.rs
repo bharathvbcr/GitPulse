@@ -384,7 +384,8 @@ sessions, uncommitted work, contended files and index health in one call. Then \
 `gitpulse_active_changes` for what is in flight, `gitpulse_change_context` / \
 `gitpulse_provenance` for what changed and why, and `gitpulse_ledger_events` for the recorded \
 history. Its facets fail independently — check each `ok`, because a facet that could not scan \
-is not a facet that came back clean.";
+is not a facet that came back clean. A `deferred`, timed-out or `ok: false` facet is likewise \
+not a clean answer, and an absent `gitpulse-mcp` is reported the way an absent `devmap` is.";
 
 /// Why the guide addresses agents it will never be loaded by.
 ///
@@ -397,7 +398,13 @@ this file. When you delegate — a subagent, a worktree lane, a handoff plan —
 GitPulse Insights in the prompt with the same precedence, rather than leaving that agent to grep \
 its way in. When either tool cannot answer (truncated, `walk_incomplete`, empty on a built index, \
 or a capability it does not have), record the gap and say so; do not silently fall back to grep \
-and report the result as if the graph had confirmed it.";
+and report the result as if the graph had confirmed it. When the tools are not installed at all \
+(`devmap` or `gitpulse-mcp` is command not found, or their MCP server is not loaded, as in a cloud \
+session), say so once in your reply, naming the missing command (`devmap gap-record` is a devmap \
+command and fails when devmap is absent), then navigate by source inspection: that is not a silent \
+fallback. Without `devmap`, skip the `devmap paths --json` / `devmap status --json` / \
+`devmap build --manifest` steps (1 and 10) and the `.devcouncil/...` store reads; they are not \
+required then.";
 
 /// Render the guide for `map`, whose artifact sits at `map_rel` relative to the
 /// repository root.
@@ -1399,6 +1406,43 @@ mod tests {
         assert!(
             text.contains("record the gap"),
             "a tool that could not answer must be reported, not quietly swapped for grep: {text}"
+        );
+    }
+
+    #[test]
+    fn the_guide_says_what_to_do_when_the_tools_are_not_installed() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            text.contains("command not found"),
+            "an absent binary (cloud session) needs its own rule: {text}"
+        );
+        assert!(
+            text.contains("say so once in your reply, naming the missing command"),
+            "absence is reported once in the reply, naming the command: {text}"
+        );
+        assert!(
+            text.contains("then navigate by source inspection"),
+            "source inspection is allowed once the absence is reported: {text}"
+        );
+        assert!(
+            text.contains(
+                "`devmap gap-record` is a devmap command and fails when devmap is absent"
+            ),
+            "the gap-record command cannot be the way to report that devmap is absent: {text}"
+        );
+        assert!(
+            text.contains("skip the `devmap paths --json` / `devmap status --json` / `devmap build --manifest` steps"),
+            "the steps an absent devmap replaces must be named as skippable: {text}"
+        );
+        assert!(
+            text.contains(
+                "A `deferred`, timed-out or `ok: false` facet is likewise not a clean answer"
+            ),
+            "a slow or failed Insights facet is not a clean answer: {text}"
+        );
+        assert!(
+            text.contains("an absent `gitpulse-mcp` is reported the way an absent `devmap` is"),
+            "an absent gitpulse-mcp is reported like an absent devmap: {text}"
         );
     }
 

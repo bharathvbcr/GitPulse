@@ -17,7 +17,7 @@
 //! "1,000 of 12,103 nodes" is what the reader sees, never "1,000 nodes".
 
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Visibility classification shared by file/symbol and subsystem payloads.
 /// Directory names alone do not make source code into a note.
@@ -311,6 +311,7 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
             .cmp(degree.get(id_a).unwrap_or(&0))
             .then_with(|| id_a.cmp(id_b))
     });
+    let all_candidates = candidates.clone();
     candidates.truncate(options.max_nodes);
 
     let shown: std::collections::BTreeSet<&str> = candidates
@@ -402,6 +403,8 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
         }
     }
 
+    let unresolved = collect_unresolved_handoffs(graph, &all_candidates, &nodes);
+
     json!({
         "level": if options.symbols { "symbol" } else { "file" },
         "nodes": nodes,
@@ -416,6 +419,9 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
             "max_nodes": options.max_nodes,
         },
         "communities": communities,
+        "unresolved_handoffs": unresolved.listed,
+        "unresolved_handoffs_total": unresolved.total,
+        "unresolved_handoffs_by_subsystem": unresolved.by_subsystem,
         "meta": {"projection": {
             "scope": if options.symbols { "symbol relationships" } else { "cross-file dependencies" },
             "invalid_nodes": invalid_nodes, "invalid_edges": invalid_edges,
@@ -426,12 +432,127 @@ pub fn build_payload(graph: &Value, options: &VizOptions) -> Value {
     })
 }
 
+fn collect_unresolved_handoffs(
+    graph: &Value,
+    all_candidates: &[&Value],
+    surviving_nodes: &[Value],
+) -> crate::map_preview::UnresolvedHandoffSummary {
+    let mut raw_unresolved: Vec<Value> = Vec::new();
+    if let Some(items) = graph.get("unresolved_handoffs").and_then(Value::as_array) {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    let from = item
+                        .get("from")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    raw_unresolved.push(json!({"from": from, "text": text}));
+                }
+            } else if let Some(text) = item.as_str() {
+                let text = text.trim();
+                if !text.is_empty() {
+                    raw_unresolved.push(json!({"from": "", "text": text}));
+                }
+            }
+        }
+    }
+
+    if let Some(subsystems) = graph.get("subsystems").and_then(Value::as_array) {
+        let mut placeable_areas: BTreeSet<String> = BTreeSet::new();
+        let norm_trim = |raw: &str| {
+            crate::map_preview::normalize(raw.trim())
+                .trim_matches('/')
+                .to_string()
+        };
+        for node in surviving_nodes {
+            if let Some(area) = node.get("area").and_then(Value::as_str) {
+                let area = norm_trim(area);
+                if !area.is_empty() && area != "." {
+                    placeable_areas.insert(area);
+                }
+            }
+            if let Some(path) = node.get("path").and_then(Value::as_str) {
+                let path = norm_trim(path);
+                if !path.is_empty() {
+                    let derived = crate::artifacts::file_area(&path);
+                    if !derived.is_empty() && derived != "." {
+                        placeable_areas.insert(derived);
+                    }
+                    placeable_areas.insert(path);
+                }
+            }
+        }
+        let matches_sub = |node: &&Value, sub_area: &str| {
+            let area = node
+                .get("area")
+                .and_then(Value::as_str)
+                .map(norm_trim)
+                .unwrap_or_default();
+            if area == sub_area {
+                return true;
+            }
+            let path = node
+                .get("path")
+                .and_then(Value::as_str)
+                .map(norm_trim)
+                .unwrap_or_default();
+            path == sub_area || path.starts_with(&format!("{sub_area}/"))
+        };
+        for sub in subsystems {
+            let raw_area = sub
+                .get("area")
+                .or_else(|| sub.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let sub_area = norm_trim(raw_area);
+            if sub_area.is_empty() {
+                continue;
+            }
+            let had_nodes = all_candidates.iter().any(|n| matches_sub(n, &sub_area));
+            let has_surviving = surviving_nodes.iter().any(|n| matches_sub(&n, &sub_area));
+            if !had_nodes || has_surviving {
+                placeable_areas.insert(sub_area);
+            }
+        }
+        let areas: Vec<String> = placeable_areas.into_iter().collect();
+        for sub in subsystems {
+            let from = sub
+                .get("id")
+                .or_else(|| sub.get("area"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some(handoffs) = sub.get("handoff_paths").and_then(Value::as_array) else {
+                continue;
+            };
+            for handoff in handoffs {
+                let Some(text) = handoff.as_str() else {
+                    continue;
+                };
+                let (_, dst, display) = crate::map_preview::resolve_handoff(text, &areas);
+                if dst.is_none() && !display.is_empty() {
+                    raw_unresolved.push(json!({"from": from, "text": display}));
+                }
+            }
+        }
+    }
+
+    crate::map_preview::summarize_unresolved_handoffs(raw_unresolved)
+}
+
 /// Render the code graph: one HTML file, no network.
 pub fn render_html(graph: &Value, options: &VizOptions) -> String {
     let mut payload = build_payload(graph, options);
     let truncated = payload["counts"]["nodes_truncated"]
         .as_bool()
         .unwrap_or(false);
+    let unresolved_total = payload["unresolved_handoffs_total"].as_u64().unwrap_or(0) as usize;
+    let unresolved_listed = payload["unresolved_handoffs"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let unplaced_note =
+        crate::map_preview::format_unplaced_note(unresolved_total, unresolved_listed);
 
     // The page states the cap itself, from `counts`: "1,000 of 12,103 nodes"
     // and that the view is not the whole graph. A reader who never opens
@@ -447,6 +568,7 @@ pub fn render_html(graph: &Value, options: &VizOptions) -> String {
         } else {
             ""
         },
+        "unplaced_note": unplaced_note,
         "detail_fields": [
             ["Path", "path"], ["Kind", "kind"], ["Area", "area"],
             ["Community", "community"], ["Language", "language"],
@@ -523,9 +645,9 @@ mod tests {
     use super::*;
 
     /// The page reads only what `render_html` puts in its payload. The
-    /// retired subsystem view left a note reading `unresolved_handoffs_total`
-    /// and a detail pane reading `subsystems` here, neither of which the code
-    /// graph payload has ever carried.
+    /// retired subsystem view left a detail pane reading `subsystems`, which
+    /// remains repo-map-only, while unplaced handoffs and their counts now
+    /// ride explicitly on both payloads.
     ///
     /// Retargeted from the old inline script to the TypeScript that now reads
     /// the payload (`graphView.ts`, `codeGraphPage.ts`): both reach the payload
@@ -779,5 +901,94 @@ mod tests {
         let first = build_payload(&graph(), &VizOptions::default());
         let second = build_payload(&graph(), &VizOptions::default());
         assert_eq!(first, second);
+    }
+
+    fn graph_with_unplaceable_handoffs(n: usize) -> Value {
+        let mut g = graph();
+        for node in g["nodes"].as_array_mut().unwrap() {
+            match node["id"].as_str() {
+                Some("a.py") => node["area"] = json!("src/cli"),
+                Some("b.py") => node["area"] = json!("core"),
+                _ => {}
+            }
+        }
+        g["subsystems"] = json!([
+            {
+                "area": "src/cli",
+                "handoff_paths": (0..n)
+                    .map(|i| format!("nowhere/{i}.py -> elsewhere/{i}.py"))
+                    .collect::<Vec<_>>()
+            },
+            {
+                "area": "core",
+                "handoff_paths": ["a.py -> b.py"]
+            }
+        ]);
+        g
+    }
+
+    #[test]
+    fn a_handoff_the_view_cannot_place_is_reported_and_noted() {
+        let payload = build_payload(&graph_with_unplaceable_handoffs(1), &VizOptions::default());
+        assert_eq!(payload["unresolved_handoffs_total"], json!(1));
+        assert_eq!(
+            payload["unresolved_handoffs"][0],
+            json!({"from": "src/cli", "text": "nowhere/0.py -> elsewhere/0.py"})
+        );
+        assert_eq!(
+            payload["unresolved_handoffs_by_subsystem"],
+            json!({"src/cli": {"total": 1, "listed": 1}})
+        );
+
+        let html = render_html(&graph_with_unplaceable_handoffs(1), &VizOptions::default());
+        let embedded = crate::page::embedded_payload(&html);
+        assert_eq!(embedded["unresolved_handoffs_total"], json!(1));
+        assert_eq!(
+            embedded["view"]["unplaced_note"],
+            json!("1 handoff unplaced")
+        );
+        assert!(
+            html.contains("1 handoff unplaced"),
+            "the rendered page notes the unplaced handoff"
+        );
+
+        let clean = build_payload(&graph(), &VizOptions::default());
+        assert_eq!(clean["unresolved_handoffs_total"], json!(0));
+        assert_eq!(clean["unresolved_handoffs"], json!([]));
+        assert_eq!(clean["unresolved_handoffs_by_subsystem"], json!({}));
+        let clean_embedded =
+            crate::page::embedded_payload(&render_html(&graph(), &VizOptions::default()));
+        assert_eq!(clean_embedded["view"]["unplaced_note"], json!(""));
+    }
+
+    #[test]
+    fn the_unresolved_handoff_list_in_viz_is_capped_but_its_true_total_is_not() {
+        let payload = build_payload(
+            &graph_with_unplaceable_handoffs(150),
+            &VizOptions::default(),
+        );
+        assert_eq!(
+            payload["unresolved_handoffs"].as_array().unwrap().len(),
+            100
+        );
+        assert_eq!(payload["unresolved_handoffs_total"], json!(150));
+        assert_eq!(
+            payload["unresolved_handoffs_by_subsystem"]["src/cli"],
+            json!({"total": 150, "listed": 100})
+        );
+
+        let html = render_html(
+            &graph_with_unplaceable_handoffs(150),
+            &VizOptions::default(),
+        );
+        let embedded = crate::page::embedded_payload(&html);
+        assert_eq!(
+            embedded["view"]["unplaced_note"],
+            json!("150 handoffs unplaced (100 of 150 listed)")
+        );
+        assert!(
+            html.contains("100 of 150 listed"),
+            "the rendered page prints the capped N of M count"
+        );
     }
 }
