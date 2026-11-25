@@ -2124,6 +2124,11 @@ impl SessionWatcher {
             });
         }
         let telemetry_events = self.scanner.drain_telemetry();
+        // An answer given since the last read is said before anything this
+        // read raises: one read can carry both the redraw after the answer and
+        // agy's next dialog, and resolving after would find the new dialog
+        // standing and never report the answer.
+        self.resolve_answered_prompt();
         let mut notify_waiters = false;
         if !telemetry_events.is_empty() {
             let (herdr_notices, saw_probe, raised) = {
@@ -10670,6 +10675,144 @@ mod tests {
             let notices = events.notices.lock().unwrap().clone();
             assert_eq!(notices.len(), 2, "{notices:?}");
             assert_eq!(notices[1].event, Some("prompt_submitted"));
+        }
+    }
+
+    /// The incident's own PTY output (`term-1044-17`, an agy audit typed into a
+    /// shell tab), trimmed after agy's first `git -C … log` dialog and redacted
+    /// (email, host name, absolute paths). It holds agy's start-up screens,
+    /// status line, footer and spinner, the `git -C … diff` dialog drawn five
+    /// times, the answer, the `Running command` spinner, and the `log` dialog.
+    const AGY_INCIDENT: &[u8] = include_bytes!("../alerts/fixtures/agy_permission_incident.ptylog");
+
+    fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+        haystack[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|at| from + at)
+    }
+
+    /// The incident's real bytes, in any split: the prompt stands from the
+    /// first `diff` dialog, is answered, and stands again at the `log` dialog,
+    /// with nothing raised by agy's status line, footer or spinner. The
+    /// transcript records output only (agy reads keys raw, unechoed), so the
+    /// answer is placed where the screen shows it given: after the last `diff`
+    /// dialog was drawn with the highlight moved, at the first redraw of the
+    /// input box that follows (`Plan mode`), before any later dialog.
+    #[test]
+    fn the_incidents_real_output_raises_diff_then_log_and_nothing_else_however_it_is_split() {
+        let request: &[u8] = b"Requesting permission for:";
+        let first_dialog = find_from(AGY_INCIDENT, 0, request).expect("a dialog");
+        let log_dialog = find_from(AGY_INCIDENT, 0, b"git -C /work/repo log")
+            .and_then(|log| {
+                AGY_INCIDENT[..log]
+                    .windows(request.len())
+                    .rposition(|w| w == request)
+            })
+            .expect("the log dialog");
+        let last_diff_dialog = AGY_INCIDENT[..log_dialog]
+            .windows(request.len())
+            .rposition(|w| w == request)
+            .expect("a diff dialog before the log one");
+        let answered_at = find_from(AGY_INCIDENT, last_diff_dialog, b"Plan mode")
+            .expect("the redraw after the answer");
+        assert!(first_dialog < last_diff_dialog && answered_at < log_dialog);
+
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut random_split = || -> Vec<usize> {
+            let mut cuts = Vec::new();
+            let mut at = 0;
+            while at < AGY_INCIDENT.len() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                at += 1 + (seed % 700) as usize;
+                cuts.push(at.min(AGY_INCIDENT.len()));
+            }
+            cuts
+        };
+        let mut splits: Vec<(String, Vec<usize>)> = [1usize, 3, 64, 4096, AGY_INCIDENT.len()]
+            .into_iter()
+            .map(|size| {
+                let cuts = (1..=AGY_INCIDENT.len().div_ceil(size))
+                    .map(|n| (n * size).min(AGY_INCIDENT.len()))
+                    .collect();
+                (format!("chunks of {size}"), cuts)
+            })
+            .collect();
+        for n in 0..4 {
+            splits.push((format!("random split {n}"), random_split()));
+        }
+
+        for (name, cuts) in splits {
+            let events = Arc::new(RecordedEvents::default());
+            let telemetry = new_shared_telemetry();
+            let mut watcher = SessionWatcher::new(
+                "term-1044-17",
+                "/bin/zsh",
+                std::path::Path::new("/work/repo"),
+                events.clone(),
+            )
+            .with_telemetry(telemetry.clone());
+            let prompt_events = || -> Vec<(&'static str, Option<String>)> {
+                events
+                    .notices
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|n| n.channel == "screen")
+                    .map(|n| (n.event.unwrap_or("?"), n.detail.clone()))
+                    .collect()
+            };
+            let mut fed = 0;
+            let mut answered = false;
+            for cut in cuts {
+                // The person answers at the point the screen shows it: the
+                // write path clears the prompt, as `engine_write_pty_bytes` does.
+                if !answered && cut > answered_at {
+                    if fed < answered_at {
+                        watcher.observe(&AGY_INCIDENT[fed..answered_at]);
+                        fed = answered_at;
+                    }
+                    assert!(
+                        telemetry.0.lock().unwrap().agent_prompt.is_some(),
+                        "{name}: no prompt standing when the person answered: {:?}",
+                        prompt_events()
+                    );
+                    assert!(clear_agent_prompt(&mut telemetry.0.lock().unwrap()));
+                    answered = true;
+                }
+                if fed < first_dialog && cut > first_dialog {
+                    watcher.observe(&AGY_INCIDENT[fed..first_dialog]);
+                    fed = first_dialog;
+                    assert!(
+                        prompt_events().is_empty(),
+                        "{name}: agy's start-up, status line or spinner raised a prompt: {:?}",
+                        prompt_events()
+                    );
+                }
+                watcher.observe(&AGY_INCIDENT[fed..cut]);
+                fed = cut;
+            }
+
+            let seen = prompt_events();
+            let kinds: Vec<&str> = seen.iter().map(|(event, _)| *event).collect();
+            assert_eq!(
+                kinds,
+                ["permission_prompt", "prompt_submitted", "permission_prompt"],
+                "{name}: {seen:?}"
+            );
+            let diff = seen[0].1.as_deref().unwrap_or_default();
+            let log = seen[2].1.as_deref().unwrap_or_default();
+            assert!(
+                diff.starts_with("git -C /work/repo diff"),
+                "{name}: {diff:?}"
+            );
+            assert!(log.starts_with("git -C /work/repo log"), "{name}: {log:?}");
+            let state = telemetry.0.lock().unwrap();
+            let standing = state.agent_prompt.as_ref().expect("the log dialog stands");
+            assert_eq!(standing.kind, "permission", "{name}");
+            assert_eq!(standing.detail.as_deref(), Some(log), "{name}");
         }
     }
 
