@@ -469,6 +469,56 @@ pub(crate) fn windows_file_identity(file: &std::fs::File) -> io::Result<(u64, [u
     Ok((info.volume, info.id))
 }
 
+/// When NTFS last changed `file`'s data or metadata (`ChangeTime`), the stamp
+/// Unix calls ctime. Unlike the last-write time, no user-level call can set it
+/// back, so a write that restores the old mtime still moves it. Stable `std`
+/// does not expose it (`windows_change_time` is unstable).
+#[cfg(windows)]
+pub(crate) fn windows_change_time(file: &std::fs::File) -> io::Result<std::time::SystemTime> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    /// `FILE_BASIC_INFO`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            size: u32,
+        ) -> i32;
+    }
+    /// 100 ns ticks between 1601-01-01 (the FILETIME epoch) and 1970-01-01.
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+    let mut info = FileBasicInfo::default();
+    // SAFETY: File owns the live handle; class 0 is FileBasicInfo with the
+    // documented repr(C) layout and the exact output-buffer size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            0,
+            (&mut info as *mut FileBasicInfo).cast(),
+            std::mem::size_of::<FileBasicInfo>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let ticks = u64::try_from(info.change_time)
+        .ok()
+        .and_then(|ticks| ticks.checked_sub(UNIX_EPOCH_FILETIME))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ChangeTime before 1970"))?;
+    Ok(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ticks.saturating_mul(100)))
+}
+
 #[cfg(windows)]
 pub(crate) fn pin_directory(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};

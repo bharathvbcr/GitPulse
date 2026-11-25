@@ -494,6 +494,34 @@ pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
     PathBuf::from(rest)
 }
 
+/// Whether this platform's file system can hold a file at `rel`, a repository
+/// path spelled with `/`. Everywhere but Windows it can hold anything a git
+/// path can. Windows refuses a component with `< > : " \ | ? *` or a control
+/// character (a `\` there is a separator, so the name would not be one
+/// component), one that ends in a dot or a space, and a reserved device name
+/// (`CON`, `NUL`, `COM1`, ... with or without an extension). That is not a
+/// GitPulse bug, so a fixture that exercises such a name asserts the platform's
+/// outcome instead of creating it.
+#[cfg(test)]
+pub(crate) fn platform_can_hold(rel: &str) -> bool {
+    if !cfg!(windows) {
+        return true;
+    }
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    rel.split('/').all(|part| {
+        let stem = part.split('.').next().unwrap_or_default().to_ascii_uppercase();
+        !part.is_empty()
+            && !part.ends_with(['.', ' '])
+            && !part
+                .chars()
+                .any(|c| c.is_control() || "<>:\"\\|?*".contains(c))
+            && !RESERVED.contains(&stem.as_str())
+    })
+}
+
 #[cfg(test)]
 mod pin_adversary_tests;
 
