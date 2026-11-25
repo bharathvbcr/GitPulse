@@ -375,7 +375,10 @@ pub fn run() {
             // The status item and the banner for a build the relief
             // supervisor paused. Native and read-only: it works when the web
             // view is gone, and the supervisor itself is not started here.
-            desktop::pressure::start(app.handle());
+            if let Some(pressure) = desktop::pressure::start(app.handle()) {
+                use tauri::Manager as _;
+                app.manage(pressure);
+            }
             {
                 use tauri::Manager as _;
                 harness::steward::install(

@@ -1,11 +1,12 @@
 <script lang="ts">
   import {
     pausedRows,
-    reliefAge,
     reliefBindingLabel,
     reliefHeadline,
+    reliefIsCalm,
     reliefModeLabel,
-    reliefRungLabel,
+    reliefNowLabel,
+    reliefSummary,
     type ReliefOutcome,
     type ReliefStatus,
   } from "../../health/hostRelief";
@@ -41,7 +42,12 @@
     outcome && (outcome.state === "fresh" || outcome.state === "stale") ? outcome.status : null,
   );
   const rows = $derived(status ? pausedRows(status, now) : []);
-  const calm = $derived(outcome?.state === "fresh" && rows.length === 0);
+  const summary = $derived(status ? reliefSummary(status) : null);
+  const calm = $derived(reliefIsCalm(outcome));
+  // A status that could not be verified is the one where the person most needs
+  // the button: the request file can be written whatever the status says.
+  const unverified = $derived(outcome?.state === "stale" || outcome?.state === "unreadable");
+  const canResume = $derived(rows.length > 0 || outcome?.state === "unreadable");
 </script>
 
 <div class="mt-4 space-y-2 text-meta" data-testid="host-relief" data-state={outcome?.state ?? "loading"}>
@@ -60,8 +66,8 @@
       <dt class="text-textMuted">Mode</dt>
       <dd data-testid="host-relief-mode">{reliefModeLabel(status.mode)}</dd>
       <dt class="text-textMuted">Now</dt>
-      <dd data-testid="host-relief-rung">{reliefRungLabel(status.rung)}</dd>
-      {#if status.rung !== "none"}
+      <dd data-testid="host-relief-rung">{reliefNowLabel(status)}</dd>
+      {#if status.rung !== "none" || (summary && summary.wouldPause.length + summary.wouldSlow > 0)}
         <dt class="text-textMuted">Because</dt>
         <dd data-testid="host-relief-binding">{reliefBindingLabel(status.binding)}</dd>
       {/if}
@@ -77,6 +83,16 @@
       {/if}
     </dl>
 
+    {#if summary && summary.wouldPause.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-would-pause">
+        {#each summary.wouldPause as tree (`${tree.pid}:${tree.start_us}`)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2 text-textMuted">
+            Would pause <span class="font-mono text-textPrimary break-all">{tree.command}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
     {#if rows.length > 0}
       <ul class="space-y-1.5" data-testid="host-relief-paused">
         {#each rows as row (row.key)}
@@ -91,28 +107,6 @@
           </li>
         {/each}
       </ul>
-      <div class="flex items-center gap-2">
-        <button
-          type="button"
-          class="gp-btn text-meta px-2 py-0.5"
-          data-testid="host-relief-resume"
-          disabled={requesting}
-          onclick={() => onresume?.()}
-        >
-          Resume all
-        </button>
-        {#if requested && outcome?.state === "stale"}
-          <span class="text-warn" data-testid="host-relief-requested-stale">
-            Requested, but the supervisor has not reported in for {reliefAge(outcome.age_ms)}. If it is not running,
-            nothing will act on this and a paused process stays paused until it is resumed by hand
-            (kill -CONT with its pid).
-          </span>
-        {:else if requested}
-          <span class="text-textMuted" data-testid="host-relief-requested">
-            Requested. The supervisor resumes them on its next check.
-          </span>
-        {/if}
-      </div>
     {/if}
 
     {#if status.last_action}
@@ -132,6 +126,31 @@
         </ul>
       </div>
     {/if}
+  {/if}
+
+  {#if canResume}
+    <div class="flex items-center gap-2">
+      <button
+        type="button"
+        class="gp-btn text-meta px-2 py-0.5"
+        data-testid="host-relief-resume"
+        disabled={requesting}
+        onclick={() => onresume?.()}
+      >
+        Resume all
+      </button>
+      {#if requested && unverified}
+        <span class="text-warn" data-testid="host-relief-requested-stale">
+          Requested, but the memory protection status couldn't be verified. If the supervisor is not running,
+          nothing will act on this and a paused process stays paused until it is resumed by hand
+          (kill -CONT with its pid).
+        </span>
+      {:else if requested}
+        <span class="text-textMuted" data-testid="host-relief-requested">
+          Requested. The supervisor resumes them on its next check.
+        </span>
+      {/if}
+    </div>
   {/if}
 
   {#if error}

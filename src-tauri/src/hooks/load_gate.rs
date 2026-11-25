@@ -56,8 +56,10 @@
 //! # Paused builds
 //!
 //! A tree is "this session's" when its `terminal_session_id` is the terminal
-//! this hook runs under (`GITPULSE_SESSION_ID`), or the call's `cwd` is inside
-//! its `repo_path`. An advised-only entry is what Act would have paused and is
+//! this hook runs under (`GITPULSE_SESSION_ID`). Only when either side does not
+//! say which terminal it is, the root of the worktree the call runs in must
+//! equal the tree's `repo_path` exactly: a sibling worktree under the same
+//! repository is another session. An advised-only entry is what Act would have paused and is
 //! never reported as paused. The relief note is silent with the gate set to Off
 //! and for the heavy lane's holder, like everything else in this stage.
 //!
@@ -88,7 +90,7 @@ use super::heavy_commands::{classify, Classified, Hit};
 use super::{
     decision, fnv1a, HookInput, HookOutput, HookSpecificOutput, PermissionDecision, PRE_TOOL_USE,
 };
-use crate::sysload::relief_status::{self, ReliefOutcome, ReliefRung, ReliefStatus};
+use crate::sysload::relief_status::{self, ReliefOutcome, ReliefStaleCause, ReliefStatus};
 use crate::sysload::{
     Binding, InputMode, PublishedVerdict, Reading, SensorReport, SensorState, Snapshot, Tier,
 };
@@ -148,6 +150,10 @@ pub(super) struct Gathered {
     /// key a paused tree is matched to a caller by. Injected, never read from
     /// the environment inside the judge.
     pub terminal_session: Option<String>,
+    /// The root of the worktree or checkout the call's `cwd` is in: what a
+    /// paused tree's `repo_path` is matched against when a terminal id is
+    /// missing on either side.
+    pub session_root: Option<PathBuf>,
 }
 
 /// Where the facts about the build lease come from.
@@ -418,20 +424,31 @@ pub(super) fn gather_live(cwd: &str) -> Gathered {
     } else {
         crate::harness::steward::active_throttle_for_cwd(cwd)
     };
-    let live = |availability, exempt, disk, steward_throttle, relief| Gathered {
-        mode,
-        exempt,
-        availability,
-        state_dir: marker_dir(),
-        now: SystemTime::now(),
-        disk,
-        read_free: real_free,
-        lease: LeaseSource::Live,
-        steward_throttle,
-        relief,
-        terminal_session: std::env::var(crate::alerts::bridge::SESSION_ENV)
-            .ok()
-            .filter(|id| !id.is_empty()),
+    let live = |availability, exempt, disk, steward_throttle, relief: ReliefOutcome| {
+        // The worktree root is looked up only when something is paused, so a
+        // call on a calm machine pays for no extra directory walk.
+        let session_root = match &relief {
+            ReliefOutcome::Fresh { status } if status.paused_count() > 0 => {
+                crate::engine::find_git_root(Path::new(cwd))
+            }
+            _ => None,
+        };
+        Gathered {
+            mode,
+            exempt,
+            availability,
+            state_dir: marker_dir(),
+            now: SystemTime::now(),
+            disk,
+            read_free: real_free,
+            lease: LeaseSource::Live,
+            steward_throttle,
+            relief,
+            terminal_session: std::env::var(crate::alerts::bridge::SESSION_ENV)
+                .ok()
+                .filter(|id| !id.is_empty()),
+            session_root,
+        }
     };
     if mode == HostLoadHookMode::Off && steward_throttle.is_none() {
         return live(
@@ -740,22 +757,33 @@ const MAX_ECHOED_COMMAND: usize = 120;
 fn relief_note(input: &HookInput, g: &Gathered) -> Option<String> {
     match &g.relief {
         ReliefOutcome::Absent => None,
-        ReliefOutcome::Fresh { status } => relief_text(status, input, g),
-        ReliefOutcome::Stale { age_ms, .. } => unchecked_relief(
+        ReliefOutcome::Fresh { status } => relief_text(status, g),
+        ReliefOutcome::Stale { age_ms, cause, .. } => unchecked_relief(
             input,
             g,
-            &format!(
-                "the status was last written {}s ago, so the supervisor may no longer be running",
-                age_ms / 1000
-            ),
+            // The kind, never the age: the age changes every second and would
+            // make this a new notice, and a new marker file, on every command.
+            &format!("stale:{}", cause.code()),
+            &match cause {
+                ReliefStaleCause::Age => format!(
+                    "the status was last written {}s ago, so the supervisor may no longer be running",
+                    age_ms / 1000
+                ),
+                ReliefStaleCause::WriterGone => {
+                    "the process that wrote the status is no longer running".to_string()
+                }
+                ReliefStaleCause::ClockAhead => {
+                    "the status is dated ahead of this machine's clock".to_string()
+                }
+            },
         ),
-        ReliefOutcome::Unreadable { reason } => unchecked_relief(input, g, reason),
+        ReliefOutcome::Unreadable { reason } => unchecked_relief(input, g, "unreadable", reason),
     }
 }
 
-fn unchecked_relief(input: &HookInput, g: &Gathered, why: &str) -> Option<String> {
+fn unchecked_relief(input: &HookInput, g: &Gathered, kind: &str, why: &str) -> Option<String> {
     let why = clip(&crate::alerts::text::sanitize(why), 200);
-    match first_notice(g, input, &format!("relief: {why}")) {
+    match first_notice(g, input, &format!("relief: {kind}")) {
         Notice::Repeat => None,
         notice => Some(format!(
             "GitPulse could NOT check whether its memory protection has paused a build or test ({why}). \
@@ -765,17 +793,20 @@ fn unchecked_relief(input: &HookInput, g: &Gathered, why: &str) -> Option<String
     }
 }
 
-fn relief_text(status: &ReliefStatus, input: &HookInput, g: &Gathered) -> Option<String> {
-    let cwd = Path::new(&input.cwd);
+fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
     let mine = status.paused().find(|tree| {
-        let by_session = matches!(
-            (&tree.terminal_session_id, &g.terminal_session),
-            (Some(theirs), Some(ours)) if theirs == ours
-        );
-        let by_repo = cwd.is_absolute()
-            && !tree.repo_path.is_empty()
-            && cwd.starts_with(Path::new(&tree.repo_path));
-        by_session || by_repo
+        match (&tree.terminal_session_id, &g.terminal_session) {
+            // Both sides know their terminal: it decides, and a different one
+            // is a different session, whatever directory it works in.
+            (Some(theirs), Some(ours)) => theirs == ours,
+            // One side does not say: the worktree or checkout root the call
+            // runs in is the only other evidence, and only an exact match is.
+            // A sibling worktree under the same repository is not this one.
+            _ => g
+                .session_root
+                .as_deref()
+                .is_some_and(|root| same_root(root, Path::new(&tree.repo_path))),
+        }
     });
     if let Some(tree) = mine {
         let command = clip(
@@ -789,7 +820,8 @@ fn relief_text(status: &ReliefStatus, input: &HookInput, g: &Gathered) -> Option
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
         ));
     }
-    if status.rung != ReliefRung::None && status.slowed > 0 {
+    // `slowed` counts processes really slowed, so Advise mode (0) says nothing.
+    if status.slowed > 0 {
         return Some(format!(
             "GitPulse's memory protection has lowered the priority of {} agent process(es) because {}, so builds and tests run slower. Run one at a time.",
             status.slowed,
@@ -797,6 +829,19 @@ fn relief_text(status: &ReliefStatus, input: &HookInput, g: &Gathered) -> Option
         ));
     }
     None
+}
+
+/// Whether two paths name the same directory: the same path, or the same
+/// directory once symlinks are resolved (a checkout reached through one).
+fn same_root(a: &Path, b: &Path) -> bool {
+    if b.as_os_str().is_empty() {
+        return false;
+    }
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// The first `max` characters of `text`, with an ellipsis when cut.

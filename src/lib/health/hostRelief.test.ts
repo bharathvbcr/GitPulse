@@ -9,6 +9,8 @@ import {
   pausedRows,
   reliefChipInput,
   reliefHeadline,
+  reliefIsCalm,
+  reliefStatusKey,
   requestResumeAll,
   type FrozenTree,
   type ReliefOutcome,
@@ -49,10 +51,13 @@ function status(over: Partial<ReliefStatus> = {}): ReliefStatus {
   return {
     version: 1,
     written_at_ms: NOW,
+    writer_pid: 321,
+    writer_start_us: 1_700_000_000_000_000,
     mode: "act",
     rung: "freeze",
     binding: "compressor_segments",
     slowed: 3,
+    would_slow: 0,
     frozen: [tree()],
     last_action: { at_ms: NOW - 120_000, kind: "freeze", detail: "cargo test" },
     failures: [],
@@ -62,7 +67,12 @@ function status(over: Partial<ReliefStatus> = {}): ReliefStatus {
 }
 
 const fresh = (s: ReliefStatus = status()): ReliefOutcome => ({ state: "fresh", status: s });
-const stale = (s: ReliefStatus = status()): ReliefOutcome => ({ state: "stale", status: s, age_ms: 95_000 });
+const stale = (s: ReliefStatus = status()): ReliefOutcome => ({
+  state: "stale",
+  status: s,
+  age_ms: 95_000,
+  cause: "age",
+});
 const unreadable: ReliefOutcome = { state: "unreadable", reason: "not a status this build understands" };
 
 const pulse = (over: Partial<HostLoadPulse> = {}): HostLoadPulse => ({
@@ -91,7 +101,7 @@ describe("the Health row for memory protection", () => {
     const body = render(HostReliefPanel, { props: { outcome: fresh(), now: NOW } }).body;
     expect(body).toContain('data-state="fresh"');
     expect(body).toContain(">Act<");
-    expect(body).toContain("A build or test is paused");
+    expect(body).toContain("1 build or test paused, 3 agent process(es) slowed");
     expect(body).toContain("the memory compressor is nearly out of segments");
     expect(body).toContain("cargo test --workspace");
     expect(body).toContain(">gitpulse<");
@@ -139,7 +149,7 @@ describe("the Health row for memory protection", () => {
       props: { outcome: stale(), now: NOW, requested: true },
     }).body;
     expect(requested).toContain("host-relief-requested-stale");
-    expect(requested).toContain("If it is not running");
+    expect(requested).toContain("If the supervisor is not running");
     expect(requested).toContain("kill -CONT");
     expect(requested).not.toContain("resumes them on its next check");
     const live = render(HostReliefPanel, { props: { outcome: fresh(), now: NOW, requested: true } }).body;
@@ -169,13 +179,96 @@ describe("the Health row for memory protection", () => {
     expect(calm).not.toContain("Resume all");
   });
 
-  it("does not list an advised-only entry as paused", () => {
-    const body = render(HostReliefPanel, {
-      props: { outcome: fresh(status({ mode: "advise", frozen: [tree({ advised_only: true })] })), now: NOW },
-    }).body;
+  const advise = (over: Partial<ReliefStatus> = {}) =>
+    fresh(
+      status({
+        mode: "advise",
+        slowed: 0,
+        would_slow: 4,
+        frozen: [tree({ advised_only: true })],
+        ...over,
+      }),
+    );
+
+  it("in Advise mode says it would pause, never that something is paused", () => {
+    const body = render(HostReliefPanel, { props: { outcome: advise(), now: NOW } }).body;
     expect(body).not.toContain("host-relief-paused");
     expect(body).not.toContain("Resume all");
+    expect(body).not.toContain("build or test is paused");
+    expect(body).not.toContain("build or test paused");
     expect(body).toContain(">Advise only<");
+    expect(body).toContain("In Advise mode it would pause 1 build or test and slow 4 agent process(es)");
+    expect(body).toContain("Would pause");
+    expect(body).toContain("cargo test --workspace");
+    expect(body).toContain("Memory protection is in Advise mode, so nothing was paused or slowed");
+    expect(body).not.toContain("Memory protection is idle");
+  });
+
+  it("is not idle, and not calm, when the rung is freeze but only slowing happened", () => {
+    const outcome = fresh(status({ frozen: [], slowed: 2 }));
+    expect(reliefHeadline(outcome)).toBe("2 agent process(es) slowed; nothing is paused.");
+    const body = render(HostReliefPanel, { props: { outcome, now: NOW } }).body;
+    expect(body).not.toContain("Memory protection is idle");
+    expect(body).not.toContain('data-tone="ok"');
+    expect(body).toContain("2 agent process(es) slowed");
+    expect(body).not.toContain("build or test paused");
+  });
+
+  it("is not idle when a pause was tried and failed", () => {
+    const outcome = fresh(
+      status({
+        frozen: [],
+        slowed: 0,
+        failures: [{ at_ms: NOW, pid: 4242, what: "SIGSTOP refused: EPERM" }],
+      }),
+    );
+    expect(reliefHeadline(outcome)).toContain("tried to act and couldn't");
+    const body = render(HostReliefPanel, { props: { outcome, now: NOW } }).body;
+    expect(body).not.toContain("Memory protection is idle");
+    expect(body).not.toContain('data-tone="ok"');
+    expect(body).toContain("Tried to act and couldn't");
+    expect(body).toContain("SIGSTOP refused: EPERM");
+  });
+
+  it("is idle, and calm, only when nothing is happening and nothing was tried", () => {
+    const rest = status({ rung: "none", frozen: [], slowed: 0, binding: null });
+    expect(reliefIsCalm(fresh(rest))).toBe(true);
+    // A leftover failure from an earlier episode does not make rest uneasy.
+    expect(
+      reliefIsCalm(fresh({ ...rest, failures: [{ at_ms: 1, pid: 1, what: "old" }] })),
+    ).toBe(true);
+    expect(reliefIsCalm(fresh(status({ rung: "slow", frozen: [], slowed: 0 })))).toBe(false);
+    expect(reliefIsCalm(stale(rest))).toBe(false);
+    expect(reliefIsCalm(null)).toBe(false);
+  });
+
+  it("offers Resume all when the status is unreadable, since the request can still be written", () => {
+    const body = render(HostReliefPanel, { props: { outcome: unreadable, now: NOW } }).body;
+    expect(body).toContain("host-relief-resume");
+    expect(body).toContain("Resume all");
+    const sent = render(HostReliefPanel, { props: { outcome: unreadable, now: NOW, requested: true } }).body;
+    expect(sent).toContain("couldn't be verified");
+    expect(sent).toContain("kill -CONT");
+    const absent = render(HostReliefPanel, { props: { outcome: { state: "absent" }, now: NOW } }).body;
+    expect(absent).not.toContain("Resume all");
+  });
+
+  it("says why a Stale status is stale", () => {
+    const gone: ReliefOutcome = { state: "stale", status: status(), age_ms: 2_000, cause: "writer_gone" };
+    expect(reliefHeadline(gone)).toContain("no longer running");
+    const ahead: ReliefOutcome = { state: "stale", status: status(), age_ms: 0, cause: "clock_ahead" };
+    expect(reliefHeadline(ahead)).toContain("ahead of this computer's clock");
+  });
+
+  it("the request-sent note lasts as long as the status it was made against", () => {
+    const frozen = fresh();
+    const key = reliefStatusKey(frozen);
+    // A refresh of the same pause (a later write time) is the same account.
+    expect(reliefStatusKey(fresh(status({ written_at_ms: NOW + 5_000 })))).toBe(key);
+    // The pause ended: the account moved on, and so does the note.
+    expect(reliefStatusKey(fresh(status({ rung: "none", frozen: [], slowed: 0 })))).not.toBe(key);
+    expect(reliefStatusKey(stale())).not.toBe(key);
+    expect(reliefStatusKey(unreadable)).not.toBe(key);
   });
 });
 
@@ -199,6 +292,17 @@ describe("the status bar text", () => {
     expect(unknown?.text).toBe("Memory protection · pause status unverified");
     expect(unknown?.tone).toBe("muted");
     expect(statusChip(calm, { paused: 0, unverified: false })).toBeNull();
+  });
+
+  it("shows the relief part of the bar even before any host-load reading", () => {
+    expect(bottomBarMetrics(null, "full").visible).toBe(false);
+    const paused = bottomBarMetrics(null, "full", { paused: 2, unverified: false });
+    expect(paused.visible).toBe(true);
+    expect(paused.alertChip?.text).toBe("Memory protection · 2 paused");
+    expect(paused.severity).toBe("warn");
+    const unknown = bottomBarMetrics(null, "full", { paused: 0, unverified: true });
+    expect(unknown.visible).toBe(true);
+    expect(unknown.alertChip?.text).toBe("Memory protection · pause status unverified");
   });
 
   it("carries into the bottom bar's alert chip", () => {

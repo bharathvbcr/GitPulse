@@ -44,6 +44,7 @@ fn gathered(availability: Availability, dir: &Path) -> Gathered {
         steward_throttle: None,
         relief: ReliefOutcome::Absent,
         terminal_session: None,
+        session_root: None,
     }
 }
 
@@ -1812,7 +1813,7 @@ fn without_a_hook_deadline_the_steward_slowdown_advises_but_never_sleeps() {
 mod relief {
     use super::*;
     use crate::sysload::relief_status::{
-        FrozenTree, ReliefBinding, ReliefMode, ReliefRung, ReliefStatus,
+        FrozenTree, ReliefBinding, ReliefMode, ReliefRung, ReliefStaleCause, ReliefStatus,
     };
 
     const OURS: &str = "term-4000-ab12";
@@ -1871,15 +1872,97 @@ mod relief {
         }
     }
 
+    fn told(g: &Gathered) -> bool {
+        context(&judged(HEAVY, g)).contains("paused `cargo test")
+    }
+
     #[test]
-    fn a_tree_is_also_matched_by_the_sessions_cwd_inside_its_repository() {
+    fn without_a_terminal_id_the_worktree_root_must_equal_the_trees_repo_path() {
         let dir = tempfile::tempdir().unwrap();
-        // The call's cwd is /repo; the tree has no terminal id.
-        let g = with(frozen(vec![tree(None, "/repo", false)]), dir.path());
-        assert!(context(&judged(HEAVY, &g)).contains("paused `cargo test"));
-        // A sibling directory with the same prefix is not inside it.
-        let g = with(frozen(vec![tree(None, "/rep", false)]), dir.path());
-        assert!(!context(&judged(HEAVY, &g)).contains("paused `cargo test"));
+        let mut g = with(frozen(vec![tree(None, "/repo", false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some("/repo".into());
+        assert!(told(&g), "the same root is the same session");
+        // A trailing separator is the same directory.
+        let mut g = with(frozen(vec![tree(None, "/repo/", false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some("/repo".into());
+        assert!(told(&g));
+        // A sibling directory with the same prefix.
+        let mut g = with(frozen(vec![tree(None, "/rep", false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some("/repo".into());
+        assert!(!told(&g));
+        // The root could not be found: no evidence, no claim.
+        let mut g = with(frozen(vec![tree(None, "/repo", false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = None;
+        assert!(!told(&g));
+    }
+
+    #[test]
+    fn an_agent_in_a_sibling_worktree_is_not_told_its_neighbours_build_was_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = "/repo/.gitpulse/worktrees/agent-a";
+        let ours = "/repo/.gitpulse/worktrees/agent-b";
+        // Both terminal ids are known and differ: the directory is not consulted
+        // even when it matches.
+        let mut g = with(
+            frozen(vec![tree(Some("term-9-zz"), ours, false)]),
+            dir.path(),
+        );
+        g.session_root = Some(ours.into());
+        assert!(!told(&g), "a different terminal is a different session");
+        // No ids on one side: only an exact worktree root counts.
+        let mut g = with(frozen(vec![tree(None, theirs, false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some(ours.into());
+        assert!(!told(&g), "a sibling worktree is another session");
+        // The main checkout holding the worktrees is not the worktree either.
+        let mut g = with(frozen(vec![tree(None, "/repo", false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some(ours.into());
+        assert!(!told(&g));
+        let mut g = with(frozen(vec![tree(None, ours, false)]), dir.path());
+        g.terminal_session = None;
+        g.session_root = Some(ours.into());
+        assert!(told(&g), "its own worktree is");
+    }
+
+    #[test]
+    fn a_stale_notice_is_keyed_on_its_kind_not_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = |age_ms, cause| ReliefOutcome::Stale {
+            status: ReliefStatus::at_rest(ReliefMode::Act, 1),
+            age_ms,
+            cause,
+        };
+        let first = judged(
+            HEAVY,
+            &with(stale(61_000, ReliefStaleCause::Age), dir.path()),
+        );
+        assert!(context(&first).contains("61s ago"));
+        // A second, a minute older: the same notice, not said again.
+        for age in [62_000, 75_000, 600_000] {
+            let again = judged(HEAVY, &with(stale(age, ReliefStaleCause::Age), dir.path()));
+            assert!(!context(&again).contains("could NOT check"), "age {age}");
+        }
+        let markers = std::fs::read_dir(dir.path().join("state"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("loadnote-"))
+            .count();
+        assert_eq!(markers, 1, "one marker, not one per age");
+        // A different kind of stale is a new fact.
+        let gone = judged(
+            HEAVY,
+            &with(stale(5_000, ReliefStaleCause::WriterGone), dir.path()),
+        );
+        assert!(
+            context(&gone).contains("no longer running"),
+            "{}",
+            context(&gone)
+        );
     }
 
     #[test]
@@ -1924,6 +2007,7 @@ mod relief {
         let stale = ReliefOutcome::Stale {
             status: ReliefStatus::at_rest(ReliefMode::Act, 1),
             age_ms: 61_000,
+            cause: ReliefStaleCause::Age,
         };
         let unreadable = ReliefOutcome::Unreadable {
             reason: "not a status this build understands".into(),

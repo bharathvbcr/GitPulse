@@ -44,23 +44,64 @@ export interface ReliefFailure {
 
 export interface ReliefStatus {
   version: number;
+  /** Unix epoch milliseconds, as every `*_ms` here. */
   written_at_ms: number;
+  writer_pid: number;
+  writer_start_us: number;
   mode: ReliefMode;
   rung: ReliefRung;
   binding: ReliefBinding | null;
+  /** Processes actually slowed; 0 in Advise mode. */
   slowed: number;
+  /** Processes Act would have slowed; 0 in Act mode. */
+  would_slow: number;
   frozen: FrozenTree[];
   last_action: ReliefAction | null;
   failures: ReliefFailure[];
   cap_hits: number;
 }
 
-/** `ReadOutcome` in `sysload/relief_status.rs`, as serialised. */
+/** Why a status that claims activity cannot be relied on. */
+export type ReliefStaleCause = "age" | "writer_gone" | "clock_ahead";
+
+/** `ReliefOutcome` in `sysload/relief_status.rs`, as serialised. */
 export type ReliefOutcome =
   | { state: "absent" }
   | { state: "fresh"; status: ReliefStatus }
-  | { state: "stale"; status: ReliefStatus; age_ms: number }
+  | { state: "stale"; status: ReliefStatus; age_ms: number; cause: ReliefStaleCause }
   | { state: "unreadable"; reason: string };
+
+/** What a status really says is happening, from the counts and not the rung. */
+export interface ReliefSummary {
+  /** Trees actually stopped. */
+  paused: number;
+  /** Processes actually slowed. */
+  slowed: number;
+  /** Advise mode: trees Act would have stopped. */
+  wouldPause: FrozenTree[];
+  /** Advise mode: processes Act would have slowed. */
+  wouldSlow: number;
+  /** The rung is above none and something was tried and failed. */
+  failedToAct: boolean;
+  /** Nothing is happening and nothing was tried. */
+  idle: boolean;
+}
+
+export function reliefSummary(status: ReliefStatus): ReliefSummary {
+  const paused = pausedTrees(status).length;
+  const wouldPause = status.frozen.filter((tree) => tree.advised_only);
+  const nothingDone =
+    paused === 0 && status.slowed === 0 && wouldPause.length === 0 && status.would_slow === 0;
+  const failedToAct = nothingDone && status.rung !== "none" && status.failures.length > 0;
+  return {
+    paused,
+    slowed: status.slowed,
+    wouldPause,
+    wouldSlow: status.would_slow,
+    failedToAct,
+    idle: nothingDone && !failedToAct && status.rung === "none",
+  };
+}
 
 /** How often a watching view rereads the file; it is small and local. */
 export const HOST_RELIEF_POLL_MS = 5000;
@@ -114,15 +155,42 @@ export function reliefModeLabel(mode: ReliefMode): string {
   return MODE_LABEL[mode];
 }
 
-export function reliefRungLabel(rung: ReliefRung): string {
-  switch (rung) {
-    case "none":
-      return "Nothing slowed or paused";
-    case "slow":
-      return "Agent processes slowed";
-    case "freeze":
-      return "A build or test is paused";
-  }
+/** What is happening now, from what was really done and not from the rung. */
+export function reliefNowLabel(status: ReliefStatus): string {
+  const s = reliefSummary(status);
+  const parts: string[] = [];
+  if (s.paused > 0) parts.push(`${s.paused} build or test paused`);
+  if (s.slowed > 0) parts.push(`${s.slowed} agent process(es) slowed`);
+  if (parts.length > 0) return parts.join(", ");
+  const would: string[] = [];
+  if (s.wouldPause.length > 0) would.push(`pause ${s.wouldPause.length} build or test`);
+  if (s.wouldSlow > 0) would.push(`slow ${s.wouldSlow} agent process(es)`);
+  if (would.length > 0) return `Nothing changed. In Advise mode it would ${would.join(" and ")}`;
+  if (s.failedToAct) return "Tried to act and couldn't; nothing is paused or slowed";
+  if (status.rung !== "none") return "Engaged, but nothing is paused or slowed";
+  return "Nothing slowed or paused";
+}
+
+/** Whether the status deserves the calm tone: nothing is happening or was tried. */
+export function reliefIsCalm(outcome: ReliefOutcome | null): boolean {
+  return outcome?.state === "fresh" && reliefSummary(outcome.status).idle;
+}
+
+/**
+ * A key that changes when the supervisor's account of things does, so a
+ * "request sent" note can end when the status moves on.
+ */
+export function reliefStatusKey(outcome: ReliefOutcome | null): string {
+  if (!outcome) return "none";
+  if (outcome.state === "absent") return "absent";
+  if (outcome.state === "unreadable") return `unreadable:${outcome.reason}`;
+  const { status } = outcome;
+  const trees = pausedTrees(status)
+    .map((tree) => `${tree.pid}:${tree.start_us}`)
+    .join(",");
+  // Not the time it was written: that moves on every tick while a pause lasts,
+  // and the note should last as long as the pause it was made for.
+  return `${outcome.state}:${status.rung}:${trees}`;
 }
 
 /** "the last 3 min", or the stated age. */
@@ -175,17 +243,33 @@ export function reliefHeadline(outcome: ReliefOutcome | null): string {
       return "No memory protection status has been published. Nothing is known to be paused.";
     case "unreadable":
       return `The memory protection status couldn't be read, so whether anything is paused is unknown: ${outcome.reason}`;
-    case "stale":
-      return `The memory protection status was last written ${reliefAge(outcome.age_ms)} ago, so the supervisor may no longer be running. What follows may be out of date, and a paused process may still be paused.`;
+    case "stale": {
+      const why =
+        outcome.cause === "writer_gone"
+          ? "the process that wrote the memory protection status is no longer running"
+          : outcome.cause === "clock_ahead"
+            ? "the memory protection status is dated ahead of this computer's clock"
+            : `the memory protection status was last written ${reliefAge(outcome.age_ms)} ago, so the supervisor may no longer be running`;
+      return `${capitalise(why)}. What follows may be out of date, and a paused process may still be paused.`;
+    }
     case "fresh": {
-      const paused = pausedTrees(outcome.status).length;
-      if (paused > 0) return `${paused} build or test paused by memory protection. It resumes automatically.`;
-      if (outcome.status.rung === "slow") {
-        return `${outcome.status.slowed} agent process(es) slowed; nothing is paused.`;
+      const s = reliefSummary(outcome.status);
+      if (s.paused > 0) return `${s.paused} build or test paused by memory protection. It resumes automatically.`;
+      if (s.slowed > 0) return `${s.slowed} agent process(es) slowed; nothing is paused.`;
+      if (s.wouldPause.length > 0 || s.wouldSlow > 0) {
+        return "Memory is tight. Memory protection is in Advise mode, so nothing was paused or slowed.";
       }
+      if (s.failedToAct) {
+        return "Memory protection tried to act and couldn't: nothing is paused or slowed. See the failures below.";
+      }
+      if (!s.idle) return "Memory protection is engaged, but nothing is paused or slowed.";
       return "Memory protection is idle: nothing is slowed or paused.";
     }
   }
+}
+
+function capitalise(text: string): string {
+  return text.length === 0 ? text : text[0].toUpperCase() + text.slice(1);
 }
 
 /** Asks the supervisor to resume everything it paused. */

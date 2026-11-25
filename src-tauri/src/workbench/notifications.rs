@@ -82,10 +82,53 @@ pub(super) enum Event {
 /// Posts a pressure-relief banner (`desktop::pressure`) in its own category,
 /// whose "Resume now" and "Settings" buttons the delegate answers. `native`
 /// replaces the banner of the same identifier rather than stacking.
-pub(crate) fn post_relief(native: &str, heading: &str, body: &str) -> Result<bool, String> {
-    platform::post(native, heading, body, true, platform::RELIEF_CATEGORY)
-        .map_err(|error| error.message)
+///
+/// It obeys the person's notification preference like every other banner here:
+/// off means no banner (the status item and Health still show the pause), the
+/// sound setting decides the sound, and with "while GitPulse is in the
+/// background" off a hidden window gets none. A preference or permission that
+/// cannot be read is an error, not a banner.
+pub(crate) fn post_relief(
+    app: &tauri::AppHandle,
+    native: &str,
+    heading: &str,
+    body: &str,
+) -> Result<bool, String> {
+    let host = app.state::<WorkbenchState>().inner().clone();
+    let preferences = settings(&host).map_err(|error| {
+        format!(
+            "the notification preference could not be read: {}",
+            error.message
+        )
+    })?;
+    let window_visible = app.get_webview_window("main").is_some_and(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
+    });
+    if !relief_banner_wanted(&preferences, window_visible) {
+        return Ok(false);
+    }
+    let authorization = platform::authorization(false).map_err(|error| error.message)?;
+    if !matches!(authorization.as_str(), "authorized" | "provisional") {
+        return Err(format!("macOS notification permission is {authorization}"));
+    }
+    platform::post(
+        native,
+        heading,
+        body,
+        preferences.sound,
+        platform::RELIEF_CATEGORY,
+    )
+    .map_err(|error| error.message)
 }
+
+/// Whether the saved notification preference lets a relief banner out.
+fn relief_banner_wanted(preferences: &Settings, window_visible: bool) -> bool {
+    preferences.enabled && (preferences.background || window_visible)
+}
+
+/// The identity a relief banner's Settings button is forwarded under when the
+/// banner was answered by a launch that only passes requests on.
+pub(crate) const RELIEF_SETTINGS_ID: &str = "gitpulse.relief.settings";
 
 /// How long the banner's Snooze defers a notice. The activity inbox's own
 /// Snooze sends the same number from `attentionWrite` in
@@ -449,7 +492,11 @@ fn enqueue_response(host: &WorkbenchState, native: String, snooze: bool) -> Resu
         .notifications
         .get()
         .ok_or("native notifications are not installed in this process")?;
-    let event = if snooze {
+    let event = if native == RELIEF_SETTINGS_ID {
+        // A relief banner's Settings, answered by another launch: it opens
+        // Settings, and there is nothing to claim or snooze in the store.
+        Event::Relief
+    } else if snooze {
         Event::Snooze(native)
     } else {
         Event::Activate(native)
@@ -476,9 +523,10 @@ impl ResponseTap {
             match self.0.try_recv().ok()? {
                 Event::Activate(native) => return Some((native, false)),
                 Event::Snooze(native) => return Some((native, true)),
-                // Settings from a relief banner needs the running app's
-                // window; the launch that only passes responses on has none.
-                Event::Wake | Event::Relief => continue,
+                // Passed on under a fixed identity, so the running app opens
+                // Settings (`enqueue_response`).
+                Event::Relief => return Some((RELIEF_SETTINGS_ID.to_owned(), false)),
+                Event::Wake => continue,
             }
         }
     }
@@ -1032,6 +1080,10 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(Event::Activate(n)) if n == "open-me"));
         enqueue_response(&host, "later".into(), true).unwrap();
         assert!(matches!(receiver.try_recv(), Ok(Event::Snooze(n)) if n == "later"));
+        // A relief banner's Settings, answered by another launch, is not an
+        // activity claim to look up: it arrives as its own event.
+        enqueue_response(&host, RELIEF_SETTINGS_ID.into(), false).unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Event::Relief)));
 
         enqueue_response(&host, "fills".into(), false).unwrap();
         let full = enqueue_response(&host, "overflows".into(), false).unwrap_err();
@@ -1039,6 +1091,24 @@ mod tests {
         drop(receiver);
         let stopped = enqueue_response(&host, "nobody".into(), false).unwrap_err();
         assert!(stopped.contains("stopped"), "{stopped}");
+    }
+    #[test]
+    fn a_relief_banner_obeys_the_saved_notification_preference() {
+        let prefs = |enabled, background| Settings {
+            enabled,
+            sound: true,
+            background,
+        };
+        assert!(
+            !relief_banner_wanted(&prefs(false, true), true),
+            "off is off"
+        );
+        assert!(relief_banner_wanted(&prefs(true, true), false));
+        assert!(relief_banner_wanted(&prefs(true, false), true));
+        assert!(
+            !relief_banner_wanted(&prefs(true, false), false),
+            "no banners while hidden when the person said so"
+        );
     }
     #[test]
     fn native_id_cannot_be_a_path_command_or_another_namespace() {

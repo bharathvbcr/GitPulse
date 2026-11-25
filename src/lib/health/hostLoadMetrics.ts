@@ -225,12 +225,15 @@ export function bottomBarMetrics(
   relief: ReliefChipInput = NO_RELIEF_CHIP,
 ): BottomBarMetricsModel {
   if (!pulse) {
+    // No host-load reading yet, but a paused build (or a status that could not
+    // be read) is still what the bar must say.
+    const reliefChip = statusChip(null, relief);
     return {
-      visible: false,
-      alertChip: null,
+      visible: reliefChip !== null,
+      alertChip: reliefChip,
       items: [],
-      severity: "normal",
-      summaryLabel: "Host metrics unavailable",
+      severity: reliefChip === null ? "normal" : reliefChip.tone === "danger" ? "critical" : "warn",
+      summaryLabel: reliefChip ? reliefChip.text : "Host metrics unavailable",
     };
   }
 

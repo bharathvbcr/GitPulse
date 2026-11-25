@@ -15,8 +15,11 @@ use crate::sysload::relief_status::{
     self, FrozenTree, ReliefActionKind, ReliefOutcome, ReliefRung, ReliefStatus,
 };
 use crate::sysload::{Binding, Clock, Reading, Tier};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use tauri::{AppHandle, Runtime};
+use tauri::AppHandle;
 
 /// How often the status file and the verdict are read.
 const POLL: Duration = Duration::from_secs(5);
@@ -113,11 +116,16 @@ impl Notice {
     }
 }
 
+/// The least time between two pause banners in one episode.
+const BANNER_GAP_MS: u64 = 60_000;
+
 /// What the banner rule remembers between reads.
 #[derive(Debug, Default)]
 pub struct Episode {
-    /// A pause in the current episode has been announced.
-    announced_pause: bool,
+    /// The trees (`pid`, `start_us`) a banner has announced in this episode.
+    announced: BTreeSet<(u32, u64)>,
+    /// When the last pause banner of this episode was raised.
+    last_banner_ms: Option<u64>,
     /// The newest cap resume that has been announced.
     announced_cap_at_ms: u64,
 }
@@ -125,18 +133,23 @@ pub struct Episode {
 impl Episode {
     /// The banner this read calls for, if any.
     ///
-    /// One banner when a pause starts and one when the ten-minute cap resumed
-    /// it, each once per episode. An episode is from the first pause until a
-    /// read that finds the supervisor at rest. A stale or unreadable status
-    /// neither starts nor ends one: a status that flaps between readable and
-    /// not must not announce the same pause twice, and "could not read" is not
-    /// "resumed".
+    /// A pause banner when a tree not yet announced in this episode is paused,
+    /// at most one every [`BANNER_GAP_MS`]: a second tree paused later in the
+    /// same episode is news, a flapping one is not. A tree held back by the
+    /// gap is announced on the first read after it. One banner when the
+    /// ten-minute cap resumed a pause, once per cap. An episode is from the
+    /// first pause until a read that finds the supervisor at rest. A stale or
+    /// unreadable status neither starts nor ends one: a status that flaps
+    /// between readable and not must not announce the same pause twice, and
+    /// "could not read" is not "resumed".
     pub fn observe(&mut self, outcome: &ReliefOutcome, now_ms: u64) -> Option<Notice> {
         let ReliefOutcome::Fresh { status } = outcome else {
             return None;
         };
-        if status.rung == ReliefRung::None && status.paused_count() == 0 {
-            self.announced_pause = false;
+        let paused: Vec<&FrozenTree> = status.paused().collect();
+        if status.rung == ReliefRung::None && paused.is_empty() {
+            self.announced.clear();
+            self.last_banner_ms = None;
         }
         if let Some(action) = &status.last_action {
             if action.kind == ReliefActionKind::CapResume
@@ -147,13 +160,19 @@ impl Episode {
                 return Some(cap_notice(action.detail.as_str()));
             }
         }
-        if !self.announced_pause {
-            if let Some(tree) = status.paused().next() {
-                self.announced_pause = true;
-                return Some(pause_notice(status, tree));
-            }
+        let fresh = paused
+            .iter()
+            .find(|tree| !self.announced.contains(&(tree.pid, tree.start_us)))?;
+        let due = self
+            .last_banner_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= BANNER_GAP_MS);
+        if !due {
+            return None;
         }
-        None
+        self.announced
+            .extend(paused.iter().map(|tree| (tree.pid, tree.start_us)));
+        self.last_banner_ms = Some(now_ms);
+        Some(pause_notice(status, fresh))
     }
 }
 
@@ -241,62 +260,124 @@ fn severity_now() -> (bool, Option<Binding>) {
     }
 }
 
-/// Starts the thread that keeps the status item and the banner current. It
-/// runs for the life of the app process and only reads.
-pub fn start<R: Runtime>(app: &AppHandle<R>) {
-    let app = app.clone();
-    let spawned = crate::supervisor::spawn_once(
-        "relief-surfaces",
-        "pressure relief surfaces",
-        move || {
-            let mut episode = Episode::default();
-            let mut shown: Option<HostPressure> = None;
-            loop {
-                std::thread::sleep(POLL);
-                let outcome = match relief_status::default_dir() {
-                    Some(dir) => relief_status::read_status(&dir),
-                    None => ReliefOutcome::Unreadable {
-                        reason: "there is no per-user config directory (HOME unset)".into(),
-                    },
-                };
-                let (severe, cause) = severity_now();
-                let pressure = HostPressure::of(&outcome, severe, cause);
-                if shown != Some(pressure) {
-                    let handle = app.clone();
-                    let applied = app.run_on_main_thread(move || {
-                    if let Err(error) = super::set_host_pressure(&handle, pressure) {
-                        log::warn!(target: "desktop", "status item pressure not applied: {error}");
-                    }
-                });
-                    match applied {
-                        Ok(()) => shown = Some(pressure),
-                        Err(error) => {
-                            log::warn!(target: "desktop", "status item pressure not queued: {error}")
-                        }
-                    }
+/// What one poll keeps between polls, so a restart after a panic carries on
+/// where it was instead of announcing everything again.
+#[derive(Debug, Default)]
+struct Poller {
+    episode: Episode,
+    /// What the status item last showed, set only once it was drawn.
+    shown: Option<HostPressure>,
+}
+
+impl Poller {
+    /// One read: redraw the status item if what it shows changed, and raise
+    /// the banner it calls for. `apply` returns `Err` when the item could not
+    /// be drawn, which leaves `shown` as it was so the next poll tries again.
+    /// `post` is told of a banner; one the notification centre does not take
+    /// is logged, not retried every poll.
+    fn step(
+        &mut self,
+        outcome: &ReliefOutcome,
+        severity: (bool, Option<Binding>),
+        now_ms: u64,
+        apply: &mut dyn FnMut(HostPressure) -> Result<(), String>,
+        post: &mut dyn FnMut(&Notice),
+    ) {
+        let pressure = HostPressure::of(outcome, severity.0, severity.1);
+        if self.shown != Some(pressure) {
+            match apply(pressure) {
+                Ok(()) => self.shown = Some(pressure),
+                Err(error) => {
+                    log::warn!(target: "desktop", "status item pressure not applied, will retry: {error}")
                 }
-                if let Some(notice) = episode.observe(&outcome, relief_status::now_ms()) {
-                    // Marked announced either way: a refused banner is not
-                    // retried every poll, but it is never silent in the log.
+            }
+        }
+        if let Some(notice) = self.episode.observe(outcome, now_ms) {
+            post(&notice);
+        }
+    }
+}
+
+/// Stops the poller [`start`] began.
+#[derive(Clone, Debug)]
+pub struct PressureHandle(Arc<AtomicBool>);
+
+impl PressureHandle {
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Draws `pressure` on the status item on the main thread and waits, bounded,
+/// for the answer: a draw that was queued is not a draw that happened.
+fn apply_on_main(app: &AppHandle, pressure: HostPressure) -> Result<(), String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(super::set_host_pressure(&handle, pressure));
+    })
+    .map_err(|error| error.to_string())?;
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "the main thread did not answer in time".to_string())?
+}
+
+/// Starts the service that keeps the status item and the banner current. It is
+/// restarted with backoff if it panics (so the status item is not left at its
+/// last state), carries its memory across the restart, and ends when the
+/// returned handle is stopped. It only reads.
+pub fn start(app: &AppHandle) -> Option<PressureHandle> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = PressureHandle(stop.clone());
+    let app = app.clone();
+    let mut poller = Poller::default();
+    let spawned = crate::supervisor::spawn_service("relief-surfaces", move || {
+        while !stop.load(Ordering::Acquire) {
+            // Slept in slices so a stop is heard within a second.
+            let mut waited = Duration::ZERO;
+            while waited < POLL && !stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_secs(1));
+                waited += Duration::from_secs(1);
+            }
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let outcome = match relief_status::default_dir() {
+                Some(dir) => relief_status::read_status(&dir),
+                None => ReliefOutcome::Unreadable {
+                    reason: "there is no per-user config directory (HOME unset)".into(),
+                },
+            };
+            poller.step(
+                &outcome,
+                severity_now(),
+                relief_status::now_ms(),
+                &mut |pressure| apply_on_main(&app, pressure),
+                &mut |notice| {
                     match crate::workbench::notifications::post_relief(
+                        &app,
                         notice.native_id(),
                         notice.heading,
                         &notice.body,
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
-                            log::warn!(target: "desktop", "pressure relief banner was not accepted by the notification centre")
+                            log::info!(target: "desktop", "pressure relief banner not shown: notifications are off for this profile")
                         }
                         Err(error) => {
                             log::warn!(target: "desktop", "pressure relief banner not posted: {error}")
                         }
                     }
-                }
-            }
-        },
-    );
-    if let Err(error) = spawned {
-        log::warn!(target: "desktop", "pressure relief surfaces did not start: {error}");
+                },
+            );
+        }
+    });
+    match spawned {
+        Ok(_) => Some(handle),
+        Err(error) => {
+            log::warn!(target: "desktop", "pressure relief surfaces did not start: {error}");
+            None
+        }
     }
 }
 
@@ -412,6 +493,7 @@ mod tests {
                 ..ReliefStatus::at_rest(ReliefMode::Act, 1)
             },
             age_ms: 90_000,
+            cause: relief_status::ReliefStaleCause::Age,
         };
         let pressure = HostPressure::of(&stale, false, None);
         assert!(pressure.unverified && pressure.paused == 1 && pressure.needs_glance());
@@ -448,9 +530,81 @@ mod tests {
             assert!(notice.body.contains(needle), "{needle}: {}", notice.body);
         }
         assert!(episode.observe(&paused, 200).is_none());
-        // A second tree in the same episode is not a second banner.
-        let two = fresh(ReliefRung::Freeze, vec![tree(false), tree(false)], None);
-        assert!(episode.observe(&two, 300).is_none());
+        assert!(episode.observe(&paused, 100 + BANNER_GAP_MS * 5).is_none());
+    }
+
+    fn other_tree(pid: u32) -> FrozenTree {
+        FrozenTree {
+            pid,
+            start_us: 99,
+            command: "go test ./...".into(),
+            ..tree(false)
+        }
+    }
+
+    #[test]
+    fn a_new_freeze_in_the_same_episode_gets_a_banner_rate_limited_to_the_gap() {
+        let mut episode = Episode::default();
+        let first = fresh(ReliefRung::Freeze, vec![tree(false)], None);
+        assert!(episode.observe(&first, 1_000).is_some());
+        // A different tree (pid and start) joins within the gap: held back,
+        // and not forgotten.
+        let two = fresh(ReliefRung::Freeze, vec![tree(false), other_tree(8)], None);
+        assert!(episode.observe(&two, 1_000 + 5_000).is_none());
+        let notice = episode
+            .observe(&two, 1_000 + BANNER_GAP_MS)
+            .expect("the held-back freeze is announced once the gap has passed");
+        assert!(notice.body.contains("go test ./..."), "{}", notice.body);
+        // And then it is announced: nothing more for the same set.
+        assert!(episode.observe(&two, 1_000 + 3 * BANNER_GAP_MS).is_none());
+        // The same pid with a different start is a different tree.
+        let reused = fresh(
+            ReliefRung::Freeze,
+            vec![FrozenTree {
+                start_us: 12345,
+                ..other_tree(8)
+            }],
+            None,
+        );
+        assert!(episode
+            .observe(&reused, 1_000 + 5 * BANNER_GAP_MS)
+            .is_some());
+    }
+
+    /// The step the poller takes: a draw that failed is not remembered as
+    /// shown, so the next poll tries it again.
+    #[test]
+    fn a_failed_draw_is_retried_and_only_a_successful_one_is_remembered() {
+        let mut poller = Poller::default();
+        let severe = (true, Some(Binding::Swap));
+        let mut attempts = 0;
+        let mut banners = 0;
+        let paused = fresh(ReliefRung::Freeze, vec![tree(false)], None);
+        let mut run = |poller: &mut Poller, ok: bool, now: u64| {
+            poller.step(
+                &paused,
+                severe,
+                now,
+                &mut |_| {
+                    attempts += 1;
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err("the main thread is busy".into())
+                    }
+                },
+                &mut |_| banners += 1,
+            );
+        };
+        run(&mut poller, false, 1);
+        assert_eq!(poller.shown, None);
+        run(&mut poller, false, 2);
+        run(&mut poller, true, 3);
+        assert!(poller.shown.is_some());
+        run(&mut poller, true, 4);
+        // Drawn once more than it failed, then left alone while unchanged.
+        assert_eq!(attempts, 3);
+        assert_eq!(banners, 1, "the banner is independent of the draw");
     }
 
     #[test]

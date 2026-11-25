@@ -69,10 +69,21 @@ define_class!(
                 == RELIEF_CATEGORY
             {
                 if response.actionIdentifier().to_string() == RELIEF_RESUME_ACTION {
-                    if let Err(error) =
-                        crate::sysload::relief_status::request_resume("notification")
-                    {
-                        log::warn!(target:"workbench","resume request from a banner was not written: {error}");
+                    // The write (a sync and a rename) is not done on the
+                    // delegate's thread, which AppKit is waiting on.
+                    let spawned = crate::supervisor::spawn_once(
+                        "relief-resume",
+                        "pressure relief resume request",
+                        || {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_resume("notification")
+                            {
+                                log::warn!(target:"workbench","resume request from a banner was not written: {error}");
+                            }
+                        },
+                    );
+                    if let Err(error) = spawned {
+                        log::warn!(target:"workbench","resume request from a banner was not started: {error}");
                     }
                 } else if let Err(error) = self.ivars().sender.try_send(Event::Relief) {
                     log::warn!(target:"workbench","relief banner activation could not be queued: {error}");
