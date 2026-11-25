@@ -16511,6 +16511,177 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(resolve_default_remote(&repo), expected);
     }
 
+    /// The default remote through the uncached reads, with the reason it was
+    /// guessed, if any.
+    fn default_remote_fresh(repo: &Path) -> (String, Option<CommandError>) {
+        default_remote_from(repo, Reads::Fresh, config_snapshot_fresh(repo))
+    }
+
+    /// Remote names with dots, slashes, unicode and capitals are matched
+    /// exactly (git keeps a remote's case), and a name differing only in case
+    /// is not that remote.
+    #[test]
+    fn default_remote_matches_odd_remote_names_exactly() {
+        for odd in ["my.remote", "a/b", "ünï", "ORIGIN", "x.y.z"] {
+            let dir = init_repo_with_remotes(&["upstream", odd], "main");
+            let repo = dir.path().canonicalize().unwrap();
+            git_in(&repo, &["config", "branch.main.remote", odd]);
+            let (remote, unread) = default_remote_fresh(&repo);
+            assert_eq!((remote.as_str(), unread.is_none()), (odd, true), "{odd}");
+            git_in(&repo, &["config", "--unset", "branch.main.remote"]);
+            git_in(&repo, &["config", "checkout.defaultRemote", odd]);
+            assert_eq!(
+                default_remote_fresh(&repo).0,
+                odd,
+                "checkout.defaultRemote {odd}"
+            );
+        }
+        // Case differs: "origin" is not the configured "ORIGIN", so it falls
+        // through to the lone remote.
+        let dir = init_repo_with_remotes(&["ORIGIN"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "checkout.defaultRemote", "origin"]);
+        git_in(&repo, &["config", "branch.main.remote", "origin"]);
+        assert_eq!(default_remote_fresh(&repo).0, "ORIGIN");
+    }
+
+    /// `branch.<b>.remote` may be a URL; it is not a configured remote, so it
+    /// falls through and the listings still work.
+    #[test]
+    fn default_remote_ignores_a_url_in_branch_remote() {
+        let dir = init_repo_with_remotes(&["upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(
+            &repo,
+            &[
+                "config",
+                "branch.main.remote",
+                "https://example.com/other.git",
+            ],
+        );
+        let (remote, unread) = default_remote_fresh(&repo);
+        assert_eq!(remote, "upstream");
+        assert!(unread.is_none());
+        let path = repo.to_str().unwrap();
+        GitReader::list_branches(path).expect("branches with a URL as branch remote");
+        GitReader::list_tags(path).expect("tags with a URL as branch remote");
+    }
+
+    /// The branch subsection keeps its case: `branch.Feature.remote` is read
+    /// for `Feature` and not for `feature`.
+    #[test]
+    fn default_remote_reads_a_mixed_case_branch_subsection() {
+        let dir = init_repo_with_remotes(&["upstream", "fork"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["checkout", "-b", "Feature"]);
+        // Only the lower-case subsection is set: it is another key, so it
+        // must not answer for `Feature` (a second branch `feature` cannot be
+        // made here, the filesystem folds its ref file onto `Feature`).
+        git_in(&repo, &["config", "branch.feature.remote", "fork"]);
+        assert_eq!(default_remote_fresh(&repo).0, "origin");
+        git_in(&repo, &["config", "branch.Feature.remote", "fork"]);
+        assert_eq!(default_remote_fresh(&repo).0, "fork");
+    }
+
+    /// A detached HEAD has no branch to read a remote for, and an unborn
+    /// branch in a fresh repository still resolves the configured remote.
+    #[test]
+    fn default_remote_with_a_detached_or_unborn_head() {
+        let dir = init_repo_with_remotes(&["upstream", "fork"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.main.remote", "fork"]);
+        git_in(&repo, &["checkout", "--detach"]);
+        let (remote, unread) = default_remote_fresh(&repo);
+        assert_eq!(remote, "origin", "detached: no branch, two remotes");
+        assert!(
+            unread.is_none(),
+            "detached HEAD is not an unread: {unread:?}"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(
+            &repo,
+            &["remote", "add", "upstream", "https://example.com/u.git"],
+        );
+        git_in(
+            &repo,
+            &["remote", "add", "fork", "https://example.com/f.git"],
+        );
+        git_in(&repo, &["config", "branch.main.remote", "fork"]);
+        let (remote, unread) = default_remote_fresh(&repo);
+        assert_eq!(remote, "fork", "unborn main tracking fork");
+        assert!(
+            unread.is_none(),
+            "unborn branch is not an unread: {unread:?}"
+        );
+        git_in(&repo, &["config", "--unset", "branch.main.remote"]);
+        git_in(&repo, &["remote", "remove", "fork"]);
+        assert_eq!(default_remote_fresh(&repo).0, "upstream");
+    }
+
+    /// An unreadable config is reported, not turned into a confident answer:
+    /// the name is the guess, and the reason comes back with it.
+    #[test]
+    fn default_remote_reports_an_unreadable_config() {
+        let dir = init_repo_with_remotes(&["upstream"], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        git_in(&repo, &["config", "branch.main.remote", "upstream"]);
+        let (_remote, unread) = default_remote_from(
+            &repo,
+            Reads::Fresh,
+            Err(CommandError::plain("config unreadable")),
+        );
+        let reason = unread.expect("the config failure is reported");
+        assert!(reason.message().contains("config unreadable"), "{reason:?}");
+    }
+
+    /// With a legacy `.git/remotes` entry, `git remote` is asked; when it
+    /// fails the reason is reported rather than a quiet "not a remote".
+    #[test]
+    fn default_remote_reports_a_failing_git_remote_for_legacy_remotes() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let legacy = repo.join(".git/remotes");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old"), "URL: https://example.invalid/old.git\n").unwrap();
+        // A config read taken before the file is damaged, so only `git remote`
+        // meets the breakage.
+        let mut config = config_snapshot_fresh(&repo).unwrap();
+        config.insert("branch.main.remote".into(), "old".into());
+        std::fs::write(repo.join(".git/config"), "[core\n\tbroken = = =\n").unwrap();
+        let (remote, unread) = default_remote_from(&repo, Reads::Fresh, Ok(config));
+        assert_eq!(remote, "origin", "a guess built from an unread");
+        assert!(unread.is_some(), "a failing `git remote` must set unread");
+    }
+
+    /// Spawn cost of the legacy case: the check of a name no config key lists
+    /// and the lone-remote count each ask `git remote`.
+    #[test]
+    fn default_remote_legacy_case_spawn_count() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let repo = dir.path().canonicalize().unwrap();
+        let legacy = repo.join(".git/remotes");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("old"), "URL: https://example.invalid/old.git\n").unwrap();
+        git_in(&repo, &["config", "branch.main.remote", "ghost"]);
+        let remote_listings = || {
+            crate::engine::process::spawn_log::spawns_in(&repo)
+                .iter()
+                .filter(|argv| argv.last().is_some_and(|a| a == "remote"))
+                .count()
+        };
+        let before = remote_listings();
+        let _ = default_remote_fresh(&repo);
+        let spawned = remote_listings() - before;
+        assert!(
+            spawned <= 2,
+            "legacy case asked `git remote` {spawned} times"
+        );
+        eprintln!("LEGACY_REMOTE_SPAWNS={spawned}");
+    }
+
     /// A repository whose one commit touches `files` files, and that
     /// commit's full object id.
     fn repo_with_commit_of(files: usize) -> (tempfile::TempDir, std::path::PathBuf, String) {
