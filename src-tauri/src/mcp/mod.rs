@@ -13190,7 +13190,8 @@ mod tests {
     #[test]
     fn worktree_create_defaults_to_gitpulse_lane_and_allows_explicit_sibling() {
         let (_sandbox, repo) = honesty_repo();
-        let canon_repo = std::path::Path::new(&repo).canonicalize().unwrap();
+        let canon_repo =
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&repo)).unwrap();
 
         // 1. Default invocation places the worktree under <repo>/.gitpulse/worktrees/<slug>,
         //    matches the shared resolver / WorktreeCreate hook plan, and stays out of git status.
@@ -13203,9 +13204,10 @@ mod tests {
             }),
         );
         assert!(!err, "create failed: {created}");
-        let actual = std::path::PathBuf::from(created["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            created["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let expected = canon_repo.join(".gitpulse/worktrees/feat-auth-lane");
         assert_eq!(actual, expected, "{created}");
         let resolved = crate::engine::worktree::resolve_worktree_path(
@@ -13244,9 +13246,10 @@ mod tests {
             }),
         );
         assert!(!err, "create from inside lane failed: {nested}");
-        let nested_actual = std::path::PathBuf::from(nested["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let nested_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            nested["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             nested_actual,
             canon_repo.join(".gitpulse/worktrees/feat-from-lane"),
@@ -13281,9 +13284,10 @@ mod tests {
             }),
         );
         assert!(!err, "sparse create failed: {sparse}");
-        let sparse_actual = std::path::PathBuf::from(sparse["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sparse_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sparse["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         assert_eq!(
             sparse_actual,
             canon_repo.join(".gitpulse/worktrees/feat-sparse-lane"),
@@ -13301,9 +13305,10 @@ mod tests {
             }),
         );
         assert!(!err, "sibling create failed: {sibling}");
-        let sibling_actual = std::path::PathBuf::from(sibling["worktree_path"].as_str().unwrap())
-            .canonicalize()
-            .unwrap();
+        let sibling_actual = crate::engine::process::canonicalize_plain(&std::path::PathBuf::from(
+            sibling["worktree_path"].as_str().unwrap(),
+        ))
+        .unwrap();
         let sibling_expected = crate::engine::worktree::resolve_worktree_path(
             &canon_repo,
             "feat-sibling-opt",
