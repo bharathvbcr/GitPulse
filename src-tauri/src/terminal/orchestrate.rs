@@ -90,6 +90,42 @@ pub(crate) fn is_valid_external_caller_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Owner-key prefix of terminal children launched by a Mavi thread:
+/// `ext-mavi-<thread key>`, where the thread key is the page's
+/// `ThreadRecord.key`, a UUID (45 bytes in all, under the caller-id limit).
+pub(crate) const MAVI_OWNER_PREFIX: &str = "ext-mavi-";
+
+/// Environment variable a host sets on an agent process so that agent's
+/// `gitpulse-mcp` / `gitpulse-hook` orchestrate as a stable external caller
+/// (today only `ext-mavi-<uuid>`) instead of the per-process `mcp-<pid>`.
+pub(crate) const ORCHESTRATE_CALLER_ENV: &str = "GITPULSE_ORCHESTRATE_CALLER";
+
+/// A canonical (lowercase, hyphenated, 36-byte) UUID, as `crypto.randomUUID`
+/// writes it. Anything else is not a Mavi thread key.
+fn is_canonical_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
+
+/// The owner key for a Mavi thread's children, or `None` when the thread key
+/// is not a UUID (an older fallback key, or anything a page made up). Upper
+/// case is folded so the key is one spelling per thread.
+pub(crate) fn mavi_owner_key(thread_key: &str) -> Option<String> {
+    let lower = thread_key.trim().to_ascii_lowercase();
+    is_canonical_uuid(&lower).then(|| format!("{MAVI_OWNER_PREFIX}{lower}"))
+}
+
+/// The Mavi thread key an owner key names, or `None` when the key is not
+/// exactly `ext-mavi-<canonical uuid>`.
+pub(crate) fn mavi_thread_of_owner(owner_key: &str) -> Option<&str> {
+    owner_key
+        .strip_prefix(MAVI_OWNER_PREFIX)
+        .filter(|rest| is_canonical_uuid(rest))
+}
+
 /// Allowed child launchers for `Spawn`.
 pub const ALLOWED_CHILD_LAUNCHERS: [&str; 6] = ["shell", "claude", "agy", "codex", "manvi", "grok"];
 
@@ -3082,6 +3118,39 @@ pub(crate) mod tests {
     use crate::procguard::LockedSpawn;
     use crate::terminal::{SessionEnded, TerminalLossPayload};
     use std::sync::Arc;
+
+    #[test]
+    fn mavi_owner_key_accepts_only_canonical_uuid_thread_keys() {
+        let key = "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2b";
+        let owner = mavi_owner_key(key).expect("uuid thread key");
+        assert_eq!(owner, format!("ext-mavi-{key}"));
+        assert!(owner.len() <= 64);
+        assert!(is_valid_external_caller_id(&owner));
+        assert_eq!(mavi_thread_of_owner(&owner), Some(key));
+        // Upper case folds to one spelling per thread.
+        assert_eq!(mavi_owner_key(&key.to_ascii_uppercase()), Some(owner));
+        for bad in [
+            "",
+            "t1795634163229abc",
+            "0f8e2b9a1c3d4e5f8a6b7c8d9e0f1a2b",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2bb",
+            "0f8e2b9a-1c3d-4e5f-8a6b-7c8d9e0f1a2g",
+            "../../../../etc/passwd-0000-0000-0000",
+        ] {
+            assert_eq!(mavi_owner_key(bad), None, "{bad:?}");
+        }
+        for not_mavi in [
+            "ext-1234",
+            "mcp-99",
+            "ext-mavi-",
+            "ext-mavi-not-a-uuid",
+            "ext-mavi-0F8E2B9A-1C3D-4E5F-8A6B-7C8D9E0F1A2B",
+            "term-1-ab",
+        ] {
+            assert_eq!(mavi_thread_of_owner(not_mavi), None, "{not_mavi:?}");
+        }
+    }
 
     #[derive(Default)]
     struct RecordingEvents;
