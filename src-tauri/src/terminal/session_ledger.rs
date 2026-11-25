@@ -3061,6 +3061,36 @@ mod tests {
         assert!(holds.unverified);
     }
 
+    /// A protocol this build cannot speak is never connected to, so a stale
+    /// socket left by a host that died in a crash must be judged by its lock:
+    /// free means gone (the agents are lost and offered), held means a live
+    /// host GitPulse cannot ask (unverified).
+    #[cfg(unix)]
+    #[test]
+    fn a_protocol_without_a_dialect_is_unverified_only_while_its_lock_is_held() {
+        use crate::terminal::host::legacy::LegacyStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let report = crate::terminal::LegacyHostReport {
+            protocol: 3,
+            socket: dir.path().join(crate::terminal::host::socket_name(3)),
+            status: LegacyStatus::NoCompat,
+        };
+        let stale = crate::terminal::foreign_holds(std::slice::from_ref(&report));
+        assert!(
+            !stale.unverified,
+            "a stale socket with a free lock is a dead host, not one that could not be asked"
+        );
+        let held = crate::daemon_lock::acquire_named(
+            dir.path(),
+            &crate::terminal::host::lock_name(3),
+            "test",
+        );
+        assert!(matches!(held, crate::daemon_lock::Acquire::Held(_)));
+        let live = crate::terminal::foreign_holds(std::slice::from_ref(&report));
+        assert!(live.unverified, "a live host with no dialect could not be asked");
+        drop(held);
+    }
+
     #[test]
     fn a_deliberate_close_of_a_reopen_does_not_restore_the_old_offer() {
         let dir = tempfile::tempdir().unwrap();

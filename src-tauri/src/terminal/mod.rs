@@ -516,9 +516,23 @@ pub(crate) fn foreign_holds(reports: &[LegacyHostReport]) -> session_ledger::For
                 holds.held.extend(sessions.iter().map(|s| s.id.clone()));
             }
             LegacyStatus::Unreachable { .. } => {}
-            LegacyStatus::NoCompat
-            | LegacyStatus::Refused { .. }
-            | LegacyStatus::Failed { .. } => holds.unverified = true,
+            // No dialect means the socket is never connected to, so whether a
+            // host is behind it is asked of its lock instead. A socket left by
+            // a host that died with the machine holds nothing: treating it as
+            // unverified would leave every agent after a reboot "could not
+            // check", the very loss this ledger exists to prevent.
+            LegacyStatus::NoCompat => {
+                let lock_free = report.socket.parent().is_some_and(|dir| {
+                    matches!(
+                        crate::daemon_lock::running_named(dir, &host::lock_name(report.protocol)),
+                        Ok(None)
+                    )
+                });
+                if !lock_free {
+                    holds.unverified = true;
+                }
+            }
+            LegacyStatus::Refused { .. } | LegacyStatus::Failed { .. } => holds.unverified = true,
         }
     }
     holds
