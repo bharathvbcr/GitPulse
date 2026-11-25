@@ -730,10 +730,26 @@ fn dir_id(meta: &std::fs::Metadata, _path: &std::path::Path) -> Option<DirId> {
     Some((meta.dev(), meta.ino()))
 }
 
-/// Without device and inode numbers the canonical path stands in for them.
+/// Without device and inode numbers a file is identified by the volume and file
+/// id its handle reports, so two hard links to one transcript are one file. A
+/// directory, or a file whose handle cannot say, falls back to its canonical
+/// path, which tells two names for one directory apart from two directories but
+/// not two links to one file.
 #[cfg(not(unix))]
-fn dir_id(_meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
+fn dir_id(meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
     use std::hash::{Hash, Hasher};
+    #[cfg(windows)]
+    if meta.is_file() {
+        let identity = std::fs::File::open(path)
+            .and_then(|file| crate::fs_entry::windows_file_identity(&file));
+        if let Ok((volume, id)) = identity {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut hasher);
+            return Some((volume, hasher.finish()));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = meta;
     let canonical = std::fs::canonicalize(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.hash(&mut hasher);
