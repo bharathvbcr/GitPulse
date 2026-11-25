@@ -504,6 +504,21 @@ fn lane_fixture(
     (dir, repo, lane, tip)
 }
 
+/// Where no process table can be read (Windows), a teardown is refused before
+/// it merges or removes anything: a worktree whose use cannot be checked is
+/// left alone, by design.
+fn assert_refused_unchecked(err: crate::engine::worktree::MergeTeardownError) {
+    let crate::engine::worktree::MergeTeardownError::Refused { message } = err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        message.starts_with(
+            "Could not check whether a process is still working in this worktree, so it was left alone:"
+        ) && message.contains("listing processes is not supported on this platform"),
+        "{message}"
+    );
+}
+
 /// A combined tree with no task to verify is not merged. The checkout, the
 /// lane, and the scratch list stay as they were.
 #[test]
@@ -526,10 +541,15 @@ fn a_wave_merge_of_an_unverified_candidate_is_refused() {
         &allow_merge,
     )
     .unwrap_err();
-    let crate::engine::worktree::MergeTeardownError::CandidateFailed { message, .. } = err else {
-        panic!("{err:?}");
-    };
-    assert!(message.contains("does not exist"), "{message}");
+    if cfg!(windows) {
+        assert_refused_unchecked(err);
+    } else {
+        let crate::engine::worktree::MergeTeardownError::CandidateFailed { message, .. } = err
+        else {
+            panic!("{err:?}");
+        };
+        assert!(message.contains("does not exist"), "{message}");
+    }
     assert_eq!(git_text(&repo, &["rev-parse", "HEAD"]).unwrap(), before);
     assert_eq!(
         git_text(&repo, &["status", "--porcelain"]).unwrap(),
@@ -550,7 +570,7 @@ fn a_fast_forward_of_the_verified_tip_lands_without_a_task_record() {
     let profile = dir.path().join("profile.sqlite");
     let _store = dc_store::Store::open(&profile).unwrap();
     let state = host(&profile);
-    let merged = crate::commands::merge_teardown_guarded(
+    let outcome = crate::commands::merge_teardown_guarded(
         &state,
         repo.to_str().unwrap(),
         lane.to_str().unwrap(),
@@ -560,8 +580,21 @@ fn a_fast_forward_of_the_verified_tip_lands_without_a_task_record() {
         true,
         Some("ft-missing"),
         &allow_merge,
-    )
-    .unwrap();
+    );
+    if cfg!(windows) {
+        assert_refused_unchecked(outcome.unwrap_err());
+        // Refused before the merge: main did not move, the lane is whole.
+        assert_ne!(
+            git_text(&repo, &["rev-parse", "refs/heads/main"])
+                .unwrap()
+                .trim(),
+            tip
+        );
+        assert!(!repo.join("feature.txt").exists());
+        assert!(lane.is_dir());
+        return;
+    }
+    let merged = outcome.unwrap();
     assert_eq!(
         git_text(&repo, &["rev-parse", "refs/heads/main"])
             .unwrap()
