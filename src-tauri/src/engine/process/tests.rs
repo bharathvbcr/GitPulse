@@ -1859,6 +1859,192 @@ fn timeout_marker_round_trips_between_formatter_and_matcher() {
     )));
 }
 
+/// Lane B attack: whatever program name is asked about, a gate refusal (slot
+/// wait, deferral, cancel) or a spawn failure written for ANOTHER program, or
+/// for this one, is never read as that program's own run timing out. The slot
+/// wait ends in the gate's suffix and the rest carry no timeout marker, so a
+/// program that is a prefix of the label (or empty) cannot mislead the check.
+#[test]
+fn own_run_timeout_never_reads_a_refusal_as_a_run_whatever_the_program() {
+    use super::{is_own_run_timeout, refusal_message, Refusal};
+    let slot = refusal_message(
+        "sleep",
+        Refusal::TimedOut {
+            deadline: Duration::from_millis(500),
+        },
+    );
+    let deferred = refusal_message(
+        "sleep",
+        Refusal::Refused {
+            waited: Duration::from_millis(500),
+        },
+    );
+    let cancelled = refusal_message("sleep", Refusal::Cancelled);
+    let not_found = spawn_error("sleep", &std::io::Error::from(std::io::ErrorKind::NotFound));
+    let coded_slot = format!("[E123] {}", slot.message());
+    for program in [
+        "",
+        "s",
+        "sl",
+        "sleep",
+        "sleep timed",
+        "[E123] sleep",
+        "[E123]",
+    ] {
+        for refused in [
+            slot.message(),
+            deferred.message(),
+            cancelled.message(),
+            not_found.as_str(),
+            coded_slot.as_str(),
+        ] {
+            assert!(
+                !is_own_run_timeout(program, refused),
+                "program {program:?} read {refused:?} as its own timeout"
+            );
+        }
+    }
+}
+
+/// Lane B attack: the ledger's `[code] ` prefix is added by `LedgerError`'s
+/// Display, not by `run_bounded` (which labels with the program and returns a
+/// plain error), so a coded timeout does not reach `run_captured`. A coded
+/// slot wait is still not an own timeout, whichever way the program is spelled.
+#[test]
+fn own_run_timeout_survives_a_coded_slot_wait() {
+    use super::is_own_run_timeout;
+    let coded = format!("[E123] sleep{TIMEOUT_MARKER}0.500{SLOT_WAIT_SUFFIX}");
+    assert!(!is_own_run_timeout("sleep", &coded));
+    assert!(!is_own_run_timeout("[E123] sleep", &coded));
+}
+
+/// Lane B attack: a child that prints the slot-wait phrase to stderr and exits
+/// non-zero ran; it is a finished run with a failing status.
+#[cfg(unix)]
+#[test]
+fn run_captured_finishes_a_child_that_prints_the_slot_phrase_and_fails() {
+    let script = format!("echo '{TIMEOUT_MARKER}5{SLOT_WAIT_SUFFIX}' >&2; exit 3");
+    let outcome = run_captured(
+        "sh",
+        &["-c", &script],
+        None,
+        Duration::from_secs(30),
+        &[],
+        MAX_OUTPUT_BYTES,
+    )
+    .expect("a child that ran is an outcome");
+    match outcome {
+        RunOutcome::Finished(run) => {
+            assert!(!run.success);
+            assert_eq!(run.status_code, 3);
+            assert!(
+                run.stderr_tail.contains(SLOT_WAIT_SUFFIX),
+                "{}",
+                run.stderr_tail
+            );
+        }
+        other => panic!("expected Finished, got {other:?}"),
+    }
+}
+
+/// Lane B attack: a program the OS cannot find is a spawn error, even when its
+/// path spells the timeout marker; the error starts with "Failed to spawn", not
+/// with the program.
+#[cfg(unix)]
+#[test]
+fn run_captured_keeps_a_missing_program_an_error_even_if_its_path_spells_a_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join(format!("x{TIMEOUT_MARKER}1s")).join("nope");
+    let outcome = run_captured(
+        missing.to_str().unwrap(),
+        &[],
+        None,
+        Duration::from_secs(5),
+        &[],
+        MAX_OUTPUT_BYTES,
+    );
+    match outcome {
+        Err(e) => assert!(
+            e.message().starts_with("Failed to spawn "),
+            "{}",
+            e.message()
+        ),
+        other => panic!("a missing program must stay an error, got {other:?}"),
+    }
+}
+
+/// Lane B attack: a deadline beyond the runner's ceiling is refused up front
+/// and stays an error.
+#[cfg(unix)]
+#[test]
+fn run_captured_keeps_an_oversized_deadline_an_error() {
+    let outcome = run_captured(
+        "/usr/bin/true",
+        &[],
+        None,
+        Duration::from_secs(u32::MAX as u64),
+        &[],
+        MAX_OUTPUT_BYTES,
+    );
+    match outcome {
+        Err(e) => assert!(e.message().contains("deadline exceeds"), "{}", e.message()),
+        other => panic!("an oversized deadline must stay an error, got {other:?}"),
+    }
+}
+
+/// Lane B attack: a zero deadline never ran the child (the runner refuses it
+/// before spawning, with text that carries the timeout marker), so it must not
+/// be reported as a run that timed out.
+#[cfg(unix)]
+#[test]
+#[ignore = "lane B attack: a zero timeout is refused before spawn but its text carries the timeout marker, so run_captured returns Ok(TimedOut(0s)) for a child that never ran"]
+fn run_captured_does_not_report_a_zero_deadline_as_a_timed_out_run() {
+    let outcome = run_captured(
+        "/usr/bin/true",
+        &[],
+        None,
+        Duration::ZERO,
+        &[],
+        MAX_OUTPUT_BYTES,
+    );
+    assert!(
+        matches!(outcome, Err(_)),
+        "a refused zero deadline is not a run that timed out: {outcome:?}"
+    );
+}
+
+/// Lane B attack: the gate's only slot is released while the caller waits; the
+/// child then runs and finishes inside its own deadline, not as a refusal.
+#[cfg(unix)]
+#[test]
+fn run_captured_runs_once_the_only_slot_is_released_mid_wait() {
+    let gate = leak_gate(SpawnGate::new(1));
+    let permit = gate
+        .acquire(Instant::now() + Duration::from_secs(30))
+        .expect("the one slot");
+    let (started_tx, started_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        with_gate_for_test(gate, || {
+            started_tx.send(()).unwrap();
+            run_captured(
+                "/usr/bin/true",
+                &[],
+                None,
+                Duration::from_secs(60),
+                &[],
+                MAX_OUTPUT_BYTES,
+            )
+        })
+    });
+    started_rx.recv().unwrap();
+    drop(permit);
+    let outcome = worker.join().unwrap();
+    match outcome {
+        Ok(RunOutcome::Finished(run)) => assert!(run.success),
+        other => panic!("expected the child to run and finish, got {other:?}"),
+    }
+}
+
 #[test]
 fn capture_command_keeps_stdout_on_nonzero() {
     let output = capture_command(
