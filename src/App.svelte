@@ -66,6 +66,7 @@
   import ToastContainer from "./lib/components/ToastContainer.svelte";
   import NativeNotificationBridge from "./lib/components/NativeNotificationBridge.svelte";
   import SessionNotificationBridge from "./lib/components/SessionNotificationBridge.svelte";
+  import MaviBridge from "./lib/components/mavi/MaviBridge.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   // The gate loads the tour's component only while the tour is open.
@@ -120,6 +121,7 @@
   const loadTaskBoard = () => import("./lib/components/TaskBoard.svelte");
   const loadCodeView = () => import("./lib/components/CodeView.svelte");
   const loadHistoryView = () => import("./lib/components/HistoryView.svelte");
+  const loadMaviView = () => import("./lib/components/mavi/MaviView.svelte");
 
   // Overlays. None of these is on screen at startup and most sessions open
   // none of them, yet all six were parsed at boot because App mounted them
@@ -175,6 +177,8 @@
   import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
   import { quitRisks } from "./lib/terminal/quitGuard";
+  import { maviQuitRisks } from "./lib/mavi/quit";
+  import { maviStore } from "./lib/mavi/store.svelte";
   import { decideQuitManagedRuns, decideQuitTerminals, readTerminalBackend, type QuitTerminals } from "./lib/terminal/quitChoice";
   import { listAllLiveRuns } from "./lib/workbench/client";
   import {
@@ -431,15 +435,22 @@
     });
     if ("cancelled" in decision) { cancelNativeExitRequest(); return; }
     const terminals: QuitTerminals | undefined = decision.backend === "host" ? decision.terminals : undefined;
-    const agents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
+    const terminalAgents = decision.backend === "host" ? [] : await quitRisks(get(terminalSessions), {
       onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Couldn't check ${what}. ${formatErrorRaw(error)}`),
     });
+    // Mavi agents end with the app whatever the terminal backend keeps.
+    const maviAgents = maviQuitRisks(
+      maviStore.records,
+      (record) => maviStore.summaryOf(record),
+      (record) => maviStore.queues[record.key]?.length ?? 0,
+    );
+    const agents = [...terminalAgents, ...maviAgents];
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
       const omitted = agents.length > 5 ? `\n…and ${agents.length - 5} more` : "";
       const quit = await askConfirm({
         title: agents.length === 1 ? "Quit While an Agent Is Running?" : `Quit While ${agents.length} Agents Are Running?`,
-        message: `${listed}${omitted}\nQuitting GitPulse ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.`,
+        message: `${listed}${omitted}\nQuitting GitPulse ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.${maviAgents.some((a) => a.resumable) ? "\nMavi threads can be resumed after you reopen GitPulse." : ""}`,
         confirmLabel: agents.length === 1 ? "Quit and End Agent" : "Quit and End Agents",
         cancelLabel: "Keep Working",
         destructive: true,
@@ -1204,6 +1215,7 @@
   <ToastContainer />
   <NativeNotificationBridge />
   <SessionNotificationBridge />
+  <MaviBridge />
 
   <!-- The repository surface. Hidden, not unmounted, while Fleet is open. -->
   <div class="flex-1 flex flex-col min-h-0" class:hidden={$interfaceStore.globalSurface !== "repository"}>
@@ -1280,6 +1292,8 @@
                   loadGitHub={loadGitHubPanel}
                   loadStack={loadCodeStackViewer}
                 />
+              {:else if $repoStore.activeTab === "mavi"}
+                <LazyView load={loadMaviView} name="Mavi" />
               {:else if $repoStore.activeTab === "code"}
                 <LazyView
                   load={loadCodeView}

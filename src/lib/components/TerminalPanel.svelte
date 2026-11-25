@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { composeMaviThread, showMaviThread } from "../mavi/navigate";
+  import { continueInMavi } from "../mavi/handoff";
+  import { MAVI_MODES } from "../mavi/client";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord, shortcutTextLabel } from "../ui/platformCopy";
@@ -40,6 +43,7 @@
     Columns2,
     Rows2,
     FolderTree,
+    MessagesSquare,
     PanelLeft,
     PanelLeftClose,
     FileText,
@@ -1825,6 +1829,29 @@
   }
 
   let creatingWorktreePreset = $state(false);
+
+  /**
+   * "Continue in Mavi": the conversation moves to a Mavi thread, which shows
+   * its earlier turns from the transcript. The checks run before this tab's
+   * session ends; this tab's process ends before Mavi's agent starts.
+   */
+  async function moveTabToMavi(tabId: string) {
+    const result = await continueInMavi(tabId, (move) =>
+      askConfirm({
+        title: "Continue in Mavi",
+        message:
+          `Moves this conversation to a Mavi thread in ${move.root}, with its earlier turns. ` +
+          "This tab's session ends first, then Mavi resumes the same conversation " +
+          (move.mode === "bypass"
+            ? "in Bypass: the agent will run everything without asking."
+            : `with the permission mode ${MAVI_MODES.find((m) => m.id === move.mode)?.label ?? move.mode}.`),
+        confirmLabel: move.mode === "bypass" ? "Move and run in Bypass" : "Move to Mavi",
+        destructive: move.mode === "bypass",
+      }),
+    );
+    if (result.ok && result.key) await showMaviThread(result.key);
+    else if (!result.ok && result.reason) toastStore.warning(result.reason);
+  }
 
   async function openWorktreeAgentPreset() {
     launcherMenuOpen = false;
@@ -5434,6 +5461,24 @@
           {/each}
         </div>
         <div class="gp-menu-sep my-1"></div>
+        <!-- Mavi is a view, not a session kind: this starts no process here. -->
+        <div class="flex flex-col gap-0.5" role="group" aria-label="Mavi">
+          <button
+            type="button"
+            class="gp-menu-item text-textMuted"
+            data-testid="terminal-launcher-new-mavi"
+            disabled={!repoPath}
+            title="Start a conversation with an agent in Mavi, the chat view for agents"
+            onclick={() => {
+              launcherMenuOpen = false;
+              composeMaviThread();
+            }}
+          >
+            <MessagesSquare size={13} class="text-accent shrink-0" />
+            <span class="truncate">New Mavi Thread</span>
+          </button>
+        </div>
+        <div class="gp-menu-sep my-1"></div>
         <div class="flex flex-col gap-0.5" role="group" aria-label="Sidebar and file explorer">
           <span class="gp-label px-2.5 py-0.5">Sidebar &amp; Explorer</span>
           <button
@@ -5812,6 +5857,23 @@
             <Plus size={13} class="shrink-0" />
             <span class="truncate">New {ctxKindLabel} Tab</span>
           </button>
+          {#if ctxTab.launcher === "claude"}
+            <button
+              type="button"
+              role="menuitem"
+              class="gp-menu-item text-textMuted"
+              data-testid="terminal-tab-ctx-continue-in-mavi"
+              title="Move this conversation to Mavi, with its earlier turns, and end this tab's session"
+              onclick={() => {
+                const targetId = ctxTab.id;
+                closeChrome();
+                void moveTabToMavi(targetId);
+              }}
+            >
+              <MessagesSquare size={13} class="shrink-0" />
+              <span class="truncate">Continue in Mavi</span>
+            </button>
+          {/if}
           <button
             type="button"
             role="menuitem"

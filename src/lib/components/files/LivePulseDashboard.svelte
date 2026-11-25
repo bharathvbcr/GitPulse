@@ -18,7 +18,9 @@
     CheckCircle2,
     Flame,
     PanelRightClose,
+    MessagesSquare,
   } from "@lucide/svelte";
+  import { maviStore } from "../../mavi/store.svelte";
   import { formatAge } from "../../storage/format";
   import { askConfirm } from "../../stores/modalStore";
   import { reportFailure } from "../../stores/mutationOutcome";
@@ -76,7 +78,40 @@
     return Date.now();
   });
 
-  let statuses = $derived($repoStore.statuses);
+  // Mavi threads working in this repository. Git status alone says a file
+  // changed; this says which conversation changed it, and whether it is
+  // still at it, so a file is not discarded or committed from under an agent.
+  onMount(() => {
+    void maviStore.init().catch(() => {});
+  });
+  let agentEdits = $derived($currentRepoPath ? maviStore.touchedIn($currentRepoPath) : []);
+  let agentThreads = $derived.by(() => {
+    const byKey = new Map<string, { key: string; title: string; working: boolean; files: number; waiting: boolean }>();
+    for (const edit of agentEdits) {
+      const entry = byKey.get(edit.key) ?? { key: edit.key, title: edit.title, working: edit.working, files: 0, waiting: false };
+      entry.files += 1;
+      byKey.set(edit.key, entry);
+    }
+    for (const record of maviStore.records) {
+      const entry = byKey.get(record.key);
+      if (entry) entry.waiting = maviStore.status(record) === "needs_you";
+    }
+    return [...byKey.values()];
+  });
+  let agentByPath = $derived(new Map(agentEdits.map((e) => [e.path, e])));
+
+  function openThread(key: string) {
+    repoStore.setActiveTab("mavi");
+    void maviStore.open(key);
+  }
+
+  let rawStatuses = $derived($repoStore.statuses);
+  // Files an agent is editing right now lead the list.
+  let statuses = $derived(
+    agentEdits.some((e) => e.working)
+      ? [...rawStatuses].sort((a, b) => Number(!!agentByPath.get(b.path)?.working) - Number(!!agentByPath.get(a.path)?.working))
+      : rawStatuses,
+  );
   let dash = $derived(summarizeStatuses(statuses));
 
   let stagedFiles = $derived(statuses.filter((s) => classifyFileChange(s) === "staged"));
@@ -122,9 +157,12 @@
   async function discardFile(path: string) {
     // The repository this file belongs to, held across the confirm.
     const target = repoStore.captureTarget();
+    const agent = agentByPath.get(path);
     const confirmed = await askConfirm({
       title: "Discard changes",
-      message: `Discard all uncommitted changes to ${path}? This cannot be undone.`,
+      message: agent?.working
+        ? `The Mavi thread "${agent.title}" is editing ${path} right now. Discard all uncommitted changes to it anyway? This cannot be undone, and the agent may write to it again.`
+        : `Discard all uncommitted changes to ${path}? This cannot be undone.`,
       confirmLabel: "Discard changes",
     });
     if (!confirmed) return;
@@ -317,6 +355,27 @@
     </div>
 
     <!-- Live Uncommitted Modifications Stream -->
+    {#if agentThreads.length}
+      <div class="space-y-1.5" aria-label="Agents editing this repository">
+        {#each agentThreads as thread (thread.key)}
+          <button
+            type="button"
+            class="w-full p-2 rounded-xl border border-edgeSoft bg-surface/50 hover:border-border flex items-center gap-2 text-left"
+            onclick={() => openThread(thread.key)}
+            title="Open this conversation in Mavi"
+          >
+            <MessagesSquare size={13} class="shrink-0 {thread.waiting ? 'text-warn' : thread.working ? 'text-accent' : 'text-textMuted'}" />
+            <span class="min-w-0 flex-1">
+              <span class="block text-xs text-textPrimary truncate">{thread.title}</span>
+              <span class="block text-micro {thread.waiting ? 'text-warn' : 'text-textMuted'}">
+                {thread.waiting ? "Waiting for your answer" : thread.working ? "Editing now" : "Idle"} · {thread.files} {thread.files === 1 ? "file" : "files"} edited
+              </span>
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     <div>
       <div class="flex items-center justify-between gp-label mb-2">
         <div class="flex items-center gap-1.5">
@@ -350,6 +409,17 @@
                   <LanguageLogo filePath={s.path} size={12} class="shrink-0" />
                   <span class="px-1 py-0.2 text-micro font-semibold rounded {statusBadgeClass(kind)}">{statusBadgeLabel(kind)}</span>
                   <span class="min-w-0 text-xs font-medium text-textPrimary truncate">{formatPathParts(s.path).name}</span>
+                  {#if agentByPath.get(s.path)}
+                    {@const agent = agentByPath.get(s.path)!}
+                    <span
+                      class="gp-chip shrink-0"
+                      data-kind="label"
+                      data-tone={agent.working ? "accent" : "neutral"}
+                      title="Edited by the Mavi thread “{agent.title}”"
+                    >
+                      <MessagesSquare size={9} aria-hidden="true" />{agent.working ? "Agent editing" : "Agent"}
+                    </span>
+                  {/if}
                 </div>
                 <div class="text-micro text-textMuted font-mono truncate max-w-[180px] pl-4">
                   {s.path}

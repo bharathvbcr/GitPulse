@@ -61,6 +61,8 @@ const NOT_A_CLASSIFIER: readonly Entry[] = [
  * follow-up, named here so it is not forgotten and cannot grow.
  */
 const REMAINING_TEXT_READERS: readonly Entry[] = [
+  { file: "lib/mavi/changes.ts", line: "const header = /^@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@/.exec(line);", why: "parses the hunk header of git's unified diff format (a patch the Mavi host read with `git diff`), not an error message; the format is git's documented output, not text that a kind could replace" },
+  { file: "lib/mavi/changes.ts", line: "if (/^Binary files /.test(line)) binary = true;", why: "git's unified diff format marks a binary file with this line; part of the same patch parse as the entry above, not an error message" },
   { file: "lib/async/deferral.ts", line: "return message.includes(DEFERRED_UNDER_LOAD_MARKER);", why: "text helper for already-flattened strings (toast severity, diagnostics severity, autoInit reports, githubAlerts report fields) that carry no kind; pinned to the Rust marker by deferral.test.ts. The command-error retry in invoke.ts does not use it" },
   { file: "lib/async/deferral.ts", line: "return message.includes(RUN_TIMEOUT_MARKER) && !message.includes(SLOT_WAIT_SUFFIX);", count: 2, why: "outcomeUnknown reads the `create issue` outcome struct's error text (workbench/taskIssue.ts); that struct has no kind field yet" },
   { file: "lib/branches/deleteEscalation.ts", line: "if (text.includes(WORKTREE_GUARD) || text.includes(GIT_WORKTREE_REFUSAL)) {", count: 2, why: "reads git's own refusal wording for `branch -d` plus a Rust guard; typing it means the backend classifying git's stderr into branch-delete kinds, which no card has asked for yet" },
