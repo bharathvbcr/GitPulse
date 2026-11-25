@@ -524,7 +524,14 @@ fn put_bind(repo: &str, worktree: &str, ms: u64, ulid: &str, task: &str) {
             "INSERT INTO events (ulid, ts_utc, repo_path, worktree_path, actor_kind, task_id,
                                  action, outcome)
              VALUES (?1, ?2, ?3, ?4, 'human', ?5, 'worktree.bind', 'ok')",
-            rusqlite::params![ulid, ids::iso8601_utc(ms), repo, worktree, task],
+            rusqlite::params![
+                ulid,
+                ids::iso8601_utc(ms),
+                // The spelling every other row of this ledger is stored under.
+                ledger::canonical_repo(repo),
+                worktree,
+                task
+            ],
         )
         .map_err(|e| ledger::LedgerError::new("insert", e.to_string()))?;
         Ok(())
