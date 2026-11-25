@@ -4729,7 +4729,7 @@
       <button type="button" class="gp-icon-btn" data-size="sm" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
-  {#if repoLedgerOffers.length > 0 && mode === "shell"}
+  {#if repoLedgerOffers.length > 0}
     <div
       class="gp-notice flex flex-col gap-1.5"
       data-tone={repoReopenableOffers.length > 0 ? "warn" : "unknown"}
