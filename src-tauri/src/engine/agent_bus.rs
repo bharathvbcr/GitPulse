@@ -2711,7 +2711,7 @@ mod tests {
             ],
         );
 
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         crate::test_support::trust_repo(&canon_anchor);
         crate::devmap::ensure_state_dir_excluded(&canon_anchor);
 
@@ -3070,12 +3070,15 @@ mod tests {
         fs::write(&lease_path, b"{ not json").unwrap();
 
         let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
-        let wt_canon = wt.canonicalize().unwrap();
+        let wt_canon = crate::engine::process::canonicalize_plain(&wt).unwrap();
         let failed = radar
             .scan_errors
             .iter()
             .find(|e| {
-                Path::new(&e.worktree).canonicalize().ok().as_deref() == Some(wt_canon.as_path())
+                crate::engine::process::canonicalize_plain(Path::new(&e.worktree))
+                    .ok()
+                    .as_deref()
+                    == Some(wt_canon.as_path())
             })
             .unwrap_or_else(|| panic!("scan failure must be surfaced: {radar:?}"));
         assert!(!failed.error.is_empty());

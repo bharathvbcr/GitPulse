@@ -2110,7 +2110,7 @@ mod tests {
                 "seed fresh anchor",
             ],
         );
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         let mut head_out_cmd = Command::new("git");
         crate::test_support::pin_git(&mut head_out_cmd);
         let head_out = head_out_cmd
@@ -2650,7 +2650,7 @@ mod tests {
             &devmap_extract::paths::stack_lease_path(&legit_wt),
         )
         .unwrap();
-        spoofed_lease.worktree_root = fs::canonicalize(stranger)
+        spoofed_lease.worktree_root = crate::engine::process::canonicalize_plain(stranger)
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -3097,7 +3097,7 @@ mod tests {
                 "polyglot init",
             ],
         );
-        let canon_anchor = fs::canonicalize(anchor).unwrap();
+        let canon_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         crate::test_support::trust_repo(&canon_anchor);
         crate::devmap::ensure_state_dir_excluded(&canon_anchor);
         let built = crate::devmap::cli::build(&canon_anchor.to_string_lossy())
@@ -3259,7 +3259,7 @@ mod tests {
         let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
         let anchor = anchor_dir.path();
         crate::test_support::trust_repo(anchor);
-        let canonical_anchor = fs::canonicalize(anchor).unwrap();
+        let canonical_anchor = crate::engine::process::canonicalize_plain(anchor).unwrap();
         {
             let anchor_conn = Connection::open(devmap_query::paths::store_path(anchor)).unwrap();
             anchor_conn
@@ -3300,11 +3300,15 @@ mod tests {
         );
 
         let wt_db = devmap_query::paths::store_path(&wt);
-        let canonical_wt = fs::canonicalize(&wt).unwrap();
+        let canonical_wt = crate::engine::process::canonicalize_plain(&wt).unwrap();
         let reopened = Store::open_read_only(&wt_db).unwrap();
         let effective_root = reopened.latest_repo_root().unwrap().unwrap();
         drop(reopened);
-        assert_eq!(fs::canonicalize(&effective_root).unwrap(), canonical_wt);
+        assert_eq!(
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&effective_root))
+                .unwrap(),
+            canonical_wt
+        );
 
         let conn = Connection::open(&wt_db).unwrap();
         let hist_gen_root: String = conn
@@ -3315,7 +3319,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            fs::canonicalize(&hist_gen_root).unwrap(),
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&hist_gen_root))
+                .unwrap(),
             canonical_anchor,
             "rebind_staged must preserve historical generation CoW pages"
         );
