@@ -482,7 +482,7 @@ fn sample(input: &Input) -> Option<Sample> {
 /// that a full disk entered keeps naming the disk when memory later joins it;
 /// reading memory directly cannot miss the compound crisis, and a Severe that
 /// only the disk, the CPU or the battery holds never reaches the relief.
-pub(super) fn memory_sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
+pub(super) fn memory_sample(input: &Input) -> Option<MemoryReading> {
     if !matches!(availability(input), Availability::Governing) {
         return None;
     }
@@ -501,12 +501,38 @@ pub(super) fn memory_sample(input: &Input) -> Option<(Tier, Option<Binding>)> {
     if input.level == Some(Level::Warn) {
         consider(Tier::Elevated, Binding::MemoryPressure);
     }
+    let mut segments_elevated = false;
     for c in input.thresholds.assess(&input.readings).contributions {
         if matches!(c.binding, Binding::CompressorSegments | Binding::Swap) {
             consider(c.tier, c.binding);
         }
+        if c.binding == Binding::CompressorSegments && c.tier >= Tier::Elevated {
+            segments_elevated = true;
+        }
     }
-    Some(best)
+    Some(MemoryReading {
+        tier: best.0,
+        binding: best.1,
+        kernel_warn: matches!(input.level, Some(Level::Warn | Level::Critical)),
+        kernel_critical: input.level == Some(Level::Critical),
+        thrash: input.compressor_thrash,
+        segments_elevated,
+    })
+}
+
+/// What [`memory_sample`] read: the tier, and which inputs stand behind it. The
+/// relief needs the causes apart because swap *level* is a bad reason to act: it
+/// stays high long after a recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MemoryReading {
+    pub tier: Tier,
+    pub binding: Option<Binding>,
+    /// The kernel's memory-pressure level is Warn or worse.
+    pub kernel_warn: bool,
+    pub kernel_critical: bool,
+    pub thrash: bool,
+    /// Compressor segments are at or above their Elevated threshold.
+    pub segments_elevated: bool,
 }
 
 /// What one sample read: the tier and the resource that put it there, and what

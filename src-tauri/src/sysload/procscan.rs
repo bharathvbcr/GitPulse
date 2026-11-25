@@ -2085,6 +2085,59 @@ static LINUX_SLOWED_FROM: std::sync::Mutex<std::collections::BTreeMap<(i32, u64)
 #[cfg(target_os = "linux")]
 const MAX_LINUX_SLOWED: usize = 4096;
 
+/// What a priority change checks about a process: who it is, not what it
+/// uses. [`probe_one`] also reads the footprint, the I/O counters and a
+/// 1 MiB-bounded argument block, per process, for a decision that touches
+/// thousands.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PriorityFacts {
+    pub start_us: u64,
+    pub uid: u32,
+    pub memguard: bool,
+}
+
+/// Whether `pid` (still the process that started at `start_us`) reads back as
+/// in the background; `None` when that cannot be read (gone, recycled, not
+/// ours, or a platform that cannot say).
+pub(crate) fn is_background(pid: i32, start_us: u64) -> Option<bool> {
+    if pid <= 1 {
+        return None;
+    }
+    let facts = os::priority_facts(pid)?;
+    if facts.start_us != start_us {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        darwin_task_priority(pid)
+            .ok()
+            .map(|pri| pri <= DARWIN_MAXPRI_THROTTLE)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `__errno_location` is thread-local; `getpriority` takes plain integers.
+        let nice = unsafe {
+            *libc::__errno_location() = 0;
+            let nice = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
+            if nice == -1 && *libc::__errno_location() != 0 {
+                return None;
+            }
+            nice
+        };
+        Some(nice >= LINUX_SLOW_NICE)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = facts;
+        None
+    }
+}
+
+/// The arguments `pid` was started with, `None` when the OS will not say.
+pub(crate) fn argv_of_pid(pid: i32) -> Option<Vec<String>> {
+    os::argv_sized(pid)
+}
+
 /// Places (`enable = true`) or restores (`enable = false`) a live current-user
 /// process in OS background scheduler / I/O throttle after re-verifying both
 /// `pid` and `start_us` against the live process table.
@@ -2100,7 +2153,7 @@ pub(crate) fn set_background_throttle(
     if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
         return Err("refused to change priority of reserved or current process".into());
     }
-    let Some(facts) = probe_one(pid) else {
+    let Some(facts) = os::priority_facts(pid) else {
         return Err("process is no longer running".into());
     };
     if facts.start_us != start_us {
@@ -2114,7 +2167,7 @@ pub(crate) fn set_background_throttle(
     if facts.uid != me {
         return Err("process belongs to another user".into());
     }
-    if facts.ident.memguard {
+    if facts.memguard {
         return Err("GitPulse never modifies memguard scheduling".into());
     }
 
@@ -3189,8 +3242,63 @@ mod os {
     /// binary reads back with an empty environment, which this cannot tell
     /// from one that has none.
     pub(crate) fn environment(pid: i32) -> Option<Vec<String>> {
-        let mut buf = vec![0u8; argmax()];
-        full_procargs(pid, &mut buf).map(|(_, _, env)| env)
+        sized_procargs(pid).map(|(_, _, env)| env)
+    }
+
+    /// The arguments of `pid`, `None` when the kernel refuses them.
+    pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
+        sized_procargs(pid).map(|(_, argv, _)| argv)
+    }
+
+    /// The path `pid` was exec'd with.
+    fn exec_sized(pid: i32) -> Option<String> {
+        sized_procargs(pid).map(|(exec, _, _)| exec)
+    }
+
+    /// [`full_procargs`] in a buffer sized to what the kernel reports for this
+    /// process (the size query is exact: 9 220 bytes for a 9 220-byte block)
+    /// rather than `KERN_ARGMAX` (1 MiB). A block that grew past the slack
+    /// between the two calls reads as `None`, never as a cut one.
+    fn sized_procargs(pid: i32) -> Option<(String, Vec<String>, Vec<String>)> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut need = 0usize;
+        // SAFETY: a null buffer asks only for the size, written to `need`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut need,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || need < 4 {
+            return None;
+        }
+        let mut buf = vec![0u8; need.saturating_add(512).min(argmax())];
+        full_procargs(pid, &mut buf)
+    }
+
+    /// What `setpriority` needs to know of a process, without the footprint,
+    /// the I/O counters or an argument block.
+    pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {
+        let basic = basic(pid)?;
+        if basic.zombie {
+            return None;
+        }
+        let me = uid();
+        let memguard = basic.name == "memguard"
+            || (basic.uid == me
+                && exec_sized(pid)
+                    .as_deref()
+                    .and_then(|e| std::path::Path::new(e).file_name())
+                    .is_some_and(|n| n == "memguard"));
+        Some(super::PriorityFacts {
+            start_us: basic.start_us,
+            uid: basic.uid,
+            memguard,
+        })
     }
 
     pub(crate) fn cwd(pid: i32) -> Option<PathBuf> {
@@ -4203,6 +4311,18 @@ mod os {
         ))
     }
 
+    pub(crate) fn argv_sized(pid: i32) -> Option<Vec<String>> {
+        argv_of(pid, &mut Vec::new())
+    }
+
+    pub(super) fn priority_facts(pid: i32) -> Option<super::PriorityFacts> {
+        probe_one(pid).map(|f| super::PriorityFacts {
+            start_us: f.start_us,
+            uid: f.uid,
+            memguard: f.ident.memguard,
+        })
+    }
+
     pub(crate) fn argv_of(pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
         match read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20) {
             Ok(raw) => Some(super::split_cmdline(&raw)),
@@ -4480,6 +4600,14 @@ mod os {
     }
 
     pub(crate) fn argv_of(_pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
+        None
+    }
+
+    pub(crate) fn argv_sized(_pid: i32) -> Option<Vec<String>> {
+        None
+    }
+
+    pub(super) fn priority_facts(_pid: i32) -> Option<super::PriorityFacts> {
         None
     }
 

@@ -25,6 +25,9 @@ struct Fake {
     /// Where the journal is, so a stop can check it was written first.
     journal_dir: Arc<Mutex<Option<PathBuf>>>,
     journaled_before_stop: Arc<Mutex<Vec<(i32, bool)>>>,
+    /// Set when a priority change found the ledger locked for good: the caller
+    /// held it across the call. (Another test's brief hold is waited out.)
+    ledger_held_across_a_call: Arc<Mutex<bool>>,
 }
 
 impl Fake {
@@ -79,7 +82,7 @@ impl Fake {
         }
         match live.get(&pid) {
             Some(start) if *start == start_us => Ok(()),
-            Some(_) => Err(Err("pid now belongs to a different process".into())),
+            Some(_) => Err(Err("pid was recycled by a newer process".into())),
             None => Err(Ok(Delivery::Gone)),
         }
     }
@@ -87,6 +90,18 @@ impl Fake {
 
 impl Actuator for Fake {
     fn set_background(&self, pid: i32, start_us: u64, enable: bool) -> Result<bool, String> {
+        // The ledger must not be held across a priority change: the steward
+        // and every other caller would wait behind a pass over hundreds.
+        let free = (0..100).any(|_| {
+            if LEDGER.try_lock().is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+            false
+        });
+        if !free {
+            *self.ledger_held_across_a_call.lock().unwrap() = true;
+        }
         self.calls.lock().unwrap().push(Call::Bg(pid, enable));
         match self.check(pid, start_us) {
             Ok(()) => {}
@@ -124,6 +139,11 @@ impl Actuator for Fake {
             Err(outcome) => outcome,
         }
     }
+
+    fn is_background(&self, pid: i32, start_us: u64) -> Option<bool> {
+        self.check(pid, start_us).ok()?;
+        Some(self.background.lock().unwrap().contains(&pid))
+    }
 }
 
 #[derive(Clone)]
@@ -132,7 +152,12 @@ struct FakeProbe {
     cwd: Arc<Mutex<HashMap<i32, PathBuf>>>,
     env: Arc<Mutex<HashMap<i32, Vec<String>>>>,
     env_unreadable: Arc<Mutex<HashSet<i32>>>,
-    leases: Arc<Mutex<Result<BTreeSet<i32>, String>>>,
+    /// The arguments of a process; every other one is an agent's tool shell.
+    argv: Arc<Mutex<HashMap<i32, Vec<String>>>>,
+    argv_unreadable: Arc<Mutex<HashSet<i32>>>,
+    leases: Arc<Mutex<Result<LeaseBoard, String>>>,
+    /// How many times the environment of each process was read.
+    env_reads: Arc<Mutex<HashMap<i32, u32>>>,
 }
 
 impl FakeProbe {
@@ -143,9 +168,29 @@ impl FakeProbe {
             cwd: Arc::default(),
             env: Arc::default(),
             env_unreadable: Arc::default(),
-            leases: Arc::new(Mutex::new(Ok(BTreeSet::new()))),
+            argv: Arc::default(),
+            argv_unreadable: Arc::default(),
+            leases: Arc::new(Mutex::new(Ok(LeaseBoard::default()))),
+            env_reads: Arc::default(),
         }
     }
+
+    /// The board holds `holders` and `waiters`.
+    fn board(&self, holders: &[i32], waiters: &[i32]) {
+        *self.leases.lock().unwrap() = Ok(LeaseBoard {
+            holders: holders.iter().copied().collect(),
+            waiters: waiters.iter().copied().collect(),
+        });
+    }
+}
+
+/// What Claude Code's Bash tool starts a command with.
+fn tool_shell_argv() -> Vec<String> {
+    vec![
+        "/bin/zsh".into(),
+        "-c".into(),
+        "source /Users/x/.claude/shell-snapshots/snapshot-zsh-1795-abc.sh 2>/dev/null || true && eval 'cargo build'".into(),
+    ]
 }
 
 impl Probe for FakeProbe {
@@ -161,6 +206,7 @@ impl Probe for FakeProbe {
     }
 
     fn environment(&self, pid: i32) -> Option<Vec<String>> {
+        *self.env_reads.lock().unwrap().entry(pid).or_default() += 1;
         if self.env_unreadable.lock().unwrap().contains(&pid) {
             return None;
         }
@@ -174,7 +220,21 @@ impl Probe for FakeProbe {
         )
     }
 
-    fn lease_pids(&self) -> Result<BTreeSet<i32>, String> {
+    fn argv(&self, pid: i32) -> Option<Vec<String>> {
+        if self.argv_unreadable.lock().unwrap().contains(&pid) {
+            return None;
+        }
+        Some(
+            self.argv
+                .lock()
+                .unwrap()
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(tool_shell_argv),
+        )
+    }
+
+    fn lease_board(&self) -> Result<LeaseBoard, String> {
         self.leases.lock().unwrap().clone()
     }
 }
@@ -195,6 +255,8 @@ struct Rig {
     dir: tempfile::TempDir,
     _worktree: tempfile::TempDir,
     now: Instant,
+    /// What the lease board says to each tick.
+    refuses: bool,
 }
 
 impl Rig {
@@ -228,12 +290,19 @@ impl Rig {
             dir,
             _worktree: worktree,
             now: Instant::now(),
+            refuses: false,
         }
     }
 
     fn tick(&mut self, input: &GovernorInput, table: &ReliefTable) {
         self.now += STEP;
-        self.relief.tick(self.now, input, &|| table.clone());
+        self.relief
+            .tick(self.now, input, self.refuses, &|| table.clone());
+    }
+
+    /// The ledger namespace this rig's relief and steward calls share.
+    fn ns(&self) -> PathBuf {
+        self.dir.path().to_path_buf()
     }
 
     fn ticks(&mut self, n: usize, input: impl Fn(usize) -> GovernorInput, table: &ReliefTable) {
@@ -250,14 +319,33 @@ fn input(level: Level, swap_mib: u64) -> GovernorInput {
     input
 }
 
-/// Severe, with swap climbing `rate` MiB per sample from 2 GiB.
-fn rising(rate: u64) -> impl Fn(usize) -> GovernorInput {
-    move |i| input(Level::Critical, 2048 + rate * i as u64)
+/// Swap, in MiB, at which the default thresholds read Severe (0.75 of 64 GiB
+/// is 48 GiB; this is a margin above it).
+const SEVERE_SWAP_MIB: u64 = 52 * 1024;
+
+/// A host that reads Severe through *swap* with the kernel at Warn: memory
+/// pressure is real but not pinned (the kernel is not Critical, the compressor
+/// is not thrashing), so a rising swap is what worsens it and a flat one is
+/// not. `above` MiB over the Severe floor.
+fn severe(above: u64) -> GovernorInput {
+    input(Level::Warn, SEVERE_SWAP_MIB + above)
 }
 
-/// Severe, with swap parked at 40 GiB.
+/// Severe, with swap climbing `rate` MiB per sample.
+fn rising(rate: u64) -> impl Fn(usize) -> GovernorInput {
+    move |i| severe(2048 + rate * i as u64)
+}
+
+/// Severe, with swap parked high.
 fn flat(_: usize) -> GovernorInput {
-    input(Level::Critical, 40 * 1024)
+    severe(40 * 1024)
+}
+
+/// Kernel pressure Critical, swap flat: pinned at the edge.
+fn critical_flat(_: usize) -> GovernorInput {
+    let mut input = GovernorInput::test_pressure(Level::Critical);
+    input.readings.swap_used = Reading::Value(2048 * MIB);
+    input
 }
 
 fn proc(pid: i32, ppid: i32, name: &str, mib: u64) -> ReliefProc {
@@ -337,6 +425,25 @@ fn severe_sample(swap_mib: u64, segment_pct: f64) -> Sample {
         tier: Some((Tier::Severe, Some(Binding::Swap))),
         swap_used: Some(swap_mib * MIB),
         segment_pct: Some(segment_pct),
+        ..Sample::default()
+    }
+}
+
+/// [`severe_sample`] with the kernel at Warn, so rung A has a cause.
+fn warn_sample(swap_mib: u64, segment_pct: f64) -> Sample {
+    Sample {
+        cause: true,
+        ..severe_sample(swap_mib, segment_pct)
+    }
+}
+
+/// Pinned at the edge: kernel Critical, swap as given.
+fn critical_sample(swap_mib: u64) -> Sample {
+    Sample {
+        tier: Some((Tier::Severe, Some(Binding::MemoryPressure))),
+        cause: true,
+        pinned: true,
+        ..severe_sample(swap_mib, 10.0)
     }
 }
 
@@ -356,11 +463,121 @@ fn severe_for_sixty_seconds_with_rising_swap_begins_a_freeze_on_the_thirtieth_sa
 
 #[test]
 fn a_high_but_flat_swap_never_begins_a_freeze() {
-    // 400 samples (13 minutes) of Severe with swap parked high.
-    let out = trigger_run(|_| severe_sample(40 * 1024, 10.0), 400);
+    // 400 samples (13 minutes) of Severe with swap parked high and the kernel
+    // at Warn.
+    let out = trigger_run(|_| warn_sample(40 * 1024, 10.0), 400);
     assert!(out.iter().all(|(_, v)| v.freeze == Step::Hold));
-    // ...though rung A holds the whole time.
+    // ...though rung A holds the whole time: the kernel is complaining.
     assert!(out.last().unwrap().1.slow);
+}
+
+#[test]
+fn a_high_flat_swap_with_a_normal_kernel_slows_nobody() {
+    // Swap does not drain after a recovery: 400 samples at Severe by swap
+    // *level* alone, the kernel Normal, the compressor idle, nothing rising.
+    // That is a host that was in trouble, not one that is.
+    let out = trigger_run(|_| severe_sample(60 * 1024, 10.0), 400);
+    assert!(
+        out.iter().all(|(_, v)| !v.slow),
+        "rung A must not turn on for swap level alone"
+    );
+    assert!(out.iter().all(|(_, v)| v.freeze == Step::Hold));
+}
+
+#[test]
+fn a_swap_that_is_rising_slows_without_the_kernel_saying_so() {
+    // Rising swap is a cause of its own: 15 samples are enough to see it, and
+    // three more to enter.
+    let out = trigger_run(|i| severe_sample(2048 + 100 * i as u64, 10.0), 40);
+    let first = out.iter().find(|(_, v)| v.slow).expect("it slows").0;
+    assert!(
+        (SLOW_TREND_SAMPLES.min(2 * TREND_ENDS)..SLOW_TREND_SAMPLES + 5).contains(&first),
+        "slowed at sample {first}"
+    );
+}
+
+#[test]
+fn slowing_ends_when_the_cause_does_even_though_swap_stays_high() {
+    // The kernel complains for 20 samples, then goes Normal; swap stays high.
+    let out = trigger_run(
+        |i| {
+            if i < 20 {
+                warn_sample(60 * 1024, 10.0)
+            } else {
+                severe_sample(60 * 1024, 10.0)
+            }
+        },
+        40,
+    );
+    assert!(out[19].1.slow);
+    assert!(
+        !out[20 + EXIT_SAMPLES as usize].1.slow,
+        "released {EXIT_SAMPLES} samples after the cause ended"
+    );
+}
+
+#[test]
+fn a_critical_kernel_that_is_flat_still_begins_a_freeze() {
+    // Nothing rises: kernel Critical for 60 s is failing on its own.
+    let out = trigger_run(|_| critical_sample(2048), 40);
+    let first = out
+        .iter()
+        .find(|(_, v)| v.freeze == Step::Begin)
+        .expect("a pinned kernel begins a freeze")
+        .0;
+    assert_eq!(first, SEVERE_SAMPLES as usize - 1);
+}
+
+#[test]
+fn compressor_segments_at_ninety_five_percent_count_as_worsening_when_flat() {
+    let at = |pct: f64| {
+        trigger_run(
+            |_| Sample {
+                pinned: pct >= PINNED_SEGMENT_PCT,
+                cause: true,
+                ..severe_sample(2048, pct)
+            },
+            40,
+        )
+        .iter()
+        .any(|(_, v)| v.freeze == Step::Begin)
+    };
+    assert!(at(96.0), "segments pinned at 96% of the limit");
+    assert!(!at(90.0), "90% and flat is not pinned");
+}
+
+#[test]
+fn a_pinned_freeze_is_not_ended_by_flat_but_a_swap_level_one_is() {
+    let resumed = |feed: &dyn Fn(usize) -> Sample| {
+        let mut trigger = Trigger::default();
+        let mut now = Instant::now();
+        let mut began = None;
+        for i in 0..200 {
+            now += STEP;
+            let verdict = trigger.observe(now, &feed(i));
+            match verdict.freeze {
+                Step::Begin => {
+                    trigger.began(now, true);
+                    began = Some(i);
+                }
+                Step::Resume(reason) => return Some((began?, i, reason)),
+                Step::Hold => {}
+            }
+        }
+        None
+    };
+    // Rising to begin, then parked: the swap-level case resumes flat.
+    let swap =
+        resumed(&|i| warn_sample(2048 + if i < 40 { 100 * i as u64 } else { 100 * 40 }, 10.0));
+    let (began, at, reason) = swap.expect("a flat swap ends the freeze");
+    assert_eq!(reason, ResumeReason::Flat);
+    assert!(at - began >= FLAT_SAMPLES);
+    // Kernel Critical the whole time: nothing to call flat.
+    assert_eq!(
+        resumed(&|_| critical_sample(2048)),
+        None,
+        "a pinned kernel is not 'flat': the freeze runs to its cap, not before"
+    );
 }
 
 #[test]
@@ -401,6 +618,8 @@ fn unreadable_readings_never_begin_a_freeze() {
             tier: Some((Tier::Severe, Some(Binding::MemoryPressure))),
             swap_used: None,
             segment_pct: None,
+            cause: true,
+            pinned: false,
         },
         200,
     );
@@ -444,6 +663,8 @@ fn slowing_follows_elevated_for_three_samples_and_lets_go_after_five_quiet_ones(
         tier: Some((Tier::Elevated, Some(Binding::MemoryPressure))),
         swap_used: None,
         segment_pct: None,
+        cause: true,
+        pinned: false,
     };
     let clear = Sample {
         tier: Some((Tier::Clear, None)),
@@ -613,6 +834,7 @@ fn a_freeze_ends_when_the_tier_drops_and_unreadable_readings_never_hold_it() {
                 tier: Some((Tier::Clear, None)),
                 swap_used: Some(2048 * MIB),
                 segment_pct: Some(10.0),
+                ..Sample::default()
             },
         ),
         (
@@ -621,6 +843,7 @@ fn a_freeze_ends_when_the_tier_drops_and_unreadable_readings_never_hold_it() {
                 tier: None,
                 swap_used: None,
                 segment_pct: None,
+                ..Sample::default()
             },
         ),
     ] {
@@ -691,12 +914,26 @@ fn a_freeze_that_selected_nothing_waits_before_looking_again() {
 // ---------------------------------------------------------------------------
 
 fn pick(table: &ReliefTable, probe: &FakeProbe, room: usize) -> Result<Vec<Selection>, String> {
+    pick_while(table, probe, room, false)
+}
+
+/// [`pick`] while the lease board is (not) refusing new builds.
+fn pick_while(
+    table: &ReliefTable,
+    probe: &FakeProbe,
+    room: usize,
+    refusing: bool,
+) -> Result<Vec<Selection>, String> {
     select(
         table,
         probe,
         &|_| true,
-        &BTreeSet::new(),
-        room,
+        &Want {
+            busy: &BTreeSet::new(),
+            room,
+            refusing,
+        },
+        &mut MarkCache::default(),
         &mut Vec::new(),
     )
 }
@@ -766,16 +1003,25 @@ fn a_process_with_a_heavier_footprint_loses_to_the_exemptions() {
 }
 
 #[test]
-fn a_build_lease_holder_or_waiter_and_everything_under_it_is_never_selected() {
+fn a_build_lease_waiter_and_everything_under_it_is_never_selected() {
     let (probe, _w) = fresh_probe();
-    // The holder is the cargo: the subtree and its rustc are both barred.
-    *probe.leases.lock().unwrap() = Ok(BTreeSet::from([102]));
-    assert!(pick(&standard(), &probe, 3).unwrap().is_empty());
-    // The holder is a process inside the subtree.
-    *probe.leases.lock().unwrap() = Ok(BTreeSet::from([103]));
-    assert!(pick(&standard(), &probe, 3).unwrap().is_empty());
-    // Another build's holder leaves this one alone.
-    *probe.leases.lock().unwrap() = Ok(BTreeSet::from([4242]));
+    // The waiter is the cargo: the subtree and its rustc are both barred,
+    // whether or not the board is refusing.
+    probe.board(&[], &[102]);
+    for refusing in [false, true] {
+        assert!(pick_while(&standard(), &probe, 3, refusing)
+            .unwrap()
+            .is_empty());
+    }
+    // The waiter is a process inside the subtree.
+    probe.board(&[], &[103]);
+    for refusing in [false, true] {
+        assert!(pick_while(&standard(), &probe, 3, refusing)
+            .unwrap()
+            .is_empty());
+    }
+    // Another build's waiter leaves this one alone.
+    probe.board(&[], &[4242]);
     assert_eq!(pick(&standard(), &probe, 3).unwrap().len(), 1);
     // A board that could not be read freezes nothing, and says why.
     *probe.leases.lock().unwrap() = Err("slot-3 unreadable".into());
@@ -784,11 +1030,44 @@ fn a_build_lease_holder_or_waiter_and_everything_under_it_is_never_selected() {
 }
 
 #[test]
-fn trees_carrying_a_held_marker_or_an_unreadable_environment_are_never_selected() {
+fn a_build_lease_holder_is_selected_only_while_the_board_is_refusing() {
+    let (probe, _w) = fresh_probe();
+    // The holder is the cargo.
+    probe.board(&[102], &[]);
+    assert!(
+        pick_while(&standard(), &probe, 3, false)
+            .unwrap()
+            .is_empty(),
+        "a board that takes builds leaves its holders alone"
+    );
+    let picks = pick_while(&standard(), &probe, 3, true).unwrap();
+    assert_eq!(
+        picks.len(),
+        1,
+        "a refusing board frees its holder for rung B"
+    );
+    assert_eq!(picks[0].root.pid, 102);
+    assert!(
+        picks[0].holder,
+        "the selection says a lease holder is in it"
+    );
+    // The holder is a process inside the subtree: same.
+    probe.board(&[103], &[]);
+    assert!(pick_while(&standard(), &probe, 3, false)
+        .unwrap()
+        .is_empty());
+    assert!(pick_while(&standard(), &probe, 3, true).unwrap()[0].holder);
+    // A tree with no holder in it says so.
+    probe.board(&[4242], &[]);
+    assert!(!pick(&standard(), &probe, 3).unwrap()[0].holder);
+}
+
+#[test]
+fn a_held_marker_in_a_subtree_is_eligible_only_while_the_board_is_refusing() {
     for marker in [
-        "MAC_HEAVY_LABEL=go-test",
         "GITPULSE_LEASE_HELD=2",
         "CARGO_SLOT_HELD=1",
+        "GITPULSE_LEASE_HELD=anything",
     ] {
         let (probe, _w) = fresh_probe();
         probe
@@ -797,10 +1076,44 @@ fn trees_carrying_a_held_marker_or_an_unreadable_environment_are_never_selected(
             .unwrap()
             .insert(103, vec!["PATH=/usr/bin".into(), marker.into()]);
         assert!(
-            pick(&standard(), &probe, 3).unwrap().is_empty(),
-            "{marker} on a member bars the subtree"
+            pick_while(&standard(), &probe, 3, false)
+                .unwrap()
+                .is_empty(),
+            "{marker}: barred while the board takes builds"
         );
+        let picks = pick_while(&standard(), &probe, 3, true).unwrap();
+        assert_eq!(
+            picks.len(),
+            1,
+            "{marker}: eligible while it refuses (any value)"
+        );
+        assert!(picks[0].holder);
     }
+    // mac_heavy.sh's marker is a person's heavy job: never, refusing or not.
+    let (probe, _w) = fresh_probe();
+    probe
+        .env
+        .lock()
+        .unwrap()
+        .insert(103, vec!["MAC_HEAVY_LABEL=go-test".into()]);
+    for refusing in [false, true] {
+        assert!(pick_while(&standard(), &probe, 3, refusing)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn trees_carrying_a_heavy_marker_or_an_unreadable_environment_are_never_selected() {
+    let (probe, _w) = fresh_probe();
+    probe.env.lock().unwrap().insert(
+        103,
+        vec!["PATH=/usr/bin".into(), "MAC_HEAVY_LABEL=go-test".into()],
+    );
+    assert!(
+        pick(&standard(), &probe, 3).unwrap().is_empty(),
+        "MAC_HEAVY_LABEL on a member bars the subtree"
+    );
     // An empty value is not a marker (the lease wrapper unsets, not blanks).
     let (probe, _w) = fresh_probe();
     probe
@@ -875,7 +1188,20 @@ fn only_launched_sessions_in_trusted_repositories_are_candidates() {
     );
     let table = standard();
     let mut notes = Vec::new();
-    let untrusted = select(&table, &probe, &|_| false, &BTreeSet::new(), 3, &mut notes).unwrap();
+    let want = Want {
+        busy: &BTreeSet::new(),
+        room: 3,
+        refusing: false,
+    };
+    let untrusted = select(
+        &table,
+        &probe,
+        &|_| false,
+        &want,
+        &mut MarkCache::default(),
+        &mut notes,
+    )
+    .unwrap();
     assert!(untrusted.is_empty());
     assert!(notes[0].contains("not trusted"), "{notes:?}");
     // A session whose working directory cannot be read is not guessed at.
@@ -887,16 +1213,19 @@ fn only_launched_sessions_in_trusted_repositories_are_candidates() {
         fn environment(&self, pid: i32) -> Option<Vec<String>> {
             self.0.environment(pid)
         }
-        fn lease_pids(&self) -> Result<BTreeSet<i32>, String> {
-            self.0.lease_pids()
+        fn argv(&self, pid: i32) -> Option<Vec<String>> {
+            self.0.argv(pid)
+        }
+        fn lease_board(&self) -> Result<LeaseBoard, String> {
+            self.0.lease_board()
         }
     }
     let picks = select(
         &standard(),
         &Blind(probe),
         &|_| true,
-        &BTreeSet::new(),
-        3,
+        &want,
+        &mut MarkCache::default(),
         &mut Vec::new(),
     )
     .unwrap();
@@ -945,7 +1274,19 @@ fn a_session_holds_one_subtree_and_the_host_three() {
     assert!(pick(&table, &probe, 0).unwrap().is_empty());
     // A session that already has one frozen is not chosen again.
     let busy = BTreeSet::from([(240, 1_000_000 + 240)]);
-    let picks = select(&table, &probe, &|_| true, &busy, 3, &mut Vec::new()).unwrap();
+    let picks = select(
+        &table,
+        &probe,
+        &|_| true,
+        &Want {
+            busy: &busy,
+            room: 3,
+            refusing: false,
+        },
+        &mut MarkCache::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert!(picks.iter().all(|p| p.session_pid != 240));
 }
 
@@ -1066,10 +1407,10 @@ fn a_frozen_tree_resumes_when_deterioration_is_flat_though_swap_stays_high() {
     assert!(rig.fake.conts().is_empty());
     // Swap parks at 5 GiB, Severe throughout.
     for n in 1..FLAT_SAMPLES {
-        rig.tick(&input(Level::Critical, 5000), &table);
+        rig.tick(&severe(5000), &table);
         assert!(rig.fake.conts().is_empty(), "sample {n} after the freeze");
     }
-    rig.tick(&input(Level::Critical, 5000), &table);
+    rig.tick(&severe(5000), &table);
     assert_eq!(
         rig.fake.conts(),
         [103, 102],
@@ -1097,7 +1438,7 @@ fn the_ten_minute_cap_resumes_and_is_counted() {
     assert_eq!(rig.fake.stops(), [102, 103]);
     // Swap keeps climbing, so only the cap can end it.
     for n in 0..400usize {
-        rig.tick(&input(Level::Critical, 9000 + 100 * n as u64), &table);
+        rig.tick(&severe(9000 + 100 * n as u64), &table);
         if !rig.fake.conts().is_empty() {
             break;
         }
@@ -1191,7 +1532,18 @@ fn what_has_ended_leaves_the_ledger_the_cap_and_the_journal() {
     let mut listed: Vec<i32> = journal.entries.iter().map(|e| e.pid).collect();
     listed.sort_unstable();
     assert_eq!(listed, [101, 105, 106]);
-    assert!(lock(&LEDGER).get(&102).is_none_or(|(s, _)| *s != 1_000_102));
+    assert!(ledger_get(&lock(&LEDGER), &rig.ns(), 102).is_none());
+    // The build ended but its processes are still running (they left the
+    // agent's tree): what was slowed is put back, not forgotten in the
+    // background.
+    let mut restored = rig.fake.restored();
+    restored.sort_unstable();
+    assert_eq!(restored, [102, 103], "restored on absence from the trees");
+    assert!(
+        !rig.fake.background.lock().unwrap().contains(&102)
+            && !rig.fake.background.lock().unwrap().contains(&103),
+        "and they read back at normal priority"
+    );
     // A pid whose start time differs is a new process, not the old one.
     let mut reused = after.clone();
     reused.sessions[0].members.push(ReliefProc {
@@ -1262,14 +1614,14 @@ fn a_journal_another_running_gitpulse_wrote_is_left_alone() {
     let fake = Fake::default();
     // Written by a process that is still running, and is not this one: its.
     write(parent, live_start);
-    let replay = replay_journal(dir.path(), &fake);
+    let replay = replay_journal(dir.path(), dir.path(), &fake);
     assert_eq!(replay.left_to, Some(parent));
     assert!(fake.calls().is_empty());
     assert!(journal_path(dir.path()).exists(), "and its journal stays");
     // The same pid with another start time is a recycled one: the writer is
     // gone, so the journal is ours to replay.
     write(parent, live_start + 1);
-    let replay = replay_journal(dir.path(), &fake);
+    let replay = replay_journal(dir.path(), dir.path(), &fake);
     assert_eq!(replay.left_to, None);
     assert_eq!(fake.conts(), [301]);
     assert!(!journal_path(dir.path()).exists());
@@ -1302,18 +1654,14 @@ fn resume_all_continues_every_frozen_process_through_the_journal_and_holds_off_t
         "cleared after the attempt"
     );
     // The relief takes account on its next tick, with nothing signalled twice.
-    rig.tick(&input(Level::Critical, 9000), &table);
+    rig.tick(&severe(9000), &table);
     assert!(rig.relief.status.frozen.is_empty());
     assert_eq!(rig.fake.conts(), [103, 102]);
     let note = rig.relief.status.last_action.clone().unwrap();
     assert_eq!(note.kind, ActionKind::Resume);
     assert!(note.detail.contains("the person asked"), "{note:?}");
     // Severe and still worsening for a long time: held off, nothing refreezes.
-    rig.ticks(
-        120,
-        |i| input(Level::Critical, 9000 + 100 * i as u64),
-        &table,
-    );
+    rig.ticks(120, |i| severe(9000 + 100 * i as u64), &table);
     assert_eq!(rig.fake.stops(), [102, 103]);
     // Once the tier has dropped below Severe, a new episode may freeze again.
     rig.ticks(
@@ -1335,7 +1683,7 @@ fn resume_all_without_holding_off_lets_the_next_severe_minute_freeze_again() {
     assert!(!outcome.held_off);
     rig.ticks(
         SEVERE_SAMPLES as usize + 1,
-        |i| input(Level::Critical, 9000 + 100 * i as u64),
+        |i| severe(9000 + 100 * i as u64),
         &table,
     );
     assert_eq!(rig.fake.stops().len(), 4);
@@ -1355,7 +1703,7 @@ fn resume_all_reports_each_pid_and_records_a_refused_one_as_failed() {
     assert!(outcome.results[0]
         .detail
         .as_deref()
-        .is_some_and(|d| d.contains("different process")));
+        .is_some_and(|d| d.contains("recycled")));
     assert_eq!(
         rig.fake.conts(),
         [103, 102],
@@ -1408,7 +1756,11 @@ fn the_snapshot_says_what_is_frozen_and_what_was_last_done() {
     let snap = &rig.relief.status;
     assert_eq!(snap.mode, SupervisorMode::Act);
     assert_eq!(snap.rung, Rung::Freeze);
-    assert_eq!(snap.binding, Some(Binding::MemoryPressure));
+    assert_eq!(
+        snap.binding,
+        Some(Binding::Swap),
+        "Severe through swap, with the kernel at Warn"
+    );
     assert_eq!(snap.slowed, 5);
     let f = &snap.frozen[0];
     assert_eq!((f.root_pid, f.start_us), (102, 1_000_102));
@@ -1424,7 +1776,7 @@ fn the_snapshot_says_what_is_frozen_and_what_was_last_done() {
     // A refused signal is a failure with its pid, and a cap resume is its own kind.
     rig.fake.live.lock().unwrap().insert(103, 5);
     for n in 0..400usize {
-        rig.tick(&input(Level::Critical, 9000 + 100 * n as u64), &table);
+        rig.tick(&severe(9000 + 100 * n as u64), &table);
         if rig.relief.status.frozen.is_empty() {
             break;
         }
@@ -1438,7 +1790,7 @@ fn the_snapshot_says_what_is_frozen_and_what_was_last_done() {
     assert!(snap
         .failures
         .iter()
-        .any(|f| f.pid == Some(103) && f.what.contains("different process")));
+        .any(|f| f.pid == Some(103) && f.what.contains("recycled")));
     assert!(snap.failure_count >= 1);
 }
 
@@ -1447,7 +1799,8 @@ fn nothing_to_freeze_is_a_refused_action() {
     let mut rig = Rig::new(SupervisorMode::Act);
     let table = standard();
     live_all(&rig, &table);
-    *rig.probe.leases.lock().unwrap() = Ok(BTreeSet::from([102]));
+    // A waiter on the build: never eligible, whatever the board says.
+    rig.probe.board(&[], &[102]);
     rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
     assert_eq!(
         rig.relief.status.last_action.as_ref().unwrap().kind,
@@ -1563,13 +1916,13 @@ fn a_process_that_appears_under_a_frozen_subtree_is_stopped_too() {
     let mut grown = table.clone();
     grown.sessions[0].members.push(proc(120, 103, "cc1", 50));
     live_all(&rig, &grown);
-    rig.tick(&input(Level::Critical, 9000), &grown);
+    rig.tick(&severe(9000), &grown);
     assert_eq!(rig.fake.stops(), [102, 103, 120]);
     assert_eq!(rig.relief.status.frozen[0].members, 3);
     // When the subtree's own root ends, the rest is let go at once.
     let mut ended = grown.clone();
     ended.sessions[0].members.retain(|m| m.pid != 102);
-    rig.tick(&input(Level::Critical, 9100), &ended);
+    rig.tick(&severe(9100), &ended);
     assert_eq!(rig.fake.conts(), [120, 103, 102]);
     assert!(rig.relief.status.frozen.is_empty());
 }
@@ -1610,7 +1963,7 @@ fn leaving_act_or_switching_off_puts_everything_back() {
     rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
     assert_eq!(rig.relief.status.frozen.len(), 1);
     *rig.mode.lock().unwrap() = SupervisorMode::Off;
-    rig.tick(&input(Level::Critical, 9000), &table);
+    rig.tick(&severe(9000), &table);
     assert_eq!(rig.fake.conts(), [103, 102]);
     let mut restored = rig.fake.restored();
     restored.sort_unstable();
@@ -1629,7 +1982,7 @@ fn switching_host_load_off_stands_the_relief_down_too() {
     let mut rig = Rig::new(SupervisorMode::Act);
     live_all(&rig, &table);
     rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
-    let mut off = input(Level::Critical, 9000);
+    let mut off = severe(9000);
     off.enabled = false;
     rig.tick(&off, &table);
     assert_eq!(rig.fake.conts(), [103, 102]);
@@ -1652,7 +2005,7 @@ fn a_recycled_pid_is_refused_and_recorded_as_failed() {
             .status
             .failures
             .iter()
-            .any(|f| f.what.contains("different process")),
+            .any(|f| f.what.contains("recycled")),
         "{:?}",
         rig.relief.status.failures
     );
@@ -1722,7 +2075,7 @@ fn a_journaled_freeze_is_resumed_by_a_new_relief_and_a_recycled_entry_is_a_failu
             .status
             .failures
             .iter()
-            .any(|f| f.what.contains("302") && f.what.contains("different process")),
+            .any(|f| f.what.contains("302") && f.what.contains("recycled")),
         "{:?}",
         relief.status.failures
     );
@@ -1741,7 +2094,7 @@ fn an_unreadable_journal_is_cleared_and_reported() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(JOURNAL_DIR)).unwrap();
     std::fs::write(journal_path(dir.path()), b"{ not json").unwrap();
-    let replay = replay_journal(dir.path(), &Fake::default());
+    let replay = replay_journal(dir.path(), dir.path(), &Fake::default());
     assert_eq!(replay.failures.len(), 1);
     assert!(
         replay.failures[0].contains("could not be read"),
@@ -1790,7 +2143,7 @@ fn the_steward_cannot_put_back_what_the_relief_slowed() {
     // The steward's "Manvi is not configured: restore" path.
     let before = rig.fake.calls().len();
     assert_eq!(
-        steward_throttle_with(&rig.fake, 9_000_102, start, false),
+        steward_throttle_with(&rig.fake, &rig.ns(), 9_000_102, start, false),
         Ok(false),
         "refused as not its own"
     );
@@ -1822,7 +2175,7 @@ fn what_the_steward_slowed_is_left_to_the_steward() {
     live_all(&rig, &table);
     let start = 1_000_000 + 9_100_102u64;
     assert_eq!(
-        steward_throttle_with(&rig.fake, 9_100_102, start, true),
+        steward_throttle_with(&rig.fake, &rig.ns(), 9_100_102, start, true),
         Ok(true)
     );
     rig.ticks(5, |_| input(Level::Warn, 0), &table);
@@ -1838,7 +2191,7 @@ fn what_the_steward_slowed_is_left_to_the_steward() {
     );
     // The steward's own restore still works.
     assert_eq!(
-        steward_throttle_with(&rig.fake, 9_100_102, start, false),
+        steward_throttle_with(&rig.fake, &rig.ns(), 9_100_102, start, false),
         Ok(true)
     );
     assert!(!rig.fake.background.lock().unwrap().contains(&9_100_102));
@@ -1883,6 +2236,640 @@ fn a_child_that_inherited_the_background_is_recorded_as_the_reliefs_and_restored
     rig.ticks(5, |_| input(Level::Warn, 0), &table);
     rig.ticks(EXIT_SAMPLES as usize, |_| input(Level::Normal, 0), &table);
     assert!(rig.fake.restored().is_empty(), "{:?}", rig.fake.calls());
+}
+
+// ---------------------------------------------------------------------------
+// The lease ruling: a refusing board frees its holders; waiters never.
+// ---------------------------------------------------------------------------
+
+/// A relief in act mode, its lease board refusing new builds (or not).
+fn rig_with_board(refuses: bool, holders: &[i32], waiters: &[i32]) -> Rig {
+    let mut rig = Rig::new(SupervisorMode::Act);
+    rig.refuses = refuses;
+    rig.probe.board(holders, waiters);
+    rig
+}
+
+#[test]
+fn a_lease_holder_subtree_is_frozen_at_severe_while_the_board_refuses_and_a_waiter_never_is() {
+    let table = standard();
+    let mut rig = rig_with_board(true, &[102], &[]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(
+        rig.fake.stops(),
+        [102, 103],
+        "a holder, with the board refusing"
+    );
+    assert!(rig.relief.frozen[0].holder);
+
+    let mut rig = rig_with_board(false, &[102], &[]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert!(rig.fake.stops().is_empty(), "the board is taking builds");
+
+    let mut rig = rig_with_board(true, &[], &[102]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert!(
+        rig.fake.stops().is_empty(),
+        "a waiter is about to run: never, refusing or not"
+    );
+
+    let mut rig = rig_with_board(true, &[], &[]);
+    rig.probe
+        .env
+        .lock()
+        .unwrap()
+        .insert(103, vec!["MAC_HEAVY_LABEL=go-test".into()]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert!(rig.fake.stops().is_empty(), "a person's heavy job: never");
+}
+
+#[test]
+fn a_frozen_holder_resumes_on_the_tick_the_board_stops_refusing_while_swap_is_still_high() {
+    let table = standard();
+    let mut rig = rig_with_board(true, &[102], &[]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+    assert!(rig.fake.conts().is_empty());
+    // Swap is still climbing, so "flat" could not end this; the board does.
+    rig.refuses = false;
+    rig.tick(&severe(2048 + 100 * SEVERE_SAMPLES as u64), &table);
+    assert_eq!(rig.fake.conts(), [103, 102], "on that very tick");
+    assert!(rig.relief.status.frozen.is_empty());
+    let last = rig.relief.status.last_action.clone().unwrap();
+    assert_eq!(last.kind, ActionKind::Resume);
+    assert!(last.detail.contains("lease"), "{last:?}");
+    assert!(
+        read_journal(rig.dir.path())
+            .unwrap()
+            .is_none_or(|j| j.entries.iter().all(|e| e.rung != JournalRung::Freeze)),
+        "and its journal entries went with it"
+    );
+    // The board takes builds, so the holder is no longer eligible: nothing
+    // freezes it again however long swap climbs.
+    rig.ticks(100, |i| severe(9000 + 100 * i as u64), &table);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+}
+
+#[test]
+fn a_frozen_build_that_holds_no_lease_is_not_continued_when_the_board_opens() {
+    let table = standard();
+    let mut rig = rig_with_board(true, &[], &[]);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+    assert!(!rig.relief.frozen[0].holder);
+    rig.refuses = false;
+    rig.tick(&severe(2048 + 100 * SEVERE_SAMPLES as u64), &table);
+    assert!(rig.fake.conts().is_empty(), "its own conditions still hold");
+    assert_eq!(rig.relief.status.frozen.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Rung A needs a cause; rung B counts a pinned edge as worsening.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_high_flat_swap_under_a_normal_kernel_slows_nobody_and_releases_existing_slowing() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(200, |_| input(Level::Normal, 60 * 1024), &table);
+    assert!(rig.fake.calls().is_empty(), "{:?}", rig.fake.calls());
+    assert_eq!(rig.relief.status.rung, Rung::None);
+    assert_eq!(
+        rig.relief.status.tier,
+        Some(Tier::Severe),
+        "it did read Severe"
+    );
+
+    // Slowing that is already in force lets go once the cause has.
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(5, |_| input(Level::Warn, 0), &table);
+    assert_eq!(rig.relief.status.slowed, 5);
+    rig.ticks(
+        EXIT_SAMPLES as usize,
+        |_| input(Level::Normal, 60 * 1024),
+        &table,
+    );
+    assert_eq!(rig.relief.status.slowed, 0);
+    let mut restored = rig.fake.restored();
+    restored.sort_unstable();
+    assert_eq!(restored, [101, 102, 103, 105, 106]);
+}
+
+#[test]
+fn a_critical_kernel_with_flat_swap_freezes_and_stays_frozen_until_the_tier_eases() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, critical_flat, &table);
+    assert_eq!(rig.fake.stops(), [102, 103], "pinned at Critical for 60 s");
+    // 200 s more of the same: nothing is "flat" about a kernel at Critical.
+    rig.ticks(100, critical_flat, &table);
+    assert!(rig.fake.conts().is_empty(), "{:?}", rig.fake.conts());
+    rig.ticks(
+        SEVERE_BREAK_SAMPLES as usize,
+        |_| input(Level::Normal, 0),
+        &table,
+    );
+    assert_eq!(rig.fake.conts(), [103, 102]);
+}
+
+#[test]
+fn compressor_segments_pinned_near_their_limit_freeze_even_when_nothing_rises() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    let segments = |pct: u64| {
+        move |_: usize| {
+            let mut input = GovernorInput::test_pressure(Level::Normal);
+            input.readings.segments = Reading::Value(CompressorSegments {
+                total: pct,
+                limit: 100,
+            });
+            input
+        }
+    };
+    // 90 % is Severe by segments but is not the edge, and flat is not worsening.
+    rig.ticks(SEVERE_SAMPLES as usize + 10, segments(90), &table);
+    assert!(rig.fake.stops().is_empty(), "90% and flat");
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, segments(96), &table);
+    assert_eq!(rig.fake.stops(), [102, 103], "96% of the limit, flat");
+}
+
+// ---------------------------------------------------------------------------
+// Rung B enters only what is positively an agent's tool shell, and judges
+// late joiners by the same predicate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn only_a_shell_identified_as_an_agent_tool_shell_is_entered() {
+    let (probe, _w) = fresh_probe();
+    // An MCP server's launcher is a shell too: `zsh -c exec some-mcp`.
+    probe.argv.lock().unwrap().insert(
+        101,
+        vec![
+            "/bin/zsh".into(),
+            "-c".into(),
+            "exec context7-server --stdio".into(),
+        ],
+    );
+    assert!(pick(&standard(), &probe, 3).unwrap().is_empty());
+    // A shell whose arguments cannot be read is not identified either.
+    probe.argv.lock().unwrap().clear();
+    probe.argv_unreadable.lock().unwrap().insert(101);
+    assert!(pick(&standard(), &probe, 3).unwrap().is_empty());
+    // Claude Code's Bash tool shell, under any config directory.
+    probe.argv_unreadable.lock().unwrap().clear();
+    for config in ["/Users/x/.claude", "/Users/x/.claude-sarat"] {
+        probe.argv.lock().unwrap().insert(
+            101,
+            vec![
+                "/bin/zsh".into(),
+                "-c".into(),
+                format!("source {config}/shell-snapshots/snapshot-zsh-17-abc.sh && cargo build"),
+            ],
+        );
+        assert_eq!(pick(&standard(), &probe, 3).unwrap().len(), 1, "{config}");
+    }
+}
+
+#[test]
+fn a_late_joiner_is_judged_by_the_predicate_that_chose_the_subtree() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+    let locked = clean_worktree();
+    std::fs::write(locked.path().join(".git/index.lock"), b"").unwrap();
+    // Seven processes appear under the frozen rustc: only one may be stopped.
+    let mut grown = table.clone();
+    for (pid, name) in [
+        (120, "cc1"),
+        (121, "context7-mcp"),
+        (122, "ld"),
+        (123, "ld"),
+        (124, "ld"),
+        (125, "ld"),
+        (126, "git"),
+    ] {
+        grown.sessions[0].members.push(proc(pid, 103, name, 50));
+    }
+    live_all(&rig, &grown);
+    rig.probe
+        .env
+        .lock()
+        .unwrap()
+        .insert(122, vec!["MAC_HEAVY_LABEL=go-test".into()]);
+    rig.probe
+        .env
+        .lock()
+        .unwrap()
+        .insert(125, vec!["GITPULSE_LEASE_HELD=1".into()]);
+    rig.probe.board(&[], &[123]);
+    rig.probe
+        .cwd
+        .lock()
+        .unwrap()
+        .insert(124, locked.path().to_path_buf());
+    rig.tick(&severe(5000), &grown);
+    assert_eq!(
+        rig.fake.stops(),
+        [102, 103, 120],
+        "not the MCP server (121), the heavy job (122), the lease waiter (123), \
+         the one in a locked worktree (124), the lease-marker carrier (125), or git (126)"
+    );
+}
+
+#[test]
+fn late_joiners_are_not_stopped_when_the_lease_board_cannot_be_read() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let mut grown = table.clone();
+    grown.sessions[0].members.push(proc(120, 103, "cc1", 50));
+    live_all(&rig, &grown);
+    *rig.probe.leases.lock().unwrap() = Err("slot-1 unreadable".into());
+    rig.tick(&severe(5000), &grown);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+    assert!(rig
+        .relief
+        .status
+        .failures
+        .iter()
+        .any(|f| f.what.contains("slot-1 unreadable")));
+}
+
+// ---------------------------------------------------------------------------
+// The watchdog, the bounded shutdown, and a live writer's aged journal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_watchdog_continues_what_is_past_the_cap_and_its_grace_and_nothing_younger() {
+    let fake = Fake::default();
+    let watch = Watch::default();
+    let t0 = Instant::now();
+    let limit = t0 + FREEZE_CAP + WATCHDOG_GRACE;
+    watch.beat(limit);
+    watch.set(vec![
+        Watched {
+            pid: 1,
+            start_us: 10,
+            since: t0,
+        },
+        Watched {
+            pid: 2,
+            start_us: 20,
+            since: t0 + Duration::from_secs(300),
+        },
+    ]);
+    assert!(
+        watch.pass(&fake, limit - Duration::from_secs(1)).is_empty(),
+        "still inside the sampler's own cap plus the grace"
+    );
+    assert_eq!(watch.pass(&fake, limit), [(1, 10)]);
+    assert_eq!(fake.conts(), [1], "only the overdue one");
+    assert!(watch.pass(&fake, limit).is_empty(), "and only once");
+}
+
+#[test]
+fn the_watchdog_continues_everything_when_the_tick_stops_advancing() {
+    let fake = Fake::default();
+    let watch = Watch::default();
+    let t0 = Instant::now();
+    watch.beat(t0);
+    watch.set(vec![
+        Watched {
+            pid: 1,
+            start_us: 10,
+            since: t0,
+        },
+        Watched {
+            pid: 2,
+            start_us: 20,
+            since: t0,
+        },
+    ]);
+    assert!(watch
+        .pass(&fake, t0 + WATCHDOG_STALL - Duration::from_secs(1))
+        .is_empty());
+    watch.beat(t0 + Duration::from_secs(30));
+    assert!(
+        watch
+            .pass(&fake, t0 + WATCHDOG_STALL + Duration::from_secs(1))
+            .is_empty(),
+        "a tick at 30 s is a sampler that is alive"
+    );
+    assert_eq!(
+        watch.pass(&fake, t0 + Duration::from_secs(30) + WATCHDOG_STALL),
+        [(2, 20), (1, 10)],
+        "last stopped first"
+    );
+}
+
+#[test]
+fn a_freeze_the_sampler_can_no_longer_end_is_continued_by_the_watchdog_without_the_action_lock() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(rig.fake.stops(), [102, 103]);
+    let watch = rig.relief.watch();
+    // The tick hangs on a disk write, holding the action lock. The watchdog
+    // needs neither it nor the journal.
+    let hung = lock(&ACT);
+    let sent = watch.pass(&rig.fake, rig.now + WATCHDOG_STALL + STEP);
+    drop(hung);
+    assert_eq!(sent, [(103, 1_000_103), (102, 1_000_102)]);
+    assert_eq!(rig.fake.conts(), [103, 102]);
+}
+
+#[test]
+fn the_watch_follows_what_the_relief_freezes_and_resumes() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    let watch = rig.relief.watch();
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    assert_eq!(lock(&watch.state).frozen.len(), 2);
+    rig.ticks(
+        SEVERE_BREAK_SAMPLES as usize,
+        |_| input(Level::Normal, 0),
+        &table,
+    );
+    assert!(lock(&watch.state).frozen.is_empty());
+}
+
+#[test]
+fn shutdown_does_not_wait_for_a_hung_tick_and_continues_from_memory() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let watch = rig.relief.watch();
+    let hung = lock(&ACT);
+    let began = Instant::now();
+    let replayed = shutdown_within(
+        rig.dir.path(),
+        &rig.ns(),
+        Some(&*watch),
+        &rig.fake,
+        Duration::from_millis(150),
+    );
+    let took = began.elapsed();
+    drop(hung);
+    assert!(!replayed, "the action lock never came");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(
+        rig.fake.conts(),
+        [103, 102],
+        "continued from the memory copy"
+    );
+    assert!(
+        journal_path(rig.dir.path()).exists(),
+        "the journal is left for the next start"
+    );
+    // With the lock free, the journal is replayed as well.
+    assert!(shutdown_within(
+        rig.dir.path(),
+        &rig.ns(),
+        Some(&*watch),
+        &rig.fake,
+        Duration::from_millis(150),
+    ));
+    assert!(!journal_path(rig.dir.path()).exists());
+}
+
+#[test]
+fn recovery_continues_what_a_live_writer_left_stopped_past_the_cap_and_its_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = std::os::unix::process::parent_id();
+    let live_start = crate::sysload::process_start_us(parent).expect("the parent is running");
+    let now = unix_ms();
+    let grace = u64::try_from((FREEZE_CAP + WATCHDOG_GRACE).as_millis()).unwrap();
+    let entry = |pid: i32, at: u64, rung: JournalRung| JournalEntry {
+        pid,
+        start_us: 1000 + pid as u64,
+        session_id: "300-1".into(),
+        at_unix_ms: at,
+        rung,
+    };
+    let entries = vec![
+        entry(301, now - grace - 1000, JournalRung::Freeze),
+        entry(302, now - 60_000, JournalRung::Freeze),
+        entry(303, now - grace - 1000, JournalRung::Slow),
+    ];
+    write_journal_as(dir.path(), &entries, parent, live_start).unwrap();
+    let fake = Fake::default();
+    let worktree = clean_worktree();
+    let mut relief = Relief::new(
+        dir.path().to_path_buf(),
+        Box::new(fake.clone()),
+        Box::new(FakeProbe::new(worktree.path())),
+        Box::new(|| SupervisorMode::Act),
+        Box::new(|_| true),
+    );
+    relief.recover();
+    assert_eq!(
+        fake.conts(),
+        [301],
+        "the one past the cap and the grace, and no other"
+    );
+    assert!(fake.restored().is_empty(), "slowed ones are the writer's");
+    let left = read_journal(dir.path()).unwrap().unwrap();
+    assert_eq!(left.writer_pid, parent, "the writer's file is untouched");
+    assert_eq!(left.entries, entries);
+}
+
+#[test]
+fn a_resume_all_that_lands_while_a_tick_waits_for_the_action_lock_is_seen_by_that_tick() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+    let dir = rig.dir.path().to_path_buf();
+    let before = external_of(&dir).generation;
+    let (now, sample) = (rig.now + STEP, severe(9000));
+    let held = lock(&ACT);
+    std::thread::scope(|scope| {
+        let relief = &mut rig.relief;
+        let tick = scope.spawn(move || relief.tick(now, &sample, false, &|| table.clone()));
+        // The tick is waiting for the lock. (A tick that read the generation
+        // before taking it would have read `before` by now.)
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let mut all = lock(&EXTERNAL);
+            let external = all.entry(dir.clone()).or_default();
+            external.generation += 1;
+            external.reason = "a late request".into();
+        }
+        drop(held);
+        tick.join().unwrap();
+    });
+    assert_eq!(rig.relief.seen_external, before + 1);
+    assert!(rig.relief.status.frozen.is_empty());
+    let note = rig.relief.status.last_action.clone().unwrap();
+    assert!(note.detail.contains("a late request"), "{note:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Slowing: restore what left the trees, restore inheritors, one namespace per
+// relief, and a bounded pass.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn putting_back_a_slowed_process_also_puts_back_the_children_that_inherited_its_priority() {
+    let table = standard();
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(5, |_| input(Level::Warn, 0), &table);
+    assert_eq!(rig.relief.status.slowed, 5);
+    // Children that started after the last pass inherited the priority; the
+    // relief never named them. One is the steward's own, one is a sibling of
+    // the agent's shell, under no process the relief slowed.
+    let mut grown = table.clone();
+    for (pid, ppid) in [(120, 102), (121, 103), (122, 102), (130, 100)] {
+        grown.sessions[0].members.push(proc(pid, ppid, "cc1", 50));
+    }
+    live_all(&rig, &grown);
+    for pid in [120, 121, 130] {
+        rig.fake.background.lock().unwrap().insert(pid);
+    }
+    let start = 1_000_122;
+    assert_eq!(
+        steward_throttle_with(&rig.fake, &rig.ns(), 122, start, true),
+        Ok(true)
+    );
+    // The last quiet sample ends the slowing, on a tick that makes no pass.
+    rig.ticks(
+        EXIT_SAMPLES as usize - 1,
+        |_| input(Level::Normal, 0),
+        &table,
+    );
+    rig.tick(&input(Level::Normal, 0), &grown);
+    let restored = rig.fake.restored();
+    assert!(
+        restored.contains(&120) && restored.contains(&121),
+        "inheritors of a slowed process: {restored:?}"
+    );
+    assert!(
+        !restored.contains(&122),
+        "the steward's own is the steward's"
+    );
+    assert!(!restored.contains(&130), "under nothing the relief slowed");
+    let background = rig.fake.background.lock().unwrap();
+    assert!(background.contains(&122) && background.contains(&130));
+}
+
+#[test]
+fn two_reliefs_that_share_pids_do_not_share_a_ledger() {
+    let table = standard();
+    let mut a = Rig::new(SupervisorMode::Act);
+    let mut b = Rig::new(SupervisorMode::Act);
+    live_all(&a, &table);
+    live_all(&b, &table);
+    // In A's namespace the steward owns the cargo.
+    assert_eq!(
+        steward_throttle_with(&a.fake, &a.ns(), 102, 1_000_102, true),
+        Ok(true)
+    );
+    b.ticks(ENTER_SAMPLES as usize, |_| input(Level::Warn, 0), &table);
+    assert!(
+        b.fake.backgrounded().contains(&102) && b.relief.slowed.contains_key(&102),
+        "B's relief is not told that A's steward owns pid 102"
+    );
+    a.ticks(ENTER_SAMPLES as usize, |_| input(Level::Warn, 0), &table);
+    assert!(
+        !a.relief.slowed.contains_key(&102),
+        "but in A's own namespace it does"
+    );
+}
+
+#[test]
+fn a_pass_slows_a_bounded_number_without_holding_the_ledger_and_the_rest_follow() {
+    let mut members = vec![proc(101, 100, "zsh", 10)];
+    members.extend((0..300).map(|n| proc(1000 + n, 101, "worker", 1)));
+    let table = ReliefTable {
+        sessions: vec![session(100, true, members)],
+    };
+    let mut rig = Rig::new(SupervisorMode::Act);
+    live_all(&rig, &table);
+    rig.ticks(ENTER_SAMPLES as usize, |_| input(Level::Warn, 0), &table);
+    assert_eq!(
+        rig.fake.backgrounded().len(),
+        MAX_SLOW_PER_PASS,
+        "the first pass is bounded"
+    );
+    rig.ticks(SLOW_PASS_EVERY as usize, |_| input(Level::Warn, 0), &table);
+    assert_eq!(
+        rig.fake.backgrounded().len(),
+        301,
+        "the next pass takes the rest"
+    );
+    assert!(
+        !*rig.fake.ledger_held_across_a_call.lock().unwrap(),
+        "no priority change ran with the ledger locked"
+    );
+    rig.ticks(EXIT_SAMPLES as usize, |_| input(Level::Normal, 0), &table);
+    assert_eq!(rig.fake.restored().len(), 301);
+    assert!(!*rig.fake.ledger_held_across_a_call.lock().unwrap());
+}
+
+#[test]
+fn environments_and_arguments_are_read_once_per_process_across_selections() {
+    let (probe, _w) = fresh_probe();
+    let mut marks = MarkCache::default();
+    let want = Want {
+        busy: &BTreeSet::new(),
+        room: 3,
+        refusing: false,
+    };
+    for _ in 0..4 {
+        let picks = select(
+            &standard(),
+            &probe,
+            &|_| true,
+            &want,
+            &mut marks,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(picks.len(), 1);
+    }
+    let reads = probe.env_reads.lock().unwrap().clone();
+    assert!(!reads.is_empty());
+    assert!(
+        reads.values().all(|n| *n == 1),
+        "an environment cannot change after exec, so it is read once: {reads:?}"
+    );
+    // A read that failed is not remembered as an answer.
+    let (probe, _w) = fresh_probe();
+    probe.env_unreadable.lock().unwrap().insert(102);
+    let mut marks = MarkCache::default();
+    for _ in 0..3 {
+        let _ = select(
+            &standard(),
+            &probe,
+            &|_| true,
+            &want,
+            &mut marks,
+            &mut Vec::new(),
+        );
+    }
+    assert!(
+        probe.env_reads.lock().unwrap()[&102] >= 3,
+        "an unreadable environment is asked for again, every selection"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1967,7 +2954,7 @@ mod real_signals {
         )
         .unwrap();
         // "A fresh process": nothing of the freezing relief survives but the file.
-        let replay = replay_journal(dir.path(), &OsActuator);
+        let replay = replay_journal(dir.path(), dir.path(), &OsActuator);
         assert_eq!(replay.resumed, 1, "{replay:?}");
         assert!(replay.failures.is_empty(), "{replay:?}");
         assert!(child.wait_for(false), "still {:?}", child.state());
@@ -1990,7 +2977,7 @@ mod real_signals {
             }],
         )
         .unwrap();
-        let replay = replay_journal(dir.path(), &OsActuator);
+        let replay = replay_journal(dir.path(), dir.path(), &OsActuator);
         assert_eq!(replay.resumed, 0);
         assert_eq!(replay.failures.len(), 1, "{replay:?}");
         assert!(
@@ -2059,7 +3046,7 @@ mod real_signals {
         rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
         assert!(child.wait_for(true), "state {:?}", child.state());
         assert_eq!(rig.relief.status.rung, Rung::Freeze);
-        rig.ticks(FLAT_SAMPLES, |_| input(Level::Critical, 5000), &table);
+        rig.ticks(FLAT_SAMPLES, |_| severe(5000), &table);
         assert!(child.wait_for(false), "state {:?}", child.state());
         assert!(rig.relief.status.frozen.is_empty());
     }
@@ -2093,8 +3080,144 @@ mod real_signals {
             .status
             .failures
             .iter()
-            .any(|f| f.what.contains("different process")));
+            .any(|f| f.what.contains("recycled") || f.what.contains("different process")));
         assert!(rig.relief.status.frozen.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_os_actuator_reads_back_the_background_priority_it_sets() {
+        let child = Sleeper::spawn();
+        let (pid, start) = (child.pid(), child.start_us());
+        assert_eq!(OsActuator.is_background(pid, start), Some(false));
+        assert_eq!(OsActuator.set_background(pid, start, true), Ok(true));
+        assert_eq!(OsActuator.is_background(pid, start), Some(true));
+        assert_eq!(
+            OsActuator.is_background(pid, start + 1),
+            None,
+            "a recycled pid reads as unknown, not as a priority"
+        );
+        assert_eq!(OsActuator.set_background(pid, start, false), Ok(true));
+        assert_eq!(OsActuator.is_background(pid, start), Some(false));
+        // A process that ended is refused as gone, not as a failure to restore.
+        drop(child);
+        let gone = OsActuator.set_background(pid, start, false).unwrap_err();
+        assert!(process_is_gone(&gone), "{gone}");
+    }
+
+    /// The identification of an agent's tool shell reads `/bin/zsh`'s own
+    /// arguments, and `/bin/zsh` is an Apple platform binary: macOS hides the
+    /// *environment* of those, and this test is what shows it does not hide
+    /// the arguments.
+    #[test]
+    fn a_shell_started_with_a_tool_snapshot_is_identified_through_real_argv() {
+        let spawn = |script: &str| {
+            Sleeper(
+                std::process::Command::new("/bin/zsh")
+                    .args(["-c", script])
+                    .spawn_locked()
+                    .expect("zsh"),
+            )
+        };
+        let tool = spawn("sleep 60; echo # source /x/.claude/shell-snapshots/snapshot-zsh-1-a.sh");
+        let plain = spawn("sleep 60; echo # a login shell, no snapshot");
+        let probe = OsProbe {
+            config: tempfile::tempdir().unwrap().path().to_path_buf(),
+        };
+        let as_proc = |child: &Sleeper| ReliefProc {
+            pid: child.pid(),
+            ppid: 1,
+            start_us: child.start_us(),
+            name: "zsh".into(),
+            footprint: None,
+            exempt: false,
+        };
+        // zsh may take a moment to exec its `sleep` child; its own argv is what
+        // is read, and it is there from the start.
+        let argv = probe
+            .argv(tool.pid())
+            .expect("zsh's arguments are readable");
+        assert!(
+            argv.iter().any(|a| a.contains(TOOL_SHELL_MARK)),
+            "argv: {argv:?}"
+        );
+        let mut marks = MarkCache::default();
+        assert_eq!(marks.tool_shell(&probe, &as_proc(&tool)), Some(true));
+        assert_eq!(marks.tool_shell(&probe, &as_proc(&plain)), Some(false));
+        let gone = ReliefProc {
+            pid: 2_000_000_000,
+            ..as_proc(&plain)
+        };
+        assert_eq!(
+            marks.tool_shell(&probe, &gone),
+            None,
+            "unreadable is not 'not a tool shell'"
+        );
+    }
+
+    /// A read-only measurement, not a test: what one priority pass costs per
+    /// process on this host, the way it was (a full process probe, an
+    /// argument buffer of `KERN_ARGMAX` bytes) and the way it is (who the
+    /// process is, no footprint, no I/O counters, no argument block unless the
+    /// owner is us). Run it with
+    /// `cargo test --lib relief_tests::real_signals::measure -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "a read-only measurement of this host, run on demand"]
+    fn measure_the_per_process_cost_of_a_priority_pass() {
+        /// `PROC_ALL_PIDS` of `<libproc.h>`, which `libc` does not export.
+        const PROC_ALL_PIDS: u32 = 1;
+        let mut pids = vec![0i32; 8192];
+        // SAFETY: the buffer is `pids.len() * 4` bytes, as stated.
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_ALL_PIDS,
+                0,
+                pids.as_mut_ptr().cast(),
+                i32::try_from(pids.len() * 4).unwrap(),
+            )
+        };
+        pids.truncate(usize::try_from(bytes).unwrap() / 4);
+        let live: Vec<(i32, u64)> = pids
+            .into_iter()
+            .filter(|p| *p > 1)
+            .filter_map(|p| {
+                crate::sysload::process_start_us(u32::try_from(p).ok()?).map(|s| (p, s))
+            })
+            .take(2048)
+            .collect();
+        let pass = |f: &dyn Fn(i32, u64)| {
+            let began = Instant::now();
+            for &(pid, start) in &live {
+                f(pid, start);
+            }
+            began.elapsed().as_secs_f64() * 1000.0
+        };
+        // Interleaved, so a load spike lands on both arms alike; the minimum is
+        // the cost, the median says how noisy the host was.
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for _ in 0..25 {
+            before.push(pass(&|pid, _| {
+                let _ = crate::sysload::procscan::probe_one(pid);
+                let _ = crate::sysload::procscan::darwin_task_priority(pid);
+            }));
+            after.push(pass(&|pid, start| {
+                let _ = crate::sysload::procscan::is_background(pid, start);
+            }));
+        }
+        let summarize = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            (v[0], v[v.len() / 2])
+        };
+        let (b, a) = (summarize(&mut before), summarize(&mut after));
+        println!(
+            "priority pass over {} processes, 25 interleaved rounds: before min {:.1} ms / median {:.1} ms, after min {:.1} ms / median {:.1} ms",
+            live.len(),
+            b.0,
+            b.1,
+            a.0,
+            a.1
+        );
     }
 }
 

@@ -15,25 +15,33 @@
 //! load, thermals, the battery or a filling disk holds never acts.
 //!
 //! * **Rung A, slow.** Memory-bound Elevated or worse for
-//!   [`super::ENTER_SAMPLES`] samples puts every eligible process of every agent
-//!   session (launched or observed) in `PRIO_DARWIN_BG`; the priority is put back
-//!   once the host has read below Elevated for [`super::EXIT_SAMPLES`] samples.
+//!   [`super::ENTER_SAMPLES`] samples *with a cause* puts every eligible process
+//!   of every agent session (launched or observed) in `PRIO_DARWIN_BG`; the
+//!   priority is put back once the host has read below Elevated, or the cause
+//!   has gone, for [`super::EXIT_SAMPLES`] samples. A cause is the kernel at Warn
+//!   or worse, compressor thrash, compressor segments at their Elevated level,
+//!   or swap or segments *rising* across the last [`SLOW_TREND_SAMPLES`]. Swap
+//!   *level* is not one: it stays high long after a recovery, and a host that
+//!   was in trouble is not one that is.
 //! * **Rung B, freeze.** Memory-bound Severe for [`SEVERE_SAMPLES`] samples (60
-//!   s) *and* deterioration (swap or compressor segments still rising across
-//!   that window by [`SWAP_RISE_BYTES`] or [`SEGMENT_RISE_POINTS`]) `SIGSTOP`s
-//!   the single heaviest eligible subtree of a GitPulse-launched session in a
-//!   trusted repository, below the shells the agent started, never the shell or
-//!   the agent. Level alone never triggers it: swap does not drain after a
-//!   recovery, so a high but flat swap is not a reason. At most one subtree per
-//!   session and [`MAX_FROZEN_PER_HOST`] per host.
+//!   s) *and* worsening `SIGSTOP`s the single heaviest eligible subtree of a
+//!   GitPulse-launched session in a trusted repository, below the shells an
+//!   agent started to run a command, never the shell or the agent. Worsening
+//!   is swap or compressor segments still rising across that window by
+//!   [`SWAP_RISE_BYTES`] or [`SEGMENT_RISE_POINTS`], or *pinned at the edge*
+//!   for all of it: the kernel at Critical, compressor thrash, or segments at
+//!   [`PINNED_SEGMENT_PCT`] of their limit, where flat is still failing. Swap
+//!   level never counts. At most one subtree per session and
+//!   [`MAX_FROZEN_PER_HOST`] per host.
 //!
 //! Nothing is frozen indefinitely. The subtrees resume (`SIGCONT`) when
-//! deterioration has been flat for [`FLAT_SAMPLES`] samples, when the tier has
-//! read below Severe for [`super::EXIT_SAMPLES`] samples, or at
-//! [`FREEZE_CAP`], whichever comes first; at the cap the freeze is not
-//! escalated (there is no terminate rung in this slice) and the cap hit is
-//! counted. Any future kill path must `SIGCONT` first: a signal to a stopped
-//! process waits for the continue (`terminal/jobs.rs` does the same).
+//! worsening has been flat for [`FLAT_SAMPLES`] samples (not while pinned),
+//! when the tier has read below Severe for [`super::EXIT_SAMPLES`] samples, on
+//! the first tick the build-lease board stops refusing (for a frozen build that
+//! held a slot), or at [`FREEZE_CAP`], whichever comes first; at the cap the
+//! freeze is not escalated (there is no terminate rung in this slice) and the
+//! cap hit is counted. Any future kill path must `SIGCONT` first: a signal to a
+//! stopped process waits for the continue (`terminal/jobs.rs` does the same).
 //!
 //! `activity.rs` rejects `SIGSTOP` for idle agent *roots*. That stands: the
 //! root and the shells beside it are never signalled. A subtree below a shell
@@ -46,16 +54,36 @@
 //! `memguard`, GitPulse's, Manvi's, ptyd's and devmap's binaries, an IDE's
 //! non-agent children, Manvi worker trees) spares both rungs. Rung B adds, and
 //! one exempt member spares the whole subtree: `git` processes and any process
-//! working inside a worktree with a live `index.lock`; build-lease holders and
-//! waiters (the lease board, `lease::Dir::board`, because `procscan` cannot see
-//! a descriptor lock) and trees whose environment carries `GITPULSE_LEASE_HELD`,
-//! `CARGO_SLOT_HELD` or `MAC_HEAVY_LABEL` (read from `KERN_PROCARGS2`, which
-//! macOS hides for Apple platform binaries: the marker is found on the program
-//! that carries it, `cargo`, `go`, `rustc`, not on `/bin/bash`); MCP servers
-//! (every direct child of the root that is not a shell, and anything named
-//! `*mcp*`); and the shells that are direct children of the root. A check that
-//! could not run (an unreadable board, environment or working directory) spares
-//! the subtree: unknown is never "clear".
+//! working inside a worktree with a live `index.lock`; build-lease *waiters*
+//! (the lease board, `lease::Dir::board`, because `procscan` cannot see a
+//! descriptor lock) and trees whose environment carries `MAC_HEAVY_LABEL` (read
+//! from `KERN_PROCARGS2`, which macOS hides for Apple platform binaries: the
+//! marker is found on the program that carries it, `cargo`, `go`, `rustc`, not
+//! on `/bin/bash`); MCP servers (anything named `*mcp*`, and everything under a
+//! direct child of the root that is not positively an agent's tool shell, see
+//! below); and the shells that are direct children of the root.
+//!
+//! A build-lease *holder* (a slot's lock holder, or a tree carrying
+//! `GITPULSE_LEASE_HELD` or `CARGO_SLOT_HELD`, any value) is eligible only while
+//! the lease board is refusing new builds (`lease::capacity(..).refuses`: the
+//! verdict is Severe, or not admitting launches). A frozen build is one nobody
+//! can replace then, and the first tick the board stops refusing every frozen
+//! holder is continued, whatever memory is doing. The board knows a holder is
+//! alive because the slot is an `fcntl` record lock the OS drops when its
+//! process dies and `F_GETLK` names the process that holds it: a stopped holder
+//! still holds it.
+//!
+//! A check that could not run (an unreadable board, environment, argument list
+//! or working directory) spares the subtree: unknown is never "clear". The same
+//! predicate judges a process that joins a frozen subtree after it was stopped.
+//!
+//! The shells an agent runs commands through are told from the shells that
+//! launch its MCP servers by their arguments: Claude Code's Bash tool starts
+//! `/bin/zsh -c source <config>/shell-snapshots/snapshot-zsh-….sh …`
+//! ([`TOOL_SHELL_MARK`]), and macOS shows the arguments of `/bin/zsh` though not
+//! its environment. No equivalent mark has been verified for Codex's or
+//! Antigravity's shells, so a session of theirs has no identified shell and is
+//! never frozen (it is still slowed).
 //!
 //! # One owner of slowing
 //!
@@ -76,6 +104,16 @@
 //! attempted, and a failure is recorded in [`ReliefSnapshot`], never dropped. A
 //! recycled pid is refused by `procguard::signal::signal_process` through its
 //! start time.
+//!
+//! The journal is the first line; a [`Watch`] is the second. It is an in-memory
+//! copy of the frozen processes behind a lock of its own (no file, no action
+//! lock), and an independent thread continues what is past [`FREEZE_CAP`] plus
+//! [`WATCHDOG_GRACE`], or everything when the tick has not advanced for
+//! [`WATCHDOG_STALL`]: a sampler that hangs on a disk write, or that lost the
+//! writer election with a freeze standing, cannot leave a build stopped.
+//! [`shutdown`] waits for a tick that is mid-action only a couple of seconds
+//! before it continues from that copy. A freeze a live writer left past its cap
+//! and grace is continued by the next sampler to win the election.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -85,7 +123,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::governor::{memory_sample, Input as GovernorInput, ENTER_SAMPLES, EXIT_SAMPLES};
+use super::governor::{
+    memory_sample, Input as GovernorInput, MemoryReading, ENTER_SAMPLES, EXIT_SAMPLES,
+};
 use super::procscan::{ReliefProc, ReliefSession, ReliefTable};
 use super::{Binding, Tier};
 use crate::tool_config::SupervisorMode;
@@ -141,9 +181,41 @@ const JOURNAL_MAX_BYTES: u64 = 4 << 20;
 const JOURNAL_DIR: &str = "relief";
 const JOURNAL_FILE: &str = "journal.v1.json";
 
-/// Environment variables whose presence marks a build or a heavy job: the
-/// lease wrapper's nested-call marker, the slot shim's, and `mac_heavy.sh`'s.
-const HELD_MARKERS: [&str; 3] = ["GITPULSE_LEASE_HELD", "CARGO_SLOT_HELD", "MAC_HEAVY_LABEL"];
+/// Environment variables that mark a build holding a lease: the lease
+/// wrapper's nested-call marker and the slot shim's. Any value counts. Such a
+/// build is a holder of the lease board, and is eligible for rung B only while
+/// the board is refusing new builds.
+const LEASE_MARKERS: [&str; 2] = ["GITPULSE_LEASE_HELD", "CARGO_SLOT_HELD"];
+/// `mac_heavy.sh`'s marker: a heavy job a person started, never frozen.
+const HEAVY_MARKER: &str = "MAC_HEAVY_LABEL";
+/// What Claude Code's Bash tool shells carry in their arguments
+/// (`/bin/zsh -c source <config>/shell-snapshots/snapshot-zsh-….sh …`). The one
+/// positive identification of "a shell an agent runs a command through":
+/// every other direct child of an agent is read as something else (an MCP
+/// server's launcher, a helper) and is never entered.
+const TOOL_SHELL_MARK: &str = "shell-snapshots/snapshot-";
+/// How long past [`FREEZE_CAP`] a freeze may stand before the watchdog thread
+/// continues it without the sampler.
+pub const WATCHDOG_GRACE: Duration = Duration::from_secs(60);
+/// A sampler tick that has not advanced for this long is a hung sampler (or a
+/// lost writer election): the watchdog continues every frozen process.
+pub const WATCHDOG_STALL: Duration = Duration::from_secs(60);
+/// How often the watchdog looks.
+const WATCHDOG_EVERY: Duration = Duration::from_secs(5);
+/// How long [`shutdown`] waits for a tick that is mid-action before it
+/// continues the frozen processes from memory.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+/// Samples whose trend decides whether pressure is *building*, which is what
+/// lets rung A act on swap alone.
+pub const SLOW_TREND_SAMPLES: usize = 15;
+/// Compressor segments at or above this percent of the limit are the edge of
+/// the 2026-10-07 panic: pinned there counts as worsening even when flat.
+pub const PINNED_SEGMENT_PCT: f64 = 95.0;
+/// Most processes one pass of rung A newly slows: each costs a few syscalls,
+/// and the pass runs on the sampler's tick. The rest follow on the next pass.
+const MAX_SLOW_PER_PASS: usize = 256;
+/// Most per-process records (environment markers, argv) kept across ticks.
+const MAX_MARKS: usize = 4096;
 
 /// Names of the shells an agent runs commands through.
 const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh"];
@@ -153,7 +225,7 @@ const SHELLS: [&str; 8] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "
 // ---------------------------------------------------------------------------
 
 /// What one tick read, reduced to what the trigger decides on.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct Sample {
     /// The memory-only tier and the input that put it there; `None` when the
     /// host cannot be governed on (a stale or unreadable sensor).
@@ -161,19 +233,34 @@ pub(crate) struct Sample {
     pub swap_used: Option<u64>,
     /// Compressor segments in use, in percent of the limit.
     pub segment_pct: Option<f64>,
+    /// A reason to slow that is not swap *level*: the kernel reports Warn or
+    /// worse, the compressor is thrashing, or segments are at their Elevated
+    /// threshold. Swap stays high long after a recovery, so a high swap alone
+    /// is not a cause; swap (or segments) *rising* is, and the trigger adds
+    /// that from its own window.
+    pub cause: bool,
+    /// Pinned at the edge: kernel level Critical, compressor thrash, or
+    /// segments at [`PINNED_SEGMENT_PCT`]. Flat is still failing here.
+    pub pinned: bool,
 }
 
 impl Sample {
     pub(crate) fn of(input: &GovernorInput) -> Self {
+        let segment_pct = input
+            .readings
+            .segments
+            .value()
+            .filter(|s| s.limit > 0)
+            .map(|s| s.total as f64 * 100.0 / s.limit as f64);
+        let reading = memory_sample(input);
+        let at = |f: fn(&MemoryReading) -> bool| reading.as_ref().is_some_and(f);
         Self {
-            tier: memory_sample(input),
+            tier: reading.map(|r| (r.tier, r.binding)),
             swap_used: input.readings.swap_used.value(),
-            segment_pct: input
-                .readings
-                .segments
-                .value()
-                .filter(|s| s.limit > 0)
-                .map(|s| s.total as f64 * 100.0 / s.limit as f64),
+            segment_pct,
+            cause: at(|r| r.kernel_warn || r.thrash || r.segments_elevated),
+            pinned: at(|r| r.kernel_critical || r.thrash)
+                || (reading.is_some() && segment_pct.is_some_and(|p| p >= PINNED_SEGMENT_PCT)),
         }
     }
 }
@@ -194,6 +281,9 @@ pub enum ResumeReason {
     Gone,
     /// GitPulse is stopping.
     Shutdown,
+    /// The build-lease board stopped refusing new builds: a frozen build that
+    /// held a slot goes on at once.
+    LeaseOpened,
 }
 
 impl ResumeReason {
@@ -205,6 +295,7 @@ impl ResumeReason {
             Self::Off => "the supervisor was switched off",
             Self::Gone => "the subtree's process ended",
             Self::Shutdown => "GitPulse stopped",
+            Self::LeaseOpened => "the build lease board is taking new builds again",
         }
     }
 }
@@ -248,6 +339,8 @@ pub(crate) struct Trigger {
     slow_down: u32,
     severe_run: u32,
     calm_run: u32,
+    /// Consecutive Severe samples that were also [`Sample::pinned`].
+    pinned_run: u32,
     window: VecDeque<(Option<u64>, Option<f64>)>,
     phase: Phase,
     retry_wait: u32,
@@ -268,22 +361,6 @@ impl Trigger {
 
     pub(crate) fn observe(&mut self, now: Instant, sample: &Sample) -> Verdict {
         let tier = sample.tier.map(|(tier, _)| tier);
-        if tier.is_some_and(|t| t >= Tier::Elevated) {
-            self.slow_down = 0;
-            self.slow_up = self.slow_up.saturating_add(1);
-            if self.slow_up >= ENTER_SAMPLES {
-                self.slowing = true;
-            }
-        } else {
-            // An ungovernable sample (stale, dead or unreadable sensor) cannot
-            // justify slowing, so it counts toward letting go.
-            self.slow_up = 0;
-            self.slow_down = self.slow_down.saturating_add(1);
-            if self.slow_down >= EXIT_SAMPLES {
-                self.slowing = false;
-            }
-        }
-
         if tier == Some(Tier::Severe) {
             self.severe_run = self.severe_run.saturating_add(1);
             self.calm_run = 0;
@@ -295,10 +372,39 @@ impl Trigger {
                 self.held_off = false;
             }
         }
+        self.pinned_run = if tier == Some(Tier::Severe) && sample.pinned {
+            self.pinned_run.saturating_add(1)
+        } else {
+            0
+        };
         self.window
             .push_back((sample.swap_used, sample.segment_pct));
         while self.window.len() > SEVERE_SAMPLES as usize {
             self.window.pop_front();
+        }
+
+        // Rung A needs a cause, not just a tier: swap *level* stays high after
+        // a recovery, so a high flat swap under a Normal kernel is not a reason
+        // to slow anyone. The kernel at Warn or worse, thrash, segments at
+        // their Elevated level, or swap/segments rising across the last
+        // [`SLOW_TREND_SAMPLES`] are.
+        let recent = self.window.len().saturating_sub(SLOW_TREND_SAMPLES);
+        let cause = sample.cause || deteriorating(self.window.iter().skip(recent));
+        if tier.is_some_and(|t| t >= Tier::Elevated) && cause {
+            self.slow_down = 0;
+            self.slow_up = self.slow_up.saturating_add(1);
+            if self.slow_up >= ENTER_SAMPLES {
+                self.slowing = true;
+            }
+        } else {
+            // An ungovernable sample (stale, dead or unreadable sensor), and
+            // one with no cause, cannot justify slowing: it counts toward
+            // letting go.
+            self.slow_up = 0;
+            self.slow_down = self.slow_down.saturating_add(1);
+            if self.slow_down >= EXIT_SAMPLES {
+                self.slowing = false;
+            }
         }
 
         let freeze = match self.phase {
@@ -307,7 +413,7 @@ impl Trigger {
                 if self.retry_wait == 0
                     && !self.held_off
                     && self.severe_run >= SEVERE_SAMPLES
-                    && deteriorating(self.window.iter())
+                    && (deteriorating(self.window.iter()) || self.pinned_run >= SEVERE_SAMPLES)
                 {
                     Step::Begin
                 } else {
@@ -322,7 +428,11 @@ impl Trigger {
                     Step::Resume(ResumeReason::Cap)
                 } else if self.calm_run >= SEVERE_BREAK_SAMPLES {
                     Step::Resume(ResumeReason::Calmed)
-                } else if samples >= FLAT_SAMPLES && !deteriorating(self.window.iter().skip(recent))
+                } else if samples >= FLAT_SAMPLES
+                    && !deteriorating(self.window.iter().skip(recent))
+                    // Pinned at the edge (kernel Critical, thrash, segments at
+                    // their limit) is failing even when nothing rises.
+                    && self.pinned_run < FLAT_SAMPLES as u32
                 {
                     Step::Resume(ResumeReason::Flat)
                 } else {
@@ -358,6 +468,7 @@ impl Trigger {
         self.phase = Phase::Idle;
         self.severe_run = 0;
         self.calm_run = 0;
+        self.pinned_run = 0;
         self.window.clear();
         self.retry_wait = 0;
     }
@@ -426,6 +537,20 @@ pub(crate) trait Actuator: Send {
     fn set_background(&self, pid: i32, start_us: u64, enable: bool) -> Result<bool, String>;
     /// Signals `pid` only while its start time is still `start_us`.
     fn signal(&self, pid: i32, start_us: u64, signal: Signal) -> Result<Delivery, String>;
+    /// Whether the process reads back as in the background; `None` when that
+    /// cannot be read (it ended, it is not ours, the platform cannot say).
+    fn is_background(&self, pid: i32, start_us: u64) -> Option<bool>;
+}
+
+/// Who is on the build-lease board, by pid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LeaseBoard {
+    /// Processes holding a slot. A slot is a descriptor lock the OS drops when
+    /// its process dies, and `F_GETLK` names the process: a holder on this list
+    /// is alive, and a stopped one still holds it.
+    pub holders: BTreeSet<i32>,
+    /// Processes queued for one. Never frozen: a waiter is about to run.
+    pub waiters: BTreeSet<i32>,
 }
 
 /// What selection reads about a process beyond the scan.
@@ -433,9 +558,11 @@ pub(crate) trait Probe: Send {
     fn cwd(&self, pid: i32) -> Option<PathBuf>;
     /// `NAME=value` strings; `None` when unreadable.
     fn environment(&self, pid: i32) -> Option<Vec<String>>;
-    /// The pids that hold or wait for a build lease. `Err` when the board
+    /// The arguments the process was started with; `None` when unreadable.
+    fn argv(&self, pid: i32) -> Option<Vec<String>>;
+    /// The holders of and waiters for a build lease. `Err` when the board
     /// could not be read in full: then nothing is frozen.
-    fn lease_pids(&self) -> Result<BTreeSet<i32>, String>;
+    fn lease_board(&self) -> Result<LeaseBoard, String>;
 }
 
 /// The real actuator: `setpriority(2)` through `procscan` and `kill(2)`
@@ -471,6 +598,10 @@ impl Actuator for OsActuator {
     fn signal(&self, _pid: i32, _start_us: u64, _signal: Signal) -> Result<Delivery, String> {
         Err("signals are not supported on this platform".into())
     }
+
+    fn is_background(&self, pid: i32, start_us: u64) -> Option<bool> {
+        super::procscan::is_background(pid, start_us)
+    }
 }
 
 /// The real probe: the OS for working directories and environments, the lease
@@ -488,12 +619,16 @@ impl Probe for OsProbe {
         super::procscan::environment_of(pid)
     }
 
+    fn argv(&self, pid: i32) -> Option<Vec<String>> {
+        super::procscan::argv_of_pid(pid)
+    }
+
     #[cfg(unix)]
-    fn lease_pids(&self) -> Result<BTreeSet<i32>, String> {
+    fn lease_board(&self) -> Result<LeaseBoard, String> {
         let root = super::lease::lease_dir(&self.config);
         if !root.exists() {
             // No build ever took a lease on this host.
-            return Ok(BTreeSet::new());
+            return Ok(LeaseBoard::default());
         }
         let board = super::lease::Dir::open(&root)?.board(&super::lease::Own::default());
         if !board.unreadable.is_empty() || !board.unreadable_slots.is_empty() {
@@ -502,16 +637,14 @@ impl Probe for OsProbe {
                 board.unreadable.len() + board.unreadable_slots.len()
             ));
         }
-        Ok(board
-            .holders
-            .iter()
-            .map(|h| h.pid)
-            .chain(board.waiters.iter().map(|w| w.record.pid))
-            .collect())
+        Ok(LeaseBoard {
+            holders: board.holders.iter().map(|h| h.pid).collect(),
+            waiters: board.waiters.iter().map(|w| w.record.pid).collect(),
+        })
     }
 
     #[cfg(not(unix))]
-    fn lease_pids(&self) -> Result<BTreeSet<i32>, String> {
+    fn lease_board(&self) -> Result<LeaseBoard, String> {
         Err("build leases are not supported on this platform".into())
     }
 }
@@ -540,6 +673,9 @@ pub(crate) struct Selection {
     pub footprint: u64,
     /// The checkout the session works in.
     pub repo_path: Option<String>,
+    /// A build that holds a lease slot is in it: eligible only while the lease
+    /// board refuses, and continued on the first tick it does not.
+    pub holder: bool,
 }
 
 fn is_shell(name: &str) -> bool {
@@ -582,74 +718,189 @@ pub(crate) fn index_lock_live(cwd: &Path) -> bool {
     false
 }
 
-/// Why a subtree may not be frozen, or `None` when nothing bars it.
+/// What an environment says about a process, and what its arguments say about
+/// it as a shell. Neither changes while the process runs, so each is read once
+/// per `(pid, start_us)` and kept across ticks: a selection reads up to a few
+/// hundred of them, every time one is wanted. A read that failed is not kept.
+#[derive(Debug, Default)]
+pub(crate) struct MarkCache {
+    env: HashMap<(i32, u64), EnvMarks>,
+    tool_shell: HashMap<(i32, u64), bool>,
+}
+
+/// The markers a process's environment carries.
+#[derive(Debug, Clone, Copy, Default)]
+struct EnvMarks {
+    /// The lease marker that was found, if any.
+    lease: Option<&'static str>,
+    heavy: bool,
+}
+
+impl MarkCache {
+    fn env(&mut self, probe: &dyn Probe, p: &ReliefProc) -> Option<EnvMarks> {
+        let key = (p.pid, p.start_us);
+        if let Some(marks) = self.env.get(&key) {
+            return Some(*marks);
+        }
+        let env = probe.environment(p.pid)?;
+        // Any value counts, an empty one does not (`NAME=` is an unset one).
+        let has = |name: &str| {
+            let prefix = format!("{name}=");
+            env.iter().any(|var| {
+                var.strip_prefix(&prefix)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        };
+        let marks = EnvMarks {
+            lease: LEASE_MARKERS.into_iter().find(|name| has(name)),
+            heavy: has(HEAVY_MARKER),
+        };
+        self.bound();
+        self.env.insert(key, marks);
+        Some(marks)
+    }
+
+    /// Whether `p` is an agent's tool-command shell, by its arguments. `None`
+    /// when they cannot be read.
+    fn tool_shell(&mut self, probe: &dyn Probe, p: &ReliefProc) -> Option<bool> {
+        let key = (p.pid, p.start_us);
+        if let Some(is) = self.tool_shell.get(&key) {
+            return Some(*is);
+        }
+        let argv = probe.argv(p.pid)?;
+        let is = argv.iter().any(|arg| arg.contains(TOOL_SHELL_MARK));
+        self.bound();
+        self.tool_shell.insert(key, is);
+        Some(is)
+    }
+
+    /// Keeps the cache to what is running: dropped wholesale when it outgrows
+    /// [`MAX_MARKS`], and refilled by the next selection.
+    fn bound(&mut self) {
+        if self.env.len() + self.tool_shell.len() >= MAX_MARKS {
+            self.env.clear();
+            self.tool_shell.clear();
+        }
+    }
+}
+
+/// The checks a process passes to be frozen, with what they read.
+struct Screen<'a> {
+    probe: &'a dyn Probe,
+    board: &'a LeaseBoard,
+    /// The lease board is refusing new builds: a holder's tree is then
+    /// eligible, because a frozen build that nobody can replace is what
+    /// relieves the host, and it resumes the moment the board stops refusing.
+    refusing: bool,
+    marks: &'a mut MarkCache,
+    locks: &'a mut HashMap<PathBuf, bool>,
+}
+
+impl Screen<'_> {
+    /// What the scan and the lease board say. `Ok(true)` when `p` holds a
+    /// lease slot (eligible only while the board refuses); `Err` is the reason
+    /// it may not be frozen.
+    fn by_name(&self, p: &ReliefProc) -> Result<bool, String> {
+        if is_git(&p.name) {
+            return Err("a git process is in it".into());
+        }
+        if is_mcp(&p.name) {
+            return Err(format!("{} looks like an MCP server", p.name));
+        }
+        if self.board.waiters.contains(&p.pid) {
+            return Err(format!("{} waits for a build lease", p.name));
+        }
+        if self.board.holders.contains(&p.pid) {
+            return if self.refusing {
+                Ok(true)
+            } else {
+                Err(format!("{} holds a build lease", p.name))
+            };
+        }
+        Ok(false)
+    }
+
+    /// What `p`'s environment says. `mac_heavy.sh`'s marker bars it always; the
+    /// lease markers bar it unless the board is refusing (`Ok(true)`: a build).
+    fn by_environment(&mut self, p: &ReliefProc) -> Result<bool, String> {
+        let Some(marks) = self.marks.env(self.probe, p) else {
+            return Err(format!("the environment of {} could not be read", p.name));
+        };
+        if marks.heavy {
+            return Err(format!("{} carries {HEAVY_MARKER}", p.name));
+        }
+        match marks.lease {
+            Some(_) if self.refusing => Ok(true),
+            Some(marker) => Err(format!("{} carries {marker}", p.name)),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether `p` works in a worktree whose git index is locked.
+    fn by_directory(&mut self, p: &ReliefProc) -> Result<(), String> {
+        let Some(cwd) = self.probe.cwd(p.pid) else {
+            return Err(format!(
+                "the working directory of {} could not be read",
+                p.name
+            ));
+        };
+        if *self
+            .locks
+            .entry(cwd.clone())
+            .or_insert_with(|| index_lock_live(&cwd))
+        {
+            return Err(format!(
+                "{} works in a worktree with a live git index.lock",
+                p.name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every check, for one process that joined a frozen subtree late.
+    fn eligible(&mut self, p: &ReliefProc) -> Result<(), String> {
+        if p.exempt {
+            return Err(format!("{} is exempt from throttling", p.name));
+        }
+        self.by_name(p)?;
+        self.by_environment(p)?;
+        self.by_directory(p)
+    }
+}
+
+/// Why a subtree may not be frozen (`Err`), or whether a build in it holds a
+/// lease (`Ok(true)`, which is eligible only while the board refuses).
 fn barred(
     chain: &[&ReliefProc],
     subtree: &[&ReliefProc],
-    probe: &dyn Probe,
-    leases: &BTreeSet<i32>,
-    locks: &mut HashMap<PathBuf, bool>,
-) -> Option<String> {
+    screen: &mut Screen<'_>,
+) -> Result<bool, String> {
     for p in chain.iter().chain(subtree.iter()) {
         if p.exempt {
-            return Some(format!("{} is exempt from throttling", p.name));
+            return Err(format!("{} is exempt from throttling", p.name));
         }
     }
+    let mut holder = false;
     for p in chain.iter().chain(subtree.iter()) {
-        if is_git(&p.name) {
-            return Some("a git process is in it".into());
-        }
-        if is_mcp(&p.name) {
-            return Some(format!("{} looks like an MCP server", p.name));
-        }
-        if leases.contains(&p.pid) {
-            return Some(format!("{} holds or waits for a build lease", p.name));
-        }
+        holder |= screen.by_name(p)?;
     }
     // Environments: the subtree's root and the first few members, and the
     // shells above it. `mac_heavy.sh`'s and the lease wrapper's markers are
     // inherited, so a marker anywhere in the chain reaches the programs below.
     for p in chain.iter().chain(subtree.iter().take(MAX_ENV_CHECKS)) {
-        let Some(env) = probe.environment(p.pid) else {
-            return Some(format!("the environment of {} could not be read", p.name));
-        };
-        for marker in HELD_MARKERS {
-            let prefix = format!("{marker}=");
-            if env
-                .iter()
-                .any(|var| var.strip_prefix(&prefix).is_some_and(|v| !v.is_empty()))
-            {
-                return Some(format!("{} carries {marker}", p.name));
-            }
-        }
+        holder |= screen.by_environment(p)?;
     }
     for p in chain.iter().chain(subtree.iter()).take(MAX_CWD_CHECKS) {
-        let Some(cwd) = probe.cwd(p.pid) else {
-            return Some(format!(
-                "the working directory of {} could not be read",
-                p.name
-            ));
-        };
-        if *locks
-            .entry(cwd.clone())
-            .or_insert_with(|| index_lock_live(&cwd))
-        {
-            return Some(format!(
-                "{} works in a worktree with a live git index.lock",
-                p.name
-            ));
-        }
+        screen.by_directory(p)?;
     }
-    None
+    Ok(holder)
 }
 
 /// The heaviest eligible subtree of one session, below the shells the agent
 /// started, and why the heavier ones were passed over.
 fn select_in_session(
     session: &ReliefSession,
-    probe: &dyn Probe,
-    leases: &BTreeSet<i32>,
-    locks: &mut HashMap<PathBuf, bool>,
+    screen: &mut Screen<'_>,
     notes: &mut Vec<String>,
 ) -> Option<Selection> {
     let members = &session.members;
@@ -671,14 +922,25 @@ fn select_in_session(
             kids[p].push(i);
         }
     }
-    // Only what runs below a shell the agent itself started. Every other
-    // direct child of the root is something else (an MCP server's stdio
-    // process, a helper) and so is everything under it.
+    // Only what runs below a shell the agent itself started to run a command:
+    // one whose arguments say so ([`TOOL_SHELL_MARK`]). Every other direct
+    // child of the root is something else (an MCP server's launcher, a
+    // helper), and so is everything under it. A shell that cannot be read, or
+    // reads as anything else, is not entered: unidentified is not eligible.
     let shells: Vec<usize> = (0..members.len())
         .filter(|&i| {
-            members[i].ppid == session.root.pid && is_shell(&members[i].name) && !members[i].exempt
+            members[i].ppid == session.root.pid
+                && is_shell(&members[i].name)
+                && !members[i].exempt
+                && screen.marks.tool_shell(screen.probe, &members[i]) == Some(true)
         })
         .collect();
+    if shells.is_empty() && members.iter().any(|m| m.ppid == session.root.pid) {
+        notes.push(format!(
+            "session {}: none of its child shells is identified as an agent tool shell",
+            session.root.pid
+        ));
+    }
     let mut order = Vec::new();
     let mut seen = HashSet::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
@@ -737,10 +999,13 @@ fn select_in_session(
             at = parent_of(i);
         }
         let subtree_procs: Vec<&ReliefProc> = subtree.iter().map(|&i| &members[i]).collect();
-        if let Some(why) = barred(&chain, &subtree_procs, probe, leases, locks) {
-            notes.push(format!("{}: {why}", members[top].name));
-            continue;
-        }
+        let holder = match barred(&chain, &subtree_procs, screen) {
+            Ok(holder) => holder,
+            Err(why) => {
+                notes.push(format!("{}: {why}", members[top].name));
+                continue;
+            }
+        };
         return Some(Selection {
             session_pid: session.root.pid,
             session_start_us: session.root.start_us,
@@ -749,9 +1014,21 @@ fn select_in_session(
             members: subtree_procs.into_iter().cloned().collect(),
             footprint: sums[n],
             repo_path: None,
+            holder,
         });
     }
     None
+}
+
+/// What a selection is asked for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Want<'a> {
+    /// Sessions that already have a subtree frozen.
+    pub busy: &'a BTreeSet<(i32, u64)>,
+    /// Most subtrees wanted.
+    pub room: usize,
+    /// The lease board is refusing new builds.
+    pub refusing: bool,
 }
 
 /// The subtrees rung B stops: for each GitPulse-launched session in a trusted
@@ -762,17 +1039,29 @@ pub(crate) fn select(
     table: &ReliefTable,
     probe: &dyn Probe,
     trusted: &dyn Fn(&Path) -> bool,
-    busy: &BTreeSet<(i32, u64)>,
-    room: usize,
+    want: &Want<'_>,
+    marks: &mut MarkCache,
     notes: &mut Vec<String>,
 ) -> Result<Vec<Selection>, String> {
+    let Want {
+        busy,
+        room,
+        refusing,
+    } = *want;
     if room == 0 {
         return Ok(Vec::new());
     }
-    let leases = probe
-        .lease_pids()
+    let board = probe
+        .lease_board()
         .map_err(|why| format!("the build lease board could not be read: {why}"))?;
     let mut locks: HashMap<PathBuf, bool> = HashMap::new();
+    let mut screen = Screen {
+        probe,
+        board: &board,
+        refusing,
+        marks,
+        locks: &mut locks,
+    };
     let mut picks = Vec::new();
     for session in &table.sessions {
         if !session.launched || busy.contains(&(session.root.pid, session.root.start_us)) {
@@ -792,7 +1081,7 @@ pub(crate) fn select(
             ));
             continue;
         }
-        if let Some(mut pick) = select_in_session(session, probe, &leases, &mut locks, notes) {
+        if let Some(mut pick) = select_in_session(session, &mut screen, notes) {
             pick.repo_path = Some(
                 crate::engine::git_cli::find_git_root(&cwd)
                     .unwrap_or(cwd)
@@ -817,8 +1106,47 @@ enum SlowOwner {
     Steward,
 }
 
-/// Every process GitPulse has put in the background, and who asked.
-static LEDGER: Mutex<BTreeMap<i32, (u64, SlowOwner)>> = Mutex::new(BTreeMap::new());
+/// Every process GitPulse has put in the background, and who asked, by
+/// namespace. The app's relief and the steward share one (the empty path); a
+/// relief built for a test is its own directory's, so two reliefs that share
+/// nothing never see each other's pids.
+type Ledger = BTreeMap<PathBuf, BTreeMap<i32, (u64, SlowOwner)>>;
+
+static LEDGER: Mutex<Ledger> = Mutex::new(BTreeMap::new());
+
+fn ledger_get(ledger: &Ledger, ns: &Path, pid: i32) -> Option<(u64, SlowOwner)> {
+    ledger.get(ns).and_then(|space| space.get(&pid)).copied()
+}
+
+fn ledger_put(ledger: &mut Ledger, ns: &Path, pid: i32, start_us: u64, owner: SlowOwner) {
+    ledger
+        .entry(ns.to_path_buf())
+        .or_default()
+        .insert(pid, (start_us, owner));
+}
+
+/// Forgets `pid` when the entry is for the process that started at `start_us`.
+fn ledger_clear(ledger: &mut Ledger, ns: &Path, pid: i32, start_us: u64) {
+    if let Some(space) = ledger.get_mut(ns) {
+        if space.get(&pid).is_some_and(|(start, _)| *start == start_us) {
+            space.remove(&pid);
+        }
+        if space.is_empty() {
+            ledger.remove(ns);
+        }
+    }
+}
+
+/// What the steward slowed: its own to put back.
+fn ledger_stewards(ledger: &Ledger, ns: &Path) -> HashSet<(i32, u64)> {
+    ledger
+        .get(ns)
+        .into_iter()
+        .flatten()
+        .filter(|(_, (_, owner))| *owner == SlowOwner::Steward)
+        .map(|(pid, (start_us, _))| (*pid, *start_us))
+        .collect()
+}
 
 /// Serialises every action that changes a process (a tick's, and teardown's):
 /// teardown must not race a tick that is about to stop something.
@@ -841,11 +1169,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// "already in the state asked", which is what the steward reads as "not mine
 /// to restore"); the relief puts that back itself when pressure eases.
 pub(crate) fn steward_throttle(pid: i32, start_us: u64, enable: bool) -> Result<bool, String> {
-    steward_throttle_with(&OsActuator, pid, start_us, enable)
+    steward_throttle_with(&OsActuator, Path::new(""), pid, start_us, enable)
 }
 
 fn steward_throttle_with(
     actuator: &dyn Actuator,
+    ns: &Path,
     pid: i32,
     start_us: u64,
     enable: bool,
@@ -854,20 +1183,15 @@ fn steward_throttle_with(
     if enable {
         let changed = actuator.set_background(pid, start_us, true)?;
         if changed {
-            ledger.insert(pid, (start_us, SlowOwner::Steward));
+            ledger_put(&mut ledger, ns, pid, start_us, SlowOwner::Steward);
         }
         return Ok(changed);
     }
-    if ledger.get(&pid) == Some(&(start_us, SlowOwner::Relief)) {
+    if ledger_get(&ledger, ns, pid) == Some((start_us, SlowOwner::Relief)) {
         return Ok(false);
     }
     let result = actuator.set_background(pid, start_us, false);
-    if ledger
-        .get(&pid)
-        .is_some_and(|(start, _)| *start == start_us)
-    {
-        ledger.remove(&pid);
-    }
+    ledger_clear(&mut ledger, ns, pid, start_us);
     result
 }
 
@@ -905,6 +1229,18 @@ fn journal_path(dir: &Path) -> PathBuf {
 
 /// Records `entries`, or removes the journal when there are none.
 fn write_journal(dir: &Path, entries: &[JournalEntry]) -> Result<(), String> {
+    let pid = std::process::id();
+    write_journal_as(dir, entries, pid, super::process_start_us(pid).unwrap_or(0))
+}
+
+/// [`write_journal`] naming `writer_pid` (started at `writer_start_us`) as the
+/// GitPulse process that owns the entries.
+fn write_journal_as(
+    dir: &Path,
+    entries: &[JournalEntry],
+    writer_pid: u32,
+    writer_start_us: u64,
+) -> Result<(), String> {
     let path = journal_path(dir);
     if entries.is_empty() {
         return match std::fs::symlink_metadata(&path) {
@@ -918,8 +1254,8 @@ fn write_journal(dir: &Path, entries: &[JournalEntry]) -> Result<(), String> {
     }
     let journal = Journal {
         version: 1,
-        writer_pid: std::process::id(),
-        writer_start_us: super::process_start_us(std::process::id()).unwrap_or(0),
+        writer_pid,
+        writer_start_us,
         entries: entries.to_vec(),
     };
     let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
@@ -975,7 +1311,7 @@ pub(crate) struct Replay {
 /// it. An entry is cleared after its resume was attempted, whether or not it
 /// worked, and each failure is returned. Shared by the election-win recovery,
 /// the drop and the teardown.
-pub(crate) fn replay_journal(dir: &Path, actuator: &dyn Actuator) -> Replay {
+pub(crate) fn replay_journal(dir: &Path, ns: &Path, actuator: &dyn Actuator) -> Replay {
     let mut out = Replay::default();
     let journal = match read_journal(dir) {
         Ok(Some(journal)) => journal,
@@ -1012,7 +1348,7 @@ pub(crate) fn replay_journal(dir: &Path, actuator: &dyn Actuator) -> Replay {
                     entry.pid, entry.session_id
                 )),
             },
-            JournalRung::Slow => match restore_priority(actuator, entry.pid, entry.start_us) {
+            JournalRung::Slow => match restore_priority(actuator, ns, entry.pid, entry.start_us) {
                 Ok(true) => out.restored += 1,
                 Ok(false) => {}
                 Err(why) => out.failures.push(format!(
@@ -1029,19 +1365,51 @@ pub(crate) fn replay_journal(dir: &Path, actuator: &dyn Actuator) -> Replay {
     out
 }
 
+/// A frozen entry of a journal another GitPulse that is still running wrote
+/// is that one's, until it has stood past what the cap and the watchdog's grace
+/// allow: then the writer is hung (or lost its election with the freeze
+/// standing) and nothing else will continue it. Continues those and leaves the
+/// rest, and the writer's file, alone. Returns how many were continued.
+pub(crate) fn resume_aged_of_live_writer(
+    dir: &Path,
+    actuator: &dyn Actuator,
+    now_ms: u64,
+    failures: &mut Vec<String>,
+) -> u32 {
+    let Ok(Some(journal)) = read_journal(dir) else {
+        return 0;
+    };
+    let limit = u64::try_from((FREEZE_CAP + WATCHDOG_GRACE).as_millis()).unwrap_or(u64::MAX);
+    let mut resumed = 0;
+    for entry in journal.entries.iter().rev() {
+        if entry.rung != JournalRung::Freeze || now_ms.saturating_sub(entry.at_unix_ms) < limit {
+            continue;
+        }
+        match actuator.signal(entry.pid, entry.start_us, Signal::Cont) {
+            Ok(Delivery::Delivered) => resumed += 1,
+            Ok(Delivery::Gone) => {}
+            Err(why) => failures.push(format!(
+                "could not resume process {} that GitPulse process {} left stopped past its limit: {why}",
+                entry.pid, journal.writer_pid
+            )),
+        }
+    }
+    resumed
+}
+
 /// Restores a priority, treating a process that ended as nothing to restore.
-fn restore_priority(actuator: &dyn Actuator, pid: i32, start_us: u64) -> Result<bool, String> {
-    let mut ledger = lock(&LEDGER);
+/// The ledger is not held across the call.
+fn restore_priority(
+    actuator: &dyn Actuator,
+    ns: &Path,
+    pid: i32,
+    start_us: u64,
+) -> Result<bool, String> {
     let result = match actuator.set_background(pid, start_us, false) {
-        Err(why) if why.contains("no longer running") => Ok(false),
+        Err(why) if process_is_gone(&why) => Ok(false),
         other => other,
     };
-    if ledger
-        .get(&pid)
-        .is_some_and(|(start, _)| *start == start_us)
-    {
-        ledger.remove(&pid);
-    }
+    ledger_clear(&mut lock(&LEDGER), ns, pid, start_us);
     result
 }
 
@@ -1056,10 +1424,167 @@ pub fn shutdown() {
         return;
     };
     STOPPING.store(true, Ordering::SeqCst);
-    let _act = lock(&ACT);
-    let replay = replay_journal(dir, &OsActuator);
-    log_replay("shutdown", &replay);
+    shutdown_within(
+        dir,
+        Path::new(""),
+        APP_WATCH.get().map(|watch| &**watch),
+        &OsActuator,
+        SHUTDOWN_WAIT,
+    );
     *lock(&SNAPSHOT) = None;
+}
+
+/// [`shutdown`]'s work. The frozen processes are continued first, from the
+/// in-memory copy ([`Watch`]), which needs neither the journal nor the action
+/// lock: a tick that hangs mid-action (a disk that stalls under the very
+/// pressure this answers) must not hold up the app's quit, or leave a build
+/// stopped. The journal is replayed too when the action lock comes within
+/// `wait`. Returns whether it did.
+pub(crate) fn shutdown_within(
+    dir: &Path,
+    ns: &Path,
+    watch: Option<&Watch>,
+    actuator: &dyn Actuator,
+    wait: Duration,
+) -> bool {
+    if let Some(watch) = watch {
+        watch.continue_all(actuator);
+    }
+    let Some(_act) = lock_within(&ACT, wait) else {
+        log::warn!(
+            target: "relief",
+            "shutdown: a tick held the action lock for over {} ms; the frozen processes were continued from memory and the journal was left for the next start",
+            wait.as_millis()
+        );
+        return false;
+    };
+    let replay = replay_journal(dir, ns, actuator);
+    log_replay("shutdown", &replay);
+    true
+}
+
+/// `mutex`, waiting at most `wait` for it.
+fn lock_within<T>(mutex: &Mutex<T>, wait: Duration) -> Option<std::sync::MutexGuard<'_, T>> {
+    use std::sync::TryLockError;
+    let deadline = Instant::now() + wait;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// One frozen process as the watchdog sees it.
+#[derive(Debug, Clone, Copy)]
+struct Watched {
+    pid: i32,
+    start_us: u64,
+    /// When the freeze began, on the monotonic clock.
+    since: Instant,
+}
+
+#[derive(Debug, Default)]
+struct WatchState {
+    frozen: Vec<Watched>,
+    /// The last tick, on the monotonic clock.
+    last_tick: Option<Instant>,
+}
+
+/// The frozen processes and the tick's pulse, kept where an independent thread
+/// can reach them: behind a lock of their own, which is held for a copy and
+/// never across a signal, a file or [`ACT`]. The sampler keeps it current; the
+/// watchdog thread (and [`shutdown`]) read it, so a sampler that hangs, loses
+/// the writer election with a freeze standing, or stalls on a disk write cannot
+/// leave a process stopped.
+#[derive(Debug, Default)]
+pub(crate) struct Watch {
+    state: Mutex<WatchState>,
+}
+
+impl Watch {
+    fn beat(&self, now: Instant) {
+        lock(&self.state).last_tick = Some(now);
+    }
+
+    fn set(&self, frozen: Vec<Watched>) {
+        lock(&self.state).frozen = frozen;
+    }
+
+    /// Continues what is overdue: every entry when the tick has not advanced
+    /// for [`WATCHDOG_STALL`], else the entries older than
+    /// [`FREEZE_CAP`] + [`WATCHDOG_GRACE`] (the sampler's own cap resume has
+    /// had a minute to act). Returns what it continued.
+    pub(crate) fn pass(&self, actuator: &dyn Actuator, now: Instant) -> Vec<(i32, u64)> {
+        let due = {
+            let mut state = lock(&self.state);
+            let stalled = state
+                .last_tick
+                .is_some_and(|tick| now.saturating_duration_since(tick) >= WATCHDOG_STALL);
+            let (due, keep): (Vec<Watched>, Vec<Watched>) =
+                state.frozen.iter().copied().partition(|w| {
+                    stalled || now.saturating_duration_since(w.since) >= FREEZE_CAP + WATCHDOG_GRACE
+                });
+            state.frozen = keep;
+            due
+        };
+        Self::send_cont(&due, actuator)
+    }
+
+    /// Continues everything, now.
+    fn continue_all(&self, actuator: &dyn Actuator) {
+        let all = std::mem::take(&mut lock(&self.state).frozen);
+        Self::send_cont(&all, actuator);
+    }
+
+    /// Last stopped first: a child never runs while its parent is stopped.
+    fn send_cont(entries: &[Watched], actuator: &dyn Actuator) -> Vec<(i32, u64)> {
+        let mut sent = Vec::new();
+        for w in entries.iter().rev() {
+            match actuator.signal(w.pid, w.start_us, Signal::Cont) {
+                Ok(_) => sent.push((w.pid, w.start_us)),
+                Err(why) => log::warn!(
+                    target: "relief",
+                    "could not continue pid {} from memory: {why}",
+                    w.pid
+                ),
+            }
+        }
+        sent
+    }
+}
+
+/// The app's [`Watch`], shared by every relief this process builds (the
+/// sampler rebuilds its relief after a panic) and by [`shutdown`].
+static APP_WATCH: OnceLock<std::sync::Arc<Watch>> = OnceLock::new();
+
+/// The app's watch, started once with its thread.
+fn app_watch() -> std::sync::Arc<Watch> {
+    let watch = APP_WATCH.get_or_init(|| {
+        let watch = std::sync::Arc::new(Watch::default());
+        let looks = watch.clone();
+        let started = crate::supervisor::spawn_loop("relief-watchdog", WATCHDOG_EVERY, move || {
+            let freed = looks.pass(&OsActuator, Instant::now());
+            if !freed.is_empty() {
+                log::warn!(
+                    target: "relief",
+                    "the watchdog continued {} stopped process(es) the sampler had not",
+                    freed.len()
+                );
+            }
+        });
+        if let Err(why) = started {
+            log::error!(target: "relief", "the relief watchdog did not start: {why}");
+        }
+        watch
+    });
+    watch.clone()
 }
 
 fn log_replay(when: &str, replay: &Replay) {
@@ -1325,12 +1850,26 @@ struct Frozen {
     root: (i32, u64),
     /// The processes this freeze stopped, parent first.
     members: Vec<(i32, u64)>,
+    /// When it was frozen, on the monotonic clock.
+    since: Instant,
+    /// A build holding a lease slot is in it: continued on the first tick the
+    /// lease board stops refusing.
+    holder: bool,
 }
 
 /// The relief. One per sampler; it lives on the sampler's thread and is
 /// ticked only while that sampler holds the writer election.
 pub(crate) struct Relief {
     dir: PathBuf,
+    /// The ledger namespace: the app's relief shares the steward's; any other
+    /// relief is its own directory's.
+    ns: PathBuf,
+    watch: std::sync::Arc<Watch>,
+    marks: MarkCache,
+    /// The lease board was refusing new builds at the last tick.
+    refusing: bool,
+    #[cfg(test)]
+    table_override: Option<std::sync::Arc<dyn Fn() -> ReliefTable + Send + Sync>>,
     actuator: Box<dyn Actuator>,
     probe: Box<dyn Probe>,
     mode: Box<dyn Fn() -> SupervisorMode + Send>,
@@ -1366,6 +1905,12 @@ impl Relief {
         let initial = mode();
         let seen_external = external_of(&dir).generation;
         Self {
+            ns: dir.clone(),
+            watch: std::sync::Arc::default(),
+            marks: MarkCache::default(),
+            refusing: false,
+            #[cfg(test)]
+            table_override: None,
             dir,
             actuator,
             probe,
@@ -1388,14 +1933,36 @@ impl Relief {
     /// the grant store. Remembers `dir` for [`shutdown`].
     pub(crate) fn os(dir: PathBuf) -> Self {
         let _ = APP_DIR.set(dir.clone());
-        Self::new(
+        let mut relief = Self::new(
             dir.clone(),
             Box::new(OsActuator),
             Box::new(OsProbe { config: dir }),
             Box::new(crate::tool_config::host_load_supervisor),
             Box::new(repository_trusted),
         )
-        .publishing()
+        .publishing();
+        // The steward's slowing and this relief's are one ledger, and the
+        // watchdog thread and the teardown reach the frozen ones through one
+        // watch.
+        relief.ns = PathBuf::new();
+        relief.watch = app_watch();
+        relief
+    }
+
+    /// Reads this relief's process table from `table` instead of the scan the
+    /// sampler hands in: a test's seam.
+    #[cfg(test)]
+    pub(crate) fn with_table(
+        mut self,
+        table: std::sync::Arc<dyn Fn() -> ReliefTable + Send + Sync>,
+    ) -> Self {
+        self.table_override = Some(table);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watch(&self) -> std::sync::Arc<Watch> {
+        self.watch.clone()
     }
 
     /// This relief's state is what [`snapshot`] serves.
@@ -1412,7 +1979,18 @@ impl Relief {
         }
         self.recovered = true;
         let _act = lock(&ACT);
-        let replay = replay_journal(&self.dir, &*self.actuator);
+        let mut replay = replay_journal(&self.dir, &self.ns, &*self.actuator);
+        if replay.left_to.is_some() {
+            // Another GitPulse that is still running owns the journal; what
+            // it left stopped past the cap and the watchdog's grace is
+            // nobody's to continue but ours.
+            replay.resumed = resume_aged_of_live_writer(
+                &self.dir,
+                &*self.actuator,
+                unix_ms(),
+                &mut replay.failures,
+            );
+        }
         log_replay("recovery", &replay);
         if replay.resumed > 0 || replay.restored > 0 {
             self.note(
@@ -1439,6 +2017,7 @@ impl Relief {
         self.seen_external = external.generation;
         let had = self.frozen.iter().filter(|f| !f.info.advised_only).count();
         self.frozen.clear();
+        self.watch_frozen();
         self.journal.retain(|e| e.rung != JournalRung::Freeze);
         self.trigger.ended();
         if external.hold_off {
@@ -1455,20 +2034,40 @@ impl Relief {
 
     /// One sample. `table` reads the sessions of the scan this tick just made;
     /// it is called only when something needs the processes.
+    ///
+    /// `refuses` is whether the build-lease board is refusing new builds under
+    /// the governor's verdict (`lease::capacity(..).refuses`): while it is, a
+    /// build that holds a slot may be frozen, and the first tick it is not,
+    /// those are continued.
     pub(crate) fn tick(
         &mut self,
         now: Instant,
         input: &GovernorInput,
+        refuses: bool,
         table: &dyn Fn() -> ReliefTable,
     ) {
         if STOPPING.load(Ordering::SeqCst) {
             return;
         }
+        // The whole tick runs under the action lock, taken before anything is
+        // read: a `resume_all` from another thread is then either wholly
+        // before this tick (its generation is read below, under the lock) or
+        // wholly after it, never between the read and the action it changes.
+        let _act = lock(&ACT);
+        if STOPPING.load(Ordering::SeqCst) {
+            return;
+        }
+        #[cfg(test)]
+        let over = self.table_override.clone();
+        #[cfg(test)]
+        let table: &dyn Fn() -> ReliefTable = &|| over.as_ref().map_or_else(table, |read| read());
+        self.watch.beat(now);
+        self.refusing = refuses;
         self.reconcile_external();
         let mode = (self.mode)();
         self.status.mode = mode;
         if mode == SupervisorMode::Off || !input.enabled {
-            self.stand_down(ResumeReason::Off);
+            self.stand_down(ResumeReason::Off, table);
             self.status.binding = None;
             self.status.tier = None;
             self.publish();
@@ -1478,10 +2077,6 @@ impl Relief {
         self.status.tier = sample.tier.map(|(tier, _)| tier);
         self.status.binding = sample.tier.and_then(|(_, binding)| binding);
         let verdict = self.trigger.observe(now, &sample);
-        let _act = lock(&ACT);
-        if STOPPING.load(Ordering::SeqCst) {
-            return;
-        }
         let act = mode == SupervisorMode::Act;
 
         // An advised freeze left `act`, or the setting moved to `advise` with
@@ -1523,10 +2118,15 @@ impl Relief {
         // What is in the background goes back as soon as the slowing is over
         // or the setting left `act`.
         if (!verdict.slow || !act) && !self.slowed.is_empty() {
-            self.restore_slowed();
+            self.restore_slowed(table);
         }
 
-        // Rung B.
+        // Rung B. A build that held a lease slot was frozen because the board
+        // was refusing new builds; the first tick it is not, it goes on,
+        // without waiting for memory to flatten.
+        if !refuses && self.frozen.iter().any(|f| f.holder && !f.info.advised_only) {
+            self.resume_holders();
+        }
         match verdict.freeze {
             Step::Begin => {
                 let scan = table();
@@ -1546,13 +2146,12 @@ impl Relief {
     }
 
     /// Ends everything in force: the setting went off, or measurement did.
-    fn stand_down(&mut self, reason: ResumeReason) {
-        let _act = lock(&ACT);
+    fn stand_down(&mut self, reason: ResumeReason, table: &dyn Fn() -> ReliefTable) {
         if !self.frozen.is_empty() {
             self.resume_frozen(reason);
         }
         if !self.slowed.is_empty() {
-            self.restore_slowed();
+            self.restore_slowed(table);
         }
         self.foreign.clear();
         self.status.would_slow = 0;
@@ -1632,10 +2231,17 @@ impl Relief {
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
-    /// Forgets what has ended: a process that is no longer in the table (by pid
-    /// and start time) leaves `slowed`, `foreign`, the ledger and the journal,
-    /// so the cap counts live processes and not every one a long build made.
-    /// Returns whether the journal changed.
+    /// Lets go of what has left the scanned trees: a process that is no longer
+    /// in the table (by pid and start time) leaves `slowed`, `foreign`, the
+    /// ledger and the journal, so the cap counts live processes and not every
+    /// one a long build made.
+    ///
+    /// A process that left the trees is not necessarily gone: when its agent
+    /// ended it became launchd's child and kept running, in the background.
+    /// Forgetting it unrestored would be forgetting the one thing this relief
+    /// promised to put back, so it is restored first (the actuator checks the
+    /// start time, so a recycled pid is refused, not touched); only a process
+    /// that is gone is simply dropped. Returns whether the journal changed.
     fn prune(&mut self, table: &ReliefTable) -> bool {
         let live: HashSet<(i32, u64)> = table
             .sessions
@@ -1649,12 +2255,22 @@ impl Relief {
             .filter(|key| !live.contains(key))
             .collect();
         if !gone.is_empty() {
-            let mut ledger = lock(&LEDGER);
-            for (pid, start_us) in &gone {
-                self.slowed.remove(pid);
-                if ledger.get(pid) == Some(&(*start_us, SlowOwner::Relief)) {
-                    ledger.remove(pid);
+            let stewards = ledger_stewards(&lock(&LEDGER), &self.ns);
+            for &(pid, start_us) in &gone {
+                self.slowed.remove(&pid);
+                if !stewards.contains(&(pid, start_us)) {
+                    match self.actuator.set_background(pid, start_us, false) {
+                        Ok(_) => {}
+                        Err(why) if process_is_gone(&why) => {}
+                        Err(why) => self.fail(
+                            Some(pid),
+                            format!(
+                                "could not put process {pid} back to normal priority after it left the agent's tree: {why}"
+                            ),
+                        ),
+                    }
                 }
+                ledger_clear(&mut lock(&LEDGER), &self.ns, pid, start_us);
             }
         }
         self.foreign.retain(|key| live.contains(key));
@@ -1670,11 +2286,7 @@ impl Relief {
         // priority is recognised as ours rather than as someone else's.
         let mut fresh: Vec<(usize, &ReliefProc, String)> = Vec::new();
         // What the steward slowed is its own to put back.
-        let stewards: HashSet<(i32, u64)> = lock(&LEDGER)
-            .iter()
-            .filter(|(_, (_, owner))| *owner == SlowOwner::Steward)
-            .map(|(pid, (start_us, _))| (*pid, *start_us))
-            .collect();
+        let stewards = ledger_stewards(&lock(&LEDGER), &self.ns);
         for session in &table.sessions {
             let depth_of = depths(&session.members, session.root.pid);
             let session_id = format!("{}-{}", session.root.pid, session.root.start_us);
@@ -1693,7 +2305,13 @@ impl Relief {
             }
         }
         fresh.sort_by_key(|(depth, m, _)| (*depth, m.pid));
-        fresh.truncate(MAX_SLOWED.saturating_sub(self.slowed.len()));
+        // Bounded per pass as well as in all: each is a few syscalls on the
+        // sampler's tick. The rest follow on the next pass.
+        fresh.truncate(
+            MAX_SLOWED
+                .saturating_sub(self.slowed.len())
+                .min(MAX_SLOW_PER_PASS),
+        );
         if fresh.is_empty() {
             if pruned {
                 if let Err(why) = self.sync_journal() {
@@ -1718,19 +2336,26 @@ impl Relief {
         let mut refused: BTreeMap<String, u32> = BTreeMap::new();
         let mut taken = 0u32;
         let mut drop_entries: HashSet<i32> = HashSet::new();
+        // The syscalls first, with no lock held: another thread (the steward)
+        // takes the ledger for one process at a time and must not wait behind
+        // a pass over hundreds. The answers are recorded after.
+        let answers: Vec<Result<bool, String>> = fresh
+            .iter()
+            .map(|(_, m, _)| self.actuator.set_background(m.pid, m.start_us, true))
+            .collect();
         let mut ledger = lock(&LEDGER);
-        for (_, m, _) in &fresh {
-            match self.actuator.set_background(m.pid, m.start_us, true) {
+        for ((_, m, _), answer) in fresh.iter().zip(answers) {
+            match answer {
                 Ok(true) => {
                     self.slowed.insert(m.pid, m.start_us);
-                    ledger.insert(m.pid, (m.start_us, SlowOwner::Relief));
+                    ledger_put(&mut ledger, &self.ns, m.pid, m.start_us, SlowOwner::Relief);
                     taken += 1;
                 }
                 Ok(false) => {
                     if self.slowed.contains_key(&m.ppid) {
                         // Inherited from a parent this relief slowed.
                         self.slowed.insert(m.pid, m.start_us);
-                        ledger.insert(m.pid, (m.start_us, SlowOwner::Relief));
+                        ledger_put(&mut ledger, &self.ns, m.pid, m.start_us, SlowOwner::Relief);
                     } else {
                         self.foreign.insert((m.pid, m.start_us));
                         drop_entries.insert(m.pid);
@@ -1741,7 +2366,7 @@ impl Relief {
                     // Refused once is refused until the slowing ends or the
                     // process does; it is not asked again every pass.
                     self.foreign.insert((m.pid, m.start_us));
-                    if !why.contains("no longer running") {
+                    if !process_is_gone(&why) {
                         *refused.entry(why).or_default() += 1;
                     }
                 }
@@ -1769,24 +2394,87 @@ impl Relief {
         }
     }
 
-    fn restore_slowed(&mut self) {
+    /// What would stay in the background after its parent is put back: the
+    /// descendants of `slowed` (in this scan) that were never slowed by name,
+    /// because they started after the last pass and inherited the priority,
+    /// and that read back as in the background now. What the steward slowed is
+    /// its own and is not listed.
+    fn inheritors(
+        &self,
+        slowed: &BTreeMap<i32, u64>,
+        stewards: &HashSet<(i32, u64)>,
+        table: &dyn Fn() -> ReliefTable,
+    ) -> Vec<(i32, u64)> {
+        if slowed.is_empty() {
+            return Vec::new();
+        }
+        let scan = table();
+        let mut found = Vec::new();
+        for session in &scan.sessions {
+            let mut under: HashSet<i32> = session
+                .members
+                .iter()
+                .filter(|m| slowed.get(&m.pid) == Some(&m.start_us))
+                .map(|m| m.pid)
+                .collect();
+            // Members come in table order, not tree order: sweep until none joins.
+            for _ in 0..MAX_TREE_DEPTH {
+                let before = under.len();
+                for m in &session.members {
+                    if under.contains(&m.ppid) {
+                        under.insert(m.pid);
+                    }
+                }
+                if under.len() == before {
+                    break;
+                }
+            }
+            for m in &session.members {
+                let key = (m.pid, m.start_us);
+                if under.contains(&m.pid)
+                    && slowed.get(&m.pid) != Some(&m.start_us)
+                    && !stewards.contains(&key)
+                    && self.actuator.is_background(m.pid, m.start_us) == Some(true)
+                {
+                    found.push(key);
+                }
+            }
+        }
+        found.truncate(MAX_SLOWED);
+        found
+    }
+
+    fn restore_slowed(&mut self, table: &dyn Fn() -> ReliefTable) {
         let slowed = std::mem::take(&mut self.slowed);
         let mut restored = 0u32;
         let mut refused: BTreeMap<String, u32> = BTreeMap::new();
+        let stewards = ledger_stewards(&lock(&LEDGER), &self.ns);
+        let inherited = self.inheritors(&slowed, &stewards, table);
+        for &(pid, start_us) in &inherited {
+            match self.actuator.set_background(pid, start_us, false) {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(why) if process_is_gone(&why) => {}
+                Err(why) => *refused.entry(why).or_default() += 1,
+            }
+        }
+        // No lock across the syscalls; the ledger is cleared after.
+        for (&pid, &start_us) in &slowed {
+            if stewards.contains(&(pid, start_us)) {
+                continue;
+            }
+            match self.actuator.set_background(pid, start_us, false) {
+                Ok(true) => restored += 1,
+                Ok(false) => {}
+                Err(why) if process_is_gone(&why) => {}
+                Err(why) => *refused.entry(why).or_default() += 1,
+            }
+        }
         {
             let mut ledger = lock(&LEDGER);
             for (&pid, &start_us) in &slowed {
-                if ledger.get(&pid) == Some(&(start_us, SlowOwner::Steward)) {
-                    continue;
-                }
-                match self.actuator.set_background(pid, start_us, false) {
-                    Ok(true) => restored += 1,
-                    Ok(false) => {}
-                    Err(why) if why.contains("no longer running") => {}
-                    Err(why) => *refused.entry(why).or_default() += 1,
-                }
-                if ledger.get(&pid).is_some_and(|(s, _)| *s == start_us) {
-                    ledger.remove(&pid);
+                if !stewards.contains(&(pid, start_us)) {
+                    ledger_clear(&mut ledger, &self.ns, pid, start_us);
                 }
             }
         }
@@ -1815,7 +2503,19 @@ impl Relief {
         let busy: BTreeSet<(i32, u64)> = self.frozen.iter().map(|f| f.session).collect();
         let room = MAX_FROZEN_PER_HOST.saturating_sub(self.frozen.len());
         let mut notes = Vec::new();
-        let picks = match select(table, &*self.probe, &*self.trusted, &busy, room, &mut notes) {
+        let want = Want {
+            busy: &busy,
+            room,
+            refusing: self.refusing,
+        };
+        let picks = match select(
+            table,
+            &*self.probe,
+            &*self.trusted,
+            &want,
+            &mut self.marks,
+            &mut notes,
+        ) {
             Ok(picks) => picks,
             Err(why) => {
                 self.fail(None, format!("nothing was frozen: {why}"));
@@ -1838,13 +2538,15 @@ impl Relief {
         let mut any = false;
         for pick in picks {
             if act {
-                any |= self.freeze(&pick);
+                any |= self.freeze(&pick, now);
             } else {
                 self.frozen.push(Frozen {
                     info: frozen_info(&pick, true),
                     session: (pick.session_pid, pick.session_start_us),
                     root: (pick.root.pid, pick.root.start_us),
                     members: Vec::new(),
+                    since: now,
+                    holder: pick.holder,
                 });
                 self.note(
                     ActionKind::Freeze,
@@ -1862,7 +2564,7 @@ impl Relief {
     }
 
     /// Stops one subtree: journal first, then the root, then the rest.
-    fn freeze(&mut self, pick: &Selection) -> bool {
+    fn freeze(&mut self, pick: &Selection, now: Instant) -> bool {
         let session = format!("{}-{}", pick.session_pid, pick.session_start_us);
         let before = self.journal.len();
         for m in &pick.members {
@@ -1880,8 +2582,27 @@ impl Relief {
             );
             return false;
         }
+        // The watchdog's copy is made before the first signal, like the
+        // journal: a tick that hangs after a stop must leave something that
+        // continues it.
+        self.sync_watch(
+            pick.members
+                .iter()
+                .map(|m| (m.pid, m.start_us))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            now,
+        );
         let mut stopped: Vec<(i32, u64)> = Vec::new();
         for (n, m) in pick.members.iter().enumerate() {
+            // GitPulse is quitting: stop nothing more, and undo what this
+            // freeze stopped (the teardown may already have continued the
+            // rest, and would not know of these).
+            if STOPPING.load(Ordering::SeqCst) {
+                self.continue_all(&stopped);
+                stopped.clear();
+                break;
+            }
             match self.actuator.signal(m.pid, m.start_us, Signal::Stop) {
                 Ok(Delivery::Delivered) => stopped.push((m.pid, m.start_us)),
                 Ok(Delivery::Gone) => {}
@@ -1906,6 +2627,7 @@ impl Relief {
             if let Err(why) = self.sync_journal() {
                 self.fail(None, format!("the journal could not be trimmed: {why}"));
             }
+            self.watch_frozen();
             return false;
         }
         // Journal only what was stopped.
@@ -1935,8 +2657,40 @@ impl Relief {
             session: (pick.session_pid, pick.session_start_us),
             root: (pick.root.pid, pick.root.start_us),
             members: stopped,
+            since: now,
+            holder: pick.holder,
         });
+        self.watch_frozen();
         true
+    }
+
+    /// Makes the watchdog's copy what this relief has frozen, plus `joining`
+    /// (about to be stopped), counted from `now`.
+    fn sync_watch(&self, joining: &[(i32, u64)], now: Instant) {
+        let mut entries: Vec<Watched> = self
+            .frozen
+            .iter()
+            .filter(|f| !f.info.advised_only)
+            .flat_map(|f| {
+                let since = f.since;
+                f.members.iter().map(move |&(pid, start_us)| Watched {
+                    pid,
+                    start_us,
+                    since,
+                })
+            })
+            .collect();
+        entries.extend(joining.iter().map(|&(pid, start_us)| Watched {
+            pid,
+            start_us,
+            since: now,
+        }));
+        self.watch.set(entries);
+    }
+
+    /// The watchdog's copy is exactly what this relief has frozen.
+    fn watch_frozen(&self) {
+        self.sync_watch(&[], Instant::now());
     }
 
     /// `SIGCONT`s each, last first; failures are recorded.
@@ -1986,7 +2740,39 @@ impl Relief {
                     .into(),
             );
         }
+        self.watch_frozen();
         self.trigger.ended();
+    }
+
+    /// Continues the frozen builds that held a lease slot, because the board
+    /// stopped refusing. Everything else stays frozen on its own conditions.
+    fn resume_holders(&mut self) {
+        let (holders, rest): (Vec<Frozen>, Vec<Frozen>) = std::mem::take(&mut self.frozen)
+            .into_iter()
+            .partition(|f| f.holder && !f.info.advised_only);
+        self.frozen = rest;
+        for f in &holders {
+            self.continue_all(&f.members);
+            let ids: HashSet<i32> = f.members.iter().map(|(pid, _)| *pid).collect();
+            self.journal
+                .retain(|e| e.rung != JournalRung::Freeze || !ids.contains(&e.pid));
+            self.note(
+                ActionKind::Resume,
+                format!(
+                    "resumed {} in session {}: {}",
+                    f.info.command,
+                    f.info.session_id,
+                    ResumeReason::LeaseOpened.words()
+                ),
+            );
+        }
+        if let Err(why) = self.sync_journal() {
+            self.fail(None, format!("the journal could not be trimmed: {why}"));
+        }
+        self.watch_frozen();
+        if self.frozen.is_empty() {
+            self.trigger.ended();
+        }
     }
 
     /// Stops processes that appeared under a frozen subtree after it was
@@ -1994,45 +2780,86 @@ impl Relief {
     /// root ended.
     fn maintain_frozen(&mut self, table: &ReliefTable) {
         let mut ended = Vec::new();
-        for at in 0..self.frozen.len() {
-            if self.frozen[at].info.advised_only {
-                continue;
-            }
-            let (session, root) = (self.frozen[at].session, self.frozen[at].root);
-            let Some(scan) = table
-                .sessions
-                .iter()
-                .find(|s| (s.root.pid, s.root.start_us) == session)
-            else {
-                ended.push(at);
-                continue;
-            };
-            if !scan.members.iter().any(|m| (m.pid, m.start_us) == root) {
-                ended.push(at);
-                continue;
-            }
-            let known: HashSet<i32> = self.frozen[at].members.iter().map(|(p, _)| *p).collect();
-            let mut inside: HashSet<i32> = known.clone();
-            let mut fresh: Vec<&ReliefProc> = Vec::new();
-            // Members are in table order, not tree order: sweep until no more join.
-            for _ in 0..MAX_TREE_DEPTH {
-                let before = fresh.len();
-                for m in &scan.members {
-                    if !inside.contains(&m.pid)
-                        && inside.contains(&m.ppid)
-                        && !m.exempt
-                        && !is_git(&m.name)
-                    {
-                        inside.insert(m.pid);
-                        fresh.push(m);
+        // What joined each subtree, judged by the same predicate that chose
+        // it: a late member that is an MCP server, a lease waiter, a heavy job,
+        // a git process or in a worktree with a live index.lock is left
+        // running, and so is everything under it. Anything that cannot be
+        // checked is left too. The board is read once for all of them.
+        let board = self.probe.lease_board();
+        let mut locks: HashMap<PathBuf, bool> = HashMap::new();
+        let mut joiners: Vec<(usize, Vec<ReliefProc>)> = Vec::new();
+        {
+            let mut screen = board.as_ref().ok().map(|board| Screen {
+                probe: &*self.probe,
+                board,
+                refusing: self.refusing,
+                marks: &mut self.marks,
+                locks: &mut locks,
+            });
+            let mut checked = 0usize;
+            for (at, frozen) in self.frozen.iter().enumerate() {
+                if frozen.info.advised_only {
+                    continue;
+                }
+                let (session, root) = (frozen.session, frozen.root);
+                let Some(scan) = table
+                    .sessions
+                    .iter()
+                    .find(|s| (s.root.pid, s.root.start_us) == session)
+                else {
+                    ended.push(at);
+                    continue;
+                };
+                if !scan.members.iter().any(|m| (m.pid, m.start_us) == root) {
+                    ended.push(at);
+                    continue;
+                }
+                let Some(screen) = screen.as_mut() else {
+                    continue;
+                };
+                let mut inside: HashSet<i32> = frozen.members.iter().map(|(p, _)| *p).collect();
+                let mut rejected: HashSet<i32> = HashSet::new();
+                let mut fresh: Vec<ReliefProc> = Vec::new();
+                // Members are in table order, not tree order: sweep until no more join.
+                for _ in 0..MAX_TREE_DEPTH {
+                    let before = (fresh.len(), rejected.len());
+                    for m in &scan.members {
+                        if inside.contains(&m.pid)
+                            || !inside.contains(&m.ppid)
+                            || rejected.contains(&m.pid)
+                        {
+                            continue;
+                        }
+                        if checked >= MAX_CWD_CHECKS {
+                            // The rest wait for the next tick.
+                            continue;
+                        }
+                        checked += 1;
+                        if screen.eligible(m).is_ok() {
+                            inside.insert(m.pid);
+                            fresh.push(m.clone());
+                        } else {
+                            rejected.insert(m.pid);
+                        }
+                    }
+                    if (fresh.len(), rejected.len()) == before {
+                        break;
                     }
                 }
-                if fresh.len() == before {
-                    break;
-                }
+                let room = MAX_SUBTREE_MEMBERS.saturating_sub(frozen.members.len());
+                fresh.truncate(room);
+                joiners.push((at, fresh));
             }
-            let room = MAX_SUBTREE_MEMBERS.saturating_sub(self.frozen[at].members.len());
-            fresh.truncate(room);
+        }
+        if let Err(why) = &board {
+            self.fail(
+                None,
+                format!(
+                    "late members of a frozen subtree were not stopped: the build lease board could not be read: {why}"
+                ),
+            );
+        }
+        for (at, fresh) in joiners {
             if fresh.is_empty() {
                 continue;
             }
@@ -2047,6 +2874,16 @@ impl Relief {
                 self.fail(None, format!("a new member of a frozen subtree was not stopped: the journal could not be written: {why}"));
                 continue;
             }
+            // In the watchdog's copy before the first signal, counted from
+            // the subtree's own start.
+            self.sync_watch(
+                fresh
+                    .iter()
+                    .map(|m| (m.pid, m.start_us))
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                self.frozen[at].since,
+            );
             let mut added = Vec::new();
             for m in &fresh {
                 match self.actuator.signal(m.pid, m.start_us, Signal::Stop) {
@@ -2072,6 +2909,7 @@ impl Relief {
             self.frozen[at].members.extend(added);
             self.frozen[at].info.members =
                 u32::try_from(self.frozen[at].members.len()).unwrap_or(u32::MAX);
+            self.watch_frozen();
         }
         for at in ended.into_iter().rev() {
             let f = self.frozen.remove(at);
@@ -2092,6 +2930,7 @@ impl Relief {
                 ),
             );
         }
+        self.watch_frozen();
         if self.frozen.is_empty() && self.trigger.frozen() {
             self.trigger.ended();
         }
@@ -2103,10 +2942,11 @@ impl Drop for Relief {
     /// stopped or slowed because the thread that did it is gone.
     fn drop(&mut self) {
         if self.frozen.is_empty() && self.slowed.is_empty() && self.journal.is_empty() {
+            self.watch.set(Vec::new());
             return;
         }
         let _act = lock(&ACT);
-        let replay = replay_journal(&self.dir, &*self.actuator);
+        let replay = replay_journal(&self.dir, &self.ns, &*self.actuator);
         log_replay("stop", &replay);
         // Anything the journal could not list (a failed write) is resumed
         // from memory too.
@@ -2119,14 +2959,22 @@ impl Drop for Relief {
         for (pid, start_us) in members.into_iter().rev() {
             let _ = self.actuator.signal(pid, start_us, Signal::Cont);
         }
-        let mut ledger = lock(&LEDGER);
         for (&pid, &start_us) in &self.slowed {
-            if ledger.get(&pid) == Some(&(start_us, SlowOwner::Relief)) {
+            let ours =
+                ledger_get(&lock(&LEDGER), &self.ns, pid) == Some((start_us, SlowOwner::Relief));
+            if ours {
                 let _ = self.actuator.set_background(pid, start_us, false);
-                ledger.remove(&pid);
+                ledger_clear(&mut lock(&LEDGER), &self.ns, pid, start_us);
             }
         }
+        self.watch.set(Vec::new());
     }
+}
+
+/// Whether a refusal from the actuator means there is nothing to change: the
+/// process ended, or its pid belongs to another process now.
+fn process_is_gone(why: &str) -> bool {
+    why.contains("no longer running") || why.contains("recycled")
 }
 
 fn frozen_info(pick: &Selection, advised_only: bool) -> FrozenSubtree {

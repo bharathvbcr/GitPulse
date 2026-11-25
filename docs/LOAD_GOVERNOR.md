@@ -928,27 +928,41 @@ never acts.
 
 | Rung | When | Does |
 |---|---|---|
-| A, slow | Memory-bound Elevated or worse for 3 samples; released after 5 samples below Elevated | `PRIO_DARWIN_BG` on every non-exempt process of every agent session, launched or observed |
-| B, freeze | Memory-bound Severe for 30 consecutive samples (60 s) **and** deterioration | `SIGSTOP` of one subtree per session, at most three on the host |
+| A, slow | Memory-bound Elevated or worse for 3 samples **with a cause**; released after 5 samples below Elevated or without one | `PRIO_DARWIN_BG` on every non-exempt process of every agent session, launched or observed |
+| B, freeze | Memory-bound Severe for 30 consecutive samples (60 s) **and** worsening | `SIGSTOP` of one subtree per session, at most three on the host |
 
-Deterioration is swap in use or compressor segments still rising across that
-60 s window: the median of the last 5 readings over the median of the first 5,
-by at least 256 MiB of swap or 1 percentage point of the segment limit
-(`SWAP_RISE_BYTES`, `SEGMENT_RISE_POINTS`). **Level alone never triggers
-rung B**: swap does not drain after a recovery, so a high but flat swap is not a
-reason. Five consecutive samples below Severe end a Severe run; one dip does not
-restart the minute. An unreadable swap or segment reading never starts a freeze
-and never holds one.
+**A cause for rung A** is the kernel's memory-pressure level at Warn or worse,
+compressor thrash, compressor segments at their Elevated level, or swap or
+segments *rising* across the last 15 samples (`SLOW_TREND_SAMPLES`). Swap
+*level* is not one: it stays high long after a recovery, so a high flat swap
+under a Normal kernel slows nobody, and slowing already in force is put back.
+
+**Worsening for rung B** is swap in use or compressor segments still rising
+across the 60 s window (the median of the last 5 readings over the median of the
+first 5, by at least 256 MiB of swap or 1 percentage point of the segment limit:
+`SWAP_RISE_BYTES`, `SEGMENT_RISE_POINTS`), **or pinned at the edge for the whole
+window**: the kernel level Critical, compressor thrash, or segments at 95 % of
+their limit (`PINNED_SEGMENT_PCT`), where flat is still failing. A freeze begun
+that way is not ended by "flat" while it stays pinned. **Swap level never counts
+for either**: a high but flat swap is not a reason. Five consecutive samples
+below Severe end a Severe run; one dip does not restart the minute. An unreadable
+swap or segment reading never starts a freeze and never holds one.
 
 ### Selection (rung B)
 
 Only a **GitPulse-launched** session (its tree carries a launch id) in a
 **trusted** repository (`repository_trust::require` on the session's checkout,
 which starts no `git`). In it, the single heaviest eligible *subtree* by
-footprint sum, at least 256 MiB, **below a shell that is a direct child of the
-agent**: never the agent, never that shell. Every other direct child of the
-agent (an MCP server's stdio process, a helper) and everything under it is
-outside the search.
+footprint sum, at least 256 MiB, **below a shell that is positively an agent's
+tool-command shell and a direct child of the agent**: never the agent, never
+that shell. Every other direct child of the agent (an MCP server's stdio
+process, a launcher, a helper) and everything under it is outside the search.
+A tool shell is told by its arguments: Claude Code's Bash tool starts
+`/bin/zsh -c source <config>/shell-snapshots/snapshot-zsh-….sh …`, and macOS
+shows the arguments of `/bin/zsh` (an Apple platform binary) though not its
+environment. A shell whose arguments are unreadable, or carry no such mark, is
+not entered. No equivalent mark is verified for Codex's or Antigravity's shells,
+so their sessions are slowed and never frozen.
 
 ### Exemptions
 
@@ -960,31 +974,46 @@ trees. Rung B adds, and **one exempt member spares the whole subtree**:
 - `git` processes, and any process whose working directory is in a worktree
   with a live `index.lock` (the nearest `.git` directory, or the gitdir a linked
   worktree's `.git` file names);
-- **build-lease holders and waiters**, read from the lease board
-  (`lease::Dir::board`: the `F_GETLK` owner of each slot and each waiter's
-  ticket), because `procscan` cannot see a descriptor lock. A holder anywhere
-  in the subtree or in the chain above it spares it, so the children of a
-  holder are spared too. A board that cannot be read in full freezes nothing;
-- trees whose environment carries `GITPULSE_LEASE_HELD`, `CARGO_SLOT_HELD` or
-  `MAC_HEAVY_LABEL` (a non-empty value), read from `KERN_PROCARGS2` on the
-  subtree's root, its first 24 members and the shells above it. **Limit:** macOS
-  hides the environment of Apple platform binaries (`/bin/bash`, `/usr/bin/git`),
-  so the marker is found on the program that carries it (`cargo`, `go`,
-  `rustc`), not on the script that started it. An environment that cannot be
-  read spares the subtree: unknown is never clear;
-- MCP servers: the direct children of the agent that are not shells, and any
-  process named `*mcp*`. **Limit:** an MCP server started as `sh -c "npx ..."`
-  looks like a shell's child; it is frozen only if it is the heaviest eligible
-  subtree, and is resumed within the cap;
+- **build-lease waiters**, read from the lease board (`lease::Dir::board`: each
+  waiter's locked ticket), because `procscan` cannot see a descriptor lock. A
+  waiter anywhere in the subtree or in the chain above it spares it. A board
+  that cannot be read in full freezes nothing;
+- trees whose environment carries `MAC_HEAVY_LABEL` (a non-empty value), read
+  from `KERN_PROCARGS2` on the subtree's root, its first 24 members and the
+  shells above it; each process's environment is read once per (pid, start
+  time) and kept. **Limit:** macOS hides the environment of Apple platform
+  binaries (`/bin/bash`, `/usr/bin/git`), so the marker is found on the program
+  that carries it (`cargo`, `go`, `rustc`), not on the script that started it.
+  An environment that cannot be read spares the subtree: unknown is never clear;
+- MCP servers: any process named `*mcp*`, and everything under a direct child of
+  the agent that is not an identified tool shell (see Selection);
 - the shells that are direct children of the agent, and a process whose working
   directory cannot be read.
+
+**Build-lease holders are eligible while the lease board is refusing.** A holder
+(the `F_GETLK` owner of a slot, or a tree whose environment carries
+`GITPULSE_LEASE_HELD` or `CARGO_SLOT_HELD`, any non-empty value) is spared while
+the board takes builds, and eligible once `lease::capacity(..).refuses` is true
+(the verdict is Severe, or not admitting launches): a build nobody can replace
+is what is worth stopping. The board knows a holder is alive because a slot is
+an `fcntl` record lock the OS drops when its process dies and `F_GETLK` names
+the process holding it, so a stopped holder still holds it. **The first tick the
+board stops refusing, every frozen holder is continued**, without waiting for
+the memory to flatten or the 15 samples. A waiter and a `MAC_HEAVY_LABEL` job
+stay spared throughout.
+
+The same predicate (exempt, git, MCP, waiter, held markers, `index.lock`,
+environment and directory readable) judges a process that forks under a frozen
+subtree afterwards; one that fails it is left running.
 
 ### Recovery
 
 A freeze never lasts indefinitely. It ends at the first of:
 
-- deterioration flat for 15 samples (swap may stay high);
+- worsening flat for 15 samples (swap may stay high), unless the host is pinned
+  at the edge (kernel Critical, thrash, segments at 95 %);
 - the tier below Severe for 5 samples;
+- the lease board taking builds again, for a frozen build that held a slot;
 - **10 minutes** on the monotonic clock (`FREEZE_CAP`). At the cap the subtree
   resumes and is not refrozen until a whole new Severe minute with
   deterioration; there is no terminate rung in this slice. The cap hit is
@@ -1005,6 +1034,17 @@ its resume was attempted. Signals go through `procguard::signal::signal_process`
 which refuses a recycled pid by its start time; a refusal or any failed signal
 is recorded in `failures` and `failure_count`, never as done.
 
+**A second line that needs no file.** The journal is written on the sampler's
+thread, and a stalled disk is what a host short of memory has. The relief also
+keeps an in-memory copy of what is frozen (pid, start time, since) behind a lock
+of its own, and a watchdog thread continues what is past the cap plus 60 s, or
+everything when the tick has not advanced for 60 s (a hung sampler, or one that
+lost the writer election with a freeze standing). The teardown waits at most 2 s
+for a tick that is mid-action, then continues from that copy and leaves the
+journal for the next start. A freeze a live GitPulse left past its cap and grace
+is continued by the sampler that wins the next election; the rest of that
+journal stays the writer's.
+
 ### Slowing has one owner
 
 Every priority change GitPulse makes to an agent's process goes through the
@@ -1013,7 +1053,9 @@ now delegates to it (`relief::steward_throttle`): it may slow what the relief
 has not, and it cannot put back what the relief slowed. Before this, a steward
 tick with Manvi unconfigured restored every priority it knew of, which would
 have undone rung A. The steward keeps its lease, its pacing and its directive
-text; the relief releases rung A itself when pressure eases.
+text; the relief releases rung A itself when pressure eases. The ledger is
+per namespace (the app's relief and the steward share one), and no priority
+change runs with it locked.
 
 ### Setting and status
 
@@ -1041,9 +1083,14 @@ Only the writer's relief acts, and a journal belongs to the GitPulse that wrote
 it: a process that lost the writer election and quits does not continue or
 restore what the writer's relief did (the steward's journal follows the same
 rule). Rung A runs at once when a slowing begins and then every fifth sample;
-processes that have ended leave the ledger, the cap (2,048 live processes) and
-the journal on each pass; a process the OS refused once is not asked again until
-the slowing ends.
+a pass slows at most 256 new processes (2,048 in all) and the rest follow on the
+next. A slowed process that has left the scanned trees (its agent ended and it
+became launchd's child) is **put back** before it is forgotten, and a process
+that is gone leaves the ledger, the cap and the journal; the children that
+inherited the background from a slowed parent after the last pass are put back
+with it (they read back as in the background and are not the steward's). A
+process the OS refused once is not asked again until the slowing ends. Those
+inheritors are not journaled, so a crash restores only what the journal lists.
 
 ### Not verified
 
@@ -1058,11 +1105,19 @@ the slowing ends.
 - Selection was run read-only on this host's real trees (no signals): GitPulse-
   launched Claude sessions showed root-child shells and launch ids, and
   `KERN_PROCARGS2` returned environments. Every heavy subtree was then barred by
-  `GITPULSE_LEASE_HELD` (the builds running at the time), so a positive pick on a
-  real tree was not observed. A Codex session's root is its wrapper, so its
-  shells are grandchildren of the root and are never candidates.
+  `GITPULSE_LEASE_HELD` (the builds running at the time), which is why holders
+  became eligible while the board refuses; a positive pick on a real tree was not
+  observed. A Codex session's root is its wrapper, so its shells are
+  grandchildren of the root and are never candidates.
 - Apple platform binaries show an empty environment (a shell read back with 0
   variables), so a marker is found only on the non-Apple program that carries it.
+  Their **arguments** are readable: a `/bin/zsh -c source …/shell-snapshots/
+  snapshot-…` read back whole, which is what identifies an agent's tool shell.
+- The tick's per-process cost on this host was measured read-only (see
+  `measure_the_per_process_cost_of_a_priority_pass`), not under load.
+- A `resume_all` that lands between a tick's reading and its action is closed by
+  taking the action lock before the generation is read; the interleaving itself
+  is tested only by holding that lock, not by a scheduler that forces it.
 
 ## Health and the status bar
 

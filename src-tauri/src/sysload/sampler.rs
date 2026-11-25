@@ -936,7 +936,15 @@ fn run(shared: &Shared, options: &SamplerOptions) {
         // for it.
         if let (Some(relief), Some(input)) = (relief.as_mut(), relief_input.as_ref()) {
             relief.recover();
-            relief.tick(Instant::now(), input, &|| scanner.relief_table(me_pid));
+            // Whether the build-lease board is refusing new builds under the
+            // verdict this tick published: what lets a build that holds a
+            // slot be frozen, and sets it going the tick it is not.
+            let refuses = held_verdict.value().is_some_and(|verdict| {
+                super::lease::capacity(1, &super::lease::Load::Verdict(verdict)).refuses
+            });
+            relief.tick(Instant::now(), input, refuses, &|| {
+                scanner.relief_table(me_pid)
+            });
         }
 
         // One record every fifth tick (10 s), from the elected writer only.
@@ -1695,14 +1703,26 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_elected_sampler_ticks_the_relief_without_manvi_and_serves_its_snapshot() {
-        use super::super::relief::{snapshot, Actuator, Delivery, Probe, Relief, Rung, Signal};
-        struct Refusing;
+        use super::super::procscan::{ReliefProc, ReliefSession, ReliefTable};
+        use super::super::relief::{
+            snapshot, Actuator, Delivery, LeaseBoard, Probe, Relief, Rung, Signal,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        /// Asked to slow, and says no: the count is how often it was asked.
+        struct Refusing(Arc<AtomicUsize>);
         impl Actuator for Refusing {
-            fn set_background(&self, _: i32, _: u64, _: bool) -> Result<bool, String> {
+            fn set_background(&self, _: i32, _: u64, enable: bool) -> Result<bool, String> {
+                if enable {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
                 Err("this test never changes a priority".into())
             }
             fn signal(&self, _: i32, _: u64, _: Signal) -> Result<Delivery, String> {
                 Err("this test never signals".into())
+            }
+            fn is_background(&self, _: i32, _: u64) -> Option<bool> {
+                None
             }
         }
         struct Blind;
@@ -1713,10 +1733,37 @@ mod tests {
             fn environment(&self, _: i32) -> Option<Vec<String>> {
                 None
             }
-            fn lease_pids(&self) -> Result<std::collections::BTreeSet<i32>, String> {
+            fn argv(&self, _: i32) -> Option<Vec<String>> {
+                None
+            }
+            fn lease_board(&self) -> Result<LeaseBoard, String> {
                 Err("this test reads no lease board".into())
             }
         }
+        // One agent session with one worker, so there is something to slow
+        // whatever this host is running.
+        let member = |pid: i32, ppid: i32, name: &str| ReliefProc {
+            pid,
+            ppid,
+            start_us: 1_000_000 + pid as u64,
+            name: name.into(),
+            footprint: Some(64 << 20),
+            exempt: false,
+        };
+        let table = ReliefTable {
+            sessions: vec![ReliefSession {
+                root: ReliefProc {
+                    exempt: true,
+                    ..member(7_000_100, 1, "claude")
+                },
+                kind: super::super::AgentKind::Claude,
+                launched: true,
+                terminal_session_id: None,
+                run_id: None,
+                members: vec![member(7_000_101, 7_000_100, "worker")],
+            }],
+        };
+        let asked = Arc::new(AtomicUsize::new(0));
         let dir = tempfile::tempdir().unwrap();
         let mut options = SamplerOptions::new(dir.path().to_path_buf());
         options.cadence = Duration::from_millis(20);
@@ -1727,23 +1774,41 @@ mod tests {
             }]))
         }));
         let relief_dir = dir.path().to_path_buf();
+        let counted = asked.clone();
+        let shown = table.clone();
         options.relief = Some(Box::new(move || {
             Relief::new(
                 relief_dir.clone(),
-                Box::new(Refusing),
+                Box::new(Refusing(counted.clone())),
                 Box::new(Blind),
                 Box::new(|| crate::tool_config::SupervisorMode::Act),
                 Box::new(|_| false),
             )
+            .with_table(Arc::new({
+                let shown = shown.clone();
+                move || shown.clone()
+            }))
             .publishing()
         }));
         let sampler = start(options).unwrap();
+        // The rung alone could be the trigger's verdict with nothing done:
+        // wait for the actuator itself to have been asked to slow.
         let reached = crate::test_support::wait_until(Duration::from_secs(30), || {
-            snapshot().rung == Rung::Slow
+            snapshot().rung == Rung::Slow && asked.load(Ordering::SeqCst) > 0
         });
         let seen = snapshot();
         sampler.stop();
-        assert!(reached, "the relief never reported a slowing: {seen:?}");
+        assert!(reached, "the relief never slowed anything: {seen:?}");
+        assert!(
+            asked.load(Ordering::SeqCst) > 0,
+            "the actuator was never asked to slow the session's worker"
+        );
+        assert!(
+            seen.failures
+                .iter()
+                .any(|f| f.what.contains("never changes a priority")),
+            "the refusal is in the snapshot, not dropped: {seen:?}"
+        );
         assert_eq!(seen.tier, Some(super::super::Tier::Severe));
         assert_eq!(seen.binding, Some(super::super::Binding::MemoryPressure));
         assert_eq!(seen.mode, crate::tool_config::SupervisorMode::Act);
