@@ -298,7 +298,11 @@ function run(
   }
 }
 
-describe.skipIf(!hasBash)("the fixture address rule", () => {
+// Every suite below spawns bash and git. Process start-up on a Windows runner
+// can take longer than vitest's 5 s default for one test (four of these timed
+// out there in CI), so each suite gets the 30 s the hook suites above use.
+// A test that needs more still sets its own limit.
+describe.skipIf(!hasBash)("the fixture address rule", { timeout: 30_000 }, () => {
   it("agrees with every row of the table GitWriter is tested against", () => {
     // fixture-identity.cases is read by GitWriter's Rust test too; this runs
     // the shell rule over the same rows, so the two cannot drift apart.
