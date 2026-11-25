@@ -291,7 +291,11 @@ fn a_split_index_whose_entries_replace_shared_ones_is_read() {
             IndexReadState::Present,
             "v{version}: {report:?}"
         );
-        assert_eq!(report.index.split_index, Some(true), "v{version}: {report:?}");
+        assert_eq!(
+            report.index.split_index,
+            Some(true),
+            "v{version}: {report:?}"
+        );
     }
 }
 
