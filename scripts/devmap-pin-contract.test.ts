@@ -65,6 +65,16 @@ export function devmapPin(workflow: string): string | undefined {
   return /^ {2}DEVMAP_REV: (\S+)\s*$/m.exec(workflow)?.[1];
 }
 
+/** The instrumented lib suite drives the CLI too, so devmap must be installed before it runs. */
+export function coverageOrderProblems(coverage: string): string[] {
+  // The step, not the words: a comment near the top already mentions `cargo llvm-cov`.
+  const install = coverage.indexOf("name: Install devmap");
+  const suite = coverage.indexOf("name: Generate Rust Coverage");
+  if (suite === -1) return ["coverage.yml has no 'Generate Rust Coverage' step; this contract needs updating"];
+  if (install === -1 || install > suite) return ["coverage.yml runs the instrumented suite before it installs devmap"];
+  return [];
+}
+
 describe("devmap pin contract", () => {
   const ci = read(".github/workflows/ci.yml");
   // The coverage workflow runs the same lib suite, so it installs the same CLI.
@@ -77,11 +87,7 @@ describe("devmap pin contract", () => {
   it("holds the coverage workflow to the same rules and the same pin as ci.yml", () => {
     expect(devmapPinProblems(coverage)).toEqual([]);
     expect(devmapPin(coverage), "coverage.yml builds devmap from another commit than ci.yml").toBe(devmapPin(ci));
-    // The step, not the words: a comment near the top already mentions `cargo llvm-cov`.
-    const install = coverage.indexOf("name: Install devmap");
-    const suite = coverage.indexOf("name: Generate Rust Coverage");
-    expect(suite, "coverage.yml has no 'Generate Rust Coverage' step; this contract needs updating").toBeGreaterThan(-1);
-    expect(install !== -1 && install < suite, "coverage.yml runs the instrumented suite before it installs devmap").toBe(true);
+    expect(coverageOrderProblems(coverage)).toEqual([]);
   });
 
   it("builds from the commit the vendored devmap-store schema number comes from", () => {
@@ -91,6 +97,15 @@ describe("devmap pin contract", () => {
     const stated = /DevCouncil commit `devmap` is built from[\s\S]*?store schema (\d+)/.exec(ci)?.[1];
     expect(vendored, "vendored schema number not found").toBeDefined();
     expect(stated, `ci.yml states schema ${stated}, the vendored crates are at ${vendored}`).toBe(vendored);
+  });
+
+  it("the coverage ordering rule fails on a job that installs devmap late or never", () => {
+    const missing = coverage.replace("name: Install devmap", "name: Fetch devmap");
+    expect(missing).not.toBe(coverage);
+    expect(coverageOrderProblems(missing)).toEqual(["coverage.yml runs the instrumented suite before it installs devmap"]);
+    const noSuite = coverage.replace("name: Generate Rust Coverage", "name: Something else");
+    expect(noSuite).not.toBe(coverage);
+    expect(coverageOrderProblems(noSuite)[0]).toContain("this contract needs updating");
   });
 
   describe("the rules fail on the shapes they are for", () => {

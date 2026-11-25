@@ -1262,9 +1262,6 @@ mod tests {
         super::git_in(second.path(), &["init", "-q"]);
     }
 
-    /// `GIT_WORK_TREE` moves the work tree git reads files from: with a
-    /// neighbour's value inherited, `add f.txt` looks for `f.txt` in the
-    /// neighbour's directory and the fixture's file is never staged.
     use super::{git_in, git_merge_in, git_repo, write};
     use tempfile::TempDir;
 
@@ -1311,6 +1308,9 @@ mod tests {
         git_merge_in(dir.path(), &["merge", "--no-edit", "no-such-branch"]);
     }
 
+    /// `GIT_WORK_TREE` moves the work tree git reads files from: with a
+    /// neighbour's value inherited, `add f.txt` looks for `f.txt` in the
+    /// neighbour's directory and the fixture's file is never staged.
     #[test]
     fn git_in_does_not_follow_a_neighbours_work_tree() {
         use crate::test_support::env::{bind_env, env_serial};
