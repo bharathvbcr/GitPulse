@@ -84,14 +84,17 @@ describe("engine prose folding survives hostile shapes", () => {
     () => {
       // The structural claim, independent of any machine: SIZE_FACTOR times the
       // input must cost about what SIZE_FACTOR calls on the small input cost.
-      // Linear reads ~1; the quadratic rescan this guards reads ~SIZE_FACTOR.
+      // Linear read 0.87–1.04 over 20 runs (macOS, load ~4); with the whitespace
+      // collapse removed it read 3.94. The limit is 2.
       //
       // One fold is tiny once whitespace is collapsed (~0.02ms for 30k chars),
       // so the old single-call doubling ratio measured timer and GC noise over
       // a 0.05ms floor: it read 4.0 against a limit of 3 on macOS CI with the
-      // fix in place. Each sample is now a batch grown until it costs 50ms of
-      // CPU, the two sizes are timed as equal work in alternating rounds, and
-      // the minimum of each is compared (as markdevRender.test.ts does).
+      // fix in place. Each sample is now a batch grown until it costs 250ms of
+      // CPU (about 16 of Windows' 15.6ms process-time ticks, so one tick either
+      // side moves the ratio ~6%), the two sizes are timed as equal work in
+      // alternating rounds, and the minimum of each is compared (as
+      // markdevRender.test.ts does). GITPULSE_PERF_REPORT=1 prints the ratio.
       const SIZE_FACTOR = 4;
       const small = whitespaceBomb(30_000);
       const large = whitespaceBomb(30_000 * SIZE_FACTOR);
@@ -109,7 +112,7 @@ describe("engine prose folding survives hostile shapes", () => {
         1000,
       );
       let reps = 1;
-      while (reps < 4096 && fastestCpuOf(1, foldLarge(reps)) < 50) reps *= 2;
+      while (reps < 1 << 16 && fastestCpuOf(1, foldLarge(reps)) < 250) reps *= 2;
       let cpuSmallBatch = Number.POSITIVE_INFINITY;
       let cpuLarge = Number.POSITIVE_INFINITY;
       for (let round = 0; round < 3; round += 1) {
@@ -117,6 +120,13 @@ describe("engine prose folding survives hostile shapes", () => {
         cpuLarge = Math.min(cpuLarge, fastestCpuOf(1, foldLarge(reps)));
       }
       const ratio = cpuLarge / cpuSmallBatch;
+      if (process.env.GITPULSE_PERF_REPORT) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `PERF whitespace scaling: ratio ${ratio.toFixed(3)} (${reps} reps, ` +
+            `large ${cpuLarge.toFixed(0)}ms, small batch ${cpuSmallBatch.toFixed(0)}ms)`,
+        );
+      }
       expect(
         ratio,
         `${SIZE_FACTOR}x the input cost ${ratio.toFixed(2)}x the equal small-input work (${reps} reps)`,
