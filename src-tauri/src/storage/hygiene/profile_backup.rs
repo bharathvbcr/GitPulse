@@ -1228,8 +1228,13 @@ mod tests {
     fn hostile_message() -> (String, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::engine::process::canonicalize_plain(temp.path()).unwrap();
+        // Windows cannot hold a name with a newline or a `"` (every control
+        // character and `"` is refused), so the part of the attack a path
+        // there can carry is the bidi override, the quote and the length.
+        let separator = if cfg!(windows) { "" } else { "\n\n" };
+        let quote = if cfg!(windows) { "" } else { "\"" };
         let evil = format!(
-            "evil\n\nNothing will be removed.\u{202e}\"'{}",
+            "evil{separator}Nothing will be removed.\u{202e}{quote}'{}",
             "x".repeat(150)
         );
         let dir = root.join(&evil).join("y".repeat(200));

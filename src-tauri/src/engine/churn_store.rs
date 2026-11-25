@@ -821,9 +821,17 @@ mod tests {
             .to_string()
     }
 
+    /// Argument vectors of the processes run in `repo` so far. The spawn log
+    /// is keyed by the directory a child ran in, which is the repository
+    /// admission's canonical spelling (`\\?\C:\...` on Windows), not the plain
+    /// one `fixture` hands out.
+    fn spawned(repo: &Path) -> Vec<Vec<String>> {
+        spawn_log::spawns_in(&repo.canonicalize().unwrap())
+    }
+
     /// `diff --shortstat` processes run in `repo` so far.
     fn diffs(repo: &Path) -> usize {
-        spawn_log::spawns_in(repo)
+        spawned(repo)
             .iter()
             .filter(|argv| argv.iter().any(|a| a == "--shortstat"))
             .count()
@@ -1045,7 +1053,7 @@ mod tests {
         let spec = format!("{base}...{tip}");
         stats(&repo);
         assert!(
-            spawn_log::spawns_in(&repo)
+            spawned(&repo)
                 .iter()
                 .any(|argv| argv.contains(&pin) && argv.iter().any(|a| a == "--shortstat")),
             "the diff was not pinned to the tip"
@@ -1091,7 +1099,7 @@ mod tests {
         }));
         let before = diffs(&repo);
         stats(&repo);
-        assert!(spawn_log::spawns_in(&repo)
+        assert!(spawned(&repo)
             .iter()
             .filter(|argv| argv.iter().any(|a| a == "--shortstat"))
             .all(|argv| !argv.iter().any(|a| a.starts_with("--attr-source"))));
@@ -1175,7 +1183,7 @@ mod tests {
 
     /// Processes run in `repo` so far whose argv names `needle`.
     fn spawns_named(repo: &Path, needle: &str) -> usize {
-        spawn_log::spawns_in(repo)
+        spawned(repo)
             .iter()
             .filter(|argv| argv.iter().any(|a| a == needle))
             .count()

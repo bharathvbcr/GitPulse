@@ -111,7 +111,8 @@ pub(crate) fn validate_user_path(
     }
     let home =
         crate::engine::process::canonicalize_plain(home).unwrap_or_else(|_| home.to_path_buf());
-    if given == Path::new("/") || home.starts_with(given) {
+    // The root of any volume has no parent: `/`, or `C:\` on Windows.
+    if given.parent().is_none() || home.starts_with(given) {
         return Err(format!(
             "{path} is the filesystem root, the home directory or one of its ancestors; list a directory inside it instead"
         ));

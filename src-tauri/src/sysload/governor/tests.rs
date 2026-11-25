@@ -88,7 +88,13 @@ fn replay(counters: &[(u64, u64)], level: Level, written: u64, read: u64) -> Inp
     }
     let mut writer = SnapshotWriter::elect(dir.path()).unwrap().unwrap();
     writer.publish(&snap).unwrap();
-    let (report, snap) = snapshot::report(&dir.path().join(SNAPSHOT_FILE_NAME), clock(read));
+    // Read as a reader that has a sensor, on any host: this is the governor's
+    // replay, not a test of what a sensorless platform's reader says.
+    let (report, snap) = snapshot::report_on(
+        Platform::Governed,
+        &dir.path().join(SNAPSHOT_FILE_NAME),
+        clock(read),
+    );
     Input::from_report(&report, snap.as_ref(), true, Thresholds::default())
 }
 

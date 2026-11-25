@@ -122,10 +122,48 @@ fn nobody() -> LiveSessions {
     LiveSessions::default()
 }
 
+/// What a removal answers on a platform with no reviewed removal.
+use super::tree::NO_REMOVAL;
+
+/// An ordinary refusal that removed nothing, with the platform's own text.
+fn assert_no_removal(refusal: &Refusal) {
+    assert!(
+        matches!(refusal, Refusal::Kept(why) if why == NO_REMOVAL),
+        "{refusal:?}"
+    );
+}
+
+/// Removes an offered candidate and returns the bytes it freed, where this
+/// platform removes. Where it does not, the removal must be refused with the
+/// platform's text and leave the folder as it was, which is checked here and
+/// answered as `None`: what a test asserts about the folder being gone
+/// applies only to a `Some`.
+fn remove_offered(candidate: &CleanerCandidate) -> Option<u64> {
+    let outcome = run(&nobody(), &idle, |ctx| remove(candidate, ctx, u64::MAX));
+    if cfg!(unix) {
+        return Some(outcome.unwrap());
+    }
+    assert_eq!(outcome, Err(NO_REMOVAL.to_string()));
+    assert!(
+        Path::new(&candidate.path).is_dir(),
+        "a refused removal left {} as it was",
+        candidate.path
+    );
+    None
+}
+
+/// Whether `path`, as a path, ends in `tail` written with `/`: component-wise,
+/// so a Windows path's `\` matches `/`.
+fn ends_in(path: &str, tail: &str) -> bool {
+    Path::new(path).ends_with(tail)
+}
+
+/// The kept row whose path holds `needle`, written with `/` as the tests
+/// write paths: Windows spells the same path with `\`.
 fn kept_reason<'a>(scan: &'a Scan, needle: &str) -> &'a KeptItem {
     scan.kept
         .iter()
-        .find(|k| k.path.contains(needle))
+        .find(|k| k.path.replace('\\', "/").contains(needle))
         .unwrap_or_else(|| panic!("{needle} not kept: {:?}", scan.kept))
 }
 
@@ -150,9 +188,10 @@ fn a_finished_sessions_cargo_target_is_offered_and_only_it_is_removed() {
         .evidence
         .iter()
         .any(|e| e.contains("Cargo target")));
-    let freed = run(&nobody(), &idle, |ctx| remove(candidate, ctx, u64::MAX)).unwrap();
-    assert!(freed >= 4096);
-    assert!(!pad.join("cargo-target").exists());
+    if let Some(freed) = remove_offered(candidate) {
+        assert!(freed >= 4096);
+        assert!(!pad.join("cargo-target").exists());
+    }
     assert!(pad.is_dir(), "the scratchpad itself stays");
     assert_eq!(
         fs::read_to_string(pad.join("notes.txt")).unwrap(),
@@ -448,7 +487,7 @@ fn a_preserved_name_between_the_scope_root_and_the_target_keeps_it() {
     });
     let offered: Vec<&str> = scan.candidates.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(offered.len(), 1, "{offered:?} / {:?}", scan.kept);
-    assert!(offered[0].ends_with("work/cargo-target"));
+    assert!(ends_in(offered[0], "work/cargo-target"));
     assert!(
         kept_reason(&scan, "tmp/cargo-target")
             .reason
@@ -479,12 +518,10 @@ fn a_scratch_target_in_a_repository_needs_git_to_ignore_it() {
     assert!(kept_reason(&scan, "target-b")
         .reason
         .contains("does not ignore"));
-    let freed = run(&nobody(), &idle, |ctx| {
-        remove(&scan.candidates[0], ctx, u64::MAX)
-    })
-    .unwrap();
-    assert!(freed > 0);
-    assert!(!repo.join(".gitpulse/scratch/target-a").exists());
+    if let Some(freed) = remove_offered(&scan.candidates[0]) {
+        assert!(freed > 0);
+        assert!(!repo.join(".gitpulse/scratch/target-a").exists());
+    }
     assert!(repo.join(".gitpulse/scratch/target-b").is_dir());
 }
 
@@ -581,7 +618,7 @@ fn a_claude_build_folder_is_judged_in_the_checkout_and_in_a_worktrees_copy() {
     });
     let offered: Vec<&str> = scan.candidates.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(offered.len(), 1, "{offered:?} / {:?}", scan.kept);
-    assert!(offered[0].ends_with("lane/.claude/x-target"), "{offered:?}");
+    assert!(ends_in(offered[0], "lane/.claude/x-target"), "{offered:?}");
     let candidate = &scan.candidates[0];
     assert_eq!(candidate.scope, SCOPE_CLAUDE);
     assert!(
@@ -595,8 +632,9 @@ fn a_claude_build_folder_is_judged_in_the_checkout_and_in_a_worktrees_copy() {
     let in_use = kept_reason(&scan, "repo/.claude/x-target");
     assert!(in_use.reason.starts_with("in use:"), "{}", in_use.reason);
     // Removal takes the copy and nothing else under .claude, in either checkout.
-    run(&nobody(), &idle, |ctx| remove(candidate, ctx, u64::MAX)).unwrap();
-    assert!(!lane.join(".claude/x-target").exists());
+    if remove_offered(candidate).is_some() {
+        assert!(!lane.join(".claude/x-target").exists());
+    }
     for kept in [
         lane.join(".claude/skills/a.md"),
         lane.join(".claude/settings.local.json"),
@@ -705,11 +743,9 @@ fn a_real_shaped_cargo_target_with_tmp_is_offered_and_removed() {
         scan_sessions(&root, UID, ctx, false)
     });
     assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
-    run(&nobody(), &idle, |ctx| {
-        remove(&scan.candidates[0], ctx, u64::MAX)
-    })
-    .unwrap();
-    assert!(!target.exists());
+    if remove_offered(&scan.candidates[0]).is_some() {
+        assert!(!target.exists());
+    }
 }
 
 #[test]
@@ -725,11 +761,9 @@ fn a_claude_target_with_tmp_is_removed_and_a_repository_inside_it_is_not() {
         scan_claude_targets(std::slice::from_ref(&lane), ctx, false)
     });
     assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
-    run(&nobody(), &idle, |ctx| {
-        remove(&scan.candidates[0], ctx, u64::MAX)
-    })
-    .unwrap();
-    assert!(!copy.exists());
+    if remove_offered(&scan.candidates[0]).is_some() {
+        assert!(!copy.exists());
+    }
     assert!(lane.join(".claude/skills/a.md").is_file());
     // A repository, a .env or node_modules inside the main one keep it whole.
     let main = repo.join(".claude/x-target");
@@ -1004,13 +1038,11 @@ fn a_marked_target_under_a_repositorys_tmp_is_offered_and_one_under_a_git_dir_is
     cargo_target(&repo.join("tmp/a/target"), 30);
     let scan = run(&nobody(), &idle, |ctx| scan_repository(&repo, ctx, false));
     assert_eq!(scan.candidates.len(), 1, "{:?}", scan.kept);
-    assert!(scan.candidates[0].path.ends_with("tmp/a/target"));
-    let freed = run(&nobody(), &idle, |ctx| {
-        remove(&scan.candidates[0], ctx, u64::MAX)
-    })
-    .unwrap();
-    assert!(freed > 0);
-    assert!(!repo.join("tmp/a/target").exists());
+    assert!(ends_in(&scan.candidates[0].path, "tmp/a/target"));
+    if let Some(freed) = remove_offered(&scan.candidates[0]) {
+        assert!(freed > 0);
+        assert!(!repo.join("tmp/a/target").exists());
+    }
     // Forged: a target below a repository's own metadata.
     let hidden = repo.join("tmp/x/.git/y/target");
     cargo_target(&hidden, 30);
@@ -1182,6 +1214,30 @@ fn a_real_child_holding_the_target_keeps_it_through_the_real_process_table() {
     let (_temp, root) = temp_root();
     let target = scratchpad(&root, OLD).join("target-x");
     cargo_target(&target, 30);
+    if !cfg!(unix) {
+        // No process table is read here, so whether a process holds the folder
+        // cannot be answered: the reading says so, and the folder is kept as
+        // one that could not be checked, never offered.
+        let table = crate::sysload::procscan::dir_use(&target).unwrap_err();
+        assert!(
+            table.contains("listing processes is not supported on this platform"),
+            "{table}"
+        );
+        let real_use = |dir: &Path| crate::sysload::procscan::dir_use(dir);
+        let scan = run(&nobody(), &real_use, |ctx| {
+            scan_sessions(&root, UID, ctx, false)
+        });
+        assert!(scan.candidates.is_empty(), "{:?}", scan.candidates);
+        let reason = &kept_reason(&scan, "target-x").reason;
+        assert!(
+            reason.starts_with(COULD_NOT_CHECK)
+                && reason.contains("listing processes is not supported on this platform"),
+            "{reason}"
+        );
+        assert!(scan.unexamined >= 1, "{}", scan.unexamined);
+        assert!(target.is_dir());
+        return;
+    }
     let mut child = std::process::Command::new("sh")
         .args(["-c", "read line"])
         .current_dir(&target)
@@ -1342,7 +1398,7 @@ fn a_build_named_wrapper_in_a_session_scratchpad_is_looked_into_one_level() {
     });
     let offered: Vec<&str> = scan.candidates.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(offered.len(), 1, "{offered:?} / {:?}", scan.kept);
-    assert!(offered[0].ends_with("target-wrap/inner"), "{offered:?}");
+    assert!(ends_in(offered[0], "target-wrap/inner"), "{offered:?}");
     assert!(
         kept_reason(&scan, "target-wrap")
             .reason
@@ -1360,12 +1416,9 @@ fn a_build_named_wrapper_in_a_session_scratchpad_is_looked_into_one_level() {
     let scan = run(&nobody(), &idle, |ctx| {
         scan_sessions(&root, UID, ctx, false)
     });
-    run(&nobody(), &idle, |ctx| {
-        remove(&scan.candidates[0], ctx, u64::MAX)
-    })
-    .unwrap();
+    let removed = remove_offered(&scan.candidates[0]);
     assert!(wrapper.is_dir());
-    assert!(!wrapper.join("inner").exists());
+    assert_eq!(!wrapper.join("inner").exists(), removed.is_some());
 }
 
 /// A process that begins using the folder after the judgement and before the
@@ -2029,10 +2082,14 @@ fn a_removal_refused_before_its_first_unlink_does_not_excuse_its_parent() {
     let live = nobody();
     let ctx = recency_context(&live, &cancel, Some(&removals), &adds_a_file);
     let failure = remove_judged(&candidate, &ctx, u64::MAX).unwrap_err();
-    assert!(
-        matches!(&failure, Refusal::Kept(why) if why.contains("changed after preview")),
-        "refused before the first unlink: {failure:?}"
-    );
+    if cfg!(unix) {
+        assert!(
+            matches!(&failure, Refusal::Kept(why) if why.contains("changed after preview")),
+            "refused before the first unlink: {failure:?}"
+        );
+    } else {
+        assert_no_removal(&failure);
+    }
     assert!(target.join("debug/app.o").exists(), "nothing was removed");
     // The file the fixture added changed the target's own time: put it back,
     // so the only recent time left is the one the parent gets below.
@@ -2264,6 +2321,12 @@ fn a_removal_stopped_part_way_reports_the_bytes_it_removed() {
         removals: None,
     };
     let failure = remove_judged(&candidate, &ctx, u64::MAX).unwrap_err();
+    if !cfg!(unix) {
+        // No removal, so none stops part way: it is refused whole.
+        assert_no_removal(&failure);
+        assert!(target.join("debug/app.o").exists(), "nothing was removed");
+        return;
+    }
     let Refusal::PartlyRemoved { why, bytes } = &failure else {
         panic!("a partial removal is not a plain refusal: {failure:?}");
     };
@@ -2368,7 +2431,13 @@ fn zero_retention_admits_recent_idle_scratch_but_still_refuses_future_dates_and_
     assert!(recent.exists());
 
     // When genuinely idle, `remove_judged` with `retention_days == 0` reclaims it.
-    let freed = remove_judged(cand, &ctx, u64::MAX).expect("reclaims recent idle scratch");
-    assert!(freed >= 4096, "{freed}");
-    assert!(!recent.exists());
+    let reclaimed = remove_judged(cand, &ctx, u64::MAX);
+    if cfg!(unix) {
+        let freed = reclaimed.expect("reclaims recent idle scratch");
+        assert!(freed >= 4096, "{freed}");
+        assert!(!recent.exists());
+    } else {
+        assert_no_removal(&reclaimed.unwrap_err());
+        assert!(recent.exists());
+    }
 }

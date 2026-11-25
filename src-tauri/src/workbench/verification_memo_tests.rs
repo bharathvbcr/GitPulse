@@ -574,6 +574,19 @@ fn a_store_replaced_on_disk_is_seen() {
         put(&other, "a", "failed");
         put(&other, "z", "passed");
     }
+    if cfg!(windows) {
+        // The memo keeps a connection to the file open to watch it, and
+        // Windows will not replace a database a connection holds open: the
+        // move is refused, the file is the one it was, and what the memo
+        // knew of it stands.
+        let refused = std::fs::rename(&other_path, &path).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        let reopened = Store::open(&path).unwrap();
+        let found = memo.latest_many(&reopened, &ids(&["a", "z", "c"])).unwrap();
+        assert_eq!(outcome_of(&found, "a").as_deref(), Some("passed"));
+        assert!(!found.contains_key("z"));
+        return;
+    }
     std::fs::rename(&other_path, &path).unwrap();
     let reopened = Store::open(&path).unwrap();
     let found = memo.latest_many(&reopened, &ids(&["a", "z", "c"])).unwrap();

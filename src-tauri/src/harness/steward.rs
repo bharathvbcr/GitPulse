@@ -5230,7 +5230,7 @@ mod tests {
             .any(|w| w.contains("local model server")));
         assert_eq!(critical.throttled_processes, 1);
         assert_eq!(*deps.throttle_ops.borrow(), vec![(4100, true)]);
-        assert!(tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE).is_file());
+        let _ = published_lease(tmp.path(), &critical);
 
         // Recovery to Clear restores pid 4100 and deletes active.json!
         deps.now_ms += 60_000;
@@ -5859,7 +5859,11 @@ mod tests {
         assert!(live_deps.repo_trusted(&repo_str));
         assert!(live_deps.repo_common_dir(&repo_str).is_some());
         let calm = make_load(SensorState::Fresh, Tier::Clear, None, true);
-        assert!(live_deps.candidate_repos(&calm, None).contains(&repo_str));
+        // The candidates are spelled the way the repository admission spells a
+        // checkout (`\\?\C:\...` on Windows), which is not the plain path the
+        // bus peers above were registered under.
+        let admitted = repo.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(live_deps.candidate_repos(&calm, None).contains(&admitted));
 
         let mb = Mailbox::at_default().expect("default mailbox");
         let msg_id = format!(
@@ -6283,30 +6287,39 @@ mod tests {
     #[test]
     fn foreign_live_writer_lease_survives_reader_standdown_and_non_throttled_critical_debounce_resets(
     ) {
-        struct ChildKillGuard(std::process::Child);
-        impl Drop for ChildKillGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
         let rt = StewardRuntime::default();
         let mut deps = base_deps(tmp.path());
 
-        use crate::procguard::LockedSpawn;
-        // Spawn a distinct live OS process to represent the elected primary GitPulse writer.
-        let mut guard_child = ChildKillGuard(
-            std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn_locked()
-                .expect("spawn sleep"),
-        );
-        let foreign_pid = guard_child.0.id();
+        // A distinct live OS process represents the elected primary GitPulse
+        // writer. Windows reads no process start time, so no writer there can
+        // be shown live: the record names a pid that is not this one and a
+        // start time nothing can match, and is cleared as stale.
+        #[cfg(unix)]
+        let (mut guard_child, foreign_pid, foreign_start_us) = {
+            use crate::procguard::LockedSpawn;
+            struct ChildKillGuard(std::process::Child);
+            impl Drop for ChildKillGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = ChildKillGuard(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn_locked()
+                    .expect("spawn sleep"),
+            );
+            let pid = child.0.id();
+            let start_us = crate::sysload::process_start_us(pid).expect("live child start_us");
+            (child, pid, start_us)
+        };
+        #[cfg(not(unix))]
+        let (foreign_pid, foreign_start_us) = (std::process::id().wrapping_add(1), 1u64);
         assert_ne!(foreign_pid, std::process::id());
-        let foreign_start_us =
-            crate::sysload::process_start_us(foreign_pid).expect("live child start_us");
+        // Whether a foreign writer's lease is believed live, and so kept.
+        let kept = cfg!(unix);
 
         let foreign_record = ActiveThrottleRecord {
             version: LEASE_VERSION,
@@ -6327,8 +6340,9 @@ mod tests {
         // 1. Secondary instance shutdown / passive cleanup must NOT clobber a live foreign writer's lease.
         clear_active_throttle_if_owned_or_stale(tmp.path(), deps.now_ms)
             .expect("passive clear succeeds");
-        assert!(
+        assert_eq!(
             active_file.exists(),
+            kept,
             "live foreign writer's active.json must survive passive/shutdown clear"
         );
 
@@ -6351,21 +6365,26 @@ mod tests {
         assert_eq!(sched_rec.outcome, "sensor_unavailable");
         assert_eq!(*deps.llm_calls.borrow(), 0);
         assert!(deps.delivered.borrow().is_empty());
-        assert!(
+        assert_eq!(
             active_file.exists(),
+            kept,
             "Role::Reader scheduled stand-down must keep primary writer's active.json"
         );
 
         let manual_rec = evaluate_tick_with(&rt, "manual", None, &deps);
         assert_eq!(manual_rec.outcome, "acted");
-        assert!(
+        assert_eq!(
             active_file.exists(),
+            kept,
             "Role::Reader manual tick must not clobber primary writer's active.json"
         );
 
         // Once the foreign writer exits, passive cleanup reclaims the stale lease file.
-        let _ = guard_child.0.kill();
-        let _ = guard_child.0.wait();
+        #[cfg(unix)]
+        {
+            let _ = guard_child.0.kill();
+            let _ = guard_child.0.wait();
+        }
         clear_active_throttle_if_owned_or_stale(tmp.path(), deps.now_ms)
             .expect("stale clear succeeds");
         assert!(
@@ -7565,10 +7584,10 @@ Trailing note {done}."#;
         *deps.settings.borrow_mut() = settings;
         deps.load = critical_memory();
         deps.candidates = vec![agent_worker(4100)];
-        evaluate_tick_with(&rt, "critical_wake", None, &deps);
-        let raw = fs::read(tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE)).unwrap();
-        let lease: ActiveThrottleRecord = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(lease.expires_at_ms - lease.issued_at_ms, 900_000);
+        let rec = evaluate_tick_with(&rt, "critical_wake", None, &deps);
+        if let Some(lease) = published_lease(tmp.path(), &rec) {
+            assert_eq!(lease.expires_at_ms - lease.issued_at_ms, 900_000);
+        }
     }
 
     #[test]
@@ -7611,6 +7630,27 @@ Trailing note {done}."#;
             read(lease(now + 120_000, now + 600_000)).is_none(),
             "issued in the future"
         );
+    }
+
+    /// Where the lease goes when this platform can read its own process start
+    /// time: the file a tick publishes. Windows reads none (`process_start_us`
+    /// answers `None` for every pid), so a tick there publishes no lease and
+    /// says so in its warnings, and the command hook has nothing to trust.
+    fn published_lease(dir: &Path, rec: &StewardTickRecord) -> Option<ActiveThrottleRecord> {
+        let file = dir.join(STEWARD_SUBDIR).join(ACTIVE_FILE);
+        if cfg!(unix) {
+            let raw = fs::read(&file).unwrap();
+            return Some(serde_json::from_slice(&raw).unwrap());
+        }
+        assert!(!file.exists(), "a lease was published with no start time");
+        assert!(
+            rec.warnings
+                .iter()
+                .any(|w| w.contains("could not read its own process start time")),
+            "{:?}",
+            rec.warnings
+        );
+        None
     }
 
     fn slowing_on() -> ManviStewardSettings {
@@ -7703,9 +7743,9 @@ Trailing note {done}."#;
             vec![(4100, true), (4700, true)],
             "an untrusted repository's agent, or one in no repository, is never slowed; a build script outside the repository is judged by the session it serves"
         );
-        let raw = fs::read(tmp.path().join(STEWARD_SUBDIR).join(ACTIVE_FILE)).unwrap();
-        let lease: ActiveThrottleRecord = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(lease.repositories, vec!["/trusted/a/.git".to_string()]);
+        if let Some(lease) = published_lease(tmp.path(), &rec) {
+            assert_eq!(lease.repositories, vec!["/trusted/a/.git".to_string()]);
+        }
     }
 
     #[test]
