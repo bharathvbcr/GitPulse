@@ -839,6 +839,62 @@ mod tests {
         (child, port, dir)
     }
 
+    /// The incident's shape: the tab's root is a shell, agy was typed into it,
+    /// and agy holds a listener of its own. Probed from the shell, as the tab
+    /// is, agy's port is not a dev server; a server the same shell started is.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_a_shell_root_agys_own_listener_is_not_a_dev_server_but_the_shells_server_is() {
+        let exe = std::env::current_exe().expect("test exe");
+        let dir = tempfile::tempdir_in(exe.parent().unwrap()).expect("link dir");
+        for name in ["agy", "devsrv"] {
+            std::fs::hard_link(&exe, dir.path().join(name)).expect("hard link test binary");
+        }
+        let helper = "--exact terminal::port_probe::tests::port_probe_listener_helper --ignored --test-threads=1";
+        // `; wait` keeps the shell as the parent of both, as a tab's shell is.
+        let script = format!(
+            "GITPULSE_PORT_PROBE_HELPER_FILE=\"$1/agy.port\" \"$1/agy\" {helper} >/dev/null 2>&1 & \
+             GITPULSE_PORT_PROBE_HELPER_FILE=\"$1/devsrv.port\" \"$1/devsrv\" {helper} >/dev/null 2>&1 & wait"
+        );
+        use std::os::unix::process::CommandExt;
+        // Its own process group, as a tab's shell has, so it and both
+        // listeners end together below.
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "sh"])
+            .arg(dir.path())
+            .process_group(0)
+            .spawn()
+            .expect("start the tab's shell");
+        let port_of = |name: &str| {
+            std::fs::read_to_string(dir.path().join(format!("{name}.port")))
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok())
+        };
+        let ready = crate::test_support::wait_until(std::time::Duration::from_secs(90), || {
+            port_of("agy").is_some() && port_of("devsrv").is_some()
+        });
+        let (agy_port, server_port) = (port_of("agy"), port_of("devsrv"));
+        let seen = listening_loopback_ports_for_root_pid(shell.id());
+        let group = i32::try_from(shell.id()).unwrap();
+        // SAFETY: a signal to the process group this test created; it holds
+        // only the shell and the two listeners it started.
+        unsafe {
+            libc::kill(-group, libc::SIGTERM);
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(ready, "the listeners never reported their ports");
+        let (agy_port, server_port) = (agy_port.unwrap(), server_port.unwrap());
+        assert!(
+            seen.contains(&server_port),
+            "the shell's server {server_port} is a dev server: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&agy_port),
+            "agy's own port {agy_port} was offered as a dev server: {seen:?}"
+        );
+    }
+
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn a_listener_owned_by_an_agent_cli_is_not_a_dev_server_port() {
