@@ -309,10 +309,16 @@ fn refuse_nested_gitdir_below_capped(
     while let Some((dir, depth)) = pending.pop() {
         if is_git_directory(&dir) {
             let inside = dir.strip_prefix(abs).unwrap_or(Path::new(""));
-            let at = Path::new(path).join(inside);
+            // `path` is a repository path, which git spells with `/` on every
+            // platform; `Path::join` would append the platform's separator.
+            let below: Vec<_> = inside
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
             return Err(format!(
-                "{path} contains the git directory of a nested repository at {}",
-                at.display()
+                "{path} contains the git directory of a nested repository at {}/{}",
+                path.trim_end_matches('/'),
+                below.join("/")
             ));
         }
         let entries = std::fs::read_dir(&dir).map_err(|e| {
