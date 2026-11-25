@@ -231,11 +231,17 @@ fn tuning_violations(production: &str) -> Vec<String> {
 }
 
 /// Files that name `core.fsmonitor` with a `true` that is not a git call a test
-/// makes: the apply's own argv (covered by `tuning_violations`), a table of
+/// makes: the apply's own argv (covered by `tuning_violations`), two tables of
 /// fixture config entries, and this file's scanner samples.
-const FSMONITOR_TRUE_NOT_A_GIT_CALL: [&str; 3] = [
+///
+/// `advice_tests.rs` writes `Some("true")` into an in-memory
+/// `RepoTuningReport` key slot (its `key` helper) to check the advice the
+/// report produces; it runs no git and creates no repository, so no daemon
+/// can start.
+const FSMONITOR_TRUE_NOT_A_GIT_CALL: [&str; 4] = [
     TUNING_ARGV_FILE,
     "storage/repo_tuning/detector_tests.rs",
+    "storage/repo_tuning/advice_tests.rs",
     "git_config_posture.rs",
 ];
 

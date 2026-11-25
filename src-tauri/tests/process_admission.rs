@@ -266,6 +266,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("signal_teardown.rs", "subprocess-only: signal teardown of child processes; procguard only"),
     ("spawn_budget_isolation.rs", "builds the gate once from its first spawn and must stay off the shared record; lifting the cap would defeat it"),
     ("updates_integration.rs", "no spawn: updates::{evaluate, latest_stable_tag} parse text handed to them"),
+    ("windows_runtime.rs", "no git spawn: the Windows WebView2/Win32 runtime smoke test, parallel to gtk_runtime.rs; the library supplies desktop::{install_menu, set_recent_menu, DesktopState}, and on other targets main only prints that it does not apply"),
 ];
 
 /// The statements in `source` that lift the spawn rate cap for the process:

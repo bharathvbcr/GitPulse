@@ -486,7 +486,7 @@ fn conflict_dd_au_ua_via_stages(root: &Path) -> PathBuf {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("spawn update-index");
     use std::io::Write;
     child

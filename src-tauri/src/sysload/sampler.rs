@@ -2117,7 +2117,14 @@ mod tests {
 
         let mut options = SamplerOptions::new(dir.path().to_path_buf());
         options.cadence = Duration::from_millis(250);
-        options.hibernated_cadence = Duration::from_secs(6);
+        // The wake limit is scaled for coverage and host load, so the
+        // hibernated sleep it must beat is sized from it: a fixed 6 s sleep
+        // would sit inside a limit stretched to 8 s on a busy host, and the
+        // "woke immediately" assertion could then never fail.
+        let wake_limit = crate::test_support::coverage_relaxed(Duration::from_secs(2));
+        let hibernated_cadence = wake_limit * 3;
+        let hibernated_cadence_ms = u32::try_from(hibernated_cadence.as_millis()).unwrap();
+        options.hibernated_cadence = hibernated_cadence;
         options.thresholds = Box::new(|| {
             use super::super::thresholds::{InputMode, Thresholds};
             let mut t = Thresholds::default();
@@ -2144,22 +2151,18 @@ mod tests {
         }));
 
         let sampler = start(options).unwrap();
-        let limit = crate::test_support::coverage_relaxed(Duration::from_secs(20));
         let wait_for = |what: &str, done: &dyn Fn() -> bool| {
-            let deadline = Instant::now() + limit;
-            while !done() {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for {what}: live={}, status={:?}",
-                    live.load(Ordering::SeqCst),
-                    sampler.status().map(|s| (
-                        s.snapshot.as_ref().map(|sn| (sn.seq, sn.cadence_ms)),
-                        s.governor.verdict.clone(),
-                        s.tick,
-                    ))
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            let reached = crate::test_support::wait_until(Duration::from_secs(20), done);
+            assert!(
+                reached,
+                "timed out waiting for {what}: live={}, status={:?}",
+                live.load(Ordering::SeqCst),
+                sampler.status().map(|s| (
+                    s.snapshot.as_ref().map(|sn| (sn.seq, sn.cadence_ms)),
+                    s.governor.verdict.clone(),
+                    s.tick,
+                ))
+            );
         };
 
         wait_for("initial activity and ticks", &|| {
@@ -2184,7 +2187,7 @@ mod tests {
                 && sampler
                     .status()
                     .and_then(|s| s.snapshot)
-                    .is_some_and(|s| s.cadence_ms == 6_000)
+                    .is_some_and(|s| s.cadence_ms == hibernated_cadence_ms)
         });
         let ticks_at_hibernate = sampler.status().unwrap().tick.ticks;
         std::thread::sleep(Duration::from_millis(400));
@@ -2206,7 +2209,7 @@ mod tests {
                     .is_some_and(|s| s.tick.ticks >= ticks_while_hibernated + 2)
         });
         assert!(
-            wake_start.elapsed() < Duration::from_secs(2),
+            wake_start.elapsed() < wake_limit,
             "wake took {:?} instead of waking immediately",
             wake_start.elapsed()
         );

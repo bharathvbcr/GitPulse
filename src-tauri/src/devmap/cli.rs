@@ -3068,11 +3068,12 @@ exit 2
             });
             std::thread::scope(|scope| {
                 let user = scope.spawn(|| budget.admit(Duration::from_secs(10)));
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while budget.waiting_user_now() == 0 {
-                    assert!(Instant::now() < deadline, "the user's read never waited");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                assert!(
+                    crate::test_support::wait_until(Duration::from_secs(10), || {
+                        budget.waiting_user_now() > 0
+                    }),
+                    "the user's read never waited"
+                );
                 let mut held = held;
                 drop(held.pop());
                 let probe = with_background_processes(|| budget.admit(Duration::ZERO));
@@ -3107,9 +3108,13 @@ exit 2
                     }
                 });
             }
-            while budget.waiting_user_now() == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+            let waited = crate::test_support::wait_until(Duration::from_secs(10), || {
+                budget.waiting_user_now() > 0
+            });
+            if !waited {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            assert!(waited, "no user read ever waited on the flooded budget");
             let probe = with_background_processes(|| budget.admit(Duration::from_secs(2)));
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             probe.map(drop)
@@ -3169,13 +3174,9 @@ exit 2
                     })
                 })
                 .collect();
-            let patience = Instant::now();
-            while started() < crate::devmap::live::PROBE_LIMIT
-                && patience.elapsed()
-                    < crate::test_support::coverage_relaxed(Duration::from_secs(10))
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            crate::test_support::wait_until(Duration::from_secs(10), || {
+                started() >= crate::devmap::live::PROBE_LIMIT
+            });
             assert_eq!(
                 started(),
                 crate::devmap::live::PROBE_LIMIT,
