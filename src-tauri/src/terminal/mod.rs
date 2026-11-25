@@ -2402,6 +2402,29 @@ pub fn spawn_session_in<R: tauri::Runtime>(
     )
 }
 
+/// [`spawn_session_in`] for a caller that knows what the session resumes, in
+/// which mode it runs and which offer it reopens ([`session_ledger::SpawnHints`]).
+/// Every session is recorded in the ledger by the spawn owner ([`spawn_at`]),
+/// whichever route started it; this only carries what the owner cannot see.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_session_recorded<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    start_dir: Option<&str>,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
+    spawn_session_with_hints(
+        app, state, repo_path, start_dir, rows, cols, program, args, env, output, None, hints,
+    )
+}
+
 /// Longest `start_dir` accepted over IPC, in bytes: PATH_MAX on both Unix hosts.
 const START_DIR_BYTES_CAP: usize = 4096;
 
@@ -3348,12 +3371,43 @@ fn spawn_session_inner<R: tauri::Runtime>(
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
 ) -> Result<TerminalSpawned, CommandError> {
+    spawn_session_with_hints(
+        app,
+        state,
+        repo_path,
+        start_dir,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        output,
+        observer,
+        session_ledger::SpawnHints::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_session_with_hints<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &TerminalSessions,
+    repo_path: &str,
+    start_dir: Option<&str>,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    observer: Option<Arc<dyn SessionObserver>>,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
     let events: Arc<dyn SessionEvents> = Arc::new(AppEvents::new(
         app,
         state.incidents.clone(),
         state.session_ledger.clone(),
     ));
-    spawn_at(
+    spawn_at_with_hints(
         state,
         Place::Repo {
             repo_path: repo_path.to_owned(),
@@ -3368,6 +3422,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         events,
         observer,
         None,
+        hints,
     )
 }
 
@@ -3389,6 +3444,39 @@ pub(crate) fn spawn_at(
     observer: Option<Arc<dyn SessionObserver>>,
     orchestrated: Option<orchestrate::ChildSpawnMeta>,
 ) -> Result<TerminalSpawned, CommandError> {
+    spawn_at_with_hints(
+        state,
+        place,
+        rows,
+        cols,
+        program,
+        args,
+        env,
+        output,
+        events,
+        observer,
+        orchestrated,
+        session_ledger::SpawnHints::default(),
+    )
+}
+
+/// [`spawn_at`] with what the caller knows of the session's conversation, mode
+/// and reopened offer. The one place a session is recorded in the ledger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_at_with_hints(
+    state: &TerminalSessions,
+    place: Place,
+    rows: u16,
+    cols: u16,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    env: Option<HashMap<String, String>>,
+    output: OutputSink,
+    events: Arc<dyn SessionEvents>,
+    observer: Option<Arc<dyn SessionObserver>>,
+    orchestrated: Option<orchestrate::ChildSpawnMeta>,
+    hints: session_ledger::SpawnHints,
+) -> Result<TerminalSpawned, CommandError> {
     let token = orchestrate::mint_session_token()?;
     let token_hash_hex = orchestrate::token_hash_hex(&token)?;
     let mut env_with_token = env.unwrap_or_default();
@@ -3409,6 +3497,16 @@ pub(crate) fn spawn_at(
         .as_deref()
         .and_then(launcher_kind)
         .unwrap_or("shell");
+    let row_launcher = launcher_label.to_owned();
+    // The ledger names the repository as the caller gave it, the same string
+    // a reopen sends back; a task attempt has only its checkout.
+    let (row_repo, row_start) = match &place {
+        Place::Repo {
+            repo_path,
+            start_dir,
+        } => (repo_path.clone(), start_dir.clone()),
+        Place::Task { .. } => (repo.to_string_lossy().into_owned(), None),
+    };
     let (parent_session_id, child_launcher, child_title) = match &orchestrated {
         Some(meta) => (
             Some(meta.parent_session_id.clone()),
@@ -3451,6 +3549,8 @@ pub(crate) fn spawn_at(
             .unwrap_or_else(default_shell),
         request.args.clone(),
     );
+    let recorded_events = events.clone();
+    let parent_terminal = request.parent_session_id.clone();
     #[cfg(unix)]
     let started_res = state
         .host
@@ -3479,6 +3579,23 @@ pub(crate) fn spawn_at(
         ledger.1,
         agent_launcher(&spawned.shell).is_some(),
     );
+    let parent_row_id = parent_terminal
+        .as_deref()
+        .and_then(|parent| state.session_ledger.row_id_for_terminal(parent));
+    state
+        .session_ledger
+        .record_spawn(session_ledger::NewSessionRow {
+            terminal_id: spawned.id.clone(),
+            launcher: row_launcher,
+            native_id: hints.native_id,
+            repo_path: row_repo,
+            start_dir: row_start,
+            cwd: spawned.cwd.clone(),
+            mode: hints.mode,
+            reopen_row_id: hints.reopen_row_id,
+            parent_row_id,
+        });
+    recorded_events.session_recorded();
     Ok(spawned)
 }
 
@@ -11022,6 +11139,7 @@ mod tests {
             cwd: spawned.cwd.clone(),
             mode: None,
             reopen_row_id: None,
+            parent_row_id: None,
         });
         (state, ledger, spawned.id)
     }

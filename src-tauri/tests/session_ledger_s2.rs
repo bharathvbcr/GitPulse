@@ -54,6 +54,7 @@ fn spawn_spec(
         cwd: cwd.to_string_lossy().into_owned(),
         mode: mode.map(str::to_owned),
         reopen_row_id: None,
+        parent_row_id: None,
     }
 }
 

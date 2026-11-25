@@ -43,6 +43,8 @@ pub trait SessionEvents: Send + Sync {
     /// A connection to the terminal host listed its sessions: the one moment a
     /// reconcile that could not ask the host earlier can run. Must not block.
     fn host_adopted(&self) {}
+    /// A session was recorded in the durable ledger: the recovery view changed.
+    fn session_recorded(&self) {}
 }
 
 /// The engine's events, inside the app: the Tauri events and banners the
@@ -80,6 +82,10 @@ impl<R: tauri::Runtime> SessionEvents for AppEvents<R> {
 
     fn scan_drops(&self, dropped: u64) {
         crate::alerts::record_scan_drops(dropped);
+    }
+
+    fn session_recorded(&self) {
+        self.session_ledger.emit_view(&self.app);
     }
 
     fn host_adopted(&self) {

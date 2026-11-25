@@ -101,7 +101,14 @@ pub async fn cmd_terminal_spawn(
                 return Err(CommandError::plain(message));
             }
         };
-        let spawned = match crate::terminal::spawn_session_in(
+        let native_id = if is_fork {
+            session_id
+        } else {
+            resume.map(|r| r.session_id).or(session_id)
+        };
+        // The spawn owner records the session in the ledger; these are the
+        // facts only this command knows.
+        let spawned = match crate::terminal::spawn_session_recorded(
             &app,
             &state,
             &repo_path,
@@ -112,6 +119,11 @@ pub async fn cmd_terminal_spawn(
             args,
             env,
             crate::terminal::OutputSink::channel(on_output),
+            crate::terminal::session_ledger::SpawnHints {
+                native_id,
+                mode: permission_mode,
+                reopen_row_id: reopen_row_id.clone(),
+            },
         ) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -127,29 +139,6 @@ pub async fn cmd_terminal_spawn(
                 return Err(error);
             }
         };
-        let launcher = program
-            .as_deref()
-            .and_then(crate::terminal::launcher_kind)
-            .unwrap_or("shell")
-            .to_owned();
-        let native_id = if is_fork {
-            session_id
-        } else {
-            resume.map(|r| r.session_id).or(session_id)
-        };
-        state
-            .session_ledger()
-            .record_spawn(crate::terminal::session_ledger::NewSessionRow {
-                terminal_id: spawned.id.clone(),
-                launcher,
-                native_id,
-                repo_path,
-                start_dir,
-                cwd: spawned.cwd.clone(),
-                mode: permission_mode,
-                reopen_row_id,
-            });
-        state.session_ledger().emit_view(&app);
         Ok(spawned)
     })
     .await

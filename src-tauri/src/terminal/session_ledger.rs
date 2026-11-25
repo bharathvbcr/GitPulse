@@ -98,6 +98,10 @@ pub struct SessionLedgerOffer {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The ledger row of the session that spawned this one (an orchestrated
+    /// child), when that session is a tab this ledger recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_row_id: Option<String>,
 }
 
 /// Current snapshot of durable recovery offers pushed via `SESSION_LEDGER_EVENT`
@@ -174,6 +178,10 @@ struct StoredRow {
     /// downgrade shows the old row and the new one as two offers, never none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumes_row_id: Option<String>,
+    /// The row of the session that spawned this one (an orchestrated child).
+    /// Absent on rows written before it existed; older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_row_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +256,17 @@ pub struct NewSessionRow {
     pub repo_path: String,
     pub start_dir: Option<String>,
     pub cwd: String,
+    pub mode: Option<String>,
+    pub reopen_row_id: Option<String>,
+    pub parent_row_id: Option<String>,
+}
+
+/// What a caller of the spawn owner knows about a session that its command
+/// line does not carry: the conversation it resumes or starts, the permission
+/// mode it asked for, and the offer it reopens. The owner adds the rest.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnHints {
+    pub native_id: Option<String>,
     pub mode: Option<String>,
     pub reopen_row_id: Option<String>,
 }
@@ -524,6 +543,20 @@ impl SessionLedger {
         changed
     }
 
+    /// The newest row recorded for the tab `terminal_id`.
+    pub fn row_id_for_terminal(&self, terminal_id: &str) -> Option<String> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Valid(row) if row.terminal_id.as_deref() == Some(terminal_id) => {
+                Some(row.row_id.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Path of the durable `.jsonl` file, or `None` when in-memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -585,6 +618,7 @@ impl SessionLedger {
             protected: false,
             resume_unconfirmed: resumes_row_id.is_some(),
             resumes_row_id,
+            parent_row_id: spec.parent_row_id,
         };
         let spawned_launcher = row.launcher.clone();
         let spawned_repo = row.repo_path.clone();
@@ -874,6 +908,7 @@ impl SessionLedger {
     }
 
     /// Settles unconfirmed reopens as of `now` and persists a change.
+    #[cfg(test)]
     pub(crate) fn settle_reopens_at(&self, now: u64) -> bool {
         let mut guard = self
             .state
@@ -1563,6 +1598,7 @@ fn project_corrupt_row(row_id: &str, detail: &str) -> SessionLedgerOffer {
         reason: Some("unreadable".to_owned()),
         last_error: Some(detail.to_owned()),
         title: None,
+        parent_row_id: None,
     }
 }
 
@@ -1608,6 +1644,7 @@ fn project_valid_row_with_status(
         reason,
         last_error: row.last_error.clone(),
         title: row.title.clone(),
+        parent_row_id: row.parent_row_id.clone(),
     }
 }
 
@@ -1976,6 +2013,7 @@ mod tests {
             cwd: repo_str,
             mode: Some("edit".to_owned()),
             reopen_row_id: reopen_row_id.map(str::to_owned),
+            parent_row_id: None,
         }
     }
 

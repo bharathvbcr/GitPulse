@@ -3985,6 +3985,113 @@ pub(crate) mod tests {
         }
     }
 
+    /// Before: only the UI's spawn command wrote a ledger row, so an agent
+    /// started by another agent or over MCP could never be offered for reopen.
+    #[cfg(unix)]
+    #[test]
+    fn an_orchestrated_agent_child_is_recorded_with_its_parent_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let parent = "term-90011-1";
+        state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let ledger = state.session_ledger();
+        let parent_row = ledger.record_spawn(crate::terminal::session_ledger::NewSessionRow {
+            terminal_id: parent.into(),
+            launcher: "claude".into(),
+            native_id: None,
+            repo_path: repo.clone(),
+            start_dir: None,
+            cwd: repo.clone(),
+            mode: None,
+            reopen_row_id: None,
+            parent_row_id: None,
+        });
+        // A stand-in named like the agent CLI, so the launcher is `claude`
+        // without starting the real one.
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let child = crate::terminal::spawn_at(
+            &state,
+            Place::Repo {
+                repo_path: repo.clone(),
+                start_dir: None,
+            },
+            24,
+            80,
+            Some(fake.to_string_lossy().into_owned()),
+            None,
+            None,
+            discard_sink(),
+            Arc::new(RecordingEvents),
+            None,
+            Some(ChildSpawnMeta {
+                parent_session_id: parent.into(),
+                launcher: "claude".into(),
+                title: None,
+            }),
+        )
+        .expect("agent child");
+        assert!(ledger.row_id_for_terminal(&child.id).is_some());
+        ledger.mark_app_quit();
+        let offers = ledger.view().offers;
+        let offer = offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some(child.id.as_str()))
+            .expect("the child is offered for reopen");
+        assert_eq!(offer.launcher, "claude");
+        assert_eq!(offer.parent_row_id.as_deref(), Some(parent_row.as_str()));
+        let _ = crate::terminal::kill_session(&state, &child.id, KillOrigin::Unspecified);
+    }
+
+    /// An MCP/CLI `Spawn` goes through `execute`; its shell child is recorded
+    /// too, and a shell is never resumable.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_shell_child_is_recorded_and_never_resumable() {
+        let (_dir, repo) = init_trusted_repo();
+        let state = TerminalSessions::default();
+        let ui = TestUiSink::default();
+        let parent = "term-90012-1";
+        let token = state
+            .orchestration
+            .register_test_parent(parent, Path::new(&repo));
+        let spawned = execute(
+            &state,
+            &ui,
+            OrchestrateCall::Spawn {
+                repo_path: repo.clone(),
+                caller_session_id: Some(parent.into()),
+                caller_token: Some(token),
+                external_caller_id: None,
+                launcher: Some("shell".into()),
+                cwd: None,
+                command: None,
+                prompt: None,
+                title: None,
+                split: Some(false),
+                rows: Some(24),
+                cols: Some(80),
+            },
+        )
+        .expect("spawn child");
+        let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        let ledger = state.session_ledger();
+        assert!(ledger.row_id_for_terminal(&child).is_some());
+        ledger.mark_app_quit();
+        let offers = ledger.view().offers;
+        let offer = offers
+            .iter()
+            .find(|o| o.terminal_id.as_deref() == Some(child.as_str()))
+            .expect("listed");
+        assert!(!offer.resumable);
+        let _ = crate::terminal::kill_session(&state, &child, KillOrigin::Unspecified);
+    }
+
     /// Before: an agent's close (`gitpulse_terminal_close`, `term close`) always
     /// ended the child, whatever the user had asked to keep.
     #[cfg(unix)]
@@ -4017,17 +4124,8 @@ pub(crate) mod tests {
         )
         .expect("spawn child");
         let child = spawned["child_session_id"].as_str().unwrap().to_string();
+        // The spawn owner recorded the child; nothing here does.
         let ledger = state.session_ledger();
-        ledger.record_spawn(crate::terminal::session_ledger::NewSessionRow {
-            terminal_id: child.clone(),
-            launcher: "shell".into(),
-            native_id: None,
-            repo_path: repo.clone(),
-            start_dir: None,
-            cwd: repo.clone(),
-            mode: None,
-            reopen_row_id: None,
-        });
         assert!(ledger.set_protected(&child, true));
         let close = || {
             execute(
