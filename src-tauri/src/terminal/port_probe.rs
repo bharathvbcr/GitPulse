@@ -32,23 +32,39 @@ struct ProcRow {
     name: String,
 }
 
-/// The pids in `rows` that belong to an agent CLI: the CLI itself, anything
-/// descended from it, and anything in a process group it leads (a helper the
-/// CLI started and that was then reparented keeps the group).
+/// Shells an agent runs its commands through. What starts under one is the
+/// user's work (a dev server started with Claude's Bash tool), not the agent's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SHELL_PROCESS_NAMES: [&str; 10] = [
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "tcsh", "csh", "nu", "pwsh",
+];
+
+/// The pids in `rows` that belong to an agent CLI: the CLI itself, what it
+/// spawns directly and their descendants, and a reparented helper still in a
+/// process group the CLI leads. Ownership stops at a shell: an agent runs the
+/// user's commands through `sh -c`, and a non-interactive shell does no job
+/// control, so a dev server it starts sits in the agent's group yet is exactly
+/// the port the tab's radar exists to find.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn agent_owned_pids(rows: &[ProcRow]) -> std::collections::HashSet<i32> {
     use std::collections::HashSet;
-    let is_agent = |row: &ProcRow| {
-        AGENT_PROCESS_NAMES
-            .iter()
-            .any(|name| row.name.eq_ignore_ascii_case(name))
+    let named = |row: &ProcRow, names: &[&str]| {
+        names.iter().any(|name| row.name.eq_ignore_ascii_case(name))
     };
-    let mut owned: HashSet<i32> = rows.iter().filter(|r| is_agent(r)).map(|r| r.pid).collect();
+    let mut owned: HashSet<i32> = rows
+        .iter()
+        .filter(|r| named(r, &AGENT_PROCESS_NAMES))
+        .map(|r| r.pid)
+        .collect();
     let leaders: HashSet<i32> = owned.clone();
     loop {
         let before = owned.len();
         for row in rows {
-            if owned.contains(&row.ppid) || (leaders.contains(&row.pgid) && row.pgid > 1) {
+            if named(row, &SHELL_PROCESS_NAMES) {
+                continue;
+            }
+            let reparented_helper = row.ppid <= 1 && row.pgid > 1 && leaders.contains(&row.pgid);
+            if owned.contains(&row.ppid) || reparented_helper {
                 owned.insert(row.pid);
             }
         }
@@ -867,6 +883,36 @@ mod tests {
         let mut owned: Vec<i32> = owned.into_iter().collect();
         owned.sort_unstable();
         assert_eq!(owned, vec![20, 21, 22, 23]);
+    }
+
+    /// What an agent runs through a shell is the user's work, not the agent's
+    /// plumbing: a dev server Claude starts with its Bash tool (`zsh -c "npm
+    /// run dev"`, in Claude's process group because a non-interactive shell
+    /// does no job control) is exactly what the tab's port radar exists to
+    /// find. Only what the agent spawns directly, or a reparented helper left
+    /// in its group, is the agent's own.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn what_an_agent_runs_through_a_shell_is_not_agent_owned() {
+        let row = |pid, ppid, pgid, name: &str| super::ProcRow {
+            pid,
+            ppid,
+            pgid,
+            name: name.to_owned(),
+        };
+        let rows = [
+            row(10, 1, 10, "zsh"),
+            row(20, 10, 20, "claude"),
+            row(21, 20, 20, "language_server"),
+            row(40, 20, 20, "zsh"),
+            row(41, 40, 20, "node"),
+            row(42, 41, 20, "esbuild"),
+            row(50, 20, 20, "bash"),
+            row(51, 50, 51, "vite"),
+        ];
+        let mut owned: Vec<i32> = super::agent_owned_pids(&rows).into_iter().collect();
+        owned.sort_unstable();
+        assert_eq!(owned, vec![20, 21]);
     }
 
     #[test]
