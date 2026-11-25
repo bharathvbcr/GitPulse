@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { BROWSER_HARNESSES, DEFAULT_DEADLINE_SECONDS, HARNESS_DEADLINE_SECONDS, chromeBinary, engineDisplayName, harnessDeadlineSeconds, nativeRunnerBinary, readBrowserVerdict, resolveEngine, waitForProcessClose } from "./browser-regressions.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 describe("browser regression gate", () => {
   it("keeps the native WebKit entrypoint aligned with every supported harness", () => {
@@ -74,9 +75,12 @@ describe("browser regression gate", () => {
       if (Number.isInteger(n) && n > 1) grandchildPid = n;
     });
     try {
+      // The hard cap sits above the budget, so returning on the cap (the hang
+      // this guards) cannot pass for returning on the child's exit.
+      const budget = wallClockBudget(1_500);
       const t0 = Date.now();
-      await waitForProcessClose(child, 50, 1_500);
-      expect(Date.now() - t0).toBeLessThan(1_500);
+      await waitForProcessClose(child, 50, budget * 2);
+      expect(Date.now() - t0).toBeLessThan(budget);
     } finally {
       if (grandchildPid > 1) {
         try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already gone */ }

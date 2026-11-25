@@ -96,7 +96,8 @@ describe("e2e-driver-smoke", () => {
       return new Response(JSON.stringify({ value: { ok: true } }), { status: 200 });
     };
 
-    const client = new WebDriverClient("http://127.0.0.1:4444", fakeFetch);
+    const base = "http://127.0.0.1:4444";
+    const client = new WebDriverClient(base, fakeFetch);
     expect(await client.createSession("/bin/gitpulse", ["/tmp/repo"])).toBe("sess-123");
     expect(await client.executeScript("return 1", [])).toEqual({ ok: true });
     const dir = mkdtempSync(path.join(tmpdir(), "gp-e2e-unit-"));
@@ -109,12 +110,13 @@ describe("e2e-driver-smoke", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     await client.deleteSession();
-    expect(seen.map((s) => `${s.method} ${new URL(s.url).pathname}`)).toEqual([
-      "POST /session",
-      "POST /session/sess-123/timeouts",
-      "POST /session/sess-123/execute/sync",
-      "GET /session/sess-123/screenshot",
-      "DELETE /session/sess-123",
+    // Whole request URLs: the client must address the driver it was given.
+    expect(seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+      `POST ${base}/session`,
+      `POST ${base}/session/sess-123/timeouts`,
+      `POST ${base}/session/sess-123/execute/sync`,
+      `GET ${base}/session/sess-123/screenshot`,
+      `DELETE ${base}/session/sess-123`,
     ]);
   });
 
