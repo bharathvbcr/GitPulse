@@ -619,15 +619,19 @@ fn run_status_with_interrupt(
         return Ok(GixStatus::Fallback("incomplete_outcome"));
     }
 
+    // git's order: every tracked change by path, then every untracked path.
+    // Status lists keep the order they parse, so one sort over both would put
+    // `?? .cache/x` ahead of `M  README.md` where git lists it after.
     let mut rows: Vec<(String, char, char, Option<String>)> =
         Vec::with_capacity(tracked.len() + untracked.len());
     for (path, row) in tracked {
         rows.push((path, row.x, row.y, row.old_path));
     }
+    rows.sort();
+    untracked.sort();
     for path in untracked {
         rows.push((path, '?', '?', None));
     }
-    rows.sort();
 
     let mut out = String::new();
     for (path, x, y, old_path) in rows {

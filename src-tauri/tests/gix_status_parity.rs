@@ -36,6 +36,10 @@ fn git(cwd: &Path, args: &[&str]) -> String {
 }
 
 fn git_status(cwd: &Path) -> Vec<Row> {
+    parse_porcelain_z(&git_status_bytes(cwd))
+}
+
+fn git_status_bytes(cwd: &Path) -> Vec<u8> {
     let output = Command::new("git")
         .args([
             "-c",
@@ -56,7 +60,7 @@ fn git_status(cwd: &Path) -> Vec<Row> {
         cwd.display(),
         String::from_utf8_lossy(&output.stderr)
     );
-    parse_porcelain_z(&output.stdout)
+    output.stdout
 }
 
 fn gix_rows_at(cwd: &Path) -> Vec<Row> {
@@ -67,6 +71,13 @@ fn gix_rows_at(cwd: &Path) -> Vec<Row> {
 }
 
 fn parse_porcelain_z(bytes: &[u8]) -> Vec<Row> {
+    let mut rows = rows_in_order(bytes);
+    rows.sort();
+    rows
+}
+
+/// The rows as the bytes list them, unsorted: order is part of the output.
+fn rows_in_order(bytes: &[u8]) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut fields = bytes.split(|b| *b == 0).filter(|f| !f.is_empty());
     while let Some(record) = fields.next() {
@@ -84,7 +95,6 @@ fn parse_porcelain_z(bytes: &[u8]) -> Vec<Row> {
         };
         rows.push((path, old_path, x, y));
     }
-    rows.sort();
     rows
 }
 
@@ -187,6 +197,17 @@ fn untracked_dir(root: &Path) -> PathBuf {
     let repo = init(root);
     write(&repo, "newdir/one.txt", "1\n");
     write(&repo, "newdir/deep/two.txt", "2\n");
+    repo
+}
+/// An untracked path that sorts before a tracked change: git lists the
+/// tracked change first.
+fn untracked_sorting_before_a_change(root: &Path) -> PathBuf {
+    let repo = init(root);
+    write(&repo, "a.txt", &body("changed"));
+    write(&repo, "dir/e.txt", &body("changed"));
+    git(&repo, &["add", "dir/e.txt"]);
+    write(&repo, ".cache/ledger.sqlite", "x\n");
+    write(&repo, "0first.txt", "x\n");
     repo
 }
 fn untracked_empty_dir(root: &Path) -> PathBuf {
@@ -524,6 +545,10 @@ fn cases() -> Vec<Case> {
         c("untracked_file", untracked_file),
         c("untracked_dir", untracked_dir),
         c("untracked_empty_dir", untracked_empty_dir),
+        c(
+            "untracked_sorting_before_a_change",
+            untracked_sorting_before_a_change,
+        ),
         c("ignored", ignored),
         c("nested_gitignore", nested_gitignore),
         c("info_exclude", info_exclude),
@@ -598,6 +623,38 @@ fn gix_status_matches_git_status_u_z_across_all_cases() {
     assert!(
         failures.is_empty(),
         "gix status diverged from git:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Order is part of the output: status lists keep the order they parse, so
+/// gix must list rows as git does (tracked changes by path, then untracked
+/// paths), not merely the same set.
+#[test]
+fn gix_status_lists_rows_in_gits_order_across_all_cases() {
+    let mut failures = Vec::new();
+    for case in cases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = (case.setup)(dir.path());
+        let expected = rows_in_order(&git_status_bytes(&cwd));
+        let actual = rows_in_order(
+            porcelain_v1_z_for_test(&cwd)
+                .expect("gix status must not error")
+                .expect("parity fixture must stay on gix without fallback")
+                .as_bytes(),
+        );
+        if expected != actual {
+            failures.push(format!(
+                "{}:\n  git: {}\n  gix: {}",
+                case.name,
+                fmt(&expected),
+                fmt(&actual)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "gix status listed rows in another order than git:\n{}",
         failures.join("\n")
     );
 }
