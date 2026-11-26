@@ -57,7 +57,7 @@ export function agentKind(path: string): string {
 }
 
 export function isWaylodeLane(kind: string): boolean {
-  return kind.toLowerCase() === WAYLODE_LANE_KIND;
+  return kind.toLowerCase() === GITPULSE_LANE_KIND;
 }
 
 export function agentKindLabel(kind: string): string {

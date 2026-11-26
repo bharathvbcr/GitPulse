@@ -418,6 +418,5 @@ blob-report/
 *.stackdump
 *.pdb
 
-/crates/gitpulse-worktree/target/
 /src-tauri/crates/waylode-protocol/target/
 /crates/waylode-worktree/target/

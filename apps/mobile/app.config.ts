@@ -25,9 +25,9 @@ export interface WaylodeMobileConfig extends ExpoConfig {
 export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): WaylodeMobileConfig {
   const base = context.config ?? {};
   const updatesUrl =
-    process.env.WAYLODE_UPDATES_URL ?? process.env.GITPULSE_UPDATES_URL ?? "https://u.expo.dev/00000000-0000-0000-0000-000000000000";
+    envCompat("WAYLODE_UPDATES_URL", "GITPULSE_UPDATES_URL") ?? "https://u.expo.dev/00000000-0000-0000-0000-000000000000";
   const codeSigningCert =
-    process.env.WAYLODE_CODE_SIGNING_CERT ?? process.env.GITPULSE_CODE_SIGNING_CERT ?? WAYLODE_CODE_SIGNING_CERT_PATH;
+    envCompat("WAYLODE_CODE_SIGNING_CERT", "GITPULSE_CODE_SIGNING_CERT") ?? WAYLODE_CODE_SIGNING_CERT_PATH;
 
   const config: WaylodeMobileConfig = {
     ...base,
@@ -50,7 +50,7 @@ export function buildMobileAppConfig(context: Partial<ConfigContext> = {}): Wayl
       fallbackToCacheTimeout: 0,
       codeSigningCertificate: codeSigningCert,
       codeSigningMetadata: {
-        keyid: process.env.WAYLODE_CODE_SIGNING_KEYID ?? process.env.GITPULSE_CODE_SIGNING_KEYID ?? "main",
+        keyid: envCompat("WAYLODE_CODE_SIGNING_KEYID", "GITPULSE_CODE_SIGNING_KEYID") ?? "main",
         alg: "rsa-v1_5-sha256",
       },
     },
@@ -175,6 +175,10 @@ export function validateMobileAppConfig(config: Partial<WaylodeMobileConfig>): v
     );
   }
 }
+
+/** The renamed env var wins unless it is empty or unset; then the pre-rename name (as main's env_compat does). */
+const envCompat = (name: string, legacy: string): string | undefined =>
+  process.env[name] || process.env[legacy] || undefined;
 
 export default function expoConfig(context: ConfigContext): WaylodeMobileConfig {
   return buildMobileAppConfig(context);
