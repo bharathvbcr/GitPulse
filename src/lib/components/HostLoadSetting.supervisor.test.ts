@@ -38,6 +38,17 @@ describe("the memory supervisor setting", () => {
     expect(block).toMatch(/aria-pressed="true"[^>]*data-active="true"[^>]*title="Pause the heaviest build or test under an agent"/);
   });
 
+  it("offers ending a build at the cap as an opt-in that is off by default and shows what was saved", async () => {
+    const label = "When a paused build is still paused after 10 minutes, end it instead of resuming it";
+    const off = supervisorBlock(render(HostLoadSetting).body);
+    expect(off).toContain(label);
+    expect(off).toMatch(/role="switch"[^>]*aria-checked="false"/);
+    const reported: HostLoadSettings = { ...DEFAULT_HOST_LOAD_SETTINGS, supervisor_terminate: true };
+    await saveHostLoadSettings(reported);
+    const on = supervisorBlock(render(HostLoadSetting).body);
+    expect(on).toMatch(/role="switch"[^>]*aria-checked="true"/);
+  });
+
   it("shows the reported mode as pressed", async () => {
     const reported: HostLoadSettings = { ...DEFAULT_HOST_LOAD_SETTINGS, supervisor: "advise" };
     await saveHostLoadSettings(reported);

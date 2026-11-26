@@ -50,6 +50,7 @@
 //! | in the table as advise-only | elevated or severe | one line of advice, never a refusal |
 //! | any classified command | the relief supervisor paused a tree for this session | the paused command named, "resumes automatically", do not retry or run in parallel; inside the reason when the command is refused |
 //! | any classified command | the supervisor only slowed agent processes | one line of advice |
+//! | any classified command | the relief supervisor ended a tree for this session (rung C) | "ended by memory protection", must not be re-run until pressure clears; only while the status is fresh and the episode lasts |
 //! | any classified command | the relief status is stale or unreadable | one line saying it could **not** be checked, once per session; never "nothing is paused" |
 //! | any classified command | no relief status, or one at rest | nothing |
 //!
@@ -794,7 +795,7 @@ fn unchecked_relief(input: &HookInput, g: &Gathered, kind: &str, why: &str) -> O
 }
 
 fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
-    let mine = status.paused().find(|tree| {
+    let is_mine = |tree: &relief_status::FrozenTree| {
         match (&tree.terminal_session_id, &g.terminal_session) {
             // Both sides know their terminal: it decides, and a different one
             // is a different session, whatever directory it works in.
@@ -807,7 +808,24 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
                 .as_deref()
                 .is_some_and(|root| same_root(root, Path::new(&tree.repo_path))),
         }
-    });
+    };
+    // A tree the supervisor ended in this Severe episode: the build is gone,
+    // and the agent must not start it again into the same shortage. Only a
+    // status that is Fresh gets here, and the supervisor forgets what it ended
+    // when the episode does, so this says nothing once pressure has cleared.
+    if let Some(tree) = status.ended.iter().rev().find(|tree| is_mine(tree)) {
+        let command = clip(
+            &crate::alerts::text::sanitize(&tree.command),
+            MAX_ECHOED_COMMAND,
+        );
+        return Some(format!(
+            "GitPulse's memory protection ended `{command}` (pid {}) because {}. \
+             The build was ended by memory protection: it did not finish, and it must not be re-run (or another build started in parallel) until memory pressure clears.",
+            tree.pid,
+            status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
+        ));
+    }
+    let mine = status.paused().find(|tree| is_mine(tree));
     if let Some(tree) = mine {
         let command = clip(
             &crate::alerts::text::sanitize(&tree.command),

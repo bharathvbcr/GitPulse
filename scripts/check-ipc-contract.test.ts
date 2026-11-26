@@ -366,8 +366,10 @@ describe("annotated but unregistered commands", () => {
     // cmd_diff_turn_checkpoint and cmd_github_pr_diff. 367 with
     // cmd_host_relief_status and cmd_host_relief_request_resume (the memory
     // supervisor's published status, and a person's request to resume what it
-    // paused).
-    expect(found.size).toBe(367);
+    // paused). 369 with cmd_host_relief_request_terminate and
+    // cmd_host_relief_request_pause (a person's request to end a paused tree,
+    // and to pause one of an agent GitPulse did not launch).
+    expect(found.size).toBe(369);
     for (const legacy of ["hosts", "kill", "transcript"]) {
       expect(found.has(`cmd_terminal_legacy_${legacy}`)).toBe(true);
     }

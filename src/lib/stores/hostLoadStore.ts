@@ -692,6 +692,11 @@ export interface HostLoadSettings {
   profile: ProfileChoice;
   /** What the memory-pressure supervisor may do. Stored as the top-level `host_load_supervisor`. */
   supervisor: SupervisorMode;
+  /**
+   * Rung C, opt-in: a paused build still paused at the 10-minute cap is ended
+   * instead of resumed. Stored as the top-level `host_load_supervisor_terminate`.
+   */
+  supervisor_terminate: boolean;
 }
 
 /** Off does nothing, Advise only says what it would pause, Act pauses. */
@@ -1115,6 +1120,7 @@ export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
   idle: DEFAULT_IDLE,
   profile: "auto",
   supervisor: "act",
+  supervisor_terminate: false,
 };
 
 /**

@@ -59,8 +59,39 @@
 //! then calls `relief::resume_all(true, reason)` and applies the request only to
 //! pauses whose `since_ms` is at or before the request's `at_ms`: a request
 //! never resumes a pause that began after it was made. Any process of the same
-//! user can write the file, so the supervisor decides how far to trust one; it
-//! can only end a pause, never start one.
+//! user can write the file, so the supervisor decides how far to trust one.
+//!
+//! # The terminate and pause seams (phase 2)
+//!
+//! Two more request files follow the same contract (private, 0600, atomic,
+//! [`REQUEST_TTL_MS`], read and deleted by one `take_*` call per tick), and each
+//! names its target by pid and start time ([`TargetRequest`]):
+//!
+//! * `host-relief-terminate.request` ([`request_terminate`]): end the paused
+//!   tree whose first process is that pid and start time. The supervisor acts
+//!   only on a tree it currently holds paused, whatever the opt-in setting says;
+//!   a request for anything else is ignored and recorded.
+//! * `host-relief-pause.request` ([`request_pause`]): pause the tree this file's
+//!   `offers` list names, a tree of an agent GitPulse did not launch. The
+//!   supervisor acts only on a tree it currently holds as an offer (never an
+//!   `untrusted` one), re-screens it, and applies its normal bounds.
+//!
+//! **Security.** These files are not behind the IPC grant: any process of the
+//! same user, a paused agent included, can write them. A request therefore
+//! names only what the supervisor itself published (an agent cannot name an
+//! arbitrary pid and have it ended), is bounded by the 2-minute expiry, the
+//! pid-plus-start-time identity, the screening and the per-session and per-host
+//! limits, and ends only a process that was stopped by the supervisor and
+//! journaled as running before it was. A request that widens nothing the person
+//! could not already do by hand is the most this seam can express; the
+//! limitation is that it cannot tell a click from a same-user process that wrote
+//! the file, exactly as the resume request cannot.
+//!
+//! `offers` (trees the supervisor would have paused but may not, with a `why`)
+//! and `ended` (trees it ended, for the command-gate hook's wording) are optional
+//! in the file and default empty, so a phase-1 reader still reads a phase-2
+//! file. A phase-1 reader meeting `kind: "terminate"` in `last_action` finds the
+//! file Unreadable, which is loud, not silent.
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -70,6 +101,10 @@ use std::path::{Path, PathBuf};
 pub const STATUS_FILE_NAME: &str = "host-relief.v1.json";
 /// The request a banner or Health button leaves for the supervisor.
 pub const RESUME_REQUEST_FILE_NAME: &str = "host-relief-resume.request";
+/// The request "End it" (banner or Health) leaves: end one paused tree.
+pub const TERMINATE_REQUEST_FILE_NAME: &str = "host-relief-terminate.request";
+/// The request "Pause it" (banner or Health) leaves: pause one offered tree.
+pub const PAUSE_REQUEST_FILE_NAME: &str = "host-relief-pause.request";
 /// The version this build writes and the only one it reads.
 pub const VERSION: u32 = 1;
 /// A file that claims activity and is older than this is Stale.
@@ -143,6 +178,21 @@ pub struct FrozenTree {
     /// The mode was Advise: this is what Act would have paused, and nothing is
     /// stopped. Never counted as paused.
     pub advised_only: bool,
+    /// Set on an entry of [`ReliefStatus::offers`]: why the supervisor will
+    /// not pause this tree by itself. Absent on a paused or advised tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<OfferWhy>,
+}
+
+/// Why a tree the supervisor would have paused is only offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferWhy {
+    /// The agent is one GitPulse did not launch (the Claude desktop app, a
+    /// terminal started elsewhere). A person may still ask for the pause.
+    Observed,
+    /// The agent's repository is not trusted. Advice only: there is no pause.
+    Untrusted,
 }
 
 /// What an action did.
@@ -154,6 +204,9 @@ pub enum ReliefActionKind {
     Resume,
     CapResume,
     Refused,
+    /// A paused tree was ended (rung C: the opt-in at the cap, or a person's
+    /// "End it").
+    Terminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +247,15 @@ pub struct ReliefStatus {
     /// Bounded to [`MAX_FAILURES`], newest last.
     pub failures: Vec<ReliefFailure>,
     pub cap_hits: u32,
+    /// Trees rung B would have paused but may not by itself (`advised_only` is
+    /// true; `why` says which). Never counted as paused, never a rung.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offers: Vec<FrozenTree>,
+    /// Trees the supervisor ended in this Severe episode, newest last
+    /// (`since_ms` is when they were ended). The command-gate hook tells the
+    /// agent they were ended and must not be re-run until pressure clears.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ended: Vec<FrozenTree>,
 }
 
 impl ReliefStatus {
@@ -213,6 +275,8 @@ impl ReliefStatus {
             last_action: None,
             failures: Vec::new(),
             cap_hits: 0,
+            offers: Vec::new(),
+            ended: Vec::new(),
         }
     }
 
@@ -231,7 +295,11 @@ impl ReliefStatus {
     /// what makes its age and its writer matter: a rung above none, a tree
     /// really paused, or a process really slowed.
     pub fn claims_activity(&self) -> bool {
-        self.rung != ReliefRung::None || self.paused_count() > 0 || self.slowed > 0
+        self.rung != ReliefRung::None
+            || self.paused_count() > 0
+            || self.slowed > 0
+            || !self.offers.is_empty()
+            || !self.ended.is_empty()
     }
 }
 
@@ -488,6 +556,139 @@ pub fn take_resume_request(dir: &Path, now_ms: u64) -> Option<ResumeRequest> {
     (now_ms.saturating_sub(request.at_ms) <= REQUEST_TTL_MS).then_some(request)
 }
 
+/// A request that names one tree: a person's "End it" or "Pause it".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetRequest {
+    pub reason: String,
+    /// Unix epoch milliseconds, when the request was made.
+    pub at_ms: u64,
+    /// The first process of the tree, as the status file published it.
+    pub pid: u32,
+    pub start_us: u64,
+}
+
+/// What a target request is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Terminate,
+    Pause,
+}
+
+impl TargetKind {
+    fn file(self) -> &'static str {
+        match self {
+            Self::Terminate => TERMINATE_REQUEST_FILE_NAME,
+            Self::Pause => PAUSE_REQUEST_FILE_NAME,
+        }
+    }
+}
+
+/// Whether `pid` could be the first process of a tree: an ordinary process id
+/// that fits a `pid_t`, with a start time. 0, 1 and wrapped values never name
+/// one, so a request cannot even ask for them.
+fn plausible_target(pid: u32, start_us: u64) -> bool {
+    pid > 1 && i32::try_from(pid).is_ok() && start_us != 0
+}
+
+/// Asks the supervisor to end the paused tree `pid`/`start_us`.
+pub fn request_terminate(reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
+    request_target(TargetKind::Terminate, reason, pid, start_us)
+}
+
+/// Asks the supervisor to pause the offered tree `pid`/`start_us`.
+pub fn request_pause(reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
+    request_target(TargetKind::Pause, reason, pid, start_us)
+}
+
+fn request_target(kind: TargetKind, reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
+    let dir = default_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "there is no per-user config directory (HOME unset)",
+        )
+    })?;
+    request_target_in(&dir, kind, reason, pid, start_us, now_ms())
+}
+
+/// [`request_terminate`] / [`request_pause`] into `dir`, as of `now_ms`. A
+/// target that cannot be a tree's first process is refused here, not written.
+pub fn request_target_in(
+    dir: &Path,
+    kind: TargetKind,
+    reason: &str,
+    pid: u32,
+    start_us: u64,
+    now_ms: u64,
+) -> io::Result<()> {
+    if !plausible_target(pid, start_us) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid {pid} with start time {start_us} does not name a process tree"),
+        ));
+    }
+    let reason: String = reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON)
+        .collect();
+    let body = serde_json::to_vec(&TargetRequest {
+        reason,
+        at_ms: now_ms,
+        pid,
+        start_us,
+    })
+    .map_err(io::Error::other)?;
+    write_private_atomic(&dir.join(kind.file()), &body)
+}
+
+/// Reads and deletes the pending request of `kind`, the one call the supervisor
+/// makes per tick for it. `None` when there is none, when it is older than
+/// [`REQUEST_TTL_MS`], dated ahead of the clock by more than [`FUTURE_SLACK_MS`],
+/// does not name a plausible process, or is not a request this user wrote: all
+/// delete it, so none is acted on later.
+pub fn take_target_request(dir: &Path, kind: TargetKind, now_ms: u64) -> Option<TargetRequest> {
+    let path = dir.join(kind.file());
+    let record = read_private(&path);
+    if matches!(record, Record::Missing) {
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+    let Record::Bytes(bytes) = record else {
+        return None;
+    };
+    let request: TargetRequest = serde_json::from_slice(&bytes).ok()?;
+    let fresh = now_ms.saturating_sub(request.at_ms) <= REQUEST_TTL_MS
+        && request.at_ms <= now_ms.saturating_add(FUTURE_SLACK_MS);
+    (fresh && plausible_target(request.pid, request.start_us)).then_some(request)
+}
+
+/// [`take_target_request`] for a terminate request.
+pub fn take_terminate_request(dir: &Path, now_ms: u64) -> Option<TargetRequest> {
+    take_target_request(dir, TargetKind::Terminate, now_ms)
+}
+
+/// [`take_target_request`] for a pause request.
+pub fn take_pause_request(dir: &Path, now_ms: u64) -> Option<TargetRequest> {
+    take_target_request(dir, TargetKind::Pause, now_ms)
+}
+
+/// The identifier a relief banner about one tree is posted under:
+/// `<prefix>:<pid>:<start_us>`. macOS replaces a banner of the same identifier
+/// and the notification delegate sees nothing but this and the action's name,
+/// so the tree an "End it" or "Pause it" press is for travels in it.
+pub fn banner_id(prefix: &str, pid: u32, start_us: u64) -> String {
+    format!("{prefix}:{pid}:{start_us}")
+}
+
+/// The tree a banner identifier made by [`banner_id`] names, or `None` for an
+/// identifier that names none (or one that does not parse).
+pub fn banner_target(native: &str, prefix: &str) -> Option<(u32, u64)> {
+    let rest = native.strip_prefix(prefix)?.strip_prefix(':')?;
+    let (pid, start) = rest.split_once(':')?;
+    let (pid, start_us) = (pid.parse::<u32>().ok()?, start.parse::<u64>().ok()?);
+    plausible_target(pid, start_us).then_some((pid, start_us))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +704,7 @@ mod tests {
             footprint_bytes: 9 << 30,
             since_ms: 1_000,
             advised_only: false,
+            why: None,
         }
     }
 
@@ -869,6 +1071,118 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.reason.len(), MAX_REASON);
+    }
+
+    #[test]
+    fn target_requests_are_private_atomic_named_taken_once_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [TargetKind::Terminate, TargetKind::Pause] {
+            let path = dir.path().join(kind.file());
+            request_target_in(dir.path(), kind, "banner\u{7}", 4242, 7_000_000, 10_000).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let taken = take_target_request(dir.path(), kind, 10_000 + REQUEST_TTL_MS).unwrap();
+            assert_eq!(
+                taken,
+                TargetRequest {
+                    reason: "banner".into(),
+                    at_ms: 10_000,
+                    pid: 4242,
+                    start_us: 7_000_000
+                }
+            );
+            assert!(!path.exists(), "taken means deleted");
+            assert_eq!(take_target_request(dir.path(), kind, 10_000), None);
+            // Expired, from the future, and not a request: dropped and deleted.
+            request_target_in(dir.path(), kind, "x", 4242, 7_000_000, 10_000).unwrap();
+            assert_eq!(
+                take_target_request(dir.path(), kind, 10_000 + REQUEST_TTL_MS + 1),
+                None
+            );
+            assert!(!path.exists());
+            request_target_in(dir.path(), kind, "x", 4242, 7_000_000, 900_000).unwrap();
+            assert_eq!(take_target_request(dir.path(), kind, 10_000), None);
+            std::fs::write(&path, b"{nope").unwrap();
+            make_private(&path);
+            assert_eq!(take_target_request(dir.path(), kind, 1), None);
+            assert!(!path.exists());
+        }
+        // The two kinds never read each other's file.
+        request_target_in(dir.path(), TargetKind::Pause, "x", 4242, 7, 5).unwrap();
+        assert_eq!(take_terminate_request(dir.path(), 5), None);
+        assert!(take_pause_request(dir.path(), 5).is_some());
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_a_process_tree_is_refused_by_writer_and_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        for (pid, start) in [(0, 5), (1, 5), (u32::MAX, 5), (4242, 0)] {
+            assert!(
+                request_target_in(dir.path(), TargetKind::Terminate, "x", pid, start, 1).is_err(),
+                "{pid}/{start}"
+            );
+            // A file somebody else wrote by hand is refused as well.
+            let path = dir.path().join(TERMINATE_REQUEST_FILE_NAME);
+            let body = serde_json::to_vec(&TargetRequest {
+                reason: "x".into(),
+                at_ms: 1,
+                pid,
+                start_us: start,
+            })
+            .unwrap();
+            std::fs::write(&path, body).unwrap();
+            make_private(&path);
+            assert_eq!(take_terminate_request(dir.path(), 1), None, "{pid}/{start}");
+        }
+    }
+
+    #[test]
+    fn a_banner_identifier_carries_its_tree_and_nothing_else_parses() {
+        let id = banner_id("gitpulse.relief.paused", 4242, 1_700_000_000_000_000);
+        assert_eq!(
+            banner_target(&id, "gitpulse.relief.paused"),
+            Some((4242, 1_700_000_000_000_000))
+        );
+        assert_eq!(banner_target(&id, "gitpulse.relief.offer"), None);
+        for bad in [
+            "gitpulse.relief.paused",
+            "gitpulse.relief.paused:",
+            "gitpulse.relief.paused:4242",
+            "gitpulse.relief.paused:x:1",
+            "gitpulse.relief.paused:1:5",
+            "gitpulse.relief.paused:4242:0",
+            "gitpulse.relief.paused:-4:5",
+        ] {
+            assert_eq!(banner_target(bad, "gitpulse.relief.paused"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_phase_one_file_reads_and_offers_and_ended_are_optional_on_the_wire() {
+        let mut json = serde_json::to_value(frozen_at(10_000)).unwrap();
+        assert!(json.get("offers").is_none() && json.get("ended").is_none());
+        assert!(json["frozen"][0].get("why").is_none());
+        let status: ReliefStatus = serde_json::from_value(json.clone()).unwrap();
+        assert!(status.offers.is_empty() && status.ended.is_empty());
+        json["offers"] = serde_json::json!([{
+            "pid": 9, "start_us": 3, "agent_root_pid": 1, "terminal_session_id": null,
+            "repo_path": "/r", "command": "cargo", "footprint_bytes": 1, "since_ms": 1,
+            "advised_only": true, "why": "observed"
+        }]);
+        let status: ReliefStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.offers[0].why, Some(OfferWhy::Observed));
+        assert_eq!(
+            serde_json::to_value(ReliefActionKind::Terminate).unwrap(),
+            "terminate"
+        );
+        // An offer is activity: a dead writer's offers go stale like a pause.
+        assert!(status.claims_activity());
     }
 
     #[test]

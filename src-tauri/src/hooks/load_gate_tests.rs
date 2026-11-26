@@ -1829,6 +1829,7 @@ mod relief {
             footprint_bytes: 9 << 30,
             since_ms: 1,
             advised_only,
+            why: None,
         }
     }
 
@@ -1870,6 +1871,56 @@ mod relief {
         ] {
             assert!(text.contains(must), "lacks {must:?}: {text}");
         }
+    }
+
+    #[test]
+    fn a_tree_ended_for_this_session_says_so_and_a_neighbours_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let ended = |trees: Vec<FrozenTree>| ReliefOutcome::Fresh {
+            status: ReliefStatus {
+                rung: ReliefRung::Slow,
+                binding: Some(ReliefBinding::CompressorSegments),
+                ended: trees,
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
+            },
+        };
+        let g = with(
+            ended(vec![tree(Some(OURS), "/elsewhere", false)]),
+            dir.path(),
+        );
+        let text = context(&judged(HEAVY, &g));
+        for must in [
+            "ended `cargo test --workspace`",
+            "ended by memory protection",
+            "must not be re-run",
+            "until memory pressure clears",
+        ] {
+            assert!(text.contains(must), "lacks {must:?}: {text}");
+        }
+        assert!(!text.contains("resume automatically"), "{text}");
+        let other = with(
+            ended(vec![tree(Some("term-9999-zz"), "/elsewhere", false)]),
+            dir.path(),
+        );
+        assert!(
+            !context(&judged(HEAVY, &other)).contains("ended by memory protection"),
+            "another session's ended build is not this one's business"
+        );
+        // A status that could not be verified says so; it never repeats an
+        // ended build as if it were current.
+        let mut stale = with(
+            ended(vec![tree(Some(OURS), "/elsewhere", false)]),
+            dir.path(),
+        );
+        stale.relief = ReliefOutcome::Stale {
+            status: ReliefStatus {
+                ended: vec![tree(Some(OURS), "/elsewhere", false)],
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
+            },
+            age_ms: 90_000,
+            cause: ReliefStaleCause::Age,
+        };
+        assert!(!context(&judged(HEAVY, &stale)).contains("ended by memory protection"));
     }
 
     fn told(g: &Gathered) -> bool {

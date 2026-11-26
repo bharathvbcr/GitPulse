@@ -157,7 +157,8 @@
     <p class="text-textMuted text-micro leading-snug">
       Act (the default): pause the heaviest build or test under an agent GitPulse launched, never the agent
       itself, until the pressure eases or 10 minutes pass; first, agent processes are slowed to background
-      priority. Advise: only tell me what it would pause. Off: do nothing.
+      priority. A build under an agent GitPulse did not start is only offered for pausing, and you decide.
+      Advise: only tell me what it would pause. Off: do nothing.
     </p>
     <SettingSegment
       ariaLabel="What GitPulse does when memory runs out"
@@ -166,6 +167,13 @@
       onselect={(next) => {
         if (readOk && !busy) void save({ supervisor: next });
       }}
+    />
+    <SettingToggle
+      label="When a paused build is still paused after 10 minutes, end it instead of resuming it"
+      description="Off by default. Ending stops the build for good (SIGTERM, then SIGKILL after 10 seconds) and the agent sees it fail. A build you end yourself from the banner or Health never needs this. Only a build GitPulse paused is ever ended."
+      checked={settings.supervisor_terminate}
+      disabled={busy || !readOk || supervisor !== "act"}
+      onchange={(next) => void save({ supervisor_terminate: next })}
     />
   </div>
   <div class="space-y-1 pt-1" data-testid="host-load-lease-settings">

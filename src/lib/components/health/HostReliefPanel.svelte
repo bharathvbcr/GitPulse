@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    offerRows,
     pausedRows,
     reliefBindingLabel,
     reliefHeadline,
@@ -7,6 +8,7 @@
     reliefModeLabel,
     reliefNowLabel,
     reliefSummary,
+    type FrozenTree,
     type ReliefOutcome,
     type ReliefStatus,
   } from "../../health/hostRelief";
@@ -28,20 +30,34 @@
     requesting = false,
     requested = false,
     error = "",
+    note = "",
     onresume,
+    onend,
+    onpause,
   }: {
     outcome: ReliefOutcome | null;
     now?: number;
     requesting?: boolean;
     requested?: boolean;
     error?: string;
+    /** What the last End or Pause request said happened. */
+    note?: string;
     onresume?: () => void;
+    /** "End" on a paused tree, after the section's confirm. */
+    onend?: (tree: FrozenTree) => void;
+    /** "Pause" on an offered tree, after the section's confirm. */
+    onpause?: (tree: FrozenTree) => void;
   } = $props();
 
   const status = $derived<ReliefStatus | null>(
     outcome && (outcome.state === "fresh" || outcome.state === "stale") ? outcome.status : null,
   );
   const rows = $derived(status ? pausedRows(status, now) : []);
+  const offers = $derived(status ? offerRows(status, now) : []);
+  // End and Pause are acted on by the supervisor, so they are offered only
+  // while its status is current: a stale one may belong to a supervisor that is
+  // gone, and nothing would answer.
+  const live = $derived(outcome?.state === "fresh");
   const summary = $derived(status ? reliefSummary(status) : null);
   const calm = $derived(reliefIsCalm(outcome));
   // A status that could not be verified is the one where the person most needs
@@ -104,6 +120,47 @@
               · <span data-testid="host-relief-footprint">{row.footprint}</span>
               · paused <span data-testid="host-relief-since">{row.since}</span>
             </div>
+            {#if live}
+              <button
+                type="button"
+                class="gp-btn text-meta px-2 py-0.5 mt-1"
+                data-testid="host-relief-end"
+                disabled={requesting}
+                title="Ends this build: it is stopped for good and the agent sees it fail"
+                onclick={() => onend?.(row.tree)}
+              >
+                End
+              </button>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if offers.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-offers">
+        {#each offers as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-offer-row">
+            <div class="font-mono text-textPrimary break-all" data-testid="host-relief-offer-command">{row.command}</div>
+            <div class="text-textMuted">
+              <span title={row.repoPath}>{row.repo}</span>
+              · {row.agent}
+              · {row.footprint}
+              · not paused
+            </div>
+            {#if row.canPause && live}
+              <button
+                type="button"
+                class="gp-btn text-meta px-2 py-0.5 mt-1"
+                data-testid="host-relief-pause"
+                disabled={requesting}
+                onclick={() => onpause?.(row.tree)}
+              >
+                Pause
+              </button>
+            {:else if row.note}
+              <p class="text-textMuted" data-testid="host-relief-offer-note">{row.note}</p>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -151,6 +208,10 @@
         </span>
       {/if}
     </div>
+  {/if}
+
+  {#if note}
+    <p class="text-textMuted" data-testid="host-relief-note">{note}</p>
   {/if}
 
   {#if error}

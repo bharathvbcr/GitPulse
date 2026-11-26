@@ -55,6 +55,8 @@ mod platform {
     pub(super) fn withdraw(_natives: &[String]) {}
     pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
     pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
+    pub(super) const RELIEF_OFFER_CATEGORY: &str = "gitpulse-relief-offer";
+    pub(super) const RELIEF_ADVICE_CATEGORY: &str = "gitpulse-relief-advice";
 }
 
 pub(super) struct Coordinator {
@@ -93,6 +95,7 @@ pub(crate) fn post_relief(
     native: &str,
     heading: &str,
     body: &str,
+    banner: ReliefBanner,
 ) -> Result<bool, String> {
     let host = app.state::<WorkbenchState>().inner().clone();
     let preferences = settings(&host).map_err(|error| {
@@ -116,9 +119,72 @@ pub(crate) fn post_relief(
         heading,
         body,
         preferences.sound,
-        platform::RELIEF_CATEGORY,
+        match banner {
+            ReliefBanner::Paused => platform::RELIEF_CATEGORY,
+            ReliefBanner::Offer => platform::RELIEF_OFFER_CATEGORY,
+            ReliefBanner::Advice => platform::RELIEF_ADVICE_CATEGORY,
+        },
     )
     .map_err(|error| error.message)
+}
+
+/// Which buttons a relief banner carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReliefBanner {
+    /// "Resume now", "End it" and "Settings".
+    Paused,
+    /// "Pause it" and "Settings": a tree of an agent GitPulse did not launch.
+    Offer,
+    /// "Settings" only: advice about a tree it may not pause.
+    Advice,
+}
+
+/// The identifier prefixes of the relief banners that are about one tree
+/// (`<prefix>:<pid>:<start_us>`, `relief_status::banner_id`).
+pub(crate) const RELIEF_PAUSED_PREFIX: &str = "gitpulse.relief.paused";
+pub(crate) const RELIEF_OFFER_PREFIX: &str = "gitpulse.relief.offer";
+pub(crate) const RELIEF_ADVICE_PREFIX: &str = "gitpulse.relief.advice";
+
+/// The relief banners' buttons, by the identifier each is registered under.
+pub(super) const RELIEF_RESUME_ACTION: &str = "relief-resume";
+pub(super) const RELIEF_TERMINATE_ACTION: &str = "relief-terminate";
+pub(super) const RELIEF_PAUSE_ACTION: &str = "relief-pause";
+pub(super) const RELIEF_SETTINGS_ACTION: &str = "relief-settings";
+
+/// What a press on a relief banner asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReliefTap {
+    /// Resume everything.
+    Resume,
+    /// End the paused tree the banner names.
+    Terminate(u32, u64),
+    /// Pause the offered tree the banner names.
+    Pause(u32, u64),
+    /// Open Settings (the Settings button and a click on the body).
+    Settings,
+    /// A button whose banner does not name a tree: nothing to act on.
+    Ignore,
+}
+
+/// Routes a press on a relief banner. Each button acts only on the category
+/// it is registered with, and the tree comes only from the banner's own
+/// identifier, parsed by `relief_status::banner_target`: an identifier that
+/// does not name a plausible tree is [`ReliefTap::Ignore`], never a guess.
+pub(super) fn relief_tap(category: &str, action: &str, native: &str) -> ReliefTap {
+    use crate::sysload::relief_status::banner_target;
+    let target = |prefix: &str, make: fn(u32, u64) -> ReliefTap| {
+        banner_target(native, prefix).map_or(ReliefTap::Ignore, |(pid, start)| make(pid, start))
+    };
+    match (category, action) {
+        (platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION) => ReliefTap::Resume,
+        (platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION) => {
+            target(RELIEF_PAUSED_PREFIX, ReliefTap::Terminate)
+        }
+        (platform::RELIEF_OFFER_CATEGORY, RELIEF_PAUSE_ACTION) => {
+            target(RELIEF_OFFER_PREFIX, ReliefTap::Pause)
+        }
+        _ => ReliefTap::Settings,
+    }
 }
 
 /// Whether the saved notification preference lets a relief banner out.
@@ -1050,6 +1116,78 @@ pub(super) fn native_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relief_button_acts_on_the_tree_its_banner_names_and_on_nothing_else() {
+        let paused = crate::sysload::relief_status::banner_id(RELIEF_PAUSED_PREFIX, 4242, 77);
+        let offer = crate::sysload::relief_status::banner_id(RELIEF_OFFER_PREFIX, 4243, 78);
+        let tap = relief_tap;
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION, &paused),
+            ReliefTap::Terminate(4242, 77)
+        );
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION, &paused),
+            ReliefTap::Resume
+        );
+        assert_eq!(
+            tap(platform::RELIEF_OFFER_CATEGORY, RELIEF_PAUSE_ACTION, &offer),
+            ReliefTap::Pause(4243, 78)
+        );
+        // The body click and the Settings button open Settings, on every banner.
+        for category in [
+            platform::RELIEF_CATEGORY,
+            platform::RELIEF_OFFER_CATEGORY,
+            platform::RELIEF_ADVICE_CATEGORY,
+        ] {
+            assert_eq!(
+                tap(category, RELIEF_SETTINGS_ACTION, &paused),
+                ReliefTap::Settings
+            );
+            assert_eq!(
+                tap(
+                    category,
+                    "com.apple.UNNotificationDefaultActionIdentifier",
+                    &paused
+                ),
+                ReliefTap::Settings
+            );
+        }
+        // A button never acts across kinds: End it on an offer's identifier,
+        // Pause it on a paused tree's, or on an untrusted advice banner.
+        assert_eq!(
+            tap(platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION, &offer),
+            ReliefTap::Ignore
+        );
+        assert_eq!(
+            tap(
+                platform::RELIEF_OFFER_CATEGORY,
+                RELIEF_PAUSE_ACTION,
+                &paused
+            ),
+            ReliefTap::Ignore
+        );
+        let advice = crate::sysload::relief_status::banner_id(RELIEF_ADVICE_PREFIX, 4244, 79);
+        assert_eq!(
+            tap(
+                platform::RELIEF_ADVICE_CATEGORY,
+                RELIEF_PAUSE_ACTION,
+                &advice
+            ),
+            ReliefTap::Settings,
+            "an untrusted repository's advice has no pause path"
+        );
+        // A banner that names no tree (the cap notice) ends nothing.
+        assert_eq!(
+            tap(
+                platform::RELIEF_CATEGORY,
+                RELIEF_TERMINATE_ACTION,
+                "gitpulse.relief.cap-resumed"
+            ),
+            ReliefTap::Ignore
+        );
+    }
+
     #[test]
     fn activation_is_a_queued_event_distinct_from_wake() {
         assert!(!matches!(Event::Wake, Event::Activate(_)));

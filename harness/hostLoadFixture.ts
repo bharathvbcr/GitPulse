@@ -124,6 +124,7 @@ export function hostLoadSettingsFixture(): HostLoadSettings {
     idle: { idle_after_s: 900, park_after_s: 3600 },
     profile: "auto",
     supervisor: "act",
+    supervisor_terminate: false,
     thresholds: {
       swap: { mode: "refuse", elevated_at: 0.5, severe_at: 0.75 },
       compressor_segments: { mode: "refuse", elevated_at: 0.6, severe_at: 0.8 },

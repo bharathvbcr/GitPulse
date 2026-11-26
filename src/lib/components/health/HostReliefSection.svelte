@@ -1,6 +1,13 @@
 <script lang="ts">
   import { explainError } from "../../workbench/client";
-  import { hostRelief, reliefStatusKey, requestResumeAll } from "../../health/hostRelief";
+  import {
+    hostRelief,
+    reliefStatusKey,
+    requestEndTree,
+    requestPauseTree,
+    requestResumeAll,
+    type FrozenTree,
+  } from "../../health/hostRelief";
   import HostReliefPanel from "./HostReliefPanel.svelte";
 
   /**
@@ -21,6 +28,30 @@
     void $hostRelief;
     return Date.now();
   });
+
+  let note = $state("");
+
+  /**
+   * End or Pause one tree: the confirm comes first (it is `requestEndTree` /
+   * `requestPauseTree`'s), and the request is only left when it is accepted.
+   */
+  async function askTree(
+    tree: FrozenTree,
+    ask: (tree: FrozenTree) => Promise<boolean>,
+    sent: string,
+  ) {
+    if (requesting) return;
+    requesting = true;
+    error = "";
+    note = "";
+    try {
+      if (await ask(tree)) note = sent;
+    } catch (cause) {
+      error = explainError(cause);
+    } finally {
+      requesting = false;
+    }
+  }
 
   async function resumeAll() {
     if (requesting) return;
@@ -46,5 +77,8 @@
   {requesting}
   {requested}
   {error}
+  {note}
   onresume={() => void resumeAll()}
+  onend={(tree) => void askTree(tree, requestEndTree, "End requested. The supervisor ends it on its next check.")}
+  onpause={(tree) => void askTree(tree, requestPauseTree, "Pause requested. The supervisor pauses it on its next check, if it still qualifies.")}
 />

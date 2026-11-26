@@ -225,6 +225,8 @@
           case "cmd_host_relief_status":
             return knobs.hostRelief ? knobs.hostRelief() : { state: "absent" };
           case "cmd_host_relief_request_resume":
+          case "cmd_host_relief_request_terminate":
+          case "cmd_host_relief_request_pause":
             return null;
           case "cmd_host_load_leases":
             if (knobs.hostLoadLeases) return knobs.hostLoadLeases();

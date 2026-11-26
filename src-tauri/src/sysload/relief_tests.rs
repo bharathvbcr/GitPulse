@@ -13,6 +13,8 @@ const MIB: u64 = 1 << 20;
 enum Call {
     Stop(i32),
     Cont(i32),
+    Term(i32),
+    Kill(i32),
     Bg(i32, bool),
 }
 
@@ -142,12 +144,20 @@ impl Actuator for Fake {
                 self.calls.lock().unwrap().push(Call::Stop(pid));
             }
             Signal::Cont => self.calls.lock().unwrap().push(Call::Cont(pid)),
+            Signal::Term => self.calls.lock().unwrap().push(Call::Term(pid)),
+            Signal::Kill => self.calls.lock().unwrap().push(Call::Kill(pid)),
         }
         match self.check(pid, start_us) {
             Ok(()) => {
                 match signal {
                     Signal::Stop => self.stopped.lock().unwrap().insert(pid),
                     Signal::Cont => self.stopped.lock().unwrap().remove(&pid),
+                    // The fake's processes ignore SIGTERM and die of SIGKILL.
+                    Signal::Term => false,
+                    Signal::Kill => {
+                        self.live.lock().unwrap().remove(&pid);
+                        self.stopped.lock().unwrap().remove(&pid)
+                    }
                 };
                 Ok(Delivery::Delivered)
             }
@@ -4020,3 +4030,6 @@ fn putting_back_leaves_alone_what_was_born_before_the_slowing_and_what_is_under_
         "born before the slowing, and in the background on its own account"
     );
 }
+
+#[path = "relief_tests/rung_c.rs"]
+mod rung_c;

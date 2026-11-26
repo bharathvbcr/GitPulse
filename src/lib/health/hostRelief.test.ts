@@ -11,6 +11,8 @@ import {
   reliefHeadline,
   reliefIsCalm,
   reliefStatusKey,
+  requestEndTree,
+  requestPauseTree,
   requestResumeAll,
   type FrozenTree,
   type ReliefOutcome,
@@ -344,6 +346,82 @@ describe("reading and resuming", () => {
     vi.mocked(invoke).mockResolvedValueOnce(undefined);
     await requestResumeAll();
     expect(vi.mocked(invoke).mock.calls.at(-1)?.[0]).toBe("cmd_host_relief_request_resume");
+  });
+
+  describe("ending a paused tree and pausing an offered one", () => {
+    const offered = (over: Partial<FrozenTree> = {}) =>
+      tree({ pid: 5151, start_us: 9, advised_only: true, why: "observed", command: "node build.js", ...over });
+    const body = (outcome: ReliefOutcome) => render(HostReliefPanel, { props: { outcome, now: NOW } }).body;
+
+    it("renders End beside Resume all for a paused tree, and only while the status is fresh", () => {
+      const live = body(fresh());
+      expect(live).toContain('data-testid="host-relief-end"');
+      expect(live).toContain('data-testid="host-relief-resume"');
+      // A stale status may belong to a supervisor that is gone: no End, but
+      // the resume button stays.
+      const old = body(stale());
+      expect(old).not.toContain('data-testid="host-relief-end"');
+      expect(old).toContain('data-testid="host-relief-resume"');
+    });
+
+    it("renders an observed tree as an offer with a Pause and never lists it as paused", () => {
+      const html = body(fresh(status({ rung: "slow", slowed: 0, frozen: [], offers: [offered()] })));
+      expect(html).toContain('data-testid="host-relief-offer-row"');
+      expect(html).toContain("node build.js");
+      expect(html).toContain('data-testid="host-relief-pause"');
+      expect(html).not.toContain('data-testid="host-relief-paused-row"');
+      expect(html).not.toContain('data-testid="host-relief-end"');
+      expect(html).toContain("could be paused if you ask");
+    });
+
+    it("renders an untrusted offer as advice with no Pause, and no Pause outside Act mode", () => {
+      const untrusted = body(
+        fresh(status({ rung: "slow", slowed: 0, frozen: [], offers: [offered({ why: "untrusted" })] })),
+      );
+      expect(untrusted).toContain("does not trust this repository");
+      expect(untrusted).not.toContain('data-testid="host-relief-pause"');
+      const advise = body(
+        fresh(status({ mode: "advise", rung: "slow", slowed: 0, frozen: [], offers: [offered()] })),
+      );
+      expect(advise).not.toContain('data-testid="host-relief-pause"');
+      expect(advise).toContain("not in Act mode");
+    });
+
+    it("a status without the new fields reads as it always did", () => {
+      const html = body(fresh());
+      expect(html).not.toContain("host-relief-offers");
+      expect(reliefIsCalm(fresh(status({ rung: "none", slowed: 0, frozen: [] })))).toBe(true);
+      expect(reliefIsCalm(fresh(status({ rung: "none", slowed: 0, frozen: [], offers: [offered()] })))).toBe(false);
+    });
+
+    it("asks first, with the command and pid, and leaves the request only when confirmed", async () => {
+      const target = tree();
+      const decline = vi.fn().mockResolvedValue(false);
+      expect(await requestEndTree(target, decline)).toBe(false);
+      expect(invoke).not.toHaveBeenCalled();
+      const ask = decline.mock.calls[0][0] as { message: string; destructive?: boolean };
+      expect(ask.message).toBe("This stops cargo test --workspace (pid 4242). The agent will see it fail.");
+      expect(ask.destructive).toBe(true);
+
+      vi.mocked(invoke).mockResolvedValueOnce(undefined);
+      expect(await requestEndTree(target, vi.fn().mockResolvedValue(true))).toBe(true);
+      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_terminate", { pid: 4242, startUs: 7 });
+    });
+
+    it("pause asks first too, and names the same tree by pid and start time", async () => {
+      const target = offered();
+      const decline = vi.fn().mockResolvedValue(false);
+      expect(await requestPauseTree(target, decline)).toBe(false);
+      expect(invoke).not.toHaveBeenCalled();
+      vi.mocked(invoke).mockResolvedValueOnce(undefined);
+      expect(await requestPauseTree(target, vi.fn().mockResolvedValue(true))).toBe(true);
+      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_pause", { pid: 5151, startUs: 9 });
+    });
+
+    it("an end request that could not be written is an error, never a quiet success", async () => {
+      vi.mocked(invoke).mockRejectedValueOnce(new Error("disk full"));
+      await expect(requestEndTree(tree(), vi.fn().mockResolvedValue(true))).rejects.toThrow("disk full");
+    });
   });
 
   it("a read that fails is an unreadable outcome, not the last good one", async () => {

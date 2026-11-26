@@ -61,7 +61,7 @@ flowchart TD
     subgraph GitPulseHost["GitPulse Desktop Host"]
         direction TB
         UIHost["Svelte 5 UI (Work · Code · History · Insights)"]
-        RustIPC["Rust Core (367 Handlers, Tauri 2 IPC)"]
+        RustIPC["Rust Core (369 Handlers, Tauri 2 IPC)"]
         InProcessReaders["In-process Vendored Readers<br/>(<code>src-tauri/vendored/</code>)"]
         CLIGate["Live Indexing Gate & Daemon Probe<br/>(<code>src-tauri/src/devmap/</code>)"]
         HarnessClient["Harness Client & Grants<br/>(<code>src-tauri/src/harness/</code>)"]

@@ -95,6 +95,10 @@ impl HostPressure {
 pub enum NoticeKind {
     Paused,
     CapResumed,
+    /// A tree rung B may not pause by itself, offered to the person.
+    Offer,
+    /// A heavy tree in an untrusted repository: advice, no action.
+    Advice,
 }
 
 /// One banner to raise.
@@ -103,15 +107,37 @@ pub struct Notice {
     pub kind: NoticeKind,
     pub heading: &'static str,
     pub body: String,
+    /// The tree (`pid`, `start_us`) the banner is about, which its "End it" or
+    /// "Pause it" button acts on. Travels in the banner's identifier.
+    pub target: Option<(u32, u64)>,
 }
 
 impl Notice {
-    /// The identifier the banner is posted under: one per kind, so a repeat
-    /// replaces the banner on screen instead of stacking.
-    pub fn native_id(&self) -> &'static str {
+    /// The identifier the banner is posted under. A banner about a tree
+    /// carries the tree in it (a repeat for the same tree replaces the banner
+    /// on screen instead of stacking, and a button press knows which tree it is
+    /// for); the cap banner has one fixed identifier.
+    pub fn native_id(&self) -> String {
+        use crate::workbench::notifications as n;
+        let about = |prefix: &str| match self.target {
+            Some((pid, start_us)) => relief_status::banner_id(prefix, pid, start_us),
+            None => prefix.to_string(),
+        };
         match self.kind {
-            NoticeKind::Paused => "gitpulse.relief.paused",
-            NoticeKind::CapResumed => "gitpulse.relief.cap-resumed",
+            NoticeKind::Paused => about(n::RELIEF_PAUSED_PREFIX),
+            NoticeKind::CapResumed => "gitpulse.relief.cap-resumed".to_string(),
+            NoticeKind::Offer => about(n::RELIEF_OFFER_PREFIX),
+            NoticeKind::Advice => about(n::RELIEF_ADVICE_PREFIX),
+        }
+    }
+
+    /// Which set of buttons the banner carries.
+    pub(crate) fn banner(&self) -> crate::workbench::notifications::ReliefBanner {
+        use crate::workbench::notifications::ReliefBanner;
+        match self.kind {
+            NoticeKind::Paused | NoticeKind::CapResumed => ReliefBanner::Paused,
+            NoticeKind::Offer => ReliefBanner::Offer,
+            NoticeKind::Advice => ReliefBanner::Advice,
         }
     }
 }
@@ -128,6 +154,15 @@ pub struct Episode {
     last_banner_ms: Option<u64>,
     /// The newest cap resume that has been announced.
     announced_cap_at_ms: u64,
+    /// The offered trees (`pid`, `start_us`) a banner has been raised for.
+    /// Reset when a read finds no offers: an offer has its own life, apart
+    /// from the pause episode (a tree that is only offered is paused by nobody).
+    offered: BTreeSet<(u32, u64)>,
+    /// When the last offer banner was raised.
+    last_offer_ms: Option<u64>,
+    /// The person opted in to ending a tree at the 10-minute cap, so the pause
+    /// banner says that instead of "resumes".
+    pub terminate_at_cap: bool,
 }
 
 impl Episode {
@@ -160,19 +195,50 @@ impl Episode {
                 return Some(cap_notice(action.detail.as_str()));
             }
         }
-        let fresh = paused
+        if let Some(fresh) = paused
             .iter()
-            .find(|tree| !self.announced.contains(&(tree.pid, tree.start_us)))?;
+            .find(|tree| !self.announced.contains(&(tree.pid, tree.start_us)))
+        {
+            let due = self
+                .last_banner_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= BANNER_GAP_MS);
+            if !due {
+                return None;
+            }
+            self.announced
+                .extend(paused.iter().map(|tree| (tree.pid, tree.start_us)));
+            self.last_banner_ms = Some(now_ms);
+            return Some(if self.terminate_at_cap {
+                pause_notice_terminating(status, fresh)
+            } else {
+                pause_notice(status, fresh)
+            });
+        }
+        self.observe_offers(status, now_ms)
+    }
+
+    /// The banner a standing offer calls for: one per offered tree, at most one
+    /// every [`BANNER_GAP_MS`]. An observed session's tree gets "Pause it"; an
+    /// untrusted repository's gets advice only.
+    fn observe_offers(&mut self, status: &ReliefStatus, now_ms: u64) -> Option<Notice> {
+        if status.offers.is_empty() {
+            self.offered.clear();
+            self.last_offer_ms = None;
+            return None;
+        }
+        let fresh = status
+            .offers
+            .iter()
+            .find(|tree| !self.offered.contains(&(tree.pid, tree.start_us)))?;
         let due = self
-            .last_banner_ms
+            .last_offer_ms
             .is_none_or(|last| now_ms.saturating_sub(last) >= BANNER_GAP_MS);
         if !due {
             return None;
         }
-        self.announced
-            .extend(paused.iter().map(|tree| (tree.pid, tree.start_us)));
-        self.last_banner_ms = Some(now_ms);
-        Some(pause_notice(status, fresh))
+        self.offered.insert((fresh.pid, fresh.start_us));
+        self.last_offer_ms = Some(now_ms);
+        Some(offer_notice(fresh))
     }
 }
 
@@ -216,11 +282,63 @@ fn pause_notice(status: &ReliefStatus, tree: &FrozenTree) -> Notice {
         heading: "GitPulse paused a build",
         body: format!(
             "`{}`{also} ({}) under the agent in {} was paused because {why}. \
-             It resumes automatically when pressure eases, or after 10 minutes.",
+             It resumes automatically when pressure eases, or after 10 minutes. \
+             \"End it\" ends it instead.",
             clean(&tree.command, MAX_COMMAND),
             gib(tree.footprint_bytes),
             repo_name(&tree.repo_path),
         ),
+        target: Some((tree.pid, tree.start_us)),
+    }
+}
+
+/// The pause banner when the person chose to have a paused build ended at the
+/// 10-minute cap: it must not promise a resume that will not come.
+fn pause_notice_terminating(status: &ReliefStatus, tree: &FrozenTree) -> Notice {
+    let why = status.binding.map_or(
+        "memory is nearly exhausted",
+        relief_status::ReliefBinding::phrase,
+    );
+    Notice {
+        kind: NoticeKind::Paused,
+        heading: "GitPulse paused a build",
+        body: format!(
+            "`{}` ({}) under the agent in {} was paused because {why}. \
+             It resumes when pressure eases; if it is still paused after 10 minutes it is \
+             ended, as you chose in Settings. \"End it\" ends it now.",
+            clean(&tree.command, MAX_COMMAND),
+            gib(tree.footprint_bytes),
+            repo_name(&tree.repo_path),
+        ),
+        target: Some((tree.pid, tree.start_us)),
+    }
+}
+
+/// The banner for an offered tree.
+fn offer_notice(tree: &FrozenTree) -> Notice {
+    let command = clean(&tree.command, MAX_COMMAND);
+    let repo = repo_name(&tree.repo_path);
+    match tree.why {
+        Some(relief_status::OfferWhy::Untrusted) => Notice {
+            kind: NoticeKind::Advice,
+            heading: "Memory is running out",
+            body: format!(
+                "`{command}` ({}) under the agent in {repo} is using a lot of it. GitPulse \
+                 does not trust that repository, so it will not pause the build.",
+                gib(tree.footprint_bytes),
+            ),
+            target: Some((tree.pid, tree.start_us)),
+        },
+        _ => Notice {
+            kind: NoticeKind::Offer,
+            heading: "Memory is running out",
+            body: format!(
+                "Memory is running out. Pause `{command}` ({}) under the agent in {repo}? \
+                 GitPulse did not start that agent, so it asks first.",
+                gib(tree.footprint_bytes),
+            ),
+            target: Some((tree.pid, tree.start_us)),
+        },
     }
 }
 
@@ -236,6 +354,7 @@ fn cap_notice(detail: &str) -> Notice {
                 "The 10-minute limit on a pause was reached, so it was resumed even though memory is still tight: {detail}"
             )
         },
+        target: None,
     }
 }
 
@@ -348,6 +467,7 @@ pub fn start(app: &AppHandle) -> Option<PressureHandle> {
                     reason: "there is no per-user config directory (HOME unset)".into(),
                 },
             };
+            poller.episode.terminate_at_cap = crate::tool_config::host_load_supervisor_terminate();
             poller.step(
                 &outcome,
                 severity_now(),
@@ -356,9 +476,10 @@ pub fn start(app: &AppHandle) -> Option<PressureHandle> {
                 &mut |notice| {
                     match crate::workbench::notifications::post_relief(
                         &app,
-                        notice.native_id(),
+                        &notice.native_id(),
                         notice.heading,
                         &notice.body,
+                        notice.banner(),
                     ) {
                         Ok(true) => {}
                         Ok(false) => {
@@ -397,6 +518,7 @@ mod tests {
             footprint_bytes: 9 << 30,
             since_ms: 1,
             advised_only,
+            why: None,
         }
     }
 
@@ -668,6 +790,99 @@ mod tests {
         );
         assert!(!notice.body.contains('\u{202e}'));
         assert!(notice.body.chars().count() < 400, "{}", notice.body);
+    }
+
+    fn offer(pid: u32, why: relief_status::OfferWhy) -> FrozenTree {
+        FrozenTree {
+            pid,
+            start_us: 500 + u64::from(pid),
+            advised_only: true,
+            why: Some(why),
+            ..tree(true)
+        }
+    }
+
+    fn with_offers(offers: Vec<FrozenTree>) -> ReliefOutcome {
+        ReliefOutcome::Fresh {
+            status: ReliefStatus {
+                rung: ReliefRung::Slow,
+                offers,
+                ..ReliefStatus::at_rest(ReliefMode::Act, 1)
+            },
+        }
+    }
+
+    #[test]
+    fn an_offer_is_announced_once_per_tree_rate_limited_and_asks_first() {
+        let mut episode = Episode::default();
+        let observed = relief_status::OfferWhy::Observed;
+        let one = with_offers(vec![offer(7, observed)]);
+        let notice = episode.observe(&one, 1_000).expect("an offer is news");
+        assert_eq!(notice.kind, NoticeKind::Offer);
+        assert_eq!(notice.target, Some((7, 507)));
+        for needle in [
+            "Memory is running out. Pause",
+            "cargo test --workspace",
+            "gitpulse",
+        ] {
+            assert!(notice.body.contains(needle), "{needle}: {}", notice.body);
+        }
+        assert_eq!(notice.native_id(), "gitpulse.relief.offer:7:507");
+        // Once per tree: the same offer standing is not announced again.
+        assert!(episode.observe(&one, 1_000 + 10 * BANNER_GAP_MS).is_none());
+        // A second tree inside the gap is held back, not forgotten.
+        let two = with_offers(vec![offer(7, observed), offer(8, observed)]);
+        assert!(episode.observe(&two, 1_000 + 5_000).is_none());
+        let second = episode
+            .observe(&two, 1_000 + BANNER_GAP_MS)
+            .expect("announced once the gap has passed");
+        assert_eq!(second.target, Some((8, 508)));
+        // The offers going away is its own reset: a later offer is news again.
+        assert!(episode
+            .observe(&rest(), 1_000 + 3 * BANNER_GAP_MS)
+            .is_none());
+        assert!(episode.observe(&one, 1_000 + 4 * BANNER_GAP_MS).is_some());
+    }
+
+    #[test]
+    fn an_untrusted_offer_is_advice_with_no_pause_and_a_paused_banner_says_what_the_opt_in_does() {
+        let mut episode = Episode::default();
+        let advice = episode
+            .observe(
+                &with_offers(vec![offer(9, relief_status::OfferWhy::Untrusted)]),
+                1,
+            )
+            .unwrap();
+        assert_eq!(advice.kind, NoticeKind::Advice);
+        assert_eq!(
+            advice.banner(),
+            crate::workbench::notifications::ReliefBanner::Advice
+        );
+        assert!(advice.body.contains("will not pause"), "{}", advice.body);
+        let paused = fresh(ReliefRung::Freeze, vec![tree(false)], None);
+        let mut off = Episode::default();
+        let plain = off.observe(&paused, 1).unwrap();
+        assert!(
+            plain.body.contains("resumes automatically"),
+            "{}",
+            plain.body
+        );
+        assert!(plain.body.contains("End it"));
+        let mut on = Episode {
+            terminate_at_cap: true,
+            ..Episode::default()
+        };
+        let ending = on.observe(&paused, 1).unwrap();
+        assert!(
+            ending.body.contains("ended") && !ending.body.contains("resumes automatically"),
+            "{}",
+            ending.body
+        );
+        assert_eq!(
+            ending.banner(),
+            crate::workbench::notifications::ReliefBanner::Paused
+        );
+        assert_eq!(ending.native_id(), "gitpulse.relief.paused:7:1");
     }
 
     #[test]

@@ -718,6 +718,16 @@ where
     }))
 }
 
+/// An opt-in switch read leniently: anything but a real `true` is "no", and
+/// costs nothing else in the file (a bad value must neither opt anyone in nor
+/// discard the whole configuration).
+fn lenient_opt_in<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool() == Some(true))
+}
+
 fn is_default_supervisor_mode(mode: &SupervisorMode) -> bool {
     *mode == SupervisorMode::default()
 }
@@ -1085,6 +1095,12 @@ pub struct HostLoadSettings {
     /// Stored at the top level as `host_load_supervisor`, like `hook_mode`.
     #[serde(default)]
     pub supervisor: SupervisorMode,
+    /// Rung C. When a paused build is still paused at the 10-minute cap, end
+    /// it (SIGCONT, SIGTERM, then SIGKILL) instead of resuming it. Off by
+    /// default: ending a person's build is opt-in. Stored at the top level as
+    /// `host_load_supervisor_terminate`, like `supervisor`.
+    #[serde(default)]
+    pub supervisor_terminate: bool,
 }
 
 fn is_default_hook_mode(mode: &HostLoadHookMode) -> bool {
@@ -1106,6 +1122,7 @@ impl Default for HostLoadSettings {
             leases: HostLoadLeases::default(),
             idle: HostLoadIdle::default(),
             supervisor: SupervisorMode::default(),
+            supervisor_terminate: false,
         }
     }
 }
@@ -1733,6 +1750,14 @@ pub struct ToolConfig {
         skip_serializing_if = "is_default_supervisor_mode"
     )]
     pub host_load_supervisor: SupervisorMode,
+    /// Whether the supervisor ends a paused build at the 10-minute cap
+    /// instead of resuming it. A sibling key of `host_load_supervisor`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_opt_in",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub host_load_supervisor_terminate: bool,
     /// Periodic Manvi system steward settings (host-wide and per-repository).
     #[serde(
         default,
@@ -1776,6 +1801,7 @@ impl Default for ToolConfig {
             host_load_leases: HostLoadLeases::default(),
             host_load_idle: HostLoadIdle::default(),
             host_load_supervisor: SupervisorMode::default(),
+            host_load_supervisor_terminate: false,
             manvi_steward: ManviStewardSettings::default(),
             idle_memory_mode: IdleMemoryMode::default(),
             unknown: serde_json::Map::new(),
@@ -2483,6 +2509,7 @@ pub fn host_load_settings() -> HostLoadSettings {
                 leases: cfg.host_load_leases,
                 idle: cfg.host_load_idle,
                 supervisor: cfg.host_load_supervisor,
+                supervisor_terminate: cfg.host_load_supervisor_terminate,
                 ..cfg.host_load
             }
         })
@@ -2525,6 +2552,15 @@ pub fn host_load_supervisor() -> SupervisorMode {
     load()
         .map(|cfg| cfg.host_load_supervisor)
         .unwrap_or_default()
+}
+
+/// Whether a freeze still standing at the 10-minute cap is ended instead of
+/// resumed. An unreadable file is "no": ending a person's build is opt-in, and
+/// a broken config must never be what opts them in.
+pub fn host_load_supervisor_terminate() -> bool {
+    load()
+        .map(|cfg| cfg.host_load_supervisor_terminate)
+        .unwrap_or(false)
 }
 
 /// Stores the supervisor's mode (`off`, `advise`, `act`).
@@ -2575,6 +2611,7 @@ pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
     cfg.host_load_leases = next.leases.clone();
     cfg.host_load_idle = next.idle.clone();
     cfg.host_load_supervisor = next.supervisor;
+    cfg.host_load_supervisor_terminate = next.supervisor_terminate;
     cfg.host_load = next;
     save(&cfg)?;
     Ok(())
@@ -4070,6 +4107,43 @@ mod tests {
             // A save from a client that does not know the key sends the default.
             let sent: HostLoadSettings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
             assert_eq!(sent.supervisor, SupervisorMode::Act);
+        });
+    }
+
+    #[test]
+    fn ending_a_paused_build_at_the_cap_is_opt_in_stored_beside_the_supervisor_and_round_trips() {
+        with_temp_config(|path| {
+            assert!(!host_load_supervisor_terminate(), "off by default");
+            assert!(!host_load_settings().supervisor_terminate);
+            let mut next = host_load_settings();
+            next.supervisor_terminate = true;
+            set_host_load_settings(next).unwrap();
+            invalidate_cache();
+            assert!(host_load_supervisor_terminate());
+            assert!(host_load_settings().supervisor_terminate);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load_supervisor_terminate"], true);
+            assert!(
+                stored["host_load"].get("supervisor_terminate").is_none(),
+                "never inside host_load, which an older build would discard whole"
+            );
+            // Turning it off omits the key again, and the mode is untouched.
+            let mut off = host_load_settings();
+            off.supervisor_terminate = false;
+            set_host_load_settings(off).unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(stored.get("host_load_supervisor_terminate").is_none());
+            assert_eq!(host_load_supervisor(), SupervisorMode::Act);
+            // A client that does not know the key sends false; an unreadable
+            // value never opts anyone in.
+            let sent: HostLoadSettings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+            assert!(!sent.supervisor_terminate);
+            fs::write(path, r#"{"host_load_supervisor_terminate": "yes"}"#).unwrap();
+            invalidate_cache();
+            assert!(!host_load_supervisor_terminate());
         });
     }
 

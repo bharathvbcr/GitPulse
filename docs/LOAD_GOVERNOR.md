@@ -47,7 +47,7 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 |---|---|---|
 | One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
-| A tree's processes while **memory** is short, and a runaway subtree that keeps making it worse | Card 4 (pressure relief, `sysload::relief`) | Slow and freeze by default, with a setting (`host_load_supervisor`: off, advise, act). Terminate is opt-in and not built. See Pressure relief. |
+| A tree's processes while **memory** is short, and a runaway subtree that keeps making it worse | Card 4 (pressure relief, `sysload::relief`) | Slow and freeze by default, with a setting (`host_load_supervisor`: off, advise, act). Terminate (rung C) is opt-in (`host_load_supervisor_terminate`) and ends only a tree the relief itself froze, at the cap or on a person's click; observed agents and untrusted repositories are only ever offered a pause. See Pressure relief. |
 | Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
 | Leases, the hook, advice | Cards 1d, 3 | **The sensor only measures and publishes.** They consume the same verdict. |
 
@@ -66,7 +66,7 @@ in Health. That signal is re-checked on the live process before it is sent
 | 3 | The `gitpulse-hook` check, the skill, `doctor` | The command-gate verdict, the session-brief line, the skill and the plugin-cache drift check are implemented (see The command gate). Leases are card 1d's. `gitpulse_system_load` and launch-environment caps are not |
 | Per-call gate cost | The hook's per-call budget | Separate card |
 | Startup churn | The startup git-spawn burst | Separate card |
-| 4 | Pressure relief: slow and freeze by default; terminate is opt-in | Implemented for this slice: slowing and freezing (see Pressure relief). Terminate and the launched-orphan stop are not built |
+| 4 | Pressure relief: slow and freeze by default; terminate is opt-in | Implemented: slowing, freezing, offers for observed agents and untrusted repositories, and rung C (opt-in terminate of a tree it froze; see Pressure relief). The launched-orphan stop is not built |
 | 5 | Disk-write budget; consumes the per-tree write rate | Not started |
 
 ## Sensor states
@@ -909,9 +909,11 @@ On 2026-11-24 the Mac hung for two hours on memory-compressor exhaustion and
 about eighteen agent sessions in GitPulse terminals were lost. The governor
 shed GitPulse's own work and refused new launches; nothing acted on the agent
 trees already running. The relief (`sysload::relief`) does, and it is the one
-card that touches an agent's processes. It still never kills one, and memguard
-(above) stays the only thing that ends a process for its footprint: **GitPulse
-never kills a single process for its footprint.**
+card that touches an agent's processes. It kills nothing for its footprint, and
+memguard (above) stays the only thing that ends a process for it: **GitPulse
+never kills a single process for its footprint.** The one thing it can end is a
+tree *it froze itself*, on a host that is still exhausted, when the person opted
+in or clicked End (rung C, below): that is card 4's row, not memguard's.
 
 It runs on the elected sensor writer's sampler tick (2 s), from the scan that
 tick just made, with no spawn gate, no `manvi use` probe and no subprocess:
@@ -1025,13 +1027,108 @@ A freeze never lasts indefinitely. It ends at the first of:
 - the lease board taking builds again, for a frozen build that held a slot;
 - **10 minutes** on the monotonic clock (`FREEZE_CAP`). At the cap the subtree
   resumes and is not refrozen until a whole new Severe minute with
-  deterioration; there is no terminate rung in this slice. The cap hit is
-  counted (`cap_hits`) and said in `last_action`.
+  deterioration, **unless the person opted in to rung C** (below), in which case
+  the paused tree is ended instead. The cap hit is counted (`cap_hits`) and said
+  in `last_action`.
 
 Processes that forked under a frozen subtree before their parent stopped are
 stopped on the following ticks; a subtree whose own process ended is let go. Any
-future kill path must `SIGCONT` first: a signal to a stopped process waits for
-the continue.
+kill path must `SIGCONT` first: a signal to a stopped process waits for the
+continue.
+
+### Rung C: ending a paused tree (opt-in)
+
+Rung C acts on host exhaustion **plus a tree rung B froze**, which is card 4's
+row above; it is not memguard's footprint rule, and the line "GitPulse never
+kills a single process for its footprint" stands: nothing is ended because of
+how big it is, only because the host is still failing ten minutes after the
+relief stopped it, and the person said so (the setting) or clicked **End**.
+
+Two things start it, and nothing else:
+
+1. **The cap, with the opt-in.** `host_load_supervisor_terminate` (Settings →
+   "When a paused build is still paused after 10 minutes, end it instead of
+   resuming it", off by default, only meaningful in `act`, stored beside
+   `host_load_supervisor`, never inside `host_load`; an unreadable value is
+   *no*). At `FREEZE_CAP`, a tree frozen for its whole ten minutes is ended; one
+   a person's pause froze later has not had its ten minutes and is resumed as
+   before. Not opted in, the cap behaves exactly as it always did (resume), and
+   the pause banner offers **End it**.
+2. **A person's request** (`host-relief-terminate.request`, below), whatever the
+   opt-in says: the click is the consent.
+
+The ladder, per tree, never on the tick's own wait: re-read that the tree's
+first process still reads as **stopped by us** (one that reads as running was
+continued by somebody; it is not ours to end and is resumed instead), **`SIGCONT`
+every member** (a signal to a stopped process waits for the continue,
+`terminal/jobs.rs`), `SIGTERM`, then a grace of 10 s (`TERMINATE_GRACE`)
+counted on the tick's monotonic clock, then `SIGKILL` for what survived. Every
+signal goes through `procguard::signal::signal_process` (pid **and start time**
+must still match) and only to a member the journal still lists as `was_running`:
+the agent root, its tool shell, a process somebody else stopped (`left`) and
+anything the relief did not stop are never signalled. The tree leaves the frozen
+list at once; its journal entries stay until the kill pass is over, so a crash in
+between replays only `SIGCONT`. A person's **Resume** in the grace (the journal
+entries go), the setting leaving `act` or going off, or GitPulse stopping,
+abandons the pending kill. `last_action` has kind `terminate`; the command-gate
+hook tells the agent whose build it was that it "was ended by memory protection"
+and must not be re-run (or another started) until pressure clears, only while
+the status is fresh and the episode lasts (the supervisor forgets what it ended
+when the Severe episode ends).
+
+Residual: the kill pass is driven by the tick, not the watchdog. A sampler that
+stalls between `SIGTERM` and the grace leaves a SIGTERM-ignoring process running
+(it is continued, no longer stopped) until the next tick; nothing is left
+*stopped*. A phase-1 reader meeting `kind: "terminate"` in `last_action` finds
+the file Unreadable (loud, not silent).
+
+### Offers and the two request files
+
+Rung B never freezes an agent GitPulse did not launch (the Claude desktop app, a
+terminal started elsewhere: an *observed* session) or one in an untrusted
+repository. When it would have picked a tree there (the same screening, the same
+"worsening for 60 s" trigger), it publishes the tree as an **offer**:
+`offers: FrozenTree[]` in `host-relief.v1.json` (`advised_only: true`, plus
+`why: "observed" | "untrusted"`; both fields are optional with a default, so a
+phase-1 reader still reads the file, and `version` is unchanged). At most 8, newest
+pass replacing the last, forgotten when the Severe run ends. An offer is activity
+(a dead writer's offers go stale like a pause), never a rung and never counted
+as paused.
+
+- A banner "Memory is running out. Pause `<command>` under the agent in
+  `<repo>`?" (once per offered tree, at most one every 60 s) with **Pause it**;
+  Health lists the offers with **Pause**, behind a confirm. An *untrusted* offer
+  is advice only: a banner with **Settings** and no pause, a Health note, and
+  the supervisor refuses a pause request for it even if the repository is trusted
+  later.
+- `host-relief-pause.request` pauses exactly that tree through the normal freeze
+  path: it must match an offer the supervisor currently holds (`observed`), the
+  screening is run again on the present table (parameterised `select_in_session`,
+  not a copy), state is read, the journal is written with `was_running` before
+  the stop, the bounds of one per session and three per host apply, and the pause
+  follows every normal resume rule (flat, calmed, the cap, the watchdog, a
+  person's resume). In `advise` or `off` there is no pause.
+
+The two request files follow the resume request's contract (private 0600, atomic,
+`at_ms`, a 2-minute expiry, read and deleted by one `take_*` call per tick) and
+name their target by `pid` and `start_us`: a request for a tree the supervisor is
+not holding (paused for terminate, offered for pause), with a stale start time, or
+expired, is ignored and recorded as `refused`. The banner buttons carry the tree
+in the banner's identifier (`<prefix>:<pid>:<start_us>`), parsed by one pure
+function, and write the file off the notification delegate's thread. IPC:
+`cmd_host_relief_request_terminate` and `cmd_host_relief_request_pause`, main
+window only.
+
+Security impact: neither IPC sends a signal; each leaves one small file in
+GitPulse's own config directory. The files are *not* behind the IPC grant: any
+process of the same user, a paused agent included, can write them. They can only
+name what the supervisor itself published, and it acts only on a tree it holds
+(paused, for terminate; offered and observed, for pause), after the expiry, the
+identity check, the screening and the bounds above. The resume request's old
+property, "it can only end a pause, never start one", is therefore no longer
+true: a same-user process can now ask for an observed tree to be paused, or a
+paused tree to be ended. That widens nothing a same-user process could not do with
+`kill`; it is stated here because it is a change in what a file can ask for.
 
 **Crash safety.** Before a `SIGSTOP` (or a priority change) the process is
 written to a private journal, `<config>/relief/journal.v1.json` (pid, start
@@ -1135,8 +1232,9 @@ A banner or Health "Resume now" leaves `host-relief-resume.request`
 not this user's) and resumes **only the pauses whose `since_ms` is at or before
 the request's `at_ms`**, through the journal like every resume, holding off a
 new freeze until the tier drops below Severe; a pause that began after the
-request stays frozen. It is recorded as the last action. A request can only end
-a pause, never start one. The contract needed no change for the writer.
+request stays frozen. It is recorded as the last action. The resume request can
+only end a pause; the two newer requests (below, "Offers and the two request
+files") can start one or end a process, and are bounded there.
 
 Only the writer's relief acts, and a journal belongs to the GitPulse that wrote
 it: a process that lost the writer election and quits does not continue or

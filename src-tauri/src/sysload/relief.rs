@@ -39,9 +39,36 @@
 //! when the tier has read below Severe for [`super::EXIT_SAMPLES`] samples, on
 //! the first tick the build-lease board stops refusing (for a frozen build that
 //! held a slot), or at [`FREEZE_CAP`], whichever comes first; at the cap the
-//! freeze is not escalated (there is no terminate rung in this slice) and the
-//! cap hit is counted. Any future kill path must `SIGCONT` first: a signal to a
-//! stopped process waits for the continue (`terminal/jobs.rs` does the same).
+//! freeze is resumed and the cap hit is counted, unless the person opted in to
+//! rung C (below). Any kill path must `SIGCONT` first: a signal to a stopped
+//! process waits for the continue (`terminal/jobs.rs` does the same).
+//!
+//! # Rung C: ending a paused tree
+//!
+//! Rung C acts only on a tree rung B froze, on a host still exhausted. Two
+//! things start it, and nothing else: a freeze reaching [`FREEZE_CAP`] while the
+//! person has opted in (`host_load_supervisor_terminate`, off by default), or a
+//! person's own "End it" (`host-relief-terminate.request`, honoured whatever the
+//! opt-in says: the click is the consent). Not opted in, the cap resumes the
+//! tree as before. Ending is the ladder `SIGCONT`, `SIGTERM`, a grace of
+//! [`TERMINATE_GRACE`] measured on the tick (the tick never waits), then
+//! `SIGKILL` for what survived. Every member is signalled only while its pid and
+//! start time still match and the journal still lists it as `was_running`; the
+//! agent root, the tool shell and anything the supervisor did not stop are never
+//! signalled. A root that reads as running is not frozen by us any more and is
+//! not ended. A tree being ended leaves the frozen list at once (its journal
+//! entries stay until the kill pass is over, so a crash replays only
+//! `SIGCONT`); a person's "Resume", the setting going off, or GitPulse stopping
+//! abandons the pending kill.
+//!
+//! # Offers
+//!
+//! Rung B never freezes an agent GitPulse did not launch (the Claude desktop
+//! app) or one in an untrusted repository. When it would have picked a tree
+//! there, the tree is published as an *offer* (`offers`, with `why`). A person's
+//! "Pause it" (`host-relief-pause.request`) pauses exactly that tree through the
+//! normal freeze path (state read, journal, per-session and per-host bounds,
+//! re-screening); an untrusted offer is advice only and has no pause.
 //!
 //! `activity.rs` rejects `SIGSTOP` for idle agent *roots*. That stands: the
 //! root and the shells beside it are never signalled. A subtree below a shell
@@ -197,6 +224,14 @@ const TOOL_SHELL_MARK: &str = "shell-snapshots/snapshot-";
 /// How long past [`FREEZE_CAP`] a freeze may stand before the watchdog thread
 /// continues it without the sampler.
 pub const WATCHDOG_GRACE: Duration = Duration::from_secs(60);
+/// How long a tree that was sent `SIGTERM` has to end before the survivors are
+/// sent `SIGKILL`, measured on the tick's monotonic clock.
+pub const TERMINATE_GRACE: Duration = Duration::from_secs(10);
+/// Most offers published: each is screened (environments, working directories)
+/// when it is chosen.
+pub const MAX_OFFERS: usize = 8;
+/// Most ended trees kept in the status for the command-gate hook.
+const MAX_ENDED: usize = 16;
 /// A sampler tick that has not advanced for this long is a hung sampler (or a
 /// lost writer election): the watchdog continues every frozen process.
 pub const WATCHDOG_STALL: Duration = Duration::from_secs(60);
@@ -541,6 +576,22 @@ impl Trigger {
     pub(crate) fn frozen(&self) -> bool {
         matches!(self.phase, Phase::Frozen { .. })
     }
+
+    /// A Severe run is under way (any Severe sample since the last recovery).
+    pub(crate) fn in_severe_run(&self) -> bool {
+        self.severe_run > 0
+    }
+
+    /// A person's pause began a freeze the trigger did not ask for: the normal
+    /// resume rules (flat, calmed, the cap) count from now. It spends nothing
+    /// of the episode's pinned-only allowance.
+    pub(crate) fn paused_by_request(&mut self, now: Instant) {
+        self.phase = Phase::Frozen {
+            since: now,
+            samples: 0,
+        };
+        self.froze_this_episode = true;
+    }
 }
 
 /// Whether swap or compressor segments rose across `readings` by their
@@ -580,6 +631,10 @@ fn rises(values: &[f64], minimum: f64) -> bool {
 pub(crate) enum Signal {
     Stop,
     Cont,
+    /// Rung C only, and only after a `Cont`.
+    Term,
+    /// Rung C only: what survived the grace after `Term`.
+    Kill,
 }
 
 /// What became of a signal that was not refused.
@@ -650,6 +705,8 @@ impl Actuator for OsActuator {
         let signo = match signal {
             Signal::Stop => libc::SIGSTOP,
             Signal::Cont => libc::SIGCONT,
+            Signal::Term => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
         };
         let start_of = |p: i32| u32::try_from(p).ok().and_then(super::process_start_us);
         match crate::procguard::signal::signal_process(pid, start_us, &start_of, signo, "relief") {
@@ -984,6 +1041,7 @@ fn select_in_session(
     screen: &mut Screen<'_>,
     spent: &HashSet<(i32, u64)>,
     notes: &mut Vec<String>,
+    only: Option<(i32, u64)>,
 ) -> Option<Selection> {
     let members = &session.members;
     let at_of: HashMap<i32, usize> = members
@@ -1049,8 +1107,13 @@ fn select_in_session(
             sums[parent] = sums[parent].saturating_add(add);
         }
     }
+    // `only` names the one subtree a person asked for: it is judged by the
+    // same screening as any other, and nothing else is picked in its place.
     let mut ranked: Vec<usize> = (0..order.len())
         .filter(|&n| sums[n] >= MIN_FREEZE_BYTES)
+        .filter(|&n| {
+            only.is_none_or(|target| (members[order[n]].pid, members[order[n]].start_us) == target)
+        })
         .collect();
     ranked.sort_by_key(|&n| (std::cmp::Reverse(sums[n]), members[order[n]].pid));
     for &n in ranked.iter().take(MAX_CANDIDATES_CHECKED) {
@@ -1127,6 +1190,7 @@ pub(crate) struct Want<'a> {
 /// repository that has none frozen already, its heaviest eligible subtree; the
 /// heaviest `room` of those. `Err` when the lease board could not be read:
 /// then nothing is chosen.
+#[cfg(test)]
 pub(crate) fn select(
     table: &ReliefTable,
     probe: &dyn Probe,
@@ -1135,6 +1199,46 @@ pub(crate) fn select(
     marks: &mut MarkCache,
     notes: &mut Vec<String>,
 ) -> Result<Vec<Selection>, String> {
+    select_with(
+        table,
+        probe,
+        trusted,
+        want,
+        marks,
+        notes,
+        &mut Scope::PicksOnly,
+    )
+}
+
+/// What [`select_with`] is asked to do besides choosing for rung B.
+pub(crate) enum Scope<'a> {
+    /// Rung B's own choice: launched sessions in trusted repositories. The
+    /// tick always asks for offers too; this is what [`select`] (the tests'
+    /// entry) asks for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    PicksOnly,
+    /// Rung B's choice, and the trees it would have chosen in the sessions it
+    /// may not touch (observed, or untrusted), at most [`MAX_OFFERS`].
+    WithOffers(&'a mut Vec<(Selection, super::relief_status::OfferWhy)>),
+    /// One tree a person asked to pause: an observed session's subtree rooted
+    /// at this pid and start time, screened like any other. The answer is in
+    /// the offers vector, at most one.
+    Only(
+        (i32, u64),
+        &'a mut Vec<(Selection, super::relief_status::OfferWhy)>,
+    ),
+}
+
+pub(crate) fn select_with(
+    table: &ReliefTable,
+    probe: &dyn Probe,
+    trusted: &dyn Fn(&Path) -> bool,
+    want: &Want<'_>,
+    marks: &mut MarkCache,
+    notes: &mut Vec<String>,
+    scope: &mut Scope<'_>,
+) -> Result<Vec<Selection>, String> {
+    use super::relief_status::OfferWhy;
     let Want {
         busy,
         room,
@@ -1156,8 +1260,22 @@ pub(crate) fn select(
         locks: &mut locks,
     };
     let mut picks = Vec::new();
+    let (offering, only) = match scope {
+        Scope::PicksOnly => (false, None),
+        Scope::WithOffers(_) => (true, None),
+        Scope::Only(target, _) => (true, Some(*target)),
+    };
+    let mut offered = 0usize;
     for session in &table.sessions {
-        if !session.launched || busy.contains(&(session.root.pid, session.root.start_us)) {
+        if busy.contains(&(session.root.pid, session.root.start_us)) {
+            continue;
+        }
+        // Rung B's own picks are launched sessions only; the rest are looked at
+        // only when offers (or one asked-for tree) are wanted.
+        if !session.launched && !offering {
+            continue;
+        }
+        if only.is_some() && session.launched {
             continue;
         }
         let Some(cwd) = probe.cwd(session.root.pid) else {
@@ -1167,21 +1285,38 @@ pub(crate) fn select(
             ));
             continue;
         };
-        if !trusted(&cwd) {
+        let why = if !trusted(&cwd) {
             notes.push(format!(
                 "session {}: its repository is not trusted",
                 session.root.pid
             ));
+            if !offering {
+                continue;
+            }
+            Some(OfferWhy::Untrusted)
+        } else if !session.launched {
+            Some(OfferWhy::Observed)
+        } else {
+            None
+        };
+        if why.is_some() && offered >= MAX_OFFERS && only.is_none() {
             continue;
         }
-        if let Some(mut pick) = select_in_session(session, &mut screen, spent, notes) {
+        if let Some(mut pick) = select_in_session(session, &mut screen, spent, notes, only) {
             pick.repo_path = Some(
                 crate::engine::git_cli::find_git_root(&cwd)
                     .unwrap_or(cwd)
                     .to_string_lossy()
                     .into_owned(),
             );
-            picks.push(pick);
+            match (why, &mut *scope) {
+                (None, _) => picks.push(pick),
+                (Some(why), Scope::WithOffers(offers) | Scope::Only(_, offers)) => {
+                    offered += 1;
+                    offers.push((pick, why));
+                }
+                (Some(_), Scope::PicksOnly) => {}
+            }
         }
     }
     picks.sort_by_key(|p| (std::cmp::Reverse(p.footprint), p.root.pid));
@@ -1838,6 +1973,8 @@ pub struct FrozenSubtree {
     pub since_unix_ms: u64,
     /// `advise` mode: chosen and shown, never signalled.
     pub advised_only: bool,
+    /// An offer: why the supervisor will not pause this tree by itself.
+    pub why: Option<super::relief_status::OfferWhy>,
 }
 
 /// What the relief did last.
@@ -1852,6 +1989,8 @@ pub enum ActionKind {
     /// Something was called for and not done: nothing qualified, the journal
     /// or the lease board could not be read.
     Refused,
+    /// A paused tree was ended (rung C).
+    Terminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1879,6 +2018,11 @@ pub struct ReliefSnapshot {
     pub binding: Option<Binding>,
     pub tier: Option<Tier>,
     pub frozen: Vec<FrozenSubtree>,
+    /// Trees rung B would have paused in an observed session or an untrusted
+    /// repository: published, never paused unasked.
+    pub offers: Vec<FrozenSubtree>,
+    /// Trees rung C ended in this Severe episode (`since_unix_ms` is when).
+    pub ended: Vec<FrozenSubtree>,
     /// Processes in the background because of the relief.
     pub slowed: u32,
     /// `advise` mode: the processes that would be slowed.
@@ -1900,6 +2044,8 @@ impl ReliefSnapshot {
             binding: None,
             tier: None,
             frozen: Vec::new(),
+            offers: Vec::new(),
+            ended: Vec::new(),
             slowed: 0,
             would_slow: 0,
             last_action: None,
@@ -2105,6 +2251,25 @@ struct Frozen {
     left: BTreeSet<(i32, u64)>,
 }
 
+/// A tree rung C is ending: the part of the ladder after `SIGTERM`.
+#[derive(Debug, Clone)]
+struct Ending {
+    info: FrozenSubtree,
+    /// The processes this relief stopped, and now sent `SIGTERM`: only these
+    /// are ever sent `SIGKILL`.
+    targets: Vec<(i32, u64)>,
+    /// When `SIGTERM` went, on the monotonic clock.
+    termed_at: Instant,
+}
+
+/// A tree rung B would have paused, and may not unasked.
+#[derive(Debug, Clone)]
+struct Offer {
+    info: FrozenSubtree,
+    session: (i32, u64),
+    root: (i32, u64),
+}
+
 /// The relief. One per sampler; it lives on the sampler's thread and is
 /// ticked only while that sampler holds the writer election.
 pub(crate) struct Relief {
@@ -2141,6 +2306,20 @@ pub(crate) struct Relief {
     /// someone else's choice, left alone until the slowing ends.
     foreign: BTreeSet<(i32, u64)>,
     frozen: Vec<Frozen>,
+    /// Trees being ended (rung C): `SIGCONT` and `SIGTERM` sent, the kill pass
+    /// waiting out [`TERMINATE_GRACE`]. Never also in `frozen`.
+    ending: Vec<Ending>,
+    /// Trees rung B would have paused in an observed session or an untrusted
+    /// repository, refreshed on every begin pass.
+    offers: Vec<Offer>,
+    /// Trees ended in this Severe episode, for the status and the hook.
+    ended: Vec<FrozenSubtree>,
+    /// Whether the person opted in to ending a tree at the cap.
+    terminate_opt_in: Box<dyn Fn() -> bool + Send>,
+    /// A person's end/pause request, taken from its file and waiting for the
+    /// tick's action lock.
+    pending_terminate: Option<super::relief_status::TargetRequest>,
+    pending_pause: Option<super::relief_status::TargetRequest>,
     journal: Vec<JournalEntry>,
     status: ReliefSnapshot,
     /// Whether [`snapshot`] serves this relief's state: only the app's does, so
@@ -2200,6 +2379,12 @@ impl Relief {
             slowed_mark: BTreeMap::new(),
             foreign: BTreeSet::new(),
             frozen: Vec::new(),
+            ending: Vec::new(),
+            offers: Vec::new(),
+            ended: Vec::new(),
+            terminate_opt_in: Box::new(|| false),
+            pending_terminate: None,
+            pending_pause: None,
             journal: Vec::new(),
             status: ReliefSnapshot::idle(initial),
             publishing: false,
@@ -2227,7 +2412,8 @@ impl Relief {
             Box::new(crate::tool_config::host_load_supervisor),
             Box::new(repository_trusted),
         )
-        .publishing();
+        .publishing()
+        .with_terminate(Box::new(crate::tool_config::host_load_supervisor_terminate));
         // The steward's slowing and this relief's are one ledger, and the
         // watchdog thread and the teardown reach the frozen ones through one
         // watch.
@@ -2259,6 +2445,12 @@ impl Relief {
     #[cfg(test)]
     pub(crate) fn watch(&self) -> std::sync::Arc<Watch> {
         self.watch.clone()
+    }
+
+    /// Where the opt-in to rung C at the cap is read from (default: never).
+    pub(crate) fn with_terminate(mut self, opt_in: Box<dyn Fn() -> bool + Send>) -> Self {
+        self.terminate_opt_in = opt_in;
+        self
     }
 
     /// This relief's state is what [`snapshot`] serves.
@@ -2407,6 +2599,7 @@ impl Relief {
         table: &dyn Fn() -> ReliefTable,
     ) {
         self.take_resume_request();
+        self.take_target_requests();
         self.tick_locked(now, input, refuses, table);
         self.publish_file();
     }
@@ -2473,6 +2666,25 @@ impl Relief {
         }
     }
 
+    /// Takes a person's "End it" and "Pause it" requests from their files. The
+    /// tick acts on them under the action lock: until then they are held here
+    /// (a newer request replaces an older one of its kind).
+    fn take_target_requests(&mut self) {
+        let Some(dir) = self.status_dir.clone() else {
+            return;
+        };
+        if STOPPING.load(Ordering::SeqCst) {
+            return;
+        }
+        let now_ms = super::relief_status::now_ms();
+        if let Some(request) = super::relief_status::take_terminate_request(&dir, now_ms) {
+            self.pending_terminate = Some(request);
+        }
+        if let Some(request) = super::relief_status::take_pause_request(&dir, now_ms) {
+            self.pending_pause = Some(request);
+        }
+    }
+
     /// The status as the published file carries it.
     fn file_status(&self) -> super::relief_status::ReliefStatus {
         use super::relief_status as file;
@@ -2513,21 +2725,9 @@ impl Relief {
             } else {
                 0
             },
-            frozen: snapshot
-                .frozen
-                .iter()
-                .map(|f| file::FrozenTree {
-                    pid: u32::try_from(f.root_pid).unwrap_or(0),
-                    start_us: f.start_us,
-                    agent_root_pid: u32::try_from(f.session_pid).unwrap_or(0),
-                    terminal_session_id: f.terminal_session_id.clone(),
-                    repo_path: f.repo_path.clone().unwrap_or_default(),
-                    command: f.command.clone(),
-                    footprint_bytes: f.footprint_bytes,
-                    since_ms: f.since_unix_ms,
-                    advised_only: f.advised_only,
-                })
-                .collect(),
+            frozen: snapshot.frozen.iter().map(tree_of).collect(),
+            offers: snapshot.offers.iter().map(tree_of).collect(),
+            ended: snapshot.ended.iter().map(tree_of).collect(),
             last_action: snapshot.last_action.as_ref().map(|a| file::ReliefAction {
                 at_ms: a.at_unix_ms,
                 kind: match a.kind {
@@ -2536,6 +2736,7 @@ impl Relief {
                     ActionKind::Resume => file::ReliefActionKind::Resume,
                     ActionKind::CapResume => file::ReliefActionKind::CapResume,
                     ActionKind::Refused => file::ReliefActionKind::Refused,
+                    ActionKind::Terminate => file::ReliefActionKind::Terminate,
                 },
                 detail: a.detail.clone(),
             }),
@@ -2647,8 +2848,18 @@ impl Relief {
             // The Severe episode is over: what it froze may be frozen again.
             self.episode_seen = self.trigger.episode();
             self.spent.clear();
+            self.ended.clear();
+        }
+        if !self.trigger.in_severe_run() {
+            // Offers describe the Severe run that raised them.
+            self.offers.clear();
         }
         let act = mode == SupervisorMode::Act;
+        if act {
+            self.advance_endings(now);
+        } else {
+            self.abandon_endings("the supervisor is not in act mode");
+        }
 
         // An advised freeze left `act`, or the setting moved to `advise` with
         // real freezes standing: the real ones end now.
@@ -2658,6 +2869,13 @@ impl Relief {
         if act && self.frozen.iter().any(|f| f.info.advised_only) {
             self.frozen.retain(|f| !f.info.advised_only);
             self.trigger.ended();
+        }
+
+        // A person's "End it" and "Pause it".
+        self.handle_terminate_request(now, act);
+        if self.pending_pause.is_some() {
+            let scan = table();
+            self.handle_pause_request(now, &scan, act);
         }
 
         // Rung A. The first pass of a slowing runs at once; the rest every
@@ -2703,6 +2921,9 @@ impl Relief {
                 let scan = table();
                 self.begin_freeze(now, &scan, act);
             }
+            Step::Resume(ResumeReason::Cap) if act && (self.terminate_opt_in)() => {
+                self.end_at_cap(now);
+            }
             Step::Resume(reason) => {
                 self.resume_frozen(reason);
             }
@@ -2721,6 +2942,11 @@ impl Relief {
         if !self.frozen.is_empty() {
             self.resume_frozen(reason);
         }
+        self.abandon_endings("the supervisor was switched off");
+        self.offers.clear();
+        self.ended.clear();
+        self.pending_terminate = None;
+        self.pending_pause = None;
         if !self.slowed.is_empty() {
             self.restore_slowed(table);
         }
@@ -2781,6 +3007,8 @@ impl Relief {
     fn publish(&mut self) {
         self.status.slowed = u32::try_from(self.slowed.len()).unwrap_or(u32::MAX);
         self.status.frozen = self.frozen.iter().map(|f| f.info.clone()).collect();
+        self.status.offers = self.offers.iter().map(|o| o.info.clone()).collect();
+        self.status.ended = self.ended.clone();
         self.status.rung = if !self.frozen.is_empty() {
             Rung::Freeze
         } else if self.slowed.is_empty() && self.status.would_slow == 0 && !self.trigger.slowing() {
@@ -3099,6 +3327,314 @@ impl Relief {
         }
     }
 
+    // -- rung C -----------------------------------------------------------
+
+    /// The journal still lists the process as one this relief stopped while it
+    /// was running: the only kind it ever ends.
+    fn journaled_running(&self, pid: i32, start_us: u64) -> bool {
+        self.journal.iter().any(|e| {
+            e.rung == JournalRung::Freeze && e.pid == pid && e.start_us == start_us && e.was_running
+        })
+    }
+
+    /// The freeze cap with the opt-in: trees frozen for the whole
+    /// [`FREEZE_CAP`] are ended; one frozen later (a person's pause) has not had
+    /// its ten minutes and is resumed as at any cap.
+    fn end_at_cap(&mut self, now: Instant) {
+        let (old, young): (Vec<Frozen>, Vec<Frozen>) =
+            std::mem::take(&mut self.frozen).into_iter().partition(|f| {
+                !f.info.advised_only && now.saturating_duration_since(f.since) >= FREEZE_CAP
+            });
+        self.frozen = young;
+        if !old.is_empty() {
+            self.status.cap_hits = self.status.cap_hits.saturating_add(1);
+        }
+        for f in old {
+            self.end_tree(
+                f,
+                now,
+                "the 10-minute limit was reached and the person opted in to ending it",
+            );
+        }
+        self.resume_frozen(ResumeReason::Cap);
+    }
+
+    /// A person's "End it": only a tree this relief holds paused, whatever the
+    /// opt-in says. Anything else is ignored and recorded.
+    fn handle_terminate_request(&mut self, now: Instant, act: bool) {
+        let Some(request) = self.pending_terminate.take() else {
+            return;
+        };
+        let fresh = super::relief_status::now_ms().saturating_sub(request.at_ms)
+            <= super::relief_status::REQUEST_TTL_MS;
+        let at = if act && fresh {
+            self.frozen.iter().position(|f| {
+                !f.info.advised_only
+                    && u32::try_from(f.root.0) == Ok(request.pid)
+                    && f.root.1 == request.start_us
+            })
+        } else {
+            None
+        };
+        let Some(at) = at else {
+            self.note(
+                ActionKind::Refused,
+                format!(
+                    "a request to end pid {} was ignored: GitPulse is not holding that process tree paused",
+                    request.pid
+                ),
+            );
+            return;
+        };
+        let f = self.frozen.remove(at);
+        self.end_tree(f, now, "a person asked for it");
+        self.watch_frozen();
+        if self.frozen.is_empty() {
+            self.trigger.ended();
+        }
+    }
+
+    /// Ends one tree already removed from `frozen`: every process it stopped
+    /// is continued first (a signal to a stopped process waits for the
+    /// continue), then sent `SIGTERM`; the kill pass follows
+    /// [`TERMINATE_GRACE`] later on a tick. A root that does not read as
+    /// stopped is not frozen by this relief any more, and is not ended.
+    fn end_tree(&mut self, f: Frozen, now: Instant, why: &str) {
+        match self.actuator.is_stopped(f.root.0, f.root.1) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.release_unended(
+                    f,
+                    "something else had continued it, so it is not ours to end",
+                );
+                return;
+            }
+            Err(error) if has_ended(&error) => {
+                self.release_unended(f, "its process had already ended");
+                return;
+            }
+            Err(error) => {
+                self.fail(
+                    Some(f.root.0),
+                    format!(
+                        "pid {} was not ended: its state could not be read: {error}",
+                        f.root.0
+                    ),
+                );
+                self.release_unended(f, "its state could not be read");
+                return;
+            }
+        }
+        // Never the agent, and only what the journal says was running when
+        // this relief stopped it.
+        let targets: Vec<(i32, u64)> = f
+            .members
+            .iter()
+            .copied()
+            .filter(|&(pid, start)| pid != f.session.0 && self.journaled_running(pid, start))
+            .collect();
+        self.continue_all(&targets);
+        for &(pid, start) in &targets {
+            if let Err(error) = self.actuator.signal(pid, start, Signal::Term) {
+                self.fail(Some(pid), format!("could not terminate pid {pid}: {error}"));
+            }
+        }
+        let mut info = f.info.clone();
+        info.since_unix_ms = unix_ms();
+        self.ended.push(info.clone());
+        let excess = self.ended.len().saturating_sub(MAX_ENDED);
+        self.ended.drain(..excess);
+        self.note(
+            ActionKind::Terminate,
+            format!(
+                "ended {} ({} process(es)) in session {}: {why}",
+                f.info.command,
+                targets.len(),
+                f.info.session_id
+            ),
+        );
+        self.ending.push(Ending {
+            info,
+            targets,
+            termed_at: now,
+        });
+        self.watch_frozen();
+    }
+
+    /// A tree that was to be ended but is not ours to: resumed as at any cap.
+    fn release_unended(&mut self, f: Frozen, why: &str) {
+        self.continue_all(&f.members);
+        let ids: HashSet<i32> = f.members.iter().map(|(pid, _)| *pid).collect();
+        self.journal
+            .retain(|e| e.rung != JournalRung::Freeze || !ids.contains(&e.pid));
+        if let Err(error) = self.sync_journal() {
+            self.fail(None, format!("the journal could not be trimmed: {error}"));
+        }
+        self.note(
+            ActionKind::Resume,
+            format!(
+                "{} in session {} was not ended: {why}",
+                f.info.command, f.info.session_id
+            ),
+        );
+        self.watch_frozen();
+    }
+
+    /// The kill pass: for each tree whose grace has run out, `SIGKILL` the
+    /// processes of it that are still there, still the ones this relief
+    /// stopped, still journaled and not stopped by somebody else since.
+    fn advance_endings(&mut self, now: Instant) {
+        if self.ending.is_empty() {
+            return;
+        }
+        if STOPPING.load(Ordering::SeqCst) {
+            self.ending.clear();
+            return;
+        }
+        let (due, waiting): (Vec<Ending>, Vec<Ending>) = std::mem::take(&mut self.ending)
+            .into_iter()
+            .partition(|e| now.saturating_duration_since(e.termed_at) >= TERMINATE_GRACE);
+        self.ending = waiting;
+        for e in due {
+            let mut killed = 0usize;
+            for &(pid, start) in &e.targets {
+                if !self.journaled_running(pid, start) {
+                    continue;
+                }
+                match self.actuator.is_stopped(pid, start) {
+                    Err(error) if has_ended(&error) => {}
+                    Err(error) => self.fail(
+                        Some(pid),
+                        format!("pid {pid} was not killed: its state could not be read: {error}"),
+                    ),
+                    Ok(true) => self.fail(
+                        Some(pid),
+                        format!("pid {pid} was left alone: somebody else has stopped it"),
+                    ),
+                    Ok(false) => match self.actuator.signal(pid, start, Signal::Kill) {
+                        Ok(Delivery::Delivered) => killed += 1,
+                        Ok(Delivery::Gone) => {}
+                        Err(error) => {
+                            self.fail(Some(pid), format!("could not kill pid {pid}: {error}"))
+                        }
+                    },
+                }
+            }
+            self.forget_targets(&e.targets);
+            self.note(
+                ActionKind::Terminate,
+                format!(
+                    "{} in session {} did not end within {} s: {killed} process(es) killed",
+                    e.info.command,
+                    e.info.session_id,
+                    TERMINATE_GRACE.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// Drops what is pending: the setting went off or left act. The processes
+    /// were continued and sent `SIGTERM`; nothing more is sent.
+    fn abandon_endings(&mut self, why: &str) {
+        for e in std::mem::take(&mut self.ending) {
+            self.forget_targets(&e.targets);
+            self.note(
+                ActionKind::Terminate,
+                format!("the kill pass for {} was abandoned: {why}", e.info.command),
+            );
+        }
+    }
+
+    fn forget_targets(&mut self, targets: &[(i32, u64)]) {
+        self.journal
+            .retain(|e| e.rung != JournalRung::Freeze || !targets.contains(&(e.pid, e.start_us)));
+        if let Err(error) = self.sync_journal() {
+            self.fail(None, format!("the journal could not be trimmed: {error}"));
+        }
+    }
+
+    /// A person's "Pause it": exactly the offered tree, through the normal
+    /// freeze path, after the screening is run again on the present table.
+    fn handle_pause_request(&mut self, now: Instant, table: &ReliefTable, act: bool) {
+        let Some(request) = self.pending_pause.take() else {
+            return;
+        };
+        let refuse = |this: &mut Self, why: &str| {
+            this.note(
+                ActionKind::Refused,
+                format!("a request to pause pid {} was ignored: {why}", request.pid),
+            );
+        };
+        if super::relief_status::now_ms().saturating_sub(request.at_ms)
+            > super::relief_status::REQUEST_TTL_MS
+        {
+            return refuse(self, "it had expired");
+        }
+        if !act {
+            return refuse(self, "the supervisor is not in act mode");
+        }
+        let Some(offer) = self
+            .offers
+            .iter()
+            .find(|o| u32::try_from(o.root.0) == Ok(request.pid) && o.root.1 == request.start_us)
+            .cloned()
+        else {
+            return refuse(self, "it is not a tree GitPulse is offering to pause");
+        };
+        if offer.info.why != Some(super::relief_status::OfferWhy::Observed) {
+            return refuse(self, "that repository is not trusted, so there is no pause");
+        }
+        if self.frozen.len() >= MAX_FROZEN_PER_HOST
+            || self.frozen.iter().any(|f| f.session == offer.session)
+        {
+            return refuse(self, "the limit on paused trees was reached");
+        }
+        if STOPPING.load(Ordering::SeqCst) {
+            return;
+        }
+        let busy: BTreeSet<(i32, u64)> = self.frozen.iter().map(|f| f.session).collect();
+        let spent = self.spent.clone();
+        let want = Want {
+            busy: &busy,
+            room: MAX_FROZEN_PER_HOST.saturating_sub(self.frozen.len()),
+            refusing: self.refusing,
+            spent: &spent,
+        };
+        let mut found = Vec::new();
+        let mut notes = Vec::new();
+        let selected = select_with(
+            table,
+            &*self.probe,
+            &*self.trusted,
+            &want,
+            &mut self.marks,
+            &mut notes,
+            &mut Scope::Only(offer.root, &mut found),
+        );
+        if let Err(why) = selected {
+            return refuse(self, &why);
+        }
+        let Some((pick, why)) = found.pop() else {
+            let why = notes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "it no longer qualifies".into());
+            return refuse(self, &why);
+        };
+        if why != super::relief_status::OfferWhy::Observed {
+            return refuse(self, "that repository is not trusted, so there is no pause");
+        }
+        if !self.freeze(&pick, now) {
+            return refuse(self, "it could not be paused");
+        }
+        self.offers.retain(|o| o.root != offer.root);
+        // A pause the supervisor did not begin follows every normal resume rule
+        // from now: the trigger starts counting its cap.
+        if !self.trigger.frozen() {
+            self.trigger.paused_by_request(now);
+        }
+    }
+
     // -- rung B -----------------------------------------------------------
 
     fn begin_freeze(&mut self, now: Instant, table: &ReliefTable, act: bool) {
@@ -3112,13 +3648,15 @@ impl Relief {
             refusing: self.refusing,
             spent: &spent,
         };
-        let picks = match select(
+        let mut offered: Vec<(Selection, super::relief_status::OfferWhy)> = Vec::new();
+        let picks = match select_with(
             table,
             &*self.probe,
             &*self.trusted,
             &want,
             &mut self.marks,
             &mut notes,
+            &mut Scope::WithOffers(&mut offered),
         ) {
             Ok(picks) => picks,
             Err(why) => {
@@ -3127,6 +3665,20 @@ impl Relief {
                 return;
             }
         };
+        // What rung B would have picked in a session it may not touch is
+        // published as an offer, newest pass replacing the last.
+        offered.sort_by_key(|(p, _)| (std::cmp::Reverse(p.footprint), p.root.pid));
+        self.offers = offered
+            .into_iter()
+            .map(|(pick, why)| Offer {
+                info: FrozenSubtree {
+                    why: Some(why),
+                    ..frozen_info(&pick, true)
+                },
+                session: (pick.session_pid, pick.session_start_us),
+                root: (pick.root.pid, pick.root.start_us),
+            })
+            .collect();
         if picks.is_empty() {
             let why = notes
                 .first()
@@ -3733,6 +4285,22 @@ fn has_ended(why: &str) -> bool {
     why.contains("no longer running")
 }
 
+/// One tree as the published file carries it.
+fn tree_of(f: &FrozenSubtree) -> super::relief_status::FrozenTree {
+    super::relief_status::FrozenTree {
+        pid: u32::try_from(f.root_pid).unwrap_or(0),
+        start_us: f.start_us,
+        agent_root_pid: u32::try_from(f.session_pid).unwrap_or(0),
+        terminal_session_id: f.terminal_session_id.clone(),
+        repo_path: f.repo_path.clone().unwrap_or_default(),
+        command: f.command.clone(),
+        footprint_bytes: f.footprint_bytes,
+        since_ms: f.since_unix_ms,
+        advised_only: f.advised_only,
+        why: f.why,
+    }
+}
+
 fn frozen_info(pick: &Selection, advised_only: bool) -> FrozenSubtree {
     FrozenSubtree {
         root_pid: pick.root.pid,
@@ -3746,6 +4314,7 @@ fn frozen_info(pick: &Selection, advised_only: bool) -> FrozenSubtree {
         members: u32::try_from(pick.members.len()).unwrap_or(u32::MAX),
         since_unix_ms: unix_ms(),
         advised_only,
+        why: None,
     }
 }
 

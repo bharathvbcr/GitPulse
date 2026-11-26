@@ -1,5 +1,8 @@
 //! Public UserNotifications APIs; no permissions are requested during setup.
-use super::{Event, Status, WorkbenchError};
+use super::{
+    Event, Status, WorkbenchError, RELIEF_PAUSE_ACTION, RELIEF_RESUME_ACTION,
+    RELIEF_SETTINGS_ACTION, RELIEF_TERMINATE_ACTION,
+};
 use block2::{DynBlock, RcBlock};
 use objc2::{
     define_class, msg_send,
@@ -60,33 +63,73 @@ define_class!(
             // file the supervisor reads (`relief_status::request_resume`), here,
             // so it works in whichever launch macOS delivered it to; Settings
             // and the body click open Settings.
-            if response
+            let category = response
                 .notification()
                 .request()
                 .content()
                 .categoryIdentifier()
-                .to_string()
-                == RELIEF_CATEGORY
-            {
-                if response.actionIdentifier().to_string() == RELIEF_RESUME_ACTION {
-                    // The write (a sync and a rename) is not done on the
-                    // delegate's thread, which AppKit is waiting on.
-                    let spawned = crate::supervisor::spawn_once(
+                .to_string();
+            if matches!(
+                category.as_str(),
+                RELIEF_CATEGORY | RELIEF_OFFER_CATEGORY | RELIEF_ADVICE_CATEGORY
+            ) {
+                // Every request file is written off the delegate's thread
+                // (the write is a sync and a rename, and AppKit is waiting on
+                // this thread); the banner's own identifier says which tree.
+                let action = response.actionIdentifier().to_string();
+                let spawn = |name: &'static str,
+                             what: &'static str,
+                             body: Box<dyn FnOnce() + Send>| {
+                    if let Err(error) = crate::supervisor::spawn_once(name, what, body) {
+                        log::warn!(target:"workbench","{what} from a banner was not started: {error}");
+                    }
+                };
+                match super::relief_tap(&category, &action, &native) {
+                    super::ReliefTap::Resume => spawn(
                         "relief-resume",
                         "pressure relief resume request",
-                        || {
+                        Box::new(|| {
                             if let Err(error) =
                                 crate::sysload::relief_status::request_resume("notification")
                             {
                                 log::warn!(target:"workbench","resume request from a banner was not written: {error}");
                             }
-                        },
-                    );
-                    if let Err(error) = spawned {
-                        log::warn!(target:"workbench","resume request from a banner was not started: {error}");
+                        }),
+                    ),
+                    super::ReliefTap::Terminate(pid, start_us) => spawn(
+                        "relief-terminate",
+                        "pressure relief end request",
+                        Box::new(move || {
+                            if let Err(error) = crate::sysload::relief_status::request_terminate(
+                                "notification",
+                                pid,
+                                start_us,
+                            ) {
+                                log::warn!(target:"workbench","end request from a banner was not written: {error}");
+                            }
+                        }),
+                    ),
+                    super::ReliefTap::Pause(pid, start_us) => spawn(
+                        "relief-pause",
+                        "pressure relief pause request",
+                        Box::new(move || {
+                            if let Err(error) = crate::sysload::relief_status::request_pause(
+                                "notification",
+                                pid,
+                                start_us,
+                            ) {
+                                log::warn!(target:"workbench","pause request from a banner was not written: {error}");
+                            }
+                        }),
+                    ),
+                    super::ReliefTap::Settings => {
+                        if let Err(error) = self.ivars().sender.try_send(Event::Relief) {
+                            log::warn!(target:"workbench","relief banner activation could not be queued: {error}");
+                        }
                     }
-                } else if let Err(error) = self.ivars().sender.try_send(Event::Relief) {
-                    log::warn!(target:"workbench","relief banner activation could not be queued: {error}");
+                    super::ReliefTap::Ignore => {
+                        log::warn!(target:"workbench","a relief banner button named no tree and was ignored: {native}");
+                    }
                 }
                 completion.call(());
                 return;
@@ -178,28 +221,57 @@ pub(super) fn install(
             UNNotificationCategoryOptions::empty(),
         )
     })
-    .chain(std::iter::once({
-        // Resume is a background action: pressing it must not bring GitPulse
-        // forward over the thing the person is trying to get back to.
-        let actions = [
-            UNNotificationAction::actionWithIdentifier_title_options(
-                &NSString::from_str(RELIEF_RESUME_ACTION),
-                &NSString::from_str("Resume now"),
-                UNNotificationActionOptions::empty(),
+    .chain(
+        // Resume, End it and Pause it are background actions: pressing one
+        // must not bring GitPulse forward over the thing the person is trying
+        // to get back to. A banner that offers a pause carries only Pause it
+        // and Settings; advice about an untrusted repository carries Settings
+        // alone, because there is no pause to offer.
+        [
+            (
+                RELIEF_CATEGORY,
+                vec![
+                    (RELIEF_RESUME_ACTION, "Resume now", false),
+                    (RELIEF_TERMINATE_ACTION, "End it", false),
+                    (RELIEF_SETTINGS_ACTION, "Settings", true),
+                ],
             ),
-            UNNotificationAction::actionWithIdentifier_title_options(
-                &NSString::from_str(RELIEF_SETTINGS_ACTION),
-                &NSString::from_str("Settings"),
-                UNNotificationActionOptions::Foreground,
+            (
+                RELIEF_OFFER_CATEGORY,
+                vec![
+                    (RELIEF_PAUSE_ACTION, "Pause it", false),
+                    (RELIEF_SETTINGS_ACTION, "Settings", true),
+                ],
             ),
-        ];
-        UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
-            &NSString::from_str(RELIEF_CATEGORY),
-            &NSArray::from_retained_slice(&actions),
-            &NSArray::<NSString>::new(),
-            UNNotificationCategoryOptions::empty(),
-        )
-    }))
+            (
+                RELIEF_ADVICE_CATEGORY,
+                vec![(RELIEF_SETTINGS_ACTION, "Settings", true)],
+            ),
+        ]
+        .into_iter()
+        .map(|(category, buttons)| {
+            let actions: Vec<_> = buttons
+                .into_iter()
+                .map(|(identifier, title, foreground)| {
+                    UNNotificationAction::actionWithIdentifier_title_options(
+                        &NSString::from_str(identifier),
+                        &NSString::from_str(title),
+                        if foreground {
+                            UNNotificationActionOptions::Foreground
+                        } else {
+                            UNNotificationActionOptions::empty()
+                        },
+                    )
+                })
+                .collect();
+            UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+                &NSString::from_str(category),
+                &NSArray::from_retained_slice(&actions),
+                &NSArray::<NSString>::new(),
+                UNNotificationCategoryOptions::empty(),
+            )
+        }),
+    )
     .collect();
     center.setNotificationCategories(&NSSet::from_retained_slice(&categories));
     Ok(())
@@ -216,9 +288,10 @@ const SNOOZE_ACTION: &str = "snooze";
 /// Category and thread of the pressure-relief supervisor's banners
 /// (`desktop::pressure`).
 pub(super) const RELIEF_CATEGORY: &str = "gitpulse-relief";
-/// The relief banner's "Resume now" and "Settings" buttons.
-const RELIEF_RESUME_ACTION: &str = "relief-resume";
-const RELIEF_SETTINGS_ACTION: &str = "relief-settings";
+/// The category of a banner that offers to pause a tree, and of one that only
+/// advises. The buttons' identifiers are `notifications`' (`RELIEF_*_ACTION`).
+pub(super) const RELIEF_OFFER_CATEGORY: &str = "gitpulse-relief-offer";
+pub(super) const RELIEF_ADVICE_CATEGORY: &str = "gitpulse-relief-advice";
 
 fn timeout() -> WorkbenchError {
     WorkbenchError::new("timeout","macOS notification reply was not confirmed. Recheck status; a delivery will not be sent again automatically.")

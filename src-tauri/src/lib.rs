@@ -831,6 +831,8 @@ pub fn run() {
             cmd_host_load_status,
             cmd_host_relief_status,
             cmd_host_relief_request_resume,
+            cmd_host_relief_request_terminate,
+            cmd_host_relief_request_pause,
             cmd_host_load_leases,
             cmd_host_load_idle,
             cmd_host_load_park,

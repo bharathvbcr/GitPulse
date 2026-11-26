@@ -10,6 +10,7 @@ import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { humanBytes } from "../storage/format";
+import { askConfirm } from "../stores/modalStore";
 
 export type ReliefMode = "off" | "advise" | "act";
 export type ReliefRung = "none" | "slow" | "freeze";
@@ -26,9 +27,24 @@ export interface FrozenTree {
   since_ms: number;
   /** Advise mode: what Act would have paused. Nothing is stopped. */
   advised_only: boolean;
+  /**
+   * Set on an offer: why the supervisor will not pause this tree by itself.
+   * "observed": the agent is one GitPulse did not launch, and a person may ask
+   * for the pause. "untrusted": the repository is not trusted, and there is no
+   * pause. Absent on a paused tree.
+   */
+  why?: OfferWhy;
 }
 
-export type ReliefActionKind = "slow" | "freeze" | "resume" | "cap_resume" | "refused";
+export type OfferWhy = "observed" | "untrusted";
+
+export type ReliefActionKind =
+  | "slow"
+  | "freeze"
+  | "resume"
+  | "cap_resume"
+  | "refused"
+  | "terminate";
 
 export interface ReliefAction {
   at_ms: number;
@@ -59,6 +75,10 @@ export interface ReliefStatus {
   last_action: ReliefAction | null;
   failures: ReliefFailure[];
   cap_hits: number;
+  /** Trees the supervisor would have paused but may not unasked. Absent when none. */
+  offers?: FrozenTree[];
+  /** Trees it ended in this Severe episode. Absent when none. */
+  ended?: FrozenTree[];
 }
 
 /** Why a status that claims activity cannot be relied on. */
@@ -81,6 +101,8 @@ export interface ReliefSummary {
   wouldPause: FrozenTree[];
   /** Advise mode: processes Act would have slowed. */
   wouldSlow: number;
+  /** Trees it may not pause unasked (an observed agent, an untrusted repository). */
+  offers: FrozenTree[];
   /** The rung is above none and something was tried and failed. */
   failedToAct: boolean;
   /** Nothing is happening and nothing was tried. */
@@ -90,17 +112,28 @@ export interface ReliefSummary {
 export function reliefSummary(status: ReliefStatus): ReliefSummary {
   const paused = pausedTrees(status).length;
   const wouldPause = status.frozen.filter((tree) => tree.advised_only);
+  const offers = reliefOffers(status);
   const nothingDone =
-    paused === 0 && status.slowed === 0 && wouldPause.length === 0 && status.would_slow === 0;
+    paused === 0 &&
+    status.slowed === 0 &&
+    wouldPause.length === 0 &&
+    status.would_slow === 0 &&
+    offers.length === 0;
   const failedToAct = nothingDone && status.rung !== "none" && status.failures.length > 0;
   return {
     paused,
     slowed: status.slowed,
     wouldPause,
     wouldSlow: status.would_slow,
+    offers,
     failedToAct,
     idle: nothingDone && !failedToAct && status.rung === "none",
   };
+}
+
+/** The offered trees; the field is absent from a file with none. */
+export function reliefOffers(status: ReliefStatus): FrozenTree[] {
+  return status.offers ?? [];
 }
 
 /** How often a watching view rereads the file; it is small and local. */
@@ -166,6 +199,7 @@ export function reliefNowLabel(status: ReliefStatus): string {
   if (s.wouldPause.length > 0) would.push(`pause ${s.wouldPause.length} build or test`);
   if (s.wouldSlow > 0) would.push(`slow ${s.wouldSlow} agent process(es)`);
   if (would.length > 0) return `Nothing changed. In Advise mode it would ${would.join(" and ")}`;
+  if (s.offers.length > 0) return `Nothing paused. ${s.offers.length} build or test could be paused if you ask`;
   if (s.failedToAct) return "Tried to act and couldn't; nothing is paused or slowed";
   if (status.rung !== "none") return "Engaged, but nothing is paused or slowed";
   return "Nothing slowed or paused";
@@ -208,6 +242,8 @@ export function repoName(path: string): string {
 }
 
 export interface PausedRow {
+  /** The tree itself, for the buttons that name it by pid and start time. */
+  tree: FrozenTree;
   key: string;
   command: string;
   repo: string;
@@ -219,7 +255,12 @@ export interface PausedRow {
 
 /** One row per paused tree, `now` supplied so the age is testable. */
 export function pausedRows(status: ReliefStatus, now: number): PausedRow[] {
-  return pausedTrees(status).map((tree) => ({
+  return pausedTrees(status).map((tree) => rowOf(tree, now));
+}
+
+function rowOf(tree: FrozenTree, now: number): PausedRow {
+  return {
+    tree,
     key: `${tree.pid}:${tree.start_us}`,
     command: tree.command,
     repo: repoName(tree.repo_path),
@@ -229,7 +270,67 @@ export function pausedRows(status: ReliefStatus, now: number): PausedRow[] {
       : `agent pid ${tree.agent_root_pid}`,
     footprint: humanBytes(tree.footprint_bytes),
     since: `${reliefAge(now - tree.since_ms)} ago`,
-  }));
+  };
+}
+
+export interface OfferRow extends PausedRow {
+  /** Whether a "Pause" is on offer: an observed agent's tree, in Act mode. */
+  canPause: boolean;
+  /** What is said when there is no pause to offer. */
+  note: string | null;
+}
+
+/** One row per offered tree. An untrusted repository's has no pause. */
+export function offerRows(status: ReliefStatus, now: number): OfferRow[] {
+  return reliefOffers(status).map((tree) => {
+    const canPause = tree.why === "observed" && status.mode === "act";
+    return {
+      ...rowOf(tree, now),
+      canPause,
+      note: canPause
+        ? null
+        : tree.why === "untrusted"
+          ? "GitPulse does not trust this repository, so it will not pause this build."
+          : "Memory protection is not in Act mode, so there is no pause to offer.",
+    };
+  });
+}
+
+/** What the confirm before "End" says: the command and what the agent will see. */
+export function endConfirmCopy(tree: FrozenTree): { title: string; message: string; confirmLabel: string } {
+  return {
+    title: "End this paused build?",
+    message: `This stops ${tree.command} (pid ${tree.pid}). The agent will see it fail.`,
+    confirmLabel: "End it",
+  };
+}
+
+/** What the confirm before "Pause" says. */
+export function pauseConfirmCopy(tree: FrozenTree): { title: string; message: string; confirmLabel: string } {
+  return {
+    title: "Pause this build?",
+    message: `This pauses ${tree.command} (pid ${tree.pid}) under an agent GitPulse did not start. It resumes when memory pressure eases, or after 10 minutes.`,
+    confirmLabel: "Pause it",
+  };
+}
+
+type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive?: boolean }) => Promise<boolean>;
+
+/**
+ * Asks the person first, then leaves the end request for the supervisor.
+ * Resolves true when the request was left, false when they declined.
+ */
+export async function requestEndTree(tree: FrozenTree, confirm: Confirm = askConfirm): Promise<boolean> {
+  if (!(await confirm({ ...endConfirmCopy(tree), destructive: true }))) return false;
+  await invoke<void>("cmd_host_relief_request_terminate", { pid: tree.pid, startUs: tree.start_us });
+  return true;
+}
+
+/** Asks the person first, then leaves the pause request for the supervisor. */
+export async function requestPauseTree(tree: FrozenTree, confirm: Confirm = askConfirm): Promise<boolean> {
+  if (!(await confirm(pauseConfirmCopy(tree)))) return false;
+  await invoke<void>("cmd_host_relief_request_pause", { pid: tree.pid, startUs: tree.start_us });
+  return true;
 }
 
 /**
@@ -256,6 +357,9 @@ export function reliefHeadline(outcome: ReliefOutcome | null): string {
       const s = reliefSummary(outcome.status);
       if (s.paused > 0) return `${s.paused} build or test paused by memory protection. It resumes automatically.`;
       if (s.slowed > 0) return `${s.slowed} agent process(es) slowed; nothing is paused.`;
+      if (s.offers.length > 0) {
+        return `Memory is tight. ${s.offers.length} build or test could be paused if you ask. GitPulse pauses nothing in an agent it did not start without your say-so.`;
+      }
       if (s.wouldPause.length > 0 || s.wouldSlow > 0) {
         return "Memory is tight. Memory protection is in Advise mode, so nothing was paused or slowed.";
       }
