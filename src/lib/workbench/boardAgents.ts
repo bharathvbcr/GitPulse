@@ -15,6 +15,7 @@
 
 import { writable, type Readable } from "svelte/store";
 import { explainError, listAllLiveRuns, listPendingDecisions, type TaskRun } from "./client";
+import { createBusyGrace } from "./busyGrace";
 import { readPendingRequests, type PendingRequests } from "./taskSessions";
 import { runHoldsCheckout } from "./taskHandoff";
 import { TASK_RUN_POLL_MS, nextTaskRunPollDelay } from "./runPoll";
@@ -32,6 +33,9 @@ export interface BoardAgents {
   /**
    * Why the last read failed. The runs are then cleared rather than kept:
    * a card still marked from an old read would claim an agent nobody checked.
+   * The one exception is the host refusing the read as busy: that says the
+   * store is loaded, not that the marks are wrong, so the last reading is
+   * kept for a bounded grace (`busyGrace.ts`) and `error` stays null.
    */
   error: string | null;
 }
@@ -82,6 +86,7 @@ export function createBoardAgents(overrides: Partial<BoardAgentsDeps> = {}): Boa
   let timer: ReturnType<typeof setTimeout> | null = null;
   // A stop and a later start must not let the first run's read land.
   let epoch = 0;
+  const grace = createBusyGrace(deps.clock);
 
   const clear = () => { if (timer !== null) { deps.clearTimer(timer); timer = null; } };
 
@@ -107,8 +112,10 @@ export function createBoardAgents(overrides: Partial<BoardAgentsDeps> = {}): Boa
       const pending = await readPendingRequests(live, deps.listPending);
       if (ticket !== epoch) return;
       state = { runs: live, complete, pending, readAt, error: null };
+      grace.succeeded();
     } catch (cause) {
       if (ticket !== epoch) return;
+      if (grace.failed(cause)) return;
       state = { ...EMPTY, error: explainError(cause) };
     }
     store.set(state);
@@ -145,6 +152,7 @@ export function createBoardAgents(overrides: Partial<BoardAgentsDeps> = {}): Boa
     stop() {
       started = false;
       epoch += 1;
+      grace.forget();
       again = false;
       clear();
     },
