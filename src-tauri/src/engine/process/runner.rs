@@ -1191,20 +1191,7 @@ pub(super) fn ask_and_drain(
     guard.ask_then_stop_and_reap_with_grace(child, kill_grace, &mut std::thread::sleep)
 }
 
-/// [`run_with_gate`] with `on_admitted` called after the gate admits the
-/// child and before it is spawned — the last moment at which nothing has been
-/// read yet, which is what [`run_read_shared`] needs to stop new joiners.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn run_admitted(
-    cmd: &mut Command,
-    label: &str,
-    options: RunOptions,
-    stdin_bytes: Option<&[u8]>,
-    stdout_cap: usize,
-    observer: &mut dyn ProcessObserver,
-    gate: &'static SpawnGate,
-    on_admitted: &dyn Fn(),
-) -> Result<BoundedRun, CommandError> {
+fn check_test_spawn_hooks(cmd: &Command, label: &str) -> Result<(), CommandError> {
     #[cfg(test)]
     SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
     #[cfg(test)]
@@ -1222,6 +1209,220 @@ pub(super) fn run_admitted(
         note_process_failure(&error);
         return Err(error);
     }
+    #[cfg(not(test))]
+    let _ = (cmd, label);
+    Ok(())
+}
+
+fn validate_spawn_timeout(label: &str, timeout: Duration) -> Result<(), CommandError> {
+    if timeout > NETWORK_TIMEOUT {
+        return Err(format!("{label} deadline exceeds {}s", NETWORK_TIMEOUT.as_secs()).into());
+    }
+    if timeout.is_zero() {
+        return Err(format!(
+            "{label}{TIMEOUT_MARKER}{}s: deadline must be positive and at most {}s",
+            timeout.as_secs_f64(),
+            NETWORK_TIMEOUT.as_secs()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn admit_and_spawn(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+    options_qos: Option<QosTier>,
+    observer: &dyn ProcessObserver,
+    gate: &'static SpawnGate,
+    on_admitted: &dyn Fn(),
+) -> Result<
+    (
+        std::process::Child,
+        crate::procguard::Registration,
+        super::gate::SpawnPermit<'static>,
+        Instant,
+    ),
+    CommandError,
+> {
+    let queue_deadline = gate.clock.now() + timeout;
+    default_child_path(cmd);
+
+    let credited = current_admission() == Admission::Reactive
+        && cmd
+            .get_current_dir()
+            .is_some_and(|dir| gate.take_credit(dir));
+    let class = if credited {
+        Admission::Interactive
+    } else {
+        current_admission()
+    };
+    let permit = with_admission(class, || {
+        gate.acquire_judged(queue_deadline, &|| observer.cancelled())
+    })
+    .map_err(|(refusal, level)| match observer.cancellation() {
+        Some(cancelled) if refusal == Refusal::Cancelled => cancelled,
+        _ => refusal_message_at(label, refusal, level),
+    })?;
+    gate.note_admitted_label(label);
+    on_admitted();
+
+    let deadline = Instant::now() + timeout;
+    let in_band = QosTier::current(options_qos, class) == QosTier::Background;
+    let spawned = if in_band {
+        crate::procguard::spawn_background(cmd, label)
+    } else {
+        crate::procguard::spawn(cmd, label)
+    };
+    #[cfg(all(test, target_os = "macos"))]
+    if in_band {
+        qos::count_band_spawn(&spawned);
+    }
+    let (child, guard) = spawned.map_err(|e| {
+        let message = spawn_error(label, &e);
+        match crate::procguard::trust_refusal(&e) {
+            Some(refusal) => refusal.clone().wrap(|_| message),
+            None => message.into(),
+        }
+    })?;
+    #[cfg(test)]
+    spawn_log::record(cmd);
+    Ok((child, guard, permit, deadline))
+}
+
+/// A long-lived child process with piped stdio and a single held [`SpawnPermit`].
+///
+/// Consumes one concurrency slot and one rate token from [`SpawnGate`] for its
+/// entire lifetime. Dropping it closes stdin and kills + reaps the process
+/// group via [`crate::procguard::Registration`] before releasing the permit.
+pub(crate) struct StreamingChild {
+    child: std::process::Child,
+    guard: crate::procguard::Registration,
+    reaped: bool,
+    _permit: super::gate::SpawnPermit<'static>,
+}
+
+impl StreamingChild {
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) fn wait_stdout_readable(
+        &self,
+        stdout: &std::process::ChildStdout,
+        duration: Duration,
+    ) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut pfd = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = i32::try_from(duration.as_millis()).unwrap_or(i32::MAX);
+            let millis = if !duration.is_zero() && millis == 0 {
+                1
+            } else {
+                millis
+            };
+            // SAFETY: `stdout` remains open and owned by the caller across this call.
+            let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+            Ok(ready > 0 && pfd.revents != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (stdout, duration);
+            Ok(true)
+        }
+    }
+
+    pub(crate) fn wait_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let _ = self.child.stdin.take();
+        self.reaped = true;
+        self.guard.reap(|| self.child.wait())
+    }
+
+    pub(crate) fn kill_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let _ = self.child.stdin.take();
+        self.reaped = true;
+        self.guard.stop_and_reap(&mut self.child, Duration::ZERO)
+    }
+}
+
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.stdin.take();
+            let _ = self.guard.stop_and_reap(&mut self.child, Duration::ZERO);
+            self.reaped = true;
+        }
+    }
+}
+
+/// Spawns `cmd` through the admission gate for interactive lockstep streaming
+/// over piped stdin/stdout/stderr.
+pub(crate) fn spawn_streaming(
+    cmd: &mut Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<StreamingChild, CommandError> {
+    if let Err(err) = check_test_spawn_hooks(cmd, label) {
+        note_process_failure(&err);
+        return Err(err);
+    }
+    validate_spawn_timeout(label, timeout)?;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let result = admit_and_spawn(cmd, label, timeout, None, &(), spawn_gate(), &|| {});
+    match result {
+        Ok((child, guard, permit, _deadline)) => Ok(StreamingChild {
+            child,
+            guard,
+            reaped: false,
+            _permit: permit,
+        }),
+        Err(err) => {
+            if !is_cancellation(&err) {
+                note_process_failure(&err);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// [`run_with_gate`] with `on_admitted` called after the gate admits the
+/// child and before it is spawned — the last moment at which nothing has been
+/// read yet, which is what [`run_read_shared`] needs to stop new joiners.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_admitted(
+    cmd: &mut Command,
+    label: &str,
+    options: RunOptions,
+    stdin_bytes: Option<&[u8]>,
+    stdout_cap: usize,
+    observer: &mut dyn ProcessObserver,
+    gate: &'static SpawnGate,
+    on_admitted: &dyn Fn(),
+) -> Result<BoundedRun, CommandError> {
+    check_test_spawn_hooks(cmd, label)?;
     let result = run_admitted_inner(
         cmd,
         label,
@@ -1268,17 +1469,7 @@ fn run_admitted_inner(
     on_admitted: &dyn Fn(),
 ) -> Result<BoundedRun, CommandError> {
     let timeout = options.timeout;
-    if timeout > NETWORK_TIMEOUT {
-        return Err(format!("{label} deadline exceeds {}s", NETWORK_TIMEOUT.as_secs()).into());
-    }
-    if timeout.is_zero() {
-        return Err(format!(
-            "{label}{TIMEOUT_MARKER}{}s: deadline must be positive and at most {}s",
-            timeout.as_secs_f64(),
-            NETWORK_TIMEOUT.as_secs()
-        )
-        .into());
-    }
+    validate_spawn_timeout(label, timeout)?;
     let stdout_limit = if observer.drains_stdout() {
         MAX_DRAINED_OUTPUT_BYTES
     } else {
@@ -1290,7 +1481,6 @@ fn run_admitted_inner(
             format!("{label} input/output budget exceeds the {stdout_limit} byte limit").into(),
         );
     }
-    let queue_deadline = gate.clock.now() + timeout;
     if stdin_bytes.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -1302,76 +1492,16 @@ fn run_admitted_inner(
     // `capture_command`, `run_bounded`, `run_bounded_capped` and `run_observed`
     // all end up in this function. A per-site fix would have to be remembered
     // by the next spawn someone adds; this one cannot be forgotten.
-    default_child_path(cmd);
-
-    // Held until this function returns, covering the child's descriptors, its
-    // output buffers and fallback reader threads -- see [`SpawnGate`] for why an
-    // unbounded fan-out here exhausted the process descriptor table.
-    // A refresh in the repository a user action just changed is admitted
-    // like the action itself, within the credit `run_command_scope` granted.
-    let credited = current_admission() == Admission::Reactive
-        && cmd
-            .get_current_dir()
-            .is_some_and(|dir| gate.take_credit(dir));
-    let class = if credited {
-        Admission::Interactive
-    } else {
-        current_admission()
-    };
-    let _permit = Arc::new(
-        with_admission(class, || {
-            gate.acquire_judged(queue_deadline, &|| observer.cancelled())
-        })
-        .map_err(|(refusal, level)| {
-            // Decided here, where the observer that cancelled is known: only a
-            // read-cancel observer's cancel is a `ReadCancelled`.
-            match observer.cancellation() {
-                Some(cancelled) if refusal == Refusal::Cancelled => cancelled,
-                _ => refusal_message_at(label, refusal, level),
-            }
-        })?,
-    );
-    gate.note_admitted_label(label);
-    on_admitted();
-
-    // Slot wait is already bounded by `queue_deadline`. The child then gets
-    // the full requested runtime: a 5s git call that spent 4.9s queued must
-    // not be reported as "timed out" after 100ms of actual work. Under
-    // llvm-cov that is how shebang and stub-devmap tests failed a 5s/30s
-    // deadline they would have met once they started.
-    let deadline = Instant::now() + timeout;
-
-    // Spawned into a process group of its own and registered, so a SIGTERM to
-    // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
-    // shutdown path — takes this child and everything it forked down with it
-    // instead of orphaning them. See [`crate::procguard`].
-    //
-    // A background-band child enters the band itself, before it execs: applied
-    // from here after the spawn, the band missed any child that exec'd at once
-    // (every `sh -c`, and the `git` shims), and a child that cannot enter it
-    // fails the spawn rather than silently running at normal priority. See
-    // [`crate::procguard::spawn_background`] for the mechanism and its cost.
-    let in_band = QosTier::current(options.qos, class) == QosTier::Background;
-    let spawned = if in_band {
-        crate::procguard::spawn_background(cmd, label)
-    } else {
-        crate::procguard::spawn(cmd, label)
-    };
-    #[cfg(all(test, target_os = "macos"))]
-    if in_band {
-        qos::count_band_spawn(&spawned);
-    }
-    let (mut child, guard) = spawned.map_err(|e| {
-        let message = spawn_error(label, &e);
-        // A trust refusal keeps its kind in other words, which is what a
-        // caller that only holds the spawn error asks about.
-        match crate::procguard::trust_refusal(&e) {
-            Some(refusal) => refusal.clone().wrap(|_| message),
-            None => message.into(),
-        }
-    })?;
-    #[cfg(test)]
-    spawn_log::record(cmd);
+    let (mut child, guard, permit, deadline) = admit_and_spawn(
+        cmd,
+        label,
+        timeout,
+        options.qos,
+        observer,
+        gate,
+        on_admitted,
+    )?;
+    let _permit = Arc::new(permit);
 
     // On Unix the command waiter owns and drains both nonblocking pipes.
     // EOF no longer depends on two separately scheduled reader threads
