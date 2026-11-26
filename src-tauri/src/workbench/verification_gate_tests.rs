@@ -145,15 +145,14 @@ fn a_passed_record_for_an_older_head_on_an_unlanded_lane_is_stale() {
     // The work is on a lane that has not landed: a head that moved past a
     // pass on the default branch itself would be landed work.
     crate::test_support::git_in(repo.path(), &["checkout", "-q", "-b", "lane"]);
-    crate::test_support::git_in(
-        repo.path(),
-        &["commit", "-q", "--allow-empty", "-m", "lane work"],
-    );
+    std::fs::write(repo.path().join("work.txt"), "v1\n").unwrap();
+    crate::test_support::git_in(repo.path(), &["add", "work.txt"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "lane work"]);
     verified(&store, &repo, &id);
-    crate::test_support::git_in(
-        repo.path(),
-        &["commit", "-q", "--allow-empty", "-m", "more work"],
-    );
+    // Change tree contents (empty commits preserve tree_oid and remain valid).
+    std::fs::write(repo.path().join("work.txt"), "v2\n").unwrap();
+    crate::test_support::git_in(repo.path(), &["add", "work.txt"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "more work"]);
     let response = claim(&store, &repo, &id, None);
     assert_held(
         &store,
@@ -170,10 +169,10 @@ fn a_passed_record_for_an_older_head_on_an_unlanded_lane_is_stale() {
 fn a_passed_record_for_an_older_head_is_stale() {
     let (_d, store, repo, id) = setup();
     verified(&store, &repo, &id);
-    crate::test_support::git_in(
-        repo.path(),
-        &["commit", "-q", "--allow-empty", "-m", "more work"],
-    );
+    // Change tree contents (empty commits preserve tree_oid and remain valid).
+    std::fs::write(repo.path().join("work.txt"), "v2\n").unwrap();
+    crate::test_support::git_in(repo.path(), &["add", "work.txt"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "more work"]);
     let response = claim(&store, &repo, &id, None);
     assert_held(
         &store,
@@ -191,16 +190,10 @@ fn a_landed_pass_does_not_cover_commits_that_landed_after_it() {
     let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
     land(&repo);
     tear_down(&repo, &lane);
-    crate::test_support::git_in(
-        repo.path(),
-        &[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "unverified follow-up",
-        ],
-    );
+    // Change tree contents (empty commits preserve tree_oid and remain valid).
+    std::fs::write(repo.path().join("followup.txt"), "new\n").unwrap();
+    crate::test_support::git_in(repo.path(), &["add", "followup.txt"]);
+    crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "unverified follow-up"]);
     let response = claim(&store, &repo, &id, None);
     assert_held(&store, &id, &response, "the claim is for");
 }
@@ -411,10 +404,11 @@ fn verified_lane(
     let parent = tempfile::tempdir().unwrap();
     let lane = parent.path().join("lane").to_str().unwrap().to_owned();
     crate::test_support::git_in(repo.path(), &["worktree", "add", "-q", "-b", "lane", &lane]);
-    crate::test_support::git_in(
-        std::path::Path::new(&lane),
-        &["commit", "-q", "--allow-empty", "-m", "the work"],
-    );
+    // Commit real file content so the lane's tree differs from an empty/unmerged base.
+    let lane_path = std::path::Path::new(&lane);
+    std::fs::write(lane_path.join("lane_work.txt"), "verified work\n").unwrap();
+    crate::test_support::git_in(lane_path, &["add", "lane_work.txt"]);
+    crate::test_support::git_in(lane_path, &["commit", "-q", "-m", "the work"]);
     let m = current_head(&lane).unwrap();
     let mut passed = record(id, "passed", "settled", repo, &m);
     passed["worktree"] = json!(lane);
@@ -489,15 +483,12 @@ fn a_lane_that_moved_to_a_commit_without_the_verified_one_stays_held() {
     let (_lane_dir, lane, _m) = verified_lane(&store, &repo, &id);
     let lane_path = std::path::Path::new(&lane);
     crate::test_support::git_in(lane_path, &["reset", "-q", "--hard", "HEAD~1"]);
+    // Change tree contents (empty commits preserve tree_oid and remain valid).
+    std::fs::write(lane_path.join("different.txt"), "alt\n").unwrap();
+    crate::test_support::git_in(lane_path, &["add", "different.txt"]);
     crate::test_support::git_in(
         lane_path,
-        &[
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "a different line of work",
-        ],
+        &["commit", "-q", "-m", "a different line of work"],
     );
     let response = claim(&store, &repo, &id, None);
     assert_held(
@@ -750,10 +741,12 @@ fn attack_a_default_branch_force_moved_to_an_unrelated_root_holds_it() {
     land(&repo);
     tear_down(&repo, &lane);
     git(repo.path(), &["checkout", "-q", "--orphan", "fresh"]);
-    git(
-        repo.path(),
-        &["commit", "-q", "--allow-empty", "-m", "unrelated root"],
-    );
+    // `git checkout --orphan` keeps the previous index staged; clear it so
+    // `fresh` is genuinely an unrelated tree rather than a squash of `main`.
+    git(repo.path(), &["rm", "-q", "-rf", "."]);
+    std::fs::write(repo.path().join("unrelated.txt"), "unrelated\n").unwrap();
+    git(repo.path(), &["add", "unrelated.txt"]);
+    git(repo.path(), &["commit", "-q", "-m", "unrelated root"]);
     git(repo.path(), &["branch", "-q", "-M", "main"]);
     let response = claim(&store, &repo, &id, None);
     assert!(!is_done(&response), "{response}");

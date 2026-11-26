@@ -83,6 +83,8 @@ pub(crate) struct Record {
     pub worktree: String,
     #[serde(default)]
     pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_oid: Option<String>,
     #[serde(default)]
     pub criteria: Vec<Criterion>,
     #[serde(default)]
@@ -108,7 +110,8 @@ impl Record {
         ]
         .iter()
         .map(|text| text.len())
-        .sum::<usize>();
+        .sum::<usize>()
+            + self.tree_oid.as_ref().map_or(0, String::len);
         let criteria: usize = self
             .criteria
             .iter()
@@ -205,6 +208,8 @@ pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
 
 /// What the spawn-gate report calls the launches [`landed_on_default`] makes.
 pub(crate) const LANDED_SOURCE: &str = "verification_gate.landed_on_default";
+/// What the spawn-gate report calls the launches [`resolve_tree_oid`] makes.
+pub(crate) const TREE_OID_SOURCE: &str = "verification_gate.tree_oid";
 
 /// A full, lowercase commit id: 40 hex digits (SHA-1) or 64 (SHA-256), exactly.
 pub(crate) fn is_full_commit_id(text: &str) -> bool {
@@ -212,6 +217,71 @@ pub(crate) fn is_full_commit_id(text: &str) -> bool {
         && text
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Resolves `<commit>^{tree}` in `checkout`, verifying first that `commit` is
+/// a full commit id that resolves to itself (no ref-name spoofing).
+fn resolve_tree_oid(checkout: &Path, commit: &str) -> Result<String, String> {
+    if !is_full_commit_id(commit) {
+        return Err(format!("{commit:?} is not a full commit id"));
+    }
+    let commit_spec = format!("{commit}^{{commit}}");
+    let resolved_commit = crate::engine::process::with_spawn_source(TREE_OID_SOURCE, || {
+        crate::engine::git_cli::git_text(
+            checkout,
+            &["rev-parse", "--verify", "--end-of-options", &commit_spec],
+        )
+    })
+    .map_err(|e| {
+        format!(
+            "the commit {commit:?} could not be resolved: {}",
+            e.message()
+        )
+    })?;
+    if resolved_commit.trim() != commit {
+        return Err(format!(
+            "the head {commit:?} does not resolve to itself (it resolves to {:?})",
+            resolved_commit.trim()
+        ));
+    }
+    let tree_spec = format!("{commit}^{{tree}}");
+    let tree = crate::engine::process::with_spawn_source(TREE_OID_SOURCE, || {
+        crate::engine::git_cli::git_text(
+            checkout,
+            &["rev-parse", "--verify", "--end-of-options", &tree_spec],
+        )
+    })
+    .map_err(|e| {
+        format!(
+            "the tree of {commit:?} could not be resolved: {}",
+            e.message()
+        )
+    })?;
+    let tree = tree.trim().to_owned();
+    if !is_full_commit_id(&tree) {
+        return Err(format!("the resolved tree {tree:?} is not a valid OID"));
+    }
+    Ok(tree)
+}
+
+/// Tree OID for `record`: uses `record.tree_oid` if present (validated as a
+/// full OID), otherwise resolves `<record.head>^{tree}` from `checkout`.
+fn record_tree_oid(checkout: &Path, record: &Record) -> Result<String, String> {
+    if let Some(tree) = record.tree_oid.as_deref() {
+        if !is_full_commit_id(tree) {
+            return Err(format!("the recorded tree_oid {tree:?} is not a valid OID"));
+        }
+        return Ok(tree.to_owned());
+    }
+    resolve_tree_oid(checkout, &record.head)
+}
+
+/// Whether `candidate_commit`'s exact tree OID matches `record`'s verified tree.
+/// Fails closed (`Ok(false)` or `Err`) if either OID cannot be resolved.
+fn trees_match(checkout: &Path, candidate_commit: &str, record: &Record) -> Result<bool, String> {
+    let claimant_tree = resolve_tree_oid(checkout, candidate_commit)?;
+    let record_tree = record_tree_oid(checkout, record)?;
+    Ok(claimant_tree == record_tree)
 }
 
 /// The local checkout a repository identity (`local:<git dir>`) names, when it
@@ -314,11 +384,16 @@ pub(crate) fn judge(
             Err(error) => format!(
                 "the head of the verified worktree could not be read, so the verdict cannot be tied to the work: {error}", error = error.message()
             ),
-            Ok(head) if head != record.head => format!(
-                "verification passed for {} but the worktree is now at {}; the work changed after it was verified. Verify again",
-                short(&record.head),
-                short(&head)
-            ),
+            Ok(head) if head != record.head => {
+                if trees_match(Path::new(&record.worktree), &head, record) == Ok(true) {
+                    return Gate::Passed(verdict);
+                }
+                format!(
+                    "verification passed for {} but the worktree is now at {}; the work changed after it was verified. Verify again",
+                    short(&record.head),
+                    short(&head)
+                )
+            }
             Ok(_) => return Gate::Passed(verdict),
         },
         Err(error) => format!(
@@ -326,9 +401,10 @@ pub(crate) fn judge(
             record.worktree, error.message
         ),
     };
-    // Landed work is a pass only for the commit it was verified at: commits
-    // that landed on top of it were never judged.
-    match claimant_head {
+    // Landed work is a pass for the commit it was verified at, or a commit
+    // whose exact tree OID equals the verified commit's tree (e.g. rebase or
+    // squash with identical tree). Commits with different trees were never judged.
+    let landed_commit = match claimant_head {
         None => {
             return Gate::Held(format!(
                 "{moved}; the head the claim is for could not be read, so the verified commit {} cannot be tied to it",
@@ -336,26 +412,32 @@ pub(crate) fn judge(
             ))
         }
         Some(claimed) if claimed != record.head => {
-            return Gate::Held(format!(
-                "{moved}; the claim is for {} but the verified commit is {}. Verify again",
-                short(claimed),
-                short(&record.head)
-            ))
+            let equivalent = checkout_of(repository_identity).is_some_and(|checkout| {
+                trees_match(Path::new(&checkout), claimed, record) == Ok(true)
+            });
+            if !equivalent {
+                return Gate::Held(format!(
+                    "{moved}; the claim is for {} but the verified commit is {}. Verify again",
+                    short(claimed),
+                    short(&record.head)
+                ));
+            }
+            claimed
         }
-        Some(_) => {}
-    }
-    match landed(repository_identity, &record.head) {
+        Some(claimed) => claimed,
+    };
+    match landed(repository_identity, landed_commit) {
         Ok(true) => Gate::Passed(format!(
             "{verdict}\nThe verified commit {} is on the default branch.",
-            short(&record.head)
+            short(landed_commit)
         )),
         Ok(false) => Gate::Held(format!(
             "{moved}; the verified commit {} is not on the default branch either",
-            short(&record.head)
+            short(landed_commit)
         )),
         Err(why) => Gate::Held(format!(
             "{moved}; whether the verified commit {} reached the default branch could not be read: {why}",
-            short(&record.head)
+            short(landed_commit)
         )),
     }
 }
@@ -496,4 +578,237 @@ pub(crate) fn get_params(input: &str) -> Result<Value, WorkbenchError> {
         Some(request_id) => json!({"item_id": parsed.id, "request_id": request_id}),
         None => json!({"item_id": parsed.id}),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn init_repo() -> tempfile::TempDir {
+        let repo = crate::test_support::git_repo();
+        std::fs::write(repo.path().join("app.txt"), "v1\n").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "app.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    fn git_out(repo: &Path, args: &[&str]) -> String {
+        crate::engine::git_cli::git_text(repo, args)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    fn passed_record(item: &str, worktree: &Path, head: &str, tree_oid: Option<String>) -> Record {
+        Record {
+            request_id: "req-1".into(),
+            item_id: item.into(),
+            state: "settled".into(),
+            outcome: "passed".into(),
+            worktree: worktree.to_str().unwrap().into(),
+            head: head.into(),
+            tree_oid,
+            ..Record::default()
+        }
+    }
+
+    #[test]
+    fn tree_oid_equivalent_rebased_or_squashed_commit_passes() {
+        let repo = init_repo();
+        let repo_id = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+
+        // 1. Rebased/amended commit B on a lane with identical tree A^{tree} == B^{tree}.
+        let lane_parent = tempfile::tempdir().unwrap();
+        let lane = lane_parent.path().join("lane");
+        crate::test_support::git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                lane.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(lane.join("feature.txt"), "feat\n").unwrap();
+        crate::test_support::git_in(&lane, &["add", "feature.txt"]);
+        crate::test_support::git_in(&lane, &["commit", "-q", "-m", "feature A"]);
+        let sha_a = git_out(&lane, &["rev-parse", "HEAD"]);
+        let tree_a = git_out(&lane, &["rev-parse", "HEAD^{tree}"]);
+
+        // Rebase lane onto an empty commit on main (or amend): SHA changes A -> B, tree identical.
+        crate::test_support::git_in(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "main metadata"],
+        );
+        crate::test_support::git_in(&lane, &["rebase", "-q", "main"]);
+        let sha_b = git_out(&lane, &["rev-parse", "HEAD"]);
+        assert_ne!(sha_a, sha_b);
+        assert_eq!(git_out(&lane, &["rev-parse", "HEAD^{tree}"]), tree_a);
+
+        let rec = passed_record("task-1", &lane, &sha_a, None);
+        let gate = judge(
+            &rec,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_b),
+        );
+        assert!(matches!(gate, Gate::Passed(_)), "{gate:?}");
+
+        // 2. Squashed onto default branch with lane removed: B^{tree} == A^{tree} passes.
+        crate::test_support::git_in(repo.path(), &["merge", "-q", "--squash", "lane"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "squash feature"]);
+        let sha_squashed = git_out(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(sha_a, sha_squashed);
+        assert_eq!(git_out(repo.path(), &["rev-parse", "HEAD^{tree}"]), tree_a);
+        crate::test_support::git_in(
+            repo.path(),
+            &["worktree", "remove", "--force", lane.to_str().unwrap()],
+        );
+
+        let rec_with_tree = passed_record("task-1", &lane, &sha_a, Some(tree_a.clone()));
+        let gate_squashed = judge(
+            &rec_with_tree,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_squashed),
+        );
+        assert!(
+            matches!(gate_squashed, Gate::Passed(_)),
+            "{gate_squashed:?}"
+        );
+
+        // Also passes when record.tree_oid was omitted and resolved via <record.head>^{tree}.
+        let gate_squashed_inferred = judge(
+            &rec,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_squashed),
+        );
+        assert!(
+            matches!(gate_squashed_inferred, Gate::Passed(_)),
+            "{gate_squashed_inferred:?}"
+        );
+    }
+
+    #[test]
+    fn commit_with_different_tree_returns_held() {
+        let repo = init_repo();
+        let repo_id = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+        let sha_a = git_out(repo.path(), &["rev-parse", "HEAD"]);
+        let tree_a = git_out(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+
+        std::fs::write(repo.path().join("app.txt"), "v2\n").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "app.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "changed tree C"]);
+        let sha_c = git_out(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(git_out(repo.path(), &["rev-parse", "HEAD^{tree}"]), tree_a);
+
+        let rec = passed_record("task-1", repo.path(), &sha_a, Some(tree_a));
+        let gate = judge(
+            &rec,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_c),
+        );
+        assert!(matches!(gate, Gate::Held(_)), "{gate:?}");
+    }
+
+    #[test]
+    fn invalid_or_missing_tree_oid_or_commit_fails_closed() {
+        let repo = init_repo();
+        let repo_id = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+        let sha_a = git_out(repo.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(repo.path().join("app.txt"), "v2\n").unwrap();
+        crate::test_support::git_in(repo.path(), &["add", "app.txt"]);
+        crate::test_support::git_in(repo.path(), &["commit", "-q", "-m", "c2"]);
+        let sha_b = git_out(repo.path(), &["rev-parse", "HEAD"]);
+
+        // Malformed tree_oid fails closed.
+        let bad_tree = passed_record(
+            "task-1",
+            repo.path(),
+            &sha_a,
+            Some("not-a-valid-oid".into()),
+        );
+        let gate = judge(
+            &bad_tree,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_b),
+        );
+        assert!(matches!(gate, Gate::Held(_)), "{gate:?}");
+
+        // Missing commit in record.head fails closed.
+        let missing = passed_record("task-1", repo.path(), &"ab".repeat(20), None);
+        let gate_missing = judge(
+            &missing,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_b),
+        );
+        assert!(matches!(gate_missing, Gate::Held(_)), "{gate_missing:?}");
+    }
+
+    #[test]
+    fn tree_equivalent_unlanded_claim_outside_moved_worktree_stays_held() {
+        let repo = init_repo();
+        let repo_id = resolve(repo.path().to_str().unwrap()).unwrap().identity;
+
+        let lane_parent = tempfile::tempdir().unwrap();
+        let lane = lane_parent.path().join("lane");
+        crate::test_support::git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane",
+                lane.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(lane.join("feature.txt"), "feat\n").unwrap();
+        crate::test_support::git_in(&lane, &["add", "feature.txt"]);
+        crate::test_support::git_in(&lane, &["commit", "-q", "-m", "feature A"]);
+        let sha_a = git_out(&lane, &["rev-parse", "HEAD"]);
+        let tree_a = git_out(&lane, &["rev-parse", "HEAD^{tree}"]);
+
+        // Amend on an unlanded branch to B with identical tree, then remove the lane.
+        crate::test_support::git_in(&lane, &["commit", "-q", "--amend", "-m", "feature B"]);
+        let sha_b = git_out(&lane, &["rev-parse", "HEAD"]);
+        assert_ne!(sha_a, sha_b);
+        assert_eq!(git_out(&lane, &["rev-parse", "HEAD^{tree}"]), tree_a);
+        crate::test_support::git_in(
+            repo.path(),
+            &["worktree", "remove", "--force", lane.to_str().unwrap()],
+        );
+
+        // B has identical tree A^{tree} == B^{tree}, but B never landed on main: must hold.
+        let rec = passed_record("task-1", &lane, &sha_a, Some(tree_a));
+        let gate = judge(
+            &rec,
+            "task-1",
+            &repo_id,
+            &current_head,
+            &landed_on_default,
+            Some(&sha_b),
+        );
+        assert!(matches!(gate, Gate::Held(_)), "{gate:?}");
+    }
 }
