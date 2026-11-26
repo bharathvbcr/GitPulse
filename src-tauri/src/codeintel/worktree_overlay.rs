@@ -3319,7 +3319,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(PathBuf::from(rebound_root), canonical_wt);
+        // devmap-store's rebind_staged records the root as std canonicalize
+        // spells it, `\\?\C:\...` on Windows; the lane is the same directory
+        // whichever spelling names it.
+        assert_eq!(
+            PathBuf::from(crate::engine::process::plain_path_text(&rebound_root)),
+            canonical_wt
+        );
     }
 
     #[test]

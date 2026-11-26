@@ -46,17 +46,24 @@ fn call(tool: &str, args: &[(&str, String)]) -> (i32, Value, String) {
     )
 }
 
-/// Why a call failed: its output without the `WARN [setup]` lines every
-/// Windows child prints first, which filled the 160-200 characters a failure
-/// used to show and left the actual error unread.
-fn failure_reason(raw: &str) -> String {
-    raw.lines()
-        .filter(|line| !line.contains(" WARN [setup] "))
-        .collect::<Vec<_>>()
-        .join(" | ")
-        .chars()
-        .take(300)
-        .collect()
+/// Why a call failed: its exit code and its output without the `WARN [...]`
+/// log lines a Windows child prints first. Filtering only `[setup]` left a
+/// `[spawn_gate]` summary in the 300 characters shown, so the actual error
+/// still went unread; when nothing but log lines was printed, those are shown.
+fn failure_reason(code: i32, raw: &str) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|line| !line.contains(" WARN ["))
+        .collect();
+    let shown = if lines.is_empty() {
+        raw.to_owned()
+    } else {
+        lines.join(" | ")
+    };
+    format!(
+        "exit {code}: {}",
+        shown.chars().take(300).collect::<String>()
+    )
 }
 
 fn s(x: impl ToString) -> String {
@@ -512,7 +519,7 @@ fn concurrent_senders_in_separate_processes_lose_nothing() {
                         if code == 0 {
                             String::new()
                         } else {
-                            failure_reason(&raw)
+                            failure_reason(code, &raw)
                         },
                     ));
                 }
@@ -630,7 +637,7 @@ fn concurrent_large_senders_lose_nothing() {
                             if code == 0 {
                                 String::new()
                             } else {
-                                failure_reason(&raw)
+                                failure_reason(code, &raw)
                             },
                         )
                     })

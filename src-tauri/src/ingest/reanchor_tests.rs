@@ -224,7 +224,8 @@ fn a_renamed_repository_keeps_recording_with_no_loss_and_no_duplicate() {
         "the pre-move row keeps its identity"
     );
     assert!(
-        rows.iter().all(|(_, _, repo)| *repo == new),
+        rows.iter()
+            .all(|(_, _, repo)| crate::engine::process::plain_path_text(repo) == new),
         "reads present the new path: {rows:?}"
     );
     // History stays honest about where it was written.
@@ -802,8 +803,16 @@ fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
         true
     })
     .unwrap();
-    assert_eq!(adopted, vec![old.clone()]);
-    assert_eq!(*earlier.borrow(), vec![old.clone()]);
+    // Adoption names earlier locations in the ledger's own spelling
+    // (`\\?\C:\...` on Windows); compare them in git's.
+    let plain = |paths: &[String]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| crate::engine::process::plain_path_text(path))
+            .collect()
+    };
+    assert_eq!(plain(&adopted), vec![old.clone()]);
+    assert_eq!(plain(&earlier.borrow()), vec![old.clone()]);
 
     let out = corpus.pass(&new);
     assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");

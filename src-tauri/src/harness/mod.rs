@@ -1799,7 +1799,11 @@ mod scope_tests {
         assert!(matches!(hook_scope(&worktree), HookScope::Untrusted));
         crate::test_support::trust_repo(main.path());
 
-        // Missing.
+        // Missing. The legacy row above opened the worktree's own ledger, and
+        // this process keeps that connection. Unix deletes a directory under an
+        // open file and drops the connection later; Windows refuses the delete
+        // while the handle is open (os error 32), so it is released first.
+        crate::ledger::tests_support::reset_registry_for(&worktree);
         crate::test_support::remove_dir_all_retrying(Path::new(&worktree))
             .expect("delete worktree");
         assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
