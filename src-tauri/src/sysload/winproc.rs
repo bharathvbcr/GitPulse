@@ -35,6 +35,27 @@
 //! family, so aarch64 Windows uses the same offsets; that is inferred from the
 //! definitions, not observed.
 //!
+//! A 32-bit (WoW64) process keeps a second, 32-bit PEB. `NtQueryInformationProcess`
+//! (`ProcessWow64Information`) returns its address, and the same `phnt`
+//! definitions at 32-bit pointer width (4-byte pointers and handles, derived by
+//! the method that reproduces the 64-bit numbers above) give:
+//!
+//! ```text
+//! PEB32.ProcessParameters (+0x10)       -> RTL_USER_PROCESS_PARAMETERS32*
+//! RTL_USER_PROCESS_PARAMETERS32
+//!   .Flags                  (+0x08)
+//!   .CurrentDirectory.DosPath (+0x24)   UNICODE_STRING32 (8 bytes)
+//!   .CommandLine            (+0x40)     UNICODE_STRING32
+//!   .Environment            (+0x48)     u32
+//!   .EnvironmentSize        (+0x290)    u32, bytes
+//! ```
+//!
+//! These are phnt `ntrtl.h`/`ntpebteb.h` layouts at 32-bit pointer width, not
+//! Microsoft documentation, and are asserted the same way. Both widths are
+//! normalised into one [`Block`] (every address a `u64`), so the working
+//! directory, command line and environment readers, and every bound they
+//! apply, exist once.
+//!
 //! None of the `windows` code here has been run by its author: it is written
 //! on macOS and compiled by a cross `clippy`. The Windows-only tests in
 //! `procscan` are what exercise it.
@@ -155,7 +176,7 @@ pub(crate) enum StringRefusal {
 /// bytes, then the pointer at +8.
 #[cfg(any(all(windows, target_pointer_width = "64"), test))]
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UnicodeString {
     pub length: u16,
     pub maximum_length: u16,
@@ -165,7 +186,6 @@ pub(crate) struct UnicodeString {
 
 #[cfg(any(all(windows, target_pointer_width = "64"), test))]
 impl UnicodeString {
-    #[cfg(test)]
     pub(crate) fn new(length: u16, maximum_length: u16, buffer: u64) -> Self {
         Self {
             length,
@@ -198,7 +218,24 @@ impl UnicodeString {
     }
 }
 
-/// `RTL_DRIVE_LETTER_CURDIR`; its `STRING` has the shape of a
+/// The `UNICODE_STRING` of a 32-bit (WoW64) target: the same two lengths, then
+/// a 4-byte pointer at +4, 8 bytes in all. It is validated only after widening
+/// into a [`UnicodeString`], so [`UnicodeString::extent`] is the one check.
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UnicodeString32 {
+    pub length: u16,
+    pub maximum_length: u16,
+    pub buffer: u32,
+}
+
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+impl From<UnicodeString32> for UnicodeString {
+    fn from(text: UnicodeString32) -> Self {
+        Self::new(text.length, text.maximum_length, u64::from(text.buffer))
+    }
+}
 /// [`UnicodeString`].
 #[cfg(any(all(windows, target_pointer_width = "64"), test))]
 #[repr(C)]
@@ -265,15 +302,132 @@ struct ProcessBasicInformation {
     inherited_from_unique_process_id: u64,
 }
 
-/// `PEB.ProcessParameters`.
+/// `RTL_DRIVE_LETTER_CURDIR` at 32-bit pointer width.
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+struct DriveLetterCurdir32 {
+    flags: u16,
+    length: u16,
+    timestamp: u32,
+    dos_path: UnicodeString32,
+}
+
+/// `RTL_USER_PROCESS_PARAMETERS` of a 32-bit (WoW64) target, as far as
+/// `EnvironmentSize`: the 64-bit layout with every pointer and handle 4 bytes.
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+pub(crate) struct ProcessParameters32 {
+    maximum_length: u32,
+    length: u32,
+    pub flags: u32,
+    debug_flags: u32,
+    console_handle: u32,
+    console_flags: u32,
+    standard_input: u32,
+    standard_output: u32,
+    standard_error: u32,
+    pub current_directory: UnicodeString32,
+    current_directory_handle: u32,
+    dll_path: UnicodeString32,
+    image_path_name: UnicodeString32,
+    pub command_line: UnicodeString32,
+    pub environment: u32,
+    starting_x: u32,
+    starting_y: u32,
+    count_x: u32,
+    count_y: u32,
+    count_chars_x: u32,
+    count_chars_y: u32,
+    fill_attribute: u32,
+    window_flags: u32,
+    show_window_flags: u32,
+    window_title: UnicodeString32,
+    desktop_info: UnicodeString32,
+    shell_info: UnicodeString32,
+    runtime_data: UnicodeString32,
+    current_directories: [DriveLetterCurdir32; 32],
+    pub environment_size: u32,
+}
+
+/// `PEB.ProcessParameters` of a 64-bit target.
 #[cfg(any(all(windows, target_pointer_width = "64"), test))]
 const PEB_PROCESS_PARAMETERS: u64 = 0x20;
+
+/// `PEB32.ProcessParameters`, a 4-byte pointer.
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+const PEB32_PROCESS_PARAMETERS: u64 = 0x10;
 
 /// `RTL_USER_PROC_PARAMS_NORMALIZED`: the string pointers are absolute. Clear,
 /// they are offsets from the block, and reading them as addresses would read
 /// unrelated memory.
 #[cfg(any(all(windows, target_pointer_width = "64"), test))]
 const PARAMS_NORMALIZED: u32 = 0x1;
+
+/// What the three readers need of a parameter block, whichever pointer width
+/// the target has: every address is a `u64` and every string a
+/// [`UnicodeString`] (a 32-bit header widens losslessly). The bounds on all of
+/// it live here and in [`string_extent`], once.
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Block {
+    pub current_directory: UnicodeString,
+    pub command_line: UnicodeString,
+    pub environment: u64,
+    pub environment_size: u64,
+}
+
+#[cfg(any(all(windows, target_pointer_width = "64"), test))]
+impl Block {
+    /// The block of a 64-bit target. Refused unless its string pointers are
+    /// absolute: clear, they are offsets from the block, and reading them as
+    /// addresses would read unrelated memory.
+    pub(crate) fn from_native(raw: &ProcessParameters) -> Result<Self, String> {
+        Self::normalized(raw.flags)?;
+        Ok(Self {
+            current_directory: raw.current_directory,
+            command_line: raw.command_line,
+            environment: raw.environment,
+            environment_size: raw.environment_size,
+        })
+    }
+
+    /// The block of a 32-bit (WoW64) target; the same check, widened.
+    pub(crate) fn from_wow64(raw: &ProcessParameters32) -> Result<Self, String> {
+        Self::normalized(raw.flags)?;
+        Ok(Self {
+            current_directory: raw.current_directory.into(),
+            command_line: raw.command_line.into(),
+            environment: u64::from(raw.environment),
+            environment_size: u64::from(raw.environment_size),
+        })
+    }
+
+    fn normalized(flags: u32) -> Result<(), String> {
+        if flags & PARAMS_NORMALIZED == 0 {
+            return Err("the parameter block is not normalized".into());
+        }
+        Ok(())
+    }
+
+    /// Where and how much of the environment to read. Refused (not read as
+    /// empty) when the address or size is absent, odd or over
+    /// [`MAX_ENV_BYTES`].
+    pub(crate) fn environment_extent(&self) -> Result<(u64, usize), String> {
+        let size = usize::try_from(self.environment_size)
+            .map_err(|_| "the environment size is not a size".to_string())?;
+        if self.environment == 0 || size == 0 {
+            return Err("the process has no environment block".into());
+        }
+        if size % 2 != 0 || size > MAX_ENV_BYTES {
+            return Err(format!("the environment block size {size} is not readable"));
+        }
+        Ok((self.environment, size))
+    }
+}
 
 #[cfg(all(target_pointer_width = "64", any(windows, test)))]
 const _: () = {
@@ -288,6 +442,20 @@ const _: () = {
     assert!(offset_of!(ProcessParameters, environment) == 0x80);
     assert!(offset_of!(ProcessParameters, current_directories) == 0xF0);
     assert!(offset_of!(ProcessParameters, environment_size) == 0x3F0);
+    // The 32-bit layouts (phnt at 4-byte pointers).
+    assert!(size_of::<UnicodeString32>() == 8);
+    assert!(size_of::<DriveLetterCurdir32>() == 16);
+    assert!(offset_of!(UnicodeString32, buffer) == 0x04);
+    assert!(offset_of!(ProcessParameters32, flags) == 0x08);
+    assert!(offset_of!(ProcessParameters32, current_directory) == 0x24);
+    assert!(offset_of!(ProcessParameters32, dll_path) == 0x30);
+    assert!(offset_of!(ProcessParameters32, image_path_name) == 0x38);
+    assert!(offset_of!(ProcessParameters32, command_line) == 0x40);
+    assert!(offset_of!(ProcessParameters32, environment) == 0x48);
+    assert!(offset_of!(ProcessParameters32, window_title) == 0x70);
+    assert!(offset_of!(ProcessParameters32, runtime_data) == 0x88);
+    assert!(offset_of!(ProcessParameters32, current_directories) == 0x90);
+    assert!(offset_of!(ProcessParameters32, environment_size) == 0x290);
 };
 
 #[cfg(windows)]
@@ -295,8 +463,8 @@ pub(crate) mod sys {
     use super::{cwd_path, decode_utf16, sid_in_token_user, split_environment, utf16_units};
     #[cfg(target_pointer_width = "64")]
     use super::{
-        ProcessBasicInformation, ProcessParameters, UnicodeString, MAX_ENV_BYTES, MAX_STRING_BYTES,
-        PARAMS_NORMALIZED, PEB_PROCESS_PARAMETERS,
+        Block, ProcessBasicInformation, ProcessParameters, ProcessParameters32, UnicodeString,
+        MAX_STRING_BYTES, PEB32_PROCESS_PARAMETERS, PEB_PROCESS_PARAMETERS,
     };
     use std::ffi::c_void;
     use std::io;
@@ -614,12 +782,13 @@ pub(crate) mod sys {
         }
     }
 
-    /// Another process's parameter block, read through its PEB. 64-bit
-    /// targets only: a 32-bit build cannot walk a 64-bit PEB.
+    /// Another process's parameter block, read through its PEB (its 32-bit
+    /// PEB for a WoW64 process). Built for 64-bit hosts only: a 32-bit build
+    /// cannot address a 64-bit process's memory.
     #[cfg(target_pointer_width = "64")]
     pub(crate) struct Remote<'a> {
         handle: &'a Handle,
-        block: ProcessParameters,
+        block: Block,
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -650,8 +819,9 @@ pub(crate) mod sys {
         Ok(())
     }
 
-    /// A plain-data struct read from another process. Only for the two
-    /// integer-only mirror structs above, for which every bit pattern is valid.
+    /// A plain-data struct read from another process. Only for the
+    /// integer-only mirror structs above (`ProcessBasicInformation`, and the
+    /// 64- and 32-bit parameter blocks), for which every bit pattern is valid.
     #[cfg(target_pointer_width = "64")]
     fn read_struct<T: Copy + Default>(handle: &Handle, address: u64) -> Result<T, String> {
         let mut value = T::default();
@@ -670,9 +840,11 @@ pub(crate) mod sys {
     #[cfg(target_pointer_width = "64")]
     impl<'a> Remote<'a> {
         /// Locates `handle`'s parameter block. `handle` needs
-        /// [`QUERY_LIMITED`] and [`VM_READ`]. A 32-bit (WoW64) process is
-        /// refused: its 64-bit PEB is not where it keeps its working
-        /// directory, and a wrong answer is worse than none.
+        /// [`QUERY_LIMITED`] and [`VM_READ`]. A 32-bit (WoW64) process keeps
+        /// its working directory in its 32-bit PEB, not the 64-bit one, so it
+        /// is read through that (`ProcessWow64Information` is its address)
+        /// and widened into the same [`Block`]. Anything that cannot be read
+        /// is refused: a wrong answer is worse than none.
         pub(crate) fn of(handle: &'a Handle) -> Result<Self, String> {
             let mut wow64 = 0usize;
             // SAFETY: `wow64` is a writable pointer-sized out-value, the
@@ -690,7 +862,25 @@ pub(crate) mod sys {
                 return Err(format!("NtQueryInformationProcess failed: {status:#x}"));
             }
             if wow64 != 0 {
-                return Err("a 32-bit process: its parameters are not read".into());
+                // A 32-bit PEB lies in the low 4 GiB; an address above that
+                // is not one.
+                let peb32 = u32::try_from(wow64)
+                    .map_err(|_| "the 32-bit PEB address is not a 32-bit address")?;
+                let mut pointer = [0u8; 4];
+                read_exact(
+                    handle,
+                    u64::from(peb32) + PEB32_PROCESS_PARAMETERS,
+                    &mut pointer,
+                )?;
+                let block_at = u32::from_le_bytes(pointer);
+                if block_at == 0 {
+                    return Err("the process has no parameter block".into());
+                }
+                let raw: ProcessParameters32 = read_struct(handle, u64::from(block_at))?;
+                return Ok(Self {
+                    handle,
+                    block: Block::from_wow64(&raw)?,
+                });
             }
             let mut basic = ProcessBasicInformation::default();
             // SAFETY: `basic` is a writable PROCESS_BASIC_INFORMATION of the
@@ -722,11 +912,11 @@ pub(crate) mod sys {
             if block_at == 0 {
                 return Err("the process has no parameter block".into());
             }
-            let block: ProcessParameters = read_struct(handle, block_at)?;
-            if block.flags & PARAMS_NORMALIZED == 0 {
-                return Err("the parameter block is not normalized".into());
-            }
-            Ok(Self { handle, block })
+            let raw: ProcessParameters = read_struct(handle, block_at)?;
+            Ok(Self {
+                handle,
+                block: Block::from_native(&raw)?,
+            })
         }
 
         fn string(&self, text: &UnicodeString, cap: usize) -> Result<Vec<u8>, String> {
@@ -793,16 +983,9 @@ pub(crate) mod sys {
         /// when the block's address or size is absent, odd or over
         /// [`MAX_ENV_BYTES`].
         pub(crate) fn env(&self) -> Result<Vec<String>, String> {
-            let size = usize::try_from(self.block.environment_size)
-                .map_err(|_| "the environment size is not a size")?;
-            if self.block.environment == 0 || size == 0 {
-                return Err("the process has no environment block".into());
-            }
-            if size % 2 != 0 || size > MAX_ENV_BYTES {
-                return Err(format!("the environment block size {size} is not readable"));
-            }
+            let (address, size) = self.block.environment_extent()?;
             let mut bytes = vec![0u8; size];
-            read_exact(self.handle, self.block.environment, &mut bytes)?;
+            read_exact(self.handle, address, &mut bytes)?;
             Ok(split_environment(&bytes))
         }
     }
@@ -872,6 +1055,148 @@ mod tests {
         );
         // The bound is inclusive: a string of exactly the cap is read.
         assert_eq!(UnicodeString::new(64, 64, 8).extent(64), Ok(Some((8, 64))));
+    }
+
+    /// The 32-bit header is the 64-bit one's rules at 4-byte pointers: the same
+    /// refusals, in the same order, from the one validation.
+    #[test]
+    fn a_32_bit_string_is_read_only_when_its_header_is_a_strings() {
+        let header = |length, maximum_length, buffer| {
+            UnicodeString::from(UnicodeString32 {
+                length,
+                maximum_length,
+                buffer,
+            })
+        };
+        assert_eq!(header(8, 10, 0x1000).extent(64), Ok(Some((0x1000, 8))));
+        // The whole 32-bit address space is representable.
+        assert_eq!(
+            header(8, 8, u32::MAX).extent(64),
+            Ok(Some((u64::from(u32::MAX), 8)))
+        );
+        assert_eq!(header(0, 0, 0).extent(64), Ok(None));
+        assert_eq!(
+            header(7, 8, 0x1000).extent(64),
+            Err(StringRefusal::OddLength)
+        );
+        assert_eq!(
+            header(12, 8, 0x1000).extent(64),
+            Err(StringRefusal::PastMaximum)
+        );
+        assert_eq!(
+            header(66, 66, 0x1000).extent(64),
+            Err(StringRefusal::TooLong)
+        );
+        assert_eq!(header(8, 8, 0).extent(64), Err(StringRefusal::NoBuffer));
+        assert_eq!(header(64, 64, 8).extent(64), Ok(Some((8, 64))));
+        // The real bound: Windows's longest command line (32,767 units, 65,534
+        // bytes) is under MAX_STRING_BYTES and is read; a cap one unit short of
+        // it refuses.
+        let longest = 65_534u16;
+        assert_eq!(
+            header(longest, u16::MAX, 8).extent(MAX_STRING_BYTES),
+            Ok(Some((8, usize::from(longest))))
+        );
+        assert_eq!(
+            header(longest, u16::MAX, 8).extent(usize::from(longest) - 2),
+            Err(StringRefusal::TooLong)
+        );
+    }
+
+    /// Bytes laid out at the offsets the 32-bit parameter block is documented
+    /// (phnt, at 4-byte pointers) to have, read back through the mirror: the
+    /// fields land where the readers will take them from.
+    #[test]
+    fn a_32_bit_parameter_block_is_read_from_its_documented_offsets() {
+        let mut image = vec![0u8; std::mem::size_of::<ProcessParameters32>()];
+        let put = |image: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            image[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut image, 0x08, &1u32.to_le_bytes());
+        // CurrentDirectory.DosPath: Length 6, MaximumLength 8, Buffer.
+        put(&mut image, 0x24, &6u16.to_le_bytes());
+        put(&mut image, 0x26, &8u16.to_le_bytes());
+        put(&mut image, 0x28, &0x0040_1000u32.to_le_bytes());
+        // CommandLine.
+        put(&mut image, 0x40, &10u16.to_le_bytes());
+        put(&mut image, 0x42, &12u16.to_le_bytes());
+        put(&mut image, 0x44, &0x0050_2000u32.to_le_bytes());
+        // Environment and EnvironmentSize.
+        put(&mut image, 0x48, &0x0060_3000u32.to_le_bytes());
+        put(&mut image, 0x290, &0x40u32.to_le_bytes());
+        assert_eq!(image.len(), 0x294);
+        let mut raw = ProcessParameters32::default();
+        // SAFETY: `raw` is a live ProcessParameters32 of integers only, so any
+        // bytes are a valid value; the copy is exactly its size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                image.as_ptr(),
+                (&mut raw as *mut ProcessParameters32).cast::<u8>(),
+                image.len(),
+            );
+        }
+        let block = Block::from_wow64(&raw).expect("a normalized block");
+        assert_eq!(
+            block.current_directory.extent(MAX_STRING_BYTES),
+            Ok(Some((0x0040_1000, 6)))
+        );
+        assert_eq!(
+            block.command_line.extent(MAX_STRING_BYTES),
+            Ok(Some((0x0050_2000, 10)))
+        );
+        assert_eq!(block.environment_extent(), Ok((0x0060_3000, 0x40)));
+    }
+
+    #[test]
+    fn a_block_whose_pointers_are_offsets_is_refused_at_either_width() {
+        let native = ProcessParameters::default();
+        let wow = ProcessParameters32::default();
+        assert!(Block::from_native(&native)
+            .unwrap_err()
+            .contains("not normalized"));
+        assert!(Block::from_wow64(&wow)
+            .unwrap_err()
+            .contains("not normalized"));
+        let native = ProcessParameters {
+            flags: PARAMS_NORMALIZED,
+            ..native
+        };
+        let wow = ProcessParameters32 {
+            flags: PARAMS_NORMALIZED,
+            ..wow
+        };
+        assert!(Block::from_native(&native).is_ok());
+        assert!(Block::from_wow64(&wow).is_ok());
+        // Other flag bits do not make one normalized.
+        let wow = ProcessParameters32 {
+            flags: 0xFFFF_FFFE,
+            ..wow
+        };
+        assert!(Block::from_wow64(&wow).is_err());
+    }
+
+    #[test]
+    fn an_environment_is_read_only_when_its_address_and_size_are_sane() {
+        let block = |environment, environment_size| Block {
+            current_directory: UnicodeString::default(),
+            command_line: UnicodeString::default(),
+            environment,
+            environment_size,
+        };
+        assert_eq!(block(0x1000, 64).environment_extent(), Ok((0x1000, 64)));
+        // Inclusive at the bound.
+        let max = MAX_ENV_BYTES as u64;
+        assert_eq!(
+            block(0x1000, max).environment_extent(),
+            Ok((0x1000, MAX_ENV_BYTES))
+        );
+        assert!(block(0x1000, max + 2).environment_extent().is_err());
+        // Odd, empty, and no address are refused, never read as an empty
+        // environment.
+        assert!(block(0x1000, 63).environment_extent().is_err());
+        assert!(block(0x1000, 0).environment_extent().is_err());
+        assert!(block(0, 64).environment_extent().is_err());
+        assert!(block(0x1000, u64::MAX).environment_extent().is_err());
     }
 
     #[test]

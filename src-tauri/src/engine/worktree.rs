@@ -9130,26 +9130,11 @@ mod tests {
         )
         .unwrap();
         assert!(merged.ok);
-        // Windows has a process scan, so no agent session stands in the way. What
-        // can is the live-process check (`processes_using`), which refuses
-        // unless every process of the user's can be read. Protected, elevated
-        // and other users' processes are counted, not unproven, but a 32-bit
-        // process of the user's has a parameter block the reader refuses
-        // (WoW64), and any host running one keeps the worktree and its branch
-        // rather than remove files from under a process it cannot rule out,
-        // saying why ("could not check for live processes"). A host with none
-        // removes the lane as everywhere else. Either is honest, so either
-        // passes; unverified on Windows (not run by its author).
-        if cfg!(windows) && !merged.worktree_removed {
-            let reason = merged.worktree_kept_reason.as_deref().unwrap_or_default();
-            assert!(
-                reason.contains("agent session") || reason.contains("process"),
-                "{merged:?}"
-            );
-            assert!(wt_clean.exists(), "the lane must be kept");
-        } else {
-            assert!(merged.worktree_removed);
-        }
+        // Every platform removes the merged lane: on Windows the process scan
+        // reads every same-user process (32-bit ones through their PEB32), so
+        // the live-process check can rule one out. That Windows expectation is
+        // not run locally; the Windows CI shards prove it.
+        assert!(merged.worktree_removed, "{merged:?}");
         assert!(merged.squashed_commit.is_some());
         assert_eq!(
             std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(),

@@ -4413,9 +4413,10 @@ mod os {
 /// or another user's, or `System`). That is an access-control refusal with a
 /// known cause, as Linux's `withheld_by_kernel` is: it is counted, not
 /// unproven. A process that opened but whose parameter block could not then
-/// be read (a 32-bit process, a block that is not normalised, a read that
-/// failed while it is still running) is the user's own and unexplained, which
-/// leaves it unproven.
+/// be read (a block that is not normalised, a read that failed while it is
+/// still running) is the user's own and unexplained, which leaves it
+/// unproven. A 32-bit (WoW64) process is not among them: its parameters are
+/// read through its 32-bit PEB (`winproc::Remote`).
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod os {
     use super::{
