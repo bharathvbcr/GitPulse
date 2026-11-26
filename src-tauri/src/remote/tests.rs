@@ -2,6 +2,9 @@
 //! delegating all protocol crypto, Noise IK, sliding replay window, cert,
 //! revocation, approval, and steering verification to `waylode-protocol`.
 
+// The Codex app server and the ptyd handoff run over Unix sockets; only the
+// Unix tests reach them.
+#[cfg(unix)]
 use super::codex_app_server::{
     refuse_remote_policy_change, reject_remote_policy_overrides, CodexAppServerClient,
     CodexApprovalPolicy, CodexError, CodexLaunchConfig, CodexSandboxMode,
@@ -19,6 +22,7 @@ use super::pty_gate::{
     sha256_hex, LossyPtyStreamBuffer, PtyGateDenial, PtyInputGate, SignedPtyInputRequest,
     MAX_PTY_CHUNK_BYTES,
 };
+#[cfg(unix)]
 use super::ptyd_handoff::{
     desktop_takeover_and_connect, HandoffRetryPolicy, PtydHandoffCoordinator, TakeoverPtydRequest,
     HANDOFF_GRACE,
