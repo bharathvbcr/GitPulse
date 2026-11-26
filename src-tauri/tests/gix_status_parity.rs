@@ -5,6 +5,7 @@
 mod common;
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -303,12 +304,14 @@ fn sparse_cone(root: &Path) -> PathBuf {
     write(&repo, "inside/new.txt", "x\n");
     repo
 }
+#[cfg(unix)]
 fn symlink_added(root: &Path) -> PathBuf {
     let repo = init(root);
     symlink("a.txt", repo.join("link")).expect("symlink");
     git(&repo, &["add", "link"]);
     repo
 }
+#[cfg(unix)]
 fn symlink_retargeted(root: &Path) -> PathBuf {
     let repo = symlink_added(root);
     git(&repo, &["commit", "-q", "-m", "link"]);
@@ -316,17 +319,20 @@ fn symlink_retargeted(root: &Path) -> PathBuf {
     symlink("b.txt", repo.join("link")).expect("symlink");
     repo
 }
+#[cfg(unix)]
 fn symlink_dangling_untracked(root: &Path) -> PathBuf {
     let repo = init(root);
     symlink("does-not-exist", repo.join("dangling")).expect("symlink");
     repo
 }
+#[cfg(unix)]
 fn file_became_symlink(root: &Path) -> PathBuf {
     let repo = init(root);
     fs::remove_file(repo.join("b.txt")).expect("rm");
     symlink("a.txt", repo.join("b.txt")).expect("symlink");
     repo
 }
+#[cfg(unix)]
 fn file_became_symlink_staged(root: &Path) -> PathBuf {
     let repo = file_became_symlink(root);
     git(&repo, &["add", "b.txt"]);
@@ -390,6 +396,7 @@ fn crlf_without_normalisation_is_a_change(root: &Path) -> PathBuf {
     write(&repo, "lf.txt", "one\r\ntwo\r\n");
     repo
 }
+#[cfg(unix)]
 fn exec_bit(root: &Path) -> PathBuf {
     let repo = init(root);
     let path = repo.join("a.txt");
@@ -398,6 +405,7 @@ fn exec_bit(root: &Path) -> PathBuf {
     fs::set_permissions(&path, perm).expect("chmod");
     repo
 }
+#[cfg(unix)]
 fn exec_bit_staged(root: &Path) -> PathBuf {
     let repo = exec_bit(root);
     git(&repo, &["add", "a.txt"]);
@@ -527,7 +535,8 @@ fn conflict_dd_au_ua_via_stages(root: &Path) -> PathBuf {
 
 fn cases() -> Vec<Case> {
     let c = |name, setup: fn(&Path) -> PathBuf| Case { name, setup };
-    vec![
+    #[allow(unused_mut)]
+    let mut all = vec![
         c("clean", clean),
         c("modified", modified),
         c("touched_unchanged (stale stat)", touched_unchanged),
@@ -557,11 +566,6 @@ fn cases() -> Vec<Case> {
         c("submodule_modified_content", submodule_modified_content),
         c("submodule_untracked_content", submodule_untracked_content),
         c("sparse_cone", sparse_cone),
-        c("symlink_added", symlink_added),
-        c("symlink_retargeted", symlink_retargeted),
-        c("symlink_dangling_untracked", symlink_dangling_untracked),
-        c("file_became_symlink", file_became_symlink),
-        c("file_became_symlink_staged", file_became_symlink_staged),
         c("case_rename_staged", case_rename_staged),
         c("case_rename_on_disk_only", case_rename_on_disk_only),
         c("crlf_autocrlf_true_clean", crlf_autocrlf_true_clean),
@@ -575,8 +579,6 @@ fn cases() -> Vec<Case> {
             "crlf_without_normalisation_is_a_change",
             crlf_without_normalisation_is_a_change,
         ),
-        c("exec_bit", exec_bit),
-        c("exec_bit_staged", exec_bit_staged),
         c("intent_to_add", intent_to_add),
         c(
             "intent_to_add_plus_staged_modify",
@@ -587,7 +589,21 @@ fn cases() -> Vec<Case> {
         c("merge_conflict_uu", merge_conflict_uu),
         c("merge_conflict_aa_du_ud", merge_conflict_aa_du_ud),
         c("conflict_dd_au_ua_via_stages", conflict_dd_au_ua_via_stages),
-    ]
+    ];
+    // Symlinks and the exec bit are unix file-system features: git on Windows
+    // records neither from a plain checkout (core.symlinks and core.filemode
+    // default to false there), so there is no git answer to compare against.
+    #[cfg(unix)]
+    all.extend([
+        c("symlink_added", symlink_added),
+        c("symlink_retargeted", symlink_retargeted),
+        c("symlink_dangling_untracked", symlink_dangling_untracked),
+        c("file_became_symlink", file_became_symlink),
+        c("file_became_symlink_staged", file_became_symlink_staged),
+        c("exec_bit", exec_bit),
+        c("exec_bit_staged", exec_bit_staged),
+    ]);
+    all
 }
 
 fn fmt(rows: &[Row]) -> String {
@@ -670,6 +686,8 @@ fn fsmonitor_hook_is_never_executed_by_gix_status() {
         "#!/bin/sh\n: > fsmonitor-executed\nprintf 'probe-token\\0'\n",
     )
     .expect("hook");
+    // Windows has no execute bit; the hook is a file git would hand to a shell.
+    #[cfg(unix)]
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("chmod");
     git(
         &repo,

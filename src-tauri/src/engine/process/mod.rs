@@ -89,9 +89,13 @@ pub(in crate::engine::process) use gate::{
 #[cfg_attr(not(unix), allow(unused_imports))]
 pub(crate) use gate::{
     frozen_gate, leak_gate, refusal_message, rev_parse_launches_from, spawn_log, spent_gate,
-    take_post_action_credit, with_background_budget_wait, with_gate_for_test, Refusal, SpawnGate,
+    take_post_action_credit, with_background_budget_wait, Refusal, SpawnGate,
     POST_ACTION_CREDIT_SPAWNS, SLOT_WAIT_SUFFIX,
 };
+// Its only callers are the devmap read-budget tests, which spawn real children
+// and are unix-only.
+#[cfg(all(test, unix))]
+pub(crate) use gate::with_gate_for_test;
 
 #[cfg(all(test, unix))]
 pub(crate) use gate::hold_credit_open;

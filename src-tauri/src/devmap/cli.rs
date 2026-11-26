@@ -759,8 +759,9 @@ impl ReadBudget {
         }
     }
 
-    /// (total, background) slots held now.
-    #[cfg(test)]
+    /// (total, background) slots held now. Its tests spawn real children and
+    /// are unix-only.
+    #[cfg(all(test, unix))]
     fn held_now(&self) -> (usize, usize) {
         let held = self
             .held
@@ -861,7 +862,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn with_read_budget<T>(budget: &'static ReadBudget, wait: Duration, body: impl FnOnce() -> T) -> T {
     let _restore = std::mem::DropGuard::new(
         (
@@ -3139,6 +3140,7 @@ exit 2
     }
 
     /// A budget shaped as the process's own, leaked so a test can hold slots.
+    #[cfg(unix)]
     fn production_shaped_budget() -> &'static ReadBudget {
         Box::leak(Box::new(ReadBudget::new(READ_SLOTS, BACKGROUND_READ_SLOTS)))
     }
