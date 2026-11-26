@@ -519,7 +519,13 @@ mockIPC(async (cmd, args) => {
 applyPlatformClass();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "quick-fixture" });
-window.addEventListener("error", e => crashes.push(e.message));
+window.addEventListener("error", e => {
+  // Chrome's ResizeObserver delivery notice carries no exception: it is the
+  // browser deferring a notification, not the board failing. An event with a
+  // real error attached still counts (isBrowserObserverNoise's contract).
+  if (!e.error && /^ResizeObserver loop (?:limit exceeded|completed with undelivered notifications)\.?$/.test(String(e.message || "").trim())) return;
+  crashes.push(e.message);
+});
 window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
 const root = document.getElementById("app");
 // The board's polls (a running Manvi suggestion, for one) pause while the
