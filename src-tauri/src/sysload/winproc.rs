@@ -573,6 +573,8 @@ pub(crate) mod sys {
     const TOKEN_QUERY: u32 = 0x0008;
     /// `TOKEN_INFORMATION_CLASS::TokenUser`.
     const TOKEN_USER: u32 = 1;
+    /// `TOKEN_INFORMATION_CLASS::TokenOwner`.
+    const TOKEN_OWNER: u32 = 4;
     /// `ProcessBasicInformation` and `ProcessWow64Information` of
     /// `PROCESSINFOCLASS` (`ntpsapi.h`).
     const PROCESS_BASIC_INFORMATION: u32 = 0;
@@ -783,6 +785,31 @@ pub(crate) mod sys {
     }
 
     fn token_user(process: *mut c_void) -> Option<Vec<u8>> {
+        token_sid(process, TOKEN_USER)
+    }
+
+    /// This process's own SIDs a file it makes can be owned by: its user
+    /// (`TokenUser`) and the default owner of what it creates (`TokenOwner`,
+    /// which an elevated administrator's token sets to Administrators). One
+    /// entry when the two are the same SID; empty when the token is unreadable.
+    pub(crate) fn own_token_sids() -> Vec<Vec<u8>> {
+        // SAFETY: GetCurrentProcess has no preconditions.
+        let me = unsafe { GetCurrentProcess() };
+        let mut sids: Vec<Vec<u8>> = Vec::with_capacity(2);
+        for sid in [token_sid(me, TOKEN_USER), token_sid(me, TOKEN_OWNER)]
+            .into_iter()
+            .flatten()
+        {
+            if !sids.contains(&sid) {
+                sids.push(sid);
+            }
+        }
+        sids
+    }
+
+    /// The SID a `TOKEN_USER` or `TOKEN_OWNER` class names: both are one
+    /// structure whose first field points at the SID stored after it.
+    fn token_sid(process: *mut c_void, class: u32) -> Option<Vec<u8>> {
         let mut token: *mut c_void = std::ptr::null_mut();
         // SAFETY: `process` is a live handle or the current-process pseudo
         // handle, and `token` is a writable out-pointer.
@@ -797,7 +824,7 @@ pub(crate) mod sys {
         let ok = unsafe {
             GetTokenInformation(
                 token.0,
-                TOKEN_USER,
+                class,
                 buffer.as_mut_ptr().cast(),
                 std::mem::size_of_val(&buffer) as u32,
                 &mut returned,
