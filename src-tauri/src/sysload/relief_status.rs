@@ -251,11 +251,19 @@ pub struct ReliefStatus {
     /// true; `why` says which). Never counted as paused, never a rung.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offers: Vec<FrozenTree>,
-    /// Trees the supervisor ended in this Severe episode, newest last
-    /// (`since_ms` is when they were ended). The command-gate hook tells the
-    /// agent they were ended and must not be re-run until pressure clears.
+    /// Trees the supervisor has been *confirmed* to have ended in this Severe
+    /// episode (every process it signalled is gone), newest last (`since_ms` is
+    /// when that was confirmed). The command-gate hook tells the agent they
+    /// were ended and must not be re-run until pressure clears.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ended: Vec<FrozenTree>,
+    /// Trees the supervisor has sent `SIGTERM` and whose grace is still
+    /// running: asked to end, not yet confirmed (`since_ms` is when it asked).
+    /// One leaves this list for `ended` when the kill pass confirms every
+    /// process is gone, and for nothing when a person's Resume cancels it or a
+    /// process cannot be ended (a failure is recorded instead).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ending: Vec<FrozenTree>,
 }
 
 impl ReliefStatus {
@@ -277,6 +285,7 @@ impl ReliefStatus {
             cap_hits: 0,
             offers: Vec::new(),
             ended: Vec::new(),
+            ending: Vec::new(),
         }
     }
 
@@ -300,6 +309,7 @@ impl ReliefStatus {
             || self.slowed > 0
             || !self.offers.is_empty()
             || !self.ended.is_empty()
+            || !self.ending.is_empty()
     }
 }
 
@@ -565,6 +575,40 @@ pub struct TargetRequest {
     /// The first process of the tree, as the status file published it.
     pub pid: u32,
     pub start_us: u64,
+    /// When that tree was paused or first offered (`FrozenTree::since_ms`): the
+    /// supervisor acts only on the tree it holds *now* with this identity, so a
+    /// stale request or banner never reaches a later pause of the same process.
+    /// Absent (0) in a file an older writer made, which names nothing.
+    #[serde(default)]
+    pub since_ms: u64,
+}
+
+/// What names one tree: its first process by pid and start time, and the moment
+/// it was paused or first offered. A process can be paused more than once; the
+/// moment tells those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeId {
+    pub pid: u32,
+    pub start_us: u64,
+    pub since_ms: u64,
+}
+
+impl TreeId {
+    /// The identity a published tree carries.
+    pub fn of(tree: &FrozenTree) -> Self {
+        Self {
+            pid: tree.pid,
+            start_us: tree.start_us,
+            since_ms: tree.since_ms,
+        }
+    }
+
+    /// Whether this could name a tree: an ordinary process id that fits a
+    /// `pid_t`, a start time, and a moment. 0, 1 and wrapped values never name
+    /// one, so a request cannot even ask for them.
+    fn plausible(self) -> bool {
+        self.pid > 1 && i32::try_from(self.pid).is_ok() && self.start_us != 0 && self.since_ms != 0
+    }
 }
 
 /// What a target request is for.
@@ -583,31 +627,24 @@ impl TargetKind {
     }
 }
 
-/// Whether `pid` could be the first process of a tree: an ordinary process id
-/// that fits a `pid_t`, with a start time. 0, 1 and wrapped values never name
-/// one, so a request cannot even ask for them.
-fn plausible_target(pid: u32, start_us: u64) -> bool {
-    pid > 1 && i32::try_from(pid).is_ok() && start_us != 0
+/// Asks the supervisor to end the paused tree `id`.
+pub fn request_terminate(reason: &str, id: TreeId) -> io::Result<()> {
+    request_target(TargetKind::Terminate, reason, id)
 }
 
-/// Asks the supervisor to end the paused tree `pid`/`start_us`.
-pub fn request_terminate(reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
-    request_target(TargetKind::Terminate, reason, pid, start_us)
+/// Asks the supervisor to pause the offered tree `id`.
+pub fn request_pause(reason: &str, id: TreeId) -> io::Result<()> {
+    request_target(TargetKind::Pause, reason, id)
 }
 
-/// Asks the supervisor to pause the offered tree `pid`/`start_us`.
-pub fn request_pause(reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
-    request_target(TargetKind::Pause, reason, pid, start_us)
-}
-
-fn request_target(kind: TargetKind, reason: &str, pid: u32, start_us: u64) -> io::Result<()> {
+fn request_target(kind: TargetKind, reason: &str, id: TreeId) -> io::Result<()> {
     let dir = default_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "there is no per-user config directory (HOME unset)",
         )
     })?;
-    request_target_in(&dir, kind, reason, pid, start_us, now_ms())
+    request_target_in(&dir, kind, reason, id, now_ms())
 }
 
 /// [`request_terminate`] / [`request_pause`] into `dir`, as of `now_ms`. A
@@ -616,14 +653,16 @@ pub fn request_target_in(
     dir: &Path,
     kind: TargetKind,
     reason: &str,
-    pid: u32,
-    start_us: u64,
+    id: TreeId,
     now_ms: u64,
 ) -> io::Result<()> {
-    if !plausible_target(pid, start_us) {
+    if !id.plausible() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("pid {pid} with start time {start_us} does not name a process tree"),
+            format!(
+                "pid {} with start time {} and pause time {} does not name a process tree",
+                id.pid, id.start_us, id.since_ms
+            ),
         ));
     }
     let reason: String = reason
@@ -634,8 +673,9 @@ pub fn request_target_in(
     let body = serde_json::to_vec(&TargetRequest {
         reason,
         at_ms: now_ms,
-        pid,
-        start_us,
+        pid: id.pid,
+        start_us: id.start_us,
+        since_ms: id.since_ms,
     })
     .map_err(io::Error::other)?;
     write_private_atomic(&dir.join(kind.file()), &body)
@@ -659,7 +699,18 @@ pub fn take_target_request(dir: &Path, kind: TargetKind, now_ms: u64) -> Option<
     let request: TargetRequest = serde_json::from_slice(&bytes).ok()?;
     let fresh = now_ms.saturating_sub(request.at_ms) <= REQUEST_TTL_MS
         && request.at_ms <= now_ms.saturating_add(FUTURE_SLACK_MS);
-    (fresh && plausible_target(request.pid, request.start_us)).then_some(request)
+    (fresh && request.id().plausible()).then_some(request)
+}
+
+impl TargetRequest {
+    /// The tree this request names.
+    pub fn id(&self) -> TreeId {
+        TreeId {
+            pid: self.pid,
+            start_us: self.start_us,
+            since_ms: self.since_ms,
+        }
+    }
 }
 
 /// [`take_target_request`] for a terminate request.
@@ -673,20 +724,26 @@ pub fn take_pause_request(dir: &Path, now_ms: u64) -> Option<TargetRequest> {
 }
 
 /// The identifier a relief banner about one tree is posted under:
-/// `<prefix>:<pid>:<start_us>`. macOS replaces a banner of the same identifier
-/// and the notification delegate sees nothing but this and the action's name,
-/// so the tree an "End it" or "Pause it" press is for travels in it.
-pub fn banner_id(prefix: &str, pid: u32, start_us: u64) -> String {
-    format!("{prefix}:{pid}:{start_us}")
+/// `<prefix>:<pid>:<start_us>:<since_ms>`. macOS replaces a banner of the same
+/// identifier and the notification delegate sees nothing but this and the
+/// action's name, so the tree an "End it" or "Pause it" press is for travels in
+/// it, with the moment it was paused (a stale banner never names a later pause
+/// of the same process).
+pub fn banner_id(prefix: &str, id: TreeId) -> String {
+    format!("{prefix}:{}:{}:{}", id.pid, id.start_us, id.since_ms)
 }
 
 /// The tree a banner identifier made by [`banner_id`] names, or `None` for an
 /// identifier that names none (or one that does not parse).
-pub fn banner_target(native: &str, prefix: &str) -> Option<(u32, u64)> {
+pub fn banner_target(native: &str, prefix: &str) -> Option<TreeId> {
     let rest = native.strip_prefix(prefix)?.strip_prefix(':')?;
-    let (pid, start) = rest.split_once(':')?;
-    let (pid, start_us) = (pid.parse::<u32>().ok()?, start.parse::<u64>().ok()?);
-    plausible_target(pid, start_us).then_some((pid, start_us))
+    let mut parts = rest.split(':');
+    let id = TreeId {
+        pid: parts.next()?.parse().ok()?,
+        start_us: parts.next()?.parse().ok()?,
+        since_ms: parts.next()?.parse().ok()?,
+    };
+    (parts.next().is_none() && id.plausible()).then_some(id)
 }
 
 #[cfg(test)]
@@ -1078,7 +1135,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for kind in [TargetKind::Terminate, TargetKind::Pause] {
             let path = dir.path().join(kind.file());
-            request_target_in(dir.path(), kind, "banner\u{7}", 4242, 7_000_000, 10_000).unwrap();
+            request_target_in(
+                dir.path(),
+                kind,
+                "banner\u{7}",
+                id(4242, 7_000_000, 9_000),
+                10_000,
+            )
+            .unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1094,19 +1158,20 @@ mod tests {
                     reason: "banner".into(),
                     at_ms: 10_000,
                     pid: 4242,
-                    start_us: 7_000_000
+                    start_us: 7_000_000,
+                    since_ms: 9_000,
                 }
             );
             assert!(!path.exists(), "taken means deleted");
             assert_eq!(take_target_request(dir.path(), kind, 10_000), None);
             // Expired, from the future, and not a request: dropped and deleted.
-            request_target_in(dir.path(), kind, "x", 4242, 7_000_000, 10_000).unwrap();
+            request_target_in(dir.path(), kind, "x", id(4242, 7_000_000, 9_000), 10_000).unwrap();
             assert_eq!(
                 take_target_request(dir.path(), kind, 10_000 + REQUEST_TTL_MS + 1),
                 None
             );
             assert!(!path.exists());
-            request_target_in(dir.path(), kind, "x", 4242, 7_000_000, 900_000).unwrap();
+            request_target_in(dir.path(), kind, "x", id(4242, 7_000_000, 9_000), 900_000).unwrap();
             assert_eq!(take_target_request(dir.path(), kind, 10_000), None);
             std::fs::write(&path, b"{nope").unwrap();
             make_private(&path);
@@ -1114,18 +1179,39 @@ mod tests {
             assert!(!path.exists());
         }
         // The two kinds never read each other's file.
-        request_target_in(dir.path(), TargetKind::Pause, "x", 4242, 7, 5).unwrap();
+        request_target_in(dir.path(), TargetKind::Pause, "x", id(4242, 7, 3), 5).unwrap();
         assert_eq!(take_terminate_request(dir.path(), 5), None);
         assert!(take_pause_request(dir.path(), 5).is_some());
+    }
+
+    fn id(pid: u32, start_us: u64, since_ms: u64) -> TreeId {
+        TreeId {
+            pid,
+            start_us,
+            since_ms,
+        }
     }
 
     #[test]
     fn a_target_that_cannot_be_a_process_tree_is_refused_by_writer_and_reader() {
         let dir = tempfile::tempdir().unwrap();
-        for (pid, start) in [(0, 5), (1, 5), (u32::MAX, 5), (4242, 0)] {
+        for (pid, start, since) in [
+            (0, 5, 5),
+            (1, 5, 5),
+            (u32::MAX, 5, 5),
+            (4242, 0, 5),
+            (4242, 5, 0),
+        ] {
             assert!(
-                request_target_in(dir.path(), TargetKind::Terminate, "x", pid, start, 1).is_err(),
-                "{pid}/{start}"
+                request_target_in(
+                    dir.path(),
+                    TargetKind::Terminate,
+                    "x",
+                    id(pid, start, since),
+                    1
+                )
+                .is_err(),
+                "{pid}/{start}/{since}"
             );
             // A file somebody else wrote by hand is refused as well.
             let path = dir.path().join(TERMINATE_REQUEST_FILE_NAME);
@@ -1134,30 +1220,42 @@ mod tests {
                 at_ms: 1,
                 pid,
                 start_us: start,
+                since_ms: since,
             })
             .unwrap();
             std::fs::write(&path, body).unwrap();
             make_private(&path);
-            assert_eq!(take_terminate_request(dir.path(), 1), None, "{pid}/{start}");
+            assert_eq!(
+                take_terminate_request(dir.path(), 1),
+                None,
+                "{pid}/{start}/{since}"
+            );
         }
     }
 
     #[test]
-    fn a_banner_identifier_carries_its_tree_and_nothing_else_parses() {
-        let id = banner_id("gitpulse.relief.paused", 4242, 1_700_000_000_000_000);
-        assert_eq!(
-            banner_target(&id, "gitpulse.relief.paused"),
-            Some((4242, 1_700_000_000_000_000))
+    fn a_banner_identifier_carries_its_tree_and_the_pause_it_was_raised_for() {
+        let tree = id(4242, 1_700_000_000_000_000, 1_700_000_100_000);
+        let text = banner_id("gitpulse.relief.paused", tree);
+        assert_eq!(banner_target(&text, "gitpulse.relief.paused"), Some(tree));
+        assert_eq!(banner_target(&text, "gitpulse.relief.offer"), None);
+        // A later pause of the same process is a different banner.
+        let later = banner_id(
+            "gitpulse.relief.paused",
+            id(4242, tree.start_us, tree.since_ms + 1),
         );
-        assert_eq!(banner_target(&id, "gitpulse.relief.offer"), None);
+        assert_ne!(text, later);
         for bad in [
             "gitpulse.relief.paused",
             "gitpulse.relief.paused:",
             "gitpulse.relief.paused:4242",
-            "gitpulse.relief.paused:x:1",
-            "gitpulse.relief.paused:1:5",
-            "gitpulse.relief.paused:4242:0",
-            "gitpulse.relief.paused:-4:5",
+            "gitpulse.relief.paused:4242:7",
+            "gitpulse.relief.paused:4242:7:0",
+            "gitpulse.relief.paused:4242:7:5:9",
+            "gitpulse.relief.paused:x:1:1",
+            "gitpulse.relief.paused:1:5:5",
+            "gitpulse.relief.paused:4242:0:5",
+            "gitpulse.relief.paused:-4:5:5",
         ] {
             assert_eq!(banner_target(bad, "gitpulse.relief.paused"), None, "{bad}");
         }

@@ -157,9 +157,9 @@ pub(super) enum ReliefTap {
     /// Resume everything.
     Resume,
     /// End the paused tree the banner names.
-    Terminate(u32, u64),
+    Terminate(crate::sysload::relief_status::TreeId),
     /// Pause the offered tree the banner names.
-    Pause(u32, u64),
+    Pause(crate::sysload::relief_status::TreeId),
     /// Open Settings (the Settings button and a click on the body).
     Settings,
     /// A button whose banner does not name a tree: nothing to act on.
@@ -172,8 +172,8 @@ pub(super) enum ReliefTap {
 /// does not name a plausible tree is [`ReliefTap::Ignore`], never a guess.
 pub(super) fn relief_tap(category: &str, action: &str, native: &str) -> ReliefTap {
     use crate::sysload::relief_status::banner_target;
-    let target = |prefix: &str, make: fn(u32, u64) -> ReliefTap| {
-        banner_target(native, prefix).map_or(ReliefTap::Ignore, |(pid, start)| make(pid, start))
+    let target = |prefix: &str, make: fn(crate::sysload::relief_status::TreeId) -> ReliefTap| {
+        banner_target(native, prefix).map_or(ReliefTap::Ignore, make)
     };
     match (category, action) {
         (platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION) => ReliefTap::Resume,
@@ -1119,12 +1119,20 @@ mod tests {
 
     #[test]
     fn a_relief_button_acts_on_the_tree_its_banner_names_and_on_nothing_else() {
-        let paused = crate::sysload::relief_status::banner_id(RELIEF_PAUSED_PREFIX, 4242, 77);
-        let offer = crate::sysload::relief_status::banner_id(RELIEF_OFFER_PREFIX, 4243, 78);
+        use crate::sysload::relief_status::TreeId;
+        let id = |pid, start_us, since_ms| TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        let paused =
+            crate::sysload::relief_status::banner_id(RELIEF_PAUSED_PREFIX, id(4242, 77, 5));
+        let offer = crate::sysload::relief_status::banner_id(RELIEF_OFFER_PREFIX, id(4243, 78, 6));
         let tap = relief_tap;
         assert_eq!(
             tap(platform::RELIEF_CATEGORY, RELIEF_TERMINATE_ACTION, &paused),
-            ReliefTap::Terminate(4242, 77)
+            ReliefTap::Terminate(id(4242, 77, 5)),
+            "the pause the banner was raised for travels with it"
         );
         assert_eq!(
             tap(platform::RELIEF_CATEGORY, RELIEF_RESUME_ACTION, &paused),
@@ -1132,7 +1140,7 @@ mod tests {
         );
         assert_eq!(
             tap(platform::RELIEF_OFFER_CATEGORY, RELIEF_PAUSE_ACTION, &offer),
-            ReliefTap::Pause(4243, 78)
+            ReliefTap::Pause(id(4243, 78, 6))
         );
         // The body click and the Settings button open Settings, on every banner.
         for category in [
@@ -1167,7 +1175,8 @@ mod tests {
             ),
             ReliefTap::Ignore
         );
-        let advice = crate::sysload::relief_status::banner_id(RELIEF_ADVICE_PREFIX, 4244, 79);
+        let advice =
+            crate::sysload::relief_status::banner_id(RELIEF_ADVICE_PREFIX, id(4244, 79, 7));
         assert_eq!(
             tap(
                 platform::RELIEF_ADVICE_CATEGORY,

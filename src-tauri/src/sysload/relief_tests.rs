@@ -40,6 +40,10 @@ struct Fake {
     /// n-th read of it (n is the value) and every later one finds it stopped.
     flip_on_read: Arc<Mutex<HashMap<i32, u32>>>,
     reads: Arc<Mutex<HashMap<i32, u32>>>,
+    /// Processes that exit on `SIGTERM` (the others ignore it).
+    exits_on_term: Arc<Mutex<HashSet<i32>>>,
+    /// Processes that survive even `SIGKILL` (a process stuck in the kernel).
+    survives_kill: Arc<Mutex<HashSet<i32>>>,
 }
 
 impl Fake {
@@ -156,10 +160,18 @@ impl Actuator for Fake {
                 match signal {
                     Signal::Stop => self.stopped.lock().unwrap().insert(pid),
                     Signal::Cont => self.stopped.lock().unwrap().remove(&pid),
-                    // The fake's processes ignore SIGTERM and die of SIGKILL.
-                    Signal::Term => false,
+                    // The fake's processes ignore SIGTERM (unless listed) and
+                    // die of SIGKILL (unless listed).
+                    Signal::Term => {
+                        if self.exits_on_term.lock().unwrap().contains(&pid) {
+                            self.live.lock().unwrap().remove(&pid);
+                        }
+                        false
+                    }
                     Signal::Kill => {
-                        self.live.lock().unwrap().remove(&pid);
+                        if !self.survives_kill.lock().unwrap().contains(&pid) {
+                            self.live.lock().unwrap().remove(&pid);
+                        }
                         self.stopped.lock().unwrap().remove(&pid)
                     }
                 };

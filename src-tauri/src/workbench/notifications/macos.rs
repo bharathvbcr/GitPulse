@@ -96,28 +96,24 @@ define_class!(
                             }
                         }),
                     ),
-                    super::ReliefTap::Terminate(pid, start_us) => spawn(
+                    super::ReliefTap::Terminate(id) => spawn(
                         "relief-terminate",
                         "pressure relief end request",
                         Box::new(move || {
-                            if let Err(error) = crate::sysload::relief_status::request_terminate(
-                                "notification",
-                                pid,
-                                start_us,
-                            ) {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_terminate("notification", id)
+                            {
                                 log::warn!(target:"workbench","end request from a banner was not written: {error}");
                             }
                         }),
                     ),
-                    super::ReliefTap::Pause(pid, start_us) => spawn(
+                    super::ReliefTap::Pause(id) => spawn(
                         "relief-pause",
                         "pressure relief pause request",
                         Box::new(move || {
-                            if let Err(error) = crate::sysload::relief_status::request_pause(
-                                "notification",
-                                pid,
-                                start_us,
-                            ) {
+                            if let Err(error) =
+                                crate::sysload::relief_status::request_pause("notification", id)
+                            {
                                 log::warn!(target:"workbench","pause request from a banner was not written: {error}");
                             }
                         }),

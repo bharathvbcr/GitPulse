@@ -1923,6 +1923,26 @@ mod relief {
         assert!(!context(&judged(HEAVY, &stale)).contains("ended by memory protection"));
     }
 
+    #[test]
+    fn a_tree_only_asked_to_end_is_not_said_to_be_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = with(
+            ReliefOutcome::Fresh {
+                status: ReliefStatus {
+                    rung: ReliefRung::Slow,
+                    binding: Some(ReliefBinding::CompressorSegments),
+                    ending: vec![tree(Some(OURS), "/elsewhere", false)],
+                    ..ReliefStatus::at_rest(ReliefMode::Act, 1)
+                },
+            },
+            dir.path(),
+        );
+        let text = context(&judged(HEAVY, &g));
+        assert!(text.contains("asked `cargo test --workspace`"), "{text}");
+        assert!(text.contains("not confirmed it ended yet"), "{text}");
+        assert!(!text.contains("ended by memory protection"), "{text}");
+    }
+
     fn told(g: &Gathered) -> bool {
         context(&judged(HEAVY, g)).contains("paused `cargo test")
     }

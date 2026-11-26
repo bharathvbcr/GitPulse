@@ -107,9 +107,11 @@ pub struct Notice {
     pub kind: NoticeKind,
     pub heading: &'static str,
     pub body: String,
-    /// The tree (`pid`, `start_us`) the banner is about, which its "End it" or
-    /// "Pause it" button acts on. Travels in the banner's identifier.
-    pub target: Option<(u32, u64)>,
+    /// The tree (pid, start time and the moment it was paused or offered) the
+    /// banner is about, which its "End it" or "Pause it" button acts on. Travels
+    /// in the banner's identifier, so a banner left on screen cannot reach a
+    /// later pause of the same process.
+    pub target: Option<relief_status::TreeId>,
 }
 
 impl Notice {
@@ -120,7 +122,7 @@ impl Notice {
     pub fn native_id(&self) -> String {
         use crate::workbench::notifications as n;
         let about = |prefix: &str| match self.target {
-            Some((pid, start_us)) => relief_status::banner_id(prefix, pid, start_us),
+            Some(id) => relief_status::banner_id(prefix, id),
             None => prefix.to_string(),
         };
         match self.kind {
@@ -288,7 +290,7 @@ fn pause_notice(status: &ReliefStatus, tree: &FrozenTree) -> Notice {
             gib(tree.footprint_bytes),
             repo_name(&tree.repo_path),
         ),
-        target: Some((tree.pid, tree.start_us)),
+        target: Some(relief_status::TreeId::of(tree)),
     }
 }
 
@@ -310,7 +312,7 @@ fn pause_notice_terminating(status: &ReliefStatus, tree: &FrozenTree) -> Notice 
             gib(tree.footprint_bytes),
             repo_name(&tree.repo_path),
         ),
-        target: Some((tree.pid, tree.start_us)),
+        target: Some(relief_status::TreeId::of(tree)),
     }
 }
 
@@ -327,7 +329,7 @@ fn offer_notice(tree: &FrozenTree) -> Notice {
                  does not trust that repository, so it will not pause the build.",
                 gib(tree.footprint_bytes),
             ),
-            target: Some((tree.pid, tree.start_us)),
+            target: Some(relief_status::TreeId::of(tree)),
         },
         _ => Notice {
             kind: NoticeKind::Offer,
@@ -337,7 +339,7 @@ fn offer_notice(tree: &FrozenTree) -> Notice {
                  GitPulse did not start that agent, so it asks first.",
                 gib(tree.footprint_bytes),
             ),
-            target: Some((tree.pid, tree.start_us)),
+            target: Some(relief_status::TreeId::of(tree)),
         },
     }
 }
@@ -819,7 +821,10 @@ mod tests {
         let one = with_offers(vec![offer(7, observed)]);
         let notice = episode.observe(&one, 1_000).expect("an offer is news");
         assert_eq!(notice.kind, NoticeKind::Offer);
-        assert_eq!(notice.target, Some((7, 507)));
+        assert_eq!(
+            notice.target,
+            Some(relief_status::TreeId::of(&offer(7, observed)))
+        );
         for needle in [
             "Memory is running out. Pause",
             "cargo test --workspace",
@@ -827,7 +832,7 @@ mod tests {
         ] {
             assert!(notice.body.contains(needle), "{needle}: {}", notice.body);
         }
-        assert_eq!(notice.native_id(), "gitpulse.relief.offer:7:507");
+        assert_eq!(notice.native_id(), "gitpulse.relief.offer:7:507:1");
         // Once per tree: the same offer standing is not announced again.
         assert!(episode.observe(&one, 1_000 + 10 * BANNER_GAP_MS).is_none());
         // A second tree inside the gap is held back, not forgotten.
@@ -836,7 +841,7 @@ mod tests {
         let second = episode
             .observe(&two, 1_000 + BANNER_GAP_MS)
             .expect("announced once the gap has passed");
-        assert_eq!(second.target, Some((8, 508)));
+        assert_eq!(second.target.map(|id| id.pid), Some(8));
         // The offers going away is its own reset: a later offer is news again.
         assert!(episode
             .observe(&rest(), 1_000 + 3 * BANNER_GAP_MS)
@@ -882,7 +887,7 @@ mod tests {
             ending.banner(),
             crate::workbench::notifications::ReliefBanner::Paused
         );
-        assert_eq!(ending.native_id(), "gitpulse.relief.paused:7:1");
+        assert_eq!(ending.native_id(), "gitpulse.relief.paused:7:1:1");
     }
 
     #[test]

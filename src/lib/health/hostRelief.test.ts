@@ -4,6 +4,7 @@ import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import HostReliefPanel from "../components/health/HostReliefPanel.svelte";
 import {
+  endRequestOutcome,
   hostRelief,
   loadHostRelief,
   pausedRows,
@@ -405,7 +406,64 @@ describe("reading and resuming", () => {
 
       vi.mocked(invoke).mockResolvedValueOnce(undefined);
       expect(await requestEndTree(target, vi.fn().mockResolvedValue(true))).toBe(true);
-      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_terminate", { pid: 4242, startUs: 7 });
+      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_terminate", {
+        pid: 4242,
+        startUs: 7,
+        sinceMs: NOW - 120_000,
+      });
+    });
+
+    it("an end request is only 'ended' once the supervisor confirmed it, and a refusal is shown", () => {
+      const target = tree();
+      const asked = NOW - 1_000;
+      // Requested, no answer yet: waiting, never ended.
+      expect(endRequestOutcome(status(), target, asked)).toEqual({ state: "waiting" });
+      // SIGTERM sent, not confirmed.
+      expect(
+        endRequestOutcome(status({ frozen: [], ending: [{ ...target, since_ms: NOW }] }), target, asked),
+      ).toEqual({ state: "ending" });
+      // Confirmed gone.
+      expect(
+        endRequestOutcome(status({ frozen: [], ended: [{ ...target, since_ms: NOW }] }), target, asked),
+      ).toEqual({ state: "ended" });
+      // An older ending of the same process is not this request's.
+      expect(
+        endRequestOutcome(status({ frozen: [], ended: [{ ...target, since_ms: asked - 5 }] }), target, asked).state,
+      ).toBe("waiting");
+      // Refused: the reason from the supervisor, for this tree only.
+      const refused = (detail: string) =>
+        status({ last_action: { at_ms: NOW, kind: "refused", detail } });
+      expect(
+        endRequestOutcome(
+          refused("a request to end pid 4242 was ignored: GitPulse is not holding that process tree paused"),
+          target,
+          asked,
+        ),
+      ).toEqual({
+        state: "refused",
+        detail: "a request to end pid 4242 was ignored: GitPulse is not holding that process tree paused",
+      });
+      expect(endRequestOutcome(refused("a request to end pid 999 was ignored"), target, asked).state).toBe(
+        "waiting",
+      );
+    });
+
+    it("lists what was asked to end apart from what was confirmed ended", () => {
+      const html = body(
+        fresh(
+          status({
+            frozen: [],
+            ending: [tree({ command: "cargo build" })],
+            ended: [tree({ pid: 77, command: "rustc big.rs" })],
+          }),
+        ),
+      );
+      expect(html).toContain('data-testid="host-relief-ending-row"');
+      expect(html).toContain("Not confirmed gone yet");
+      expect(html).toContain('data-testid="host-relief-ended-row"');
+      expect(html).toContain("confirmed gone");
+      expect(reliefHeadline(fresh(status({ frozen: [], ending: [tree()] })))).toContain("not confirmed gone yet");
+      expect(reliefIsCalm(fresh(status({ rung: "none", slowed: 0, frozen: [], ending: [tree()] })))).toBe(false);
     });
 
     it("pause asks first too, and names the same tree by pid and start time", async () => {
@@ -415,7 +473,11 @@ describe("reading and resuming", () => {
       expect(invoke).not.toHaveBeenCalled();
       vi.mocked(invoke).mockResolvedValueOnce(undefined);
       expect(await requestPauseTree(target, vi.fn().mockResolvedValue(true))).toBe(true);
-      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_pause", { pid: 5151, startUs: 9 });
+      expect(invoke).toHaveBeenLastCalledWith("cmd_host_relief_request_pause", {
+        pid: 5151,
+        startUs: 9,
+        sinceMs: NOW - 120_000,
+      });
     });
 
     it("an end request that could not be written is an error, never a quiet success", async () => {

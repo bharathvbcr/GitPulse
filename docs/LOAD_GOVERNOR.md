@@ -1050,31 +1050,47 @@ Two things start it, and nothing else:
    "When a paused build is still paused after 10 minutes, end it instead of
    resuming it", off by default, only meaningful in `act`, stored beside
    `host_load_supervisor`, never inside `host_load`; an unreadable value is
-   *no*). At `FREEZE_CAP`, a tree frozen for its whole ten minutes is ended; one
-   a person's pause froze later has not had its ten minutes and is resumed as
-   before. Not opted in, the cap behaves exactly as it always did (resume), and
+   *no*). At `FREEZE_CAP`, a tree *the relief itself* froze, for its whole ten
+   minutes, is ended. A tree a person's **Pause** froze is never ended by the
+   cap, opt-in or not: the confirm they answered says it resumes, so it is
+   resumed as before (they can still click **End**). So is one frozen later,
+   which has not had its ten minutes. Not opted in, the cap behaves exactly as it always did (resume), and
    the pause banner offers **End it**.
 2. **A person's request** (`host-relief-terminate.request`, below), whatever the
    opt-in says: the click is the consent.
 
 The ladder, per tree, never on the tick's own wait: re-read that the tree's
 first process still reads as **stopped by us** (one that reads as running was
-continued by somebody; it is not ours to end and is resumed instead), **`SIGCONT`
-every member** (a signal to a stopped process waits for the continue,
-`terminal/jobs.rs`), `SIGTERM`, then a grace of 10 s (`TERMINATE_GRACE`)
-counted on the tick's monotonic clock, then `SIGKILL` for what survived. Every
-signal goes through `procguard::signal::signal_process` (pid **and start time**
-must still match) and only to a member the journal still lists as `was_running`:
-the agent root, its tool shell, a process somebody else stopped (`left`) and
-anything the relief did not stop are never signalled. The tree leaves the frozen
-list at once; its journal entries stay until the kill pass is over, so a crash in
-between replays only `SIGCONT`. A person's **Resume** in the grace (the journal
-entries go), the setting leaving `act` or going off, or GitPulse stopping,
-abandons the pending kill. `last_action` has kind `terminate`; the command-gate
-hook tells the agent whose build it was that it "was ended by memory protection"
-and must not be re-run (or another started) until pressure clears, only while
-the status is fresh and the episode lasts (the supervisor forgets what it ended
-when the Severe episode ends).
+continued by somebody; it is not ours to end and is resumed instead), then **each
+member is read again** and only one that still reads as stopped, and that the
+journal lists as `was_running`, is a target (a member somebody continued, or
+stopped by hand, is left alone and recorded as a failure). **`SIGCONT` the
+targets** (a signal to a stopped process waits for the continue,
+`terminal/jobs.rs`), read each once more (one somebody stopped in between gets no
+`SIGTERM`), `SIGTERM`, then a grace of 10 s (`TERMINATE_GRACE`) counted on the
+tick's monotonic clock, then `SIGKILL` for what survived. Every signal goes
+through `procguard::signal::signal_process` (pid **and start time** must still
+match) and only to a member the journal still lists as `was_running`: the agent
+root, its tool shell, a process somebody else stopped (`left`) and anything the
+relief did not stop are never signalled. The tree leaves the frozen list at
+once; its journal entries stay until the kill pass is over, so a crash in between
+replays only `SIGCONT`.
+
+**Asked to end is not ended.** After `SIGTERM` the tree is in `ending` (the
+published `ending: FrozenTree[]`, `since_ms` is when it was asked). It moves to
+`ended` only when the kill pass has confirmed every process it signalled gone:
+early if `SIGTERM` was enough, otherwise after the grace and `SIGKILL`, re-read
+`KILL_CONFIRM` (2 s) later. A survivor of `SIGKILL`, a process that cannot be
+read, or one somebody else stopped is recorded in `failures` ("was not confirmed
+ended"), never as ended; nothing at all signalled is a failure too. A person's
+**Resume** in the grace (the journal entries go) cancels it: it is neither killed
+nor ended. The setting leaving `act` or going off, or GitPulse stopping, abandons
+the pending kill. `ending` is optional with a default, like `ended`. `last_action`
+has kind `terminate`; the command-gate hook tells the agent whose build it was
+that it was "asked to end" while the status says `ending`, and "ended by memory
+protection" (and must not be re-run, nor another started, until pressure clears)
+only for `ended`, while the status is fresh and the episode lasts (the supervisor
+forgets both when the Severe episode ends).
 
 Residual: the kill pass is driven by the tick, not the watchdog. A sampler that
 stalls between `SIGTERM` and the grace leaves a SIGTERM-ignoring process running
@@ -1111,10 +1127,14 @@ as paused.
 
 The two request files follow the resume request's contract (private 0600, atomic,
 `at_ms`, a 2-minute expiry, read and deleted by one `take_*` call per tick) and
-name their target by `pid` and `start_us`: a request for a tree the supervisor is
-not holding (paused for terminate, offered for pause), with a stale start time, or
-expired, is ignored and recorded as `refused`. The banner buttons carry the tree
-in the banner's identifier (`<prefix>:<pid>:<start_us>`), parsed by one pure
+name their target by `pid`, `start_us` and `since_ms` (when that pause or offer
+began; a request without it never matches): a request for a tree the supervisor is
+not holding (paused for terminate, offered for pause), with a stale start time,
+naming an earlier pause or offer of the same process (a banner or Health row left
+on screen must not end a later freeze), or expired, is ignored and recorded as
+`refused`. An offer keeps the time it was first offered across passes, so its
+identity survives refreshes. The banner buttons carry the tree
+in the banner's identifier (`<prefix>:<pid>:<start_us>:<since_ms>`), parsed by one pure
 function, and write the file off the notification delegate's thread. IPC:
 `cmd_host_relief_request_terminate` and `cmd_host_relief_request_pause`, main
 window only.

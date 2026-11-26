@@ -227,6 +227,9 @@ pub const WATCHDOG_GRACE: Duration = Duration::from_secs(60);
 /// How long a tree that was sent `SIGTERM` has to end before the survivors are
 /// sent `SIGKILL`, measured on the tick's monotonic clock.
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(10);
+/// How long after `SIGKILL` a tree is checked for survivors: a killed process
+/// is gone a moment later, not at the call.
+pub const KILL_CONFIRM: Duration = Duration::from_secs(2);
 /// Most offers published: each is screened (environments, working directories)
 /// when it is chosen.
 pub const MAX_OFFERS: usize = 8;
@@ -658,7 +661,12 @@ fn rises(values: &[f64], minimum: f64) -> bool {
         sorted.sort_by(f64::total_cmp);
         sorted[sorted.len() / 2]
     };
-    median(&values[values.len() - TREND_ENDS..]) - median(&values[..TREND_ENDS]) >= minimum
+    // The last `TREND_ENDS` readings: `rchunks` yields them first, and the length
+    // check above guarantees a full chunk.
+    let Some(last) = values.rchunks(TREND_ENDS).next() else {
+        return false;
+    };
+    median(last) - median(&values[..TREND_ENDS]) >= minimum
 }
 
 // ---------------------------------------------------------------------------
@@ -2101,6 +2109,9 @@ pub struct ReliefSnapshot {
     pub offers: Vec<FrozenSubtree>,
     /// Trees rung C ended in this Severe episode (`since_unix_ms` is when).
     pub ended: Vec<FrozenSubtree>,
+    /// Trees rung C has sent `SIGTERM` whose grace is still running
+    /// (`since_unix_ms` is when it asked): asked to end, not yet confirmed.
+    pub ending: Vec<FrozenSubtree>,
     /// Processes in the background because of the relief.
     pub slowed: u32,
     /// `advise` mode: the processes that would be slowed.
@@ -2124,6 +2135,7 @@ impl ReliefSnapshot {
             frozen: Vec::new(),
             offers: Vec::new(),
             ended: Vec::new(),
+            ending: Vec::new(),
             slowed: 0,
             would_slow: 0,
             last_action: None,
@@ -2337,17 +2349,25 @@ struct Frozen {
     /// Members somebody else had stopped already: left alone, never stopped,
     /// never continued, and not asked about again.
     left: BTreeSet<(i32, u64)>,
+    /// A person's "Pause" froze it (an agent GitPulse did not launch): rung C
+    /// never ends it on its own, only resumes it at the cap. A person's "End"
+    /// may still end it.
+    by_request: bool,
 }
 
 /// A tree rung C is ending: the part of the ladder after `SIGTERM`.
 #[derive(Debug, Clone)]
 struct Ending {
+    /// `since_unix_ms` is when `SIGTERM` was sent.
     info: FrozenSubtree,
-    /// The processes this relief stopped, and now sent `SIGTERM`: only these
-    /// are ever sent `SIGKILL`.
+    /// The processes this relief stopped, continued and sent `SIGTERM`: only
+    /// these are ever sent `SIGKILL`, and the tree is *ended* only when every
+    /// one of them is confirmed gone.
     targets: Vec<(i32, u64)>,
     /// When `SIGTERM` went, on the monotonic clock.
     termed_at: Instant,
+    /// When the survivors were sent `SIGKILL`; the confirmation follows.
+    killed_at: Option<Instant>,
 }
 
 /// A tree rung B would have paused, and may not unasked.
@@ -2831,6 +2851,7 @@ impl Relief {
             frozen: snapshot.frozen.iter().map(tree_of).collect(),
             offers: snapshot.offers.iter().map(tree_of).collect(),
             ended: snapshot.ended.iter().map(tree_of).collect(),
+            ending: snapshot.ending.iter().map(tree_of).collect(),
             last_action: snapshot.last_action.as_ref().map(|a| file::ReliefAction {
                 at_ms: a.at_unix_ms,
                 kind: match a.kind {
@@ -3152,6 +3173,7 @@ impl Relief {
         self.status.frozen = self.frozen.iter().map(|f| f.info.clone()).collect();
         self.status.offers = self.offers.iter().map(|o| o.info.clone()).collect();
         self.status.ended = self.ended.clone();
+        self.status.ending = self.ending.iter().map(|e| e.info.clone()).collect();
         self.status.rung = if !self.frozen.is_empty() {
             Rung::Freeze
         } else if self.slowed.is_empty() && self.status.would_slow == 0 && !self.trigger.slowing() {
@@ -3487,16 +3509,22 @@ impl Relief {
         })
     }
 
-    /// The freeze cap with the opt-in: trees frozen for the whole
-    /// [`FREEZE_CAP`] are ended; one frozen later (a person's pause) has not had
-    /// its ten minutes and is resumed as at any cap.
+    /// The freeze cap with the opt-in: trees the relief froze itself, for the
+    /// whole [`FREEZE_CAP`], are ended. One frozen later, and any a person's
+    /// "Pause" froze (the confirm they answered says it resumes), are resumed
+    /// as at any cap: rung C is for the relief's own freezes only.
     fn end_at_cap(&mut self, now: Instant) {
         let (old, young): (Vec<Frozen>, Vec<Frozen>) =
             std::mem::take(&mut self.frozen).into_iter().partition(|f| {
-                !f.info.advised_only && now.saturating_duration_since(f.since) >= FREEZE_CAP
+                !f.info.advised_only
+                    && !f.by_request
+                    && now.saturating_duration_since(f.since) >= FREEZE_CAP
             });
+        let resumes_some = !young.is_empty();
         self.frozen = young;
-        if !old.is_empty() {
+        // One cap event is one hit: when something is also resumed below,
+        // `resume_frozen` counts it.
+        if !old.is_empty() && !resumes_some {
             self.status.cap_hits = self.status.cap_hits.saturating_add(1);
         }
         for f in old {
@@ -3519,9 +3547,13 @@ impl Relief {
             <= super::relief_status::REQUEST_TTL_MS;
         let at = if act && fresh {
             self.frozen.iter().position(|f| {
+                // The freeze the person saw: a banner or Health row that is
+                // out of date names an earlier pause of the same process, and
+                // must not end a later one.
                 !f.info.advised_only
                     && u32::try_from(f.root.0) == Ok(request.pid)
                     && f.root.1 == request.start_us
+                    && f.info.since_unix_ms == request.since_ms
             })
         } else {
             None
@@ -3576,37 +3608,99 @@ impl Relief {
             }
         }
         // Never the agent, and only what the journal says was running when
-        // this relief stopped it.
-        let targets: Vec<(i32, u64)> = f
+        // this relief stopped it, and that still reads as stopped *now*, member
+        // by member: one somebody continued is not frozen by us any more.
+        let mut targets: Vec<(i32, u64)> = Vec::new();
+        for &(pid, start) in &f.members {
+            if pid == f.session.0 || !self.journaled_running(pid, start) {
+                continue;
+            }
+            match self.actuator.is_stopped(pid, start) {
+                Ok(true) => targets.push((pid, start)),
+                Ok(false) => self.fail(
+                    Some(pid),
+                    format!("pid {pid} was left alone: it is no longer stopped by us"),
+                ),
+                Err(error) if has_ended(&error) => {}
+                Err(error) => self.fail(
+                    Some(pid),
+                    format!("pid {pid} was left alone: its state could not be read: {error}"),
+                ),
+            }
+        }
+        if targets.is_empty() {
+            self.forget_targets(&f.members);
+            self.fail(
+                None,
+                format!(
+                    "{} was not ended: no process of it reads as stopped by this relief",
+                    f.info.command
+                ),
+            );
+            self.watch_frozen();
+            return;
+        }
+        // Continue first (a signal to a stopped process waits for it), then read
+        // each again: one somebody stopped in between is left alone.
+        self.continue_all(&targets);
+        let mut termed: Vec<(i32, u64)> = Vec::new();
+        for &(pid, start) in &targets {
+            match self.actuator.is_stopped(pid, start) {
+                Ok(false) => match self.actuator.signal(pid, start, Signal::Term) {
+                    Ok(Delivery::Delivered) => termed.push((pid, start)),
+                    Ok(Delivery::Gone) => {}
+                    Err(error) => {
+                        self.fail(Some(pid), format!("could not terminate pid {pid}: {error}"))
+                    }
+                },
+                Ok(true) => self.fail(
+                    Some(pid),
+                    format!("pid {pid} was left alone: somebody else has stopped it"),
+                ),
+                Err(error) if has_ended(&error) => {}
+                Err(error) => self.fail(
+                    Some(pid),
+                    format!("pid {pid} was left alone: its state could not be read: {error}"),
+                ),
+            }
+        }
+        if termed.is_empty() {
+            // Nothing was asked to end: that is a failure, never an ending.
+            self.forget_targets(&f.members);
+            self.fail(
+                None,
+                format!(
+                    "{} was not ended: no process could be sent SIGTERM",
+                    f.info.command
+                ),
+            );
+            self.watch_frozen();
+            return;
+        }
+        // The members that were not signalled are not this tree's to wait for.
+        let untargeted: Vec<(i32, u64)> = f
             .members
             .iter()
             .copied()
-            .filter(|&(pid, start)| pid != f.session.0 && self.journaled_running(pid, start))
+            .filter(|m| !termed.contains(m))
             .collect();
-        self.continue_all(&targets);
-        for &(pid, start) in &targets {
-            if let Err(error) = self.actuator.signal(pid, start, Signal::Term) {
-                self.fail(Some(pid), format!("could not terminate pid {pid}: {error}"));
-            }
-        }
+        self.forget_targets(&untargeted);
         let mut info = f.info.clone();
         info.since_unix_ms = unix_ms();
-        self.ended.push(info.clone());
-        let excess = self.ended.len().saturating_sub(MAX_ENDED);
-        self.ended.drain(..excess);
         self.note(
             ActionKind::Terminate,
             format!(
-                "ended {} ({} process(es)) in session {}: {why}",
+                "asked {} ({} process(es)) in session {} to end: {why}",
                 f.info.command,
-                targets.len(),
+                termed.len(),
                 f.info.session_id
             ),
         );
         self.ending.push(Ending {
             info,
-            targets,
+            targets: termed,
             termed_at: now,
+            killed_at: None,
         });
         self.watch_frozen();
     }
@@ -3630,9 +3724,14 @@ impl Relief {
         self.watch_frozen();
     }
 
-    /// The kill pass: for each tree whose grace has run out, `SIGKILL` the
-    /// processes of it that are still there, still the ones this relief
-    /// stopped, still journaled and not stopped by somebody else since.
+    /// Moves each ending along. A tree is *ended* only when every process it
+    /// signalled is confirmed gone: early if `SIGTERM` was enough, otherwise
+    /// after [`TERMINATE_GRACE`] the survivors (still the ones this relief
+    /// stopped, still journaled, not stopped by somebody else since) are sent
+    /// `SIGKILL` and checked again [`KILL_CONFIRM`] later. A survivor then, a
+    /// process that cannot be read, or one somebody else stopped is a failure
+    /// and never an ending; a person's Resume (the journal entries are gone)
+    /// cancels it.
     fn advance_endings(&mut self, now: Instant) {
         if self.ending.is_empty() {
             return;
@@ -3641,50 +3740,111 @@ impl Relief {
             self.ending.clear();
             return;
         }
-        let (due, waiting): (Vec<Ending>, Vec<Ending>) = std::mem::take(&mut self.ending)
-            .into_iter()
-            .partition(|e| now.saturating_duration_since(e.termed_at) >= TERMINATE_GRACE);
-        self.ending = waiting;
-        for e in due {
-            let mut killed = 0usize;
-            for &(pid, start) in &e.targets {
-                if !self.journaled_running(pid, start) {
-                    continue;
-                }
+        for mut e in std::mem::take(&mut self.ending) {
+            let ours: Vec<(i32, u64)> = e
+                .targets
+                .iter()
+                .copied()
+                .filter(|&(pid, start)| self.journaled_running(pid, start))
+                .collect();
+            if ours.is_empty() {
+                self.note(
+                    ActionKind::Resume,
+                    format!(
+                        "ending {} in session {} was cancelled: a person resumed it",
+                        e.info.command, e.info.session_id
+                    ),
+                );
+                continue;
+            }
+            // Who is still there: `running` can be killed, `stuck` cannot be
+            // read or was stopped by somebody else since.
+            let mut running: Vec<(i32, u64)> = Vec::new();
+            let mut stuck: Vec<i32> = Vec::new();
+            for &(pid, start) in &ours {
                 match self.actuator.is_stopped(pid, start) {
                     Err(error) if has_ended(&error) => {}
-                    Err(error) => self.fail(
-                        Some(pid),
-                        format!("pid {pid} was not killed: its state could not be read: {error}"),
-                    ),
-                    Ok(true) => self.fail(
-                        Some(pid),
-                        format!("pid {pid} was left alone: somebody else has stopped it"),
-                    ),
-                    Ok(false) => match self.actuator.signal(pid, start, Signal::Kill) {
-                        Ok(Delivery::Delivered) => killed += 1,
-                        Ok(Delivery::Gone) => {}
-                        Err(error) => {
-                            self.fail(Some(pid), format!("could not kill pid {pid}: {error}"))
-                        }
-                    },
+                    Err(error) => {
+                        self.fail(
+                            Some(pid),
+                            format!("pid {pid} could not be checked: its state could not be read: {error}"),
+                        );
+                        stuck.push(pid);
+                    }
+                    Ok(true) => {
+                        self.fail(
+                            Some(pid),
+                            format!("pid {pid} was left alone: somebody else has stopped it"),
+                        );
+                        stuck.push(pid);
+                    }
+                    Ok(false) => running.push((pid, start)),
                 }
             }
-            self.forget_targets(&e.targets);
-            self.note(
-                ActionKind::Terminate,
-                format!(
-                    "{} in session {} did not end within {} s: {killed} process(es) killed",
-                    e.info.command,
-                    e.info.session_id,
-                    TERMINATE_GRACE.as_secs()
-                ),
-            );
+            if running.is_empty() && stuck.is_empty() {
+                self.confirm_ended(&e);
+                continue;
+            }
+            match e.killed_at {
+                None if now.saturating_duration_since(e.termed_at) < TERMINATE_GRACE => {
+                    self.ending.push(e);
+                }
+                None => {
+                    for &(pid, start) in &running {
+                        match self.actuator.signal(pid, start, Signal::Kill) {
+                            Ok(_) => {}
+                            Err(error) => {
+                                self.fail(Some(pid), format!("could not kill pid {pid}: {error}"))
+                            }
+                        }
+                    }
+                    e.killed_at = Some(now);
+                    self.ending.push(e);
+                }
+                Some(at)
+                    if now.saturating_duration_since(at) < KILL_CONFIRM && stuck.is_empty() =>
+                {
+                    self.ending.push(e);
+                }
+                Some(_) => {
+                    // Still there after SIGKILL, or left alone: not ended.
+                    let mut left: Vec<i32> = running.iter().map(|&(pid, _)| pid).collect();
+                    left.extend(stuck);
+                    self.forget_targets(&e.targets);
+                    self.fail(
+                        None,
+                        format!(
+                            "{} in session {} was not confirmed ended: pid(s) {left:?} still there",
+                            e.info.command, e.info.session_id
+                        ),
+                    );
+                }
+            }
         }
     }
 
+    /// Every process the tree was sent `SIGTERM` is gone: it is ended.
+    fn confirm_ended(&mut self, e: &Ending) {
+        self.forget_targets(&e.targets);
+        let mut info = e.info.clone();
+        info.since_unix_ms = unix_ms();
+        self.ended.push(info);
+        let excess = self.ended.len().saturating_sub(MAX_ENDED);
+        self.ended.drain(..excess);
+        self.note(
+            ActionKind::Terminate,
+            format!(
+                "ended {} ({} process(es)) in session {}: confirmed gone",
+                e.info.command,
+                e.targets.len(),
+                e.info.session_id
+            ),
+        );
+    }
+
     /// Drops what is pending: the setting went off or left act. The processes
-    /// were continued and sent `SIGTERM`; nothing more is sent.
+    /// were continued and sent `SIGTERM`; nothing more is sent, and the tree is
+    /// not recorded as ended (nothing confirmed it).
     fn abandon_endings(&mut self, why: &str) {
         for e in std::mem::take(&mut self.ending) {
             self.forget_targets(&e.targets);
@@ -3726,7 +3886,11 @@ impl Relief {
         let Some(offer) = self
             .offers
             .iter()
-            .find(|o| u32::try_from(o.root.0) == Ok(request.pid) && o.root.1 == request.start_us)
+            .find(|o| {
+                u32::try_from(o.root.0) == Ok(request.pid)
+                    && o.root.1 == request.start_us
+                    && o.info.since_unix_ms == request.since_ms
+            })
             .cloned()
         else {
             return refuse(self, "it is not a tree GitPulse is offering to pause");
@@ -3778,6 +3942,10 @@ impl Relief {
             return refuse(self, "it could not be paused");
         }
         self.offers.retain(|o| o.root != offer.root);
+        if let Some(f) = self.frozen.last_mut() {
+            // Rung C never ends what a person's click paused.
+            f.by_request = true;
+        }
         // A pause the supervisor did not begin follows every normal resume rule
         // from now: the trigger starts counting its cap.
         if !self.trigger.frozen() {
@@ -3870,11 +4038,22 @@ impl Relief {
         // What rung B would have picked in a session it may not touch is
         // published as an offer, newest pass replacing the last.
         offered.sort_by_key(|(p, _)| (std::cmp::Reverse(p.footprint), p.root.pid));
+        // An offer keeps the moment it was first made while it stands, so a
+        // banner or Health row naming it still matches after a refresh.
+        let first_offered: HashMap<(i32, u64), u64> = self
+            .offers
+            .iter()
+            .map(|o| (o.root, o.info.since_unix_ms))
+            .collect();
         self.offers = offered
             .into_iter()
             .map(|(pick, why)| Offer {
                 info: FrozenSubtree {
                     why: Some(why),
+                    since_unix_ms: first_offered
+                        .get(&(pick.root.pid, pick.root.start_us))
+                        .copied()
+                        .unwrap_or_else(unix_ms),
                     ..frozen_info(&pick, true)
                 },
                 session: (pick.session_pid, pick.session_start_us),
@@ -3906,6 +4085,7 @@ impl Relief {
                     since: now,
                     holder: pick.holder,
                     left: BTreeSet::new(),
+                    by_request: false,
                 });
                 // Nothing is spent: advise stopped nothing, so the same build
                 // is still Act's to freeze the moment the mode changes.
@@ -4116,6 +4296,7 @@ impl Relief {
             since: now,
             holder: pick.holder,
             left,
+            by_request: false,
         });
         self.watch_frozen();
         true

@@ -77,8 +77,45 @@ export interface ReliefStatus {
   cap_hits: number;
   /** Trees the supervisor would have paused but may not unasked. Absent when none. */
   offers?: FrozenTree[];
-  /** Trees it ended in this Severe episode. Absent when none. */
+  /** Trees every process of which was confirmed gone. Absent when none. */
   ended?: FrozenTree[];
+  /** Trees it asked to end (SIGTERM sent, grace running), not yet confirmed. Absent when none. */
+  ending?: FrozenTree[];
+}
+
+/** The trees asked to end and not yet confirmed gone; absent from a file with none. */
+export function reliefEnding(status: ReliefStatus): FrozenTree[] {
+  return status.ending ?? [];
+}
+
+/** The trees confirmed ended; absent from a file with none. */
+export function reliefEnded(status: ReliefStatus): FrozenTree[] {
+  return status.ended ?? [];
+}
+
+const sameTree = (a: FrozenTree, b: FrozenTree) =>
+  a.pid === b.pid && a.start_us === b.start_us;
+
+/**
+ * What became of a request to end `tree`, read from the status published
+ * since. "ended" only when the supervisor confirmed it; "refused" carries its
+ * reason. "waiting" is the state before the supervisor has answered: it is
+ * never shown as done.
+ */
+export type EndRequestOutcome =
+  | { state: "waiting" }
+  | { state: "ending" }
+  | { state: "ended" }
+  | { state: "refused"; detail: string };
+
+export function endRequestOutcome(status: ReliefStatus, tree: FrozenTree, requestedAtMs: number): EndRequestOutcome {
+  if (reliefEnded(status).some((t) => sameTree(t, tree) && t.since_ms >= requestedAtMs)) return { state: "ended" };
+  if (reliefEnding(status).some((t) => sameTree(t, tree))) return { state: "ending" };
+  const last = status.last_action;
+  if (last && last.kind === "refused" && last.at_ms >= requestedAtMs && last.detail.includes(`pid ${tree.pid}`)) {
+    return { state: "refused", detail: last.detail };
+  }
+  return { state: "waiting" };
 }
 
 /** Why a status that claims activity cannot be relied on. */
@@ -115,6 +152,7 @@ export function reliefSummary(status: ReliefStatus): ReliefSummary {
   const offers = reliefOffers(status);
   const nothingDone =
     paused === 0 &&
+    reliefEnding(status).length === 0 &&
     status.slowed === 0 &&
     wouldPause.length === 0 &&
     status.would_slow === 0 &&
@@ -193,6 +231,8 @@ export function reliefNowLabel(status: ReliefStatus): string {
   const s = reliefSummary(status);
   const parts: string[] = [];
   if (s.paused > 0) parts.push(`${s.paused} build or test paused`);
+  const ending = reliefEnding(status).length;
+  if (ending > 0) parts.push(`${ending} build or test asked to end, not yet confirmed gone`);
   if (s.slowed > 0) parts.push(`${s.slowed} agent process(es) slowed`);
   if (parts.length > 0) return parts.join(", ");
   const would: string[] = [];
@@ -296,6 +336,16 @@ export function offerRows(status: ReliefStatus, now: number): OfferRow[] {
   });
 }
 
+/** One row per tree asked to end and not yet confirmed gone; `since` is when it was asked. */
+export function endingRows(status: ReliefStatus, now: number): PausedRow[] {
+  return reliefEnding(status).map((tree) => rowOf(tree, now));
+}
+
+/** One row per tree confirmed ended; `since` is when that was confirmed. */
+export function endedRows(status: ReliefStatus, now: number): PausedRow[] {
+  return reliefEnded(status).map((tree) => rowOf(tree, now));
+}
+
 /** What the confirm before "End" says: the command and what the agent will see. */
 export function endConfirmCopy(tree: FrozenTree): { title: string; message: string; confirmLabel: string } {
   return {
@@ -322,14 +372,22 @@ type Confirm = (options: { title: string; message: string; confirmLabel: string;
  */
 export async function requestEndTree(tree: FrozenTree, confirm: Confirm = askConfirm): Promise<boolean> {
   if (!(await confirm({ ...endConfirmCopy(tree), destructive: true }))) return false;
-  await invoke<void>("cmd_host_relief_request_terminate", { pid: tree.pid, startUs: tree.start_us });
+  await invoke<void>("cmd_host_relief_request_terminate", {
+    pid: tree.pid,
+    startUs: tree.start_us,
+    sinceMs: tree.since_ms,
+  });
   return true;
 }
 
 /** Asks the person first, then leaves the pause request for the supervisor. */
 export async function requestPauseTree(tree: FrozenTree, confirm: Confirm = askConfirm): Promise<boolean> {
   if (!(await confirm(pauseConfirmCopy(tree)))) return false;
-  await invoke<void>("cmd_host_relief_request_pause", { pid: tree.pid, startUs: tree.start_us });
+  await invoke<void>("cmd_host_relief_request_pause", {
+    pid: tree.pid,
+    startUs: tree.start_us,
+    sinceMs: tree.since_ms,
+  });
   return true;
 }
 
@@ -356,6 +414,10 @@ export function reliefHeadline(outcome: ReliefOutcome | null): string {
     case "fresh": {
       const s = reliefSummary(outcome.status);
       if (s.paused > 0) return `${s.paused} build or test paused by memory protection. It resumes automatically.`;
+      const ending = reliefEnding(outcome.status).length;
+      if (ending > 0) {
+        return `${ending} build or test asked to end by memory protection. It is not confirmed gone yet.`;
+      }
       if (s.slowed > 0) return `${s.slowed} agent process(es) slowed; nothing is paused.`;
       if (s.offers.length > 0) {
         return `Memory is tight. ${s.offers.length} build or test could be paused if you ask. GitPulse pauses nothing in an agent it did not start without your say-so.`;

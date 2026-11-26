@@ -422,9 +422,18 @@ pub async fn cmd_host_relief_request_resume() -> Result<(), IpcError> {
 /// expires in two minutes, and only processes it journaled as running are
 /// signalled).
 #[tauri::command(async)]
-pub async fn cmd_host_relief_request_terminate(pid: u32, start_us: u64) -> Result<(), IpcError> {
+pub async fn cmd_host_relief_request_terminate(
+    pid: u32,
+    start_us: u64,
+    since_ms: u64,
+) -> Result<(), IpcError> {
     off_thread(move || {
-        crate::sysload::relief_status::request_terminate("health", pid, start_us).map_err(|error| {
+        let id = crate::sysload::relief_status::TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        crate::sysload::relief_status::request_terminate("health", id).map_err(|error| {
             CommandError::from(format!("the end request was not written: {error}"))
         })
     })
@@ -441,9 +450,18 @@ pub async fn cmd_host_relief_request_terminate(pid: u32, start_us: u64) -> Resul
 /// pause ends by every normal resume rule. This IPC is granted to the main
 /// window only.
 #[tauri::command(async)]
-pub async fn cmd_host_relief_request_pause(pid: u32, start_us: u64) -> Result<(), IpcError> {
+pub async fn cmd_host_relief_request_pause(
+    pid: u32,
+    start_us: u64,
+    since_ms: u64,
+) -> Result<(), IpcError> {
     off_thread(move || {
-        crate::sysload::relief_status::request_pause("health", pid, start_us).map_err(|error| {
+        let id = crate::sysload::relief_status::TreeId {
+            pid,
+            start_us,
+            since_ms,
+        };
+        crate::sysload::relief_status::request_pause("health", id).map_err(|error| {
             CommandError::from(format!("the pause request was not written: {error}"))
         })
     })

@@ -68,8 +68,10 @@ mod ending {
         assert_eq!(last.kind, ActionKind::Terminate, "{last:?}");
         assert_eq!(rig.relief.status.cap_hits, 1);
         assert!(rig.relief.status.frozen.is_empty());
-        assert_eq!(rig.relief.status.ended.len(), 1);
-        assert_eq!(rig.relief.status.ended[0].command, "cargo");
+        // Asked, not yet ended: nothing is confirmed gone.
+        assert!(rig.relief.status.ended.is_empty());
+        assert_eq!(rig.relief.status.ending.len(), 1);
+        assert_eq!(rig.relief.status.ending[0].command, "cargo");
         // The grace is measured on the tick and never waited for: nothing is
         // killed before it has run out.
         for _ in 0..(TERMINATE_GRACE.as_secs() / STEP.as_secs() - 1) {
@@ -88,6 +90,14 @@ mod ending {
             [Call::Kill(102), Call::Kill(103)],
             "survivors are killed once the grace is over"
         );
+        assert!(
+            rig.relief.status.ended.is_empty(),
+            "not before it is checked"
+        );
+        rig.tick(&severe(20_000), &table);
+        assert_eq!(rig.relief.status.ended.len(), 1);
+        assert_eq!(rig.relief.status.ended[0].command, "cargo");
+        assert!(rig.relief.status.ending.is_empty());
         for pid in [100, 101] {
             assert!(
                 !rig.fake.calls().iter().any(|c| matches!(
@@ -155,16 +165,32 @@ mod ending {
         );
     }
 
-    fn request(rig: &Rig, pid: u32, start: u64, at: u64) {
+    /// The pause the person is looking at: the frozen tree rooted at `pid`.
+    fn seen_since(rig: &Rig, pid: u32) -> u64 {
+        rig.relief
+            .frozen
+            .iter()
+            .find(|f| u32::try_from(f.root.0) == Ok(pid))
+            .map_or(5, |f| f.info.since_unix_ms)
+    }
+
+    fn request_seen(rig: &Rig, pid: u32, start: u64, since: u64, at: u64) {
         file::request_target_in(
             rig.dir.path(),
             file::TargetKind::Terminate,
             "health",
-            pid,
-            start,
+            file::TreeId {
+                pid,
+                start_us: start,
+                since_ms: since,
+            },
             at,
         )
         .unwrap();
+    }
+
+    fn request(rig: &Rig, pid: u32, start: u64, at: u64) {
+        request_seen(rig, pid, start, seen_since(rig, pid), at);
     }
 
     #[test]
@@ -213,10 +239,12 @@ mod ending {
             .path()
             .join(file::TERMINATE_REQUEST_FILE_NAME)
             .exists());
-        // The published file names what was ended, for the hook.
+        // The published file names what was asked to end, for the hook; it is
+        // not "ended" until the kill pass has confirmed it.
         let status = published(&rig);
-        assert_eq!(status.ended.len(), 1);
-        assert_eq!(status.ended[0].pid, 202);
+        assert!(status.ended.is_empty());
+        assert_eq!(status.ending.len(), 1);
+        assert_eq!(status.ending[0].pid, 202);
         assert_eq!(status.paused_count(), 1);
     }
 
@@ -244,16 +272,32 @@ mod ending {
         table
     }
 
-    fn pause_request(rig: &Rig, pid: u32, start: u64) {
+    fn pause_request_seen(rig: &Rig, pid: u32, start: u64, since: u64) {
         file::request_target_in(
             rig.dir.path(),
             file::TargetKind::Pause,
             "banner",
-            pid,
-            start,
+            file::TreeId {
+                pid,
+                start_us: start,
+                since_ms: since,
+            },
             file::now_ms(),
         )
         .unwrap();
+    }
+
+    /// The offer the person is looking at, by root pid (5 when there is none).
+    fn offered_since(rig: &Rig, pid: u32) -> u64 {
+        rig.relief
+            .offers
+            .iter()
+            .find(|o| u32::try_from(o.root.0) == Ok(pid))
+            .map_or(5, |o| o.info.since_unix_ms)
+    }
+
+    fn pause_request(rig: &Rig, pid: u32, start: u64) {
+        pause_request_seen(rig, pid, start, offered_since(rig, pid));
     }
 
     #[test]
@@ -361,12 +405,201 @@ mod ending {
                 since: rig.now,
                 holder: false,
                 left: BTreeSet::new(),
+                by_request: false,
             })
             .collect();
         pause_request(&rig, 102, 1_000_102);
         rig.tick(&severe(9000), &table);
         assert!(rig.fake.stops().is_empty());
         rig.relief.frozen.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // The fix round: a person's Pause is never auto-ended; ending is not ended;
+    // one cap event is one hit; identity includes the pause.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_tree_a_person_paused_is_only_resumed_at_the_cap_even_when_opted_in() {
+        let table = observed();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        live_all(&rig, &table);
+        rig.ticks(SEVERE_SAMPLES as usize + 5, rising(100), &table);
+        pause_request(&rig, 102, 1_000_102);
+        rig.tick(&severe(9000), &table);
+        assert_eq!(rig.fake.stops(), [102, 103]);
+        to_the_cap(&mut rig, &table);
+        rig.ticks(10, |_| severe(20_000), &table);
+        let calls = after_freeze(&rig);
+        assert_eq!(
+            calls,
+            [Call::Cont(103), Call::Cont(102)],
+            "the confirm the person answered said it resumes: {calls:?}"
+        );
+        let last = rig.relief.status.last_action.clone().unwrap();
+        assert_eq!(last.kind, ActionKind::CapResume, "{last:?}");
+        assert!(rig.relief.status.ended.is_empty());
+        assert!(rig.relief.status.ending.is_empty());
+        assert_eq!(rig.relief.status.cap_hits, 1);
+    }
+
+    #[test]
+    fn sigterm_that_was_enough_is_ended_only_once_it_is_confirmed_gone() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        frozen_standard(&mut rig, &table);
+        rig.fake.exits_on_term.lock().unwrap().extend([102, 103]);
+        to_the_cap(&mut rig, &table);
+        let status = published(&rig);
+        assert!(status.ended.is_empty(), "asked, not confirmed: {status:?}");
+        assert_eq!(status.ending.len(), 1);
+        rig.tick(&severe(20_000), &table);
+        let status = published(&rig);
+        assert_eq!(status.ended.len(), 1, "{status:?}");
+        assert!(status.ending.is_empty());
+        assert!(
+            !after_freeze(&rig)
+                .iter()
+                .any(|c| matches!(c, Call::Kill(_))),
+            "nothing needed killing"
+        );
+        assert!(no_freeze_entries(&rig));
+    }
+
+    #[test]
+    fn a_survivor_of_sigkill_is_a_failure_never_an_ending() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        frozen_standard(&mut rig, &table);
+        rig.fake.survives_kill.lock().unwrap().insert(103);
+        to_the_cap(&mut rig, &table);
+        let before = rig.relief.status.failure_count;
+        let grace = TERMINATE_GRACE.as_secs() / STEP.as_secs();
+        let confirm = KILL_CONFIRM.as_secs() / STEP.as_secs();
+        rig.ticks((grace + confirm + 2) as usize, |_| severe(20_000), &table);
+        let status = published(&rig);
+        assert!(status.ended.is_empty(), "{status:?}");
+        assert!(status.ending.is_empty(), "no longer pending: {status:?}");
+        assert!(rig.relief.status.failure_count > before);
+        let what = &status.failures.last().unwrap().what;
+        assert!(what.contains("not confirmed ended"), "{what}");
+    }
+
+    #[test]
+    fn a_resume_cancels_an_ending_and_it_is_neither_killed_nor_ended() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        frozen_standard(&mut rig, &table);
+        to_the_cap(&mut rig, &table);
+        file::request_resume_in(rig.dir.path(), "banner", file::now_ms()).unwrap();
+        rig.ticks(
+            (TERMINATE_GRACE.as_secs() / STEP.as_secs() + 3) as usize,
+            |_| severe(20_000),
+            &table,
+        );
+        let status = published(&rig);
+        assert!(status.ended.is_empty(), "{status:?}");
+        assert!(status.ending.is_empty());
+        assert!(!after_freeze(&rig)
+            .iter()
+            .any(|c| matches!(c, Call::Kill(_))));
+    }
+
+    #[test]
+    fn a_member_somebody_continued_is_left_alone_and_the_rest_is_still_ended() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        frozen_standard(&mut rig, &table);
+        // Somebody continued the build's child by hand; the root is still ours.
+        rig.fake.stopped.lock().unwrap().remove(&103);
+        to_the_cap(&mut rig, &table);
+        let calls = after_freeze(&rig);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::Cont(103) | Call::Term(103) | Call::Kill(103))),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&Call::Term(102)), "{calls:?}");
+    }
+
+    #[test]
+    fn a_member_somebody_stopped_between_the_continue_and_the_term_gets_no_term() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        frozen_standard(&mut rig, &table);
+        // The 2nd read of 103 from here on (the one after our SIGCONT) finds it
+        // stopped, as a debugger attaching would.
+        rig.fake.flip_on_read.lock().unwrap().insert(103, 2);
+        rig.fake.reads.lock().unwrap().insert(103, 0);
+        request(&rig, 102, 1_000_102, file::now_ms());
+        rig.tick(&severe(9000), &table);
+        let calls = after_freeze(&rig);
+        assert!(!calls.contains(&Call::Term(103)), "{calls:?}");
+        assert!(calls.contains(&Call::Term(102)), "{calls:?}");
+        assert!(rig.fake.is_stopped_now(103));
+    }
+
+    #[test]
+    fn one_cap_event_is_one_hit_even_when_one_tree_is_ended_and_another_resumed() {
+        let table = two_sessions();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        opted_in(&mut rig);
+        live_all(&rig, &table);
+        rig.ticks(SEVERE_SAMPLES as usize, rising(100), &table);
+        assert_eq!(rig.relief.frozen.len(), 2);
+        // The second session was frozen later: it only resumes at the cap.
+        rig.relief.frozen[1].since = rig.now + FREEZE_CAP / 2;
+        to_the_cap(&mut rig, &table);
+        assert_eq!(rig.relief.status.cap_hits, 1);
+    }
+
+    #[test]
+    fn a_request_naming_an_earlier_pause_of_the_same_process_ends_nothing() {
+        let table = standard();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        frozen_standard(&mut rig, &table);
+        let stale = seen_since(&rig, 102) + 1;
+        request_seen(&rig, 102, 1_000_102, stale, file::now_ms());
+        rig.tick(&severe(9000), &table);
+        assert_eq!(after_freeze(&rig), []);
+        assert_eq!(rig.relief.frozen.len(), 1);
+        assert_eq!(
+            rig.relief.status.last_action.as_ref().unwrap().kind,
+            ActionKind::Refused
+        );
+        // So is one naming a pause long before this one.
+        request_seen(&rig, 102, 1_000_102, 1, file::now_ms());
+        rig.tick(&severe(9000), &table);
+        assert_eq!(after_freeze(&rig), []);
+    }
+
+    #[test]
+    fn a_pause_request_naming_an_earlier_offer_pauses_nothing_and_an_offer_keeps_its_identity() {
+        let table = observed();
+        let mut rig = publishing_rig(SupervisorMode::Act);
+        live_all(&rig, &table);
+        rig.ticks(SEVERE_SAMPLES as usize + 5, rising(100), &table);
+        let first = offered_since(&rig, 102);
+        rig.ticks(5, |_| severe(9000), &table);
+        assert_eq!(
+            offered_since(&rig, 102),
+            first,
+            "the same offer across ticks is the same offer"
+        );
+        pause_request_seen(&rig, 102, 1_000_102, first + 1);
+        rig.tick(&severe(9000), &table);
+        assert!(rig.fake.stops().is_empty());
+        assert_eq!(
+            rig.relief.status.last_action.as_ref().unwrap().kind,
+            ActionKind::Refused
+        );
     }
 }
 

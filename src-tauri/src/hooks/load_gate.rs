@@ -825,6 +825,20 @@ fn relief_text(status: &ReliefStatus, g: &Gathered) -> Option<String> {
             status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
         ));
     }
+    // Asked to end (SIGTERM sent, the grace running) is not yet ended: the
+    // build may still be exiting, and the text says only what is known.
+    if let Some(tree) = status.ending.iter().rev().find(|tree| is_mine(tree)) {
+        let command = clip(
+            &crate::alerts::text::sanitize(&tree.command),
+            MAX_ECHOED_COMMAND,
+        );
+        return Some(format!(
+            "GitPulse's memory protection asked `{command}` (pid {}) to end because {}; it has not confirmed it ended yet. \
+             Do not re-run it, and do not start it or another build in parallel, until memory pressure clears.",
+            tree.pid,
+            status.binding.map_or("memory is nearly exhausted", relief_status::ReliefBinding::phrase)
+        ));
+    }
     let mine = status.paused().find(|tree| is_mine(tree));
     if let Some(tree) = mine {
         let command = clip(

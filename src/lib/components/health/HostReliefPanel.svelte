@@ -1,5 +1,7 @@
 <script lang="ts">
   import {
+    endedRows,
+    endingRows,
     offerRows,
     pausedRows,
     reliefBindingLabel,
@@ -54,6 +56,8 @@
   );
   const rows = $derived(status ? pausedRows(status, now) : []);
   const offers = $derived(status ? offerRows(status, now) : []);
+  const ending = $derived(status ? endingRows(status, now) : []);
+  const ended = $derived(status ? endedRows(status, now) : []);
   // End and Pause are acted on by the supervisor, so they are offered only
   // while its status is current: a stale one may belong to a supervisor that is
   // gone, and nothing would answer.
@@ -132,6 +136,33 @@
                 End
               </button>
             {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if ending.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-ending">
+        {#each ending as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-ending-row">
+            <div class="font-mono text-textPrimary break-all">{row.command}</div>
+            <div class="text-textMuted">
+              {row.repo} · {row.agent} · asked to end <span data-testid="host-relief-ending-since">{row.since}</span>.
+              Not confirmed gone yet.
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
+    {#if ended.length > 0}
+      <ul class="space-y-1.5" data-testid="host-relief-ended">
+        {#each ended as row (row.key)}
+          <li class="rounded-xl border border-edge bg-surface px-3 py-2" data-testid="host-relief-ended-row">
+            <div class="font-mono text-textPrimary break-all">{row.command}</div>
+            <div class="text-textMuted">
+              {row.repo} · {row.agent} · ended, confirmed gone <span data-testid="host-relief-ended-since">{row.since}</span>
+            </div>
           </li>
         {/each}
       </ul>
