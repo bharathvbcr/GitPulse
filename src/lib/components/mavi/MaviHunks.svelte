@@ -56,7 +56,7 @@
 
 <div class="mavi-hunks font-mono text-meta select-text" role="table" aria-label="Changes">
   {#each blocks.out as block, b (b)}
-    <div class="px-2 py-0.5 text-micro text-faint bg-surfaceHover" role="row">{block.header}</div>
+    <div class="mavi-hunk-head px-2.5 py-1 text-micro text-textMuted" role="row">{block.header}</div>
     {#each block.lines as line, i (i)}
       <div
         class="mavi-line flex"
@@ -65,8 +65,8 @@
         role="row"
       >
         {#if numbered}
-          <span class="mavi-num text-faint" aria-hidden="true">{line.old ?? ""}</span>
-          <span class="mavi-num text-faint" aria-hidden="true">{line.new ?? ""}</span>
+          <span class="mavi-num text-faint tabular-nums" aria-hidden="true">{line.old ?? ""}</span>
+          <span class="mavi-num text-faint tabular-nums" aria-hidden="true">{line.new ?? ""}</span>
         {/if}
         <span
           class="mavi-sign"
@@ -79,7 +79,7 @@
     {/each}
   {/each}
   {#if blocks.hidden > 0}
-    <div class="px-2 py-1 text-micro text-textMuted">{blocks.hidden} more lines not shown</div>
+    <div class="px-2.5 py-1.5 text-micro text-textMuted">{blocks.hidden} more lines not shown</div>
   {/if}
 </div>
 
@@ -89,8 +89,13 @@
     overflow: hidden;
     border: 1px solid var(--gp-edge);
   }
+  .mavi-hunk-head {
+    background: rgb(var(--c-surface-hover) / 0.65);
+    border-bottom: 1px solid var(--gp-edge-soft);
+  }
   .mavi-line {
-    line-height: 1.5;
+    line-height: 1.55;
+    padding-right: 8px;
   }
   .mavi-num {
     flex: 0 0 auto;
@@ -101,7 +106,7 @@
   }
   .mavi-sign {
     flex: 0 0 auto;
-    width: 1.25em;
+    width: 1.35em;
     text-align: center;
     user-select: none;
   }

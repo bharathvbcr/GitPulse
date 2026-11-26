@@ -226,7 +226,7 @@ pub(super) fn resolve_route(
 
 /// [`resolve_route`] for the running app: reads Manvi's choice and asks the
 /// workbench's worker for that selection whether it serves the op.
-fn route_for(
+pub(crate) fn route_for(
     base_url: Option<String>,
     model: Option<String>,
     workbench: &crate::workbench::WorkbenchState,
@@ -246,7 +246,7 @@ fn route_for(
 }
 
 /// Puts the reason for a fallback at the head of a result's warnings.
-fn with_route_warning(
+pub(crate) fn with_route_warning(
     result: Result<crate::ai::AiGeneration, CommandError>,
     warning: Option<String>,
 ) -> Result<crate::ai::AiGeneration, CommandError> {

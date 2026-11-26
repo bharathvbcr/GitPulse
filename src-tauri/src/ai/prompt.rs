@@ -364,6 +364,30 @@ pub fn branch_name_system() -> String {
     )
 }
 
+/// System prompt for summarizing a finished coding-agent session.
+pub fn session_summary_system() -> String {
+    String::from(
+        "You summarize a finished coding-agent session for a developer.\n\
+         Rules:\n\
+         - Reply with a concise Markdown summary only. No preamble, no sign-off.\n\
+         - Start with 1-2 sentences stating the overall outcome.\n\
+         - Then add `### What changed` with 3-5 short `- ` bullets naming concrete files, \
+           fixes, or verification results.\n\
+         - Add `### Open items` with 1-3 `- ` bullets ONLY if work was left incomplete, \
+           failed, or waiting on input; otherwise omit that section completely.\n\
+         - Describe only what the transcript and touched files show. Never invent file \
+           names, edits, commands, or test results.",
+    )
+}
+
+/// User turn carrying the redacted, bounded session digest.
+pub fn session_summary_user(digest: &str) -> String {
+    format!(
+        "Coding-agent session digest:\n\n```\n{}\n```\n\nWrite the session summary.",
+        digest
+    )
+}
+
 /// Reads a model reply back into a commit message.
 ///
 /// Local models wrap answers in fences, restate the question, and — when the
@@ -793,5 +817,18 @@ mod tests {
         let user = coverage_report_user("REPORT BODY");
         assert!(user.contains("```\nREPORT BODY\n```"));
         assert!(user.ends_with("Write the coverage analysis."));
+    }
+
+    #[test]
+    fn session_summary_prompts_enforce_structure_and_grounding() {
+        let system = session_summary_system();
+        assert!(system.contains("No preamble"));
+        assert!(system.contains("### What changed"));
+        assert!(system.contains("### Open items"));
+        assert!(system.contains("Describe only what the transcript and touched files show"));
+
+        let user = session_summary_user("DIGEST BODY");
+        assert!(user.contains("```\nDIGEST BODY\n```"));
+        assert!(user.ends_with("Write the session summary."));
     }
 }

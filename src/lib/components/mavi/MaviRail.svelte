@@ -8,7 +8,7 @@
    * title) and removed after a confirmation that says what removal ends.
    */
   import { tick } from "svelte";
-  import { Plus, Server, Laptop, Trash2, Pencil } from "@lucide/svelte";
+  import { Plus, Server, Laptop, Trash2, Pencil, Search, X, MessagesSquare } from "@lucide/svelte";
   import { askConfirm } from "../../stores/modalStore";
   import { maviStore } from "../../mavi/store.svelte";
   import { STATUS_LABEL, STATUS_PRIORITY, statusTone, targetLabel, type ThreadRecord } from "../../mavi/threads";
@@ -21,10 +21,18 @@
   let now = $state(Date.now());
   $effect(() => createAdaptiveTimer(() => (now = Date.now()), 30_000));
 
+  let query = $state("");
+
   let groups = $derived.by(() => {
+    const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const byTarget = new Map<string, { label: string; ssh: boolean; records: ThreadRecord[] }>();
     for (const record of maviStore.records) {
       const label = targetLabel(record.target);
+      if (tokens.length > 0) {
+        const statusText = STATUS_LABEL[maviStore.status(record)].toLowerCase();
+        const haystack = `${record.title.toLowerCase()} ${label.toLowerCase()} ${statusText}`;
+        if (!tokens.every((token) => haystack.includes(token))) continue;
+      }
       const key = `${record.target.kind}:${label}`;
       const group = byTarget.get(key) ?? { label, ssh: record.target.kind === "ssh", records: [] };
       group.records.push(record);
@@ -78,13 +86,56 @@
 <nav class="mavi-rail flex flex-col min-h-0 h-full" aria-label="Mavi threads">
   <div class="mavi-rail-head flex items-center gap-2">
     <span class="text-xs font-medium text-textPrimary">Threads</span>
+    {#if maviStore.records.length > 0}
+      <span class="gp-chip" data-kind="count" data-tone="neutral">{maviStore.records.length}</span>
+    {/if}
     <button class="gp-btn ml-auto" data-variant="primary" onclick={onNew} title="Start a new thread">
       <Plus size={12} aria-hidden="true" /> New
     </button>
   </div>
-  <div class="flex-1 min-h-0 overflow-y-auto">
-    {#if groups.length === 0}
-      <p class="text-meta text-textMuted px-3 py-4">No threads yet. A thread is one conversation with an agent in one repository or on one host.</p>
+  {#if maviStore.records.length >= 6}
+    <div class="mavi-rail-search">
+      <div class="relative flex items-center">
+        <Search size={12} class="mavi-search-icon text-faint pointer-events-none" aria-hidden="true" />
+        <input
+          type="text"
+          bind:value={query}
+          class="gp-field w-full pl-7 {query.length > 0 ? 'pr-7' : ''}"
+          data-size="sm"
+          placeholder="Filter threads…"
+          aria-label="Filter threads"
+        />
+        {#if query.length > 0}
+          <span class="mavi-search-clear">
+            <button
+              type="button"
+              class="gp-icon-btn"
+              data-size="sm"
+              aria-label="Clear thread filter"
+              title="Clear filter"
+              onclick={() => (query = "")}
+            >
+              <X size={11} aria-hidden="true" />
+            </button>
+          </span>
+        {/if}
+      </div>
+    </div>
+  {/if}
+  <div class="flex-1 min-h-0 overflow-y-auto py-1">
+    {#if maviStore.records.length === 0}
+      <div class="flex flex-col items-center text-center px-4 py-8 gap-2">
+        <span class="mavi-empty-badge flex items-center justify-center rounded-xl text-textMuted">
+          <MessagesSquare size={16} aria-hidden="true" />
+        </span>
+        <p class="text-xs font-medium text-textPrimary">No threads yet</p>
+        <p class="text-meta text-textMuted">A thread is one conversation with an agent in one repository or on one host.</p>
+      </div>
+    {:else if groups.length === 0}
+      <div class="px-3 py-4 text-meta text-textMuted">
+        <p>No threads match “{query.trim()}”.</p>
+        <button class="gp-btn mt-1.5" data-variant="ghost" onclick={() => (query = "")}>Clear filter</button>
+      </div>
     {/if}
     {#each groups as group (group.label + group.ssh)}
       <div class="mavi-group-label flex items-center gap-1.5 gp-label">
@@ -98,7 +149,7 @@
           <li class="mavi-thread" class:mavi-thread-open={maviStore.openKey === record.key}>
             {#if renaming === record.key}
               <form
-                class="mavi-thread-row flex items-center gap-2"
+                class="mavi-thread-row rounded-lg flex items-center gap-2"
                 onsubmit={(e) => {
                   e.preventDefault();
                   finishRename(true);
@@ -120,40 +171,40 @@
                 />
               </form>
             {:else}
-            <button
-              class="mavi-thread-row flex items-start gap-2 w-full text-left"
-              aria-current={maviStore.openKey === record.key ? "true" : undefined}
-              onclick={() => onOpen(record.key)}
-              ondblclick={() => void startRename(record)}
-            >
-              <span class="mavi-dot mt-1.5" class:animate-pulse={tone === "accent"} data-tone={tone} aria-hidden="true"></span>
-              <span class="min-w-0 flex-1">
-                <span class="block truncate text-xs text-textPrimary">{record.title}</span>
-                <span class="block text-micro" class:text-warn={tone === "warn"} class:text-danger={tone === "danger"} class:text-textMuted={tone !== "warn" && tone !== "danger"}>
-                  {STATUS_LABEL[status]}{record.lastActivityAt ? ` · ${age(record.lastActivityAt)}` : ""}
+              <button
+                class="mavi-thread-row rounded-lg flex items-start gap-2 w-full text-left"
+                aria-current={maviStore.openKey === record.key ? "true" : undefined}
+                onclick={() => onOpen(record.key)}
+                ondblclick={() => void startRename(record)}
+              >
+                <span class="mavi-dot mt-1.5" class:animate-pulse={tone === "accent"} data-tone={tone} aria-hidden="true"></span>
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate text-xs text-textPrimary">{record.title}</span>
+                  <span class="block text-micro" class:text-warn={tone === "warn"} class:text-danger={tone === "danger"} class:text-textMuted={tone !== "warn" && tone !== "danger"}>
+                    {STATUS_LABEL[status]}{record.lastActivityAt ? ` · ${age(record.lastActivityAt)}` : ""}
+                  </span>
                 </span>
+              </button>
+              <span class="mavi-thread-actions rounded-full flex items-center gap-0.5">
+                <button
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  aria-label="Rename {record.title}"
+                  title="Rename"
+                  onclick={() => void startRename(record)}
+                >
+                  <Pencil size={11} aria-hidden="true" />
+                </button>
+                <button
+                  class="gp-icon-btn"
+                  data-size="sm"
+                  aria-label="Remove {record.title} from the list"
+                  title="Remove from the list (ends its agent)"
+                  onclick={() => void remove(record)}
+                >
+                  <Trash2 size={11} aria-hidden="true" />
+                </button>
               </span>
-            </button>
-            <span class="mavi-thread-actions flex items-center">
-              <button
-                class="gp-icon-btn"
-                data-size="sm"
-                aria-label="Rename {record.title}"
-                title="Rename"
-                onclick={() => void startRename(record)}
-              >
-                <Pencil size={11} aria-hidden="true" />
-              </button>
-              <button
-                class="gp-icon-btn"
-                data-size="sm"
-                aria-label="Remove {record.title} from the list"
-                title="Remove from the list (ends its agent)"
-                onclick={() => void remove(record)}
-              >
-                <Trash2 size={11} aria-hidden="true" />
-              </button>
-            </span>
             {/if}
           </li>
         {/each}
@@ -167,17 +218,37 @@
     border-right: 1px solid var(--gp-edge-soft);
   }
   .mavi-rail-head {
-    padding: 8px 10px 8px 12px;
+    min-height: 44px;
+    padding: 6px 10px 6px 12px;
     border-bottom: 1px solid var(--gp-edge-soft);
+  }
+  .mavi-empty-badge {
+    width: 32px;
+    height: 32px;
+    background: rgb(var(--c-surface) / 0.9);
+    border: 1px solid var(--gp-edge-soft);
+  }
+  .mavi-rail-search {
+    padding: 8px 10px 4px;
+  }
+  .mavi-rail-search :global(.mavi-search-icon) {
+    position: absolute;
+    left: 9px;
+  }
+  .mavi-search-clear {
+    position: absolute;
+    right: 2px;
   }
   .mavi-group-label {
     padding: 10px 12px 4px;
   }
   .mavi-thread {
     position: relative;
+    margin: 2px 6px;
   }
   .mavi-thread-row {
-    padding: 6px 52px 6px 12px;
+    padding: 8px 10px;
+    transition: background-color var(--gp-dur-instant) var(--gp-ease-effect);
   }
   .mavi-thread-row:hover,
   .mavi-thread-open .mavi-thread-row {
@@ -189,12 +260,19 @@
   .mavi-thread-actions {
     position: absolute;
     right: 6px;
-    top: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    padding: 1px 2px;
+    background: rgb(var(--c-surface) / 0.9);
+    border: 1px solid var(--gp-edge-soft);
     opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--gp-dur-fast) var(--gp-ease-effect);
   }
   .mavi-thread:hover .mavi-thread-actions,
-  .mavi-thread-actions:focus-within {
+  .mavi-thread:focus-within .mavi-thread-actions {
     opacity: 1;
+    pointer-events: auto;
   }
   .mavi-dot {
     flex: 0 0 auto;

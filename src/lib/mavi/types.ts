@@ -225,3 +225,34 @@ export interface ThreadState {
   ended: string | null;
   lastSeq: number;
 }
+
+export type MaviSummaryEngine = "claude" | "ai";
+
+export interface MaviWorkSummary {
+  readonly text: string;
+  readonly model: string;
+  readonly engine: string;
+  readonly elapsedMs: number;
+  readonly truncated: boolean;
+  readonly warnings: string[];
+}
+
+export interface SummarizeRequest {
+  readonly sessionId?: string;
+  readonly title?: string;
+  readonly transcript?: string;
+  readonly touched?: readonly string[];
+  readonly repoPath?: string;
+  readonly engine?: MaviSummaryEngine;
+  readonly model?: string;
+  readonly baseUrl?: string;
+}
+
+export interface ThreadWorkSummary {
+  readonly text: string;
+  readonly model: string;
+  readonly engine: string;
+  readonly createdAt: number;
+  readonly truncated?: boolean;
+  readonly warnings?: readonly string[];
+}

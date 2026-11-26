@@ -19,7 +19,67 @@ import {
   type ThreadRecord,
   type ThreadStatus,
 } from "./threads";
-import type { MaviEntry, MaviSummary, MaviTarget, ThreadState } from "./types";
+import type {
+  MaviEntry,
+  MaviSummary,
+  MaviSummaryEngine,
+  MaviTarget,
+  SummarizeRequest,
+  ThreadState,
+  ThreadWorkSummary,
+  ToolItem,
+} from "./types";
+
+const MAX_CLIENT_TRANSCRIPT_CHARS = 24_000;
+
+function toolPrimaryArg(tool: ToolItem): string | null {
+  const input = tool.input;
+  for (const key of ["file_path", "notebook_path", "path", "command", "pattern", "description", "url", "query"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) {
+      const compact = value.trim().replace(/\s+/g, " ");
+      return compact.length > 240 ? `${compact.slice(0, 239)}…` : compact;
+    }
+  }
+  return null;
+}
+
+/** Extracts a concise, bounded transcript from a thread's loaded timeline. */
+export function buildClientTranscript(timeline: ThreadState | null | undefined): string {
+  if (!timeline?.items.length) return "";
+  const lines: string[] = [];
+  let totalChars = 0;
+  for (const item of timeline.items) {
+    let line: string | null = null;
+    if (item.kind === "user") {
+      const text = item.text.trim();
+      if (text) line = `User: ${text.length > 2000 ? `${text.slice(0, 1999)}…` : text}`;
+    } else if (item.kind === "assistant") {
+      const text = item.text.trim();
+      if (text) line = `Assistant: ${text.length > 2000 ? `${text.slice(0, 1999)}…` : text}`;
+    } else if (item.kind === "tool") {
+      const arg = toolPrimaryArg(item);
+      line = arg ? `Tool ${item.name} (${item.status}): ${arg}` : `Tool ${item.name} (${item.status})`;
+    } else if (item.kind === "turn_end") {
+      if (item.summary?.detail || item.summary?.needsAction) {
+        const parts = [`Turn summary [${item.summary.category || (item.ok ? "ok" : "failed")}]`];
+        if (item.summary.detail) parts.push(item.summary.detail.trim());
+        if (item.summary.needsAction) parts.push(`(needs action: ${item.summary.needsAction.trim()})`);
+        line = parts.join(": ");
+      } else if (!item.ok) {
+        line = `Turn ${item.turn} ended (${item.subtype})`;
+      }
+    } else if (item.kind === "notice" && item.tone === "error") {
+      line = `Notice: ${item.text.trim()}`;
+    }
+    if (!line) continue;
+    const nextLen = totalChars + line.length + (lines.length > 0 ? 1 : 0);
+    if (nextLen > MAX_CLIENT_TRANSCRIPT_CHARS) break;
+    lines.push(line);
+    totalChars = nextLen;
+  }
+  return lines.join("\n");
+}
 
 function storage(): Storage | null {
   try {
@@ -85,6 +145,8 @@ class MaviStore {
   /** A request from elsewhere in the app to show the new-thread form. */
   composeRequest = $state<{ id: number; message: string; newWorktree: boolean } | null>(null);
   errors = $state<Record<string, string>>({});
+  summarizing = $state<Record<string, boolean>>({});
+  summaryErrors = $state<Record<string, string>>({});
   #started = false;
   #buffer = new Map<string, MaviEntry[]>();
   #loading = new Set<string>();
@@ -517,6 +579,69 @@ class MaviStore {
     if (record?.sessionId) await maviClient.stop(record.sessionId);
   }
 
+  async summarize(
+    key: string,
+    options: { engine?: MaviSummaryEngine; model?: string; baseUrl?: string } = {},
+  ): Promise<ThreadWorkSummary | null> {
+    const record = this.record(key);
+    if (!record || this.summarizing[key]) return null;
+    this.summarizing[key] = true;
+    delete this.summaryErrors[key];
+    try {
+      const summary = this.summaryOf(record);
+      const timeline = this.timelines[key];
+      const touched = new Set<string>(summary?.touched ?? []);
+      if (timeline) {
+        for (const tf of Object.values(timeline.turnFiles)) {
+          for (const m of tf.moved) {
+            if (m.path) touched.add(m.path);
+          }
+        }
+      }
+      const transcript = buildClientTranscript(timeline);
+      const request: SummarizeRequest = {
+        title: record.title,
+        ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+        ...(transcript ? { transcript } : {}),
+        ...(touched.size > 0 ? { touched: [...touched] } : {}),
+        ...(record.target.kind === "local" ? { repoPath: record.target.root } : {}),
+        ...(options.engine ? { engine: options.engine } : {}),
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+      };
+      const result = await maviClient.summarize(request);
+      const current = this.record(key);
+      if (!current) return null;
+      const workSummary: ThreadWorkSummary = {
+        text: result.text.slice(0, 8000),
+        model: result.model,
+        engine: result.engine,
+        createdAt: Date.now(),
+        ...(result.truncated ? { truncated: true } : {}),
+        ...(result.warnings.length > 0 ? { warnings: result.warnings.slice(0, 4) } : {}),
+      };
+      current.workSummary = workSummary;
+      this.#persist();
+      return workSummary;
+    } catch (error) {
+      if (this.record(key)) {
+        this.summaryErrors[key] = error instanceof Error ? error.message : String(error);
+      }
+      return null;
+    } finally {
+      delete this.summarizing[key];
+    }
+  }
+
+  clearSummary(key: string): void {
+    delete this.summaryErrors[key];
+    const record = this.record(key);
+    if (record?.workSummary) {
+      record.workSummary = null;
+      this.#persist();
+    }
+  }
+
   forget(key: string): void {
     const record = this.record(key);
     if (record?.sessionId && this.summaries[record.sessionId]?.phase !== "ended") void maviClient.stop(record.sessionId);
@@ -531,6 +656,8 @@ class MaviStore {
     delete this.drafts[key];
     this.#saveUnsent();
     delete this.errors[key];
+    delete this.summarizing[key];
+    delete this.summaryErrors[key];
     this.#buffer.delete(key);
     if (record?.sessionId) delete this.summaries[record.sessionId];
     if (this.openKey === key) this.openKey = null;
