@@ -1686,18 +1686,41 @@ fn handle_connection(mut stream: std::os::unix::net::UnixStream, broker: Arc<App
     }
 }
 
+/// What the approval broker said about one human issuance, or that none is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuanceAnswer {
+    /// A broker answered and verified the issuance.
+    Verified,
+    /// Something answered on the socket and did not verify it, or the exchange
+    /// failed part way.
+    Refused,
+    /// Nothing listens: the socket file is missing or refuses connections.
+    NoBroker,
+}
+
 /// Sends a read-only `verify_human_issuance` query to `socket_path`.
-/// Never fails open: any I/O error, missing socket, or malformed reply returns `false`.
+/// Never fails open: any I/O error after connecting, or a malformed reply, is
+/// [`IssuanceAnswer::Refused`]; only a socket nobody listens on is
+/// [`IssuanceAnswer::NoBroker`].
 #[cfg(unix)]
-pub fn verify_human_issuance_via_socket(
+pub fn query_human_issuance_via_socket(
     socket_path: &Path,
     session_id: &str,
     request_id: &str,
     text_sha256: &str,
-) -> bool {
+) -> IssuanceAnswer {
     use std::os::unix::net::UnixStream;
-    let Ok(mut stream) = UnixStream::connect(socket_path) else {
-        return false;
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return IssuanceAnswer::NoBroker;
+        }
+        Err(_) => return IssuanceAnswer::Refused,
     };
     let payload = json!({
         "op": "verify_human_issuance",
@@ -1707,26 +1730,44 @@ pub fn verify_human_issuance_via_socket(
     });
     write_json_line(&mut stream, &payload);
     let Ok(raw) = read_json_line(&mut stream, SHORT_QUERY_TIMEOUT) else {
-        return false;
+        return IssuanceAnswer::Refused;
     };
     let Ok(reply) = serde_json::from_slice::<Value>(&raw) else {
-        return false;
+        return IssuanceAnswer::Refused;
     };
-    reply.get("ok").and_then(Value::as_bool) == Some(true)
+    if reply.get("ok").and_then(Value::as_bool) == Some(true)
         && reply.get("verified").and_then(Value::as_bool) == Some(true)
+    {
+        IssuanceAnswer::Verified
+    } else {
+        IssuanceAnswer::Refused
+    }
 }
 
-/// Sends a read-only `verify_human_issuance` query to the default broker socket.
+/// [`query_human_issuance_via_socket`] as a verdict: `true` only when a broker
+/// verified the issuance.
 #[cfg(unix)]
-pub fn verify_human_issuance_via_default_socket(
+pub fn verify_human_issuance_via_socket(
+    socket_path: &Path,
     session_id: &str,
     request_id: &str,
     text_sha256: &str,
 ) -> bool {
+    query_human_issuance_via_socket(socket_path, session_id, request_id, text_sha256)
+        == IssuanceAnswer::Verified
+}
+
+/// [`query_human_issuance_via_socket`] against the default broker socket.
+#[cfg(unix)]
+pub fn query_human_issuance_via_default_socket(
+    session_id: &str,
+    request_id: &str,
+    text_sha256: &str,
+) -> IssuanceAnswer {
     let Some(path) = default_socket_path() else {
-        return false;
+        return IssuanceAnswer::NoBroker;
     };
-    verify_human_issuance_via_socket(&path, session_id, request_id, text_sha256)
+    query_human_issuance_via_socket(&path, session_id, request_id, text_sha256)
 }
 
 /// Sends a `register_or_attach` request from `gitpulse-hook permission-bridge`
@@ -2256,6 +2297,15 @@ mod tests {
         let text = "approved by human in desktop ui";
         let hash = crate::agent_mailbox::text_sha256_hex(text);
         assert!(!verify_human_issuance_via_socket(&sock, "s-human", "req-1", &hash));
+        assert_eq!(
+            query_human_issuance_via_socket(&sock, "s-human", "req-1", &hash),
+            IssuanceAnswer::Refused,
+            "a listening broker that has no record refuses; it is not 'no broker'"
+        );
+        assert_eq!(
+            query_human_issuance_via_socket(&base.join("nobody.sock"), "s-human", "req-1", &hash),
+            IssuanceAnswer::NoBroker
+        );
         broker_arc.record_human_issuance("s-human", "req-1", text, 1000);
         assert!(verify_human_issuance_via_socket(&sock, "s-human", "req-1", &hash));
         assert!(!verify_human_issuance_via_socket(

@@ -1665,6 +1665,40 @@ fn adv_forged_same_uid_human_confirmed_sidecar_downgrades_to_untrusted_peer_xml(
     );
 }
 
+/// The app deposits a person's message in its own process, and `gitpulse-hook
+/// deliver` claims it in another whose issuance ledger is empty. While no
+/// approval broker listens (no release starts one), the message must still
+/// reach the agent as the person's, not as an unverified peer's.
+#[test]
+fn a_human_message_claimed_in_another_process_stays_human_while_no_broker_listens() {
+    let serial = crate::test_support::env::env_serial();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("agent-mailbox");
+    let _env = crate::test_support::env::bind_env(&serial).set(
+        crate::alerts::approval_broker::SOCKET_ENV,
+        dir.path().join("no-broker.sock"),
+    );
+    let now = SystemTime::now();
+    let app = Mailbox::with_isolated_ledger(root.clone(), Arc::new(HumanIssuanceLedger::new()));
+    app.deposit(SESSION, "cross-1", "stop and revert that", now)
+        .unwrap();
+    let hook = Mailbox {
+        root,
+        ledger: None,
+        verifier: None,
+        query_broker_socket: true,
+    };
+    let claimed = hook.try_claim_batch(SESSION, 8, now).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].provenance, EnvelopeProvenance::HumanConfirmed);
+    assert!(claimed[0].human_verified, "{:?}", claimed[0]);
+    let rendered = crate::hooks::deliver::render_message(&claimed[0], None);
+    assert!(
+        !rendered.contains("unverified_peer_agent"),
+        "a person's message rendered as an untrusted peer's: {rendered}"
+    );
+}
+
 #[test]
 fn a_symlinked_high_water_mark_is_refused() {
     let (_dir, mailbox) = mailbox();

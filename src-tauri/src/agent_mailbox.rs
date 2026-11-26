@@ -809,13 +809,22 @@ impl Mailbox {
             return true;
         }
         if self.query_broker_socket {
+            // No release starts the approval broker yet. While nothing listens on its
+            // socket, a HumanConfirmed sidecar the app wrote into this private mailbox
+            // keeps the trust it had before the control plane, so a person's message
+            // claimed by `gitpulse-hook deliver` in another process still reads as
+            // theirs. Only a broker that answers and does not verify downgrades it.
             #[cfg(unix)]
             {
-                return crate::alerts::approval_broker::verify_human_issuance_via_default_socket(
-                    session_uuid,
-                    request_id,
-                    text_sha256,
-                );
+                use crate::alerts::approval_broker::{
+                    query_human_issuance_via_default_socket, IssuanceAnswer,
+                };
+                return query_human_issuance_via_default_socket(session_uuid, request_id, text_sha256)
+                    != IssuanceAnswer::Refused;
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
             }
         }
         false
@@ -823,9 +832,10 @@ impl Mailbox {
 
     /// Authenticates `provenance` for `(session_uuid, request_id, text)`.
     ///
-    /// Any `HumanConfirmed` sidecar that does not match an in-memory issuance
-    /// record from the control-plane owner process is downgraded to untrusted
-    /// `PeerAgent` framing (`human_verified = false`). Never fails open.
+    /// A `HumanConfirmed` sidecar that the issuance ledger or a listening broker
+    /// refuses is downgraded to untrusted `PeerAgent` framing
+    /// (`human_verified = false`). The default mailbox with no broker listening
+    /// keeps the sidecar's trust (see [`Self::verify_human_issuance`]).
     fn authenticate_provenance(
         &self,
         session_uuid: &str,
