@@ -25,6 +25,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -561,6 +563,47 @@ function windowsAttachProcesses() {
   return rows;
 }
 
+/**
+ * Application event log entries from the last 15 minutes that name gitpulse
+ * (an "Application Error" crash record carries the exception code and the
+ * faulting module), at most 6, each cut at 900 characters.
+ * @returns {string[]}
+ */
+function windowsAppEvents() {
+  const ps =
+    "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'gitpulse' } | Select-Object -First 6 | ForEach-Object { \"$($_.TimeCreated.ToString('s')) $($_.ProviderName) $($_.Id): $($_.Message -replace '\\s+',' ')\" }";
+  const res = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", timeout: 45_000 });
+  if (res.error) return [`(event query failed: ${res.error.message.slice(0, 300)})`];
+  return String(res.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => (line.length > 900 ? `${line.slice(0, 900)}…` : line));
+}
+
+/**
+ * The last 40 lines of each of up to 4 files in `dir`, headed by the file
+ * name. A missing or unreadable directory says so.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function logTails(dir) {
+  let names;
+  try {
+    names = readdirSync(dir).sort().slice(0, 4);
+  } catch (error) {
+    return [`(${dir}: ${error instanceof Error ? error.message : String(error)})`];
+  }
+  return names.flatMap((name) => {
+    try {
+      const lines = readFileSync(path.join(dir, name), "utf8").split(/\r?\n/).filter(Boolean);
+      return [`--- ${name} (${lines.length} lines, last 40)`, ...lines.slice(-40).map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l))];
+    } catch (error) {
+      return [`--- ${name}: ${error instanceof Error ? error.message : String(error)}`];
+    }
+  });
+}
+
 /** @param {SmokeOptions} opts */
 async function runSmoke(opts) {
   if (process.platform === "darwin") {
@@ -1033,6 +1076,12 @@ async function runSmoke(opts) {
       // --remote-debugging-port and --user-data-dir.
       const rows = windowsAttachProcesses();
       console.error(`WebView2 attach processes (${rows.length}):\n${rows.join("\n") || "(none)"}`);
+      // The app has been seen gone with its WebView2 children orphaned and no
+      // line on stderr: say whether Windows recorded it crashing, and what
+      // the app's own log files hold.
+      const events = windowsAppEvents();
+      console.error(`Application event log, gitpulse (${events.length}):\n${events.join("\n") || "(none)"}`);
+      console.error(`App log files:\n${logTails(path.join(profileRoot, "logs")).join("\n") || "(none)"}`);
     }
     if (error instanceof Error) console.error(`E2E smoke failed: ${error.message}`);
   } finally {
