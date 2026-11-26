@@ -376,6 +376,19 @@ describe("check:workflows", () => {
     expect(sqlite, "fails loudly after the last attempt").toMatch(/throw "sqlite3 could not be installed/);
   });
 
+  it("builds and tests the desktop app with one feature set, so no test step rebuilds the smoke binary in dev mode", () => {
+    // `cargo test --test gtk_runtime` also builds the `gitpulse` bin. Without
+    // tauri/custom-protocol it recompiled tauri in dev mode and overwrote
+    // target/debug/gitpulse, so the real-binary smoke launched an app that
+    // waited on the dev server (#app never appeared on any platform).
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const invocations = [...e2e.matchAll(/cargo (?:build|test) --manifest-path src-tauri\/Cargo\.toml(?:[^\n]*\\\n)*[^\n]*/g)].map(m => m[0]);
+    expect(invocations.length, "finds the app build and both runtime test steps").toBeGreaterThanOrEqual(5);
+    for (const call of invocations) {
+      expect(call, `every app cargo step keeps the bundled frontend: ${call}`).toContain("--features tauri/custom-protocol");
+    }
+  });
+
   it("keeps e2e-desktop.yml safe on Windows (shell: bash, cygpath, WebView2 msedgedriver matching) and Linux (X11 + Wayland)", () => {
     const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
     const linux = e2e.slice(e2e.indexOf("\n  e2e-linux:"), e2e.indexOf("\n  e2e-windows:"));

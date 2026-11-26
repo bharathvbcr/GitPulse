@@ -148,7 +148,7 @@ jobs:
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export LIBGL_ALWAYS_SOFTWARE=1
           xvfb-run -a -s "-screen 0 1440x960x24" dbus-run-session -- \
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test gtk_runtime -- --nocapture
 
       - name: Native GTK/WebKit Runtime Smoke (Headless Wayland)
         if: ${{ !cancelled() }}
@@ -191,7 +191,7 @@ jobs:
             exit 1
           fi
           dbus-run-session -- \
-            cargo test --manifest-path src-tauri/Cargo.toml --locked --test gtk_runtime -- --nocapture
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test gtk_runtime -- --nocapture
 
       - name: Native WebKitGTK UI Regressions (X11)
         if: ${{ !cancelled() }}
@@ -515,7 +515,7 @@ jobs:
       - name: Native Windows WebView2 Runtime Smoke
         if: ${{ !cancelled() }}
         shell: bash
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --test windows_runtime -- --nocapture --test-threads=1
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol --test windows_runtime -- --nocapture --test-threads=1
 
       - name: Native WebView2 UI Regressions
         if: ${{ !cancelled() }}
