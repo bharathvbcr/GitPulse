@@ -48,7 +48,7 @@ pub(crate) fn is_exported(node: Node, source: &str, name: &str) -> bool {
     }
     // A bare `private` / `protected` / `public` earlier in the same body sets
     // the default for this `def`; the nearest one wins.
-    let mut sibling = node.prev_named_sibling();
+    let mut sibling = crate::parent_index::prev_named_sibling_of(node);
     while let Some(previous) = sibling {
         if previous.kind() == "identifier" {
             let word = get_node_text(previous, source);
@@ -59,7 +59,7 @@ pub(crate) fn is_exported(node: Node, source: &str, name: &str) -> bool {
                 break;
             }
         }
-        sibling = previous.prev_named_sibling();
+        sibling = crate::parent_index::prev_named_sibling_of(previous);
     }
     // `private :helper, :other` anywhere in the same body.
     let mut cursor = parent.walk();

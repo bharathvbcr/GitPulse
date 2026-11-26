@@ -11,6 +11,8 @@ pub(crate) mod payload_codec;
 pub mod schema;
 pub mod seed;
 
+pub use payload_codec::{compress_json_frame, inflate_json_frame};
+
 pub use delta::{
     DeltaBusy, DeltaDamaged, DeltaEdgeRecord, DeltaFileRecord, DeltaSnapshot, DeltaStore,
     DeltaSymbolRecord, DEFAULT_READ_WAIT,

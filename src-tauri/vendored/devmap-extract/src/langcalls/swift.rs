@@ -37,7 +37,7 @@ use tree_sitter::Node;
 use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
 use crate::treesitter::{
     get_node_text, is_anonymous_callable, is_callee_identity, node_span,
-    note_swift_unspelled_operator, split_call_target,
+    note_swift_unspelled_operator, split_call_target, swift_leading_dot_prefix,
 };
 
 use super::scope::{clamp_receiver, enclosing_emitted_symbol, receiver_from};
@@ -131,7 +131,12 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
             // Measured on 342 real `.swift` files: two functions called only
             // through `if !f(…)` were reported dead at 0.9 confidence, from a
             // call the graph never saw.
-            let target = swift_unwrap_prefix(target).unwrap_or(target);
+            // The operand first: under 0.7.4 `x ?? !f { }` and `x ?? .a.b { }`
+            // put the prefix inside the operator the closure was bound over.
+            let target = swift_call_operand(target);
+            let target = swift_unwrap_prefix(target)
+                .or_else(|| swift_leading_dot_chain(target))
+                .unwrap_or(target);
             let target = swift_call_operand(target);
             if target.kind() == "navigation_expression" {
                 return swift_navigation_call(target, source);
@@ -255,6 +260,26 @@ fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
     target.child_by_field_name("target")
 }
 
+/// The member chain under a leading dot: `caption.weight` for the callee of
+/// `.caption.weight(.medium)`.
+///
+/// tree-sitter-swift 0.7.4 binds the `.` over the whole chain up to the
+/// argument list, so the callee is `prefix(., navigation(caption, weight))`
+/// where 0.7.3 gave `navigation(prefix(., caption), weight)`. The member call
+/// is `weight` on the leading-dot base either way; [`swift_navigation_call`]
+/// puts the dot back on the receiver. A bare `.circle(1)` (no chain) is not
+/// this: its member is the callee itself, refused by [`swift_unwrap_prefix`].
+fn swift_leading_dot_chain<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
+    if target.kind() != "prefix_expression"
+        || !target.child(0).is_some_and(|first| first.kind() == ".")
+    {
+        return None;
+    }
+    target
+        .child_by_field_name("target")
+        .filter(|chain| chain.kind() == "navigation_expression")
+}
+
 /// The operand a call's callee really is, when the grammar bound the operator
 /// too tightly.
 ///
@@ -264,16 +289,38 @@ fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
 /// (recorded as a bare reference). `1 - q.r()` is the same shape one level down,
 /// with the sum as the *target* of the member access, and `a.bump() + g.bump()`
 /// typed its second call by the receiver `a.bump() + g`. The right operand of
-/// the sum is the callee (or the member target); `+ - * /` are the only
-/// operators the grammar treats this way.
+/// the sum is the callee (or the member target).
+///
+/// tree-sitter-swift 0.7.4 does the same with a trailing closure that has no
+/// parenthesised arguments, over every binary operator: `x ?? y.foo { }` is
+/// `call_expression(nil_coalescing_expression(x, y.foo), { })`, and so are
+/// `&&`, `||`, comparisons, equality, ranges, custom operators, the ternary's
+/// last branch and `try`. Swift gives the closure to the postfix expression
+/// before it, so the callee is the rightmost operand there too. An
+/// unparenthesised operator expression is never really a callee or a member
+/// target (a parenthesised one is a `tuple_expression`), so reading through
+/// it is always the right operand, never a guess.
 pub(crate) fn swift_call_operand<'tree>(node: Node<'tree>) -> Node<'tree> {
     let mut node = node;
-    while matches!(
-        node.kind(),
-        "additive_expression" | "multiplicative_expression"
-    ) {
-        match node.child_by_field_name("rhs") {
-            Some(rhs) => node = rhs,
+    // Bounded like `swift_sum_tail`: `a ?? b ?? … ?? f { }` nests one level per
+    // operator, and a chain longer than this keeps the operator as its callee.
+    for _ in 0..=16 {
+        let field = match node.kind() {
+            "additive_expression"
+            | "multiplicative_expression"
+            | "comparison_expression"
+            | "equality_expression"
+            | "conjunction_expression"
+            | "disjunction_expression"
+            | "infix_expression" => "rhs",
+            "nil_coalescing_expression" => "if_nil",
+            "range_expression" => "end",
+            "ternary_expression" => "if_false",
+            "try_expression" | "await_expression" => "expr",
+            _ => break,
+        };
+        match node.child_by_field_name(field) {
+            Some(operand) => node = operand,
             None => break,
         }
     }
@@ -327,6 +374,9 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     let (callee_name, _) = split_call_target(name_node, source)?;
     let raw_target = nav.child_by_field_name("target")?;
     let target = swift_call_operand(raw_target);
+    // `.caption.weight(…)` under tree-sitter-swift 0.7.4: the leading dot is a
+    // prefix around the chain, so `raw_target` is `caption` without it.
+    let leading_dot = swift_leading_dot_prefix(raw_target, source).is_some();
     // `Person.init(name:)` constructs a `Person`; recording `init` as the callee
     // would name a symbol that does not exist, because the generic declaration
     // arm emits nothing for an `init_declaration`. `self.init` and `super.init`
@@ -334,6 +384,14 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     // inside, and the second names a superclass this node cannot identify.
     if callee_name == "init" {
         let (type_name, qualifier) = swift_init_type(target, source)?;
+        // `.Foo.init()` constructs the member `Foo` of a contextual type, not
+        // a type named `Foo`; a qualified `.Outer.Inner.init()` keeps the dot
+        // on its qualifier, as the 0.7.3 shape spelled it.
+        let qualifier = match (leading_dot, qualifier) {
+            (false, qualifier) => qualifier,
+            (true, None) => return None,
+            (true, Some(qualifier)) => Some(format!(".{qualifier}")),
+        };
         return Some(SwiftCall {
             callee_name: type_name,
             receiver_expr: qualifier,
@@ -348,6 +406,7 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
         Some(tail) => source
             .get(tail.start_byte()..raw_target.end_byte())
             .and_then(clamp_receiver),
+        None if leading_dot => swift_receiver(target, source).map(|base| format!(".{base}")),
         None => swift_receiver(target, source),
     };
     Some(SwiftCall {

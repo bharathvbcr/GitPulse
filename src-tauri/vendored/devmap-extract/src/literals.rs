@@ -9,6 +9,7 @@
 //! the method that *uses* the const would not show up. Those names are resolved
 //! inside the file and each use is recorded as another site of the same value.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ pub fn index_literals(
     if Instant::now() >= deadline {
         return exhausted();
     }
+    let lines = LineStarts::new(source);
     let mut sites = Vec::new();
     let mut notes = Vec::new();
     let mut capped = false;
@@ -59,7 +61,7 @@ pub fn index_literals(
                     capped = true;
                     break;
                 }
-                sites.push(site_at(source, symbols, node.start_byte(), value));
+                sites.push(site_at(&lines, symbols, node.start_byte(), value));
             }
         }
         if cursor.goto_first_child() {
@@ -70,7 +72,7 @@ pub fn index_literals(
         }
     }
     if lang == "rust" && !capped {
-        match propagate_rust_consts(root, source, symbols, deadline, &mut sites) {
+        match propagate_rust_consts(root, source, &lines, symbols, deadline, &mut sites) {
             Err(note) if note == "exhausted" => return exhausted(),
             Err(note) => notes.push(note),
             Ok(()) => {}
@@ -108,7 +110,7 @@ fn advance(cursor: &mut TreeCursor<'_>, root: Node) -> bool {
 }
 
 fn site_at(
-    source: &str,
+    lines: &LineStarts<'_>,
     symbols: &[ExtractedSymbol],
     start: usize,
     value: String,
@@ -117,19 +119,54 @@ fn site_at(
     ExtractedLiteral {
         value,
         start_byte: start,
-        line: line_of(source, start),
+        line: lines.line_of(start),
         enclosing_qualified_name: qualified,
         enclosing_name: name,
     }
 }
 
-fn line_of(source: &str, start: usize) -> u32 {
-    let end = start.min(source.len());
-    let newlines = source.as_bytes()[..end]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
-    u32::try_from(newlines + 1).unwrap_or(u32::MAX)
+#[cfg(test)]
+thread_local! {
+    /// Bytes of source read to answer line numbers, for the bound test.
+    static LINE_BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Line numbers for byte offsets in one file.
+///
+/// The newline offsets are found once, on the first lookup, and each lookup is
+/// a binary search. Counting newlines from the start of the file for every site
+/// cost (sites x file size): about 0.45 s of extraction for 4,096 literals at
+/// the end of a 1 MB file (release build). Sites arrive out of order (const
+/// uses are recorded after the walk), so a running count would not do.
+struct LineStarts<'a> {
+    source: &'a str,
+    newlines: OnceCell<Vec<usize>>,
+}
+
+impl<'a> LineStarts<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            newlines: OnceCell::new(),
+        }
+    }
+
+    /// One more than the newlines before `start`; an offset past the end counts
+    /// every newline in the file.
+    fn line_of(&self, start: usize) -> u32 {
+        let newlines = self.newlines.get_or_init(|| {
+            #[cfg(test)]
+            LINE_BYTES_READ.with(|read| read.set(read.get() + self.source.len()));
+            self.source
+                .bytes()
+                .enumerate()
+                .filter_map(|(at, byte)| (byte == b'\n').then_some(at))
+                .collect()
+        });
+        let end = start.min(self.source.len());
+        let before = newlines.partition_point(|&at| at < end);
+        u32::try_from(before + 1).unwrap_or(u32::MAX)
+    }
 }
 
 /// Innermost non-file, non-module symbol containing `byte`. A tie keeps the
@@ -175,6 +212,7 @@ struct ConstBinding {
 fn propagate_rust_consts(
     root: Node,
     source: &str,
+    lines: &LineStarts<'_>,
     symbols: &[ExtractedSymbol],
     deadline: Instant,
     sites: &mut Vec<ExtractedLiteral>,
@@ -246,7 +284,7 @@ fn propagate_rust_consts(
                         if sites.len() >= MAX_LITERALS_PER_FILE {
                             return Ok(());
                         }
-                        sites.push(site_at(source, symbols, node.start_byte(), value));
+                        sites.push(site_at(lines, symbols, node.start_byte(), value));
                     }
                 }
             }
@@ -580,4 +618,99 @@ fn take_hex(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, n: usize) -> O
         hex.push(ch);
     }
     u32::from_str_radix(&hex, 16).ok()
+}
+
+#[cfg(test)]
+mod line_starts_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The per-site count this module used before `LineStarts`, kept as the
+    /// oracle.
+    fn counted_line(source: &str, start: usize) -> u32 {
+        let end = start.min(source.len());
+        let newlines = source.as_bytes()[..end]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        u32::try_from(newlines + 1).unwrap_or(u32::MAX)
+    }
+
+    #[test]
+    fn every_offset_gets_the_line_the_per_site_count_gave() {
+        for source in [
+            "",
+            "\n",
+            "\n\n\n",
+            "no newline at all",
+            "a\nb\r\nc\n",
+            "trailing\n",
+            "\nleading",
+            "é\nü\n€ multi-byte\n",
+        ] {
+            let lines = LineStarts::new(source);
+            // Every offset, the end, and offsets past the end.
+            for start in 0..=source.len() + 3 {
+                assert_eq!(
+                    lines.line_of(start),
+                    counted_line(source, start),
+                    "offset {start} of {source:?}"
+                );
+            }
+        }
+    }
+
+    /// 4,096 literals after ~900 KB of filler, where counting newlines from
+    /// byte 0 for every site read about 3.9 GB. The bound is on bytes read for
+    /// line numbers, not on time: the file is read once, however many sites
+    /// it has.
+    #[test]
+    fn many_literals_late_in_a_large_file_read_it_once_for_line_numbers() {
+        let filler: String = (0..12_000)
+            .map(|n| {
+                format!("// filler line {n} ....................................................\n")
+            })
+            .collect();
+        let literals: String = (0..MAX_LITERALS_PER_FILE)
+            .map(|n| format!("        \"literal-value-{n}\",\n"))
+            .collect();
+        let source = format!(
+            "{filler}pub fn many() -> Vec<&'static str> {{\n    vec![\n{literals}    ]\n}}\n"
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+
+        LINE_BYTES_READ.with(|read| read.set(0));
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let (sites, notes) = index_literals(tree.root_node(), &source, "rust", &[], deadline);
+
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(sites.len(), MAX_LITERALS_PER_FILE);
+        // The oracle in one pass: the line each byte starts on, counted
+        // forward. Calling `counted_line` per site here is the very cost under
+        // test, and took ~20 s in a debug build.
+        let mut by_start: Vec<_> = sites.iter().collect();
+        by_start.sort_by_key(|site| site.start_byte);
+        let (mut line, mut at) = (1u32, 0usize);
+        for site in by_start {
+            line += u32::try_from(
+                source.as_bytes()[at..site.start_byte]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count(),
+            )
+            .unwrap();
+            at = site.start_byte;
+            assert_eq!(site.line, line, "{}", site.value);
+        }
+        let read = LINE_BYTES_READ.with(|read| read.get());
+        assert!(
+            read <= source.len(),
+            "line numbers read {read} bytes of a {}-byte file",
+            source.len()
+        );
+    }
 }

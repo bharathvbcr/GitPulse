@@ -1500,6 +1500,13 @@ impl Resolver {
                     .or_default()
                     .insert(subtype.to_string());
             }
+            // The type-kind symbols this file declares, by name and by
+            // qualified name, for `is_type_scope` below. Built once per file:
+            // that check used to scan every symbol of the file for every
+            // receiver reference, splitting the scope name on `::` once per
+            // symbol: 44% of the profiler samples under `index_extractions` in a
+            // build of this repository.
+            let declared_types = DeclaredTypes::of(ext);
             for reference in &ext.references {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
@@ -1534,21 +1541,7 @@ impl Resolver {
                     if scope == ext.file_path {
                         return false;
                     }
-                    let is_type = |name: &str| {
-                        ext.symbols.iter().any(|s| {
-                            (s.name == name
-                                || s.qualified_name == name
-                                || s.name == name.rsplit("::").next().unwrap_or(name))
-                                && matches!(
-                                    s.kind,
-                                    SymbolKind::Class
-                                        | SymbolKind::Struct
-                                        | SymbolKind::Interface
-                                        | SymbolKind::Trait
-                                        | SymbolKind::Enum
-                                )
-                        })
-                    };
+                    let is_type = |name: &str| declared_types.contains(name);
                     is_type(scope)
                         || self
                             .declaring_type_of(&ext.file_path, scope)
@@ -3033,5 +3026,120 @@ impl Resolver {
             }
         }
         (chains, cutoff)
+    }
+}
+
+/// The class, struct, interface, trait and enum symbols one file declares,
+/// by name and by qualified name.
+///
+/// `contains` answers what a linear scan used to: is there such a symbol whose
+/// name or qualified name is `name`, or whose name is the last `::` segment of
+/// `name`. Built once per file rather than scanned once per reference.
+pub(super) struct DeclaredTypes<'a> {
+    names: std::collections::HashSet<&'a str>,
+    qualified: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> DeclaredTypes<'a> {
+    pub(super) fn of(ext: &'a Extraction) -> Self {
+        Self::from_parts(
+            ext.symbols
+                .iter()
+                .map(|s| (s.name.as_str(), s.qualified_name.as_str(), s.kind)),
+        )
+    }
+
+    fn from_parts(symbols: impl Iterator<Item = (&'a str, &'a str, SymbolKind)>) -> Self {
+        let mut names = std::collections::HashSet::new();
+        let mut qualified = std::collections::HashSet::new();
+        for (name, qualified_name, kind) in symbols {
+            if is_type_kind(kind) {
+                names.insert(name);
+                qualified.insert(qualified_name);
+            }
+        }
+        Self { names, qualified }
+    }
+
+    pub(super) fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+            || self.qualified.contains(name)
+            || self
+                .names
+                .contains(name.rsplit("::").next().unwrap_or(name))
+    }
+}
+
+fn is_type_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Enum
+    )
+}
+
+#[cfg(test)]
+mod declared_types_tests {
+    use super::*;
+
+    /// The scan `DeclaredTypes` replaced, kept as the oracle.
+    fn scanned(symbols: &[(&str, &str, SymbolKind)], name: &str) -> bool {
+        symbols.iter().any(|&(s_name, s_qualified, kind)| {
+            (s_name == name
+                || s_qualified == name
+                || s_name == name.rsplit("::").next().unwrap_or(name))
+                && is_type_kind(kind)
+        })
+    }
+
+    #[test]
+    fn the_set_answers_exactly_what_the_scan_answered() {
+        let symbols = [
+            ("Engine", "src/a.rs::Engine", SymbolKind::Struct),
+            ("Shape", "src/a.rs::Shape", SymbolKind::Trait),
+            ("Color", "src/a.rs::Color", SymbolKind::Enum),
+            ("Widget", "pkg.Widget", SymbolKind::Class),
+            ("Reader", "io.Reader", SymbolKind::Interface),
+            ("run", "src/a.rs::run", SymbolKind::Function),
+            (
+                "Engine::start",
+                "src/a.rs::Engine::start",
+                SymbolKind::Method,
+            ),
+            ("", "src/a.rs::", SymbolKind::Struct),
+        ];
+        let set = DeclaredTypes::from_parts(symbols.iter().copied());
+        let probes = [
+            "Engine",
+            "src/a.rs::Engine",
+            "other::Engine",
+            "Engine::start",
+            "src/a.rs::Engine::start",
+            "run",
+            "src/a.rs::run",
+            "pkg.Widget",
+            "Widget",
+            "io.Reader",
+            "Shape",
+            "a::b::Color",
+            "Missing",
+            "",
+            "::",
+            "Engine::",
+            "src/a.rs::",
+        ];
+        for probe in probes {
+            assert_eq!(
+                set.contains(probe),
+                scanned(&symbols, probe),
+                "DeclaredTypes and the scan disagree on {probe:?}"
+            );
+        }
+        // Some probes must be true, or agreement proves nothing.
+        assert!(set.contains("other::Engine") && set.contains("pkg.Widget"));
+        assert!(!set.contains("run") && !set.contains("Missing"));
     }
 }

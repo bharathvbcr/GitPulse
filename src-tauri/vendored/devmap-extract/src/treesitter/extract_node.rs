@@ -1280,7 +1280,7 @@ pub(super) fn extract_node(
                     }
                     // The directive comments directly above the declaration:
                     // cgo's `//export` and `//go:linkname`.
-                    let mut above = node.prev_sibling();
+                    let mut above = crate::parent_index::prev_sibling_of(node);
                     while let Some(comment) = above.filter(|sibling| sibling.kind() == "comment") {
                         let text = &source[comment.start_byte()..comment.end_byte()];
                         if let Some(reason) = crate::wiring::go_directive_entry_reason(text, &n) {
@@ -1291,7 +1291,7 @@ pub(super) fn extract_node(
                             });
                             break;
                         }
-                        above = comment.prev_sibling();
+                        above = crate::parent_index::prev_sibling_of(comment);
                     }
                     // Bind each parameter name to its declared type, scoped
                     // to this function so two functions using the same
