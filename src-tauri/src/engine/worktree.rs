@@ -5496,21 +5496,8 @@ pub(crate) fn merge_and_teardown_configured(
             message: crate::engine::merge_tree::wave_unsupported_message(),
         });
     }
-    let main_is_on_target = || -> Result<(), CommandError> {
-        // A refused read is an error, not "a detached HEAD": naming the wrong
-        // reason would send the user to fix the wrong thing.
-        let current = crate::engine::git_reader::head_branch(&repo)?.unwrap_or_default();
-        if current != target {
-            return Err(format!(
-                "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
-                if current.is_empty() { "a detached HEAD".to_string() } else { current }
-            )
-            .into());
-        }
-        Ok(())
-    };
     if !object_db {
-        main_is_on_target()?;
+        ensure_main_is_on_target(&repo, target)?;
     }
 
     // 2. Pre-merge hooks
@@ -5549,284 +5536,40 @@ pub(crate) fn merge_and_teardown_configured(
     // and refuses, keeping the worktree and branch, when it moved. A candidate
     // check drops the lock for its wait and takes it again before the ref moves.
     let repo_lock = repo_mutation_lock(&repo);
-    let mut guard = repo_lock
+    let guard = repo_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // The pre-merge hooks above may have switched the main checkout. The
-    // object-database path does not merge into that checkout, so it does not
-    // refuse here.
-    if !object_db {
-        main_is_on_target()?;
-    }
-
-    // A merge, rebase or squash parked in the main checkout is somebody's
-    // unfinished work. Merging over it would tangle the two, and rolling a
-    // failure back would undo theirs.
-    if let Some(kind) = crate::engine::repo_op::detect_kind(&repo)? {
-        // A squash probe that could not read the index says so; that is a
-        // read failure to report, not a squash known to be parked.
-        if kind == crate::engine::repo_op::OperationKind::SquashMerge {
-            let unread = crate::engine::repo_op::detect(&repo)?.and_then(|op| {
-                op.warnings
-                    .into_iter()
-                    .find(|w| w.starts_with(crate::engine::repo_op::SQUASH_READ_FAILURE))
-            });
-            if let Some(why) = unread {
-                return Err(format!(
-                    "The main checkout's index could not be read ({why}), so it cannot be shown free of a parked squash; nothing was merged."
-                )
-                .into());
-            }
-        }
-        return Err(
-            if kind == crate::engine::repo_op::OperationKind::SquashMerge {
-                MergeTeardownError::SquashParked {
-                    message: format!(
-                    "A squash merge is parked in the main checkout: its changes are staged and not \
-                     committed. Commit them, or undo them with `git reset --merge`, before merging \
-                     {branch}. Nothing was merged."
-                ),
-                }
-            } else {
-                MergeTeardownError::Refused {
-                message: format!(
-                    "A {} is in progress in the main checkout. Finish or abort it before merging {branch}; nothing was merged.",
-                    kind.label()
-                ),
-            }
-            },
-        );
-    }
-
-    // Unmerged index entries with no merge in progress are the user's own (a
-    // conflicted stash pop they are resolving). Git would refuse to merge over
-    // them, and a rollback of that refusal would reset their resolution away,
-    // so none of that is started. What a rollback later undoes is then
-    // provably this call's: the checkout had none before it.
-    let (unmerged, unmerged_total) =
-        crate::engine::repo_op::conflicted_paths(&repo).map_err(|e| {
-            format!(
-                "The main checkout's unmerged files could not be checked: {e}. Nothing was merged.",
-                e = e.message()
-            )
-        })?;
-    if unmerged_total > 0 {
-        let shown: Vec<&str> = unmerged.iter().take(5).map(String::as_str).collect();
-        return Err(format!(
-            "The main checkout has {unmerged_total} unmerged file(s) with no merge in progress ({}{}). Resolve and commit them, or restore them, before merging {branch}; nothing was merged and nothing was reset.",
-            shown.join(", "),
-            if unmerged_total > shown.len() { ", ..." } else { "" }
-        )
-        .into());
-    }
-
-    // 3. Collision / uncommitted changes check
-    let worktree_text = worktree.to_string_lossy().to_string();
-    let (changed, _) = changed_paths(&worktree_text)?;
-    if !changed.is_empty() {
-        return Err(format!(
-            "Worktree has {} uncommitted file changes; commit or stash them before merging",
-            changed.len()
-        )
-        .into());
-    }
-    // The branch tip being merged. Anything that lands on the branch after
-    // this is not in the merge and must not be deleted with it.
+    let (integrated, guard) = integrate_branch_locked(
+        IntegrateBranchRequest {
+            repo: &repo,
+            source_wt: Some(&worktree),
+            branch: &branch,
+            target,
+            squash,
+            commit_message: None,
+            expected_tip: expected_tip.as_deref(),
+            config,
+            check_six_point: false,
+            filter_runtime_artifacts_on_source: false,
+            allow_dirty_main_hooks_fallback: true,
+        },
+        &repo_lock,
+        guard,
+        verify,
+        gate,
+    )?;
+    let before_oid = integrated.before_oid;
+    let base_oid = integrated.base_oid;
+    let merged_tip = integrated.merged_tip;
+    let commits_merged = integrated.commits_merged;
+    let candidate_oid = integrated.candidate_oid;
+    let checkout_note = integrated.checkout_note;
+    let checkout_advanced = integrated.checkout_advanced;
+    let checkout_fallback = integrated.checkout_fallback;
     let branch_ref = format!("refs/heads/{branch}");
-    let merged_tip = git_text(&repo, &["rev-parse", "--verify", branch_ref.as_str()])?
-        .trim()
-        .to_string();
-    if let Some(expected) = expected_tip.as_deref() {
-        if expected != merged_tip {
-            return Err(MergeTeardownError::Moved {
-                message: format!(
-                    "{branch} is at {merged_tip}, not the {expected} that was checked. \
-                     It moved after the check, so nothing was merged and the worktree was kept."
-                ),
-                branch: branch.clone(),
-                expected: expected.to_string(),
-                actual: merged_tip,
-            });
-        }
-    }
-
-    // The target the merge lands on. An unborn one has no tip to merge onto.
     let target_ref = format!("refs/heads/{target}");
-    let before_oid = git_text(&repo, &["rev-parse", "--verify", target_ref.as_str()])
-        .map_err(|e| {
-            e.wrap(|e| format!("{target} has no commits to merge onto ({e}); nothing was merged."))
-        })?
-        .trim()
-        .to_string();
-
-    // The lane is merged into the branch it was cut from. A main checkout
-    // switched to another branch since, or a target rewritten so that the
-    // lane's base is no longer in it, would take the merge somewhere the
-    // lane was never based on.
-    let base_oid = match read_base_record(&worktree)? {
-        None => None,
-        Some((base_branch, base_oid)) => {
-            let mismatch = |message: String| MergeTeardownError::BaseMismatch {
-                message,
-                base_branch: base_branch.clone(),
-                target_branch: target.to_string(),
-                base_oid: base_oid.clone(),
-            };
-            if base_oid.len() != before_oid.len() {
-                return Err(format!(
-                    "{branch}'s recorded base {base_oid} is not in this repository's object format ({}-character ids); nothing was merged.",
-                    before_oid.len()
-                )
-                .into());
-            }
-            if base_branch != target {
-                return Err(mismatch(format!(
-                    "{branch} was cut from {base_branch}, but the merge target is {target}. Nothing was merged."
-                )));
-            }
-            let ancestor = crate::engine::git_cli::git_captured(
-                &repo,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    base_oid.as_str(),
-                    target_ref.as_str(),
-                ],
-            )?;
-            match ancestor.status_code {
-                0 => {}
-                1 => {
-                    return Err(mismatch(format!(
-                        "{branch} was cut from {base_oid} on {base_branch}, which {target} no longer contains: \
-                         incompatible merge-base. Nothing was merged."
-                    )))
-                }
-                code => {
-                    return Err(format!(
-                        "Could not check whether {target} still contains {base_oid} (git exit {code}): {}. Nothing was merged.",
-                        String::from_utf8_lossy(&ancestor.stderr).trim()
-                    )
-                    .into())
-                }
-            }
-            Some(base_oid)
-        }
-    };
-
-    // Count commits being merged
-    let commits_merged: usize = git_text(
-        &repo,
-        &["rev-list", "--count", &format!("{target}..{branch}")],
-    )?
-    .trim()
-    .parse()
-    .map_err(|_| format!("git did not report how many commits {branch} adds to {target}"))?;
-
-    // 4. Integrate the lane. The object database is the owner when this git
-    // can write a merge tree; the in-checkout merge is only the older-git
-    // fallback, and it is the one that calls [`merge_teardown_argv`].
-    let mut candidate_oid = None;
-    let checkout_note: Option<String>;
-    let checkout_advanced: bool;
-    let mut checkout_fallback = false;
-    if object_db {
-        // No verifier: one locked integrate, the same commands the gate pins
-        // name. A verifier waits outside the lock, and only for a tree the
-        // caller's tip does not already cover. The in-checkout fallback stays
-        // on the unverified path.
-        if let Some(verify) = verify {
-            let candidate = crate::engine::merge_tree::prepare(
-                &repo,
-                &branch,
-                target,
-                &before_oid,
-                &merged_tip,
-                squash,
-                gate,
-            )
-            .map_err(map_integrate_failure)?;
-            let covered = crate::engine::merge_tree::already_covered(
-                &repo,
-                &candidate,
-                &before_oid,
-                expected_tip.as_deref(),
-            )
-            .map_err(map_integrate_failure)?;
-            if !covered {
-                drop(guard);
-                let verdict =
-                    crate::engine::merge_tree::verify_in_scratch(&repo, &candidate, verify, gate);
-                guard = repo_lock
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                verdict.map_err(map_integrate_failure)?;
-                recheck_after_verify(&repo, &worktree, &branch, target, &before_oid, &merged_tip)?;
-            }
-            let touch = checkout_holders(&repo, target)?;
-            match crate::engine::merge_tree::land(
-                &repo,
-                &branch,
-                target,
-                &before_oid,
-                &candidate,
-                &touch,
-                gate,
-            ) {
-                Ok(landed) => {
-                    candidate_oid = Some(landed.candidate_oid);
-                    checkout_note = landed.checkout_note;
-                    checkout_advanced = landed.checkout_advanced;
-                }
-                Err(failure) => return Err(map_integrate_failure(failure)),
-            }
-        } else {
-            let touch = checkout_holders(&repo, target)?;
-            match crate::engine::merge_tree::integrate(
-                &repo,
-                &branch,
-                target,
-                &before_oid,
-                &merged_tip,
-                squash,
-                &touch,
-                None,
-                gate,
-            ) {
-                Ok(landed) => {
-                    candidate_oid = Some(landed.candidate_oid);
-                    checkout_note = landed.checkout_note;
-                    checkout_advanced = landed.checkout_advanced;
-                }
-                Err(crate::engine::merge_tree::IntegrateFailure::Unsupported { .. })
-                    if !config.require_write_tree =>
-                {
-                    main_is_on_target()?;
-                    in_checkout_merge(gate, &repo, &branch, target, &merged_tip, squash)?;
-                    checkout_fallback = true;
-                    checkout_advanced = true;
-                    checkout_note = Some(crate::engine::merge_tree::fallback_note());
-                }
-                // The hooks the object-database commit would skip run in the
-                // in-checkout merge, as they always did.
-                Err(crate::engine::merge_tree::IntegrateFailure::CommitHooks { hooks })
-                    if !config.require_write_tree =>
-                {
-                    main_is_on_target()?;
-                    in_checkout_merge(gate, &repo, &branch, target, &merged_tip, squash)?;
-                    checkout_fallback = true;
-                    checkout_advanced = true;
-                    checkout_note = Some(crate::engine::merge_tree::hooks_fallback_note(&hooks));
-                }
-                Err(failure) => return Err(map_integrate_failure(failure)),
-            }
-        }
-    } else {
-        in_checkout_merge(gate, &repo, &branch, target, &merged_tip, squash)?;
-        checkout_fallback = true;
-        checkout_advanced = true;
-        checkout_note = Some(crate::engine::merge_tree::fallback_note());
-    }
+    let worktree_text = worktree.to_string_lossy().to_string();
 
     // From here the merge has landed. Nothing below returns `Err`: what it
     // cannot finish is reported on the result.
@@ -5975,12 +5718,457 @@ pub(crate) fn merge_and_teardown_configured(
     })
 }
 
+fn ensure_main_is_on_target(repo: &Path, target: &str) -> Result<(), CommandError> {
+    // A refused read is an error, not "a detached HEAD": naming the wrong
+    // reason would send the user to fix the wrong thing.
+    let current = crate::engine::git_reader::head_branch(repo)?.unwrap_or_default();
+    if current != target {
+        return Err(format!(
+            "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
+            if current.is_empty() { "a detached HEAD".to_string() } else { current }
+        )
+        .into());
+    }
+    Ok(())
+}
+
+struct IntegrateBranchRequest<'a> {
+    repo: &'a Path,
+    source_wt: Option<&'a Path>,
+    branch: &'a str,
+    target: &'a str,
+    squash: bool,
+    commit_message: Option<&'a str>,
+    expected_tip: Option<&'a str>,
+    config: crate::engine::merge_tree::IntegrateConfig,
+    check_six_point: bool,
+    filter_runtime_artifacts_on_source: bool,
+    allow_dirty_main_hooks_fallback: bool,
+}
+
+struct IntegrateBranchOutcome {
+    before_oid: String,
+    base_oid: Option<String>,
+    merged_tip: String,
+    commits_merged: usize,
+    candidate_oid: Option<String>,
+    squashed_commit: Option<String>,
+    checkout_advanced: bool,
+    checkout_fallback: bool,
+    checkout_note: Option<String>,
+}
+
+/// Canonical locked branch integration path backed by `merge_tree`
+/// (`prepare_with_message`, `verify_in_scratch`, `land`) and multi-holder
+/// `checkout_holders`, falling back to `in_checkout_merge` only when allowed.
+fn integrate_branch_locked<'a>(
+    req: IntegrateBranchRequest<'_>,
+    repo_lock: &'a Mutex<()>,
+    mut guard: std::sync::MutexGuard<'a, ()>,
+    verify: Option<&mut crate::engine::merge_tree::CandidateVerifier<'_>>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(IntegrateBranchOutcome, std::sync::MutexGuard<'a, ()>), MergeTeardownError> {
+    let repo = req.repo;
+    let branch = req.branch;
+    let target = req.target;
+    let object_db = crate::engine::merge_tree::write_tree_available(req.config.write_tree);
+    if !object_db && req.config.require_write_tree {
+        return Err(MergeTeardownError::WriteTreeUnavailable {
+            message: crate::engine::merge_tree::wave_unsupported_message(),
+        });
+    }
+
+    // The pre-merge hooks above may have switched the main checkout. The
+    // object-database path does not merge into that checkout, so it does not
+    // refuse here.
+    if !object_db {
+        ensure_main_is_on_target(repo, target)?;
+    }
+
+    // A merge, rebase or squash parked in the main checkout is somebody's
+    // unfinished work. Merging over it would tangle the two, and rolling a
+    // failure back would undo theirs.
+    if let Some(kind) = crate::engine::repo_op::detect_kind(repo)? {
+        // A squash probe that could not read the index says so; that is a
+        // read failure to report, not a squash known to be parked.
+        if kind == crate::engine::repo_op::OperationKind::SquashMerge {
+            let unread = crate::engine::repo_op::detect(repo)?.and_then(|op| {
+                op.warnings
+                    .into_iter()
+                    .find(|w| w.starts_with(crate::engine::repo_op::SQUASH_READ_FAILURE))
+            });
+            if let Some(why) = unread {
+                return Err(format!(
+                    "The main checkout's index could not be read ({why}), so it cannot be shown free of a parked squash; nothing was merged."
+                )
+                .into());
+            }
+        }
+        return Err(
+            if kind == crate::engine::repo_op::OperationKind::SquashMerge {
+                MergeTeardownError::SquashParked {
+                    message: format!(
+                        "A squash merge is parked in the main checkout: its changes are staged and not \
+                         committed. Commit them, or undo them with `git reset --merge`, before merging \
+                         {branch}. Nothing was merged."
+                    ),
+                }
+            } else {
+                MergeTeardownError::Refused {
+                    message: format!(
+                        "A {} is in progress in the main checkout. Finish or abort it before merging {branch}; nothing was merged.",
+                        kind.label()
+                    ),
+                }
+            },
+        );
+    }
+
+    // Unmerged index entries with no merge in progress are the user's own (a
+    // conflicted stash pop they are resolving). Git would refuse to merge over
+    // them, and a rollback of that refusal would reset their resolution away,
+    // so none of that is started. What a rollback later undoes is then
+    // provably this call's: the checkout had none before it.
+    let (unmerged, unmerged_total) =
+        crate::engine::repo_op::conflicted_paths(repo).map_err(|e| {
+            format!(
+                "The main checkout's unmerged files could not be checked: {e}. Nothing was merged.",
+                e = e.message()
+            )
+        })?;
+    if unmerged_total > 0 {
+        let shown: Vec<&str> = unmerged.iter().take(5).map(String::as_str).collect();
+        return Err(format!(
+            "The main checkout has {unmerged_total} unmerged file(s) with no merge in progress ({}{}). Resolve and commit them, or restore them, before merging {branch}; nothing was merged and nothing was reset.",
+            shown.join(", "),
+            if unmerged_total > shown.len() { ", ..." } else { "" }
+        )
+        .into());
+    }
+
+    // Check source worktree cleanliness when a worktree holds `branch`.
+    if let Some(wt) = req.source_wt {
+        let wt_text = wt.to_str().ok_or_else(|| {
+            CommandError::plain("The worktree path is not UTF-8, so it could not be checked.")
+        })?;
+        let (changed, _) = if req.filter_runtime_artifacts_on_source {
+            user_changed_paths(wt_text)?
+        } else {
+            changed_paths(wt_text)?
+        };
+        if !changed.is_empty() {
+            return Err(format!(
+                "Worktree has {} uncommitted file changes; commit or stash them before merging",
+                changed.len()
+            )
+            .into());
+        }
+    }
+
+    // The branch tip being merged. Anything that lands on the branch after
+    // this is not in the merge and must not be deleted with it.
+    let branch_ref = format!("refs/heads/{branch}");
+    let merged_tip = git_text(repo, &["rev-parse", "--verify", branch_ref.as_str()])?
+        .trim()
+        .to_string();
+    if let Some(expected) = req.expected_tip {
+        if expected != merged_tip {
+            return Err(MergeTeardownError::Moved {
+                message: format!(
+                    "{branch} is at {merged_tip}, not the {expected} that was checked. \
+                     It moved after the check, so nothing was merged and the worktree was kept."
+                ),
+                branch: branch.to_string(),
+                expected: expected.to_string(),
+                actual: merged_tip,
+            });
+        }
+    }
+
+    // The target the merge lands on. An unborn one has no tip to merge onto.
+    let target_ref = format!("refs/heads/{target}");
+    let before_oid = git_text(repo, &["rev-parse", "--verify", target_ref.as_str()])
+        .map_err(|e| {
+            e.wrap(|e| format!("{target} has no commits to merge onto ({e}); nothing was merged."))
+        })?
+        .trim()
+        .to_string();
+
+    // The lane is merged into the branch it was cut from when a base record exists.
+    let base_oid = match req.source_wt {
+        None => None,
+        Some(wt) => match read_base_record(wt)? {
+            None => None,
+            Some((base_branch, base_oid)) => {
+                let mismatch = |message: String| MergeTeardownError::BaseMismatch {
+                    message,
+                    base_branch: base_branch.clone(),
+                    target_branch: target.to_string(),
+                    base_oid: base_oid.clone(),
+                };
+                if base_oid.len() != before_oid.len() {
+                    return Err(format!(
+                        "{branch}'s recorded base {base_oid} is not in this repository's object format ({}-character ids); nothing was merged.",
+                        before_oid.len()
+                    )
+                    .into());
+                }
+                if base_branch != target {
+                    return Err(mismatch(format!(
+                        "{branch} was cut from {base_branch}, but the merge target is {target}. Nothing was merged."
+                    )));
+                }
+                let ancestor = crate::engine::git_cli::git_captured(
+                    repo,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        base_oid.as_str(),
+                        target_ref.as_str(),
+                    ],
+                )?;
+                match ancestor.status_code {
+                    0 => {}
+                    1 => {
+                        return Err(mismatch(format!(
+                            "{branch} was cut from {base_oid} on {base_branch}, which {target} no longer contains: \
+                             incompatible merge-base. Nothing was merged."
+                        )))
+                    }
+                    code => {
+                        return Err(format!(
+                            "Could not check whether {target} still contains {base_oid} (git exit {code}): {}. Nothing was merged.",
+                            String::from_utf8_lossy(&ancestor.stderr).trim()
+                        )
+                        .into())
+                    }
+                }
+                Some(base_oid)
+            }
+        },
+    };
+
+    let commits_merged: usize = git_text(
+        repo,
+        &["rev-list", "--count", &format!("{target}..{branch}")],
+    )?
+    .trim()
+    .parse()
+    .map_err(|_| format!("git did not report how many commits {branch} adds to {target}"))?;
+
+    if req.check_six_point {
+        let check = verify_branch_integration(repo, branch, target)?;
+        if check.is_integrated {
+            return Ok((
+                IntegrateBranchOutcome {
+                    before_oid,
+                    base_oid,
+                    merged_tip,
+                    commits_merged,
+                    candidate_oid: None,
+                    squashed_commit: None,
+                    checkout_advanced: false,
+                    checkout_fallback: false,
+                    checkout_note: None,
+                },
+                guard,
+            ));
+        }
+    }
+
+    let mut candidate_oid = None;
+    let checkout_note: Option<String>;
+    let checkout_advanced: bool;
+    let mut checkout_fallback = false;
+    if object_db {
+        let integrate_result = if verify.is_none() && req.commit_message.is_none() {
+            let touch = checkout_holders(repo, target)?;
+            crate::engine::merge_tree::integrate(
+                repo,
+                branch,
+                target,
+                &before_oid,
+                &merged_tip,
+                req.squash,
+                &touch,
+                None,
+                gate,
+            )
+        } else {
+            let prepared = if req.commit_message.is_some() {
+                crate::engine::merge_tree::prepare_with_message(
+                    repo,
+                    branch,
+                    target,
+                    &before_oid,
+                    &merged_tip,
+                    req.squash,
+                    req.commit_message,
+                    gate,
+                )
+            } else {
+                crate::engine::merge_tree::prepare(
+                    repo,
+                    branch,
+                    target,
+                    &before_oid,
+                    &merged_tip,
+                    req.squash,
+                    gate,
+                )
+            };
+            match prepared {
+                Ok(candidate) => {
+                    if let Some(verify) = verify {
+                        let covered = crate::engine::merge_tree::already_covered(
+                            repo,
+                            &candidate,
+                            &before_oid,
+                            req.expected_tip,
+                        )
+                        .map_err(map_integrate_failure)?;
+                        if !covered {
+                            drop(guard);
+                            let verdict = crate::engine::merge_tree::verify_in_scratch(
+                                repo, &candidate, verify, gate,
+                            );
+                            guard = repo_lock
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            verdict.map_err(map_integrate_failure)?;
+                            recheck_after_verify(
+                                repo,
+                                req.source_wt,
+                                branch,
+                                target,
+                                &before_oid,
+                                &merged_tip,
+                            )?;
+                        }
+                    }
+                    let touch = checkout_holders(repo, target)?;
+                    crate::engine::merge_tree::land(
+                        repo,
+                        branch,
+                        target,
+                        &before_oid,
+                        &candidate,
+                        &touch,
+                        gate,
+                    )
+                }
+                Err(failure) => Err(failure),
+            }
+        };
+        match integrate_result {
+            Ok(landed) => {
+                candidate_oid = Some(landed.candidate_oid);
+                checkout_note = landed.checkout_note;
+                checkout_advanced = landed.checkout_advanced;
+            }
+            Err(crate::engine::merge_tree::IntegrateFailure::Unsupported { .. })
+                if !req.config.require_write_tree =>
+            {
+                ensure_main_is_on_target(repo, target)?;
+                in_checkout_merge(
+                    gate,
+                    repo,
+                    branch,
+                    target,
+                    &merged_tip,
+                    req.squash,
+                    req.commit_message,
+                )?;
+                checkout_fallback = true;
+                checkout_advanced = true;
+                checkout_note = Some(crate::engine::merge_tree::fallback_note());
+            }
+            // The hooks the object-database commit would skip run in the
+            // in-checkout merge when the primary checkout is cleanly on target.
+            Err(crate::engine::merge_tree::IntegrateFailure::CommitHooks { hooks })
+                if !req.config.require_write_tree =>
+            {
+                ensure_main_is_on_target(repo, target)?;
+                if !req.allow_dirty_main_hooks_fallback {
+                    let repo_str = repo
+                        .to_str()
+                        .ok_or_else(|| CommandError::plain("repository path is not valid UTF-8"))?;
+                    let clean_main = user_changed_paths(repo_str)
+                        .map(|(dirty, truncated)| dirty.is_empty() && !truncated)
+                        .unwrap_or(false);
+                    if !clean_main {
+                        return Err(MergeTeardownError::Held {
+                            reason: crate::engine::merge_tree::HeldReason::CommitHooks,
+                            message: crate::engine::merge_tree::hooks_refusal_message(&hooks),
+                            path: Some(repo.display().to_string()),
+                        });
+                    }
+                }
+                in_checkout_merge(
+                    gate,
+                    repo,
+                    branch,
+                    target,
+                    &merged_tip,
+                    req.squash,
+                    req.commit_message,
+                )?;
+                checkout_fallback = true;
+                checkout_advanced = true;
+                checkout_note = Some(crate::engine::merge_tree::hooks_fallback_note(&hooks));
+            }
+            Err(failure) => return Err(map_integrate_failure(failure)),
+        }
+    } else {
+        in_checkout_merge(
+            gate,
+            repo,
+            branch,
+            target,
+            &merged_tip,
+            req.squash,
+            req.commit_message,
+        )?;
+        checkout_fallback = true;
+        checkout_advanced = true;
+        checkout_note = Some(crate::engine::merge_tree::fallback_note());
+    }
+
+    let squashed_commit = if req.squash {
+        match candidate_oid.as_deref() {
+            Some(cand) if cand != before_oid => Some(cand.to_string()),
+            Some(_) => None,
+            None => git_text(repo, &["rev-parse", "--verify", target_ref.as_str()])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|tip| tip != &before_oid),
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        IntegrateBranchOutcome {
+            before_oid,
+            base_oid,
+            merged_tip,
+            commits_merged,
+            candidate_oid,
+            squashed_commit,
+            checkout_advanced,
+            checkout_fallback,
+            checkout_note,
+        },
+        guard,
+    ))
+}
+
 /// The repository can change while a candidate is verified, because that wait
 /// does not hold the mutation lock. Land only when the tips and the lane are
 /// still what the candidate was built from.
 fn recheck_after_verify(
     repo: &Path,
-    worktree: &Path,
+    worktree: Option<&Path>,
     branch: &str,
     target: &str,
     before_oid: &str,
@@ -6026,21 +6214,23 @@ fn recheck_after_verify(
             actual: branch_now,
         });
     }
-    let text = worktree
-        .to_str()
-        .ok_or_else(|| MergeTeardownError::Refused {
-            message:
-                "The worktree path is not UTF-8, so it could not be re-checked. Nothing was merged."
-                    .into(),
-        })?;
-    let (changed, _) = changed_paths(text)?;
-    if !changed.is_empty() {
-        return Err(MergeTeardownError::Refused {
-            message: format!(
-                "The worktree gained {} uncommitted change(s) while the candidate was being verified, so nothing was merged.",
-                changed.len()
-            ),
-        });
+    if let Some(worktree) = worktree {
+        let text = worktree
+            .to_str()
+            .ok_or_else(|| MergeTeardownError::Refused {
+                message:
+                    "The worktree path is not UTF-8, so it could not be re-checked. Nothing was merged."
+                        .into(),
+            })?;
+        let (changed, _) = changed_paths(text)?;
+        if !changed.is_empty() {
+            return Err(MergeTeardownError::Refused {
+                message: format!(
+                    "The worktree gained {} uncommitted change(s) while the candidate was being verified, so nothing was merged.",
+                    changed.len()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -6164,7 +6354,7 @@ fn map_integrate_failure(
 }
 
 /// The merge that runs in the main checkout when `merge-tree` cannot write a
-/// tree. Both arms go through [`merge_teardown_argv`] for the first command.
+/// tree or active commit hooks require an in-checkout commit.
 fn in_checkout_merge(
     gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     repo: &Path,
@@ -6172,14 +6362,21 @@ fn in_checkout_merge(
     target: &str,
     merged_tip: &str,
     squash: bool,
+    commit_message: Option<&str>,
 ) -> Result<(), MergeTeardownError> {
+    let custom_msg = commit_message.map(str::trim).filter(|m| !m.is_empty());
     if squash {
+        let squash_res = if let Some(custom) = custom_msg {
+            squash_merge_with_message_locked(repo, branch, custom, gate)
+        } else {
+            GitWriter::squash_merge_locked(repo, branch, gate).map(drop)
+        };
         // Nothing staged means the branch's changes are already on the
         // target and there is nothing to commit — not a failure. A failed
         // commit fails closed before anything is torn down: it used to be
         // discarded, and the next steps removed the worktree and
         // force-deleted the branch whose work was never committed.
-        GitWriter::squash_merge_locked(repo, branch, gate).map_err(|failure| match failure {
+        squash_res.map_err(|failure| match failure {
             SquashFailure::Merge(e) => MergeTeardownError::Refused {
                 message: e.into_message(),
             },
@@ -6202,7 +6399,9 @@ fn in_checkout_merge(
             // The same two guards the squash runs, before the commit a merge
             // commit is.
             GitWriter::require_commit_identity(repo)?;
-            let commit_msg = format!("Merge branch '{branch}' into {target}");
+            let commit_msg = custom_msg
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Merge branch '{branch}' into {target}"));
             let merge = ["merge", "--no-edit", branch, "-m", commit_msg.as_str()];
             gate(&merge)?;
             if let Err(e) = git_text(repo, &merge) {
@@ -6221,6 +6420,50 @@ fn in_checkout_merge(
             }
         }
     }
+    Ok(())
+}
+
+fn squash_merge_with_message_locked(
+    repo: &Path,
+    branch: &str,
+    message: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(), SquashFailure> {
+    GitWriter::require_commit_identity(repo).map_err(SquashFailure::Merge)?;
+    let merge = GitWriter::merge_argv(branch, MergeMode::Squash);
+    gate(&merge).map_err(SquashFailure::Merge)?;
+    git_text(repo, &merge).map_err(SquashFailure::Conflict)?;
+    let staged_note = |e: CommandError| {
+        SquashFailure::Commit(e.wrap(|e| {
+            format!(
+                "The squashed changes of {branch} are staged but could not be committed: {e}. \
+                 Commit the staged changes, or undo them with `git reset --merge`."
+            )
+        }))
+    };
+    let staged = git_text(repo, &["diff", "--cached", "--name-only"]).map_err(staged_note)?;
+    if staged.trim().is_empty() {
+        let squash_msg = resolve_git_dir(repo)
+            .map_err(SquashFailure::Commit)?
+            .join("SQUASH_MSG");
+        match std::fs::remove_file(&squash_msg) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SquashFailure::Commit(
+                    format!(
+                        "The squash of {branch} staged nothing, but {} could not be removed: {e}",
+                        squash_msg.display()
+                    )
+                    .into(),
+                ))
+            }
+        }
+        return Ok(());
+    }
+    let commit = ["commit", "-m", message];
+    gate(&commit).map_err(staged_note)?;
+    git_text(repo, &commit).map_err(staged_note)?;
     Ok(())
 }
 
@@ -7971,7 +8214,7 @@ pub(crate) fn agent_hold(
 ) -> Option<String> {
     let path = Path::new(worktree_path);
     if honour_claims {
-        match crate::engine::agent_bus::list_lanes(repo_path) {
+        match crate::engine::agent_bus::list_live_lanes(repo_path) {
             Err(e) => return Some(format!("could not read the lane claims: {}", e.message())),
             Ok(claims) => {
                 if let Some(hold) = claim_hold(&claims, path, branch) {
@@ -8046,10 +8289,10 @@ pub fn user_changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), Co
 /// Executes the automated worktree merge pipeline safely across checked-out and
 /// headless target branches:
 /// 1. Repository trust, policy & agent-review gate (`harness::guard_command`)
-/// 2. Dirty-worktree & parked-operation guards on both source and target checkouts
-/// 3. 6-point integration verification + quarantined 3-way `git merge-tree` conflict check
-/// 4. Working-tree merge (when target is checked out) or CAS in-memory `merge-tree` + `commit-tree`
-/// 5. Process reaping, worktree removal, and source branch cleanup
+/// 2. Canonical locked ODB integration (`integrate_branch_locked`: dirty/parked-op
+///    guards, `gitpulse-base` validation, 6-point idempotency, `merge_tree`,
+///    active commit hook enforcement, and multi-holder CAS landing/rollback)
+/// 3. Process reaping, split worktree removal, source branch cleanup, and lane release
 pub fn merge_worktree_pipeline(
     repo_path: &str,
     source_branch: &str,
@@ -8057,6 +8300,43 @@ pub fn merge_worktree_pipeline(
     squash: bool,
     commit_message: Option<&str>,
     remove_wt: bool,
+) -> Result<WorktreeMergeResult, CommandError> {
+    merge_worktree_pipeline_with_gate(
+        repo_path,
+        source_branch,
+        target_branch,
+        squash,
+        commit_message,
+        remove_wt,
+        &mut |_| Ok(()),
+    )
+}
+
+fn map_pipeline_integrate_error(
+    source_branch: &str,
+    target: &str,
+    err: MergeTeardownError,
+) -> CommandError {
+    match err {
+        MergeTeardownError::Conflict { paths, total, .. } => {
+            let preview: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+            CommandError::plain(format!(
+                "Merge of {source_branch} into {target} has {total} conflicting file(s): {}",
+                preview.join(", ")
+            ))
+        }
+        other => CommandError::plain(other.message()),
+    }
+}
+
+fn merge_worktree_pipeline_with_gate(
+    repo_path: &str,
+    source_branch: &str,
+    target_branch: Option<&str>,
+    squash: bool,
+    commit_message: Option<&str>,
+    remove_wt: bool,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<WorktreeMergeResult, CommandError> {
     let family = resolve_worktree_family(repo_path, repo_path)?;
     let anchor = family.anchor;
@@ -8105,169 +8385,54 @@ pub fn merge_worktree_pipeline(
         .map_err(CommandError::from)?;
 
     let (source_sha, source_wt_path, squashed_sha, final_sha) = {
-        let _repo_lock = repo_mutation_lock(&anchor);
-        let _guard = _repo_lock
+        let repo_lock = repo_mutation_lock(&anchor);
+        let guard = repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let source_ref = format!("refs/heads/{source_branch}");
+        let entries = read_worktree_entries(&anchor)?;
+        let anchor_id = lane_identity(&anchor);
+        let source_entry = entries
+            .iter()
+            .find(|e| e.branch.as_deref() == Some(source_branch));
+        let source_wt_for_integration = source_entry.map(|e| PathBuf::from(&e.path));
+        let swt_path = source_entry
+            .filter(|e| lane_identity(Path::new(&e.path)) != anchor_id)
+            .map(|e| e.path.clone());
+
+        let (integrated, guard) = integrate_branch_locked(
+            IntegrateBranchRequest {
+                repo: &anchor,
+                source_wt: source_wt_for_integration.as_deref(),
+                branch: source_branch,
+                target: &target,
+                squash,
+                commit_message,
+                expected_tip: None,
+                config: crate::engine::merge_tree::IntegrateConfig::default(),
+                check_six_point: true,
+                filter_runtime_artifacts_on_source: true,
+                allow_dirty_main_hooks_fallback: false,
+            },
+            &repo_lock,
+            guard,
+            None,
+            gate,
+        )
+        .map_err(|err| map_pipeline_integrate_error(source_branch, &target, err))?;
+
         let target_ref = format!("refs/heads/{target}");
-        let source_sha = git_text(&anchor, &["rev-parse", "--verify", &source_ref])
-            .map(|s| s.trim().to_string())?;
-        let target_sha = git_text(&anchor, &["rev-parse", "--verify", &target_ref])
-            .map(|s| s.trim().to_string())?;
-
-        let worktrees = list_worktrees(anchor_str)?;
-        let source_wt = worktrees
-            .iter()
-            .find(|w| w.branch.as_deref() == Some(source_branch))
-            .cloned();
-        if let Some(ref swt) = source_wt {
-            let (dirty, _) = user_changed_paths(&swt.path)?;
-            if !dirty.is_empty() {
-                return Err(CommandError::plain(format!(
-                    "Worktree for {source_branch} has {} uncommitted file change(s); commit or stash them before merging",
-                    dirty.len()
-                )));
-            }
-        }
-
-        let target_wt = worktrees
-            .iter()
-            .find(|w| w.branch.as_deref() == Some(target.as_str()))
-            .cloned();
-        if let Some(ref twt) = target_wt {
-            let (dirty, _) = user_changed_paths(&twt.path)?;
-            if !dirty.is_empty() {
-                return Err(CommandError::plain(format!(
-                    "Target worktree ({target}) has {} uncommitted file change(s); commit or stash them before merging",
-                    dirty.len()
-                )));
-            }
-            if let Some(kind) = crate::engine::repo_op::detect_kind(Path::new(&twt.path))? {
-                return Err(CommandError::plain(format!(
-                    "Target worktree ({target}) has a {} in progress; finish or abort it before merging",
-                    kind.label()
-                )));
-            }
-        }
-
-        let check = verify_branch_integration(&anchor, source_branch, &target)?;
-        let mut squashed_sha = None;
-
-        if !check.is_integrated {
-            let quarantine = crate::engine::object_quarantine::ObjectQuarantine::new(&anchor)
-                .map_err(|e| CommandError::plain(e.to_string()))?;
-            match quarantine
-                .merge_tree(
-                    &anchor,
-                    &target_sha,
-                    &source_sha,
-                    Instant::now() + crate::engine::process::DEFAULT_TIMEOUT,
-                )
-                .map_err(|e| CommandError::plain(e.to_string()))?
-            {
-                crate::engine::object_quarantine::MergeOutcome::Conflicted {
-                    paths,
-                    paths_total,
-                    ..
-                } => {
-                    let preview: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
-                    return Err(CommandError::plain(format!(
-                        "Merge of {source_branch} into {target} has {paths_total} conflicting file(s): {}",
-                        preview.join(", ")
-                    )));
-                }
-                crate::engine::object_quarantine::MergeOutcome::Clean { .. } => {}
-            }
-
-            let is_ff = crate::engine::git_cli::git_captured(
-                &anchor,
-                &["merge-base", "--is-ancestor", &target_sha, &source_sha],
-            )
-            .map(|r| r.status_code == 0)
-            .unwrap_or(false);
-
-            if squash || !is_ff {
-                GitWriter::require_commit_identity(&anchor)?;
-            }
-
-            let msg = match commit_message {
-                Some(m) => m.to_string(),
-                None if squash => format!("Squash merge branch '{source_branch}' into {target}"),
-                None => format!("Merge branch '{source_branch}' into {target}"),
-            };
-
-            let new_commit = if !squash && is_ff {
-                source_sha.clone()
-            } else {
-                let merged_tree = git_text(
-                    &anchor,
-                    &[
-                        "merge-tree",
-                        "--write-tree",
-                        "--no-messages",
-                        &target_sha,
-                        &source_sha,
-                    ],
-                )?
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-                if merged_tree.is_empty() {
-                    return Err(CommandError::plain(
-                        "git merge-tree did not return a merged tree OID",
-                    ));
-                }
-                let created_commit = if squash {
-                    git_text(
-                        &anchor,
-                        &["commit-tree", &merged_tree, "-p", &target_sha, "-m", &msg],
-                    )?
-                    .trim()
-                    .to_string()
-                } else {
-                    git_text(
-                        &anchor,
-                        &[
-                            "commit-tree",
-                            &merged_tree,
-                            "-p",
-                            &target_sha,
-                            "-p",
-                            &source_sha,
-                            "-m",
-                            &msg,
-                        ],
-                    )?
-                    .trim()
-                    .to_string()
-                };
-                if squash {
-                    squashed_sha = Some(created_commit.clone());
-                }
-                created_commit
-            };
-
-            if let Some(ref twt) = target_wt {
-                let twt_path = Path::new(&twt.path);
-                git_text(twt_path, &["merge", "--ff-only", &new_commit])?;
-            } else {
-                git_text(
-                    &anchor,
-                    &["update-ref", &target_ref, &new_commit, &target_sha],
-                )?;
-            }
-        }
-
         let final_sha = git_text(&anchor, &["rev-parse", "--verify", &target_ref])
             .map(|s| s.trim().to_string())
             .ok();
+        drop(guard);
 
-        let swt_path = source_wt.filter(|w| !w.is_main).map(|w| w.path);
-        (source_sha, swt_path, squashed_sha, final_sha)
+        (
+            integrated.merged_tip,
+            swt_path,
+            integrated.squashed_commit,
+            final_sha,
+        )
     };
 
     let mut wt_removed = false;
@@ -9201,6 +9366,394 @@ mod tests {
         assert!(
             wt_conflict.exists(),
             "conflicting worktree must be preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_merge_worktree_pipeline_enforces_active_pre_commit_hooks() {
+        let setup_repo = || {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().to_path_buf();
+            crate::test_support::git_in(&repo, &["init", "-b", "main"]);
+            crate::test_support::git_in(&repo, &["config", "user.name", "Test User"]);
+            crate::test_support::git_in(&repo, &["config", "user.email", "user@example.com"]);
+            std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+            crate::test_support::git_in(&repo, &["add", "."]);
+            crate::test_support::git_in(&repo, &["commit", "-m", "base"]);
+            crate::test_support::trust_repo(&repo);
+
+            let wt_parent = tempfile::tempdir().unwrap();
+            let wt = wt_parent.path().join("wt-hook");
+            add_worktree(
+                repo.to_str().unwrap(),
+                wt.to_str().unwrap(),
+                Some("feat/hook"),
+                Some("main"),
+                false,
+            )
+            .unwrap();
+            crate::test_support::trust_repo(&wt);
+            std::fs::write(wt.join("lane.txt"), "lane change\n").unwrap();
+            crate::test_support::git_in(&wt, &["add", "."]);
+            crate::test_support::git_in(&wt, &["commit", "-m", "lane commit"]);
+
+            // Diverge `main` so integration creates a new commit (non-FF).
+            std::fs::write(repo.join("main.txt"), "main change\n").unwrap();
+            crate::test_support::git_in(&repo, &["add", "."]);
+            crate::test_support::git_in(&repo, &["commit", "-m", "main commit"]);
+            (dir, wt_parent, wt)
+        };
+
+        // Case 1: Active failing pre-commit hook when `main` is cleanly on `main`
+        // must refuse (never bypass the hook and never advance `main`).
+        {
+            let (dir, _wt_parent, wt) = setup_repo();
+            let repo = dir.path();
+            crate::test_support::write_git_script(
+                &repo.join(".git/hooks/pre-commit"),
+                "#!/bin/sh\necho blocked by pre-commit >&2\nexit 1\n",
+                true,
+            );
+            let before = rev(repo, "refs/heads/main");
+            let err = merge_worktree_pipeline(
+                repo.to_str().unwrap(),
+                "feat/hook",
+                Some("main"),
+                true,
+                Some("custom squash msg"),
+                true,
+            )
+            .expect_err("failing pre-commit hook must refuse");
+            assert!(
+                err.message().contains("could not be committed")
+                    || err.message().contains("pre-commit"),
+                "{err:?}"
+            );
+            assert_eq!(rev(repo, "refs/heads/main"), before);
+            assert!(wt.exists() && branch_exists(repo, "feat/hook"));
+        }
+
+        // Case 2: Active pre-commit hook when `main` is on another branch or dirty
+        // must refuse cleanly without touching `refs/heads/main` or bypassing hooks.
+        {
+            let (dir, _wt_parent, wt) = setup_repo();
+            let repo = dir.path();
+            crate::test_support::write_git_script(
+                &repo.join(".git/hooks/pre-commit"),
+                "#!/bin/sh\nexit 0\n",
+                true,
+            );
+            std::fs::write(repo.join("dirty.txt"), "staged\n").unwrap();
+            crate::test_support::git_in(repo, &["add", "dirty.txt"]);
+            let before = rev(repo, "refs/heads/main");
+            let err = merge_worktree_pipeline(
+                repo.to_str().unwrap(),
+                "feat/hook",
+                Some("main"),
+                true,
+                None,
+                true,
+            )
+            .expect_err("dirty main with active pre-commit hook must refuse");
+            assert!(err.message().contains("pre-commit"), "{err:?}");
+            assert_eq!(rev(repo, "refs/heads/main"), before);
+            assert!(wt.exists() && branch_exists(repo, "feat/hook"));
+        }
+
+        // Case 3: Active passing pre-commit hook when `main` is cleanly on `main`
+        // runs the hook via clean in-checkout fallback and preserves custom commit_message.
+        {
+            let (dir, _wt_parent, wt) = setup_repo();
+            let repo = dir.path();
+            let marker = dir.path().join("hook-ran.marker");
+            crate::test_support::write_git_script(
+                &repo.join(".git/hooks/pre-commit"),
+                &format!(
+                    "#!/bin/sh\necho ran > {}\nexit 0\n",
+                    crate::test_support::sh_quote(&marker)
+                ),
+                true,
+            );
+            let res = merge_worktree_pipeline(
+                repo.to_str().unwrap(),
+                "feat/hook",
+                Some("main"),
+                true,
+                Some("feat: hooked squash"),
+                true,
+            )
+            .unwrap();
+            assert!(res.ok);
+            assert!(marker.exists(), "pre-commit hook was bypassed!");
+            assert!(!wt.exists() && !branch_exists(repo, "feat/hook"));
+            let subject = git_text(repo, &["log", "-1", "--format=%s"]).unwrap();
+            assert_eq!(subject.trim(), "feat: hooked squash");
+        }
+    }
+
+    #[test]
+    fn test_merge_worktree_pipeline_rolls_back_atomically_on_second_holder_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Test User"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "user@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "base"]);
+        crate::test_support::trust_repo(repo);
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_lane = wt_parent.path().join("wt-lane");
+        add_worktree(
+            repo.to_str().unwrap(),
+            wt_lane.to_str().unwrap(),
+            Some("feat/two-holder"),
+            Some("main"),
+            false,
+        )
+        .unwrap();
+        crate::test_support::trust_repo(&wt_lane);
+        std::fs::write(wt_lane.join("lane.txt"), "lane work\n").unwrap();
+        crate::test_support::git_in(&wt_lane, &["add", "."]);
+        crate::test_support::git_in(&wt_lane, &["commit", "-m", "lane work"]);
+
+        // Second checkout holding `main`.
+        let wt_second = wt_parent.path().join("wt-second-main");
+        crate::test_support::git_in(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-f",
+                wt_second.to_str().unwrap(),
+                "main",
+            ],
+        );
+        crate::test_support::trust_repo(&wt_second);
+
+        let before = rev(repo, "refs/heads/main");
+        let mut read_trees = 0usize;
+        let err = merge_worktree_pipeline_with_gate(
+            repo.to_str().unwrap(),
+            "feat/two-holder",
+            Some("main"),
+            false,
+            None,
+            true,
+            &mut |argv: &[&str]| {
+                if argv.first() == Some(&"read-tree") {
+                    read_trees += 1;
+                    if read_trees == 2 {
+                        return Err(CommandError::plain(
+                            "injected failure on second target holder",
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect_err("2nd holder failure must roll back atomically");
+        assert!(
+            err.message().contains("put back at")
+                && err
+                    .message()
+                    .contains("injected failure on second target holder"),
+            "{err:?}"
+        );
+        assert_eq!(rev(repo, "refs/heads/main"), before);
+        assert_eq!(rev(repo, "HEAD"), before);
+        assert_eq!(rev(&wt_second, "HEAD"), before);
+        assert!(!repo.join("lane.txt").exists());
+        assert!(!wt_second.join("lane.txt").exists());
+        assert!(user_changed_paths(repo.to_str().unwrap())
+            .unwrap()
+            .0
+            .is_empty());
+        assert!(user_changed_paths(wt_second.to_str().unwrap())
+            .unwrap()
+            .0
+            .is_empty());
+        assert!(wt_lane.exists() && branch_exists(repo, "feat/two-holder"));
+    }
+
+    #[test]
+    fn test_merge_worktree_pipeline_headless_branch_no_remove_and_base_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Test User"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "user@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "base"]);
+        crate::test_support::trust_repo(repo);
+
+        // Create a worktree-less branch `feat/headless` with one commit.
+        crate::test_support::git_in(repo, &["checkout", "-qb", "feat/headless"]);
+        std::fs::write(repo.join("headless.txt"), "headless\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "headless commit"]);
+        crate::test_support::git_in(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("main2.txt"), "main2\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "main2"]);
+
+        // Merge with remove_wt = false and custom commit_message: branch is kept.
+        let kept = merge_worktree_pipeline(
+            repo.to_str().unwrap(),
+            "feat/headless",
+            Some("main"),
+            true,
+            Some("feat: headless custom msg"),
+            false,
+        )
+        .unwrap();
+        assert!(kept.ok && !kept.worktree_removed);
+        assert!(kept.squashed_commit.is_some());
+        assert!(branch_exists(repo, "feat/headless"));
+        let msg = git_text(repo, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(msg.trim(), "feat: headless custom msg");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("headless.txt")).unwrap(),
+            "headless\n"
+        );
+
+        // Second worktree-less branch with remove_wt = true deletes the branch cleanly.
+        crate::test_support::git_in(repo, &["checkout", "-qb", "feat/headless-rm"]);
+        std::fs::write(repo.join("headless_rm.txt"), "rm\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "headless_rm.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "headless rm"]);
+        crate::test_support::git_in(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("main3.txt"), "main3\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "main3.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "main3"]);
+        let deleted = merge_worktree_pipeline(
+            repo.to_str().unwrap(),
+            "feat/headless-rm",
+            Some("main"),
+            false,
+            Some("merge: headless rm"),
+            true,
+        )
+        .unwrap();
+        assert!(deleted.ok && !deleted.worktree_removed);
+        assert!(!branch_exists(repo, "feat/headless-rm"));
+
+        // Worktree with mismatched `gitpulse-base` must refuse.
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_bad_base = wt_parent.path().join("wt-bad-base");
+        add_worktree(
+            repo.to_str().unwrap(),
+            wt_bad_base.to_str().unwrap(),
+            Some("feat/bad-base"),
+            Some("main"),
+            false,
+        )
+        .unwrap();
+        crate::test_support::trust_repo(&wt_bad_base);
+        write_base_record(&wt_bad_base, "other-branch", &rev(repo, "refs/heads/main")).unwrap();
+        let base_err = merge_worktree_pipeline(
+            repo.to_str().unwrap(),
+            "feat/bad-base",
+            Some("main"),
+            true,
+            None,
+            true,
+        )
+        .expect_err("mismatched gitpulse-base must refuse");
+        assert!(base_err.message().contains("other-branch"), "{base_err:?}");
+        assert!(wt_bad_base.exists());
+    }
+
+    #[test]
+    fn test_agent_hold_ignores_expired_legacy_claims_and_fails_closed_on_corrupt_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Test User"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "user@example.com"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "base"]);
+        crate::test_support::trust_repo(repo);
+
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-legacy");
+        add_worktree(
+            repo.to_str().unwrap(),
+            wt.to_str().unwrap(),
+            Some("feat/legacy"),
+            Some("main"),
+            false,
+        )
+        .unwrap();
+        crate::test_support::trust_repo(&wt);
+
+        let repo_str = repo.to_str().unwrap();
+        let wt_str = wt.to_str().unwrap();
+        let lanes_dir = repo.join(".git/gitpulse/lanes");
+        std::fs::create_dir_all(&lanes_dir).unwrap();
+
+        // Expired legacy claim (expires_at_ms = None, updated_at_ms older than 4h TTL):
+        // must NOT trigger agent_hold.
+        let expired_legacy = serde_json::json!({
+            "lanes": [{
+                "agent_id": "legacy-zombie",
+                "branch": "feat/legacy",
+                "worktree_path": wt_str,
+                "sparse_cone": [],
+                "claimed_files": [],
+                "claimed_symbols": [],
+                "updated_at_ms": 1_000_u64
+            }]
+        });
+        std::fs::write(
+            lanes_dir.join("claims.json"),
+            serde_json::to_string_pretty(&expired_legacy).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            agent_hold(repo_str, wt_str, Some("feat/legacy"), true),
+            None,
+            "expired legacy lane claim must not hold worktree"
+        );
+
+        // Live lane claim must still hold the worktree.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let live_claim = serde_json::json!({
+            "lanes": [{
+                "agent_id": "active-agent",
+                "branch": "feat/legacy",
+                "worktree_path": wt_str,
+                "sparse_cone": [],
+                "claimed_files": [],
+                "claimed_symbols": [],
+                "updated_at_ms": now_ms,
+                "expires_at_ms": now_ms + 600_000
+            }]
+        });
+        std::fs::write(
+            lanes_dir.join("claims.json"),
+            serde_json::to_string_pretty(&live_claim).unwrap(),
+        )
+        .unwrap();
+        let held = agent_hold(repo_str, wt_str, Some("feat/legacy"), true)
+            .expect("live lane claim must still hold");
+        assert!(held.contains("active-agent"), "{held}");
+
+        // Corrupt claims.json must still fail closed.
+        std::fs::write(lanes_dir.join("claims.json"), "{not valid json").unwrap();
+        let corrupt = agent_hold(repo_str, wt_str, Some("feat/legacy"), true)
+            .expect("corrupt claims.json must fail closed");
+        assert!(
+            corrupt.contains("could not read the lane claims"),
+            "{corrupt}"
         );
     }
 
@@ -13003,23 +13556,20 @@ some-future-field whatever
         }
     }
 
-    /// Staged or untracked work in a checkout that has the target is the
-    /// person's, and moving the target would change it underneath them. The
-    /// integration is refused with a typed reason, the checkout keeps its
-    /// branch (nothing is detached), and the target, the lane and the porcelain
-    /// are exactly as they were.
+    /// Overlapping staged or untracked changes on a target checkout refuse
+    /// with `HeldReason::CheckoutDirty` without detaching HEAD or modifying
+    /// the checkout; disjoint staged changes succeed cleanly and preserve
+    /// `A  staged.txt`.
     #[test]
     fn adv_a_dirty_target_checkout_refuses_whatever_the_dirt_is() {
         for squash in [false, true] {
-            for dirt in ["staged", "untracked-over-lane-file"] {
+            for dirt in ["staged-over-lane-file", "untracked-over-lane-file"] {
                 let (dir, wt) = teardown_fixture(None);
                 let repo = dir.path();
                 diverge_main(&dir);
-                if dirt == "staged" {
-                    std::fs::write(repo.join("staged.txt"), "user staged\n").unwrap();
-                    crate::test_support::git_in(repo, &["add", "staged.txt"]);
-                } else {
-                    std::fs::write(repo.join("feature.txt"), "user's own feature.txt\n").unwrap();
+                std::fs::write(repo.join("feature.txt"), "user's own feature.txt\n").unwrap();
+                if dirt == "staged-over-lane-file" {
+                    crate::test_support::git_in(repo, &["add", "feature.txt"]);
                 }
                 let before = rev(repo, "HEAD");
                 let porcelain = git_text(repo, &["status", "--porcelain"]).unwrap();
@@ -13055,6 +13605,36 @@ some-future-field whatever
                     "squash={squash} {dirt}"
                 );
             }
+
+            // Disjoint staged file on target must succeed cleanly and preserve `A  staged.txt`.
+            let (dir, wt) = teardown_fixture(None);
+            let repo = dir.path();
+            diverge_main(&dir);
+            std::fs::write(repo.join("staged.txt"), "user staged\n").unwrap();
+            crate::test_support::git_in(repo, &["add", "staged.txt"]);
+            let before = rev(repo, "HEAD");
+            let res = teardown(&dir, &wt, squash, None).unwrap_or_else(|e| {
+                panic!("squash={squash}: disjoint staged should succeed: {e:?}")
+            });
+            assert!(
+                res.merged && res.checkout_advanced,
+                "squash={squash}: {res:?}"
+            );
+            assert_ne!(rev(repo, "refs/heads/main"), before, "squash={squash}");
+            assert_eq!(
+                git_text(repo, &["symbolic-ref", "-q", "HEAD"])
+                    .unwrap()
+                    .trim(),
+                "refs/heads/main",
+                "squash={squash}: the checkout was detached"
+            );
+            assert_eq!(adv_read(&repo.join("feature.txt")), "lane work\n");
+            assert_eq!(adv_read(&repo.join("staged.txt")), "user staged\n");
+            let status = git_text(repo, &["status", "--porcelain"]).unwrap();
+            assert!(
+                status.contains("A  staged.txt"),
+                "squash={squash}: staged.txt must remain staged: {status:?}"
+            );
         }
     }
 
