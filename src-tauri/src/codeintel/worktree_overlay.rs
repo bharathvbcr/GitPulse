@@ -3311,7 +3311,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(PathBuf::from(latest_gen_root), canonical_wt);
+        // devmap stores the root as it canonicalized it, which is the `\\?\`
+        // spelling on Windows; one directory either way, as above.
+        assert_eq!(
+            crate::engine::process::canonicalize_plain(std::path::Path::new(&latest_gen_root))
+                .unwrap(),
+            canonical_wt
+        );
         let rebound_root: String = conn
             .query_row(
                 "SELECT seeded_repo_root FROM seed_rebind WHERE singleton = 1",

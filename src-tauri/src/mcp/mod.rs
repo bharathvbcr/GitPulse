@@ -13226,13 +13226,7 @@ mod tests {
             json!({ "repo_path": repo, "force": true }),
         );
         assert!(!err, "{out}");
-        let find = |path: &str| {
-            out["outcomes"]
-                .as_array()
-                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
-                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
-                .clone()
-        };
+        let find = |path: &str| outcome_for(&out, path);
         let kept_outcome = find(&kept);
         assert_eq!(kept_outcome["status"], "skipped", "{out}");
         assert!(
