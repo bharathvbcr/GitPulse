@@ -566,6 +566,8 @@ async fn live_relay_free_gate_pro_noise_ik_approvals_steering_and_4003_revocatio
     let gitpulsed_out = Command::new(env!("CARGO_BIN_EXE_gitpulsed"))
         .args(["--relay", "--once", "--config-dir"])
         .arg(&free_cfg_dir)
+        // The binary logs to GITPULSE_LOG_DIR; never the user's real log.
+        .env("GITPULSE_LOG_DIR", free_cfg_dir.join("logs"))
         .output_locked()
         .expect("run real gitpulsed --relay binary");
     assert_eq!(
