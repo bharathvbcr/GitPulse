@@ -162,6 +162,8 @@ mod child {
         quit_at: Mutex<Option<Instant>>,
         survived_cancel: AtomicBool,
         crash_reload_delays: Mutex<Vec<Duration>>,
+        /// A quit confirmation put the window or a Dock icon on screen.
+        in_the_way: AtomicBool,
     }
 
     static PROBE: OnceLock<Probe> = OnceLock::new();
@@ -192,7 +194,7 @@ mod child {
         let mut context = waylode_lib::context();
         context.config_mut().identifier = "com.gitpulse.tests.quit-guard".into();
         context.config_mut().app.windows.clear();
-        let mut app = tauri::Builder::default()
+        let mut app = super::quiet_app::background_launch(tauri::Builder::default())
             .manage(DesktopState::default())
             .manage(waylode_lib::terminal::TerminalSessions::from_settings())
             .on_web_content_process_terminate(webcrash::on_terminated)
@@ -268,6 +270,10 @@ mod child {
     /// The frontend's answer to request number `index` in this scenario.
     fn frontend(app: &AppHandle<Wry>, index: usize) {
         let scenario = SCENARIO.get().unwrap().as_str();
+        // The confirmation was revealed before this request was emitted.
+        let handle = app.clone();
+        let in_the_way = on_main(app, move || super::quiet_app::in_the_way(&handle));
+        probe().in_the_way.fetch_or(in_the_way, Ordering::SeqCst);
         let seen = || exit::answer(app, exit::ExitAnswer::Seen);
         match (scenario, index) {
             ("no_ack", _) => {}
@@ -476,6 +482,10 @@ mod child {
             .unwrap()
             .map(|at| at.elapsed())
             .unwrap_or_default();
+        check(
+            !probe.in_the_way.load(Ordering::SeqCst),
+            "a quit confirmation under test showed a window or a Dock icon",
+        );
         match scenario {
             "unarmed" => check(requests == 0, "an unarmed quit asks nobody"),
             "approve" | "internal" | "crash_reload" => {

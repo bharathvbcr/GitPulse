@@ -53,7 +53,7 @@ fn main() {
         .expect("the config declares the main window");
     main_window.visible = false;
     context.config_mut().app.windows.clear();
-    let mut app = tauri::Builder::default()
+    let mut app = quiet_app::background_launch(tauri::Builder::default())
         .manage(DesktopState::default())
         .setup(move |app| {
             // Phase 0: the main window's webview backdrop is clear.
