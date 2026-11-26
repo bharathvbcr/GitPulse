@@ -227,7 +227,10 @@ pub(super) fn probe_session_liveness(run: &Value, session_id: Option<&str>) -> S
                             .is_some_and(|p| p.eq_ignore_ascii_case(sid)))
             }) {
                 return SessionLiveness::Live {
-                    detail: format!("session {sid} is still live in alerts hub ({})", entry.state),
+                    detail: format!(
+                        "session {sid} is still live in alerts hub ({})",
+                        entry.state
+                    ),
                 };
             }
         }

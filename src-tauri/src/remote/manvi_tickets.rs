@@ -69,9 +69,8 @@ pub fn compute_manvi_action_sha256(
 ) -> String {
     let mut payload = Vec::with_capacity(256);
     payload.extend_from_slice(MANVI_ACTION_DOMAIN);
-    let canonical = format!(
-        "repo_root={repo_root}\ntask_id={task_id}\nrule={rule}\ntarget={target}\n"
-    );
+    let canonical =
+        format!("repo_root={repo_root}\ntask_id={task_id}\nrule={rule}\ntarget={target}\n");
     payload.extend_from_slice(canonical.as_bytes());
     sha256_hex(&payload)
 }
@@ -265,8 +264,7 @@ impl ManviTicketBridge {
             return Err(ManviTicketError::EnterpriseRemoteApprovalDenied);
         }
 
-        let severities =
-            rule_severities().map_err(ManviTicketError::ContractUnavailable)?;
+        let severities = rule_severities().map_err(ManviTicketError::ContractUnavailable)?;
         let severity = match severities.get(&rule).map(String::as_str) {
             Some("soft") => "soft".to_string(),
             Some("warn") => "warn".to_string(),
@@ -387,11 +385,13 @@ impl ManviTicketBridge {
                 .open_tickets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let existing = guard
-                .get(&decision.signed.ticket_id)
-                .ok_or_else(|| ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone()))?;
+            let existing = guard.get(&decision.signed.ticket_id).ok_or_else(|| {
+                ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone())
+            })?;
             if now_secs >= existing.expires_at {
-                return Err(ManviTicketError::TicketExpired(decision.signed.ticket_id.clone()));
+                return Err(ManviTicketError::TicketExpired(
+                    decision.signed.ticket_id.clone(),
+                ));
             }
             existing.action_sha256.clone()
         };
@@ -430,9 +430,9 @@ impl ManviTicketBridge {
                 .open_tickets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard
-                .remove(&decision.signed.ticket_id)
-                .ok_or_else(|| ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone()))?
+            guard.remove(&decision.signed.ticket_id).ok_or_else(|| {
+                ManviTicketError::TicketNotFound(decision.signed.ticket_id.clone())
+            })?
         };
 
         match verified_kind {

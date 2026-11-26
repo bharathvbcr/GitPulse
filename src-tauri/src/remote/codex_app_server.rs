@@ -15,8 +15,8 @@
 //!   3. GitPulse never mutates Codex's trust store.
 
 use crate::procguard::{self, Registration};
-use crate::supervisor;
 use crate::remote::pty_gate::sha256_hex;
+use crate::supervisor;
 use gitpulse_protocol::canonical::canonical_json_string;
 use gitpulse_protocol::wire::ApprovalDecisionKind;
 use serde::{Deserialize, Serialize};
@@ -186,7 +186,10 @@ impl std::fmt::Display for CodexError {
                 "remote attempt to set or relax Codex policy field '{field}' is strictly forbidden"
             ),
             CodexError::ApprovalNotFoundOrResolved { item_id } => {
-                write!(f, "Codex approval item '{item_id}' not found or already resolved")
+                write!(
+                    f,
+                    "Codex approval item '{item_id}' not found or already resolved"
+                )
             }
             CodexError::Closed => write!(f, "codex app-server connection closed"),
         }
@@ -395,7 +398,9 @@ impl CodexAppServerClient {
                 let _ = tx.send(Err(CodexError::Closed));
             }
         };
-        if let Err(e) = supervisor::spawn_once("codex-app-server-reader", "codex app-server reader", reader) {
+        if let Err(e) =
+            supervisor::spawn_once("codex-app-server-reader", "codex app-server reader", reader)
+        {
             reap(&mut child, &registration);
             return Err(CodexError::SpawnFailed(format!("reader thread: {e}")));
         }
@@ -480,10 +485,7 @@ impl CodexAppServerClient {
             }
         }
         params.insert("threadId".into(), json!(thread_id));
-        params.insert(
-            "input".into(),
-            json!([{ "type": "text", "text": prompt }]),
-        );
+        params.insert("input".into(), json!([{ "type": "text", "text": prompt }]));
 
         let result = self.call("turn/start", Value::Object(params)).await?;
         extract_id(&result, &["turnId", "turn_id", "id"])
@@ -491,7 +493,11 @@ impl CodexAppServerClient {
     }
 
     /// Interrupts an in-flight turn on `thread_id`.
-    pub async fn turn_interrupt(&self, thread_id: &str, turn_id: &str) -> Result<Value, CodexError> {
+    pub async fn turn_interrupt(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Value, CodexError> {
         self.call(
             "turn/interrupt",
             json!({

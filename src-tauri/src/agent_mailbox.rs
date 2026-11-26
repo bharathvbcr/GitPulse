@@ -192,7 +192,9 @@ impl HumanIssuanceLedger {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.entries.retain(|_, entry| entry.expires_at_ms >= now_ms);
+        guard
+            .entries
+            .retain(|_, entry| entry.expires_at_ms >= now_ms);
         let key = (scope.to_path_buf(), session_key, request_id.to_owned());
         if let Some(existing) = guard.entries.get(&key) {
             if const_time_eq(existing.text_sha256.as_bytes(), text_sha256.as_bytes()) {
@@ -786,28 +788,52 @@ impl Mailbox {
             .ok_or_else(|| MailboxError::Io("There is no GitPulse configuration directory.".into()))
     }
 
-    fn record_human_issuance(&self, session_uuid: &str, request_id: &str, text: &str, created: u64) {
+    fn record_human_issuance(
+        &self,
+        session_uuid: &str,
+        request_id: &str,
+        text: &str,
+        created: u64,
+    ) {
         match &self.ledger {
             Some(ledger) => {
                 ledger.record_scoped(&self.root, session_uuid, request_id, text, created);
             }
             None => {
-                process_human_issuance_ledger()
-                    .record_scoped(&self.root, session_uuid, request_id, text, created);
+                process_human_issuance_ledger().record_scoped(
+                    &self.root,
+                    session_uuid,
+                    request_id,
+                    text,
+                    created,
+                );
             }
         }
     }
 
-    fn verify_human_issuance(&self, session_uuid: &str, request_id: &str, text_sha256: &str) -> bool {
+    fn verify_human_issuance(
+        &self,
+        session_uuid: &str,
+        request_id: &str,
+        text_sha256: &str,
+    ) -> bool {
         if let Some(verifier) = &self.verifier {
-            return verifier.verify_human_issuance(&self.root, session_uuid, request_id, text_sha256);
+            return verifier.verify_human_issuance(
+                &self.root,
+                session_uuid,
+                request_id,
+                text_sha256,
+            );
         }
         if let Some(ledger) = &self.ledger {
             return ledger.verify_scoped(&self.root, session_uuid, request_id, text_sha256);
         }
-        if process_human_issuance_ledger()
-            .verify_scoped(&self.root, session_uuid, request_id, text_sha256)
-        {
+        if process_human_issuance_ledger().verify_scoped(
+            &self.root,
+            session_uuid,
+            request_id,
+            text_sha256,
+        ) {
             return true;
         }
         if self.query_broker_socket {
@@ -821,8 +847,11 @@ impl Mailbox {
                 use crate::alerts::approval_broker::{
                     query_human_issuance_via_default_socket, IssuanceAnswer,
                 };
-                return query_human_issuance_via_default_socket(session_uuid, request_id, text_sha256)
-                    != IssuanceAnswer::Refused;
+                return query_human_issuance_via_default_socket(
+                    session_uuid,
+                    request_id,
+                    text_sha256,
+                ) != IssuanceAnswer::Refused;
             }
             #[cfg(not(unix))]
             {
@@ -1437,9 +1466,10 @@ impl Mailbox {
                 break;
             }
             if let Some((_, _, id)) = parse_message_name(&name) {
-                if let (Ok(text), Ok(prov)) =
-                    (read_message(&dir.join(&name)), self.read_provenance(&key, id))
-                {
+                if let (Ok(text), Ok(prov)) = (
+                    read_message(&dir.join(&name)),
+                    self.read_provenance(&key, id),
+                ) {
                     let (effective, _) = self.authenticate_provenance(&key, id, &text, prov);
                     if !accept(&effective) {
                         refused = true;

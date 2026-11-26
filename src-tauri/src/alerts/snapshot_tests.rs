@@ -409,7 +409,12 @@ fn hub_session_state_projects_subagents_and_fully_idle_with_backward_compatible_
     let counters = Counters::default();
     let t0 = Instant::now();
 
-    let mut parent = hook_notice("term-swarm", Some("prompt_submitted"), Some("sid-s"), Some("/repo"));
+    let mut parent = hook_notice(
+        "term-swarm",
+        Some("prompt_submitted"),
+        Some("sid-s"),
+        Some("/repo"),
+    );
     parent.fully_idle = Some(false);
     let _ = admit_at(parent, t0, 1_000, &mut tracked, &counters);
 
@@ -418,13 +423,25 @@ fn hub_session_state_projects_subagents_and_fully_idle_with_backward_compatible_
     sub_a.subagent = true;
     sub_a.agent_id = Some("sub-alpha".into());
     sub_a.detail = Some("running tests".into());
-    let _ = admit_at(sub_a, t0 + Duration::from_secs(1), 2_000, &mut tracked, &counters);
+    let _ = admit_at(
+        sub_a,
+        t0 + Duration::from_secs(1),
+        2_000,
+        &mut tracked,
+        &counters,
+    );
 
     let mut sub_b = hook_notice("term-swarm", Some("permission_request"), None, None);
     sub_b.subagent = true;
     sub_b.agent_id = Some("sub-beta".into());
     sub_b.detail = Some("Bash: cargo build".into());
-    let _ = admit_at(sub_b, t0 + Duration::from_secs(2), 3_000, &mut tracked, &counters);
+    let _ = admit_at(
+        sub_b,
+        t0 + Duration::from_secs(2),
+        3_000,
+        &mut tracked,
+        &counters,
+    );
 
     let snap = snapshot_of(&tracked, 42, 100, 3_500);
     assert_eq!(snap.sessions.len(), 1);

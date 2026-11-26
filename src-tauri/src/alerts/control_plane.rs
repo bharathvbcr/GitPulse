@@ -205,12 +205,7 @@ pub trait ControlPlaneService: Send + Sync {
     ) -> Result<u64, BrokerError>;
 
     /// Read-only check verifying a `HumanConfirmed` mailbox envelope.
-    fn verify_human_issuance(
-        &self,
-        session_id: &str,
-        request_id: &str,
-        text_sha256: &str,
-    ) -> bool;
+    fn verify_human_issuance(&self, session_id: &str, request_id: &str, text_sha256: &str) -> bool;
 
     /// Updates whether a paired paid remote device is currently connected.
     fn set_remote_approval_active(&self, active: bool) -> Result<(), BrokerError>;
@@ -300,12 +295,7 @@ impl ControlPlaneService for InProcessControlPlane {
             .record_human_issuance(session_id, request_id, text, created_at_ms))
     }
 
-    fn verify_human_issuance(
-        &self,
-        session_id: &str,
-        request_id: &str,
-        text_sha256: &str,
-    ) -> bool {
+    fn verify_human_issuance(&self, session_id: &str, request_id: &str, text_sha256: &str) -> bool {
         self.broker
             .verify_human_issuance(session_id, request_id, text_sha256)
     }
@@ -403,12 +393,7 @@ impl ControlPlaneService for SocketControlPlaneClient {
         ))
     }
 
-    fn verify_human_issuance(
-        &self,
-        session_id: &str,
-        request_id: &str,
-        text_sha256: &str,
-    ) -> bool {
+    fn verify_human_issuance(&self, session_id: &str, request_id: &str, text_sha256: &str) -> bool {
         super::approval_broker::verify_human_issuance_via_socket(
             &self.broker_socket,
             session_id,
@@ -472,22 +457,14 @@ mod tests {
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let sock = base.join(SOCKET_NAME);
 
-        let lock = ControlPlaneLock::try_acquire(
-            &base,
-            ControlPlaneOwnerMode::Desktop,
-            &sock,
-        )
-        .unwrap()
-        .expect("first owner acquires lock");
+        let lock = ControlPlaneLock::try_acquire(&base, ControlPlaneOwnerMode::Desktop, &sock)
+            .unwrap()
+            .expect("first owner acquires lock");
         assert_eq!(lock.owner().mode, ControlPlaneOwnerMode::Desktop);
 
         // Second process / caller cannot steal ownership while lock is held.
-        let second = ControlPlaneLock::try_acquire(
-            &base,
-            ControlPlaneOwnerMode::Daemon,
-            &sock,
-        )
-        .unwrap();
+        let second =
+            ControlPlaneLock::try_acquire(&base, ControlPlaneOwnerMode::Daemon, &sock).unwrap();
         assert!(second.is_none(), "control-plane.lock must be single-owner");
         let recorded = inspect_owner(&base).expect("owner metadata readable");
         assert_eq!(recorded.pid, std::process::id());
@@ -498,18 +475,13 @@ mod tests {
         let keys = Arc::new(TrustedApprovalKeyStore::new());
         crate::alerts::approval_broker::configure_test_trust_anchor(&keys);
         let broker = Arc::new(
-            ApprovalBroker::new(
-                "host-cp-1",
-                base.join("agent-mailbox"),
-                presence,
-                keys,
-            )
-            .with_repo_trust_checker(Arc::new(
-                crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
-            ))
-            .with_human_ledger(ledger)
-            .with_hold_ceiling(Duration::from_secs(30))
-            .with_presence_poll_interval(Duration::from_millis(10)),
+            ApprovalBroker::new("host-cp-1", base.join("agent-mailbox"), presence, keys)
+                .with_repo_trust_checker(Arc::new(
+                    crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
+                ))
+                .with_human_ledger(ledger)
+                .with_hold_ceiling(Duration::from_secs(30))
+                .with_presence_poll_interval(Duration::from_millis(10)),
         );
         let _server = ApprovalBrokerServer::bind_and_start(sock.clone(), broker.clone())
             .expect("start broker server");
@@ -547,14 +519,7 @@ mod tests {
         let ticket_id = in_proc.pending_approvals().unwrap()[0].ticket_id.clone();
 
         // Both implementations answer the exact same read contract.
-        assert_shared_read_contract(
-            &in_proc,
-            "host-cp-1",
-            &ticket_id,
-            "sess-1",
-            "req-1",
-            &hash,
-        );
+        assert_shared_read_contract(&in_proc, "host-cp-1", &ticket_id, "sess-1", "req-1", &hash);
         assert_shared_read_contract(
             &socket_client,
             "host-cp-1",
@@ -576,7 +541,10 @@ mod tests {
         let outcome = in_proc
             .resolve_approval_in_process(&ticket_id, ApprovalDecision::AllowOnce, None)
             .unwrap();
-        assert_eq!(outcome.status, crate::alerts::approval_broker::ResolveStatus::Applied);
+        assert_eq!(
+            outcome.status,
+            crate::alerts::approval_broker::ResolveStatus::Applied
+        );
         let _ = waiter.join().unwrap();
     }
 }

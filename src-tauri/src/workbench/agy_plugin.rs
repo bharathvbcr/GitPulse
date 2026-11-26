@@ -146,11 +146,9 @@ pub fn parse_agy_semver(raw: &str) -> Option<(u32, u32, u32)> {
         if parts.next().is_some() {
             continue;
         }
-        if let (Ok(maj), Ok(min), Ok(pat)) = (
-            maj.parse::<u32>(),
-            min.parse::<u32>(),
-            pat.parse::<u32>(),
-        ) {
+        if let (Ok(maj), Ok(min), Ok(pat)) =
+            (maj.parse::<u32>(), min.parse::<u32>(), pat.parse::<u32>())
+        {
             return Some((maj, min, pat));
         }
     }
@@ -169,7 +167,9 @@ pub fn evaluate_pre_tool_use_canary(
     let parsed = detected_version.and_then(parse_agy_semver);
     let version_eligible = parsed.is_some_and(|v| v > PRE_TOOL_USE_BROKEN_MAX_VERSION);
     AgyPreToolUseCanary {
-        detected_version: detected_version.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()),
+        detected_version: detected_version
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
         passthrough_probe_passed,
         enabled: version_eligible && passthrough_probe_passed,
         unlock_gate: PRE_TOOL_USE_UNLOCK_GATE,

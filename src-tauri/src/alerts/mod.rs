@@ -1390,7 +1390,8 @@ fn update_subagent_state(entry: &mut Tracked, notice: &Notice, now_ms: u64) {
         let clipped: String = clean.chars().take(ANNOUNCE_DETAIL_CHARS).collect();
         (!clipped.trim().is_empty()).then_some(clipped)
     });
-    if entry.subagents.len() >= MAX_SUBAGENTS_PER_SESSION && !entry.subagents.contains_key(&agent_id)
+    if entry.subagents.len() >= MAX_SUBAGENTS_PER_SESSION
+        && !entry.subagents.contains_key(&agent_id)
     {
         if let Some(oldest) = entry
             .subagents

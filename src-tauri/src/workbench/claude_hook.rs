@@ -664,13 +664,19 @@ mod tests {
                 .collect();
             let notify = handlers
                 .iter()
-                .find(|h| h["command"].as_str().unwrap().ends_with("notify permission_request"))
+                .find(|h| {
+                    h["command"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("notify permission_request")
+                })
                 .unwrap_or_else(|| panic!("{label}: missing notify permission_request"));
             assert_eq!(notify["async"], json!(true), "{label}");
             assert!(
-                !handlers
-                    .iter()
-                    .any(|h| h["command"].as_str().unwrap().ends_with(" permission-bridge")),
+                !handlers.iter().any(|h| h["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" permission-bridge")),
                 "{label}: permission-bridge is registered, but the broker is not authenticated"
             );
         }

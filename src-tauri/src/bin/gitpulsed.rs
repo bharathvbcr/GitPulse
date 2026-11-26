@@ -195,9 +195,7 @@ fn parse(argv: &[String]) -> Parsed {
                 };
                 let path = std::path::PathBuf::from(raw);
                 if !path.is_absolute() {
-                    return Parsed::Error(format!(
-                        "--config-dir {raw:?} must be an absolute path"
-                    ));
+                    return Parsed::Error(format!("--config-dir {raw:?} must be an absolute path"));
                 }
                 config_dir = Some(path);
                 i += 1;
@@ -1017,7 +1015,10 @@ mod tests {
             "default free config must exit 4"
         );
         assert!(
-            !free_dir.path().join("gitpulsed/gitpulsed-relay.lock").exists(),
+            !free_dir
+                .path()
+                .join("gitpulsed/gitpulsed-relay.lock")
+                .exists(),
             "exit 4 refusal must happen before acquiring lock or opening any socket"
         );
 

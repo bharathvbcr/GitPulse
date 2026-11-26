@@ -171,8 +171,7 @@ fn run_relay_mode_refuses_with_exit_4_and_trust_anchor_unavailable_without_platf
         ..Default::default()
     };
     std::fs::write(
-        dir.path()
-            .join(crate::remote::config::REMOTE_CONFIG_FILE),
+        dir.path().join(crate::remote::config::REMOTE_CONFIG_FILE),
         serde_json::to_vec(&cfg).unwrap(),
     )
     .unwrap();
@@ -180,7 +179,10 @@ fn run_relay_mode_refuses_with_exit_4_and_trust_anchor_unavailable_without_platf
     // Production `run_relay_mode` ALWAYS uses `PlatformTrustAnchor` and NEVER
     // falls back to an in-memory anchor: missing OS Keychain items -> exit 4!
     let code = run_relay_mode(dir.path(), true, None);
-    assert_eq!(code, 4, "must fail closed with exit 4 when OS trust anchor is absent");
+    assert_eq!(
+        code, 4,
+        "must fail closed with exit 4 when OS trust anchor is absent"
+    );
     assert!(
         !dir.path().join("gitpulsed/gitpulsed-relay.lock").exists(),
         "must not acquire lock when trust anchor is unavailable"
@@ -477,13 +479,8 @@ fn noise_ik_roundtrip_sliding_window_replay_rejection_and_backoff_bounds() {
 
     // Verify duplicate msg1 replay within same epoch is cheaply dropped via crate's EpochHandshakeReplayGuard.
     let host_x_pub = x25519_public_from_secret(&host_x_secret);
-    let mut init_hs = NoiseHandshake::new_initiator_pinned(
-        &mob_x_secret,
-        &host_x_pub,
-        &stream_id,
-        42,
-    )
-    .unwrap();
+    let mut init_hs =
+        NoiseHandshake::new_initiator_pinned(&mob_x_secret, &host_x_pub, &stream_id, 42).unwrap();
     let msg1 = init_hs.write_message(&[]).unwrap();
     let msg2 = host_mgr
         .accept_mobile(&host_x_secret, &mob_cert, &rev_cache, &msg1, now)
@@ -717,7 +714,10 @@ async fn tunnel_emits_inbox_snapshot_on_connect_and_releases_state_on_4003() {
     assert!(matches!(end, TunnelSessionEnd::RevokedOrDowngraded(_)));
 
     let state = read_remote_approval_state(state_dir.path()).unwrap();
-    assert!(state.is_released(), "4003 must release holds to native: {state:?}");
+    assert!(
+        state.is_released(),
+        "4003 must release holds to native: {state:?}"
+    );
     let json = serde_json::to_string(&state).unwrap();
     assert!(json.contains("relay_close_4003"), "{json}");
 }
@@ -780,14 +780,7 @@ async fn tunnel_returns_going_away_on_1001_and_keychain_locked_without_connectin
         after_seq: 0,
     };
     let end2 = run_host_tunnel_once(
-        &params2,
-        &unlocked,
-        &rev_arc,
-        &mgr_arc,
-        &snap,
-        None,
-        None,
-        rx2,
+        &params2, &unlocked, &rev_arc, &mgr_arc, &snap, None, None, rx2,
     )
     .await;
     srv.await.unwrap();
@@ -799,7 +792,8 @@ async fn tunnel_returns_going_away_on_1001_and_keychain_locked_without_connectin
         "wss://relay.gitpulse.dev/v1/tunnel/ws?role=host&after_epoch=9&after_seq=42"
     );
     assert_eq!(uri, "/v1/tunnel/ws?role=host&after_epoch=9&after_seq=42");
-    let hdrs = sign_relay_request("host-1", &host_ed_seed, "GET", &uri, 1700000000000, &[]).unwrap();
+    let hdrs =
+        sign_relay_request("host-1", &host_ed_seed, "GET", &uri, 1700000000000, &[]).unwrap();
     assert_eq!(hdrs.device_id, "host-1");
 }
 
@@ -1041,7 +1035,8 @@ fn pty_input_is_denied_by_default_and_requires_consent_plus_p256_step_up_plus_au
 
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_mock_app_server_handles_approval_idle_wake_interrupt_and_refuses_policy_relaxation() {
+async fn codex_mock_app_server_handles_approval_idle_wake_interrupt_and_refuses_policy_relaxation()
+{
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1241,7 +1236,12 @@ fn manvi_tickets_enforce_single_use_hash_binding_hard_deny_and_enterprise_policy
     };
 
     assert_eq!(
-        bridge.apply_mobile_decision(&make_decision(true, true, "mn-1"), &mob_cert, &rev_cache, now),
+        bridge.apply_mobile_decision(
+            &make_decision(true, true, "mn-1"),
+            &mob_cert,
+            &rev_cache,
+            now
+        ),
         Err(ManviTicketError::CachedGrantForbidden)
     );
     assert_eq!(
@@ -1255,7 +1255,12 @@ fn manvi_tickets_enforce_single_use_hash_binding_hard_deny_and_enterprise_policy
     );
 
     let grant = match bridge
-        .apply_mobile_decision(&make_decision(false, true, "mn-3"), &mob_cert, &rev_cache, now)
+        .apply_mobile_decision(
+            &make_decision(false, true, "mn-3"),
+            &mob_cert,
+            &rev_cache,
+            now,
+        )
         .expect("valid decision grants once")
     {
         ManviDecisionOutcome::Granted(g) => g,
@@ -1322,7 +1327,8 @@ fn manvi_tickets_enforce_single_use_hash_binding_hard_deny_and_enterprise_policy
 // ---------------------------------------------------------------------------
 
 #[test]
-fn steering_ingress_gate_requires_p256_signature_and_mandatory_revocations_before_human_confirmed() {
+fn steering_ingress_gate_requires_p256_signature_and_mandatory_revocations_before_human_confirmed()
+{
     let now = now_secs();
     let (_, _, mob_p256_secret, _, mob_cert, rev_cache) =
         build_verified_mobile_fixture(now, vec![]);

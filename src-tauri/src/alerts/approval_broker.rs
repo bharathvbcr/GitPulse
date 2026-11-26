@@ -193,9 +193,9 @@ impl std::error::Error for BrokerError {}
 fn map_protocol_error(err: ProtocolError, device_id: &str) -> BrokerError {
     match err {
         ProtocolError::Revoked(id) => BrokerError::DeviceRevoked(id),
-        ProtocolError::RevocationRollback { got, min } => BrokerError::DeviceRevoked(format!(
-            "revocation list rollback (got v{got}, min v{min})"
-        )),
+        ProtocolError::RevocationRollback { got, min } => {
+            BrokerError::DeviceRevoked(format!("revocation list rollback (got v{got}, min v{min})"))
+        }
         ProtocolError::Expired(m) | ProtocolError::NotYetValid(m) => {
             if m.contains("revocation") {
                 BrokerError::RevocationListMissingOrStale(m)
@@ -940,7 +940,11 @@ impl ApprovalBroker {
                 summary
             })
             .collect();
-        out.sort_by(|a, b| a.issued_at.cmp(&b.issued_at).then(a.ticket_id.cmp(&b.ticket_id)));
+        out.sort_by(|a, b| {
+            a.issued_at
+                .cmp(&b.issued_at)
+                .then(a.ticket_id.cmp(&b.ticket_id))
+        });
         out
     }
 
@@ -1247,7 +1251,8 @@ impl ApprovalBroker {
         let seq = guard.next_ticket_seq;
         let ticket_id = format!("{}:tkt-{seq}", self.host_id);
         let now_secs = wall_now_secs();
-        let expires_at = now_secs.saturating_add(i64::try_from(wait_duration.as_secs()).unwrap_or(1740));
+        let expires_at =
+            now_secs.saturating_add(i64::try_from(wait_duration.as_secs()).unwrap_or(1740));
         let deadline = Instant::now() + wait_duration;
         let signal = Arc::new((Mutex::new(()), Condvar::new()));
 
@@ -1556,7 +1561,11 @@ fn accept_loop(
                     move || handle_connection(stream, broker_conn),
                 );
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
             Err(e) => {
                 log::warn!(target: "alerts", "approval broker accept failed: {e}");
                 std::thread::sleep(Duration::from_millis(25));
@@ -1613,25 +1622,28 @@ fn handle_connection(mut stream: std::os::unix::net::UnixStream, broker: Arc<App
     let parsed: Value = match serde_json::from_slice::<Value>(&raw) {
         Ok(v) if v.is_object() => v,
         _ => {
-            write_json_line(&mut stream, &json!({"ok": false, "error": "malformed_json"}));
+            write_json_line(
+                &mut stream,
+                &json!({"ok": false, "error": "malformed_json"}),
+            );
             return;
         }
     };
     let op = parsed.get("op").and_then(Value::as_str).unwrap_or_default();
     match op {
         "register_or_attach" => {
-            let req: RegisterApprovalRequest = match serde_json::from_value(
-                parsed.get("request").cloned().unwrap_or(Value::Null),
-            ) {
-                Ok(r) => r,
-                Err(_) => {
-                    write_json_line(
-                        &mut stream,
-                        &json!({"ok": false, "error": "malformed_request"}),
-                    );
-                    return;
-                }
-            };
+            let req: RegisterApprovalRequest =
+                match serde_json::from_value(parsed.get("request").cloned().unwrap_or(Value::Null))
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        write_json_line(
+                            &mut stream,
+                            &json!({"ok": false, "error": "malformed_request"}),
+                        );
+                        return;
+                    }
+                };
             let reply = match broker.register_or_attach(&req) {
                 Ok((ticket_id, signal, deadline)) => {
                     let probe = stream.try_clone().ok();
@@ -2055,7 +2067,8 @@ mod tests {
 
         let broker_bg = broker.clone();
         let handle = std::thread::spawn(move || {
-            broker_bg.register_and_wait_in_process(&bash_request("s-return", "cargo test"), || false)
+            broker_bg
+                .register_and_wait_in_process(&bash_request("s-return", "cargo test"), || false)
         });
 
         assert!(crate::test_support::wait_until(
@@ -2165,7 +2178,10 @@ mod tests {
         assert_eq!(outcome.applied_decision, Some(ApprovalDecision::AllowOnce));
 
         // Replay of same nonce is rejected.
-        assert_eq!(broker.resolve_signed(&valid), Err(BrokerError::NonceReplayed));
+        assert_eq!(
+            broker.resolve_signed(&valid),
+            Err(BrokerError::NonceReplayed)
+        );
 
         // Second valid signature with fresh nonce gets NotApplied (already_resolved).
         let second = sign_decision(
@@ -2249,7 +2265,10 @@ mod tests {
     fn unix_socket_rejects_same_uid_resolve_and_cancels_on_hook_eof() {
         use std::os::unix::net::UnixStream;
 
-        let dir = tempfile::Builder::new().prefix("gp-brk-").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gp-brk-")
+            .tempdir()
+            .unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let sock = base.join(SOCKET_NAME);
         let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
@@ -2257,16 +2276,11 @@ mod tests {
         let keys = Arc::new(TrustedApprovalKeyStore::new());
         configure_test_trust_anchor(&keys);
         let broker_arc = Arc::new(
-            ApprovalBroker::new(
-                "host-sock-1",
-                base.join("agent-mailbox"),
-                presence,
-                keys,
-            )
-            .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
-            .with_human_ledger(ledger)
-            .with_hold_ceiling(Duration::from_secs(30))
-            .with_presence_poll_interval(Duration::from_millis(10)),
+            ApprovalBroker::new("host-sock-1", base.join("agent-mailbox"), presence, keys)
+                .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
+                .with_human_ledger(ledger)
+                .with_hold_ceiling(Duration::from_secs(30))
+                .with_presence_poll_interval(Duration::from_millis(10)),
         );
         broker_arc.set_remote_approval_active(true);
 
@@ -2317,7 +2331,9 @@ mod tests {
         // 3. Read-only human issuance verification works over socket, and rejects forgeries.
         let text = "approved by human in desktop ui";
         let hash = crate::agent_mailbox::text_sha256_hex(text);
-        assert!(!verify_human_issuance_via_socket(&sock, "s-human", "req-1", &hash));
+        assert!(!verify_human_issuance_via_socket(
+            &sock, "s-human", "req-1", &hash
+        ));
         assert_eq!(
             query_human_issuance_via_socket(&sock, "s-human", "req-1", &hash),
             IssuanceAnswer::Refused,
@@ -2328,7 +2344,9 @@ mod tests {
             IssuanceAnswer::NoBroker
         );
         broker_arc.record_human_issuance("s-human", "req-1", text, 1000);
-        assert!(verify_human_issuance_via_socket(&sock, "s-human", "req-1", &hash));
+        assert!(verify_human_issuance_via_socket(
+            &sock, "s-human", "req-1", &hash
+        ));
         assert!(!verify_human_issuance_via_socket(
             &sock,
             "s-human",
@@ -2342,9 +2360,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let presence = Arc::new(MockPresenceProvider::new(UserPresence::Away));
         let keys = Arc::new(TrustedApprovalKeyStore::new());
-        let broker = ApprovalBroker::new("host-rev-1", dir.path().to_path_buf(), presence, keys.clone())
-            .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
-            .with_hold_ceiling(Duration::from_secs(30));
+        let broker = ApprovalBroker::new(
+            "host-rev-1",
+            dir.path().to_path_buf(),
+            presence,
+            keys.clone(),
+        )
+        .with_repo_trust_checker(Arc::new(MockRepoTrustChecker::new(true)))
+        .with_hold_ceiling(Duration::from_secs(30));
         broker.set_remote_approval_active(true);
 
         let now = wall_now_secs();
@@ -2370,7 +2393,13 @@ mod tests {
             }
         );
         assert_eq!(
-            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            keys.verify_decision(
+                &sample_sig,
+                "host-rev-1",
+                "host-rev-1:tkt-1",
+                &dummy_hash,
+                now
+            ),
             Err(BrokerError::TrustAnchorUnconfigured)
         );
 
@@ -2395,7 +2424,13 @@ mod tests {
             Err(BrokerError::RevocationListMissingOrStale(_))
         ));
         assert!(matches!(
-            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            keys.verify_decision(
+                &sample_sig,
+                "host-rev-1",
+                "host-rev-1:tkt-1",
+                &dummy_hash,
+                now
+            ),
             Err(BrokerError::RevocationListMissingOrStale(_))
         ));
         assert_eq!(
@@ -2407,15 +2442,23 @@ mod tests {
 
         // 3. Install valid list, enroll cert, then let the revocation list expire -> MUST fail closed & bypass.
         let valid_list =
-            issue_revocation_list(&TEST_IDENTITY_SEED, 1, now - 60, now + 3600, Vec::new()).unwrap();
+            issue_revocation_list(&TEST_IDENTITY_SEED, 1, now - 60, now + 3600, Vec::new())
+                .unwrap();
         keys.install_revocation_list(valid_list, now).unwrap();
         keys.enroll_device_cert(cert, now).unwrap();
 
         let expired_list =
-            issue_revocation_list(&TEST_IDENTITY_SEED, 2, now - 3600, now - 10, Vec::new()).unwrap();
+            issue_revocation_list(&TEST_IDENTITY_SEED, 2, now - 3600, now - 10, Vec::new())
+                .unwrap();
         keys.seed_revocation_list_for_test(expired_list);
         assert!(matches!(
-            keys.verify_decision(&sample_sig, "host-rev-1", "host-rev-1:tkt-1", &dummy_hash, now),
+            keys.verify_decision(
+                &sample_sig,
+                "host-rev-1",
+                "host-rev-1:tkt-1",
+                &dummy_hash,
+                now
+            ),
             Err(BrokerError::RevocationListMissingOrStale(_))
         ));
         assert_eq!(
@@ -2437,8 +2480,9 @@ mod tests {
         configure_test_trust_anchor(&keys);
 
         // Default `ApprovalBroker::new` uses `RealRepoTrustChecker` (`find_git_root` + `repository_trust::require`).
-        let broker = ApprovalBroker::new("host-trust-1", dir.path().join("mailbox"), presence, keys)
-            .with_hold_ceiling(Duration::from_secs(30));
+        let broker =
+            ApprovalBroker::new("host-trust-1", dir.path().join("mailbox"), presence, keys)
+                .with_hold_ceiling(Duration::from_secs(30));
         broker.set_remote_approval_active(true);
 
         let mut req = bash_request("s-untrusted", "rm -rf /tmp/x");

@@ -234,9 +234,7 @@ pub fn write_remote_approval_state(
 pub fn read_remote_approval_state(state_dir: &Path) -> Result<RemoteApprovalState, String> {
     let path = state_dir.join(REMOTE_APPROVAL_STATE_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
-        }
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(RemoteApprovalState::ReleasedToNative {
                 reason: "state_missing".into(),

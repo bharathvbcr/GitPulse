@@ -174,11 +174,7 @@ pub fn run(input: &HookInput) -> Option<String> {
 /// Executes `permission-bridge` against an explicit socket path, enforcing
 /// `find_git_root` + `repository_trust::require` before connecting. Never
 /// blocks or denies when the repo is untrusted or the broker is absent.
-pub fn run_against_socket(
-    input: &HookInput,
-    socket_path: &Path,
-    wait: Duration,
-) -> Option<String> {
+pub fn run_against_socket(input: &HookInput, socket_path: &Path, wait: Duration) -> Option<String> {
     run_against_socket_with_trust_check(input, socket_path, wait, is_trusted_repo_cwd)
 }
 
@@ -249,11 +245,11 @@ pub(crate) fn forbidden_fields_absent(rendered: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use crate::alerts::approval_broker::{
         ApprovalBroker, ApprovalBrokerServer, MockPresenceProvider, TrustedApprovalKeyStore,
         UserPresence, SOCKET_NAME,
     };
+    use serde_json::json;
     use std::sync::Arc;
 
     fn sample_bash_input() -> HookInput {
@@ -401,7 +397,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn untrusted_repository_bypasses_immediately_without_contacting_broker() {
-        let dir = tempfile::Builder::new().prefix("gp-pb-ut-").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gp-pb-ut-")
+            .tempdir()
+            .unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         let untrusted_repo = base.join("untrusted-repo");
         std::fs::create_dir_all(untrusted_repo.join(".git")).unwrap();
@@ -413,16 +412,11 @@ mod tests {
         // Even if the broker itself had a permissive checker, `run_against_socket` MUST
         // bypass locally via real `repository_trust::require` before touching the socket.
         let broker = Arc::new(
-            ApprovalBroker::new(
-                "host-pb-ut",
-                base.join("agent-mailbox"),
-                presence,
-                keys,
-            )
-            .with_repo_trust_checker(Arc::new(
-                crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
-            ))
-            .with_hold_ceiling(Duration::from_secs(30)),
+            ApprovalBroker::new("host-pb-ut", base.join("agent-mailbox"), presence, keys)
+                .with_repo_trust_checker(Arc::new(
+                    crate::alerts::approval_broker::MockRepoTrustChecker::new(true),
+                ))
+                .with_hold_ceiling(Duration::from_secs(30)),
         );
         broker.set_remote_approval_active(true);
         let _server = ApprovalBrokerServer::bind_and_start(sock.clone(), broker.clone())
@@ -432,7 +426,10 @@ mod tests {
         input.cwd = untrusted_repo.to_string_lossy().into_owned();
 
         let t0 = std::time::Instant::now();
-        assert_eq!(run_against_socket(&input, &sock, Duration::from_secs(5)), None);
+        assert_eq!(
+            run_against_socket(&input, &sock, Duration::from_secs(5)),
+            None
+        );
         assert!(t0.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(200)));
         assert!(broker.pending_tickets().is_empty());
     }
@@ -440,7 +437,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_broker_socket_bypasses_cleanly_with_empty_stdout() {
-        let dir = tempfile::Builder::new().prefix("gp-pb-none-").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("gp-pb-none-")
+            .tempdir()
+            .unwrap();
         let missing = dir.path().join("does-not-exist.sock");
         assert_eq!(
             run_against_socket_with_trust_check(
