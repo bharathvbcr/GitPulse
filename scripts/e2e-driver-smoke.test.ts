@@ -75,7 +75,7 @@ describe("e2e-driver-smoke", () => {
   it("resolves default binaries honoring CARGO_TARGET_DIR and rejects bad ports/timeouts", () => {
     expect(defaultAppBinary("linux", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse"));
     expect(defaultAppBinary("win32", {}, "/repo")).toBe(path.join("/repo", "src-tauri", "target", "debug", "gitpulse.exe"));
-    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.join("/target", "debug", "examples", "e2e_seed_trust"));
+    expect(defaultSeedBinary("linux", { CARGO_TARGET_DIR: "/target" }, "/repo")).toBe(path.resolve("/target", "debug", "examples", "e2e_seed_trust"));
     expect(() => parseArgs(["--port", "0"])).toThrow(/1\.\.65535/);
     expect(() => parseArgs(["--timeout", "5"])).toThrow(/30 and 900/);
   });
