@@ -23,10 +23,198 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
-pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+const REPO_MUTATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Exclusive advisory lock on `<common_git_dir>/gitpulse/mutation.lock` held
+/// for the lifetime of a repository mutation alongside the in-process mutex.
+pub(crate) struct AdvisoryFileLock {
+    file: std::fs::File,
+}
+
+impl Drop for AdvisoryFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+pub(crate) struct RepoMutationLock {
+    in_proc: Mutex<()>,
+    cross_proc_path: Option<PathBuf>,
+}
+
+pub(crate) struct RepoMutationGuard<'a> {
+    // Drop the cross-process flock before releasing the in-process mutex so
+    // another thread in this process never wakes into a self-contended flock.
+    _cross_proc: Option<AdvisoryFileLock>,
+    _in_proc: std::sync::MutexGuard<'a, ()>,
+}
+
+fn open_mutation_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn acquire_mutation_file_lock(
+    lock_path: &Path,
+    timeout: std::time::Duration,
+    deadline: Option<AskerDeadline>,
+) -> Result<AdvisoryFileLock, CommandError> {
+    let file = open_mutation_lock_file(lock_path).map_err(|e| {
+        CommandError::from(format!(
+            "cannot open repository mutation lock {}: {e}",
+            lock_path.display()
+        ))
+    })?;
+    let timeout_deadline = Instant::now() + timeout;
+    let mut backoff_ms = 1u64;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AdvisoryFileLock { file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(CommandError::from(format!(
+                    "cannot lock repository mutation lock {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+        if deadline.is_some_and(|d| d.has_passed()) {
+            return Err(OP_DEADLINE_PASSED.into());
+        }
+        if Instant::now() >= timeout_deadline {
+            return Err(CommandError::from(format!(
+                "timed out after {}s waiting for repository mutation lock {}",
+                timeout.as_secs(),
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        backoff_ms = (backoff_ms * 2).min(25);
+    }
+}
+
+impl RepoMutationLock {
+    pub(crate) fn lock(
+        &self,
+    ) -> Result<RepoMutationGuard<'_>, std::sync::PoisonError<RepoMutationGuard<'_>>> {
+        let (in_proc, poisoned) = match self.in_proc.lock() {
+            Ok(guard) => (guard, false),
+            Err(poison) => (poison.into_inner(), true),
+        };
+        let cross_proc = self.cross_proc_path.as_ref().map(|path| {
+            acquire_mutation_file_lock(path, REPO_MUTATION_LOCK_TIMEOUT, None).unwrap_or_else(|e| {
+                panic!(
+                    "failed to acquire repository mutation lock: {}",
+                    e.message()
+                )
+            })
+        });
+        let guard = RepoMutationGuard {
+            _cross_proc: cross_proc,
+            _in_proc: in_proc,
+        };
+        if poisoned {
+            Err(std::sync::PoisonError::new(guard))
+        } else {
+            Ok(guard)
+        }
+    }
+
+    pub(crate) fn try_lock(
+        &self,
+    ) -> Result<RepoMutationGuard<'_>, std::sync::TryLockError<RepoMutationGuard<'_>>> {
+        let (in_proc, poisoned) = match self.in_proc.try_lock() {
+            Ok(guard) => (guard, false),
+            Err(std::sync::TryLockError::Poisoned(poison)) => (poison.into_inner(), true),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(std::sync::TryLockError::WouldBlock);
+            }
+        };
+        let cross_proc = match &self.cross_proc_path {
+            None => None,
+            Some(path) => {
+                let Ok(file) = open_mutation_lock_file(path) else {
+                    return Err(std::sync::TryLockError::WouldBlock);
+                };
+                match file.try_lock() {
+                    Ok(()) => Some(AdvisoryFileLock { file }),
+                    Err(_) => return Err(std::sync::TryLockError::WouldBlock),
+                }
+            }
+        };
+        let guard = RepoMutationGuard {
+            _cross_proc: cross_proc,
+            _in_proc: in_proc,
+        };
+        if poisoned {
+            Err(std::sync::TryLockError::Poisoned(
+                std::sync::PoisonError::new(guard),
+            ))
+        } else {
+            Ok(guard)
+        }
+    }
+
+    pub(crate) fn lock_asked(
+        &self,
+        deadline: Option<AskerDeadline>,
+    ) -> Result<RepoMutationGuard<'_>, CommandError> {
+        let fallback_deadline = Instant::now() + REPO_MUTATION_LOCK_TIMEOUT;
+        let mut backoff_ms = 1u64;
+        let in_proc = loop {
+            match self.in_proc.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if deadline.is_some_and(|d| d.has_passed()) {
+                        return Err(OP_DEADLINE_PASSED.into());
+                    }
+                    if deadline.is_none() && Instant::now() >= fallback_deadline {
+                        return Err("Timed out waiting for repository mutation lock".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(25);
+                }
+            }
+        };
+        let cross_proc = match &self.cross_proc_path {
+            None => None,
+            Some(path) => Some(acquire_mutation_file_lock(
+                path,
+                REPO_MUTATION_LOCK_TIMEOUT,
+                deadline,
+            )?),
+        };
+        Ok(RepoMutationGuard {
+            _cross_proc: cross_proc,
+            _in_proc: in_proc,
+        })
+    }
+}
+
+pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<RepoMutationLock> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<RepoMutationLock>>>> = OnceLock::new();
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = resolve_git_common_dir(canon).unwrap_or_else(|_| canon.to_path_buf());
+    let common = resolve_git_common_dir(canon).ok();
+    let cross_proc_path = common
+        .as_ref()
+        .filter(|dir| dir.is_dir())
+        .map(|dir| dir.join("gitpulse").join("mutation.lock"));
+    let key = common.unwrap_or_else(|| canon.to_path_buf());
     let mut map = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -34,7 +222,12 @@ pub(crate) fn repo_mutation_lock(canon: &Path) -> Arc<Mutex<()>> {
         map.retain(|_, arc| Arc::strong_count(arc) > 1);
     }
     map.entry(key)
-        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .or_insert_with(|| {
+            Arc::new(RepoMutationLock {
+                in_proc: Mutex::new(()),
+                cross_proc_path,
+            })
+        })
         .clone()
 }
 
@@ -175,7 +368,7 @@ pub const MAX_CLONE_DEPTH: u32 = 1_000_000;
 impl CloneOptions {
     fn validate(&self) -> Result<(), CommandError> {
         if let Some(branch) = &self.branch {
-            validate_ref_name(branch)?;
+            validate_short_ref_name(branch)?;
         }
         if let Some(depth) = self.depth {
             if depth == 0 || depth > MAX_CLONE_DEPTH {
@@ -1721,7 +1914,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo: &Path,
         branch_name: &str,
     ) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(branch_name)?;
+        validate_short_ref_name(branch_name)?;
         let ref_exists = |full: &str| -> Result<bool, CommandError> {
             Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
         };
@@ -1879,7 +2072,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         branch_name: &str,
         start_point: Option<&str>,
     ) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(branch_name)?;
+        validate_short_ref_name(branch_name)?;
         let mut argv = vec!["git".into(), "branch".into(), branch_name.into()];
         if let Some(sp) = start_point {
             // Start points are revisions, not refs-to-create: HEAD~1 and raw
@@ -1893,7 +2086,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// Git's argv for `branch -d|-D <name>`, validated like [`Self::create_branch_argv`].
     pub fn delete_branch_argv(branch_name: &str, force: bool) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(branch_name)?;
+        validate_agent_ref_name(branch_name)?;
         Ok(vec![
             "git".into(),
             "branch".into(),
@@ -1904,8 +2097,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// Git's argv for `branch -m <old> <new>`, validated like [`Self::create_branch_argv`].
     pub fn rename_branch_argv(old_name: &str, new_name: &str) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(old_name)?;
-        validate_ref_name(new_name)?;
+        validate_short_ref_name(old_name)?;
+        validate_short_ref_name(new_name)?;
         Ok(vec![
             "git".into(),
             "branch".into(),
@@ -1937,7 +2130,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         commit_id: Option<&str>,
         message: Option<&str>,
     ) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(tag_name)?;
+        validate_short_ref_name(tag_name)?;
         if let Some(cid) = commit_id {
             validate_oid(cid)?;
         }
@@ -1955,7 +2148,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// Git's argv for `tag -d <name>`, validated like [`Self::create_branch_argv`].
     pub fn delete_tag_argv(tag_name: &str) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(tag_name)?;
+        validate_agent_ref_name(tag_name)?;
         Ok(vec![
             "git".into(),
             "tag".into(),
@@ -1969,8 +2162,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// the remote, never its URL, so nothing credential-bearing is judged.
     /// Validated like [`Self::create_branch_argv`].
     pub fn push_tag_argv(remote: &str, tag: &str) -> Result<Vec<String>, CommandError> {
-        validate_ref_name(remote)?;
-        validate_ref_name(tag)?;
+        validate_agent_ref_name(remote)?;
+        validate_short_ref_name(tag)?;
         Ok(vec![
             "git".into(),
             "push".into(),
@@ -2605,7 +2798,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             crate::engine::remotes::require_configured(&repo, remote)?;
         }
         for name in remote.into_iter().chain(branch) {
-            validate_ref_name(name)?;
+            validate_agent_ref_name(name)?;
         }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2680,7 +2873,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 }
                 continue;
             }
-            validate_ref_name(arg)?;
+            validate_agent_ref_name(arg)?;
         }
         if forced[0] != forced[1] {
             return Err(
@@ -2782,7 +2975,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
-        validate_ref_name(branch_name)?;
+        validate_short_ref_name(branch_name)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
@@ -2887,8 +3080,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
         onto: &str,
         requested: Option<&str>,
     ) -> Result<String, CommandError> {
-        validate_ref_name(branch)?;
-        validate_ref_name(onto)?;
+        validate_short_ref_name(branch)?;
+        validate_short_ref_name(onto)?;
         if let Some(fork_point) = requested {
             validate_oid(fork_point)?;
             // `git_captured`, not `git_text`: a non-zero exit means "not an
@@ -2942,8 +3135,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
         onto: &str,
         upstream: &str,
     ) -> Result<String, CommandError> {
-        validate_ref_name(branch)?;
-        validate_ref_name(onto)?;
+        validate_short_ref_name(branch)?;
+        validate_short_ref_name(onto)?;
         // Upstream is either the validated `onto` fallback or a git-emitted
         // OID from merge-base; anything else must never reach argv.
         if upstream != onto {
@@ -4086,7 +4279,7 @@ fn require_force_if_includes(
 
 /// A branch given to a push: a valid ref name that is not refspec syntax.
 fn validate_push_branch(name: &str) -> Result<(), CommandError> {
-    validate_ref_name(name)?;
+    validate_short_ref_name(name)?;
     if name.starts_with('+') || name.contains(':') {
         return Err(format!(
             "Refusing to push `{name}`: a push takes a plain branch name, and a leading `+` \
@@ -4113,7 +4306,7 @@ fn plan_push_argv(
             let branch = read_head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())?;
             if branch_upstream(repo, &branch)? == BranchUpstream::Unconfigured {
                 let remote = unpublished_push_remote(repo)?;
-                validate_ref_name(&remote)?;
+                validate_agent_ref_name(&remote)?;
                 validate_push_branch(&branch)?;
                 args.push("-u".into());
                 args.push(remote);
@@ -4122,12 +4315,12 @@ fn plan_push_argv(
         }
         (Some(remote), None) => {
             crate::engine::remotes::require_configured(repo, remote)?;
-            validate_ref_name(remote)?;
+            validate_agent_ref_name(remote)?;
             args.push(remote.to_string());
         }
         (Some(remote), Some(branch)) => {
             crate::engine::remotes::require_configured(repo, remote)?;
-            validate_ref_name(remote)?;
+            validate_agent_ref_name(remote)?;
             validate_push_branch(branch)?;
             args.push(remote.to_string());
             args.push(branch.to_string());
@@ -4139,7 +4332,7 @@ fn plan_push_argv(
             // remote is resolved explicitly, from a configured name.
             validate_push_branch(branch)?;
             let remote = implicit_push_remote(repo)?;
-            validate_ref_name(&remote)?;
+            validate_agent_ref_name(&remote)?;
             args.push(remote);
             args.push(branch.to_string());
         }
@@ -4185,9 +4378,30 @@ fn implicit_push_remote(repo: &Path) -> Result<String, CommandError> {
 ///
 /// The tests check this function against `git check-ref-format` over a table and
 /// a sweep of short names, and name the C1 rows as the expected divergence.
+/// Maximum byte length of a Git ref name (matching `git-ai` `MaxReferenceNameLength`).
+pub const MAX_REFERENCE_NAME_LENGTH: usize = 1024;
+/// Reserved internal Waylode/GitPulse ref namespace protected from agent branch/ref mutations.
+pub const RESERVED_GITPULSE_REF_PREFIX: &str = "refs/gitpulse/";
+/// DWIM decoy prefixes that hijack unqualified ref resolution when the real ref is absent.
+const DWIM_DECOY_PREFIXES: &[&str] = &[
+    "refs/refs/",
+    "refs/tags/refs/",
+    "refs/heads/refs/",
+    "refs/remotes/refs/",
+];
+
 pub fn validate_ref_name(name: &str) -> Result<(), CommandError> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
+    }
+    if name.len() > MAX_REFERENCE_NAME_LENGTH {
+        return Err(format!("Invalid ref name: exceeds {MAX_REFERENCE_NAME_LENGTH} bytes").into());
+    }
+    if DWIM_DECOY_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return Err("Invalid ref name: DWIM decoy ref prefix is not allowed".into());
     }
     // Rule 3.
     if name.contains("..") {
@@ -4222,6 +4436,34 @@ pub fn validate_ref_name(name: &str) -> Result<(), CommandError> {
             || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
     }) {
         return Err("Invalid ref name: contains a character git forbids in ref names".into());
+    }
+    Ok(())
+}
+
+/// Validates a ref name for external/agent mutations, additionally protecting
+/// `refs/gitpulse/*` internal refs (while [`validate_ref_name`] continues to
+/// validate internal `refs/gitpulse/{green,turns}/*` refs).
+pub fn validate_agent_ref_name(name: &str) -> Result<(), CommandError> {
+    validate_ref_name(name)?;
+    if name == "refs/gitpulse" || name.starts_with(RESERVED_GITPULSE_REF_PREFIX) {
+        return Err(
+            "Invalid ref name: refs/gitpulse/* is reserved for Waylode internal state".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Validates an unqualified branch/tag name where Git will prepend
+/// `refs/heads/` or `refs/tags/`, preventing `refs/heads/refs/...` DWIM decoys.
+fn validate_short_ref_name(name: &str) -> Result<(), CommandError> {
+    validate_agent_ref_name(name)?;
+    if name == "refs"
+        || name.starts_with("refs/")
+        || name.starts_with("heads/refs/")
+        || name.starts_with("tags/refs/")
+        || name.starts_with("remotes/refs/")
+    {
+        return Err("Invalid ref name: DWIM decoy ref prefix is not allowed".into());
     }
     Ok(())
 }
@@ -4793,9 +5035,7 @@ impl GitWriter {
             return Err(OP_DEADLINE_PASSED.into());
         }
         let lock = repo_mutation_lock(&repo);
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = lock.lock_asked(ask.deadline)?;
         // The lock may have been held by another write for as long as it took
         // for the asker to give up.
         if deadline_passed() {
@@ -4837,20 +5077,62 @@ impl GitWriter {
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| format!("Failed to serialize op snapshot payload: {e}"))?;
 
-        let mut parents: Vec<String> = Vec::new();
+        let mut all_parents: Vec<String> = Vec::new();
         let mut seen_parents: HashSet<String> = HashSet::new();
         for oid in head_oid
             .iter()
             .chain(stash_oid.iter())
             .chain(live_refs.iter().filter_map(|r| r.commit_oid.as_ref()))
         {
-            if parents.len() >= OP_SNAPSHOT_PARENT_CAP {
-                break;
-            }
             if seen_parents.insert(oid.clone()) {
-                parents.push(oid.clone());
+                all_parents.push(oid.clone());
             }
         }
+
+        let parents: Vec<String> = if all_parents.len() <= OP_SNAPSHOT_PARENT_CAP {
+            all_parents
+        } else {
+            // Keep at most 64 `-p` flags per `commit-tree` call (Windows 32 KiB
+            // argv safety) while keeping every ref GC-reachable by chaining
+            // overflow parents (`63..`) in reverse into synthetic pin commits
+            // (`<= 63` real parents + `1` link to the next pin commit).
+            const PIN_REAL_PARENTS: usize = OP_SNAPSHOT_PARENT_CAP - 1;
+            const PIN_COMMIT_MESSAGE: &[u8] = b"waylode op-snapshot gc-pin";
+            let mut capped = all_parents[..PIN_REAL_PARENTS].to_vec();
+            let overflow = &all_parents[PIN_REAL_PARENTS..];
+            let mut next_pin: Option<String> = None;
+            for chunk in overflow.chunks(PIN_REAL_PARENTS).rev() {
+                let mut pin_args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
+                    .iter()
+                    .map(|a| (*a).to_string())
+                    .chain(["commit-tree".to_string(), tree_oid.clone()])
+                    .collect();
+                for p in chunk {
+                    pin_args.push("-p".into());
+                    pin_args.push(p.clone());
+                }
+                if let Some(ref link) = next_pin {
+                    pin_args.push("-p".into());
+                    pin_args.push(link.clone());
+                }
+                pin_args.push("-F".into());
+                pin_args.push("-".into());
+                let pin_arg_refs: Vec<&str> = pin_args.iter().map(String::as_str).collect();
+                let pin_run = git_captured_with_stdin(&repo, &pin_arg_refs, PIN_COMMIT_MESSAGE)?;
+                if !pin_run.success {
+                    return Err(format!(
+                        "Failed to write op snapshot gc-pin commit object: {}",
+                        String::from_utf8_lossy(&pin_run.stderr).trim()
+                    )
+                    .into());
+                }
+                let pin_oid = String::from_utf8_lossy(&pin_run.stdout).trim().to_string();
+                validate_oid(&pin_oid)?;
+                next_pin = Some(pin_oid);
+            }
+            capped.push(next_pin.expect("overflow chunks must produce head pin commit"));
+            capped
+        };
 
         let mut args: Vec<String> = SNAPSHOT_IDENTITY_ARGS
             .iter()
@@ -5086,7 +5368,7 @@ impl GitWriter {
         let mut expected_map: HashMap<&str, Option<&str>> =
             HashMap::with_capacity(plan.expected_refs.len());
         for exp in &plan.expected_refs {
-            validate_ref_name(&exp.refname)?;
+            validate_agent_ref_name(&exp.refname)?;
             if let Some(oid) = &exp.expected_oid {
                 validate_oid(oid)?;
             }
@@ -5103,7 +5385,7 @@ impl GitWriter {
         }
 
         for recorded in &payload.refs {
-            validate_ref_name(&recorded.refname)?;
+            validate_agent_ref_name(&recorded.refname)?;
             validate_oid(&recorded.oid)?;
             if !expected_map.contains_key(recorded.refname.as_str()) {
                 return Err(format!(
@@ -5169,7 +5451,7 @@ impl GitWriter {
 
         let mut head_target_changed = false;
         if let Some(sym) = &payload.head_ref {
-            validate_ref_name(sym)?;
+            validate_agent_ref_name(sym)?;
             if head_sym_before.as_deref() != Some(sym.as_str()) {
                 git_text(&repo, &["symbolic-ref", "HEAD", sym])?;
                 head_target_changed = true;
@@ -5894,6 +6176,58 @@ mod tests {
         assert!(validate_ref_name(".hidden/inner").is_err());
         assert!(validate_ref_name("feat/dot.file").is_ok());
         assert!(validate_ref_name("feat/auth").is_ok());
+    }
+
+    #[test]
+    fn validate_ref_name_rejects_dwim_decoys_overlong_and_protects_gitpulse_refs() {
+        for decoy in [
+            "refs/refs/heads/main",
+            "refs/tags/refs/heads/main",
+            "refs/heads/refs/heads/main",
+            "refs/remotes/refs/heads/main",
+        ] {
+            let err = validate_ref_name(decoy).expect_err(&format!("decoy {decoy} must fail"));
+            assert!(
+                err.message().contains("DWIM decoy"),
+                "unexpected error for {decoy}: {}",
+                err.message()
+            );
+        }
+
+        // Exact 1024-byte ref name is allowed; 1025-byte ref name is rejected.
+        let exact_1024 = format!("refs/heads/{}", "a".repeat(1024 - "refs/heads/".len()));
+        assert_eq!(exact_1024.len(), 1024);
+        assert!(validate_ref_name(&exact_1024).is_ok());
+        let over_1024 = format!("{exact_1024}b");
+        assert_eq!(over_1024.len(), 1025);
+        let len_err = validate_ref_name(&over_1024).expect_err("1025-byte ref must be rejected");
+        assert!(len_err.message().contains("1024"), "{}", len_err.message());
+
+        // Internal callers (`provenance`, `turn_checkpoint`) still validate `refs/gitpulse/*`.
+        assert!(validate_ref_name("refs/gitpulse/green/main").is_ok());
+        assert!(validate_ref_name("refs/gitpulse/turns/0123456789abcdef/0001").is_ok());
+
+        // Agent/user mutation helpers protect `refs/gitpulse/*` and block branch-prefixed decoys.
+        assert!(validate_agent_ref_name("refs/gitpulse").is_err());
+        assert!(validate_agent_ref_name("refs/gitpulse/ops/1").is_err());
+        assert!(validate_agent_ref_name("refs/gitpulse/green/main").is_err());
+        assert!(GitWriter::create_branch_argv("refs/gitpulse/ops/1", None).is_err());
+        assert!(GitWriter::delete_branch_argv("refs/gitpulse/ops/1", true).is_err());
+        assert!(GitWriter::create_branch_argv("refs/heads/main", None).is_err());
+        assert!(GitWriter::create_tag_argv("refs/heads/main", None, None).is_err());
+        assert!(GitWriter::delete_tag_argv("refs/gitpulse/ops/1").is_err());
+        assert!(GitWriter::create_branch_argv(&"b".repeat(1025), None).is_err());
+        assert!(GitWriter::push_tag_argv("origin", "refs/heads/v1").is_err());
+        let repo = init_repo_with_commit();
+        let path = repo_path(&repo);
+        assert!(GitWriter::checkout_branch_argv(&path, "refs/gitpulse/ops/1").is_err());
+        assert!(GitWriter::merge_branch(
+            &path,
+            "refs/gitpulse/ops/1",
+            MergeMode::Default,
+            &mut |_| Ok(())
+        )
+        .is_err());
     }
 
     /// Every row is `(name, git accepts it)`. A name is refused here when git
@@ -7104,6 +7438,179 @@ mod tests {
             Arc::ptr_eq(&l_main, &l_wt),
             "main checkout and linked worktree must share one mutation lock"
         );
+    }
+
+    const MUTATION_LOCK_HOLD_CHILD: &str =
+        "engine::git_writer::tests::repo_mutation_lock_hold_child";
+    const MUTATION_LOCK_RACE_CHILD: &str =
+        "engine::git_writer::tests::repo_mutation_lock_race_child";
+    const ENV_MUTATION_REPO: &str = "GITPULSE_TEST_MUTATION_REPO";
+    const ENV_MUTATION_READY: &str = "GITPULSE_TEST_MUTATION_READY";
+    const ENV_MUTATION_RELEASE: &str = "GITPULSE_TEST_MUTATION_RELEASE";
+    const ENV_MUTATION_TAG: &str = "GITPULSE_TEST_MUTATION_TAG";
+
+    #[test]
+    fn repo_mutation_lock_hold_child() {
+        let Ok(repo) = std::env::var(ENV_MUTATION_REPO) else {
+            return;
+        };
+        let ready = std::env::var(ENV_MUTATION_READY).expect("ready marker");
+        let release = std::env::var(ENV_MUTATION_RELEASE).expect("release marker");
+        crate::test_support::trust_repo(std::path::Path::new(&repo));
+        let canon = validate_repo(&repo).expect("valid repo");
+        let lock = super::repo_mutation_lock(&canon);
+        let _guard = lock.lock().expect("acquire lock in child");
+        std::fs::write(&ready, b"locked").expect("write ready marker");
+        let wait_limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !std::path::Path::new(&release).exists() {
+            assert!(
+                std::time::Instant::now() < wait_limit,
+                "parent never released child lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn repo_mutation_lock_race_child() {
+        let Ok(repo) = std::env::var(ENV_MUTATION_REPO) else {
+            return;
+        };
+        let tag = std::env::var(ENV_MUTATION_TAG).expect("worker tag");
+        crate::test_support::trust_repo(std::path::Path::new(&repo));
+        for i in 0..4 {
+            let file = format!("proc_{tag}_{i}.txt");
+            std::fs::write(
+                std::path::Path::new(&repo).join(&file),
+                format!("from {tag} round {i}\n"),
+            )
+            .expect("write file");
+            GitWriter::commit_files(&repo, &format!("proc-{tag}-{i}"), &[file])
+                .unwrap_or_else(|e| panic!("child {tag} round {i} failed: {}", e.message()));
+        }
+    }
+
+    #[test]
+    fn repo_mutation_lock_serializes_across_processes_and_respects_asker_deadline() {
+        let dir = init_repo_with_commit();
+        configure_identity(dir.path());
+        let repo = repo_path(&dir);
+        let canon = validate_repo(&repo).unwrap();
+        let markers = tempfile::TempDir::new().unwrap();
+        let ready = markers.path().join("ready");
+        let release = markers.path().join("release");
+
+        // 1. Child process holds `<common>/gitpulse/mutation.lock`; parent must
+        //    see `WouldBlock` on `try_lock`, and `record_op_snapshot_with_limits_asked`
+        //    must abort cleanly once `AskerDeadline` passes.
+        let (mut hold_cmd, _hold_harness) =
+            crate::test_support::isolated_libtest_command(MUTATION_LOCK_HOLD_CHILD);
+        let mut holder = hold_cmd
+            .env(ENV_MUTATION_REPO, &repo)
+            .env(ENV_MUTATION_READY, &ready)
+            .env(ENV_MUTATION_RELEASE, &release)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn_locked()
+            .expect("spawn lock-holder child");
+
+        let wait_limit = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() {
+            if let Some(status) = holder.try_wait().expect("poll holder") {
+                let out = holder.wait_with_output().expect("collect holder output");
+                panic!(
+                    "holder child exited early ({status}): stdout={} stderr={}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            assert!(
+                std::time::Instant::now() < wait_limit,
+                "holder child never acquired mutation.lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let parent_lock = super::repo_mutation_lock(&canon);
+        assert!(
+            matches!(
+                parent_lock.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "parent try_lock must observe child's cross-process flock"
+        );
+
+        let ask = super::OpAsk {
+            request_id: Some("cross-proc-deadline"),
+            deadline: Some(super::AskerDeadline {
+                expires_at: std::time::Instant::now() + std::time::Duration::from_millis(80),
+                now: std::time::Instant::now,
+            }),
+        };
+        let err = GitWriter::record_op_snapshot_with_limits_asked(
+            &repo,
+            "git reset --hard HEAD",
+            None,
+            None,
+            1_700_000_000_000,
+            super::MAX_OPS,
+            super::OP_EXPIRY_SECS,
+            &ask,
+        )
+        .expect_err(
+            "snapshot must abort when AskerDeadline passes while child holds mutation.lock",
+        );
+        assert!(
+            err.message().contains("deadline"),
+            "expected deadline refusal, got: {}",
+            err.message()
+        );
+        assert!(
+            GitWriter::list_op_snapshots(&repo, 10)
+                .expect("list")
+                .entries
+                .is_empty(),
+            "no snapshot ref may be written after deadline refusal"
+        );
+
+        std::fs::write(&release, b"go").expect("release holder");
+        let hold_status = holder.wait().expect("wait holder");
+        assert!(hold_status.success(), "holder child failed");
+
+        // 2. Two child processes racing `GitWriter::commit_files` serialize
+        //    cleanly through `mutation.lock` with zero index.lock failures.
+        let mut children = Vec::new();
+        for tag in ["p1", "p2"] {
+            let (mut race_cmd, race_harness) =
+                crate::test_support::isolated_libtest_command(MUTATION_LOCK_RACE_CHILD);
+            let child = race_cmd
+                .env(ENV_MUTATION_REPO, &repo)
+                .env(ENV_MUTATION_TAG, tag)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn_locked()
+                .expect("spawn race child");
+            children.push((tag, child, race_harness));
+        }
+        for (tag, child, _harness) in children {
+            let output = child.wait_with_output().expect("wait race child");
+            assert!(
+                output.status.success(),
+                "race child {tag} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let log = git_text(dir.path(), &["log", "--format=%s"]).expect("log");
+        for tag in ["p1", "p2"] {
+            for i in 0..4 {
+                let msg = format!("proc-{tag}-{i}");
+                assert!(log.lines().any(|l| l == msg), "missing commit {msg}");
+            }
+        }
     }
 
     /// A stale `.git/index.lock` from a concurrent agent must be retried, not
@@ -10365,6 +10872,77 @@ mod bound_to_checked_state {
             }),
             "the prune failure is recorded on the snapshot's row"
         );
+    }
+
+    #[test]
+    fn op_snapshot_pins_over_64_branches_across_gc_prune_and_restores_branch_75() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Ada"]);
+        git_in(p, &["config", "user.email", "ada@gitpulse.dev"]);
+        git_in(p, &["config", "commit.gpgsign", "false"]);
+        crate::test_support::trust_repo(p);
+
+        std::fs::write(p.join("base.txt"), "base\n").unwrap();
+        git_in(p, &["add", "--", "base.txt"]);
+        git_in(p, &["commit", "-q", "-m", "base"]);
+        let base_oid = rev(p, "refs/heads/main");
+
+        // Create 80 branches with unique commits (> 64 parent cap).
+        let mut branch_oids = Vec::new();
+        for idx in 0..80_usize {
+            let branch = format!("topic-{idx:02}");
+            git_in(p, &["checkout", "-q", "-b", &branch, &base_oid]);
+            std::fs::write(p.join("topic.txt"), format!("topic {idx}\n")).unwrap();
+            git_in(p, &["add", "--", "topic.txt"]);
+            git_in(p, &["commit", "-q", "-m", &format!("topic-{idx:02}")]);
+            branch_oids.push((branch, rev(p, &format!("refs/heads/topic-{idx:02}"))));
+        }
+        git_in(p, &["checkout", "-q", "main"]);
+
+        let repo_canon = p.canonicalize().unwrap();
+        let repo_str = repo_canon.to_str().unwrap();
+        let snap = GitWriter::record_op_snapshot_with_limits(
+            repo_str,
+            "git branch -D topic-74",
+            None,
+            None,
+            1_700_000_050_000,
+            MAX_OPS,
+            OP_EXPIRY_SECS,
+        )
+        .expect("op snapshot with 80 branches must succeed");
+        assert!(snap.refs.len() >= 81, "expected main + 80 topic branches");
+
+        // Every commit in the snapshot / gc-pin chain must stay <= 64 parents.
+        let parent_line = git_text(
+            p,
+            &["rev-list", "--no-walk", "--parents", &snap.snapshot_oid],
+        )
+        .expect("inspect snapshot parents");
+        let direct_parents: Vec<&str> = parent_line.split_whitespace().skip(1).collect();
+        assert_eq!(direct_parents.len(), OP_SNAPSHOT_PARENT_CAP);
+        let head_pin = *direct_parents.last().expect("head pin parent");
+        let pin_msg = git_text(p, &["log", "-n", "1", "--format=%s", head_pin]).expect("pin msg");
+        assert_eq!(pin_msg.trim(), "waylode op-snapshot gc-pin");
+
+        // Delete branch #75 (0-based topic-74) and prune all unreachable objects.
+        let (target_branch, target_oid) = &branch_oids[74];
+        git_in(p, &["branch", "-D", target_branch]);
+        git_in(p, &["reflog", "expire", "--expire=now", "--all"]);
+        git_in(p, &["gc", "--prune=now", "-q"]);
+
+        // Undo must restore branch #75 intact with zero missing objects.
+        let mut plan = GitWriter::prepare_op_undo(repo_str, snap.seq).expect("prepare undo");
+        plan.confirm_dirty = true;
+        GitWriter::undo_op_snapshot_with_gate(repo_str, &plan, &mut |_| Ok(()))
+            .expect("undo must restore branch #75 after git gc --prune=now");
+        assert_eq!(
+            rev(p, &format!("refs/heads/{target_branch}")),
+            *target_oid,
+            "branch #75 tip must match pre-gc commit"
+        );
+        git_in(p, &["fsck", "--full", "--no-dangling"]);
     }
 }
 
