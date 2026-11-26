@@ -191,10 +191,18 @@ export function parseSourceFreshness(value: unknown, command = "codeintel"): Sou
   if (reason !== undefined && typeof reason !== "string") {
     throw new Error(`${command} returned a corrupt source_freshness`);
   }
+  // Rust omits the field when the age is unknown (`skip_serializing_if`), so
+  // only "absent" means unknown; any value present must be a whole,
+  // non-negative millisecond count (`Option<u64>`).
+  const age = value.verified_age_ms;
+  if (age !== undefined && (typeof age !== "number" || !Number.isSafeInteger(age) || age < 0)) {
+    throw new Error(`${command} returned a corrupt source_freshness`);
+  }
   return {
     fresh: value.fresh,
     ...(typeof generation === "number" ? { generation_id: generation } : {}),
     ...(typeof reason === "string" ? { reason } : {}),
+    ...(typeof age === "number" ? { verified_age_ms: age } : {}),
   };
 }
 

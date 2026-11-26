@@ -59,6 +59,36 @@ describe("parseCodeintelResponse", () => {
     expect(parsed.source_freshness).toEqual({ fresh: true, generation_id: 12 });
   });
 
+  it("keeps the verdict's verified_age_ms, which devmap sends since extract 101", () => {
+    const parsed = parseCodeintelResponse<{ n: string }>({
+      available: true,
+      items: [],
+      truncated: false,
+      source_freshness: { fresh: true, generation_id: 12, verified_age_ms: 0 },
+    });
+    expect(parsed.source_freshness).toEqual({ fresh: true, generation_id: 12, verified_age_ms: 0 });
+    const aged = parseCodeintelResponse<{ n: string }>({
+      available: true,
+      items: [],
+      truncated: false,
+      source_freshness: { fresh: true, verified_age_ms: 4_200 },
+    });
+    expect(aged.source_freshness.verified_age_ms).toBe(4_200);
+  });
+
+  it("refuses a verified_age_ms that is not a whole non-negative number of milliseconds", () => {
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "12", null, true]) {
+      expect(() =>
+        parseCodeintelResponse({
+          available: true,
+          items: [],
+          truncated: false,
+          source_freshness: { fresh: true, verified_age_ms: bad },
+        }),
+      ).toThrow(/corrupt source_freshness/);
+    }
+  });
+
   describe("scope", () => {
     const base = { available: true, items: [], truncated: false, source_freshness: { fresh: true } };
     const scope = {
