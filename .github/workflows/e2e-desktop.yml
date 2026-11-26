@@ -532,10 +532,47 @@ jobs:
             node scripts/browser-regressions.mjs --native --harness diagnostics
           fi
 
+      # WebView2 Runtime 150+ ignores WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS for an
+      # elevated host (MicrosoftEdge/WebView2Feedback#5645, tauri-apps/wry#1782).
+      # This runner is elevated, so msedgedriver's --remote-debugging-port never
+      # reached the app and every session failed with "DevToolsActivePort file
+      # doesn't exist". The smoke runs at medium integrity instead.
+      - name: Prepare a De-elevated E2E Run
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          GSUDO_VERSION: "2.6.1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install gsudo --version $env:GSUDO_VERSION --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco install gsudo failed ($LASTEXITCODE)" }
+          $exe = Get-ChildItem 'C:\Program Files\gsudo', "$env:ChocolateyInstall\lib\gsudo" -Recurse -Filter gsudo.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'gsudo.exe was not found after the install' }
+          Add-Content -Path $env:GITHUB_PATH -Value $exe.DirectoryName
+          # The de-elevated token keeps Administrators only as a deny-only SID,
+          # so what the elevated steps wrote is not its to read or write. Grant
+          # this user, not Everyone.
+          icacls $env:GITHUB_WORKSPACE /grant "${env:USERNAME}:(OI)(CI)F" /C /Q | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "icacls failed ($LASTEXITCODE)" }
+          # Fail here, by name, rather than as the same session timeout, if any
+          # of what the smoke relies on does not carry across.
+          $groups = & $exe.FullName --integrity Medium whoami /groups
+          if (-not ($groups -match 'Medium Mandatory Level')) { throw "gsudo did not de-elevate: $($groups -match 'Mandatory Level')" }
+          & $exe.FullName --integrity Medium cmd /c 'exit 7'
+          if ($LASTEXITCODE -ne 7) { throw "gsudo did not pass the exit code through (got $LASTEXITCODE)" }
+          $env:GITPULSE_GSUDO_PROBE = 'carried'
+          $seen = "$(& $exe.FullName --integrity Medium cmd /c 'echo %GITPULSE_GSUDO_PROBE%')".Trim()
+          if ($seen -ne 'carried') { throw "gsudo did not carry the environment (saw '$seen')" }
+          $cwd = "$(& $exe.FullName --integrity Medium cmd /c 'cd')".Trim()
+          if ($cwd -ne (Get-Location).Path) { throw "gsudo changed the working directory ('$cwd')" }
+          Write-Output "gsudo $env:GSUDO_VERSION de-elevates: $($groups -match 'Mandatory Level')"
+
       - name: Real-Binary tauri-driver E2E Smoke (Windows)
         if: ${{ !cancelled() }}
-        shell: bash
-        run: node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
+        shell: pwsh
+        run: |
+          gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows
+          exit $LASTEXITCODE
 
       - name: Publish Windows E2E Summary
         if: always()

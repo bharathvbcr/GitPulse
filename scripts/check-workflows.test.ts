@@ -438,6 +438,29 @@ describe("check:workflows", () => {
     expect(windows).toContain("retention-days: 14");
   });
 
+  it("runs the Windows tauri-driver smoke de-elevated, after proving the de-elevation carries", () => {
+    // WebView2 150+ drops WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS for an elevated
+    // host, so an elevated smoke never gets --remote-debugging-port.
+    const e2e = readFileSync(fileURLToPath(new URL("../.github/workflows/e2e-desktop.yml", import.meta.url)), "utf8");
+    const windows = e2e.slice(e2e.indexOf("\n  e2e-windows:"));
+    const prepare = windows.slice(windows.indexOf("- name: Prepare a De-elevated E2E Run"), windows.indexOf("- name: Real-Binary tauri-driver E2E Smoke (Windows)"));
+    const smoke = windows.slice(windows.indexOf("- name: Real-Binary tauri-driver E2E Smoke (Windows)"), windows.indexOf("- name: Publish Windows E2E Summary"));
+    expect(prepare, "the prepare step exists and precedes the smoke").toContain("choco install gsudo --version $env:GSUDO_VERSION");
+    expect(prepare).toMatch(/GSUDO_VERSION: "\d+\.\d+\.\d+"/);
+    // Narrower than the upstream workaround's grant to Everyone.
+    expect(prepare).toContain('/grant "${env:USERNAME}:(OI)(CI)F"');
+    expect(prepare).not.toMatch(/\/grant\s+"?Everyone:/);
+    // Each of these fails the prepare step by name instead of as a session timeout.
+    expect(prepare).toContain("Medium Mandatory Level");
+    expect(prepare).toContain("$LASTEXITCODE -ne 7");
+    expect(prepare).toContain("GITPULSE_GSUDO_PROBE");
+    expect(prepare).toContain("gsudo changed the working directory");
+    // gsudo by name: a `sudo` alias can resolve to Windows' own sudo.exe.
+    expect(smoke).toContain("gsudo --integrity Medium node scripts/e2e-driver-smoke.mjs --artifacts .gitpulse/scratch/e2e-windows");
+    expect(smoke).toContain("exit $LASTEXITCODE");
+    expect(smoke).not.toMatch(/^\s*node scripts\/e2e-driver-smoke\.mjs/m);
+  });
+
   it("keeps DEVMAP_REV, MANVI_REV, NEXTEST_VERSION, TAURI_DRIVER_VERSION, BUN_VERSION, and Node major identical across workflows, package.json, and Containerfile.linux-test", () => {
     const readWf = (name: string) =>
       readFileSync(fileURLToPath(new URL(`../.github/workflows/${name}`, import.meta.url)), "utf8");
